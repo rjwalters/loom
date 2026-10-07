@@ -146,6 +146,7 @@ pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) 
         a: report(LAND_V1, current_mean),
         b: report(LAND_V2, candidate_mean),
         paired,
+        paired_by_subset: Default::default(),
         better,
     }
 }

@@ -4,10 +4,12 @@
 
 use super::{as_of, provenance, subject};
 use crate::eta::backtest::subsets::{
-    SUBSET_HELD, SUBSET_LABELS_KNOWN, SUBSET_SEQUENCED, SUBSET_STARRED,
+    SUBSET_HELD, SUBSET_LABELS_KNOWN, SUBSET_SEQUENCED, SUBSET_STARRED, SUBSET_STARRED_ANY,
+    SUBSET_STAR_ANY_UNKNOWN, SUBSET_UNSTARRED_ANY,
 };
 use crate::eta::backtest::{self, pr_case_entries, Filter, ReplayCase};
 use crate::eta::explanation::EstimateResult;
+use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::heuristics::blank;
 use crate::eta::history::StageSamples;
 use crate::eta::labels::{FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED};
@@ -241,4 +243,158 @@ fn a_report_with_no_subset_member_omits_the_section() {
     assert_eq!(held["late_decided"], 1);
     let back: backtest::BacktestReport = serde_json::from_value(json).unwrap();
     assert_eq!(back, report);
+}
+
+// ------------------------------------- linked-issue-aware star subsets (#10508)
+
+/// Answers every case with remaining `(60, 90, 120, 150)`: late on every
+/// case [`Fixed`] covers, so a paired subset has something to tell apart.
+#[derive(Debug, Clone, Copy)]
+struct Short;
+
+impl Heuristic for Short {
+    fn id(&self) -> &'static str {
+        "short-subset-test"
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Land
+    }
+
+    fn models_hold(&self) -> bool {
+        true
+    }
+
+    fn estimate(&self, input: &EstimateInput, _history: &StageSamples) -> Explanation {
+        let mut e = blank("short-subset-test", Kind::Land, input);
+        e.result = Some(EstimateResult {
+            p25_sec: 60,
+            p50_sec: 90,
+            p75_sec: 120,
+            p90_sec: Some(150),
+            eta_p50_at: input.as_of + Duration::seconds(90),
+            samples_min: 10,
+            stage_marks: Vec::new(),
+            tail_extrapolated: false,
+        });
+        e
+    }
+}
+
+fn with_star(mut c: ReplayCase, starred_any: Option<bool>) -> ReplayCase {
+    c.priority = Some(PriorityInputs {
+        starred_any,
+        priority_level: starred_any.map(u8::from),
+        ..PriorityInputs::default()
+    });
+    c
+}
+
+/// No PR label carries a star on any of these: the first two are starred
+/// only through their linked issue, which [`SUBSET_STARRED`] cannot see.
+fn priority_cases() -> Vec<ReplayCase> {
+    vec![
+        // Linked-issue star only, covered.
+        with_star(case(0, Stage::MergeWait, Some(0), 900), Some(true)),
+        // Linked-issue star only, a late surprise for both.
+        with_star(case(1, Stage::MergeWait, Some(0), 2000), Some(true)),
+        // Known unstarred, covered.
+        with_star(case(2, Stage::ReviewWait, Some(0), 900), Some(false)),
+        // Star unknown: never counted as unstarred.
+        with_star(case(3, Stage::ReviewWait, Some(0), 900), None),
+        // No priority inputs at all (another source): in no star_any subset.
+        case(4, Stage::ReviewWait, None, 900),
+    ]
+}
+
+#[test]
+fn star_any_subsets_see_the_linked_issue_star_and_keep_unknown_apart() {
+    let report = run(&priority_cases());
+    let keys: Vec<&str> = report.by_subset.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            SUBSET_LABELS_KNOWN,
+            SUBSET_STAR_ANY_UNKNOWN,
+            SUBSET_STARRED_ANY,
+            SUBSET_UNSTARRED_ANY
+        ]
+    );
+    // The PR-label subset sees none of the linked-issue stars.
+    assert!(!report.by_subset.contains_key(SUBSET_STARRED));
+
+    let starred = &report.by_subset[SUBSET_STARRED_ANY];
+    assert_eq!(starred.bucket.n, 2);
+    assert_eq!((starred.late_decided, starred.late_rate), (2, Some(0.5)));
+
+    let unstarred = &report.by_subset[SUBSET_UNSTARRED_ANY];
+    assert_eq!(unstarred.bucket.n, 1, "the unknown case is not unstarred");
+    assert_eq!(unstarred.late_rate, Some(0.0));
+
+    let unknown = &report.by_subset[SUBSET_STAR_ANY_UNKNOWN];
+    assert_eq!(unknown.bucket.n, 1);
+}
+
+/// The star_any subsets select cases only: the pooled figures are those of
+/// the same cases without priority inputs (`Fixed` reads no priority).
+#[test]
+fn star_any_subsets_never_change_a_pooled_figure() {
+    let bare: Vec<ReplayCase> = priority_cases()
+        .into_iter()
+        .map(|mut c| {
+            c.priority = None;
+            c
+        })
+        .collect();
+    let (with, without) = (run(&priority_cases()), run(&bare));
+    assert_eq!(with.overall, without.overall);
+    assert_eq!(with.by_horizon, without.by_horizon);
+    assert!(!without.by_subset.contains_key(SUBSET_STARRED_ANY));
+}
+
+#[test]
+fn compare_pairs_the_two_heuristics_inside_each_subset() {
+    let cases = priority_cases();
+    let history = StageSamples::default();
+    let c = backtest::compare(&Fixed, &Short, &history, &cases, Filter::default(), &provenance())
+        .unwrap();
+
+    let starred = &c.paired_by_subset[SUBSET_STARRED_ANY];
+    assert_eq!((starred.cases, starred.late_pairs), (2, 2));
+    // Fixed (a) is late on the 2000 s case only; Short (b) on both.
+    assert_eq!(starred.a_late_rate, Some(0.5));
+    assert_eq!(starred.b_late_rate, Some(1.0));
+    assert_eq!(starred.loss4_pairs, 2);
+    assert_eq!(starred.delta4_items, 2, "one issue per case");
+    let delta = starred.delta_pinball4_loss_sec.as_ref().unwrap();
+    assert_eq!(delta.n, 2);
+
+    let unstarred = &c.paired_by_subset[SUBSET_UNSTARRED_ANY];
+    assert_eq!(unstarred.cases, 1);
+    assert_eq!((unstarred.a_late_rate, unstarred.b_late_rate), (Some(0.0), Some(1.0)));
+
+    // A subset's pairing is a report, never the ranking: the whole-union
+    // `paired` and `better` are those of the same cases without subsets.
+    let bare: Vec<ReplayCase> = cases
+        .into_iter()
+        .map(|mut c| {
+            c.priority = None;
+            c.pr_flags = None;
+            c
+        })
+        .collect();
+    let plain =
+        backtest::compare(&Fixed, &Short, &history, &bare, Filter::default(), &provenance())
+            .unwrap();
+    assert!(plain.paired_by_subset.is_empty());
+    assert_eq!(plain.paired, c.paired);
+    assert_eq!(plain.better, c.better);
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("paired_by_subset").is_none(), "{json}");
+
+    // With subsets, it round-trips.
+    let json = serde_json::to_value(&c).unwrap();
+    assert_eq!(json["paired_by_subset"][SUBSET_STARRED_ANY]["late_pairs"], 2);
+    let back: backtest::Comparison = serde_json::from_value(json).unwrap();
+    assert_eq!(back, c);
 }

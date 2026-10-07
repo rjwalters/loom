@@ -162,6 +162,25 @@ pub(super) fn render_comparison(c: &Comparison) -> String {
             secs(f.b_mean_pinball4_loss_sec),
         ));
     }
+    if !c.paired_by_subset.is_empty() {
+        out.push_str("  paired by subset (#10508):\n");
+        for (name, s) in &c.paired_by_subset {
+            let delta = s.delta_pinball4_loss_sec.as_ref();
+            out.push_str(&format!(
+                "    {name:<18} cases={:<5} pinball4 {a}={} {b}={} delta={} CI [{}, {}] items={} late {a}={} {b}={} over {}\n",
+                s.cases,
+                secs(s.a_mean_pinball4_loss_sec),
+                secs(s.b_mean_pinball4_loss_sec),
+                secs(delta.and_then(|d| d.value)),
+                secs(delta.and_then(|d| d.lo)),
+                secs(delta.and_then(|d| d.hi)),
+                s.delta4_items,
+                pct(s.a_late_rate),
+                pct(s.b_late_rate),
+                s.late_pairs,
+            ));
+        }
+    }
     let w = &p.day_wins;
     out.push_str(&format!(
         "  {b} won {}/{} decided day(s) ({} tied), 95% CI [{}, {}]\n",
