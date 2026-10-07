@@ -344,13 +344,7 @@ pub fn reap_worktrees(
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_generic(
-        repo_root,
-        &crate::worktree_ops::naming::issue_from_worktree,
-        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
-        quarantine,
-        remove,
-    )
+    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, remove, &|_| None)
 }
 
 /// Enumerate `pr-<N>` worktrees under `repo_root`'s worktree root, classify
@@ -376,17 +370,7 @@ pub fn reap_pr_worktrees(
     probes: &clean::PrWorktreeProbes<'_>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_generic(
-        repo_root,
-        &crate::worktree_ops::naming::pr_from_worktree,
-        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
-        // `classify_pr_worktree` never returns `RemoveWithQuarantine` (issue
-        // #6653's quarantine-then-reclaim path is scoped to issue-<N>
-        // worktrees only, so far) — this closure is unreachable for the
-        // `pr-<N>` pass.
-        &|_: &Path, _: u32| None,
-        remove,
-    )
+    reap_pr_worktrees_confirmed(repo_root, opts, probes, remove, &|_| None)
 }
 
 // ============================================================================
@@ -708,31 +692,28 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
-    // Resolved once per pass, not once per worktree: from the repo-facts
-    // record (no call when warm), else one REST call. Owner confirmations
-    // for a `NoPr` are memoised for this pass (W3a).
-    let _facts_pass = crate::forge_repo_facts::PassScope::enter();
-    let owner = crate::worktree_ops::clean_owner::repo_owner(repo_root);
+    // One hygiene pass (W6 PR2, `worktree_ops::hygiene_pass`): the owner is
+    // resolved once (repo-facts record, else one REST call; `NoPr` owner
+    // confirmations memoised, W3a), and each issue / PR / branch answer is
+    // held for this pass only, so the removal pass and the artifact-reclaim
+    // pass below share one read instead of making two. Every removal is
+    // confirmed by one fresh unconditional read first (`confirm_*`).
+    let pass = crate::worktree_ops::hygiene_pass::Pass::begin(repo_root);
     // #6652: likewise, one `git worktree list` per pass — see
     // `clean::registered_worktree_paths` doc comment for the fail-closed
     // contract on a `None` (undeterminable) snapshot.
     let registered = clean::registered_worktree_paths(repo_root);
     let is_registered_fn = clean::is_registered_worktree_probe(&registered);
 
-    let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
+    let issue_state_fn = |n: u32| pass.issue_state(n);
     // #6653: the safety criterion for gating `PrStatus::NoPr`'s grace period
-    // — REST, same quota-isolation rationale as every other probe here.
-    let issue_closed_at_fn = |n: u32| crate::worktree_ops::gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| match owner.as_ref() {
-        Some(owner) => crate::worktree_ops::clean_owner::pr_status_confirmed(
-            repo_root,
-            owner,
-            &crate::worktree_ops::naming::branch_name(n),
-        ),
-        // No owner ⇒ no REST head filter is constructible; fall back to the
-        // GraphQL-backed probe rather than silently reporting Unknown forever.
-        None => clean::check_pr_merged(repo_root, n),
-    };
+    // — REST, same quota-isolation rationale as every other probe here (and
+    // the same body `issue_state_fn` just read: no second call).
+    let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
+    // The owner-confirmed REST listing; with no owner no REST head filter is
+    // constructible, and the GraphQL-backed probe is the fallback rather than
+    // silently reporting Unknown forever.
+    let pr_status_fn = |n: u32| pass.issue_pr_status(n, false);
     // #6418: the safety criterion for removing a `ClosedNoMerge` worktree's
     // directory — every commit on the issue's own branch must be reachable
     // from some remote ref. Local refs are shared across worktrees of the
@@ -778,7 +759,9 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
         )
     };
 
-    let mut report = reap_worktrees(repo_root, &opts, &probes, &quarantine, &remover);
+    let confirm_issue = |n: u32| pass.confirm_issue(n).keep_reason();
+    let mut report =
+        reap_worktrees_confirmed(repo_root, &opts, &probes, &quarantine, &remover, &confirm_issue);
 
     // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
     // never matched the issue-keyed pass above — the one worktree class no
@@ -787,22 +770,14 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // see `check_pr_status_by_number_rest`), so this needs neither `owner`
     // nor a GraphQL fallback the way the issue-keyed `pr_status_fn` above does.
     //
-    // Memoized per `reap_repo` call (#5939 review): the removal pass and the
-    // artifact-reclaim pass below share these probes, and each kept `pr-<N>`
-    // worktree would otherwise cost two identical `gh api .../pulls/<N>` calls
-    // every tick, forever. One cache, one call per PR per tick. The removal
-    // path also needs the PR's head SHA — same payload, same call — to decide
-    // whether force-deleting the local branch can lose anything.
-    let pr_cache: std::cell::RefCell<std::collections::HashMap<u32, clean::PrProbe>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    let probe_pr = |n: u32| -> clean::PrProbe {
-        if let Some(hit) = pr_cache.borrow().get(&n) {
-            return hit.clone();
-        }
-        let probed = clean::check_pr_by_number_rest(repo_root, n);
-        pr_cache.borrow_mut().insert(n, probed.clone());
-        probed
-    };
+    // Held for this pass (#5939 review; now `hygiene_pass::Pass::pull`): the
+    // removal pass and the artifact-reclaim pass below share these probes,
+    // and each kept `pr-<N>` worktree would otherwise cost two identical
+    // `gh api .../pulls/<N>` calls every tick, forever. A PR that merged is
+    // remembered across passes and costs none. The removal path also needs
+    // the PR's head SHA — same payload — to decide whether force-deleting the
+    // local branch can lose anything; by then `confirm_pull` has re-read it.
+    let probe_pr = |n: u32| -> clean::PrProbe { pass.pull(n) };
     let pr_status_by_number_fn = |n: u32| probe_pr(n).status;
     // #6418: the `pr-<N>` counterpart of `branch_reachable_fn` above — the
     // branch is whatever `gh pr checkout` produced, so it is read from the
@@ -831,7 +806,9 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
             )
         })
     };
-    let pr_report = reap_pr_worktrees(repo_root, &opts, &pr_probes, &pr_remover);
+    let confirm_pr = |n: u32| pass.confirm_pull(n).keep_reason();
+    let pr_report =
+        reap_pr_worktrees_confirmed(repo_root, &opts, &pr_probes, &pr_remover, &confirm_pr);
     log_pr_report(repo_root, &pr_report);
 
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
@@ -2795,4 +2772,6 @@ mod tests {
 }
 
 mod private_route;
+#[cfg(any(test, doc))]
 use private_route::reap_worktrees_generic;
+use private_route::{reap_pr_worktrees_confirmed, reap_worktrees_confirmed};

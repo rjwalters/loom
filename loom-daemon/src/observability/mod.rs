@@ -112,6 +112,7 @@ mod eta_dependency;
 pub mod eta_fit;
 pub mod eta_fleet_refresh;
 mod eta_friction;
+pub mod eta_nightly_folds;
 pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
@@ -1207,6 +1208,13 @@ pub fn spawn_task(
             host_id.clone(),
         ));
     }
+    // The captain's nightly walk-forward backtest folds (#10492): independent
+    // of the refit/refresh either/or above; `fleet.captain`-gated per check.
+    ops_handles.extend(eta_nightly_folds::spawn_task(
+        workspace_root.clone(),
+        otlp_queues.clone(),
+        host_id.clone(),
+    ));
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the

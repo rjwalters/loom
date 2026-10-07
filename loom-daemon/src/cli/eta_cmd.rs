@@ -189,12 +189,8 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(
-            &DatedFits::new(Vec::new()),
-            &mut history,
-            &cases,
-            &loom,
-        );
+        let unfitted = DatedFits::new(Vec::new());
+        backtest::with_replay_calibration(|id| unfitted.heuristic(id), &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -443,7 +439,7 @@ impl EtaBacktestArgs {
             eprintln!("{note}");
         }
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(&fits, &mut history, &cases, &loom);
+        backtest::with_replay_calibration(|id| fits.heuristic(id), &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
             let Some(other) = fits.heuristic(other_id) else {

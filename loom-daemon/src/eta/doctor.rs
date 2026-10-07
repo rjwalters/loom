@@ -2,7 +2,7 @@
 //! (`cli/eta_doctor_cmd.rs`) gathers [`Facts`] from this host, read-only, and
 //! [`evaluate`] turns them into one verdict per check, walking the pipeline
 //! in order: `config` -> `data` -> `fit` -> `serving` -> `snapshot_feed` ->
-//! `outcomes`. Every WARN and FAIL carries the exact remedy.
+//! `outcomes` -> `backtest` (the nightly fold scoreboard, #10492). Every WARN and FAIL carries the exact remedy.
 //!
 //! No I/O here, so every verdict is table-testable: a wrong remedy or a wrong
 //! classification passes the type checker and misleads an operator, which is
@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use crate::eta::fit::publish::{FetchKind, PubStatus};
 use crate::eta::fit::run;
 use crate::eta::health::RefreshCycleState;
+use crate::eta::nightly_folds;
 use crate::eta::regime::DriftState;
 use crate::telemetry::kinds::eta_fit::EtaFitRecord;
 
@@ -270,6 +271,16 @@ pub struct DriftFacts {
     pub state: DriftState,
 }
 
+/// `backtest` link inputs (#10492): the captain's nightly walk-forward folds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BacktestFacts {
+    /// `autonomous.eta.nightlyFolds.enabled`.
+    pub enabled: bool,
+    /// The newest run (`.loom/state/eta/backtest/summary.json`), when this
+    /// host has run one.
+    pub state: Option<nightly_folds::State>,
+}
+
 /// Everything the doctor reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Facts {
@@ -285,6 +296,8 @@ pub struct Facts {
     pub serving: ServingFacts,
     /// `outcomes`.
     pub outcomes: OutcomeFacts,
+    /// `backtest`.
+    pub backtest: BacktestFacts,
 }
 
 /// Whether any check failed (the CLI's exit code 1).
@@ -302,6 +315,7 @@ pub fn evaluate(facts: &Facts) -> Vec<Check> {
     out.extend(serving(facts));
     out.extend(snapshot_feed(facts));
     out.extend(outcomes(facts));
+    out.extend(backtest(facts));
     out
 }
 
@@ -948,6 +962,94 @@ fn outcomes(f: &Facts) -> Vec<Check> {
             format!("{} pending; oldest estimate is {} old", o.pending, age(f.now, at)),
         ),
     });
+    out
+}
+
+/// A run older than this means the daily task is not folding (it folds once a
+/// day, so one missed day is normal).
+pub const BACKTEST_STALE_DAYS: i64 = 3;
+
+/// The nightly fold scoreboard: one line per challenger heuristic, from the
+/// newest `summary.json`. Only the captain folds, so on any other host this is
+/// a SKIP, never a failure.
+fn backtest(f: &Facts) -> Vec<Check> {
+    let b = &f.backtest;
+    if !b.enabled {
+        return vec![Check::skip(
+            "backtest",
+            "nightly_folds",
+            "autonomous.eta.nightlyFolds.enabled is off: no nightly walk-forward folds",
+        )];
+    }
+    let Some(state) = &b.state else {
+        let who = match &f.data.gate {
+            Gate::StandDown { captain } => format!("the fleet captain ({captain}) runs it"),
+            Gate::NoCaptain => {
+                "no fleet.captain is declared, so no host runs it: set `fleet.captain`".to_string()
+            }
+            _ => "it runs once a day after 00:30 UTC".to_string(),
+        };
+        return vec![Check::skip(
+            "backtest",
+            "nightly_folds",
+            format!("no nightly fold has run on this host; {who}"),
+        )];
+    };
+    let mut out = Vec::new();
+    let stale = f.now - state.written_at > Duration::days(BACKTEST_STALE_DAYS);
+    out.push(if stale {
+        Check::bad(
+            "backtest",
+            "nightly_folds",
+            Status::Warn,
+            format!("newest fold is {} ({} old)", state.day, age(f.now, state.written_at)),
+            "the daily task folds after 00:30 UTC on the fleet captain: check the daemon log for `eta nightly folds`, and that `fleet.captain` names this host",
+        )
+    } else {
+        Check::ok(
+            "backtest",
+            "nightly_folds",
+            format!("newest fold {} ({} old)", state.day, age(f.now, state.written_at)),
+        )
+    });
+    if state.summaries.is_empty() {
+        out.push(Check::skip(
+            "backtest",
+            "scoreboard",
+            "no challenger heuristic is registered against `current`",
+        ));
+    }
+    for s in &state.summaries {
+        let rate = match (s.win_rate, s.ci_low) {
+            (Some(rate), Some(low)) => {
+                format!(
+                    "won {}/{} day(s) ({:.0}%, 95% lower bound {:.1}%)",
+                    s.wins,
+                    s.days,
+                    rate * 100.0,
+                    low * 100.0
+                )
+            }
+            _ => "no decided day yet".to_string(),
+        };
+        out.push(Check::ok(
+            "backtest",
+            &format!("scoreboard {}", s.heuristic),
+            format!(
+                "{rate} vs {}; backtest gate {} ({} case(s){}; needs {} decided days): {}",
+                s.compared_to,
+                if s.gate_ready { "READY" } else { "not ready" },
+                s.cases,
+                match (&s.fitted_from, s.cases_before_fit) {
+                    (None, _) => ", no coefficient file".to_string(),
+                    (Some(_), 0) => String::new(),
+                    (Some(d), n) => format!(", {n} predicted before the oldest fit ({d}) left out"),
+                },
+                s.min_folds,
+                s.gate_detail
+            ),
+        ));
+    }
     out
 }
 

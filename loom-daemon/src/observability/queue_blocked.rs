@@ -15,9 +15,17 @@
 //!   allowlisted hold labels in [`HOLD_LABELS`]; comment text (where a
 //!   blocking reason is usually written) is never read, let alone exported.
 //! - **Order.** The rows are not in dispatch order, so their `rank` is `0`.
+//! - **One lister per fleet (W12 part 2).** With
+//!   `fleet.captainGauges.queueBlocked`, the fleet captain lists and publishes
+//!   each repo's blocked issues (number, creation time, label names), and a
+//!   dispatcher builds its rows from those facts instead of listing, for the
+//!   repos the captain's fresh heartbeat covers. Anything else (no captain,
+//!   stale, uncovered) is this host's own listing, as before. The rows are
+//!   the same either way: both go through [`blocked_rows`]. See
+//!   [`super::captain_gauges::facts`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::forge_listing::RestIssue;
 use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
@@ -40,16 +48,23 @@ pub const HOLD_LABELS: &[&str] = &[
 /// `rank` for rows outside the dispatch order.
 pub const UNRANKED: usize = 0;
 
-/// The snapshot rows for one repo's open `loom:blocked` listing: issues only
-/// (REST listings include PRs), minus those that also carry `loom:issue`
-/// (the work finder already lists those). Pure.
+/// Whether a listed item gets a blocked row: an issue (REST listings include
+/// PRs) carrying `loom:blocked` and not `loom:issue` (the work finder already
+/// lists those). Pure.
+#[must_use]
+pub fn is_blocked_row(item: &RestIssue) -> bool {
+    !item.is_pull_request
+        && item.labels.iter().any(|l| l == BLOCKED_LABEL)
+        && !item.labels.iter().any(|l| l == "loom:issue")
+}
+
+/// The snapshot rows for one repo's open `loom:blocked` listing
+/// ([`is_blocked_row`]). Pure.
 #[must_use]
 pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnapshotRow> {
     listing
         .iter()
-        .filter(|item| !item.is_pull_request)
-        .filter(|item| item.labels.iter().any(|l| l == BLOCKED_LABEL))
-        .filter(|item| !item.labels.iter().any(|l| l == "loom:issue"))
+        .filter(|item| is_blocked_row(item))
         .map(|item| {
             let disposition = QueueDisposition::LabelledBlocked;
             let holds: Vec<&str> = HOLD_LABELS
@@ -123,8 +138,16 @@ pub(super) async fn collect(
         if !listed.insert(slug.clone()) {
             continue;
         }
-        let Some(listing) = list_open(root, BLOCKED_LABEL, "queue_blocked").await else {
-            continue;
+        // W12 part 2: the fleet captain listed this repo and its facts are
+        // fresh, so no listing here. Stale, uncovered or unconfigured: list.
+        let from_captain = super::captain_gauges::captain_blocked(&slug, chrono::Utc::now())
+            .map(|facts| super::captain_gauges::facts::as_listing(&facts));
+        let listing = match from_captain {
+            Some(listing) => listing,
+            None => match list_open(root, BLOCKED_LABEL, "queue_blocked").await {
+                Some(listing) => listing,
+                None => continue,
+            },
         };
         let repo = QueueRepoRef {
             visibility: super::collector::resolve_visibility(&slug).await,
@@ -136,17 +159,30 @@ pub(super) async fn collect(
 }
 
 /// One ETag-cached listing of open items carrying `label` in the repo at
-/// `root`, off the async runtime. `None` on failure.
+/// `root` (its `origin` remote, or `LOOM_REPO` when set), off the async
+/// runtime. `None` on failure.
 pub(super) async fn list_open(
     root: PathBuf,
     label: &'static str,
     caller: &'static str,
 ) -> Option<Vec<RestIssue>> {
+    list_open_in(root, None, label, caller).await
+}
+
+/// [`list_open`] of an explicit `repo`, which wins over both `origin` and
+/// `LOOM_REPO`; `root` then only picks the credential. The captain passes the
+/// slug it publishes its facts under, so the repo it lists is the repo it
+/// names (W12 part 2).
+pub(super) async fn list_open_in(
+    root: PathBuf,
+    repo: Option<String>,
+    label: &'static str,
+    caller: &'static str,
+) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        let gh = gh_buf.as_path();
-        crate::forge_listing::list_issues_cached_as(caller, gh, Some(&root), None, label, "open")
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        list_open_with(&gh, &root, repo.as_deref(), label, caller)
     })
     .await;
     match result {
@@ -160,6 +196,17 @@ pub(super) async fn list_open(
             None
         }
     }
+}
+
+/// [`list_open`]'s blocking body, with the `gh` binary passed in.
+fn list_open_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
+    caller: &'static str,
+) -> anyhow::Result<Vec<RestIssue>> {
+    crate::forge_listing::list_issues_cached_as(caller, gh, Some(root), repo, label, "open")
 }
 
 #[cfg(test)]

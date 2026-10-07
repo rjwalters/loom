@@ -331,6 +331,26 @@ impl GhInvocation {
                 self.clone().execute_direct()
             };
         }
+        self.record_read_shed(class, owner, resource, until, app);
+        Ok(GhCompletion::Shed {
+            owner: owner.to_string(),
+            resource,
+            until,
+        })
+    }
+
+    /// Book one shed of this read: the `o=shed` accounting row, the
+    /// `forge.read.shed` span and the (rate-limited) log line. No request is
+    /// sent. Shared with the conditional-read path
+    /// ([`crate::forge_etag_store`]), which sheds outside this chain.
+    pub(crate) fn record_read_shed(
+        &self,
+        class: ReadClass,
+        owner: &str,
+        resource: Resource,
+        until: SystemTime,
+        app: Option<&str>,
+    ) {
         super::super::accounting::record_shed(self, app, owner, resource, until);
         #[cfg(test)]
         super::super::test_routing::note_shed();
@@ -362,11 +382,6 @@ impl GhInvocation {
                 resource.as_str()
             );
         }
-        Ok(GhCompletion::Shed {
-            owner: owner.to_string(),
-            resource,
-            until,
-        })
     }
 }
 

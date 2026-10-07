@@ -44,6 +44,11 @@ pub(crate) mod clean_owner;
 /// for every reaping and cleaning consumer.
 pub(crate) mod forge_state;
 pub mod gh;
+/// One hygiene pass (W6 PR2): what a pass may hold, and the fresh read
+/// every removal makes first.
+pub(crate) mod hygiene_pass;
+/// The one hygiene answer remembered across passes: a merged PR.
+pub(crate) mod hygiene_terminal;
 pub mod landed;
 /// Leg 0 of both open-linked-PR probes: the cached open-PR listing (#10514).
 pub(crate) mod linked_pr_listing;

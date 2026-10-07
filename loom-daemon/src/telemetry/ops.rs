@@ -373,7 +373,7 @@ pub enum MetricName {
     CodexSessionState,
     // ---- Fleet gauges produced by the captain (W12) ----------------------
     /// Age of the captain's last production of a fleet gauge job, labelled
-    /// `task` = the job (`observability::captain_gauges::JOBS`): on the captain its own,
+    /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
     /// on a dispatcher the published `as_of` it last read.
     #[serde(rename = "loom.captain.gauge_age_seconds")]
     CaptainGaugeAgeSeconds,

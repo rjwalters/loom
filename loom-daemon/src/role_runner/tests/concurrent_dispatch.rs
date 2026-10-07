@@ -479,8 +479,15 @@ fn gate_outcome(role: &'static str, probe: QueueProbe) -> (RoleTickOutcome, usiz
     let root = workspace(ENABLED);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut runner = FixedRunner(RoleTickOutcome::Success, Arc::clone(&calls));
-    let outcome =
-        run_gated(&mut runner, &probe, root.path(), role, "/loom:x", Duration::from_secs(300));
+    let outcome = run_gated(
+        &mut runner,
+        &probe,
+        root.path(),
+        role,
+        "/loom:x",
+        Duration::from_secs(300),
+        None,
+    );
     (outcome, calls.load(Ordering::SeqCst))
 }
 

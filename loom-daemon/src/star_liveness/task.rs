@@ -78,6 +78,10 @@ pub struct LivenessState {
     pool_since: HashMap<(String, u32), DateTime<Utc>>,
     /// Consecutive failed passes per workspace root.
     failed_passes: HashMap<PathBuf, u32>,
+    /// Repos left to the fleet captain's "no star here" report (W12 part 2).
+    /// Empty unless [`Self::set_captain_star_free`] is called: every repo is
+    /// then evaluated here, as before.
+    captain: super::captain::StandDown,
 }
 
 impl LivenessState {
@@ -87,6 +91,13 @@ impl LivenessState {
     /// with no bus drops them, which is the pre-#9321 behavior.
     pub fn take_notices(&mut self) -> Vec<Notice> {
         self.ledger.take_notices()
+    }
+
+    /// Hand in the repos (lowercased slugs) the fleet captain freshly reports
+    /// as having no open starred issue, with each report's `as_of`, for the
+    /// next [`Self::run_pass`] ([`super::captain`]).
+    pub fn set_captain_star_free(&mut self, free: HashMap<String, DateTime<Utc>>) {
+        self.captain.set_free(free);
     }
 
     fn record_drop(&mut self, intent: &StarIntent, d: DroppedStarIntent) {
@@ -117,6 +128,7 @@ impl LivenessState {
         batch: Vec<StarIntent>,
         managed: &HashMap<String, (String, PathBuf)>,
         write: bool,
+        now: DateTime<Utc>,
         forges: &mut ForgeFactory<'_>,
     ) {
         for intent in batch {
@@ -137,6 +149,11 @@ impl LivenessState {
                     match intents::apply(forge.as_mut(), &valid) {
                         Ok(done) => {
                             self.applied.insert(&valid.id);
+                            if valid.action == intents::Action::Star {
+                                // This host knows of a star the captain's
+                                // last listing may predate.
+                                self.captain.note_star(&valid.repo, now);
+                            }
                             log::info!(
                                 "star_liveness: applied loom-ui intent {} on {}#{} \
                                  (label changed: {}, commented: {})",
@@ -172,7 +189,7 @@ impl LivenessState {
             .iter()
             .map(|r| (r.slug.to_ascii_lowercase(), (r.slug.clone(), r.root.clone())))
             .collect();
-        self.apply_intents(batch, &managed, settings.escalate, forges);
+        self.apply_intents(batch, &managed, settings.escalate, now, forges);
         // A repo registered since the star arrived is handled normally.
         self.unmanaged
             .retain(|(repo, _), _| !managed.contains_key(&repo.to_ascii_lowercase()));
@@ -181,6 +198,13 @@ impl LivenessState {
         let mut failed = Vec::new();
         let is_managed = |slug: &str| managed.contains_key(&slug.to_ascii_lowercase());
         for repo in repos {
+            if self.captain.stands_down(repo, now) {
+                // The local pass over an empty starred listing, without the
+                // listing: no rows, no inheritance, a successful pass.
+                inherit::publish(&repo.root, Vec::new());
+                self.failed_passes.remove(&repo.root);
+                continue;
+            }
             let root = repo.root.clone();
             let recorded = move |n: u32| intents::recorded_starred_at(&root, n);
             let ctx = RepoContext {
@@ -199,6 +223,9 @@ impl LivenessState {
                 .run();
             match result {
                 Ok(rows) => {
+                    if !rows.is_empty() {
+                        self.captain.note_star(&repo.slug, now);
+                    }
                     let inherited: Vec<Inherited> = rows
                         .iter()
                         .filter_map(|e| {
@@ -807,6 +834,15 @@ pub fn spawn(
                     &mut skip_logged,
                     || {
                         let repos = resolve_repos(&workspace_root, &mut slugs, &mut web_bases);
+                        // W12 part 2: empty unless this host is a dispatcher
+                        // with `fleet.captainGauges.starFacts` and the
+                        // captain's facts are fresh right now.
+                        let labels = crate::operator_levels::operator_labels(
+                            crate::operator_levels::table(),
+                        );
+                        state.set_captain_star_free(
+                            crate::observability::captain_gauges::star_free(Utc::now(), &labels),
+                        );
                         let batch = intents::global_queue()
                             .map(|q| q.drain())
                             .unwrap_or_default();

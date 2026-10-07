@@ -20,13 +20,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::doctor::{
-    AuthorityFacts, ConfigFacts, DataFacts, DriftFacts, FitFacts, Gate, HeuristicTally,
-    OutcomeFacts, PairFacts, RepoFacts, ServingFacts,
+    AuthorityFacts, BacktestFacts, ConfigFacts, DataFacts, DriftFacts, FitFacts, Gate,
+    HeuristicTally, OutcomeFacts, PairFacts, RepoFacts, ServingFacts,
 };
 use super::heuristics::{CALIBRATION_BASE, CALIBRATION_BASES};
 use super::{
-    calibration_log, config, fit, fleet, fleet_refresh, health, regime, shadow, Kind, Registry,
-    Stage,
+    calibration_log, config, fit, fleet, fleet_refresh, health, nightly_folds, regime, shadow,
+    Kind, Registry, Stage,
 };
 use crate::eta::doctor::Facts;
 use crate::eta::score::EstimateSummary;
@@ -201,8 +201,14 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         drift,
     };
 
+    let backtest = BacktestFacts {
+        enabled: eta.enabled && eta.nightly_folds_enabled,
+        state: nightly_folds::read_state(root),
+    };
+
     Facts {
         now,
+        backtest,
         config: config_facts,
         data,
         fit: fit_facts,

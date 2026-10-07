@@ -61,6 +61,14 @@
 //! client for one message kind is a new integration, not a reuse. The
 //! follow-up is recorded on the PR.
 //!
+//! # One lister per fleet for the idle probe (W12 part 2)
+//!
+//! For a repo with no open starred issue the pass only lists the operator
+//! labels and stops. With `fleet.captainGauges.starFacts` the fleet captain
+//! makes those listings for the fleet, and this host skips its evaluator for
+//! a repo the captain freshly reports as star-free ([`captain`]). A repo with
+//! a star is still evaluated here in full, by every host that manages it.
+//!
 //! # Where it runs
 //!
 //! One background thread ([`task`]) while the work finder is enabled, every
@@ -75,6 +83,7 @@ use std::time::Duration;
 use crate::types::StarLivenessReport;
 pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
 
+pub mod captain;
 pub mod collect;
 pub mod edges;
 pub mod escalate;

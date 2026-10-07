@@ -73,6 +73,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.issue_release",
         "heal.issue_add_label",
         "intake.add_triage",
+        "intake.remove_triage",
         "verdict.clear_labels",
         "sequence.pr_edit",
         "review_conflict.pr_edit",
