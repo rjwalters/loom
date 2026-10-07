@@ -254,6 +254,7 @@ pub mod cleanup_paths;
 pub mod closed_building;
 pub mod consolidate;
 pub mod dirty_guard;
+pub mod discovered_worktree;
 pub mod head_sync;
 pub mod hold_state;
 pub mod issue_close_gate;

@@ -86,6 +86,7 @@ mod merge_pr_closed_building;
 mod merge_pr_consolidate;
 mod merge_pr_delete_branch;
 mod merge_pr_dirty_guard;
+mod merge_pr_discovered_worktree;
 mod merge_pr_head_sync;
 mod merge_pr_hold_state;
 mod merge_pr_issue_close_gate;

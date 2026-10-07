@@ -943,6 +943,13 @@ pub(crate) enum MergePrCommand {
     /// The shell treats anything else as REFUSE — see
     /// `cli::merge_pr_remove_gate`.
     RemoveGate(super::merge_pr_remove_gate::RemoveGateArgs),
+
+    /// What post-merge cleanup does with a worktree it DISCOVERED by branch
+    /// name (#8191 slice): primary checkout / managed / user-owned. First line
+    /// `LOOM-DISCOVERED DECIDE|NOTE` then `LEVEL<TAB>message` records; the
+    /// shell removes nothing unless it reads DECIDE — see
+    /// `cli::merge_pr_discovered_worktree`.
+    DiscoveredWorktree(super::merge_pr_discovered_worktree::DiscoveredWorktreeArgs),
 }
 
 impl MergePrCommand {
@@ -989,6 +996,7 @@ impl MergePrCommand {
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::RemoveGate(args) => args.run(),
+            MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }
