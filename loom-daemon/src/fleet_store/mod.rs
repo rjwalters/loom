@@ -85,8 +85,9 @@ pub const ADMINS_PATH: &str = "fleet/admins.json";
 /// Store-relative path of the compiled fleet document (#10705). Fetched when
 /// the store has it; when present it is the only source of the roster, run
 /// state and config tiers ([`compiled`]), and the legacy files above are the
-/// fallback only while it is absent. [`floor`] also reads it
-/// (`loom_min_version`, #10711), raw, with its own `repos.yml` fallback.
+/// fallback only while it is absent. [`floor`] also reads it through
+/// [`compiled`] (`loom_min_version`, #10711); it falls back to `repos.yml`
+/// only when this file is absent.
 pub const FLEET_JSON_PATH: &str = "fleet.json";
 
 /// Store-relative path of `host`'s machine-tier overlay.

@@ -1420,7 +1420,7 @@ and the legacy files are not consulted.
 
 | Store path | Read by | Contract |
 |---|---|---|
-| `fleet.json` | `roster`, `state`, `render`, version floor | JSON, above. When present, the next five rows are not read for the roster, state or tiers. The version floor reads only its top-level `loom_min_version` (#10711), and falls back to `repos.yml` when that key is absent — see below |
+| `fleet.json` | `roster`, `state`, `render`, version floor | JSON, above. When present, the next five rows are not read for the roster, state or tiers. The version floor reads only its top-level `loom_min_version` (#10711), through the same compiled reader. A present `fleet.json` without that key means no floor (`repos.yml` is not consulted); an invalid one is a fleet-sync error — see below |
 | `fleet/defaults.json` | `render` | JSON object: the machine tier every host shares |
 | `fleet/hosts/<host>/defaults.json` | `render` | JSON object: that host's overlay. Required for a host `render` is asked about |
 | `fleet/hosts/<host>/local.json` | `render` | JSON object: that host's host-local tier. Optional — absent leaves the local tier alone |
@@ -1449,11 +1449,17 @@ never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
 non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
 
 **`loom_min_version`** (#10711): an optional top-level `"X.Y.Z"` string, the
-fleet-wide minimum Loom version. Read from `fleet.json` when that file carries
-the key, else from the top level of `repos.yml` (an extra key there, which the
-roster ignores). Every fleet-sync pass reads it into a process-wide value, not
+fleet-wide minimum Loom version. Read from the top level of `fleet.json` when
+the store has that file (a valid one without the key means no floor; an invalid
+one is a fleet-sync error, with no `repos.yml` fallback); only when
+`fleet.json` is absent is it read from the top level of `repos.yml` (an extra
+key there, which the roster ignores). In `fleet.json` it is always a JSON
+string; in `repos.yml` quote it (an unquoted `X.Y.Z` is also read, an unquoted
+`X.Y` is a number and is refused). It must be canonical: no whitespace, no
+leading zeros (`"0.0.0"` and `"0.19.830"` are fine, `"01.2.3"` and
+`" 0.19.830 "` are not). Every fleet-sync pass reads it into a process-wide value, not
 the config tiers, so a change takes effect on the next tick without a restart.
-Absent means no floor; a malformed value (not a string, not `X.Y.Z`) keeps the
+Absent means no floor; a malformed value (not a string, not canonical `X.Y.Z`) keeps the
 last good floor and is reported as a fleet-sync error. It appears as
 `floor` in `fleet-sync-status.json` and on the `Fleet store:` status block.
 Nothing acts on it yet (#10698).
