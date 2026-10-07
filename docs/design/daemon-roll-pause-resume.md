@@ -9,9 +9,8 @@ restarts onto the new binary, and the new process resumes that work.
 on #10714 and #10698).** Those decisions answer every §12 question (Q1-Q7).
 The operator must review this doc before #10715 (implementation) is curated. No runtime behaviour changes until #10715 lands.
 
-This is a repo-local design doc (it is on the `ORPHAN_ALLOWLIST` in
-`scripts/check-docs-defaults-parity.sh`). It is never installed into consumer
-repos.
+This is a repo-local design doc under `docs/design/`. It is never installed
+into consumer repos.
 
 Citations are `path:line` against `main` at `74721c1c4` (2026-10-07). Paths
 without a prefix are under `loom-daemon/src/`.
