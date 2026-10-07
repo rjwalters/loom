@@ -511,7 +511,7 @@ fn remote(repo: &str, number: i64, state: &str) -> RemoteRef {
 fn a_closed_cross_repo_declared_blocker_is_stale() {
     let e = Evidence {
         declared: vec![BlockerRef {
-            repo: Some("2AMLogic/2am".into()),
+            repo: Some("example-org/tool-repo".into()),
             number: 202,
         }],
         remote: vec![remote("example-org/tool-repo", 202, "CLOSED")],
