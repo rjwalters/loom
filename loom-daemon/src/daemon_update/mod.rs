@@ -130,6 +130,8 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
     let _ = ARGV0.set(argv0.to_string());
 
     let a = Args::parse(argv);
+    // #10179: no rebuild / provision / restart / relaunch on a disabled host.
+    crate::host_optout::refuse_if_disabled_exit("daemon-update");
 
     // `--resolve-json` (#7609): stdout is reserved for the single JSON object,
     // so every informational line from here on is diverted to stderr. Doing it

@@ -257,17 +257,19 @@ pub fn child_env(
 /// parents the child's own spans inside this execution's trace. Injecting
 /// telemetry without that context is legal but yields orphan traces, so it is
 /// warned about once per spawn rather than silently accepted.
-pub fn prepare_child(command: &mut Command, root: &Path) {
+///
+/// Returns whether the telemetry env was injected.
+pub fn prepare_child(command: &mut Command, root: &Path) -> bool {
     for name in MANAGED_CHILD_ENV {
         command.env_remove(name);
     }
     let config = read_config(root);
     if !resolve_enabled(&config) {
-        return;
+        return false;
     }
     let pairs = child_env(&config, &super::read_config(root));
     if pairs.is_empty() {
-        return;
+        return false;
     }
     if !super::tracing::enabled(root) {
         log::warn!(
@@ -279,6 +281,55 @@ pub fn prepare_child(command: &mut Command, root: &Path) {
     for (name, value) in pairs {
         command.env(name, value);
     }
+    true
+}
+
+/// The standard OTel resource-attribute variable [`prepare_scheduled_child`]
+/// extends. Not in [`MANAGED_CHILD_ENV`]: Loom only *appends* to it, and only
+/// when the opt-in injected, so an off path leaves inheritance untouched.
+pub const RESOURCE_ATTRIBUTES_ENV: &str = "OTEL_RESOURCE_ATTRIBUTES";
+
+/// [`prepare_child`] for a scheduled, non-sweep Claude session — a role-runner
+/// tick or an epic-supervisor role dispatch (#10743). When the opt-in injects,
+/// the session's resource is also stamped `loom.role=<role>` and, when known,
+/// `loom.sweep_id=<execution>` (the id the tick's `loom.role_attempt` root
+/// carries), appended to any inherited [`RESOURCE_ATTRIBUTES_ENV`] value, so a
+/// tick's per-request LLM records can be grouped by role and tick.
+pub fn prepare_scheduled_child(
+    command: &mut Command,
+    root: &Path,
+    role: &str,
+    execution: Option<&str>,
+) -> bool {
+    if !prepare_child(command, root) {
+        return false;
+    }
+    let mut ours = format!("loom.role={}", encode_attribute_value(role));
+    if let Some(execution) = execution {
+        ours.push_str(",loom.sweep_id=");
+        ours.push_str(&encode_attribute_value(execution));
+    }
+    let value = match env_nonempty(RESOURCE_ATTRIBUTES_ENV) {
+        Some(inherited) => format!("{inherited},{ours}"),
+        None => ours,
+    };
+    command.env(RESOURCE_ATTRIBUTES_ENV, value);
+    true
+}
+
+/// Percent-encode every byte outside `[A-Za-z0-9._~:/-]`, so a value can never
+/// break the `key=value,key=value` list (`,`, `=`, `%`, whitespace).
+#[must_use]
+pub fn encode_attribute_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"._~:/-".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

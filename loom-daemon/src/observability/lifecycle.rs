@@ -930,9 +930,13 @@ thread_local! {
     static ROLE_CONTEXT: std::cell::RefCell<Option<RoleSlot>> = const { std::cell::RefCell::new(None) };
 }
 
-pub fn role_command(command: &mut Command) {
+/// Stamp the in-flight role tick's context on its launch, opening the
+/// `loom.role_attempt` root. Returns the tick's [`role_execution_id`] on the
+/// call that opens it (#10743), even when tracing is off and no span opened.
+pub fn role_command(command: &mut Command) -> Option<String> {
     ROLE_CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
+        let mut opened = None;
         if let Some(RoleSlot::Pending {
             root,
             role,
@@ -940,12 +944,14 @@ pub fn role_command(command: &mut Command) {
             started_at,
         }) = slot.as_ref()
         {
+            opened = Some(execution.clone());
             *slot = open_role_attempt(root, role, execution, *started_at).map(RoleSlot::Open);
         }
         if let Some(RoleSlot::Open(span)) = slot.as_ref() {
             span.command(command);
         }
-    });
+        opened
+    })
 }
 
 /// Journal a launching tick's `loom.role_attempt` root, started at the tick's

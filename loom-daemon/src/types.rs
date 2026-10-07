@@ -1431,6 +1431,13 @@ pub struct DaemonStatusReport {
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
     pub task_liveness: Vec<crate::task_liveness::TaskLivenessEntry>,
+    /// Codex session containers, per session-managed account (Issue
+    /// #10600): state, mounts, posture, hold, removal record and the
+    /// reconciler's last action, read from the published snapshot (no docker
+    /// call). `None` on a host without a session-managed account, and from a
+    /// pre-#10600 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_containers: Option<crate::session_status::SessionContainersReport>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status

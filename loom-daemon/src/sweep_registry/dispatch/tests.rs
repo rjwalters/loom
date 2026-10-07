@@ -1286,6 +1286,22 @@ fn dispatch_forwards_experiment_env_and_sets_cwd() {
     );
 }
 
+/// #9473: a sweep child spawned through anything but `spawn-worker.sh` (here
+/// the `spawn-claude.sh` fixture) never inherits the LLM-gateway contract.
+#[test]
+#[serial]
+fn dispatch_withholds_the_llm_gateway_contract_from_a_non_seam_child() {
+    let dir = tempdir().unwrap();
+    let (mut registry, record_log) = fixture_registry(dir.path());
+    std::env::set_var("LOOM_LLM_GATEWAY_VK", "sk-bf-sweep-fixture");
+    let outcome = registry.dispatch(&SweepKind::Issue(49), None, None, None, None);
+    std::env::remove_var("LOOM_LLM_GATEWAY_VK");
+    let outcome = outcome.expect("dispatch should succeed");
+    let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+    let recorded = assert_child_wrote(&record_log, &needle);
+    assert!(recorded.contains("LOOM_LLM_GATEWAY_VK=unset"), "{recorded}");
+}
+
 /// Issue #3730 no-op criterion: when none of the experiment env vars are
 /// set in the daemon process, `spawn_child` does NOT forward them to the
 /// child (the child observes them as unset). The cwd is still pinned to

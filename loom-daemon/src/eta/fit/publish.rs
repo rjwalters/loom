@@ -614,7 +614,7 @@ pub(crate) fn blob_sha(
     }
 }
 
-fn put_file(
+pub(crate) fn put_file(
     wt: &dyn WriteTransport,
     loc: &StoreLocation,
     path: &str,
@@ -718,7 +718,7 @@ fn branch_name(reference: &str) -> &str {
 /// ([`validate_publication_ref`]); both sides are normalized
 /// ([`branch_name`]) and compared case-insensitively, so `refs/heads/main`,
 /// `Main` or `fleet.ref = refs/heads/stable` against `stable` are refused.
-fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
+pub(crate) fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
     refuse_reviewed_branch_for(REF_KEY, "the eta fit", loc, base_ref)
 }
 
@@ -751,7 +751,7 @@ pub(crate) fn refuse_reviewed_branch_for(
 /// every field equal (schema, fit, window, **captain**, fitter, file, sha)
 /// except `published_at`. A former captain's envelope for the same fit is
 /// not: the new captain must republish it, or every host would refuse it.
-fn same_publication(cur: &Envelope, env: &Envelope) -> bool {
+pub(crate) fn same_publication(cur: &Envelope, env: &Envelope) -> bool {
     Envelope {
         published_at: env.published_at,
         ..cur.clone()

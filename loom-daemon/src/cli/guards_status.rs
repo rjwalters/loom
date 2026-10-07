@@ -52,6 +52,13 @@ impl StatusArgs {
             now: chrono::Utc::now(),
             ask_threshold: self.ask_threshold,
             log_path: std::env::var_os("LOOM_GUARD_DECISION_LOG_FILE").map(PathBuf::from),
+            daemon_version: Some(resolved_daemon_version()),
+            host: std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "unknown".into()),
         };
         let report = guards_status::collect(&inputs);
         if self.json {
@@ -61,4 +68,21 @@ impl StatusArgs {
         }
         Ok(())
     }
+}
+
+/// First line of `--version` from the loom-daemon `merge-pr.sh` would resolve
+/// (`LOOM_DAEMON_BIN`, else `loom-daemon` on `PATH`); empty when it cannot run.
+fn resolved_daemon_version() -> String {
+    let bin = std::env::var("LOOM_DAEMON_BIN").unwrap_or_else(|_| "loom-daemon".into());
+    std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }

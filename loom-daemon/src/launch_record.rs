@@ -48,7 +48,8 @@ pub use crate::api_keys_pool::ingest::LAUNCH_RECORD_PREFIX as LAUNCH_RECORD_MARK
 /// per-account failure attribution are reconstructable from the journal alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialAttribution {
-    /// `"pool"`, `"env"` or `"none"` — `worker_spawn::credential::Source`.
+    /// `"pool"`, `"env"`, `"gateway"` (#9473) or `"none"` —
+    /// `worker_spawn::credential::Source`.
     pub source: String,
     /// The API-key pool's provider namespace (`zai`, …). `None` for an
     /// env-sourced or unpooled spawn.
@@ -108,6 +109,12 @@ pub struct RuntimeAttribution {
     /// The resolved model profile name, when one was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `llm.billing` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_billing: Option<String>,
+    /// `llm.credential.kind` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_credential_kind: Option<String>,
 }
 
 /// Parse one `# LOOM_LAUNCH {…}` record body's runtime attribution (Issue
@@ -135,6 +142,8 @@ pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
         provider: string("provider"),
         model: string("model"),
         profile: string("profile"),
+        llm_billing: string("llmBilling"),
+        llm_credential_kind: string("llmCredentialKind"),
     })
 }
 

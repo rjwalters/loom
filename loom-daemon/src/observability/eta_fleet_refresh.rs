@@ -65,9 +65,14 @@
 //! 2. **Gates**: inside a rate-limit backoff, or with the breaker suppressed,
 //!    every repo is recorded (`backoff` / `breaker_open`) and no call is made;
 //!    a due backfill is recorded as in progress, so it holds the fit (#10292).
-//! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle`] under the two
-//!    budgets and the reserve floor.
-//! 4. **Raw events** (#10250, #10298): each repo's raw cache is synced
+//! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle_with`] under the
+//!    two budgets and the reserve floor. With `signoz.enabled` and
+//!    `signoz.historyPrimary` (#10520) each pass reads its history from the
+//!    SigNoz timeline first and the forge only to fill gaps, under
+//!    `gapFillMaxCallsPerPass` ([`crate::eta::fleet_signoz_history`]).
+//! 4. **Raw events** (#10250, #10298): with SigNoz history on, a repo SigNoz
+//!    covered is skipped and the others' reads are gap-fill, counted and capped
+//!    ([`EventsGate`], #10520). Each repo's raw cache is synced
 //!    in-process from every repo-wide listing ([`event_endpoints`]: issue
 //!    events, then pulls), each through its own reader-only source and its own
 //!    cursor, from what the matching shared budget has left. After the
@@ -95,12 +100,14 @@ use super::cycle_guard::{CycleGuard, CycleTick};
 pub use super::eta_fit::FitCheck;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::{EtaConfig, FleetRefreshConfig};
-use crate::eta::fit::{publish, run, Fitter};
+use crate::eta::fit::{publish, publish_v2, run, Fitter};
 use crate::eta::fleet;
 use crate::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode};
 use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use crate::eta::fleet_fetch::{ForgeRead, Installation, NoReader, Reader, ReaderForge, RepoTarget};
 use crate::eta::fleet_refresh::{self, Budgets, CycleReport, PassKind, RepoReport, StopReason};
+use crate::eta::fleet_signoz_history::EventsGate;
+use crate::eta::fleet_signoz_refresh::{Limits, SignozRead};
 use crate::eta::Provenance;
 use crate::task_liveness::ETA_FLEET_REFRESH;
 use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
@@ -528,14 +535,10 @@ pub fn distribute_fetch(
     let (loc, _) = publish::publication_location(root)?;
     let effective = crate::config_resolver::resolve_effective_config(root);
     let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
-    Some(publish::fetch_and_install(
-        &transport,
-        &loc,
-        root,
-        captain,
-        now,
-        publish::resolve_max_age(&effective),
-    ))
+    let max_age = publish::resolve_max_age(&effective);
+    // The v2 lane (#10508) is independent: its outcome never changes v1's.
+    let _ = publish_v2::fetch_and_install_v2(&transport, &loc, root, captain, now, max_age);
+    Some(publish::fetch_and_install(&transport, &loc, root, captain, now, max_age))
 }
 
 /// #10395, captain: publish the newest local fit unless already published. A
@@ -546,6 +549,7 @@ pub fn distribute_publish(root: &Path, captain: &str, now: DateTime<Utc>) {
     };
     let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
     let _ = publish::publish_newest(&transport, &transport, &loc, &base, root, captain, now);
+    let _ = publish_v2::publish_newest_v2(&transport, &transport, &loc, &base, root, captain, now);
 }
 
 /// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the
@@ -646,12 +650,29 @@ pub fn event_endpoints() -> impl Iterator<Item = ForgeEndpoint> {
 }
 
 /// One cycle over `targets`: gates, snapshots, raw events. Testable with a
-/// fake forge and events seam; the fit call and the record emission are the
-/// caller's.
+/// fake forge and events seam ([`cycle_with`] adds a SigNoz seam); the fit
+/// call and the record emission are the caller's.
 pub fn cycle(
     root: &Path,
     targets: &[RepoTarget],
     forge: &mut dyn ForgeRead,
+    events: &mut EventsSync<'_>,
+    config: &FleetRefreshConfig,
+    task: &mut TaskState,
+    now: DateTime<Utc>,
+) -> CycleOutcome {
+    let mut history = crate::eta::fleet_signoz_history::reader(&config.signoz);
+    let signoz = history
+        .as_mut()
+        .map(|(reader, limits)| (reader as &mut dyn SignozRead, *limits));
+    cycle_with(root, targets, (forge, signoz), events, config, task, now)
+}
+
+/// [`cycle`] over a given forge and SigNoz timeline reader (#10520).
+pub fn cycle_with(
+    root: &Path,
+    targets: &[RepoTarget],
+    (forge, signoz): (&mut dyn ForgeRead, Option<(&mut dyn SignozRead, Limits)>),
     events: &mut EventsSync<'_>,
     config: &FleetRefreshConfig,
     task: &mut TaskState,
@@ -702,9 +723,11 @@ pub fn cycle(
             backfill: config.backfill_max_calls_per_cycle,
             reserve: config.reserve_calls,
             backfill_days: config.backfill_days,
+            gap_fill: config.gap_fill_max_calls_per_pass,
         };
-        let mut report = fleet_refresh::run_cycle(root, targets, forge, budgets, now);
-        sync_all_events(root, targets, events, &mut report);
+        let mut report = fleet_refresh::run_cycle_with(root, targets, forge, signoz, budgets, now);
+        let gap = (config.gap_fill_max_calls_per_pass, now);
+        sync_all_events(root, targets, events, &mut report, gap);
         report
     };
     if let Some(reset) = report.rate_limited {
@@ -739,6 +762,8 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
         snapshot_id: published.as_ref().map(|s| s.snapshot_id.clone()),
         as_of: published.as_ref().map(|s| s.as_of),
         raw_events_added: None,
+        gap_fill_calls: None,
+        history: None,
         duration_ms: 0,
     };
     match target.reader {
@@ -755,12 +780,19 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// and repo. Skipped for a repo whose snapshot pass hit a coverage gap, for
 /// every repo on a reader installation (App and owner, #10329) that hit the
 /// reserve, and for everything left
-/// once one sync is rate limited or meets the open breaker.
+/// once one sync is rate limited or meets the open breaker. With SigNoz
+/// history on (#10520) each repo also follows its [`EventsGate`]: for a
+/// covered repo only its backfilled star listings' ETag'd refreshes (#10746;
+/// otherwise its coverage stays frozen, so stars read unknown past it),
+/// gap-fill (counted, and capped by `gap`'s per-repo budget less what
+/// the snapshot pass spent) otherwise. A refresh that completes stamps its
+/// listing's `synced_through` at `now`: the cache was caught up then.
 fn sync_all_events(
     root: &Path,
     targets: &[RepoTarget],
     events: &mut EventsSync<'_>,
     report: &mut CycleReport,
+    (gap_budget, now): (u64, DateTime<Utc>),
 ) {
     let halted = report.repos.iter().any(|r| {
         matches!(r.stop, StopReason::RateLimited | StopReason::BreakerOpen | StopReason::Shutdown)
@@ -783,6 +815,20 @@ fn sync_all_events(
         let Some(repo_report) = report.repos.iter_mut().find(|r| r.repo == target.repo) else {
             continue;
         };
+        let mut gate = EventsGate::for_repo(repo_report, gap_budget);
+        // A covered repo (#10746): its cache is frozen, then only the
+        // star-bearing listings refresh, and only a completed backfill's
+        // cheap ETag'd refresh, drawn from what the snapshot pass left of the
+        // per-repo gap-fill budget. SigNoz never stands in for the
+        // issue-events listing: it has no ingestion watermark proving a
+        // window complete, so only this refresh advances its coverage.
+        let covered = gate == EventsGate::Skip;
+        if covered {
+            crate::eta::fleet_signoz_history::freeze_raw_cache(root, &target.repo);
+            gate = EventsGate::GapFill(Some(
+                gap_budget.saturating_sub(repo_report.gap_fill_calls.unwrap_or(0)),
+            ));
+        }
         if repo_report.stop == StopReason::Coverage {
             continue;
         }
@@ -797,19 +843,41 @@ fn sync_all_events(
                 .endpoints
                 .get(&format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()))
                 .is_some_and(|e| e.backfill_complete);
+            if covered {
+                let star_listing = crate::eta::star::listing_keys()
+                    .iter()
+                    .any(|k| *k == format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()));
+                if !star_listing || !complete {
+                    continue;
+                }
+            }
             let (mode, left) = if complete {
                 (SyncMode::Refresh, &mut report.remaining.0)
             } else {
                 (SyncMode::Backfill, &mut report.remaining.1)
             };
-            if *left == 0 {
+            let allowed = gate.allowance(*left);
+            if allowed == 0 {
                 continue;
             }
-            let (appended, spent, stop) = events(target, reader, endpoint, *left, mode);
+            let (appended, spent, stop) = events(target, reader, endpoint, allowed, mode);
+            if mode == SyncMode::Refresh && stop.is_none() {
+                // A completed refresh: the cache is caught up with this listing.
+                let key = format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name());
+                if let Err(e) =
+                    fleet_events::mark_synced_through(&cursor_file, &target.repo, &key, now)
+                {
+                    log::warn!("eta fleet refresh: {}: could not stamp {key}: {e}", target.repo);
+                }
+            }
             *left = left.saturating_sub(spent);
             repo_report.raw_events_added =
                 Some(repo_report.raw_events_added.unwrap_or(0) + appended);
             repo_report.forge_calls += spent;
+            gate.charge(repo_report, spent);
+            if spent > 0 {
+                crate::eta::fleet_signoz_history::note_report(root, repo_report, now);
+            }
             match stop {
                 Some(StopReason::RateLimited) => {
                     // Same consequence as a snapshot read: end the cycle, back off.
@@ -1010,6 +1078,8 @@ pub fn records(
             snapshot_id: r.snapshot_id.clone(),
             as_of: r.as_of,
             duration_ms: r.duration_ms,
+            gap_fill_calls: r.gap_fill_calls,
+            history_source: r.history.map(|h| h.as_str().to_string()),
             loom: loom.clone(),
         })
         .collect()

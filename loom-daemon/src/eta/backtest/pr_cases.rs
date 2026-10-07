@@ -60,20 +60,28 @@
 //! strictly after that lap's own entry. [`super::run`] reaches history only
 //! through `select`/`select_at` (`observed_at < as_of`), so a PR's own future
 //! segments are excluded by the same structural rule as everything else.
-//! Each case's predictor inputs — `as_of`, `stage`, `rework_rounds` — are
-//! computed only from events at or before its entry (the replay is causal:
+//! Each case's predictor inputs — `as_of`, `stage`, `rework_rounds` — and
+//! its subset flags (`pr_flags`, #10524) are computed only from events at or
+//! before its entry (the replay is causal:
 //! each instant's resolution reads only the labels in force after it), so
 //! later labels, rejections and the final rework count cannot reach them;
 //! `tests/backtest_pr.rs` pins both properties.
 
 use super::ReplayCase;
 use crate::eta::episodes::{input_from_pr_history, replay};
+use crate::eta::flag_timeline::FlagChange;
 use crate::eta::labels::{
-    hold_labels, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED, TREATING,
+    hold_labels, pr_flags, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED,
+    TREATING,
 };
+use crate::eta::priority_features::{PriorityEntry, PriorityState};
+use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
+use crate::eta::queue_features::QueueSubject;
 use crate::eta::queue_features::{EventKind, EventLog, RosterEntry, StageEvent};
+use crate::eta::repo_priority::RosterRevision;
 use crate::eta::score::OutcomeKind;
 use crate::eta::stage_queue::stage_queue;
+use crate::eta::star::LinkedStar;
 use crate::eta::{Kind, NoEstimateReason, Stage, Subject};
 use crate::pr_latency::history::{PrEvent, PrState};
 use crate::pr_latency::PrHistory;
@@ -113,6 +121,16 @@ pub enum PrEventRecord {
         /// When.
         at: DateTime<Utc>,
     },
+    /// The PR was closed.
+    Closed {
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// The PR was reopened.
+    Reopened {
+        /// When.
+        at: DateTime<Utc>,
+    },
 }
 
 impl From<&PrEvent> for PrEventRecord {
@@ -128,6 +146,8 @@ impl From<&PrEvent> for PrEventRecord {
             },
             PrEvent::Pushed { at } => Self::Pushed { at: *at },
             PrEvent::Merged { at } => Self::Merged { at: *at },
+            PrEvent::Closed { at } => Self::Closed { at: *at },
+            PrEvent::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
@@ -145,6 +165,8 @@ impl From<&PrEventRecord> for PrEvent {
             },
             PrEventRecord::Pushed { at } => Self::Pushed { at: *at },
             PrEventRecord::Merged { at } => Self::Merged { at: *at },
+            PrEventRecord::Closed { at } => Self::Closed { at: *at },
+            PrEventRecord::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
@@ -178,6 +200,14 @@ pub struct PrCaseRecord {
     /// read that found none. Either is an excluded case, never a guess.
     #[serde(default)]
     pub closing_issues: Option<Vec<u32>>,
+    /// The instants a linked issue's star turned on or off for this PR
+    /// (#10372), ascending, alternating on/off from the first. `None` when
+    /// the linked-star history was never read: the PR's star is then known
+    /// only through its own labels (never read as unstarred). `Some([])` is
+    /// a read that found no linked star. Read only for the v2 priority
+    /// inputs ([`cases_from_pr_records_with_roster`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_star: Option<Vec<DateTime<Utc>>>,
     /// `false` when the timeline read did not fully answer.
     pub timeline_complete: bool,
     /// The timeline, any order (sorted on conversion).
@@ -202,6 +232,7 @@ impl PrCaseRecord {
             merged_at: h.merged_at,
             closed_at: h.closed_at,
             closing_issues,
+            linked_star: None,
             timeline_complete: h.timeline_complete,
             events: h.events.iter().map(PrEventRecord::from).collect(),
         }
@@ -334,6 +365,26 @@ struct QueueWorld<'a> {
     log: EventLog,
     /// The repos whose roster and events the batch holds in full.
     scope: Vec<String>,
+    /// Each PR's star inputs, for the priority inputs (#10508).
+    stars: Vec<WorldStar<'a>>,
+}
+
+/// One PR's own flag timeline and linked-star toggles.
+struct WorldStar<'a> {
+    repo: &'a str,
+    pr: u32,
+    flags: Vec<FlagChange>,
+    linked: Option<Vec<DateTime<Utc>>>,
+}
+
+/// The PR's linked-issue star as known strictly before `cutoff`, from its
+/// on/off instants; `None` when the history was never read.
+fn linked_at(toggles: Option<&[DateTime<Utc>]>, cutoff: DateTime<Utc>) -> Option<LinkedStar> {
+    let known: Vec<DateTime<Utc>> = toggles?.iter().copied().filter(|t| *t < cutoff).collect();
+    Some(LinkedStar {
+        since: (known.len() % 2 == 1).then(|| known[known.len() - 1]),
+        changes: known,
+    })
 }
 
 impl<'a> QueueWorld<'a> {
@@ -342,13 +393,26 @@ impl<'a> QueueWorld<'a> {
             stints: Vec::new(),
             log: EventLog::default(),
             scope: Vec::new(),
+            stars: Vec::new(),
         }
     }
 
     /// Add one PR's occupancy: every PR whose timeline is readable, whatever
     /// became of it — an open, closed-unmerged or identity-less neighbour
     /// held a queue position all the same.
-    fn add(&mut self, repo: &'a str, pr: u32, occupancy: &Occupancy) {
+    fn add(
+        &mut self,
+        repo: &'a str,
+        pr: u32,
+        occupancy: &Occupancy,
+        linked: Option<&[DateTime<Utc>]>,
+    ) {
+        self.stars.push(WorldStar {
+            repo,
+            pr,
+            flags: occupancy.flags.clone(),
+            linked: linked.map(<[_]>::to_vec),
+        });
         if !self.scope.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
             self.scope.push(repo.to_string());
         }
@@ -406,6 +470,59 @@ impl<'a> QueueWorld<'a> {
     }
 }
 
+impl QueueWorld<'_> {
+    /// The v2 priority inputs the case's PR faced at `as_of` (#10508): the
+    /// one builder the fit and serving call, over the batch's PRs standing
+    /// where `as_of` found them, with each PR's own flags and linked star as
+    /// known strictly before `as_of`. A PR with no linked-star history and
+    /// no star of its own is unknown, never unstarred.
+    fn fill_priority(&self, case: &mut ReplayCase, history: Option<&[RosterRevision]>) {
+        let Some(pr) = case.subject.pr_number else {
+            return;
+        };
+        let as_of = case.as_of;
+        let state_of = |repo: &str, number: u32| {
+            let star = self
+                .stars
+                .iter()
+                .find(|w| w.repo.eq_ignore_ascii_case(repo) && w.pr == number);
+            let own = star
+                .and_then(|w| PriorityState::from_flags(&w.flags, as_of))
+                .unwrap_or_default();
+            let linked = star.and_then(|w| linked_at(w.linked.as_deref(), as_of));
+            (own, linked)
+        };
+        let roster: Vec<PriorityEntry> = self
+            .stints
+            .iter()
+            .filter(|(_, _, s)| s.entered_at <= as_of && as_of < s.left_at)
+            .map(|(repo, number, s)| {
+                let (own, linked) = state_of(repo, *number);
+                PriorityEntry {
+                    repo: (*repo).to_string(),
+                    pr: *number,
+                    stage: s.stage,
+                    entered_at: s.entered_at,
+                    known_at: s.entered_at,
+                    star: linked.map_or(own.clone(), |l| own.with_linked(l)),
+                }
+            })
+            .collect();
+        let subject = QueueSubject {
+            repo: case.subject.repo.clone(),
+            pr: Some(pr),
+            current: Some((case.stage, as_of)),
+        };
+        let (own, linked) = state_of(&case.subject.repo, pr);
+        let ctx = PriorityContext {
+            roster: &roster,
+            scope: &self.scope,
+            fleet_history: history,
+        };
+        case.priority = Some(priority_inputs(&subject, &own, linked.as_ref(), &ctx, as_of));
+    }
+}
+
 /// The review labels: a label set carrying none of them names no review
 /// stage at all (a fresh or fully unlabeled PR), which is neither an entry
 /// nor a refusal. Which stage they name is [`stage_from_pr_labels`]' call.
@@ -441,8 +558,9 @@ fn land_terminal(
 }
 
 /// One instant the PR's resolved stage changed: `None` when its last review
-/// label was removed (a gap in review, not a refusal).
-type LabelEntry = (DateTime<Utc>, Option<Result<Stage, NoEstimateReason>>);
+/// label was removed (a gap in review, not a refusal), with
+/// [`pr_flags`] of the labels in force at that instant (#10524).
+type LabelEntry = (DateTime<Utc>, Option<Result<Stage, NoEstimateReason>>, u8);
 
 /// The stage transitions of one PR's label timeline strictly before
 /// `cutoff`, gaps included, and the instants of its rejection laps. Shared by
@@ -473,14 +591,15 @@ fn label_entries(
         if named == Some(Stage::Doctor) && prev_named != Some(Stage::Doctor) {
             rejections.push(at);
         }
+        let flags = pr_flags(present);
         match resolved {
             Some(Ok(stage)) if prev_resolved != Some(Ok(stage)) => {
-                entries.push((at, Some(Ok(stage))));
+                entries.push((at, Some(Ok(stage)), flags));
             }
             Some(Err(reason)) if prev_resolved != Some(Err(reason)) || prev_named != named => {
-                entries.push((at, Some(Err(reason))));
+                entries.push((at, Some(Err(reason)), flags));
             }
-            None if prev_resolved.is_some() => entries.push((at, None)),
+            None if prev_resolved.is_some() => entries.push((at, None, flags)),
             _ => {}
         }
         prev_resolved = resolved;
@@ -501,6 +620,27 @@ enum PrEnding {
 struct Occupancy {
     stints: Vec<Stint>,
     end: PrEnding,
+    /// The PR's own flag mask after every label event up to its end, for the
+    /// priority inputs (#10508).
+    flags: Vec<FlagChange>,
+}
+
+/// `h`'s own flag mask after every label event strictly before `cutoff`,
+/// one change per instant whose mask differs from the previous one
+/// ([`PriorityState::from_flags`] reads it).
+fn flag_changes(repo: &str, h: &PrHistory, cutoff: DateTime<Utc>) -> Vec<FlagChange> {
+    let mut out: Vec<FlagChange> = Vec::new();
+    replay(&input_from_pr_history(h, repo), cutoff, |at, present| {
+        let flags = pr_flags(present);
+        if out.last().map_or(0, |c| c.flags) != flags {
+            out.push(FlagChange {
+                pr_number: h.number,
+                at,
+                flags,
+            });
+        }
+    });
+    out
 }
 
 /// Every interval a PR spent in a stage, whatever became of it — merged,
@@ -524,13 +664,17 @@ fn pr_occupancy(repo: &str, h: &PrHistory) -> Option<Occupancy> {
     let stints = entries
         .iter()
         .enumerate()
-        .map(|(i, (at, resolved))| Stint {
+        .map(|(i, (at, resolved, _))| Stint {
             stage: resolved.as_ref().and_then(|r| r.as_ref().ok().copied()),
             entered_at: *at,
             left_at: entries.get(i + 1).map_or(cutoff, |next| next.0),
         })
         .collect();
-    Some(Occupancy { stints, end })
+    Some(Occupancy {
+        stints,
+        end,
+        flags: flag_changes(repo, h, cutoff),
+    })
 }
 
 /// Every stage entry one PR's history answers before its merge — cases and
@@ -571,7 +715,7 @@ pub fn pr_case_entries(
         merged_at: Some(merged_at),
         ..PrCaseEntries::default()
     };
-    for (as_of, resolved) in entries {
+    for (as_of, resolved, flags) in entries {
         // A gap (every review label removed) is no case and no refusal.
         let Some(resolved) = resolved else { continue };
         match resolved {
@@ -586,6 +730,8 @@ pub fn pr_case_entries(
                 dispatch: None,
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: Some(flags),
+                priority: None,
             }),
             Err(reason) => out.refused.push(RefusedEntry { at: as_of, reason }),
         }
@@ -636,6 +782,61 @@ pub struct PrCaseSummary {
 /// [`pr_case_entries`] over every record, with the tally.
 #[must_use]
 pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCaseSummary) {
+    build_cases(records, None)
+}
+
+/// [`cases_from_pr_records`], also filling each case's `eta-fit/v2` priority
+/// inputs ([`ReplayCase::priority`], #10508) from the batch's own PR
+/// timelines and `history`, the fleet roster's revisions (oldest first), with
+/// `None` leaving every roster-derived input unknown (never today's file).
+/// The cases are otherwise identical to [`cases_from_pr_records`]'.
+///
+/// Knowability is the fit's: a PR's flags and linked star are read strictly
+/// before the case's `as_of`, a roster revision from
+/// [`crate::eta::fit::KNOWABLE_LAG_SEC`] earlier. Unlike training, a replayed roster entry is
+/// known at its own stage entry, as the replayed queue ([`stage_queue`]) is.
+#[must_use]
+pub fn cases_from_pr_records_with_roster(
+    records: &[PrCaseRecord],
+    history: Option<&[RosterRevision]>,
+) -> (Vec<ReplayCase>, PrCaseSummary) {
+    build_cases(records, Some(history))
+}
+
+/// Fill the unread `linked_star` of each record from the cached star events
+/// (#10372, #10508), so a forge-fetched or saved record carries the instants
+/// its linked issue's star turned on and off.
+///
+/// A record is read at its end (`merged_at`, else `closed_at`, else `now`),
+/// by [`crate::eta::star::RepoStar::linked_at`]: strictly-before facts only,
+/// and `None` (still unread, hence unknown, never unstarred) when the repo's
+/// cache does not cover that instant. A record that already carries
+/// `linked_star` is left as it is. Returns how many records were filled.
+pub fn fill_linked_stars(
+    records: &mut [PrCaseRecord],
+    stars: &crate::eta::star::StarInputs,
+    now: DateTime<Utc>,
+) -> usize {
+    let mut filled = 0;
+    for r in records.iter_mut().filter(|r| r.linked_star.is_none()) {
+        let Some(repo) = stars.repos.get(&r.repo.to_ascii_lowercase()) else {
+            continue;
+        };
+        let end = r.merged_at.or(r.closed_at).unwrap_or(now);
+        if let Some(linked) = repo.linked_at(r.number, end) {
+            r.linked_star = Some(linked.changes);
+            filled += 1;
+        }
+    }
+    filled
+}
+
+/// Shared body: `priority` is `None` for no priority inputs at all, else the
+/// roster history the builder reads.
+fn build_cases(
+    records: &[PrCaseRecord],
+    priority: Option<Option<&[RosterRevision]>>,
+) -> (Vec<ReplayCase>, PrCaseSummary) {
     let mut summary = PrCaseSummary {
         prs: records.len(),
         ..PrCaseSummary::default()
@@ -644,7 +845,7 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
     let mut world = QueueWorld::new();
     for record in records {
         if let Some(occupancy) = pr_occupancy(&record.repo, &record.history()) {
-            world.add(&record.repo, record.number, &occupancy);
+            world.add(&record.repo, record.number, &occupancy, record.linked_star.as_deref());
         }
         let reason = match pr_case_entries(
             &record.repo,
@@ -676,6 +877,9 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
     }
     for case in &mut cases {
         world.fill(case);
+        if let Some(history) = priority {
+            world.fill_priority(case, history);
+        }
     }
     (cases, summary)
 }

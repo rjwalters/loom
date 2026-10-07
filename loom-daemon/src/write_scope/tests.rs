@@ -433,6 +433,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("eta/retire_filing.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
         (
@@ -492,6 +493,20 @@ fn daemon_write_paths_are_scoped() {
                  shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
                  unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
                  behind QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
+        (
+            "forge_merge_queue/group_github.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the merge-group commit-status POST (#10256) is `StatusApi::post_status` on \
+                 `GhLifecycleForge`, reached only through `revoke_for_transition_groups`, \
+                 whose callers are exactly the gh_lifecycle.rs ones above: `forge \
+                 merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
+                 gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
+                 before any forge call in direct mode, refuses a non-sha target, and only \
+                 ever writes `failure` (withdraws authority); dormant behind \
+                 QUEUE_EXECUTION_ENABLED=false",
             ),
         ),
         ("cli/forge_action.rs", Gated),

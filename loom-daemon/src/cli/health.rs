@@ -224,6 +224,11 @@ pub(crate) async fn handle_health_command(since: Option<String>, json: bool) -> 
         None => Duration::from_secs(health::DEFAULT_WINDOW_SECS),
     };
 
+    // #10179: a deliberately disabled host is not an outage - say so, exit 0.
+    if crate::cli::host::report_disabled(json) {
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(0);
+    }
     let report = collect(window).await;
 
     if json {
@@ -1016,8 +1021,13 @@ mod tests {
     /// production does — `LOOM_CONFIG_DEFAULTS_FILE` set to an empty string
     /// (see `config_resolver::private_defaults_path`'s doc comment) — rather
     /// than relying on the host happening not to have one provisioned.
+    ///
+    /// Also holds `loom_config_env`, the key every other bin-target writer of
+    /// `LOOM_CONFIG_DEFAULTS_FILE` serializes on (`fleet_captain_cmd`'s tests,
+    /// #9850): this test's trailing `remove_var` would otherwise re-open the
+    /// host tier under one of those tests mid-run in a threaded `cargo test`.
     #[test]
-    #[serial_test::serial(codesign_identity_env)]
+    #[serial_test::serial(codesign_identity_env, loom_config_env)]
     fn resolve_configured_codesign_identity_is_none_when_unconfigured() {
         let tmp = tempfile::tempdir().unwrap();
 

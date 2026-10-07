@@ -620,10 +620,16 @@ pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)
             run(&spec).ok().map(|s| s.quantiles)?
         }
     };
-    Some(match (&explanation.recalibration, &explanation.calibration) {
+    let served = match (&explanation.recalibration, &explanation.calibration) {
         (Some(r), _) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
-        (None, Some(c)) => super::conformal::apply(simulated, &c.shift),
+        (None, Some(c)) => super::conformal::apply_record(simulated, c),
         (None, None) => simulated,
+    };
+    // `land-2026-10-06-brisk-petrel` (#10528): the recorded regime factor,
+    // applied last, exactly as the heuristic did.
+    Some(match &explanation.regime_adjustment {
+        Some(r) => super::regime::scale(served, r.factor),
+        None => served,
     })
 }
 

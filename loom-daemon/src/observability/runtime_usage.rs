@@ -37,6 +37,7 @@
 //! `session.summary` log with the same execution's trace context, so the log
 //! and the usage span share one trace id in SigNoz.
 
+mod billing;
 pub mod cost;
 pub mod join;
 pub mod record;
@@ -49,7 +50,7 @@ use chrono::{DateTime, Utc};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
 use crate::telemetry::trace::store::TraceStore;
-use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes, TraceContext};
+use crate::telemetry::trace::{SpanName, SpanRecord, TraceAttributes};
 
 /// One execution's token totals, in Claude's disjoint vocabulary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -212,24 +213,43 @@ pub fn journal_phase_usage(
     }
     let saved = TraceStore::load(&path)?;
     let journal = Journal::for_context(&path);
-    let mut attempts: Vec<SpanRecord> = journal
+    let completed: Vec<SpanRecord> = journal
         .completed()?
         .into_iter()
-        .filter(|span| {
-            span.name == SpanName::RoleAttempt && span.context.trace_id == saved.context.trace_id
-        })
+        .filter(|span| span.context.trace_id == saved.context.trace_id)
         .collect();
+    let of_name = |name: SpanName| -> Vec<SpanRecord> {
+        completed
+            .iter()
+            .filter(|span| span.name == name)
+            .cloned()
+            .collect()
+    };
+    let mut attempts = of_name(SpanName::RoleAttempt);
     attempts.sort_by_key(|span| span.started_at);
+    // #10749: the billing class lives on each launch's `loom.runtime.run` span.
+    let runs = of_name(SpanName::RuntimeRun);
+    // Every span of the trace (open ones too), for attempt/run ancestry.
+    let mut trace = completed.clone();
+    trace.extend(
+        journal
+            .active()?
+            .into_iter()
+            .map(|active| active.record)
+            .filter(|span| span.context.trace_id == saved.context.trace_id),
+    );
     let pricing = cost::Pricing::active();
     let mut spans = Vec::new();
     for phase in phases {
         if phase.rows.is_empty() {
             continue;
         }
-        let Some(parent) = match_attempt(&attempts, phase.role, phase.attempt) else {
+        let Some(attempt) = match_attempt(&attempts, phase.role, phase.attempt) else {
             continue;
         };
+        let parent = &attempt.context;
         let mut common = TraceAttributes::new();
+        billing::attempt(&trace, &runs, attempt).stamp(&mut common);
         common.insert("loom.sweep_id".into(), execution.to_string());
         common.insert("loom.role".into(), phase.role.to_string());
         common.insert("loom.phase".into(), phase.role.to_string());
@@ -256,7 +276,7 @@ fn match_attempt<'a>(
     attempts: &'a [SpanRecord],
     role: &str,
     attempt: u32,
-) -> Option<&'a TraceContext> {
+) -> Option<&'a SpanRecord> {
     let of_role: Vec<&SpanRecord> = attempts
         .iter()
         .filter(|span| span.attributes.get("loom.role").is_some_and(|r| r == role))
@@ -269,12 +289,10 @@ fn match_attempt<'a>(
                 .is_some_and(|a| a == &attempt.to_string())
         })
         .copied();
-    labelled
-        .or_else(|| {
-            let index = usize::try_from(attempt).ok()?.checked_sub(1)?;
-            of_role.get(index).copied()
-        })
-        .map(|span| &span.context)
+    labelled.or_else(|| {
+        let index = usize::try_from(attempt).ok()?.checked_sub(1)?;
+        of_role.get(index).copied()
+    })
 }
 
 /// [`record_execution_usage`] without the enablement check. Returns the
@@ -297,14 +315,15 @@ pub fn journal_usage(
     }
     let saved = TraceStore::load(&path)?;
     let journal = Journal::for_context(&path);
-    let run = journal
+    let runs: Vec<SpanRecord> = journal
         .completed()?
         .into_iter()
         .filter(|span| {
             span.name == SpanName::RuntimeRun && span.context.trace_id == saved.context.trace_id
         })
-        .max_by_key(|span| span.ended_at);
-    let (parent, started_at, ended_at) = match &run {
+        .collect();
+    let run = runs.iter().max_by_key(|span| span.ended_at);
+    let (parent, started_at, ended_at) = match run {
         Some(run) => (&run.context, run.started_at, run.ended_at),
         None => (&saved.context, window.0, window.1),
     };
@@ -313,6 +332,9 @@ pub fn journal_usage(
     if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
         common.insert("loom.runtime".into(), runtime.to_string());
     }
+    // #10749: the per-model totals span every launch of the execution, so
+    // they carry only a class all launches share (mixed: `unknown`).
+    billing::execution(&runs).stamp(&mut common);
     let spans = spans::model_usage_spans(
         parent,
         (started_at, ended_at),
@@ -333,6 +355,18 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "runtime_usage/model_tests.rs"]
 mod model_tests;
+
+// `llm.billing` on sweep-scope usage spans (Issue #10749).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[path = "runtime_usage/billing_tests.rs"]
+mod billing_tests;
+
+// Billing attribution never borrows an unrelated launch's class (#10749).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[path = "runtime_usage/attribution_tests.rs"]
+mod attribution_tests;
 
 // Per-phase usage on the execution's `loom.role_attempt` spans (Issue #9443).
 #[cfg(test)]

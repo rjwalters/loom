@@ -277,13 +277,15 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 #   classify-response  97609b86f (#9228, squash)          0.19.455 -> 0.19.456
 #   partial-conflict   2ab7630c5 (merge of #9246)          0.19.463 -> 0.19.464
 #   checks-failure     397f06feb (merge of #9272)          0.19.464 -> 0.19.465
+#   ci-result          01d5b279f (merge of #10447, #10444) 0.19.762 -> 0.19.763
+#                      (fail-open until #10567 made an unanswered CI-run gate hold the merge)
 # tree-checks (#10026) is `open` BY CONSTRUCTION: _check_tree_checks only calls it when .loom/config.json
 # declares merge.treeChecks (opt-in), so no repo that has not opted in is gated on a daemon carrying it; an
 # opted-in repo on an older binary is refused (fail closed) and told to roll the host.
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
 tree-checks open -
 chain-lock open -
-ci-result open -
+ci-result closed 0.19.763
 stale-checks closed 0.19.221
 loom-pr-guard closed 0.19.375
 classify-response closed 0.19.456
@@ -297,6 +299,7 @@ zero-checks-settle open -
 check-runs-streak open -
 check-runs-rollup open -
 stacked-children open -
+retarget-children open -
 version-policy open -
 partial-reset open -
 partial-comment open -
@@ -306,6 +309,8 @@ issue-close-gate open -
 dirty-guard open -
 worktree-contains open -
 worktree-preserve open -
+discovered-worktree open -
+retries-used open -
 cleanup-paths open -"
 
 # Shared comparison, so the controls below exercise the SAME logic the real
@@ -340,7 +345,7 @@ CALLED_VERBS="$(grep -o 'loom-daemon}" merge-pr [a-z][a-z0-9-]*' "$MERGE_PR_SRC"
 # If the invocation idiom is ever refactored, the scan above could come back
 # empty and every assertion below would vacuously pass. Pin the three verbs
 # that are fail-closed TODAY so that refactor fails loudly instead.
-for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure; do
+for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure ci-result; do
     assert_contains "$CALLED_VERBS" "$_known" \
       "the invocation scan still finds 'merge-pr $_known' in merge-pr.sh"
 done
@@ -398,8 +403,8 @@ mkdir -p "$WORKDIR/rv-repo/.loom"
 REPO_ROOT_SAVED="$REPO_ROOT"
 REPO_ROOT="$WORKDIR/rv-repo"
 
-REV_OFF="$(LOOM_MERGE_REVERIFY_STALE_CHECKS="" LOOM_DAEMON_BIN="$WORKDIR/stale-loom-daemon" _mp_warn_reverify_floor 2>&1)"; REV_OFF_RC=$?
-assert_eq "" "$REV_OFF" "no warning while reverify is off (default)"
+REV_OFF="$(LOOM_MERGE_REVERIFY_STALE_CHECKS=off LOOM_DAEMON_BIN="$WORKDIR/stale-loom-daemon" _mp_warn_reverify_floor 2>&1)"; REV_OFF_RC=$?
+assert_eq "" "$REV_OFF" "no warning while reverify is explicitly off (env)"
 assert_eq "0" "$REV_OFF_RC" "off: returns 0"
 
 REV_ON="$(LOOM_MERGE_REVERIFY_STALE_CHECKS=1 LOOM_DAEMON_BIN="$WORKDIR/stale-loom-daemon" _mp_warn_reverify_floor 2>&1)"; REV_ON_RC=$?
@@ -413,6 +418,9 @@ assert_contains "$REV_ON" "$(hostname 2>/dev/null || echo unknown)" "the warning
 echo '{"merge":{"reverifyStaleChecks":true}}' >"$REPO_ROOT/.loom/config.json"
 REV_CFG="$(LOOM_MERGE_REVERIFY_STALE_CHECKS="" LOOM_DAEMON_BIN="$WORKDIR/stale-loom-daemon" _mp_warn_reverify_floor 2>&1)"
 assert_contains "$REV_CFG" "0.19.161" "the config key enables the check too"
+echo '{"merge":{"reverifyStaleChecks":false}}' >"$REPO_ROOT/.loom/config.json"
+REV_CFG_OFF="$(LOOM_MERGE_REVERIFY_STALE_CHECKS="" LOOM_DAEMON_BIN="$WORKDIR/stale-loom-daemon" _mp_warn_reverify_floor 2>&1)"
+assert_eq "" "$REV_CFG_OFF" "config false disables the warning"
 
 cat >"$WORKDIR/new-loom-daemon" <<'FAKE'
 #!/usr/bin/env bash

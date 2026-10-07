@@ -271,6 +271,14 @@ impl SweepRegistry {
         // divergence. Shared with `role_runner::launch`'s identical block —
         // the rationale for each pin lives in `launch_env`'s module doc.
         crate::launch_env::apply_launch_env(&mut cmd, runtime_admission, "sweep_registry");
+        // #9473: the LLM-gateway contract reaches this child only when it is
+        // `spawn-worker.sh` and the admitted runtime is a mapped native
+        // harness — never a Claude or Codex sweep.
+        crate::worker_spawn::llm_gateway::guard_dispatch(
+            &mut cmd,
+            &spawn_bin,
+            runtime_admission.map(|a| a.runtime.as_str()),
+        );
 
         // Issue #3800: put the sweep child in its OWN process group
         // (`setpgid(0, 0)` runs post-fork/pre-exec via `process_group(0)`,

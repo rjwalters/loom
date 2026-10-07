@@ -220,8 +220,8 @@ fn external_review_path_from_listings_to_merge() {
     assert_eq!(merge_row.duration_sec, Some(200), "observed entry: a real sample");
     assert_eq!(
         merged.outcomes.len(),
-        26,
-        "two estimates x land-v1 + the land-v2, calm-plover, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, both twin-otter, land-v4, little-v0 and tandem-wren shadows"
+        28,
+        "two estimates x land-v1 + the land-v2, even-lark, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, loop-kite, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
     );
     for outcome in &merged.outcomes {
         assert_eq!(outcome.score.outcome, OutcomeKind::Landed);
@@ -262,15 +262,18 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
         IssueState::ClosedNotPlanned(t(400)),
         t(600),
     );
-    // Twelve: `land-v1` (primary) and the `land-v2`,
-    // `land-2026-10-06-calm-plover`, `land-2026-10-06-quick-tern`, `-swift-tern`,
+    // Fourteen: `land-v1` (primary) and the `land-v2`,
+    // `land-2026-10-06-even-lark`, `land-2026-10-06-brisk-petrel` (#10528),
+    // `land-2026-10-06-quick-tern`, `-swift-tern`,
     // `land-2026-10-06-held-heron`, `land-2026-10-06-keen-wren` (#10508),
-    // `land-2026-10-04-twin-otter`, `-b`, `land-v4`, `little-v0` and
+    // `land-2026-10-06-bold-lark`, `land-2026-10-06-loop-kite` (#10521),
+    // `land-2026-10-04-twin-otter-b`, `land-v4`, `little-v0` and
     // `land-2026-10-06-tandem-wren` shadows, scored against the same outcome
     // at the same `as_of` — the live pairs (#9328, #10489, #10524, #10523,
-    // #10508, #10243, #10210, #10208, #10510; `land-v3` and `-amber-heron`
-    // retired, #10484).
-    assert_eq!(not_planned.outcomes.len(), 13);
+    // #10508, #10244, #10210, #10208, #10510, #10528, #10521; `land-v3` and
+    // `-amber-heron` retired, #10484; `-fresh-tide`, #10549;
+    // `land-2026-10-04-twin-otter`, #10528).
+    assert_eq!(not_planned.outcomes.len(), 14);
     assert_eq!(not_planned.outcomes[0].score.outcome, OutcomeKind::Abandoned);
     assert_eq!(not_planned.outcomes[0].score.error_sec, None);
     assert_eq!(not_planned.outcomes[0].outcome_source, "issues_read");
@@ -309,7 +312,7 @@ fn a_pre_pr_crash_with_the_issue_open_stays_pending() {
         .tracker
         .on_issue_resolved(&ItemKey::new(REPO, 61), IssueState::Open, t(1200));
     assert!(open.outcomes.is_empty(), "still open: neither landed nor abandoned");
-    assert_eq!(h.tracker.pending().len(), 13, "every land estimate waits for the landing");
+    assert_eq!(h.tracker.pending().len(), 14, "every land estimate waits for the landing");
     assert!(h.tracker.pending().iter().all(|p| p.kind == Kind::Land));
     assert!(h.tracker.item_keys().is_empty(), "nothing left to observe");
 
@@ -324,7 +327,7 @@ fn a_pre_pr_crash_with_the_issue_open_stays_pending() {
         .iter()
         .filter(|o| o.estimate.as_of == t(1))
         .collect();
-    assert_eq!(landed.len(), 13, "the original estimate, every land heuristic, scored");
+    assert_eq!(landed.len(), 14, "the original estimate, every land heuristic, scored");
     assert!(landed
         .iter()
         .all(|o| o.score.outcome == OutcomeKind::Landed));
@@ -336,13 +339,13 @@ fn a_closed_pr_replaced_by_one_that_merges_lands() {
     h.tracker
         .on_listing(REPO, &[pr(701, 71, &["loom:review-requested"], -60)], t(0), 300);
     h.estimate(t(0));
-    assert_eq!(h.tracker.pending().len(), 13, "land-v1 + the twelve land shadows");
+    assert_eq!(h.tracker.pending().len(), 14, "land-v1 + the thirteen land shadows");
     h.tracker.on_listing(REPO, &[], t(300), 300);
     h.tracker
         .on_pr_resolved(&ItemKey::new(REPO, 71), PrState::Closed, t(300));
     h.tracker
         .on_issue_resolved(&ItemKey::new(REPO, 71), IssueState::Open, t(300));
-    assert_eq!(h.tracker.pending().len(), 13, "not abandoned: a replacement may land");
+    assert_eq!(h.tracker.pending().len(), 14, "not abandoned: a replacement may land");
 
     // The replacement PR for the same issue.
     h.tracker
@@ -356,7 +359,7 @@ fn a_closed_pr_replaced_by_one_that_merges_lands() {
         .iter()
         .filter(|o| o.estimate.as_of == t(0))
         .collect();
-    assert_eq!(first.len(), 13, "the first PR's estimates scored against the landing");
+    assert_eq!(first.len(), 14, "the first PR's estimates scored against the landing");
     assert!(first.iter().all(|o| o.score.outcome == OutcomeKind::Landed));
 }
 
@@ -373,7 +376,7 @@ fn an_issue_closed_as_completed_without_a_pr_lands() {
         IssueState::ClosedCompleted(t(700)),
         t(900),
     );
-    assert_eq!(completed.outcomes.len(), 13, "land-v1 + the twelve land shadows");
+    assert_eq!(completed.outcomes.len(), 14, "land-v1 + the thirteen land shadows");
     assert_eq!(completed.outcomes[0].score.outcome, OutcomeKind::Landed);
     assert_eq!(completed.outcomes[0].score.actual_at, t(700));
     assert_eq!(completed.outcomes[0].outcome_resolution_sec, Some(200));
@@ -432,18 +435,18 @@ fn estimates_emitted_after_the_landing_are_dropped_not_scored_by_a_reopen() {
     assert_eq!(h.estimate(t(0)).len(), 1);
     // A refresh emitted while the PR was already merged (the read is late).
     assert_eq!(h.estimate(t(300)).len(), 1);
-    assert_eq!(h.tracker.pending().len(), 26, "two estimates x thirteen land heuristics");
+    assert_eq!(h.tracker.pending().len(), 28, "two estimates x fourteen land heuristics");
     h.tracker.on_listing(REPO, &[], t(600), 300);
     let merged = h
         .tracker
         .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(200)), t(600));
-    assert_eq!(merged.outcomes.len(), 13, "only the estimates made before the landing");
+    assert_eq!(merged.outcomes.len(), 14, "only the estimates made before the landing");
     assert!(merged.outcomes.iter().all(|o| o.estimate.as_of == t(0)));
     assert!(
         h.tracker.pending().is_empty(),
         "the post-landing estimate is dropped, so a reopen cannot score it"
     );
-    assert_eq!(h.tracker.drain_dropped().orphaned, 13);
+    assert_eq!(h.tracker.drain_dropped().orphaned, 14);
 
     // The reopen lands again: nothing stale is waiting for it.
     h.tracker
@@ -453,7 +456,7 @@ fn estimates_emitted_after_the_landing_are_dropped_not_scored_by_a_reopen() {
     let again =
         h.tracker
             .on_pr_resolved(&ItemKey::new(REPO, 13), PrState::Merged(t(1100)), t(1200));
-    assert_eq!(again.outcomes.len(), 13, "a reopen starts a new series");
+    assert_eq!(again.outcomes.len(), 14, "a reopen starts a new series");
     assert!(again.outcomes.iter().all(|o| o.estimate.as_of == t(900)));
 }
 
@@ -493,7 +496,7 @@ fn unchanged_items_refresh_on_the_cadence() {
     let refreshed = h.estimate(t(300));
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].trigger, crate::eta::emit::Trigger::Refresh);
-    assert_eq!(h.tracker.pending().len(), 26, "every emitted estimate waits for its outcome");
+    assert_eq!(h.tracker.pending().len(), 28, "every emitted estimate waits for its outcome");
 }
 
 #[test]
@@ -522,7 +525,7 @@ fn pending_survives_a_restart() {
     restarted.on_listing(REPO, &[pr(901, 90, &["loom:pr"], 100)], t(400), 300);
     restarted.on_listing(REPO, &[], t(700), 300);
     let merged = restarted.on_pr_resolved(&ItemKey::new(REPO, 90), PrState::Merged(t(650)), t(700));
-    assert_eq!(merged.outcomes.len(), 13, "the join survived");
+    assert_eq!(merged.outcomes.len(), 14, "the join survived");
     assert_eq!(merged.outcomes[0].estimate.as_of, t(0));
 }
 
@@ -533,7 +536,7 @@ fn expire_drops_old_pending() {
         .on_listing(REPO, &[pr(111, 11, &["loom:pr"], -60)], t(0), 300);
     h.estimate(t(0));
     assert_eq!(h.tracker.expire(t(3600)).dropped, 0);
-    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)).dropped, 13);
+    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)).dropped, 14);
     assert!(h.tracker.pending().is_empty());
 }
 

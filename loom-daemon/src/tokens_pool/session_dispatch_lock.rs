@@ -135,6 +135,23 @@ pub fn try_exclusive(dir: Option<&Path>, container: &str) -> Exclusive {
     }
 }
 
+/// [`try_exclusive`], retried every 100 ms while [`Exclusive::Busy`] for up
+/// to `wait` (#10661: the reconciler undoing its own start for a hold that
+/// a concurrent operator `stop` wrote, which holds this lock until it
+/// returns).
+#[must_use]
+pub fn exclusive_within(dir: Option<&Path>, container: &str, wait: Duration) -> Exclusive {
+    let deadline = Instant::now() + wait;
+    loop {
+        match try_exclusive(dir, container) {
+            Exclusive::Busy if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// The lock an operator `accounts session stop` (without `--force`) takes
 /// for the account's `container`. `Ok(None)` when the lock is
 /// unusable: the operator's stop then proceeds on the `docker top` check
@@ -192,6 +209,26 @@ mod tests {
         assert!(shared(dir.path(), "loom-codex-session-b", Duration::ZERO).is_some());
         drop(teardown);
         assert!(shared(dir.path(), C, Duration::ZERO).is_some());
+    }
+
+    #[test]
+    fn exclusive_within_waits_for_a_holder_that_lets_go_and_gives_up_on_one_that_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = shared(dir.path(), C, Duration::ZERO).unwrap();
+        let path = dir.path().to_path_buf();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let got = exclusive_within(Some(&path), C, Duration::from_secs(10));
+        assert!(matches!(got, Exclusive::Acquired(_)), "{got:?}");
+        release.join().unwrap();
+        drop(got);
+        let _stuck = shared(dir.path(), C, Duration::ZERO).unwrap();
+        let started = Instant::now();
+        let got = exclusive_within(Some(dir.path()), C, Duration::from_millis(300));
+        assert!(matches!(got, Exclusive::Busy), "{got:?}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]

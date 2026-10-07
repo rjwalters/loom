@@ -20,10 +20,12 @@ use crate::tokens_pool::session_lifecycle::{
     check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
     ExecOutput, WORKSPACE_LABEL,
 };
-use crate::tokens_pool::session_state::{classify_inspect, Observed};
+use crate::tokens_pool::session_state::{DriftInputs, Observed};
 
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
+#[path = "session_reconcile_hold_tests.rs"]
+mod hold_tests;
 #[path = "session_reconcile_removal_tests.rs"]
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
@@ -86,6 +88,10 @@ struct FakeState {
     start_races_stop: Mutex<bool>,
     /// `docker start` hits its deadline (wedged engine).
     start_times_out: Mutex<bool>,
+    /// An operator `stop` writes its hold into this profile while the next
+    /// `docker run`/`docker start` is in flight (#10661): the start still
+    /// succeeds, after the hold is on disk.
+    hold_during_start: Mutex<Option<PathBuf>>,
     /// `docker stop` hits its deadline (a drift recreate's teardown).
     stop_times_out: Mutex<bool>,
     /// The next N `stop_and_remove` calls stop the container, then fail the
@@ -129,6 +135,11 @@ impl FakeState {
         let intended = workspace_mount_roots(workspace, &registered).unwrap_or_default();
         check_mount_denials(&intended, None, walls)?;
         Ok(intended)
+    }
+    fn hold_if_racing_a_stop(&self) {
+        if let Some(profile) = self.hold_during_start.lock().unwrap().take() {
+            session_hold::write_hold(&profile, session_hold::now_unix_ms()).unwrap();
+        }
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -175,10 +186,7 @@ impl FakeState {
             .map(|(name, state)| {
                 let inspect =
                     inspect_json(name, state, mounts.get(name).map_or(&[], Vec::as_slice));
-                let observed = Observed {
-                    state: classify_inspect(Some(&inspect), registered),
-                    inspect,
-                };
+                let observed = Observed::of(inspect, &DriftInputs::registry(registered));
                 (name.clone(), observed)
             })
             .collect();
@@ -225,6 +233,7 @@ impl ContainerRunner for Fake {
         _daemon_root: &Path,
     ) -> Result<()> {
         self.log("create");
+        self.hold_if_racing_a_stop();
         if *self.fail_create.lock().unwrap() {
             bail!("docker run {image} failed: Unable to find image");
         }
@@ -252,6 +261,7 @@ impl ContainerRunner for Fake {
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.log("start_existing");
+        self.hold_if_racing_a_stop();
         if *self.start_times_out.lock().unwrap() {
             return Err(DockerTimedOut {
                 subcommand: "start".into(),
@@ -860,8 +870,15 @@ fn a_hold_written_during_the_reconcile_start_still_blocks_docker_start() {
     assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
     // The hold-respecting recreate path refuses outright, before any docker call.
     let calls = lifecycle.runner().calls().len();
-    let error =
-        recreate_container(&mut lifecycle, "alice", Path::new("/w"), None, &|| true).unwrap_err();
+    let error = recreate_container(
+        &mut lifecycle,
+        "alice",
+        Path::new("/w"),
+        None,
+        &|| true,
+        UndoLock::Take(None),
+    )
+    .unwrap_err();
     assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
     assert_eq!(lifecycle.runner().calls().len(), calls);
 }

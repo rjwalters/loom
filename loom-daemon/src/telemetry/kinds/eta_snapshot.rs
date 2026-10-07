@@ -48,8 +48,9 @@ use crate::telemetry::RepoVisibility;
 /// (`land` with `p50`, `land` refusals, then `start`/`finish`), not sort order.
 ///
 /// Measured (#10052): a serialized row is ~245 bytes for a short slug (~350 with long slugs), so 200 rows is ~50-70 KB.
-/// With `alternates` (#10390) a `land` row carrying the 12 [`MAX_ALTERNATES`]
-/// is ~2.7 KB with long ids (#10549), so a full record is at most ~550 KB,
+/// With `alternates` (#10390) a `land` row carrying the 13 [`MAX_ALTERNATES`]
+/// is ~2.9 KB with long ids (#10549, #10521), so a full record is at most
+/// ~600 KB,
 /// well under the dashboard's 2 MiB value limit.
 /// The record lands as one `eta:<hostId>` dashboard state value, so the cap
 /// is held rather than raised: priority cutting, not a bigger record, is
@@ -57,12 +58,13 @@ use crate::telemetry::RepoVisibility;
 pub const MAX_ROWS: usize = 200;
 
 /// Most alternates one row carries; mirrors loom-ui's `MAX_ALTERNATES`
-/// (`src/etaState.ts`), which slices before it filters. 12 since #10549
-/// (was 8): a loom-ui still slicing at 8 reads the first 8 of the id-sorted
-/// list, so either deploy order is safe. Held equal to
-/// `autonomous.eta.shadow.maxActive`'s default minus the `current` heuristic
-/// ([`crate::eta::shadow_fleet::DEFAULT_MAX_ACTIVE`]).
-pub const MAX_ALTERNATES: usize = 12;
+/// (`src/etaState.ts`), which slices before it filters. 13 since #10521
+/// (12 since #10549, was 8): a loom-ui still slicing at 12 reads the first 12
+/// of the id-sorted list, so either deploy order is safe (with the shipped
+/// registry and the default `current`, the 13th by id is `little-v0`, a
+/// baseline the chooser never offers). Held equal to `autonomous.eta.shadow.maxActive`'s default minus
+/// the `current` heuristic ([`crate::eta::shadow_fleet::DEFAULT_MAX_ACTIVE`]).
+pub const MAX_ALTERNATES: usize = 13;
 
 /// One shadow heuristic's newest estimate (or refusal) for the same
 /// `(repo, issue, kind)` as its row (#10390). Never the row's answer.

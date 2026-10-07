@@ -34,6 +34,7 @@ fn facts(role: &str) -> TickFacts {
         runtime: Some("claude".to_string()),
         model: Some("claude-sonnet-5".to_string()),
         tokens_by_model: None,
+        llm_billing: None,
     }
 }
 

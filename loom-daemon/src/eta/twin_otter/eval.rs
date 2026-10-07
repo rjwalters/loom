@@ -3,6 +3,7 @@
 
 use super::{EvalConfig, EvalError, TwinOtterInput, PROBIT_TAUS};
 use crate::eta::fit::features_v2::{model_features_v2, ModelInputsV2, FEATURES_V2};
+use crate::eta::fit::features_v3::{model_features_v3, ModelInputsV3, FEATURES_V3};
 use crate::eta::fit::math::sigmoid;
 use crate::eta::fit::{clock, model_features, AftFit, HazardFit, ModelInputs, FEATURES};
 use chrono::{DateTime, Duration, Utc};
@@ -28,17 +29,23 @@ enum Transform {
     /// `eta-fit/v2` (#10508): [`model_features_v2`], positions in
     /// [`FEATURES_V2`].
     V2,
+    /// `eta-fit/v3` (#10521): [`model_features_v3`], positions in
+    /// [`FEATURES_V3`].
+    V3,
 }
 
 impl Transform {
     /// The transform whose names cover every one of `names`: v1 first, so
-    /// a v1 model is read exactly as before; `None` when neither does.
+    /// a v1 model is read exactly as before, then v2 (so a v2 model is too),
+    /// then v3; `None` when none does.
     fn of(names: &[String]) -> Option<Self> {
         let covers = |set: &[&str]| names.iter().all(|n| set.contains(&n.as_str()));
         if covers(&FEATURES) {
             Some(Transform::V1)
         } else if covers(&FEATURES_V2) {
             Some(Transform::V2)
+        } else if covers(&FEATURES_V3) {
+            Some(Transform::V3)
         } else {
             None
         }
@@ -48,6 +55,7 @@ impl Transform {
         match self {
             Transform::V1 => &FEATURES,
             Transform::V2 => &FEATURES_V2,
+            Transform::V3 => &FEATURES_V3,
         }
     }
 }
@@ -140,6 +148,22 @@ impl<'a> Features<'a> {
                 priority: self.input.priority.unwrap_or_default(),
             })
             .to_vec(),
+            Transform::V3 => {
+                let mut loops = self.input.loops.clone().unwrap_or_default();
+                // The cumulative stage age advances with the clock, as the
+                // age does; every other friction input stays frozen.
+                let offset_h =
+                    ((at - self.input.as_of).num_milliseconds().max(0) as f64) / 3_600_000.0;
+                loops.cum_stage_h = loops.cum_stage_h.map(|h| h + offset_h);
+                model_features_v3(&ModelInputsV3 {
+                    v2: ModelInputsV2 {
+                        base,
+                        priority: self.input.priority.unwrap_or_default(),
+                    },
+                    loops,
+                })
+                .to_vec()
+            }
         };
         self.index
             .iter()
@@ -278,6 +302,24 @@ fn check_input(input: &TwinOtterInput) -> Result<(), EvalError> {
         return Err(EvalError::InvalidInput(
             "since_merge_h must be non-negative and finite".to_string(),
         ));
+    }
+    if let Some(loops) = &input.loops {
+        if loops
+            .cum_stage_h
+            .is_some_and(|h| !(h.is_finite() && h >= 0.0))
+        {
+            return Err(EvalError::InvalidInput(
+                "loops.cum_stage_h must be non-negative and finite".to_string(),
+            ));
+        }
+        if loops
+            .judge_reject_rate_7d
+            .is_some_and(|r| !(0.0..=1.0).contains(&r))
+        {
+            return Err(EvalError::InvalidInput(
+                "loops.judge_reject_rate_7d must be in [0, 1]".to_string(),
+            ));
+        }
     }
     Ok(())
 }

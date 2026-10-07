@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | `LOOM-MERGE-QUEUE-DIRECT` | 0 | direct mode: proceed exactly as before |
 //! | `LOOM-MERGE-QUEUE-MODE` | 0 | (`--mode-only`) queue mode, nothing read |
-//! | `LOOM-MERGE-QUEUE-CONTINUE` | 0 | queue mode: run the guards, then `handoff` |
+//! | `LOOM-MERGE-QUEUE-CONTINUE` | 0 | queue mode: run the guards, then `handoff` (`step` does both) |
 //! | `LOOM-MERGE-QUEUE-MERGED` | 0 | GitHub confirmed the merge |
 //! | `LOOM-MERGE-QUEUE-QUEUED` | 7 | still queued and authorized: not merged, nothing wrong |
 //! | `LOOM-MERGE-QUEUE-DROPPED` | 7 | GitHub dropped it; reason commented and routed |
@@ -23,9 +23,9 @@ use super::authz::{CheckConclusion, HandoffError};
 use super::events::FileEventSink;
 use super::gh_lifecycle::GhLifecycleForge;
 use super::github::GhQueueApi;
+use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{
-    authorize_check, handoff, reconcile_pr, revoke_for_transition, sweep, transition_line, Ctx,
-    HandoffFailure, Reconciled,
+    authorize_check, handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled,
 };
 use super::mode::MergeMode;
 use super::ops::{self, EnqueueOutcome};
@@ -276,6 +276,42 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
             let r = handoff(&ctx(env, mode, &l), *pr, approved_sha, &required);
             render_handoff(*pr, approved_sha, &r)
         }
+        MergeQueueCmd::Step {
+            pr,
+            approved_sha,
+            repo,
+        } => {
+            if mode == MergeMode::Direct {
+                return Some(direct());
+            }
+            let rec = run(
+                &MergeQueueCmd::Reconcile {
+                    pr: Some(*pr),
+                    repo: repo.clone(),
+                    mode_only: false,
+                },
+                env,
+                mode,
+            )?;
+            // Hand off only on the explicit CONTINUE verdict; every other
+            // outcome (queued, dropped, merged, undetermined) is final here.
+            if rec
+                .stdout
+                .first()
+                .is_some_and(|l| l.starts_with("LOOM-MERGE-QUEUE-CONTINUE"))
+            {
+                return run(
+                    &MergeQueueCmd::Handoff {
+                        pr: *pr,
+                        approved_sha: approved_sha.clone(),
+                        repo: repo.clone(),
+                    },
+                    env,
+                    mode,
+                );
+            }
+            rec
+        }
         MergeQueueCmd::Revoke { pr, reason, repo } => {
             if mode == MergeMode::Direct {
                 return Some(lines(
@@ -287,7 +323,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
                 Ok(x) => x,
                 Err(r) => return Some(r),
             };
-            match revoke_for_transition(&ctx(env, mode, &l), *pr, reason) {
+            match revoke_for_transition_groups(&ctx(env, mode, &l), &l.forge, *pr, reason) {
                 None => direct(),
                 Some(rev) => lines(
                     if rev.safe_to_transition() { 0 } else { 1 },
@@ -296,7 +332,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
                             "LOOM-MERGE-QUEUE-REVOKED pr={pr} safe_to_transition={}",
                             rev.safe_to_transition()
                         ),
-                        transition_line(&rev),
+                        group_transition_line(&rev),
                     ],
                 ),
             }

@@ -100,12 +100,13 @@ fn sampled_phase_history_exempts_a_productive_clean_exit() {
     // observes `exit_code == Some(0)` — the no-handle fallback yields `None`,
     // which would skip the PR probe entirely and make this test vacuous.
     std::fs::remove_file(&checkpoint).unwrap();
-    let child = Command::new("true")
+    let mut child = Command::new("true")
         .spawn()
         .expect("spawn `true` fixture child");
     registry.entries.get_mut(&sweep_id).unwrap().pid = child.id();
+    // Block on the real exit (#10726) instead of a fixed sleep.
+    child.wait().expect("wait for `true` fixture child");
     registry.children.insert(sweep_id.clone(), child);
-    std::thread::sleep(Duration::from_millis(50));
 
     // Tick 2 -> the checkpoint-less clean-exit branch this fix lives in.
     let changed = registry.reap_once();

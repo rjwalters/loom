@@ -374,6 +374,8 @@ fn the_backtest_buckets_tail_estimates_apart() {
         dispatch: None,
         age_sec,
         queue: Vec::new(),
+        pr_flags: None,
+        priority: None,
     };
     let cases = [case(0), case(2350)];
     let v4 = backtest::run(&LandV4, &history, &cases, Filter::default(), &provenance());

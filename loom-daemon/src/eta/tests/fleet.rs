@@ -616,15 +616,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/land_v1.rs", include_str!("../heuristics/land_v1.rs")),
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
     ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
-    (
-        "heuristics/land_calm_plover.rs",
-        include_str!("../heuristics/land_calm_plover.rs"),
-    ),
+    ("heuristics/land_even_lark.rs", include_str!("../heuristics/land_even_lark.rs")),
     // #10209: the recency weighting the engine and recalibration call.
     ("recency.rs", include_str!("../recency.rs")),
     // #10207: the recalibration fit and transform the heuristic calls.
     ("recalibrate.rs", include_str!("../recalibrate.rs")),
-    // #10489: the conformal calibration the calm-plover heuristic calls.
+    // #10489: the conformal calibration the even-lark heuristic calls.
     ("conformal.rs", include_str!("../conformal.rs")),
     // #10524: the IPCW conformal calibration the quick-tern heuristic calls.
     ("conformal_ipcw.rs", include_str!("../conformal_ipcw.rs")),
@@ -660,6 +657,7 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     // the evaluation core calls for it.
     ("heuristics/land_bold_lark.rs", include_str!("../heuristics/land_bold_lark.rs")),
     ("heuristics/land_keen_wren.rs", include_str!("../heuristics/land_keen_wren.rs")),
+    ("heuristics/land_loop_kite.rs", include_str!("../heuristics/land_loop_kite.rs")),
     ("fit/features_v2.rs", include_str!("../fit/features_v2.rs")),
     ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
     // #10510: the dependency wrapper and the composition it calls.
@@ -673,6 +671,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     // #10208: the zero-parameter queue floor and the queue context it reads.
     ("heuristics/little_v0.rs", include_str!("../heuristics/little_v0.rs")),
     ("stage_queue.rs", include_str!("../stage_queue.rs")),
+    // #10528: brisk-petrel and the regime adjustment it serves through.
+    ("regime.rs", include_str!("../regime.rs")),
+    (
+        "heuristics/land_brisk_petrel.rs",
+        include_str!("../heuristics/land_brisk_petrel.rs"),
+    ),
 ];
 
 /// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently

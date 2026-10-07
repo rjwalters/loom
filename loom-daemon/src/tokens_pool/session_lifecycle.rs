@@ -81,6 +81,12 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 /// (Issue #10454) — what lets selection pass over a down session account.
 pub mod liveness;
 
+// `stop`, and the reconciler's hold-respecting start, with their race
+// handling (file-size ratchet, #7711; #10661).
+mod start;
+mod stop;
+pub use start::UndoLock;
+
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.
@@ -323,10 +329,10 @@ pub fn check_mount_denials(
     Ok(())
 }
 
-/// The `firewall: true` repository paths in the fleet roster (`repos.yml`),
-/// read from the fleet-store cache the daemon's sync already keeps — never
-/// fetched here, and deny-only, so a stale cache can only under-deny, never
-/// widen a mount (issue #9979). `Ok(empty)` when no store is configured or
+/// The `firewall: true` repository paths in the fleet roster (`fleet.json`,
+/// else `repos.yml`), read from the fleet-store cache the daemon's sync already
+/// keeps — never fetched here, and deny-only, so a stale cache can only
+/// under-deny, never widen a mount (issue #9979). `Ok(empty)` when no store is configured or
 /// nothing is cached yet; `Err` when a cached roster exists but cannot be
 /// read or parsed, so a broken firewall input fails closed.
 pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
@@ -339,11 +345,12 @@ pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
     let Some(snapshot) = fetch::read_cache(&cache, &location)? else {
         return Ok(Vec::new());
     };
-    let Some(text) = snapshot.text(store::ROSTER_PATH)? else {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let Some(parsed) =
+        roster::from_snapshot(&snapshot, &home).context("fleet roster (firewall input)")?
+    else {
         return Ok(Vec::new());
     };
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
-    let parsed = roster::parse(&text, &home).context("fleet roster (firewall input)")?;
     Ok(parsed
         .records
         .iter()
@@ -1208,70 +1215,6 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
         Ok(status)
     }
 
-    /// The automated start the session reconciler uses (issue #10453): like
-    /// [`Self::start_with_workspace`], but it never lifts a hold or records
-    /// an operator choice, and it re-checks `is_held` after inspecting the
-    /// container and before any `docker start`/`run`, failing with
-    /// [`session_hold::OperatorHeld`] — so a `stop` that wrote its hold
-    /// while this was in flight is never undone.
-    pub fn start_unless_held(
-        &self,
-        name: &str,
-        workspace: Option<&Path>,
-        is_held: &dyn Fn() -> bool,
-    ) -> Result<SessionStatus> {
-        self.start_inner(name, workspace, Some(is_held))
-    }
-
-    fn start_inner(
-        &self,
-        name: &str,
-        workspace: Option<&Path>,
-        is_held: Option<&dyn Fn() -> bool>,
-    ) -> Result<SessionStatus> {
-        let account = find_codex_account(&self.workspace, name)?;
-        let name = account.id.name.as_str();
-        let profile = account.credential_reference;
-        let container = container_name(name);
-        let requested_workspace = workspace
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.workspace.clone());
-        match self.runner.inspect(&container)? {
-            Some(state) if state.running => {
-                // Already running: reuse it (idempotent `start`).
-                Self::check_workspace_match(name, &state, &requested_workspace)?;
-            }
-            Some(state) if state.restarting => bail!(
-                "session {name:?} ({container}) is restarting — Docker is backing off before \
-                 restarting a crashed container, so it is not reused. Recreate it: \
-                 `loom-daemon accounts session stop {name} --force`, then start it again \
-                 (issue #10453)"
-            ),
-            Some(state) => {
-                Self::check_workspace_match(name, &state, &requested_workspace)?;
-                if is_held.is_some_and(|held| held()) {
-                    return Err(session_hold::OperatorHeld.into());
-                }
-                self.runner.start_existing(&container)?;
-            }
-            None => {
-                if is_held.is_some_and(|held| held()) {
-                    return Err(session_hold::OperatorHeld.into());
-                }
-                ensure_profile_controls(&profile)?;
-                self.runner.create(
-                    &container,
-                    &self.image,
-                    &profile,
-                    &requested_workspace,
-                    &self.workspace,
-                )?;
-            }
-        }
-        mark_session_managed(&profile, &container)?;
-        self.status(name)
-    }
-
     fn require_host_mode(state: &ContainerState) -> Result<()> {
         if state.workspace.as_deref() == Some(Path::new(super::private_workspace::REPO)) {
             bail!("private-clone sessions require the private workspace lifecycle and exclusive account lease; unleased host-mode access refused");
@@ -1293,65 +1236,6 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                     requested.display()
                 );
             }
-        }
-        Ok(())
-    }
-
-    /// Tear down the container cleanly. Refuses (unless `force`) when an
-    /// in-flight `docker exec` is detected, per this module's restart-safety
-    /// doc comment. Idempotent: a session that is already stopped/absent is
-    /// success, not an error.
-    ///
-    /// A stop is deliberate, so it stays down: an operator hold
-    /// ([`session_hold::HOLD_FILE`]) is written *before* `docker stop`, and
-    /// the session reconciler leaves a held account alone until an operator
-    /// `start` lifts it (issue #10453).
-    pub fn stop(&self, name: &str, force: bool) -> Result<SessionStatus> {
-        let account = find_codex_account(&self.workspace, name)?;
-        let name = account.id.name.as_str();
-        let container = container_name(name);
-        let state = self.runner.inspect(&container)?;
-        if let Some(state) = &state {
-            Self::require_host_mode(state)?;
-            self.refuse_if_busy(name, &container, state, force)?;
-        }
-        session_hold::write_hold(&account.credential_reference, session_hold::now_unix_ms())?;
-        if state.is_some() {
-            if let Err(error) = self.runner.stop_and_remove(&container, STOP_GRACE) {
-                // The stop/reconcile race: a reconcile pass whose hold check
-                // ran just before the hold above was written can still
-                // `docker start` the container between our `docker stop` and
-                // `docker rm`, so `rm` finds it running. Every later start
-                // re-checks the (now written) hold, so at most that one start
-                // can be in flight: re-inspect, re-apply the in-flight-exec
-                // refusal, and stop+rm exactly once more.
-                match self.runner.inspect(&container)? {
-                    None => {}
-                    Some(again) if again.running || again.restarting => {
-                        self.refuse_if_busy(name, &container, &again, force)?;
-                        self.runner.stop_and_remove(&container, STOP_GRACE)?;
-                    }
-                    Some(_) => return Err(error),
-                }
-            }
-        }
-        self.status(name)
-    }
-
-    fn refuse_if_busy(
-        &self,
-        name: &str,
-        container: &str,
-        state: &ContainerState,
-        force: bool,
-    ) -> Result<()> {
-        if state.running && !force && self.runner.has_active_exec(container)? {
-            bail!(
-                "session {name:?} has an in-flight `docker exec`; refusing to stop without \
-                 --force (a hard stop here would SIGKILL active work, violating the #5119 \
-                 restart-safety contract). Retry once the exec finishes, or pass --force to \
-                 override."
-            );
         }
         Ok(())
     }

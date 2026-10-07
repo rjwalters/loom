@@ -17,14 +17,15 @@
 //! - **Newton:** from a warm start (stage intercepts = per-stage mean of `y`,
 //!   `log σ` = per-stage `ln std(y)`, features 0) — an all-zero start
 //!   diverges, its Hessian indefinite from the first step — with Levenberg
-//!   damping and Armijo backtracking; stops at `‖g‖∞ < 1e-10` or a full step
-//!   under `1e-13`.
+//!   damping and Armijo backtracking; stops at `‖g‖∞ < 1e-10`, a full step
+//!   under `1e-13`, or the noise floor (`math::DECREASE_RTOL`, #10501).
 
 use std::collections::BTreeMap;
 
 use super::coeffs::AftFit;
 use super::math::{
     mirror_upper, newton, norm_logpdf, norm_logsf, standardization, standardize, Derivatives, Stop,
+    DECREASE_RTOL, STEP_RTOL,
 };
 use super::{
     model_features, FitStage, TrainingRow, AFT_L2, MIN_DUR_H, MIN_STAGE_EXITS, MIN_STAGE_ROWS,
@@ -126,6 +127,8 @@ pub fn fit_x<const N: usize>(rows: &[TrainingRow], xs: &[[f64; N]]) -> Option<Af
     let stop = Stop {
         grad_tol: GRAD_TOL,
         step_tol: STEP_TOL,
+        decrease_rtol: DECREASE_RTOL,
+        step_rtol: STEP_RTOL,
     };
     let min = newton(
         problem.warm_start(),

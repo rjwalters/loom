@@ -62,6 +62,15 @@ pub struct EtaFleetRefreshRecord {
     pub as_of: Option<DateTime<Utc>>,
     /// Wall time spent on this repo, milliseconds.
     pub duration_ms: u64,
+    /// Forge reads made while SigNoz is the history source (#10520): `0`
+    /// when SigNoz covered the pass; absent when SigNoz history is off.
+    /// Body-only, like `history_source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_fill_calls: Option<u64>,
+    /// `signoz`, `signoz_gap_fill`, `forge_uncovered` or `forge_unavailable`
+    /// (#10520); absent when SigNoz history is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_source: Option<String>,
     /// The computing build.
     pub loom: Provenance,
 }

@@ -58,10 +58,9 @@ use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
-use crate::eta::stall::{self, StallSnapshot};
 use crate::eta::tracker::{
-    events_from_journal, DispatchMeta, Effects, Emission, EstimateContext, IssueRow, IssueState,
-    ItemKey, ListedPr, PrState, PrView, ReadyPlan, ReadyRow, RegistryMeta, Resolved, Tracker,
+    events_from_journal, DispatchMeta, Effects, Emission, IssueRow, IssueState, ItemKey, ListedPr,
+    PrState, PrView, ReadyPlan, ReadyRow, RegistryMeta, Resolved, Tracker,
 };
 use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -286,59 +285,6 @@ fn write_pending(path: &Path, pending: &[EstimateSummary]) {
     }
 }
 
-/// Estimate `keys` (all when `None`) under the lock, returning the
-/// emissions plus what delivery needs.
-fn estimate_locked(
-    state: &mut State,
-    keys: Option<&[ItemKey]>,
-    now: DateTime<Utc>,
-) -> Vec<Emission> {
-    let stalls = stalls_now(state, now);
-    let ctx = EstimateContext {
-        registry: &state.registry,
-        current_start: state.config.current_start.as_deref(),
-        current_finish: state.config.current_finish.as_deref(),
-        current_land: state.config.current_land.as_deref(),
-        history: &state.history,
-        refresh_secs: state.config.refresh_secs,
-        host_id: Some(state.host_id.as_str()),
-        repo_ids: &state.repo_ids,
-        stalls: &stalls,
-    };
-    let emissions = state.tracker.estimate(keys, &ctx, now);
-    // A full pass also tallied every live series' answer state (#10233):
-    // fold it into the ledger as paired answer-rate evidence.
-    let answers = state.tracker.drain_answers();
-    if !answers.is_empty() {
-        let ids = current_ids(state);
-        state
-            .shadow
-            .record_answers(&|kind| ids.get(&kind).cloned().unwrap_or_default(), &answers);
-        let path = shadow::ledger_path(&state.workspace_root);
-        if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
-            log::warn!("eta: persisting the shadow ledger failed: {error}");
-        }
-    }
-    emissions
-}
-
-/// The stall snapshot an estimate at `now` reads (#10210): the rate-limit
-/// breaker and the forge-call ledger's last zero readings (in-process, read
-/// fresh), plus the pass's token-pool brake and lockout readings. Read-only:
-/// no stall costs a forge call.
-fn stalls_now(state: &State, now: DateTime<Utc>) -> StallSnapshot {
-    let breaker = crate::rate_limit_breaker::global_snapshot();
-    let pools = crate::forge_call_stats::exhausted_pools(now);
-    let pools: Vec<(&str, Option<DateTime<Utc>>)> = pools
-        .iter()
-        .map(|(pool, reset)| (pool.as_str(), *reset))
-        .collect();
-    StallSnapshot {
-        host: stall::host_signals(breaker.as_ref(), &pools, state.pool_exhausted, now),
-        locked_repos: state.locked_repos.clone(),
-    }
-}
-
 /// Whether any provisioned workspace's empty-pool brake is tripped — the
 /// sweep registry's own reading, never a token probe.
 fn pool_brake_tripped(
@@ -525,6 +471,7 @@ pub fn spawn_task(
     }
     log_fit(None, registry.fit(), &workspace_root);
     log_fit_v2(None, registry.fit_v2());
+    log_fit_v3(None, registry.fit_v3());
     let mut tracker = Tracker::new(loom);
     // Only the ETA authority restores (#10498); a pending estimate of a retired
     // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
@@ -1007,7 +954,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, (loaded_fit, roster), snapshots) =
+    let ((history, events), repo_ids, (loaded_fit, roster), (snapshots, files)) =
         tokio::task::spawn_blocking(move || {
             let ids: BTreeMap<String, u64> = slugs
                 .iter()
@@ -1020,16 +967,18 @@ pub(super) async fn record(
             let loaded_fit = (
                 fit::load_latest(&journal_root, listed_at),
                 fit::v2::load_latest_v2(&journal_root, listed_at),
+                fit::v3::load_latest_v3(&journal_root, listed_at),
             );
             // #10586: the roster history the fit read, from the same cache.
             let roster = crate::eta::roster_history::load_for(&journal_root, listed_at).0;
-            // #10500: the label timeline serving dates first-seen PRs from.
+            // #10500: the label timeline serving dates first-seen PRs from
             let snapshots = crate::eta::fleet::load_all(&journal_root);
+            // #10550: ...and the per-PR file lists the fit reads beside them.
             (
                 load_history(&history_roots, &journal_root, &host),
                 ids,
                 (loaded_fit, roster),
-                snapshots,
+                (snapshots, crate::eta::pr_file_log::load(&journal_root)),
             )
         })
         .await
@@ -1060,12 +1009,14 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
-        let registered = (state.registry.fit_id(), state.registry.fit_v2_id());
+        let registered =
+            (state.registry.fit_id(), state.registry.fit_v2_id(), state.registry.fit_v3_id());
         if let Some(registry) = swap_fit(registered, loaded_fit) {
             if registry.fit_id() != state.registry.fit_id() {
                 log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
             }
             log_fit_v2(state.registry.fit_v2_id(), registry.fit_v2());
+            log_fit_v3(state.registry.fit_v3_id(), registry.fit_v3());
             state.registry = registry;
         }
         // #10207: every still-pending base estimate is a censored lower bound
@@ -1077,6 +1028,7 @@ pub(super) async fn record(
         state.repo_ids.extend(repo_ids);
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
         state.tracker.set_fleet_history(roster);
+        state.tracker.set_file_snapshots(Some(files));
         state.tracker.friction = book;
         state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;
@@ -1237,12 +1189,14 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
 }
 
 mod authority;
+mod estimate_pass;
+use estimate_pass::estimate_locked;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
 mod pr_resolved;
-use fit_swap::{log_fit, log_fit_v2, swap_fit};
+use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

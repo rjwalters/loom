@@ -178,6 +178,22 @@ pub struct RepoFacts {
     pub snapshot_as_of: Option<DateTime<Utc>>,
     /// An in-progress backfill's start.
     pub backfill_since: Option<DateTime<Utc>>,
+    /// The last SigNoz-primary pass: its source and gap-fill request count
+    /// (#10520); `None` when SigNoz history has not run for the repo.
+    pub history: Option<crate::eta::fleet_signoz_history::HistoryNote>,
+}
+
+/// `; history <source>, N gap-fill request(s) at <when>` (#10520), or
+/// nothing when SigNoz history has not run for the repo.
+fn history_text(r: &RepoFacts) -> String {
+    r.history.map_or_else(String::new, |h| {
+        format!(
+            "; history {}, {} gap-fill request(s) on its last cycle ({})",
+            h.source.as_str(),
+            h.gap_fill_calls,
+            h.at.to_rfc3339()
+        )
+    })
 }
 
 /// `data` link inputs.
@@ -203,6 +219,9 @@ pub struct FitFacts {
     /// The captain-published fit state (`fit-pub/status.json`, #10395);
     /// default when the file is absent.
     pub published: PubStatus,
+    /// The `eta-fit/v2` lane's state (`fit-pub/status-v2.json`, #10508);
+    /// default when the file is absent. Independent of [`Self::published`].
+    pub published_v2: PubStatus,
 }
 
 /// One heuristic's pending-estimate tally.
@@ -269,6 +288,9 @@ pub struct DriftFacts {
     pub n_recent: u64,
     /// The tri-state verdict: `Unknown` below the sample floor.
     pub state: DriftState,
+    /// Whether the serving `land` heuristic scales its ETAs for drift
+    /// (`land-2026-10-06-brisk-petrel`, #10528). `false` for every other.
+    pub adjusted: bool,
 }
 
 /// `backtest` link inputs (#10492): the captain's nightly walk-forward folds.
@@ -468,7 +490,7 @@ fn data(f: &Facts) -> Vec<Check> {
                 "data",
                 &name,
                 if refreshes { Status::Fail } else { Status::Warn },
-                "no snapshot",
+                format!("no snapshot{}", history_text(r)),
                 if refreshes {
                     "run `loom-daemon eta fleet backfill --repo OWNER/NAME`, or let the refresh loop backfill it"
                 } else if standing_down {
@@ -482,7 +504,8 @@ fn data(f: &Facts) -> Vec<Check> {
                 let backfill = r
                     .backfill_since
                     .map(|b| format!("; backfill in progress since {}", b.to_rfc3339()))
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    + &history_text(r);
                 let interval = i64::try_from(c.interval_secs).unwrap_or(i64::MAX / 4);
                 if f.now - as_of > Duration::hours(SNAPSHOT_FAIL_HOURS) {
                     Check::bad(
@@ -577,7 +600,7 @@ fn fit(f: &Facts) -> Vec<Check> {
             "fit",
             "coefficient_file",
             Status::Fail,
-            "no coefficient file: twin-otter refuses no_model",
+            "no coefficient file: twin-otter-b refuses no_model",
             fit_remedy(x.last_check.as_ref()),
         ),
         Some((id, cutoff)) if f.now - *cutoff > Duration::hours(FIT_FAIL_HOURS) => Check::bad(
@@ -611,7 +634,8 @@ fn fit(f: &Facts) -> Vec<Check> {
         ),
         Some(r) => last_check(f.now, r),
     });
-    out.push(published_fit(f.now, &x.published));
+    out.push(published_fit(f.now, &x.published, "published_fit"));
+    out.push(published_fit(f.now, &x.published_v2, "published_fit_v2"));
     let snapshot_dates: Vec<DateTime<Utc>> = f
         .data
         .repos
@@ -638,23 +662,24 @@ fn fit(f: &Facts) -> Vec<Check> {
     out
 }
 
-/// The captain-published fit (#10395). Informational unless the last fetch or
+/// The captain-published fit (#10395), for the lane `check` names
+/// (`published_fit` for v1, `published_fit_v2` for #10508's v2 lane). Informational unless the last fetch or
 /// publish failed: an absent or stale publication just means this host uses
 /// its own fit, or refuses `no_model`, exactly as before publication existed.
-fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
+fn published_fit(now: DateTime<Utc>, p: &PubStatus, check: &str) -> Check {
     let publish_failed = p.publish_error.as_deref();
     let Some(kind) = p.kind else {
         return match publish_failed {
             Some(e) => Check::bad(
                 "fit",
-                "published_fit",
+                check,
                 Status::Warn,
                 format!("captain publish failing: {e}"),
                 "check `fleet.repo`, `fleet.etaFitRef` and the captain's write credential",
             ),
             None => Check::skip(
                 "fit",
-                "published_fit",
+                check,
                 "no published fit: this host uses its own fit, or refuses no_model",
             ),
         };
@@ -677,23 +702,23 @@ fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
         FetchKind::Installed | FetchKind::Current | FetchKind::NotModified
             if publish_failed.is_none() =>
         {
-            Check::ok("fit", "published_fit", detail)
+            Check::ok("fit", check, detail)
         }
-        FetchKind::Absent => Check::skip(
+        FetchKind::Absent if publish_failed.is_none() => Check::skip(
             "fit",
-            "published_fit",
+            check,
             format!("{detail}: nothing published, this host uses its own fit or refuses no_model"),
         ),
         FetchKind::Stale => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             format!("{detail}: stale publication ignored, this host uses its own fit or refuses no_model"),
             "the captain has stopped publishing; see the captain's `eta doctor` (fit.last_check, fit.published_fit)",
         ),
         _ => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             detail,
             "the previous fit stays in service; check `fleet.repo`/`fleet.etaFitRef` and the refusal code",
@@ -809,7 +834,7 @@ fn serving(f: &Facts) -> Vec<Check> {
             "serving",
             "twin_otter_model",
             Status::Fail,
-            "no coefficient file loaded: land-2026-10-04-twin-otter refuses no_model",
+            "no coefficient file loaded: land-2026-10-04-twin-otter-b refuses no_model on PR stages",
             "see the `fit` link: a fit must be written before twin-otter can answer",
         )
     });
@@ -931,10 +956,21 @@ fn outcomes(f: &Facts) -> Vec<Check> {
                 "outcomes",
                 &name,
                 Status::Warn,
-                format!(
-                    "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it yet (serving-path application is deferred, #10528)",
-                    d.n_recent, d.heuristic
-                ),
+                if d.adjusted {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are scaled by the drift-gated regime adjustment ({} is serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                } else {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it (only the {} candidate adjusts, and it is not serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                },
                 "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
             ),
             DriftState::Unknown => Check::ok(

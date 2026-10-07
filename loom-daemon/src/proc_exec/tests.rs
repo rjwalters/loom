@@ -281,3 +281,138 @@ fn succeeded_reports_false_for_a_nonzero_exit() {
     assert!(!c.succeeded());
     assert!(c.output().is_some(), "a completed execution still yields its Output");
 }
+
+// ---- #10661: forwarding an interactive caller's signal --------------------
+
+#[test]
+fn forwarding_without_a_pending_signal_is_run_bounded() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "echo out; exit 4"]);
+    let completion = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        &|| None,
+        |_| {},
+    )
+    .unwrap();
+    let Completion::Exited(output) = completion else {
+        panic!("timed out")
+    };
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+}
+
+#[test]
+fn a_forwarded_signal_reaches_the_group_and_the_childs_own_exit_is_kept() {
+    let start = Instant::now();
+    let pending = move || (start.elapsed() >= Duration::from_millis(200)).then_some(libc::SIGTERM);
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        "trap 'kill $! 2>/dev/null; exit 9' TERM; sleep 30 & wait",
+    ]);
+    let completion = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        &pending,
+        |_| {},
+    )
+    .unwrap();
+    let Completion::Exited(output) = completion else {
+        panic!("timed out")
+    };
+    assert_eq!(output.status.code(), Some(9), "the child handled the forwarded SIGTERM");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_child_ignoring_a_forwarded_signal_is_killed_after_the_grace() {
+    let start = Instant::now();
+    let pending = move || (start.elapsed() >= Duration::from_millis(100)).then_some(libc::SIGINT);
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "trap '' INT; sleep 30"]);
+    let error = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_millis(300),
+        &pending,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Collect(e) if e.kind() == io::ErrorKind::Interrupted),
+        "{error}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+}
+
+/// Issue #10799. A child that prints its answer and exits 0 while a descendant
+/// still holds the pipe open longer than [`DRAIN_GRACE`] — the deterministic
+/// stand-in for "the reader thread was not scheduled within 500ms on a loaded
+/// host". The old fixed-grace drain returned `Exited` with exit 0 and EMPTY
+/// stdout here; the answer must survive because the drain now uses the call's
+/// remaining budget.
+#[test]
+#[cfg(unix)]
+fn a_normal_exit_waits_out_a_descendant_holding_the_pipe_within_the_budget() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        "echo the-answer; echo diag >&2; (/bin/sleep 1.5) & exit 0",
+    ]);
+    let start = Instant::now();
+    let c = run_bounded(cmd, GENEROUS).expect("sh should spawn");
+    let elapsed = start.elapsed();
+    let Completion::Exited(o) = c else {
+        panic!("the child exited on its own; got {c:?}")
+    };
+    assert!(o.status.success());
+    assert_eq!(o.stdout, b"the-answer\n", "stdout must not be lost to the drain grace");
+    assert_eq!(o.stderr, b"diag\n", "stderr must not be lost to the drain grace");
+    // Proves the fixture exercised the bug: the pipe really stayed open past
+    // the old 500ms grace (twice over, once per stream).
+    assert!(
+        elapsed > DRAIN_GRACE * 2,
+        "fixture did not hold the pipe past the old grace (took {elapsed:?})"
+    );
+}
+
+/// Issue #10799. Same shape, but the descendant outlives the whole call
+/// budget: the output cannot be known, so the result must be an explicit
+/// `Collect(TimedOut)` — never `Exited` with empty stdout, which a caller
+/// would read as "succeeded, printed nothing".
+#[test]
+#[cfg(unix)]
+fn a_normal_exit_whose_pipe_outlives_the_budget_is_a_collect_error_not_empty_success() {
+    for (label, script) in [
+        ("stdout", "echo the-answer; (/bin/sleep 5) & exit 0"),
+        // Only stderr held: a lost stderr must fail too, not read as "no diagnostic".
+        ("stderr", "echo the-answer; (/bin/sleep 5 >/dev/null) & exit 0"),
+    ] {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let mut pgid = None;
+        let start = Instant::now();
+        let r = run_bounded_observed(cmd, Duration::from_millis(1000), |pid| pgid = Some(pid));
+        let elapsed = start.elapsed();
+        // Do not leak the descendant: it is still in the group this call created.
+        if let Some(pgid) = pgid {
+            // SAFETY: the group is still populated by the sleeping descendant,
+            // so its pgid cannot have been reused.
+            unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+        }
+        match r {
+            Err(ExecError::Collect(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{label}: {e}");
+                assert!(e.to_string().contains(label), "{label}: error must name the stream: {e}");
+            }
+            other => panic!("{label}: expected Collect(TimedOut), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "{label}: the drain must stay bounded by the call budget (took {elapsed:?})"
+        );
+    }
+}

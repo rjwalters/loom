@@ -420,7 +420,10 @@ fn labels_at(h: &PrHistory, as_of: chrono::DateTime<chrono::Utc>) -> Vec<String>
             PrEvent::Unlabeled { label, .. } => {
                 labels.remove(label);
             }
-            PrEvent::Pushed { .. } | PrEvent::Merged { .. } => {}
+            PrEvent::Pushed { .. }
+            | PrEvent::Merged { .. }
+            | PrEvent::Closed { .. }
+            | PrEvent::Reopened { .. } => {}
         }
     }
     labels.into_iter().collect()

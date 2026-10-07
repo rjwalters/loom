@@ -59,6 +59,7 @@ use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
+use crate::eta::loop_features::FileSnapshot;
 use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
 use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
@@ -191,9 +192,22 @@ pub(super) struct PassContext {
     /// The fleet roster's revisions, oldest first (#10508), for the
     /// roster-derived `eta-fit/v2` inputs; `None` leaves them unknown.
     fleet_history: Option<Vec<RosterRevision>>,
+    /// Each open PR's changed-file list as logged (#10550); `None` until a
+    /// host loads the log, which leaves the overlap predictor unknown.
+    file_snapshots: Option<Vec<FileSnapshot>>,
 }
 
 impl PassContext {
+    /// An open PR's `(head, base)` branches as the feature reads last saw
+    /// them (#10526).
+    pub(super) fn open_pull_refs(
+        &self,
+        repo: &str,
+        pr: u32,
+    ) -> Option<(Option<String>, Option<String>)> {
+        self.reads.open_pull_refs(repo, pr)
+    }
+
     /// `pr`'s current-stage entry from the timeline (see [`Timeline::current`]).
     pub(super) fn timeline_dated(
         &self,
@@ -526,6 +540,18 @@ impl Tracker {
         Some(self.priority_features_at(&subject, as_of))
     }
 
+    /// Hand the tracker the logged per-PR file lists (#10550), what the
+    /// serving side's file-overlap predictor reads exactly as `eta fit` does
+    /// (`None`: unknown, so the predictor stays unknown).
+    pub fn set_file_snapshots(&mut self, files: Option<Vec<FileSnapshot>>) {
+        self.context.file_snapshots = files;
+    }
+
+    /// The logged file lists (#10550), or `None` when none were loaded.
+    pub(super) fn file_snapshots(&self) -> Option<&[FileSnapshot]> {
+        self.context.file_snapshots.as_deref()
+    }
+
     /// Hand the tracker the fleet roster's revisions, oldest first (#10508):
     /// what every later estimate's roster-derived `eta-fit/v2` inputs read
     /// (`None`: unknown). Never today's `repos.yml` standing in for history.
@@ -777,6 +803,9 @@ impl Tracker {
         if let Some(pr) = item.pr_number {
             features.priority =
                 self.priority_inputs_of(&key.repo, pr, now, self.context.fleet_history.as_deref());
+            // #10521: the v3 friction predictors, through the builder the
+            // fit calls, over the same timeline at `now − LAG`.
+            features.loops = Some(self.loop_features_of(&key.repo, pr, now));
         }
         let pr = item.pr_number.ok_or(reason::NO_PR_YET);
         self.context

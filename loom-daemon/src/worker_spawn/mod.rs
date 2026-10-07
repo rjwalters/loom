@@ -10,6 +10,9 @@ pub(crate) mod credential;
 pub mod egress_proxy;
 mod harness;
 pub mod launch_outcome;
+// #9473: route opted-in API-key profiles through the host's LLM gateway;
+// `pub(crate)` so the daemon's dispatch surfaces can call `guard_dispatch`.
+pub(crate) mod llm_gateway;
 mod opencode_version;
 mod profile_check;
 pub(crate) mod profiles;
@@ -281,6 +284,29 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
     result
 }
 
+/// The billing class of a native-harness launch (#10749). The profile is
+/// re-looked-up for its declared `billing` and whether it names a credential.
+fn native_llm_billing(
+    selection: &profiles::Selection,
+    config: &serde_json::Value,
+    credential_source: &str,
+) -> crate::observability::llm_billing::LlmBilling {
+    let profile = selection
+        .profile
+        .as_deref()
+        .and_then(|name| profiles::lookup(Some(name), config).ok())
+        .map(|(_, profile)| profile);
+    crate::observability::llm_billing::LlmBilling::native(
+        selection.profile.as_deref(),
+        profile.as_ref().and_then(|p| p.billing.as_deref()),
+        profile.as_ref().map_or_else(
+            || !selection.credential_sources.is_empty(),
+            |p| p.credential_env.is_some(),
+        ),
+        credential_source,
+    )
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -362,7 +388,7 @@ fn run_preflight(
             crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
-        let selection = profiles::select(&runtime, &options, &config)?;
+        let mut selection = profiles::select(&runtime, &options, &config)?;
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {
@@ -372,6 +398,11 @@ fn run_preflight(
             trace_identity.insert("loom.configured_model".into(), model.clone());
         }
 
+        // #9473: decided after profile selection and before both containment
+        // and the credential ladder — a routed launch reads no provider key.
+        // Reads no secret yet; an opted-in profile it cannot route refuses.
+        let gateway = llm_gateway::plan(&runtime, &selection, &config)?;
+
         // Per-sweep ephemeral containment (issue #8403). Decided here, after
         // admission and profile selection (so a misconfigured launch still
         // fails fast on the host) but BEFORE prompt expansion and binding
@@ -379,6 +410,13 @@ fn run_preflight(
         // against its own isolated directories, not against the shared
         // workspace the host would use.
         if let Some(profile) = containment::resolve(&config) {
+            if gateway.is_some() {
+                return Err(LaunchError::config(
+                    "this model profile is routed through the LLM gateway, which contained \
+                     launches do not support yet; turn off runtimes.containment.native or \
+                     drop the profile from LOOM_LLM_GATEWAY_PROFILES (#9473)",
+                ));
+            }
             // Forward the profile's credential variables by NAME: every
             // declared source (profile resolution re-runs inside the container
             // and fails closed on an unset required source), plus each mapped
@@ -419,6 +457,7 @@ fn run_preflight(
                 prepared.as_ref().map(|p| &p.injection),
                 worker_egress.as_ref(),
             )?;
+            llm_gateway::scrub(&mut command);
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
                 .map_err(|e| LaunchError::config(e.to_string()))?;
@@ -438,7 +477,19 @@ fn run_preflight(
         containment::materialize_launch_dirs();
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
-        let credential = credential::resolve(root, &selection)?;
+        let gateway = gateway.map(llm_gateway::Plan::open).transpose()?;
+        let credential = match &gateway {
+            Some(route) => {
+                route.adapt(&runtime, &mut selection);
+                route.credential()
+            }
+            None => credential::resolve(root, &selection)?,
+        };
+        // #10749: how this launch is billed, from the profile's declared class
+        // and the credential source actually resolved. Enumerated vocabulary
+        // plus the profile name only; never a key, account or path.
+        let llm_billing = native_llm_billing(&selection, &config, credential.source.as_str());
+        llm_billing.stamp(&mut trace_identity);
         let expanded = options
             .prompt
             .as_deref()
@@ -452,6 +503,9 @@ fn run_preflight(
             root,
             role.is_some() || prompt_role.is_some(),
         )?;
+        if let Some(route) = &gateway {
+            route.finish(&runtime, &selection.provider, &mut command)?;
+        }
         log = attach_log(&mut command, options.log.as_deref())?;
         // `credentialAccount` is an account NAME, never key material (#8401).
         // `promptBytes` (#8506) is the expanded prompt's size, so an E2BIG-class
@@ -470,7 +524,11 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        if let Some(route) = &gateway {
+            writeln!(log, "{}", route.marker(&runtime))
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+        }
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
@@ -493,6 +551,11 @@ fn run_preflight(
         command.args(&args.args);
         command
     };
+    // #9473 red line: the gateway contract never crosses into the exec'd
+    // process — not `spawn-claude.sh` / `spawn-codex.sh` (subscription seats),
+    // and not a native harness either, which holds a routed key only under
+    // its own provider-key variable (`llm_gateway::Route::credential`).
+    llm_gateway::scrub(&mut command);
     let private_selection = if runtime == "codex"
         && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
@@ -627,6 +690,18 @@ fn run_preflight(
     log.flush()
         .map_err(|e| LaunchError::config(e.to_string()))?;
     trace_identity.insert("loom.runtime".into(), runtime.clone());
+    // #10749: Claude/Codex (legacy adapters) are classified by runtime; a
+    // native harness already stamped its own billing above.
+    if !trace_identity.contains_key(crate::observability::llm_billing::BILLING_KEY) {
+        let metered_backstop = nonempty_env(crate::launch_env::PREFERENCE_MARKER_ENV)
+            .is_some_and(|marker| marker.contains(" backstop="));
+        crate::observability::llm_billing::LlmBilling::for_runtime(
+            &runtime,
+            nonempty_env("LOOM_MODEL_PROFILE").as_deref(),
+            metered_backstop,
+        )
+        .stamp(&mut trace_identity);
+    }
     // Host memory state at the runtime's launch (this span's begin boundary;
     // the daemon stamps the end boundary when the child exits or is observed
     // gone). Clones of this identity carry the snapshot onto the RuntimeRun

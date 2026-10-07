@@ -2733,6 +2733,10 @@ pub use inbox_mail_section::assess_inbox_mail;
 /// host that actually has Codex accounts.
 pub mod codex_accounts;
 
+/// The conditional `session_containers` section (#10600): the Codex session
+/// seats `loom-daemon status` lists, on a host that has any.
+pub mod session_containers;
+
 // ============================================================================
 // Roll-up
 // ============================================================================
@@ -2786,6 +2790,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_pool_hold(inputs),
     ];
     sections.extend(codex_accounts::assess(inputs));
+    sections.extend(session_containers::assess(inputs));
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));

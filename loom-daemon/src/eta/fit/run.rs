@@ -23,8 +23,10 @@
 use super::coeffs::{self, CoefficientFile, FitMeta, FitWindow, Fitter};
 use super::features_v2::PriorityCoverage;
 use super::rows::{self, Assembled};
-use super::{v2, FitStage};
+use super::{v2, v3, FitStage};
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::loop_features::{FileSnapshot, LoopCoverage};
+use crate::eta::pr_file_log;
 use crate::eta::repo_priority::RosterRevision;
 use crate::eta::roster_history::{self, HistoryCoverage};
 use crate::eta::star::StarInputs;
@@ -110,6 +112,12 @@ pub struct FitReport {
     /// The fleet roster history the v2 inputs read (#10586): whether it was
     /// loaded, and on what basis its revisions are knowable.
     pub roster_history: HistoryCoverage,
+    /// The `eta-fit/v3` file's content-derived id (#10521).
+    pub v3_id: String,
+    /// Where the v3 file was (or would have been) written.
+    pub v3_path: PathBuf,
+    /// How many rows know each v3 friction input.
+    pub loop_coverage: LoopCoverage,
 }
 
 /// This build, as the file's `fitter`.
@@ -161,7 +169,22 @@ pub fn fit_snapshots_with_context(
     star: Option<&StarInputs>,
     fleet_history: Option<&[RosterRevision]>,
 ) -> (CoefficientFile, Assembled) {
-    let assembled = rows::build_with_context(snapshots, as_of, star, fleet_history);
+    fit_snapshots_with_files(snapshots, as_of, fitter, star, fleet_history, None)
+}
+
+/// [`fit_snapshots_with_context`], also reading the logged per-PR file lists
+/// (#10550) for the friction rows. The v1 and v2 files are the same either
+/// way.
+#[must_use]
+pub fn fit_snapshots_with_files(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    fitter: &Fitter,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+    files: Option<&[FileSnapshot]>,
+) -> (CoefficientFile, Assembled) {
+    let assembled = rows::build_with_files(snapshots, as_of, star, fleet_history, files);
     let meta = fit_meta(&assembled, as_of, fitter);
     let file = coeffs::fit(&meta, &assembled.rows, &assembled.dwells);
     (file, assembled)
@@ -178,6 +201,14 @@ pub fn fit_v2_of(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -
         &assembled.priority_inputs,
         &assembled.dwells,
     )
+}
+
+/// The `eta-fit/v3` file (#10521) of rows [`fit_snapshots_with_star`]
+/// assembled at `as_of`: the same rows, window and fitter, over the
+/// friction-aware features.
+#[must_use]
+pub fn fit_v3_of(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> CoefficientFile {
+    v3::fit_v3(&fit_meta(assembled, as_of, fitter), assembled)
 }
 
 fn fit_meta(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> FitMeta {
@@ -227,21 +258,37 @@ fn fit_loaded(
     let star = StarInputs::load(root, &repos);
     // The cache the tracker's pass also loads (#10586): one history value.
     let (history, roster_history) = roster_history::load_for(root, as_of);
-    let (file, assembled) =
-        fit_snapshots_with_context(snapshots, as_of, fitter, Some(&star), history.as_deref());
+    // #10550: the file lists the daemon logged, as known at each row's cutoff.
+    let files = pr_file_log::load(root);
+    let (file, assembled) = fit_snapshots_with_files(
+        snapshots,
+        as_of,
+        fitter,
+        Some(&star),
+        history.as_deref(),
+        Some(&files),
+    );
     let dir = coeffs::fit_dir(root);
     let path = out.map_or_else(|| dir.join(coeffs::path_for(as_of)), Path::to_path_buf);
     let file_v2 = fit_v2_of(&assembled, as_of, fitter);
     let dir_v2 = v2::fit_dir_v2(root);
     let path_v2 =
         out.map_or_else(|| dir_v2.join(coeffs::path_for(as_of)), |o| o.with_extension("v2.json"));
+    let file_v3 = fit_v3_of(&assembled, as_of, fitter);
+    let dir_v3 = v3::fit_dir_v3(root);
+    let path_v3 =
+        out.map_or_else(|| dir_v3.join(coeffs::path_for(as_of)), |o| o.with_extension("v3.json"));
     let mut pruned = 0;
     if !dry_run {
         coeffs::write(&path, &file).with_context(|| format!("writing {}", path.display()))?;
         coeffs::write(&path_v2, &file_v2)
             .with_context(|| format!("writing {}", path_v2.display()))?;
+        coeffs::write(&path_v3, &file_v3)
+            .with_context(|| format!("writing {}", path_v3.display()))?;
         if out.is_none() {
-            pruned = prune_dir(&dir, RETAIN_FILES) + prune_dir(&dir_v2, RETAIN_FILES);
+            pruned = prune_dir(&dir, RETAIN_FILES)
+                + prune_dir(&dir_v2, RETAIN_FILES)
+                + prune_dir(&dir_v3, RETAIN_FILES);
         }
     }
 
@@ -288,6 +335,9 @@ fn fit_loaded(
         v2_path: path_v2,
         priority_coverage: PriorityCoverage::of(&assembled.priority_inputs),
         roster_history,
+        v3_id: file_v3.id.clone(),
+        v3_path: path_v3,
+        loop_coverage: LoopCoverage::of(&assembled.loops),
     })
 }
 

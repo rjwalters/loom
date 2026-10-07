@@ -428,6 +428,14 @@ pub struct EndpointCursor {
     /// visit every pending PR ([`super::fleet_events_fanout`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_after: Option<u32>,
+    /// On a repo-wide listing: the instant the cache was last known caught up
+    /// with it — stamped by the daemon when a refresh completes, and frozen
+    /// while SigNoz covers the repo and the listing is not read (#10520).
+    /// Star coverage ([`super::star::StarInputs::load`]) ends here: a fact
+    /// after it may be missing, so it reads as unknown, never as "unstarred".
+    /// `None`: never stamped (a pre-#10520 or CLI-only cache): no upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_through: Option<DateTime<Utc>>,
 }
 
 /// The cursor file: per-endpoint resume state for one repo.
@@ -459,6 +467,15 @@ impl EventsCursor {
             .and_then(|t| serde_json::from_str::<EventsCursor>(&t).ok())
             .filter(|c| c.schema == CURSOR_SCHEMA)
             .unwrap_or_else(|| Self::empty(repo))
+    }
+
+    /// The earliest [`EndpointCursor::synced_through`] among `keys`' stamped
+    /// entries; `None` when none is stamped.
+    #[must_use]
+    pub fn synced_through(&self, keys: &[String]) -> Option<DateTime<Utc>> {
+        keys.iter()
+            .filter_map(|k| self.endpoints.get(k)?.synced_through)
+            .min()
     }
 
     /// Write atomically (temp file + rename).
@@ -542,6 +559,28 @@ pub struct SyncReport {
     pub pages: u64,
     /// Rows appended this run.
     pub appended: usize,
+}
+
+/// Stamp `key`'s [`EndpointCursor::synced_through`] in `repo`'s cursor at
+/// `cursor_file`: the cache was caught up with that listing at `at`. Never
+/// moves a stamp back.
+///
+/// # Errors
+///
+/// The cursor could not be written.
+pub fn mark_synced_through(
+    cursor_file: &Path,
+    repo: &str,
+    key: &str,
+    at: DateTime<Utc>,
+) -> std::io::Result<()> {
+    let mut cursor = EventsCursor::read(cursor_file, repo);
+    let state = cursor.endpoints.entry(key.to_string()).or_default();
+    if state.synced_through.is_some_and(|held| held >= at) {
+        return Ok(());
+    }
+    state.synced_through = Some(at);
+    cursor.write(cursor_file)
 }
 
 /// Page `source` into `log`, checkpointing `cursor` to `cursor_file` after

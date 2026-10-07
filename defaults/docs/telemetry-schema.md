@@ -903,7 +903,10 @@ never a fabricated `"unknown"`: a Claude/legacy-adapter spawn writes no launch
 record, so all three keys are simply absent, keeping "not a native pool spawn"
 distinguishable from "a pool spawn whose account could not be recovered". An
 env-sourced or unpooled spawn records `credential_source` alone, with no
-provider and no account. The sibling `sweep-outcomes.jsonl` record carries the
+provider and no account, and so does a launch routed through the host's LLM
+gateway (`credential_source: "gateway"`, #9473): its virtual key is a gateway
+credential, not a pool account, and its spend is measured by the gateway
+([`llm-gateway.md`](llm-gateway.md)). The sibling `sweep-outcomes.jsonl` record carries the
 same three values under one optional `credential` object
 (`{source, provider?, account?}`, `#[serde(default)]` so every pre-#8447 line
 still parses). Additive per #4703 — no `schema_version` bump.
@@ -1635,7 +1638,9 @@ Never an issue number, sha or path.
 | `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
 | `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
 | `loom.eta.health.pending_over_cap` | `{estimate}` | none | cumulative pending estimates evicted by the `MAX_PENDING` cap since process start (#10496). Omitted before the first ETA pass; a rising value means refreshes are being thinned (redundant middles, then pairs to their earliest). Whole series are evicted only when distinct series alone exceed the cap; the daemon log's `whole series lost` count reports those |
-| `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: the container's workspace mounts differ from what its workspace label would mount today, either a registered root under the label is not mounted or a mount is no longer registered (#10364). Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
+| `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: the container's workspace mounts differ from what its workspace label would mount today: a registered root under the label is not mounted, a mount is no longer registered, or a mount is one `session start` now refuses although still registered (home, `firewall: true`) (#10364; the reconciler's own definition since #10600). No drift verdict, so never `stale_mounts`, while the workspace registry cannot be read. Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
+| `loom.codex_session.record` | `1` | `account`, `kind` ∈ `hold`, `drift_removal`, `container` | per session-managed Codex account, `1` while that on-disk record stands, else `0` (#10600): `hold` is an operator `accounts session stop` (`.session-hold.json`); `drift_removal` is the reconciler's fail-closed removal for a denied mount (`.session-drift-removed.json`), which keeps the seat down. Emitted with `loom.codex_session.state`, and omitted the same way |
+| `loom.codex_session.mount_drift` | `{path}` | `account`, `kind` ∈ `missing`, `extra`, `denied`, `container` | per session-managed Codex account whose container has a drift verdict (#10600): how many workspace paths drift that way. `missing`: registered roots it does not mount; `extra`: mounts no longer registered; `denied`: mounts `session start` refuses today (not counted in `extra`). Omitted for a missing, private-clone or unlabelled container, and while the registry cannot be read |
 
 Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
 Gauges on the collector pass, emitted only on a host that is the armed captain
@@ -1758,7 +1763,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 |---|---|---|---|
 | `loom.pool.account_marks` | delta `Sum` | `{account}`; labels `provider`, `reason` | one per account mark the daemon writes, at the seam that writes it: sweep and role-tick Codex terminal feedback (`provider=codex`), API-key pool bad marks (`provider` = the pool namespace, e.g. `zai`), and the Claude insta-crash exhaustion mark (`claude`). `reason` ∈ `rate_limited`, `exhausted`, `session_limit`, `model_credits`, `credential`, `transient`. No point when no mark is written (a native credential failure, a Codex `SUCCESS`/`TIMEOUT`, a failed write) |
 | `loom.pool.hold` span | own root trace (derived from `loom.pool.hold.pool` + hold start) | `loom.pool.hold.pool` (16-hex SHA-256 prefix of the pool directory — the pool's identity, never its path), `loom.pool.hold.post_mortem` (`true` when a real token-selection death armed it), `loom.pool.hold.accounts` | one work-finder pool dispatch hold, from arming to clearing. A hold still armed when the daemon stops emits no span |
-| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
+| `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `llm.billing`, `llm.credential.kind`, `llm.provider.profile` (see [LLM billing class](#llm-billing-class-10749)); `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime`, `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback) |
 
 GitHub rate limit (Issue #10022):
 
@@ -1799,6 +1804,47 @@ span's `github.account`, `account` is `app-<app id>`,
 | `execution` | a role-runner tick's own `loom.role_attempt` root | the tick's transcript/native-store scan |
 | `attempt` | the role's `loom.role_attempt` in the execution journal (daemon child), else a `loom.role_attempt` created in the issue's story trace (operator session) | `loom-daemon usage-record`, run by the sweep prompt after each checkpoint write |
 | `attempt` | the tick's story span, **only when the tick stitched exactly one target** | the role runner; a multi-target tick is never split |
+
+#### LLM billing class (#10749)
+
+`loom.cost.usd_estimate` is the list price whatever the run was billed, so
+`loom.runtime.run` and every `loom.runtime.usage` span (sweep execution and
+attempt scope, and role-tick usage) also carry how it was billed:
+
+| Attribute | Values | Notes |
+|---|---|---|
+| `llm.billing` | `subscription` \| `api` \| `local` \| `unknown` | `api` is metered cash spend. `unknown` is stated, never guessed. |
+| `llm.credential.kind` | `oauth-pool` \| `chatgpt-seat` \| `api-key` | Omitted for `local` and `unknown`. |
+| `llm.provider.profile` | model-profile name (`zai-flash`, `quick-cerebras`, ...) | Present when the launch selected a profile. |
+
+Classification is data-driven: a Claude launch is `subscription`/`oauth-pool`,
+a Codex launch `subscription`/`chatgpt-seat`; a launch the preference walk put
+on a governed metered tap (`backstop=` in its marker) is `api`/`api-key`; a
+native-harness launch uses its model profile's optional `billing` field
+(`subscription` | `api` | `local`, e.g. `zai-flash` is the flat-rate z.ai
+coding plan) and, when absent, treats a profile that reads a provider
+credential as metered (`api`/`api-key`) and a credential-less one as
+`unknown`. An LLM-gateway route is always `api`/`api-key`. Usage spans copy
+the class from the launch's `loom.runtime.run` span (role ticks: from the
+launch record's `llmBilling`/`llmCredentialKind`, else the runtime), and only
+when that launch is established — otherwise they say `unknown`:
+
+- **`execution` scope** totals every launch of the sweep per model and cannot
+  split them, so it carries the class *all* of the execution's runs share; a
+  sweep with differently billed launches (or an unstamped run) is `unknown`,
+  and `llm.credential.kind` / `llm.provider.profile` are kept only when every
+  run shares them. For such a sweep, split cash from subscription with its
+  `attempt` spans.
+- **`attempt` scope** takes the runs in the attempt's own span ancestry (a run
+  under the `loom.role_attempt`, or the run it sits under), else a run that
+  belongs to no attempt and whose interval encloses the attempt's. Those must
+  agree; none, or a disagreement, is `unknown`. A run under another attempt is
+  never borrowed.
+
+Count `unknown` separately — never as `api` nor as `subscription`. Only this
+closed vocabulary and the profile name are emitted: no key value, account
+name or token path. Sum metered spend per day with
+`llm.billing = api` grouped by `llm.provider.profile`.
 
 A daemon sweep's `claude -p` child also runs `usage-record`, so one trace can
 hold both scopes for one `loom.sweep_id`. **Total per `loom.sweep_id` from its
@@ -2042,7 +2088,8 @@ closes those estimates stay pending.
 `merge_hold` stage, so `merge_hold` is a possible `stage` /
 `stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
 `eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
-hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
+hold**: today the shadow `land-2026-10-04-twin-otter-b` and the hold-aware
+wrappers over it (`land-2026-10-04-twin-otter` itself is retired, #10528). Every path-engine
 heuristic refuses it as `blocked`, exactly as before. In `eta.snapshot` it
 never becomes a row's `stage` while `current.land` is one of them; a shadow's
 estimate appears only under the row's `alternates[]` (stage-less, #10390). Once a hold-aware
@@ -2281,7 +2328,7 @@ snapshot. Each alternate:
 
 | Field | Type | Notes |
 |---|---|---|
-| `heuristic` | string | e.g. `land-2026-10-04-twin-otter` |
+| `heuristic` | string | e.g. `land-2026-10-04-twin-otter-b` |
 | `tier` | string, optional | `baseline` or `candidate` (#10525); the ETA chooser offers only `candidate`. Absent only for an id the emitting build does not know, or from a build before tiers |
 | `estimate_id` | string | that heuristic's own `eta.estimate` id, for "why this ETA?" |
 | `as_of` | RFC 3339 | the alternate's own `as_of`, which may differ from the row's; the ETA anchor for `p50` |
@@ -2464,6 +2511,15 @@ cross-repo dispatch tier from the workspace registry (`Workspace.priority`,
 lower dispatches first); it is omitted for a root that is not a registered
 workspace and on older daemons, never defaulted. Additive, no `schema_version`
 bump.
+
+**`managed_repos[].stale_blocked_release` (#10763).** This host's
+`loom:blocked` release-pass tallies for the repo since the daemon started:
+`released` and `reparked` (applied writes only), `last_outcome`, and `ticks`, a
+count per outcome key (`ran`, `not_due`, `skipped_shard`, `denied_scope`,
+`not_served`, `rate_limited`, `skipped_off`, `dry_run`, `archived`,
+`enumerate_error`). Omitted before the pass first ticks the repo on this host,
+never a fabricated zero. A repo whose `ran` stays at zero on every host is
+diagnosable from these keys alone. Additive, no `schema_version` bump.
 
 **Binary identity (`build_commit` / `built_at`, #4956).** `daemon_version` is
 `CARGO_PKG_VERSION`, so it only moves once per release: every build between two

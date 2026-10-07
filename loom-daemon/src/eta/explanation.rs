@@ -138,6 +138,12 @@ pub struct Explanation {
     /// one made before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_adjustment: Option<RegimeAdjustment>,
+    /// The planner regime the estimate was served under
+    /// ([`super::planner_version::planner_version`], #10528). Stamped once at
+    /// the serve seam; absent otherwise, so such explanations are
+    /// byte-identical to ones made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_version: Option<String>,
 }
 
 /// A stage's latent-regime adjustment ([`super::regime::adjust`]).
@@ -800,6 +806,13 @@ pub struct Features {
     /// in a fleet view before `as_of`, and then not in [`Features::NAMES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<crate::eta::fit::features_v2::PriorityInputs>,
+    /// The `eta-fit/v3` friction predictors (#10521), built by the one
+    /// builder the fit calls ([`crate::eta::loop_features`]) over the fleet
+    /// snapshots' label timeline at `as_of − LAG`. Read only by
+    /// `land-2026-10-06-loop-kite`; absent when the item has no PR, and then
+    /// not in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loops: Option<crate::eta::loop_features::LoopFeatures>,
     /// The host's REST (`core`) rate-limit calls left (#10232).
     #[serde(default)]
     pub ratelimit_core_remaining: Option<u32>,

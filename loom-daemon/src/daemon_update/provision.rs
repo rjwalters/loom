@@ -128,44 +128,130 @@ exit "$rc"
     ProvisionOutcome::Provisioned(std::fs::read_to_string(&sink).unwrap_or_default())
 }
 
-/// The `LOOM_DAEMON_BIN` override path:
-/// `install -m 755 "$NEW_BIN" "$dest" || { cp -f … && chmod 755 … }`.
+/// The `LOOM_DAEMON_BIN` override path: install `new_bin` at `dest`, mode
+/// 755, atomically (#10708).
 ///
-/// Run as the real tools rather than reimplemented with `std::fs::copy`, and
-/// that is load-bearing for the self-replacement case this whole script is
-/// about: both `install(1)` and `cp -f` UNLINK a destination they cannot
-/// rewrite in place, which is the only way to replace a binary that is
-/// currently executing (`ETXTBSY`). A `File::create` on the destination
-/// truncates it instead, and truncating a running executable is the one
-/// outcome worse than failing.
+/// The new bytes are written in full to a uniquely named temp file in the
+/// SAME directory as `dest` (so the same filesystem), chmod'ed to 755,
+/// fsync'ed, and only then `rename(2)`d over `dest`. At every instant `dest`
+/// is either the complete old file or the complete new one; a kill at any
+/// point leaves at worst a stray temp file next to an intact `dest`.
+///
+/// The rename is also what makes replacing a CURRENTLY EXECUTING binary safe
+/// (the self-replacement case `selfrepl` documents): `dest` is pointed at a
+/// new inode while the running process keeps its old, now-unnamed one until
+/// it exits. The old inode is never opened for writing, so there is no
+/// `ETXTBSY` on Linux and no in-place rewrite of a running, signed image on
+/// macOS (which the kernel answers by killing the process).
+///
+/// There is deliberately NO fallback. This used to run `install -m 755` and
+/// then `cp -f`, and `cp -f` rewrites a writable `dest` in place when it
+/// cannot do anything else (for example in a read-only directory): exactly
+/// the partial-binary hazard. If the temp file cannot be created, written or
+/// renamed, the install fails, the temp file is removed, and `dest` is left
+/// as it was.
+///
+/// `true` on success, `false` on any failure.
 pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
-    let installed = Command::new("install")
-        .arg("-m")
-        .arg("755")
-        .arg(new_bin)
-        .arg(dest)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if installed {
-        return true;
+    atomic_install(new_bin, dest).is_ok()
+}
+
+fn atomic_install(new_bin: &Path, dest: &Path) -> std::io::Result<()> {
+    // Open the source FIRST: a missing or unreadable source must fail before
+    // anything is created next to `dest`.
+    let mut src = std::fs::File::open(new_bin)?;
+    let dir = staging_dir(dest);
+    let (tmp_path, mut tmp) = create_staging_file(dir, dest)?;
+    let staged = StagedFile(Some(tmp_path.clone()));
+
+    std::io::copy(&mut src, &mut tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // fchmod, so the process umask does not apply.
+        tmp.set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
-    let copied = Command::new("cp")
-        .arg("-f")
-        .arg(new_bin)
-        .arg(dest)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !copied {
-        return false;
+    tmp.sync_all()?;
+    drop(tmp);
+
+    std::fs::rename(&tmp_path, dest)?;
+    staged.disarm();
+
+    // Persist the rename itself. Best-effort: the swap has already happened
+    // and is atomic either way; this only shortens the window in which a
+    // power loss could roll the directory entry back to the old file.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
-    Command::new("chmod")
-        .arg("755")
-        .arg(dest)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    Ok(())
+}
+
+/// The directory `dest` lives in, where its temp file is staged so the
+/// final rename never crosses a filesystem. A bare file name means `.`.
+fn staging_dir(dest: &Path) -> &Path {
+    match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Create a new, uniquely named temp file next to `dest`.
+///
+/// The name carries the pid, a per-process counter and the clock, and the
+/// file is opened with `create_new`, so two concurrent installs (in one
+/// process or several) can never write into the same temp file.
+fn create_staging_file(dir: &Path, dest: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let base = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "loom-daemon".to_string());
+    let mut last_err = None;
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let name = format!(
+            ".{base}.loom-install.{}.{}.{nanos}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = dir.join(name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Owner-only until the bytes are complete; chmod 755 after.
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no unique temp name")))
+}
+
+/// Removes the staged temp file on drop unless the rename consumed it.
+struct StagedFile(Option<PathBuf>);
+
+impl StagedFile {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// `DEST_DIR` / `PROVISION_TARGET` — where a restart will invoke the daemon
@@ -190,3 +276,8 @@ pub fn warn_no_provision_script(new_bin: &Path) {
         new_bin.display()
     ));
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "provision_tests.rs"]
+mod tests;

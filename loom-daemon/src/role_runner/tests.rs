@@ -4271,7 +4271,9 @@ fn tick_admitted(root: &Path) -> bool {
 mod archived_gate;
 mod concierge_gate;
 mod invoke;
+mod llm_gateway;
 mod model_resolution;
+mod pipeline_idle_gate;
 mod prompt_cache_prefix;
 mod roster_fence;
 mod shard_dispatch;

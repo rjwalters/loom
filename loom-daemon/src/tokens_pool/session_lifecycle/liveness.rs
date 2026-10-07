@@ -195,7 +195,9 @@ fn selector_read(
     if published.is_some() || watched {
         return published;
     }
-    let snapshot = session_state::snapshot(docker?, &[], session_state::SNAPSHOT_DEADLINE);
+    // Selection asks only "is it down": no drift verdict is needed.
+    let inputs = session_state::DriftInputs::unknown();
+    let snapshot = session_state::snapshot(docker?, &inputs, session_state::SNAPSHOT_DEADLINE);
     if let Snapshot::Unavailable(reason) = &snapshot {
         log::warn!(
             "session liveness: Codex session containers cannot be observed ({reason}) — not \
@@ -298,6 +300,7 @@ pub(crate) mod test_support {
                 let observed = Observed {
                     state: *state,
                     inspect: serde_json::Value::Null,
+                    drift: None,
                 };
                 (container_name(name), observed)
             })

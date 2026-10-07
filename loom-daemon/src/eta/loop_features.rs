@@ -86,7 +86,9 @@ pub const MIN_JUDGE_VERDICTS: u32 = 5;
 
 /// One PR's changed-file list as observed at `known_at`: the head commit's
 /// files then, never the final diff. A PR may have several snapshots; the
-/// builder takes the latest before `as_of`.
+/// builder takes the latest before `as_of`, and an incomplete latest one
+/// (`complete: false`) makes the list unknown then, never an older complete
+/// list served as current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSnapshot {
     /// `owner/repo`.
@@ -95,8 +97,21 @@ pub struct FileSnapshot {
     pub pr: u32,
     /// When the list was read.
     pub known_at: DateTime<Utc>,
-    /// The changed paths.
+    /// The changed paths; empty and meaningless when not `complete`.
     pub files: Vec<String>,
+    /// The head commit the list describes, when the read could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// Whether `files` is the PR's whole list at that head. `false` records
+    /// that the read returned a possibly truncated or head-inconsistent page:
+    /// the list is unknown from `known_at` on. Absent (older lines) is
+    /// `true`: only complete lists were logged before the field existed.
+    #[serde(default = "complete_default")]
+    pub complete: bool,
+}
+
+const fn complete_default() -> bool {
+    true
 }
 
 /// One finished CI run of a PR's head, as read from SigNoz `ci.run` (or the
@@ -112,8 +127,9 @@ pub struct CiObservation {
 }
 
 /// What the builder reads. `files` and `ci` are `None` when the source is
-/// not logged for the caller (the fit today): the dependent features are
-/// then `None`.
+/// not logged for the caller: the dependent features are then `None`. File
+/// lists are logged since #10550 ([`super::pr_file_log`]); CI runs are not
+/// yet.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopInputs<'a> {
     /// `owner/repo` of the subject.
@@ -196,7 +212,9 @@ pub fn repo_context<'a>(
         .collect()
 }
 
-/// The latest snapshot of `pr` known strictly before `as_of`.
+/// The latest snapshot of `pr` known strictly before `as_of`, or `None` when
+/// there is none or the latest is an incomplete (unknown) observation: an
+/// older complete list is not current once a later read could not confirm it.
 fn latest_files<'a>(
     files: &'a [FileSnapshot],
     repo: &str,
@@ -207,6 +225,7 @@ fn latest_files<'a>(
         .iter()
         .filter(|s| s.pr == pr && s.repo.eq_ignore_ascii_case(repo) && s.known_at < as_of)
         .max_by_key(|s| s.known_at)
+        .filter(|s| s.complete)
 }
 
 /// The repo's Judge rejection rate over the trailing window before `as_of`.
@@ -327,6 +346,42 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
             .map(|c| c.failed);
     }
     out
+}
+
+/// How many of a set of rows know each friction input: the coverage a fit
+/// or a backtest reports next to its numbers (#10521). File overlap
+/// is 0 for rows older than the file-list log (#10550) and own CI everywhere
+/// until its source is logged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopCoverage {
+    /// Rows counted.
+    pub rows: usize,
+    /// Rows with an open episode (a cumulative stage age).
+    pub cum_stage_known: usize,
+    /// Rows whose current stage was visited before.
+    pub stage_looped: usize,
+    /// Rows with a repo Judge rejection rate.
+    pub judge_rate_known: usize,
+    /// Rows with a complete file-overlap roster.
+    pub overlap_known: usize,
+    /// Rows with a known last CI run.
+    pub ci_known: usize,
+}
+
+impl LoopCoverage {
+    /// The coverage of `loops`.
+    #[must_use]
+    pub fn of(loops: &[LoopFeatures]) -> Self {
+        let n = |f: fn(&LoopFeatures) -> bool| loops.iter().filter(|l| f(l)).count();
+        LoopCoverage {
+            rows: loops.len(),
+            cum_stage_known: n(|l| l.cum_stage_h.is_some()),
+            stage_looped: n(|l| l.stage_looped),
+            judge_rate_known: n(|l| l.judge_reject_rate_7d.is_some()),
+            overlap_known: n(|l| l.overlap_prs.is_some()),
+            ci_known: n(|l| l.own_ci_failed.is_some()),
+        }
+    }
 }
 
 /// The model-ready vector in [`LOOP_FEATURES`] order: counts and hours as

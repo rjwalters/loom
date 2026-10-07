@@ -5,7 +5,7 @@
 //! created (#9979). A repository registered later is unreachable from it
 //! (every Codex tick there fails `chdir to cwd`), and one deregistered later
 //! stays mounted read-write while Codex runs with its own sandbox off. Part A
-//! detects both ([`mount_drift`]) and refuses a dispatch into an unmounted
+//! detects both ([`session_state::mount_drift`]) and refuses a dispatch into an unmounted
 //! workdir; this module fixes the container.
 //!
 //! # Safety rules
@@ -91,9 +91,11 @@
 //!
 //! # What counts as `extra`
 //!
-//! Part A's registry comparison, plus any workspace mount the denials refuse
-//! today (the home directory or an ancestor, an overlap with a `firewall:
-//! true` repository) **even if it is still registered**. A container created
+//! [`assess`] is [`session_state::effective_drift`], the one drift definition
+//! the gauge, `loom-daemon status` and the `workspace add/remove` report read
+//! too (#10600): Part A's registry comparison, plus any workspace mount the
+//! denials refuse today (the home directory or an ancestor, an overlap with a
+//! `firewall: true` repository) **even if it is still registered**. A container created
 //! with `--mount-workspace <one git checkout>` is not `extra` merely because
 //! that checkout is unregistered: `session start` accepts that as an explicit
 //! operator grant, and a recreate would mount it again. Such a container
@@ -114,11 +116,14 @@ use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_drift_removal::{self, DriftRemoval};
 use crate::tokens_pool::session_hold::{now_unix_ms, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
-    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, STOP_GRACE,
+    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, UndoLock, STOP_GRACE,
 };
 pub use crate::tokens_pool::session_mount_gate::Denials;
+/// One running container's drift as the reconciler acts on it:
+/// [`session_state::EffectiveDrift`], the shared definition (#10600).
+pub use crate::tokens_pool::session_state::EffectiveDrift as Assessed;
 use crate::tokens_pool::session_state::{
-    container_running, is_private_clone, mount_drift, workspace_label, workspace_mounts,
+    self, container_running, is_private_clone, workspace_label, workspace_mounts, DriftInputs,
     MountDrift, Snapshot,
 };
 use crate::workspace_registry::normalize_path;
@@ -157,45 +162,46 @@ pub(super) struct DriftMemory {
     /// The standing removal record was already WARNed about.
     removal_reported: bool,
     /// Passes a record has stood beside this running container whose mounts
-    /// are not denied; WARNed at 1, 2, 4, 8, … (a backoff cadence).
+    /// are not denied; WARNed on a capped backoff ([`healthy_record_warn_due`]).
     healthy_beside_record: u32,
+    /// When that was last WARNed (unix secs).
+    healthy_warned_at: Option<u64>,
 }
 
-/// One running container's drift as the reconciler acts on it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Assessed {
-    /// [`mount_drift`], with every `denied` mount added to `extra`.
-    pub drift: MountDrift,
-    /// Mounted paths the denials positively refuse. Empty when `denials` is
-    /// `None` (unknown is not denied).
-    pub denied: Vec<PathBuf>,
+/// The longest gap between two WARNs that a removal record stands beside a
+/// healthy running container (#10661): about a day, so the stale record stays
+/// visible however long it stands.
+pub const HEALTHY_RECORD_WARN_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Whether the `passes`-th consecutive sighting of a record beside a healthy
+/// container WARNs: on passes 1, 2, 4, 8, … (a backoff), and whenever
+/// [`HEALTHY_RECORD_WARN_MAX_SECS`] have passed since the last WARN. The count
+/// lives in memory, so a daemon restart starts it over at pass 1, which
+/// WARNs at once: a restart never makes the record quieter. A large
+/// backward step of the wall clock mutes the 24 h cap until the clock
+/// catches up again; the doubling cadence still fires meanwhile.
+#[must_use]
+pub fn healthy_record_warn_due(passes: u32, warned_at: Option<u64>, now: u64) -> bool {
+    passes.is_power_of_two()
+        || warned_at.is_none_or(|at| now.saturating_sub(at) >= HEALTHY_RECORD_WARN_MAX_SECS)
 }
 
 /// Assess `inspect` against `registered` and, when they could be read, the
-/// `denials` for its workspace. Empty for a private-clone or unlabelled
-/// container.
+/// `denials` for its workspace: [`session_state::effective_drift`]. Empty for
+/// a private-clone or unlabelled container.
 #[must_use]
 pub fn assess(inspect: &Value, registered: &[PathBuf], denials: Option<&Denials>) -> Assessed {
-    let mut drift = mount_drift(inspect, registered);
-    let denied: Vec<PathBuf> = denials.map_or_else(Vec::new, |denials| {
-        workspace_mounts(inspect)
-            .into_iter()
-            .filter(|mount| denials.check(std::slice::from_ref(mount)).is_err())
-            .collect()
-    });
-    for mount in &denied {
-        if !drift.extra.contains(mount) {
-            drift.extra.push(mount.clone());
-        }
-    }
-    drift.extra.sort();
-    Assessed { drift, denied }
+    session_state::effective_drift(inspect, registered, denials)
 }
 
+/// The shared verdict with this pass's inputs (`None`: the registry is
+/// unknown, or the container is private-clone or unlabelled).
 fn assess_for(inspect: &Value, inputs: &PassInputs<'_>) -> Option<Assessed> {
-    let registered = inputs.registered?;
-    let denials = workspace_label(inspect).and_then(|label| (inputs.denials_for)(label).ok());
-    Some(assess(inspect, registered, denials.as_ref()))
+    DriftInputs {
+        registered: inputs.registered,
+        denials_for: inputs.denials_for,
+    }
+    .verdict(inspect)
 }
 
 /// The last [`priority`] class.
@@ -443,7 +449,9 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         return Ok(Outcome::DriftRemoved { drift });
     }
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
-    recreate_container(lifecycle, name, &workspace, image, &is_held)?;
+    // This teardown still holds the container's dispatch lock exclusively.
+    let undo = UndoLock::HeldByCaller;
+    recreate_container(lifecycle, name, &workspace, image, &is_held, undo)?;
     account_mem.awaiting_confirm = true;
     account_mem.drift = DriftMemory {
         recreated: Some(drift.clone()),
@@ -565,6 +573,7 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
     let container = container_name(name);
     let Some(removal) = standing(name, None, inputs, &mut account_mem.drift) else {
         account_mem.drift.healthy_beside_record = 0;
+        account_mem.drift.healthy_warned_at = None;
         return Ok(None);
     };
     account_mem.awaiting_confirm = false;
@@ -581,8 +590,10 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
         };
         let denied = assess(inspect, registered, Some(&denials)).denied;
         if denied.is_empty() {
-            mem.healthy_beside_record += 1;
-            if mem.healthy_beside_record.is_power_of_two() {
+            mem.healthy_beside_record = mem.healthy_beside_record.saturating_add(1);
+            let now = now_unix_ms() / 1000;
+            if healthy_record_warn_due(mem.healthy_beside_record, mem.healthy_warned_at, now) {
+                mem.healthy_warned_at = Some(now);
                 log::warn!(
                     "session_reconcile: {container} (account {name}) is running and mounts \
                      nothing denied, but a removal record for {} ({}) still stands and blocks \
@@ -599,6 +610,7 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
         mounted_of(inspect, &removal.denied)
     };
     mem.healthy_beside_record = 0;
+    mem.healthy_warned_at = None;
     let why = format!(
         "it was removed for mounting {} ({}) and is present again",
         paths(&reported),

@@ -66,8 +66,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod pr_cases;
 pub use pr_cases::{
-    cases_from_pr_history, cases_from_pr_records, parse_pr_records, pr_case_entries, PrCaseEntries,
-    PrCaseExclusion, PrCaseRecord, PrCaseSummary, RefusedEntry,
+    cases_from_pr_history, cases_from_pr_records, cases_from_pr_records_with_roster,
+    fill_linked_stars, parse_pr_records, pr_case_entries, PrCaseEntries, PrCaseExclusion,
+    PrCaseRecord, PrCaseSummary, RefusedEntry,
 };
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),
@@ -107,6 +108,22 @@ pub struct ReplayCase {
     /// [`super::stage_queue::stage_queue`], the same function the tracker
     /// serves from.
     pub queue: Vec<super::stage_queue::StageQueue>,
+    /// [`super::labels::pr_flags`] of the PR's own labels in force at
+    /// `as_of` (#10524), when the source reconstructs them: a forge
+    /// label-timeline case ([`pr_cases`]) does, a `sweep.outcome` or journal
+    /// case does not (`None`). Read only by the subset breakdown
+    /// ([`BacktestReport::by_subset`]); it is **not** fed to the estimator,
+    /// so the replayed answer is unchanged.
+    pub pr_flags: Option<u8>,
+    /// The `eta-fit/v2` priority inputs at `as_of` (#10508), built by the one
+    /// builder the fit and serving call
+    /// ([`super::priority_inputs::priority_inputs`]) from the batch's PR
+    /// timelines, when a source supplies them
+    /// ([`pr_cases::cases_from_pr_records_with_roster`]). `None` leaves the
+    /// replayed estimate's `features.priority` absent, as before. Fed to the
+    /// estimator (unlike [`Self::pr_flags`]) but read only by a heuristic over
+    /// an `eta-fit/v2` file: every other answer is unchanged.
+    pub priority: Option<super::fit::features_v2::PriorityInputs>,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -169,6 +186,8 @@ pub fn cases_from_record(
             dispatch: None,
             age_sec: 0,
             queue: Vec::new(),
+            pr_flags: None,
+            priority: None,
         });
         if landed {
             cases.push(ReplayCase {
@@ -182,6 +201,8 @@ pub fn cases_from_record(
                 dispatch: None,
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: None,
+                priority: None,
             });
         }
         if stage == Stage::Doctor {
@@ -251,6 +272,8 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 dispatch: Some(dispatch),
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: None,
+                priority: None,
             });
         }
     }
@@ -408,6 +431,17 @@ pub struct BacktestReport {
     /// `overall` still counts every case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_tail: BTreeMap<String, Bucket>,
+    /// The starred, held and sequenced cases apart (#10524), each with its
+    /// late-surprise rate; keys and membership in [`subsets`]. Present only
+    /// when some case is held or knows its PR labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_subset: BTreeMap<String, SubsetBucket>,
+    /// The regime layer's adaptation times on this heuristic's residuals
+    /// under an injected x2 shift (#10528, [`adaptation`]). Only
+    /// [`run_with_adaptation`] fills it (`eta backtest --adaptation`);
+    /// diagnostic, never a promotion input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_adaptation: Option<RegimeAdaptation>,
 }
 
 /// `by_tail` key for an ordinary estimate (or a refusal).
@@ -448,7 +482,10 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
             rework_rounds: case.rework_rounds,
             episode_entered_at: None,
         }),
-        features: explanation::Features::default(),
+        features: explanation::Features {
+            priority: case.priority,
+            ..explanation::Features::default()
+        },
         features_omitted: Vec::new(),
         provenance: loom.clone(),
         dispatch: case.dispatch.clone(),
@@ -479,6 +516,38 @@ pub fn run(
 ) -> BacktestReport {
     let replayed = replay(heuristic, history, cases, filter, loom);
     report_of(heuristic, &replayed)
+}
+
+/// The signature [`run`] and [`run_with_adaptation`] share.
+pub type RunFn =
+    fn(&dyn Heuristic, &StageSamples, &[ReplayCase], Filter<'_>, &Provenance) -> BacktestReport;
+
+/// [`run_with_adaptation`] when `adaptation` is set, else [`run`].
+#[must_use]
+pub fn runner(adaptation: bool) -> RunFn {
+    if adaptation {
+        run_with_adaptation
+    } else {
+        run
+    }
+}
+
+/// [`run`], plus the regime layer's adaptation times on the same replay
+/// ([`adaptation::measure`]); `regime_adaptation` stays `None` when no stage
+/// has enough scored outcomes on each side of its median.
+#[must_use]
+pub fn run_with_adaptation(
+    heuristic: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    filter: Filter<'_>,
+    loom: &Provenance,
+) -> BacktestReport {
+    let replayed = replay(heuristic, history, cases, filter, loom);
+    BacktestReport {
+        regime_adaptation: adaptation::measure(&adaptation::rows_of(&replayed)),
+        ..report_of(heuristic, &replayed)
+    }
 }
 
 /// Every case matching `heuristic.kind()` and `filter`, replayed and scored,
@@ -582,6 +651,8 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         stability: paired::stability_of(replayed),
         convergence: paired::convergence_of(replayed),
         by_tail,
+        by_subset: subsets::subsets_of(replayed),
+        regime_adaptation: None,
     }
 }
 
@@ -614,12 +685,13 @@ pub fn calibration_from_replay(
         .collect()
 }
 
-/// Give the calibrating `land` heuristics (`land-2026-10-06-calm-plover`,
+/// Give the calibrating `land` heuristics (`land-2026-10-06-even-lark`,
 /// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
-/// `land-2026-10-04-twin-otter-b`) their calibration evidence from the replay
-/// itself: each [`super::heuristics::CALIBRATION_BASES`] estimate at every
-/// `land` case in `cases`, landing at the case's own outcome
-/// ([`calibration_from_replay`]). `base` resolves a base id to the heuristic
+/// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
+/// whose regime residuals are the same `-b` rows) their calibration evidence
+/// from the replay itself: each [`super::heuristics::CALIBRATION_BASES`]
+/// estimate at every `land` case in `cases`, landing at the case's own
+/// outcome ([`calibration_from_replay`]). `base` resolves a base id to the heuristic
 /// that replays it: a registry's own, or a walk-forward one whose fit is
 /// chosen per case ([`super::walk_forward::DatedFits`], the nightly fold's
 /// per-prediction-day registries), so a fitted base's logged quantiles are
@@ -739,6 +811,16 @@ mod paired;
 
 use paired::Replayed;
 pub use paired::{Convergence, Fold, Paired, Stability};
+
+#[path = "backtest_subsets.rs"]
+pub mod subsets;
+
+pub use subsets::SubsetBucket;
+
+#[path = "backtest_adaptation.rs"]
+pub mod adaptation;
+
+pub use adaptation::RegimeAdaptation;
 
 /// [`compare`] was asked to rank two heuristics that predict different
 /// kinds, whose replay sets do not overlap.

@@ -18,15 +18,18 @@
 //!
 //! # The two sources
 //!
-//! The same label change usually reaches SigNoz twice: the loom-ui webhook
-//! export (an exact receipt time) and the daemon's listing diff (a polling
-//! time, up to one listing interval late). A merge or close reaches it as a
-//! webhook `closed` row and as the daemon's `pr.resolved` record.
+//! A webhook record (an exact receipt time) reaches SigNoz once per loom-ui
+//! exporter (the export and d1sync, both [`Source::Webhook`]); its copies
+//! share one identity, so they are one row, never a corroboration. The daemon
+//! (a polling time, up to one listing interval late) contributes `pr.resolved`
+//! for a merge or close, and, once its stage journal is exported (no producer
+//! yet, #10756), whole label sets.
 //!
 //! **Rules** (one unit test each):
 //!
 //! 1. **Delivery identity.** Rows with one `record_id` are one row; the first
-//!    knowable is kept.
+//!    knowable is kept. A record any knowable copy flags `noop` (it changed
+//!    nothing: one exporter may omit the flag) adds no event.
 //! 2. **Webhook time wins.** A daemon occurrence and a webhook occurrence of
 //!    the same `(repo, number, label, transition)` (or the same lifecycle
 //!    event) are one event, dated by the webhook. The pair matches when the
@@ -39,11 +42,13 @@
 //!    instant are one event, so a redelivered or re-exported row never
 //!    counts twice.
 //!
-//! The daemon's label rows carry the whole label set, not a single change
-//! (stage journal rows). Consecutive sets of one item are diffed into
+//! The daemon's label rows (stage journal rows, not yet exported) carry the
+//! whole label set, not a single change. Consecutive sets of one item are diffed into
 //! changes, dated at the later set's observation. An item's first set is a
 //! baseline and dates nothing: the daemon cannot know when those labels were
-//! added.
+//! added. Every set is still kept on the item ([`ItemTimeline::label_sets`]),
+//! so an item the daemon only ever saw as a baseline (or as repeated identical
+//! sets) is a known item, never a missing one (#10520).
 //!
 //! # Coverage
 //!
@@ -95,6 +100,11 @@ pub struct ItemTimeline {
     pub labels: Vec<LabelEvent>,
     /// In `at` order.
     pub lifecycle: Vec<LifecycleEvent>,
+    /// The daemon's whole label sets, `(observed_at, labels)`, ascending: the
+    /// first is the baseline. They date no change of their own (the diffs
+    /// between them are already in `labels`); they say the item exists, when
+    /// the daemon saw it, and what it carried then.
+    pub label_sets: Vec<(DateTime<Utc>, BTreeSet<String>)>,
 }
 
 impl ItemTimeline {
@@ -136,6 +146,48 @@ impl ItemTimeline {
             };
         }
         labels
+    }
+
+    /// The labels the item carried at `at`: the latest daemon set observed by
+    /// then, with the recorded changes after it applied; just
+    /// [`ItemTimeline::labels_at`] when the daemon saw no set by then. Unlike
+    /// `labels_at`, this knows a baseline's labels, which no change dates.
+    #[must_use]
+    pub fn current_labels(&self, at: DateTime<Utc>) -> BTreeSet<String> {
+        let Some((seen, set)) = self.label_sets.iter().rfind(|(seen, _)| *seen <= at) else {
+            return self.labels_at(at);
+        };
+        let mut labels = set.clone();
+        for event in self.labels.iter().filter(|e| e.at > *seen && e.at <= at) {
+            match event.transition {
+                Transition::Added => labels.insert(event.label.clone()),
+                Transition::Removed => labels.remove(&event.label),
+            };
+        }
+        labels
+    }
+
+    /// The baseline's labels that no recorded change explains: carried at the
+    /// first daemon set, yet absent from [`ItemTimeline::labels_at`] at that
+    /// set's observation (plus [`MATCH_SLACK_SEC`], a webhook receipt's lag).
+    /// Their addition time is unknown.
+    #[must_use]
+    pub fn undated_baseline_labels(&self) -> BTreeSet<String> {
+        let Some((seen, set)) = self.label_sets.first() else {
+            return BTreeSet::new();
+        };
+        let dated = self.labels_at(*seen + Duration::seconds(MATCH_SLACK_SEC));
+        set.difference(&dated).cloned().collect()
+    }
+
+    /// Every instant the item became knowable to have changed or been seen:
+    /// each label event, lifecycle event and daemon set, at the later of its
+    /// time and its observation.
+    pub fn seen_at(&self) -> impl Iterator<Item = DateTime<Utc>> + '_ {
+        let label = self.labels.iter().map(|e| e.at.max(e.observed_at));
+        let life = self.lifecycle.iter().map(|e| e.at.max(e.observed_at));
+        let sets = self.label_sets.iter().map(|(seen, _)| *seen);
+        label.chain(life).chain(sets)
     }
 }
 
@@ -224,6 +276,8 @@ pub struct TimelineStats {
     pub not_knowable: usize,
     /// Repeats of a held `record_id` (rule 1).
     pub duplicate_records: usize,
+    /// Records flagged `noop` by a knowable copy (rule 1), dropped.
+    pub noop: usize,
     /// Same-source repeats of one event (rule 4), and repeats of a CI run,
     /// job or duration sample.
     pub duplicate_events: usize,
@@ -349,14 +403,19 @@ impl Timeline {
             .collect();
         stats.not_knowable = rows.len() - knowable.len();
         knowable.sort_by(|a, b| (a.0, &a.1.record_id).cmp(&(b.0, &b.1.record_id)));
-        // Rule 1.
+        // Rule 1. The noop flag is the record's, whichever copy carries it.
+        let noop: BTreeSet<&str> = knowable
+            .iter()
+            .filter_map(|&(_, row)| row.noop.then_some(row.record_id.as_str()))
+            .collect();
+        stats.noop = noop.len();
         let mut ids = BTreeSet::new();
-        knowable.retain(|(_, row)| {
-            let fresh = ids.insert(row.record_id.clone());
+        knowable.retain(|&(_, row)| {
+            let fresh = ids.insert(row.record_id.as_str());
             if !fresh {
                 stats.duplicate_records += 1;
             }
-            fresh
+            fresh && !noop.contains(row.record_id.as_str())
         });
 
         let mut coverage = Coverage::default();
@@ -457,9 +516,13 @@ impl Timeline {
                 }
             }
         }
-        // The daemon's label sets, diffed into changes at each observation.
+        // The daemon's label sets, diffed into changes at each observation,
+        // and each kept whole on its item (a baseline-only item still exists).
+        let mut items: BTreeMap<ItemKey, ItemTimeline> = BTreeMap::new();
         for (item, mut list) in sets {
             list.sort_by_key(|(at, _)| *at);
+            items.entry(item.clone()).or_default().label_sets =
+                list.iter().map(|(at, set)| (*at, (*set).clone())).collect();
             for pair in list.windows(2) {
                 let ((_, before), (at, after)) = (pair[0], pair[1]);
                 let occurrence = Occurrence {
@@ -483,7 +546,6 @@ impl Timeline {
             }
         }
 
-        let mut items: BTreeMap<ItemKey, ItemTimeline> = BTreeMap::new();
         for ((item, label, transition), (webhook, daemon)) in labels {
             let timeline = items.entry(item).or_default();
             for m in merge_sources(webhook, daemon, &mut stats) {

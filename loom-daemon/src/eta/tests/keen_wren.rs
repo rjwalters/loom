@@ -16,7 +16,7 @@ use crate::eta::fit::{
 };
 use crate::eta::heuristics::{
     LandKeenWren, LandTwinOtter, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_BOLD_LARK, LAND_KEEN_WREN,
-    LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
+    LAND_LOOP_KITE, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
 };
 use crate::eta::simulate::run_explanation;
 use crate::eta::twin_otter::{evaluate, EvalConfig, TwinOtterModel, PROBIT_TAUS};
@@ -51,6 +51,7 @@ fn rows(stage: FitStage, n: usize, exits: usize) -> (Vec<TrainingRow>, Vec<Prior
         .map(|i| TrainingRow {
             starred_any: None,
             star_source: None,
+            planner_version: None,
             stage,
             group: format!("g#{i}"),
             inputs: ModelInputs {
@@ -338,13 +339,15 @@ fn keen_wren_is_a_land_candidate_registered_before_the_twin_otter_pair() {
     );
     for registry in [Registry::builtin(), fitted] {
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        // `land-2026-10-06-tandem-wren` (#10510) is registered after the pair.
+        // bold-lark (#10524) and loop-kite (#10521), its successor, sit
+        // between it and the pair; `land-2026-10-06-tandem-wren` (#10510)
+        // is registered after the pair.
         assert_eq!(
             land[land.len() - 5..],
             [
                 LAND_KEEN_WREN,
                 LAND_BOLD_LARK,
-                LAND_TWIN_OTTER,
+                LAND_LOOP_KITE,
                 LAND_TWIN_OTTER_B,
                 LAND_TANDEM_WREN
             ]

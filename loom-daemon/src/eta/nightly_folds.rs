@@ -32,9 +32,10 @@
 //! cutoff, and never revisited once that day's file is written), so the
 //! longest-running cases would systematically leave the scoreboard (#10532
 //! review, finding 1). `D`'s cohort is therefore the cases known at `D`'s
-//! cutoff whose identity was not yet known at `D`'s start
-//! ([`backtest::merge_case_sets`]' case identity): each resolved case lands in
-//! exactly one daily fold.
+//! cutoff whose identity was not yet known at `D`'s start ([`cohort`]): each
+//! resolved case lands in exactly one daily fold. The identity names the PR,
+//! so a second PR on the same issue resolving out of prediction order cannot
+//! take over the first one's identity (#10626).
 //!
 //! # Every case is scored by its prediction day's registry
 //!
@@ -80,7 +81,7 @@ use super::history::StageSamples;
 use super::journal::{self, JournalEntry};
 use super::score::Score;
 use super::shadow::{self, GateStatus, MIN_FOLDS};
-use super::{EstimateInput, Explanation, Heuristic, Kind, Provenance, Registry, Tier};
+use super::{EstimateInput, Explanation, Heuristic, Kind, Provenance, Registry, Stage, Tier};
 use crate::telemetry::kinds::eta_backtest::{EtaBacktestFoldRecord, EtaBacktestSummaryRecord};
 use crate::telemetry::TelemetryEnvelope;
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -186,7 +187,24 @@ pub fn load_inputs(root: &Path) -> Inputs {
     let pr_cases = std::fs::read_to_string(pr_history_path(root))
         .ok()
         .and_then(|text| backtest::parse_pr_records(&text).ok())
-        .map(|records| backtest::cases_from_pr_records(&records).0)
+        .map(|mut records| {
+            // v2 priority inputs (#10508) from the cached roster history and
+            // the cached raw star events.
+            let now = Utc::now();
+            let history = super::roster_history::load_for(root, now).0;
+            let repos: Vec<String> = records
+                .iter()
+                .map(|r| r.repo.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            backtest::fill_linked_stars(
+                &mut records,
+                &super::star::StarInputs::load(root, &repos),
+                now,
+            );
+            backtest::cases_from_pr_records_with_roster(&records, history.as_deref()).0
+        })
         .unwrap_or_default();
     Inputs {
         envelopes,
@@ -340,7 +358,15 @@ fn point_in_time(
 
 /// The `land` cases known resolved at `cutoff`: built only from evidence
 /// observed before it, predicted and resolved before it.
+///
+/// The offline PR cache is cut at `cutoff` **before** it is merged with the
+/// local cases (#10626): [`backtest::merge_case_sets`] numbers each side's
+/// cases per issue and stage, so a PR still open at the cutoff would shift
+/// the numbering of the cache side and could let a known case be dropped
+/// for, or counted beside, another PR's — the fold changing with data from
+/// after its cutoff.
 fn known_cases(inputs: &Inputs, cutoff: DateTime<Utc>) -> Vec<ReplayCase> {
+    let resolved = |c: &ReplayCase| c.kind == KIND && c.as_of < cutoff && c.actual_at < cutoff;
     let envelopes: Vec<&TelemetryEnvelope> = inputs
         .envelopes
         .iter()
@@ -354,22 +380,65 @@ fn known_cases(inputs: &Inputs, cutoff: DateTime<Utc>) -> Vec<ReplayCase> {
         .collect();
     let mut cases = backtest::cases_from_envelopes(envelopes);
     cases.extend(backtest::cases_from_journal(&journal));
-    let (mut cases, _dropped) = backtest::merge_case_sets(cases, inputs.pr_cases.clone());
-    cases.retain(|c| c.kind == KIND && c.as_of < cutoff && c.actual_at < cutoff);
+    cases.retain(resolved);
+    let pr_cases: Vec<ReplayCase> = inputs
+        .pr_cases
+        .iter()
+        .filter(|c| resolved(c))
+        .cloned()
+        .collect();
+    let (cases, _dropped) = backtest::merge_case_sets(cases, pr_cases);
     cases
 }
 
+/// A case's identity across the daily snapshots (#10626): subject (repo,
+/// case-insensitive, issue **and PR**), kind, stage, and its lap — the
+/// *n*-th, by `as_of`, of that PR's cases of that kind and stage. Every
+/// `land` case of one PR resolves at the same instant (its merge), so another
+/// PR on the same issue resolving earlier or later never shifts a lap; and
+/// both sources carry the PR number (a `sweep.outcome` record that ends in
+/// `merge` is `landed`, which implies `pr_number`, #9441), so the same case
+/// read from a second source is not new.
+type CohortKey = (CohortGroup, usize);
+
+/// Repo (lowercased), issue, PR, kind and stage: the cases a lap counts among.
+type CohortGroup = (String, u32, Option<u32>, Kind, Stage);
+
+fn cohort_keys(cases: &[ReplayCase]) -> Vec<CohortKey> {
+    let mut groups: BTreeMap<CohortGroup, Vec<usize>> = BTreeMap::new();
+    for (i, c) in cases.iter().enumerate() {
+        let s = &c.subject;
+        groups
+            .entry((s.repo.to_ascii_lowercase(), s.issue, s.pr_number, c.kind, c.stage))
+            .or_default()
+            .push(i);
+    }
+    let mut keys = vec![None; cases.len()];
+    for (group, mut members) in groups {
+        members.sort_by_key(|&i| (cases[i].as_of, i));
+        for (lap, i) in members.into_iter().enumerate() {
+            keys[i] = Some((group.clone(), lap));
+        }
+    }
+    keys.into_iter().flatten().collect()
+}
+
 /// `day`'s cohort out of `known` (the cases known at its cutoff): those whose
-/// identity was not yet known when `day` began ([`known_cases`] at its start;
-/// identity as [`backtest::merge_case_sets`] keys it, so the same case read
-/// from a second source is not new). Each resolved case is in exactly one
-/// day's cohort: the day it became known, whichever day it was predicted on.
+/// `CohortKey` was not yet known when `day` began ([`known_cases`] at its
+/// start). Each resolved case is in exactly one day's cohort: the day it
+/// became known, whichever day it was predicted on, and whatever order the
+/// other cases of its issue resolve in.
 #[must_use]
 pub fn cohort(inputs: &Inputs, day: NaiveDate, known: &[ReplayCase]) -> Vec<ReplayCase> {
-    let before = known_cases(inputs, day_start(day));
-    let n = before.len();
-    let (merged, _) = backtest::merge_case_sets(before, known.to_vec());
-    merged.into_iter().skip(n).collect()
+    let before: BTreeSet<CohortKey> = cohort_keys(&known_cases(inputs, day_start(day)))
+        .into_iter()
+        .collect();
+    known
+        .iter()
+        .zip(cohort_keys(known))
+        .filter(|(_, key)| !before.contains(key))
+        .map(|(c, _)| c.clone())
+        .collect()
 }
 
 /// One registry per prediction day: the one the fold for that day serves,
@@ -480,7 +549,7 @@ impl Heuristic for PerDay<'_> {
 /// ([`backtest::with_replay_calibration`], the helper `eta backtest` and
 /// `eta promote` call). Leak-free because `history` and `cases` were already
 /// cut at the cutoff ([`point_in_time`]); without it
-/// `land-2026-10-06-calm-plover` would degrade to plain `land-v2` in every
+/// `land-2026-10-06-even-lark` would degrade to plain `land-v2` in every
 /// fold.
 fn calibrated(
     by_day: &ByDay,

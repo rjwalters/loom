@@ -61,6 +61,21 @@
 //! any post-`as_of` outcome leaves the output bit-identical (pinned by a
 //! test).
 //!
+//! # Two score scales
+//!
+//! [`Scale::Log`] (`land-2026-10-06-calm-plover`, retired in #10489; kept so
+//! its persisted explanations still recompute) is the score above. Its
+//! shift is one multiplicative constant per cell, which hits every rate but
+//! loses on pinball: on `land` the base's quantiles carry little information
+//! beyond a constant, so `q · exp(c)` with `c` large (a merge-wait p75 shift
+//! of `ln 49` in the #10489 backtest) blows a narrow base range up to days for
+//! every item. [`Scale::Seconds`] (`land-2026-10-06-even-lark`) scores
+//! `s = actual_remaining − q_τ` and adds the shift, `q_τ + c_τ`: the same
+//! split-conformal guarantee, but the missing time is added as time, which is
+//! what pinball (linear in seconds) prices. Its rate limit is
+//! [`MAX_DAILY_STEP_SEC`]. Everything else — cells, censoring, window,
+//! replay, point-in-time — is shared.
+//!
 //! Pure: no clock, no file, no forge.
 
 use super::explanation::Explanation;
@@ -69,8 +84,11 @@ use super::Stage;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Recorded in [`Calibration::method`].
+/// Recorded in [`Calibration::method`] by [`Scale::Log`].
 pub const METHOD: &str = "split_conformal_km_log";
+
+/// Recorded in [`Calibration::method`] by [`Scale::Seconds`] (#10489).
+pub const METHOD_SECONDS: &str = "split_conformal_km_seconds";
 
 /// The trailing window of base estimates calibrated against, days.
 pub const WINDOW_DAYS: i64 = 14;
@@ -81,6 +99,46 @@ pub const MIN_CELL_EVENTS: usize = 20;
 /// Largest change of any quantile's shift (ln units) between two
 /// evaluations one day apart: `ln 1.2 ≈ 0.18` is a 20% move of the range.
 pub const MAX_DAILY_STEP: f64 = 0.18;
+
+/// [`Scale::Seconds`]' largest change of any quantile's shift between two
+/// evaluations one day apart, seconds: no quantile moves more than 2 h a day.
+pub const MAX_DAILY_STEP_SEC: f64 = 7_200.0;
+
+/// What a conformity score measures, and so how its shift is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scale {
+    /// `ln(actual / q)`; `q' = q · exp(shift)` (the retired calm-plover).
+    Log,
+    /// `actual − q`, seconds; `q' = q + shift` (even-lark).
+    Seconds,
+}
+
+impl Scale {
+    /// The conformity score of `remaining` against quantile `q` (both
+    /// seconds, floored at 1).
+    fn score(self, remaining: f64, q: f64) -> f64 {
+        match self {
+            Scale::Log => (remaining / q).ln(),
+            Scale::Seconds => remaining - q,
+        }
+    }
+
+    /// The largest one-day move of a shift, in the score's units.
+    fn max_daily_step(self) -> f64 {
+        match self {
+            Scale::Log => MAX_DAILY_STEP,
+            Scale::Seconds => MAX_DAILY_STEP_SEC,
+        }
+    }
+
+    /// The recorded [`Calibration::method`].
+    fn method(self) -> &'static str {
+        match self {
+            Scale::Log => METHOD,
+            Scale::Seconds => METHOD_SECONDS,
+        }
+    }
+}
 
 /// The four quantile levels, in [`Q4`] order.
 pub(crate) const TAUS: [f64; 4] = [0.25, 0.50, 0.75, 0.90];
@@ -149,8 +207,9 @@ pub struct Calibration {
     /// The age bucket, when the level is `stage_age`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_bucket: Option<String>,
-    /// The shift applied per quantile, ln units: `q' = q · exp(shift)`
-    /// (after the rate limit).
+    /// The shift applied per quantile (after the rate limit): ln units,
+    /// `q' = q · exp(shift)`, for every method but [`METHOD_SECONDS`], whose
+    /// shift is seconds, `q' = q + shift`.
     pub shift: Q4<f64>,
     /// The shift before the rate limit.
     pub raw_shift: Q4<f64>,
@@ -158,7 +217,8 @@ pub struct Calibration {
     pub n_events: usize,
     /// Still-open (right-censored) base estimates behind it.
     pub n_censored: usize,
-    /// The largest one-day move allowed ([`MAX_DAILY_STEP`]). Absent for a
+    /// The largest one-day move allowed, in `shift`'s units
+    /// ([`MAX_DAILY_STEP`], or [`MAX_DAILY_STEP_SEC`]). Absent for a
     /// method with no rate limit (the IPCW wrapper, #10524, which must adapt
     /// within hours; [`super::conformal_ipcw`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,6 +350,7 @@ fn usable<'a>(
 /// The raw (un-rate-limited) fit at `t` over `evidence` (from [`usable`]):
 /// the narrowest cell with [`MIN_CELL_EVENTS`] landings, or `None`.
 fn raw_fit(
+    scale: Scale,
     evidence: &[&CalibrationObservation],
     base: &str,
     t: DateTime<Utc>,
@@ -322,7 +383,7 @@ fn raw_fit(
         for (k, tau) in TAUS.iter().enumerate() {
             let mut points: Vec<(f64, bool)> = members
                 .iter()
-                .map(|s| ((s.remaining / s.q[k]).ln(), s.event))
+                .map(|s| (scale.score(s.remaining, s.q[k]), s.event))
                 .collect();
             // Finite-sample corrected conformal level.
             let lvl = ((n + 1.0) * tau / n).min(1.0);
@@ -347,9 +408,10 @@ fn raw_fit(
 /// after the oldest usable estimate — an anchor fixed by the evidence, not
 /// by `t` — so the replay for `t + 1 day` is the replay for `t` plus one
 /// more clamped step, and the applied shift moves by at most
-/// [`MAX_DAILY_STEP`] between evaluations one day apart (#10497). A lattice
-/// point with no qualifying cell carries the previous shift forward.
+/// [`Scale::max_daily_step`] between evaluations one day apart (#10497). A
+/// lattice point with no qualifying cell carries the previous shift forward.
 fn limited_fit(
+    scale: Scale,
     observations: &[CalibrationObservation],
     base: &str,
     t: DateTime<Utc>,
@@ -371,15 +433,15 @@ fn limited_fit(
     let mut last: Option<Fit> = None;
     for k in (0..=steps).rev() {
         let at = t - Duration::days(k);
-        let raw = raw_fit(&evidence, base, at, stage, bucket);
+        let raw = raw_fit(scale, &evidence, base, at, stage, bucket);
         if let Some(fit) = &raw {
             previous = Some(match previous {
                 None => fit.shift,
                 Some(p) => {
                     let mut next = fit.shift;
+                    let step = scale.max_daily_step();
                     for i in 0..4 {
-                        next[i] =
-                            round6(next[i].clamp(p[i] - MAX_DAILY_STEP, p[i] + MAX_DAILY_STEP));
+                        next[i] = round6(next[i].clamp(p[i] - step, p[i] + step));
                     }
                     next
                 }
@@ -406,14 +468,51 @@ pub fn apply(base: (i64, i64, i64, i64), shift: &Q4<f64>) -> (i64, i64, i64, i64
     (p25, p50, p75, p90)
 }
 
+/// [`apply`] for [`Scale::Seconds`]: `q + shift` per quantile, rounded,
+/// floored at zero, monotone by construction.
+#[must_use]
+pub fn apply_seconds(base: (i64, i64, i64, i64), shift: &Q4<f64>) -> (i64, i64, i64, i64) {
+    let q = [base.0, base.1, base.2, base.3];
+    let s = shift.to_array();
+    let at = |i: usize| ((q[i] as f64) + s[i]).round().max(0.0) as i64;
+    let p25 = at(0);
+    let p50 = at(1).max(p25);
+    let p75 = at(2).max(p50);
+    let p90 = at(3).max(p75);
+    (p25, p50, p75, p90)
+}
+
+/// Apply a recorded calibration to the base quantiles it was fitted for, by
+/// its own method: what [`super::simulate::run_explanation`] recomputes.
+#[must_use]
+pub fn apply_record(base: (i64, i64, i64, i64), record: &Calibration) -> (i64, i64, i64, i64) {
+    if record.method == METHOD_SECONDS {
+        apply_seconds(base, &record.shift)
+    } else {
+        apply(base, &record.shift)
+    }
+}
+
 /// Calibrate `explanation` (a base heuristic's estimate) against the track
-/// record of `base` in `observations`. Pure.
+/// record of `base` in `observations`, on the log scale (what the retired
+/// `land-2026-10-06-calm-plover` answered). Pure.
 ///
 /// The identity — `explanation` returned untouched — for a refusal, an
 /// estimate with no current stage or no p90, or no cell with
 /// [`MIN_CELL_EVENTS`] landings.
 #[must_use]
 pub fn calibrate(
+    explanation: Explanation,
+    observations: &[CalibrationObservation],
+    base: &str,
+) -> Explanation {
+    calibrate_on(Scale::Log, explanation, observations, base)
+}
+
+/// [`calibrate`] on either [`Scale`]. Pure; the identity in the same cases.
+#[must_use]
+pub fn calibrate_on(
+    scale: Scale,
     mut explanation: Explanation,
     observations: &[CalibrationObservation],
     base: &str,
@@ -427,14 +526,18 @@ pub fn calibrate(
     };
     let as_of = explanation.as_of;
     let bucket = age_bucket(age);
-    let Some((fit, shift, replay_from)) = limited_fit(observations, base, as_of, stage, bucket)
+    let Some((fit, shift, replay_from)) =
+        limited_fit(scale, observations, base, as_of, stage, bucket)
     else {
         return explanation;
     };
     let shift = Q4::from_array(shift);
-    let (p25, p50, p75, p90) = apply(base_q, &shift);
+    let (p25, p50, p75, p90) = match scale {
+        Scale::Log => apply(base_q, &shift),
+        Scale::Seconds => apply_seconds(base_q, &shift),
+    };
     let record = Calibration {
-        method: METHOD.to_string(),
+        method: scale.method().to_string(),
         base: base.to_string(),
         window: CalibrationWindow {
             from: as_of - Duration::days(WINDOW_DAYS),
@@ -448,7 +551,7 @@ pub fn calibrate(
         raw_shift: Q4::from_array(fit.shift),
         n_events: fit.n_events,
         n_censored: fit.n_censored,
-        max_daily_step: Some(MAX_DAILY_STEP),
+        max_daily_step: Some(scale.max_daily_step()),
         replay_from: Some(replay_from),
         ipcw: None,
         base_quantiles_sec: Q4 {

@@ -15,9 +15,14 @@
 //!    webhook service. Because part 1 pins the text the model mirrors, the
 //!    model cannot drift from the SQL without a failure.
 //!
+//! The same holds for the `identity` column (#10671): [`identity`] models
+//! [`IDENTITY_EXPR`], and the tests show both exporters' copies of one D1
+//! record resolve to one identity.
+//!
 //! Not covered (needs a live ClickHouse): that ClickHouse evaluates the
 //! pinned text as modelled, e.g. `JSONExtractString` on a non-JSON body
-//! returning `''`.
+//! returning `''`. The #10671 query was run against live SigNoz once by
+//! hand (alias references and `[-1]` indexing included).
 
 use crate::eta::fleet_signoz_timeline_rows::{
     parse_row, ParsedRow, RowBody, Source, Target, Transition, SERVICE_WEBHOOK, TIMELINE_SQL,
@@ -41,6 +46,39 @@ multiIf(kind = 'queue.snapshot', {repo:String},
 
 /// The repo predicate, verbatim.
 const REPO_WHERE: &str = "AND lower(repo) = lower({repo:String})";
+
+/// The `identity` column, verbatim.
+const IDENTITY_EXPR: &str = "\
+multiIf(attributes_string['loom.record_id'] != '', record_id,
+            kind = 'label.transition' AND attributes_string['loom.delivery_id'] != '',
+            concat('dlv:', attributes_string['loom.delivery_id']),
+            kind = 'label.transition' AND attributes_string['loom.record.delivery_id'] != '',
+            concat('dlv:', attributes_string['loom.record.delivery_id']),
+            attributes_string['d1sync.record'] != '',
+            concat('d1:', replaceOne(splitByChar('/', attributes_string['d1sync.record'])[-1], '#', ':')),
+            attributes_string['loom.export.id'] != '', concat('d1:', attributes_string['loom.export.id']),
+            record_id) AS identity,";
+
+/// [`IDENTITY_EXPR`] over `raw` of the resolved `kind`, whose row cursor is
+/// `record_id`.
+fn identity(raw: &Raw, kind: &str, record_id: &str) -> String {
+    let label = kind == "label.transition";
+    if !attr(raw, "loom.record_id").is_empty() {
+        record_id.to_string()
+    } else if label && !attr(raw, "loom.delivery_id").is_empty() {
+        format!("dlv:{}", attr(raw, "loom.delivery_id"))
+    } else if label && !attr(raw, "loom.record.delivery_id").is_empty() {
+        format!("dlv:{}", attr(raw, "loom.record.delivery_id"))
+    } else if !attr(raw, "d1sync.record").is_empty() {
+        let record = attr(raw, "d1sync.record");
+        let last = record.rsplit('/').next().unwrap_or_default();
+        format!("d1:{}", last.replacen('#', ":", 1))
+    } else if !attr(raw, "loom.export.id").is_empty() {
+        format!("d1:{}", attr(raw, "loom.export.id"))
+    } else {
+        record_id.to_string()
+    }
+}
 
 /// One raw log row: the columns the resolution reads.
 struct Raw {
@@ -106,19 +144,16 @@ fn emitted(raw: &Raw, kind: &str, repo: &str) -> String {
     .to_string()
 }
 
-/// A webhook export row as SigNoz stores it: no attributes, the D1 record
-/// (the fixture's `h:w1`) as the body.
+/// A webhook export row as SigNoz stores it (live shape, #10671): no
+/// `loom.kind` / `loom.repo` attribute, the D1 record as a flat JSON body.
 fn webhook_row(repo_in_body: &str) -> Raw {
-    let payload = json!({"kind": "label.transition", "at": "2026-10-01T10:00:00Z",
-                         "repo": repo_in_body, "target": "pr", "number": 900,
-                         "action": "labeled", "labels_after": [],
-                         "label": "loom:review-requested"});
     Raw {
         attributes_string: Map::new(),
         service: SERVICE_WEBHOOK,
-        body: json!({"id": 1001, "kind": "label.transition", "repo": repo_in_body,
-                     "emitted_at": "2026-10-01T10:00:00Z",
-                     "payload": payload.to_string()})
+        body: json!({"kind": "label.transition", "at": "2026-10-01T10:00:00.000Z",
+                     "repo": repo_in_body, "target": "pr", "number": 900,
+                     "action": "labeled", "labels_after": ["loom:review-requested"],
+                     "label": "loom:review-requested"})
         .to_string(),
     }
 }
@@ -129,6 +164,9 @@ fn the_query_pins_the_resolution_the_model_mirrors() {
         ("kind", KIND_EXPR),
         ("repo", REPO_EXPR),
         ("where", REPO_WHERE),
+        ("identity", IDENTITY_EXPR),
+        ("scope", "scope_name AS scope,"),
+        ("bools", "toJSONString(attributes_bool) AS bools,"),
     ] {
         assert!(
             TIMELINE_SQL.contains(fragment),
@@ -208,4 +246,57 @@ fn the_daemon_path_still_selects_by_attribute_and_never_by_body() {
         body: json!({"kind": "label.transition", "repo": REPO}).to_string(),
     };
     assert_eq!(select(&daemon_json, REPO), None);
+}
+
+fn strings(pairs: &[(&str, &str)]) -> Map<String, Value> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), json!(v)))
+        .collect()
+}
+
+/// Both exporters' copies of one D1 record share one identity: the delivery
+/// for a label row, the D1 record id for any other kind.
+#[test]
+fn both_exporters_copies_of_one_record_resolve_to_one_identity() {
+    let export = |kind: &str, delivery: Option<&str>| Raw {
+        attributes_string: strings(
+            &[("loom.export.id", "records:1092860")]
+                .into_iter()
+                .chain(delivery.map(|d| ("loom.record.delivery_id", d)))
+                .collect::<Vec<_>>(),
+        ),
+        service: SERVICE_WEBHOOK,
+        body: json!({"kind": kind, "repo": REPO}).to_string(),
+    };
+    let d1sync = |delivery: Option<&str>| Raw {
+        attributes_string: strings(
+            &[
+                ("loom.repo", REPO),
+                ("d1sync.record", "loom-fleet-telemetry/records#1092860"),
+            ]
+            .into_iter()
+            .chain(delivery.map(|d| ("loom.delivery_id", d)))
+            .collect::<Vec<_>>(),
+        ),
+        service: "loom",
+        body: "label.transition".to_string(),
+    };
+    let dlv = Some("82392400-c0c1-11f1-94e9-ea984e41c86c");
+    let label = "label.transition";
+    let want = "dlv:82392400-c0c1-11f1-94e9-ea984e41c86c";
+    assert_eq!(identity(&export(label, dlv), label, "h:1"), want);
+    assert_eq!(identity(&d1sync(dlv), label, "h:2"), want);
+    // Without a delivery (CI, queue): the D1 record id, from either form.
+    assert_eq!(identity(&export("ci.job", None), "ci.job", "h:3"), "d1:records:1092860");
+    assert_eq!(identity(&d1sync(None), "ci.job", "h:4"), "d1:records:1092860");
+    // A delivery never keys a non-label record (one CI delivery, many records).
+    assert_eq!(identity(&export("ci.job", dlv), "ci.job", "h:5"), "d1:records:1092860");
+    // The daemon's rows keep their own identity.
+    let daemon = Raw {
+        attributes_string: strings(&[("loom.kind", "ci.run"), ("loom.repo", REPO)]),
+        service: "loom",
+        body: "ci.run".to_string(),
+    };
+    assert_eq!(identity(&daemon, "ci.run", "h:6"), "h:6");
 }

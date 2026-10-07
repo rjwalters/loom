@@ -11,6 +11,7 @@ use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::shadow::GateStatus;
 use crate::eta::tests::{history_a_envelopes, provenance};
 use crate::eta::Stage;
+use crate::telemetry::TelemetryRecord;
 use chrono::TimeZone;
 
 fn inputs() -> Inputs {
@@ -45,7 +46,7 @@ fn busiest_day(inputs: &Inputs) -> NaiveDate {
 }
 
 /// [`inputs`] plus enough slow, already-landed `land` cases in the two weeks
-/// before `day` for `land-2026-10-06-calm-plover`'s conformal calibration to
+/// before `day` for `land-2026-10-06-even-lark`'s conformal calibration to
 /// engage (every case lands days later than `land-v2` expects).
 fn calibrating_inputs() -> (Inputs, NaiveDate) {
     let mut inputs = inputs();
@@ -249,12 +250,12 @@ fn gate_ready_uses_the_promote_backtest_gate_function() {
     }
 }
 
-/// #10532 review: the fold gives `land-2026-10-06-calm-plover` the same
+/// #10532 review: the fold gives `land-2026-10-06-even-lark` the same
 /// replay calibration evidence `eta backtest` / `eta promote` do, so its fold
 /// is the calibrated heuristic's and not its uncalibrated `land-v2` fallback.
 #[test]
 fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
-    use crate::eta::heuristics::LAND_CALM_PLOVER;
+    use crate::eta::heuristics::LAND_EVEN_LARK;
     let (inputs, day) = calibrating_inputs();
     let start = day_start(day);
     let cutoff = start + Duration::days(1);
@@ -274,9 +275,9 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         "calibration evidence is itself point-in-time"
     );
 
-    let plover = registry
-        .get(LAND_CALM_PLOVER)
-        .expect("calm-plover is registered");
+    let lark = registry
+        .get(LAND_EVEN_LARK)
+        .expect("even-lark is registered");
     // The day's cohort: here, the cases that resolved on it.
     let day_cases: Vec<ReplayCase> = cases
         .iter()
@@ -284,14 +285,8 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         .cloned()
         .collect();
     let pinball = |h: &StageSamples| {
-        own_stats(&backtest::replay_scored(
-            plover,
-            h,
-            &day_cases,
-            Filter::default(),
-            &provenance(),
-        ))
-        .pinball4
+        own_stats(&backtest::replay_scored(lark, h, &day_cases, Filter::default(), &provenance()))
+            .pinball4
     };
     let (calibrated, fallback) = (pinball(&cli), pinball(&uncalibrated));
     assert_ne!(calibrated, fallback, "the fixture makes calibration matter");
@@ -299,8 +294,8 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
     let folded = records
         .folds
         .iter()
-        .find(|f| f.heuristic == LAND_CALM_PLOVER)
-        .expect("a calm-plover fold");
+        .find(|f| f.heuristic == LAND_EVEN_LARK)
+        .expect("an even-lark fold");
     assert_eq!(folded.pinball4_loss_sec, calibrated, "the fold is the CLI path's answer");
     assert_ne!(folded.pinball4_loss_sec, fallback, "not the uncalibrated fallback");
 }
@@ -433,6 +428,118 @@ fn every_fixture_case_is_in_exactly_one_daily_cohort() {
     assert_eq!(folded, want);
 }
 
+/// Two PRs closing one issue (#10626): A is predicted first and lands on
+/// `d + 1`, B is predicted later and lands on `d`. A waits two extra days in
+/// `merge`, so each of its stage entries is a day before B's. Returns their
+/// sweep records and the same `land` cases as the offline PR cache holds them.
+fn out_of_order_pair(d: NaiveDate) -> (Vec<TelemetryEnvelope>, Vec<ReplayCase>) {
+    let template = history_a_envelopes().remove(0);
+    let midnight = day_start(d);
+    let pair = [
+        (1, midnight + Duration::days(1) + Duration::hours(1), Duration::days(2)),
+        (2, midnight + Duration::hours(1), Duration::zero()),
+    ];
+    let envelopes: Vec<TelemetryEnvelope> = pair
+        .iter()
+        .map(|&(pr, landed, wait)| {
+            let mut e = template.clone();
+            e.emitted_at = landed;
+            let TelemetryRecord::SweepOutcome(r) = &mut e.record else {
+                panic!("the fixture's first line is a sweep.outcome");
+            };
+            r.issue = 6_000_000;
+            r.pr_number = Some(pr);
+            r.sweep_id = format!("sweep-out-of-order-{pr}");
+            let merge = r.phase_durations.last_mut().unwrap();
+            assert_eq!(merge.phase, "merge");
+            merge.duration_sec += wait.num_seconds();
+            r.total_duration_sec += wait.num_seconds();
+            e
+        })
+        .collect();
+    let cases = backtest::cases_from_envelopes(&envelopes)
+        .into_iter()
+        .filter(|c| c.kind == Kind::Land)
+        .collect();
+    (envelopes, cases)
+}
+
+/// #10626 (the #10532 Judge's probe): two PRs closing one issue overlap in
+/// every stage and land in the opposite order to their predictions. Keyed by
+/// issue and `as_of` rank alone, the later-predicted case was folded on both
+/// days and the earlier one never. Each is folded exactly once, on the day
+/// it lands, and the summary at the in-between cutoff holds the first-landed
+/// one once — whether the cases come from the PR cache, the sweep records,
+/// or both.
+#[test]
+fn same_issue_cases_landing_out_of_prediction_order_are_each_folded_once() {
+    let d = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+    let (envelopes, cases) = out_of_order_pair(d);
+    let key = |c: &ReplayCase| (c.subject.pr_number, c.stage, c.as_of);
+    let mut want: Vec<_> = cases
+        .iter()
+        .map(|c| (c.actual_at.date_naive(), key(c)))
+        .collect();
+    want.sort();
+    let mut first_landed: Vec<_> = want
+        .iter()
+        .filter(|(day, _)| *day == d)
+        .map(|(_, k)| *k)
+        .collect();
+    first_landed.sort();
+    assert!(!first_landed.is_empty() && first_landed.len() < want.len());
+    assert!(
+        cases.iter().all(|a| a.subject.pr_number != Some(1)
+            || cases
+                .iter()
+                .filter(|b| b.subject.pr_number == Some(2) && b.stage == a.stage)
+                .all(|b| a.as_of < b.as_of && a.actual_at > b.actual_at)),
+        "every A case is predicted before, and lands after, B's in its stage"
+    );
+
+    let sources = [
+        (
+            "pr cache",
+            Inputs {
+                pr_cases: cases.clone(),
+                ..Inputs::default()
+            },
+        ),
+        (
+            "sweep records",
+            Inputs {
+                envelopes: envelopes.clone(),
+                ..Inputs::default()
+            },
+        ),
+        (
+            "both",
+            Inputs {
+                envelopes: envelopes.clone(),
+                pr_cases: cases.clone(),
+                ..Inputs::default()
+            },
+        ),
+    ];
+    for (source, inputs) in sources {
+        let mut summary: Vec<_> = known_cases(&inputs, day_start(d) + Duration::days(1))
+            .iter()
+            .map(key)
+            .collect();
+        summary.sort();
+        assert_eq!(summary, first_landed, "{source}: known at d's cutoff");
+
+        let mut folded = Vec::new();
+        for offset in -1..=2 {
+            let day = d + Duration::days(offset);
+            let known = known_cases(&inputs, day_start(day) + Duration::days(1));
+            folded.extend(cohort(&inputs, day, &known).iter().map(|c| (day, key(c))));
+        }
+        folded.sort();
+        assert_eq!(folded, want, "{source}: each case once, on its landing day");
+    }
+}
+
 /// Finding 1's other half: the cross-midnight case is folded at the end of
 /// the day it resolves, but its prediction still reads nothing at or after
 /// its own `as_of` — not its own landing, not anything else that day.
@@ -555,7 +662,9 @@ fn walk_forward_gate(
 /// the whole window.
 #[test]
 fn the_summary_scores_each_case_with_its_prediction_days_fit() {
-    use crate::eta::heuristics::LAND_TWIN_OTTER;
+    // `-b` is the registered fitted heuristic (twin-otter itself is retired,
+    // #10528): its PR stages are twin-otter's evaluation over the dated fit.
+    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
     let inputs = inputs();
     let days = prediction_days(&inputs);
     assert!(days.len() >= 4, "the fixture spans several prediction days");
@@ -584,12 +693,12 @@ fn the_summary_scores_each_case_with_its_prediction_days_fit() {
     let s = records
         .summaries
         .iter()
-        .find(|s| s.heuristic == LAND_TWIN_OTTER)
-        .expect("a twin-otter summary");
+        .find(|s| s.heuristic == LAND_TWIN_OTTER_B)
+        .expect("a twin-otter-b summary");
 
     let walked =
-        walk_forward_gate(&inputs, day, vec![a.clone(), b], Some(days[0]), LAND_TWIN_OTTER);
-    let only_a = walk_forward_gate(&inputs, day, vec![a], Some(days[0]), LAND_TWIN_OTTER);
+        walk_forward_gate(&inputs, day, vec![a.clone(), b], Some(days[0]), LAND_TWIN_OTTER_B);
+    let only_a = walk_forward_gate(&inputs, day, vec![a], Some(days[0]), LAND_TWIN_OTTER_B);
     assert_ne!(walked.detail, only_a.detail, "the two fits are distinguishable");
     assert_eq!(s.gate_detail, walked.detail);
     assert_eq!(
@@ -610,7 +719,9 @@ fn the_summary_scores_each_case_with_its_prediction_days_fit() {
 /// `no_model` refusal; with no file at all nothing is left out.
 #[test]
 fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
-    use crate::eta::heuristics::LAND_TWIN_OTTER;
+    // `-b` is the registered fitted heuristic (twin-otter itself is retired,
+    // #10528): its PR stages are twin-otter's evaluation over the dated fit.
+    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
     let inputs = inputs();
     let days = prediction_days(&inputs);
     let from = days[days.len() / 2];
@@ -625,7 +736,7 @@ fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
         .filter(|c| c.as_of.date_naive() < from)
         .count();
     assert!(before_fit > 0, "the fixture has cases before the fit");
-    let walked = walk_forward_gate(&inputs, day, vec![only], Some(from), LAND_TWIN_OTTER);
+    let walked = walk_forward_gate(&inputs, day, vec![only], Some(from), LAND_TWIN_OTTER_B);
     for s in &records.summaries {
         assert_eq!(s.fitted_from.as_deref(), Some(from.format("%Y-%m-%d").to_string().as_str()));
         assert_eq!(s.cases_before_fit, before_fit as u64);
@@ -633,7 +744,7 @@ fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
     let s = records
         .summaries
         .iter()
-        .find(|s| s.heuristic == LAND_TWIN_OTTER)
+        .find(|s| s.heuristic == LAND_TWIN_OTTER_B)
         .unwrap();
     assert_eq!(s.gate_detail, walked.detail);
 

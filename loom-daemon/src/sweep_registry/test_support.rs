@@ -158,6 +158,7 @@ pub(crate) fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
   printf 'LOOM_SWEEP_ID=%s\n' "${{LOOM_SWEEP_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
   printf 'GH_CONFIG_DIR=%s\n' "${{GH_CONFIG_DIR:-unset}}"
+  printf 'LOOM_LLM_GATEWAY_VK=%s\n' "${{LOOM_LLM_GATEWAY_VK:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -544,11 +545,14 @@ pub(crate) fn insert_clean_exit_running(
     issue: u32,
     seq: u32,
 ) -> String {
-    let child = Command::new("true")
+    let mut child = Command::new("true")
         .spawn()
         .expect("spawn `true` fixture child");
     let pid = child.id();
-    std::thread::sleep(Duration::from_millis(50));
+    // Block on the child's actual exit (#10726): `Child` caches the status, so
+    // the reaper's later `try_wait()` deterministically sees `Some(0)` even on
+    // a heavily loaded host (a fixed sleep raced the scheduler).
+    child.wait().expect("wait for `true` fixture child");
     let sweep_id = format!("sweep-issue-{issue}-no-progress-{seq}");
     registry.entries.insert(
         sweep_id.clone(),

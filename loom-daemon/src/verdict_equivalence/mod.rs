@@ -417,24 +417,6 @@ pub fn assess(
     )
 }
 
-/// [`detect`] with both kill switches passed in explicitly, so the
-/// "switched off => nothing asked, no answer" contract is unit-testable without
-/// mutating process env (the same split
-/// [`crate::forge_tree_unchanged`] uses for its own switch).
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn detect_with(
-    carveout_enabled: bool,
-    new_kinds_enabled: bool,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    pr: u32,
-    reviewed: &str,
-    head: &str,
-) -> Equivalence {
-    assess_with(carveout_enabled, new_kinds_enabled, gh_bin, cwd, pr, reviewed, head).equivalence
-}
-
 #[allow(clippy::too_many_arguments)]
 fn assess_with(
     carveout_enabled: bool,

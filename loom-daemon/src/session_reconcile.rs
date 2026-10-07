@@ -49,11 +49,18 @@
 //!   is skipped before any `docker` call (outcome `held (operator stop)`),
 //!   and re-checked after the inspect and inside the start itself
 //!   ([`SessionLifecycle::start_unless_held`]), so a pass racing a `stop`
-//!   never `docker start`s the container `stop` is about to `rm`. The hold
+//!   never `docker start`s the container `stop` is about to `rm`; and once
+//!   more after its own `docker start`/`run` returns, undoing that start if
+//!   a `stop` held the account meanwhile (`Held`, no failure counted;
+//!   #10661). The hold
 //!   is on disk (survives daemon restarts) and per account: holds and
-//!   `enabled=false` are collected across **every** registered root first
-//!   ([`AccountIndex`]), so a root that still lists the account enabled
-//!   cannot bypass them.
+//!   `enabled=false` are collected across **every** registered root, plus
+//!   the daemon's fallback root, first ([`AccountIndex`] over
+//!   [`session_hold_roots::hold_roots`], the root set the CLI also lifts and
+//!   reads holds in, #10661), so a root that still lists the account enabled
+//!   cannot bypass them. An operator start that lifts the hold and then
+//!   fails leaves the account **unheld and down**: the pass restarts it on
+//!   its usual backoff, which is the operator's stated intent.
 //! * **Docker unavailable:** a failed (or timed-out) container read means
 //!   the runtime is unusable, not that an account is broken: the rest of the
 //!   pass is skipped and the **pass as a whole** backs off
@@ -95,6 +102,17 @@
 //! ([`SessionLifecycle::start_unless_held`]) and, before a drift recreate,
 //! a fresh inspect (same container id) plus the `docker top` in-flight check.
 //!
+//! # After a start: publish at once (#10600)
+//!
+//! A pass that started or recreated a container takes one more bounded
+//! snapshot and publishes it ([`session_state::publish`]), so liveness-aware
+//! selection sees the container at once instead of up to a watch interval
+//! later. Its outcomes are recorded for `loom-daemon status`
+//! ([`crate::session_status::record_pass`]). An operator's `accounts session
+//! start` runs in another process and cannot publish: selection sees that
+//! container at the watch's next pass (at most 60 s; never older than
+//! [`session_state::LATEST_MAX_AGE`]).
+//!
 //! # Mount drift (#10364 Part B)
 //!
 //! A running host-mode container whose workspace mounts differ from what the
@@ -117,11 +135,11 @@ use crate::tokens_pool::private_workspace;
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
     container_name, is_session_managed, refresh_session_health_uncached, ContainerRunner,
-    ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, SESSION_POSTURE,
-    SESSION_POSTURE_LABEL,
+    ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
+    SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
-use crate::tokens_pool::session_state::{self, MountDrift, Snapshot};
-use crate::tokens_pool::{session_dispatch_lock, session_mount_gate};
+use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
+use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
 
@@ -737,6 +755,7 @@ pub fn recreate_container<R: ContainerRunner>(
     workspace: &Path,
     image: Option<String>,
     is_held: &dyn Fn() -> bool,
+    undo_lock: UndoLock<'_>,
 ) -> anyhow::Result<SessionStatus> {
     if is_held() {
         return Err(OperatorHeld.into());
@@ -750,7 +769,7 @@ pub fn recreate_container<R: ContainerRunner>(
         );
     }
     lifecycle.set_image(image);
-    let started = lifecycle.start_unless_held(name, Some(workspace), is_held);
+    let started = lifecycle.start_unless_held(name, Some(workspace), is_held, undo_lock);
     lifecycle.set_image(None);
     started
 }
@@ -892,7 +911,8 @@ fn reconcile_one<R: ContainerRunner>(
                     return Ok(out);
                 }
             }
-            lifecycle.start_unless_held(name, workspace.as_deref(), &is_held)?;
+            let undo = UndoLock::Take(ctx.dispatch_locks);
+            lifecycle.start_unless_held(name, workspace.as_deref(), &is_held, undo)?;
             mem.awaiting_confirm = true;
             log::warn!("session_reconcile: {container}: was stopped; resumed it (docker start)");
             Outcome::Resumed
@@ -909,7 +929,8 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
-            recreate_container(lifecycle, name, &workspace, recreate_image, &is_held)?;
+            let undo = UndoLock::Take(ctx.dispatch_locks);
+            recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
             mem.awaiting_confirm = true;
             log::warn!(
                 "session_reconcile: {container}: was missing; recreated it host-mounted \
@@ -961,24 +982,33 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     };
     let registered = registry.roots();
     let fallback_workspace = default_mount_workspace(&registered, fallback_root);
-    let inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = registry
-        .effective_roots(fallback_root)
-        .into_iter()
-        .filter_map(|root| {
-            let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
-            Some((root, inventory))
-        })
-        .collect();
-    // Holds and `enabled=false` count across every root before any root acts.
+    // Holds and `enabled=false` count across every root before any root
+    // acts: the one hold root set the CLI also uses (#10661), a superset of
+    // the roots the pass acts in.
+    let hold_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> =
+        session_hold_roots::hold_roots(&registered, Some(fallback_root))
+            .into_iter()
+            .filter_map(|root| {
+                let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
+                Some((root, inventory))
+            })
+            .collect();
     let index = AccountIndex::from_inventories(
-        &inventories
+        &hold_inventories
             .iter()
             .map(|(_, inv)| inv.as_slice())
             .collect::<Vec<_>>(),
     );
-    // One container read for the whole pass (every root), taken lazily.
-    let mut take =
-        || session_state::snapshot("docker", &registered, session_state::SNAPSHOT_DEADLINE);
+    let acting = registry.effective_roots(fallback_root);
+    let inventories = hold_inventories
+        .into_iter()
+        .filter(|(root, _)| acting.contains(root));
+    // One container read for the whole pass (every root), taken lazily,
+    // classified with the shared drift definition (#10600).
+    let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
+    let read =
+        || session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+    let mut take = read;
     let mut observe = PassSnapshot::new(&mut take);
     let dispatch_locks = session_dispatch_lock::lock_dir();
     let mut seen = HashSet::new();
@@ -1044,6 +1074,12 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    if all.iter().any(|o| o.outcome.started()) {
+        // Selection reads the published snapshot: show it the start now.
+        let started = std::time::Instant::now();
+        session_state::publish(std::sync::Arc::new(read()), started);
+    }
+    crate::session_status::record_pass(&all, now);
     all
 }
 
@@ -1084,6 +1120,7 @@ pub fn spawn_task(fallback_root: PathBuf, interval: Duration) -> tokio::task::Jo
 /// start the loop, or return `None` when disabled.
 pub fn spawn_from_config(workspace: &Path) -> Option<tokio::task::JoinHandle<()>> {
     let config = read_config(workspace);
+    crate::session_status::set_reconciler_enabled(resolve_enabled(&config));
     if !resolve_enabled(&config) {
         log::debug!(
             "session_reconcile: disabled (LOOM_SESSION_RECONCILE=0 or \
@@ -1096,6 +1133,8 @@ pub fn spawn_from_config(workspace: &Path) -> Option<tokio::task::JoinHandle<()>
         "session_reconcile: enabled (interval={}s; no-op without session-managed Codex accounts)",
         interval.as_secs()
     );
+    // The CLI's half of the one hold root set (#10661).
+    session_hold_roots::record_daemon_fallback_root(workspace);
     Some(spawn_task(workspace.to_path_buf(), interval))
 }
 

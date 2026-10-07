@@ -17,7 +17,7 @@
 //! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
 //! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
 //! a close. Every path-engine heuristic still refuses it as `blocked` (the
-//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! shadow `land-2026-10-04-twin-otter-b` estimates it from its fit's own
 //! `merge_hold` stage), and the `merge_wait` samples still run from the
 //! approval to the merge, hold
 //! included (the **pooled** definition); the hold-free `merge_wait` and the
@@ -120,6 +120,7 @@ pub mod fleet_fetch;
 pub mod fleet_log;
 pub mod fleet_refresh;
 pub mod fleet_signoz;
+pub mod fleet_signoz_history;
 pub mod fleet_signoz_refresh;
 pub mod fleet_signoz_timeline;
 pub mod fleet_signoz_timeline_rows;
@@ -136,9 +137,12 @@ pub mod labels;
 pub mod loop_features;
 pub mod nightly_folds;
 pub mod offline;
+pub mod planner_sim;
+pub mod planner_version;
 pub mod point_in_time;
 pub mod pr_features;
 pub(crate) mod pr_features_forge;
+pub mod pr_file_log;
 pub mod priority_features;
 pub mod priority_inputs;
 pub mod queue_features;
@@ -146,10 +150,13 @@ pub mod recalibrate;
 pub mod recency;
 pub mod regime;
 pub mod repo_priority;
+pub mod retire_filing;
 pub mod roster_history;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
+pub mod shadow_lifecycle;
+pub mod shadow_stats;
 pub mod simulate;
 pub mod stage_queue;
 pub mod stall;
@@ -682,6 +689,9 @@ pub struct Registry {
     /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with
     /// (#10508).
     fit_v2: Option<Arc<fit::CoefficientFile>>,
+    /// The `eta-fit/v3` file `land-2026-10-06-loop-kite` was built with
+    /// (#10521).
+    fit_v3: Option<Arc<fit::CoefficientFile>>,
 }
 
 impl Registry {
@@ -693,9 +703,10 @@ impl Registry {
     }
 
     /// The built-in heuristics, the fitted ones built with `fit`. Pure.
-    /// `land-2026-10-04-twin-otter` (and its pre-PR composition `-b`, last)
-    /// are registered **always**, with
-    /// or without a file, so its refusals are on the record too.
+    /// `land-2026-10-04-twin-otter-b` (the fitted twin-otter evaluation plus
+    /// its pre-PR composition) is registered **always**, with or without a
+    /// file, so its refusals are on the record too. `land-2026-10-04-twin-otter`
+    /// itself is retired (#10528); `-b` still evaluates it for PR stages.
     #[must_use]
     pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
         Self::with_fits(fit, None)
@@ -709,47 +720,82 @@ impl Registry {
         fit: Option<Arc<fit::CoefficientFile>>,
         fit_v2: Option<Arc<fit::CoefficientFile>>,
     ) -> Self {
+        Self::with_all_fits(fit, fit_v2, None)
+    }
+
+    /// [`Self::with_fits`], with `fit_v3` the `eta-fit/v3` file (#10521)
+    /// `land-2026-10-06-loop-kite` reads. Pure.
+    #[must_use]
+    pub fn with_all_fits(
+        fit: Option<Arc<fit::CoefficientFile>>,
+        fit_v2: Option<Arc<fit::CoefficientFile>>,
+        fit_v3: Option<Arc<fit::CoefficientFile>>,
+    ) -> Self {
         Registry {
             heuristics: vec![
                 Box::new(heuristics::StartV1),
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
-                Box::new(heuristics::LandCalmPlover),
+                // #10489: conformal calibration over land-v2 on the seconds
+                // scale; it replaced the retired log-scale calm-plover here.
+                Box::new(heuristics::LandEvenLark),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
-                // #10524: wraps twin-otter-b; registered before the
-                // twin-otter pair so `-b` stays last.
+                // #10528: twin-otter-b plus the drift-gated regime
+                // adjustment; registered ahead of the other -b wrappers.
+                Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
+                // #10524: wraps twin-otter-b; registered before `-b` so
+                // `-b` stays last but for tandem-wren.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),
                 // #10524 slice 3: quick-tern made drift-aware (#10528).
                 Box::new(heuristics::LandSwiftTern::new(fit.clone())),
                 // #10523: twin-otter-b plus the hold/sequence simulator;
-                // also before the twin-otter pair.
+                // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 // #10508: twin-otter-b's priority-aware successor, also
-                // before the twin-otter pair.
+                // before `-b`.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
                 // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
                 Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
-                Box::new(heuristics::LandTwinOtter::new(fit.clone())),
+                // #10521: keen-wren's friction-aware successor, before
+                // twin-otter-b.
+                Box::new(heuristics::LandLoopKite::new(fit_v3.clone())),
+                // `land-2026-10-04-twin-otter` is retired (#10528): its
+                // evaluation lives on inside `-b`, which stays registered.
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
                 Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),
             ],
             fit,
             fit_v2,
+            fit_v3,
         }
     }
 
     /// The built-in heuristics with the newest coefficient file under
     /// `workspace_root` whose cutoff is strictly before `before`
     /// ([`fit::load_latest`]), and the newest `eta-fit/v2` file by the same
-    /// rule ([`fit::v2::load_latest_v2`]). The registry's only I/O.
+    /// rule ([`fit::v2::load_latest_v2`]), and the newest `eta-fit/v3` file
+    /// ([`fit::v3::load_latest_v3`]). The registry's only I/O.
     #[must_use]
     pub fn load(workspace_root: &Path, before: DateTime<Utc>) -> Self {
-        Self::with_fits(
+        Self::with_all_fits(
             fit::load_latest(workspace_root, before).map(Arc::new),
             fit::v2::load_latest_v2(workspace_root, before).map(Arc::new),
+            fit::v3::load_latest_v3(workspace_root, before).map(Arc::new),
         )
+    }
+
+    /// The `eta-fit/v3` file `land-2026-10-06-loop-kite` was built with.
+    #[must_use]
+    pub fn fit_v3(&self) -> Option<&fit::CoefficientFile> {
+        self.fit_v3.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_v3_id(&self) -> Option<&str> {
+        self.fit_v3.as_deref().map(|f| f.id.as_str())
     }
 
     /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with.

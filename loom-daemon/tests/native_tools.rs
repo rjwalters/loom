@@ -106,17 +106,42 @@ fn native_sweep_uses_profile_and_does_not_inherit_claude_pool_holds() {
     // precedence), so any host that exports it — e.g. a native worker session —
     // would flip the claude half of this test. Isolate it for this test's scope
     // and restore afterwards, including on panic.
-    struct RestoreLoomRuntime(Option<String>);
-    impl Drop for RestoreLoomRuntime {
+    //
+    // The machine-level defaults tier is pinned off the same way (#9728): this
+    // test calls `loom_daemon` IN-PROCESS, and an integration-test crate links
+    // the lib without `cfg(test)`, so `private_defaults_path`'s test-only
+    // refusal of the `~/.local/share/loom/config/defaults.json` fallback does
+    // not apply here. A fleet host's `runtimes.preference` in that file turns
+    // the root into a preference-resolved Claude root, which inherits the pool
+    // hold this test asserts it must not. `call()`'s `.env(…, "")` only reaches
+    // the spawned children, never this process.
+    //
+    // The shared token pool is pinned off for the same reason: unset, it
+    // resolves to the host's live `~/.loom/tokens`, whose account state then
+    // decides the hold's clear-time estimate — the claude half failed on an
+    // operator Mac with a populated pool even with the defaults tier off.
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+    impl RestoreEnv {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let prior = std::env::var_os(key);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self(key, prior)
+        }
+    }
+    impl Drop for RestoreEnv {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var("LOOM_RUNTIME", v),
-                None => std::env::remove_var("LOOM_RUNTIME"),
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
             }
         }
     }
-    let _runtime = RestoreLoomRuntime(std::env::var("LOOM_RUNTIME").ok());
-    std::env::remove_var("LOOM_RUNTIME");
+    let _runtime = RestoreEnv::set("LOOM_RUNTIME", None);
+    let _defaults_tier = RestoreEnv::set("LOOM_CONFIG_DEFAULTS_FILE", Some(""));
+    let _token_pool = RestoreEnv::set("LOOM_SHARED_TOKENS_DIR", Some(""));
     let d = fixture();
     fs::write(
         d.path().join(".loom/config.json"),

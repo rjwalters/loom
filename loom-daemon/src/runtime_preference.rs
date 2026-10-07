@@ -820,6 +820,9 @@ pub fn resolve_runtime_contained(
 mod containment_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+mod gateway_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod sandbox_hold_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

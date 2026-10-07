@@ -1406,8 +1406,21 @@ and whose `.loom-local/local.json` is the host-local tier.
 
 ### File contract
 
+**`fleet.json` first (#10705).** A store that publishes `fleet.json` — the
+compiled fleet document fleet-gitops renders from its one source file
+`fleet.yml` — is read from that one file: the roster is its top-level `root`
+and `repos`, run state is its `state`, and the tiers are `config.defaults`,
+`config.hosts.<host>.defaults` and `config.hosts.<host>.local`, with exactly
+the contracts below. Its `_generated.schema_version` must be `1`. When
+`fleet.json` is **absent**, the legacy files below are read instead (a
+transition fallback, removed once every store publishes it). When it is
+**present but invalid** — not JSON, no `_generated` header, another
+`schema_version`, or a section of the wrong shape — every reader fails closed
+and the legacy files are not consulted.
+
 | Store path | Read by | Contract |
 |---|---|---|
+| `fleet.json` | `roster`, `state`, `render`, version floor | JSON, above. When present, the next five rows are not read for the roster, state or tiers. The version floor reads only its top-level `loom_min_version` (#10711), and falls back to `repos.yml` when that key is absent — see below |
 | `fleet/defaults.json` | `render` | JSON object: the machine tier every host shares |
 | `fleet/hosts/<host>/defaults.json` | `render` | JSON object: that host's overlay. Required for a host `render` is asked about |
 | `fleet/hosts/<host>/local.json` | `render` | JSON object: that host's host-local tier. Optional — absent leaves the local tier alone |
@@ -1434,6 +1447,16 @@ The desired workspace set is every record with `fleet: true` and not
 `firewall: true`. A record with **both** is a hard error for the whole roster,
 never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
 non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+
+**`loom_min_version`** (#10711): an optional top-level `"X.Y.Z"` string, the
+fleet-wide minimum Loom version. Read from `fleet.json` when that file carries
+the key, else from the top level of `repos.yml` (an extra key there, which the
+roster ignores). Every fleet-sync pass reads it into a process-wide value, not
+the config tiers, so a change takes effect on the next tick without a restart.
+Absent means no floor; a malformed value (not a string, not `X.Y.Z`) keeps the
+last good floor and is reported as a fleet-sync error. It appears as
+`floor` in `fleet-sync-status.json` and on the `Fleet store:` status block.
+Nothing acts on it yet (#10698).
 
 **`fleet/state.yml`**:
 
@@ -3017,7 +3040,7 @@ rules with `git check-ignore`.
 | `autonomous.eta.historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` — `local` (this host's journals), `augment` (plus the cached fleet snapshot) or `fleet` (the snapshot alone). A no-op until a snapshot is cached (#9343); since #10263 the fleet refresh task below caches one by default, so live estimates switch to `scope = fleet` on a host with reader Apps. `local` opts out |
 | `autonomous.eta.fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily coefficient refit (#10245). It checks hourly, fits at most once per UTC day into `.loom/state/eta/fit/`, makes no forge call, and runs only with `autonomous.eta.enabled`. A no-op until a snapshot is cached. With `fleetRefresh.enabled` (below, #10263) the check runs at the end of every fleet refresh cycle instead of on its own task, so it always sees fresh snapshots. Read at start |
 | `autonomous.eta.current.{finish,land}` | none | `finish-v1` / `land-v1` |
-| `autonomous.eta.shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (floor 1, #10525): `current` plus the 12 `eta.snapshot` alternates (#10549, was 10). A build over it does not start the ETA tracker; the error names the excess heuristics. Read at start. See [eta → shadow fleet management](eta.md#shadow-fleet-management) |
+| `autonomous.eta.shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (floor 1, #10525): `current` plus the 13 `eta.snapshot` alternates (#10521; 13 since #10549, was 10). A build over it does not start the ETA tracker; the error names the excess heuristics. Read at start. See [eta → shadow fleet management](eta.md#shadow-fleet-management) |
 | `autonomous.eta.fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | **`true`** — the fleet snapshot backfill/refresh task (#10263). Default-on like `transcriptIngest`, and for the same kind of reason: it generates no work, only reads (reader Apps only, never the operator PAT), and is budgeted with a reserve floor, while default-off would leave the daily fit with no training data. Also requires `autonomous.eta.enabled` and an observability exporter. **Restart required**. **On a multi-host fleet declare `fleet.captain` together with `fleet.repo`** (#10329, #10395): only the captain refreshes and fits, and it publishes the fit through the store for every other host to serve. With no captain every host with a reader refreshes, against the same shared reader budgets; with a captain but no `fleet.repo` the other hosts cannot learn the fit and drift to `no_model`, so do not declare one there — see [Fleet captain](#fleet-captain-8848) and [eta → one refresher](eta.md#fleet-refresh-task-autonomousetafleetrefresh-10263) |
 | `fleet.etaAuthority` | `LOOM_ETA_AUTHORITY` | unset (#10498). The one host that computes and emits `eta.*` records and fits locally. Unset: the declared `fleet.captain`, else the host whose own `fleetRefresh.enabled` is on; several candidates fall back to the lowest host id with a warning. Re-read every pass. See [eta → one ETA authority](eta.md#one-eta-authority-per-fleet-fleetetaauthority-10498) |
 | `autonomous.eta.fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor `900`); first cycle 120 s after start |
@@ -3025,7 +3048,8 @@ rules with `git check-ignore`.
 | `autonomous.eta.fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` per cycle for backfill passes, host-wide (was `1500`, most of a 5,000/h installation, #10329); a larger backfill resumes next cycle. Spend per hour is `budget × 3600 / intervalSecs`, so a lowered `intervalSecs` multiplies it |
 | `autonomous.eta.fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` — below this many remaining core calls, skip the rest of that reader installation's repos (App and repo owner, #10329) this cycle |
 | `autonomous.eta.fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor `15`, the fit window + 1) |
-| `autonomous.eta.fleetRefresh.signoz.*` (`enabled`, `endpoint`, `user`, `credentialFile`, `pageSize`, `maxPages`) | `LOOM_ETA_FLEET_SIGNOZ_*` (`_ENABLED`, `_ENDPOINT`, `_USER`, `_CREDENTIAL_FILE`, `_PAGE_SIZE`, `_MAX_PAGES`) | `false` (#9758). Caches the fleet's `sweep.outcome` records from SigNoz (the in-sweep half). Needs `endpoint` (ClickHouse HTTP) and `credentialFile`, the path of an owner-only password file outside every repo, never the secret. `pageSize` `500`, `maxPages` `200`. Runs inside the fleet refresh cycle, so it also needs `fleetRefresh.enabled`. See [`eta.md` → SigNoz in-sweep half](eta.md#signoz-in-sweep-half-fleetrefreshsignoz-9758) |
+| `autonomous.eta.fleetRefresh.gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100` (floor `2`) forge reads per repo per cycle while SigNoz is the history source (#10520), the raw-event sync's included: a window SigNoz fully covers makes none (its raw-event cache is not advanced meanwhile, and star coverage ends at the cache's `synced_through` stamp, so later cutoffs read unknown, not unstarred); the rest fill gaps (items SigNoz cannot answer alone, or a window it does not reach back over). Spent: the pass stops `budget`, logs and checkpoints (an interrupted timeline keeps its pages), and resumes next cycle. Not applied when the SigNoz walk fails (the pass-kind budgets still are; reads are still counted). `eta doctor` reports the last count per repo |
+| `autonomous.eta.fleetRefresh.signoz.*` (`enabled`, `endpoint`, `user`, `credentialFile`, `pageSize`, `maxPages`) | `LOOM_ETA_FLEET_SIGNOZ_*` (`_ENABLED`, `_ENDPOINT`, `_USER`, `_CREDENTIAL_FILE`, `_PAGE_SIZE`, `_MAX_PAGES`) | `false` (#9758). Caches the fleet's `sweep.outcome` records from SigNoz (the in-sweep half). Needs `endpoint` (ClickHouse HTTP) and `credentialFile`, the path of an owner-only password file outside every repo, never the secret. `pageSize` `500`, `maxPages` `200`. Runs inside the fleet refresh cycle, so it also needs `fleetRefresh.enabled`. With `enabled`, `historyPrimary` (`LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY`, default `false`, opt-in, #10520), when set, also takes each fleet-refresh pass's PR history from the SigNoz timeline first, reading the forge only to gap-fill under `gapFillMaxCallsPerPass`. See [`eta.md` → SigNoz in-sweep half](eta.md#signoz-in-sweep-half-fleetrefreshsignoz-9758) |
 
 Model, heuristics, explanation schema, scoring and queries:
 [`eta.md`](eta.md); the fleet refresh task's passes, resume files, rate-limit
@@ -3681,6 +3705,18 @@ issue is still `loom:building` with a comment. Doctor invokes it as a documented
 best-effort step after pushing to a `feature/issue-<N>` branch. **Dependency
 auto-detection**, **diamonds / multi-parent**, and **auto-detach** remain **out
 of scope** (deferred items of the v2 epic #3747).
+
+**Remote-branch delete safety (#9372)**: a bare ref delete (what `merge-pr.sh`
+does when the repo has `delete_branch_on_merge=false`) makes GitHub *close*
+every open PR based on that branch, unrecoverably (no reopen, no retarget).
+Before that delete, `merge-pr.sh` runs `loom-daemon merge-pr retarget-children`:
+a fresh `gh pr list --base <parent> --state open`, a `gh pr edit --base
+<parent's base>` per child, and a re-check. Only exit 0 (nothing targets the
+branch) authorizes the delete; any uncertainty (query error, failed retarget,
+unknown base, old binary) keeps the branch with a warning naming the manual
+remedy. It is independent of the #9259 reconcile defer and is not bypassed by
+`--allow-stacked-children`. Repos with `delete_branch_on_merge=true` are
+unaffected by the script, but GitHub's own flow retargets there.
 
 ## Epic supervisor (#3842)
 
@@ -5449,6 +5485,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
+| `autonomous.balance.idleGate` | `LOOM_BALANCE_IDLE_GATE` | `false` | **Pipeline-empty gate for hermit/architect idle generation (#10817, slice 4 of #10630).** Off: an `onIdle` edge means a host slot is free, exactly as before (no ledger read, no log line). On: `hermit` and `architect` additionally need this repo's pipeline empty -- no review/changes/merge debt in the demand ledger (`role_runner::demand`) and, where observed, no ready/building issues; any observed work denies the run even with free slots. Unobserved axes never deny nor newly grant (today's host-slot rule applies). Other idle roles are untouched; `architectMaxProposals` still caps a granted architect run. A grant logs `role_runner: idle grant root=<r> role=<role> trigger=idle reason=pipeline-empty`. Precedence env > config > default; truthy `1/true/yes/on`, falsy `0/false/no/off`, an invalid env value warns and falls back to config. Per-repo, live |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
 | *(host-local tiers only — see below)* | `LOOM_ROLE_RUNNER_SHARD_INDEX` | *(unset)* | **This host's** 0-based role-runner shard index (#6374). Must **differ** per host, so it belongs in the service unit next to `LOOM_ROLE_RUNNER`, never in the tracked `.loom/config.json` — a committed `autonomous.roleRunner.shardIndex` gives every host the same index and leaves every other slice with zero owners fleet-wide, so the daemon **refuses** it (logs `error!`, falls back to unsharded). Requires `shardCount`; out-of-range/malformed → unsharded. See [Role-runner host sharding](#role-runner-host-sharding-6374) |
@@ -9135,29 +9172,85 @@ across the registered roots:
   the same schedule. No start is attempted and no per-account failure is
   counted.
 - Every `docker` call has a deadline: 60 s, 120 s for `stop`, 600 s for `run`.
-  The operator CLI inherits these deadlines. An `accounts session start` that
-  has to pull the image for the first time on a slow link fails after 600 s,
-  where it used to wait indefinitely. `docker pull` the image beforehand if
-  that is a risk.
+  The operator CLI inherits these deadlines, with one addition (#10661): when
+  the container is missing, an operator `accounts session start` (or `shell`)
+  first checks that the image is present and, if not, pulls it under its own
+  60 min budget, with a note on stderr. A slow first pull therefore no longer
+  fails the start at 600 s. The pull is not streamed: the note is all you see
+  until it finishes. The reconciler never pulls separately (a long pull would
+  hold the whole pass); its `docker run` keeps the 600 s budget.
+- **Ctrl-C on an operator command (#10661).** Each `docker` call runs in its
+  own process group, so the deadline can kill its descendants. That group is
+  not the terminal's, so Ctrl-C reaches only `loom-daemon`. An operator
+  `accounts session start` or `shell` therefore traps SIGINT and SIGTERM and
+  forwards the signal to the running `docker` command's group. It gives that
+  command 10 s to exit, then kills the group. The command then fails with
+  `interrupted by signal N` and starts no further `docker` call. Where the
+  account ends up depends on the phase (below): interrupted during the
+  preparation (the container inspect, the image check or the pull) it is
+  still **held** and down; interrupted during the start itself it is
+  **unheld** and down. A second Ctrl-C (or SIGTERM) kills the running
+  `docker` command's group (SIGKILL) and then the command, at once. The daemon never traps these signals for its `docker` calls: the
+  reconciler's behaviour is unchanged.
 - With no enabled session-managed account, the pass makes zero `docker` calls.
 - **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
   down. It writes `.session-hold.json` in the account's profile directory
   *before* `docker stop`. Only an operator `accounts session start` (or
-  `shell`) removes it, by deleting it before that start touches Docker.
+  `shell`) removes it, by deleting it before that start's own `docker
+  start`/`run`.
   Whether an account is held depends only on whether the file exists, never
   on timestamps, so a wall clock stepping back between a start and a stop
   cannot drop the hold. The pass checks the hold before any `docker` call and
   again just before a start. If a pass already past that check still
   `docker start`s the container between `stop`'s `docker stop` and its
   `docker rm`, the `rm` fails. `stop` then re-inspects, re-applies the
-  in-flight-exec refusal, and stops and removes the container once more. That
-  one retry suffices because every later start sees the hold. `session status`
+  in-flight-exec refusal, and stops and removes the container once more. The
+  same race exists when `stop` finds **no** container: a pass may `docker
+  run` one right after the hold is written, leaving it running and held. So
+  `stop` inspects once more after writing the hold and stops and removes
+  whatever is there now (#10661). The in-flight-exec refusal applies (unless
+  `--force`), and the dispatch lock `stop` already holds covers the retry. If
+  that container is busy, `stop` refuses as usual. The hold stays, and a
+  retry or `--force` finishes the stop. `stop`'s retries alone are not
+  enough: a `docker run` already in flight (an image pull can take minutes)
+  can finish after both of `stop`'s inspects. So the guarantee is
+  two-sided. After its own `docker start` or `docker run` returns, the
+  pass checks the hold again. If it is now held, the pass stops and removes
+  the container it just started, and reports the account as held (no failure
+  is counted). Whichever side acts second sees the other: if the pass's check
+  comes after the hold was written, the pass removes its container; if it
+  comes before, its start finished before the hold existed, and `stop`'s
+  inspect sees the container. This undo follows `stop`'s rules too. It
+  takes the dispatch lock, waiting up to 30 s for a concurrent `stop` to
+  return, and never stops a container with an in-flight exec. In those
+  cases it leaves the container running, with a WARN naming
+  `accounts session stop`. `session status`
   shows `stopped, held (operator stop)`, and `session status --json` carries
   `"held": true|false`, a field added in #10453. The hold is per account: a
-  hold, or `enabled=false`, in any registered root holds the account in all
-  of them. An operator start deletes the hold in the account's profile in
-  every registered root. `accounts disable <acct>` also keeps it down, but it
-  takes the account out of dispatch too.
+  hold, or `enabled=false`, in the account's profile in any **hold root**
+  holds the account in all of them. The hold roots are every registered root,
+  plus the daemon's fallback root (its `LOOM_WORKSPACE` or working directory)
+  when that is not registered. The pass reads holds in exactly these roots.
+  The CLI lifts and shows them in the same roots, plus its own `--workspace`
+  (#10661). The CLI runs in another process, so the daemon records its
+  fallback root in `~/.loom/session-reconcile-fallback-root.json`
+  (`LOOM_SESSION_FALLBACK_ROOT_FILE` overrides the path) when the reconcile
+  loop starts. Without that record the CLI uses the registered roots and its
+  own. A stale record only adds a root. The record is one per home
+  directory: two daemons sharing a `$HOME` keep only the last one's root,
+  and the other's fallback root gets the pre-#10661 behaviour. An operator
+  start deletes the hold in every hold root. `accounts disable <acct>` also keeps it down, but it takes
+  the account out of dispatch too.
+- **An operator start has two phases.** First the CLI prepares: it inspects
+  the container and, if it is missing, checks for the image and pulls it.
+  The hold is still in place, so a failure or a Ctrl-C here leaves the
+  account **held** and down, exactly as before the start. Then the start
+  deletes the hold, *before* its own `docker start`/`run`, so it can never
+  leave the container running and held. **Lift succeeded, start failed:** if
+  that `docker start`/`run` fails (or is interrupted), the account is
+  **unheld and down**. The reconciler then owns it. It restarts the container
+  on the per-account backoff above, because the operator asked for it to
+  run. To keep it down instead, run `accounts session stop`.
 - An operator `session start` also records its workspace and image in
   `.session-last-start.json` next to the hold. A container recreated after a
   daemon restart uses those values. If that record cannot be written, the
@@ -9171,6 +9264,44 @@ across the registered roots:
 |---|---|---|---|
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+**Seeing it: `loom-daemon status` (#10600).** `status` lists every
+session-managed Codex account across the registered roots under `Session
+containers:`, one line each: the state (`running`, `stopped`, `missing`,
+`restarting`); the mounts (`ok`, or `stale (missing N, extra M, denied K)`,
+where `denied` is a mount `session start` refuses today and is not counted in
+`extra`); the posture (`host`, `private-clone`, or `unverified` when the
+container is not running or not hardened); `held (operator stop)`; `removed
+(denied mount: <path>)` while a removal record stands; and the reconciler's
+last action in this daemon process (`started`, `recreated`, `recreated (mount
+drift)`, `deferred (in-flight)`, `backoff until <time>`, …). `status --json`
+carries the same as `session_containers`. A seat that is not running, has
+stale mounts or has a standing removal record makes the block read
+`DEGRADED`, with one line naming the accounts. So does a host whose
+containers cannot be observed. A held seat is listed but does not degrade it:
+the operator stopped it on purpose. `loom-daemon health` has the same verdict
+as its conditional `session_containers` section. A host without a
+session-managed account shows neither.
+
+`status` makes no `docker` call. It reads the snapshot the session watch
+publishes every 60 s, with the drift verdict computed there. That verdict is
+the reconciler's own definition, so a container the reconciler is about to
+remove never reads `running` (the `loom.codex_session.state` gauge and the
+`workspace add/remove` report use it too). With no snapshot, or one older than
+120 s, the block reads `unavailable`, never a container state. The watch reads
+every registered root's accounts, not only the daemon root's. It is registered
+with task liveness as `codex_session_watch` (`Task liveness:` in `status`), and
+WARNs every 15 min while seats exist and its newest snapshot is older than
+120 s. After a pass starts or recreates a container it publishes a fresh
+snapshot, so dispatch selection sees the container at once. An operator's
+`accounts session start` runs in another process and cannot publish, so
+selection sees that container at the watch's next pass, within 60 s.
+
+**Acting by hand.** The reconciler replaces the hand-recreate steps. Check
+`loom-daemon status` first. The one manual override, for a daemon that is down,
+a reconciler that is opted out, or a restart the reconciler does not make
+(changed profile control files), is in
+[`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
 
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
@@ -9234,8 +9365,11 @@ The drift path follows four safety rules:
    own mounts include a path the loaded roster denies. If the registry or
    roster cannot be read it is left running, with a WARN; if none of its
    mounts is denied it is left running too, the record is kept (it still
-   blocks any recreate) and a WARN on a backoff cadence says so, so an
-   operator can clear it with `accounts session start`. A stale record alone
+   blocks any recreate) and a WARN says so, so an operator can clear it with
+   `accounts session start`. The WARN comes on passes 1, 2, 4, 8 and so on,
+   but never more than 24 h apart (#10661). The count is in memory, so a
+   daemon restart starts it over. The first pass after a restart WARNs at
+   once. A stale record alone
    never stops a running container. A removal runs when idle, under the
    dispatch lock, with a WARN on every attempt and the per-account backoff
    while it keeps failing. A stopped container whose own mounts include a
@@ -9272,7 +9406,10 @@ The drift path follows four safety rules:
    holds when they run as the same user with the same environment. If they
    differ, each side silently locks its own file and only `docker top`
    protects a starting dispatch. Test suites set `LOOM_SESSION_LOCK_DIR` to a
-   temporary directory and fail if the real one changed. The `docker top` check remains as the second
+   temporary directory and fail if the real one changed. They also check that
+   the expected fixture lock appeared in that temporary directory (#10661).
+   Otherwise a regression that re-opens a pre-existing real lock would go
+   unseen, because it changes neither the lock's presence nor its mtime. The `docker top` check remains as the second
    line.
 
 **Known gap: a session started on one checkout.** A container started with
@@ -10295,6 +10432,26 @@ loop is not reusable as the reporter). It has three cooperating parts:
    capture into the same log via the rendered job/unit's stdout/stderr redirect)
    — **and, since #5391, recovers**: see "The watchdog recovers, it is not a
    report-only detector" below.
+
+**Host opt-out: `autonomy-disabled` (#10179).** The strongest state, above the
+marker and the `.stopped` operator-stop record (#9588). `loom-daemon host disable
+--reason "<why>"` writes `<loom_dir>/autonomy-disabled` (`reason=`/`who=`/`when=`;
+the machine-level `~/.loom`, so it covers every repo on the host; a
+`LOOM_AUTONOMY_MARKER` override moves it too), removes `autonomy-desired`, and runs
+`loom-daemon-stop.sh` to stop the daemon and its launchd/systemd daemon + watchdog
+jobs. While it exists each of these exits non-zero naming reason, who, when and
+`loom-daemon host enable`, with no side effects: `daemon-start` /
+`loom-daemon-start.sh`, the watchdog tick (no recovery, no page), the watchdog
+provisioning guard, `daemon-update` (restart / relaunch / provision, and so the
+auto-update roll), daemon startup itself (supervised relaunch), and
+`resync-installed.sh` / `install-loom.sh` (via `loom-daemon host check`, which
+exits **10** when disabled; the shell guards refuse only on 10, so an older binary
+that exits 1/2 for the unknown `host` subcommand never reads as an opt-out).
+`heal_marker` never re-arms the marker, and `loom-daemon status` / `health` print
+`disabled by operator: <reason> (<when>)` and exit 0 instead of reporting an
+outage. An unreadable marker still counts as disabled (fail closed).
+`loom-daemon host enable` removes it (idempotent) and starts nothing; `host status`
+prints the state. Agents must never start or repair a daemon on a marked host.
 
 **The watchdog recovers, it is not a report-only detector (#5391).** Through
 #5118 the only automatic remediation was two deliberately narrow gates

@@ -17,6 +17,11 @@
 //!   published on the event bus, and recorded in the host-level snapshot
 //!   `loom-daemon status` renders — **without writing anything**, unless
 //!   `fleet.autoApply` is on.
+//! - **The fleet version floor** (`loom_min_version`, #10711): every pass reads
+//!   it from the snapshot into a process-wide value ([`loom_min_version`]),
+//!   not into the config tiers, so a change takes effect on the next tick with
+//!   no restart. A malformed value keeps the last good floor and alerts. Nothing
+//!   consumes the floor yet (#10698).
 //!
 //! # Invariants this module keeps
 //!
@@ -63,6 +68,7 @@ use serde_json::Value;
 
 use crate::fleet_state::{self, Enforcement, Enforcer, StatePass};
 use crate::fleet_store::fetch::{self, Freshness, Policy, Transport};
+use crate::fleet_store::floor::{self, FloorRead};
 use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
@@ -378,14 +384,8 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let text = loaded.snapshot.text(store::ROSTER_PATH)?.ok_or_else(|| {
-        anyhow!(
-            "the store has no {} (commit {})",
-            store::ROSTER_PATH,
-            loaded.snapshot.short_commit()
-        )
-    })?;
-    let parsed = roster::parse(&text, home)?;
+    let parsed = roster::from_snapshot(&loaded.snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 
@@ -456,6 +456,127 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
 }
 
 // ============================================================================
+// The fleet version floor (#10711)
+// ============================================================================
+
+/// What one pass resolved for the fleet-wide minimum Loom version
+/// (`loom_min_version`, [`crate::fleet_store::floor`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorPass {
+    /// The floor in force after this pass, `X.Y.Z`; `None` when unset.
+    pub floor: Option<String>,
+    /// The store path the floor was read from this pass (`fleet.json` /
+    /// `repos.yml`); `None` when unset or carried over.
+    pub source: Option<String>,
+    /// Whether [`FloorPass::floor`] is the last good floor carried over
+    /// because this pass could not read a valid one (see `error`).
+    pub carried: bool,
+    /// Why this pass could not read a valid floor, when it could not. Raised
+    /// as an alert: a malformed floor is never read as "no floor".
+    pub error: Option<String>,
+}
+
+impl FloorPass {
+    /// Nothing to report: no floor and no error. A snapshot in this state
+    /// omits the field entirely, so a host with no floor writes the same
+    /// `fleet-sync-status.json` it did before #10711.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.floor.is_none() && self.error.is_none()
+    }
+}
+
+/// Decide the floor in force from this pass's `read` and the `last_good` floor.
+///
+/// - absent: unset (the operator removed it);
+/// - valid: that floor;
+/// - malformed, or the snapshot could not be read at all (`Err`): keep
+///   `last_good` (unset on a first-ever bad read) and report why.
+#[must_use]
+pub fn resolve_floor(read: Result<FloorRead, String>, last_good: Option<&str>) -> FloorPass {
+    let keep = |why: String| FloorPass {
+        floor: last_good.map(str::to_string),
+        source: None,
+        carried: last_good.is_some(),
+        error: Some(match last_good {
+            Some(f) => format!("{why} — keeping the last good floor {f}"),
+            None => format!("{why} — no previous floor, so none is in force"),
+        }),
+    };
+    match read {
+        Ok(FloorRead::Absent) => FloorPass::default(),
+        Ok(FloorRead::Valid { version, source }) => FloorPass {
+            floor: Some(version),
+            source: Some(source.to_string()),
+            ..FloorPass::default()
+        },
+        Ok(FloorRead::Malformed { source, detail }) => {
+            keep(format!("{source}: malformed `{}`: {detail}", floor::KEY))
+        }
+        Err(e) => keep(format!("could not read `{}`: {e}", floor::KEY)),
+    }
+}
+
+/// Read the floor from the cached snapshot the config half of this pass just
+/// refreshed. [`Policy::Offline`]: no extra forge request — the state and
+/// config halves already revalidated the cache (or fell back to it).
+fn floor_half(
+    cache_dir: &Path,
+    location: &StoreLocation,
+    last_good: Option<&str>,
+    now: DateTime<Utc>,
+) -> FloorPass {
+    let read = fetch::load(&NoTransport, cache_dir, location, Policy::Offline, now)
+        .map(|loaded| floor::read(&loaded.snapshot))
+        .map_err(|e| format!("{e:#}"));
+    resolve_floor(read, last_good)
+}
+
+/// The transport [`Policy::Offline`] never calls.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn get(&self, api_path: &str, _: Option<&str>, _: Option<&str>) -> Result<fetch::Reply> {
+        Err(anyhow!("offline read attempted a forge request ({api_path})"))
+    }
+}
+
+/// The process-wide floor: `None` until a pass has resolved one.
+fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
+    static CELL: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+fn set_floor(floor: Option<String>) {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = Some(floor);
+    }
+}
+
+/// The fleet-wide minimum Loom version (`loom_min_version`, `X.Y.Z`) in force
+/// on this host, as of the last fleet-sync pass; `None` when the store sets
+/// none, when no pass has run, or when `fleet.repo` is unset. Updated every
+/// tick without a restart. Nothing consumes it yet (#10698).
+#[must_use]
+pub fn loom_min_version() -> Option<String> {
+    floor_cell().lock().ok().and_then(|g| g.clone().flatten())
+}
+
+/// The last good floor for this pass to fall back on: this process's value
+/// once a pass has resolved one, else what the previous process recorded in
+/// its snapshot — so a malformed value right after a restart still cannot
+/// silently drop a floor.
+fn last_good_floor() -> Option<String> {
+    if let Some(resolved) = floor_cell().lock().ok().and_then(|g| g.clone()) {
+        return resolved;
+    }
+    cached_status()
+        .or_else(probe_status)
+        .and_then(|s| s.floor.floor)
+}
+
+// ============================================================================
 // The host-level snapshot `loom-daemon status` renders
 // ============================================================================
 
@@ -503,6 +624,11 @@ pub struct FleetSyncStatus {
     /// drain-and-exit was refused and it merely held dispatch instead.
     #[serde(default = "default_enforced")]
     pub enforced: Enforcement,
+    /// The fleet version floor this pass resolved (#10711). `#[serde(default)]`
+    /// so a pre-#10711 snapshot still reads back, and omitted when unset so a
+    /// host with no floor writes the same snapshot it did before.
+    #[serde(default, skip_serializing_if = "FloorPass::is_unset")]
+    pub floor: FloorPass,
 }
 
 fn default_enforced() -> Enforcement {
@@ -516,10 +642,12 @@ impl FleetSyncStatus {
         self.config.drifted() || self.roster.drifted()
     }
 
-    /// Whether either half of the pass failed.
+    /// Whether either half of the pass failed, or the floor could not be read
+    /// (#10711) — which routes a malformed floor through the same warn log and
+    /// [`DRIFT_TOPIC`] alert as every other fleet-sync failure.
     #[must_use]
     pub fn errored(&self) -> bool {
-        self.config.error.is_some() || self.roster.error.is_some()
+        self.config.error.is_some() || self.roster.error.is_some() || self.floor.error.is_some()
     }
 }
 
@@ -633,6 +761,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     head.push(')');
     let mut lines = vec![head];
     lines.extend(state_lines(s));
+    lines.extend(floor_lines(&s.floor));
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -674,6 +803,24 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
         );
     }
     Some(lines.join("\n"))
+}
+
+/// The floor lines of the `Fleet store:` block (#10711). Empty when no floor
+/// is set and none was malformed, so `status` is unchanged for such a host.
+fn floor_lines(f: &FloorPass) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(floor) = &f.floor {
+        let from = match (&f.source, f.carried) {
+            (_, true) => " (LAST GOOD floor, carried over)".to_string(),
+            (Some(src), false) => format!(" (from {src})"),
+            (None, false) => String::new(),
+        };
+        lines.push(format!("  {}: {floor}{from}", floor::KEY));
+    }
+    if let Some(e) = &f.error {
+        lines.push(format!("  {}: ERROR — {e}", floor::KEY));
+    }
+    lines
 }
 
 /// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
@@ -778,6 +925,11 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         },
     };
     let roster = roster_half(inputs, &transport, &config, mode, now);
+    // #10711: the floor, from the snapshot the halves above just refreshed,
+    // into the process-wide value — never the config tiers, whose
+    // `autonomous.autoUpdate` changes need a restart.
+    let floor = floor_half(&inputs.cache, &inputs.location, last_good_floor().as_deref(), now);
+    set_floor(floor.floor.clone());
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -790,6 +942,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         roster,
         state,
         enforced,
+        floor,
     }
 }
 

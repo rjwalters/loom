@@ -90,6 +90,29 @@ pub fn fetch(root: &Path, read: &FeatureRead) -> Option<Value> {
     Some(body)
 }
 
+/// One PR's changed-file list (#10550): the first page of
+/// `pulls/{n}/files` as one conditional GET through the same ETag store, so
+/// an unchanged head costs a free `304`. The body is the page's JSON array.
+#[must_use]
+pub fn fetch_pr_files(root: &Path, repo: &str, pr: u32) -> Option<Value> {
+    let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let read = FeatureRead {
+        repo: repo.to_ascii_lowercase(),
+        kind: ReadKind::Pull,
+        number: pr,
+        sha: None,
+        base: None,
+    };
+    let url = format!("repos/{}/pulls/{pr}/files?per_page=100", read.repo);
+    get(
+        &gh_bin,
+        root,
+        &read,
+        &url,
+        ForgeOp::uninventoried("PR changed-file list read has no inventory row"),
+    )
+}
+
 /// One conditional GET of `url` for `read`'s repo.
 fn get(gh_bin: &str, root: &Path, read: &FeatureRead, url: &str, op: ForgeOp) -> Option<Value> {
     let target = store::resolve_target(Some(root), Some(&read.repo));
