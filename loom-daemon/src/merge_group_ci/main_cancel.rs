@@ -69,6 +69,18 @@ impl std::fmt::Display for CancelFinding {
     }
 }
 
+/// Whether `line` names a REST `.../cancel` endpoint: `/cancel` must end the
+/// path segment, whatever shell quoting (`"`, `'`), whitespace, `?query` or
+/// `)` follows it. `/cancelled` or `/cancel-foo` are other segments.
+fn ends_cancel_endpoint(line: &str) -> bool {
+    line.match_indices("/cancel").any(|(i, m)| {
+        line[i + m.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+    })
+}
+
 /// Whether a step's body or action cancels workflow runs. Shell comment
 /// lines (`# ...`) are skipped for every pattern, so a step that only
 /// *mentions* cancelling (`# never gh run cancel here`) is not a cancel step.
@@ -80,9 +92,7 @@ pub fn is_cancel_step(step: &Step) -> bool {
             !l.starts_with('#')
                 && (l.contains("run cancel")
                     || l.contains("force-cancel")
-                    || l.contains("/cancel\"")
-                    || l.contains("/cancel ")
-                    || l.ends_with("/cancel"))
+                    || ends_cancel_endpoint(l))
         })
     });
     let uses_cancels = step
@@ -590,6 +600,7 @@ jobs:
             (cancel, "            id=123\n            __GH__ run cancel $id\n"),
             (cancel, "            read -r id\n            __GH__ run cancel $id\n"),
             (cancel, "            __GH__ api -X POST repos/o/r/actions/runs/123/cancel\n"),
+            (cancel, "            __GH__ api -X POST 'repos/o/r/actions/runs/123/cancel'\n"),
             ("          done\n", "          done\n          __GH__ run cancel 123\n"),
             (" | while read -r id; do", " | sed 's/.*/123/' | while read -r id; do"),
         ] {
@@ -659,6 +670,7 @@ jobs:
             "      - uses: styfle/cancel-workflow-action@0.12.1\n",
             "      - run: __GH__ api -X POST repos/o/r/actions/runs/1/cancel\n",
             "      - run: __GH__ api -X POST \"repos/o/r/actions/runs/$id/force-cancel\"\n",
+            "      - run: __GH__ api -X POST 'repos/o/r/actions/runs/1/cancel'\n",
         ] {
             let src = PR_ONLY_CANCEL_STEP
                 .replace("      - run: cargo test\n", &format!("      - run: cargo test\n{body}"));
