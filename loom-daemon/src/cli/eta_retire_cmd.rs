@@ -78,10 +78,15 @@ impl EtaRetireArgs {
         let Some(script) = issue_script(&root) else {
             bail!("no executable .loom/scripts/create-issue.sh under {}", root.display());
         };
-        let slug = loom_daemon::daemon_update::artifact::resolve_gh_repo_slug(&root);
-        if slug.is_empty() {
-            bail!("could not resolve owner/repo from the origin remote; not filing");
-        }
+        // #9548: file only to a repository this installation manages and may
+        // write; the verdict also names it, so the dedup search reads the
+        // same repository the filing writes.
+        let slug = match loom_daemon::write_scope::may_write_from(&root, None) {
+            loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
+            loom_daemon::write_scope::Verdict::Deny(why) => {
+                bail!("refusing to file retirement proposals (#9548): {why}")
+            }
+        };
         let mut forge = ScriptForge {
             root: &root,
             script,
@@ -115,7 +120,7 @@ struct ScriptForge<'a> {
 impl ProposalForge for ScriptForge<'_> {
     fn find(&mut self, key: &str) -> Result<Option<String>, String> {
         let q = format!("\"{key}\" repo:{} is:issue in:body", self.slug);
-        let out = Command::new("gh")
+        let out = Command::new(loom_daemon::write_scope::default_gh())
             .current_dir(self.root)
             .args(["api", "-X", "GET", "search/issues", "-f"])
             .arg(format!("q={q}"))
@@ -130,6 +135,7 @@ impl ProposalForge for ScriptForge<'_> {
     }
 
     fn file(&mut self, title: &str, body: &str) -> Result<String, String> {
+        // `--repo`: the write names the vetted repository explicitly (#9548).
         // `--force`: the dedup is ours (the marker key), not the script's
         // title-similarity check.
         let out = Command::new(&self.script)
@@ -141,6 +147,8 @@ impl ProposalForge for ScriptForge<'_> {
                 body,
                 "--label",
                 "loom:triage",
+                "--repo",
+                &self.slug,
                 "--force",
             ])
             .output()
