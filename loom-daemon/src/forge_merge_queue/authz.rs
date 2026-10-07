@@ -44,6 +44,11 @@
 //! cannot be forgotten. Because of it, [`INVARIANT_FULLY_DEMONSTRATED`] is
 //! `false` and queue execution stays dormant
 //! ([`super::QUEUE_EXECUTION_ENABLED`] is unchanged).
+//!
+//! [`merge_group_check`] covers one PR; a merge group can carry several.
+//! [`super::group_authz`] evaluates every member, concludes only after the
+//! other required checks, and re-fails passed groups on revocation, which
+//! narrows (but does not close) the window above.
 
 use std::collections::BTreeMap;
 use std::fmt;
