@@ -329,10 +329,10 @@ pub fn check_mount_denials(
     Ok(())
 }
 
-/// The `firewall: true` repository paths in the fleet roster (`repos.yml`),
-/// read from the fleet-store cache the daemon's sync already keeps — never
-/// fetched here, and deny-only, so a stale cache can only under-deny, never
-/// widen a mount (issue #9979). `Ok(empty)` when no store is configured or
+/// The `firewall: true` repository paths in the fleet roster (`fleet.json`,
+/// else `repos.yml`), read from the fleet-store cache the daemon's sync already
+/// keeps — never fetched here, and deny-only, so a stale cache can only
+/// under-deny, never widen a mount (issue #9979). `Ok(empty)` when no store is configured or
 /// nothing is cached yet; `Err` when a cached roster exists but cannot be
 /// read or parsed, so a broken firewall input fails closed.
 pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
@@ -345,11 +345,12 @@ pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
     let Some(snapshot) = fetch::read_cache(&cache, &location)? else {
         return Ok(Vec::new());
     };
-    let Some(text) = snapshot.text(store::ROSTER_PATH)? else {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let Some(parsed) =
+        roster::from_snapshot(&snapshot, &home).context("fleet roster (firewall input)")?
+    else {
         return Ok(Vec::new());
     };
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
-    let parsed = roster::parse(&text, &home).context("fleet roster (firewall input)")?;
     Ok(parsed
         .records
         .iter()

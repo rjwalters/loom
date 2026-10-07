@@ -1406,8 +1406,21 @@ and whose `.loom-local/local.json` is the host-local tier.
 
 ### File contract
 
+**`fleet.json` first (#10705).** A store that publishes `fleet.json` — the
+compiled fleet document fleet-gitops renders from its one source file
+`fleet.yml` — is read from that one file: the roster is its top-level `root`
+and `repos`, run state is its `state`, and the tiers are `config.defaults`,
+`config.hosts.<host>.defaults` and `config.hosts.<host>.local`, with exactly
+the contracts below. Its `_generated.schema_version` must be `1`. When
+`fleet.json` is **absent**, the legacy files below are read instead (a
+transition fallback, removed once every store publishes it). When it is
+**present but invalid** — not JSON, no `_generated` header, another
+`schema_version`, or a section of the wrong shape — every reader fails closed
+and the legacy files are not consulted.
+
 | Store path | Read by | Contract |
 |---|---|---|
+| `fleet.json` | `roster`, `state`, `render` | JSON, above. When present, the next five rows are not read |
 | `fleet/defaults.json` | `render` | JSON object: the machine tier every host shares |
 | `fleet/hosts/<host>/defaults.json` | `render` | JSON object: that host's overlay. Required for a host `render` is asked about |
 | `fleet/hosts/<host>/local.json` | `render` | JSON object: that host's host-local tier. Optional — absent leaves the local tier alone |

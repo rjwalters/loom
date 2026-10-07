@@ -212,31 +212,17 @@ pub fn state_pass(
     };
     let cached = matches!(loaded.freshness, Freshness::Cached { .. });
     let staleness = loaded.staleness_warning(now);
-    let text = match loaded.snapshot.text(store::STATE_PATH) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return StatePass {
-                cached,
-                staleness,
-                error: Some(format!(
-                    "the store has no {} (commit {}) — nothing to enforce",
-                    store::STATE_PATH,
-                    loaded.snapshot.short_commit()
-                )),
-                ..StatePass::default()
-            }
-        }
-        Err(e) => {
-            return StatePass {
-                cached,
-                staleness,
-                error: Some(format!("{e:#}")),
-                ..StatePass::default()
-            }
-        }
-    };
-    match state::resolve(&text, host) {
-        Ok(hs) => StatePass {
+    match state::resolve_snapshot(&loaded.snapshot, host) {
+        Ok(None) => StatePass {
+            cached,
+            staleness,
+            error: Some(format!(
+                "{} — nothing to enforce",
+                state::missing_message(&loaded.snapshot)
+            )),
+            ..StatePass::default()
+        },
+        Ok(Some(hs)) => StatePass {
             desired: Some(hs.state),
             source: Some(hs.source.to_string()),
             cached,
