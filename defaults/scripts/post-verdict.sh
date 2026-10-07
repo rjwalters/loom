@@ -475,7 +475,7 @@ esac
 # beats an approval, and of two identical verdicts the lowest comment id stands
 # (the other withdraws its comment). An approval stays non-actionable (no loom:pr)
 # until this succeeds, so an unreadable arbitration never leaves one live.
-SEEN_OPP=0 SEEN_SAME=0; [[ "$VG_OUT" =~ seen-opposite=([0-9]+)\ seen-same-max-id=([0-9]+) ]] && SEEN_OPP="${BASH_REMATCH[1]}" SEEN_SAME="${BASH_REMATCH[2]}"
+SEEN_OPP=0 SEEN_SAME=0; [[ "$VG_OUT" =~ seen-opposite=([0-9]+) ]] && SEEN_OPP="${BASH_REMATCH[1]}"; [[ "$VG_OUT" =~ seen-same-max-id=([0-9]+) ]] && SEEN_SAME="${BASH_REMATCH[1]}"
 RC_RC=0; RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-reconcile "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --seen-opposite "$SEEN_OPP" --seen-same-max-id "$SEEN_SAME" --nonce "$NONCE" 2>&1)" || RC_RC=$?
 case "$RC_RC:$RC_OUT" in
   "0:LOOM-VERDICT-RECONCILE STABLE"*|"0:LOOM-VERDICT-RECONCILE PREVAILS"*) ;; # PREVAILS: our labels below win over a rival approval's

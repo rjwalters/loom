@@ -602,7 +602,7 @@ assert_eq "306" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the commen
 
 # The gate's seen-opposite count is handed to the reconcile verb.
 reset_state
-echo "0 LOOM-VERDICT-GATE PROCEED overruling the changes-requested verdict seen-opposite=2" > "$STUB_DIR/gate-answer"
+echo "0 LOOM-VERDICT-GATE PROCEED overruling the changes-requested verdict seen-opposite=2 seen-same-max-id=0" > "$STUB_DIR/gate-answer"
 run_pv 320 approved abc1234 --body "ok" --overrules-prior "each prior point was fixed in the follow-up commit"
 assert_eq "0" "$EXIT_CODE" "reconcile STABLE -> exit 0"
 assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-reconcile 320 --repo owner/repo --verdict approved --sha abc1234 --seen-opposite 2 --seen-same-max-id 0 --nonce" "reconcile runs with the gate's counts"
