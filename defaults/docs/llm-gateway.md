@@ -107,7 +107,10 @@ The virtual key always replaces the profile's own provider-key variable (its
 `credentialTargets` entry for that harness, or the `credentialEnv` name), so
 the harness presents it as `Authorization: Bearer <key>`. The API-key pool is
 not consulted, and the provider's own source variable is removed from the
-child: the gateway holds the real provider key.
+child: the gateway holds the real provider key. So a routed profile needs no
+provider key on the host at all, even one its `credentialEnv` array marks
+required: launch, `worker profile-check` and the preference walk all accept it
+with only the virtual key configured.
 
 | Runtime | Base URL | Key | Virtual-key header |
 |---|---|---|---|

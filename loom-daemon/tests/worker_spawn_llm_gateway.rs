@@ -437,3 +437,87 @@ fn profile_check_reports_the_route_without_reading_the_key() {
     assert!(text.contains("status: unresolvable, spawn would refuse at 78"), "{text}");
     assert!(!text.contains(VK), "{text}");
 }
+
+/// A profile whose provider key is a *required* (array-form) variable, mapped
+/// to Pi's `CEREBRAS_API_KEY`. Unrouted, an unset key refuses; routed, the
+/// gateway's virtual key replaces it, so it need not be set.
+fn required_key_profile(root: &Path) {
+    config(
+        root,
+        serde_json::json!({"runtimes":{"modelProfiles":{"gw-required":{
+            "model":"gpt-oss-120b",
+            "providers":{"pi":"cerebras"},
+            "credentialEnv":["LOOM_TEST_GW_REQUIRED_KEY"],
+            "credentialTargets":{"pi":{"LOOM_TEST_GW_REQUIRED_KEY":"CEREBRAS_API_KEY"}}
+        }}}}),
+    );
+}
+
+/// #9473 Judge finding: the canary host has the virtual-key file and NOT the
+/// provider key, so a routed profile must report resolvable without it, while
+/// the same profile unrouted is still unresolvable.
+#[test]
+fn profile_check_resolves_a_routed_profile_without_its_provider_variable() {
+    let d = tempfile::tempdir().unwrap();
+    required_key_profile(d.path());
+    let vk = vk_file(d.path(), 0o600);
+    let check = |profiles: &str| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+        for name in GATEWAY_ENV {
+            c.env_remove(name);
+        }
+        let out = c
+            .args(["worker", "profile-check", "gw-required", "--runtime", "pi"])
+            .current_dir(d.path())
+            .env("LOOM_WORKSPACE", d.path())
+            .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+            .env("LOOM_SHARED_API_KEYS_DIR", "")
+            .env_remove("LOOM_TEST_GW_REQUIRED_KEY")
+            .env_remove("CEREBRAS_API_KEY")
+            .env("LOOM_LLM_GATEWAY_URL", URL)
+            .env("LOOM_LLM_GATEWAY_PROFILES", profiles)
+            .env("LOOM_LLM_GATEWAY_VK_FILE", &vk)
+            .output()
+            .unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let (ok, text) = check("gw-required");
+    assert!(ok, "{text}");
+    assert!(text.contains("llm gateway: routed"), "{text}");
+    assert!(text.contains("status: resolvable"), "{text}");
+    let (ok, text) = check("quick-cerebras");
+    assert!(!ok, "{text}");
+    assert!(text.contains("status: unresolvable, set LOOM_TEST_GW_REQUIRED_KEY"), "{text}");
+}
+
+/// The launch counterpart: routed, the profile launches with the provider
+/// variable unset and the virtual key under `CEREBRAS_API_KEY`; unrouted, the
+/// same launch still refuses at 78 for the unset variable.
+#[test]
+fn a_routed_profile_launches_without_its_provider_variable() {
+    let d = tempfile::tempdir().unwrap();
+    builder_role(d.path());
+    required_key_profile(d.path());
+    let vk = vk_file(d.path(), 0o600);
+    let launch = |profiles: &str| {
+        route(
+            worker(d.path(), "pi")
+                .env("LOOM_ROLE", "builder")
+                .env("LOOM_MODEL_PROFILE", "gw-required")
+                .env_remove("LOOM_TEST_GW_REQUIRED_KEY")
+                .env("FIXTURE_PRINT_ENV", print_env(&["CEREBRAS_API_KEY"])),
+            profiles,
+            &vk,
+        )
+    };
+    let out = launch("gw-required");
+    let (stdout, stderr) = texts(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(child_env(&stdout, "CEREBRAS_API_KEY"), VK);
+    assert_eq!(launch_record(&stderr)["credentialSource"], "gateway");
+    let out = launch("quick-cerebras");
+    let (stdout, stderr) = texts(&out);
+    assert_eq!(out.status.code(), Some(78), "{stdout}{stderr}");
+    assert!(stderr.contains("LOOM_TEST_GW_REQUIRED_KEY"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}

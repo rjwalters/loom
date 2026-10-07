@@ -82,9 +82,9 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
         let mapping = profiles::credentials(&profile, harness)?;
         // #9473: a routed profile takes its key from the LLM gateway, never
         // the environment or the pool. Decided without reading the key.
-        let gateway = profiles::resolve(harness, &name, &profile)
+        let gateway = profiles::resolve_shape(harness, &name, &profile)
             .ok()
-            .map(|selection| super::llm_gateway::plan(harness, &selection, &config));
+            .map(|(selection, _)| super::llm_gateway::plan(harness, &selection, &config));
         let routed = matches!(gateway, Some(Ok(Some(_))));
         let mut pool_would_refuse = false;
         for (source, target) in &mapping.pairs {
@@ -129,7 +129,7 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
         if let Some(why) = gateway_refusal {
             resolvable = false;
             let _ = writeln!(out, "  status: unresolvable, spawn would refuse at 78 ({why})");
-        } else if !unset.is_empty() {
+        } else if !routed && !unset.is_empty() {
             resolvable = false;
             let _ = writeln!(out, "  status: unresolvable, set {}", unset.join(", "));
         } else if pool_would_refuse {
