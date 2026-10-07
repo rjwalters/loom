@@ -950,6 +950,13 @@ pub(crate) enum MergePrCommand {
     /// shell removes nothing unless it reads DECIDE — see
     /// `cli::merge_pr_discovered_worktree`.
     DiscoveredWorktree(super::merge_pr_discovered_worktree::DiscoveredWorktreeArgs),
+
+    /// The backoff-attempt count for the merge-admission telemetry record
+    /// (#6978, #8191 slice): the `recheck #N` figure in the stale-mergeable
+    /// recheck's reason text, else the configured budget. One line, exit 0;
+    /// the shell falls back to the budget on any fault — see
+    /// `cli::merge_pr_retries_used`.
+    RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
 }
 
 impl MergePrCommand {
@@ -997,6 +1004,7 @@ impl MergePrCommand {
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
+            MergePrCommand::RetriesUsed(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }
