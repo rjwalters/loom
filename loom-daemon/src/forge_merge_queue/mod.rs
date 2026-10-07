@@ -48,6 +48,7 @@ pub mod gh_lifecycle;
 pub mod github;
 pub mod grants;
 pub mod group_authz;
+pub mod group_github;
 pub mod lifecycle;
 pub mod lifecycle_cli;
 pub mod mode;

@@ -23,9 +23,9 @@ use super::authz::{CheckConclusion, HandoffError};
 use super::events::FileEventSink;
 use super::gh_lifecycle::GhLifecycleForge;
 use super::github::GhQueueApi;
+use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{
-    authorize_check, handoff, reconcile_pr, revoke_for_transition, sweep, transition_line, Ctx,
-    HandoffFailure, Reconciled,
+    authorize_check, handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled,
 };
 use super::mode::MergeMode;
 use super::ops::{self, EnqueueOutcome};
@@ -323,7 +323,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
                 Ok(x) => x,
                 Err(r) => return Some(r),
             };
-            match revoke_for_transition(&ctx(env, mode, &l), *pr, reason) {
+            match revoke_for_transition_groups(&ctx(env, mode, &l), &l.forge, *pr, reason) {
                 None => direct(),
                 Some(rev) => lines(
                     if rev.safe_to_transition() { 0 } else { 1 },
@@ -332,7 +332,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
                             "LOOM-MERGE-QUEUE-REVOKED pr={pr} safe_to_transition={}",
                             rev.safe_to_transition()
                         ),
-                        transition_line(&rev),
+                        group_transition_line(&rev),
                     ],
                 ),
             }
