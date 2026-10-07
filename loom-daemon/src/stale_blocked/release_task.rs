@@ -16,6 +16,12 @@
 //! owner is a role-runner host by construction, and a work-finder host keeps
 //! the pass it had. A host running neither stays out, as before.
 //!
+//! "Runs here" means the daemon actually started the loop. Both loops are
+//! admitted at the **fallback/home** workspace (`daemon_service`), and the
+//! role runner then also checks each root — so a root's own
+//! `roleRunner.enabled` counts only when the home workspace started the loop
+//! ([`Loops`]).
+//!
 //! Every root, every tick, records exactly one
 //! [`Outcome`](super::release_outcome::Outcome), so silence is diagnosable
 //! from `host.health` without host logs.
@@ -48,23 +54,45 @@ pub fn pre_gate(mode: Mode, served: bool, rate_limited: bool) -> Option<Outcome>
     }
 }
 
-/// Whether this host takes part in `root`'s automation: the work finder runs
-/// here (a daemon-level switch, resolved from `fallback_root` exactly as
-/// `daemon_service` does) or the role runner is enabled for `root`.
+/// Which daemon-level loops this host started, resolved from the fallback
+/// workspace exactly as `daemon_service` admits them at startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loops {
+    pub work_finder: bool,
+    pub role_runner: bool,
+}
+
+impl Loops {
+    #[must_use]
+    pub fn resolve(fallback_root: &Path) -> Self {
+        Self {
+            work_finder: crate::work_finder::resolve_enabled(
+                &crate::work_finder::read_work_finder_config(fallback_root),
+            ),
+            role_runner: crate::role_runner::resolve_enabled(
+                &crate::role_runner::read_role_runner_config(fallback_root),
+            ),
+        }
+    }
+}
+
+/// Whether this host takes part in a root's automation: the work finder was
+/// started here, or the role-runner loops were started here **and** the root
+/// itself has the role runner enabled (the per-root check the loops apply).
 #[must_use]
-pub fn served(fallback_root: &Path, root: &Path) -> bool {
-    let wf = crate::work_finder::read_work_finder_config(fallback_root);
-    crate::work_finder::resolve_enabled(&wf)
-        || crate::role_runner::resolve_enabled(&crate::role_runner::read_role_runner_config(root))
+pub fn served(loops: Loops, root_role_runner_enabled: bool) -> bool {
+    loops.work_finder || (loops.role_runner && root_role_runner_enabled)
 }
 
 /// One visit of every registered root (blocking: the pass shells out to `gh`).
-pub fn tick_once(fallback_root: &Path, roots: &[PathBuf]) {
+pub fn tick_once(loops: Loops, roots: &[PathBuf]) {
     let gh_bin = PathBuf::from(crate::gh_invocation::gh_bin());
     let mode = release_gh::mode();
     for root in roots {
         let rate_limited = crate::rate_limit_breaker::global_is_suppressed();
-        match pre_gate(mode, served(fallback_root, root), rate_limited) {
+        let root_rr =
+            crate::role_runner::resolve_enabled(&crate::role_runner::read_role_runner_config(root));
+        match pre_gate(mode, served(loops, root_rr), rate_limited) {
             Some(outcome) => record(root, outcome, None),
             None => {
                 let _ = release_gh::maybe_run(&gh_bin, root);
@@ -80,6 +108,7 @@ pub fn spawn_task(fallback_root: PathBuf) -> tokio::task::JoinHandle<()> {
          per-workspace cadence, shard and write-scope gates apply, #10763)",
         TICK.as_secs()
     );
+    let loops = Loops::resolve(&fallback_root);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -91,9 +120,7 @@ pub fn spawn_task(fallback_root: PathBuf) -> tokio::task::JoinHandle<()> {
                 .unwrap_or_default()
                 .effective_roots(&fallback_root);
             let roots = filter_missing_roots(roots, &mut missing_warned);
-            let fallback = fallback_root.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || tick_once(&fallback, &roots)).await
-            {
+            if let Err(e) = tokio::task::spawn_blocking(move || tick_once(loops, &roots)).await {
                 log::warn!("stale_blocked_release: tick panicked ({e}); next tick retries");
             }
         }
@@ -111,5 +138,39 @@ mod tests {
         assert_eq!(pre_gate(Mode::DryRun, true, true), Some(Outcome::RateLimited));
         assert_eq!(pre_gate(Mode::On, true, false), None);
         assert_eq!(pre_gate(Mode::DryRun, true, false), None);
+    }
+
+    const HOME_OFF: Loops = Loops {
+        work_finder: false,
+        role_runner: false,
+    };
+    const HOME_RR: Loops = Loops {
+        work_finder: false,
+        role_runner: true,
+    };
+    const HOME_WF: Loops = Loops {
+        work_finder: true,
+        role_runner: false,
+    };
+
+    #[test]
+    fn home_off_repo_on_is_not_served() {
+        assert!(!served(HOME_OFF, true));
+    }
+
+    #[test]
+    fn home_on_repo_on_is_served() {
+        assert!(served(HOME_RR, true));
+    }
+
+    #[test]
+    fn home_on_repo_off_without_work_finder_is_not_served() {
+        assert!(!served(HOME_RR, false));
+    }
+
+    #[test]
+    fn work_finder_only_is_served() {
+        assert!(served(HOME_WF, false));
+        assert!(served(HOME_WF, true));
     }
 }
