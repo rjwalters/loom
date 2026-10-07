@@ -1535,21 +1535,25 @@ for a fit or backtest to report.
 - **Backtest decision rule (predeclared, #10508).** Stated before the run,
   so the result cannot pick its own bar. The run is
   `eta backtest --heuristic land-2026-10-04-twin-otter-b --compare
-  land-2026-10-06-keen-wren --forge-pr-cases …` over the walk-forward folds
-  in 2AMLogic/loom-experiments. `--forge-pr-cases` reads through `gh`, so
+  land-2026-10-06-keen-wren --forge-pr-cases …` over the experiment repo's
+  walk-forward folds. `--forge-pr-cases` reads through `gh`, so
   it runs as whatever `GH_TOKEN` holds: set it to a GitHub App installation
-  token (2AMLogic/loom-experiments#15), never the operator token. Or replay
+  token (see #10508), never the operator token. Or replay
   records an App-authenticated run saved with `--pr-history`. `a` is twin-otter-b, `b` is keen-wren; every figure below
   is in the comparison report.
   - *Pinball (primary).* keen-wren **beats** twin-otter-b when the 95%
     issue-bootstrap interval of `paired.delta_pinball4_loss_sec` lies
     wholly below 0. It **matches** when that interval's upper bound is at
     most 5% of twin-otter-b's `paired.a_mean_pinball4_loss_sec` (the
-    non-inferiority margin). Otherwise it fails. Its answer rate must not
+    non-inferiority margin; this 5% is *proposed*, and the operator
+    confirms it on #10508 before the run). Otherwise it fails. Its answer
+    rate must not
     fall more than `ANSWER_RATE_SLACK` (1 point) below twin-otter-b's.
   - *Starred items.* From `paired_by_subset.starred_any`: keen-wren's
-    `b_late_rate` must not exceed twin-otter-b's `a_late_rate`; the target
-    it moves toward is ≤ 15%.
+    `b_late_rate` must be lower than twin-otter-b's `a_late_rate` (a tie
+    counts as no gain); the target it moves toward is ≤ 15%. If the
+    subset's `delta4_items` is below 100, the result is reported as
+    underpowered, not as a pass (see *Power*).
   - *Unstarred items (no regression).* From
     `paired_by_subset.unstarred_any`: keen-wren's late rate at most
     `LATE_SURPRISE_SLACK` (2 points) above twin-otter-b's, and the upper
