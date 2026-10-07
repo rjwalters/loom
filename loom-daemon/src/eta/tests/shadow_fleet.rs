@@ -2,10 +2,10 @@
 //! candidate-only promotion gate.
 
 use super::as_of;
-use super::shadow::{comparison, ledger_with};
+use super::shadow::{comparison, ledger_with, BACKTEST_CASES, PASSING_PAIRS};
 use crate::eta::config::resolve;
 use crate::eta::heuristics::{LAND_V1, LAND_V2, LAND_V3, LAND_V4, LITTLE_V0};
-use crate::eta::shadow::{self, GateStatus, PromotionDecision, MIN_LIVE_PAIRS};
+use crate::eta::shadow::{self, GateStatus, PromotionDecision};
 use crate::eta::shadow_fleet::{
     builtin_tier, check_budget, BudgetExceeded, DEFAULT_MAX_ACTIVE, RETIRED,
 };
@@ -34,6 +34,7 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-2026-10-06-held-heron", Tier::Candidate),
     ("land-2026-10-06-keen-wren", Tier::Candidate),
     ("land-2026-10-06-bold-lark", Tier::Candidate),
+    ("land-2026-10-06-loop-kite", Tier::Candidate),
     ("land-2026-10-04-twin-otter-b", Tier::Candidate),
     ("land-2026-10-06-tandem-wren", Tier::Candidate),
 ];
@@ -105,18 +106,18 @@ fn twin_otter_is_retired_and_b_stays_a_candidate() {
 
 #[test]
 fn the_builtin_registry_fits_the_default_budget() {
-    assert_eq!(DEFAULT_MAX_ACTIVE, 13);
+    assert_eq!(DEFAULT_MAX_ACTIVE, 14);
     Registry::builtin()
         .check_budget(DEFAULT_MAX_ACTIVE)
         .expect("the shipped registry must fit the default shadow budget");
 }
 
-/// #10549: the default budget is the kind's `current` plus every alternate
+/// #10549, #10521: the default budget is the kind's `current` plus every alternate
 /// one `eta.snapshot` row carries, so a registry within the default budget
 /// never has a shadow the snapshot silently drops from the chooser.
 #[test]
 fn the_default_budget_is_current_plus_the_alternates_cap() {
-    assert_eq!(MAX_ALTERNATES, 12);
+    assert_eq!(MAX_ALTERNATES, 13);
     assert_eq!(DEFAULT_MAX_ACTIVE, MAX_ALTERNATES + 1);
 }
 
@@ -124,7 +125,7 @@ fn the_default_budget_is_current_plus_the_alternates_cap() {
 fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     let registry = Registry::builtin();
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(|h| h.id()).collect();
-    assert_eq!(land.len(), 13);
+    assert_eq!(land.len(), 14);
     // Exactly at the land count: fine.
     assert!(registry.check_budget(land.len()).is_ok());
 
@@ -134,13 +135,13 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
         BudgetExceeded {
             kind: Kind::Land,
             max_active: 3,
-            registered: 13,
+            registered: 14,
             excess: land[3..].to_vec(),
         }
     );
     let message = over.to_string();
     assert!(message.contains("maxActive is 3"), "{message}");
-    assert!(message.contains("13 land heuristics"), "{message}");
+    assert!(message.contains("14 land heuristics"), "{message}");
     for id in &land[3..] {
         assert!(message.contains(id), "{message} names {id}");
     }
@@ -149,7 +150,7 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     }
 
     // One over: only the last registration is the excess.
-    let one = registry.check_budget(12).unwrap_err();
+    let one = registry.check_budget(13).unwrap_err();
     assert_eq!(one.excess, ["land-2026-10-06-tandem-wren"]);
 }
 
@@ -185,12 +186,12 @@ fn max_active_follows_env_then_config_then_default_with_a_floor_of_one() {
 /// The same evidence that promotes a candidate, relabelled so `candidate` is
 /// the challenger against `current`.
 fn decide_with_passing_evidence(current: &str, candidate: &str) -> PromotionDecision {
-    let stats = ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(
+    let stats = ledger_with(PASSING_PAIRS, 100.0, 60.0, PASSING_PAIRS / 2).stats(
         Kind::Land,
         LAND_V1,
         LAND_V2,
     );
-    let mut evidence = comparison(1000.0, 800.0, 40);
+    let mut evidence = comparison(1000.0, 800.0, BACKTEST_CASES);
     evidence.a.heuristic = current.to_string();
     evidence.b.heuristic = candidate.to_string();
     evidence.better = Some(candidate.to_string());

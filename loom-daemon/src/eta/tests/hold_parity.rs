@@ -264,10 +264,12 @@ pub(crate) fn serve_with(
 /// The registry with the parity fixture's fit, cut off before the scenario.
 pub(crate) fn fitted() -> Registry {
     let at = t(0) - Duration::days(1);
-    // Both fits, so `land-2026-10-06-keen-wren` (#10508) answers too.
-    Registry::with_fits(
+    // Every fit, so `land-2026-10-06-keen-wren` (#10508) and
+    // `land-2026-10-06-loop-kite` (#10521) answer too.
+    Registry::with_all_fits(
         Some(Arc::new(fixture_fit(at))),
         Some(Arc::new(super::keen_wren::v2_fixture(at, 0.0, 0.0))),
+        Some(Arc::new(super::loop_kite::v3_fixture(at, 0.0, 0.0))),
     )
 }
 

@@ -412,8 +412,15 @@ fn the_doc_no_longer_defers_the_live_list_to_a_later_phase() {
         ETA_DOC.contains("### Adding a v2, and comparing it"),
         "eta.md must document how a candidate heuristic is compared and promoted"
     );
-    // Both halves of the promotion gate, since either alone is not the rule.
-    assert!(ETA_DOC.contains("50 paired observations") && ETA_DOC.contains("[40%, 60%]"));
+    // The whole promotion gate, since any one clause alone is not the rule: the
+    // item-clustered primary test (#10525), the coverage band, and the day
+    // consistency check.
+    assert!(
+        ETA_DOC.contains("100 distinct items")
+            && ETA_DOC.contains("[40%, 60%]")
+            && ETA_DOC.contains("day consistency check"),
+        "eta.md must keep the whole promotion gate: primary test, coverage band, day consistency"
+    );
 }
 
 /// The four #10233 views each guard one specific misreading; the clause that

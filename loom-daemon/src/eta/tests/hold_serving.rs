@@ -9,7 +9,7 @@ use crate::eta::emit::{Trigger, HOURLY_CAP};
 use crate::eta::explanation::Explanation;
 use crate::eta::heuristics::{
     LandTwinOtter, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN,
-    LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B, LAND_V4,
+    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B, LAND_V4,
 };
 use crate::eta::queue_features::{reason, EventLog};
 use crate::eta::simulate::run_explanation;
@@ -30,16 +30,18 @@ const OP: &str = "loom:operator";
 /// too, `land-2026-10-06-swift-tern` (#10524) wraps `-b` like quick-tern,
 /// `land-2026-10-06-held-heron` (#10523) answers it,
 /// `land-2026-10-06-keen-wren` (#10508) is twin-otter's evaluation over v2,
+/// `land-2026-10-06-loop-kite` (#10521) the same over v3,
 /// `land-2026-10-06-tandem-wren` (#10510) reads exactly what its base
 /// twin-otter-b reads, and `land-2026-10-06-brisk-petrel` (#10528) wraps `-b`
 /// as well.
-const HOLD_AWARE: [&str; 8] = [
+const HOLD_AWARE: [&str; 9] = [
     LAND_BRISK_PETREL,
     LAND_QUICK_TERN,
     LAND_SWIFT_TERN,
     LAND_HELD_HERON,
     LAND_KEEN_WREN,
     LAND_BOLD_LARK,
+    LAND_LOOP_KITE,
     LAND_TWIN_OTTER_B,
     LAND_TANDEM_WREN,
 ];
@@ -59,12 +61,14 @@ fn key(number: u32) -> ItemKey {
 
 /// The registry with the parity fixture's fit, cut off a day before
 /// [`as_of`].
-/// Both fits, so `land-2026-10-06-keen-wren` (#10508) answers too.
+/// Every fit, so `land-2026-10-06-keen-wren` (#10508) and
+/// `land-2026-10-06-loop-kite` (#10521) answer too.
 fn with_fit() -> Registry {
     let at = as_of() - Duration::days(1);
-    Registry::with_fits(
+    Registry::with_all_fits(
         Some(Arc::new(fixture_fit(at))),
         Some(Arc::new(super::keen_wren::v2_fixture(at, 0.0, 0.0))),
+        Some(Arc::new(super::loop_kite::v3_fixture(at, 0.0, 0.0))),
     )
 }
 
@@ -245,7 +249,7 @@ fn each_heuristic_reads_its_own_view_of_a_held_pr() {
         .iter()
         .filter(|e| e.explanation.kind == Kind::Land)
         .collect();
-    assert_eq!(land.len(), 13);
+    assert_eq!(land.len(), 14);
     for emission in land {
         let id = emission.explanation.heuristic.as_str();
         let heuristic = registry.get(id).unwrap();
@@ -306,11 +310,11 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     let mut h = Harness::new();
     h.list(&[(501, &[RR], -600)], 0);
     h.list(&[(501, &[PR], 250)], 300);
-    assert_eq!(h.land(&registry, 300, 300).len(), 13);
+    assert_eq!(h.land(&registry, 300, 300).len(), 14);
 
     h.list(&[(501, &[PR, OP], 550)], 600);
     let entry = h.land(&registry, 300, 600);
-    assert_eq!(entry.len(), 13);
+    assert_eq!(entry.len(), 14);
     for e in &entry {
         let id = e.explanation.heuristic.as_str();
         assert_eq!(e.trigger, Trigger::Transition, "{id}");
@@ -332,7 +336,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     // Released: every series transitions, the path engines answer again.
     h.list(&[(501, &[PR], 1450)], 1500);
     let released = h.land(&registry, 300, 1500);
-    assert_eq!(released.len(), 13);
+    assert_eq!(released.len(), 14);
     assert!(released.iter().all(|e| e.trigger == Trigger::Transition));
     assert!(released
         .iter()
@@ -340,7 +344,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
 
     // Held again, then merged: no further estimate.
     h.list(&[(501, &[PR, OP], 1750)], 1800);
-    assert_eq!(h.land(&registry, 300, 1800).len(), 13);
+    assert_eq!(h.land(&registry, 300, 1800).len(), 14);
     h.list(&[], 2000);
     h.tracker
         .on_pr_resolved(&key(501), PrState::Merged(t(1950)), t(2000));

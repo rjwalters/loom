@@ -495,6 +495,7 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("cli/forge_action.rs", Gated),
+        ("cli/eta_retire_cmd.rs", Gated),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),
         (

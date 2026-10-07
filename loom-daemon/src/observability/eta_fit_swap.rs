@@ -1,6 +1,7 @@
 //! The ETA tracker's coefficient-file hot reload (#10243): when a pass loads
-//! a fit with a new id, the registry is rebuilt around it. Both the
-//! `eta-fit/v1` file and the `eta-fit/v2` file (#10508) are tracked.
+//! a fit with a new id, the registry is rebuilt around it. The `eta-fit/v1`
+//! file, the `eta-fit/v2` file (#10508) and the `eta-fit/v3` file (#10521)
+//! are tracked.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -8,23 +9,50 @@ use std::sync::Arc;
 use crate::eta::fit::{self, CoefficientFile};
 use crate::eta::Registry;
 
-/// The registry to swap in after a pass loaded `loaded` (the `eta-fit/v1`
-/// and `eta-fit/v2` files, #10508) while the live registry was built with
+/// The registry to swap in after a pass loaded `loaded` (the `eta-fit/v1`,
+/// `eta-fit/v2` and `eta-fit/v3` files, #10508/#10521) while the live
+/// registry was built with
 /// the files `registered` names (#10243), or `None` to keep it. Pure, and
 /// keyed on the ids alone: the same files again swap nothing; a new id (the
 /// daily refit), or a file appearing or disappearing, rebuilds the whole
 /// registry, which is the same as rebuilding the fitted heuristics.
 pub(super) fn swap_fit(
-    registered: (Option<&str>, Option<&str>),
-    loaded: (Option<CoefficientFile>, Option<CoefficientFile>),
+    registered: (Option<&str>, Option<&str>, Option<&str>),
+    loaded: (Option<CoefficientFile>, Option<CoefficientFile>, Option<CoefficientFile>),
 ) -> Option<Registry> {
     let id = |f: &Option<CoefficientFile>| f.as_ref().map(|f| f.id.clone());
     if registered.0.map(str::to_string) == id(&loaded.0)
         && registered.1.map(str::to_string) == id(&loaded.1)
+        && registered.2.map(str::to_string) == id(&loaded.2)
     {
         return None;
     }
-    Some(Registry::with_fits(loaded.0.map(Arc::new), loaded.1.map(Arc::new)))
+    Some(Registry::with_all_fits(
+        loaded.0.map(Arc::new),
+        loaded.1.map(Arc::new),
+        loaded.2.map(Arc::new),
+    ))
+}
+
+/// Log a change of `eta-fit/v3` file (#10521), at info: until the first
+/// v3 refit, `land-2026-10-06-loop-kite` refuses its PR stages `no_model`.
+pub(super) fn log_fit_v3(old: Option<&str>, new: Option<&CoefficientFile>) {
+    if old == new.map(|f| f.id.as_str()) {
+        return;
+    }
+    match new {
+        Some(file) => log::info!(
+            "eta: eta-fit/v3 file {} (as_of {}) loaded for land-2026-10-06-loop-kite, replacing {}",
+            file.id,
+            file.as_of.to_rfc3339(),
+            old.unwrap_or("none")
+        ),
+        None => log::info!(
+            "eta: no eta-fit/v3 file (replacing {}); land-2026-10-06-loop-kite refuses its PR \
+             stages no_model until a v3 fit is written",
+            old.unwrap_or("none")
+        ),
+    }
 }
 
 /// Log a change of `eta-fit/v2` file (#10508), at info: until the first

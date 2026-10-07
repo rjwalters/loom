@@ -777,6 +777,13 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_worktree_teardown`.
     WorktreeTeardown(super::merge_pr_worktree_teardown::WorktreeTeardownArgs),
 
+    /// `merge-pr.sh --help`'s usage text (#8191 slice): the option list, the
+    /// cleanup semantics and the exit-code table, byte-frozen against the
+    /// retired `show_help` heredoc. Prints `LOOM-MERGE-PR-USAGE` then the
+    /// text; always exits 0. The shell prints a one-line usage instead when
+    /// the sentinel is absent — see `cli::merge_pr_usage`.
+    Usage(super::merge_pr_usage::UsageArgs),
+
     /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
     /// settle now, keep waiting, or report the whole wait spent. Bounded only
     /// when the base branch requires no status-check contexts; a lookup that
@@ -936,6 +943,13 @@ pub(crate) enum MergePrCommand {
     /// The shell treats anything else as REFUSE — see
     /// `cli::merge_pr_remove_gate`.
     RemoveGate(super::merge_pr_remove_gate::RemoveGateArgs),
+
+    /// What post-merge cleanup does with a worktree it DISCOVERED by branch
+    /// name (#8191 slice): primary checkout / managed / user-owned. First line
+    /// `LOOM-DISCOVERED DECIDE|NOTE` then `LEVEL<TAB>message` records; the
+    /// shell removes nothing unless it reads DECIDE — see
+    /// `cli::merge_pr_discovered_worktree`.
+    DiscoveredWorktree(super::merge_pr_discovered_worktree::DiscoveredWorktreeArgs),
 }
 
 impl MergePrCommand {
@@ -962,6 +976,7 @@ impl MergePrCommand {
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::WorktreeTeardown(args) => args.run(),
+            MergePrCommand::Usage(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
@@ -981,6 +996,7 @@ impl MergePrCommand {
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::RemoveGate(args) => args.run(),
+            MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

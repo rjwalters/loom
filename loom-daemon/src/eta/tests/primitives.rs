@@ -237,6 +237,7 @@ fn registry_resolves_current_per_kind() {
             "land-2026-10-06-held-heron",
             "land-2026-10-06-keen-wren",
             "land-2026-10-06-bold-lark",
+            "land-2026-10-06-loop-kite",
             "land-2026-10-04-twin-otter-b",
             "land-2026-10-06-tandem-wren"
         ]
@@ -328,6 +329,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-2026-10-06-held-heron",
             "land-2026-10-06-keen-wren",
             "land-2026-10-06-bold-lark",
+            "land-2026-10-06-loop-kite",
             "land-2026-10-04-twin-otter-b",
             "land-2026-10-06-tandem-wren"
         ]
