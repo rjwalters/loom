@@ -1420,14 +1420,13 @@ and the legacy files are not consulted.
 
 | Store path | Read by | Contract |
 |---|---|---|
-| `fleet.json` | `roster`, `state`, `render` | JSON, above. When present, the next five rows are not read |
+| `fleet.json` | `roster`, `state`, `render`, version floor | JSON, above. When present, the next five rows are not read for the roster, state or tiers. The version floor reads only its top-level `loom_min_version` (#10711), and falls back to `repos.yml` when that key is absent — see below |
 | `fleet/defaults.json` | `render` | JSON object: the machine tier every host shares |
 | `fleet/hosts/<host>/defaults.json` | `render` | JSON object: that host's overlay. Required for a host `render` is asked about |
 | `fleet/hosts/<host>/local.json` | `render` | JSON object: that host's host-local tier. Optional — absent leaves the local tier alone |
 | `repos.yml` | `roster` | YAML, below |
 | `fleet/state.yml` | `state` | YAML, below |
 | `fleet/admins.json` | comment trust | JSON `{"admins": ["login", ...]}`: fleet admins trusted as comment authors in every fleet repo; unreadable means empty (fails closed). See [comment-trust](comment-trust.md) (#10303) |
-| `fleet.json` | version floor | JSON object, the compiled fleet document (#10705). Optional — fetched when present; absent is not an error. Only its top-level `loom_min_version` is read today (#10711) |
 
 Other files in the store (a README, a host inventory) are never fetched.
 
