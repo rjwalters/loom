@@ -50,6 +50,12 @@
 //! before the next call. A due backfill skipped before its first call is
 //! recorded as in progress from that cycle ([`pend_backfill`], #10292), so it
 //! holds the fit like any other.
+//!
+//! # SigNoz first (#10520)
+//!
+//! [`run_cycle_with`] given a SigNoz timeline reader takes each pass's history
+//! from SigNoz and reads the forge only to fill gaps, under one more budget
+//! ([`Budgets::gap_fill`]); see [`super::fleet_signoz_history`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -62,6 +68,8 @@ use super::fleet_fetch::{
     history, listing_url, parse_listing, timeline_url, ForgeRead, Installation, NoReader, Read,
     ReadFailure, Reader, RepoTarget, PER_PAGE,
 };
+use super::fleet_signoz_history::{self as signoz_history, HistoryNote, HistorySource, Plan};
+use super::fleet_signoz_refresh::{Limits, SignozRead};
 use crate::forge_call_stats::ops::{ISSUE_LIST, TIMELINE_READ};
 use crate::forge_call_stats::ForgeOp;
 use crate::pr_latency::timeline::parse_timeline_page;
@@ -188,6 +196,9 @@ pub struct RefreshState {
     pub pass: Option<Pass>,
     /// The last stop.
     pub last_stop: Option<LastStop>,
+    /// The last SigNoz-primary pass's source and gap-fill count (#10520).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryNote>,
 }
 
 impl RefreshState {
@@ -202,6 +213,7 @@ impl RefreshState {
             derivation_rev: 0,
             pass: None,
             last_stop: None,
+            history: None,
         }
     }
 }
@@ -260,6 +272,8 @@ pub struct Budgets {
     pub reserve: u64,
     /// Backfill depth, days.
     pub backfill_days: i64,
+    /// Gap-fill calls per repo per cycle when SigNoz history is on (#10520).
+    pub gap_fill: u64,
 }
 
 /// One repo's cycle — the `eta.fleet_refresh` record's fields.
@@ -285,6 +299,11 @@ pub struct RepoReport {
     pub as_of: Option<DateTime<Utc>>,
     /// Raw event rows appended (#10250 cache), when that sync ran.
     pub raw_events_added: Option<u64>,
+    /// Forge reads made while SigNoz history is on (#10520): `Some(0)` when
+    /// SigNoz covered the pass, `None` when it is off.
+    pub gap_fill_calls: Option<u64>,
+    /// Where the pass took its history from, when SigNoz history is on.
+    pub history: Option<HistorySource>,
     /// Wall time spent on the repo. Telemetry only: measured with a
     /// monotonic `Instant`, it never reaches a file or a decision.
     pub duration_ms: u64,
@@ -308,6 +327,8 @@ impl RepoReport {
             snapshot_id: None,
             as_of: None,
             raw_events_added: None,
+            gap_fill_calls: None,
+            history: None,
             duration_ms: 0,
         }
     }
@@ -379,11 +400,44 @@ fn recover(root: &Path, repo: &str) -> Option<RefreshState> {
     state
 }
 
-/// Run one cycle over `targets`.
+/// The pass window `(L, S)`: the pass in progress's, else a new pass's.
+#[must_use]
+pub fn pass_window(
+    state: &RefreshState,
+    kind: PassKind,
+    backfill_days: i64,
+    now: DateTime<Utc>,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    if let Some(pass) = &state.pass {
+        return (pass.listed_at, pass.since);
+    }
+    let since = match kind {
+        PassKind::Backfill => now - Duration::days(backfill_days),
+        PassKind::Refresh => {
+            state.watermark.unwrap_or(now) - Duration::seconds(WATERMARK_SLACK_SEC)
+        }
+    };
+    (now, since)
+}
+
+/// Run one cycle over `targets`, forge only.
 pub fn run_cycle(
     root: &Path,
     targets: &[RepoTarget],
     forge: &mut dyn ForgeRead,
+    budgets: Budgets,
+    now: DateTime<Utc>,
+) -> CycleReport {
+    run_cycle_with(root, targets, forge, None, budgets, now)
+}
+
+/// Run one cycle over `targets`; with `signoz`, SigNoz first and the forge
+/// only as gap-fill (#10520).
+pub fn run_cycle_with(
+    root: &Path,
+    targets: &[RepoTarget],
+    forge: &mut dyn ForgeRead,
+    mut signoz: Option<(&mut dyn SignozRead, Limits)>,
     budgets: Budgets,
     now: DateTime<Utc>,
 ) -> CycleReport {
@@ -491,16 +545,30 @@ pub fn run_cycle(
             below_reserve: false,
             report: RepoReport::skipped(repo, Some(p.kind), StopReason::Complete),
             reset_epoch: None,
+            gap_left: None,
         };
         walk.report.reader_app = Some(reader.app_id.clone());
         let state = p.state.unwrap_or_else(|| RefreshState::new(repo));
-        let stop = walk.run(state, p.published, p.kind, budgets.backfill_days, now);
+        let load = signoz.as_mut().map(|(reader, limits)| {
+            let window = pass_window(&state, p.kind, budgets.backfill_days, now);
+            signoz_history::load(repo, &mut **reader, *limits, window, budgets.backfill_days)
+        });
+        let plan = walk.apply(load, budgets.gap_fill);
+        let stop = walk.run(state, p.published, p.kind, budgets.backfill_days, now, plan);
         let spent = before - *walk.remaining;
         let below_reserve = walk.below_reserve;
         let reset = walk.reset_epoch;
         let mut r = walk.report;
         r.stop = stop;
         r.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let (Some(source), Some(gap_fill_calls)) = (r.history, r.gap_fill_calls) {
+            let note = HistoryNote {
+                at: now,
+                source,
+                gap_fill_calls,
+            };
+            signoz_history::note(root, repo, note);
+        }
         match p.kind {
             PassKind::Refresh => report.refresh_calls += spent,
             PassKind::Backfill => report.backfill_calls += spent,
@@ -610,16 +678,18 @@ struct Answer {
 }
 
 /// One repo's walk within a cycle.
-struct Walk<'a> {
+pub(super) struct Walk<'a> {
     root: &'a Path,
-    target: &'a RepoTarget,
+    pub(super) target: &'a RepoTarget,
     reader: &'a Reader,
     forge: &'a mut dyn ForgeRead,
     remaining: &'a mut u64,
     reserve: u64,
     below_reserve: bool,
-    report: RepoReport,
+    pub(super) report: RepoReport,
     reset_epoch: Option<i64>,
+    /// Gap-fill calls left this cycle; `None` when unbounded (#10520).
+    pub(super) gap_left: Option<u64>,
 }
 
 impl Walk<'_> {
@@ -637,6 +707,7 @@ impl Walk<'_> {
         if *self.remaining == 0 {
             return Err(StopReason::Budget);
         }
+        self.charge_gap_fill()?;
         *self.remaining -= 1;
         self.report.forge_calls += 1;
         let read = self.forge.get(self.target, self.reader, url, etag, op);
@@ -685,7 +756,7 @@ impl Walk<'_> {
 
     /// Every page of PR `number`'s timeline: `Ok(None)` when a page did not
     /// parse (an incomplete timeline).
-    fn timeline(
+    pub(super) fn timeline(
         &mut self,
         number: u32,
     ) -> Result<Option<Vec<crate::pr_latency::PrEvent>>, StopReason> {
@@ -706,7 +777,8 @@ impl Walk<'_> {
         Ok(None)
     }
 
-    /// Run the repo's pass for this cycle; returns why it stopped.
+    /// Run the repo's pass for this cycle; returns why it stopped. With a
+    /// covered SigNoz `plan` no listing call is made (#10520).
     fn run(
         &mut self,
         mut state: RefreshState,
@@ -714,6 +786,7 @@ impl Walk<'_> {
         kind: PassKind,
         backfill_days: i64,
         now: DateTime<Utc>,
+        plan: Option<Plan>,
     ) -> StopReason {
         let repo = self.target.repo.clone();
         let published_path = fleet::snapshot_path(self.root, &repo);
@@ -721,6 +794,7 @@ impl Walk<'_> {
         let state_file = state_path(self.root, &repo);
         let before = published.as_ref().map_or(0, |s| s.samples.len());
         let mut prefetched: Option<Answer> = None;
+        let (listed_at, since) = pass_window(&state, kind, backfill_days, now);
 
         let (mut pass, mut staging) = match state.pass.take() {
             Some(pass) => match fleet::read(&staging_file) {
@@ -728,19 +802,11 @@ impl Walk<'_> {
                 None => return self.finish(StopReason::WriteError, &published_path, before),
             },
             None => {
-                let listed_at = now;
-                let since = match kind {
-                    PassKind::Backfill => listed_at - Duration::days(backfill_days),
-                    PassKind::Refresh => {
-                        state.watermark.unwrap_or(listed_at)
-                            - Duration::seconds(WATERMARK_SLACK_SEC)
-                    }
-                };
                 let staging = match (kind, &published) {
                     (PassKind::Refresh, Some(p)) => p.clone(),
                     _ => FleetSnapshot::empty(&repo),
                 };
-                if kind == PassKind::Refresh {
+                if kind == PassKind::Refresh && plan.is_none() {
                     let etag = state.listing_etag.clone();
                     match self.call(&listing_url(&repo, 1), etag.as_deref(), ISSUE_LIST) {
                         Ok(answer) if answer.status == 304 => {
@@ -786,7 +852,10 @@ impl Walk<'_> {
             }
         };
 
-        let stop = self.walk(&state, &mut pass, &mut staging, prefetched);
+        let stop = match &plan {
+            Some(plan) => self.walk_signoz(&mut pass, &mut staging, plan),
+            None => self.walk(&state, &mut pass, &mut staging, prefetched),
+        };
         self.report.pass_done = pass.done.len() as u64;
         if stop != StopReason::Complete {
             // Checkpoint and leave the published snapshot untouched.

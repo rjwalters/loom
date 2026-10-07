@@ -94,9 +94,38 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
             backfill_max_calls_per_cycle: 600,
             reserve_calls: 1500,
             backfill_days: 21,
+            gap_fill_max_calls_per_pass: 100,
             signoz: crate::eta::config::FleetSignozConfig::default(),
         }
     );
+}
+
+#[test]
+fn signoz_history_is_primary_once_signoz_is_on_and_the_gap_fill_budget_is_configurable() {
+    let c = resolve(&json!({}), no_env).fleet_refresh;
+    assert!(c.signoz.history_primary, "follows signoz.enabled by default");
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {
+            "gapFillMaxCallsPerPass": 7,
+            "signoz": {"historyPrimary": false}
+        }}}}),
+        no_env,
+    )
+    .fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 7);
+    assert!(!c.signoz.history_primary);
+    let env = |k: &str| match k {
+        "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS" => Some("3".to_string()),
+        "LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY" => Some("1".to_string()),
+        _ => None,
+    };
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {"signoz": {"historyPrimary": false}}}}}),
+        env,
+    )
+    .fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 3, "env > config");
+    assert!(c.signoz.history_primary, "env > config");
 }
 
 // -- autonomous.eta.fleetRefresh.signoz (#9758) ----------------------------

@@ -65,8 +65,11 @@
 //! 2. **Gates**: inside a rate-limit backoff, or with the breaker suppressed,
 //!    every repo is recorded (`backoff` / `breaker_open`) and no call is made;
 //!    a due backfill is recorded as in progress, so it holds the fit (#10292).
-//! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle`] under the two
-//!    budgets and the reserve floor.
+//! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle_with`] under the
+//!    two budgets and the reserve floor. With `signoz.enabled` and
+//!    `signoz.historyPrimary` (#10520) each pass reads its history from the
+//!    SigNoz timeline first and the forge only to fill gaps, under
+//!    `gapFillMaxCallsPerPass` ([`crate::eta::fleet_signoz_history`]).
 //! 4. **Raw events** (#10250, #10298): each repo's raw cache is synced
 //!    in-process from every repo-wide listing ([`event_endpoints`]: issue
 //!    events, then pulls), each through its own reader-only source and its own
@@ -702,8 +705,13 @@ pub fn cycle(
             backfill: config.backfill_max_calls_per_cycle,
             reserve: config.reserve_calls,
             backfill_days: config.backfill_days,
+            gap_fill: config.gap_fill_max_calls_per_pass,
         };
-        let mut report = fleet_refresh::run_cycle(root, targets, forge, budgets, now);
+        let mut history = crate::eta::fleet_signoz_history::reader(&config.signoz);
+        let signoz = history.as_mut().map(|(reader, limits)| {
+            (reader as &mut dyn crate::eta::fleet_signoz_refresh::SignozRead, *limits)
+        });
+        let mut report = fleet_refresh::run_cycle_with(root, targets, forge, signoz, budgets, now);
         sync_all_events(root, targets, events, &mut report);
         report
     };
@@ -739,6 +747,8 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
         snapshot_id: published.as_ref().map(|s| s.snapshot_id.clone()),
         as_of: published.as_ref().map(|s| s.as_of),
         raw_events_added: None,
+        gap_fill_calls: None,
+        history: None,
         duration_ms: 0,
     };
     match target.reader {
@@ -1010,6 +1020,8 @@ pub fn records(
             snapshot_id: r.snapshot_id.clone(),
             as_of: r.as_of,
             duration_ms: r.duration_ms,
+            gap_fill_calls: r.gap_fill_calls,
+            history_source: r.history.map(|h| h.as_str().to_string()),
             loom: loom.clone(),
         })
         .collect()

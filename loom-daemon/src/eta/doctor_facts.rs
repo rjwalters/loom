@@ -89,6 +89,9 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
                 .and_then(|s| s.pass)
                 .filter(|p| p.kind == fleet_refresh::PassKind::Backfill)
                 .map(|p| p.listed_at),
+            // #10520: persisted by the refresh cycle; never re-derived here.
+            history: fleet_refresh::read_state(&fleet_refresh::state_path(root, &t.repo))
+                .and_then(|s| s.history),
         })
         .collect();
     let data = DataFacts {

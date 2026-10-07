@@ -120,6 +120,7 @@ pub mod fleet_fetch;
 pub mod fleet_log;
 pub mod fleet_refresh;
 pub mod fleet_signoz;
+pub mod fleet_signoz_history;
 pub mod fleet_signoz_refresh;
 pub mod fleet_signoz_timeline;
 pub mod fleet_signoz_timeline_rows;
