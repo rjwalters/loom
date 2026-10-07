@@ -38,6 +38,11 @@ the next person to add one will have an equally good argument.
    `startup_failure`. Do not re-run it to "complete" the record, and do not
    treat it as a skipped check.
 
+   Releases follow the same verdict: `release.yml` releases only a `main`
+   commit whose `CI` run concluded `success` (`workflow_run`, #10826). A
+   `cancelled` or red commit is never released; its version may be skipped
+   ([release-cadence](release-cadence.md)).
+
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
    path. `conflict-markers` states this in its own comment and is right:
@@ -246,6 +251,8 @@ a cancellation rate.
   predicate, and rule 9's two narrowings
 - #9065 / #9069 — the wall-time work rule 10 exists to balance, and #9085 —
   `ci-daily.yml`, the slow run that balances it
+- #10826 — releases only from a green `main` `CI` run, at its `head_sha`
+  ([release-cadence](release-cadence.md))
 - #10257 — merge-queue qualification: rule 11, the `merge_group` trigger in
   `ci.yml`, and the audit that proves it ([merge-queue-ci](merge-queue-ci.md))
 - [`ci-observability.md`](ci-observability.md) — the observability face of
