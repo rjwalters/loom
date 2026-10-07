@@ -539,6 +539,8 @@ fn a_record_beside_a_healthy_container_is_warned_about_at_least_daily() {
     }
     assert!(gaps.iter().all(|&gap| gap <= DAY), "{gaps:?}");
     assert_eq!(gaps.len(), 20, "{gaps:?}");
-    // A wall clock stepping back never makes it due early, nor silences it.
+    // A wall clock stepping back never makes the cap fire early: it waits
+    // for the clock to catch up (the doubling cadence alone still fires).
     assert!(!due(3, Some(1_000), 10));
+    assert!(due(4, Some(1_000), 10), "pass 4 is on the doubling cadence");
 }

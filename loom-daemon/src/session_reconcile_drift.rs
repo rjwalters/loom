@@ -177,7 +177,9 @@ pub const HEALTHY_RECORD_WARN_MAX_SECS: u64 = 24 * 60 * 60;
 /// container WARNs: on passes 1, 2, 4, 8, … (a backoff), and whenever
 /// [`HEALTHY_RECORD_WARN_MAX_SECS`] have passed since the last WARN. The count
 /// lives in memory, so a daemon restart starts it over at pass 1, which
-/// WARNs at once: a restart never makes the record quieter.
+/// WARNs at once: a restart never makes the record quieter. A large
+/// backward step of the wall clock mutes the 24 h cap until the clock
+/// catches up again; the doubling cadence still fires meanwhile.
 #[must_use]
 pub fn healthy_record_warn_due(passes: u32, warned_at: Option<u64>, now: u64) -> bool {
     passes.is_power_of_two()

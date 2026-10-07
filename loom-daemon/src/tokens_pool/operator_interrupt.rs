@@ -10,7 +10,8 @@
 //! only records the signal; [`super::docker_cli`] forwards it to the running
 //! `docker` child's group, waits briefly for it to exit, and fails the call
 //! with [`Interrupted`], and refuses to start any further `docker` call. The
-//! command then exits with an error, as Ctrl-C used to make it do.
+//! command then exits with an error, as Ctrl-C used to make it do. A second
+//! Ctrl-C (or SIGTERM) kills the command at once, the default action.
 //!
 //! **The daemon never installs it.** [`pending`] is `None` until [`install`]
 //! has run in this process, so the reconcile pass and every other unattended
@@ -21,9 +22,19 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// The first signal is only recorded. A second one restores the default
+/// action and re-raises itself, so the operator can always force-quit, even
+/// during the forward grace or a step that does not poll [`pending`] (an
+/// attached `shell`).
 #[cfg(unix)]
 extern "C" fn record(signal: libc::c_int) {
-    SIGNAL.store(signal, Ordering::Relaxed);
+    if SIGNAL.swap(signal, Ordering::Relaxed) != 0 {
+        // SAFETY: `signal` and `raise` are async-signal-safe.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
 }
 
 /// Trap SIGINT and SIGTERM for this operator command.

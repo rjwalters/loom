@@ -9148,16 +9148,19 @@ across the registered roots:
   `accounts session start` or `shell` therefore traps SIGINT and SIGTERM and
   forwards the signal to the running `docker` command's group. It gives that
   command 10 s to exit, then kills the group. The command then fails with
-  `interrupted by signal N` and starts no further `docker` call. The hold was
-  already lifted, so the account is unheld and down, as in any failed start
-  (below). Run `accounts session stop` to keep it down. The daemon never traps
-  these signals for its `docker` calls: the reconciler's behaviour is
-  unchanged.
+  `interrupted by signal N` and starts no further `docker` call. Where the
+  account ends up depends on the phase (below): interrupted during the
+  preparation (the container inspect, the image check or the pull) it is
+  still **held** and down; interrupted during the start itself it is
+  **unheld** and down. A second Ctrl-C (or SIGTERM) kills the command at
+  once. The daemon never traps these signals for its `docker` calls: the
+  reconciler's behaviour is unchanged.
 - With no enabled session-managed account, the pass makes zero `docker` calls.
 - **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
   down. It writes `.session-hold.json` in the account's profile directory
   *before* `docker stop`. Only an operator `accounts session start` (or
-  `shell`) removes it, by deleting it before that start touches Docker.
+  `shell`) removes it, by deleting it before that start's own `docker
+  start`/`run`.
   Whether an account is held depends only on whether the file exists, never
   on timestamps, so a wall clock stepping back between a start and a stop
   cannot drop the hold. The pass checks the hold before any `docker` call and
@@ -9184,15 +9187,21 @@ across the registered roots:
   fallback root in `~/.loom/session-reconcile-fallback-root.json`
   (`LOOM_SESSION_FALLBACK_ROOT_FILE` overrides the path) when the reconcile
   loop starts. Without that record the CLI uses the registered roots and its
-  own. A stale record only adds a root. An operator start deletes the hold in
-  every hold root. `accounts disable <acct>` also keeps it down, but it takes
+  own. A stale record only adds a root. The record is one per home
+  directory: two daemons sharing a `$HOME` keep only the last one's root,
+  and the other's fallback root gets the pre-#10661 behaviour. An operator
+  start deletes the hold in every hold root. `accounts disable <acct>` also keeps it down, but it takes
   the account out of dispatch too.
-- **Lift succeeded, start failed.** An operator start deletes the hold
-  *before* it touches Docker, so a failure there (or a Ctrl-C) cannot leave
-  the container running and held. If the `docker start`/`run` then fails, the
-  account is **unheld and down**. The reconciler then owns it. It restarts the
-  container on the per-account backoff above, because the operator asked for
-  it to run. To keep it down instead, run `accounts session stop`.
+- **An operator start has two phases.** First the CLI prepares: it inspects
+  the container and, if it is missing, checks for the image and pulls it.
+  The hold is still in place, so a failure or a Ctrl-C here leaves the
+  account **held** and down, exactly as before the start. Then the start
+  deletes the hold, *before* its own `docker start`/`run`, so it can never
+  leave the container running and held. **Lift succeeded, start failed:** if
+  that `docker start`/`run` fails (or is interrupted), the account is
+  **unheld and down**. The reconciler then owns it. It restarts the container
+  on the per-account backoff above, because the operator asked for it to
+  run. To keep it down instead, run `accounts session stop`.
 - An operator `session start` also records its workspace and image in
   `.session-last-start.json` next to the hold. A container recreated after a
   daemon restart uses those values. If that record cannot be written, the
