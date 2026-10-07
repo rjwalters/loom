@@ -590,6 +590,8 @@ mod tests {
             snapshot_id: Some("feedface".to_string()),
             as_of: Some(at),
             duration_ms: 12,
+            gap_fill_calls: Some(0),
+            history_source: Some("signoz".to_string()),
             loom: record().explanation.loom.clone(),
         };
         let envelope =

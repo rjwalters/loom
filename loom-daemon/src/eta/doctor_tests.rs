@@ -40,6 +40,7 @@ fn healthy() -> Facts {
                 unsupported_forge: false,
                 snapshot_as_of: Some(now() - Duration::minutes(20)),
                 backfill_since: None,
+                history: None,
             }],
             refresh_cycle: Some(RefreshCycleState {
                 started_at: now() - Duration::minutes(20),
@@ -520,4 +521,42 @@ fn the_backtest_scoreboard_lists_each_challenger_and_warns_when_stale() {
     let c = find(&c, "backtest", "nightly_folds");
     assert_eq!(c.status, Status::Skip);
     assert!(c.detail.contains("fleet.captain"), "{}", c.render());
+}
+
+/// #10520: the repo check reports the last SigNoz-primary pass's gap-fill
+/// request count, `0` when SigNoz covered it, and nothing when it never ran.
+#[test]
+fn the_repo_check_reports_the_gap_fill_request_count() {
+    use crate::eta::fleet_signoz_history::{HistoryNote, HistorySource};
+    let detail = |f: &Facts| {
+        evaluate(f)
+            .into_iter()
+            .find(|c| c.link == "data" && c.check == "repo acme/alpha")
+            .unwrap()
+    };
+    let f = healthy();
+    assert!(!detail(&f).detail.contains("gap-fill"), "SigNoz history off: nothing");
+
+    let mut f = healthy();
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::Signoz,
+        gap_fill_calls: 0,
+    });
+    let c = detail(&f);
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.detail.contains("history signoz, 0 gap-fill request(s)"), "{}", c.detail);
+
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::SignozGapFill,
+        gap_fill_calls: 12,
+    });
+    let c = detail(&f);
+    assert!(
+        c.detail
+            .contains("history signoz_gap_fill, 12 gap-fill request(s)"),
+        "{}",
+        c.detail
+    );
 }

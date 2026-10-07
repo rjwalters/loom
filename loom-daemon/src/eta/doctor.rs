@@ -178,6 +178,22 @@ pub struct RepoFacts {
     pub snapshot_as_of: Option<DateTime<Utc>>,
     /// An in-progress backfill's start.
     pub backfill_since: Option<DateTime<Utc>>,
+    /// The last SigNoz-primary pass: its source and gap-fill request count
+    /// (#10520); `None` when SigNoz history has not run for the repo.
+    pub history: Option<crate::eta::fleet_signoz_history::HistoryNote>,
+}
+
+/// `; history <source>, N gap-fill request(s) at <when>` (#10520), or
+/// nothing when SigNoz history has not run for the repo.
+fn history_text(r: &RepoFacts) -> String {
+    r.history.map_or_else(String::new, |h| {
+        format!(
+            "; history {}, {} gap-fill request(s) on its last cycle ({})",
+            h.source.as_str(),
+            h.gap_fill_calls,
+            h.at.to_rfc3339()
+        )
+    })
 }
 
 /// `data` link inputs.
@@ -471,7 +487,7 @@ fn data(f: &Facts) -> Vec<Check> {
                 "data",
                 &name,
                 if refreshes { Status::Fail } else { Status::Warn },
-                "no snapshot",
+                format!("no snapshot{}", history_text(r)),
                 if refreshes {
                     "run `loom-daemon eta fleet backfill --repo OWNER/NAME`, or let the refresh loop backfill it"
                 } else if standing_down {
@@ -485,7 +501,8 @@ fn data(f: &Facts) -> Vec<Check> {
                 let backfill = r
                     .backfill_since
                     .map(|b| format!("; backfill in progress since {}", b.to_rfc3339()))
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    + &history_text(r);
                 let interval = i64::try_from(c.interval_secs).unwrap_or(i64::MAX / 4);
                 if f.now - as_of > Duration::hours(SNAPSHOT_FAIL_HOURS) {
                     Check::bad(

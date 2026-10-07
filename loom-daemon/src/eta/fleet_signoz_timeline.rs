@@ -43,7 +43,9 @@
 //! (stage journal rows). Consecutive sets of one item are diffed into
 //! changes, dated at the later set's observation. An item's first set is a
 //! baseline and dates nothing: the daemon cannot know when those labels were
-//! added.
+//! added. Every set is still kept on the item ([`ItemTimeline::label_sets`]),
+//! so an item the daemon only ever saw as a baseline (or as repeated identical
+//! sets) is a known item, never a missing one (#10520).
 //!
 //! # Coverage
 //!
@@ -95,6 +97,11 @@ pub struct ItemTimeline {
     pub labels: Vec<LabelEvent>,
     /// In `at` order.
     pub lifecycle: Vec<LifecycleEvent>,
+    /// The daemon's whole label sets, `(observed_at, labels)`, ascending: the
+    /// first is the baseline. They date no change of their own (the diffs
+    /// between them are already in `labels`); they say the item exists, when
+    /// the daemon saw it, and what it carried then.
+    pub label_sets: Vec<(DateTime<Utc>, BTreeSet<String>)>,
 }
 
 impl ItemTimeline {
@@ -136,6 +143,48 @@ impl ItemTimeline {
             };
         }
         labels
+    }
+
+    /// The labels the item carried at `at`: the latest daemon set observed by
+    /// then, with the recorded changes after it applied; just
+    /// [`ItemTimeline::labels_at`] when the daemon saw no set by then. Unlike
+    /// `labels_at`, this knows a baseline's labels, which no change dates.
+    #[must_use]
+    pub fn current_labels(&self, at: DateTime<Utc>) -> BTreeSet<String> {
+        let Some((seen, set)) = self.label_sets.iter().rfind(|(seen, _)| *seen <= at) else {
+            return self.labels_at(at);
+        };
+        let mut labels = set.clone();
+        for event in self.labels.iter().filter(|e| e.at > *seen && e.at <= at) {
+            match event.transition {
+                Transition::Added => labels.insert(event.label.clone()),
+                Transition::Removed => labels.remove(&event.label),
+            };
+        }
+        labels
+    }
+
+    /// The baseline's labels that no recorded change explains: carried at the
+    /// first daemon set, yet absent from [`ItemTimeline::labels_at`] at that
+    /// set's observation (plus [`MATCH_SLACK_SEC`], a webhook receipt's lag).
+    /// Their addition time is unknown.
+    #[must_use]
+    pub fn undated_baseline_labels(&self) -> BTreeSet<String> {
+        let Some((seen, set)) = self.label_sets.first() else {
+            return BTreeSet::new();
+        };
+        let dated = self.labels_at(*seen + Duration::seconds(MATCH_SLACK_SEC));
+        set.difference(&dated).cloned().collect()
+    }
+
+    /// Every instant the item became knowable to have changed or been seen:
+    /// each label event, lifecycle event and daemon set, at the later of its
+    /// time and its observation.
+    pub fn seen_at(&self) -> impl Iterator<Item = DateTime<Utc>> + '_ {
+        let label = self.labels.iter().map(|e| e.at.max(e.observed_at));
+        let life = self.lifecycle.iter().map(|e| e.at.max(e.observed_at));
+        let sets = self.label_sets.iter().map(|(seen, _)| *seen);
+        label.chain(life).chain(sets)
     }
 }
 
@@ -457,9 +506,13 @@ impl Timeline {
                 }
             }
         }
-        // The daemon's label sets, diffed into changes at each observation.
+        // The daemon's label sets, diffed into changes at each observation,
+        // and each kept whole on its item (a baseline-only item still exists).
+        let mut items: BTreeMap<ItemKey, ItemTimeline> = BTreeMap::new();
         for (item, mut list) in sets {
             list.sort_by_key(|(at, _)| *at);
+            items.entry(item.clone()).or_default().label_sets =
+                list.iter().map(|(at, set)| (*at, (*set).clone())).collect();
             for pair in list.windows(2) {
                 let ((_, before), (at, after)) = (pair[0], pair[1]);
                 let occurrence = Occurrence {
@@ -483,7 +536,6 @@ impl Timeline {
             }
         }
 
-        let mut items: BTreeMap<ItemKey, ItemTimeline> = BTreeMap::new();
         for ((item, label, transition), (webhook, daemon)) in labels {
             let timeline = items.entry(item).or_default();
             for m in merge_sources(webhook, daemon, &mut stats) {

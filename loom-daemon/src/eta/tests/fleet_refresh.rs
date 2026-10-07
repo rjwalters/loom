@@ -219,6 +219,7 @@ fn budgets(refresh: u64, backfill: u64) -> Budgets {
         backfill,
         reserve: 1500,
         backfill_days: 21,
+        gap_fill: 100,
     }
 }
 

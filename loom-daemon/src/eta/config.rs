@@ -25,6 +25,8 @@
 //! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` (#10329) |
 //! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 //! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
+//! | `gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100` (min `2`): forge gap-fill reads per repo per cycle with SigNoz history on (#10520) |
+//! | `signoz.historyPrimary` | `LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY` | `false` (opt-in): with `signoz.enabled`, SigNoz is the history source and the forge only gap-fills (#10520) |
 
 use super::Kind;
 use std::path::Path;
@@ -107,6 +109,17 @@ pub const DEFAULT_FLEET_REFRESH_RESERVE: u64 = 1500;
 /// Default backfill depth, in days.
 pub const DEFAULT_FLEET_REFRESH_BACKFILL_DAYS: i64 = 21;
 
+/// Default forge gap-fill reads per repo per cycle when SigNoz is the
+/// history source (#10520). Conservative: a covered window needs none, and a
+/// pass that needs more resumes next cycle.
+pub const DEFAULT_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 100;
+
+/// Smallest gap-fill budget accepted (#10520): one listing page plus one
+/// timeline page, so every cycle of an uncovered pass makes progress (an
+/// interrupted timeline resumes at its next page). Lower values, `0`
+/// included, are raised to it.
+pub const MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 2;
+
 /// Shallowest backfill accepted: one day more than the daily fit's window,
 /// so a fresh host's first fit sees a whole window of history.
 pub const MIN_FLEET_REFRESH_BACKFILL_DAYS: i64 = super::fit::WINDOW_DAYS + 1;
@@ -127,6 +140,9 @@ pub struct FleetRefreshConfig {
     pub reserve_calls: u64,
     /// How far back a backfill reaches, in days.
     pub backfill_days: i64,
+    /// Forge gap-fill reads per repo per cycle when SigNoz is the history
+    /// source (#10520).
+    pub gap_fill_max_calls_per_pass: u64,
     /// The SigNoz in-sweep half (#9758), refreshed on the same cadence.
     pub signoz: FleetSignozConfig,
 }
@@ -140,6 +156,7 @@ impl Default for FleetRefreshConfig {
             backfill_max_calls_per_cycle: DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS,
             reserve_calls: DEFAULT_FLEET_REFRESH_RESERVE,
             backfill_days: DEFAULT_FLEET_REFRESH_BACKFILL_DAYS,
+            gap_fill_max_calls_per_pass: DEFAULT_FLEET_REFRESH_GAP_FILL_MAX_CALLS,
             signoz: FleetSignozConfig::default(),
         }
     }
@@ -174,6 +191,10 @@ pub struct FleetSignozConfig {
     pub page_size: u32,
     /// Pages per repo per cycle.
     pub max_pages: u32,
+    /// With [`Self::enabled`], take fleet-refresh history from SigNoz first
+    /// and read the forge only to fill gaps (#10520). Off by default
+    /// (opt-in) so enabling SigNoz never silently switches the fit's input.
+    pub history_primary: bool,
 }
 
 impl Default for FleetSignozConfig {
@@ -185,6 +206,7 @@ impl Default for FleetSignozConfig {
             credential_file: None,
             page_size: DEFAULT_FLEET_SIGNOZ_PAGE_SIZE,
             max_pages: DEFAULT_FLEET_SIGNOZ_MAX_PAGES,
+            history_primary: false,
         }
     }
 }
@@ -399,6 +421,11 @@ fn resolve_fleet_refresh(
         "LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS",
     );
     u64_key(&mut c.reserve_calls, "reserveCalls", "LOOM_ETA_FLEET_REFRESH_RESERVE");
+    u64_key(
+        &mut c.gap_fill_max_calls_per_pass,
+        "gapFillMaxCallsPerPass",
+        "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS",
+    );
     if let Some(v) = get("backfillDays").and_then(serde_json::Value::as_i64) {
         c.backfill_days = v;
     }
@@ -408,6 +435,9 @@ fn resolve_fleet_refresh(
     }
     c.interval_secs = c.interval_secs.max(MIN_FLEET_REFRESH_INTERVAL_SECS);
     c.backfill_days = c.backfill_days.max(MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    c.gap_fill_max_calls_per_pass = c
+        .gap_fill_max_calls_per_pass
+        .max(MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS);
     c.signoz = resolve_fleet_signoz(get("signoz"), env);
     c
 }
@@ -448,6 +478,15 @@ fn resolve_fleet_signoz(
         .and_then(parse_bool)
     {
         c.enabled = v;
+    }
+    if let Some(v) = get("historyPrimary").and_then(serde_json::Value::as_bool) {
+        c.history_primary = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        c.history_primary = v;
     }
     c.endpoint = text("endpoint", "LOOM_ETA_FLEET_SIGNOZ_ENDPOINT");
     c.user = text("user", "LOOM_ETA_FLEET_SIGNOZ_USER");
