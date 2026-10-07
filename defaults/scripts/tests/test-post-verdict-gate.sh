@@ -68,6 +68,8 @@ if [[ "${1:-}" == "api" ]]; then
       [[ -f "$D/labels-post-fail" || -f "$D/labels-write-fail" ]] && { echo "HTTP 403" >&2; exit 1; }
       for l in "${adds[@]}"; do grep -qxF "$l" "$D/labels.txt" || echo "$l" >> "$D/labels.txt"; done
       echo '[]'; exit 0 ;;
+    "DELETE repos/owner/repo/issues/comments/"*)
+      jq --argjson id "${path##*/}" 'map(select(.id != $id))' "$D/comments.json" > "$D/c.tmp" && mv "$D/c.tmp" "$D/comments.json"; exit 0 ;;
     "DELETE repos/owner/repo/issues/"*/labels/*)
       [[ -f "$D/labels-write-fail" ]] && { echo "HTTP 403" >&2; exit 1; }
       l="${path##*/}"; l="${l//%3A/:}"
@@ -87,12 +89,12 @@ if [[ "${1:-} ${2:-}" == "issue comment" ]]; then
   # (the host lock cannot order it); its comment lands just before ours.
   if [[ -f "$D/rival-verdict" ]]; then
     jq --arg b "rival review\n\n<!-- loom:verdict-sha sha=$(cat "$D/cur-sha") verdict=$(cat "$D/rival-verdict") -->" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '. + [{body: $b, created_at: $t, user: {login: "rival-judge", type: "User"}, author_association: "MEMBER"}]' \
+      '. + [{id: ((map(.id // 0) | max // 0) + 1), body: $b, created_at: $t, user: {login: "rival-judge", type: "User"}, author_association: "MEMBER"}]' \
       "$D/comments.json" > "$D/c.tmp" && mv "$D/c.tmp" "$D/comments.json"
   fi
   echo "$3" >> "$D/posted.log"
   jq --arg b "$body" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '. + [{body: $b, created_at: $t, user: {login: "a-judge", type: "User"}, author_association: "MEMBER"}]' \
+    '. + [{id: ((map(.id // 0) | max // 0) + 1), body: $b, created_at: $t, user: {login: "a-judge", type: "User"}, author_association: "MEMBER"}]' \
     "$D/comments.json" > "$D/c.tmp" && mv "$D/c.tmp" "$D/comments.json"
   echo "https://github.com/owner/repo/pull/$3#issuecomment-1"; exit 0
 fi
@@ -267,6 +269,23 @@ printf approved > "$STUB_DIR/rival-verdict"
 pv 10711 changes-requested "$HEAD" --body "Please fix."
 check "changes-requested exits 0" 0 "$RC"
 check "changes-requested labels, never loom:pr" "loom:changes-requested " "$LABELS"
+
+echo "== cross-host race: an identical approval lands first (lower comment id) =="
+state "[]" loom:review-requested loom:reviewing
+printf approved > "$STUB_DIR/rival-verdict"
+pv 10713 approved "$HEAD" --body "Approved."
+check "the duplicate exits 0" 0 "$RC"
+contains "says it landed first" "$OUT" "landed first"
+check "exactly one approval comment stands" 1 "$(jq '[.[] | select(.body | contains("verdict=approved -->"))] | length' "$STUB_DIR/comments.json")"
+check "the survivor is the rival's (lowest id)" rival-judge "$(jq -r '.[0].user.login' "$STUB_DIR/comments.json")"
+check "the duplicate touched no labels" "loom:review-requested loom:reviewing " "$LABELS"
+
+echo "== cross-host race: an identical changes-requested lands first =="
+state "[]" loom:review-requested loom:reviewing
+printf changes-requested > "$STUB_DIR/rival-verdict"
+pv 10714 changes-requested "$HEAD" --body "Please fix."
+check "the duplicate exits 0" 0 "$RC"
+check "exactly one changes-requested comment stands" 1 "$(jq '[.[] | select(.body | contains("verdict=changes-requested -->"))] | length' "$STUB_DIR/comments.json")"
 
 echo "== no race: an unrelated earlier verdict at another head changes nothing =="
 state "$(cr_at "$MOVED" 60)" loom:review-requested loom:reviewing

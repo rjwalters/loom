@@ -422,8 +422,12 @@ if [[ -n "$RECONCILIATION_MARKER" ]]; then
 
 $RECONCILIATION_MARKER"
 fi
+# Per-call token (#10581): lets verdict-reconcile find THIS caller's comment among
+# identical concurrent ones; cleared below when the gate dedupes (nothing posted).
+NONCE="$(date +%s%N)-$$-$RANDOM"
 FULL_BODY="$FULL_BODY
 
+<!-- loom:verdict-nonce=$NONCE -->
 <!-- loom:verdict-sha sha=$SHA verdict=$VERDICT -->"
 
 # Loom writes only to repos it manages (#9548): vet the target, then name it
@@ -460,28 +464,29 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
-  "10:LOOM-VERDICT-GATE DEDUPE"*) echo "post-verdict.sh: not posting a duplicate verdict on PR #$PR (applying its labels only): $VG_OUT" >&2 ;;
+  "10:LOOM-VERDICT-GATE DEDUPE"*) NONCE=""; echo "post-verdict.sh: not posting a duplicate verdict on PR #$PR (applying its labels only): $VG_OUT" >&2 ;;
   "3:LOOM-VERDICT-GATE REFUSE"*) echo "post-verdict.sh: REFUSING to post the $VERDICT verdict on PR #$PR — nothing was posted: $VG_OUT" >&2; exit 7 ;;
   *) [[ "$VERDICT" == "approved" ]] && { echo "post-verdict.sh: REFUSING to post an approval on PR #$PR: '${LOOM_DAEMON_BIN:-loom-daemon} forge verdict-gate' gave no answer (missing or older daemon?): ${VG_OUT:0:500}. An unrun gate is never a pass; roll loom-daemon / run ./.loom/scripts/resync-installed.sh." >&2; exit 7; }
      echo "post-verdict.sh: WARNING — verdict gate unavailable (${VG_OUT:0:200}); posting the changes-requested verdict anyway" >&2; forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
 esac
-VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }
-# Cross-host arbitration (#10581): the lock above orders callers on THIS host only.
-# Two hosts can both pass the gate read before either writes, so re-read the forge
-# now that both writes are visible and count same-head opposite-verdict markers
-# against what the gate saw. Changes-requested deterministically wins: an approval
-# that lost posts a superseding changes-requested marker and flips the labels.
-SEEN_OPP=0; [[ "$VG_OUT" =~ seen-opposite=([0-9]+) ]] && SEEN_OPP="${BASH_REMATCH[1]}"
-RC_RC=0; RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-reconcile "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --seen-opposite "$SEEN_OPP" 2>&1)" || RC_RC=$?
+# Cross-host arbitration (#10581), BEFORE any label moves: the lock above orders
+# callers on THIS host only, so two hosts can both pass the gate read before either
+# writes. Re-read the forge now that the writes are visible: changes-requested
+# beats an approval, and of two identical verdicts the lowest comment id stands
+# (the other withdraws its comment). An approval stays non-actionable (no loom:pr)
+# until this succeeds, so an unreadable arbitration never leaves one live.
+SEEN_OPP=0 SEEN_SAME=0; [[ "$VG_OUT" =~ seen-opposite=([0-9]+)\ seen-same-max-id=([0-9]+) ]] && SEEN_OPP="${BASH_REMATCH[1]}" SEEN_SAME="${BASH_REMATCH[2]}"
+RC_RC=0; RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-reconcile "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --seen-opposite "$SEEN_OPP" --seen-same-max-id "$SEEN_SAME" --nonce "$NONCE" 2>&1)" || RC_RC=$?
 case "$RC_RC:$RC_OUT" in
-  "0:LOOM-VERDICT-RECONCILE STABLE"*) ;;
-  "0:LOOM-VERDICT-RECONCILE PREVAILS"*) # a rival approval interleaved its labels with ours: re-assert changes-requested
-    "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" >/dev/null 2>&1 || { echo "post-verdict.sh: a rival approval landed at $SHA and the labels could not be re-asserted (#10581). Re-run: loom-daemon forge verdict-labels $PR --repo $REPO --verdict $VERDICT" >&2; exit 8; } ;;
+  "0:LOOM-VERDICT-RECONCILE STABLE"*|"0:LOOM-VERDICT-RECONCILE PREVAILS"*) ;; # PREVAILS: our labels below win over a rival approval's
+  "12:LOOM-VERDICT-RECONCILE DUPLICATE"*) echo "post-verdict.sh: an identical $VERDICT verdict landed first on PR #$PR at $SHA; this duplicate comment was withdrawn and no labels were touched (#10581): $RC_OUT" >&2; exit 0 ;;
   "11:LOOM-VERDICT-RECONCILE SUPERSEDED"*)
     forge_gh_comment_rl_safe "$REPO" "$PR" "**Approval superseded (#10581)** — $RC_OUT. A changes-requested verdict at this same head landed concurrently from another Judge; changes-requested wins. Read it, and re-review after the next push.
 
 <!-- loom:verdict-sha sha=$SHA verdict=changes-requested -->" 1 || true
     "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict changes-requested >/dev/null 2>&1 || echo "post-verdict.sh: could not flip the labels; run: loom-daemon forge verdict-labels $PR --repo $REPO --verdict changes-requested" >&2
     echo "post-verdict.sh: the approval on PR #$PR was SUPERSEDED by a concurrent changes-requested verdict at the same head; it does not stand: $RC_OUT" >&2; exit 7 ;;
-  *) printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but the cross-host reconcile could not confirm no rival verdict landed (#10581): %s\nRe-run: loom-daemon forge verdict-reconcile %s --repo %s --verdict %s --sha %s --seen-opposite %s\n' "$VERDICT" "$PR" "${RC_OUT:0:300}" "$PR" "$REPO" "$VERDICT" "$SHA" "$SEEN_OPP" >&2; exit 8 ;;
+  *) printf 'post-verdict.sh: %s verdict on PR #%s posted, but the cross-host reconcile was unconfirmed (#10581): %s\n' "$VERDICT" "$PR" "${RC_OUT:0:300}" >&2
+     [[ "$VERDICT" == "approved" ]] && { echo "The approval is NOT live (no loom:pr applied). Re-run this command; the gate dedupes the comment and retries the arbitration." >&2; exit 8; } ;; # changes-requested: labels below, the safe side
 esac
+VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }

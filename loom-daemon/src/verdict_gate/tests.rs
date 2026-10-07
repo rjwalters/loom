@@ -205,10 +205,10 @@ fn two_callers_that_both_passed_the_gate_converge_on_changes_requested() {
         comment(HEAD, "approved", "2026-10-06T13:46:00Z"),
         comment(HEAD, "changes-requested", "2026-10-06T13:46:01Z"),
     ];
-    let approver = reconcile(VerdictKind::Approved, HEAD, 0, Some(&both));
+    let approver = reconcile(VerdictKind::Approved, HEAD, 0, 0, "", Some(&both));
     assert!(matches!(approver, Reconciled::Superseded(_)), "{approver:?}");
     assert_eq!(approver.render().1, EXIT_SUPERSEDED);
-    let rejecter = reconcile(VerdictKind::ChangesRequested, HEAD, 0, Some(&both));
+    let rejecter = reconcile(VerdictKind::ChangesRequested, HEAD, 0, 0, "", Some(&both));
     assert!(matches!(rejecter, Reconciled::Prevails(_)), "{rejecter:?}");
     assert_eq!(rejecter.render().1, 0);
 }
@@ -219,11 +219,11 @@ fn two_callers_that_both_passed_the_gate_converge_on_changes_requested() {
 fn the_earlier_writer_may_miss_its_rival_and_the_later_one_still_arbitrates() {
     let only_approval = vec![comment(HEAD, "approved", "2026-10-06T13:46:00Z")];
     assert_eq!(
-        reconcile(VerdictKind::Approved, HEAD, 0, Some(&only_approval)),
+        reconcile(VerdictKind::Approved, HEAD, 0, 0, "", Some(&only_approval)),
         Reconciled::Stable
     );
     assert!(matches!(
-        reconcile(VerdictKind::ChangesRequested, HEAD, 0, Some(&only_approval)),
+        reconcile(VerdictKind::ChangesRequested, HEAD, 0, 0, "", Some(&only_approval)),
         Reconciled::Prevails(_)
     ));
 }
@@ -235,15 +235,71 @@ fn an_opposite_marker_the_gate_already_saw_is_not_a_race() {
         comment(HEAD, "changes-requested", "2026-10-06T13:00:00Z"),
         comment(HEAD, "approved", "2026-10-06T13:46:00Z"),
     ];
-    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 1, Some(&cs)), Reconciled::Stable);
+    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 1, 0, "", Some(&cs)), Reconciled::Stable);
     // Another head's verdicts are irrelevant.
     let other = vec![comment(OTHER, "changes-requested", "2026-10-06T13:46:00Z")];
-    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 0, Some(&other)), Reconciled::Stable);
+    assert_eq!(
+        reconcile(VerdictKind::Approved, HEAD, 0, 0, "", Some(&other)),
+        Reconciled::Stable
+    );
 }
 
 #[test]
 fn an_unread_reconcile_is_never_stable() {
-    let r = reconcile(VerdictKind::Approved, HEAD, 0, None);
+    let r = reconcile(VerdictKind::Approved, HEAD, 0, 0, "", None);
     assert_eq!(r, Reconciled::Unread);
     assert_ne!(r.render().1, 0);
+}
+
+fn with_id(mut c: Value, id: u64, nonce: &str) -> Value {
+    c["id"] = json!(id);
+    let body = format!("{}\n<!-- loom:verdict-nonce={nonce} -->", c["body"].as_str().unwrap());
+    c["body"] = json!(body);
+    c
+}
+
+/// Two hosts both gate against an empty comment list, both post the same
+/// verdict, and both re-read: exactly one of them (the lower comment id) stands.
+#[test]
+fn identical_verdicts_that_both_passed_the_gate_arbitrate_by_lowest_id() {
+    for verdict in ["approved", "changes-requested"] {
+        let kind = parse_verdict(verdict).unwrap();
+        let both = vec![
+            with_id(comment(HEAD, verdict, "2026-10-06T13:46:00Z"), 100, "host-a"),
+            with_id(comment(HEAD, verdict, "2026-10-06T13:46:01Z"), 101, "host-b"),
+        ];
+        assert_eq!(reconcile(kind, HEAD, 0, 0, "host-a", Some(&both)), Reconciled::Stable);
+        let loser = reconcile(kind, HEAD, 0, 0, "host-b", Some(&both));
+        assert_eq!(loser, Reconciled::Duplicate(101));
+        assert_eq!(loser.render().1, EXIT_DUPLICATE);
+        // The earlier host re-reading late (after the loser withdrew) is still stable.
+        assert_eq!(reconcile(kind, HEAD, 0, 0, "host-a", Some(&both[..1])), Reconciled::Stable);
+    }
+}
+
+/// An identical marker the gate already saw is a deliberate re-review, not a race.
+#[test]
+fn an_identical_marker_the_gate_already_saw_is_not_a_duplicate() {
+    let cs = vec![
+        with_id(comment(HEAD, "approved", "2026-10-06T12:00:00Z"), 90, "old"),
+        with_id(comment(HEAD, "approved", "2026-10-06T13:46:00Z"), 100, "mine"),
+    ];
+    assert_eq!(
+        reconcile(VerdictKind::Approved, HEAD, 0, 90, "mine", Some(&cs)),
+        Reconciled::Stable
+    );
+}
+
+#[test]
+fn a_posted_verdict_missing_from_the_reread_is_unread_and_a_deduped_caller_is_stable() {
+    let cs = vec![with_id(
+        comment(HEAD, "approved", "2026-10-06T13:46:00Z"),
+        100,
+        "other",
+    )];
+    assert_eq!(
+        reconcile(VerdictKind::Approved, HEAD, 0, 0, "mine", Some(&cs)),
+        Reconciled::Unread
+    );
+    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 0, 0, "", Some(&cs)), Reconciled::Stable);
 }

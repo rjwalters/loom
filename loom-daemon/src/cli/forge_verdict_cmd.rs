@@ -63,7 +63,10 @@ pub(crate) fn verdict_gate(
     let seen = comments
         .as_deref()
         .map_or(0, |c| gate::count_markers(c, sha, opposite_of(kind)));
-    println!("{line} seen-opposite={seen}");
+    let seen_same = comments
+        .as_deref()
+        .map_or(0, |c| gate::max_marker_id(c, sha, kind));
+    println!("{line} seen-opposite={seen} seen-same-max-id={seen_same}");
     std::process::exit(code)
 }
 
@@ -83,6 +86,8 @@ pub(crate) fn verdict_reconcile(
     verdict: &str,
     sha: &str,
     seen_opposite: usize,
+    seen_same_max_id: u64,
+    nonce: &str,
 ) -> Result<()> {
     let kind = verdict_or_exit("verdict-reconcile", verdict);
     let root = super::forge_identity_cmd::workspace();
@@ -92,7 +97,25 @@ pub(crate) fn verdict_reconcile(
         &root,
         false,
     );
-    let (line, code) = gate::reconcile(kind, sha, seen_opposite, comments.as_deref()).render();
+    let outcome =
+        gate::reconcile(kind, sha, seen_opposite, seen_same_max_id, nonce, comments.as_deref());
+    // The loser of an identical-verdict race withdraws its own comment, so
+    // exactly one stands. A failed delete is an unconfirmed state, not a pass.
+    if let gate::Reconciled::Duplicate(id) = &outcome {
+        let path = format!("repos/{repo}/issues/comments/{id}");
+        let deleted =
+            loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
+                .ok_output()
+                .is_some();
+        if !deleted {
+            println!(
+                "{} UNREAD duplicate comment {id} could not be withdrawn",
+                gate::RECONCILE_SENTINEL
+            );
+            std::process::exit(1)
+        }
+    }
+    let (line, code) = outcome.render();
     println!("{line}");
     std::process::exit(code)
 }

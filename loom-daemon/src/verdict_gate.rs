@@ -65,6 +65,10 @@ pub const RECONCILE_SENTINEL: &str = "LOOM-VERDICT-RECONCILE";
 /// Exit code for a reconcile that found the caller's approval superseded.
 pub const EXIT_SUPERSEDED: i32 = 11;
 
+/// Exit code for a reconcile that found this caller's verdict a concurrent
+/// duplicate of an earlier identical one (its own comment is to be withdrawn).
+pub const EXIT_DUPLICATE: i32 = 12;
+
 /// A `<!-- loom:verdict-sha ... -->` marker read back from a comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorMarker {
@@ -170,6 +174,39 @@ pub fn count_markers(records: &[Value], sha: &str, verdict: VerdictKind) -> usiz
         .count()
 }
 
+/// Every `(comment id, verdict-marker count)` for `sha` and `verdict`: the ids
+/// of the trusted comments carrying such a marker. Ids order comments across
+/// hosts with no clock involved.
+#[must_use]
+pub fn marker_ids(records: &[Value], sha: &str, verdict: VerdictKind) -> Vec<u64> {
+    let Ok(re) = regex::Regex::new(
+        r"<!-- loom:verdict-sha sha=([0-9a-f]{7,40}) verdict=(approved|changes-requested) -->",
+    ) else {
+        return Vec::new();
+    };
+    records
+        .iter()
+        .filter(|r| {
+            r.get("body").and_then(Value::as_str).is_some_and(|b| {
+                re.captures_iter(b)
+                    .any(|c| same_sha(&c[1], sha) && parse_verdict(&c[2]) == Some(verdict))
+            })
+        })
+        .filter_map(|r| r.get("id").and_then(Value::as_u64))
+        .collect()
+}
+
+/// The newest comment id among `marker_ids` (0 when there is none): what a
+/// caller's gate read saw, so a later identical verdict is recognisably
+/// concurrent.
+#[must_use]
+pub fn max_marker_id(records: &[Value], sha: &str, verdict: VerdictKind) -> u64 {
+    marker_ids(records, sha, verdict)
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+}
+
 /// What a caller's post-write re-read concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconciled {
@@ -182,6 +219,11 @@ pub enum Reconciled {
     /// This caller posted changes-requested and a rival approval landed after
     /// its gate read: changes-requested wins; re-assert its labels.
     Prevails(String),
+    /// An identical verdict from another caller landed at the same head after
+    /// this caller's gate read, with a lower comment id: it stands, and this
+    /// caller's own comment (the carried id) is withdrawn. Nobody applies
+    /// labels for the loser.
+    Duplicate(u64),
     /// The re-read failed. Never treated as stable.
     Unread,
 }
@@ -196,6 +238,12 @@ impl Reconciled {
             Self::Superseded(m) => {
                 (format!("{RECONCILE_SENTINEL} SUPERSEDED {m}"), EXIT_SUPERSEDED)
             }
+            Self::Duplicate(id) => (
+                format!(
+                    "{RECONCILE_SENTINEL} DUPLICATE comment={id} an identical verdict landed first"
+                ),
+                EXIT_DUPLICATE,
+            ),
             Self::Unread => {
                 (format!("{RECONCILE_SENTINEL} UNREAD the PR's comments could not be re-read"), 1)
             }
@@ -203,18 +251,25 @@ impl Reconciled {
     }
 }
 
-/// Arbitrate two verdicts at one head that both passed their gate read before
+/// Arbitrate verdicts at one head that both passed their gate read before
 /// either wrote (two hosts share no lock). `seen_opposite` is the number of
 /// opposite-verdict same-head markers the caller's gate saw; any extra now
-/// arrived concurrently. Deterministic: changes-requested wins, so whichever
-/// order the writes interleave, every caller converges on the same outcome.
-/// Each caller writes before it re-reads, so at least one of two racing
-/// callers sees the other.
+/// arrived concurrently. Deterministic: changes-requested wins over approval,
+/// and among identical verdicts the lowest comment id wins, so whichever order
+/// the writes interleave, every caller converges on the same outcome. Each
+/// caller writes before it re-reads, so at least one of two racing callers
+/// sees the other.
+///
+/// `own_nonce` is the token this caller put in its comment (empty when it
+/// posted nothing, e.g. a deduped caller); `seen_same_max_id` is the newest
+/// same-verdict marker id the gate saw (0 for none).
 #[must_use]
 pub fn reconcile(
     verdict: VerdictKind,
     sha: &str,
     seen_opposite: usize,
+    seen_same_max_id: u64,
+    own_nonce: &str,
     comments: Option<&[Value]>,
 ) -> Reconciled {
     let Some(comments) = comments else {
@@ -225,17 +280,40 @@ pub fn reconcile(
         VerdictKind::ChangesRequested => VerdictKind::Approved,
     };
     let now = count_markers(comments, sha, opposite);
-    if now <= seen_opposite {
+    if now > seen_opposite {
+        let msg = format!(
+            "{} concurrent {} verdict(s) landed at {sha} after the gate read",
+            now - seen_opposite,
+            opposite.marker_token()
+        );
+        return match verdict {
+            VerdictKind::Approved => Reconciled::Superseded(msg),
+            VerdictKind::ChangesRequested => Reconciled::Prevails(msg),
+        };
+    }
+    if own_nonce.is_empty() {
         return Reconciled::Stable;
     }
-    let msg = format!(
-        "{} concurrent {} verdict(s) landed at {sha} after the gate read",
-        now - seen_opposite,
-        opposite.marker_token()
-    );
-    match verdict {
-        VerdictKind::Approved => Reconciled::Superseded(msg),
-        VerdictKind::ChangesRequested => Reconciled::Prevails(msg),
+    let own = comments
+        .iter()
+        .filter(|r| {
+            r.get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|b| b.contains(own_nonce))
+        })
+        .filter_map(|r| r.get("id").and_then(Value::as_u64))
+        .min();
+    let Some(own) = own else {
+        // Posted but not found in the re-read: arbitration is impossible.
+        return Reconciled::Unread;
+    };
+    let rival_first = marker_ids(comments, sha, verdict)
+        .into_iter()
+        .any(|id| id > seen_same_max_id && id < own);
+    if rival_first {
+        Reconciled::Duplicate(own)
+    } else {
+        Reconciled::Stable
     }
 }
 

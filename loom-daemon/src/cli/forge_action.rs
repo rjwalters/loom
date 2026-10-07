@@ -626,8 +626,10 @@ pub(crate) enum ForgeAction {
     /// re-reads: if more opposite-verdict same-head markers exist than its gate
     /// saw (`seen-opposite=N` on the gate line), a rival landed concurrently.
     /// Changes-requested wins. Prints `LOOM-VERDICT-RECONCILE
-    /// STABLE|PREVAILS|SUPERSEDED|UNREAD`; exits 0, 0, 11 (an approval that
-    /// lost: post a superseding marker, flip the labels) or 1.
+    /// STABLE|PREVAILS|SUPERSEDED|DUPLICATE|UNREAD`; exits 0, 0, 11 (an approval
+    /// that lost: post a superseding marker, flip the labels), 12 (an identical
+    /// concurrent verdict with a lower comment id exists: this caller's own
+    /// comment was withdrawn, apply no labels) or 1.
     #[command(name = "verdict-reconcile")]
     VerdictReconcile {
         /// The PR number.
@@ -644,6 +646,14 @@ pub(crate) enum ForgeAction {
         /// Opposite-verdict same-head markers the gate read saw.
         #[arg(long, default_value_t = 0)]
         seen_opposite: usize,
+        /// Newest same-verdict same-head marker comment id the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_same_max_id: u64,
+        /// The token this caller put in its own comment (empty: it posted
+        /// nothing). Lets an identical concurrent verdict be arbitrated: the
+        /// lowest comment id stands, the other withdraws (exit 12).
+        #[arg(long, default_value = "")]
+        nonce: String,
     },
 
     /// `forge verdict-lock acquire|release <pr> --repo R` (#10581) — the
@@ -900,6 +910,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             verdict,
             sha,
             seen_opposite,
+            seen_same_max_id,
+            nonce,
         } => {
             return super::forge_verdict_cmd::verdict_reconcile(
                 pr,
@@ -907,6 +919,8 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &verdict,
                 &sha,
                 seen_opposite,
+                seen_same_max_id,
+                &nonce,
             );
         }
         ForgeAction::VerdictLabels { pr, repo, verdict } => {

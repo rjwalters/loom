@@ -605,7 +605,7 @@ reset_state
 echo "0 LOOM-VERDICT-GATE PROCEED overruling the changes-requested verdict seen-opposite=2" > "$STUB_DIR/gate-answer"
 run_pv 320 approved abc1234 --body "ok" --overrules-prior "each prior point was fixed in the follow-up commit"
 assert_eq "0" "$EXIT_CODE" "reconcile STABLE -> exit 0"
-assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-reconcile 320 --repo owner/repo --verdict approved --sha abc1234 --seen-opposite 2" "reconcile runs after the labels with the gate's count"
+assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-reconcile 320 --repo owner/repo --verdict approved --sha abc1234 --seen-opposite 2 --seen-same-max-id 0 --nonce" "reconcile runs with the gate's counts"
 
 # An approval that lost the race: superseding changes-requested marker, flipped
 # labels, exit 7.
@@ -617,19 +617,37 @@ assert_contains "$OUTPUT" "SUPERSEDED" "the loss is announced"
 assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-labels 321 --repo owner/repo --verdict changes-requested" "labels flipped to changes-requested"
 assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=changes-requested" "a superseding changes-requested marker is posted"
 
+# The reconcile runs BEFORE the labels: an approval is never live while arbitration is pending.
+CALLS="$(cat "$STUB_DIR/daemon-calls.log")"
+assert_eq "yes" "$([[ "${CALLS%%forge verdict-labels*}" == *"forge verdict-reconcile"* ]] && echo yes || echo no)" "reconcile precedes verdict-labels"
+
 # A changes-requested that prevails re-asserts its own labels.
 reset_state
 echo "0 LOOM-VERDICT-RECONCILE PREVAILS 1 concurrent approved verdict(s) landed" > "$STUB_DIR/reconcile-answer"
 run_pv 322 changes-requested abc1234 --body "fix"
 assert_eq "0" "$EXIT_CODE" "changes-requested prevails -> exit 0"
-assert_eq "2" "$(grep -c 'forge verdict-labels 322 --repo owner/repo --verdict changes-requested' "$STUB_DIR/daemon-calls.log")" "labels asserted again after the rival interleaved"
+assert_eq "1" "$(grep -c 'forge verdict-labels 322 --repo owner/repo --verdict changes-requested' "$STUB_DIR/daemon-calls.log")" "prevailing changes-requested applies its labels once, after the reconcile"
 
 # An unreadable / unavailable reconcile is never silent.
 reset_state
 echo "1 LOOM-VERDICT-RECONCILE UNREAD the PR's comments could not be re-read" > "$STUB_DIR/reconcile-answer"
 run_pv 323 approved abc1234 --body "ok"
 assert_eq "8" "$EXIT_CODE" "unread reconcile -> exit 8"
-assert_contains "$OUTPUT" "forge verdict-reconcile 323 --repo owner/repo --verdict approved --sha abc1234" "re-run command is printed"
+assert_contains "$OUTPUT" "NOT live" "unread approval is announced as not live"
+assert_eq "0" "$(grep -c 'forge verdict-labels 323' "$STUB_DIR/daemon-calls.log")" "unread reconcile: NO label call, so loom:pr is never applied (final state, not just exit code)"
+
+# An unread changes-requested still applies its (safe) labels.
+reset_state
+echo "1 LOOM-VERDICT-RECONCILE UNREAD x" > "$STUB_DIR/reconcile-answer"
+run_pv 324 changes-requested abc1234 --body "fix"
+assert_eq "1" "$(grep -c 'forge verdict-labels 324 --repo owner/repo --verdict changes-requested' "$STUB_DIR/daemon-calls.log")" "unread reconcile: changes-requested labels still applied"
+
+# An identical verdict that lost the lowest-id race: comment withdrawn by the verb, NO labels touched.
+reset_state
+echo "12 LOOM-VERDICT-RECONCILE DUPLICATE comment=7 an identical verdict landed first" > "$STUB_DIR/reconcile-answer"
+run_pv 325 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "duplicate loser -> exit 0"
+assert_eq "0" "$(grep -c 'forge verdict-labels 325' "$STUB_DIR/daemon-calls.log")" "duplicate loser applies no labels (the winner owns them)"
 
 # --- Summary ---
 echo ""
