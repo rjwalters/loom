@@ -1791,22 +1791,19 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
 ## Revising `loom:needs-revision` (#10753)
 
 Champion adds `loom:needs-revision` with a NEEDS REVISION verdict an agent can
-close; its discovery skips the label. Claim it
-(`loom:curating`) and read the latest trusted `Champion Review: NEEDS
-REVISION` comment: its first bullet list is the findings. Then do one of these:
+close. Claim it (`loom:curating`), read the latest trusted `Champion Review:
+NEEDS REVISION` comment (its first bullet list is the findings), then:
 
-- **Revise** (the normal case). Edit the body; never only comment, because a
-  comment leaves the body hash unchanged and Champion re-rejects the same text.
-  Fix each finding (verify facts against `origin/main`) or refute it with
-  evidence, and append a dated `## Revision` section answering each finding by
-  name. Then remove `loom:needs-revision` and `loom:curating` in one edit
+- **Revise** (the normal case). Edit the body, never only comment: that leaves the body
+  hash unchanged and Champion re-rejects the same text. Fix each finding
+  (verify facts against `origin/main`) or refute it with evidence, and append a
+  dated `## Revision` section answering each by name. Then remove `loom:needs-revision` and `loom:curating` in one edit
   (`loom:curated` stays).
 - **Split** an oversized issue per "Decomposing Oversized Issues", then park
   the parent on its children so it never returns to Champion as a tracker:
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
   curator --remove-label loom:needs-revision --remove-label loom:curating`.
-- **Close** an obsolete, duplicate or wrong-approach issue ("Issues Are
-  Suggestions").
+- **Close** an obsolete, duplicate or wrong-approach issue.
 - **A real PO-level call** no revision settles: `loom-daemon operator-decision
   apply` with 2-4 ranked options (`.loom/docs/operator-decision.md`), then
   remove the label.
