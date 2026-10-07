@@ -3306,7 +3306,14 @@ pub fn spawn_multi_work_finder_task(
             publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
             // #10630 Slice 1: shadow per-repo balance allocation — one log line
             // per tick when `autonomous.balance.enabled`; changes no admission.
-            balance::shadow_tick(&fallback_root, &roots, &report.queue, &halted, max_concurrent);
+            balance::shadow_tick(
+                &fallback_root,
+                &roots,
+                &report.queue,
+                &halted,
+                &report.listing_failed,
+                max_concurrent,
+            );
 
             if report.halted && !was_halted {
                 // #9591: name the hold(s) actually active — a drain is not a red main.

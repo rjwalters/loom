@@ -293,9 +293,42 @@ fn queue_counts_ready_and_building_per_root() {
         row(2, 6, Some(Qd::WorkspaceHalted)),
         row(9, 7, Some(Qd::Dispatched)),
     ];
-    let counts = queue_counts(&queue, 3, &[false, false, true]);
+    let counts = queue_counts(&queue, 3, &[false, false, true], &[]);
     // A halted root admits nothing: ready is a known zero, building unobserved.
     assert_eq!(counts, vec![(Some(2), Some(1)), (Some(1), Some(0)), (Some(0), None)]);
+}
+
+#[test]
+fn failed_listing_stays_unobserved_and_gets_the_builder_floor() {
+    // Root 0: listing failed (no rows). Root 1: listed successfully, empty.
+    // Root 2: halted (listing also failed, but halt is a known zero by policy).
+    let counts = queue_counts(&[], 3, &[false, false, true], &[0, 2]);
+    assert_eq!(counts, vec![(None, None), (Some(0), Some(0)), (Some(0), None)]);
+
+    let ledger = DemandLedger::default();
+    let (a, b) = (root("a"), root("b"));
+    for r in [&a, &b] {
+        ledger.record(r, DebtAxis::Review, 0);
+        ledger.record(r, DebtAxis::Changes, 0);
+        ledger.record(r, DebtAxis::Merge, 0);
+    }
+    let enabled = BalanceConfig {
+        enabled: true,
+        ..BalanceConfig::default()
+    };
+    let allocs = shadow_allocation(
+        &enabled,
+        &DemandConfig::default(),
+        &ledger,
+        &[a, b],
+        &[],
+        &[false, false],
+        &[0],
+        4,
+    )
+    .unwrap();
+    assert_eq!(slots(&allocs, "a", "builder"), 1, "failed listing -> unobserved floor");
+    assert_eq!(slots(&allocs, "b", "builder"), 0, "successful empty listing -> no ready issues");
 }
 
 #[test]
@@ -335,6 +368,7 @@ fn disabled_computes_nothing_and_reads_no_ledger() {
         &roots,
         &[],
         &[false],
+        &[],
         10,
     );
     assert!(out.is_none());
@@ -364,6 +398,7 @@ fn enabled_reads_each_repo_debt_from_the_ledger() {
         &roots,
         &queue,
         &[false, false],
+        &[],
         6,
     )
     .unwrap();

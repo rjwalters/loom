@@ -21,7 +21,8 @@
 //!   repo's **fresh** demand-ledger totals ([`DemandLedger::repo_debt`]);
 //!   ready / building come from the work finder's own tick queue (rows it has
 //!   already listed — [`queue_counts`]; a halted repo reads ready as a known
-//!   zero). No forge call is added. `None` is an
+//!   zero, a repo whose listing failed reads both as unobserved). No forge
+//!   call is added. `None` is an
 //!   unobserved axis and **fails open**: the role gets a one-slot floor, never
 //!   zero for lack of data.
 //! - **Allocation** ([`allocate`]). Champion first: every repo with merge
@@ -442,12 +443,15 @@ pub fn allocate(
 /// `(ready, building)` per root from the work finder's tick queue — rows it
 /// already listed, so no forge call. A halted root admits nothing, so its
 /// ready count is a known zero (not a fail-open floor); its building count
-/// is unobserved (`None`).
+/// is unobserved (`None`). A non-halted root whose listing failed
+/// (`listing_failed`) left no rows, which is not an empty backlog: both counts
+/// stay unobserved (`None`) so the allocator applies its fail-open floor.
 #[must_use]
 pub fn queue_counts(
     queue: &[TickQueueRow],
     roots: usize,
     halted: &[bool],
+    listing_failed: &[usize],
 ) -> Vec<(Option<usize>, Option<usize>)> {
     let mut ready = vec![0usize; roots];
     let mut building = vec![0usize; roots];
@@ -474,6 +478,8 @@ pub fn queue_counts(
         .map(|i| {
             if halted.get(i).copied().unwrap_or(false) {
                 (Some(0), None)
+            } else if listing_failed.contains(&i) {
+                (None, None)
             } else {
                 (Some(ready[i]), Some(building[i]))
             }
@@ -484,6 +490,7 @@ pub fn queue_counts(
 /// The shadow allocation for one tick, or `None` when `balance` is disabled —
 /// in which case nothing is read (not even the ledger).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn shadow_allocation(
     balance: &BalanceConfig,
     demand_cfg: &DemandConfig,
@@ -491,12 +498,13 @@ pub fn shadow_allocation(
     roots: &[PathBuf],
     queue: &[TickQueueRow],
     halted: &[bool],
+    listing_failed: &[usize],
     host_budget: usize,
 ) -> Option<Vec<Allocation>> {
     if !balance.enabled {
         return None;
     }
-    let counts = queue_counts(queue, roots.len(), halted);
+    let counts = queue_counts(queue, roots.len(), halted, listing_failed);
     let repos: Vec<(PathBuf, RepoPipeline)> = roots
         .iter()
         .zip(counts)
@@ -544,6 +552,7 @@ pub fn shadow_tick(
     roots: &[PathBuf],
     queue: &[TickQueueRow],
     halted: &[bool],
+    listing_failed: &[usize],
     sweep_cap: usize,
 ) {
     let balance = BalanceConfig::read(primary);
@@ -553,9 +562,16 @@ pub fn shadow_tick(
     let budget = sweep_cap + super::resolve_max_concurrent_for(primary);
     let demand_cfg = demand::read_demand_config(primary);
     let ledger = demand::global();
-    if let Some(allocs) =
-        shadow_allocation(&balance, &demand_cfg, ledger, roots, queue, halted, budget)
-    {
+    if let Some(allocs) = shadow_allocation(
+        &balance,
+        &demand_cfg,
+        ledger,
+        roots,
+        queue,
+        halted,
+        listing_failed,
+        budget,
+    ) {
         log::info!("{}", log_line(&allocs, budget, balance.review_weight));
     }
 }
