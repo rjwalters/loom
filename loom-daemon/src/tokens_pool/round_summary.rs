@@ -51,6 +51,10 @@ pub struct RoundTrace {
     monitor_served: Cell<bool>,
     /// Accounts a request was sent for, with the credential kind it used.
     probed: RefCell<BTreeMap<String, CredentialKind>>,
+    /// The status each probe actually returned, by account. Kept apart from
+    /// the report because a monitor re-probe that errors leaves the ranking row
+    /// as it was, so the report alone cannot say what the probe saw.
+    results: RefCell<BTreeMap<String, String>>,
     /// Every account the run looked at, with its provider.
     seen: RefCell<BTreeMap<String, AccountProvider>>,
 }
@@ -64,6 +68,13 @@ impl RoundTrace {
                 .borrow_mut()
                 .insert(name.to_string(), CredentialKind::of_token(token));
         }
+    }
+
+    /// Record the status the probe for `name` returned.
+    pub fn record_result(&self, name: &str, status: &str) {
+        self.results
+            .borrow_mut()
+            .insert(name.to_string(), status.to_string());
     }
 
     /// A fresh claude-monitor `ranking.json` served the report.
@@ -126,6 +137,7 @@ pub fn summarize(tokens_dir: &Path, report: &ProbeReport, trace: &RoundTrace) ->
     let monitor = trace.monitor_served.get();
     let probed = trace.probed.borrow();
     let seen = trace.seen.borrow();
+    let results = trace.results.borrow();
     let accounts = report
         .accounts
         .iter()
@@ -134,7 +146,10 @@ pub fn summarize(tokens_dir: &Path, report: &ProbeReport, trace: &RoundTrace) ->
             let outcome = if monitor && provider.is_none() {
                 AccountOutcome::SkippedFresh
             } else {
-                AccountOutcome::from_status(&a.status)
+                // A request that was sent reports what it returned, not the
+                // (possibly conservatively kept) ranking status.
+                let status = results.get(&a.name).unwrap_or(&a.status);
+                AccountOutcome::from_status(status)
             };
             let provider = provider.unwrap_or(AccountProvider::Claude);
             let credential_kind = match probed.get(&a.name) {

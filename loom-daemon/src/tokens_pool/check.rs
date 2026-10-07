@@ -1119,6 +1119,7 @@ impl OverdueReprobe<'_> {
             self.transport,
             blocking.as_ref(),
         );
+        self.trace.record_result(name, &result.status);
         // A 401 here is the whole point of the re-probe: the account was
         // never quota-exhausted, its credential was revoked. Record it so the
         // knowledge outlives this process — `.ranking` is rewritten every 10
@@ -1227,7 +1228,7 @@ pub fn run_check_traced(
             None
         };
         trace.record(name, token, *provider);
-        results.push(dispatch_probe(
+        let result = dispatch_probe(
             name,
             token,
             *provider,
@@ -1236,7 +1237,9 @@ pub fn run_check_traced(
             DEFAULT_TIMEOUT_SECONDS,
             transport,
             blocking.as_ref(),
-        ));
+        );
+        trace.record_result(name, &result.status);
+        results.push(result);
     }
 
     let report = build_report(results);

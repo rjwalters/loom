@@ -229,6 +229,19 @@ fn an_overdue_monitor_row_that_is_reprobed_counts_as_probed() {
 
 #[test]
 #[serial_test::serial]
+fn an_overdue_monitor_row_whose_reprobe_errors_reports_error_but_stays_exhausted() {
+    let (summary, requests) = monitor_run(-8, &[500]);
+    assert_eq!(requests, 1);
+    let m = entry(&summary, "acct-m");
+    assert_eq!(
+        (m.outcome, m.probed, m.status.as_str()),
+        (AccountOutcome::Error, true, "exhausted")
+    );
+    assert_eq!(summary.probed_count(), 1);
+}
+
+#[test]
+#[serial_test::serial]
 fn the_summary_file_is_written_only_when_requested_and_reads_back() {
     let tmp = tempfile::tempdir().unwrap();
     probe_pool(tmp.path());
