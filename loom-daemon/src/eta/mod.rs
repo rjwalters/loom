@@ -140,6 +140,7 @@ pub mod offline;
 pub mod point_in_time;
 pub mod pr_features;
 pub(crate) mod pr_features_forge;
+pub mod pr_file_log;
 pub mod priority_features;
 pub mod priority_inputs;
 pub mod queue_features;

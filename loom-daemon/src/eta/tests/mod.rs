@@ -44,6 +44,7 @@ mod loop_kite;
 mod merge_hold;
 mod offline;
 mod point_in_time;
+mod pr_file_log;
 mod primitives;
 mod priority_features;
 mod priority_inputs;

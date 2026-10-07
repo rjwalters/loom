@@ -72,6 +72,8 @@ fn snap(pr: u32, known: f64, files: &[&str]) -> FileSnapshot {
         pr,
         known_at: at(known),
         files: files.iter().map(|f| (*f).to_string()).collect(),
+        head_sha: None,
+        complete: true,
     }
 }
 
@@ -395,4 +397,113 @@ fn a_future_label_event_changes_no_row_at_t() {
 
 fn t_plus(x: f64) -> f64 {
     10.0 + x
+}
+
+// -- logged file lists (#10550) ---------------------------------------------
+
+fn lag() -> Duration {
+    Duration::seconds(crate::eta::fit::KNOWABLE_LAG_SEC)
+}
+
+/// Lists for #1 and #2 (both open around 10 h) known well before every row
+/// the tests look at, sharing `a.rs`; #90 is landed, so not a peer.
+fn logged() -> Vec<FileSnapshot> {
+    vec![
+        snap(1, 2.5, &["a.rs", "b.rs"]),
+        snap(2, 2.5, &["a.rs", "c.rs"]),
+        snap(90, 2.5, &["a.rs"]),
+    ]
+}
+
+#[test]
+fn fit_rows_and_serving_read_the_logged_file_lists_alike() {
+    let snaps = fleet();
+    let files = logged();
+    let a = rows::build_with_files(&snaps, cutoff(), None, None, Some(&files));
+    let t = h(10.0);
+    let i = a
+        .row_keys
+        .iter()
+        .position(|k| k.at == t && k.pr == 1 && k.repo == REPO)
+        .expect("row for #1");
+    assert_eq!(a.loops[i].overlap_prs, Some(1));
+    assert_eq!(a.loops[i].overlap_files, Some(1));
+    // Without the log the same row is unknown, never "no overlap".
+    let none = rows::build(&snaps, cutoff());
+    assert!(none.loops[i].overlap_prs.is_none());
+    assert_eq!(a.rows.len(), none.rows.len());
+
+    let mut tracker = Tracker::new(provenance());
+    tracker.on_fleet_snapshots(&snaps, t);
+    tracker.set_file_snapshots(Some(files));
+    for (k, l) in a.row_keys.iter().zip(&a.loops) {
+        assert_eq!(&tracker.loop_features_of(&k.repo, k.pr, k.at), l, "#{} at {}", k.pr, k.at);
+    }
+    let known = a.loops.iter().filter(|l| l.overlap_prs.is_some()).count();
+    assert!(known > 0, "some row must know its overlap");
+}
+
+#[test]
+fn a_file_list_read_after_a_row_changes_nothing_at_that_row() {
+    let snaps = fleet();
+    let base_files = logged();
+    let base = rows::build_with_files(&snaps, cutoff(), None, None, Some(&base_files));
+    // A late push by #2 that drops the shared path, logged after 9 h: rows whose cutoff (t - lag) is at or before then
+    // must not move.
+    let mut perturbed = base_files.clone();
+    perturbed.push(snap(2, 9.0, &["z.rs"]));
+    let after = rows::build_with_files(&snaps, cutoff(), None, None, Some(&perturbed));
+    assert_eq!(base.loops.len(), after.loops.len());
+    let mut compared = 0;
+    let mut moved = 0;
+    for ((k, b), a) in base.row_keys.iter().zip(&base.loops).zip(&after.loops) {
+        if k.at - lag() <= at(9.0) {
+            assert_eq!(b, a, "#{} at {} must not see a later list", k.pr, k.at);
+            compared += 1;
+        } else if b != a {
+            moved += 1;
+        }
+    }
+    assert!(compared > 0, "the test must cover rows before the perturbation");
+    assert!(moved > 0, "the perturbation must be visible to later rows");
+}
+
+#[test]
+fn a_peer_with_no_list_known_yet_makes_the_roster_unknown() {
+    let files = vec![snap(1, 2.5, &["a.rs"])];
+    let a = rows::build_with_files(&fleet(), cutoff(), None, None, Some(&files));
+    assert!(a.loops.iter().all(|l| l.overlap_prs.is_none()));
+}
+
+#[test]
+fn a_later_incomplete_read_stops_an_older_list_serving_in_fit_and_serving() {
+    let snaps = fleet();
+    let base_files = logged();
+    let base = rows::build_with_files(&snaps, cutoff(), None, None, Some(&base_files));
+    // #2 grew past one page at 9 h: its read is logged unknown, not its paths.
+    let mut grown = base_files.clone();
+    grown.push(FileSnapshot {
+        files: vec![],
+        complete: false,
+        ..snap(2, 9.0, &[])
+    });
+    let after = rows::build_with_files(&snaps, cutoff(), None, None, Some(&grown));
+    let mut before = 0;
+    let mut unknown = 0;
+    for ((k, b), a) in base.row_keys.iter().zip(&base.loops).zip(&after.loops) {
+        if k.at - lag() <= at(9.0) {
+            assert_eq!(b, a, "#{} at {} must not see the later read", k.pr, k.at);
+            before += 1;
+        } else if b.overlap_prs.is_some() {
+            assert!(a.overlap_prs.is_none(), "#{} at {} served a stale list", k.pr, k.at);
+            unknown += 1;
+        }
+    }
+    assert!(before > 0 && unknown > 0, "the test must cover both sides of the read");
+    let mut tracker = Tracker::new(provenance());
+    tracker.on_fleet_snapshots(&snaps, h(10.0));
+    tracker.set_file_snapshots(Some(grown));
+    for (k, l) in after.row_keys.iter().zip(&after.loops) {
+        assert_eq!(&tracker.loop_features_of(&k.repo, k.pr, k.at), l, "#{} at {}", k.pr, k.at);
+    }
 }

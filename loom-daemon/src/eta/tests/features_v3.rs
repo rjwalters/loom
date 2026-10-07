@@ -90,6 +90,8 @@ fn snap(pr: u32, known: DateTime<Utc>, files: &[&str]) -> FileSnapshot {
         pr,
         known_at: known,
         files: files.iter().map(|f| (*f).to_string()).collect(),
+        head_sha: None,
+        complete: true,
     }
 }
 
