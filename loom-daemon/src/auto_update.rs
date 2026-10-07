@@ -705,9 +705,11 @@ pub trait AutoUpdateProbe: Send {
     /// resolution failure at fetch time is a plain retryable failure, not a
     /// silent downgrade to a source build.
     ///
-    /// `low_priority` has the same meaning as on [`Self::rebuild`].
-    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
-        let _ = low_priority;
+    /// `tag` (#10709) is the release the verdict compared; the child installs
+    /// exactly it, never a newer one that appeared since. `low_priority` has
+    /// the same meaning as on [`Self::rebuild`].
+    fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
+        let _ = (tag, low_priority);
         RebuildOutcome::Retryable("this probe cannot fetch release artifacts".to_string())
     }
 
@@ -854,7 +856,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
         native_probe::native_resolution(&root)
     }
 
-    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
+    fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
         let Some(root) = self.script_root() else {
             return RebuildOutcome::Retryable(format!(
                 "{} — cannot fetch",
@@ -880,7 +882,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
             &root,
             self.timeout,
             low_priority,
-            &["--fetch"],
+            &native_probe::fetch_args(tag),
             repo.as_deref(),
         )
     }

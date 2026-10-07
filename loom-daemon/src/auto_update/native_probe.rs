@@ -45,6 +45,22 @@ pub(super) fn fetch_repo(root: &Path) -> Option<String> {
     resolve_repo(&env_inputs(root))
 }
 
+/// The update-script args for an artifact roll to `tag` (#10709).
+///
+/// `--tag` pins the child to the release the verdict compared, so a release
+/// published between the tick's resolution and the child's own lookup cannot
+/// be what gets installed. The script stub forwards every argument verbatim to
+/// `loom-daemon daemon-update`. An empty tag (an `ArtifactInfo` with no
+/// identity) degrades to the unpinned `--fetch` this path always passed.
+#[must_use]
+pub(super) fn fetch_args(tag: &str) -> Vec<&str> {
+    if tag.is_empty() {
+        vec!["--fetch"]
+    } else {
+        vec!["--fetch", "--tag", tag]
+    }
+}
+
 /// Resolve the latest artifact for this host.
 ///
 /// The field mapping is total rather than defaulted: an `Option` that arrives
@@ -157,6 +173,13 @@ mod tests {
             assert_eq!(artifact_fetch_disabled(), want, "{v:?}");
         }
         unsafe { std::env::remove_var("LOOM_DAEMON_UPDATE_FETCH") };
+    }
+
+    #[test]
+    fn the_fetch_args_pin_the_verdicts_tag_and_are_unchanged_without_one() {
+        assert_eq!(fetch_args("v0.19.831"), ["--fetch", "--tag", "v0.19.831"]);
+        // Regression: no tag is exactly the pre-#10709 argv.
+        assert_eq!(fetch_args(""), ["--fetch"]);
     }
 
     #[test]
