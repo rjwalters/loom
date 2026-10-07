@@ -91,6 +91,7 @@ pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) 
         stability: Default::default(),
         convergence: Default::default(),
         by_tail: Default::default(),
+        by_subset: Default::default(),
     };
     let better = if scored == 0 {
         None
