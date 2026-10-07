@@ -1956,9 +1956,9 @@ pub fn spawn_periodic_reconciliation_task(
 mod liveness;
 pub use liveness::{
     claim_activity_marker, extra_liveness_at, most_recent_claim_activity_at,
-    most_recent_head_push_at,
-    most_recent_judge_activity_at, pr_liveness, LivenessSignal, PrComment, TimelineEvent,
-    CLAIM_ACTIVITY_MARKER_PREFIX, JUDGE_ACTIVITY_MARKER_PREFIXES, STANDDOWN_MARKER_PREFIX,
+    most_recent_head_push_at, most_recent_judge_activity_at, pr_liveness, LivenessSignal,
+    PrComment, TimelineEvent, CLAIM_ACTIVITY_MARKER_PREFIX, JUDGE_ACTIVITY_MARKER_PREFIXES,
+    STANDDOWN_MARKER_PREFIX,
 };
 
 mod pr_label_info;
