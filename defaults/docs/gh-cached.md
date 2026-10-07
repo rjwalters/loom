@@ -281,8 +281,8 @@ degrades to that real `gh`.
 - **Telemetry**: served reads (caller `agent_gh_front`) and passthroughs (one
   W5 row, `agent.gh.<cmd>`) land in `forge_call_stats` with `ag`=role,
   `vi`=served|passthrough (#10607). Every spawn path exports the host sink as
-  `LOOM_FORGE_CALL_STATS_DIR`; containers mount it rw (rows drop silently unless
-  the container uid owns it). `GH_CACHE_OUTCOME_LOG` adds `x-loom-cache`
+  `LOOM_FORGE_CALL_STATS_DIR`; containers mount it rw only if it is a sink (rows
+  drop silently unless the container uid owns it). `GH_CACHE_OUTCOME_LOG` adds `x-loom-cache`
   `revalidated`/`bypass` records. Measure the 304 share, not process counts.
 
 ## Per-skill call-site inventory

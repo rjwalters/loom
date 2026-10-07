@@ -403,7 +403,12 @@ pub fn docker_command_with(
     // Everything ELSE on the host is simply absent from the container — the
     // "read-only view of everything outside the worktree" the issue asks for
     // is the container boundary itself, not a flag.
-    for (host, container, read_only) in extra_mounts(&root, log, workspace, egress.is_some()) {
+    // #10607: the agent `gh` front's sink, resolved ONCE so the mount below
+    // and the `-e` assignment further down always name the same directory —
+    // and only a directory that is a sink (`worker_sink_dir`).
+    let sink = crate::forge_call_stats::agent::worker_sink_dir();
+    let mounts = extra_mounts(&root, log, workspace, egress.is_some(), sink.as_deref());
+    for (host, container, read_only) in mounts {
         command.arg("-v").arg(mount(&host, &container, read_only));
     }
     if let Some(egress) = egress {
@@ -453,7 +458,6 @@ pub fn docker_command_with(
         .arg(format!("LOOM_NATIVE_CONTAINMENT={KIND}"));
     // #10607: the host sink the front writes, by assignment (and mounted in
     // `extra_mounts`); the by-name pass below must not re-read the host's.
-    let sink = crate::forge_call_stats::agent::worker_sink_dir();
     if let Some(dir) = &sink {
         let key = crate::forge_call_stats::agent::SINK_DIR_ENV;
         command.arg("-e").arg(format!("{key}={}", dir.display()));
@@ -657,6 +661,7 @@ fn extra_mounts(
     log: Option<&Path>,
     workspace: &Path,
     managed_gh: bool,
+    sink: Option<&Path>,
 ) -> Vec<(PathBuf, String, bool)> {
     let mut out = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -700,13 +705,11 @@ fn extra_mounts(
             }
         }
     }
-    // #10607: the agent `gh` front's sink (the daemon's), parity-mounted
-    // read-write so a contained worker's rows outlive `--rm`.
-    if let Some(dir) = crate::forge_call_stats::agent::worker_sink_dir() {
-        if !dir.starts_with(workspace) {
-            let spec = dir.display().to_string();
-            out.push((dir, spec, false));
-        }
+    // #10607: the agent `gh` front's sink (the daemon's, already checked to
+    // be a sink by the caller), parity-mounted read-write so a contained
+    // worker's rows outlive `--rm`.
+    if let Some(dir) = sink.filter(|d| !d.starts_with(workspace)) {
+        out.push((dir.to_path_buf(), dir.display().to_string(), false));
     }
     out
 }

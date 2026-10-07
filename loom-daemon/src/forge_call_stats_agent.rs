@@ -57,14 +57,37 @@ pub const ROLES: &[&str] = &[
 
 static ROLE: OnceLock<&'static str> = OnceLock::new();
 
-/// This host's sink directory, created owner-only, for a spawned agent's
-/// front to write into: `None` when the sink is off, the path is relative,
-/// or the directory cannot be made private (a mount must never make docker
-/// create a root-owned one).
+/// This host's sink directory, for a spawned (and possibly contained)
+/// agent's front to write into: `None` when the sink is off or the directory
+/// is not a sink ([`is_mountable_sink`]).
+///
+/// The directory comes from `LOOM_FORGE_CALL_STATS_DIR` like every other
+/// sink lookup, so it is no more trusted than that variable. It is created
+/// owner-only when **absent** (a mount must never make docker create a
+/// root-owned one); an existing directory is only inspected, never chmodded
+/// or purged, so naming `$HOME` here changes nothing and mounts nothing.
+/// The path is made absolute the way `agent_session::isolation` exports it,
+/// so the exported, assigned and mounted directory are one directory.
 #[must_use]
 pub fn worker_sink_dir() -> Option<PathBuf> {
     let dir = super::host_sink_dir()?;
-    (dir.is_absolute() && crate::forge_etag_store::private_dir(&dir, true)).then_some(dir)
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    if std::fs::symlink_metadata(&dir).is_err() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let _ = builder.create(&dir);
+    }
+    is_mountable_sink(&dir).then_some(dir)
+}
+
+/// The one predicate both container paths mount by: an absolute, real
+/// (non-symlink) directory, owned by us with mode `0700`, holding nothing
+/// but sink files. Pure — it never changes what it inspects.
+#[must_use]
+pub fn is_mountable_sink(dir: &std::path::Path) -> bool {
+    dir.is_absolute() && is_owner_only_dir(dir) && holds_only_sink_files(dir)
 }
 
 /// `-v <dir>:<dir>` (read-write) for a `docker run` whose environment
@@ -87,10 +110,7 @@ pub fn docker_mount_args(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Ve
     else {
         return Vec::new();
     };
-    if !dir.is_absolute() {
-        return Vec::new();
-    }
-    if !is_owner_only_dir(&dir) || !holds_only_sink_files(&dir) {
+    if !is_mountable_sink(&dir) {
         return Vec::new();
     }
     vec!["-v".to_string(), format!("{0}:{0}", dir.display())]

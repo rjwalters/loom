@@ -860,6 +860,8 @@ fn a_passthrough_ledger_row_carries_the_agent_role_and_via() {
         !raw.contains("secret body") && !raw.contains("--title"),
         "argv never reaches the row: {raw}"
     );
+    // Every row in the sink, stamped or not: still exactly one.
+    assert_eq!(raw.lines().count(), 1, "no unstamped duplicate: {raw}");
 }
 
 /// #10607: a served read keeps its facade row, now stamped `served`.

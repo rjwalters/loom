@@ -608,8 +608,9 @@ fn run_preflight(
     command.env("LOOM_RUNTIME", &runtime);
     // #10607: the same sink variables every tmux session gets (W5,
     // `agent_session::isolation`), so the worker's `gh` front books into this
-    // host's sink whatever TMPDIR its runtime pins. The directory is made
-    // owner-only first, so a container's mount of it finds it private.
+    // host's sink whatever TMPDIR its runtime pins. An absent directory is
+    // created owner-only first, so a container's mount of it finds it
+    // private; an existing one is only inspected, never changed.
     let _ = crate::forge_call_stats::agent::worker_sink_dir();
     command.envs(crate::agent_session::isolation::ledger_vars());
     // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
