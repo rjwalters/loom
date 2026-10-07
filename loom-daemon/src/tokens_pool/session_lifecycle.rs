@@ -486,10 +486,11 @@ pub fn host_session_run_args(
     args
 }
 
-/// Grace period `stop` gives `docker stop` (SIGTERM) before it would
+/// Grace period `stop` (and the reconciler's mount-drift recreate of an idle
+/// container, #10364) gives `docker stop` (SIGTERM) before it would
 /// escalate to SIGKILL — the same shape as `docker stop`'s own `-t` timeout,
 /// never bypassed by going straight to `docker kill`.
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub const STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// Wall-clock budget for one in-container `codex login status` probe (issue
 /// #6927), bounded for the same reason the host-direct probe's
@@ -773,15 +774,10 @@ impl ContainerRunner for ProcessContainerRunner {
         daemon_root: &Path,
     ) -> Result<()> {
         // The daemon's own workspace registry is the allow-list of what the
-        // container may see (issue #9979): an unreadable registry is an
-        // empty one, so a parent directory with no registered repositories
-        // under it fails closed in `workspace_mount_roots`.
-        let registered = crate::workspace_registry::WorkspaceRegistry::load_default()
-            .map(|registry| registry.roots())
-            .unwrap_or_default();
-        let roots = workspace_mount_roots(workspace, &registered)?;
-        let firewalled = firewalled_repo_paths(workspace)?;
-        check_mount_denials(&roots, dirs::home_dir().as_deref(), &firewalled)?;
+        // container may see (issue #9979), minus the home directory and the
+        // firewalled repositories. The session reconciler asks the same
+        // function before it tears a drifted container down (#10364).
+        let roots = super::session_mount_gate::create_roots(workspace)?;
         // Daemon-owned App-token dirs for `gh` (see `gh_credential_dirs`):
         // the session workspace, the accounts registry's daemon root (#10103),
         // the daemon's own `LOOM_WORKSPACE`, and the owner of a daemon-shaped

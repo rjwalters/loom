@@ -60,7 +60,7 @@ assert_not_contains() {
 }
 
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+source "$SCRIPT_DIR/lib/session-lock-sandbox.sh" "$TMPROOT"
 
 # A profile adopted by a prior `loom-daemon accounts session start` — marked
 # with the exact sentinel session_lifecycle::mark_session_managed writes.

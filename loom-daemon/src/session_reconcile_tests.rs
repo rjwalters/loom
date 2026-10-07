@@ -1,8 +1,11 @@
 //! Issue #10453: the session reconcile pass, driven through a fake
-//! [`ContainerRunner`] so no test needs Docker.
+//! [`ContainerRunner`] so no test needs Docker. The pass's snapshot is the
+//! fake's containers rendered as `docker inspect` objects (one logged
+//! `inspect` per snapshot).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 use serial_test::serial;
@@ -13,11 +16,55 @@ use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
-use crate::tokens_pool::session_lifecycle::{mark_session_managed, parse_inspect_line, ExecOutput};
+use crate::tokens_pool::session_lifecycle::{
+    check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
+    ExecOutput, WORKSPACE_LABEL,
+};
+use crate::tokens_pool::session_state::{classify_inspect, Observed};
+
+#[path = "session_reconcile_drift_tests.rs"]
+mod drift_tests;
+#[path = "session_reconcile_removal_tests.rs"]
+mod removal_tests;
+#[path = "session_reconcile_safety_tests.rs"]
+mod safety_tests;
+
+/// Shared so a pass can snapshot it while the lifecycle owns it.
+#[derive(Default, Clone)]
+struct Fake(Arc<FakeState>);
+
+impl Deref for Fake {
+    type Target = FakeState;
+    fn deref(&self) -> &FakeState {
+        &self.0
+    }
+}
 
 #[derive(Default)]
-struct Fake {
+struct FakeState {
     containers: Mutex<HashMap<String, ContainerState>>,
+    /// Workspace bind destinations per container (path parity).
+    mounts: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// The workspace registry the pass and `create` see.
+    registered: Mutex<Vec<PathBuf>>,
+    /// `firewall: true` paths the pass's pre-check sees (and `create`, unless
+    /// `create_firewalled` says otherwise).
+    firewalled: Mutex<Vec<PathBuf>>,
+    /// What `create` sees instead, when the two disagree.
+    create_firewalled: Mutex<Option<Vec<PathBuf>>>,
+    /// Runs right after `has_active_exec` answers: a dispatch that starts in
+    /// the gap `docker top` cannot see.
+    after_top: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The firewall roster cannot be read: denials are unknown and `create`
+    /// (and its pre-check) fail closed.
+    roster_unreadable: Mutex<bool>,
+    /// Where this fake's dispatch locks live (a tempdir, made on first use).
+    lock_dir: Mutex<Option<PathBuf>>,
+    /// The pass sees no readable registry.
+    registry_unreadable: Mutex<bool>,
+    /// `create` mounts exactly these instead of what the registry implies
+    /// (intended ≠ achievable).
+    create_mounts: Mutex<Option<Vec<PathBuf>>>,
     busy: Mutex<HashMap<String, bool>>,
     /// Every runner call, by method name, in order.
     calls: Mutex<Vec<String>>,
@@ -39,9 +86,14 @@ struct Fake {
     start_races_stop: Mutex<bool>,
     /// `docker start` hits its deadline (wedged engine).
     start_times_out: Mutex<bool>,
+    /// `docker stop` hits its deadline (a drift recreate's teardown).
+    stop_times_out: Mutex<bool>,
+    /// The next N `stop_and_remove` calls stop the container, then fail the
+    /// `docker rm` (it stays present, stopped).
+    rm_fails: Mutex<u32>,
 }
 
-impl Fake {
+impl FakeState {
     fn seed(&self, container: &str, running: bool, restarting: bool, workspace: Option<&Path>) {
         self.containers.lock().unwrap().insert(
             container.into(),
@@ -54,6 +106,29 @@ impl Fake {
                 workspace: workspace.map(Path::to_path_buf),
             },
         );
+    }
+    fn denials(&self) -> drift::Denials {
+        drift::Denials {
+            home: None,
+            firewalled: self.firewalled.lock().unwrap().clone(),
+        }
+    }
+    fn lock_dir(&self) -> PathBuf {
+        self.lock_dir
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| tempfile::tempdir().unwrap().keep())
+            .clone()
+    }
+    /// What `create` accepts: its own view of the roster.
+    fn create_accepts(&self, workspace: &Path, walls: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        if *self.roster_unreadable.lock().unwrap() {
+            bail!("fleet roster (firewall input): unreadable");
+        }
+        let registered = self.registered.lock().unwrap().clone();
+        let intended = workspace_mount_roots(workspace, &registered).unwrap_or_default();
+        check_mount_denials(&intended, None, walls)?;
+        Ok(intended)
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -71,25 +146,74 @@ impl Fake {
     fn log(&self, method: &str) {
         self.calls.lock().unwrap().push(method.into());
     }
-}
-
-impl ContainerRunner for Fake {
-    fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
+    /// Count this read; on the configured read, act like a concurrent
+    /// `accounts session stop` (hold written, container stopped, not rm'd).
+    fn read(&self, containers: &mut HashMap<String, ContainerState>) {
         self.log("inspect");
-        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
-            bail!("docker inspect {container} failed: {error}");
-        }
         let n = self.count("inspect");
-        let mut containers = self.containers.lock().unwrap();
         if let Some((at, profile)) = self.stop_on_inspect.lock().unwrap().clone() {
             if n == at {
                 session_hold::write_hold(&profile, session_hold::now_unix_ms()).unwrap();
-                if let Some(state) = containers.get_mut(container) {
+                for state in containers.values_mut() {
                     state.running = false;
                     state.restarting = false;
                 }
             }
         }
+    }
+    /// The pass's one read: every container as a `docker inspect` object.
+    fn snapshot(&self, registered: &[PathBuf]) -> Snapshot {
+        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
+            self.log("inspect");
+            return Snapshot::Unavailable(format!("docker ps failed: {error}"));
+        }
+        let mut containers = self.containers.lock().unwrap();
+        self.read(&mut containers);
+        let mounts = self.mounts.lock().unwrap();
+        let map: BTreeMap<String, Observed> = containers
+            .iter()
+            .map(|(name, state)| {
+                let inspect =
+                    inspect_json(name, state, mounts.get(name).map_or(&[], Vec::as_slice));
+                let observed = Observed {
+                    state: classify_inspect(Some(&inspect), registered),
+                    inspect,
+                };
+                (name.clone(), observed)
+            })
+            .collect();
+        Snapshot::Available(map)
+    }
+}
+
+/// `state` (and its workspace binds) as `docker inspect` reports it.
+fn inspect_json(name: &str, state: &ContainerState, mounts: &[PathBuf]) -> Value {
+    let mut labels = serde_json::Map::new();
+    if let Some(workspace) = &state.workspace {
+        labels.insert(WORKSPACE_LABEL.into(), workspace.display().to_string().into());
+        if workspace == Path::new(private_workspace::REPO) {
+            labels.insert("loom.workspace-mode".into(), "private-clone".into());
+        }
+    }
+    serde_json::json!({
+        "Name": format!("/{name}"),
+        "Id": state.id,
+        "State": {"Running": state.running || state.restarting, "Restarting": state.restarting},
+        "Config": {"Image": state.image, "Labels": labels},
+        "Mounts": mounts.iter().map(|m| serde_json::json!({
+            "Type": "bind", "Source": m, "Destination": m, "RW": true,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+impl ContainerRunner for Fake {
+    fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
+        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
+            self.log("inspect");
+            bail!("docker inspect {container} failed: {error}");
+        }
+        let mut containers = self.containers.lock().unwrap();
+        self.read(&mut containers);
         Ok(containers.get(container).cloned())
     }
     fn create(
@@ -109,8 +233,21 @@ impl ContainerRunner for Fake {
             image.into(),
             workspace.to_path_buf(),
         ));
+        // Like `docker run` behind `session start`: a firewalled root is
+        // refused. (An unregistered workspace is not refused here, so the
+        // #10453 tests can use paths that do not exist.)
+        let walls = self.create_firewalled.lock().unwrap().clone();
+        let walls = walls.unwrap_or_else(|| self.firewalled.lock().unwrap().clone());
+        let intended = self.create_accepts(workspace, &walls)?;
         let dies = *self.dies_after_start.lock().unwrap();
         self.seed(container, dies.is_none(), dies == Some(true), Some(workspace));
+        let mounts = self
+            .create_mounts
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(intended);
+        self.mounts.lock().unwrap().insert(container.into(), mounts);
         Ok(())
     }
     fn start_existing(&self, container: &str) -> Result<()> {
@@ -133,11 +270,31 @@ impl ContainerRunner for Fake {
     }
     fn has_active_exec(&self, container: &str) -> Result<bool> {
         self.log("has_active_exec");
-        Ok(*self.busy.lock().unwrap().get(container).unwrap_or(&false))
+        let busy = *self.busy.lock().unwrap().get(container).unwrap_or(&false);
+        if let Some(hook) = self.after_top.lock().unwrap().as_ref() {
+            hook();
+        }
+        Ok(busy)
     }
     fn stop_and_remove(&self, container: &str, _grace: Duration) -> Result<()> {
         self.log("stop_and_remove");
+        if *self.stop_times_out.lock().unwrap() {
+            return Err(DockerTimedOut {
+                subcommand: "stop".into(),
+                secs: 120,
+            }
+            .into());
+        }
         let mut containers = self.containers.lock().unwrap();
+        let mut rm_fails = self.rm_fails.lock().unwrap();
+        if *rm_fails > 0 {
+            *rm_fails -= 1;
+            if let Some(state) = containers.get_mut(container) {
+                state.running = false;
+                state.restarting = false;
+            }
+            bail!("docker rm {container} failed: removal of container is already in progress");
+        }
         if std::mem::take(&mut *self.start_races_stop.lock().unwrap()) {
             if let Some(state) = containers.get_mut(container) {
                 state.running = true;
@@ -149,6 +306,7 @@ impl ContainerRunner for Fake {
             );
         }
         containers.remove(container);
+        self.mounts.lock().unwrap().remove(container);
         Ok(())
     }
     fn attach_interactive(&self, _container: &str, _tmux: &str) -> Result<i32> {
@@ -239,11 +397,64 @@ fn pass_with(
     state: &mut ReconcileState,
     now: u64,
 ) -> Vec<Outcome> {
-    let index = AccountIndex::from_inventories(&[accounts, other_roots]);
-    reconcile_accounts(lifecycle, accounts, &index, private, fallback, state, now)
+    pass_named(lifecycle, accounts, other_roots, private, fallback, state, now)
         .into_iter()
         .map(|o| o.outcome)
         .collect()
+}
+
+/// The inputs that do not depend on the fake's roster or registry state.
+fn fake_inputs<'a>(
+    fake: &Fake,
+    index: &'a AccountIndex,
+    private: &'a dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &'a Path,
+    registered: &'a [PathBuf],
+) -> PassInputs<'a> {
+    PassInputs {
+        index,
+        is_private_clone: private,
+        fallback_workspace: fallback,
+        registered: Some(registered),
+        denials_for: &|_| Ok(drift::Denials::default()),
+        would_create_accept: &|_| Ok(()),
+        dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
+        class: None,
+    }
+}
+
+/// [`pass_with`], keeping each outcome's account.
+fn pass_named(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    other_roots: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+) -> Vec<AccountOutcome> {
+    let index = AccountIndex::from_inventories(&[accounts, other_roots]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
+    let inputs = PassInputs {
+        registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
+        denials_for: &|_| {
+            if *fake.roster_unreadable.lock().unwrap() {
+                bail!("fleet roster (firewall input): unreadable");
+            }
+            Ok(fake.denials())
+        },
+        // The pre-check's view of the roster; `create` may be given another.
+        would_create_accept: &|workspace| {
+            let walls = fake.firewalled.lock().unwrap().clone();
+            fake.create_accepts(workspace, &walls).map(drop)
+        },
+        ..inputs
+    };
+    reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }
 
 // ---- decision function ------------------------------------------------------

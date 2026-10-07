@@ -5,9 +5,11 @@
 //! created, so a registry change never reaches a running container: a newly
 //! registered repo is unreachable from it (every Codex tick there fails), and
 //! a deregistered one stays mounted read-write (a containment gap, since Codex
-//! runs with its own sandbox off, #9979). Until the reconciler recreates idle
-//! drifted containers itself (#10364 Part B, after #10453), the registry
-//! command names them and prints the manual recreate.
+//! runs with its own sandbox off, #9979). The daemon's session reconciler
+//! recreates idle drifted containers itself (#10364 Part B,
+//! `session_reconcile::drift`); the registry command names them, says so, and
+//! prints the manual recreate as an override for when the daemon is down or
+//! the reconciler is opted out.
 //!
 //! Best-effort by contract: nothing here returns an error, and a host with no
 //! session-managed profile costs **zero** docker calls. The only I/O is one
@@ -88,8 +90,9 @@ pub fn report_lines(drifted: &[DriftedSession], private_clones: bool) -> Vec<Str
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "  {} Codex session container(s) no longer match the workspace registry; each must be \
-         recreated when idle (#10364):",
+        "  {} Codex session container(s) no longer match the workspace registry; the daemon's \
+         session reconciler recreates each one automatically once it has no tick in flight \
+         (#10364):",
         drifted.len()
     )];
     for session in drifted {
@@ -109,8 +112,9 @@ pub fn report_lines(drifted: &[DriftedSession], private_clones: bool) -> Vec<Str
         }
     }
     lines.push(
-        "  Until the daemon recreates these itself, run for each one once it has no tick in \
-         flight (`stop` refuses a busy container):"
+        "  To recreate one by hand instead (the daemon is down, or the reconciler is opted out \
+         with LOOM_SESSION_RECONCILE=0 / autonomous.sessionReconcile.enabled=false), run once it \
+         has no tick in flight (`stop` refuses a busy container):"
             .into(),
     );
     for session in drifted {
@@ -131,15 +135,66 @@ pub fn report_lines(drifted: &[DriftedSession], private_clones: bool) -> Vec<Str
     lines
 }
 
+/// Host-mode session containers started on ONE checkout
+/// (`--mount-workspace <repo>`) that is not in the registry: `(account,
+/// checkout)`. They are never drift (`session start` accepts an unregistered
+/// checkout as an explicit operator grant, and a recreate would mount it
+/// again), so nothing unmounts the checkout after a `workspace remove`
+/// except the operator. Pure.
+#[must_use]
+pub fn unregistered_single_checkouts<'a>(
+    objects: impl IntoIterator<Item = &'a Value>,
+    registered: &[PathBuf],
+) -> Vec<(String, PathBuf)> {
+    objects
+        .into_iter()
+        .filter_map(|state| {
+            let container = state["Name"].as_str()?.trim_start_matches('/');
+            let account = container.strip_prefix(CONTAINER_PREFIX)?.to_string();
+            let label = workspace_label(state)?;
+            let canonical = crate::workspace_registry::normalize_path(label);
+            let mounted_whole = session_state::workspace_mounts(state)
+                .iter()
+                .any(|mount| mount == label || *mount == canonical);
+            (mounted_whole && !registered.contains(&canonical))
+                .then(|| (account, label.to_path_buf()))
+        })
+        .collect()
+}
+
+/// Operator-facing lines for [`unregistered_single_checkouts`]. Pure.
+#[must_use]
+pub fn single_checkout_lines(sessions: &[(String, PathBuf)]) -> Vec<String> {
+    sessions
+        .iter()
+        .map(|(account, checkout)| {
+            format!(
+                "  Session container for account {account} was started on the single checkout \
+                 {} (`--mount-workspace <repo>`), which is not in the workspace registry. It \
+                 stays mounted there, and the reconciler will not change that: run \
+                 `loom-daemon accounts session stop {account}` to unmount it.",
+                checkout.display()
+            )
+        })
+        .collect()
+}
+
 /// The report for one `snapshot` of the session containers. Pure.
 #[must_use]
 pub fn report_from(snapshot: &Snapshot, registered: &[PathBuf]) -> Vec<String> {
     match snapshot {
-        Snapshot::Available(map) => report_lines(
-            &drifted(map.values().map(|observed| &observed.inspect), registered),
-            map.values()
-                .any(|observed| session_state::is_private_clone(&observed.inspect)),
-        ),
+        Snapshot::Available(map) => {
+            let objects = || map.values().map(|observed| &observed.inspect);
+            let mut lines = report_lines(
+                &drifted(objects(), registered),
+                objects().any(session_state::is_private_clone),
+            );
+            lines.extend(single_checkout_lines(&unregistered_single_checkouts(
+                objects(),
+                registered,
+            )));
+            lines
+        }
         Snapshot::Unavailable(reason) => vec![format!(
             "  Codex session containers were not checked for mount drift: docker could not be \
              queried ({reason}). Check them with `loom-daemon accounts session status <account>`."
@@ -291,6 +346,8 @@ mod tests {
              --mount-workspace {label}"
         )));
         assert!(text.contains("--private-clone"), "{text}");
+        assert!(text.contains("recreates each one automatically"), "{text}");
+        assert!(text.contains("LOOM_SESSION_RECONCILE=0"), "{text}");
     }
 
     #[test]
@@ -318,6 +375,36 @@ mod tests {
             .join("\n")
             .contains("--private-clone"));
         assert!(report_lines(&[], true).is_empty(), "no drift, no report");
+    }
+
+    #[test]
+    fn a_session_on_one_unregistered_checkout_is_named_with_the_stop_command() {
+        let (_tmp, root) = canonical_tempdir();
+        let repo = root.join("solo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let label = repo.display().to_string();
+        let objects = [
+            container(
+                "loom-codex-session-agent-1",
+                json!({WORKSPACE_LABEL: label}),
+                std::slice::from_ref(&repo),
+            ),
+            // A checkout-parent session is not a single-checkout one.
+            container(
+                "loom-codex-session-agent-2",
+                json!({WORKSPACE_LABEL: root.display().to_string()}),
+                std::slice::from_ref(&repo),
+            ),
+        ];
+        // Still registered: nothing to say.
+        assert!(unregistered_single_checkouts(&objects, std::slice::from_ref(&repo)).is_empty());
+        // `workspace remove solo`: not drift, but the operator is told.
+        assert!(drifted(&objects[..1], &[]).is_empty());
+        let found = unregistered_single_checkouts(&objects, &[]);
+        assert_eq!(found, vec![("agent-1".to_string(), repo.clone())]);
+        let text = single_checkout_lines(&found).join("\n");
+        assert!(text.contains("accounts session stop agent-1"), "{text}");
+        assert!(text.contains(&label), "{text}");
     }
 
     #[test]

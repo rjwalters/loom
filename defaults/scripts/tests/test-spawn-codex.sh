@@ -105,7 +105,7 @@ assert_not_contains() {
 }
 
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+source "$SCRIPT_DIR/lib/session-lock-sandbox.sh" "$TMPROOT"
 
 # ============================================================
 # Section 0: syntax + help
