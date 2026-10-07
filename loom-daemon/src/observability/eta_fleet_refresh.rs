@@ -781,9 +781,10 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// every repo on a reader installation (App and owner, #10329) that hit the
 /// reserve, and for everything left
 /// once one sync is rate limited or meets the open breaker. With SigNoz
-/// history on (#10520) each repo also follows its [`EventsGate`]: none for a
-/// covered repo (whose cache coverage is frozen, so stars read unknown past
-/// it), gap-fill (counted, and capped by `gap`'s per-repo budget less what
+/// history on (#10520) each repo also follows its [`EventsGate`]: for a
+/// covered repo only its backfilled star listings' ETag'd refreshes (#10746;
+/// otherwise its coverage stays frozen, so stars read unknown past it),
+/// gap-fill (counted, and capped by `gap`'s per-repo budget less what
 /// the snapshot pass spent) otherwise. A refresh that completes stamps its
 /// listing's `synced_through` at `now`: the cache was caught up then.
 fn sync_all_events(
@@ -815,9 +816,18 @@ fn sync_all_events(
             continue;
         };
         let mut gate = EventsGate::for_repo(repo_report, gap_budget);
-        if gate == EventsGate::Skip {
+        // A covered repo (#10746): its cache is frozen, then only the
+        // star-bearing listings refresh, and only a completed backfill's
+        // cheap ETag'd refresh, drawn from what the snapshot pass left of the
+        // per-repo gap-fill budget. SigNoz never stands in for the
+        // issue-events listing: it has no ingestion watermark proving a
+        // window complete, so only this refresh advances its coverage.
+        let covered = gate == EventsGate::Skip;
+        if covered {
             crate::eta::fleet_signoz_history::freeze_raw_cache(root, &target.repo);
-            continue;
+            gate = EventsGate::GapFill(Some(
+                gap_budget.saturating_sub(repo_report.gap_fill_calls.unwrap_or(0)),
+            ));
         }
         if repo_report.stop == StopReason::Coverage {
             continue;
@@ -833,6 +843,14 @@ fn sync_all_events(
                 .endpoints
                 .get(&format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()))
                 .is_some_and(|e| e.backfill_complete);
+            if covered {
+                let star_listing = crate::eta::star::listing_keys()
+                    .iter()
+                    .any(|k| *k == format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()));
+                if !star_listing || !complete {
+                    continue;
+                }
+            }
             let (mode, left) = if complete {
                 (SyncMode::Refresh, &mut report.remaining.0)
             } else {

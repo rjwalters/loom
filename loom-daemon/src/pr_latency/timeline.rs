@@ -103,6 +103,8 @@ fn to_event(e: &TimelineEntry) -> Option<PrEvent> {
         }
         "head_ref_force_pushed" => Some(PrEvent::Pushed { at: e.created_at? }),
         "merged" => Some(PrEvent::Merged { at: e.created_at? }),
+        "closed" => Some(PrEvent::Closed { at: e.created_at? }),
+        "reopened" => Some(PrEvent::Reopened { at: e.created_at? }),
         _ => None,
     }
 }
@@ -169,6 +171,19 @@ mod tests {
         assert!(matches!(events[0], PrEvent::Merged { .. }));
         // …but every raw entry still counts toward the page length.
         assert_eq!(parse_timeline_page(json).unwrap().1, 4);
+    }
+
+    #[test]
+    fn close_and_reopen_entries_are_kept_with_their_times() {
+        let json = br#"[
+            {"event":"closed","created_at":"2026-09-01T00:00:00Z"},
+            {"event":"reopened","created_at":"2026-09-01T01:00:00Z"},
+            {"event":"closed","created_at":"2026-09-01T02:00:00Z"}
+        ]"#;
+        let events = parse_timeline(json).unwrap();
+        assert!(matches!(events[0], PrEvent::Closed { .. }));
+        assert!(matches!(events[1], PrEvent::Reopened { .. }));
+        assert!(matches!(events[2], PrEvent::Closed { .. }));
     }
 
     #[test]

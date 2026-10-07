@@ -121,6 +121,16 @@ pub enum PrEventRecord {
         /// When.
         at: DateTime<Utc>,
     },
+    /// The PR was closed.
+    Closed {
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// The PR was reopened.
+    Reopened {
+        /// When.
+        at: DateTime<Utc>,
+    },
 }
 
 impl From<&PrEvent> for PrEventRecord {
@@ -136,6 +146,8 @@ impl From<&PrEvent> for PrEventRecord {
             },
             PrEvent::Pushed { at } => Self::Pushed { at: *at },
             PrEvent::Merged { at } => Self::Merged { at: *at },
+            PrEvent::Closed { at } => Self::Closed { at: *at },
+            PrEvent::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
@@ -153,6 +165,8 @@ impl From<&PrEventRecord> for PrEvent {
             },
             PrEventRecord::Pushed { at } => Self::Pushed { at: *at },
             PrEventRecord::Merged { at } => Self::Merged { at: *at },
+            PrEventRecord::Closed { at } => Self::Closed { at: *at },
+            PrEventRecord::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
