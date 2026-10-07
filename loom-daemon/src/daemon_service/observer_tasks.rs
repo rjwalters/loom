@@ -38,6 +38,10 @@ pub struct ObserverHandles {
     /// Feed poll loop, `None` when the forge event feed is off or
     /// unprovisioned (ADR-0021, #8765).
     pub forge_events: Option<tokio::task::JoinHandle<()>>,
+    /// Codex session-container watch (#10455): always on, independent of
+    /// telemetry, so a down container is WARNed on every host. Zero docker
+    /// calls on a host with no session-managed Codex account.
+    pub codex_session: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn both observers against `workspace_root`'s resolved config.
@@ -70,8 +74,17 @@ pub fn spawn(
     let forge_events_config = forge_events::read_config(workspace_root);
     let forge_events = forge_events::spawn_task(&forge_events_config, bus);
 
+    // Codex session-container watch (#10455). Observe-only like the two
+    // above: it logs, publishes a snapshot and feeds the gauge; it changes no
+    // dispatch path. Selection reads what it publishes (#10660), so mark this
+    // process as the one that never forks `docker` to select an account.
+    loom_daemon::tokens_pool::session_lifecycle::liveness::mark_watch_runs_here();
+    let codex_session =
+        observability::ops::codex_session::spawn_watch(workspace_root.to_path_buf());
+
     ObserverHandles {
         observability,
         forge_events,
+        codex_session,
     }
 }

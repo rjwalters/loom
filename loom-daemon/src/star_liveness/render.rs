@@ -38,7 +38,16 @@ pub fn row_line(r: &StarLandingRow) -> String {
     if let Some(from) = r.inherited_from {
         line.push_str(&format!(" (inherited from #{from})"));
     }
+    if let Some(src) = &r.level_inherited_from {
+        line.push_str(&format!(" (inherits {} from {src})", glyph(r.level)));
+    }
     line
+}
+
+/// The level's glyph (`⭐⭐`), or `⭐` for the star and anything unknown.
+#[must_use]
+pub fn glyph(level: u8) -> &'static str {
+    crate::operator_levels::row(crate::operator_levels::table(), level).map_or("⭐", |r| r.glyph)
 }
 
 /// The block, or no lines when nothing is starred.
@@ -47,7 +56,7 @@ pub fn lines(report: Option<&StarLivenessReport>) -> Vec<String> {
     let Some(report) = report else {
         return Vec::new();
     };
-    if report.rows.is_empty() && report.dropped_intents.is_empty() {
+    if report.rows.is_empty() && report.dropped_intents.is_empty() && report.over_cap.is_empty() {
         return Vec::new();
     }
     let asks = report.needs_operator().count();
@@ -55,9 +64,22 @@ pub fn lines(report: Option<&StarLivenessReport>) -> Vec<String> {
         "Starred (loom:operator-priority): {} tracked, {asks} waiting on the operator",
         report.rows.len()
     )];
+    // #10307: an over-cap level is flagged first; it is never refused.
+    for o in &report.over_cap {
+        out.push(format!(
+            "  ! {} over cap: {} open issues carry {} (cap {}): {}",
+            glyph(o.level),
+            o.count,
+            o.label,
+            o.cap,
+            o.issues.join(", ")
+        ));
+    }
     for r in &report.rows {
         let marker = if r.inherited_from.is_some() {
             "  ->"
+        } else if r.level >= 2 {
+            "  **"
         } else {
             "  *"
         };
@@ -65,6 +87,12 @@ pub fn lines(report: Option<&StarLivenessReport>) -> Vec<String> {
         if let Some(ask) = &r.ask {
             out.push(format!("      ASK [{}]: {}", ask.kind.as_str(), ask.text));
         }
+    }
+    if !report.unfollowed_blockers.is_empty() {
+        out.push(format!(
+            "  (blockers in unmanaged repos, not followed: {})",
+            report.unfollowed_blockers.join(", ")
+        ));
     }
     if !report.failed_repos.is_empty() {
         out.push(format!(

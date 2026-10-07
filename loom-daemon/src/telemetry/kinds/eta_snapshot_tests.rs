@@ -249,3 +249,6 @@ fn alternates_round_trip_and_match_the_loom_ui_fixture_shape() {
     let back: EtaSnapshotRow = serde_json::from_value(old).unwrap();
     assert!(back.alternates.is_empty());
 }
+
+#[path = "eta_snapshot_contract_tests.rs"]
+mod contract;

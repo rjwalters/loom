@@ -21,19 +21,36 @@
 //!   "captain_host": "<host id>",
 //!   "published_at": "<rfc3339>",
 //!   "jobs": {
-//!     "stage-dwell": { "as_of": "<rfc3339>", "repos": ["owner/repo", ...] }
+//!     "stage-dwell": { "as_of": "<rfc3339>", "repos": ["owner/repo", ...] },
+//!     "star-facts": {
+//!       "as_of": "<rfc3339>", "repos": ["owner/repo", ...],
+//!       "labels": ["loom:operator-priority", ...],
+//!       "counts": { "owner/repo": 2 }
+//!     },
+//!     "queue-blocked": {
+//!       "as_of": "<rfc3339>", "repos": ["owner/repo", ...],
+//!       "blocked": { "owner/repo": [ { "n": 12, "c": "<rfc3339>", "l": ["loom:blocked"] } ] }
+//!     }
 //!   }
 //! }
 //! ```
 //!
 //! `as_of` is when the captain last finished producing that job (its points
-//! were handed to the OTLP sink); `repos` are the lowercased slugs that pass
-//! covered. A dispatcher stands down only for a job and repo the declared
-//! captain covered within the staleness bound ([`Heartbeat::fresh`]).
+//! were handed to the OTLP sink, or its listings were read); `repos` are the
+//! lowercased slugs that pass covered. A dispatcher stands down only for a
+//! job and repo the declared captain covered within the staleness bound
+//! ([`Heartbeat::fresh`]).
+//!
+//! `labels`, `counts` and `blocked` are the part 2 fact fields
+//! ([`super::facts`]). They are optional and additive: a reader that predates
+//! them ignores them, and a captain that predates them publishes no such job,
+//! so the schema tag stays `v1`. A covered repo absent from `counts` has no
+//! open starred issue; one absent from `blocked` has no blocked row.
 //!
 //! # Cost
 //!
-//! Captain: one contents `PUT` per publish interval; the blob sha comes back
+//! Captain: one contents `PUT` per publish interval, and one more when the
+//! published content changes in between; the blob sha comes back
 //! in the `PUT` reply and is reused, so the `GET` for it happens only on the
 //! first publish of a process or after a conflict. Dispatcher: one
 //! conditional `GET` per collector pass; an unchanged heartbeat is a `304`.
@@ -60,14 +77,51 @@ pub const REF_KEY: &str = "fleet.captainGauges.ref";
 /// Clock skew tolerated on a published `as_of`.
 const FUTURE_SLACK_SECS: i64 = 300;
 
-/// What the captain produced for one job.
+/// One open `loom:blocked` issue as the captain listed it (`queue-blocked`):
+/// what a dispatcher needs to build its own `queue.snapshot` row, and nothing
+/// else. Label names only, never free text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedFact {
+    /// The issue number.
+    #[serde(rename = "n")]
+    pub number: u32,
+    /// RFC 3339 creation time, as the forge reported it.
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Its `loom:*` and `tier:*` label names.
+    #[serde(rename = "l", default)]
+    pub labels: Vec<String>,
+}
+
+/// What the captain produced for one job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacts {
     /// When the captain last finished the job.
     pub as_of: DateTime<Utc>,
     /// Lowercased `owner/repo` slugs that pass covered.
     #[serde(default)]
     pub repos: BTreeSet<String>,
+    /// `star-facts`: every operator label the captain listed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
+    /// `star-facts`: open starred issues per covered repo (absent: zero).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counts: BTreeMap<String, u32>,
+    /// `queue-blocked`: the blocked rows per covered repo (absent: none).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blocked: BTreeMap<String, Vec<BlockedFact>>,
+}
+
+impl JobFacts {
+    /// Facts that cover `repos` at `as_of` and carry nothing else.
+    #[must_use]
+    pub fn covering(as_of: DateTime<Utc>, repos: BTreeSet<String>) -> Self {
+        Self {
+            as_of,
+            repos,
+            ..Self::default()
+        }
+    }
 }
 
 /// `captain-gauges/v1`.
@@ -273,7 +327,7 @@ fn put(
 ///
 /// Any store failure; `cache` then forgets the sha so the next publish
 /// re-reads it.
-pub fn publish(
+pub(super) fn publish(
     t: &dyn Transport,
     wt: &dyn WriteTransport,
     loc: &StoreLocation,
@@ -286,7 +340,9 @@ pub fn publish(
         fit_pub::ensure_branch(t, wt, loc, base_ref)?;
         cache.branch_ok = true;
     }
-    let body = serde_json::to_string_pretty(hb).context("encoding the heartbeat")? + "\n";
+    // Compact: the part 2 facts make this file a few hundred rows on a big
+    // fleet, and it is rewritten on every change.
+    let body = serde_json::to_string(hb).context("encoding the heartbeat")? + "\n";
     let message = format!("captain gauges heartbeat ({})", hb.published_at.to_rfc3339());
     let sha = match cache.sha.take() {
         Some(sha) => Some(sha),

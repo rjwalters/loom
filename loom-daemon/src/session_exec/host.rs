@@ -1,4 +1,5 @@
 use super::*;
+use crate::tokens_pool::health::TerminalClassification;
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -43,7 +44,29 @@ pub(super) fn forward_stderr(
     }
 }
 
-fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
+/// How a bounded docker probe ended.
+#[derive(Debug, PartialEq)]
+pub(super) enum Probed {
+    /// Docker exited zero; its trimmed stdout.
+    Answered(String),
+    /// Docker exited non-zero (for `inspect`: no such container, or it could
+    /// not be inspected).
+    Failed,
+    /// The probe was given up on: its deadline, a host signal, or the
+    /// launcher going away. It says nothing about the container.
+    Abandoned,
+}
+
+impl Probed {
+    fn answer(&self) -> Option<&str> {
+        match self {
+            Self::Answered(text) => Some(text),
+            Self::Failed | Self::Abandoned => None,
+        }
+    }
+}
+
+fn probe(args: &[&str], parent: i32) -> Result<Probed> {
     let mut child = Command::new("docker")
         .args(args)
         .stdin(Stdio::null())
@@ -51,12 +74,25 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()?;
+    // Drain stdout while waiting: a full `docker inspect` object can exceed
+    // the pipe buffer, and a child blocked on a full pipe never exits, which
+    // would read as the probe deadline (#10364).
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).map(|_| text)
+    });
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut text = String::new();
-            child.stdout.take().unwrap().read_to_string(&mut text)?;
-            return Ok(status.success().then(|| text.trim().to_string()));
+            let text = reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("docker probe reader panicked"))??;
+            return Ok(if status.success() {
+                Probed::Answered(text.trim().to_string())
+            } else {
+                Probed::Failed
+            });
         }
         if started.elapsed() >= Duration::from_secs(3)
             || SIGNAL.load(Ordering::Relaxed) != 0
@@ -75,10 +111,74 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
             );
             child.kill()?;
             child.wait()?;
-            return Ok(None);
+            return Ok(Probed::Abandoned);
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// What the one pre-exec `docker inspect` says about a dispatch (#10364).
+#[derive(Debug, PartialEq)]
+pub(super) enum Preflight {
+    /// Docker said the container cannot take a dispatch: it does not exist,
+    /// or its inspect is not a running container. Refuse as `SESSION_DOWN`.
+    NotRunning,
+    /// Docker did not say anything (the probe was abandoned). Refuse, as
+    /// before, but name no cause: the container may well be running (#10455).
+    Unknown,
+    /// Docker said the container is running and listed its mounts, and none
+    /// covers the workdir. Refuse as `SESSION_MOUNT_STALE`. Carries the
+    /// inspect object, for the operator's recreate command.
+    MountStale(serde_json::Value),
+    /// Running and the workdir is mounted.
+    Ready,
+}
+
+/// Read both pre-exec answers from one `docker inspect --type container`.
+///
+/// Whether the container is running fails closed, exactly as the
+/// `{{.State.Running}}` template probe this replaces did: anything but an
+/// answered, parsed object that `session_state::container_running` accepts
+/// refuses. The mount check then reads that same object, so it costs no
+/// docker call and can only refuse on what docker actually answered: an
+/// abandoned or failed inspect never reaches it, so it never becomes
+/// `SESSION_MOUNT_STALE`.
+pub(super) fn preflight(inspect: &Probed, workdir: &str) -> Preflight {
+    use crate::tokens_pool::session_state::{container_running, workdir_unmounted};
+    let text = match inspect {
+        Probed::Abandoned => return Preflight::Unknown,
+        Probed::Failed => return Preflight::NotRunning,
+        Probed::Answered(text) => text,
+    };
+    let state = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.get(0).cloned());
+    match state {
+        Some(state) if !container_running(&state) => Preflight::NotRunning,
+        Some(state) if workdir_unmounted(&state, workdir) => Preflight::MountStale(state),
+        Some(_) => Preflight::Ready,
+        None => Preflight::NotRunning,
+    }
+}
+
+/// What the operator is told when a dispatch is refused for a stale mount:
+/// the cause and the recreate command, on one line. The machine-readable
+/// cause is the `refusal::announce` line printed with it.
+pub(super) fn mount_stale_line(
+    container: &str,
+    workdir: &str,
+    state: &serde_json::Value,
+) -> String {
+    let account = container.trim_start_matches("loom-codex-session-");
+    let workspace = crate::tokens_pool::session_state::workspace_label(state)
+        .map_or_else(|| "<checkout parent>".to_string(), |w| w.display().to_string());
+    format!(
+        "session-exec: {workdir} is not mounted in {container}, which was created before this \
+         repository was registered (#10364); when the daemon's session reconciler is enabled it \
+         recreates the container once idle, otherwise run: loom-daemon accounts session stop \
+         {account} && loom-daemon accounts session start {account} --mount-workspace \
+         {workspace}"
+    )
 }
 
 pub fn run(args: HostArgs) -> Result<i32> {
@@ -113,13 +213,46 @@ pub fn run(args: HostArgs) -> Result<i32> {
             bail!("session launcher died before supervision started");
         }
     }
-    match probe(&["inspect", "-f", "{{.State.Running}}", &args.container], parent) {
-        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {
+    // Held (shared) from before the first inspect until this function
+    // returns, i.e. past the worker exec: a teardown of the container takes
+    // it exclusively and defers while any dispatch holds it, including in
+    // the gaps `docker top` cannot see (#10364). `None` (lock unusable, or a
+    // teardown still running after the wait): dispatch proceeds as before.
+    let _dispatch_lock =
+        crate::tokens_pool::session_dispatch_lock::shared_for_dispatch(&args.container);
+    // One inspect answers both pre-exec questions: is the container running
+    // (#10455), and does it mount this tick's working directory (#10364)? A
+    // host-mode container mounts each registered repo separately, fixed at
+    // creation, so a repo registered since is not inside it and `docker exec
+    // --workdir` would die with `chdir to cwd … no such file or directory`.
+    // A refusal names its cause for the daemon's terminal-record parser only
+    // when docker said so; an abandoned probe (or one that could not be run)
+    // refuses exactly as before, unnamed.
+    let preflight = match probe(&["inspect", "--type", "container", &args.container], parent) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
             eprintln!("session-exec: 'docker' command not found in PATH");
             return Ok(127);
         }
-        Ok(Some(state)) if state == "true" => {}
-        _ => bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-")),
+        Ok(inspect) => preflight(&inspect, &args.workdir),
+        Err(_) => Preflight::Unknown,
+    };
+    match preflight {
+        Preflight::Ready => {}
+        not_ready @ (Preflight::NotRunning | Preflight::Unknown) => {
+            if not_ready == Preflight::NotRunning {
+                refusal::announce(TerminalClassification::SessionDown);
+            }
+            bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
+        }
+        Preflight::MountStale(state) => {
+            refusal::announce(TerminalClassification::SessionMountStale);
+            eprintln!("{}", mount_stale_line(&args.container, &args.workdir, &state));
+            return Ok(refusal::REFUSAL_EXIT_CODE);
+        }
     }
     if probe(
         &[
@@ -131,7 +264,7 @@ pub fn run(args: HostArgs) -> Result<i32> {
         ],
         parent,
     )?
-    .as_deref()
+    .answer()
         != Some(PROTOCOL)
     {
         bail!("session container '{}' requires loom-daemon session-exec protocol {PROTOCOL}; update/recreate the session image before dispatch (no unsupervised fallback)", args.container);

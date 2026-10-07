@@ -22,7 +22,7 @@ use crate::eta::fit::{
 };
 use crate::eta::heuristics::{
     LandKeenWren, LandLoopKite, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_BOLD_LARK, LAND_KEEN_WREN,
-    LAND_LOOP_KITE, LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
+    LAND_LOOP_KITE, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
 };
 use crate::eta::loop_features::{LoopCoverage, LoopFeatures, LOOP_FEATURES};
 use crate::eta::simulate::run_explanation;
@@ -419,12 +419,11 @@ fn loop_kite_is_a_land_candidate_registered_after_keen_wren_and_bold_lark() {
         // After keen-wren and its conformal wrapper bold-lark (#10524);
         // `land-2026-10-06-tandem-wren` (#10510) stays last.
         assert_eq!(
-            land[land.len() - 6..],
+            land[land.len() - 5..],
             [
                 LAND_KEEN_WREN,
                 LAND_BOLD_LARK,
                 LAND_LOOP_KITE,
-                LAND_TWIN_OTTER,
                 LAND_TWIN_OTTER_B,
                 LAND_TANDEM_WREN
             ]

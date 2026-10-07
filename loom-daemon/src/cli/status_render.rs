@@ -20,6 +20,7 @@ mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
 mod roll_window_line;
+mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
 
@@ -580,6 +581,8 @@ pub(crate) fn build_status_json_value(
         // (distinct from the client-side `self_update` staleness read above).
         // Long-running task liveness (#10414): one entry per registered loop.
         "task_liveness": report.task_liveness,
+        // Codex session containers (#10600); `null` without a session seat.
+        "session_containers": report.session_containers,
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "last_check": report.auto_update_last_check,
@@ -2791,6 +2794,7 @@ pub(crate) fn print_status_human(
         roll_window_line::print_tail(report);
     }
     task_liveness_line::print(&report.task_liveness);
+    session_containers_line::print(report.session_containers.as_ref());
 
     println!();
 }

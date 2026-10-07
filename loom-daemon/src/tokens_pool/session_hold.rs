@@ -88,7 +88,7 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn write_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<()> {
+pub(super) fn write_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<()> {
     let path = dir.join(file);
     let temp = dir.join(format!("{file}.tmp-{}", std::process::id()));
     std::fs::write(&temp, serde_json::to_vec_pretty(value)?)
@@ -124,6 +124,9 @@ pub fn lift_holds(profiles: &[PathBuf]) -> Result<()> {
             _ => {}
         }
     }
+    // An operator start also overrides the reconciler's own "removed for a
+    // denied mount" record (#10364): the operator has taken the decision.
+    super::session_drift_removal::clear(profiles);
     Ok(())
 }
 

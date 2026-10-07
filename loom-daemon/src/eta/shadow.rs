@@ -722,7 +722,16 @@ fn report_for<'a>(
     }
 }
 
-fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>) -> BacktestGate {
+/// The backtest half of the promotion gate for `candidate` against `current`
+/// on `comparison` — the one implementation `eta promote` ([`evaluate`]) and
+/// the nightly folds' `gate_ready` (#10492) both call, so the two cannot
+/// disagree on the same data.
+#[must_use]
+pub fn backtest_gate(
+    current: &str,
+    candidate: &str,
+    comparison: Option<&Comparison>,
+) -> BacktestGate {
     let fail = |detail: String| BacktestGate {
         status: GateStatus::Failed,
         detail,

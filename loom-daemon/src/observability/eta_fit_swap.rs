@@ -88,7 +88,7 @@ pub(super) fn log_fit(old: Option<&str>, new: Option<&CoefficientFile>, workspac
         ),
         None => log::warn!(
             "eta: no coefficient file under {} (replacing {}); \
-             land-2026-10-04-twin-otter refuses no_model until a fit is written",
+             land-2026-10-04-twin-otter-b refuses no_model on PR stages until a fit is written",
             fit::fit_dir(workspace_root).display(),
             old.unwrap_or("none")
         ),

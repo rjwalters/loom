@@ -7,6 +7,7 @@
 //! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
+//! | `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true`: the captain's nightly walk-forward backtest folds (#10492) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
 //! | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (floor 1; #10525, #10549, #10521) |
 //!
@@ -206,6 +207,9 @@ pub struct EtaConfig {
     pub current_land: Option<String>,
     /// Run the daily refit (#10245); only when [`Self::enabled`] too.
     pub fit_enabled: bool,
+    /// Run the nightly walk-forward backtest folds (#10492) — on the fleet
+    /// captain only (`fleet.captain` gates it); only when [`Self::enabled`] too.
+    pub nightly_folds_enabled: bool,
     /// The fleet snapshot refresh task (#10263).
     pub fleet_refresh: FleetRefreshConfig,
     /// The shadow budget (#10525): most registered heuristics per kind. A
@@ -225,6 +229,7 @@ impl Default for EtaConfig {
             current_finish: None,
             current_land: None,
             fit_enabled: true,
+            nightly_folds_enabled: true,
             fleet_refresh: FleetRefreshConfig::default(),
             shadow_max_active: super::shadow_fleet::DEFAULT_MAX_ACTIVE,
         }
@@ -289,6 +294,13 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
         resolved.fit_enabled = v;
     }
 
+    if let Some(v) = get("nightlyFolds")
+        .and_then(|f| f.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        resolved.nightly_folds_enabled = v;
+    }
+
     if let Some(v) = env("LOOM_ETA_ENABLED").as_deref().and_then(parse_bool) {
         resolved.enabled = v;
     }
@@ -320,6 +332,12 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     resolved.shadow_max_active = resolved
         .shadow_max_active
         .max(super::shadow_fleet::MIN_MAX_ACTIVE);
+    if let Some(v) = env("LOOM_ETA_NIGHTLY_FOLDS_ENABLED")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        resolved.nightly_folds_enabled = v;
+    }
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
     resolved.fleet_refresh = resolve_fleet_refresh(block.and_then(|b| b.get("fleetRefresh")), &env);
     resolved

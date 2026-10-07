@@ -211,12 +211,10 @@ fn control_drift(docker: &str, container: &str, codex_home: Option<&Path>) -> Co
 /// Classify one `docker inspect` object.
 #[must_use]
 pub fn classify(state: &Value) -> Posture {
-    // A crash-looping `--restart unless-stopped` container reads
-    // `Running=true, Restarting=true` between restarts; nothing can be exec'd
-    // into it, so it is not running (issue #10453).
-    if state["State"]["Running"] != Value::Bool(true)
-        || state["State"]["Restarting"] == Value::Bool(true)
-    {
+    // The same "can it take a `docker exec`" rule as the session-state read
+    // (#10455, #10453): a container Docker is restarting (crash-loop back-off, where
+    // `Running` is also true) is not running.
+    if !crate::tokens_pool::session_state::container_running(state) {
         return Posture::NotRunning;
     }
     let labels = &state["Config"]["Labels"];

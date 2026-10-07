@@ -50,6 +50,21 @@
 //! branch that requires nothing falls back to waiting on every observed
 //! check (`gh pr checks --required` errors there; it never passes).
 //!
+//! # Refusals: permission vs rate limit (#10633)
+//!
+//! A `401`/`403`/`429` is classified by [`crate::forge_denial`] and the
+//! class is in the reason: `ERROR HTTP 403 for <url>: permission (needs
+//! statuses:read): Resource not accessible by integration`. A rate limit
+//! (`secondary-rate-limit` / `rate-limit`) is retried on the next poll like
+//! any blip and only ends the wait (`ERROR read-failed: …`) when it
+//! persists; a `permission` or `credential` refusal ends it at once.
+//!
+//! The one exception is the legacy commit-status read, which needs the App
+//! permission **Commit statuses: read** on top of the **Checks: read** that
+//! check-runs need. A permission refusal there degrades to a
+//! check-runs-only verdict with a stderr note rather than failing the whole
+//! wait (see `legacy_statuses` for why that is safe).
+//!
 //! # Backoff, and why it does not reset
 //!
 //! The first poll is immediate; then 30s, ×1.5 per poll, capped at 120s
@@ -269,6 +284,10 @@ struct State {
     lookup_failures: u32,
     lookup_error: String,
     zero_polls: u64,
+    /// Why the legacy commit-status read was refused for want of a
+    /// permission, once it has been (#10633). From then on the wait reads
+    /// check-runs only and never asks again.
+    statuses_denied: Option<String>,
     notes: Vec<String>,
 }
 
@@ -286,6 +305,7 @@ pub fn wait<C: Clock>(
         lookup_failures: 0,
         lookup_error: String::new(),
         zero_polls: 0,
+        statuses_denied: None,
         notes: Vec::new(),
     };
     let mut backoff = Backoff::new(opts.min_interval, opts.max_interval);
@@ -295,7 +315,11 @@ pub fn wait<C: Clock>(
         let (sha, names, sleep) = match poll(reads, selector, opts, &mut st, deadline_reached) {
             Ok(Poll::Done(o)) => return (o, st.notes),
             Err(ReadError::Fatal(why)) => return (Outcome::Error(why), st.notes),
-            Err(ReadError::Transient(why)) => {
+            Err(ReadError::Denied { denial, why }) if !denial.is_transient() => {
+                return (Outcome::Error(why), st.notes)
+            }
+            // A rate-limited read (#10633) is a blip: retried on the next poll.
+            Err(ReadError::Transient(why) | ReadError::Denied { why, .. }) => {
                 transient += 1;
                 if transient >= MAX_TRANSIENT_FAILURES || deadline_reached {
                     return (Outcome::Error(format!("read-failed: {why}")), st.notes);
@@ -349,7 +373,7 @@ fn poll(
         }
     };
     let runs = reads.check_runs(&sha)?;
-    let status = reads.statuses(&sha)?;
+    let status = legacy_statuses(reads, &sha, st)?;
     let rollup = verdict::fold(&runs, &status).map_err(ReadError::Fatal)?;
 
     if rollup.total == 0 {
@@ -373,6 +397,11 @@ fn poll(
         });
         let names = required.unwrap_or_default();
         return Ok(match d.action {
+            // With the legacy statuses unreadable, "no checks" may be "only
+            // legacy statuses we cannot see": never settle NONE on that.
+            Action::Settle if st.statuses_denied.is_some() => {
+                Poll::Done(Outcome::Error(st.statuses_denied.clone().unwrap_or_default()))
+            }
             Action::Settle => Poll::Done(Outcome::NoChecks { sha }),
             Action::TimedOut => Poll::Done(Outcome::Timeout {
                 sha,
@@ -460,6 +489,52 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
         }
     }
     Ok(st.required.clone())
+}
+
+/// The legacy commit statuses for `sha` (`GET …/commits/{sha}/status`).
+///
+/// GitHub gates that endpoint on the App permission **Commit statuses:
+/// read**, separate from the **Checks: read** the check-runs read needs —
+/// and the fleet Apps hold only the latter (#10633). A permission refusal
+/// therefore degrades instead of ending the wait: the poll folds an empty
+/// status list, a stderr note says so and names the permission to grant,
+/// and later polls skip the read. That stays safe because
+/// - a required context that only a legacy status reports is never `seen`,
+///   so the verdict waits for it ([`verdict::decide`]) — never GREEN;
+/// - an empty rollup never settles `NONE` while statuses are unreadable
+///   (see [`poll`]): it may be a status-only repository.
+///
+/// What the degraded verdict cannot see is a failing **non-required**
+/// legacy status; the note says that too. Every other refusal (a rate
+/// limit, a bad credential) is returned unchanged.
+fn legacy_statuses(
+    reads: &mut GhReads,
+    sha: &str,
+    st: &mut State,
+) -> Result<serde_json::Value, ReadError> {
+    let empty = || serde_json::json!({ "statuses": [], "total_count": 0 });
+    if st.statuses_denied.is_some() {
+        return Ok(empty());
+    }
+    match reads.statuses(sha) {
+        Err(ReadError::Denied {
+            denial: crate::forge_denial::Denial::Permission,
+            why,
+        }) => {
+            note(
+                st,
+                format!(
+                    "wait-checks: legacy commit statuses unreadable ({why}); the verdict \
+                     covers check-runs only — a failing non-required commit status would not \
+                     be seen, and a required one still counts as missing. Grant the GitHub App \
+                     'Commit statuses: Read' to include them (#10633)."
+                ),
+            );
+            st.statuses_denied = Some(format!("statuses-unreadable: {why}"));
+            Ok(empty())
+        }
+        other => other,
+    }
 }
 
 /// Record a stderr note once (a retried lookup repeats the same reason).

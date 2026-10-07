@@ -22,6 +22,9 @@ type Key = (Option<String>, i64);
 
 #[derive(Default)]
 pub(super) struct Fake {
+    /// The archived probe's answer (#10562): `Err` when it did not answer.
+    pub(super) archived: Option<Result<bool, String>>,
+    pub(super) archived_calls: usize,
     pub(super) rows: Vec<RestIssue>,
     pub(super) list_fails: bool,
     pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
@@ -49,6 +52,12 @@ pub(super) struct Fake {
 }
 
 impl StaleBlockedForge for Fake {
+    fn archived(&mut self) -> Result<bool, String> {
+        self.archived_calls += 1;
+        self.meter.rest(true, None);
+        self.archived.clone().unwrap_or(Ok(false))
+    }
+
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
         self.list_calls += 1;
         if self.list_fails {

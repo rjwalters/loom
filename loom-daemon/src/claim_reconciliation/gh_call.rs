@@ -102,6 +102,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_release"
         | "heal.issue_add_label"
         | "intake.add_triage"
+        | "intake.remove_triage"
         | "verdict.clear_labels"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
@@ -123,7 +124,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
         | "prless.comment" => ops::COMMENT_CREATE,
-        "roster.delete" | "roster.patch" => ops::COMMENT_EDIT_DELETE,
+        "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
+            ops::COMMENT_EDIT_DELETE
+        }
         _ => return None,
     })
 }

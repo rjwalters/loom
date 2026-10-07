@@ -40,7 +40,13 @@
 //!    `propagate` on (the default), a starred issue's children by every link
 //!    [`edges`] resolves inherit the same way (#10012), transitively to
 //!    [`collect::MAX_INHERIT_DEPTH`].
-//! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
+//! 5. **Priority levels** ([`levels`], #10307). Every open issue that
+//!    blocks a level >= 2 issue (`loom:operator-high-priority`), directly or
+//!    transitively and across managed repos, carries the level's derived
+//!    label (`loom:high-priority-inherited`) with a body provenance marker, and
+//!    loses it once no source reaches it. Over-cap levels and blockers that
+//!    need the operator lead the digest.
+//! 6. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
 //!    `operator_priority_intents`; the exporter queues them and this module
 //!    validates and applies them idempotently, with one audit comment whose
 //!    `requested_at` becomes the authoritative starred-at.
@@ -54,6 +60,14 @@
 //! only narrates the frozen event-bus taxonomy, and a second ad hoc socket
 //! client for one message kind is a new integration, not a reuse. The
 //! follow-up is recorded on the PR.
+//!
+//! # One lister per fleet for the idle probe (W12 part 2)
+//!
+//! For a repo with no open starred issue the pass only lists the operator
+//! labels and stops. With `fleet.captainGauges.starFacts` the fleet captain
+//! makes those listings for the fleet, and this host skips its evaluator for
+//! a repo the captain freshly reports as star-free ([`captain`]). A repo with
+//! a star is still evaluated here in full, by every host that manages it.
 //!
 //! # Where it runs
 //!
@@ -69,6 +83,7 @@ use std::time::Duration;
 use crate::types::StarLivenessReport;
 pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
 
+pub mod captain;
 pub mod collect;
 pub mod edges;
 pub mod escalate;
@@ -77,6 +92,7 @@ pub mod inherit;
 pub mod inherited_star;
 pub mod intents;
 pub mod landing;
+pub mod levels;
 pub mod parent_link;
 pub mod progress;
 pub mod propagation_rules;
@@ -129,6 +145,53 @@ pub struct Settings {
     /// (`loom:blocked` blockers, refusal incident, red-main fix), which
     /// always inherit (#10012).
     pub propagate: bool,
+    /// `levelCaps`: the most open issues fleet-wide (as this host sees it)
+    /// that may carry each level's operator label (#10307), by level. Over
+    /// the cap is reported in the digest, never refused.
+    pub level_caps: LevelCaps,
+}
+
+/// Most levels [`LevelCaps`] holds a cap for.
+pub const MAX_CAPPED_LEVEL: usize = 8;
+
+/// Per-level caps (`autonomous.operatorPriority.levelCaps`, an object keyed
+/// by level: `{"2": 5}`), defaulting to the level table's `default_cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelCaps(pub [Option<usize>; MAX_CAPPED_LEVEL + 1]);
+
+impl Default for LevelCaps {
+    fn default() -> Self {
+        let mut caps = [None; MAX_CAPPED_LEVEL + 1];
+        for row in crate::operator_levels::table() {
+            if let Some(slot) = caps.get_mut(usize::from(row.level)) {
+                *slot = row.default_cap;
+            }
+        }
+        Self(caps)
+    }
+}
+
+impl LevelCaps {
+    /// The cap for `level`, if any.
+    #[must_use]
+    pub fn cap(&self, level: u8) -> Option<usize> {
+        self.0.get(usize::from(level)).copied().flatten()
+    }
+
+    fn from_block(v: Option<&serde_json::Value>) -> Self {
+        let mut caps = Self::default();
+        if let Some(obj) = v.and_then(serde_json::Value::as_object) {
+            for (k, v) in obj {
+                let (Ok(level), Some(n)) = (k.trim().parse::<usize>(), v.as_u64()) else {
+                    continue;
+                };
+                if let Some(slot) = caps.0.get_mut(level) {
+                    *slot = usize::try_from(n).ok().filter(|n| *n > 0);
+                }
+            }
+        }
+        caps
+    }
 }
 
 impl Default for Settings {
@@ -139,6 +202,7 @@ impl Default for Settings {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
             pools_grace: Duration::from_secs(DEFAULT_POOLS_GRACE_MINUTES * 60),
             propagate: true,
+            level_caps: LevelCaps::default(),
         }
     }
 }
@@ -194,6 +258,7 @@ impl Settings {
             interval: Duration::from_secs(interval),
             pools_grace: Duration::from_secs(grace.saturating_mul(60)),
             propagate,
+            level_caps: LevelCaps::from_block(cfg("levelCaps")),
         }
     }
 

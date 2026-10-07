@@ -157,6 +157,10 @@ pub fn run(argv: &[String], argv0: &str) -> ! {
         args::Parsed::Args(a) => *a,
     };
 
+    // #10179: a host that opted out never starts a daemon, before ANY side
+    // effect (including `--heal-watchdog-only`, which provisions the job).
+    crate::host_optout::refuse_if_disabled_exit("daemon-start");
+
     // Snapshot what the CALLING SHELL already exported, BEFORE the autonomy
     // block applies the FLAGS-OFF default: the downgrade check must tell "this
     // invocation's own default logic produced 0" from "the operator explicitly

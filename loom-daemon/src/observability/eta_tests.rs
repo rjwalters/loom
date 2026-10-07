@@ -74,18 +74,19 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // finish-v1, land-v1 (primary) and the land-v2 /
     // land-2026-10-06-calm-plover / land-v4 shadows (#9328, #10489, #10210)
     // answer (land-v3 and amber-heron retired, #10484; fresh-tide retired,
-    // #10549); the land-2026-10-04-twin-otter shadow (#10243) and
-    // little-v0 (#10208) refuse this pre-PR stage; the twin-otter -b
+    // #10549; land-2026-10-04-twin-otter, which refused this pre-PR stage,
+    // retired, #10528); little-v0 (#10208) refuses it; the twin-otter -b
     // composition (#10244) answers it from land-v2's path, and so do its
     // land-2026-10-06-quick-tern and -swift-tern calibration wrappers
     // (#10524), the land-2026-10-06-held-heron hybrid (#10523), which routes
     // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
-    // (#10508) and land-2026-10-06-loop-kite (#10521), whose pre-PR stages
-    // take the dispatch plan and land-v2's path, and the
+    // (#10508), land-2026-10-06-loop-kite (#10521), whose pre-PR stages
+    // take the dispatch plan and land-v2's path, the
     // land-2026-10-06-tandem-wren dependency wrapper (#10510; no edge, so
-    // -b's own answer).
-    assert_eq!(delivered.emitted, 13, "finish + land + the eleven answering land shadows");
-    assert_eq!(delivered.refused, 2, "twin-otter and little-v0: unknown_stage before a PR");
+    // -b's own answer), and land-2026-10-06-brisk-petrel (#10528),
+    // twin-otter-b plus the regime adjustment.
+    assert_eq!(delivered.emitted, 14, "finish + land + the twelve answering land shadows");
+    assert_eq!(delivered.refused, 1, "little-v0: unknown_stage before a PR");
     assert_eq!(delivered.outcomes, 15, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
@@ -156,7 +157,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (13, 2, 15));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (14, 1, 15));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -230,7 +231,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (13, 15, 0),
+        (14, 15, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {
@@ -245,13 +246,14 @@ fn incomplete_provenance_is_emitted_and_marked() {
 
 // ------------------------------------------- the fitted heuristics' file (#10243)
 
-/// What `land-2026-10-04-twin-otter` answers from `registry`: the fit id its
-/// explanation records, or the refusal.
+/// What twin-otter's evaluation answers from `registry` for a PR stage: the
+/// fit id its explanation records, or the refusal. Served by
+/// `land-2026-10-04-twin-otter-b` (twin-otter itself retired, #10528).
 fn twin_otter_answer(registry: &Registry) -> Result<String, crate::eta::NoEstimateReason> {
-    use crate::eta::heuristics::LAND_TWIN_OTTER;
+    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
     let input = crate::eta::tests::land_twin_otter::review_input();
     let e = registry
-        .get(LAND_TWIN_OTTER)
+        .get(LAND_TWIN_OTTER_B)
         .expect("always registered")
         .estimate(&input, &StageSamples::default());
     match (e.twin_otter, e.no_estimate_reason) {

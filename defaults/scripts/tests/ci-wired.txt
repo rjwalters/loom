@@ -171,10 +171,12 @@ test-recover-orphaned-shepherds-diagnostics.sh
 test-repo-mismatch-fallback.sh
 test-require-complexity-marker.sh
 test-require-daemon-bin.sh
+test-require-daemon-bin-provenance.sh
 test-resolve-tier-model.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
+test-resync-installed-host-optout.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-dogfood-symlink.sh
@@ -195,6 +197,8 @@ test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
 test-spawn-codex-sandbox-noop.sh
+test-spawn-codex-session-down.sh
+test-spawn-codex-session-mount-stale.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh

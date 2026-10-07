@@ -224,6 +224,11 @@ pub(crate) async fn handle_health_command(since: Option<String>, json: bool) -> 
         None => Duration::from_secs(health::DEFAULT_WINDOW_SECS),
     };
 
+    // #10179: a deliberately disabled host is not an outage - say so, exit 0.
+    if crate::cli::host::report_disabled(json) {
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(0);
+    }
     let report = collect(window).await;
 
     if json {
@@ -438,6 +443,8 @@ async fn collect(window: Duration) -> HealthReport {
         tmpfs_visibility: tmpfs_visibility_status,
         // 11. CI-telemetry poller health (#9014) — local status.json read.
         ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
+        // 12. Mail config on a mail-meant host (#10137) -- local env/file reads.
+        inbox_mail: loom_daemon::inbox_config::collect_health(&transcript_ingest_repo_root),
     })
 }
 

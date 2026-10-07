@@ -13,6 +13,84 @@
 use super::*;
 use crate::claim_reconciliation::gh_call;
 
+/// How long an archived-probe answer is trusted before it is re-read. An
+/// archive (or un-archive) is a rare, deliberate act; the read itself is an
+/// ETag `304` when nothing changed.
+const ARCHIVED_TTL: Duration = Duration::from_secs(3600);
+/// How long a failed probe waits before it is retried (it never blocks).
+const ARCHIVED_RETRY: Duration = Duration::from_secs(300);
+
+/// The archived-probe cache, keyed by workspace root (`None` repo) or by an
+/// explicit `owner/name`: `(read at, answer)`, `None` meaning "did not answer".
+type ArchivedCache = HashMap<String, (std::time::Instant, Option<bool>)>;
+
+static ARCHIVED: std::sync::LazyLock<Mutex<ArchivedCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether the repository behind `root` (or the explicit `repo`) is archived
+/// (#10562), through the probe `check-stale-blocked` and the release pass
+/// share ([`crate::stale_blocked::batch::probe_archived`]). Every role this
+/// runner dispatches writes to the forge, and an archived repository refuses
+/// every write, so a `true` here means "do not dispatch".
+///
+/// Fail-open: a probe that did not answer is `false` — an unreadable flag
+/// must never bench a live workspace — and is retried after
+/// [`ARCHIVED_RETRY`]. Under `cfg(test)` nothing is read; only answers seeded
+/// with [`set_archived_for_tests`] exist.
+pub(super) fn repo_is_archived(root: &Path, repo: Option<&str>) -> bool {
+    let key = repo.map_or_else(|| root.display().to_string(), str::to_string);
+    let now = std::time::Instant::now();
+    let cache = ARCHIVED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((at, answer)) = cache.get(&key) {
+        let ttl = if answer.is_some() {
+            ARCHIVED_TTL
+        } else {
+            ARCHIVED_RETRY
+        };
+        if cfg!(test) || now.duration_since(*at) < ttl {
+            return answer.unwrap_or(false);
+        }
+    }
+    if cfg!(test) {
+        return false;
+    }
+    drop(cache);
+    let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+    let slug = crate::forge_etag_store::resolve_target(Some(root), repo)
+        .repo
+        .unwrap_or_else(|| "{owner}/{repo}".to_string());
+    let site = crate::forge_etag_store::ConditionalRead::new(
+        "role_runner",
+        crate::forge_call_stats::ops::REPO_VIEW,
+    );
+    let answer =
+        crate::stale_blocked::batch::probe_archived(site, &gh, root, repo, &slug, "role-runner-")
+            .map(|(archived, _)| archived)
+            .map_err(|e| log::debug!("role_runner: archived probe for {key} failed: {e}"))
+            .ok();
+    if answer == Some(true) {
+        log::info!(
+            "role_runner: {key} is an archived (read-only) repository — dispatching no roles \
+             there and publishing nothing to it (#10562)"
+        );
+    }
+    ARCHIVED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (now, answer));
+    answer.unwrap_or(false)
+}
+
+/// Seed [`repo_is_archived`]'s answer for `root` (or `repo`) in a test.
+#[cfg(test)]
+pub(super) fn set_archived_for_tests(root: &Path, repo: Option<&str>, archived: bool) {
+    let key = repo.map_or_else(|| root.display().to_string(), str::to_string);
+    ARCHIVED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (std::time::Instant::now(), Some(archived)));
+}
+
 /// Resolve this host's `serves` digest set: the [`crate::role_shard::hash_key`]
 /// digest of every registered workspace's resolved shard key, for every
 /// workspace whose role runner is actually enabled (an unregistered /
@@ -222,6 +300,10 @@ fn roster_heartbeat_once(
     // repository this installation manages and can write to.
     let roster_repo = format!("{}/{}", issue.owner, issue.repo);
     if !crate::write_scope::gate_repo_with(fallback_root, &roster_repo, gh, "roster heartbeat") {
+        return;
+    }
+    // #10562: an archived roster repository refuses every write.
+    if repo_is_archived(fallback_root, Some(&roster_repo)) {
         return;
     }
     let ok = match action {

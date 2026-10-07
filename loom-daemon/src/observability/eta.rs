@@ -1169,6 +1169,7 @@ pub(super) async fn record(
         .map(|state| state.tracker.pending().to_vec())
         .unwrap_or_default();
     append_journal(workspace_root, &rows);
+    pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
     let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
@@ -1244,6 +1245,7 @@ mod authority;
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
+mod pr_resolved;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]

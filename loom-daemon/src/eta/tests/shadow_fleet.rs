@@ -15,6 +15,7 @@ use serde_json::json;
 
 const AMBER_HERON: &str = "land-2026-10-04-amber-heron";
 const FRESH_TIDE: &str = "land-2026-10-04-fresh-tide";
+const TWIN_OTTER: &str = "land-2026-10-04-twin-otter";
 
 /// Every built-in id and its declared tier. A new registration fails this
 /// test until its tier is written down here: the tier is a decision, not a
@@ -27,13 +28,13 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-2026-10-06-calm-plover", Tier::Candidate),
     ("land-v4", Tier::Candidate),
     ("little-v0", Tier::Baseline),
+    ("land-2026-10-06-brisk-petrel", Tier::Candidate),
     ("land-2026-10-06-quick-tern", Tier::Candidate),
     ("land-2026-10-06-swift-tern", Tier::Candidate),
     ("land-2026-10-06-held-heron", Tier::Candidate),
     ("land-2026-10-06-keen-wren", Tier::Candidate),
     ("land-2026-10-06-bold-lark", Tier::Candidate),
     ("land-2026-10-06-loop-kite", Tier::Candidate),
-    ("land-2026-10-04-twin-otter", Tier::Candidate),
     ("land-2026-10-04-twin-otter-b", Tier::Candidate),
     ("land-2026-10-06-tandem-wren", Tier::Candidate),
 ];
@@ -55,7 +56,7 @@ fn retired_ids_are_unregistered_and_answer_retired() {
     let registry = Registry::builtin();
     assert_eq!(
         RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        [LAND_V3, AMBER_HERON, FRESH_TIDE]
+        [LAND_V3, AMBER_HERON, FRESH_TIDE, TWIN_OTTER]
     );
     for (id, kind) in RETIRED {
         assert!(!registry.registers(*kind, id), "{id} is retired, so not registered");
@@ -87,6 +88,20 @@ fn fresh_tide_is_retired() {
     let decision = decide_with_passing_evidence(LAND_V1, FRESH_TIDE);
     assert!(!decision.promote);
     assert_eq!(decision.candidate_tier, Some(Tier::Retired));
+}
+
+/// #10528: `land-2026-10-04-twin-otter` made room for brisk-petrel within
+/// the budget. `-b` is its fixed successor (the #10500 train/serve skew fix)
+/// and keeps serving its evaluation for PR stages; only the registration is
+/// retired. It answers `retired`, is not registered, and cannot be promoted.
+#[test]
+fn twin_otter_is_retired_and_b_stays_a_candidate() {
+    assert_eq!(builtin_tier(TWIN_OTTER), Some(Tier::Retired));
+    assert!(!Registry::builtin().registers(Kind::Land, TWIN_OTTER));
+    let decision = decide_with_passing_evidence(LAND_V1, TWIN_OTTER);
+    assert!(!decision.promote);
+    assert_eq!(decision.candidate_tier, Some(Tier::Retired));
+    assert_eq!(builtin_tier("land-2026-10-04-twin-otter-b"), Some(Tier::Candidate));
 }
 
 #[test]

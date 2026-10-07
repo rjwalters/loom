@@ -19,7 +19,9 @@
 //!    open same-repo blocker → `blocked-by` (every open same-repo blocker
 //!    inherits the star); only a
 //!    cross-repo blocker → `needs-operator(blocked-cross-repo)` (stars are not
-//!    inherited across repos, so nothing else would move it); otherwise the
+//!    inherited across repos, so nothing else would move it), except, at level 2
+//!    or above, into a managed repo → `blocked-by` (#10307: the blocker inherits
+//!    the level there); otherwise the
 //!    block is stale (#10151) → `stale-block`, which the pass resolves itself
 //!    ([`StaleAction`]): every cited blocker closed → unblock; none cited →
 //!    hand to Curator. Only when that already happened once and the issue is
@@ -371,6 +373,17 @@ pub fn classify(f: &StarFacts) -> Landing {
         }
         if let Some(b) = f.blockers.iter().find(open) {
             let d = &b.display;
+            // #10307: level >= 2 crosses into managed repos (the blocker
+            // inherits the level as a label), so it is an agent wait, not an
+            // operator ask. The plain star still does not cross.
+            if b.cross_repo_managed == Some(true)
+                && crate::operator_levels::level(&f.issue.labels) >= 2
+            {
+                let mut landing =
+                    Landing::stage(LandingStage::BlockedBy, &format!("blocker {d}"), pr_num);
+                landing.blocked_by = Some(d.clone());
+                return landing;
+            }
             let text = if b.cross_repo_managed == Some(true) {
                 format!(
                     "{}#{n} is starred but blocked by {d} in another repo. Stars are not \

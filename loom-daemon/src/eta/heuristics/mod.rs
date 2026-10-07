@@ -6,7 +6,11 @@
 //! from the registry, #10484; its module stays as `land-v4`'s step) plus whether a stall's term
 //! is applied and an item beyond its history is answered rather than refused.
 //! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
-//! fitted coefficient file handed to it when the registry was built.
+//! fitted coefficient file handed to it when the registry was built. It is
+//! retired from the registry (#10528); its evaluation stays, served by
+//! `land-2026-10-04-twin-otter-b` (#10244) for PR stages, and its module stays
+//! for `-b`, keen-wren, held-heron and the fit (`recompute`, `adapt_input`,
+//! `visit_*`, `DRAW_ORDER`).
 //! `land-2026-10-06-calm-plover` (#10489) and `land-2026-10-06-quick-tern`
 //! (#10524) are calibration wrappers over `land-v2` and
 //! `land-2026-10-04-twin-otter-b` respectively.
@@ -15,6 +19,8 @@
 //! ([`crate::eta::hazard_sim`]).
 //! `land-2026-10-06-keen-wren` (#10508) is twin-otter-b's priority-aware
 //! successor: the same evaluation over an `eta-fit/v2` file.
+//! `land-2026-10-06-brisk-petrel` (#10528) is twin-otter-b scaled by the
+//! drift-gated latent-regime residual adjustment ([`crate::eta::regime`]).
 //! `land-2026-10-06-swift-tern` (#10524) is quick-tern made drift-aware
 //! (#10528's drift check: shorter half-life; the inflation the check asks
 //! for is recorded, not applied).
@@ -26,6 +32,7 @@
 
 mod finish_v1;
 mod land_bold_lark;
+mod land_brisk_petrel;
 mod land_calm_plover;
 mod land_dependency;
 mod land_held_heron;
@@ -44,6 +51,7 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_bold_lark::{LandBoldLark, LAND_BOLD_LARK};
+pub use land_brisk_petrel::{LandBriskPetrel, LAND_BRISK_PETREL};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
 pub use land_held_heron::{

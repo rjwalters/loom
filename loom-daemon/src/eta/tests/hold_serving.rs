@@ -8,9 +8,8 @@ use super::{as_of, history_a, provenance};
 use crate::eta::emit::{Trigger, HOURLY_CAP};
 use crate::eta::explanation::Explanation;
 use crate::eta::heuristics::{
-    LandTwinOtter, LAND_BOLD_LARK, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_LOOP_KITE,
-    LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
-    LAND_V4,
+    LandTwinOtter, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN,
+    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B, LAND_V4,
 };
 use crate::eta::queue_features::{reason, EventLog};
 use crate::eta::simulate::run_explanation;
@@ -32,16 +31,17 @@ const OP: &str = "loom:operator";
 /// `land-2026-10-06-held-heron` (#10523) answers it,
 /// `land-2026-10-06-keen-wren` (#10508) is twin-otter's evaluation over v2,
 /// `land-2026-10-06-loop-kite` (#10521) the same over v3,
-/// and `land-2026-10-06-tandem-wren` (#10510) reads exactly what its base
-/// twin-otter-b reads.
+/// `land-2026-10-06-tandem-wren` (#10510) reads exactly what its base
+/// twin-otter-b reads, and `land-2026-10-06-brisk-petrel` (#10528) wraps `-b`
+/// as well.
 const HOLD_AWARE: [&str; 9] = [
+    LAND_BRISK_PETREL,
     LAND_QUICK_TERN,
     LAND_SWIFT_TERN,
     LAND_HELD_HERON,
     LAND_KEEN_WREN,
     LAND_BOLD_LARK,
     LAND_LOOP_KITE,
-    LAND_TWIN_OTTER,
     LAND_TWIN_OTTER_B,
     LAND_TANDEM_WREN,
 ];
@@ -172,11 +172,13 @@ fn ids(emissions: &[Emission]) -> Vec<&str> {
         .collect()
 }
 
+/// Twin-otter's evaluation as served: `land-2026-10-04-twin-otter` itself
+/// is retired (#10528), and `-b` hands every PR stage to it unchanged.
 fn twin(emissions: &[Emission]) -> &Explanation {
     &emissions
         .iter()
-        .find(|e| e.explanation.heuristic == LAND_TWIN_OTTER)
-        .expect("a twin-otter emission")
+        .find(|e| e.explanation.heuristic == LAND_TWIN_OTTER_B)
+        .expect("a twin-otter-b emission")
         .explanation
 }
 

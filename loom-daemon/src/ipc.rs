@@ -1614,6 +1614,10 @@ pub fn build_daemon_status(
         // Long-running task liveness (#10414): every registered loop's
         // last beat and whether it is inside its staleness window.
         task_liveness: crate::task_liveness::snapshot(),
+        // Codex session containers (#10600): the published snapshot, the
+        // on-disk holds/removal records and the reconciler's last action. No
+        // docker call, so a wedged Docker never stalls `status`.
+        session_containers: crate::session_status::report(),
         // Host-distress circuit breaker (#4235) — read from the process-global
         // handle the work-finder loop registers/updates each tick, mirroring the
         // auto-update global-snapshot pattern above. `None` (no breaker
@@ -1669,26 +1673,7 @@ pub fn build_daemon_status(
         // pattern as the auto-update/host-breaker fields above. `enabled:
         // false, eligible: false` when the `autonomous.idleExit` task was
         // never spawned (feature disabled), never misread as "eligible".
-        idle_exit: Some({
-            let snap = crate::idle_exit::global_status_snapshot();
-            crate::types::IdleExitStatus {
-                enabled: snap.enabled,
-                eligible: snap.eligible,
-                trigger: snap
-                    .trigger
-                    .map(crate::idle_exit::IdleExitTrigger::as_str)
-                    .map(str::to_string),
-                idle_minutes: snap.idle_minutes,
-                in_flight_sweeps: snap.in_flight_sweeps,
-                active_role_runs: snap.active_role_runs,
-                healthy_tokens: snap.healthy_tokens,
-                total_tokens: snap.total_tokens,
-                idle_elapsed_secs: snap.idle_elapsed_secs,
-                starved_elapsed_secs: snap.starved_elapsed_secs,
-                starvation_enabled: snap.starvation_enabled,
-                observed_at: snap.observed_at,
-            }
-        }),
+        idle_exit: Some(crate::idle_exit::status_report()),
         // Worktree removals the periodic reaper has backed off after repeated
         // or permission-class failures (#7590) — same process-global
         // snapshot pattern as `deep_clean`/`idle_exit` above. Empty in the

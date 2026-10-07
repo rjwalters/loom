@@ -1,0 +1,16 @@
+# Vendored consumer fixture for the eta.snapshot contract test (#10391).
+# The loom-ui half (vendoring loom's golden) is 2AMLogic/loom-ui#1854.
+#
+# Extraction: the record `etaRecord()` builds, with rows[0].alternates set as
+# the test does, transcribed to JSON verbatim (malformed alternates included —
+# their key paths are a subset of the well-formed ones).
+#
+# Re-vendor when loom-ui's consumer shape changes: re-extract, then update
+# commit, source-sha256 and fixture-sha256 below. The test checks
+# fixture-sha256 against the fixture bytes, so an edit without a re-vendor fails.
+repo: 2AMLogic/loom-ui
+commit: fa59b7fc22d8999f3aad9a8ae457973b495ccabe
+path: test/etaState.test.ts
+test: normalizeEtaSnapshot alternates (#1669) > keeps well-formed shadow estimates and refusals, drops partial triples
+source-sha256: 886bead101a6b8b11c1958c0f59a0de7383286d63b545270d5df6e86e7371b12
+fixture-sha256: c5b1bac50bcdf05e410cde796ce6ee499a2989c9ef6e8c459b4b7f38f28a0bd2

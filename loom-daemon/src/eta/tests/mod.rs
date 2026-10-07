@@ -2,6 +2,7 @@
 
 mod backtest;
 mod backtest_pr;
+mod backtest_subsets;
 mod backtest_union;
 mod censoring;
 mod conditioning;
@@ -24,6 +25,8 @@ mod flag_timeline;
 mod fleet;
 mod fleet_refresh;
 mod fleet_signoz;
+mod fleet_signoz_timeline;
+mod fleet_signoz_timeline_sql;
 mod friction;
 mod held_heron;
 mod hold_parity;
@@ -47,6 +50,7 @@ mod ready;
 mod recalibrate;
 mod recency;
 mod regime;
+mod regime_serving;
 mod roster_history;
 mod score;
 mod serve_parity;

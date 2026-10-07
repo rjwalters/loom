@@ -239,10 +239,18 @@ impl GhReleaseForge {
 
 impl ReleaseForge for GhReleaseForge {
     fn archived(&mut self) -> Result<bool, String> {
-        let url = format!("repos/{}", self.slug);
-        let v: Value = serde_json::from_str(self.get(ops::REPO_VIEW, &url)?.trim())
-            .map_err(|e| format!("parse {url}: {e}"))?;
-        Ok(v.get("archived").and_then(Value::as_bool).unwrap_or(false))
+        // The shared probe (#10562), also behind `check-stale-blocked` and the
+        // role runner's archived-root gate.
+        let site = store::ConditionalRead::new(CALLER, ops::REPO_VIEW);
+        super::batch::probe_archived(
+            site,
+            &self.gh_bin,
+            &self.root,
+            self.repo.as_deref(),
+            &self.slug,
+            "stale-release-",
+        )
+        .map(|(archived, _)| archived)
     }
 
     fn comments(&mut self, number: u64) -> Result<Vec<Value>, String> {

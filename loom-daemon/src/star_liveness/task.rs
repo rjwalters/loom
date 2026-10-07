@@ -17,6 +17,7 @@ use super::escalate::{self, Ledger, Notice, Outcome, Target};
 use super::forge::{GhStarForge, StarForge};
 use super::inherit::{self, Inherited};
 use super::intents::{self, AppliedIds, StarIntent};
+use super::levels;
 use super::progress::{self, Tracker, Watched};
 use super::stale;
 use super::Settings;
@@ -77,6 +78,10 @@ pub struct LivenessState {
     pool_since: HashMap<(String, u32), DateTime<Utc>>,
     /// Consecutive failed passes per workspace root.
     failed_passes: HashMap<PathBuf, u32>,
+    /// Repos left to the fleet captain's "no star here" report (W12 part 2).
+    /// Empty unless [`Self::set_captain_star_free`] is called: every repo is
+    /// then evaluated here, as before.
+    captain: super::captain::StandDown,
 }
 
 impl LivenessState {
@@ -86,6 +91,13 @@ impl LivenessState {
     /// with no bus drops them, which is the pre-#9321 behavior.
     pub fn take_notices(&mut self) -> Vec<Notice> {
         self.ledger.take_notices()
+    }
+
+    /// Hand in the repos (lowercased slugs) the fleet captain freshly reports
+    /// as having no open starred issue, with each report's `as_of`, for the
+    /// next [`Self::run_pass`] ([`super::captain`]).
+    pub fn set_captain_star_free(&mut self, free: HashMap<String, DateTime<Utc>>) {
+        self.captain.set_free(free);
     }
 
     fn record_drop(&mut self, intent: &StarIntent, d: DroppedStarIntent) {
@@ -116,6 +128,7 @@ impl LivenessState {
         batch: Vec<StarIntent>,
         managed: &HashMap<String, (String, PathBuf)>,
         write: bool,
+        now: DateTime<Utc>,
         forges: &mut ForgeFactory<'_>,
     ) {
         for intent in batch {
@@ -136,6 +149,11 @@ impl LivenessState {
                     match intents::apply(forge.as_mut(), &valid) {
                         Ok(done) => {
                             self.applied.insert(&valid.id);
+                            if valid.action == intents::Action::Star {
+                                // This host knows of a star the captain's
+                                // last listing may predate.
+                                self.captain.note_star(&valid.repo, now);
+                            }
                             log::info!(
                                 "star_liveness: applied loom-ui intent {} on {}#{} \
                                  (label changed: {}, commented: {})",
@@ -171,7 +189,7 @@ impl LivenessState {
             .iter()
             .map(|r| (r.slug.to_ascii_lowercase(), (r.slug.clone(), r.root.clone())))
             .collect();
-        self.apply_intents(batch, &managed, settings.escalate, forges);
+        self.apply_intents(batch, &managed, settings.escalate, now, forges);
         // A repo registered since the star arrived is handled normally.
         self.unmanaged
             .retain(|(repo, _), _| !managed.contains_key(&repo.to_ascii_lowercase()));
@@ -180,6 +198,13 @@ impl LivenessState {
         let mut failed = Vec::new();
         let is_managed = |slug: &str| managed.contains_key(&slug.to_ascii_lowercase());
         for repo in repos {
+            if self.captain.stands_down(repo, now) {
+                // The local pass over an empty starred listing, without the
+                // listing: no rows, no inheritance, a successful pass.
+                inherit::publish(&repo.root, Vec::new());
+                self.failed_passes.remove(&repo.root);
+                continue;
+            }
             let root = repo.root.clone();
             let recorded = move |n: u32| intents::recorded_starred_at(&root, n);
             let ctx = RepoContext {
@@ -198,6 +223,9 @@ impl LivenessState {
                 .run();
             match result {
                 Ok(rows) => {
+                    if !rows.is_empty() {
+                        self.captain.note_star(&repo.slug, now);
+                    }
                     let inherited: Vec<Inherited> = rows
                         .iter()
                         .filter_map(|e| {
@@ -229,6 +257,7 @@ impl LivenessState {
                 }
             }
         }
+        let level_step = self.levels(repos, &mut evaluated, settings, host, forges);
         for ((slug, number), at) in &self.unmanaged {
             evaluated.push((None, collect::unmanaged(slug, *number, at.clone())));
         }
@@ -278,6 +307,7 @@ impl LivenessState {
                     stage: e.landing.stage,
                     url: escalate::issue_url(web_base, &repo, issue),
                     inherited_from: e.inherited_from,
+                    level_from: e.level_inherited_from.as_deref().zip(e.inherited_label),
                 };
                 match self.ledger.escalate(forge.as_mut(), &target, a) {
                     Ok(Outcome::Posted) => {
@@ -326,11 +356,12 @@ impl LivenessState {
                 capacity_wait: e.landing.capacity_wait.clone(),
                 ask,
                 inherited_from: e.inherited_from,
-                operator_priority_at: e
-                    .starred_at
-                    .clone()
+                operator_priority_at: promoted_at(&e)
+                    .or_else(|| e.starred_at.clone())
                     .or_else(|| e.facts.issue.created_at.clone()),
                 last_progress_at: Some(progress_at),
+                level: e.level(),
+                level_inherited_from: e.level_inherited_from.clone(),
             });
         }
         self.tracker.retain(&live, &failed);
@@ -352,7 +383,76 @@ impl LivenessState {
             escalations_posted: posted,
             dropped_intents: self.dropped.iter().cloned().collect(),
             failed_repos: failed,
+            over_cap: level_step.over_cap,
+            unfollowed_blockers: level_step.closure.unfollowed.into_iter().collect(),
         }
+    }
+
+    /// The priority-level step (#10307, [`levels`]): walk every level >= 2
+    /// issue's blockers across the managed repos, write the derived labels,
+    /// annotate the rows the star pass already has and add the rest, and
+    /// publish the in-memory twin for the work finder.
+    fn levels(
+        &mut self,
+        repos: &[RepoInput],
+        evaluated: &mut Vec<(Option<PathBuf>, Evaluated)>,
+        settings: Settings,
+        host: &str,
+        forges: &mut ForgeFactory<'_>,
+    ) -> levels::Outcome {
+        let key = |e: &Evaluated| (e.facts.repo.clone(), e.facts.issue.number);
+        let managed_rows = || evaluated.iter().filter(|(root, _)| root.is_some());
+        let landing: HashMap<levels::Key, Vec<u32>> = managed_rows()
+            .map(|(_, e)| (key(e), e.landing.inherits.clone()))
+            .collect();
+        let starred_at: HashMap<levels::Key, Option<String>> = managed_rows()
+            // The time the source's own row sorts by, so a promoted blocker
+            // sorts exactly where its source does.
+            .map(|(_, e)| {
+                (
+                    key(e),
+                    e.starred_at.clone().or_else(|| e.facts.issue.created_at.clone()),
+                )
+            })
+            .collect();
+        let refs: Vec<levels::RepoRef> = repos
+            .iter()
+            .map(|r| (r.slug.clone(), r.root.clone()))
+            .collect();
+        let caps = settings.level_caps;
+        let mut outcome = levels::run(
+            &refs,
+            &mut *forges,
+            &landing,
+            &starred_at,
+            &|level| caps.cap(level),
+            settings.escalate,
+            host,
+        );
+        for (k, row) in std::mem::take(&mut outcome.rows) {
+            let have = evaluated
+                .iter_mut()
+                .find(|(root, e)| root.is_some() && key(e) == k);
+            if let Some((_, e)) = have {
+                e.level_inherited_from = row.level_inherited_from;
+                e.inherited_level = row.inherited_level;
+                e.inherited_label = row.inherited_label;
+                e.level_requested_at = row.level_requested_at;
+            } else {
+                let root = repos.iter().find(|r| r.slug == k.0).map(|r| r.root.clone());
+                evaluated.push((root, row));
+            }
+        }
+        for repo in repos {
+            let items = outcome
+                .items
+                .iter()
+                .filter(|(k, _)| k.0 == repo.slug)
+                .map(|(_, item)| item.clone())
+                .collect();
+            inherit::publish_levels(&repo.root, items);
+        }
+        outcome
     }
 }
 
@@ -452,13 +552,34 @@ impl LivenessState {
     }
 }
 
-/// Starred rows by starred-at (then repo, issue); each inheriting blocker
-/// right after the issue it inherits from.
-fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
-    let (mut roots, children): (Vec<_>, Vec<_>) =
-        rows.into_iter().partition(|r| r.inherited_from.is_none());
+/// The starred-at a row promoted to a level by `e`'s level source sorts by:
+/// the source's, not the plain star it also inherits.
+fn promoted_at(e: &Evaluated) -> Option<String> {
+    (e.level_inherited_from.is_some() && e.inherited_level > e.item.operator_level())
+        .then(|| e.level_requested_at.clone())
+        .flatten()
+}
+
+/// Starred rows by level (highest first, #10307), then starred-at (then
+/// repo, issue); each inheriting blocker right after the issue it inherits
+/// from. A blocker that inherits a level and needs the operator
+/// (`loom:operator-only` / `loom:operator-decision`) leads the digest:
+/// often what blocks the operator's top issue is the operator.
+pub(crate) fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
+    // Level is the primary key for every row: a child nests under the issue
+    // it inherits the plain star from only at that parent's level, else it
+    // is a root of its own level.
+    let levels: HashMap<(String, u32), u8> = rows
+        .iter()
+        .map(|r| ((r.repo.clone(), r.issue), r.level))
+        .collect();
+    let (children, mut roots): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| {
+        r.inherited_from
+            .is_some_and(|p| levels.get(&(r.repo.clone(), p)) == Some(&r.level))
+    });
     roots.sort_by(|a, b| {
-        (&a.operator_priority_at, &a.repo, a.issue).cmp(&(
+        (std::cmp::Reverse(a.level), &a.operator_priority_at, &a.repo, a.issue).cmp(&(
+            std::cmp::Reverse(b.level),
             &b.operator_priority_at,
             &b.repo,
             b.issue,
@@ -482,7 +603,14 @@ fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
         }
     }
     out.extend(pending);
-    out
+    let (mut first, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|r| {
+        r.level_inherited_from.is_some()
+            && r.ask.as_ref().is_some_and(|a| {
+                matches!(a.kind, AskKind::OperatorOnly | AskKind::OperatorDecision)
+            })
+    });
+    first.extend(rest);
+    first
 }
 
 /// This host's pool exhaustion for `root`, from the work finder's pool holds.
@@ -706,6 +834,15 @@ pub fn spawn(
                     &mut skip_logged,
                     || {
                         let repos = resolve_repos(&workspace_root, &mut slugs, &mut web_bases);
+                        // W12 part 2: empty unless this host is a dispatcher
+                        // with `fleet.captainGauges.starFacts` and the
+                        // captain's facts are fresh right now.
+                        let labels = crate::operator_levels::operator_labels(
+                            crate::operator_levels::table(),
+                        );
+                        state.set_captain_star_free(
+                            crate::observability::captain_gauges::star_free(Utc::now(), &labels),
+                        );
                         let batch = intents::global_queue()
                             .map(|q| q.drain())
                             .unwrap_or_default();
