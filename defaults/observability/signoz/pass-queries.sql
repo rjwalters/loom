@@ -12,7 +12,10 @@
 
 -- 1. Release passes per repo, last 24 h, in one row per (mechanism, repo):
 --    how many passes ran (and how many were refused), how many blocks they
---    released or re-parked, how many artifacts they skipped and why
+--    released or re-parked (`released` / `reparked` / `failed` count mode `on`
+--    passes only: a dry-run pass reports the same verdicts as a plan and
+--    removes nothing, so those land in `planned_released` / `planned_reparked`),
+--    how many artifacts they skipped and why
 --    (`skip_reasons` sums the body's per-reason map), and the GitHub calls
 --    the pass made by operation (`calls_by_op`, from its spans).
 WITH passes AS (
@@ -21,9 +24,16 @@ WITH passes AS (
            count() AS passes,
            countIf(attributes_string['loom.pass.outcome'] = 'refused') AS refused,
            countIf(attributes_string['loom.pass.mode'] = 'dry_run') AS dry_run_passes,
-           sum(JSONExtractUInt(body, 'verdicts', 'released')) AS released,
-           sum(JSONExtractUInt(body, 'verdicts', 'reparked')) AS reparked,
-           sum(JSONExtractUInt(body, 'verdicts', 'failed')) AS failed,
+           sumIf(JSONExtractUInt(body, 'verdicts', 'released'),
+                 attributes_string['loom.pass.mode'] = 'on') AS released,
+           sumIf(JSONExtractUInt(body, 'verdicts', 'reparked'),
+                 attributes_string['loom.pass.mode'] = 'on') AS reparked,
+           sumIf(JSONExtractUInt(body, 'verdicts', 'failed'),
+                 attributes_string['loom.pass.mode'] = 'on') AS failed,
+           sumIf(JSONExtractUInt(body, 'verdicts', 'released'),
+                 attributes_string['loom.pass.mode'] = 'dry_run') AS planned_released,
+           sumIf(JSONExtractUInt(body, 'verdicts', 'reparked'),
+                 attributes_string['loom.pass.mode'] = 'dry_run') AS planned_reparked,
            sum(toUInt64(attributes_number['loom.pass.skipped'])) AS skipped,
            sumMap(arrayMap(kv -> kv.1, JSONExtractKeysAndValues(body, 'skipped', 'UInt64')),
                   arrayMap(kv -> kv.2, JSONExtractKeysAndValues(body, 'skipped', 'UInt64')))
@@ -48,7 +58,8 @@ calls AS (
     GROUP BY mechanism, repo
 )
 SELECT p.mechanism, p.repo, p.passes, p.refused, p.dry_run_passes,
-       p.released, p.reparked, p.failed, p.skipped, p.skip_reasons,
+       p.released, p.reparked, p.failed, p.planned_released, p.planned_reparked,
+       p.skipped, p.skip_reasons,
        p.write_cap_hits, p.github_calls, c.github_writes, c.calls_by_op,
        p.latest_version
 FROM passes AS p
@@ -58,8 +69,9 @@ ORDER BY p.mechanism, p.repo;
 -- 2. Why is each artifact still held? The newest verdict per (repo, number)
 --    in the last 24 h. Unchanged verdicts are re-emitted at least hourly
 --    (LOOM_RELEASE_STALE_BLOCKED_VERDICT_HEARTBEAT_SECS), so every artifact a
---    pass still decides shows up here. One that left the listing shows its
---    final verdict (`released`).
+--    pass still decides shows up here. `mode` and `applied` say whether the
+--    newest verdict was written: `released` with `applied` false (or mode
+--    `dry_run`) is a plan, and the artifact is still held.
 SELECT attributes_string['loom.repo'] AS repo,
        toUInt64(attributes_number['loom.pass.number']) AS number,
        argMax(attributes_string['loom.pass.artifact'], timestamp) AS artifact,
@@ -67,6 +79,8 @@ SELECT attributes_string['loom.repo'] AS repo,
        argMax(attributes_string['loom.pass.reason'], timestamp) AS reason,
        argMax(attributes_string['loom.pass.blockers'], timestamp) AS blockers,
        argMax(attributes_string['loom.pass.mechanism'], timestamp) AS mechanism,
+       argMax(attributes_string['loom.pass.mode'], timestamp) AS mode,
+       argMax(attributes_bool['loom.pass.applied'], timestamp) AS applied,
        fromUnixTimestamp64Nano(max(timestamp)) AS decided_at
 FROM signoz_logs.distributed_logs_v2
 WHERE attributes_string['loom.kind'] = 'pass.verdict'

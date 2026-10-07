@@ -252,3 +252,48 @@ fn the_saved_queries_read_each_key_from_the_map_its_type_lands_in() {
         }
     }
 }
+
+/// A dry-run pass reports the verdicts it planned (`report.acted` still counts
+/// them) but removes nothing, so the saved queries must not fold them into the
+/// applied release/re-park totals, and the per-artifact query must say whether
+/// the newest verdict was written. No ClickHouse runs in CI, so this pins the
+/// gating in the SQL against the mode strings the daemon actually exports.
+#[test]
+fn the_saved_queries_keep_dry_run_plans_out_of_applied_totals() {
+    let mut on = summary();
+    on.mode = PassMode::On;
+    let mut dry = summary();
+    dry.mode = PassMode::DryRun;
+    let mode = |r: PassSummaryRecord| {
+        string(attrs(&log(TelemetryRecord::PassSummary(r))).get("loom.pass.mode")).to_string()
+    };
+    let (on_mode, dry_mode) = (mode(on), mode(dry));
+    assert_eq!((on_mode.as_str(), dry_mode.as_str()), ("on", "dry_run"));
+
+    let flat: String = QUERIES.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (verdict, alias) in [
+        ("released", "released"),
+        ("reparked", "reparked"),
+        ("failed", "failed"),
+    ] {
+        let applied = format!(
+            "sumIf(JSONExtractUInt(body, 'verdicts', '{verdict}'), \
+             attributes_string['loom.pass.mode'] = '{on_mode}') AS {alias}"
+        );
+        assert!(flat.contains(&applied), "{alias} must count mode {on_mode} only");
+    }
+    for verdict in ["released", "reparked"] {
+        let planned = format!(
+            "sumIf(JSONExtractUInt(body, 'verdicts', '{verdict}'), \
+             attributes_string['loom.pass.mode'] = '{dry_mode}') AS planned_{verdict}"
+        );
+        assert!(flat.contains(&planned), "planned_{verdict} must count mode {dry_mode} only");
+    }
+    assert!(
+        !flat.contains("sum(JSONExtractUInt(body, 'verdicts'"),
+        "an ungated sum over body verdicts mixes dry-run plans into applied totals"
+    );
+    // Query 2 shows mode and applied beside the verdict.
+    assert!(flat.contains("argMax(attributes_string['loom.pass.mode'], timestamp) AS mode"));
+    assert!(flat.contains("argMax(attributes_bool['loom.pass.applied'], timestamp) AS applied"));
+}
