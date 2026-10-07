@@ -194,6 +194,83 @@ fn a_repo_missing_from_a_sample_keeps_its_state() {
 }
 
 #[test]
+fn a_repo_taken_back_from_the_captain_starts_from_a_baseline() {
+    // W12: while the captain samples a repo this host forgets it, so taking
+    // it back after a stale heartbeat never replays what the captain saw.
+    let mut fake = Fake::default();
+    for n in [7, 8] {
+        fake.labels
+            .insert(n, BTreeMap::from([(CURATED.to_string(), at(10))]));
+    }
+    let mut sampler = Sampler::default();
+    sampler.sample(&[repo(&[(CURATED, vec![issue(7, 0)])])], at(20), &mut fake);
+    sampler.forget("acme/app");
+    // Back under this host with a new curated issue and a promotion: both
+    // happened while the captain sampled, so neither is sampled here.
+    let back = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0)]),
+    ];
+    assert!(sampler
+        .sample(&[repo(&back)], at(3600), &mut fake)
+        .is_empty());
+    // From the new baseline on, transitions are sampled as usual.
+    let promoted = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0), issue(8, 0)]),
+    ];
+    let samples = sampler.sample(&[repo(&promoted)], at(3900), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [3890]);
+}
+
+#[test]
+fn a_captain_that_lost_a_repo_past_the_bound_baselines_it_instead_of_replaying() {
+    // W12 follow-up: the captain could not list the repo for longer than the
+    // heartbeat's staleness bound. Every dispatcher fell back, baselined and
+    // sampled the repo's transitions itself, so the captain must not emit
+    // them again from its pre-outage state.
+    let mut fake = Fake::default();
+    for n in [7, 8] {
+        fake.labels
+            .insert(n, BTreeMap::from([(CURATED.to_string(), at(10))]));
+    }
+    let outage = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0)]),
+    ];
+    let bound = chrono::Duration::seconds(1800);
+
+    let mut captain = Sampler::default();
+    captain.set_replay_bound(Some(bound));
+    captain.sample(&[repo(&[(CURATED, vec![issue(7, 0)])])], at(20), &mut fake);
+    // The repo's listing fails for an hour (absent from the inputs).
+    assert!(captain.sample(&[], at(320), &mut fake).is_empty());
+    assert!(captain
+        .sample(&[repo(&outage)], at(3620), &mut fake)
+        .is_empty());
+    // From the new baseline on, transitions are sampled as usual.
+    let promoted = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0), issue(8, 0)]),
+    ];
+    let samples = captain.sample(&[repo(&promoted)], at(3920), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [3910]);
+
+    // A gap inside the bound is still diffed: one missed pass loses nothing.
+    let mut brief = Sampler::default();
+    brief.set_replay_bound(Some(bound));
+    brief.sample(&[repo(&[(CURATED, vec![issue(7, 0)])])], at(20), &mut fake);
+    let samples = brief.sample(&[repo(&outage)], at(1820), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [1810]);
+
+    // Without a bound (every host but the captain) an outage is caught up.
+    let mut local = Sampler::default();
+    local.sample(&[repo(&[(CURATED, vec![issue(7, 0)])])], at(20), &mut fake);
+    let samples = local.sample(&[repo(&outage)], at(3620), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [3610]);
+}
+
+#[test]
 fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
     let samples = [
         DwellSample {

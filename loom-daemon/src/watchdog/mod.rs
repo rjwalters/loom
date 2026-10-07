@@ -98,6 +98,14 @@ pub fn tick(verbose: bool) -> i32 {
     let reporter = report::Reporter::new(paths.log.clone(), verbose);
     let state = consts::StateFiles::resolve(&paths.loom_dir);
 
+    // #10179: a host opt-out outranks even an operator stop: no recovery, no
+    // page, but a non-zero exit with the reason so `systemctl status` shows it.
+    if let Err(refusal) = crate::host_optout::check_or_refuse("daemon-watchdog") {
+        recovery::clear(&state.recovery, &state.escalation_sentinel);
+        reporter.report(report::Level::Ok, &refusal.to_string());
+        eprintln!("{refusal}");
+        return 1;
+    }
     // #9588: an operator stop on record outranks everything, including a stale
     // marker — the watchdog must never revive a daemon an operator stopped.
     if crate::operator_stop::is_recorded(&paths.marker) {

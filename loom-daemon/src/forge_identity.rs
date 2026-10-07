@@ -68,6 +68,9 @@ pub use withdrawal::{
     READ_ROUTING_ENV, SECONDARY_WITHDRAWAL,
 };
 
+#[path = "forge_identity/served.rs"]
+pub mod served;
+
 #[path = "forge_identity/route.rs"]
 pub mod route;
 pub use route::{route_read, ExhaustCause, Placement, ReadClass, RouteDecision, RouteRequest};

@@ -965,7 +965,9 @@ async fn sample_snapshots(
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
-    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
+    // skips the repos a fresh captain covers (`captain_gauges`).
+    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -986,6 +988,11 @@ async fn sample_snapshots(
     // file reads, no forge call; a no-op without the ops sink. After the
     // snapshot so it reports this pass's built snapshot.
     super::ops::eta_health::record(workspace_root).await;
+    // Per-account Codex session-container state (Issue #10455): export the
+    // gauge from the always-on watch's newest observations. No docker call
+    // here (the watch owns the bounded snapshot), so a wedged Docker cannot
+    // stall this pass; the WARN lives in the watch and runs without telemetry.
+    super::ops::codex_session::record();
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

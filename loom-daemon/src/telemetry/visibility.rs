@@ -48,6 +48,16 @@
 //! one hour, so a public/private flip is seen within an hour (it was 5 min);
 //! nothing but a `200` body saying `"private": false` ever raises a repo to
 //! Public.
+//!
+//! # Installation snapshot first (W8)
+//!
+//! [`derive_visibility`] now asks the credential's installation snapshot
+//! ([`crate::forge_repo_facts::installation`]) before any per-repo probe: one
+//! hourly conditional listing per credential instead of one read per repo.
+//! A repo absent from a fresh snapshot, or a snapshot that is stale or failed,
+//! is Private — the per-repo cache's stale-survives fallback does not apply
+//! there. Only a user credential (which has no installation listing) or the
+//! kill switch takes the per-repo probe below.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -231,8 +241,39 @@ where
 /// Blocks when the cache is cold/stale (see [`refresh_visibility_cache`]).
 #[must_use]
 pub fn derive_visibility(owner_repo: &str) -> RepoVisibility {
+    derive_visibility_from(
+        owner_repo,
+        crate::forge_repo_facts::installation::lookup_repo(owner_repo),
+    )
+}
+
+/// [`derive_visibility`] given the installation snapshot's answer (W8): the
+/// snapshot decides when it applies ([`snapshot_visibility`]); only a user
+/// credential (or the kill switch) takes the per-repo probe below.
+fn derive_visibility_from(
+    owner_repo: &str,
+    snapshot: crate::forge_repo_facts::installation::Answer,
+) -> RepoVisibility {
+    if let Some(v) = snapshot_visibility(&snapshot) {
+        return v;
+    }
     refresh_visibility_cache(owner_repo);
     cached_visibility(owner_repo).unwrap_or(RepoVisibility::Private)
+}
+
+/// What the installation snapshot says, or `None` for the per-repo probe.
+/// **Fail-private:** only a FRESH snapshot that lists the repo with
+/// `"private": false` is Public. Absent from the snapshot, a stale or failed
+/// snapshot — all Private, never the per-repo cache's last-known answer.
+fn snapshot_visibility(
+    answer: &crate::forge_repo_facts::installation::Answer,
+) -> Option<RepoVisibility> {
+    use crate::forge_repo_facts::installation::Answer;
+    match answer {
+        Answer::Listed(Some(e)) if !e.private => Some(RepoVisibility::Public),
+        Answer::Listed(_) | Answer::Unavailable => Some(RepoVisibility::Private),
+        Answer::PerRepo | Answer::Disabled => None,
+    }
 }
 
 /// Why a visibility probe failed to positively establish a repo's visibility.
@@ -384,6 +425,10 @@ fn note_probe_recovered(owner_repo: &str) {
         log::info!("telemetry: visibility probe recovered for {owner_repo}");
     }
 }
+
+#[cfg(test)]
+#[path = "visibility_snapshot_tests.rs"]
+mod snapshot_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

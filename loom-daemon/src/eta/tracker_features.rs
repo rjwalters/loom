@@ -777,6 +777,9 @@ impl Tracker {
         if let Some(pr) = item.pr_number {
             features.priority =
                 self.priority_inputs_of(&key.repo, pr, now, self.context.fleet_history.as_deref());
+            // #10521: the v3 friction predictors, through the builder the
+            // fit calls, over the same timeline at `now − LAG`.
+            features.loops = Some(self.loop_features_of(&key.repo, pr, now));
         }
         let pr = item.pr_number.ok_or(reason::NO_PR_YET);
         self.context

@@ -85,11 +85,9 @@ pub const VERDICT_LABELS: &[&str] = &[APPROVED, CHANGES_REQUESTED];
 /// (#5817). The four `loom:operator-*` sub-kinds are **not** listed — they
 /// always accompany `loom:operator-only` and so would only double-count; they
 /// are surfaced as detail on the row instead.
-pub const OPERATOR_GATE_LABELS: &[&str] = &[
-    crate::work_finder::OPERATOR_HOLD_LABEL,
-    "loom:operator-only",
-    "loom:needs-capability",
-];
+/// Derived (#10013): the registry's `operator_gate` labels.
+pub static OPERATOR_GATE_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("operator_gate"));
 
 /// True when any label in `labels` is an operator gate.
 pub fn is_operator_gated<S: AsRef<str>>(labels: &[S]) -> bool {
@@ -109,22 +107,20 @@ pub fn is_parked<S: AsRef<str>>(labels: &[S]) -> bool {
         .any(|l| crate::work_finder::PARK_LABELS.contains(&l.as_ref()))
 }
 
+static HOLD_SET: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("hold"));
+
 /// Every operator-gate / park label present, for the detail column.
 ///
-/// The `loom:operator-` prefix catches the operator-only sub-kinds, but
-/// `loom:operator-priority` (#9244, "starred") and every other priority
-/// level label (`loom:operator-high-priority`, #10307) share the prefix and
-/// are the opposite of a hold — the operator wants the item landed ASAP — so
-/// they are excluded by name ([`crate::operator_levels::is_level_label`]).
+/// Derived (#10013): exactly the registry's `hold` labels. No name-prefix
+/// match, so a priority label that shares the `loom:operator-` prefix
+/// (`loom:operator-priority` #9244, `loom:operator-high-priority` #10307) is
+/// never a hold, and a new label cannot silently join the set.
 pub fn hold_labels<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
     labels
         .iter()
         .map(|l| l.as_ref())
-        .filter(|l| {
-            OPERATOR_GATE_LABELS.contains(l)
-                || crate::work_finder::PARK_LABELS.contains(l)
-                || (l.starts_with("loom:operator-") && !crate::operator_levels::is_level_label(l))
-        })
+        .filter(|l| HOLD_SET.contains(l))
         .map(str::to_string)
         .collect()
 }

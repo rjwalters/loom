@@ -73,6 +73,8 @@ fn both_eta_kinds_are_registered_otlp_logs_only() {
         "eta.outcome",
         "eta.fleet_refresh",
         "eta.fit",
+        "eta.backtest.fold",
+        "eta.backtest.summary",
     ] {
         let meta = TELEMETRY_KINDS
             .iter()

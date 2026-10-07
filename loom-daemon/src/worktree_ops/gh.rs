@@ -95,8 +95,8 @@ pub(crate) fn bounded_via(inv: GhInvocation) -> Option<Output> {
     }
 }
 
-/// [`bounded_counted`] for a deferrable hygiene probe (W4-C,
-/// [`ReadClass::Hygiene`]): when every reader for the repo's owner is
+/// A bounded counted read probe ([`bounded_via`]) for a deferrable hygiene
+/// probe (W4-C, [`ReadClass::Hygiene`]): when every reader for the repo's owner is
 /// withdrawn the probe is shed instead of spending the writer's bucket, and
 /// the shed is "no answer" (`None`) exactly like a timeout — so each caller
 /// keeps its fail-closed `UNKNOWN` / `PrStatus::Unknown` path.
@@ -109,17 +109,6 @@ pub(crate) fn bounded_hygiene(
         invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args)
             .read_class(ReadClass::Hygiene),
     )
-}
-
-/// A bounded counted read probe: the `None`-on-no-answer contract of
-/// [`bounded_via`] for a `gh <args>` call run from `repo_root`, booked under
-/// `op`.
-pub(crate) fn bounded_counted(
-    op: &'static str,
-    repo_root: &Path,
-    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
-) -> Option<Output> {
-    bounded_via(invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args))
 }
 
 /// `gh issue view <N> --json state --jq .state`. Returns `"UNKNOWN"` on any
@@ -152,63 +141,32 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
     }
 }
 
-/// `GET repos/{owner}/{repo}/issues/<N>` as JSON, through the shared ETag
-/// store (#10512): the `ETag` and body persist on disk under `issue-`, so a
-/// re-probe of an unchanged issue — the reaper's every-15-minute case, and
-/// the `closed_at` read right after `state` — is a `304`, free on the core
-/// bucket. Booked under `op`. An explicit `LOOM_REPO` names the repo, else
-/// the checkout's `origin`, else gh's placeholder (the store's
-/// `resolve_target` rule). `None` on any failure or a `404`: each caller's
-/// fail-closed answer.
-///
-/// Routed as a `Gate` read by the store, so under reader-budget exhaustion it
-/// is no longer shed (W4-C `Hygiene`); it falls through to the writer, where
-/// it is mostly a `304`.
-fn cached_issue_json(op: &'static str, repo_root: &Path, issue: u32) -> Option<serde_json::Value> {
-    use crate::forge_etag_store as store;
-    let loom_repo = std::env::var("LOOM_REPO")
-        .ok()
-        .filter(|r| !r.trim().is_empty());
-    let target = store::resolve_target(Some(repo_root), loom_repo.as_deref());
-    let url = match &target.repo {
-        Some(r) => format!("repos/{r}/issues/{issue}"),
-        None => format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-    };
-    let read = store::cached_read(
-        store::ConditionalRead::new(op, crate::forge_call_stats::ops::ISSUE_VIEW_STATE),
-        &std::path::PathBuf::from(gh_bin()),
-        Some(repo_root),
-        loom_repo.as_deref(),
-        &url,
-        "issue-",
-    )
-    .ok()?;
-    serde_json::from_str(&read.body?).ok()
-}
-
 /// The issue's REST `.state`, normalized to `"OPEN"` / `"CLOSED"` /
-/// `"UNKNOWN"` (any failure, `404`, or other value).
+/// `"UNKNOWN"` (any failure, `404`, mismatch or other value).
 ///
 /// Deliberately the REST endpoint rather than [`issue_state`]'s `gh issue
 /// view` (which goes through GraphQL): GraphQL quota exhaustion under
 /// concurrent agents is a live failure mode in this repo, and the callers of
 /// this probe are bulk hygiene passes that can issue one call per stale file
 /// (#4450). REST returns lowercase states, so they are upper-cased here to
-/// match [`issue_state`]'s contract. Conditional since #10512
-/// ([`cached_issue_json`]).
+/// match [`issue_state`]'s contract.
+///
+/// A fresh, conditional read of the checkout's OWN repo (W6,
+/// [`super::forge_state::issue_facts`]): never `LOOM_REPO`, and every call
+/// reaches the forge (an unchanged issue answers a free `304`).
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let state = cached_issue_json("worktree.issue_state_rest", repo_root, issue)
-        .and_then(|v| v.get("state")?.as_str().map(str::to_uppercase));
-    match state.as_deref() {
-        Some(s @ ("OPEN" | "CLOSED")) => s.to_string(),
-        _ => "UNKNOWN".to_string(),
+    let facts = super::forge_state::issue_facts(repo_root, issue, "worktree.issue_state_rest");
+    match facts.ok().map(|f| f.state) {
+        Some(super::forge_state::IssueState::Open) => "OPEN".to_string(),
+        Some(super::forge_state::IssueState::Closed) => "CLOSED".to_string(),
+        None => "UNKNOWN".to_string(),
     }
 }
 
 /// The issue's REST `.closed_at`: its own close timestamp (issue #6653), REST
 /// rather than GraphQL for the same quota-isolation reason as
-/// [`issue_state_rest`], and the same conditional read ([`cached_issue_json`]).
+/// [`issue_state_rest`], and the same fresh conditional read.
 ///
 /// Used to gate the grace period for a closed issue whose worktree never had
 /// a PR opened at all (`clean::PrStatus::NoPr`) — there is no PR
@@ -218,9 +176,9 @@ pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let json = cached_issue_json("worktree.issue_closed_at", repo_root, issue)?;
-    let s = json.get("closed_at")?.as_str()?.trim();
-    (!s.is_empty()).then(|| s.to_string())
+    super::forge_state::issue_facts(repo_root, issue, "worktree.issue_closed_at")
+        .ok()?
+        .closed_at
 }
 
 #[derive(Debug, Deserialize)]
@@ -1391,7 +1349,3 @@ mod tests {
         assert!(out.is_none(), "a spawn failure must stay a no-answer: {out:?}");
     }
 }
-
-#[cfg(test)]
-#[path = "gh_issue_json_tests.rs"]
-mod issue_json_tests;

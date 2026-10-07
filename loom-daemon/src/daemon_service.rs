@@ -1668,10 +1668,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
             None
         };
 
-    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
-    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
-    // Feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns` is on.
-    let _ci_poller = loom_daemon::ci_telemetry::spawn_task_on(sweep_workspace.clone(), &event_bus);
+    // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
+    // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
+    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
+    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    let _singletons = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
+
+    // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
+    let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
 
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
@@ -1748,10 +1754,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // or dispatch side effect.
     let _stash_summary_refresh_handle = {
         let interval = quarantine_stash_status::DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL;
-        log::info!(
-            "quarantine_stash_status: enabled (multi-workspace, interval={}s)",
-            interval.as_secs()
-        );
+        // Duration's Debug renders whole seconds as `<n>s`, same text as before.
+        log::info!("quarantine_stash_status: enabled (multi-workspace, interval={interval:?})");
         quarantine_stash_status::spawn_multi_stash_summary_refresh_task(
             sweep_workspace.clone(),
             interval,

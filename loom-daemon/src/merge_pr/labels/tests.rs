@@ -16,7 +16,7 @@ fn a_clean_approval_is_not_a_contradiction() {
 
 #[test]
 fn each_blocking_label_contradicts_an_approval() {
-    for b in BLOCKING {
+    for b in BLOCKING.iter() {
         let labels = format!("loom:pr\n{b}");
         assert_eq!(contradiction(&labels), Some(*b), "{b} must block");
     }
@@ -28,7 +28,7 @@ fn without_an_approval_there_is_nothing_to_contradict() {
     // `loom:changes-requested` alone is in a perfectly ordinary state, and
     // blocking it here would refuse merges that the missing-`loom:pr` guard
     // already handles with its own message and its own override.
-    for b in BLOCKING {
+    for b in BLOCKING.iter() {
         assert_eq!(contradiction(b), None, "{b} alone is not a contradiction");
     }
     assert_eq!(contradiction(""), None);

@@ -104,9 +104,11 @@ pub struct WorkFinderTickSummary {
     /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
     #[serde(default)]
     pub saturation_held: bool,
-    /// Whether the build back-off (Issue #9410) was engaged for this tick,
-    /// even with nothing deferred. `#[serde(default)]` keeps pre-#9410 wire
-    /// data compatible.
+    /// Whether the build back-off (Issue #9410) was engaged for any repo this
+    /// tick (#10624: the hold is per repo), even with nothing deferred. The
+    /// `BUILD-BACKOFF-HELD` tag and the `build_backoff_held` tick result key on
+    /// [`deferred_build_backoff`](Self::deferred_build_backoff) instead.
+    /// `#[serde(default)]` keeps pre-#9410 wire data compatible.
     #[serde(default)]
     pub build_backoff_held: bool,
     /// Cumulative cross-host dispatch collisions observed by this tick's
@@ -390,7 +392,10 @@ impl WorkFinderTickSummary {
         if self.saturation_held {
             parts.push("SATURATION-HELD".to_string());
         }
-        if self.build_backoff_held {
+        // Only when the back-off actually deferred something (#10624): with a
+        // per-repo hold some repo is often engaged, and the bare flag would
+        // tag nearly every tick.
+        if self.build_backoff_held && self.deferred_build_backoff > 0 {
             parts.push("BUILD-BACKOFF-HELD".to_string());
         }
         parts.join(", ")

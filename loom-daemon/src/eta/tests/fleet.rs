@@ -658,7 +658,9 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ),
     // #10508: twin-otter-b's priority-aware successor, and the v2 transform
     // the evaluation core calls for it.
+    ("heuristics/land_bold_lark.rs", include_str!("../heuristics/land_bold_lark.rs")),
     ("heuristics/land_keen_wren.rs", include_str!("../heuristics/land_keen_wren.rs")),
+    ("heuristics/land_loop_kite.rs", include_str!("../heuristics/land_loop_kite.rs")),
     ("fit/features_v2.rs", include_str!("../fit/features_v2.rs")),
     ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
     // #10510: the dependency wrapper and the composition it calls.
@@ -672,6 +674,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     // #10208: the zero-parameter queue floor and the queue context it reads.
     ("heuristics/little_v0.rs", include_str!("../heuristics/little_v0.rs")),
     ("stage_queue.rs", include_str!("../stage_queue.rs")),
+    // #10528: brisk-petrel and the regime adjustment it serves through.
+    ("regime.rs", include_str!("../regime.rs")),
+    (
+        "heuristics/land_brisk_petrel.rs",
+        include_str!("../heuristics/land_brisk_petrel.rs"),
+    ),
 ];
 
 /// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently

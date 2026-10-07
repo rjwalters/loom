@@ -576,6 +576,9 @@ pub struct HealthInputs {
     /// [`ci_telemetry_section::assess_ci_telemetry`] — no section unless the
     /// poller is enabled here.
     pub ci_telemetry: Option<crate::ci_telemetry::CiTelemetryHealth>,
+    /// Unresolved mail config on a mail-meant host (#10137); see
+    /// [`inbox_mail_section`].
+    pub inbox_mail: Option<crate::inbox_config::InboxResolution>,
 }
 
 // ============================================================================
@@ -2718,6 +2721,9 @@ mod ci_telemetry_section;
 
 pub use ci_telemetry_section::assess_ci_telemetry;
 
+mod inbox_mail_section;
+pub use inbox_mail_section::assess_inbox_mail;
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2726,6 +2732,10 @@ pub use ci_telemetry_section::assess_ci_telemetry;
 /// provider-scoped sibling of the Claude `tokens` section. Rendered only on a
 /// host that actually has Codex accounts.
 pub mod codex_accounts;
+
+/// The conditional `session_containers` section (#10600): the Codex session
+/// seats `loom-daemon status` lists, on a host that has any.
+pub mod session_containers;
 
 // ============================================================================
 // Roll-up
@@ -2780,12 +2790,14 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_pool_hold(inputs),
     ];
     sections.extend(codex_accounts::assess(inputs));
+    sections.extend(session_containers::assess(inputs));
     sections.extend(assess_observability(inputs));
     sections.extend(assess_codesign_identity(inputs));
     sections.extend(assess_limit_calibration(inputs));
     sections.extend(assess_transcript_ingest(inputs));
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
+    sections.extend(assess_inbox_mail(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {

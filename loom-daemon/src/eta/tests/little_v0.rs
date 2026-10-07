@@ -253,6 +253,7 @@ fn registered_beside_land_v2_never_current_and_listed_by_backtest_compare() {
         dispatch: None,
         age_sec: 0,
         queue: vec![queue(Stage::ReviewWait, 4, 2.0, 12)],
+        pr_flags: None,
     };
     let mut h = history();
     for stage in [
@@ -291,16 +292,16 @@ fn an_explicit_little_v0_configuration_never_selects_it_as_current() {
 
 #[test]
 fn little_v0_is_never_promoted_even_when_both_gates_pass() {
-    use super::shadow::{comparison, ledger_with};
+    use super::shadow::{comparison, ledger_with, BACKTEST_CASES, PASSING_PAIRS};
     use crate::eta::heuristics::{LAND_V1, LAND_V2};
-    use crate::eta::shadow::{self, GateStatus, MIN_LIVE_PAIRS};
+    use crate::eta::shadow::{self, GateStatus};
 
-    let stats = ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(
+    let stats = ledger_with(PASSING_PAIRS, 100.0, 60.0, PASSING_PAIRS / 2).stats(
         Kind::Land,
         LAND_V1,
         LAND_V2,
     );
-    let passing = comparison(1000.0, 800.0, 40);
+    let passing = comparison(1000.0, 800.0, BACKTEST_CASES);
 
     // Control: the same evidence promotes an ordinary candidate.
     let control = shadow::evaluate(Kind::Land, LAND_V1, LAND_V2, Some(&passing), &stats, as_of());

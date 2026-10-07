@@ -17,7 +17,7 @@ use super::provenance;
 use crate::eta::fit::rows;
 use crate::eta::fit::{FitStage, ModelInputs};
 use crate::eta::fleet::FleetSnapshot;
-use crate::eta::heuristics::LAND_TWIN_OTTER;
+use crate::eta::heuristics::LAND_TWIN_OTTER_B;
 use crate::eta::journal::JournalEntry;
 use crate::eta::tracker::{
     events_from_journal, EstimateContext, ItemKey, ListedPr, PrState, PrView, Tracker,
@@ -264,10 +264,12 @@ pub(crate) fn serve_with(
 /// The registry with the parity fixture's fit, cut off before the scenario.
 pub(crate) fn fitted() -> Registry {
     let at = t(0) - Duration::days(1);
-    // Both fits, so `land-2026-10-06-keen-wren` (#10508) answers too.
-    Registry::with_fits(
+    // Every fit, so `land-2026-10-06-keen-wren` (#10508) and
+    // `land-2026-10-06-loop-kite` (#10521) answer too.
+    Registry::with_all_fits(
         Some(Arc::new(fixture_fit(at))),
         Some(Arc::new(super::keen_wren::v2_fixture(at, 0.0, 0.0))),
+        Some(Arc::new(super::loop_kite::v3_fixture(at, 0.0, 0.0))),
     )
 }
 
@@ -293,8 +295,8 @@ pub(crate) fn served(
     let emissions = tracker.estimate(Some(&[spec.key()]), &ctx, h(AT));
     let twin = emissions
         .iter()
-        .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == LAND_TWIN_OTTER)
-        .expect("a twin-otter estimate");
+        .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == LAND_TWIN_OTTER_B)
+        .expect("a twin-otter-b estimate (twin-otter's PR-stage evaluation, #10528)");
     let record = twin.explanation.twin_otter.as_ref().unwrap_or_else(|| {
         panic!("PR {} not answered: {:?}", spec.pr, twin.explanation.no_estimate_reason)
     });

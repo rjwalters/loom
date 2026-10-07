@@ -33,6 +33,15 @@
 //!   by the proactive probe the selector runs (#6927), so it is not counted as
 //!   blocking either. The probe shells out to `docker`; it is deliberately NOT
 //!   run here, on the role loop's synchronous decision phase.
+//! - **A session-managed account whose container is down** (`SessionDown`,
+//!   #10454) IS counted as blocking: spawn-codex.sh refuses it with exit 78,
+//!   so counting it would select a tap only to kill it. This starts no
+//!   process: it reads the snapshot the daemon's session watch last published
+//!   (`session_lifecycle::liveness::published`, #10660), and it fails open —
+//!   with no fresh snapshot, or one in which Docker could not be queried, no
+//!   account is marked down. A running container with stale mounts is not
+//!   down. An account the operator stopped (`accounts session stop`) is
+//!   reported as held, with no hint to start it.
 //!
 //! An inventory or health-state read error is the one fail-closed case: the
 //! selector reads the same files and fails the same way (exit `78`).
@@ -293,6 +302,16 @@ pub(crate) struct CodexPoolState {
     /// release — see the module doc for why class-scoped holds and
     /// session-managed re-auth holds are not counted as blocking.
     pub spawnable: usize,
+    /// Enabled session-managed accounts whose `loom-codex-session-<name>`
+    /// container the published session snapshot shows as down — stopped,
+    /// restarting or missing (#10454, reason `SessionDown`). Never counted
+    /// spawnable: spawn-codex.sh refuses a down session with exit 78. Always 0
+    /// when there is no fresh snapshot or Docker could not be queried (fail
+    /// open), or when no account is session-managed.
+    pub session_down: usize,
+    /// How many of `session_down` the operator holds down (`accounts session
+    /// stop`, #10453). Only changes the skip text (#10660).
+    pub session_held: usize,
     /// Earliest account-wide cooldown deadline (epoch seconds) among the
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
@@ -314,6 +333,8 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
+        session_down: 0,
+        session_held: 0,
         earliest_clear: None,
         read_error: None,
     };
@@ -338,8 +359,22 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
             return state;
         }
     };
+    // #10454/#10660: the session watch's published snapshot — a mutex read,
+    // never a `docker` process on this per-tick path. Fail open on `None`.
+    let liveness = crate::tokens_pool::session_lifecycle::liveness::published();
     for account in inventory.iter().filter(|account| account.enabled) {
         state.enabled += 1;
+        // Before the no-health-entry `continue` below: an account the health
+        // file has never heard of is still unspawnable if its container is down.
+        if crate::tokens_pool::session_lifecycle::liveness::is_session_down(
+            account,
+            liveness.as_ref(),
+        ) {
+            state.session_down += 1;
+            state.session_held +=
+                usize::from(crate::tokens_pool::session_lifecycle::liveness::is_held(account));
+            continue;
+        }
         let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
@@ -361,6 +396,35 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
         state.spawnable += 1;
     }
     state
+}
+
+/// Why an enabled, readable codex pool has nothing spawnable — shared by the
+/// pre-spawn skip and `runtime_preference::availability`'s Exhausted detail so
+/// both name `SessionDown` (#10454) the same way.
+pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
+    use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+    if state.session_down == 0 {
+        return "every enabled account is cooling down or needs re-auth".to_string();
+    }
+    // #10660: never tell the operator to start a container they stopped.
+    let (down, held) = (state.session_down, state.session_held);
+    let remedy = if held == 0 {
+        " — `loom-daemon accounts session start <name>`".to_string()
+    } else if held >= down {
+        format!(": held ({HOLD_REASON_OPERATOR_STOP})")
+    } else {
+        format!(
+            ": {held} held ({HOLD_REASON_OPERATOR_STOP}) — `loom-daemon accounts session start \
+             <name>` for the {} not held",
+            down - held
+        )
+    };
+    format!(
+        "every enabled account is cooling down, needs re-auth, or is {} ({down}/{} session \
+         container(s) not running{remedy}; #10454)",
+        crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
+        state.enabled
+    )
 }
 
 /// The account provider `spawn-codex.sh` will select from for `admitted`'s
@@ -451,10 +515,7 @@ fn codex_gate(
         None if state.enabled == 0 => {
             (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
         }
-        None => (
-            PoolHold::SelfHealing,
-            "every enabled account is cooling down or needs re-auth".to_string(),
-        ),
+        None => (PoolHold::SelfHealing, codex_exhausted_reason(&state)),
     };
     note_pre_spawn_skip(
         logs,

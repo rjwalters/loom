@@ -205,6 +205,9 @@ pub struct Paired {
     pub delta_pinball_loss_sec: Option<Estimate>,
     /// `b − a` mean `pinball4_loss_sec` over `loss4_pairs`, likewise.
     pub delta_pinball4_loss_sec: Option<Estimate>,
+    /// Distinct issues behind [`Self::delta_pinball4_loss_sec`]: the
+    /// promotion gate's independence count (#10525).
+    pub delta4_items: usize,
     /// The walk-forward daily folds, oldest first.
     pub folds: Vec<Fold>,
     /// `b`'s per-day win rate over `a` on the deciding loss, with its 95%
@@ -279,6 +282,7 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     };
     out.delta_pinball_loss_sec = ci(&delta);
     out.delta_pinball4_loss_sec = ci(&delta4);
+    out.delta4_items = delta4.len();
     let sums: BTreeMap<String, DaySums> = days.iter().map(|(d, (_, s))| (d.clone(), *s)).collect();
     out.day_wins = DayWins::of(&sums);
     out.folds = days

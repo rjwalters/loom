@@ -12,6 +12,11 @@
 #[path = "../live_gh_guard.rs"]
 mod live_gh_guard;
 
+// Whole-`Cli` parsing for tests, on an 8 MiB thread like the binary's main
+// thread (#10616). `main.rs` is size-frozen, so it is mounted here.
+#[cfg(test)]
+pub(crate) mod whole_cli_parse;
+
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
@@ -45,6 +50,7 @@ mod eta_fleet_events_cmd;
 mod eta_fleet_signoz_cmd;
 mod eta_offline_cmd;
 mod eta_replay_cmd;
+mod eta_retire_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
 mod fleet_config_reload;
@@ -61,6 +67,7 @@ mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
 pub(crate) mod health;
+pub(crate) mod host;
 pub(crate) mod inflight;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
@@ -79,6 +86,7 @@ mod merge_pr_closed_building;
 mod merge_pr_consolidate;
 mod merge_pr_delete_branch;
 mod merge_pr_dirty_guard;
+mod merge_pr_discovered_worktree;
 mod merge_pr_head_sync;
 mod merge_pr_hold_state;
 mod merge_pr_issue_close_gate;
@@ -96,12 +104,15 @@ mod merge_pr_refs;
 mod merge_pr_remove_gate;
 mod merge_pr_response;
 mod merge_pr_retarget_children;
+mod merge_pr_retries_used;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_tree_checks;
+mod merge_pr_usage;
 mod merge_pr_version_policy;
 mod merge_pr_worktree_preserve;
+mod merge_pr_worktree_teardown;
 mod merge_pr_worktrees;
 mod merge_pr_zero_checks;
 pub(crate) mod misc_cmds;

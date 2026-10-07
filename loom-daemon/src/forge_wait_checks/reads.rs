@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_denial::{self as denial, Denial};
 use crate::forge_etag_store::{self as store, ConditionalRead, DiskEntry, Target};
 
 /// The `forge_call_stats` caller every read here is recorded under, so
@@ -47,11 +48,26 @@ const PER_PAGE: usize = 100;
 /// Why a read did not produce a body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
-    /// Will not get better by waiting (auth, not found, unprocessable,
+    /// Will not get better by waiting (not found, unprocessable,
     /// unreadable or truncated payload): end the wait with `ERROR`.
     Fatal(String),
     /// A blip (no HTTP answer, 5xx, timeout): retry on the next poll.
     Transient(String),
+    /// GitHub refused the read (401/403/429), classified (#10633): a rate
+    /// limit is retried like [`ReadError::Transient`]; a permission or
+    /// credential refusal ends the wait like [`ReadError::Fatal`] — except
+    /// on the legacy-status read, which degrades (see `forge_wait_checks`).
+    Denied { denial: Denial, why: String },
+}
+
+impl ReadError {
+    /// The one-line reason, whatever the variant.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Fatal(w) | Self::Transient(w) | Self::Denied { why: w, .. } => w,
+        }
+    }
 }
 
 /// The PR facts one poll needs.
@@ -59,6 +75,8 @@ pub enum ReadError {
 pub struct PullHead {
     pub sha: String,
     pub base_ref: String,
+    /// `head.ref` — the branch `gh pr checks` names when no checks exist.
+    pub head_ref: Option<String>,
 }
 
 /// Conditional REST reads for one repository.
@@ -68,6 +86,7 @@ pub struct GhReads {
     store_dir: PathBuf,
     target: Target,
     memo: HashMap<String, DiskEntry>,
+    caller: &'static str,
 }
 
 impl GhReads {
@@ -93,7 +112,16 @@ impl GhReads {
             store_dir,
             target,
             memo: HashMap::new(),
+            caller: CALLER,
         })
+    }
+
+    /// Record reads under `caller` instead of [`CALLER`] (the agent `gh`
+    /// front's `gh pr checks`, #10516, shares these reads and their entries).
+    #[must_use]
+    pub fn with_caller(mut self, caller: &'static str) -> Self {
+        self.caller = caller;
+        self
     }
 
     fn nwo(&self) -> &str {
@@ -114,7 +142,11 @@ impl GhReads {
                 .map(String::from)
         };
         match (field("head", "sha"), field("base", "ref")) {
-            (Some(sha), Some(base_ref)) => Ok(PullHead { sha, base_ref }),
+            (Some(sha), Some(base_ref)) => Ok(PullHead {
+                sha,
+                base_ref,
+                head_ref: field("head", "ref"),
+            }),
             _ => Err(ReadError::Fatal("unreadable: pull request has no head.sha/base.ref".into())),
         }
     }
@@ -207,7 +239,7 @@ impl GhReads {
                 .cloned()
                 .or_else(|| store::read_disk_entry(p))
         });
-        let site = ConditionalRead::new(CALLER, op);
+        let site = ConditionalRead::new(self.caller, op);
         let etag = prior.as_ref().map(|p| p.etag.as_str());
         let (status, response, stderr) = store::fetch_conditional(
             site,
@@ -238,7 +270,8 @@ impl GhReads {
                 }
                 Ok(r.body)
             }
-            Some(r) if matches!(r.status, 401 | 403 | 404 | 410 | 422) => {
+            Some(r) if matches!(r.status, 401 | 403 | 429) => Err(denied(url, &r, &stderr)),
+            Some(r) if matches!(r.status, 404 | 410 | 422) => {
                 Err(ReadError::Fatal(format!("HTTP {} for {url}", r.status)))
             }
             Some(r) => Err(ReadError::Transient(format!("HTTP {} for {url}", r.status))),
@@ -252,6 +285,23 @@ impl GhReads {
             }
         }
     }
+}
+
+/// A refused read (401/403/429), classified by [`crate::forge_denial`] from
+/// the response body, `gh`'s stderr and the rate-limit headers (#10633):
+/// `HTTP 403 for <url>: permission (needs statuses:read): Resource not
+/// accessible by integration`, or `…: secondary-rate-limit: …`.
+fn denied(url: &str, r: &crate::forge_listing::HttpResponse, stderr: &str) -> ReadError {
+    let text = format!("{}\n{stderr}", r.body);
+    let kind =
+        denial::classify(Some(r.status), &text, Some(&r.ratelimit)).unwrap_or(Denial::Permission);
+    let message = denial::body_message(&r.body);
+    let why = format!(
+        "HTTP {} for {url}: {}",
+        r.status,
+        denial::describe(kind, url, false, message.as_deref())
+    );
+    ReadError::Denied { denial: kind, why }
 }
 
 /// `nwo`'s `base_ref` required status-check contexts (rulesets and classic

@@ -71,9 +71,11 @@ pub mod logistic;
 pub mod math;
 pub mod paths;
 pub mod publish;
+pub mod publish_v2;
 pub mod rows;
 pub mod run;
 pub mod v2;
+pub mod v3;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

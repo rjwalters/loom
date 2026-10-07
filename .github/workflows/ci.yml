@@ -1856,6 +1856,11 @@ jobs:
       # label AND HostConfig, so this suite needs the binary this job downloads.
       - name: spawn-codex session container boundary (#8518, #9979)
         run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
+      # #10661: the stale-mount suite's last cases drive the real
+      # `loom-daemon session-exec host` (pinned via require-daemon-bin.sh), so
+      # it needs the binary this job downloads, like the step above.
+      - name: spawn-codex stale-mount refusal (#10364, #10661)
+        run: bash defaults/scripts/tests/test-spawn-codex-session-mount-stale.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
@@ -2039,6 +2044,11 @@ jobs:
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # #10203: `sweep-lease-renew.sh start` re-enters through
+      # `loom-daemon lease renewer sanitize-exec` so its detached loop holds no
+      # fd of the caller's; pins the binary like the suite above.
+      - name: lease renewer holds no caller fd (#10203)
+        run: bash defaults/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
       # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
       # contract. #5657 already skips reuse of an origin/feature/issue-N
       # whose tip is a MERGED PR's head; this covers the strictly worse
@@ -2135,6 +2145,13 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
+      # Moved out of shell-suite-tests by #8191's usage slice: merge-pr.sh's
+      # --help text is `loom-daemon merge-pr usage` now, so both suites that
+      # read --help pin this job's binary (--self-only) and FAIL without one.
+      - name: merge-pr --help (#8191)
+        run: bash defaults/scripts/tests/test-merge-pr-help.sh
+      - name: merge-pr --merge-method (#8845, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-merge-method.sh
       # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
       # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
       # whose decision is now `loom-daemon merge-pr issue-close-gate`, and drives
@@ -2286,6 +2303,10 @@ jobs:
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
         run: bash defaults/scripts/check-labels-drift.sh
+      # #10013 / PR #10053: proves the registry half of the drift check runs
+      # (identical labels.yml copies that both diverge from labels.json fail).
+      - name: Test labels.yml registry drift check (#10013)
+        run: bash defaults/scripts/tests/test-check-labels-drift.sh
       - name: Check label descriptions fit GitHub's 100-char limit (#4335)
         run: bash defaults/scripts/check-label-descriptions.sh
       - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
