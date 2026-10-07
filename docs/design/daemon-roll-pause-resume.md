@@ -277,7 +277,7 @@ audit.
     "pause_completed_at": null,              // set when phase -> paused
     "pause_budget_secs": 120,
     "min_resumable_age_secs": 300,           // the 5-minute rule in force for this pause
-    "max_age_secs": 900                      // = lease TTL at write time
+    "max_age_secs": 900                      // = lease TTL at write time; age = now - pause_started_at
   },
   "items": [
     {
@@ -453,8 +453,8 @@ matching the other `autoUpdate` knobs).
   `reconstruct`'s crash recovery and claim reconciliation's dead-pid reclaim
   for the manifest's items, so the fallback path does not race the resume.
 - **Steps, in order:**
-  1. Load the manifest (typed outcome, §6). If it is older than
-     `roll.max_age_secs`, the outcome is `Stale`: downgrade every `resume` item
+  1. Load the manifest (typed outcome, §6). If its age (now minus
+     `roll.pause_started_at`) exceeds `roll.max_age_secs`, the outcome is `Stale`: downgrade every `resume` item
      to `requeue` with reason `manifest-stale`. If `phase = pausing`, finish H4
      first: no agent is running any more, so every `stopping` item without a
      safe-point record becomes `requeue` with `pause-budget-missed`.
@@ -491,9 +491,11 @@ matching the other `autoUpdate` knobs).
     item is requeued with `resume-attempts-exhausted`.
 
 **Bound on the window.** The worst case from the H4 lease refresh to the
-start of resume relaunches is the rest of the pause budget, plus the supervisor
-relaunch, plus probation: about 120 + 10 + 90 ≈ 220 s by default, well under the
-15 min lease TTL. Config validation must reject any combination of
+end of resume relaunches is the rest of the pause budget, plus the supervisor
+relaunch, plus probation, plus the resume budget: about 120 + 10 + 90 + 120 ≈
+340 s by default, well under the 15 min lease TTL. Manifest age is measured from
+`roll.pause_started_at`, which precedes every lease refresh, so the check is
+conservative. Config validation must reject any combination of
 `pauseBudgetSecs`, `verifyProbationSecs` and `resumeBudgetSecs` whose sum
 reaches 2/3 of the lease TTL.
 
