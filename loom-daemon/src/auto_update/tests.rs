@@ -1093,6 +1093,8 @@ mod supersede_tick;
 // Unsatisfiable-drain detection (#8998) — same reason, same fixtures.
 mod roll_stall;
 mod roll_window_tick;
+// Running-version roll basis (#10710).
+mod running_basis;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1114,6 +1116,7 @@ fn artifact(
         target: Some("aarch64-apple-darwin".to_string()),
         installed_version: installed_version.map(str::to_string),
         installed_sha256: installed_sha.map(str::to_string),
+        on_disk_version: None,
     }
 }
 
