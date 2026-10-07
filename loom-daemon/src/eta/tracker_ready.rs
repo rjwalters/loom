@@ -65,11 +65,47 @@ pub(super) fn plan_max_age_secs(context: &DispatchPlanContext) -> i64 {
     READY_PLAN_MAX_AGE_SECS.max(tick.saturating_mul(3))
 }
 
-fn waiting(plan: &RowPlan) -> Option<u32> {
+/// A waiting (`next`/`queued`) row's plan position; `None` for every other row.
+#[must_use]
+pub fn waiting_position(plan: &RowPlan) -> Option<u32> {
     match plan.plan_state {
         PlanState::Next | PlanState::Queued => plan.position,
         _ => None,
     }
+}
+
+/// The [`DispatchInput`] a positioned row of a plan is estimated from:
+/// `waiting` is every waiting row's position ([`waiting_position`], any order),
+/// `context` and `plan_at` the tick's plan block and completion time. `None`
+/// for a row with no position. Pure: the one place the tracker (#9326) and
+/// the planner preview ([`crate::eta::planner_sim`], #10528) derive it.
+#[must_use]
+pub fn dispatch_input(
+    plan: &RowPlan,
+    waiting: &[u32],
+    context: &DispatchPlanContext,
+    plan_at: DateTime<Utc>,
+) -> Option<DispatchInput> {
+    let position = plan.position?;
+    let slots = &context.slots;
+    Some(DispatchInput {
+        position,
+        plan_state: plan_state_name(plan.plan_state).to_string(),
+        gate: plan
+            .gate
+            .and_then(|g| serde_json::to_value(g).ok())
+            .and_then(|v| v.as_str().map(str::to_string)),
+        ahead: to_u32(waiting.iter().filter(|&&p| p < position).count()),
+        free_slots: if slots.saturation_held {
+            0
+        } else {
+            to_u32(slots.free.unwrap_or(0))
+        },
+        max_admissions_per_tick: slots.max_admissions_per_tick.map(to_u32),
+        tick_interval_secs: context.tick_interval_secs.unwrap_or(0),
+        saturation_held: slots.saturation_held,
+        plan_at,
+    })
 }
 
 fn to_u32(n: usize) -> u32 {
@@ -93,11 +129,12 @@ impl Tracker {
         now: DateTime<Utc>,
     ) -> Effects {
         let mut effects = Effects::default();
-        let tick = plan.context.tick_interval_secs.unwrap_or(0);
         let stale = (now - plan.at).num_seconds() > plan_max_age_secs(&plan.context);
         self.context.plan = Some(super::features::PlanView::of(rows, plan));
-        let slots = &plan.context.slots;
-        let mut positions: Vec<u32> = rows.iter().filter_map(|r| waiting(&r.plan)).collect();
+        let mut positions: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| waiting_position(&r.plan))
+            .collect();
         positions.sort_unstable();
         let mut seen = Vec::new();
         for row in rows {
@@ -125,27 +162,9 @@ impl Tracker {
             } else {
                 ready_row_reason(&row.plan)
             };
-            let ready = match (reason, row.plan.position) {
-                (None, Some(position)) => Some(DispatchInput {
-                    position,
-                    plan_state: plan_state_name(row.plan.plan_state).to_string(),
-                    gate: row
-                        .plan
-                        .gate
-                        .and_then(|g| serde_json::to_value(g).ok())
-                        .and_then(|v| v.as_str().map(str::to_string)),
-                    ahead: to_u32(positions.iter().filter(|&&p| p < position).count()),
-                    free_slots: if slots.saturation_held {
-                        0
-                    } else {
-                        to_u32(slots.free.unwrap_or(0))
-                    },
-                    max_admissions_per_tick: slots.max_admissions_per_tick.map(to_u32),
-                    tick_interval_secs: tick,
-                    saturation_held: slots.saturation_held,
-                    plan_at: plan.at,
-                }),
-                _ => None,
+            let ready = match reason {
+                None => dispatch_input(&row.plan, &positions, &plan.context, plan.at),
+                Some(_) => None,
             };
             let loom = self.loom.clone();
             let dispatch_raw = serde_json::to_value(&ready).unwrap_or(serde_json::Value::Null);

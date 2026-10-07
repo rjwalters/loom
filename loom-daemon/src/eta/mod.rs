@@ -137,6 +137,7 @@ pub mod labels;
 pub mod loop_features;
 pub mod nightly_folds;
 pub mod offline;
+pub mod planner_sim;
 pub mod planner_version;
 pub mod point_in_time;
 pub mod pr_features;

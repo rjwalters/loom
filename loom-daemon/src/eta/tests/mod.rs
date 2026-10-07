@@ -47,6 +47,7 @@ mod loop_features;
 mod loop_kite;
 mod merge_hold;
 mod offline;
+mod planner_sim;
 mod planner_version;
 mod point_in_time;
 mod pr_file_log;
