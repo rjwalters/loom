@@ -27,16 +27,48 @@
 //! [`SUBSET_LABELS_KNOWN`]): compare a label subset with
 //! [`SUBSET_LABELS_KNOWN`], not with `overall`. A star that reaches the PR
 //! only through its linked issue is not on the PR's own labels and is not
-//! seen here.
+//! seen by [`SUBSET_STARRED`]; [`SUBSET_STARRED_ANY`] (below) sees it.
 //!
 //! The flags select cases; they are not fed to the estimator, whose replay
 //! input carries no labels (`backtest.rs`, `case_input`), so this breakdown
 //! never changes a replayed answer.
+//!
+//! # The linked-issue-aware star subsets (#10508)
+//!
+//! About half the starred PRs are starred only through their linked issue,
+//! which [`SUBSET_STARRED`] cannot see. #10508's acceptance reads late
+//! surprise on starred and unstarred items, so three more subsets split the
+//! cases by the `eta-fit/v2` input `starred_any`
+//! ([`super::ReplayCase::priority`]), built point-in-time by the one
+//! priority-input builder (PR or linked-issue star, read strictly before
+//! `as_of`):
+//!
+//! | key | a case is in it when |
+//! |---|---|
+//! | [`SUBSET_STARRED_ANY`] | `starred_any` is known on |
+//! | [`SUBSET_UNSTARRED_ANY`] | `starred_any` is known off |
+//! | [`SUBSET_STAR_ANY_UNKNOWN`] | the case carries priority inputs but `starred_any` is unknown (no label shows a star and the linked-issue history does not cover `as_of`) |
+//!
+//! A case with no priority inputs at all (`priority: None`, any source but
+//! [`super::cases_from_pr_records_with_roster`]) is in none of the three. An
+//! unknown star is never counted as unstarred. [`SUBSET_STARRED`] keeps its
+//! meaning (the PR's own label only).
+//!
+//! # Paired, per subset
+//!
+//! `eta backtest --compare` also pairs the two heuristics inside each subset
+//! ([`paired_subsets_of`], [`PairedSubset`]): the deciding loss and its
+//! issue-bootstrap interval, and both late-surprise rates, each over the
+//! cases both sides decided. That is the figure #10508's decision rule
+//! reads for starred and unstarred items. It is a report only; the ranking
+//! ([`super::Comparison::better`]) is unchanged.
 
 use super::super::labels::{FLAG_SEQUENCED, FLAG_STARRED};
+use super::super::offline::evaluate::Estimate;
 use super::super::score::Score;
 use super::super::Stage;
-use super::{bucket_of, Bucket, Replayed};
+use super::paired::paired_of;
+use super::{bucket_of, Bucket, ReplayCase, Replayed};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -51,6 +83,17 @@ pub const SUBSET_SEQUENCED: &str = "sequenced";
 
 /// `by_subset` key: every case whose PR labels at `as_of` are known.
 pub const SUBSET_LABELS_KNOWN: &str = "labels_known";
+
+/// `by_subset` key: starred through the PR's own labels or its linked issue
+/// at `as_of` (`starred_any` known on, #10508).
+pub const SUBSET_STARRED_ANY: &str = "starred_any";
+
+/// `by_subset` key: `starred_any` known off at `as_of` (#10508).
+pub const SUBSET_UNSTARRED_ANY: &str = "unstarred_any";
+
+/// `by_subset` key: the case carries priority inputs, but `starred_any` is
+/// unknown at `as_of` (#10508). Never counted as unstarred.
+pub const SUBSET_STAR_ANY_UNKNOWN: &str = "star_any_unknown";
 
 /// One subset's aggregate: the [`Bucket`] figures plus its late surprise.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,30 +120,111 @@ fn subset_of(scores: &[&Score]) -> SubsetBucket {
     }
 }
 
+/// Every subset `case` belongs to, in a fixed order. The one membership
+/// rule both [`subsets_of`] and [`paired_subsets_of`] read.
+pub(super) fn memberships(case: &ReplayCase) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    if case.stage == Stage::MergeHold {
+        keys.push(SUBSET_HELD);
+    }
+    if let Some(flags) = case.pr_flags {
+        keys.push(SUBSET_LABELS_KNOWN);
+        if flags & FLAG_STARRED != 0 {
+            keys.push(SUBSET_STARRED);
+        }
+        if flags & FLAG_SEQUENCED != 0 {
+            keys.push(SUBSET_SEQUENCED);
+        }
+    }
+    if let Some(priority) = &case.priority {
+        keys.push(match priority.starred_any {
+            Some(true) => SUBSET_STARRED_ANY,
+            Some(false) => SUBSET_UNSTARRED_ANY,
+            None => SUBSET_STAR_ANY_UNKNOWN,
+        });
+    }
+    keys
+}
+
 /// The subsets `replayed` has members in, each with its aggregate. Empty
-/// when no case is held and no case knows its labels, so a report over
-/// sources that carry no labels (and no hold) is unchanged.
+/// when no case is held, no case knows its labels and none carries priority
+/// inputs, so a report over sources that carry none of them is unchanged.
 pub(super) fn subsets_of(replayed: &[Replayed]) -> BTreeMap<String, SubsetBucket> {
     let mut members: BTreeMap<&'static str, Vec<&Score>> = BTreeMap::new();
     for r in replayed {
-        if r.case.stage == Stage::MergeHold {
-            members.entry(SUBSET_HELD).or_default().push(&r.score);
-        }
-        if let Some(flags) = r.case.pr_flags {
-            members
-                .entry(SUBSET_LABELS_KNOWN)
-                .or_default()
-                .push(&r.score);
-            if flags & FLAG_STARRED != 0 {
-                members.entry(SUBSET_STARRED).or_default().push(&r.score);
-            }
-            if flags & FLAG_SEQUENCED != 0 {
-                members.entry(SUBSET_SEQUENCED).or_default().push(&r.score);
-            }
+        for key in memberships(&r.case) {
+            members.entry(key).or_default().push(&r.score);
         }
     }
     members
         .into_iter()
         .map(|(key, scores)| (key.to_string(), subset_of(&scores)))
+        .collect()
+}
+
+/// Two heuristics paired inside one subset: the figures of
+/// [`super::Paired`] that a subset decision reads, each over the cases of
+/// the subset both sides decided. `a` is the incumbent, `b` the challenger,
+/// as in [`super::Paired`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PairedSubset {
+    /// Cases of the subset in the union.
+    pub cases: usize,
+    /// `a`'s answer rate over them.
+    pub a_answer_rate: Option<f64>,
+    /// `b`'s.
+    pub b_answer_rate: Option<f64>,
+    /// Cases both scored with a p90 (the deciding loss's population).
+    pub loss4_pairs: usize,
+    /// `a`'s mean `pinball4_loss_sec` over them.
+    pub a_mean_pinball4_loss_sec: Option<f64>,
+    /// `b`'s.
+    pub b_mean_pinball4_loss_sec: Option<f64>,
+    /// `b − a` mean `pinball4_loss_sec`, with its 95% issue-bootstrap
+    /// interval. Negative favours `b`.
+    pub delta_pinball4_loss_sec: Option<Estimate>,
+    /// Distinct issues behind it: the subset's independence count.
+    pub delta4_items: usize,
+    /// Cases whose late surprise is decided on both sides.
+    pub late_pairs: usize,
+    /// `a`'s late-surprise rate (`actual > p90`) over them.
+    pub a_late_rate: Option<f64>,
+    /// `b`'s.
+    pub b_late_rate: Option<f64>,
+}
+
+/// [`PairedSubset`] for every subset with a member, from `a` and `b`
+/// replayed over the same cases in the same order. Empty when no case is in
+/// any subset.
+pub(super) fn paired_subsets_of(a: &[Replayed], b: &[Replayed]) -> BTreeMap<String, PairedSubset> {
+    debug_assert_eq!(a.len(), b.len());
+    let mut members: BTreeMap<&'static str, (Vec<Replayed>, Vec<Replayed>)> = BTreeMap::new();
+    for (ra, rb) in a.iter().zip(b) {
+        for key in memberships(&ra.case) {
+            let entry = members.entry(key).or_default();
+            entry.0.push(ra.clone());
+            entry.1.push(rb.clone());
+        }
+    }
+    members
+        .into_iter()
+        .map(|(key, (sa, sb))| {
+            let p = paired_of(&sa, &sb);
+            let subset = PairedSubset {
+                cases: p.cases,
+                a_answer_rate: p.a_answer_rate,
+                b_answer_rate: p.b_answer_rate,
+                loss4_pairs: p.loss4_pairs,
+                a_mean_pinball4_loss_sec: p.a_mean_pinball4_loss_sec,
+                b_mean_pinball4_loss_sec: p.b_mean_pinball4_loss_sec,
+                delta_pinball4_loss_sec: p.delta_pinball4_loss_sec,
+                delta4_items: p.delta4_items,
+                late_pairs: p.late_pairs,
+                a_late_rate: p.a_late_rate,
+                b_late_rate: p.b_late_rate,
+            };
+            (key.to_string(), subset)
+        })
         .collect()
 }

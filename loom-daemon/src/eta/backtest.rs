@@ -755,6 +755,12 @@ pub struct Comparison {
     /// subset, with the walk-forward daily folds (#10233).
     #[serde(default)]
     pub paired: Paired,
+    /// The same pairing inside each subset of [`BacktestReport::by_subset`]
+    /// (#10508): the starred / unstarred split the priority-aware decision
+    /// rule reads. A report only; [`Self::better`] does not read it. Absent
+    /// when no case is in any subset.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub paired_by_subset: BTreeMap<String, PairedSubset>,
     /// The better heuristic id on [`Self::paired`] (see
     /// [`compare`]). `None` when neither may win, nothing was paired, or they
     /// tie exactly.
@@ -796,12 +802,14 @@ pub fn compare(
     let replayed_a = replay(a, history, cases, filter, loom);
     let replayed_b = replay(b, history, cases, filter, loom);
     let paired = paired::paired_of(&replayed_a, &replayed_b);
+    let paired_by_subset = subsets::paired_subsets_of(&replayed_a, &replayed_b);
     let better =
         paired::better_side(&paired).map(|a_wins| if a_wins { a.id() } else { b.id() }.to_string());
     Ok(Comparison {
         a: report_of(a, &replayed_a),
         b: report_of(b, &replayed_b),
         paired,
+        paired_by_subset,
         better,
     })
 }
@@ -815,7 +823,7 @@ pub use paired::{Convergence, Fold, Paired, Stability};
 #[path = "backtest_subsets.rs"]
 pub mod subsets;
 
-pub use subsets::SubsetBucket;
+pub use subsets::{PairedSubset, SubsetBucket};
 
 #[path = "backtest_adaptation.rs"]
 pub mod adaptation;
