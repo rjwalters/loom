@@ -216,8 +216,21 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
         .filter(|l| !l.trim().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    if !compact(&code).contains(r#".event=="pull_request""#) {
-        return Some("its run selection does not filter on `.event == \"pull_request\"`, so it can list and cancel push runs");
+    // The restriction must be the *whole* event predicate: a lone
+    // `select(.event == "pull_request")` and no other `.event` mention. A
+    // widened filter (`... or .event == "push"`, `... or true`) still contains
+    // the substring but lists push runs.
+    let squashed = compact(&code);
+    let exact = r#"select(.event=="pull_request")"#;
+    let only_pr_events = squashed.matches(".event").count() == 1
+        && squashed.find(exact).is_some_and(|i| {
+            squashed[i + exact.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '|' | '\'' | '"' | '\\'))
+        });
+    if !only_pr_events {
+        return Some("its run selection is not exactly `select(.event == \"pull_request\")`, so it can list and cancel push runs");
     }
     let unsafe_ref =
         |v: &str| v.contains("ref_name") || v.contains("github.ref") || v.contains("||");
@@ -375,6 +388,15 @@ jobs:
             ),
             ("REF: ${{ github.head_ref }}", "REF: ${{ github.head_ref || github.ref_name }}"),
             ("REF: ${{ github.head_ref }}", "REF: main"),
+            (
+                r#"select(.event == "pull_request")"#,
+                r#"select(.event == "pull_request" or .event == "push")"#,
+            ),
+            (
+                r#"select(.event == "pull_request")"#,
+                r#"select(.event == "pull_request" or true)"#,
+            ),
+            (r#"select(.event == "pull_request")"#, r#"select(.event != "schedule")"#),
         ] {
             let src = PR_ONLY_CANCEL_STEP.replace(from, to);
             assert_ne!(src, PR_ONLY_CANCEL_STEP, "{from}");
