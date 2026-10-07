@@ -11,20 +11,44 @@
 //!
 //! | Column | Meaning |
 //! |---|---|
-//! | `record_id` | `loom.record_id`, else a content hash (webhook export rows carry none) |
-//! | `kind` | `loom.kind`, else the body's `kind` on a webhook row, else the body (the OTLP event name) |
-//! | `service` | resource `service.name`: [`SERVICE_WEBHOOK`] for the loom-ui export |
-//! | `repo` | the queried repo on a `queue.snapshot` row (host-level, no repo); else `loom.repo`, else the body's `repo` on a webhook row |
-//! | `attrs` / `nums` | the string / number attribute maps, as JSON |
+//! | `record_id` | `loom.record_id`, else a content hash: the per-row keyset cursor |
+//! | `identity` | the delivery identity rule 1 dedupes on ([`Row::record_id`]): see below |
+//! | `kind` | `loom.kind`, else the body's `kind` on a webhook export row, else the body (the OTLP event name) |
+//! | `service` / `scope` | resource `service.name` and the OTLP scope name: the producer ([`Source`]) |
+//! | `repo` | the queried repo on a `queue.snapshot` row (host-level, no repo); else `loom.repo`, else the body's `repo` on a webhook export row |
+//! | `attrs` / `nums` / `bools` | the string / number / bool attribute maps, as JSON |
 //! | `body` | the log body: the record's JSON for the JSON-body kinds |
 //! | `event_time_ns` / `knowable_time_ns` | `timestamp` / `observed_timestamp` |
 //!
-//! A field is looked up by name in `attrs`, then `nums`, then the body
+//! A field is looked up by name in `attrs`, `nums` and `bools`, then the body
 //! object, then the body's `payload` and `raw` objects, so one reader takes
-//! both an attribute-carrying daemon row and a webhook row whose fields are in
-//! its JSON body. Which attribute names the two producers use is not pinned
-//! by this repo for the webhook export, so every field has a short list of
-//! names ([`Fields::get`]).
+//! both an attribute-carrying row and a webhook row whose fields are in its
+//! JSON body. Every field has a short list of names ([`Fields::get`]).
+//!
+//! # Producers (verified against live SigNoz, #10671)
+//!
+//! - **The loom-ui export** (`service.name` [`SERVICE_WEBHOOK`]): the D1
+//!   record as a flat JSON body, plus `loom.record.*` / `loom.export.id`
+//!   attributes. Webhook-class.
+//! - **d1sync** (OTLP scope ending [`D1SYNC_SCOPE_SUFFIX`], a
+//!   [`D1SYNC_RECORD_ATTR`] attribute; `service.name = loom`): a second
+//!   exporter of the **same** D1 records. The body is the bare event name, the
+//!   fields are `loom.*` attributes (un-namespaced `loom.run_id` etc. on CI
+//!   rows), `merged` / `noop` are in the bool map. Webhook-class: it is the
+//!   only copy of 09-14..09-28, and elsewhere it duplicates the export.
+//! - **The daemon** (`service.name = loom` too, no d1sync scope): `ci.*` with
+//!   `loom.ci.*` keys, `pr.resolved`. Daemon-class. No daemon `label.*` row
+//!   reaches SigNoz today (the stage journal has no OTLP mapping, #10756), so
+//!   [`RowBody::LabelSet`] is accepted from a daemon-class row only and has no
+//!   live producer yet.
+//!
+//! **Identity.** One D1 record reaches SigNoz up to once per exporter (and
+//! the export re-exports). `identity` is the GitHub delivery id on a
+//! `label.transition` row (`loom.delivery_id` / `loom.record.delivery_id`),
+//! else the D1 record id (`d1:records:N`, from `d1sync.record` or
+//! `loom.export.id`), else `record_id`; so every copy is one row under
+//! rule 1, and a copy never "corroborates" itself. The delivery id is scoped
+//! to label rows because one CI webhook delivery yields several records.
 //!
 //! # Knowable-at
 //!
@@ -32,9 +56,10 @@
 //! and the timeline keeps only rows with `observed_at <= cutoff`
 //! ([`super::point_in_time`]):
 //!
-//! - **Webhook rows**: the Worker's receipt time `at`. The D1 row existed from
-//!   then (the `webhook-mirror` contract in [`super::fleet_events_webhook`]),
-//!   whatever the SigNoz ingest time of a later export.
+//! - **Webhook rows** (either exporter): the Worker's receipt time `at`
+//!   (`loom.at` on a d1sync row). The D1 row existed from then (the
+//!   `webhook-mirror` contract in [`super::fleet_events_webhook`]), whatever
+//!   the SigNoz ingest time of a later export.
 //! - **Daemon rows**: the record's own `observed_at` field when it has one
 //!   (stage journal rows, `ci.*`, `pr.resolved`), else the SigNoz
 //!   `observed_timestamp`. A row with neither has `observed_at = None` and is
@@ -53,6 +78,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// `service.name` of the loom-ui webhook export.
 pub const SERVICE_WEBHOOK: &str = "loom-ui-d1-export";
+
+/// The OTLP scope-name suffix of the d1sync exporter (the full name is
+/// `github.com/2amlogic/2am/infra/ops/internal/d1sync`).
+pub const D1SYNC_SCOPE_SUFFIX: &str = "/d1sync";
+
+/// The attribute every d1sync row carries: `<database>/<table>#<id>`.
+pub const D1SYNC_RECORD_ATTR: &str = "d1sync.record";
 
 /// The record kinds the timeline reads.
 pub mod kind {
@@ -103,8 +135,8 @@ pub mod reject {
 ///
 /// `kind` and `repo` are the **resolved** values, and the `WHERE` filters on
 /// them, not on the raw attributes: a `loom.kind` / `loom.repo` attribute
-/// wins; on a [`SERVICE_WEBHOOK`] row (empty attribute maps, the D1 record as
-/// a JSON body) they fall back to the body's top-level `kind` / `repo`; any
+/// wins; on a [`SERVICE_WEBHOOK`] row (no `loom.kind` / `loom.repo`
+/// attribute, the D1 record as a JSON body) they fall back to the body's top-level `kind` / `repo`; any
 /// other row's kind falls back to the body (the OTLP event name) and its repo
 /// to nothing. The body fallback is scoped to the webhook service so a daemon
 /// row's JSON body can never stand in for its missing attributes.
@@ -113,6 +145,7 @@ SELECT
     if(attributes_string['loom.record_id'] != '', attributes_string['loom.record_id'],
        concat('h:', toString(cityHash64(body, toJSONString(attributes_string), timestamp)))) AS record_id,
     resources_string['service.name'] AS service,
+    scope_name AS scope,
     multiIf(attributes_string['loom.kind'] != '', attributes_string['loom.kind'],
             service = 'loom-ui-d1-export', JSONExtractString(body, 'kind'),
             body) AS kind,
@@ -120,8 +153,18 @@ SELECT
             attributes_string['loom.repo'] != '', attributes_string['loom.repo'],
             service = 'loom-ui-d1-export', JSONExtractString(body, 'repo'),
             '') AS repo,
+    multiIf(attributes_string['loom.record_id'] != '', record_id,
+            kind = 'label.transition' AND attributes_string['loom.delivery_id'] != '',
+            concat('dlv:', attributes_string['loom.delivery_id']),
+            kind = 'label.transition' AND attributes_string['loom.record.delivery_id'] != '',
+            concat('dlv:', attributes_string['loom.record.delivery_id']),
+            attributes_string['d1sync.record'] != '',
+            concat('d1:', replaceOne(splitByChar('/', attributes_string['d1sync.record'])[-1], '#', ':')),
+            attributes_string['loom.export.id'] != '', concat('d1:', attributes_string['loom.export.id']),
+            record_id) AS identity,
     toJSONString(attributes_string) AS attrs,
     toJSONString(attributes_number) AS nums,
+    toJSONString(attributes_bool) AS bools,
     body,
     toString(timestamp) AS event_time_ns,
     toString(observed_timestamp) AS knowable_time_ns
@@ -140,7 +183,8 @@ FORMAT JSONEachRow
 /// Which producer a row came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Source {
-    /// The loom-ui webhook export: exact receipt times.
+    /// A D1 record from the loom-ui webhook Worker, via either exporter
+    /// (the loom-ui export or d1sync): exact receipt times.
     Webhook,
     /// A Loom daemon: polling-time observations.
     Daemon,
@@ -267,13 +311,18 @@ pub enum RowBody {
 /// One admitted row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// The delivery identity.
+    /// The delivery identity (the query's `identity` column, else its
+    /// `record_id`): every copy of one record shares it.
     pub record_id: String,
     /// `owner/repo`, lower-cased.
     pub repo: String,
     pub source: Source,
     /// When the row became knowable; `None` is never knowable.
     pub observed_at: Option<DateTime<Utc>>,
+    /// The record says it changed nothing (`noop`: a `labeled` for a label
+    /// already on, an `opened` already seen). A record any knowable copy flags
+    /// adds no event ([`super::fleet_signoz_timeline`] rule 1).
+    pub noop: bool,
     pub body: RowBody,
 }
 
@@ -314,7 +363,7 @@ fn object(value: Option<&Value>) -> Option<Map<String, Value>> {
 impl<'a> Fields<'a> {
     fn new(columns: &'a Map<String, Value>) -> Self {
         let mut maps = Vec::new();
-        for name in ["attrs", "nums"] {
+        for name in ["attrs", "nums", "bools"] {
             maps.extend(object(columns.get(name)));
         }
         if let Some(body) = object(columns.get("body")) {
@@ -429,7 +478,28 @@ pub fn parse_row(line: &str, repo: &str) -> Result<(RowCursor, ParsedRow), Strin
         _ => return Err("row has no record_id column".to_string()),
     };
     let cursor = (knowable_ns, record_id.clone());
-    Ok((cursor, admit(&Fields::new(&columns), record_id, repo)))
+    // Rule 1's identity: the cursor stays per row, so paging never skips a
+    // second exporter's copy of the same record.
+    let identity = match columns.get("identity") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => record_id,
+    };
+    Ok((cursor, admit(&Fields::new(&columns), identity, repo)))
+}
+
+/// Which exporter wrote a row: either loom-ui exporter is webhook-class; the
+/// daemon shares d1sync's `service.name = loom`, so the scope or the
+/// [`D1SYNC_RECORD_ATTR`] attribute tells them apart.
+fn source(fields: &Fields<'_>) -> Source {
+    let d1sync = fields
+        .column("scope")
+        .is_some_and(|scope| scope.ends_with(D1SYNC_SCOPE_SUFFIX))
+        || fields.text(&[D1SYNC_RECORD_ATTR]).is_some();
+    if d1sync || fields.column("service") == Some(SERVICE_WEBHOOK) {
+        Source::Webhook
+    } else {
+        Source::Daemon
+    }
 }
 
 fn admit(fields: &Fields<'_>, record_id: String, repo: &str) -> ParsedRow {
@@ -452,15 +522,13 @@ fn admit(fields: &Fields<'_>, record_id: String, repo: &str) -> ParsedRow {
     if !row_repo.is_some_and(|r| r.eq_ignore_ascii_case(repo)) {
         return Rejected(reject::REPO_MISMATCH);
     }
-    let source = if fields.column("service") == Some(SERVICE_WEBHOOK) {
-        Source::Webhook
-    } else {
-        Source::Daemon
-    };
+    let source = source(fields);
     let event_at = fields.column_time("event_time_ns");
     let knowable_column = fields.column_time("knowable_time_ns");
+    let noop = matches!(kind.as_str(), kind::LABEL_TRANSITION | kind::LABEL_FIRST_SEEN)
+        && flag(fields, &["noop", "loom.noop"]);
     let body = match kind.as_str() {
-        kind::LABEL_TRANSITION | kind::LABEL_FIRST_SEEN => label_body(fields, repo),
+        kind::LABEL_TRANSITION | kind::LABEL_FIRST_SEEN => label_body(fields, repo, source),
         kind::PR_RESOLVED => resolved_body(fields, repo),
         kind::QUEUE_SNAPSHOT => queue_body(fields, repo, event_at),
         _ => ci_body(fields, &kind),
@@ -508,13 +576,20 @@ fn admit(fields: &Fields<'_>, record_id: String, repo: &str) -> ParsedRow {
         repo: repo.to_ascii_lowercase(),
         source,
         observed_at,
+        noop,
         body,
     }))
 }
 
+/// A boolean field: a JSON `true` (body, bool map) or the text `"true"`.
+fn flag(fields: &Fields<'_>, names: &[&str]) -> bool {
+    matches!(fields.get(names), Some(Value::Bool(true)))
+        || fields.text(names).as_deref() == Some("true")
+}
+
 type Body = Result<Option<RowBody>, &'static str>;
 
-fn label_body(fields: &Fields<'_>, repo: &str) -> Body {
+fn label_body(fields: &Fields<'_>, repo: &str, source: Source) -> Body {
     let action = fields.text(&["action", "loom.action"]);
     let label = fields.text(&["label", "loom.label"]);
     let target = match fields.text(&["target", "loom.target"]).as_deref() {
@@ -524,7 +599,13 @@ fn label_body(fields: &Fields<'_>, repo: &str) -> Body {
         None => None,
     };
     if action.is_none() {
+        // A webhook record always names its action.
+        if source == Source::Webhook {
+            return Err(reject::UNKNOWN_ACTION);
+        }
         // A daemon stage-journal row: the whole label set after the change.
+        // No producer exports these to SigNoz yet (#10756); the path is
+        // pinned by synthetic rows only.
         let item = match (fields.uint::<u32>(PR_NUMBER), fields.uint::<u32>(ISSUE)) {
             (Some(pr), _) if pr > 0 => ItemKey::new(repo, Target::Pr, pr),
             (_, Some(issue)) if issue > 0 => ItemKey::new(repo, Target::Issue, issue),
@@ -552,11 +633,11 @@ fn label_body(fields: &Fields<'_>, repo: &str) -> Body {
     };
     let item = ItemKey::new(repo, target, number);
     let at = fields
-        .time(&["at", "emitted_at"])
+        .time(&["at", "loom.at", "emitted_at"])
         .or_else(|| fields.column_time("event_time_ns"))
         .ok_or(reject::MISSING_EVENT_TIME)?;
-    let merged = matches!(fields.get(&["merged"]), Some(Value::Bool(true)))
-        || fields.text(&["merged"]).as_deref() == Some("true");
+    // d1sync carries it in the bool map only (#10671).
+    let merged = flag(fields, &["merged", "loom.merged"]);
     let lifecycle = |event| {
         Ok(Some(RowBody::Lifecycle {
             item: item.clone(),
@@ -606,46 +687,50 @@ fn resolved_body(fields: &Fields<'_>, repo: &str) -> Body {
     }))
 }
 
+/// A CI job id: the daemon's `loom.ci.*`, the export's body, d1sync's
+/// un-namespaced `loom.*` (#10671).
+const JOB_ID: [&str; 3] = ["loom.ci.job_id", "job_id", "loom.job_id"];
+
 fn ci_body(fields: &Fields<'_>, kind: &str) -> Body {
     let completed_at = fields
-        .time(&["loom.ci.completed_at", "completed_at"])
+        .time(&["loom.ci.completed_at", "completed_at", "loom.completed_at"])
         .or_else(|| fields.column_time("event_time_ns"))
         .ok_or(reject::MISSING_EVENT_TIME)?;
     let run_id = fields
-        .uint::<u64>(&["loom.ci.run_id", "run_id"])
+        .uint::<u64>(&["loom.ci.run_id", "run_id", "loom.run_id"])
         .ok_or(reject::MISSING_CI_RUN)?;
     let run_attempt = fields
-        .uint::<u32>(&["loom.ci.run_attempt", "run_attempt"])
+        .uint::<u32>(&["loom.ci.run_attempt", "run_attempt", "loom.run_attempt"])
         .unwrap_or(1);
-    let conclusion = fields.text(&["loom.ci.conclusion", "conclusion"]);
-    let duration_ms = fields.int(&["loom.ci.duration_ms", "duration_ms"]);
+    let conclusion = fields.text(&["loom.ci.conclusion", "conclusion", "loom.conclusion"]);
+    let duration_ms = fields.int(&["loom.ci.duration_ms", "duration_ms", "loom.duration_ms"]);
     Ok(Some(match kind {
         kind::CI_RUN => RowBody::CiRun(CiRunRow {
             run_id,
             run_attempt,
             workflow: fields
-                .text(&["loom.ci.workflow", "workflow"])
+                .text(&["loom.ci.workflow", "workflow", "loom.workflow"])
                 .unwrap_or_default(),
-            git_ref: fields.text(&["loom.ci.ref", "git_ref", "ref"]),
-            head_sha: fields.text(&["loom.ci.head_sha", "head_sha"]),
-            status: fields.text(&["loom.ci.status", "status"]),
+            git_ref: fields.text(&["loom.ci.ref", "git_ref", "ref", "loom.ref"]),
+            head_sha: fields.text(&["loom.ci.head_sha", "head_sha", "loom.head_sha"]),
+            status: fields.text(&["loom.ci.status", "status", "loom.status"]),
             conclusion,
             completed_at,
             duration_ms,
         }),
         kind::CI_JOB => RowBody::CiJob(CiJobRow {
             run_id,
-            job_id: fields
-                .uint::<u64>(&["loom.ci.job_id", "job_id"])
-                .ok_or(reject::MISSING_CI_RUN)?,
-            job: fields.text(&["loom.ci.job", "job"]).unwrap_or_default(),
+            job_id: fields.uint::<u64>(&JOB_ID).ok_or(reject::MISSING_CI_RUN)?,
+            job: fields
+                .text(&["loom.ci.job", "job", "loom.job"])
+                .unwrap_or_default(),
             conclusion,
             completed_at,
         }),
         _ => RowBody::CiDuration(CiDurationRow {
             run_id,
             run_attempt,
-            job_id: fields.uint::<u64>(&["loom.ci.job_id", "job_id"]),
+            job_id: fields.uint::<u64>(&JOB_ID),
             duration_ms: duration_ms.ok_or(reject::MISSING_CI_RUN)?,
             completed_at,
         }),

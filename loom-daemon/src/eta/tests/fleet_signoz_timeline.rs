@@ -2,10 +2,13 @@
 //!
 //! Pure: no daemon, no network, no clock. The fixture
 //! (`fixtures/signoz-timeline.jsonl`) is rows in exactly the shape
-//! `TIMELINE_SQL` returns as `JSONEachRow`, from both sources: the loom-ui
-//! webhook export (`service = loom-ui-d1-export`, the D1 record as the body)
-//! and the daemon (stage-journal label sets, `pr.resolved`, `ci.*`,
-//! `queue.snapshot`).
+//! `TIMELINE_SQL` returns as `JSONEachRow`, with every producer in its live
+//! shape (verified against SigNoz, #10671): the loom-ui export (the D1
+//! record as a flat body), d1sync (the same records as `loom.*` attributes
+//! and bools, plus a d1sync-only PR), and the daemon (`ci.*` with `loom.ci.*`
+//! keys, `pr.resolved`). The daemon's stage-journal label sets have no live
+//! producer, so they appear only as synthetic rows built here
+//! ([`label_set`]).
 
 use crate::eta::fleet_signoz_refresh::{
     FileRows, Limits, PageQuery, ReadError, SignozRead, SignozStop,
@@ -56,6 +59,7 @@ fn label(source: Source, id: &str, item: &ItemKey, name: &str, tr: Transition, a
         repo: REPO.to_string(),
         source,
         observed_at: Some(t(at)),
+        noop: false,
         body: RowBody::Label {
             item: item.clone(),
             label: name.to_string(),
@@ -65,12 +69,15 @@ fn label(source: Source, id: &str, item: &ItemKey, name: &str, tr: Transition, a
     }
 }
 
+/// A daemon stage-journal label set. Synthetic: no producer exports these to
+/// SigNoz yet (#10756), so they pin the gated `LabelSet` path only.
 fn label_set(id: &str, item: &ItemKey, labels: &[&str], observed: Option<i64>) -> Row {
     Row {
         record_id: id.to_string(),
         repo: REPO.to_string(),
         source: Source::Daemon,
         observed_at: observed.map(t),
+        noop: false,
         body: RowBody::LabelSet {
             item: item.clone(),
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
@@ -91,6 +98,7 @@ fn lifecycle(
         repo: REPO.to_string(),
         source,
         observed_at: Some(t(seen)),
+        noop: false,
         body: RowBody::Lifecycle {
             item: item.clone(),
             event,
@@ -105,11 +113,12 @@ const APPROVED: &str = "loom:pr";
 // -- the fixture, end to end ----------------------------------------------
 
 #[test]
-fn fixture_rows_from_both_sources_give_labels_merge_close_ci_and_queue() {
+fn fixture_rows_from_every_producer_give_labels_merge_close_ci_and_queue() {
     let rows = fixture_rows(500);
     let timeline = Timeline::build(&rows, t(30 * 86_400));
 
-    // PR 900: both sources; every change dated by the webhook.
+    // PR 900: both exporters carry every record; each is one webhook event,
+    // and a copy never corroborates itself.
     let p900 = timeline.item(&pr(900)).unwrap();
     let changes: Vec<(&str, Transition, DateTime<Utc>, Source, bool)> = p900
         .labels
@@ -120,50 +129,58 @@ fn fixture_rows_from_both_sources_give_labels_merge_close_ci_and_queue() {
         changes,
         vec![
             (RR, Transition::Added, t(0), Source::Webhook, false),
-            (RR, Transition::Removed, t(3610), Source::Webhook, true),
-            (APPROVED, Transition::Added, t(3612), Source::Webhook, true),
-        ]
+            (RR, Transition::Removed, t(3610), Source::Webhook, false),
+            (APPROVED, Transition::Added, t(3612), Source::Webhook, false),
+        ],
+        "the noop re-add at 3700 (flagged by d1sync only) adds nothing"
     );
     assert_eq!(p900.merged_at(), Some(t(7205)), "the webhook's receipt time wins");
     assert_eq!(p900.closed_at(), None);
+    // d1sync's `loom.merged` is in the bool map: no spurious `Closed`.
+    let events: Vec<Lifecycle> = p900.lifecycle.iter().map(|e| e.event).collect();
+    assert_eq!(events, vec![Lifecycle::Merged]);
     let merge = p900.resolution().unwrap();
     assert!(merge.corroborated, "the daemon's pr.resolved saw it too");
     assert_eq!(merge.observed_at, t(7205));
     assert_eq!(p900.labels_at(t(3611)), BTreeSet::from([] as [String; 0]));
     assert_eq!(p900.labels_at(t(3612)), BTreeSet::from([APPROVED.to_string()]));
 
-    // PR 901: the daemon only; its polling times stand.
+    // PR 901: d1sync only (the 09-14..09-28 shape); still webhook-dated.
     let p901 = timeline.item(&pr(901)).unwrap();
-    let changes: Vec<(&str, Transition, DateTime<Utc>, Source)> = p901
+    let changes: Vec<(&str, Transition, DateTime<Utc>, Source, bool)> = p901
         .labels
         .iter()
-        .map(|e| (e.label.as_str(), e.transition, e.at, e.source))
+        .map(|e| (e.label.as_str(), e.transition, e.at, e.source, e.corroborated))
         .collect();
     assert_eq!(
         changes,
         vec![
-            ("loom:changes-requested", Transition::Added, t(1000), Source::Daemon),
-            (RR, Transition::Removed, t(1000), Source::Daemon),
+            (RR, Transition::Added, t(-60), Source::Webhook, false),
+            ("loom:changes-requested", Transition::Added, t(720), Source::Webhook, false),
+            (RR, Transition::Removed, t(720), Source::Webhook, false),
         ]
     );
-    assert_eq!(p901.closed_at(), Some(t(2000)));
+    assert_eq!(p901.closed_at(), Some(t(2001)));
+    assert!(p901.resolution().unwrap().corroborated, "by the daemon's pr.resolved");
     assert_eq!(p901.merged_at(), None);
 
-    // Issue 899: a webhook-only issue label.
+    // Issue 899: one label, from both exporters.
     let issue = timeline
         .item(&ItemKey::new(REPO, Target::Issue, 899))
         .unwrap();
     assert_eq!(issue.labels.len(), 1);
     assert_eq!(issue.labels[0].at, t(-600));
 
-    // CI: the latest attempt of the workflow on the PR's branch, with its job.
+    // CI: the latest attempt of the workflow on the PR's branch, with its
+    // job; d1sync's un-namespaced copies collapse into the export's.
     let ci = timeline.ci_for_ref(REPO, "feature/issue-899").unwrap();
     let latest = &ci.latest["CI"];
     assert_eq!((latest.run.run_id, latest.run.run_attempt), (55, 2));
     assert_eq!(latest.run.conclusion.as_deref(), Some("success"));
-    assert_eq!(latest.observed_at, t(1510), "the earliest knowable copy");
+    assert_eq!(latest.observed_at, t(1500), "the receipt, not the daemon's later poll");
     assert_eq!(latest.jobs.len(), 1);
     assert_eq!(latest.jobs[0].job, "test");
+    assert_eq!(latest.duration_samples.len(), 1);
     assert!(ci.all_green());
 
     // Queue: the latest snapshot, this repo's rows only.
@@ -172,26 +189,34 @@ fn fixture_rows_from_both_sources_give_labels_merge_close_ci_and_queue() {
     assert_eq!(queue.entries.len(), 1);
     assert_eq!(timeline.queue_entry(899).unwrap().state.as_deref(), Some("running"));
 
-    // One redelivered record, one re-exported merge and one re-exported CI
-    // run were dropped; three daemon changes found their webhook partner.
-    assert_eq!(timeline.stats.duplicate_records, 1);
-    assert_eq!(timeline.stats.duplicate_events, 2);
-    assert_eq!(timeline.stats.corroborated, 3);
+    // Nine second copies of a record (eight d1sync copies and one
+    // re-export), two noop records, one daemon copy of a CI run; only the
+    // daemon's two resolutions corroborate anything.
+    assert_eq!(timeline.stats.duplicate_records, 9);
+    assert_eq!(timeline.stats.noop, 2);
+    assert_eq!(timeline.stats.duplicate_events, 1);
+    assert_eq!(timeline.stats.corroborated, 2);
     assert_eq!(timeline.stats.not_knowable, 0);
 }
 
 #[test]
-fn the_walk_rejects_foreign_kinds_and_pages_to_the_same_rows() {
+fn the_walk_rejects_only_foreign_kinds_and_pages_to_the_same_rows() {
     let mut reader = FileRows::parse(FIXTURE).unwrap();
     let (one_page, report) =
         walk(REPO, &mut reader, t(-86_400), t(30 * 86_400), limits(500)).unwrap();
     assert_eq!(report.pages, 1);
-    assert_eq!(report.rejected.get(reject::UNKNOWN_KIND), Some(&1), "sweep.outcome");
+    // d1sync's CI rows are admitted, not `missing_ci_run` (#10671).
+    let rejected: Vec<(&str, usize)> = report
+        .rejected
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    assert_eq!(rejected, vec![(reject::UNKNOWN_KIND, 1)], "sweep.outcome only");
     let mut reader = FileRows::parse(FIXTURE).unwrap();
     let (paged, report) = walk(REPO, &mut reader, t(-86_400), t(30 * 86_400), limits(3)).unwrap();
     assert!(report.pages > 3);
-    // The redelivered webhook row repeats its cursor exactly, so a page
-    // boundary between the two copies keeps one; the timeline is the same.
+    // The re-exported merge repeats its cursor exactly, so a page boundary
+    // between the two copies keeps one; the timeline is the same.
     assert_eq!(
         Timeline::build(&paged, t(30 * 86_400)).items,
         Timeline::build(&one_page, t(30 * 86_400)).items
@@ -214,11 +239,14 @@ fn an_unavailable_backend_stops_the_walk_with_nothing() {
 fn the_query_selects_every_column_the_parser_reads() {
     for column in [
         "AS record_id",
+        "AS identity",
         "AS kind",
         "AS service",
+        "AS scope",
         "AS repo",
         "AS attrs",
         "AS nums",
+        "AS bools",
         "body,",
         "AS event_time_ns",
         "AS knowable_time_ns",
@@ -474,13 +502,16 @@ fn a_row_after_the_cutoff_cannot_change_a_dedupe_decision() {
 #[test]
 fn the_cutoff_picks_the_queue_and_ci_that_were_knowable_then() {
     let rows = fixture_rows(500);
-    // The second snapshot ticked at 1200 but was knowable at 1205.
-    let timeline = Timeline::build(&rows, t(1_204));
+    // The export's snapshots are dated by their tick (the record's own
+    // time), whatever the later export.
+    let timeline = Timeline::build(&rows, t(1_199));
     assert_eq!(timeline.queue.as_ref().unwrap().tick_at, t(600));
     assert_eq!(timeline.queue_entry(899).unwrap().state.as_deref(), Some("ready"));
     let ci = timeline.ci_for_ref(REPO, "feature/issue-899").unwrap();
     assert_eq!(ci.latest["CI"].run.run_attempt, 1, "the rerun was not yet observed");
     assert!(!ci.all_green());
+    let later = Timeline::build(&rows, t(1_200));
+    assert_eq!(later.queue_entry(899).unwrap().state.as_deref(), Some("running"));
 }
 
 fn parse(row: serde_json::Value) -> ParsedRow {
@@ -500,16 +531,18 @@ fn ns(at: DateTime<Utc>) -> String {
 
 #[test]
 fn a_webhook_row_is_knowable_at_its_receipt_and_a_daemon_row_at_its_observation() {
-    let payload = json!({"target": "pr", "number": 7, "action": "labeled", "label": RR,
-                         "at": "2026-10-01T10:00:00Z"});
+    let body = json!({"kind": "label.transition", "repo": REPO, "target": "pr", "number": 7,
+                      "action": "labeled", "label": RR, "at": "2026-10-01T10:00:00.000Z"});
     let webhook = admitted(json!({
         "record_id": "h:1", "kind": "label.transition", "service": SERVICE_WEBHOOK,
-        "repo": REPO, "attrs": "{}", "nums": "{}",
-        "body": json!({"id": 1, "payload": payload.to_string()}).to_string(),
+        "repo": REPO, "attrs": "{}", "nums": "{}", "body": body.to_string(),
         "event_time_ns": ns(t(0)), "knowable_time_ns": ns(t(4 * 86_400)),
     }));
     assert_eq!(webhook.source, Source::Webhook);
     assert_eq!(webhook.observed_at, Some(t(0)), "receipt, not the later export");
+    // d1sync: the same instant from `loom.at`, whatever its sync time.
+    let d1sync = admitted(d1sync_label("labeled", Some(RR), &json!({}), t(4 * 86_400)));
+    assert_eq!((d1sync.source, d1sync.observed_at), (Source::Webhook, Some(t(0))));
 
     let daemon = |body: serde_json::Value, knowable: i64| {
         admitted(json!({
@@ -565,6 +598,7 @@ fn ci_and_queue_cover_a_fit_window_only_once_it_lies_wholly_after_the_first_row(
         repo: REPO.to_string(),
         source: Source::Daemon,
         observed_at: Some(first),
+        noop: false,
         body: RowBody::Queue {
             tick_at: first,
             entries: Vec::new(),
@@ -589,7 +623,10 @@ fn coverage_is_per_family_and_source_and_only_counts_knowable_rows() {
     let timeline = Timeline::build(&rows, cutoff);
     let coverage = &timeline.coverage;
     assert_eq!(coverage.earliest[&(Family::Labels, Source::Webhook)], t(-600));
-    assert_eq!(coverage.earliest[&(Family::Labels, Source::Daemon)], t(100));
+    // No daemon label row reaches SigNoz; d1sync's are webhook-class.
+    assert!(!coverage
+        .earliest
+        .contains_key(&(Family::Labels, Source::Daemon)));
     assert_eq!(coverage.first(Family::Lifecycle), Some(t(2_000)));
     assert_eq!(coverage.first(Family::Ci), Some(t(520)));
     assert!(!coverage.covers(Family::Ci, cutoff, WINDOW_DAYS), "30 days of 60");
@@ -600,4 +637,157 @@ fn coverage_is_per_family_and_source_and_only_counts_knowable_rows() {
             .first(Family::Labels),
         None
     );
+}
+
+// -- live producer shapes (#10671) ------------------------------------------------
+
+const D1SYNC_SCOPE: &str = "github.com/2amlogic/2am/infra/ops/internal/d1sync";
+
+/// A d1sync `label.transition` row for PR 7 at `t(0)`, as `TIMELINE_SQL`
+/// returns it (synced at `seen`).
+fn d1sync_label(
+    action: &str,
+    label: Option<&str>,
+    bools: &serde_json::Value,
+    seen: DateTime<Utc>,
+) -> serde_json::Value {
+    let mut attrs = json!({"loom.repo": REPO, "loom.target": "pr", "loom.action": action,
+                           "loom.at": "2026-10-01T10:00:00.000Z", "loom.labels_after": "[]",
+                           "loom.delivery_id": "dlv-7",
+                           "d1sync.record": "loom-fleet-telemetry/records#7"});
+    if let Some(label) = label {
+        attrs["loom.label"] = json!(label);
+    }
+    json!({
+        "record_id": "h:s7", "identity": "dlv:dlv-7", "kind": "label.transition",
+        "service": "loom", "scope": D1SYNC_SCOPE, "repo": REPO,
+        "attrs": attrs.to_string(), "nums": json!({"loom.number": 7, "loom.issue": 7}).to_string(),
+        "bools": bools.to_string(), "body": "label.transition",
+        "event_time_ns": ns(seen), "knowable_time_ns": ns(seen),
+    })
+}
+
+#[test]
+fn a_d1sync_row_is_webhook_class_and_keyed_by_its_delivery() {
+    let row = admitted(d1sync_label("labeled", Some(RR), &json!({}), t(0)));
+    assert_eq!(row.source, Source::Webhook, "not the daemon, though service.name = loom");
+    assert_eq!(row.record_id, "dlv:dlv-7", "the identity column, not the row cursor");
+    assert!(!row.noop);
+    // Either marker alone classifies it.
+    let mut scope_only = d1sync_label("labeled", Some(RR), &json!({}), t(0));
+    let attrs: serde_json::Value =
+        serde_json::from_str(scope_only["attrs"].as_str().unwrap()).unwrap();
+    let mut attrs = attrs.as_object().unwrap().clone();
+    attrs.remove("d1sync.record");
+    scope_only["attrs"] = json!(serde_json::Value::Object(attrs).to_string());
+    assert_eq!(admitted(scope_only.clone()).source, Source::Webhook);
+    scope_only["scope"] = json!("");
+    assert_eq!(admitted(scope_only).source, Source::Daemon, "neither marker");
+}
+
+#[test]
+fn a_d1sync_merge_is_read_from_the_bool_map() {
+    let merged = admitted(d1sync_label("closed", None, &json!({"loom.merged": true}), t(0)));
+    assert!(matches!(
+        merged.body,
+        RowBody::Lifecycle {
+            event: Lifecycle::Merged,
+            ..
+        }
+    ));
+    let closed = admitted(d1sync_label("closed", None, &json!({"loom.merged": false}), t(0)));
+    assert!(matches!(
+        closed.body,
+        RowBody::Lifecycle {
+            event: Lifecycle::Closed,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_noop_row_is_flagged_from_the_body_or_the_bool_map() {
+    let d1sync = admitted(d1sync_label("labeled", Some(RR), &json!({"loom.noop": true}), t(0)));
+    assert!(d1sync.noop);
+    let export = admitted(json!({
+        "record_id": "h:e7", "identity": "dlv:dlv-7", "kind": "label.transition",
+        "service": SERVICE_WEBHOOK, "scope": "loom-ui.d1-export", "repo": REPO,
+        "attrs": "{}", "nums": "{}", "bools": "{}",
+        "body": json!({"kind": "label.transition", "repo": REPO, "target": "pr", "number": 7,
+                       "action": "unlabeled", "label": RR, "noop": true,
+                       "at": "2026-10-01T10:00:00.000Z"}).to_string(),
+        "event_time_ns": ns(t(0)), "knowable_time_ns": ns(t(0)),
+    }));
+    assert!(export.noop);
+}
+
+/// A webhook record always names its action: one without is not a label set.
+#[test]
+fn an_action_less_webhook_row_is_never_a_label_set() {
+    let mut row = d1sync_label("labeled", Some(RR), &json!({}), t(0));
+    let attrs: serde_json::Value = serde_json::from_str(row["attrs"].as_str().unwrap()).unwrap();
+    let mut attrs = attrs.as_object().unwrap().clone();
+    attrs.remove("loom.action");
+    attrs.insert("loom.labels".to_string(), json!("[\"loom:pr\"]"));
+    row["attrs"] = json!(serde_json::Value::Object(attrs).to_string());
+    assert_eq!(parse(row), ParsedRow::Rejected(reject::UNKNOWN_ACTION));
+}
+
+/// Rule 1: a noop on either copy drops the record (one exporter may omit the
+/// flag), in any order; a copy not yet knowable decides nothing.
+#[test]
+fn a_record_any_knowable_copy_flags_noop_adds_no_event() {
+    let item = pr(60);
+    let copy = |noop: bool, seen: i64| {
+        let mut row = label(Source::Webhook, "dlv:x", &item, RR, Transition::Added, 100);
+        row.noop = noop;
+        row.observed_at = Some(t(seen));
+        row
+    };
+    for rows in [
+        vec![copy(false, 100), copy(true, 100)],
+        vec![copy(true, 100), copy(false, 100)],
+    ] {
+        let timeline = Timeline::build(&rows, t(1_000));
+        assert!(!timeline.items.contains_key(&item), "{rows:?}");
+        assert_eq!((timeline.stats.noop, timeline.stats.duplicate_records), (1, 1));
+    }
+    let rows = vec![copy(false, 100), copy(true, 900)];
+    let early = Timeline::build(&rows, t(500));
+    assert_eq!(early.items[&item].labels.len(), 1, "the noop copy is not knowable yet");
+    assert_eq!(early.stats.noop, 0);
+}
+
+#[test]
+fn d1sync_and_daemon_ci_rows_parse_with_their_own_keys() {
+    let ci = |service: &str, scope: &str, attrs: serde_json::Value, nums: serde_json::Value| {
+        admitted(json!({
+            "record_id": "h:c", "kind": "ci.job", "service": service, "scope": scope,
+            "repo": REPO, "attrs": attrs.to_string(), "nums": nums.to_string(), "bools": "{}",
+            "body": "ci.job", "event_time_ns": ns(t(900)), "knowable_time_ns": ns(t(900)),
+        }))
+    };
+    let d1sync = ci(
+        "loom",
+        D1SYNC_SCOPE,
+        json!({"loom.repo": REPO, "loom.job": "test", "loom.conclusion": "success",
+               "loom.completed_at": "2026-10-01T10:05:00Z",
+               "d1sync.record": "loom-fleet-telemetry/records#9"}),
+        json!({"loom.run_id": 55, "loom.job_id": 77, "loom.duration_ms": 50_000}),
+    );
+    assert_eq!(d1sync.source, Source::Webhook);
+    assert_eq!(d1sync.observed_at, Some(t(300)), "its completion, not the sync time");
+    let RowBody::CiJob(job) = d1sync.body else {
+        panic!("not a job: {:?}", d1sync.body);
+    };
+    assert_eq!((job.run_id, job.job_id, job.job.as_str()), (55, 77, "test"));
+    // The daemon's own CI rows share `service.name = loom` but no d1sync scope.
+    let daemon = ci(
+        "loom",
+        "",
+        json!({"loom.repo": REPO, "loom.ci.job": "test",
+               "loom.ci.completed_at": "2026-10-01T10:05:00+00:00"}),
+        json!({"loom.ci.run_id": 55, "loom.ci.job_id": 77}),
+    );
+    assert_eq!((daemon.source, daemon.observed_at), (Source::Daemon, Some(t(900))));
 }

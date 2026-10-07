@@ -18,15 +18,18 @@
 //!
 //! # The two sources
 //!
-//! The same label change usually reaches SigNoz twice: the loom-ui webhook
-//! export (an exact receipt time) and the daemon's listing diff (a polling
-//! time, up to one listing interval late). A merge or close reaches it as a
-//! webhook `closed` row and as the daemon's `pr.resolved` record.
+//! A webhook record (an exact receipt time) reaches SigNoz once per loom-ui
+//! exporter (the export and d1sync, both [`Source::Webhook`]); its copies
+//! share one identity, so they are one row, never a corroboration. The daemon
+//! (a polling time, up to one listing interval late) contributes `pr.resolved`
+//! for a merge or close, and, once its stage journal is exported (no producer
+//! yet, #10756), whole label sets.
 //!
 //! **Rules** (one unit test each):
 //!
 //! 1. **Delivery identity.** Rows with one `record_id` are one row; the first
-//!    knowable is kept.
+//!    knowable is kept. A record any knowable copy flags `noop` (it changed
+//!    nothing: one exporter may omit the flag) adds no event.
 //! 2. **Webhook time wins.** A daemon occurrence and a webhook occurrence of
 //!    the same `(repo, number, label, transition)` (or the same lifecycle
 //!    event) are one event, dated by the webhook. The pair matches when the
@@ -39,8 +42,8 @@
 //!    instant are one event, so a redelivered or re-exported row never
 //!    counts twice.
 //!
-//! The daemon's label rows carry the whole label set, not a single change
-//! (stage journal rows). Consecutive sets of one item are diffed into
+//! The daemon's label rows (stage journal rows, not yet exported) carry the
+//! whole label set, not a single change. Consecutive sets of one item are diffed into
 //! changes, dated at the later set's observation. An item's first set is a
 //! baseline and dates nothing: the daemon cannot know when those labels were
 //! added. Every set is still kept on the item ([`ItemTimeline::label_sets`]),
@@ -273,6 +276,8 @@ pub struct TimelineStats {
     pub not_knowable: usize,
     /// Repeats of a held `record_id` (rule 1).
     pub duplicate_records: usize,
+    /// Records flagged `noop` by a knowable copy (rule 1), dropped.
+    pub noop: usize,
     /// Same-source repeats of one event (rule 4), and repeats of a CI run,
     /// job or duration sample.
     pub duplicate_events: usize,
@@ -398,14 +403,19 @@ impl Timeline {
             .collect();
         stats.not_knowable = rows.len() - knowable.len();
         knowable.sort_by(|a, b| (a.0, &a.1.record_id).cmp(&(b.0, &b.1.record_id)));
-        // Rule 1.
+        // Rule 1. The noop flag is the record's, whichever copy carries it.
+        let noop: BTreeSet<&str> = knowable
+            .iter()
+            .filter_map(|&(_, row)| row.noop.then_some(row.record_id.as_str()))
+            .collect();
+        stats.noop = noop.len();
         let mut ids = BTreeSet::new();
-        knowable.retain(|(_, row)| {
-            let fresh = ids.insert(row.record_id.clone());
+        knowable.retain(|&(_, row)| {
+            let fresh = ids.insert(row.record_id.as_str());
             if !fresh {
                 stats.duplicate_records += 1;
             }
-            fresh
+            fresh && !noop.contains(row.record_id.as_str())
         });
 
         let mut coverage = Coverage::default();

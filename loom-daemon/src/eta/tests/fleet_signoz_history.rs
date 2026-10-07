@@ -122,7 +122,8 @@ fn ns(at: DateTime<Utc>) -> String {
     at.timestamp_nanos_opt().unwrap().to_string()
 }
 
-/// One loom-ui webhook export row, as `TIMELINE_SQL` returns it.
+/// One loom-ui webhook export row, as `TIMELINE_SQL` returns it: the D1
+/// record as a flat body (the live shape, #10671).
 fn webhook(
     id: &str,
     target: &str,
@@ -147,13 +148,6 @@ fn webhook(
     if merged {
         payload["merged"] = json!(true);
     }
-    let body = json!({
-        "id": 1,
-        "kind": "label.transition",
-        "repo": A,
-        "emitted_at": at.to_rfc3339(),
-        "payload": payload.to_string(),
-    });
     json!({
         "record_id": id,
         "kind": "label.transition",
@@ -161,7 +155,7 @@ fn webhook(
         "repo": A,
         "attrs": "{}",
         "nums": "{}",
-        "body": body.to_string(),
+        "body": payload.to_string(),
         "event_time_ns": ns(at),
         "knowable_time_ns": ns(at),
     })
@@ -170,6 +164,7 @@ fn webhook(
 
 /// One daemon stage-journal row (`label.first_seen`, as `TIMELINE_SQL`
 /// returns it): PR `number`'s whole label set, observed at `seen`.
+/// Synthetic: no producer exports these to SigNoz yet (#10756).
 fn label_set_row(id: &str, number: u32, labels: &[&str], seen: DateTime<Utc>) -> String {
     let body = json!({
         "schema": "eta-stage-sample/v1",
@@ -1119,8 +1114,8 @@ fn signoz_and_forge_timelines_agree_within_the_polling_tolerance() {
     let timeline = Timeline::build(&rows, cutoff);
 
     // The forge's record of the same two PRs (the fixture's ground truth:
-    // #900 requested, approved and merged; #901 requested before the
-    // daemon first saw it, rejected, then closed unmerged).
+    // #900 requested, approved and merged; #901 requested, rejected, then
+    // closed unmerged).
     let truth: BTreeMap<u32, PrHistory> = [
         forge_history(
             900,
@@ -1194,12 +1189,15 @@ fn signoz_and_forge_timelines_agree_within_the_polling_tolerance() {
         .item(&ItemKey::new(FIXTURE_REPO, Target::Pr, 900))
         .unwrap();
     assert_eq!(keys(&pr_history(900, item900, cutoff)), keys(&truth[&900]));
-    // #901's first label predates the daemon's first sight of it — exactly
-    // what makes it incomplete from SigNoz, so a pass gap-fills it.
+    // #901 is d1sync-only (the 09-14..09-28 shape): webhook-dated, never
+    // self-corroborated, and with no `opened` row, so a pass gap-fills it.
     let item901 = timeline
         .item(&ItemKey::new(FIXTURE_REPO, Target::Pr, 901))
         .unwrap();
-    assert!(item901.labels.iter().all(|e| e.source == Source::Daemon));
+    assert!(item901
+        .labels
+        .iter()
+        .all(|e| e.source == Source::Webhook && !e.corroborated));
     assert!(!item_complete(item901));
     assert!(!item_complete(item900), "the fixture carries no `opened` row");
 }
