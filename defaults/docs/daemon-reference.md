@@ -7174,6 +7174,7 @@ are unchanged on every host. Code: `observability/captain_gauges.rs`.
 | `fleet.captainGauges.ref` | `fleet.etaFitRef` (`eta-fit`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
 | `fleet.captainGauges.starFacts` | `false` | Part 2 job **`star-facts`**. Captain (with `enabled`): list every operator label per repo and publish how many open starred issues each has. Dispatcher (with `standDown`): skip the starred-issue liveness evaluator for a repo the captain freshly reports as having none |
 | `fleet.captainGauges.queueBlocked` | `false` | Part 2 job **`queue-blocked`**. Captain: list `loom:blocked` per repo and publish number, creation time and label names. Dispatcher: build its `queue.snapshot` blocked rows from that instead of listing |
+| `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | The staleness bound for `star-facts` alone, in place of `maxAgeSecs`: two collector passes plus slack. A believed "no star here" is a skipped liveness pass, so this bounds how long a new star can go unevaluated when the captain stops reporting. While it produces `star-facts`, the captain republishes at least every `starFactsMaxAgeSecs − 600` s (300 s at the default) so its facts stay inside the bound |
 
 **How a dispatcher knows the captain is fresh.** Hosts have no channel to
 each other's telemetry, so the captain publishes a heartbeat to the fleet
@@ -7183,15 +7184,16 @@ per job the `as_of` of the captain's last finished pass (its points handed to
 the OTLP sink) and the repos it covered. A dispatcher reads it once per
 collector pass with `If-None-Match` (a `304` when unchanged) and stands down
 for a job and repo only when the heartbeat names the declared captain and the
-`as_of` is within `maxAgeSecs`. A read failure keeps the last heartbeat, which
-keeps ageing; a missing or malformed one counts as absent. Without
+`as_of` is within `maxAgeSecs` (`starFactsMaxAgeSecs` for `star-facts`). A
+read failure keeps the last heartbeat, which keeps ageing against the same
+bound; a missing or malformed one counts as absent. Without
 `fleet.repo` there is no heartbeat and every host produces locally. When a
 dispatcher takes a repo back it starts from a fresh baseline, so the
 transitions the captain already sampled are not replayed.
 
 | Gate | `fleet.captainGauges` | What the pass does |
 |---|---|---|
-| `Armed` | `enabled` | Arms `stage-dwell` (and `star-facts` / `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` and at once when its content changes |
+| `Armed` | `enabled` | Arms `stage-dwell` (and `star-facts` / `queue-blocked` when switched on), produces, and publishes the heartbeat every `publishIntervalSecs` (shorter while `star-facts` is produced, see `starFactsMaxAgeSecs`) and at once when its content changes |
 | `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
 | anything else | | Produces locally, exactly as before |
 
@@ -7211,9 +7213,12 @@ it on recovery too, because the dispatchers have sampled it meanwhile.
 host. Each has its own switch, so a fleet running only part 1 is unchanged.
 Code: `observability/captain_gauges/facts.rs`, `star_liveness/captain.rs`.
 
-- **`star-facts`.** The liveness pass lists both operator labels of every
-  managed repo every `intervalSecs` (120 s), and for a repo with no open
-  starred issue that is all it does. The captain makes those listings once
+- **`star-facts`.** The liveness evaluator lists both operator labels of
+  every managed repo every `intervalSecs` (120 s), and for a repo with no
+  open starred issue that is all it does. (The level step that runs after it,
+  #10307, lists the level 2 operator label and its inherited label in every
+  managed repo; it is not covered by this job and still runs on every host.)
+  The captain makes those listings once
   per collector pass and publishes a count per repo. A dispatcher skips its
   evaluator for a repo only when all of these hold: the fact is fresh and from
   the declared captain, judged at the liveness pass's own clock; the captain
@@ -7226,16 +7231,32 @@ Code: `observability/captain_gauges/facts.rs`, `star_liveness/captain.rs`.
   evaluated by every host that manages it, as before**: landing rows read the
   host's own queue and pools, blocker inheritance is that host's dispatch
   input and never comes from the captain, and escalation comments keep their
-  marker dedupe across hosts. A brand-new star in a repo the captain reported
-  star-free is picked up after at most one captain pass, the publish and one
-  dispatcher pass (about 10 minutes); the starred issue itself is ordered
-  first by the work finder's own listing meanwhile, and its tick row sends
-  the repo back to local evaluation on the next liveness pass.
+  marker dedupe across hosts. **Worst-case delay for a brand-new star** in a
+  repo the captain reported star-free, before its landing row, escalation
+  and inheritance start on a dispatcher: with a healthy captain, one captain
+  pass (300 s; it publishes the changed fact at once), one dispatcher
+  heartbeat read (300 s) and one liveness pass (120 s), about 12 minutes.
+  With the captain stalled or the heartbeat unreadable, the dispatcher keeps
+  the last report only until it is `starFactsMaxAgeSecs` old, judged at each
+  liveness pass: up to `starFactsMaxAgeSecs` plus the 300 s clock-skew
+  allowance plus one liveness pass, about 22 minutes at the defaults. The
+  report's `as_of` is taken before the captain's first listing of the pass,
+  so a slow pass never overstates it. Meanwhile the starred issue is still
+  ordered first by the work finder's own listing when it is `loom:issue`,
+  and that tick row sends the repo back to local evaluation on the next
+  liveness pass.
 - **`queue-blocked`.** The captain publishes each repo's open `loom:blocked`
   issues as number, creation time and `loom:*` / `tier:*` label names (no
   title, body or author). A dispatcher runs them through the same row
   builder as its own listing and appends them to its own `queue.snapshot`.
   The rows can trail the forge by up to `maxAgeSecs`.
+
+The captain lists **the repo it publishes under**: each listing names the
+slug the collector resolves for the checkout (as `gh` does: an `upstream`
+remote first, renames followed), never the checkout's `origin` or a
+`LOOM_REPO` in the daemon's environment. On a fork checkout those differ,
+and a listing of the fork would publish its star count under the upstream's
+name. Checkouts that resolve to the same slug are listed once.
 
 A repo is covered for a job only when every listing it needs succeeded on the
 captain; a failed listing (a rate-limited or withdrawn reader included)

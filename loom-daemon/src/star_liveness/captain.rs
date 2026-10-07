@@ -1,8 +1,9 @@
 //! Standing down for repos the fleet captain reports star-free (W12 part 2).
 //!
-//! Every pass lists every operator label of every managed repo, and for a
-//! repo with no open starred issue that is all it does: the evaluator returns
-//! no rows before any other read. With `fleet.captainGauges.starFacts` the
+//! Every pass's evaluator lists every operator label of every managed repo,
+//! and for a repo with no open starred issue that is all it does: it returns
+//! no rows before any other read. (The level step after it, #10307, lists
+//! its own labels in every managed repo; standing down does not touch it.) With `fleet.captainGauges.starFacts` the
 //! fleet captain makes those listings once for the fleet and publishes, per
 //! repo, how many open starred issues it found
 //! ([`crate::observability::captain_gauges::facts`]). This module decides,

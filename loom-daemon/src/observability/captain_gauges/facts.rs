@@ -32,6 +32,8 @@
 //! never reaches the host-wide rate-limit breaker.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -177,18 +179,81 @@ pub fn blocked_job(repos: &[RepoListings], at: DateTime<Utc>) -> JobFacts {
     job
 }
 
-/// Every listing of `labels` for the repo at `root`, or `None` as soon as
-/// one fails.
-async fn list_all(
-    root: &std::path::Path,
+/// Every listing of `labels` for `repo`, or `None` as soon as one fails.
+async fn list_all<F, Fut>(
+    list: &mut F,
+    root: &Path,
+    repo: &str,
     labels: &[&'static str],
-    caller: &'static str,
-) -> Option<Vec<Vec<RestIssue>>> {
+) -> Option<Vec<Vec<RestIssue>>>
+where
+    F: FnMut(PathBuf, String, &'static str, &'static str) -> Fut,
+    Fut: Future<Output = Option<Vec<RestIssue>>>,
+{
     let mut out = Vec::with_capacity(labels.len());
     for label in labels {
-        out.push(queue_blocked::list_open(root.to_path_buf(), label, caller).await?);
+        out.push(list(root.to_path_buf(), repo.to_string(), label, STAR_CALLER).await?);
     }
     Some(out)
+}
+
+/// The facts of one pass: `(star-facts, queue-blocked)`, each `None` when its
+/// switch is off.
+pub type PassFacts = (Option<JobFacts>, Option<JobFacts>);
+
+/// One pass over `targets` (each provisioned root with the slug its facts are
+/// published under), listing through `list(root, repo, label, caller)`.
+///
+/// - **The listing names the published repo.** `repo` is always the slug the
+///   facts are published under, never left to the listing helper: that one
+///   would list the checkout's `origin` (or `LOOM_REPO`), while the slug
+///   resolves like `gh` (an `upstream` remote first, renames followed). On a
+///   fork checkout the two differ, and a dispatcher would skip the upstream's
+///   evaluation on the strength of the fork's star count. `root` only picks
+///   the credential.
+/// - **One listing per repo.** Roots that resolve to the same slug (compared
+///   lowercased) are listed once; since the listing names the slug, which
+///   root came first does not matter.
+/// - **`as_of` is taken before the first listing.** A pass that takes minutes
+///   must not claim a freshness its first listings do not have.
+pub async fn gather<F, Fut>(
+    star_facts: bool,
+    queue_blocked: bool,
+    labels: &[&'static str],
+    targets: Vec<(PathBuf, String)>,
+    mut list: F,
+) -> PassFacts
+where
+    F: FnMut(PathBuf, String, &'static str, &'static str) -> Fut,
+    Fut: Future<Output = Option<Vec<RestIssue>>>,
+{
+    if !star_facts && !queue_blocked {
+        return (None, None);
+    }
+    let as_of = Utc::now();
+    let mut repos: BTreeMap<String, RepoListings> = BTreeMap::new();
+    for (root, slug) in targets {
+        let key = slug.to_ascii_lowercase();
+        if repos.contains_key(&key) {
+            continue;
+        }
+        let mut listings = RepoListings {
+            slug: key.clone(),
+            ..RepoListings::default()
+        };
+        if star_facts {
+            listings.star = list_all(&mut list, &root, &slug, labels).await;
+        }
+        if queue_blocked {
+            listings.blocked = list(root, slug, BLOCKED_LABEL, BLOCKED_CALLER).await;
+        }
+        repos.insert(key, listings);
+    }
+    let repos: Vec<RepoListings> = repos.into_values().collect();
+    (
+        star_facts.then(|| star_job(&repos, labels, as_of)),
+        queue_blocked.then(|| blocked_job(&repos, as_of)),
+    )
 }
 
 /// The captain's facts pass: list what the switched-on jobs need for every
@@ -203,38 +268,28 @@ pub(super) async fn produce(
         return;
     }
     let labels = crate::operator_levels::operator_labels(crate::operator_levels::table());
-    let mut repos: BTreeMap<String, RepoListings> = BTreeMap::new();
+    let mut targets = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();
-        let Some(slug) =
+        if let Some(slug) =
             crate::observability::collector::resolve_repo_slug_cached(slug_cache, &root_str).await
-        else {
-            continue;
-        };
-        let slug = slug.to_ascii_lowercase();
-        if repos.contains_key(&slug) {
-            continue;
+        {
+            targets.push((root, slug));
         }
-        let mut listings = RepoListings {
-            slug: slug.clone(),
-            ..RepoListings::default()
-        };
-        if config.star_facts {
-            listings.star = list_all(&root, &labels, STAR_CALLER).await;
-        }
-        if config.queue_blocked {
-            listings.blocked =
-                queue_blocked::list_open(root.clone(), BLOCKED_LABEL, BLOCKED_CALLER).await;
-        }
-        repos.insert(slug, listings);
     }
-    let repos: Vec<RepoListings> = repos.into_values().collect();
-    let now = Utc::now();
-    if config.star_facts {
-        super::note_facts(STAR_FACTS_JOB, star_job(&repos, &labels, now));
+    let (star, blocked) = gather(
+        config.star_facts,
+        config.queue_blocked,
+        &labels,
+        targets,
+        |root, repo, label, caller| queue_blocked::list_open_in(root, Some(repo), label, caller),
+    )
+    .await;
+    if let Some(job) = star {
+        super::note_facts(STAR_FACTS_JOB, job);
     }
-    if config.queue_blocked {
-        super::note_facts(QUEUE_BLOCKED_JOB, blocked_job(&repos, now));
+    if let Some(job) = blocked {
+        super::note_facts(QUEUE_BLOCKED_JOB, job);
     }
 }
 

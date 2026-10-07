@@ -3,8 +3,12 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use super::{
-    as_listing, blocked_facts, blocked_job, star_count, star_free, star_job, RepoListings,
+    as_listing, blocked_facts, blocked_job, gather, star_count, star_free, star_job, RepoListings,
+    BLOCKED_CALLER, STAR_CALLER,
 };
 use crate::forge_listing::RestIssue;
 use crate::observability::queue_blocked::blocked_rows;
@@ -166,4 +170,97 @@ fn blocked_coverage_distinguishes_none_blocked_from_not_listed() {
     assert!(job.repos.contains("acme/clear"), "covered: a dispatcher appends no row");
     assert!(!job.repos.contains("acme/unread"), "not covered: a dispatcher lists it itself");
     assert!(job.blocked.is_empty());
+}
+
+// ---- the pass: what is listed, and when (B1, S2) ---------------------------
+
+/// One listing the pass asked for: `(root, repo, label, caller, at)`.
+type Call = (PathBuf, String, &'static str, &'static str, DateTime<Utc>);
+
+/// Run one pass over `targets` against a lister that records every call,
+/// answers an empty listing, and takes a few milliseconds per call.
+async fn run(targets: &[(&str, &str)], star: bool, blocked: bool) -> (super::PassFacts, Vec<Call>) {
+    let calls: Arc<Mutex<Vec<Call>>> = Arc::default();
+    let log = Arc::clone(&calls);
+    let targets = targets
+        .iter()
+        .map(|(root, slug)| (PathBuf::from(root), (*slug).to_string()))
+        .collect();
+    let facts = gather(star, blocked, &[STAR, HIGH], targets, move |root, repo, label, caller| {
+        let log = Arc::clone(&log);
+        async move {
+            log.lock()
+                .unwrap()
+                .push((root, repo, label, caller, Utc::now()));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Some(Vec::new())
+        }
+    })
+    .await;
+    let calls = calls.lock().unwrap().clone();
+    (facts, calls)
+}
+
+#[tokio::test]
+async fn every_listing_names_the_slug_the_facts_are_published_under() {
+    // A fork checkout: the slug resolves to the upstream (`gh` prefers an
+    // `upstream` remote) while `origin` is the fork. The listing must be of
+    // the upstream, or the fork's star count is published under its name.
+    let (facts, calls) = run(&[("/w/fork-checkout", "Acme/App")], true, true).await;
+    assert_eq!(calls.len(), 3, "two operator labels and loom:blocked: {calls:?}");
+    assert!(calls.iter().all(|(_, repo, ..)| repo == "Acme/App"), "{calls:?}");
+    let star_calls: Vec<_> = calls.iter().filter(|c| c.3 == STAR_CALLER).collect();
+    assert_eq!(star_calls.iter().map(|c| c.2).collect::<Vec<_>>(), [STAR, HIGH]);
+    assert!(calls
+        .iter()
+        .any(|c| c.2 == "loom:blocked" && c.3 == BLOCKED_CALLER));
+    let (star, blocked) = facts;
+    assert!(star.unwrap().repos.contains("acme/app"), "published lowercased");
+    assert!(blocked.unwrap().repos.contains("acme/app"));
+}
+
+#[tokio::test]
+async fn roots_that_resolve_to_one_slug_are_listed_once_and_as_that_slug() {
+    let (facts, calls) = run(
+        &[
+            ("/w/b-clone", "acme/app"),
+            ("/w/a-fork", "ACME/app"),
+            ("/w/lib", "acme/lib"),
+        ],
+        true,
+        false,
+    )
+    .await;
+    let app: Vec<_> = calls
+        .iter()
+        .filter(|c| c.1.eq_ignore_ascii_case("acme/app"))
+        .collect();
+    assert_eq!(app.len(), 2, "one listing per label for the repo, not per root: {calls:?}");
+    assert!(
+        app.iter()
+            .all(|c| c.0.as_path() == std::path::Path::new("/w/b-clone")),
+        "the first root wins"
+    );
+    let star = facts.0.unwrap();
+    assert_eq!(star.repos.len(), 2);
+    assert!(facts.1.is_none(), "queue-blocked is off");
+}
+
+#[tokio::test]
+async fn as_of_is_no_later_than_the_first_listing_of_the_pass() {
+    let (facts, calls) = run(&[("/w/a", "acme/a"), ("/w/b", "acme/b")], true, true).await;
+    let first = calls.iter().map(|c| c.4).min().unwrap();
+    let last = calls.iter().map(|c| c.4).max().unwrap();
+    assert!(last > first, "the pass took time");
+    let (star, blocked) = facts;
+    let (star, blocked) = (star.unwrap(), blocked.unwrap());
+    assert!(star.as_of <= first, "{} > {first}", star.as_of);
+    assert_eq!(blocked.as_of, star.as_of, "one clock for the pass");
+}
+
+#[tokio::test]
+async fn a_pass_with_both_jobs_off_lists_nothing() {
+    let (facts, calls) = run(&[("/w/a", "acme/a")], false, false).await;
+    assert!(calls.is_empty());
+    assert!(facts.0.is_none() && facts.1.is_none());
 }

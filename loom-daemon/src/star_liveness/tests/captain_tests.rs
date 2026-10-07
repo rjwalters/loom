@@ -29,6 +29,20 @@ fn star_needing_the_operator(world: &World, slug: &str) {
     world.add(slug, pr(2, 1, &["loom:pr", "loom:operator-decision"]));
 }
 
+/// The evaluator's listings in `slug`: those of the plain star's label,
+/// which only the evaluator lists. The level step (#10307) lists its own
+/// labels (the level 2 operator label and its inherited label) in every
+/// managed repo on every pass; standing down does not touch it, and it says
+/// nothing about whether the evaluator ran.
+fn evaluator_listings(world: &World, slug: &str) -> usize {
+    world
+        .repo(slug)
+        .listed
+        .iter()
+        .filter(|label| *label == STAR)
+        .count()
+}
+
 fn escalations(world: &World, slug: &str) -> usize {
     world
         .posted(slug)
@@ -44,7 +58,7 @@ fn an_unconfigured_host_evaluates_every_repo_as_before() {
     world.add(slug, issue(3, &["loom:issue"]));
     let mut host = Host::new("host-a");
     host.pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
-    assert_eq!(world.repo(slug).listings, 2, "one listing per operator label, as today");
+    assert_eq!(evaluator_listings(&world, slug), 1, "the evaluator lists, as today");
 }
 
 #[test]
@@ -66,7 +80,7 @@ fn standing_down_is_the_empty_local_pass_without_the_listing() {
     let mut host = Host::new("host-a");
     host.state.set_captain_star_free(free(&[slug], t(9, 58)));
     let report = host.pass(&world, &repos, Vec::new(), t(10, 0));
-    assert_eq!(world.repo(slug).listings, 0, "no forge read at all for the repo");
+    assert_eq!(evaluator_listings(&world, slug), 0, "the evaluator made no listing");
     assert!(report.rows.is_empty());
     assert!(report.failed_repos.is_empty(), "a stood-down repo is a successful pass");
     assert!(inherit::current(&repos[0].root).is_empty(), "as an empty local pass publishes");
@@ -74,7 +88,7 @@ fn standing_down_is_the_empty_local_pass_without_the_listing() {
     // The captain's report is gone (stale, withdrawn, switched off): local.
     host.state.set_captain_star_free(HashMap::new());
     host.pass(&world, &repos, Vec::new(), t(10, 2));
-    assert_eq!(world.repo(slug).listings, 2);
+    assert_eq!(evaluator_listings(&world, slug), 1);
 }
 
 #[test]
@@ -88,7 +102,7 @@ fn only_the_reported_repos_are_skipped() {
     host.state
         .set_captain_star_free(free(&["c/quiet"], t(9, 58)));
     let report = host.pass(&world, &repos, Vec::new(), t(10, 0));
-    assert_eq!(world.repo("c/quiet").listings, 0);
+    assert_eq!(evaluator_listings(&world, "c/quiet"), 0);
     assert!(world.repo("c/starred").listings > 0, "a repo with a star is evaluated here");
     assert_eq!(report.rows.len(), 1);
     assert_eq!(report.rows[0].stage, LandingStage::NeedsOperator);
@@ -199,9 +213,10 @@ fn the_escalation_marker_dedupe_holds_across_a_mixed_version_rollout() {
     // No star anywhere: the old host lists, the new one does not.
     new.state.set_captain_star_free(free(&[slug], t(9, 58)));
     old.pass(&world, &repos, Vec::new(), t(10, 0));
-    let listed_by_old = world.repo(slug).listings;
+    let listed_by_old = evaluator_listings(&world, slug);
+    assert_eq!(listed_by_old, 1);
     new.pass(&world, &repos, Vec::new(), t(10, 0));
-    assert_eq!(world.repo(slug).listings, listed_by_old, "the new host made no read");
+    assert_eq!(evaluator_listings(&world, slug), listed_by_old, "the new host did not evaluate");
     assert_eq!(escalations(&world, slug), 0);
 
     // A star that needs the operator appears. The captain has not listed
@@ -270,4 +285,45 @@ fn the_new_host_posts_first_when_the_captain_goes_stale_and_the_old_host_defers(
     assert_eq!(again.rows.len(), 1);
     assert_eq!(again.escalations_posted, 0);
     assert_eq!(escalations(&world, slug), 1);
+}
+
+#[test]
+fn star_facts_older_than_their_bound_send_the_dispatcher_back_to_its_own_listing() {
+    // S1: the captain's "no star here" is aged against `starFactsMaxAgeSecs`
+    // (15 min), not `maxAgeSecs` (30 min), at the liveness pass's own clock.
+    use crate::observability::captain_gauges::store::{Heartbeat, JobFacts};
+    use crate::observability::captain_gauges::{facts, fresh_job, Config, Role, STAR_FACTS_JOB};
+
+    let slug = "c/quiet";
+    let as_of = t(10, 0);
+    let labels = crate::operator_levels::operator_labels(crate::operator_levels::table());
+    // The captain listed every operator label and found no star.
+    let mut job = JobFacts::covering(as_of, [slug.to_string()].into());
+    job.labels = labels.iter().map(|label| (*label).to_string()).collect();
+    let hb = Heartbeat::new("captain-host", as_of, [(STAR_FACTS_JOB.to_string(), job)].into());
+    let effective =
+        serde_json::json!({"fleet": {"captainGauges": {"standDown": true, "starFacts": true}}});
+    let cfg = Config::from_effective(&effective, &|_: &str| None);
+    let role = Role::Dispatcher {
+        captain: "captain-host".into(),
+    };
+    let reported = |now| {
+        fresh_job(Some(&role), Some(&cfg), Some(&hb), STAR_FACTS_JOB, now)
+            .map(|job| facts::star_free(job, &labels))
+            .unwrap_or_default()
+    };
+
+    let world = World::default();
+    world.add(slug, issue(3, &["loom:issue"]));
+    let repos = vec![repo_input(slug)];
+    let mut host = Host::new("host-a");
+    host.state.set_captain_star_free(reported(t(10, 14)));
+    host.pass(&world, &repos, Vec::new(), t(10, 14));
+    assert_eq!(evaluator_listings(&world, slug), 0, "inside the star bound: stood down");
+
+    // 16 minutes old: past the star bound, well inside `maxAgeSecs`.
+    assert!(cfg.max_age > Duration::minutes(16));
+    host.state.set_captain_star_free(reported(t(10, 16)));
+    host.pass(&world, &repos, Vec::new(), t(10, 16));
+    assert_eq!(evaluator_listings(&world, slug), 1, "the dispatcher evaluates the repo itself");
 }

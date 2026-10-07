@@ -25,7 +25,7 @@
 //!   [`super::captain_gauges::facts`].
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::forge_listing::RestIssue;
 use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
@@ -159,17 +159,30 @@ pub(super) async fn collect(
 }
 
 /// One ETag-cached listing of open items carrying `label` in the repo at
-/// `root`, off the async runtime. `None` on failure.
+/// `root` (its `origin` remote, or `LOOM_REPO` when set), off the async
+/// runtime. `None` on failure.
 pub(super) async fn list_open(
     root: PathBuf,
     label: &'static str,
     caller: &'static str,
 ) -> Option<Vec<RestIssue>> {
+    list_open_in(root, None, label, caller).await
+}
+
+/// [`list_open`] of an explicit `repo`, which wins over both `origin` and
+/// `LOOM_REPO`; `root` then only picks the credential. The captain passes the
+/// slug it publishes its facts under, so the repo it lists is the repo it
+/// names (W12 part 2).
+pub(super) async fn list_open_in(
+    root: PathBuf,
+    repo: Option<String>,
+    label: &'static str,
+    caller: &'static str,
+) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
-        let gh = gh_buf.as_path();
-        crate::forge_listing::list_issues_cached_as(caller, gh, Some(&root), None, label, "open")
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        list_open_with(&gh, &root, repo.as_deref(), label, caller)
     })
     .await;
     match result {
@@ -183,6 +196,17 @@ pub(super) async fn list_open(
             None
         }
     }
+}
+
+/// [`list_open`]'s blocking body, with the `gh` binary passed in.
+fn list_open_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    label: &str,
+    caller: &'static str,
+) -> anyhow::Result<Vec<RestIssue>> {
+    crate::forge_listing::list_issues_cached_as(caller, gh, Some(root), repo, label, "open")
 }
 
 #[cfg(test)]

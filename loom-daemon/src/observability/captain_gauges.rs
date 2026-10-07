@@ -35,9 +35,10 @@
 //! own switch (off by default, so a part 1 fleet is unchanged):
 //!
 //! - **`star-facts`** (`starFacts`). The starred-issue liveness pass
-//!   ([`crate::star_liveness`]) lists every operator label of every managed
-//!   repo every two minutes, and does nothing else for a repo with no open
-//!   starred issue. The captain publishes, per repo, how many open starred
+//!   ([`crate::star_liveness`]) evaluator lists every operator label of every
+//!   managed repo every two minutes, and does nothing else for a repo with no
+//!   open starred issue (the level step after it lists its own labels and is
+//!   not covered). The captain publishes, per repo, how many open starred
 //!   issues there are; a dispatcher skips its evaluator for a repo the captain
 //!   freshly reports as having none ([`star_free`]). A repo with a star is
 //!   evaluated locally by every host exactly as before: landing rows, blocker
@@ -75,11 +76,22 @@
 //! | `fleet.captainGauges.ref` | `fleet.etaFitRef` | the store branch the heartbeat lives on |
 //! | `fleet.captainGauges.starFacts` | `false` | captain: produce `star-facts`; dispatcher: skip the liveness evaluator for repos it reports star-free |
 //! | `fleet.captainGauges.queueBlocked` | `false` | captain: produce `queue-blocked`; dispatcher: build its snapshot's blocked rows from it |
+//! | `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | the staleness bound for `star-facts` alone (see below) |
 //!
 //! The default staleness bound follows the fleet refresh task's liveness rule
 //! (`task_liveness::default_stale_after`: two intervals plus slack): two
 //! publish intervals plus two collector passes (`2 × 600 + 2 × 300`), so one
 //! missed publish never flaps a dispatcher back to local production.
+//!
+//! `star-facts` has its own, tighter bound (`starFactsMaxAgeSecs`, 900 s: two
+//! collector passes plus slack). A "no star here" a dispatcher believes is a
+//! liveness pass it skips, so its age is the delay before a brand-new star is
+//! evaluated when the captain stops reporting, not just a gauge's lag. The
+//! dispatcher ages its last read heartbeat against it at every liveness pass,
+//! so a failed heartbeat read does not extend it. While it produces
+//! `star-facts` the captain republishes at least every `starFactsMaxAgeSecs`
+//! minus [`READ_LAG_SECS`] ([`effective_publish_interval`]), so a healthy
+//! captain's facts never age out between publishes.
 //!
 //! # Gating (re-read every collector pass, so an edit needs no restart)
 //!
@@ -132,12 +144,18 @@ pub const PUBLISH_INTERVAL_KEY: &str = "fleet.captainGauges.publishIntervalSecs"
 pub const STAR_FACTS_KEY: &str = "fleet.captainGauges.starFacts";
 /// Config key: the `queue-blocked` job, on both roles.
 pub const QUEUE_BLOCKED_KEY: &str = "fleet.captainGauges.queueBlocked";
+/// Config key: the `star-facts` staleness bound, in seconds.
+pub const STAR_FACTS_MAX_AGE_KEY: &str = "fleet.captainGauges.starFactsMaxAgeSecs";
 /// Env override of [`STAND_DOWN_KEY`] (`0`/`false` forces local production).
 pub const STAND_DOWN_ENV: &str = "LOOM_CAPTAIN_GAUGES_STAND_DOWN";
 /// Default [`MAX_AGE_KEY`].
 pub const DEFAULT_MAX_AGE_SECS: i64 = 1800;
 /// Default [`PUBLISH_INTERVAL_KEY`].
 pub const DEFAULT_PUBLISH_INTERVAL_SECS: i64 = 600;
+/// Default [`STAR_FACTS_MAX_AGE_KEY`]: two collector passes (`2 × 300`) plus
+/// 300 s of slack. The captain republishes often enough to stay inside it
+/// ([`effective_publish_interval`]).
+pub const DEFAULT_STAR_FACTS_MAX_AGE_SECS: i64 = 900;
 
 /// The resolved `fleet.captainGauges` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +172,8 @@ pub struct Config {
     pub star_facts: bool,
     /// `queueBlocked`.
     pub queue_blocked: bool,
+    /// `starFactsMaxAgeSecs`: the `star-facts` bound, in place of `max_age`.
+    pub star_facts_max_age: Duration,
 }
 
 fn env_bool(raw: Option<String>) -> Option<bool> {
@@ -187,6 +207,18 @@ impl Config {
             publish_interval: secs(PUBLISH_INTERVAL_KEY, DEFAULT_PUBLISH_INTERVAL_SECS),
             star_facts: flag(STAR_FACTS_KEY),
             queue_blocked: flag(QUEUE_BLOCKED_KEY),
+            star_facts_max_age: secs(STAR_FACTS_MAX_AGE_KEY, DEFAULT_STAR_FACTS_MAX_AGE_SECS),
+        }
+    }
+
+    /// The staleness bound for `job`: `starFactsMaxAgeSecs` for `star-facts`,
+    /// `maxAgeSecs` for everything else.
+    #[must_use]
+    pub fn max_age_for(&self, job: &str) -> Duration {
+        if job == STAR_FACTS_JOB {
+            self.star_facts_max_age
+        } else {
+            self.max_age
         }
     }
 
@@ -250,20 +282,21 @@ pub fn resolve_role(gate: &CaptainGate, config: &Config, store_configured: bool)
 /// Per job, the lowercased repos the captain freshly covers.
 pub type Coverage = BTreeMap<String, BTreeSet<String>>;
 
-/// What a dispatcher may leave to `captain` at `now`, from `heartbeat`. Pure.
+/// What a dispatcher may leave to `captain` at `now`, from `heartbeat`, each
+/// job judged against its own bound ([`Config::max_age_for`]). Pure.
 #[must_use]
 pub fn coverage(
     heartbeat: Option<&Heartbeat>,
     captain: &str,
     now: DateTime<Utc>,
-    max_age: Duration,
+    config: &Config,
 ) -> Coverage {
     let Some(hb) = heartbeat else {
         return Coverage::new();
     };
     JOBS.iter()
         .filter_map(|job| {
-            hb.fresh(job, captain, now, max_age)
+            hb.fresh(job, captain, now, config.max_age_for(job))
                 .map(|facts| ((*job).to_string(), facts.repos.clone()))
         })
         .collect()
@@ -342,7 +375,7 @@ pub fn fresh_job<'a>(
     if !config.jobs().contains(&job) {
         return None;
     }
-    heartbeat?.fresh(job, captain, now, config.max_age)
+    heartbeat?.fresh(job, captain, now, config.max_age_for(job))
 }
 
 /// What the captain published last, with its `as_of` zeroed: two heartbeats
@@ -367,6 +400,29 @@ pub fn publish_due(
     interval: Duration,
 ) -> bool {
     last.is_none_or(|(at, published)| now - at >= interval || published != key)
+}
+
+/// How long a published `as_of` takes to reach a dispatcher's check: its next
+/// collector pass reads the heartbeat (300 s), and the captain's own pass
+/// takes as long again at most.
+pub const READ_LAG_SECS: i64 = 600;
+
+/// How often the captain must republish: `publishIntervalSecs`, shortened
+/// while `star-facts` is produced so its published `as_of` stays inside
+/// `starFactsMaxAgeSecs` for as long as the captain keeps producing
+/// (`starFactsMaxAgeSecs − READ_LAG_SECS`, 300 s at the defaults). Without
+/// it a quiet fleet's facts would go stale between publishes and every
+/// dispatcher would flap back to its own listings. Pure.
+#[must_use]
+pub fn effective_publish_interval(
+    config: &Config,
+    produced: &BTreeMap<String, JobFacts>,
+) -> Duration {
+    if !produced.contains_key(STAR_FACTS_JOB) {
+        return config.publish_interval;
+    }
+    let star = (config.star_facts_max_age - Duration::seconds(READ_LAG_SECS)).max(Duration::zero());
+    config.publish_interval.min(star)
 }
 
 #[derive(Debug, Default)]
@@ -586,7 +642,7 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
             fetch = FetchCache::default();
             let key = content_key(&produced);
             let last = published.zip(published_key.as_deref());
-            let due = publish_due(last, &key, now, config.publish_interval);
+            let due = publish_due(last, &key, now, effective_publish_interval(config, &produced));
             if let Some((loc, base)) = location.as_ref().filter(|_| due && !produced.is_empty()) {
                 let hb = Heartbeat::new(captain, now, produced.clone());
                 match store::publish_heartbeat(root, loc, base, &hb, &mut publish) {
@@ -608,7 +664,7 @@ fn exchange(root: &Path, pass: &Pass, now: DateTime<Utc>) {
                     Fetched::Updated | Fetched::NotModified => {}
                 }
             }
-            covered = coverage(fetch.heartbeat.as_ref(), captain, now, config.max_age);
+            covered = coverage(fetch.heartbeat.as_ref(), captain, now, config);
             covered.retain(|job, _| jobs.contains(&job.as_str()));
             log_fallback(&jobs, &previous, &covered);
         }
