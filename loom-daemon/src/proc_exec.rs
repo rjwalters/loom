@@ -229,13 +229,16 @@ pub fn run_bounded_cancellable(
 /// returned (the caller decides what an interrupted exit means). If not, the
 /// group is killed and the result is `Collect(Interrupted)`, as for
 /// cancellation. With `pending` always `None` this is exactly [`run_bounded`].
+/// `spawned` observes the child's pid (= its process group id) once it runs,
+/// as in [`run_bounded_observed`].
 pub fn run_bounded_forwarding(
     cmd: Command,
     timeout: Duration,
     grace: Duration,
     pending: &dyn Fn() -> Option<i32>,
+    spawned: impl FnOnce(u32),
 ) -> Result<Completion, ExecError> {
-    run_bounded_inner(cmd, timeout, || false, |_| {}, Some((pending, grace)))
+    run_bounded_inner(cmd, timeout, || false, spawned, Some((pending, grace)))
 }
 
 /// Observe the actual child PID before waiting, while retaining the shared

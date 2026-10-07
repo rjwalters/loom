@@ -289,7 +289,7 @@ fn forwarding_without_a_pending_signal_is_run_bounded() {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", "echo out; exit 4"]);
     let completion =
-        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_secs(1), &|| None)
+        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_secs(1), &|| None, |_| {})
             .unwrap();
     let Completion::Exited(output) = completion else {
         panic!("timed out")
@@ -308,7 +308,7 @@ fn a_forwarded_signal_reaches_the_group_and_the_childs_own_exit_is_kept() {
         "trap 'kill $! 2>/dev/null; exit 9' TERM; sleep 30 & wait",
     ]);
     let completion =
-        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_secs(10), &pending)
+        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_secs(10), &pending, |_| {})
             .unwrap();
     let Completion::Exited(output) = completion else {
         panic!("timed out")
@@ -324,7 +324,7 @@ fn a_child_ignoring_a_forwarded_signal_is_killed_after_the_grace() {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", "trap '' INT; sleep 30"]);
     let error =
-        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_millis(300), &pending)
+        run_bounded_forwarding(cmd, Duration::from_secs(30), Duration::from_millis(300), &pending, |_| {})
             .unwrap_err();
     assert!(
         matches!(&error, ExecError::Collect(e) if e.kind() == io::ErrorKind::Interrupted),

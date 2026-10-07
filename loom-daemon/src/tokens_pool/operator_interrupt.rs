@@ -11,7 +11,8 @@
 //! `docker` child's group, waits briefly for it to exit, and fails the call
 //! with [`Interrupted`], and refuses to start any further `docker` call. The
 //! command then exits with an error, as Ctrl-C used to make it do. A second
-//! Ctrl-C (or SIGTERM) kills the command at once, the default action.
+//! Ctrl-C (or SIGTERM) SIGKILLs the `docker` group in flight and kills the
+//! command at once, the default action.
 //!
 //! **The daemon never installs it.** [`pending`] is `None` until [`install`]
 //! has run in this process, so the reconcile pass and every other unattended
@@ -21,20 +22,45 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// The process group of the `docker` call in flight (0: none).
+static ACTIVE_GROUP: AtomicI32 = AtomicI32::new(0);
 
-/// The first signal is only recorded. A second one restores the default
-/// action and re-raises itself, so the operator can always force-quit, even
+/// The first signal is only recorded. A second one SIGKILLs the `docker`
+/// group in flight, if any (it may ignore the forwarded signal, or not have
+/// been sent it yet), then restores the default action and re-raises itself,
+/// so the operator can always force-quit, leaving nothing running, even
 /// during the forward grace or a step that does not poll [`pending`] (an
 /// attached `shell`).
 #[cfg(unix)]
 extern "C" fn record(signal: libc::c_int) {
     if SIGNAL.swap(signal, Ordering::Relaxed) != 0 {
-        // SAFETY: `signal` and `raise` are async-signal-safe.
+        let group = ACTIVE_GROUP.load(Ordering::Relaxed);
+        // SAFETY: `kill`, `signal` and `raise` are async-signal-safe. `group`
+        // leads a group `proc_exec` created for the docker child (never 0 or
+        // an inherited group), so `kill(-group)` reaches only that child and
+        // its descendants.
         unsafe {
+            if group > 0 {
+                libc::kill(-group, libc::SIGKILL);
+            }
             libc::signal(signal, libc::SIG_DFL);
             libc::raise(signal);
         }
     }
+}
+
+/// Record the `docker` child's process group (its pid) while it runs, for
+/// the second-signal kill. A no-op unless [`install`] has run, so the
+/// daemon's concurrent docker calls never touch it.
+pub fn set_active_group(pid: u32) {
+    if INSTALLED.load(Ordering::Relaxed) {
+        ACTIVE_GROUP.store(i32::try_from(pid).unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
+/// The `docker` call has returned (its group is gone or was killed).
+pub fn clear_active_group() {
+    ACTIVE_GROUP.store(0, Ordering::Relaxed);
 }
 
 /// Trap SIGINT and SIGTERM for this operator command.

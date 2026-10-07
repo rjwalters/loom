@@ -99,7 +99,11 @@ pub(crate) fn run_bounded_with(
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null());
     let subcommand = args.first().copied().unwrap_or_default();
-    let completion = proc_exec::run_bounded_forwarding(command, timeout, FORWARD_GRACE, pending);
+    let completion =
+        proc_exec::run_bounded_forwarding(command, timeout, FORWARD_GRACE, pending, |pid| {
+            operator_interrupt::set_active_group(pid);
+        });
+    operator_interrupt::clear_active_group();
     // A call that still succeeded stands; one that failed (or was killed
     // after the grace) once a signal was forwarded failed because of it.
     if let (Some(signal), false) = (pending(), completion.as_ref().is_ok_and(Completion::succeeded))

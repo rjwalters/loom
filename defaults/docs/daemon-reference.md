@@ -9152,8 +9152,8 @@ across the registered roots:
   account ends up depends on the phase (below): interrupted during the
   preparation (the container inspect, the image check or the pull) it is
   still **held** and down; interrupted during the start itself it is
-  **unheld** and down. A second Ctrl-C (or SIGTERM) kills the command at
-  once. The daemon never traps these signals for its `docker` calls: the
+  **unheld** and down. A second Ctrl-C (or SIGTERM) kills the running
+  `docker` command's group (SIGKILL) and then the command, at once. The daemon never traps these signals for its `docker` calls: the
   reconciler's behaviour is unchanged.
 - With no enabled session-managed account, the pass makes zero `docker` calls.
 - **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
