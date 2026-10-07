@@ -24,7 +24,9 @@
 //! container parity-mounts it read-write ([`docker_mount_args`],
 //! `worker_spawn::containment`). Inside a container the front writes only
 //! when its uid owns the directory (MOUNT-CONTRACT §3, uid 1000); otherwise
-//! its rows are dropped silently, by design.
+//! its rows are dropped silently, by design. `cargo` runs in this repository
+//! reset the variable (`.cargo/config.toml` `[env]`), so a Builder's test
+//! binaries never write fake-stub rows into the host sink they inherited.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

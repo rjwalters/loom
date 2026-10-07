@@ -978,3 +978,22 @@ fn a_sigkilled_front_does_not_leave_an_orphaned_gh() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+/// #10607 review S3: every spawn path exports the host sink as
+/// `LOOM_FORGE_CALL_STATS_DIR` (W5), so a Builder's `cargo test` would pass it
+/// to every `loom-daemon` test binary, and their fake-`gh` rows would land in
+/// the real sink. Cargo resets it for whatever it runs in this repository.
+#[test]
+fn cargo_never_hands_a_test_binary_the_inherited_forge_call_sink() {
+    let config = include_str!("../../.cargo/config.toml");
+    let reset = r#"LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }"#;
+    assert!(
+        config.lines().any(|l| l.trim() == reset),
+        ".cargo/config.toml [env] must force-reset the sink variable"
+    );
+    assert_eq!(
+        std::env::var("LOOM_FORGE_CALL_STATS_DIR").unwrap_or_default(),
+        "",
+        "a test process inherited a forge-call sink"
+    );
+}
