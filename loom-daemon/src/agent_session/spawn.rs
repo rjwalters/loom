@@ -496,10 +496,13 @@ pub fn build_claude_command(cmd: &ClaudeCommand<'_>) -> String {
     }
 
     match cmd.wrapper {
+        // W5: the host forge-call sink travels with TMPDIR — `{ledger}`, see
+        // `isolation` (it ends in a space, like `prefix`).
         Some(wrapper) => format!(
             "{prefix}LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' \
              CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{tmpdir}' \
-             '{wrapper}' --dangerously-skip-permissions \"{role_cmd}\"",
+             {ledger}'{wrapper}' --dangerously-skip-permissions \"{role_cmd}\"",
+            ledger = super::isolation::ledger_prefix(),
             name = cmd.name,
             working_dir = cmd.working_dir.display(),
             config_dir = cmd.config_dir.display(),
@@ -676,8 +679,9 @@ pub fn spawn_agent(env: &dyn AgentEnv, opts: &SpawnOptions, repo_root: &Path) ->
         log_error(format!("Failed to set up CLAUDE_CONFIG_DIR for '{}'", opts.name));
         return SpawnResult::error(&opts.name, "config_dir_failed");
     };
-    set_session_env(env, &session, "CLAUDE_CONFIG_DIR", &config_dir.to_string_lossy());
-    set_session_env(env, &session, "TMPDIR", &config_dir.join("tmp").to_string_lossy());
+    // CLAUDE_CONFIG_DIR, TMPDIR, and — because that TMPDIR would otherwise
+    // move it — the host's forge-call sink (W5; see `isolation`).
+    super::isolation::export(env, &session, &config_dir);
 
     // Pre-seed folder trust for the *spawn target* (the worktree path when
     // spawning into one — trust is keyed per-path), so a freshly-created
