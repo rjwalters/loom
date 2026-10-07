@@ -3994,6 +3994,10 @@ pub mod demand;
 // `role_runner/idle_gate.rs`.
 pub mod idle_gate;
 
+// Per-repo demand-driven balance allocator, shadow mode (#10630) — see
+// `role_runner/balance.rs`.
+pub mod balance;
+
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;
 pub use outcome::{CredentialPool, PoolHold, PoolStateFile, RoleTickOutcome};

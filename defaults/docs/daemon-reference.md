@@ -4621,6 +4621,52 @@ on its first tick after upgrade and stops admitting unstarred builds until its
 debt falls below `low`; that is the intended WIP limit. The escape hatches are
 `buildBackoff.enabled: false` and starring an issue.
 
+#### Per-repo balance allocator, shadow mode (`autonomous.balance`, #10630)
+
+Slice 1 of #10630: one allocator that splits the host's agent budget across
+`(repo, role)` pairs for **champion, judge, doctor and builder** from each
+repo's own pipeline state. **It changes no admission yet.** With
+`autonomous.balance.enabled: true` the work finder computes the allocation once
+per multi-workspace tick and logs it; the demand width and reservation, doctor
+lanes and the build back-off above behave identically with the flag on or off.
+Wiring it into admission is #10815.
+
+- **Input — no forge call.** Review / changes / merge are the repo's **fresh**
+  demand-ledger totals (the same per-repo read as the build back-off). Ready
+  and building counts come from the rows the work finder already listed this
+  tick (ready = dispatched or deferred; building = `in_flight`); a halted repo
+  reads both as unobserved. Untriaged issues are not observed yet.
+- **Fail open.** An unobserved input gives that role a one-slot `floor`, never
+  zero for lack of data.
+- **Champion first.** Every repo with merge debt gets its champion slot before
+  anything else, deepest queue first, up to `budget − demandWidth.nonPrFloor`.
+- **Marginal value.** Each remaining slot goes to the `(repo, role)` with the
+  highest `demand / (slots + 1)`: judge demand is review debt × `reviewWeight`,
+  doctor demand is changes debt × `reviewWeight`, builder demand is ready
+  issues − `ceil(reviewWeight × (review + changes))`. So a repo deep in changes
+  debt gets doctors and no builders, a review-deep one gets judges, and a
+  debt-free repo with ready work gets builders. Judge and doctor are capped per
+  repo at `clamp(ceil(debt / demandWidth.perRun), 1, demandWidth.max)`;
+  champion at 1. Ties break by role (champion, judge, doctor, builder), then
+  repo path, so the output is deterministic.
+- **Budget.** This tick's work-finder cap plus the role-runner ceiling
+  (`autonomous.roleRunner.maxConcurrent`). The total never exceeds it.
+- **Observability.** One `INFO` line per tick, carrying the Loom version and
+  full SHA and every `(repo, role)` with its slots, trigger
+  (`debt:review` / `debt:changes` / `debt:merge` / `ready` / `floor`) and reason, e.g.
+  `role_runner::balance: shadow allocation (no admission change, #10630) —
+  budget 10, assigned 6, reviewWeight 1.00, loom 0.19.866 (<sha>):
+  /srv/acme/doctor=3 [debt:changes: loom:changes-requested debt 9 → wants 3];
+  /srv/acme/builder=0 [debt:changes: builds paused — …]; …`.
+
+| Config (under `autonomous.balance`) | Env | Default | Validation |
+|---|---|---|---|
+| `enabled` | `LOOM_BALANCE_ENABLED` | `false` | Bool (env also `1`/`0`, `yes`/`no`, `on`/`off`); anything else drops to the next tier. `false` computes and logs nothing |
+| `reviewWeight` | `LOOM_BALANCE_REVIEW_WEIGHT` | `1.0` | Finite number `> 0`; zero, negative, non-finite or non-number drops to the next tier. `> 1` tilts toward review, `< 1` toward building |
+
+Precedence env > config > default, re-read every tick from the daemon's
+primary workspace.
+
 #### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
 
 `autonomous.workFinder.maxConcurrent` is the only *policy* term in the cap, and
@@ -5425,6 +5471,8 @@ knobs not yet audited here.
 | `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
 | `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
 | `autonomous.workFinder.buildBackoff.hostLow` | *(config only)* | absent (off) | Release the host ceiling when the host total is strictly below this. A crossed or half-set `hostHigh`/`hostLow` pair leaves the ceiling off (one `WARN`). **Live** |
+| `autonomous.balance.enabled` | `LOOM_BALANCE_ENABLED` | `false` | Per-repo balance allocator, **shadow mode** (#10630 Slice 1): logs one champion/judge/doctor/builder allocation per tick; changes no admission. **Live**. See [Per-repo balance allocator](#per-repo-balance-allocator-shadow-mode-autonomousbalance-10630) |
+| `autonomous.balance.reviewWeight` | `LOOM_BALANCE_REVIEW_WEIGHT` | `1.0` | Bias of the allocator: `> 1` toward review (judge/doctor), `< 1` toward building. Must be a finite number `> 0`, else default. **Live** |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default. This is the **generation-1** TTL; a relapse serves an escalated one (see `ttlMaxSecs`) |

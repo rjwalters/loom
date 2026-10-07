@@ -130,6 +130,7 @@ use crate::capacity::{self, CapacityAdvisory};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
+use crate::role_runner::balance;
 #[cfg(test)]
 use crate::sweep_registry::{
     DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
@@ -3303,6 +3304,9 @@ pub fn spawn_multi_work_finder_task(
             // tick the log line describes (#4761).
             let plan = dispatch_plan::PlanInputs::new(max_concurrent, interval, &shard_decisions);
             publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
+            // #10630 Slice 1: shadow per-repo balance allocation — one log line
+            // per tick when `autonomous.balance.enabled`; changes no admission.
+            balance::shadow_tick(&fallback_root, &roots, &report.queue, &halted, max_concurrent);
 
             if report.halted && !was_halted {
                 // #9591: name the hold(s) actually active — a drain is not a red main.
