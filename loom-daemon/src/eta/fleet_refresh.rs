@@ -306,6 +306,9 @@ pub struct RepoReport {
     pub gap_fill_calls: Option<u64>,
     /// Where the pass took its history from, when SigNoz history is on.
     pub history: Option<HistorySource>,
+    /// SigNoz advanced the repo's issue-events star coverage this cycle
+    /// (#10746), so the raw-event phase need not read that listing.
+    pub star_issues_from_signoz: bool,
     /// Wall time spent on the repo. Telemetry only: measured with a
     /// monotonic `Instant`, it never reaches a file or a decision.
     pub duration_ms: u64,
@@ -331,6 +334,7 @@ impl RepoReport {
             raw_events_added: None,
             gap_fill_calls: None,
             history: None,
+            star_issues_from_signoz: false,
             duration_ms: 0,
         }
     }
@@ -675,7 +679,7 @@ pub(super) struct Answer {
 
 /// One repo's walk within a cycle.
 pub(super) struct Walk<'a> {
-    root: &'a Path,
+    pub(super) root: &'a Path,
     pub(super) target: &'a RepoTarget,
     reader: &'a Reader,
     forge: &'a mut dyn ForgeRead,

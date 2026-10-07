@@ -44,6 +44,7 @@
 //! `defaults/docs/eta.md`), so coefficient files are unchanged.
 
 use super::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
+use super::fleet_signoz_history::SOURCE_SIGNOZ;
 use super::labels::FLAG_STARRED;
 use crate::worktree_ops::gh::linkage_refs;
 use chrono::{DateTime, Utc};
@@ -252,13 +253,33 @@ pub struct RepoStar {
 }
 
 impl RepoStar {
-    /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows count:
-    /// the coverage floors name the forge listings, and an imported
+    /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows set
+    /// coverage: the coverage floors name the forge listings, and an imported
     /// webhook-mirror row (#10197) would move them and replay a star twice.
+    /// A [`SOURCE_SIGNOZ`] row (#10746) is a star change only, appended for a
+    /// window whose issue history SigNoz proved contiguous; it sets no floor.
     #[must_use]
     pub fn from_events(events: &[RawEvent]) -> Self {
         let mut star = RepoStar::default();
-        for e in events.iter().filter(|e| e.source == SOURCE_FORGE) {
+        for e in events {
+            if e.source == SOURCE_SIGNOZ {
+                // A star change SigNoz dated (#10746): a star change only. It
+                // sets no coverage floor; the forge listings' rows do.
+                let label = e.label.as_deref().filter(|l| is_star_label(l));
+                if let (ItemKind::Issue, Some(_), EventKind::LabelAdded | EventKind::LabelRemoved) =
+                    (e.item_kind, label, e.kind)
+                {
+                    star.issue_stars.push(IssueStarChange {
+                        issue: e.item,
+                        at: e.event_time,
+                        starred: e.kind == EventKind::LabelAdded,
+                    });
+                }
+                continue;
+            }
+            if e.source != SOURCE_FORGE {
+                continue;
+            }
             let min = |slot: &mut Option<DateTime<Utc>>| {
                 *slot = Some(slot.map_or(e.event_time, |x| x.min(e.event_time)));
             };

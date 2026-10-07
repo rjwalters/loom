@@ -56,8 +56,22 @@
 //! completes); star coverage ends there, so a later cutoff reads as
 //! **unknown**. A covered repo's stamps simply stop advancing; one with no
 //! stamp yet (a cache from before #10520) is frozen at its newest cached
-//! forge row by [`freeze_raw_cache`] — never later than the cache can vouch
-//! for.
+//! forge row of its own listing by [`freeze_raw_cache`] — never later than the
+//! cache can vouch for.
+//!
+//! # Star coverage keeps advancing (#10746)
+//!
+//! Frozen coverage would, over time, turn every later star input unknown. So
+//! a covered pass advances it ([`advance_star_coverage`]): SigNoz dates the
+//! star changes on issues (its `label.transition` rows), which it appends as
+//! [`SOURCE_SIGNOZ`] raw rows and stamps the issue-events listing through the
+//! pass's `L`, but only when an **issue** row at or before the listing's
+//! stamp proves the history contiguous (a PR-history query succeeding proves
+//! nothing about issues). SigNoz knows no PR links, so the pulls listing is
+//! refreshed from the forge — a completed backfill's ETag'd refresh, counted
+//! as gap-fill and capped by the repo's budget — and the issue-events listing
+//! too when SigNoz could not prove it. An interrupted refresh stamps nothing:
+//! coverage stays where it was, unknown, never "unstarred".
 //!
 //! Every forge read made while SigNoz history is configured — snapshot and
 //! raw-event alike — is counted (`gap_fill_calls` on the repo's report and its
@@ -123,6 +137,7 @@ use super::fleet_refresh::{self, Pass, RepoReport, StopReason, Walk};
 use super::fleet_signoz_refresh::{ClickhouseHttp, Limits, SignozRead};
 use super::fleet_signoz_timeline::{Family, ItemTimeline, Timeline};
 use super::fleet_signoz_timeline_rows::{walk, Lifecycle, Target, TimelineHttp, Transition};
+use super::star::{is_star_label, IssueStarChange};
 use crate::forge_call_stats::ops::TIMELINE_READ;
 use crate::pr_latency::timeline::parse_timeline_page;
 use crate::pr_latency::{PrEvent, PrHistory, PrState, CHANGES_REQUESTED};
@@ -244,12 +259,36 @@ impl EventsGate {
     }
 }
 
+/// The repo-wide listing (a [`super::star::listing_keys`] key) a cached forge
+/// row belongs to, when it belongs to exactly one. The pulls listing is the
+/// only source of `closing_ref` and `head_commit` rows; the issue-events
+/// listing the only source of an issue's rows and of a PR's label and reopen
+/// rows. A PR's `opened` / `closed` / `merged` rows come from both listings,
+/// and a review or check run from a per-PR walk: none of those vouches for a
+/// listing's own coverage, so they belong to no listing.
+fn listing_of(event: &super::fleet_events::RawEvent) -> Option<String> {
+    use super::fleet_events::{EventKind, ItemKind, SOURCE_FORGE};
+    use super::fleet_events_forge::ForgeEndpoint;
+    let endpoint = match (event.item_kind, event.kind) {
+        (ItemKind::Pr, EventKind::ClosingRef | EventKind::HeadCommit) => ForgeEndpoint::Pulls,
+        (ItemKind::Issue, _)
+        | (ItemKind::Pr, EventKind::LabelAdded | EventKind::LabelRemoved | EventKind::Reopened) => {
+            ForgeEndpoint::IssuesEvents
+        }
+        _ => return None,
+    };
+    Some(format!("{SOURCE_FORGE}:{}", endpoint.name()))
+}
+
 /// A covered repo's raw cache is not read this cycle: make sure each of its
 /// repo-wide listings has a `synced_through` stamp, so star coverage ends
 /// where the cache does (see the module docs). A listing already stamped
-/// keeps its stamp (it stops advancing); an unstamped one is stamped at the
-/// newest cached forge row, the latest instant the cache vouches for. An
-/// empty cache needs no stamp: star inputs already read it as uncovered.
+/// keeps its stamp; an unstamped one is stamped at the newest cached forge
+/// row **of its own listing** ([`listing_of`]), the latest instant the cache
+/// vouches for that listing (#10746: one newest row across the whole cache
+/// stamped a listing later than its own rows could vouch for). A listing
+/// with no qualifying row stays unstamped, so star inputs read it as
+/// uncovered.
 pub fn freeze_raw_cache(root: &Path, repo: &str) {
     use super::fleet_events::{self, EventsCursor, SOURCE_FORGE};
     let cursor_file = fleet_events::cursor_path(root, repo);
@@ -266,14 +305,22 @@ pub fn freeze_raw_cache(root: &Path, repo: &str) {
     if unstamped.is_empty() {
         return;
     }
-    let newest = fleet_events::load_events(&fleet_events::events_path(root, repo))
+    let mut newest: std::collections::BTreeMap<String, DateTime<Utc>> =
+        std::collections::BTreeMap::new();
+    for e in fleet_events::load_events(&fleet_events::events_path(root, repo))
         .iter()
         .filter(|e| e.source == SOURCE_FORGE)
-        .map(|e| e.event_time)
-        .max();
-    let Some(newest) = newest else { return };
+    {
+        if let Some(key) = listing_of(e) {
+            let slot = newest.entry(key).or_insert(e.event_time);
+            *slot = (*slot).max(e.event_time);
+        }
+    }
     for key in unstamped {
-        if let Err(e) = fleet_events::mark_synced_through(&cursor_file, repo, &key, newest) {
+        let Some(at) = newest.get(&key).copied() else {
+            continue;
+        };
+        if let Err(e) = fleet_events::mark_synced_through(&cursor_file, repo, &key, at) {
             log::warn!("eta fleet refresh: {repo}: could not freeze {key}'s coverage: {e}");
         }
     }
@@ -293,6 +340,14 @@ pub struct Candidate {
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub candidates: Vec<Candidate>,
+    /// The instant the timeline was built as knowable at.
+    pub listed_at: Option<DateTime<Utc>>,
+    /// The star changes the timeline dates on issues (see [`issue_stars`]).
+    pub issue_stars: Vec<(IssueStarChange, String)>,
+    /// The earliest row SigNoz has about any **issue**. A PR-history query
+    /// that succeeded says nothing about issue labels, so star coverage is
+    /// proved from issue rows alone.
+    pub issue_first: Option<DateTime<Utc>>,
 }
 
 impl Plan {
@@ -364,7 +419,148 @@ pub fn plan(timeline: &Timeline, cutoff: DateTime<Utc>, since: DateTime<Utc>) ->
             history: item_complete(item).then(|| pr_history(key.number, item, cutoff)),
         })
         .collect();
-    Plan { candidates }
+    Plan {
+        candidates,
+        listed_at: Some(cutoff),
+        issue_stars: issue_stars(timeline),
+        issue_first: issue_first(timeline),
+    }
+}
+
+/// The earliest row (label change, lifecycle event or daemon label set) of
+/// any issue in `timeline`.
+#[must_use]
+pub fn issue_first(timeline: &Timeline) -> Option<DateTime<Utc>> {
+    timeline
+        .items
+        .iter()
+        .filter(|(key, _)| key.target == Target::Issue)
+        .flat_map(|(_, item)| {
+            item.labels
+                .iter()
+                .map(|e| e.at)
+                .chain(item.lifecycle.iter().map(|e| e.at))
+                .chain(item.label_sets.iter().map(|(seen, _)| *seen))
+        })
+        .min()
+}
+
+/// Every star change `timeline` dates on an issue, by the one star-label
+/// rule ([`is_star_label`]), each at the later of its time and its
+/// observation (when it became knowable). A star label in an issue's
+/// undated baseline set carries no addition time, so it is dated at the set's
+/// observation: later than the truth, never earlier, so it cannot leak into a
+/// row before the daemon saw it.
+#[must_use]
+pub fn issue_stars(timeline: &Timeline) -> Vec<(IssueStarChange, String)> {
+    let mut out = Vec::new();
+    for (key, item) in &timeline.items {
+        if key.target != Target::Issue {
+            continue;
+        }
+        for e in item.labels.iter().filter(|e| is_star_label(&e.label)) {
+            let change = IssueStarChange {
+                issue: key.number,
+                at: e.at.max(e.observed_at),
+                starred: e.transition == Transition::Added,
+            };
+            out.push((change, e.label.clone()));
+        }
+        if let Some((seen, _)) = item.label_sets.first() {
+            for label in item
+                .undated_baseline_labels()
+                .into_iter()
+                .filter(|l| is_star_label(l))
+            {
+                let change = IssueStarChange {
+                    issue: key.number,
+                    at: *seen,
+                    starred: true,
+                };
+                out.push((change, label));
+            }
+        }
+    }
+    out.sort_by_key(|(c, label)| (c.at, c.issue, c.starred, label.clone()));
+    out
+}
+
+/// `source` of a star change SigNoz dated (a raw-cache row the forge
+/// listing never wrote).
+pub const SOURCE_SIGNOZ: &str = "signoz";
+
+/// A covered pass's chance to keep a covered repo's star coverage moving
+/// (#10746). SigNoz knows issue label changes but nothing about a PR's
+/// links, so it can advance only the issue-events listing's coverage; the
+/// pulls listing (links) is refreshed from the forge, budgeted and ETag'd, by
+/// the raw-event phase. Returns whether the issue-events listing advanced.
+///
+/// It advances only when contiguity is proved: the cache is stamped (a cache
+/// with no stamp is first frozen), and SigNoz has an **issue** row at or
+/// before that stamp, so every issue change after it is in `plan`. The star
+/// changes knowable in `(stamp, listed_at]` are appended as
+/// [`SOURCE_SIGNOZ`] rows and the listing's stamp moves to `listed_at`.
+/// Otherwise nothing changes: coverage stays where it was, never
+/// "unstarred".
+pub fn advance_star_coverage(root: &Path, repo: &str, plan: &Plan) -> bool {
+    use super::fleet_events::{self, EventKind, EventLog, EventsCursor, ItemKind, RawEvent};
+    use super::fleet_events_forge::ForgeEndpoint;
+    let Some(listed_at) = plan.listed_at else {
+        return false;
+    };
+    freeze_raw_cache(root, repo);
+    let key = format!("{}:{}", fleet_events::SOURCE_FORGE, ForgeEndpoint::IssuesEvents.name());
+    let cursor_file = fleet_events::cursor_path(root, repo);
+    let Some(stamp) = EventsCursor::read(&cursor_file, repo)
+        .endpoints
+        .get(&key)
+        .and_then(|e| e.synced_through)
+    else {
+        return false;
+    };
+    if stamp >= listed_at {
+        return true;
+    }
+    if !plan.issue_first.is_some_and(|first| first <= stamp) {
+        return false;
+    }
+    let rows: Vec<RawEvent> = plan
+        .issue_stars
+        .iter()
+        .filter(|(c, _)| c.at > stamp && c.at <= listed_at)
+        .map(|(c, label)| {
+            RawEvent::new(
+                repo,
+                c.issue,
+                ItemKind::Issue,
+                if c.starred {
+                    EventKind::LabelAdded
+                } else {
+                    EventKind::LabelRemoved
+                },
+                Some(label.clone()),
+                c.at,
+                SOURCE_SIGNOZ,
+                0,
+                listed_at,
+            )
+        })
+        .collect();
+    if !rows.is_empty() {
+        let appended = EventLog::open(&fleet_events::events_path(root, repo))
+            .and_then(|mut log| log.append(&rows).map(drop));
+        if let Err(e) = appended {
+            log::warn!("eta fleet refresh: {repo}: could not record SigNoz star changes: {e}");
+            return false;
+        }
+    }
+    match fleet_events::mark_synced_through(&cursor_file, repo, &key, listed_at) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("eta fleet refresh: {repo}: could not advance {key}'s coverage: {e}");
+            false
+        }
+    }
 }
 
 /// Whether `item` was touched (a change, or a daemon label set, became
@@ -442,8 +638,21 @@ pub fn pr_history(number: u32, item: &ItemTimeline, cutoff: DateTime<Utc>) -> Pr
 
 /// A gap-filled PR: the forge timeline's events, SigNoz's listing facts,
 /// the forge's own `merged` event winning the merge instant.
+///
+/// The forge's `closed` / `reopened` events resolve the state when there is no
+/// merge (#10746): a PR closed unmerged with no SigNoz close event would
+/// otherwise stay as SigNoz listed it, open. Only events at or before
+/// `cutoff` count (the listing instant), the last one deciding: `closed` is
+/// [`PrState::Closed`], `reopened` is open. A merge outranks both (a merge
+/// emits its own `closed` event), and with no close or reopen evidence the
+/// SigNoz state stands: a missing event is never read as a close.
 #[must_use]
-pub fn gap_fill_history(number: u32, listed: &ListedPr, events: Vec<PrEvent>) -> PrHistory {
+pub fn gap_fill_history(
+    number: u32,
+    listed: &ListedPr,
+    events: Vec<PrEvent>,
+    cutoff: DateTime<Utc>,
+) -> PrHistory {
     let mut listed = listed.clone();
     let merged = events.iter().rev().find_map(|e| match e {
         PrEvent::Merged { at } => Some(*at),
@@ -452,6 +661,17 @@ pub fn gap_fill_history(number: u32, listed: &ListedPr, events: Vec<PrEvent>) ->
     if let Some(at) = merged {
         listed.state = PrState::Merged;
         listed.merged_at = Some(at);
+    } else {
+        let resolution = events
+            .iter()
+            .filter(|e| matches!(e, PrEvent::Closed { .. } | PrEvent::Reopened { .. }))
+            .filter(|e| e.at() <= cutoff)
+            .max_by_key(|e| e.at());
+        match resolution {
+            Some(PrEvent::Closed { .. }) => listed.state = PrState::Closed,
+            Some(PrEvent::Reopened { .. }) => listed.state = PrState::Open,
+            _ => {}
+        }
     }
     history(number, &listed, events, true)
 }
@@ -510,6 +730,8 @@ impl Walk<'_> {
         match load {
             Load::Covered(plan) => {
                 self.report.history = Some(HistorySource::Signoz);
+                self.report.star_issues_from_signoz =
+                    advance_star_coverage(self.root, &repo, &plan);
                 self.gap_left = Some(gap_budget);
                 if plan.gap_fills() > 0 {
                     log::info!(
@@ -622,7 +844,8 @@ impl Walk<'_> {
                     self.report.history = Some(HistorySource::SignozGapFill);
                     match self.timeline(pass, number) {
                         Ok(Some(events)) => {
-                            let h = gap_fill_history(number, &candidate.listed, events);
+                            let h =
+                                gap_fill_history(number, &candidate.listed, events, pass.listed_at);
                             staging.merge(&[h], pass.listed_at);
                         }
                         Ok(None) => self.report.timelines_incomplete += 1,

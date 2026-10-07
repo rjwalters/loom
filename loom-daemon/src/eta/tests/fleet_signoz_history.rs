@@ -827,107 +827,6 @@ fn the_production_cycle_counts_and_caps_raw_event_reads_too() {
     assert_eq!((seen.len(), r.forge_calls, r.gap_fill_calls), (2, 8, None));
 }
 
-// -- star coverage of a raw cache SigNoz stops (#10520, judge round 3) ---------
-
-/// A pre-#10520 raw cache for [`A`]: PR 101 links issue 7 (known at
-/// `linked`), and issue 7 is labelled (no star) at `linked` and again at
-/// `labeled`, the newest row. No cursor stamp.
-fn plant_raw_cache(root: &Path, linked: DateTime<Utc>, labeled: DateTime<Utc>) {
-    use crate::eta::fleet_events::{self, EventKind, EventLog, ItemKind, RawEvent};
-    let rows = [
-        RawEvent::new(
-            A,
-            101,
-            ItemKind::Pr,
-            EventKind::ClosingRef,
-            Some("closes".into()),
-            linked,
-            "forge",
-            1,
-            linked,
-        )
-        .with_target(Some(7)),
-        RawEvent::new(
-            A,
-            7,
-            ItemKind::Issue,
-            EventKind::LabelAdded,
-            Some("loom:issue".into()),
-            linked,
-            "forge",
-            2,
-            linked,
-        ),
-        RawEvent::new(
-            A,
-            7,
-            ItemKind::Issue,
-            EventKind::LabelAdded,
-            Some("loom:ready".into()),
-            labeled,
-            "forge",
-            3,
-            labeled,
-        ),
-    ];
-    EventLog::open(&fleet_events::events_path(root, A))
-        .unwrap()
-        .append(&rows)
-        .unwrap();
-}
-
-/// The judge's star finding at the production boundary: SigNoz covers the
-/// repo, so its raw cache is not read and stops advancing. Before the fix the
-/// cache still "covered" every later cutoff, so a link or star added after it
-/// stopped read as known-unstarred. Now the cycle freezes the cache's
-/// coverage at its newest row, and a cutoff after it reads unknown (`None`);
-/// before it the cache still answers. A completed refresh (SigNoz history
-/// off) stamps the listings at the cycle's `now` instead.
-#[test]
-fn a_covered_repo_freezes_raw_cache_coverage_so_stars_read_unknown_after_it() {
-    use crate::eta::fleet_events::{self, EventsCursor};
-    use crate::eta::star::{listing_keys, StarInputs};
-    let prs = [approved(101, now() - Duration::hours(10))];
-    let (linked, labeled) = (now() - Duration::days(3), now() - Duration::days(2));
-    let repos = [A.to_string()];
-
-    // Covered: no raw-event read, coverage frozen at the newest cached row.
-    let dir = tempfile::tempdir().unwrap();
-    plant_raw_cache(dir.path(), linked, labeled);
-    let mut forge = Counting::with(&prs);
-    let mut signoz = signoz_rows(&prs, true);
-    let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
-    assert_eq!((r.history, seen.len()), (Some(HistorySource::Signoz), 0));
-    let star = StarInputs::load(dir.path(), &repos);
-    let star = &star.repos[A];
-    assert_eq!(star.synced_through, Some(labeled), "frozen at the newest cached row");
-    let after = labeled + Duration::hours(1);
-    assert_eq!(star.state_at(101, 0, None, after), None, "after the cache stopped: unknown");
-    assert!(star.state_at(101, 0, None, labeled).is_some(), "before it, the cache answers");
-
-    // A frozen stamp stays put on later covered cycles.
-    let mut signoz = signoz_rows(&prs, true);
-    production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
-    let cursor = EventsCursor::read(&fleet_events::cursor_path(dir.path(), A), A);
-    assert_eq!(cursor.synced_through(&listing_keys()), Some(labeled));
-
-    // History off, both listings refreshing to completion: stamped at `now`.
-    let dir = tempfile::tempdir().unwrap();
-    plant_raw_cache(dir.path(), linked, labeled);
-    let cursor_file = fleet_events::cursor_path(dir.path(), A);
-    let mut cursor = EventsCursor::read(&cursor_file, A);
-    for key in listing_keys() {
-        cursor.endpoints.entry(key).or_default().backfill_complete = true;
-    }
-    cursor.write(&cursor_file).unwrap();
-    let mut forge = Counting::with(&prs);
-    let (_, seen) = production_cycle(dir.path(), &mut forge, None, 5);
-    assert_eq!(seen.len(), 2, "both listings refreshed");
-    let star = StarInputs::load(dir.path(), &repos);
-    assert_eq!(star.repos[A].synced_through, Some(now()));
-    assert!(star.repos[A].state_at(101, 0, None, now()).is_some());
-}
-
 // -- baseline-only PRs (#10520, judge round 3) --------------------------------
 
 /// Requested at `opened` and nothing since: open, awaiting review.
@@ -1062,7 +961,7 @@ fn a_gap_filled_item_takes_the_forges_events_and_merge_instant() {
         },
         PrEvent::Merged { at: merged_at },
     ];
-    let h = gap_fill_history(9, &listed, events.clone());
+    let h = gap_fill_history(9, &listed, events.clone(), now());
     assert_eq!((h.state, h.merged_at), (PrState::Merged, Some(merged_at)));
     assert_eq!(h.events, events);
     assert!(h.timeline_complete);
@@ -1201,3 +1100,7 @@ fn signoz_and_forge_timelines_agree_within_the_polling_tolerance() {
     assert!(!item_complete(item901));
     assert!(!item_complete(item900), "the fixture carries no `opened` row");
 }
+
+// -- #10746: star coverage keeps advancing under historyPrimary ----------------
+
+mod star_coverage;

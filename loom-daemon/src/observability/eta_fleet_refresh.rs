@@ -764,6 +764,7 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
         raw_events_added: None,
         gap_fill_calls: None,
         history: None,
+        star_issues_from_signoz: false,
         duration_ms: 0,
     };
     match target.reader {
@@ -815,9 +816,17 @@ fn sync_all_events(
             continue;
         };
         let mut gate = EventsGate::for_repo(repo_report, gap_budget);
-        if gate == EventsGate::Skip {
+        // A covered repo (#10746): its cache is frozen, then only the
+        // star-bearing listings refresh, and only a completed backfill's
+        // cheap ETag'd refresh, drawn from what the snapshot pass left of the
+        // per-repo gap-fill budget. The issue-events listing is skipped when
+        // SigNoz advanced its star coverage this cycle.
+        let covered = gate == EventsGate::Skip;
+        if covered {
             crate::eta::fleet_signoz_history::freeze_raw_cache(root, &target.repo);
-            continue;
+            gate = EventsGate::GapFill(Some(
+                gap_budget.saturating_sub(repo_report.gap_fill_calls.unwrap_or(0)),
+            ));
         }
         if repo_report.stop == StopReason::Coverage {
             continue;
@@ -833,6 +842,16 @@ fn sync_all_events(
                 .endpoints
                 .get(&format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()))
                 .is_some_and(|e| e.backfill_complete);
+            if covered {
+                let star_listing = crate::eta::star::listing_keys()
+                    .iter()
+                    .any(|k| *k == format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()));
+                let issue_events_done =
+                    endpoint == ForgeEndpoint::IssuesEvents && repo_report.star_issues_from_signoz;
+                if !star_listing || issue_events_done || !complete {
+                    continue;
+                }
+            }
             let (mode, left) = if complete {
                 (SyncMode::Refresh, &mut report.remaining.0)
             } else {
