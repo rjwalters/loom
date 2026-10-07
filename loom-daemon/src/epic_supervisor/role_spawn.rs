@@ -36,6 +36,9 @@ pub(super) fn command(
         &role,
         Some(&execution),
     );
+    // #9473: no admission here, so only `spawn-worker.sh` keeps the LLM-gateway
+    // contract (it maps it per launch and scrubs it from every legacy adapter).
+    crate::worker_spawn::llm_gateway::guard_dispatch(&mut cmd, spawn_bin, None);
     cmd
 }
 
@@ -149,5 +152,20 @@ mod tests {
             assert_eq!(env(&cmd, name), Some(None), "{name} is removed when off");
         }
         assert_eq!(env(&cmd, RESOURCE_ATTRIBUTES_ENV), None, "no attribute stamp when off");
+    }
+
+    /// #9473: the gateway contract survives only into `spawn-worker.sh`.
+    #[test]
+    fn epic_role_command_withholds_the_llm_gateway_contract_from_a_non_seam_bin() {
+        let dir = root(false);
+        let gateway = crate::worker_spawn::llm_gateway::ENV_NAMES;
+        let direct = command(Path::new("/x/spawn-claude.sh"), dir.path(), 42, &shape(), "sonnet");
+        for name in gateway {
+            assert_eq!(env(&direct, name), Some(None), "{name} must be removed");
+        }
+        let seam = command(Path::new("/x/spawn-worker.sh"), dir.path(), 42, &shape(), "sonnet");
+        for name in gateway {
+            assert_eq!(env(&seam, name), None, "{name} is left to spawn-worker");
+        }
     }
 }

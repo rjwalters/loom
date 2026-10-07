@@ -80,15 +80,23 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
     for harness in harnesses {
         let _ = writeln!(out, "harness {harness}: provider {}", profile.providers[harness]);
         let mapping = profiles::credentials(&profile, harness)?;
+        // #9473: a routed profile takes its key from the LLM gateway, never
+        // the environment or the pool. Decided without reading the key.
+        let gateway = profiles::resolve(harness, &name, &profile)
+            .ok()
+            .map(|selection| super::llm_gateway::plan(harness, &selection, &config));
+        let routed = matches!(gateway, Some(Ok(Some(_))));
         let mut pool_would_refuse = false;
         for (source, target) in &mapping.pairs {
             let is_set = std::env::var_os(source).is_some_and(|v| !v.is_empty());
-            let mut state = if is_set {
+            let mut state = if routed {
+                "supplied by the LLM gateway virtual key".to_string()
+            } else if is_set {
                 "present".to_string()
             } else {
                 "unset".to_string()
             };
-            if !is_set {
+            if !is_set && !routed {
                 if let Some(status) = pool_status(&root, &profile, source) {
                     if status.would_refuse() {
                         pool_would_refuse = true;
@@ -109,8 +117,19 @@ fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), L
                 let _ = writeln!(out, "  {key}: {}", keys.join(", "));
             }
         }
+        let gateway_refusal = match &gateway {
+            Some(Ok(Some(plan))) => {
+                let _ = writeln!(out, "  llm gateway: routed, {}", plan.summary());
+                plan.check_source().err()
+            }
+            Some(Err(error)) => Some(error.message.clone()),
+            _ => None,
+        };
         let unset = profiles::missing(&mapping.required);
-        if !unset.is_empty() {
+        if let Some(why) = gateway_refusal {
+            resolvable = false;
+            let _ = writeln!(out, "  status: unresolvable, spawn would refuse at 78 ({why})");
+        } else if !unset.is_empty() {
             resolvable = false;
             let _ = writeln!(out, "  status: unresolvable, set {}", unset.join(", "));
         } else if pool_would_refuse {

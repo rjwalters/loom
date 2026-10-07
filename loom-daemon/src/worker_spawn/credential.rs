@@ -47,6 +47,9 @@ pub enum Source {
     Env,
     /// Selected from this host's API-key account pool.
     Pool,
+    /// The host's LLM gateway virtual key (#9473): the gateway holds the
+    /// provider's real key, so neither the environment nor the pool is read.
+    Gateway,
 }
 
 impl Source {
@@ -55,6 +58,7 @@ impl Source {
             Self::None => "none",
             Self::Env => "env",
             Self::Pool => "pool",
+            Self::Gateway => "gateway",
         }
     }
 }
@@ -97,6 +101,17 @@ impl Resolved {
     pub fn apply(&self, command: &mut Command) {
         for (target, value) in &self.injected {
             command.env(target, value);
+        }
+    }
+
+    /// The gateway's virtual key under the profile's own provider-key
+    /// variable (#9473). Built only by `llm_gateway::Route::credential`.
+    pub(super) fn gateway(target: String, value: OsString) -> Self {
+        Self {
+            source: Source::Gateway,
+            provider: None,
+            account: None,
+            injected: vec![(target, value)],
         }
     }
 
