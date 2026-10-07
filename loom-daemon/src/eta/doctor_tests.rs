@@ -56,6 +56,7 @@ fn healthy() -> Facts {
             today_exists: true,
             last_check: Some(fit_record("skipped", Some("today_exists"), 1)),
             published: PubStatus::default(),
+            published_v2: PubStatus::default(),
         },
         serving: ServingFacts {
             fit_loaded: true,
@@ -371,6 +372,55 @@ fn published_fit_states_map_to_status() {
     let c = find(&c, "fit", "published_fit");
     assert_eq!(c.status, Status::Warn);
     assert!(c.detail.contains("403"), "{}", c.render());
+}
+
+#[test]
+fn published_fit_v2_is_its_own_check_independent_of_v1() {
+    let mut f = healthy();
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // A failing v2 lane warns on its own check and leaves v1's untouched.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Refused),
+        reason: Some("bad_fit".into()),
+        fit_id: Some("fitV2".into()),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("bad_fit"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+
+    // A healthy v2 lane is ok while v1 is absent.
+    f.fit.published_v2.kind = Some(FetchKind::Installed);
+    f.fit.published_v2.reason = None;
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Ok);
+    assert!(v2.detail.contains("fitV2"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
+fn v2_publish_error_after_an_absent_fetch_warns() {
+    let mut f = healthy();
+    // Absent without an error stays a skip.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Absent),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // Absent store followed by a failed captain upload is a warning.
+    f.fit.published_v2.publish_error = Some("403".into());
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("403"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
 }
 
 #[test]

@@ -114,6 +114,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         .is_some(),
         last_check: health::read_fit_check(root),
         published: fit::publish::read_status(root),
+        published_v2: fit::publish_v2::read_status_v2(root),
     };
 
     let pending = read_pending(root);
