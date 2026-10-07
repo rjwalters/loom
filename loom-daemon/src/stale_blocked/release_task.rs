@@ -20,14 +20,14 @@
 //! admitted at the **fallback/home** workspace (`daemon_service`), and the
 //! role runner then also checks each root — so a root's own
 //! `roleRunner.enabled` counts only when the home workspace started the loop
-//! ([`Loops`]).
+//! ([`Loops`], decided by `daemon_service` and passed in).
 //!
 //! Every root, every tick, records exactly one
 //! [`Outcome`](super::release_outcome::Outcome), so silence is diagnosable
 //! from `host.health` without host logs.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::release_gh::{self, Mode};
@@ -54,24 +54,21 @@ pub fn pre_gate(mode: Mode, served: bool, rate_limited: bool) -> Option<Outcome>
     }
 }
 
-/// Which daemon-level loops this host started, resolved from the fallback
-/// workspace exactly as `daemon_service` admits them at startup.
+/// Which daemon-level loops `daemon_service` actually started, decided once at
+/// startup and handed to [`spawn_task`] (not re-read from config, so the task
+/// can never claim a loop runs that was not spawned).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Loops {
     pub work_finder: bool,
     pub role_runner: bool,
 }
 
-impl Loops {
-    #[must_use]
-    pub fn resolve(fallback_root: &Path) -> Self {
+impl From<(bool, bool)> for Loops {
+    /// `(work_finder, role_runner)`, in that order.
+    fn from((work_finder, role_runner): (bool, bool)) -> Self {
         Self {
-            work_finder: crate::work_finder::resolve_enabled(
-                &crate::work_finder::read_work_finder_config(fallback_root),
-            ),
-            role_runner: crate::role_runner::resolve_enabled(
-                &crate::role_runner::read_role_runner_config(fallback_root),
-            ),
+            work_finder,
+            role_runner,
         }
     }
 }
@@ -101,14 +98,17 @@ pub fn tick_once(loops: Loops, roots: &[PathBuf]) {
     }
 }
 
-/// Spawn the task. Held for the process lifetime by the caller.
-pub fn spawn_task(fallback_root: PathBuf) -> tokio::task::JoinHandle<()> {
+/// Spawn the task. Held for the process lifetime by the caller. `loops` is
+/// what the daemon started; `fallback_root` only resolves the registry.
+pub fn spawn_task(fallback_root: PathBuf, loops: Loops) -> tokio::task::JoinHandle<()> {
     log::info!(
         "stale_blocked_release: task started (visits every registered workspace each {}s; \
-         per-workspace cadence, shard and write-scope gates apply, #10763)",
-        TICK.as_secs()
+         work finder {}, role runner {}; per-workspace cadence, shard and write-scope gates \
+         apply, #10763)",
+        TICK.as_secs(),
+        if loops.work_finder { "on" } else { "off" },
+        if loops.role_runner { "on" } else { "off" },
     );
-    let loops = Loops::resolve(&fallback_root);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -172,5 +172,11 @@ mod tests {
     fn work_finder_only_is_served() {
         assert!(served(HOME_WF, false));
         assert!(served(HOME_WF, true));
+    }
+
+    #[test]
+    fn loops_from_tuple_is_work_finder_then_role_runner() {
+        assert_eq!(Loops::from((true, false)), HOME_WF);
+        assert_eq!(Loops::from((false, true)), HOME_RR);
     }
 }
