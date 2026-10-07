@@ -16,9 +16,12 @@
 //!   *ordering* excludes them).
 //! - **Plan.** Eligible open PRs (not draft, no hold label, no agent
 //!   mid-flight, pinnable head) are grouped into connected components of the
-//!   shared-changed-file graph. Shared filenames are evidence of possible
-//!   overlap, never proof of semantic compatibility — the pass only orders,
-//!   it never merges, vouches, or combines. Within a component, existing
+//!   REAL-conflict graph (#10350, [`conflict`]): a shared changed filename is
+//!   only the prefilter, and a pair is an edge only when `git merge-tree` of
+//!   the two heads conflicts (any unknown counts as a conflict — fail
+//!   closed); stacked bases are edges unconditionally. A clean merge is not
+//!   proof of semantic compatibility either — the pass only orders, it never
+//!   merges, vouches, or combines. Within a component, existing
 //!   trusted `loom:sequence` markers and base-branch stacking are
 //!   authoritative constraints; everything else orders ready-first (#10371,
 //!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
@@ -28,8 +31,8 @@
 //!   cycle skips the whole component for that tick — a half-rewritten order
 //!   is worse than a deferred one.
 //! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
-//!   waits only for its nearest earlier member that shares a changed file
-//!   with it (or that it is stacked on), never for a PR it reaches only
+//!   waits only for its nearest earlier member it really conflicts with
+//!   (or that it is stacked on), never for a PR it reaches only
 //!   through a third PR — so the marker's "changes files #N also changes" is
 //!   always true. No edge is written behind a predecessor that is not ready
 //!   to land (#10371). The follower gets `loom:sequenced` (#9378's durable gate)
@@ -60,7 +63,8 @@
 //!   `loom:blocked`, is released on the next tick; hard holds never are.
 //! - **No-overlap release (#10077, [`overlap`]).** A soft in-flight hold
 //!   whose two PRs share no changed file (a transitive-only edge recorded
-//!   before #10060) is released; any failed read or unknown keeps it.
+//!   before #10060) or do not really conflict (#10350) is released; any
+//!   failed read or unknown keeps it.
 //! - **Defer repairs.** The review-conflict pass
 //!   (`super::review_conflict`) consults this module's `defer_base_repair`:
 //!   a base-conflicting review-queue PR whose sequencing predecessor is
@@ -86,7 +90,7 @@
 //! the master `LOOM_STALE_CLAIM_RECONCILE` switch like the review-conflict
 //! pass. Read-only inspection: `loom-daemon merge-pr sequence-plan`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -132,6 +136,11 @@ pub mod sticky;
 // One landing-order comment per follower, upserted by key (#10634).
 #[path = "merge_sequence_landing.rs"]
 pub mod landing;
+// The real-merge-conflict pair predicate edges require (#10350).
+#[path = "merge_sequence_conflict.rs"]
+pub mod conflict;
+pub use conflict::overlap_components_with;
+use conflict::Conflicts;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -297,40 +306,7 @@ pub fn overlap_components(
     eligible: &[&SequencePr],
     files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> Vec<Vec<u32>> {
-    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
-    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (i, a) in eligible.iter().enumerate() {
-        for b in &eligible[i + 1..] {
-            let shared = files
-                .get(&a.number)
-                .zip(files.get(&b.number))
-                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
-            if shared {
-                adj.entry(a.number).or_default().push(b.number);
-                adj.entry(b.number).or_default().push(a.number);
-            }
-        }
-    }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut out = Vec::new();
-    for start in &nums {
-        if seen.contains(start) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut queue = VecDeque::from([*start]);
-        seen.insert(*start);
-        while let Some(n) = queue.pop_front() {
-            component.push(n);
-            for next in adj.get(&n).into_iter().flatten() {
-                if seen.insert(*next) {
-                    queue.push_back(*next);
-                }
-            }
-        }
-        out.push(component);
-    }
-    out
+    overlap_components_with(eligible, files, &conflict::assume_conflict)
 }
 
 /// Order one component's members: constraint edges first (trusted markers
@@ -410,6 +386,19 @@ pub fn plan_group(
     by_number: &BTreeMap<u32, SequencePr>,
     files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> SequenceGroup {
+    plan_group_with(plan, order, by_number, files, &conflict::assume_conflict)
+}
+
+/// [`plan_group`] where a shared file yields an edge only when `conflicts`
+/// says the pair really conflicts (#10350); stacking is unconditional.
+#[must_use]
+pub fn plan_group_with(
+    plan: &str,
+    order: &[u32],
+    by_number: &BTreeMap<u32, SequencePr>,
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    conflicts: Conflicts<'_>,
+) -> SequenceGroup {
     let shares = |a: u32, b: u32| {
         files
             .get(&a)
@@ -422,10 +411,9 @@ pub fn plan_group(
             continue;
         };
         let Some(&after) = order[..i].iter().rev().find(|&&a| {
-            shares(a, follower)
-                || by_number
-                    .get(&a)
-                    .is_some_and(|p| fol.base_ref == p.head_ref)
+            by_number.get(&a).is_some_and(|p| {
+                fol.base_ref == p.head_ref || (shares(a, follower) && conflicts(p, fol))
+            })
         }) else {
             continue;
         };
@@ -468,8 +456,19 @@ pub fn plan_repo(
     files: &BTreeMap<u32, BTreeSet<String>>,
     markers: &BTreeMap<u32, SequenceMarker>,
 ) -> Vec<SequenceGroup> {
+    plan_repo_checked(open_prs, files, markers, &conflict::assume_conflict)
+}
+
+/// [`plan_repo`] with the real-conflict predicate (#10350) — the live pass.
+#[must_use]
+pub fn plan_repo_checked(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+    conflicts: Conflicts<'_>,
+) -> Vec<SequenceGroup> {
     let stalled = stall::stalled_for_ordering(open_prs, Utc::now(), stall_hours());
-    plan_repo_with(open_prs, files, markers, &stalled)
+    plan_repo_conflicts(open_prs, files, markers, &stalled, conflicts)
 }
 
 /// [`plan_repo`] with an explicit stalled set (deterministic for tests).
@@ -479,6 +478,18 @@ pub fn plan_repo_with(
     files: &BTreeMap<u32, BTreeSet<String>>,
     markers: &BTreeMap<u32, SequenceMarker>,
     stalled: &BTreeSet<u32>,
+) -> Vec<SequenceGroup> {
+    plan_repo_conflicts(open_prs, files, markers, stalled, &conflict::assume_conflict)
+}
+
+/// [`plan_repo_with`] with an explicit pair-conflict predicate (#10350).
+#[must_use]
+pub fn plan_repo_conflicts(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+    stalled: &BTreeSet<u32>,
+    conflicts: Conflicts<'_>,
 ) -> Vec<SequenceGroup> {
     if open_prs.len() <= TRIGGER_OPEN_PRS {
         return Vec::new();
@@ -493,7 +504,7 @@ pub fn plan_repo_with(
     let by_number: BTreeMap<u32, SequencePr> =
         open_prs.iter().map(|p| (p.number, p.clone())).collect();
     let mut groups = Vec::new();
-    for component in overlap_components(&eligible, files) {
+    for component in overlap_components_with(&eligible, files, conflicts) {
         if component.len() < 2 {
             continue;
         }
@@ -531,7 +542,7 @@ pub fn plan_repo_with(
             })
             .collect();
         let id = plan_id(&member_pins);
-        let mut group = plan_group(&id, &order, &by_number, files);
+        let mut group = plan_group_with(&id, &order, &by_number, files, conflicts);
         ready::drop_edges_behind_unready(&mut group, &by_number);
         groups.push(group);
     }
@@ -976,13 +987,16 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         .collect();
     report.holders = holder_numbers.len();
     let mut cache = overlap::TickFiles::default();
-    report.would_release_no_overlap = overlap::would_release(gh_bin, root, &open, &mut cache);
+    let pairs = conflict::live(root);
+    let conflicts = |a: &SequencePr, b: &SequencePr| pairs.conflicts(a, b);
+    report.would_release_no_overlap =
+        overlap::would_release(gh_bin, root, &open, &mut cache, &conflicts);
     for pr in &eligible {
         cache.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
     let files = cache.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
-    report.groups = plan_repo(&open, &files, &markers);
+    report.groups = plan_repo_checked(&open, &files, &markers, &conflicts);
     let bin = gh_bin.to_string_lossy().to_string();
     for g in &mut report.groups {
         g.edges.retain(|e| {
@@ -1138,6 +1152,9 @@ pub(super) fn reconcile_merge_sequences_gated(
     let mut stalls = stall::StallLedger::default();
     // One changed-files read per PR per tick, shared by both phases (#10077).
     let mut files = overlap::TickFiles::default();
+    // One real-conflict predicate per tick, shared by both phases (#10350).
+    let pairs = conflict::live(root);
+    let conflicts = |a: &SequencePr, b: &SequencePr| pairs.conflicts(a, b);
 
     // Phase 1: evaluate every existing hold, oldest first for a stable
     // transcript.
@@ -1227,8 +1244,9 @@ pub(super) fn reconcile_merge_sequences_gated(
         let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, ready_head);
         // #10077: a soft hold between PRs sharing no file is released.
         let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
+        let (p, open) = (pred.as_ref(), open.as_slice());
         let action =
-            overlap::with_no_overlap(action, &marker, pred.as_ref(), pr, &open, &mut files, fetch);
+            overlap::with_no_overlap(action, &marker, p, pr, open, &mut files, fetch, &conflicts);
         let result = match action {
             HoldAction::Release
             | HoldAction::ReleaseDissolved
@@ -1316,7 +1334,7 @@ pub(super) fn reconcile_merge_sequences_gated(
     let files = files.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &read_markers);
     let fleet = crate::forge_identity::FleetLogins::for_root(root);
-    for group in plan_repo(&open, &files, &markers) {
+    for group in plan_repo_checked(&open, &files, &markers, &conflicts) {
         stats.groups += 1;
         for edge in group.edges {
             // Never re-plan a follower that already carries an ordering

@@ -67,6 +67,11 @@ pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::n
 /// cached set until [`MAX_AGE`] (the PR's own diff rarely changes from that).
 pub(super) static CHANGED_FILES: ReadCache<BTreeSet<String>> = ReadCache::new(MAX_AGE);
 
+/// Whether two PR heads conflict under `git merge-tree` (#10350): `true` =
+/// conflict. A function of the two SHAs alone, so it never goes stale; the
+/// expiry only bounds memory.
+pub(super) static PAIR_CONFLICT: ReadCache<bool> = ReadCache::new(MAX_AGE);
+
 /// A closed-over compare of two commit SHAs (`tree_unchanged`): whether the
 /// trees are byte-identical. A function of the two SHAs alone, so it never
 /// goes stale; keyed with no version stamp (see [`key_of`]).
