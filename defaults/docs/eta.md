@@ -860,8 +860,21 @@ captain dedups twice:
   once the first issue is indexed (GitHub's search index lags writes, so a
   handover inside that window can still double-file).
 
-A failed search refuses the filing; it is retried on the next run. Nothing
-schedules `eta retire --file` yet: run it by hand or from cron.
+A failed search refuses the filing; it is retried on the next run.
+
+**Scheduled filing (shipped, #10525).** With
+`autonomous.eta.nightlyFolds.retirementFiling` (env
+`LOOM_ETA_RETIREMENT_FILING_ENABLED`, default **off**, read at start; needs
+`enabled` and `nightlyFolds.enabled` too), the captain's
+[nightly fold task](#nightly-backtest-folds-autonomousetanightlyfolds-10492)
+runs the same path as `eta retire --file` on each tick after the folds are
+saved. It is off by default because it is the one outward write the fold task
+makes (the folds themselves are CPU-only and local). It passes the
+`fleet.captain` gate (re-checked inside the filing, fail-closed), dedups
+through the same ledger and forge search, so reruns of an unchanged or slid
+window file nothing new, and a failed search or filing is logged at `warn` and
+retried next tick without affecting the folds. It never unregisters a
+heuristic. By hand, `eta retire --file` still works.
 
 ### Promotion statistics: the unit of independence
 
@@ -911,7 +924,6 @@ record says so rather than implying the check passed.
 - A producer of `t_p50` / `t_cov` per heuristic (#10528). Until one exists,
   the adaptation check records `not_measured`. Retirement domination does not
   yet consider adaptation either; the proposal body says so.
-- Scheduling `eta retire --file` (from the nightly job or cron).
 - loom-ui's chooser filtering on `tier` is owned by loom-ui#2031 / #2097 and
   is not verified here.
 
@@ -2507,6 +2519,7 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true` (#10492): the captain's nightly walk-forward backtest folds ([below](#nightly-backtest-folds-autonomousetanightlyfolds-10492)). Runs only with `enabled` too; read at start |
+| `nightlyFolds.retirementFiling` | `LOOM_ETA_RETIREMENT_FILING_ENABLED` | `false` (#10525): after the folds, the captain files retirement proposals as issues ([above](#shadow-fleet-management)). Needs `nightlyFolds.enabled`; read at start |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
 | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (`current` + 13 alternates, #10549, #10521), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |

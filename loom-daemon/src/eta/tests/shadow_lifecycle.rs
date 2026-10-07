@@ -354,3 +354,107 @@ fn builtin_candidates_are_the_only_eligible_ids() {
         );
     }
 }
+
+/// A workspace whose saved folds make `calm-plover` a dominated, worse
+/// candidate (against `twin-otter-b`), declaring `captain` as `fleet.captain`.
+fn scheduled_root(captain: Option<&str>) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let text = captain
+        .map_or_else(|| "{}".to_string(), |c| format!(r#"{{"fleet": {{"captain": "{c}"}}}}"#));
+    std::fs::write(&config, text).unwrap();
+    let d = wobbled(days(
+        RETIREMENT_MIN_DAYS,
+        &[
+            (LAND_CALM_PLOVER, (40.0, 900.0, 0.8, 0.2)),
+            (LAND_TWIN_OTTER_B, (-20.0, 700.0, 0.5, 0.1)),
+        ],
+    ));
+    std::fs::create_dir_all(crate::eta::nightly_folds::dir(root.path())).unwrap();
+    for day in &d {
+        let date = NaiveDate::parse_from_str(&day.day, "%Y-%m-%d").unwrap();
+        std::fs::write(
+            crate::eta::nightly_folds::day_path(root.path(), date),
+            serde_json::to_string(day).unwrap(),
+        )
+        .unwrap();
+    }
+    root
+}
+
+fn gate(root: &std::path::Path, host: &str) -> crate::fleet_captain::CaptainGate {
+    crate::fleet_captain::resolve_gate_for_root(root, host)
+}
+
+#[test]
+fn scheduled_filing_files_exactly_once_across_reruns_and_removes_nothing() {
+    use crate::eta::retire_filing::{file_gated, proposals_for_root};
+    let root = scheduled_root(Some("w1"));
+    let before = Registry::builtin().ids();
+    let mut forge = FakeForge::default();
+    let now = Utc::now();
+    for run in 0..3 {
+        let proposed = proposals_for_root(root.path()).unwrap();
+        assert_eq!(proposed.proposals.len(), 1, "{:?}", proposed.proposals);
+        let report =
+            file_gated(root.path(), &gate(root.path(), "w1"), &proposed.proposals, now, &mut forge)
+                .unwrap();
+        assert_eq!(report.filed.len(), usize::from(run == 0), "run {run}");
+    }
+    assert_eq!(forge.issues.len(), 1);
+    assert!(forge.issues[0].1.contains(&dedup_key(LAND_CALM_PLOVER)));
+    assert_eq!(Registry::builtin().ids(), before, "nothing unregistered");
+}
+
+#[test]
+fn scheduled_filing_refuses_a_non_captain_and_a_captainless_fleet() {
+    use crate::eta::retire_filing::{file_gated, proposals_for_root};
+    for captain in [Some("w1"), None] {
+        let root = scheduled_root(captain);
+        let proposed = proposals_for_root(root.path()).unwrap();
+        let mut forge = FakeForge::default();
+        let err = file_gated(
+            root.path(),
+            &gate(root.path(), "w2"),
+            &proposed.proposals,
+            Utc::now(),
+            &mut forge,
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to file"), "{err}");
+        assert!(forge.issues.is_empty());
+        assert!(!crate::eta::shadow_lifecycle::filed_path(root.path()).exists());
+    }
+}
+
+#[test]
+fn scheduled_filing_refuses_when_the_forge_cannot_be_searched_then_retries() {
+    use crate::eta::retire_filing::{file_gated, proposals_for_root};
+    let root = scheduled_root(Some("w1"));
+    let proposed = proposals_for_root(root.path()).unwrap();
+    let g = gate(root.path(), "w1");
+    let mut forge = FakeForge {
+        search_down: true,
+        ..FakeForge::default()
+    };
+    let err = file_gated(root.path(), &g, &proposed.proposals, Utc::now(), &mut forge).unwrap_err();
+    assert!(err.contains("not filing"), "{err}");
+    assert!(forge.issues.is_empty());
+    assert!(!crate::eta::shadow_lifecycle::filed_path(root.path()).exists());
+    forge.search_down = false;
+    let ok = file_gated(root.path(), &g, &proposed.proposals, Utc::now(), &mut forge).unwrap();
+    assert_eq!(ok.filed, vec![LAND_CALM_PLOVER]);
+}
+
+#[test]
+fn retirement_filing_is_off_by_default_with_config_and_env_switches() {
+    use crate::eta::config::resolve;
+    let no_env = |_: &str| None;
+    assert!(!resolve(&serde_json::json!({}), no_env).retirement_filing_enabled);
+    let on =
+        serde_json::json!({"autonomous": {"eta": {"nightlyFolds": {"retirementFiling": true}}}});
+    assert!(resolve(&on, no_env).retirement_filing_enabled);
+    let env_off = |k: &str| (k == "LOOM_ETA_RETIREMENT_FILING_ENABLED").then(|| "0".to_string());
+    assert!(!resolve(&on, env_off).retirement_filing_enabled, "env beats config");
+}
