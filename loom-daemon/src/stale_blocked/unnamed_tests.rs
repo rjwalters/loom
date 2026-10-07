@@ -194,6 +194,50 @@ fn legacy_daemon_hold_comments_are_skipped_and_counted() {
 }
 
 #[test]
+fn an_old_legacy_hold_does_not_veto_a_later_bare_reblock() {
+    for marker in [QUARANTINE_COMMENT_MARKER, PRLESS_HOLD_COMMENT_MARKER] {
+        let mut w = World::new();
+        w.add(5, "No blocker recorded.", &[]);
+        w.extra.comments.insert(
+            5,
+            vec![json!({
+                "body": format!("{marker}\nheld"),
+                "user": {"login": "someone"},
+                "author_association": "MEMBER",
+                "created_at": "2026-01-01T00:00:00Z",
+            })],
+        );
+        w.extra
+            .blocked_at
+            .insert(5, "2026-10-01T00:00:00Z".to_string());
+        let r = w.run();
+        assert_eq!(skipped(&r, "daemon-hold"), 0, "{marker}");
+        assert_eq!(r.queued, vec![5], "{marker}");
+    }
+}
+
+#[test]
+fn a_legacy_hold_posted_after_the_label_still_vetoes() {
+    let mut w = World::new();
+    w.add(5, "No blocker recorded.", &[]);
+    w.extra.comments.insert(
+        5,
+        vec![json!({
+            "body": format!("{QUARANTINE_COMMENT_MARKER}\nheld"),
+            "user": {"login": "someone"},
+            "author_association": "MEMBER",
+            "created_at": "2026-10-02T00:00:00Z",
+        })],
+    );
+    w.extra
+        .blocked_at
+        .insert(5, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert!(w.park.writes.is_empty());
+}
+
+#[test]
 fn permanent_operator_and_claimed_issues_are_skipped() {
     let mut w = World::new();
     w.add(1, "x\n<!-- loom:permanent-block -->", &[]);

@@ -460,15 +460,39 @@ fn queue(
         return;
     }
     // Legacy comment marker: only for a pre-#10161 hold, i.e. no body record.
+    // A hold comment older than the latest `loom:blocked` belongs to a
+    // released hold and must not veto a later bare re-block; an undated
+    // comment or unreadable label time still vetoes (fail safe).
     let body_record = parse(&fresh.body).iter().any(is_daemon_hold);
-    if !body_record
-        && comments.iter().filter(|c| policy.trusts_json(c)).any(|c| {
-            let b = body_of(c);
-            b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
-        })
-    {
-        report.skip(Skip::DaemonHold);
-        return;
+    let hold_comments: Vec<&Value> = if body_record {
+        Vec::new()
+    } else {
+        comments
+            .iter()
+            .filter(|c| policy.trusts_json(c))
+            .filter(|c| {
+                let b = body_of(c);
+                b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
+            })
+            .collect()
+    };
+    if !hold_comments.is_empty() {
+        let labeled_at = match extra.last_labeled_at(n, BLOCKED_LABEL) {
+            Ok(t) => t,
+            Err(e) => {
+                report.unread(n, format!("label-event read failed: {e}"));
+                return;
+            }
+        };
+        if hold_comments.iter().any(|c| {
+            super::hold::reviews_current_block(
+                c.get("created_at").and_then(Value::as_str),
+                labeled_at.as_deref(),
+            )
+        }) {
+            report.skip(Skip::DaemonHold);
+            return;
+        }
     }
     // A review of an earlier block (older than the latest label) does not
     // count: that later bare re-block is unreviewed and is queued.
