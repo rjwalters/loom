@@ -52,7 +52,6 @@ use loom_daemon::cmd_out::CmdOutcome;
 use loom_daemon::script_helpers::run_gh;
 
 use super::notify_cleared_blockers::{pr_close_targets, scan_cleared, ScanOptions, ScanReport};
-use super::stale_blocked::DEFAULT_LIMIT;
 
 pub(crate) const ENABLE_ENV: &str = "LOOM_CLOSED_WATCH";
 pub(crate) const INTERVAL_ENV: &str = "LOOM_CLOSED_WATCH_INTERVAL_SECS";
@@ -296,6 +295,14 @@ pub(crate) fn walk(
     Ok((batch, cur))
 }
 
+/// Per-population cap on the open `loom:blocked` artifacts a poll examines:
+/// none. The CLI's `--limit` (100) silently drops the rest of a larger
+/// population before citation filtering and reports success, so the poll would
+/// consume a close whose only citer sat past the cap and never retry it. The
+/// rate-limit budget guard still bounds cost and holds the cursor when it
+/// refuses or stops.
+pub(crate) const SCAN_LIMIT: u32 = u32::MAX;
+
 /// What one poll did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PollOutcome {
@@ -350,7 +357,7 @@ pub(crate) fn poll_once(root: &Path) -> PollOutcome {
                 let opts = ScanOptions {
                     repo,
                     root,
-                    limit: DEFAULT_LIMIT,
+                    limit: SCAN_LIMIT,
                     no_prs: false,
                     dry_run: false,
                 };

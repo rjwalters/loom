@@ -15,6 +15,7 @@ use loom_daemon::stale_blocked::budget::{Budget, Floor, Meter};
 use loom_daemon::stale_blocked::Artifact;
 
 use super::super::notify_cleared_blockers::scan_cleared_with;
+use super::super::stale_blocked::DEFAULT_LIMIT;
 use super::*;
 
 fn ts(s: &str) -> DateTime<Utc> {
@@ -414,6 +415,8 @@ fn knob_is_default_off_with_env_over_config_precedence() {
 struct World {
     comments_fail: bool,
     comments: Vec<extract::Comment>,
+    /// Open `loom:blocked` issues listed ahead of #201 that cite nothing closed.
+    unrelated_ahead: u32,
     posted: Vec<(i64, String)>,
 }
 
@@ -425,7 +428,16 @@ impl StaleBlockedForge for World {
     }
 
     fn list_blocked(&mut self) -> anyhow::Result<Vec<RestIssue>> {
-        Ok(vec![RestIssue {
+        let mut rows: Vec<RestIssue> = (0..self.unrelated_ahead)
+            .map(|i| RestIssue {
+                number: 1000 + i,
+                title: Some("Waits on design".into()),
+                body: Some("Waiting on a design review.".into()),
+                comments: 0,
+                ..blocked_row()
+            })
+            .collect();
+        rows.push(RestIssue {
             number: 201,
             title: Some("Waits on 200".into()),
             labels: vec!["loom:blocked".into()],
@@ -437,7 +449,8 @@ impl StaleBlockedForge for World {
             author: None,
             is_pull_request: false,
             comments: 1 + u32::try_from(self.comments.len()).unwrap(),
-        }])
+        });
+        Ok(rows)
     }
 
     fn comments(&mut self, number: u32) -> anyhow::Result<Vec<extract::Comment>> {
@@ -490,6 +503,22 @@ impl StaleBlockedForge for World {
     }
 }
 
+fn blocked_row() -> RestIssue {
+    RestIssue {
+        number: 0,
+        title: None,
+        labels: vec!["loom:blocked".into()],
+        created_at: None,
+        updated_at: None,
+        closed_at: None,
+        state: "open".into(),
+        body: None,
+        author: None,
+        is_pull_request: false,
+        comments: 0,
+    }
+}
+
 impl World {
     /// One poll through the real `scan_fresh` -> `scan_cleared_with` path.
     /// `listing` is the closed-items page; `fail_expansion` names merged PRs
@@ -503,7 +532,7 @@ impl World {
     ) -> PollOutcome {
         let fleet = FleetLogins::single(extract::DEFAULT_BOT_LOGIN);
         let gather = batch::Options {
-            limit: DEFAULT_LIMIT,
+            limit: SCAN_LIMIT,
             no_prs: false,
             floor: Floor::default(),
         };
@@ -633,5 +662,30 @@ fn failed_closing_reference_expansion_holds_cursor_then_retry_posts() {
     // Pass 3: nothing new; no duplicate.
     let out = world.poll(root.path(), listing(), &HashSet::new(), &targets);
     assert_eq!(out, PollOutcome::Idle);
+    assert_eq!(world.posted.len(), 1, "no duplicate notice");
+}
+
+#[test]
+fn citer_beyond_the_old_population_cap_is_still_notified_once() {
+    let root = tempfile::tempdir().unwrap();
+    let (none, targets) = (HashSet::new(), HashMap::new());
+    let listing = || vec![item(200, "2026-10-04T10:00:00Z")];
+    save_at(root.path(), SINCE);
+    // #201, the only citer of #200, is the 101st open blocked issue.
+    let mut world = World {
+        unrelated_ahead: DEFAULT_LIMIT,
+        ..World::default()
+    };
+
+    let out = world.poll(root.path(), listing(), &none, &targets);
+    assert_eq!(out, PollOutcome::Scanned { closed: 1 });
+    assert_eq!(world.posted.len(), 1, "the citer past the old cap is notified");
+    assert_eq!(world.posted[0].0, 201);
+    assert_eq!(cursor_at(root.path()).as_deref(), Some("2026-10-04T10:00:00Z"));
+
+    // A later poll that rescans #200 posts nothing more (marker dedupe).
+    let relisted = vec![item(200, "2026-10-04T11:30:00Z")];
+    let out = world.poll(root.path(), relisted, &none, &targets);
+    assert_eq!(out, PollOutcome::Scanned { closed: 1 });
     assert_eq!(world.posted.len(), 1, "no duplicate notice");
 }
