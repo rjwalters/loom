@@ -1,5 +1,6 @@
 {
   "zai-flash": {
+    "billing": "subscription",
     "model": "glm-5.3-flash",
     "providers": {
       "pi": "zai",
@@ -19,6 +20,7 @@
     }
   },
   "quick-cerebras": {
+    "billing": "api",
     "model": "gpt-oss-120b",
     "providers": {
       "pi": "cerebras"
@@ -30,6 +32,7 @@
     }
   },
   "quick-flash": {
+    "billing": "api",
     "model": "gemini-3.5-flash",
     "providers": {
       "pi": "google",

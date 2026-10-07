@@ -284,6 +284,29 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
     result
 }
 
+/// The billing class of a native-harness launch (#10749). The profile is
+/// re-looked-up for its declared `billing` and whether it names a credential.
+fn native_llm_billing(
+    selection: &profiles::Selection,
+    config: &serde_json::Value,
+    credential_source: &str,
+) -> crate::observability::llm_billing::LlmBilling {
+    let profile = selection
+        .profile
+        .as_deref()
+        .and_then(|name| profiles::lookup(Some(name), config).ok())
+        .map(|(_, profile)| profile);
+    crate::observability::llm_billing::LlmBilling::native(
+        selection.profile.as_deref(),
+        profile.as_ref().and_then(|p| p.billing.as_deref()),
+        profile.as_ref().map_or_else(
+            || !selection.credential_sources.is_empty(),
+            |p| p.credential_env.is_some(),
+        ),
+        credential_source,
+    )
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -462,6 +485,11 @@ fn run_preflight(
             }
             None => credential::resolve(root, &selection)?,
         };
+        // #10749: how this launch is billed, from the profile's declared class
+        // and the credential source actually resolved. Enumerated vocabulary
+        // plus the profile name only; never a key, account or path.
+        let llm_billing = native_llm_billing(&selection, &config, credential.source.as_str());
+        llm_billing.stamp(&mut trace_identity);
         let expanded = options
             .prompt
             .as_deref()
@@ -496,7 +524,7 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
         if let Some(route) = &gateway {
             writeln!(log, "{}", route.marker(&runtime))
                 .map_err(|e| LaunchError::config(e.to_string()))?;
@@ -662,6 +690,18 @@ fn run_preflight(
     log.flush()
         .map_err(|e| LaunchError::config(e.to_string()))?;
     trace_identity.insert("loom.runtime".into(), runtime.clone());
+    // #10749: Claude/Codex (legacy adapters) are classified by runtime; a
+    // native harness already stamped its own billing above.
+    if !trace_identity.contains_key(crate::observability::llm_billing::BILLING_KEY) {
+        let metered_backstop = nonempty_env(crate::launch_env::PREFERENCE_MARKER_ENV)
+            .is_some_and(|marker| marker.contains(" backstop="));
+        crate::observability::llm_billing::LlmBilling::for_runtime(
+            &runtime,
+            nonempty_env("LOOM_MODEL_PROFILE").as_deref(),
+            metered_backstop,
+        )
+        .stamp(&mut trace_identity);
+    }
     // Host memory state at the runtime's launch (this span's begin boundary;
     // the daemon stamps the end boundary when the child exits or is observed
     // gone). Clones of this identity carry the snapshot onto the RuntimeRun
