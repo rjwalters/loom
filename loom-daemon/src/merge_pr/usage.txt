@@ -115,7 +115,7 @@ Precedence (highest wins):
 
 Exit codes:
   0 = merged (or --help) · 1 = failed
-  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896), or no concluded CI run for this exact head yet (#10567) — neither is a failure; retry later
   4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
   6 = deferred behind another PR's chain-head merge lock (#10167; --auto or LOOM_CHAIN_LOCK_GUARD=1; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses) — nothing written; retry later
 
