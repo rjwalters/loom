@@ -1068,10 +1068,17 @@ mod tests {
             );
         }
         assert!(reg.prless_retry_held(7893));
-        let remaining = reg.prless_retry_remaining(7893, Utc::now()).unwrap();
+        // Query at the instant the final state was recorded, not `Utc::now()`:
+        // `record_prless_release` samples its own clock to compute `until`, so
+        // a later wall-clock read makes the remaining window depend on elapsed
+        // time, and `as_secs()` truncates to whole seconds. The old
+        // `max_backoff - 1` expectation therefore flaked by one second
+        // whenever the test crossed a second boundary (#10598).
+        let recorded_at = reg.prless_retry.get(&7893).unwrap().recorded_at;
+        let remaining = reg.prless_retry_remaining(7893, recorded_at).unwrap();
         assert_eq!(
             remaining.as_secs(),
-            reg.prless_retry_config().max_backoff.as_secs() - 1,
+            reg.prless_retry_config().max_backoff.as_secs(),
             "a held issue rides the ceiling, not the ladder"
         );
     }
