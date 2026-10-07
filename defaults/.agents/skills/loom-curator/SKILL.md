@@ -37,6 +37,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Where to Add Enhancements](#where-to-add-enhancements)
 - [Checking Dependencies](#checking-dependencies)
 - [Repairing `loom:decision-malformed` (#10057)](#repairing-loomdecision-malformed-10057)
+- [Revising `loom:needs-revision` (#10753)](#revising-loomneeds-revision-10753)
 - [Checking Operator-Only Premises (#6849)](#checking-operator-only-premises-6849)
 - [De-escalating Fact-Based Champion Escalations (#7650)](#de-escalating-fact-based-champion-escalations-7650)
 - [Issue Quality Checklist](#issue-quality-checklist)
@@ -219,7 +220,13 @@ Curate each at once (no workflow label = treat as `loom:triage`), then add
 `loom:curated` and `loom:issue` in ONE label POST. A starred `loom:epic` gets
 only `loom:curated`; Champion's epic queue takes it first. Guards still apply: skip the labels in the query above and hard exclusions. Never add or remove a priority label (the star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate, never
-promote: the daemon admits them on a red `main`.
+promote: the daemon admits them on a red `main`. Then Champion's revision requests, oldest
+first ("Revising `loom:needs-revision`" below, #10753):
+
+```bash
+gh issue list --label loom:needs-revision --state open --json number,title,labels,createdAt \
+  --jq 'sort_by(.createdAt) | .[] | select([.labels[].name] | index("loom:curating") | not) | "#\(.number) \(.title)"'
+```
 
 ### Priority 1: Approved Issues Needing Curation
 
@@ -384,7 +391,7 @@ re-check (has the named blocker/epic closed?) on `loom:operator-only` issues.
 That re-check never removes the label or auto-releases the issue.
 
 **Workflow**:
-1. Priority 0 (starred, then red-main fixes) first; then Priority 1
+1. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1
 2. If no results, use Priority 2
 3. Take the first result — the query now returns oldest-first (`sort_by(.createdAt)`), so no manual age comparison is needed
 4. Enhance and mark as `loom:curated`
@@ -1781,6 +1788,34 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
 - **No-loop guard**: a decision-bounce comment newer than your repair marker means
   the repair bounced. Comment once and leave it alone.
 
+## Revising `loom:needs-revision` (#10753)
+
+Champion adds `loom:needs-revision` with a NEEDS REVISION verdict an agent can
+close; its discovery skips the label. Claim it
+(`loom:curating`) and read the latest trusted `Champion Review: NEEDS
+REVISION` comment: its first bullet list is the findings. Then do one of these:
+
+- **Revise** (the normal case). Edit the body; never only comment, because a
+  comment leaves the body hash unchanged and Champion re-rejects the same text.
+  Fix each finding (verify facts against `origin/main`) or refute it with
+  evidence, and append a dated `## Revision` section answering each finding by
+  name. Then remove `loom:needs-revision` and `loom:curating` in one edit
+  (`loom:curated` stays).
+- **Split** an oversized issue per "Decomposing Oversized Issues", then park
+  the parent on its children so it never returns to Champion as a tracker:
+  `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
+  curator --remove-label loom:needs-revision --remove-label loom:curating`.
+- **Close** an obsolete, duplicate or wrong-approach issue ("Issues Are
+  Suggestions").
+- **A real PO-level call** no revision settles: `loom-daemon operator-decision
+  apply` with 2-4 ranked options (`.loom/docs/operator-decision.md`), then
+  remove the label.
+
+A routing comment carrying `<!-- champion:revision-exhausted -->` is the
+**final round**: a further failure goes to the operator, so prefer a split, a
+close or a decision to a marginal edit. Loop and bound:
+`.loom/docs/promotion-throughput.md`.
+
 ## Checking Operator-Only Premises (#6849)
 
 The `loom:blocked` dependency re-check above answers "has the thing this issue
@@ -1980,11 +2015,9 @@ sibling issue's PR merged.
 *every* recurring finding names a dependency and cites an issue/PR reference
 — Champion runs it itself, every pass, in "Pass 0: Self-Healing Un-Escalation
 Re-Scan" (`champion-issue-promo.md`). This section is for the complementary
-case: the escalation's findings are **not** dependency citations at all (a
-mixed or non-dependency finding set is exactly what routes Champion to
-`loom:operator-decision` instead of `loom:operator-blocked` in the first
-place — see "Choose the sub-kind before posting" in that file's escalation
-step). Do not attempt this procedure on an escalation `--check-unescalate`
+case: the escalation's findings are **not** dependency citations at all
+(since #10753 every Champion escalation is a ranked `loom:operator-decision`,
+filed per "Filing the decision" in that file's Step 4). Do not attempt this procedure on an escalation `--check-unescalate`
 would already handle; let Pass 0 handle it.
 
 **When this applies**: a `loom:operator-only` issue that carries a
@@ -2052,9 +2085,9 @@ re-evaluation could settle.
    this is the acceptance criterion's "revises the body" step, and it is
    what changes the body hash, the existing contract Champion already uses
    for "revised — evaluate again"), removes `loom:operator-only` and, best-
-   effort, its `loom:operator-decision` sub-kind label (the sub-kind a
-   fact-based escalation is expected to carry — see "Choose the sub-kind
-   before posting" in `champion-issue-promo.md`), and posts exactly one
+   effort, its `loom:operator-decision` sub-kind label (the sub-kind every
+   Champion escalation carries — "Filing the decision" in
+   `champion-issue-promo.md` Step 4), and posts exactly one
    comment naming the verifying commit and confirming the label removal. Say
    so in that comment (it already does) — do not post a second comment of
    your own repeating it.
@@ -2249,52 +2282,11 @@ cases) -- the same three sections described under "Issue Quality Checklist".
 
 ### Blocked Issue Re-check → Silent Skip vs. Real Comment
 
-See "Re-check Idempotency" under Checking Dependencies for the rule. Three
-passes over the same `loom:blocked` issue #4736, whose only blocker is the
-superseding PR #4743:
-
-```markdown
-Pass 1 — 2026-07-31 14:11. No prior `curator:dep-recheck` marker on the issue.
-  Blockers: 4743:OPEN:loom:changes-requested → CONCLUSION_HASH = a1b2c3d4e5f60718
-  → COMMENT (first-ever check always reports):
-  ---
-  **Curator dependency re-check**: still blocked. PR #4743 is OPEN with
-  `loom:changes-requested` and would close this issue, so the superseding block
-  is still active. Leaving `loom:blocked` in place.
-
-  <!-- curator:dep-recheck:a1b2c3d4e5f60718 -->
-  ---
-
-Pass 2 — 2026-07-31 15:04 (53 min later). PR #4743 unchanged.
-  CONCLUSION_HASH = a1b2c3d4e5f60718 — identical to the prior marker, and that
-  comment is 0.9h old, well inside the 24h window.
-  → SKIP SILENTLY. No comment, no label change, no `loom:curating` claim.
-  The four further passes through 2026-08-01 06:10 skip the same way — the six
-  duplicate comments that motivated #4986 collapse to the single Pass 1 comment.
-
-Pass 3 — 2026-08-01 09:30. PR #4743 merged.
-  Blockers: (none) → VERDICT=clear → CONCLUSION_HASH = 9f8e7d6c5b4a3210
-  Hash differs from the prior marker → COMMENT unconditionally (a changed
-  conclusion is never suppressed, window irrelevant), then run the normal
-  unblock steps.
-  ---
-  **Curator dependency re-check**: unblocked. PR #4743 merged, no other linked
-  PR carries `loom:changes-requested`/`loom:blocked`. Removing `loom:blocked`
-  and marking `loom:curated`.
-
-  <!-- curator:dep-recheck:9f8e7d6c5b4a3210 -->
-  ---
-```
-
-Variant — the staleness heartbeat: had PR #4743 still been OPEN and unchanged
-on 2026-08-01 15:00, Pass 3's hash would still match Pass 1's, but that marker
-would be 24.8h old — past the window. That pass posts **exactly one** heartbeat
-("still blocked on #4743, no change since <date>") carrying the same hash, and
-the 24h window restarts from it. The passes in between still skip.
-
-Why this pattern matters: only Pass 1 and Pass 3 (`$CLAIM=true` from
-`decide`) claim/act/release (#7617); Pass 2's skip claims nothing, avoiding
-the old shape's per-pass claim/release churn with no work performed.
+The rule and its four-way decision are "Re-check Idempotency" under Checking
+Dependencies. In short: the first re-check of a `loom:blocked` issue posts its
+`curator:dep-recheck` fingerprint; an unchanged conclusion skips silently and
+claims nothing, with one heartbeat once the last comment is 24h old; a changed
+conclusion always posts. On #4736 that turned six duplicate comments into one.
 
 ### Verified Corrections Survive Re-Curation → Append, Never Overwrite
 
