@@ -309,6 +309,12 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let Ok(selection) = crate::worker_spawn::profiles::resolve(runtime, &name, &profile) else {
         return ungated(CredentialSource::Unobservable);
     };
+    // #9473: a profile routed through the LLM gateway never consults the pool
+    // (the gateway's virtual key replaces it), so the pool is not its wall. A
+    // routed profile that cannot launch fails loudly at launch, as above.
+    if !matches!(crate::worker_spawn::llm_gateway::plan(runtime, &selection, &config), Ok(None)) {
+        return ungated(CredentialSource::Unobservable);
+    }
     // Step 1/2 of the ladder: which single source variable is unset?
     let unset: Vec<&str> = selection
         .credentials

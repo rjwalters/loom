@@ -100,7 +100,7 @@ pub const LAUNCH_RECORD_PREFIX: &str = "# LOOM_LAUNCH ";
 /// The parts of a `# LOOM_LAUNCH` record this module acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRecord {
-    /// `credentialSource`: `pool`, `env` or `none`.
+    /// `credentialSource`: `pool`, `env`, `gateway` (#9473) or `none`.
     pub credential_source: String,
     /// `credentialProvider` — the **pool namespace** (`zai`), not the
     /// harness-facing provider id (`zai-coding-plan`).

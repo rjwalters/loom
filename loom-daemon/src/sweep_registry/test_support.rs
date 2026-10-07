@@ -158,6 +158,7 @@ pub(crate) fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
   printf 'LOOM_SWEEP_ID=%s\n' "${{LOOM_SWEEP_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
   printf 'GH_CONFIG_DIR=%s\n' "${{GH_CONFIG_DIR:-unset}}"
+  printf 'LOOM_LLM_GATEWAY_VK=%s\n' "${{LOOM_LLM_GATEWAY_VK:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,

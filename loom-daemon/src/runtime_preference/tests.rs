@@ -45,7 +45,7 @@ use std::path::Path;
 /// claim is that *nothing* is configured. The lease **directory** override is
 /// deliberately not in this list: `ScopedLeaseDir` sets it, and the two guards
 /// coexist in the same tests.
-struct ClearedRuntimeEnv {
+pub(super) struct ClearedRuntimeEnv {
     prior: Vec<(&'static str, Option<String>)>,
     /// Held only so the empty profile root outlives the guard. Never read.
     _profile_root: tempfile::TempDir,
@@ -67,7 +67,7 @@ const ISOLATED_VARS: [&str; 10] = [
 ];
 
 impl ClearedRuntimeEnv {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let prior = ISOLATED_VARS
             .iter()
@@ -370,7 +370,7 @@ fn malformed_preference_config_fails_closed() {
 /// A workspace with the real shipped role/runtime manifests plus executable
 /// adapter stubs, so admission behaves exactly as it does in production —
 /// including `codex`'s `worktreeIsolation: "partial"`.
-fn fixture() -> tempfile::TempDir {
+pub(super) fn fixture() -> tempfile::TempDir {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let dir = tempfile::tempdir().unwrap();
     for sub in ["roles", "runtimes", "scripts"] {

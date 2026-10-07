@@ -48,7 +48,8 @@ pub use crate::api_keys_pool::ingest::LAUNCH_RECORD_PREFIX as LAUNCH_RECORD_MARK
 /// per-account failure attribution are reconstructable from the journal alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialAttribution {
-    /// `"pool"`, `"env"` or `"none"` — `worker_spawn::credential::Source`.
+    /// `"pool"`, `"env"`, `"gateway"` (#9473) or `"none"` —
+    /// `worker_spawn::credential::Source`.
     pub source: String,
     /// The API-key pool's provider namespace (`zai`, …). `None` for an
     /// env-sourced or unpooled spawn.

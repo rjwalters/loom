@@ -224,6 +224,13 @@ pub(super) fn run_role_with_timeout(
     // divergence. Shared with `sweep_registry::spawn_process`'s identical
     // block — the rationale for each pin lives in `launch_env`'s module doc.
     crate::launch_env::apply_launch_env(&mut cmd, admission, "role_runner");
+    // #9473: same LLM-gateway guard as the sweep spawn — a role tick admitted
+    // for Claude or Codex never carries the gateway contract.
+    crate::worker_spawn::llm_gateway::guard_dispatch(
+        &mut cmd,
+        script,
+        admission.map(|a| a.runtime.as_str()),
+    );
 
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call
