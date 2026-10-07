@@ -714,9 +714,13 @@ pub struct RealFallbackRecordGuard {
 
 #[allow(dead_code)]
 impl RealFallbackRecordGuard {
-    pub fn new() -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        let path = home.join(".loom").join("session-reconcile-fallback-root.json");
+    pub fn arm() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let path = home
+            .join(".loom")
+            .join("session-reconcile-fallback-root.json");
         let before = Self::fingerprint(&path);
         Self { path, before }
     }

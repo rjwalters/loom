@@ -86,7 +86,7 @@ const RESPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
 #[tokio::test]
 #[serial]
 async fn test_drain_exit0_then_watchdog_systemd_kickstart_recovers() {
-    let _real_record = common::RealFallbackRecordGuard::new();
+    let _real_record = common::RealFallbackRecordGuard::arm();
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("daemon.sock");
     let workspace_root = temp_dir.path().join("workspace");

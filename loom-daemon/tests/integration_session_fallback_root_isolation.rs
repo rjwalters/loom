@@ -15,6 +15,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+#[allow(dead_code)]
 mod common;
 
 use common::{daemon_bin, isolate_daemon_state, RealFallbackRecordGuard};
@@ -27,7 +28,7 @@ const RECORD_WAIT: Duration = Duration::from_secs(90);
 #[test]
 #[serial]
 fn a_test_daemon_writes_its_fallback_root_record_only_inside_its_fixture() {
-    let _real_record = RealFallbackRecordGuard::new();
+    let _real_record = RealFallbackRecordGuard::arm();
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().canonicalize().unwrap();
     let mut cmd = Command::new(daemon_bin());
