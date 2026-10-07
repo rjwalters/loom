@@ -86,7 +86,9 @@ pub const MIN_JUDGE_VERDICTS: u32 = 5;
 
 /// One PR's changed-file list as observed at `known_at`: the head commit's
 /// files then, never the final diff. A PR may have several snapshots; the
-/// builder takes the latest before `as_of`.
+/// builder takes the latest before `as_of`, and an incomplete latest one
+/// (`complete: false`) makes the list unknown then, never an older complete
+/// list served as current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSnapshot {
     /// `owner/repo`.
@@ -95,8 +97,21 @@ pub struct FileSnapshot {
     pub pr: u32,
     /// When the list was read.
     pub known_at: DateTime<Utc>,
-    /// The changed paths.
+    /// The changed paths; empty and meaningless when not `complete`.
     pub files: Vec<String>,
+    /// The head commit the list describes, when the read could tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// Whether `files` is the PR's whole list at that head. `false` records
+    /// that the read returned a possibly truncated or head-inconsistent page:
+    /// the list is unknown from `known_at` on. Absent (older lines) is
+    /// `true`: only complete lists were logged before the field existed.
+    #[serde(default = "complete_default")]
+    pub complete: bool,
+}
+
+const fn complete_default() -> bool {
+    true
 }
 
 /// One finished CI run of a PR's head, as read from SigNoz `ci.run` (or the
@@ -197,7 +212,9 @@ pub fn repo_context<'a>(
         .collect()
 }
 
-/// The latest snapshot of `pr` known strictly before `as_of`.
+/// The latest snapshot of `pr` known strictly before `as_of`, or `None` when
+/// there is none or the latest is an incomplete (unknown) observation: an
+/// older complete list is not current once a later read could not confirm it.
 fn latest_files<'a>(
     files: &'a [FileSnapshot],
     repo: &str,
@@ -208,6 +225,7 @@ fn latest_files<'a>(
         .iter()
         .filter(|s| s.pr == pr && s.repo.eq_ignore_ascii_case(repo) && s.known_at < as_of)
         .max_by_key(|s| s.known_at)
+        .filter(|s| s.complete)
 }
 
 /// The repo's Judge rejection rate over the trailing window before `as_of`.

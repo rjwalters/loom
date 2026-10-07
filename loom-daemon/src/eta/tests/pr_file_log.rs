@@ -3,7 +3,7 @@
 
 use crate::eta::loop_features::FileSnapshot;
 use crate::eta::pr_file_log::{
-    append, compact, load, log_path, parse_files, plan, refresh, Candidate, ReadClock,
+    append, compact, load, log_path, parse_files, parse_page, plan, refresh, Candidate, ReadClock,
     MAX_LISTED_FILES,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -26,6 +26,28 @@ fn body(files: &[&str]) -> Value {
     Value::Array(files.iter().map(|f| json!({ "filename": f })).collect())
 }
 
+/// A page as GitHub returns it: each entry names the head it was read at.
+fn body_at(head: &str, files: &[&str]) -> Value {
+    Value::Array(
+        files
+            .iter()
+            .map(|f| {
+                json!({
+                    "filename": f,
+                    "blob_url": format!("https://github.com/o/r/blob/{head}/{f}"),
+                    "contents_url": format!("https://api.github.com/repos/o/r/contents/{f}?ref={head}"),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn full_page(head: &str) -> Value {
+    let full: Vec<String> = (0..MAX_LISTED_FILES).map(|i| format!("f{i}")).collect();
+    let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+    body_at(head, &refs)
+}
+
 #[test]
 fn a_page_parses_sorted_and_a_full_page_is_refused() {
     assert_eq!(parse_files(&body(&["b", "a", "a"])), Some(vec!["a".into(), "b".into()]));
@@ -44,12 +66,16 @@ fn the_plan_reads_never_read_first_then_the_stalest_within_budget() {
             pr: 1,
             known_at: t(1),
             files: vec![],
+            head_sha: None,
+            complete: true,
         },
         FileSnapshot {
             repo: "O/R".into(),
             pr: 2,
             known_at: t(5),
             files: vec![],
+            head_sha: None,
+            complete: true,
         },
     ];
     let cands = [
@@ -76,6 +102,8 @@ fn a_pr_not_updated_since_its_last_read_is_left_alone() {
         pr: 1,
         known_at: t(5),
         files: vec![],
+        head_sha: None,
+        complete: true,
     }];
     let clock = ReadClock::default();
     assert!(plan(&[cand(1, Some(5)), cand(1, Some(4))], &log, &clock, 9).is_empty());
@@ -136,13 +164,115 @@ fn a_pass_logs_only_changed_lists_stamped_at_the_read() {
 }
 
 #[test]
-fn a_truncated_list_is_marked_read_but_never_logged() {
-    let full: Vec<String> = (0..MAX_LISTED_FILES).map(|i| format!("f{i}")).collect();
-    let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+fn a_truncated_list_logs_an_incomplete_observation_not_its_paths() {
     let mut clock = ReadClock::default();
-    let out = refresh(&[cand(1, None)], &[], &mut clock, 9, || t(1), |_| Some(body(&refs)));
-    assert!(out.is_empty());
-    assert!(plan(&[cand(1, Some(0))], &[], &clock, 9).is_empty());
+    let out = refresh(&[cand(1, None)], &[], &mut clock, 9, || t(1), |_| Some(full_page("h1")));
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].complete, "a full page is unknown, not a list");
+    assert!(out[0].files.is_empty());
+    assert_eq!((out[0].known_at, out[0].head_sha.as_deref()), (t(1), Some("h1")));
+    // Marked read: not re-read until updated.
+    assert!(plan(&[cand(1, Some(0))], &out, &clock, 9).is_empty());
+}
+
+#[test]
+fn the_page_names_its_head_and_a_mixed_head_page_is_incomplete() {
+    let page = parse_page(&body_at("abc", &["b", "a"])).unwrap();
+    assert_eq!(page.files, Some(vec!["a".into(), "b".into()]));
+    assert_eq!(page.head_sha.as_deref(), Some("abc"));
+    // A push landed mid-read: the entries disagree on the head.
+    let mut rows = body_at("h1", &["a"]).as_array().unwrap().clone();
+    rows.extend(body_at("h2", &["b"]).as_array().unwrap().clone());
+    let mixed = parse_page(&Value::Array(rows.clone())).unwrap();
+    assert_eq!((mixed.files, mixed.head_sha), (None, None));
+    let mut clock = ReadClock::default();
+    let out = refresh(
+        &[cand(1, None)],
+        &[],
+        &mut clock,
+        9,
+        || t(1),
+        |_| Some(Value::Array(rows.clone())),
+    );
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].complete, "a head race is logged unknown");
+}
+
+#[test]
+fn distinct_heads_with_the_same_paths_keep_their_identity_history() {
+    let mut clock = ReadClock::default();
+    let first =
+        refresh(&[cand(1, None)], &[], &mut clock, 9, || t(1), |_| Some(body_at("h1", &["a"])));
+    let second = refresh(
+        &[cand(1, Some(2))],
+        &first,
+        &mut clock,
+        9,
+        || t(3),
+        |_| Some(body_at("h2", &["a"])),
+    );
+    assert_eq!(second.len(), 1, "a new head is a change even with equal paths");
+    assert_eq!(second[0].head_sha.as_deref(), Some("h2"));
+    let log: Vec<_> = first.iter().chain(&second).cloned().collect();
+    let third = refresh(
+        &[cand(1, Some(4))],
+        &log,
+        &mut clock,
+        9,
+        || t(5),
+        |_| Some(body_at("h2", &["a"])),
+    );
+    assert!(third.is_empty(), "the same head and paths append nothing");
+}
+
+#[test]
+fn complete_then_truncated_then_complete_survives_a_restart() {
+    use crate::eta::loop_features::{loop_features, LoopInputs};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Each pass is a fresh process: a new clock, the log read back from disk.
+    let pass = |updated: i64, at: i64, page: Value| {
+        let mut clock = ReadClock::default();
+        let log = load(root);
+        let fresh = refresh(
+            &[cand(1, Some(updated))],
+            &log,
+            &mut clock,
+            9,
+            || t(at),
+            |_| Some(page.clone()),
+        );
+        append(root, &fresh).unwrap();
+        fresh.len()
+    };
+    assert_eq!(pass(0, 1, body_at("h1", &["a.rs"])), 1);
+    assert_eq!(pass(2, 3, full_page("h2")), 1, "the grown list is logged unknown");
+    // Not updated since: a restarted reader does not re-read it.
+    assert!(plan(&[cand(1, Some(2))], &load(root), &ReadClock::default(), 9).is_empty());
+    assert_eq!(pass(4, 5, body_at("h3", &["b.rs"])), 1);
+
+    let log = load(root);
+    assert_eq!(log.iter().map(|s| s.complete).collect::<Vec<_>>(), vec![true, false, true]);
+    // The consumer: #1 alone in the repo, so its overlap is known exactly
+    // when its own list is.
+    let known = |h: i64| {
+        loop_features(
+            &LoopInputs {
+                repo: "o/r",
+                pr: 1,
+                own: &[],
+                repo_episodes: &[],
+                files: Some(&log),
+                ci: None,
+            },
+            t(h),
+        )
+        .overlap_prs
+        .is_some()
+    };
+    assert!(known(2), "before the truncated read the older complete list serves");
+    assert!(!known(4), "after it the older list is not served as current");
+    assert!(known(6), "a later complete read restores it");
 }
 
 #[test]
@@ -155,12 +285,16 @@ fn the_log_round_trips_beside_the_fleet_snapshots_and_compacts() {
         pr: 1,
         known_at: t(1),
         files: vec!["x".into()],
+        head_sha: None,
+        complete: true,
     };
     let b = FileSnapshot {
         repo: "o/r".into(),
         pr: 2,
         known_at: t(2),
         files: vec![],
+        head_sha: None,
+        complete: true,
     };
     append(root, std::slice::from_ref(&a)).unwrap();
     append(root, std::slice::from_ref(&b)).unwrap();

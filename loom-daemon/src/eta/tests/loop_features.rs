@@ -72,6 +72,8 @@ fn snap(pr: u32, known: f64, files: &[&str]) -> FileSnapshot {
         pr,
         known_at: at(known),
         files: files.iter().map(|f| (*f).to_string()).collect(),
+        head_sha: None,
+        complete: true,
     }
 }
 
@@ -471,4 +473,37 @@ fn a_peer_with_no_list_known_yet_makes_the_roster_unknown() {
     let files = vec![snap(1, 2.5, &["a.rs"])];
     let a = rows::build_with_files(&fleet(), cutoff(), None, None, Some(&files));
     assert!(a.loops.iter().all(|l| l.overlap_prs.is_none()));
+}
+
+#[test]
+fn a_later_incomplete_read_stops_an_older_list_serving_in_fit_and_serving() {
+    let snaps = fleet();
+    let base_files = logged();
+    let base = rows::build_with_files(&snaps, cutoff(), None, None, Some(&base_files));
+    // #2 grew past one page at 9 h: its read is logged unknown, not its paths.
+    let mut grown = base_files.clone();
+    grown.push(FileSnapshot {
+        files: vec![],
+        complete: false,
+        ..snap(2, 9.0, &[])
+    });
+    let after = rows::build_with_files(&snaps, cutoff(), None, None, Some(&grown));
+    let mut before = 0;
+    let mut unknown = 0;
+    for ((k, b), a) in base.row_keys.iter().zip(&base.loops).zip(&after.loops) {
+        if k.at - lag() <= at(9.0) {
+            assert_eq!(b, a, "#{} at {} must not see the later read", k.pr, k.at);
+            before += 1;
+        } else if b.overlap_prs.is_some() {
+            assert!(a.overlap_prs.is_none(), "#{} at {} served a stale list", k.pr, k.at);
+            unknown += 1;
+        }
+    }
+    assert!(before > 0 && unknown > 0, "the test must cover both sides of the read");
+    let mut tracker = Tracker::new(provenance());
+    tracker.on_fleet_snapshots(&snaps, h(10.0));
+    tracker.set_file_snapshots(Some(grown));
+    for (k, l) in after.row_keys.iter().zip(&after.loops) {
+        assert_eq!(&tracker.loop_features_of(&k.repo, k.pr, k.at), l, "#{} at {}", k.pr, k.at);
+    }
 }

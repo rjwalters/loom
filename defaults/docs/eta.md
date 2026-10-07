@@ -1526,7 +1526,7 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
 #### File-list log (#10550)
 
 Predictor 1 needs each open PR's changed-file list **as known at `as_of`**.
-`eta::pr_file_log` logs one `FileSnapshot {repo, pr, known_at, files}` per
+`eta::pr_file_log` logs one `FileSnapshot {repo, pr, known_at, files, head_sha, complete}` per
 change of a PR's list, stamped with the instant the read returned, in
 `pr-files.jsonl` beside the fleet snapshots (`.loom/state/eta/fleet/`; the
 extension keeps `fleet::load_all`'s `*.json` listing to snapshots alone).
@@ -1538,8 +1538,17 @@ extension keeps `fleet::load_all`'s `*.json` listing to snapshots alone).
   breaker suppresses polling. Never-read PRs go first, then the stalest; a PR
   not updated since its last read is left alone, and an unchanged list (a
   `304`, or an equal body) appends nothing.
-- **A full page is not logged.** 100 entries may be truncated, and a partial
-  list would read as a confident smaller overlap, so that PR stays unknown.
+- **A full page logs unknown, not its paths.** 100 entries may be truncated,
+  and a partial list would read as a confident smaller overlap, so the read
+  logs an incomplete observation (`complete: false`) stamped at that
+  instant. From then on the PR's list is unknown; an older complete list
+  (before the PR grew past a page) still serves earlier cutoffs but is never
+  served as current after the incomplete read. A later whole page restores
+  it. Lines written before the field existed read as `complete`.
+- **Head identity.** Each snapshot carries `head_sha`, read from the page's
+  own entries (`contents_url` `?ref=` / `blob_url`). A page whose entries
+  name different heads (a push landed mid-read) logs incomplete, and a new
+  head is logged even when its paths equal the previous head's.
 - **Point in time.** The builder reads the latest snapshot strictly before
   `as_of` (`t - lag` in the fit, `now - lag` serving), so a later push, or a
   list first read later, moves no earlier row. The log starts when the reader

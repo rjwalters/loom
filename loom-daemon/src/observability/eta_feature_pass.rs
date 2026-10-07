@@ -112,9 +112,13 @@ async fn file_reads(
                 calls.set(calls.get() + 1);
                 crate::eta::pr_features_forge::fetch_pr_files(repo_root, &c.repo, c.pr)
             });
-        // A failed append is a lost observation, not a pass failure: the
-        // list is read again once its clock entry is stale.
-        let _ = pr_file_log::append(&root, &fresh);
+        // A failed append is a lost observation, not a pass failure: forget
+        // those reads so the next pass reads the lists again.
+        if pr_file_log::append(&root, &fresh).is_err() {
+            for s in &fresh {
+                clock.forget(&s.repo, s.pr);
+            }
+        }
         let _ = pr_file_log::compact(&root, Utc::now());
         calls.get()
     })
