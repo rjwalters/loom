@@ -619,7 +619,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::EtaEstimate(_)
         | TelemetryRecord::EtaOutcome(_)
         | TelemetryRecord::EtaFleetRefresh(_)
-        | TelemetryRecord::EtaFit(_) => {
+        | TelemetryRecord::EtaFit(_)
+        | TelemetryRecord::EtaBacktestFold(_)
+        | TelemetryRecord::EtaBacktestSummary(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes.
             let (event_name, severity, at, mut attributes, body) =

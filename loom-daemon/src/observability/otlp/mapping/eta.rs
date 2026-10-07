@@ -270,6 +270,80 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
         }
+        TelemetryRecord::EtaBacktestFold(r) => {
+            // #10492: one heuristic's fold for one day; stamped at its cutoff.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.eta.backtest.fold.fold_id", r.fold_id.clone()),
+                kv_string("loom.eta.backtest.fold.heuristic", r.heuristic.clone()),
+                kv_string("loom.eta.backtest.fold.kind", r.kind.clone()),
+                kv_string("loom.eta.backtest.fold.day", r.day.clone()),
+                kv_string("loom.eta.backtest.fold.compared_to", r.compared_to.clone()),
+                kv_bool("loom.eta.backtest.fold.is_current", r.is_current),
+                kv_int("loom.eta.backtest.fold.n_cases", to_i64(r.n_cases)),
+                kv_int("loom.eta.backtest.fold.n_answered", to_i64(r.n_answered)),
+                kv_int("loom.eta.backtest.fold.paired_pairs", to_i64(r.paired_pairs)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.backtest.fold.answer_rate", r.answer_rate),
+                ("loom.eta.backtest.fold.pinball4_loss_sec", r.pinball4_loss_sec),
+                ("loom.eta.backtest.fold.cov_25_75", r.cov_25_75),
+                ("loom.eta.backtest.fold.late_surprise", r.late_surprise),
+                ("loom.eta.backtest.fold.delta_pinball4_loss_sec", r.delta_pinball4_loss_sec),
+                ("loom.eta.backtest.fold.delta_answer_rate", r.delta_answer_rate),
+                ("loom.eta.backtest.fold.delta_late_surprise", r.delta_late_surprise),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_double(key, value));
+                }
+            }
+            if let Some(win) = r.win {
+                attributes.push(kv_bool("loom.eta.backtest.fold.win", win));
+            }
+            if let Some(fit_id) = &r.fit_id {
+                attributes.push(kv_string("loom.eta.backtest.fold.fit_id", fit_id.clone()));
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.backtest.fold", SeverityNumber::Info, nanos(r.cutoff), attributes, body))
+        }
+        TelemetryRecord::EtaBacktestSummary(r) => {
+            // #10492: one challenger's rolling standing; stamped at its cutoff.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.eta.backtest.summary.summary_id", r.summary_id.clone()),
+                kv_string("loom.eta.backtest.summary.heuristic", r.heuristic.clone()),
+                kv_string("loom.eta.backtest.summary.kind", r.kind.clone()),
+                kv_string("loom.eta.backtest.summary.compared_to", r.compared_to.clone()),
+                kv_string("loom.eta.backtest.summary.as_of_day", r.as_of_day.clone()),
+                kv_int("loom.eta.backtest.summary.cases", to_i64(r.cases)),
+                kv_int("loom.eta.backtest.summary.days", to_i64(r.days)),
+                kv_int("loom.eta.backtest.summary.wins", to_i64(r.wins)),
+                kv_int("loom.eta.backtest.summary.ties", to_i64(r.ties)),
+                kv_int("loom.eta.backtest.summary.min_folds", to_i64(r.min_folds)),
+                kv_bool("loom.eta.backtest.summary.gate_ready", r.gate_ready),
+                kv_string("loom.eta.backtest.summary.gate_detail", r.gate_detail.clone()),
+                kv_int("loom.eta.backtest.summary.cases_before_fit", to_i64(r.cases_before_fit)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.backtest.summary.win_rate", r.win_rate),
+                ("loom.eta.backtest.summary.ci_low", r.ci_low),
+                ("loom.eta.backtest.summary.ci_high", r.ci_high),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_double(key, value));
+                }
+            }
+            if let Some(day) = &r.fitted_from {
+                attributes.push(kv_string("loom.eta.backtest.summary.fitted_from", day.clone()));
+            }
+            if let Some(fit_id) = &r.fit_id {
+                attributes.push(kv_string("loom.eta.backtest.summary.fit_id", fit_id.clone()));
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.backtest.summary", SeverityNumber::Info, nanos(r.cutoff), attributes, body))
+        }
         _ => None,
     }
 }
