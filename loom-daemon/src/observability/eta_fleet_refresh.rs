@@ -70,7 +70,9 @@
 //!    `signoz.historyPrimary` (#10520) each pass reads its history from the
 //!    SigNoz timeline first and the forge only to fill gaps, under
 //!    `gapFillMaxCallsPerPass` ([`crate::eta::fleet_signoz_history`]).
-//! 4. **Raw events** (#10250, #10298): each repo's raw cache is synced
+//! 4. **Raw events** (#10250, #10298): with SigNoz history on, a repo SigNoz
+//!    covered is skipped and the others' reads are gap-fill, counted and capped
+//!    ([`EventsGate`], #10520). Each repo's raw cache is synced
 //!    in-process from every repo-wide listing ([`event_endpoints`]: issue
 //!    events, then pulls), each through its own reader-only source and its own
 //!    cursor, from what the matching shared budget has left. After the
@@ -104,6 +106,8 @@ use crate::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode};
 use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use crate::eta::fleet_fetch::{ForgeRead, Installation, NoReader, Reader, ReaderForge, RepoTarget};
 use crate::eta::fleet_refresh::{self, Budgets, CycleReport, PassKind, RepoReport, StopReason};
+use crate::eta::fleet_signoz_history::EventsGate;
+use crate::eta::fleet_signoz_refresh::{Limits, SignozRead};
 use crate::eta::Provenance;
 use crate::task_liveness::ETA_FLEET_REFRESH;
 use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
@@ -649,12 +653,29 @@ pub fn event_endpoints() -> impl Iterator<Item = ForgeEndpoint> {
 }
 
 /// One cycle over `targets`: gates, snapshots, raw events. Testable with a
-/// fake forge and events seam; the fit call and the record emission are the
-/// caller's.
+/// fake forge and events seam ([`cycle_with`] adds a SigNoz seam); the fit
+/// call and the record emission are the caller's.
 pub fn cycle(
     root: &Path,
     targets: &[RepoTarget],
     forge: &mut dyn ForgeRead,
+    events: &mut EventsSync<'_>,
+    config: &FleetRefreshConfig,
+    task: &mut TaskState,
+    now: DateTime<Utc>,
+) -> CycleOutcome {
+    let mut history = crate::eta::fleet_signoz_history::reader(&config.signoz);
+    let signoz = history
+        .as_mut()
+        .map(|(reader, limits)| (reader as &mut dyn SignozRead, *limits));
+    cycle_with(root, targets, (forge, signoz), events, config, task, now)
+}
+
+/// [`cycle`] over a given forge and SigNoz timeline reader (#10520).
+pub fn cycle_with(
+    root: &Path,
+    targets: &[RepoTarget],
+    (forge, signoz): (&mut dyn ForgeRead, Option<(&mut dyn SignozRead, Limits)>),
     events: &mut EventsSync<'_>,
     config: &FleetRefreshConfig,
     task: &mut TaskState,
@@ -707,12 +728,9 @@ pub fn cycle(
             backfill_days: config.backfill_days,
             gap_fill: config.gap_fill_max_calls_per_pass,
         };
-        let mut history = crate::eta::fleet_signoz_history::reader(&config.signoz);
-        let signoz = history.as_mut().map(|(reader, limits)| {
-            (reader as &mut dyn crate::eta::fleet_signoz_refresh::SignozRead, *limits)
-        });
         let mut report = fleet_refresh::run_cycle_with(root, targets, forge, signoz, budgets, now);
-        sync_all_events(root, targets, events, &mut report);
+        let gap = (config.gap_fill_max_calls_per_pass, now);
+        sync_all_events(root, targets, events, &mut report, gap);
         report
     };
     if let Some(reset) = report.rate_limited {
@@ -765,12 +783,16 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// and repo. Skipped for a repo whose snapshot pass hit a coverage gap, for
 /// every repo on a reader installation (App and owner, #10329) that hit the
 /// reserve, and for everything left
-/// once one sync is rate limited or meets the open breaker.
+/// once one sync is rate limited or meets the open breaker. With SigNoz
+/// history on (#10520) each repo also follows its [`EventsGate`]: none for a
+/// covered repo, gap-fill (counted, and capped by `gap`'s per-repo budget
+/// less what the snapshot pass spent) otherwise.
 fn sync_all_events(
     root: &Path,
     targets: &[RepoTarget],
     events: &mut EventsSync<'_>,
     report: &mut CycleReport,
+    (gap_budget, now): (u64, DateTime<Utc>),
 ) {
     let halted = report.repos.iter().any(|r| {
         matches!(r.stop, StopReason::RateLimited | StopReason::BreakerOpen | StopReason::Shutdown)
@@ -793,7 +815,8 @@ fn sync_all_events(
         let Some(repo_report) = report.repos.iter_mut().find(|r| r.repo == target.repo) else {
             continue;
         };
-        if repo_report.stop == StopReason::Coverage {
+        let mut gate = EventsGate::for_repo(repo_report, gap_budget);
+        if repo_report.stop == StopReason::Coverage || gate == EventsGate::Skip {
             continue;
         }
         let cursor_file = fleet_events::cursor_path(root, &target.repo);
@@ -812,14 +835,19 @@ fn sync_all_events(
             } else {
                 (SyncMode::Backfill, &mut report.remaining.1)
             };
-            if *left == 0 {
+            let allowed = gate.allowance(*left);
+            if allowed == 0 {
                 continue;
             }
-            let (appended, spent, stop) = events(target, reader, endpoint, *left, mode);
+            let (appended, spent, stop) = events(target, reader, endpoint, allowed, mode);
             *left = left.saturating_sub(spent);
             repo_report.raw_events_added =
                 Some(repo_report.raw_events_added.unwrap_or(0) + appended);
             repo_report.forge_calls += spent;
+            gate.charge(repo_report, spent);
+            if spent > 0 {
+                crate::eta::fleet_signoz_history::note_report(root, repo_report, now);
+            }
             match stop {
                 Some(StopReason::RateLimited) => {
                     // Same consequence as a snapshot read: end the cycle, back off.

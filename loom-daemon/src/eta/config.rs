@@ -25,7 +25,7 @@
 //! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` (#10329) |
 //! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 //! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
-//! | `gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100`: forge gap-fill reads per repo per cycle with SigNoz history on (#10520) |
+//! | `gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100` (min `2`): forge gap-fill reads per repo per cycle with SigNoz history on (#10520) |
 //! | `signoz.historyPrimary` | `LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY` | `false` (opt-in): with `signoz.enabled`, SigNoz is the history source and the forge only gap-fills (#10520) |
 
 use super::Kind;
@@ -113,6 +113,12 @@ pub const DEFAULT_FLEET_REFRESH_BACKFILL_DAYS: i64 = 21;
 /// history source (#10520). Conservative: a covered window needs none, and a
 /// pass that needs more resumes next cycle.
 pub const DEFAULT_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 100;
+
+/// Smallest gap-fill budget accepted (#10520): one listing page plus one
+/// timeline page, so every cycle of an uncovered pass makes progress (an
+/// interrupted timeline resumes at its next page). Lower values, `0`
+/// included, are raised to it.
+pub const MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 2;
 
 /// Shallowest backfill accepted: one day more than the daily fit's window,
 /// so a fresh host's first fit sees a whole window of history.
@@ -429,6 +435,9 @@ fn resolve_fleet_refresh(
     }
     c.interval_secs = c.interval_secs.max(MIN_FLEET_REFRESH_INTERVAL_SECS);
     c.backfill_days = c.backfill_days.max(MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    c.gap_fill_max_calls_per_pass = c
+        .gap_fill_max_calls_per_pass
+        .max(MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS);
     c.signoz = resolve_fleet_signoz(get("signoz"), env);
     c
 }

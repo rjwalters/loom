@@ -575,6 +575,214 @@ fn a_partial_signoz_walk_is_never_treated_as_covered() {
     assert_eq!(r.gap_fill_calls, Some(2));
 }
 
+// -- progress under a small budget ---------------------------------------------
+
+/// [`rejected`], with `extra` add/remove toggles of a bystander label first:
+/// a timeline longer than one forge page.
+fn long_rejected(number: u32, opened: DateTime<Utc>, extra: usize) -> Truth {
+    let mut pr = rejected(number, opened);
+    let toggles = (0..extra).map(|i| {
+        let at = opened + Duration::seconds(i as i64 + 1);
+        (i % 2 == 0, "loom:bystander", at)
+    });
+    pr.labels.splice(1..1, toggles);
+    pr
+}
+
+/// One cycle with `gap` as the gap-fill budget, at `now() + hours`.
+fn cycle_at(
+    root: &Path,
+    forge: &mut Counting,
+    signoz: &mut FileRows,
+    gap: u64,
+    hours: i64,
+) -> crate::eta::fleet_refresh::RepoReport {
+    let at = now() + Duration::hours(hours);
+    let report =
+        run_cycle_with(root, &[target(root)], forge, Some((signoz, limits())), budgets(gap), at);
+    report.repos[0].clone()
+}
+
+/// A covered window whose one gap-filled PR has a three-page timeline, under
+/// a budget of 1: each cycle reads exactly one page, the pages already read
+/// are checkpointed, no page is read twice, and the pass publishes the same
+/// snapshot an uninterrupted pass does.
+#[test]
+fn an_interrupted_timeline_resumes_at_its_next_page_across_cycles() {
+    let prs = [
+        long_rejected(201, now() - Duration::hours(20), 240),
+        approved(301, now() - Duration::hours(10)),
+    ];
+    assert_eq!(forge_timeline(&prs[0]).len().div_ceil(PER_PAGE), 3);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut signoz = signoz_rows(&prs, true);
+    let mut forge = Counting::with(&prs);
+
+    let mut cycles = 0;
+    loop {
+        let r = cycle_at(root, &mut forge, &mut signoz, 1, cycles);
+        cycles += 1;
+        assert!(r.forge_calls <= 1, "never over the budget: {r:?}");
+        if r.stop == StopReason::Complete {
+            break;
+        }
+        assert_eq!(r.stop, StopReason::Budget);
+        let partial = read_state(&state_path(root, A))
+            .unwrap()
+            .pass
+            .unwrap()
+            .partial;
+        let partial = partial.expect("the pages read are checkpointed");
+        assert_eq!((partial.number, partial.next_page), (201, cycles as u32 + 1));
+        assert_eq!(partial.events.len(), PER_PAGE * cycles as usize);
+        assert!(cycles < 10, "bounded");
+    }
+    assert_eq!(cycles, 3, "one page per cycle");
+    assert_eq!(forge.timeline_reads(201), 3, "no page read twice: {:?}", forge.gets);
+    assert!(read_state(&state_path(root, A)).unwrap().pass.is_none());
+
+    let whole = tempfile::tempdir().unwrap();
+    let mut signoz = signoz_rows(&prs, true);
+    let mut forge = Counting::with(&prs);
+    assert_eq!(
+        cycle_at(whole.path(), &mut forge, &mut signoz, 100, 0).stop,
+        StopReason::Complete
+    );
+    let (resumed, once) = (published(root), published(whole.path()));
+    assert_eq!(resumed.prs, once.prs);
+    assert_eq!(resumed.samples, once.samples);
+    assert_eq!(resumed.episodes, once.episodes);
+    assert_eq!(resumed.merges, once.merges);
+}
+
+/// An uncovered window at the config floor (2): each cycle re-reads the
+/// listing page and still reads one timeline page, so a multi-page timeline
+/// completes and the pass ends — the shape a budget of 1 stalled on.
+#[test]
+fn an_uncovered_pass_at_the_budget_floor_completes() {
+    let floor = crate::eta::config::MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS;
+    let prs = [
+        long_rejected(201, now() - Duration::hours(20), 240),
+        approved(101, now() - Duration::hours(4)),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut signoz = signoz_rows(&prs, false);
+    let mut forge = Counting::with(&prs);
+
+    let mut cycles = 0;
+    loop {
+        let r = cycle_at(root, &mut forge, &mut signoz, floor, cycles);
+        cycles += 1;
+        assert_eq!(r.history, Some(HistorySource::ForgeUncovered));
+        assert!(r.forge_calls <= floor, "never over the budget: {r:?}");
+        if r.stop == StopReason::Complete {
+            assert!(r.promoted);
+            break;
+        }
+        assert!(cycles < 10, "bounded");
+    }
+    // 101's one page, then 201's three, one timeline page per cycle.
+    assert_eq!(cycles, 4);
+    assert_eq!((forge.timeline_reads(101), forge.timeline_reads(201)), (1, 3));
+    assert_eq!(published(root).prs, vec![101, 201]);
+}
+
+// -- the production cycle boundary (raw events too) ----------------------------
+
+/// What the events seam saw: `(endpoint, calls allowed)`.
+type Seen = Vec<(crate::eta::fleet_events_forge::ForgeEndpoint, u64)>;
+
+/// [`crate::observability::eta_fleet_refresh::cycle_with`] over `prs`: the
+/// snapshot phase *and* the raw-event phase, with an events seam that spends
+/// up to 3 calls per listing. Returns the repo's report and what the seam saw.
+fn production_cycle(
+    root: &Path,
+    forge: &mut Counting,
+    signoz: Option<&mut dyn SignozRead>,
+    gap: u64,
+) -> (crate::eta::fleet_refresh::RepoReport, Seen) {
+    use crate::eta::config::FleetRefreshConfig;
+    use crate::observability::eta_fleet_refresh::{cycle_with, TaskState};
+    let config = FleetRefreshConfig {
+        gap_fill_max_calls_per_pass: gap,
+        ..FleetRefreshConfig::default()
+    };
+    let mut seen = Seen::new();
+    let mut events = |_: &RepoTarget,
+                      _: &Reader,
+                      endpoint: crate::eta::fleet_events_forge::ForgeEndpoint,
+                      left: u64,
+                      _: crate::eta::fleet_events::SyncMode| {
+        seen.push((endpoint, left));
+        (0, left.min(3), None)
+    };
+    let outcome = cycle_with(
+        root,
+        &[target(root)],
+        (forge, signoz.map(|s| (s, limits()))),
+        &mut events,
+        &config,
+        &mut TaskState::default(),
+        now(),
+    );
+    (outcome.report.repos[0].clone(), seen)
+}
+
+/// The judge's case (#10520): at the production cycle boundary a covered
+/// window makes no forge read in either phase — no `ForgeRead` get and no
+/// raw-event sync — and reports 0; an uncovered window's raw-event reads are
+/// gap-fill, drawn from what the snapshot pass left of the same budget and
+/// counted in the doctor's note; an unavailable SigNoz leaves them under the
+/// pass-kind budgets, counted; with SigNoz history off nothing changes.
+#[test]
+fn the_production_cycle_counts_and_caps_raw_event_reads_too() {
+    let prs = [approved(101, now() - Duration::hours(10))];
+    let note = |root: &Path| read_state(&state_path(root, A)).unwrap().history.unwrap();
+
+    // Covered: zero, in both phases.
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = Counting::with(&prs);
+    let before = counters::get(GAP_FILL_COUNTER);
+    let mut signoz = signoz_rows(&prs, true);
+    let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
+    assert!(forge.gets.is_empty(), "no snapshot read: {:?}", forge.gets);
+    assert!(seen.is_empty(), "no raw-event read: {seen:?}");
+    assert_eq!((r.forge_calls, r.gap_fill_calls, r.raw_events_added), (0, Some(0), None));
+    assert_eq!(counters::get(GAP_FILL_COUNTER), before);
+    assert_eq!(note(dir.path()).gap_fill_calls, 0);
+
+    // Uncovered: listing + timeline (2), then the 3 calls left of 5 go to the
+    // first events listing and the second gets none.
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = Counting::with(&prs);
+    let before = counters::get(GAP_FILL_COUNTER);
+    let mut signoz = signoz_rows(&prs, false);
+    let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
+    assert_eq!(forge.gets.len(), 2);
+    assert_eq!(seen.iter().map(|s| s.1).collect::<Vec<_>>(), vec![3], "capped: {seen:?}");
+    assert_eq!((r.forge_calls, r.gap_fill_calls), (5, Some(5)), "both phases, one cap");
+    assert_eq!(counters::get(GAP_FILL_COUNTER) - before, 5);
+    let n = note(dir.path());
+    assert_eq!((n.source, n.gap_fill_calls), (HistorySource::ForgeUncovered, 5));
+
+    // Unavailable: the pass-kind budgets, not the gap cap — but counted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = Counting::with(&prs);
+    let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut Down), 5);
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|s| s.1 > 5), "not gap-capped: {seen:?}");
+    assert_eq!((r.forge_calls, r.gap_fill_calls), (8, Some(8)));
+    assert_eq!(note(dir.path()).gap_fill_calls, 8);
+
+    // Off: pre-#10520 behaviour, nothing counted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = Counting::with(&prs);
+    let (r, seen) = production_cycle(dir.path(), &mut forge, None, 5);
+    assert_eq!((seen.len(), r.forge_calls, r.gap_fill_calls), (2, 8, None));
+}
+
 // -- the adapter --------------------------------------------------------------
 
 fn timeline_of(prs: &[Truth], anchored: bool) -> Timeline {

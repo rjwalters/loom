@@ -137,6 +137,32 @@ fn signoz_history_primary_is_opt_in_and_the_gap_fill_budget_is_configurable() {
     assert!(c.signoz.history_primary, "env > config");
 }
 
+/// A positive gap-fill budget must always make progress (#10520): one listing
+/// page plus one timeline page. Lower values, `0` included, are raised.
+#[test]
+fn the_gap_fill_budget_has_a_floor_of_one_listing_and_one_timeline_page() {
+    use crate::eta::config::MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS;
+    assert_eq!(MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS, 2);
+    for low in [0, 1] {
+        let c = resolve(
+            &json!({"autonomous": {"eta": {"fleetRefresh": {"gapFillMaxCallsPerPass": low}}}}),
+            no_env,
+        )
+        .fleet_refresh;
+        assert_eq!(c.gap_fill_max_calls_per_pass, 2, "config {low} is raised");
+    }
+    let env = |k: &str| (k == "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS").then(|| "0".to_string());
+    let c = resolve(&json!({}), env).fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 2, "env 0 is raised");
+    let at_floor = json!({"autonomous": {"eta": {"fleetRefresh": {"gapFillMaxCallsPerPass": 2}}}});
+    assert_eq!(
+        resolve(&at_floor, no_env)
+            .fleet_refresh
+            .gap_fill_max_calls_per_pass,
+        2
+    );
+}
+
 // -- autonomous.eta.fleetRefresh.signoz (#9758) ----------------------------
 
 #[test]

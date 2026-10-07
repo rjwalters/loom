@@ -712,6 +712,7 @@ fn an_unfinished_backfill_holds_the_fit() {
         next_page: 1,
         done: Vec::new(),
         head_etag: None,
+        partial: None,
     });
     fleet::write(
         &fleet_refresh::staging_path(root, "acme/alpha"),

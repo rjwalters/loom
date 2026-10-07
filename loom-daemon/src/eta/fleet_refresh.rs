@@ -65,14 +65,13 @@ use serde::{Deserialize, Serialize};
 
 use super::fleet::{self, FleetSnapshot};
 use super::fleet_fetch::{
-    history, listing_url, parse_listing, timeline_url, ForgeRead, Installation, NoReader, Read,
-    ReadFailure, Reader, RepoTarget, PER_PAGE,
+    history, listing_url, parse_listing, ForgeRead, Installation, NoReader, Read, ReadFailure,
+    Reader, RepoTarget, PER_PAGE,
 };
 use super::fleet_signoz_history::{self as signoz_history, HistoryNote, HistorySource, Plan};
 use super::fleet_signoz_refresh::{Limits, SignozRead};
-use crate::forge_call_stats::ops::{ISSUE_LIST, TIMELINE_READ};
+use crate::forge_call_stats::ops::ISSUE_LIST;
 use crate::forge_call_stats::ForgeOp;
-use crate::pr_latency::timeline::parse_timeline_page;
 
 /// Schema tag of a state file.
 pub const STATE_SCHEMA: &str = "eta-fleet-refresh-state/v1";
@@ -127,6 +126,9 @@ pub struct Pass {
     /// the pass completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_etag: Option<String>,
+    /// A timeline a budget interrupted, resumed next cycle (#10520).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<signoz_history::PartialTimeline>,
 }
 
 /// Why a repo's cycle ended. Also the record's `stop_reason`.
@@ -561,14 +563,7 @@ pub fn run_cycle_with(
         let mut r = walk.report;
         r.stop = stop;
         r.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let (Some(source), Some(gap_fill_calls)) = (r.history, r.gap_fill_calls) {
-            let note = HistoryNote {
-                at: now,
-                source,
-                gap_fill_calls,
-            };
-            signoz_history::note(root, repo, note);
-        }
+        signoz_history::note_report(root, &r, now);
         match p.kind {
             PassKind::Refresh => report.refresh_calls += spent,
             PassKind::Backfill => report.backfill_calls += spent,
@@ -622,6 +617,7 @@ pub fn pend_backfill(
         next_page: 1,
         done: Vec::new(),
         head_etag: None,
+        partial: None,
     });
     state.last_stop = Some(LastStop {
         at: now,
@@ -671,10 +667,10 @@ pub fn backfill_since(root: &Path, targets: &[RepoTarget]) -> Option<DateTime<Ut
 }
 
 /// One successful answer.
-struct Answer {
+pub(super) struct Answer {
     status: u16,
     etag: Option<String>,
-    body: String,
+    pub(super) body: String,
 }
 
 /// One repo's walk within a cycle.
@@ -694,7 +690,12 @@ pub(super) struct Walk<'a> {
 
 impl Walk<'_> {
     /// One budgeted, breaker-checked call.
-    fn call(&mut self, url: &str, etag: Option<&str>, op: ForgeOp) -> Result<Answer, StopReason> {
+    pub(super) fn call(
+        &mut self,
+        url: &str,
+        etag: Option<&str>,
+        op: ForgeOp,
+    ) -> Result<Answer, StopReason> {
         if self.forge.shutting_down() {
             return Err(StopReason::Shutdown);
         }
@@ -752,29 +753,6 @@ impl Walk<'_> {
                 })
             }
         }
-    }
-
-    /// Every page of PR `number`'s timeline: `Ok(None)` when a page did not
-    /// parse (an incomplete timeline).
-    pub(super) fn timeline(
-        &mut self,
-        number: u32,
-    ) -> Result<Option<Vec<crate::pr_latency::PrEvent>>, StopReason> {
-        let repo = self.target.repo.clone();
-        let mut events = Vec::new();
-        for page in 1u32.. {
-            let answer = self.call(&timeline_url(&repo, number, page), None, TIMELINE_READ)?;
-            match parse_timeline_page(answer.body.as_bytes()) {
-                Some((page_events, raw)) => {
-                    events.extend(page_events);
-                    if raw < PER_PAGE {
-                        return Ok(Some(events));
-                    }
-                }
-                None => return Ok(None),
-            }
-        }
-        Ok(None)
     }
 
     /// Run the repo's pass for this cycle; returns why it stopped. With a
@@ -847,6 +825,7 @@ impl Walk<'_> {
                     next_page: 1,
                     done: Vec::new(),
                     head_etag: None,
+                    partial: None,
                 };
                 (pass, staging)
             }
@@ -942,7 +921,7 @@ impl Walk<'_> {
                 if pass.done.binary_search(&row.number).is_ok() {
                     continue;
                 }
-                match self.timeline(row.number) {
+                match self.timeline(pass, row.number) {
                     Ok(Some(events)) => {
                         staging.merge(&[history(row.number, pr, events, true)], pass.listed_at);
                     }
