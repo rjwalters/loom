@@ -360,6 +360,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             json: false,
             fit_dir: None,
+            adaptation: false,
             pr_cases: cases,
         }
     }

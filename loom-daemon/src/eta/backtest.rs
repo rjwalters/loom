@@ -423,6 +423,12 @@ pub struct BacktestReport {
     /// when some case is held or knows its PR labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_subset: BTreeMap<String, SubsetBucket>,
+    /// The regime layer's adaptation times on this heuristic's residuals
+    /// under an injected x2 shift (#10528, [`adaptation`]). Only
+    /// [`run_with_adaptation`] fills it (`eta backtest --adaptation`);
+    /// diagnostic, never a promotion input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_adaptation: Option<RegimeAdaptation>,
 }
 
 /// `by_tail` key for an ordinary estimate (or a refusal).
@@ -494,6 +500,38 @@ pub fn run(
 ) -> BacktestReport {
     let replayed = replay(heuristic, history, cases, filter, loom);
     report_of(heuristic, &replayed)
+}
+
+/// The signature [`run`] and [`run_with_adaptation`] share.
+pub type RunFn =
+    fn(&dyn Heuristic, &StageSamples, &[ReplayCase], Filter<'_>, &Provenance) -> BacktestReport;
+
+/// [`run_with_adaptation`] when `adaptation` is set, else [`run`].
+#[must_use]
+pub fn runner(adaptation: bool) -> RunFn {
+    if adaptation {
+        run_with_adaptation
+    } else {
+        run
+    }
+}
+
+/// [`run`], plus the regime layer's adaptation times on the same replay
+/// ([`adaptation::measure`]); `regime_adaptation` stays `None` when no stage
+/// has enough scored outcomes on each side of its median.
+#[must_use]
+pub fn run_with_adaptation(
+    heuristic: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    filter: Filter<'_>,
+    loom: &Provenance,
+) -> BacktestReport {
+    let replayed = replay(heuristic, history, cases, filter, loom);
+    BacktestReport {
+        regime_adaptation: adaptation::measure(&adaptation::rows_of(&replayed)),
+        ..report_of(heuristic, &replayed)
+    }
 }
 
 /// Every case matching `heuristic.kind()` and `filter`, replayed and scored,
@@ -598,6 +636,7 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         convergence: paired::convergence_of(replayed),
         by_tail,
         by_subset: subsets::subsets_of(replayed),
+        regime_adaptation: None,
     }
 }
 
@@ -761,6 +800,11 @@ pub use paired::{Convergence, Fold, Paired, Stability};
 pub mod subsets;
 
 pub use subsets::SubsetBucket;
+
+#[path = "backtest_adaptation.rs"]
+pub mod adaptation;
+
+pub use adaptation::RegimeAdaptation;
 
 /// [`compare`] was asked to rank two heuristics that predict different
 /// kinds, whose replay sets do not overlap.
