@@ -472,7 +472,9 @@ fn a_serialized_row_stays_within_the_measured_budget() {
 // Alternates (#10390).
 // ---------------------------------------------------------------------------
 
-const TWIN: &str = "land-2026-10-04-twin-otter";
+/// A registered candidate shadow (`land-2026-10-04-twin-otter` itself is
+/// retired, #10528).
+const TWIN: &str = "land-2026-10-04-twin-otter-b";
 
 fn alts(pending: &[EstimateSummary]) -> super::Alternates {
     select_alternates(pending, &current(), &registered())
@@ -623,7 +625,8 @@ fn registering_a_fourteenth_land_heuristic_fails_loudly() {
 }
 
 /// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
-/// live shadow set, and #10549 `land-2026-10-04-fresh-tide`. Pending
+/// live shadow set, #10549 `land-2026-10-04-fresh-tide`, and #10528
+/// `land-2026-10-04-twin-otter`. Pending
 /// estimates restored from disk that still name them are never offered as
 /// `alternates[]`; the live shadows are.
 #[test]
@@ -632,6 +635,7 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         "land-v3",
         "land-2026-10-04-amber-heron",
         "land-2026-10-04-fresh-tide",
+        "land-2026-10-04-twin-otter",
     ];
     let registered = registered();
     for id in retired {
@@ -643,6 +647,7 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         summary(REPO, 1, Kind::Land, "land-v3", 0, Some(2_000)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-amber-heron", 0, Some(1_000)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-fresh-tide", 0, Some(500)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-04-twin-otter", 0, Some(400)),
     ];
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];

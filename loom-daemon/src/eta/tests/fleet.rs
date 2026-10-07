@@ -673,6 +673,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     // #10208: the zero-parameter queue floor and the queue context it reads.
     ("heuristics/little_v0.rs", include_str!("../heuristics/little_v0.rs")),
     ("stage_queue.rs", include_str!("../stage_queue.rs")),
+    // #10528: brisk-petrel and the regime adjustment it serves through.
+    ("regime.rs", include_str!("../regime.rs")),
+    (
+        "heuristics/land_brisk_petrel.rs",
+        include_str!("../heuristics/land_brisk_petrel.rs"),
+    ),
 ];
 
 /// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently

@@ -1,7 +1,8 @@
 //! Walk-forward coefficient files for a replay (#10524).
 //!
-//! A fitted heuristic (`land-2026-10-04-twin-otter`, its pre-PR composition
-//! `-b`, and `land-2026-10-06-quick-tern` over `-b`) reads its coefficients
+//! A fitted heuristic (`land-2026-10-04-twin-otter-b`, the retired
+//! twin-otter's evaluation with a pre-PR composition, and
+//! `land-2026-10-06-quick-tern` over `-b`) reads its coefficients
 //! from the registry it was built with, and refuses `no_model` without one.
 //! `eta backtest` builds [`Registry::builtin`], which has none, so a replay
 //! could never score a fitted heuristic on a PR-level stage.

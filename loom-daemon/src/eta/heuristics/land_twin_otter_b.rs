@@ -25,7 +25,8 @@
 //! The Monte Carlo seed derives from the estimate id, so its draws differ
 //! from `land-v2`'s while its refusals do not.
 //!
-//! Ships as shadow, registered after `land-2026-10-04-twin-otter`.
+//! Ships as shadow. `land-2026-10-04-twin-otter`, once registered just
+//! before it, is retired (#10528); `-b` still evaluates it for PR stages.
 
 use super::{estimate_path, LandTwinOtter, PathRules};
 use crate::eta::history::{SampleSource, StageSamples};
