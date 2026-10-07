@@ -7,7 +7,7 @@
 #
 # A NEEDS REVISION verdict used to wait for someone to edit the body, and one
 # unchanged re-check later Champion escalated with a bare loom:operator-only
-# hold. 2AMLogic/gf180-surge#331 was escalated an hour after its first verdict
+# hold. example-org/tool-repo#202 was escalated an hour after its first verdict
 # on findings ("split per leaf", "finish the registry audit") that are agent
 # work. Under #10001 the operator is for product-level calls only.
 #

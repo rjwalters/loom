@@ -90,7 +90,7 @@ of the `hyperparameters` config block, so the fleet store's machine tier
 
 A `NEEDS REVISION` verdict used to wait for somebody to edit the body. After
 one unchanged re-check, Champion escalated to the operator with a bare
-`loom:operator-only` hold. In 2AMLogic/gf180-surge#331, the findings were
+`loom:operator-only` hold. In example-org/tool-repo#202, the findings were
 "split per leaf" and "finish the registry audit". Both are agent work, and the
 issue was escalated an hour after its first verdict. Under #10001, the
 operator is asked for product-level calls only.
