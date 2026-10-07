@@ -98,6 +98,12 @@ pub enum MergeQueueCmd {
         approved_sha: String,
         repo: Option<String>,
     },
+    /// #10256: the Champion's single call: reconcile, then hand off.
+    Step {
+        pr: u32,
+        approved_sha: String,
+        repo: Option<String>,
+    },
     /// #10256: revoke + dequeue before a Loom-owned transition.
     Revoke {
         pr: u32,
@@ -313,6 +319,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env) -> Report {
         // Answered by `lifecycle_cli::run` above.
         MergeQueueCmd::Reconcile { .. }
         | MergeQueueCmd::Handoff { .. }
+        | MergeQueueCmd::Step { .. }
         | MergeQueueCmd::Revoke { .. }
         | MergeQueueCmd::AuthorizeCheck { .. } => {
             Report::err("INTERNAL", "lifecycle verb was not dispatched", 1)

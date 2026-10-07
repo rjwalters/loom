@@ -77,6 +77,18 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// #10256: the Champion's one call at the merge point: `reconcile`, then
+    /// `handoff` only when reconcile says continue. Direct mode prints
+    /// `LOOM-MERGE-QUEUE-DIRECT` and exits 0 (run `merge-pr.sh` as before);
+    /// any other first line means do NOT run `merge-pr.sh`.
+    Step {
+        #[arg(value_name = "PR")]
+        pr: u32,
+        #[arg(long, value_name = "SHA")]
+        approved_sha: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
     /// #10256: revoke the queue authorization and dequeue BEFORE a Loom-owned
     /// transition (verdict invalidation, review claim, operator hold). Exit 0
     /// when the transition may proceed (and always in direct mode).
@@ -100,6 +112,51 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+}
+
+/// `forge merge-queue`'s subcommand slot (#10256), built lazily.
+///
+/// A debug build gives each clap-derived `augment_subcommands` one stack frame
+/// sized by every arg it declares, and the derive nests them: `Commands`
+/// (~1.2 MB) -> `ForgeAction` (~0.7 MB) -> `MergeQueueAction` (~0.2 MB). Adding
+/// `Step` pushed that chain past the 2 MB test-thread stack (the
+/// `cli::sweep_outcomes_cli` parse tests aborted with a stack overflow). Boxing
+/// the field does not help: `Box<T>`'s `augment_subcommands` is `T`'s. Here
+/// [`clap::Command::defer`] adds the merge-queue verbs only when clap builds the
+/// `merge-queue` command itself (it is selected, or `--help` / `build()` walks
+/// it), in a frame of its own after `Commands`' has returned.
+pub(crate) struct DeferredMergeQueue(pub(crate) MergeQueueAction);
+
+impl clap::FromArgMatches for DeferredMergeQueue {
+    fn from_arg_matches(m: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        MergeQueueAction::from_arg_matches(m).map(Self)
+    }
+
+    fn from_arg_matches_mut(m: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        MergeQueueAction::from_arg_matches_mut(m).map(Self)
+    }
+
+    fn update_from_arg_matches(&mut self, m: &clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches(m)
+    }
+
+    fn update_from_arg_matches_mut(&mut self, m: &mut clap::ArgMatches) -> Result<(), clap::Error> {
+        self.0.update_from_arg_matches_mut(m)
+    }
+}
+
+impl Subcommand for DeferredMergeQueue {
+    fn augment_subcommands(cmd: clap::Command) -> clap::Command {
+        cmd.defer(MergeQueueAction::augment_subcommands)
+    }
+
+    fn augment_subcommands_for_update(cmd: clap::Command) -> clap::Command {
+        cmd.defer(MergeQueueAction::augment_subcommands_for_update)
+    }
+
+    fn has_subcommand(name: &str) -> bool {
+        MergeQueueAction::has_subcommand(name)
+    }
 }
 
 pub(crate) fn run(action: MergeQueueAction) -> ! {
@@ -131,6 +188,15 @@ pub(crate) fn run(action: MergeQueueAction) -> ! {
             approved_sha,
             repo,
         } => MergeQueueCmd::Handoff {
+            pr,
+            approved_sha,
+            repo,
+        },
+        MergeQueueAction::Step {
+            pr,
+            approved_sha,
+            repo,
+        } => MergeQueueCmd::Step {
             pr,
             approved_sha,
             repo,

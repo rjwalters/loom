@@ -750,3 +750,50 @@ fn handoff_fails_closed_when_the_enqueued_record_cannot_be_written() {
     // The grant is revoked, so the live check denies a merge.
     assert!(!gh.github_merge(), "an unrecorded handoff must not be mergeable");
 }
+
+fn step_env(root: &std::path::Path, mode: MergeMode, gh: &str) -> super::Env {
+    super::Env {
+        forge: crate::forge_cmd::ForgeType::GitHub,
+        gh: gh.to_string(),
+        default_repo: None,
+        mode: Ok(super::mode::ResolvedMergeMode {
+            mode,
+            source: super::mode::MergeModeSource::Default,
+        }),
+        execution_enabled: false,
+        root: root.to_path_buf(),
+    }
+}
+
+fn step_cmd() -> super::MergeQueueCmd {
+    super::MergeQueueCmd::Step {
+        pr: PR,
+        approved_sha: SHA1.to_string(),
+        repo: None,
+    }
+}
+
+#[test]
+fn step_in_direct_mode_prints_direct_and_touches_nothing() {
+    let dir = root_with_mode("direct");
+    let env = step_env(dir.path(), MergeMode::Direct, "/nonexistent/gh");
+    let r = super::run(&step_cmd(), &env);
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, vec!["LOOM-MERGE-QUEUE-DIRECT".to_string()]);
+}
+
+#[test]
+fn step_in_queue_mode_never_looks_direct_when_it_cannot_read_the_forge() {
+    // The Champion merges directly only on the DIRECT sentinel; an unreadable
+    // forge in queue mode must produce anything else.
+    let dir = root_with_mode("queue");
+    let env = step_env(dir.path(), MergeMode::Queue, "/nonexistent/gh");
+    let r = super::run(&step_cmd(), &env);
+    assert_ne!(r.code, 0, "{r:?}");
+    assert!(
+        r.stdout
+            .first()
+            .is_none_or(|l| !l.starts_with("LOOM-MERGE-QUEUE-DIRECT")),
+        "{r:?}"
+    );
+}
