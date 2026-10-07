@@ -24,6 +24,8 @@ use crate::tokens_pool::session_state::{classify_inspect, Observed};
 
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
+#[path = "session_reconcile_hold_tests.rs"]
+mod hold_tests;
 #[path = "session_reconcile_removal_tests.rs"]
 mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]

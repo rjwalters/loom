@@ -81,6 +81,9 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 /// (Issue #10454) — what lets selection pass over a down session account.
 pub mod liveness;
 
+// `stop` and its race handling (file-size ratchet, #7711; #10661).
+mod stop;
+
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.
@@ -1293,65 +1296,6 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                     requested.display()
                 );
             }
-        }
-        Ok(())
-    }
-
-    /// Tear down the container cleanly. Refuses (unless `force`) when an
-    /// in-flight `docker exec` is detected, per this module's restart-safety
-    /// doc comment. Idempotent: a session that is already stopped/absent is
-    /// success, not an error.
-    ///
-    /// A stop is deliberate, so it stays down: an operator hold
-    /// ([`session_hold::HOLD_FILE`]) is written *before* `docker stop`, and
-    /// the session reconciler leaves a held account alone until an operator
-    /// `start` lifts it (issue #10453).
-    pub fn stop(&self, name: &str, force: bool) -> Result<SessionStatus> {
-        let account = find_codex_account(&self.workspace, name)?;
-        let name = account.id.name.as_str();
-        let container = container_name(name);
-        let state = self.runner.inspect(&container)?;
-        if let Some(state) = &state {
-            Self::require_host_mode(state)?;
-            self.refuse_if_busy(name, &container, state, force)?;
-        }
-        session_hold::write_hold(&account.credential_reference, session_hold::now_unix_ms())?;
-        if state.is_some() {
-            if let Err(error) = self.runner.stop_and_remove(&container, STOP_GRACE) {
-                // The stop/reconcile race: a reconcile pass whose hold check
-                // ran just before the hold above was written can still
-                // `docker start` the container between our `docker stop` and
-                // `docker rm`, so `rm` finds it running. Every later start
-                // re-checks the (now written) hold, so at most that one start
-                // can be in flight: re-inspect, re-apply the in-flight-exec
-                // refusal, and stop+rm exactly once more.
-                match self.runner.inspect(&container)? {
-                    None => {}
-                    Some(again) if again.running || again.restarting => {
-                        self.refuse_if_busy(name, &container, &again, force)?;
-                        self.runner.stop_and_remove(&container, STOP_GRACE)?;
-                    }
-                    Some(_) => return Err(error),
-                }
-            }
-        }
-        self.status(name)
-    }
-
-    fn refuse_if_busy(
-        &self,
-        name: &str,
-        container: &str,
-        state: &ContainerState,
-        force: bool,
-    ) -> Result<()> {
-        if state.running && !force && self.runner.has_active_exec(container)? {
-            bail!(
-                "session {name:?} has an in-flight `docker exec`; refusing to stop without \
-                 --force (a hard stop here would SIGKILL active work, violating the #5119 \
-                 restart-safety contract). Retry once the exec finishes, or pass --force to \
-                 override."
-            );
         }
         Ok(())
     }

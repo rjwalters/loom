@@ -192,6 +192,22 @@ fn terminate_group(pid: u32) {
 #[cfg(not(unix))]
 fn terminate_group(_pid: u32) {}
 
+/// Forward `signal` to the group led by `pid` (and to `pid` itself, for the
+/// window before `setpgid` takes effect). Same safety argument as
+/// [`terminate_group`]: `pid` leads a group this module created.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: i32) {
+    let pid = pid as libc::pid_t;
+    // SAFETY: see `terminate_group`; ESRCH (already gone) is ignored.
+    unsafe {
+        libc::killpg(pid, signal);
+        libc::kill(pid, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _signal: i32) {}
+
 /// Run with cooperative cancellation, terminating the owned process group.
 /// Cancellation returns `Collect(Interrupted)` because side effects may have run.
 pub fn run_bounded_cancellable(
@@ -199,7 +215,27 @@ pub fn run_bounded_cancellable(
     timeout: Duration,
     cancelled: impl Fn() -> bool,
 ) -> Result<Completion, ExecError> {
-    run_bounded_inner(cmd, timeout, cancelled, |_| {})
+    run_bounded_inner(cmd, timeout, cancelled, |_| {}, None)
+}
+
+/// [`run_bounded`], forwarding a signal the **caller** received to the
+/// child's process group (issue #10661). The group this module creates is
+/// not the terminal's foreground group, so a Ctrl-C at the terminal reaches
+/// only the caller; an interactive caller that traps SIGINT/SIGTERM reports
+/// it through `pending`, polled while the child runs.
+///
+/// The first signal `pending` returns is sent to the group once. If the child
+/// then exits on its own within `grace`, its real [`Completion::Exited`] is
+/// returned (the caller decides what an interrupted exit means). If not, the
+/// group is killed and the result is `Collect(Interrupted)`, as for
+/// cancellation. With `pending` always `None` this is exactly [`run_bounded`].
+pub fn run_bounded_forwarding(
+    cmd: Command,
+    timeout: Duration,
+    grace: Duration,
+    pending: &dyn Fn() -> Option<i32>,
+) -> Result<Completion, ExecError> {
+    run_bounded_inner(cmd, timeout, || false, |_| {}, Some((pending, grace)))
 }
 
 /// Observe the actual child PID before waiting, while retaining the shared
@@ -210,14 +246,18 @@ pub fn run_bounded_observed(
     timeout: Duration,
     spawned: impl FnOnce(u32),
 ) -> Result<Completion, ExecError> {
-    run_bounded_inner(cmd, timeout, || false, spawned)
+    run_bounded_inner(cmd, timeout, || false, spawned, None)
 }
+
+/// A caller's pending-signal probe and how long to wait after forwarding it.
+type Forward<'a> = Option<(&'a dyn Fn() -> Option<i32>, Duration)>;
 
 fn run_bounded_inner(
     mut cmd: Command,
     timeout: Duration,
     cancelled: impl Fn() -> bool,
     spawned: impl FnOnce(u32),
+    forward: Forward<'_>,
 ) -> Result<Completion, ExecError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     place_in_own_process_group(&mut cmd);
@@ -232,7 +272,8 @@ fn run_bounded_inner(
     let stdout_rx = spawn_reader(child.stdout.take());
     let stderr_rx = spawn_reader(child.stderr.take());
 
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
+    let mut forwarded = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -255,7 +296,14 @@ fn run_bounded_inner(
             }
         }
 
-        if cancelled() {
+        if let (false, Some((pending, grace))) = (forwarded, forward) {
+            if let Some(signal) = pending() {
+                signal_group(pid, signal);
+                forwarded = true;
+                deadline = deadline.min(Instant::now() + grace);
+            }
+        }
+        if cancelled() || (forwarded && Instant::now() >= deadline) {
             terminate_group(pid);
             let _ = child.wait();
             let _ = collect(&stdout_rx, DRAIN_GRACE);

@@ -11,15 +11,22 @@
 //! `docker start`/`run` — so it ends the pass instead of spending the budget
 //! once per account.
 //!
-//! The operator CLI inherits these budgets too: `accounts session start` on
-//! a first, slow image pull now fails after [`DOCKER_RUN_TIMEOUT`] (it was
-//! unbounded); `docker pull` the image first if that is a risk.
+//! The operator CLI inherits these budgets too. So that a first, slow image
+//! pull does not fail `accounts session start` at [`DOCKER_RUN_TIMEOUT`],
+//! the operator commands pull a missing image first, under the longer
+//! [`DOCKER_PULL_TIMEOUT`] ([`ensure_image_for_operator`], #10661). The
+//! reconcile pass does not: a pull there would hold the whole pass.
+//!
+//! Ctrl-C/SIGTERM sent to an operator command is forwarded to the running
+//! `docker` child ([`super::operator_interrupt`], #10661); for the daemon,
+//! which never installs that handler, nothing changes.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 
+use super::operator_interrupt::{self, Interrupted};
 use crate::proc_exec::{self, Completion};
 
 /// Budget for a read-only or quick `docker` call (`inspect`, `start`, `top`,
@@ -29,6 +36,11 @@ pub const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DOCKER_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Budget for `docker stop` (its own `-t` grace plus headroom).
 pub const DOCKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Budget for the operator's explicit pull of a missing session image.
+pub const DOCKER_PULL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long a `docker` child gets to exit after an operator's signal is
+/// forwarded to it, before its group is killed.
+pub const FORWARD_GRACE: Duration = Duration::from_secs(10);
 
 /// A `docker` call hit its deadline: the runtime is unresponsive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,17 +74,39 @@ pub fn timeout_for(args: &[&str]) -> Duration {
 /// Run `program <args>` with stdin closed, capturing stdout/stderr, failing
 /// with [`DockerTimedOut`] once `timeout` elapses. Returns
 /// `(success, stdout, stderr)`.
+///
+/// An operator's SIGINT/SIGTERM ([`operator_interrupt`]) is forwarded to the
+/// child, and fails the call with [`Interrupted`]; once one is pending, no
+/// further call starts.
 pub fn run_bounded(
     program: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<(bool, String, String)> {
+    run_bounded_with(program, args, timeout, &operator_interrupt::pending)
+}
+
+/// [`run_bounded`] with an explicit pending-signal probe (tests).
+pub(crate) fn run_bounded_with(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    pending: &dyn Fn() -> Option<i32>,
+) -> Result<(bool, String, String)> {
+    if let Some(signal) = pending() {
+        return Err(Interrupted(signal).into());
+    }
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null());
     let subcommand = args.first().copied().unwrap_or_default();
-    match proc_exec::run_bounded(command, timeout)
-        .map_err(|e| anyhow!("failed to run `{program} {subcommand}`: {e}"))?
+    let completion = proc_exec::run_bounded_forwarding(command, timeout, FORWARD_GRACE, pending);
+    // A call that still succeeded stands; one that failed (or was killed
+    // after the grace) once a signal was forwarded failed because of it.
+    if let (Some(signal), false) = (pending(), completion.as_ref().is_ok_and(Completion::succeeded))
     {
+        return Err(Interrupted(signal).into());
+    }
+    match completion.map_err(|e| anyhow!("failed to run `{program} {subcommand}`: {e}"))? {
         Completion::Exited(output) => Ok((
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -85,6 +119,43 @@ pub fn run_bounded(
         .into()),
     }
 }
+
+/// Operator `session start`/`shell` only (#10661): make sure `image` is
+/// present before the bounded `docker run`, pulling it under
+/// [`DOCKER_PULL_TIMEOUT`] when it is not, with a note on stderr.
+///
+/// # Errors
+/// When Docker cannot be asked, or the pull fails or times out.
+pub fn ensure_image_for_operator(image: &str) -> Result<()> {
+    ensure_image_with("docker", image, &operator_interrupt::pending, DOCKER_PULL_TIMEOUT)
+}
+
+pub(crate) fn ensure_image_with(
+    program: &str,
+    image: &str,
+    pending: &dyn Fn() -> Option<i32>,
+    pull_timeout: Duration,
+) -> Result<()> {
+    let probe = ["image", "inspect", "--format", "{{.Id}}", image];
+    let (present, _, _) = run_bounded_with(program, &probe, DOCKER_CALL_TIMEOUT, pending)?;
+    if present {
+        return Ok(());
+    }
+    eprintln!(
+        "note: pulling {image} before starting the session (not present on this host; allowing \
+         up to {} min)",
+        pull_timeout.as_secs() / 60
+    );
+    let (pulled, _, stderr) = run_bounded_with(program, &["pull", image], pull_timeout, pending)?;
+    if !pulled {
+        bail!("docker pull {image} failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "docker_cli_interrupt_tests.rs"]
+mod interrupt_tests;
 
 #[cfg(test)]
 mod tests {

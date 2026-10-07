@@ -51,9 +51,13 @@
 //!   ([`SessionLifecycle::start_unless_held`]), so a pass racing a `stop`
 //!   never `docker start`s the container `stop` is about to `rm`. The hold
 //!   is on disk (survives daemon restarts) and per account: holds and
-//!   `enabled=false` are collected across **every** registered root first
-//!   ([`AccountIndex`]), so a root that still lists the account enabled
-//!   cannot bypass them.
+//!   `enabled=false` are collected across **every** registered root, plus
+//!   the daemon's fallback root, first ([`AccountIndex`] over
+//!   [`session_hold_roots::hold_roots`], the root set the CLI also lifts and
+//!   reads holds in, #10661), so a root that still lists the account enabled
+//!   cannot bypass them. An operator start that lifts the hold and then
+//!   fails leaves the account **unheld and down**: the pass restarts it on
+//!   its usual backoff, which is the operator's stated intent.
 //! * **Docker unavailable:** a failed (or timed-out) container read means
 //!   the runtime is unusable, not that an account is broken: the rest of the
 //!   pass is skipped and the **pass as a whole** backs off
@@ -121,7 +125,7 @@ use crate::tokens_pool::session_lifecycle::{
     SESSION_POSTURE_LABEL,
 };
 use crate::tokens_pool::session_state::{self, MountDrift, Snapshot};
-use crate::tokens_pool::{session_dispatch_lock, session_mount_gate};
+use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
 
@@ -961,21 +965,27 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     };
     let registered = registry.roots();
     let fallback_workspace = default_mount_workspace(&registered, fallback_root);
-    let inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = registry
-        .effective_roots(fallback_root)
-        .into_iter()
-        .filter_map(|root| {
-            let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
-            Some((root, inventory))
-        })
-        .collect();
-    // Holds and `enabled=false` count across every root before any root acts.
+    // Holds and `enabled=false` count across every root before any root
+    // acts: the one hold root set the CLI also uses (#10661), a superset of
+    // the roots the pass acts in.
+    let hold_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> =
+        session_hold_roots::hold_roots(&registered, Some(fallback_root))
+            .into_iter()
+            .filter_map(|root| {
+                let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
+                Some((root, inventory))
+            })
+            .collect();
     let index = AccountIndex::from_inventories(
-        &inventories
+        &hold_inventories
             .iter()
             .map(|(_, inv)| inv.as_slice())
             .collect::<Vec<_>>(),
     );
+    let acting = registry.effective_roots(fallback_root);
+    let inventories = hold_inventories
+        .into_iter()
+        .filter(|(root, _)| acting.contains(root));
     // One container read for the whole pass (every root), taken lazily.
     let mut take =
         || session_state::snapshot("docker", &registered, session_state::SNAPSHOT_DEADLINE);
@@ -1096,6 +1106,8 @@ pub fn spawn_from_config(workspace: &Path) -> Option<tokio::task::JoinHandle<()>
         "session_reconcile: enabled (interval={}s; no-op without session-managed Codex accounts)",
         interval.as_secs()
     );
+    // The CLI's half of the one hold root set (#10661).
+    session_hold_roots::record_daemon_fallback_root(workspace);
     Some(spawn_task(workspace.to_path_buf(), interval))
 }
 

@@ -511,3 +511,34 @@ fn container_state_reads_an_inspect_object() {
     assert!(state.running && !state.restarting);
     assert_eq!(state.workspace, None);
 }
+
+/// #10661: a removal record beside a healthy container is WARNed about on a
+/// doubling cadence capped at about a day, and a fresh count (a daemon
+/// restart) WARNs at once.
+#[test]
+fn a_record_beside_a_healthy_container_is_warned_about_at_least_daily() {
+    use drift::{healthy_record_warn_due as due, HEALTHY_RECORD_WARN_MAX_SECS as DAY};
+    let minute = DEFAULT_SESSION_RECONCILE_INTERVAL_SECS;
+    // Pass 1 after any start, restart included: no previous WARN.
+    assert!(due(1, None, 0));
+    let warned: Vec<u32> = (1..=40)
+        .filter(|&pass| due(pass, Some(0), u64::from(pass) * minute))
+        .collect();
+    assert_eq!(warned, vec![1, 2, 4, 8, 16, 32], "the backoff while it is young");
+    // Simulate the real loop at one pass a minute for ten days: no gap
+    // between WARNs exceeds a day (uncapped, pass 2048 is ~34 h after 1024).
+    let (mut last, mut gaps) = (None, Vec::new());
+    for pass in 1..=(10 * DAY / minute) as u32 {
+        let now = u64::from(pass) * minute;
+        if due(pass, last, now) {
+            if let Some(at) = last {
+                gaps.push(now - at);
+            }
+            last = Some(now);
+        }
+    }
+    assert!(gaps.iter().all(|&gap| gap <= DAY), "{gaps:?}");
+    assert_eq!(gaps.len(), 20, "{gaps:?}");
+    // A wall clock stepping back never makes it due early, nor silences it.
+    assert!(!due(3, Some(1_000), 10));
+}
