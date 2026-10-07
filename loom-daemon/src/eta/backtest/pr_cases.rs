@@ -121,6 +121,16 @@ pub enum PrEventRecord {
         /// When.
         at: DateTime<Utc>,
     },
+    /// The PR was closed.
+    Closed {
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// The PR was reopened.
+    Reopened {
+        /// When.
+        at: DateTime<Utc>,
+    },
 }
 
 impl From<&PrEvent> for PrEventRecord {
@@ -136,6 +146,8 @@ impl From<&PrEvent> for PrEventRecord {
             },
             PrEvent::Pushed { at } => Self::Pushed { at: *at },
             PrEvent::Merged { at } => Self::Merged { at: *at },
+            PrEvent::Closed { at } => Self::Closed { at: *at },
+            PrEvent::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
@@ -153,6 +165,8 @@ impl From<&PrEventRecord> for PrEvent {
             },
             PrEventRecord::Pushed { at } => Self::Pushed { at: *at },
             PrEventRecord::Merged { at } => Self::Merged { at: *at },
+            PrEventRecord::Closed { at } => Self::Closed { at: *at },
+            PrEventRecord::Reopened { at } => Self::Reopened { at: *at },
         }
     }
 }
@@ -787,6 +801,34 @@ pub fn cases_from_pr_records_with_roster(
     history: Option<&[RosterRevision]>,
 ) -> (Vec<ReplayCase>, PrCaseSummary) {
     build_cases(records, Some(history))
+}
+
+/// Fill the unread `linked_star` of each record from the cached star events
+/// (#10372, #10508), so a forge-fetched or saved record carries the instants
+/// its linked issue's star turned on and off.
+///
+/// A record is read at its end (`merged_at`, else `closed_at`, else `now`),
+/// by [`crate::eta::star::RepoStar::linked_at`]: strictly-before facts only,
+/// and `None` (still unread, hence unknown, never unstarred) when the repo's
+/// cache does not cover that instant. A record that already carries
+/// `linked_star` is left as it is. Returns how many records were filled.
+pub fn fill_linked_stars(
+    records: &mut [PrCaseRecord],
+    stars: &crate::eta::star::StarInputs,
+    now: DateTime<Utc>,
+) -> usize {
+    let mut filled = 0;
+    for r in records.iter_mut().filter(|r| r.linked_star.is_none()) {
+        let Some(repo) = stars.repos.get(&r.repo.to_ascii_lowercase()) else {
+            continue;
+        };
+        let end = r.merged_at.or(r.closed_at).unwrap_or(now);
+        if let Some(linked) = repo.linked_at(r.number, end) {
+            r.linked_star = Some(linked.changes);
+            filled += 1;
+        }
+    }
+    filled
 }
 
 /// Shared body: `priority` is `None` for no priority inputs at all, else the

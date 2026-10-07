@@ -614,6 +614,7 @@ fn a_traced_role_ticks_session_summary_and_usage_span_share_one_trace_id() {
         "judge",
         ended_at,
         Some("claude"),
+        None,
         &[row(11, 22, 33, 44, 0)],
     );
     let store = TraceStore::new(&workspace);

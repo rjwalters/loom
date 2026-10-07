@@ -93,6 +93,9 @@ pub(crate) enum EtaCommand {
     /// Retirement proposals from the nightly folds (#10525); `--file` files
     /// each new one as an issue. Never unregisters anything.
     Retire(super::eta_retire_cmd::EtaRetireArgs),
+    /// Preview a proposed planner config's effect on the live ready roster's
+    /// `start` / `land` ETAs (#10528): `loom-daemon eta simulate --planner PATH`.
+    Simulate(super::eta_simulate_cmd::EtaSimulateArgs),
 }
 
 impl EtaCommand {
@@ -108,6 +111,7 @@ impl EtaCommand {
             EtaCommand::Fit(args) => args.run(),
             EtaCommand::Doctor(args) => args.run(),
             EtaCommand::Retire(args) => args.run(),
+            EtaCommand::Simulate(args) => args.run(),
         }
     }
 }
@@ -151,11 +155,7 @@ pub(crate) struct EtaPromoteArgs {
 
 impl EtaPromoteArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let registry = Registry::builtin();
         let Some(candidate) = registry.get(&self.candidate) else {
             bail!(
@@ -307,11 +307,7 @@ pub(crate) struct EtaBackfillArgs {
 
 impl EtaBackfillArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let repo = match &self.repo {
             Some(r) => r.clone(),
             None => resolve_repo(&root)
@@ -436,11 +432,7 @@ pub(crate) struct EtaBacktestArgs {
 
 impl EtaBacktestArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let fits = super::eta_replay_cmd::load_fits(self.fit_dir.as_deref())?;
         let registry = fits.registry();
         let Some(heuristic) = fits.heuristic(&self.heuristic) else {
@@ -522,7 +514,7 @@ pub(crate) fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
 /// `scope` reads the cached fleet snapshot only — it makes no forge call, so
 /// `eta view` costs the same whichever scope it runs at. Building that cache
 /// is `eta fleet backfill`'s job.
-fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
+pub(super) fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     let envelopes = load_outcome_envelopes(root);
     let mut history = StageSamples::default();
     history.push_envelopes(&envelopes);
@@ -538,7 +530,7 @@ fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
 
 /// The scope a `--scope` flag asks for: the flag when given, else the
 /// configured `autonomous.eta.historyScope`.
-fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistoryScopeMode> {
+pub(super) fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistoryScopeMode> {
     match flag {
         Some(raw) => HistoryScopeMode::parse(raw)
             .ok_or_else(|| anyhow::anyhow!("invalid --scope {raw:?} (local | augment | fleet)")),
@@ -888,11 +880,7 @@ pub(crate) struct EtaViewArgs {
 
 impl EtaViewArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let (repo, issue) = parse_story(&self.story)?;
         let now = Utc::now();
 
@@ -990,11 +978,7 @@ struct ListRow {
 
 impl EtaListArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let repo = match &self.repo {
             Some(r) => r.clone(),
             None => resolve_repo(&root)

@@ -25,12 +25,13 @@ fn reaper_real_clean_exit_does_not_count_as_insta_crash() {
 
     // A real, fast, clean-exit child (mirrors what a #4111 self-skip
     // looks like on the wire: no checkpoint written, exits 0 quickly).
-    let child = Command::new("true")
+    let mut child = Command::new("true")
         .spawn()
         .expect("spawn `true` fixture child");
     let pid = child.id();
-    // Give the OS a moment to actually finish the process before we poll.
-    std::thread::sleep(Duration::from_millis(50));
+    // Block on the real exit (#10726); the cached status makes the reaper's
+    // later `try_wait()` deterministic under load.
+    child.wait().expect("wait for `true` fixture child");
 
     let sweep_id = "sweep-issue-4111-clean-exit".to_string();
     registry.entries.insert(

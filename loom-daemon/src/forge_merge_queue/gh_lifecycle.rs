@@ -11,7 +11,8 @@ use std::time::Duration;
 use super::events::FileEventSink;
 use super::forge::{LifecycleForge, PrSnapshot, RemovalEvent};
 use super::github::{safe_detail, GhQueueApi};
-use super::lifecycle::{revoke_for_transition, sweep, transition_line, Ctx, Reconciled};
+use super::group_github::{group_transition_line, revoke_for_transition_groups};
+use super::lifecycle::{sweep, Ctx, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
 use crate::cmd_out::CmdOutcome;
@@ -53,7 +54,15 @@ impl GhLifecycleForge {
         }
     }
 
-    fn nwo(&self) -> String {
+    pub(super) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub(super) fn repo_name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) fn nwo(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
 
@@ -69,7 +78,7 @@ impl GhLifecycleForge {
             .run()
     }
 
-    fn ok(
+    pub(super) fn ok(
         &self,
         op: &'static str,
         intent: AccessIntent,
@@ -281,7 +290,11 @@ enum Live<R> {
 }
 
 /// Build the live seams for `root` and run `f`.
-fn with_live<R>(gh: &Path, root: &Path, f: impl FnOnce(&Ctx<'_>) -> R) -> Live<R> {
+fn with_live<R>(
+    gh: &Path,
+    root: &Path,
+    f: impl FnOnce(&Ctx<'_>, &GhLifecycleForge) -> R,
+) -> Live<R> {
     let mode = match resolve_merge_mode(root) {
         Ok(m) => m.mode,
         Err(e) => {
@@ -311,13 +324,13 @@ fn with_live<R>(gh: &Path, root: &Path, f: impl FnOnce(&Ctx<'_>) -> R) -> Live<R
         events: &events,
         now: chrono::Utc::now(),
     };
-    Live::Ran(f(&ctx))
+    Live::Ran(f(&ctx, &forge))
 }
 
 /// The daemon's periodic pass: reconcile every pending queued PR so a drop or
 /// a merge is seen within one successful tick. No-op in direct mode.
 pub fn daemon_tick(gh: &Path, root: &Path) {
-    let Live::Ran(res) = with_live(gh, root, sweep) else {
+    let Live::Ran(res) = with_live(gh, root, |c, _| sweep(c)) else {
         return;
     };
     match res {
@@ -350,8 +363,8 @@ pub fn unresolved_line(why: &str) -> String {
 /// Returns the audit line; `None` only when direct mode is confirmed.
 #[must_use]
 pub fn revoke_for_root(gh: &Path, root: &Path, pr: u32, reason: &str) -> Option<String> {
-    match with_live(gh, root, |ctx| {
-        revoke_for_transition(ctx, pr, reason).map(|rev| transition_line(&rev))
+    match with_live(gh, root, |ctx, forge| {
+        revoke_for_transition_groups(ctx, forge, pr, reason).map(|rev| group_transition_line(&rev))
     }) {
         Live::Direct => None,
         Live::Unresolved(why) => Some(unresolved_line(&why)),

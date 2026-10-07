@@ -124,6 +124,7 @@ fn row(exit: bool) -> TrainingRow {
         inputs: ModelInputs::default(),
         starred_any: None,
         star_source: None,
+        planner_version: None,
         exit: Some(exit),
         merge: MergeLabel::default(),
     }

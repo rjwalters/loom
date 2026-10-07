@@ -1581,10 +1581,14 @@ where
             }
         };
         let priority = priorities.get(&root).copied();
+        // #10763: this host's release-pass tallies for the repo, if it ticked.
+        let stale_blocked_release =
+            crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
             priority,
+            stale_blocked_release,
         });
     }
     // Deterministic order (the dashboard renders this list directly) and

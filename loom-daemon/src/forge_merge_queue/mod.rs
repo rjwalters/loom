@@ -9,7 +9,9 @@
 //! - [`github`] — the GitHub [`ops::QueueApi`] (GraphQL via the counted `gh`
 //!   facade).
 //! - [`preflight`] — capability preflight with distinct failure kinds.
-//! - [`authz`] — the fail-closed authorization protocol (#10256, Phase B1).
+//! - [`authz`] — the fail-closed authorization protocol (#10256, Phase B1);
+//!   [`group_authz`] extends it to whole merge groups, concludes last, and
+//!   re-fails passed groups on revocation (#10256, Phase B4; not wired yet).
 //! - [`lifecycle`] (+ [`forge`], [`grants`], [`removal`], [`events`],
 //!   [`gh_lifecycle`], [`lifecycle_cli`]) — the guard-preserving handoff,
 //!   drop/merge reconciliation, revocation before Loom-owned transitions and
@@ -45,6 +47,8 @@ pub mod forge;
 pub mod gh_lifecycle;
 pub mod github;
 pub mod grants;
+pub mod group_authz;
+pub mod group_github;
 pub mod lifecycle;
 pub mod lifecycle_cli;
 pub mod mode;
@@ -355,6 +359,8 @@ pub fn handle(cmd: &MergeQueueCmd) -> ! {
 
 #[cfg(test)]
 mod authz_tests;
+#[cfg(test)]
+mod group_authz_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

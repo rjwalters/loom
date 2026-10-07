@@ -4,16 +4,19 @@
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
-//! | run concluded `success` | `LOOM-CI-RESULT-CLEAN` | 0 |
-//! | no run / still running | `LOOM-CI-RESULT-UNVERIFIED …` | 0 (caller warns) |
+//! | exact-head run concluded `success` | `LOOM-CI-RESULT-CLEAN` | 0 |
+//! | repository defines no `CI` workflow | `LOOM-CI-RESULT-NO-CI-WORKFLOW …` | 0 |
+//! | no run for this head / still running | `LOOM-CI-RESULT-UNVERIFIED …` | 3 (caller holds, #10567) |
 //! | non-success conclusion | the refusal naming cancelled/failed jobs | 1 |
 //! | forge query failed | the reason | 2 |
 //!
-//! `--from-stdin` reads `{"runs": <actions/runs payload>, "jobs": <jobs payload>}`
-//! and assesses offline (the fixture seam, and a debug facility).
+//! `--from-stdin` reads `{"runs": <actions/runs payload>, "jobs": <jobs payload>,
+//! "workflows": <actions/workflows payload>}` and assesses offline (the fixture
+//! seam, and a debug facility); a missing `workflows` key reads as a failed
+//! workflow-list query.
 
 use anyhow::Result;
-use loom_daemon::merge_pr::ci_result::{assess, Verdict, CLEAN, UNVERIFIED};
+use loom_daemon::merge_pr::ci_result::{assess, Verdict, CLEAN, NO_CI_WORKFLOW, UNVERIFIED};
 use serde_json::Value;
 use std::io::Read;
 
@@ -48,7 +51,14 @@ impl CiResultArgs {
             std::io::stdin().read_to_string(&mut raw)?;
             let doc: Value = serde_json::from_str(&raw)?;
             let jobs = doc.get("jobs").cloned().unwrap_or(Value::Null);
-            assess(&self.pr, &self.head_sha, doc.get("runs").unwrap_or(&Value::Null), |_| Ok(jobs))
+            let workflows = doc.get("workflows").cloned();
+            assess(
+                &self.pr,
+                &self.head_sha,
+                doc.get("runs").unwrap_or(&Value::Null),
+                || workflows.ok_or_else(|| "no `workflows` in the stdin document".to_string()),
+                |_| Ok(jobs),
+            )
         } else {
             let runs = match gh_api(&format!(
                 "repos/{}/actions/runs?head_sha={}&per_page=100",
@@ -61,16 +71,32 @@ impl CiResultArgs {
                 }
             };
             let repo = self.repo.clone();
-            assess(&self.pr, &self.head_sha, &runs, |id| {
-                gh_api(&format!("repos/{repo}/actions/runs/{id}/jobs?per_page=100&filter=latest"))
-            })
+            assess(
+                &self.pr,
+                &self.head_sha,
+                &runs,
+                || gh_api(&format!("repos/{repo}/actions/workflows?per_page=100")),
+                |id| {
+                    gh_api(&format!(
+                        "repos/{repo}/actions/runs/{id}/jobs?per_page=100&filter=latest"
+                    ))
+                },
+            )
         };
         match verdict {
             Verdict::Clean => println!("{CLEAN}"),
-            Verdict::Unverified(why) => println!("{UNVERIFIED} {why}"),
+            Verdict::NoCiWorkflow(why) => println!("{NO_CI_WORKFLOW} {why}"),
+            Verdict::Unverified(why) => {
+                println!("{UNVERIFIED} {why}");
+                std::process::exit(3);
+            }
             Verdict::Refuse(msg) => {
                 println!("{msg}");
                 std::process::exit(1);
+            }
+            Verdict::Unreadable(why) => {
+                println!("ci-result could not query the forge: {why}");
+                std::process::exit(2);
             }
         }
         Ok(())

@@ -1342,7 +1342,8 @@ mod hold;
 mod timeline;
 
 pub use ready::{
-    ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
+    dispatch_input, waiting_position, ReadyPlan, ReadyRow, READY_FIRST_SEEN,
+    READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
 };
 
 /// Merge several effects.

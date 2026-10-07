@@ -19,6 +19,8 @@ struct ScriptedProbe {
     in_flight: usize,
     panics_left: Arc<AtomicUsize>,
     resolves: Arc<AtomicUsize>,
+    /// Receives the running resolve count each time `resolve_artifact` starts.
+    resolve_notify: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
 }
 
 impl ScriptedProbe {
@@ -29,13 +31,17 @@ impl ScriptedProbe {
             in_flight: 0,
             panics_left: Arc::new(AtomicUsize::new(0)),
             resolves: Arc::new(AtomicUsize::new(0)),
+            resolve_notify: None,
         }
     }
 }
 
 impl AutoUpdateProbe for ScriptedProbe {
     fn resolve_artifact(&self) -> ArtifactResolution {
-        self.resolves.fetch_add(1, Ordering::SeqCst);
+        let count = self.resolves.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(tx) = &self.resolve_notify {
+            let _ = tx.send(count);
+        }
         if self
             .panics_left
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -250,18 +256,32 @@ fn every_tick_emits_one_record_with_provenance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_loop_keeps_ticking_after_a_panicking_tick() {
     let dir = tempfile::tempdir().unwrap();
-    let probe = ScriptedProbe::new(ArtifactResolution::Unresolved("none".to_string()));
+    let mut probe = ScriptedProbe::new(ArtifactResolution::Unresolved("none".to_string()));
+    let (resolve_tx, mut resolve_rx) = tokio::sync::mpsc::unbounded_channel();
+    probe.resolve_notify = Some(resolve_tx);
     probe.panics_left.store(2, Ordering::SeqCst);
     let resolves = probe.resolves.clone();
     let status = Arc::new(AutoUpdateStatus::new(true));
     let tune = tuning(Duration::from_millis(20), NOW);
     let handle =
         tokio::spawn(run_loop(state(&dir), probe, Trigger::default(), status.clone(), tune));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Ticks run serially, so the fifth resolve starting proves ticks 1-4 (two
+    // panics, then two normal) each completed and published their status. The
+    // timeout is only a hang guard, never the pass condition.
+    let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(count) = resolve_rx.recv().await {
+            if count >= 5 {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(waited, Ok(true), "the loop reached a fifth tick after the two panics");
     assert!(!handle.is_finished(), "the loop is still running");
     handle.abort();
     assert!(
-        resolves.load(Ordering::SeqCst) >= 4,
+        resolves.load(Ordering::SeqCst) >= 5,
         "ticks after the two panics ran: {}",
         resolves.load(Ordering::SeqCst)
     );

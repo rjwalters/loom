@@ -388,6 +388,46 @@ fn set_claim_event(ws: &Path, actor: &str, secs_ago: i64) {
     std::fs::write(&fake_gh, script.replacen(generic, &arm, 1)).unwrap();
 }
 
+/// Like [`set_claim_event`], but the timestamp is anchored to the dispatch under
+/// test instead of baked at fixture setup (Issue #10786). The fake `gh` records
+/// the epoch second of the dispatcher's own `--add-label loom:building` flip
+/// (the first `gh` call after `episode_start`), and the timeline answers one
+/// second before it. That satisfies both legs of the guard at once: the event
+/// PREDATES `episode_start` (so the leaseless-label yield fires) and sits within
+/// the 2s own-flip attribution slack of the flip window. Nothing depends on how
+/// long fixture setup took before dispatch started; only the one process spawn
+/// between `episode_start` and the flip matters.
+fn set_claim_event_now(ws: &Path, actor: &str) {
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_gh).unwrap();
+    let generic = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then";
+    let shebang = "#!/usr/bin/env bash\n";
+    assert!(script.contains(generic), "the shared harness's generic arm changed shape");
+    assert!(script.starts_with(shebang), "the shared harness's shebang changed shape");
+    let flip_file = ws.join("claim-flip-epoch");
+    let record = format!(
+        "{shebang}\
+         if [[ \"$*\" == *\"--add-label loom:building\"* ]]; then date +%s > \"{flip}\"; fi\n",
+        flip = flip_file.display(),
+    );
+    let arm = format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *\"/timeline\"* ]]; then\n\
+         n=$(( $(cat \"{flip}\" 2>/dev/null || date +%s) - 1 ))\n\
+         ts=$(date -u -d \"@$n\" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+         date -u -r \"$n\" +%Y-%m-%dT%H:%M:%SZ)\n\
+         if [[ \"$*\" == *max_by* ]]; then printf '%s\\t%s\\n' '{actor}' \"$ts\"; \
+         else printf '%s\\n' \"$ts\"; fi\n\
+         exit 0\n\
+         fi\n\
+         {generic}",
+        flip = flip_file.display(),
+    );
+    let patched = script
+        .replacen(generic, &arm, 1)
+        .replacen(shebang, &record, 1);
+    std::fs::write(&fake_gh, patched).unwrap();
+}
+
 /// **#10345 AC3.** A leaseless yield whose `loom:building` event was created by
 /// this daemon's own fleet identity inside its own flip window is a phantom:
 /// the label is reverted (`loom:building` removed, `loom:issue` restored) as
@@ -397,7 +437,7 @@ fn set_claim_event(ws: &Path, actor: &str, secs_ago: i64) {
 fn leaseless_yield_to_own_flip_reverts_the_phantom_label() {
     let dir = tempdir().unwrap();
     let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
-    set_claim_event(dir.path(), "loom-fleet-dispatch", 1);
+    set_claim_event_now(dir.path(), "loom-fleet-dispatch");
 
     let err = registry
         .dispatch(&SweepKind::Issue(10345), None, None, None, None)

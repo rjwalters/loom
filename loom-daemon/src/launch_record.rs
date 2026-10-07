@@ -109,6 +109,12 @@ pub struct RuntimeAttribution {
     /// The resolved model profile name, when one was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// `llm.billing` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_billing: Option<String>,
+    /// `llm.credential.kind` the launch stamped (#10749), when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_credential_kind: Option<String>,
 }
 
 /// Parse one `# LOOM_LAUNCH {…}` record body's runtime attribution (Issue
@@ -136,6 +142,8 @@ pub fn parse_launch_runtime(record_json: &str) -> Option<RuntimeAttribution> {
         provider: string("provider"),
         model: string("model"),
         profile: string("profile"),
+        llm_billing: string("llmBilling"),
+        llm_credential_kind: string("llmCredentialKind"),
     })
 }
 

@@ -246,6 +246,11 @@ pub struct TrainingRow {
     /// Where the star comes from; see [`crate::eta::star::star_state_at`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_source: Option<crate::eta::star::StarSource>,
+    /// The planner regime in force at `t` ([`crate::eta::planner_version`],
+    /// #10528), when recorded. Never read by a fit, so coefficient files are
+    /// unchanged; `None` = not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_version: Option<String>,
     /// Left the stage within the next 30 min. `None` = not fully observable
     /// before the cutoff; the hazard fit skips the row.
     pub exit: Option<bool>,

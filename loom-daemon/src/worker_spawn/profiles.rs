@@ -70,6 +70,10 @@ pub struct ModelProfile {
     pub provider_definition: BTreeMap<String, Value>,
     #[serde(default)]
     pub allowed_efforts: Vec<String>,
+    /// How this profile is billed (#10749): `subscription` (a flat-rate plan,
+    /// e.g. the z.ai coding plan), `api` (metered) or `local`. Absent: a
+    /// profile that reads a provider credential is treated as metered.
+    pub billing: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -447,6 +451,7 @@ mod tests {
             provider_options: BTreeMap::new(),
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
+            billing: None,
         }
     }
 
