@@ -525,9 +525,6 @@ assert_eq "0" "$EXIT_CODE" "changes-requested posts even when CI is red"
 assert_eq "" "$(cat "$STUB_DIR/wait-checks-calls.log" 2>/dev/null || true)" "changes-requested does not read CI"
 
 # --- T15: verdict gate + label transition wiring (#10581) -------------------
-no_comment() {
-  assert_eq "" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "$1: no comment posted"
-}
 
 # Success: gate consulted with the verdict, SHA, repo and overrule text; then
 # the label verb runs for the same verdict.
