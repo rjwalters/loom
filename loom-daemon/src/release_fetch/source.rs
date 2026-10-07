@@ -318,6 +318,9 @@ pub enum RefusalClass {
     NotDescendant,
     TagMoved,
     AssetReplaced,
+    /// The adoption pin could not be persisted, so drift protection for the
+    /// next fetch would be silently lost.
+    RecordWriteFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -335,8 +338,7 @@ pub struct SourceReport {
     pub source_anchor: Option<String>,
     /// `not_configured` | `identical` | `ahead`.
     pub source_check: &'static str,
-    /// `not_recorded` (no record path) | `first_seen` | `matched`; replaced
-    /// by `write_failed` when [`record_adoption`] could not persist it.
+    /// `not_recorded` (no record path) | `first_seen` | `matched`.
     pub adoption: &'static str,
 }
 
@@ -473,9 +475,13 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
     })
 }
 
-/// Record the adoption after every check passed; updates `report.adoption`.
-pub fn record_adoption(report: &mut SourceReport, i: &GateInputs<'_>) -> Option<String> {
-    let path = i.record_path?;
+/// Persist the adoption pin after every check passed, BEFORE the candidate is
+/// executed. A write failure is a refusal: adopting without a pin would make a
+/// later replaced tag/asset look `first_seen` and be accepted.
+pub fn record_adoption(report: &SourceReport, i: &GateInputs<'_>) -> Result<(), Refusal> {
+    let Some(path) = i.record_path else {
+        return Ok(());
+    };
     let entry = AdoptionEntry {
         slug: i.slug.to_string(),
         tag: i.tag.to_string(),
@@ -483,17 +489,18 @@ pub fn record_adoption(report: &mut SourceReport, i: &GateInputs<'_>) -> Option<
         commit: report.source_commit.clone(),
         asset_sha256: i.asset_sha256.to_string(),
     };
-    match write_entry(path, entry) {
-        Ok(()) => None,
-        Err(e) => {
-            report.adoption = "write_failed";
-            Some(format!(
-                "Could not write the release adoption record {} ({e}); tag-movement detection \
-                 for this release will not be available next time.",
+    write_entry(path, entry).map_err(|e| Refusal {
+        class: RefusalClass::RecordWriteFailed,
+        lines: vec![
+            format!(
+                "Required source assurance is on: could not write the release adoption record \
+                 {} ({e}); without it a later tag or asset replacement could not be detected. \
+                 This is NOT evidence of tampering.",
                 path.display()
-            ))
-        }
-    }
+            ),
+            "Refusing the artifact before it is executed or provisioned.".to_string(),
+        ],
+    })
 }
 
 #[cfg(test)]

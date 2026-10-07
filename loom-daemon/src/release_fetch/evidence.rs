@@ -112,6 +112,11 @@ pub enum EvidenceOutcome {
     SignatureMaterialUnavailable,
     /// The binary cannot load on this host's GLIBC (#8837). NOT tampering.
     GlibcIncompatible,
+    /// Required mode: the source-revision / tag-movement gate (#10473) refused
+    /// the artifact, or its adoption pin could not be written. NOT recorded as
+    /// tamper evidence here -- the refusal text distinguishes tag movement from
+    /// an unavailable check.
+    SourceAssuranceRefused,
     /// The required assets could not be downloaded at all.
     DownloadFailed,
 }

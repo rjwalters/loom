@@ -186,9 +186,9 @@ fn source_adoption_record_detects_movement_and_replacement() {
         m.insert(format!("repos/{SLUG}/compare/{A}...{commit}"), compare_body("ahead"));
         fake_api(m)
     };
-    let mut r = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
+    let r = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
     assert_eq!(r.adoption, "first_seen");
-    assert!(record_adoption(&mut r, &inputs(&anchor, Some(&rec), "sha1")).is_none());
+    assert!(record_adoption(&r, &inputs(&anchor, Some(&rec), "sha1")).is_ok());
     let r = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
     assert_eq!(r.adoption, "matched");
     let e = gate(&with(C), &inputs(&anchor, Some(&rec), "sha1")).unwrap_err();
@@ -198,9 +198,9 @@ fn source_adoption_record_detects_movement_and_replacement() {
     // Without an anchor the commit is unknown, so only the digest is compared,
     // and a later unanchored write keeps the commit already on record.
     let none = AnchorSetting::NotConfigured;
-    let mut r = gate(&with(C), &inputs(&none, Some(&rec), "sha1")).unwrap();
+    let r = gate(&with(C), &inputs(&none, Some(&rec), "sha1")).unwrap();
     assert_eq!(r.source_check, "not_configured");
-    assert!(record_adoption(&mut r, &inputs(&none, Some(&rec), "sha1")).is_none());
+    assert!(record_adoption(&r, &inputs(&none, Some(&rec), "sha1")).is_ok());
     let rec_json = read_record(&rec).unwrap();
     let entry = rec_json.entries.values().next().unwrap();
     assert_eq!(entry.commit.as_deref(), Some(B));
@@ -393,6 +393,26 @@ exit 1
         assert!(all.contains("left untouched"), "{all}");
         all
     }
+}
+
+#[test]
+#[serial]
+fn required_mode_refuses_when_adoption_record_is_unwritable() {
+    let fx = Fx::new();
+    // The record is absent (reads as empty) but its temp-file path is a
+    // directory, so the write fails deterministically, even when running as root.
+    let tmp = fx
+        .record
+        .with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let policy = fx.policy(Some(A));
+    fx.set_tag("v1.0.0", B, "ahead");
+    let all = fx.refused("v1.0.0", &policy);
+    assert!(all.contains("adoption record"), "{all}");
+    assert!(
+        all.contains("NOT evidence of tampering"),
+        "a storage failure is not a mismatch: {all}"
+    );
 }
 
 #[test]

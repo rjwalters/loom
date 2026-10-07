@@ -595,6 +595,7 @@ pub(super) fn verify_core(
         match source::gate(&api, &gate_inputs) {
             Ok(r) => source_report = Some(r),
             Err(refusal) => {
+                facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
                 let mut lines = refusal.lines;
                 lines.push(ABORT_LINE.to_string());
                 return FetchOutcome::VerificationFailed { lines };
@@ -619,6 +620,17 @@ pub(super) fn verify_core(
         };
     }
 
+    // Persist the adoption pin BEFORE the candidate is executed below: a
+    // failed write refuses the artifact rather than adopting it unpinned.
+    if let Some(report) = source_report.as_ref() {
+        if let Err(refusal) = source::record_adoption(report, &gate_inputs) {
+            facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+            let mut lines = refusal.lines;
+            lines.push(ABORT_LINE.to_string());
+            return FetchOutcome::VerificationFailed { lines };
+        }
+    }
+
     let version_output = read_version_output(&bin_path);
     let commit = crate::release_resolve::semver::extract_commit(&version_output);
     let had_authority = sig_result.had_authority;
@@ -630,15 +642,7 @@ pub(super) fn verify_core(
         .unwrap_or(signature::SignatureState::Unavailable);
     // The `LOOM_SIGNATURE_EVIDENCE` line (required mode) is appended by
     // `evidence::fetch_and_verify_with_evidence` from these facts.
-    let mut signature_line = sig_result.message;
-    if let Some(report) = source_report.as_mut() {
-        if let Some(warn) = source::record_adoption(report, &gate_inputs) {
-            signature_line = [signature_line.as_str(), &warn]
-                .join("\n")
-                .trim()
-                .to_string();
-        }
-    }
+    let signature_line = sig_result.message;
     facts.source = source_report;
     facts.signature_state = Some(signature_state);
     facts.outcome = EvidenceOutcome::Verified;
