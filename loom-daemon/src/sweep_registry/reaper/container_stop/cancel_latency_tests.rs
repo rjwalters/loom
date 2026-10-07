@@ -15,11 +15,16 @@
 //! after every assertion about the stalled window has been made. No pass
 //! condition here is a wall-clock latency bound (those flake under host load):
 //! each is "this completed while docker was provably still blocked", with only
-//! a large hang guard as the failure path. **Nothing here touches the host's docker service, a real
+//! a large hang guard as the failure path. To keep that true, the test pins
+//! `LOOM_REAP_GH_TIMEOUT_SECS` far above the hang guard: production's 5s
+//! discovery budget would otherwise kill the stalled `ps` mid-window, and a
+//! slow host would then be indistinguishable from the #8776 regression.
+//! **Nothing here touches the host's docker service, a real
 //! container, a credential or a model** — the stall is a poll loop in a script this
 //! test writes into its own tempdir, so the assertions hold identically on a
 //! host with no docker installed, a healthy one, and a wedged one.
 
+use super::super::REAP_GH_TIMEOUT_ENV;
 use super::DOCKER_BIN_ENV;
 use crate::sweep_registry::test_support::{fixture_registry, wait_for_condition};
 use crate::sweep_registry::BeginCancel;
@@ -51,9 +56,31 @@ const GRACE: Duration = Duration::from_millis(1_000);
 /// move off the caller's thread.
 const FAKE_CONTAINER: &str = "deadbeef9c01";
 
+/// Discovery timeout the test pins (seconds); must exceed [`HANG_GUARD_MS`].
+const PINNED_GH_TIMEOUT_SECS: &str = "300";
+
+/// Restores (or removes) an env var on drop, including on panic.
+struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+impl EnvRestore {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self(key, prev)
+    }
+}
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var(self.0, v),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
 /// Write a fake docker CLI that records every invocation's argv and, for `ps`,
 /// blocks until `<dir>/release` exists before reporting [`FAKE_CONTAINER`]
-/// (bounded at ~120s so a leaked process cannot live forever). `stop`/`kill`
+/// (bounded at ~120s, and also abandoned once its tempdir is gone, so a
+/// leaked process cannot live forever). `stop`/`kill`
 /// return immediately — the point of the fixture is a wedged *discovery*.
 ///
 /// The argv record is written BEFORE the gate so a test can observe that the
@@ -66,7 +93,7 @@ fn stalling_docker(dir: &Path) -> PathBuf {
             "#!/bin/bash\n\
              printf '%s\\n' \"$*\" >> {dir}/invocations\n\
              if [[ \"$1\" == ps ]]; then\n\
-             \x20 for ((i = 0; i < 6000; i++)); do [[ -e {dir}/release ]] && break; sleep 0.02; done\n\
+             \x20 for ((i = 0; i < 6000; i++)); do [[ -e {dir}/release || ! -d {dir} ]] && break; sleep 0.02; done\n\
              \x20 printf '%s\\t%s\\n' '{id}' 'claude-ephemeral'\n\
              fi\n\
              exit 0\n",
@@ -122,8 +149,10 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
     let fake_dir = dir.path().join("docker");
     std::fs::create_dir_all(&fake_dir).unwrap();
     let fake = stalling_docker(&fake_dir);
-    // SAFETY-of-scope: restored at the end of the test; see `#[serial]` above.
-    std::env::set_var(DOCKER_BIN_ENV, &fake);
+    // SAFETY-of-scope: restored on drop; see `#[serial]` above.
+    let _docker_env = EnvRestore::set(DOCKER_BIN_ENV, &fake);
+    // Keep production's 5s discovery budget out of the test (see module doc).
+    let _timeout_env = EnvRestore::set(REAP_GH_TIMEOUT_ENV, PINNED_GH_TIMEOUT_SECS);
 
     let (registry, _record_log) = fixture_registry(dir.path());
     let registry = Arc::new(Mutex::new(registry));
@@ -305,6 +334,4 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
         2,
         "each half must discover by the issue+dispatch label filter, once: {log}"
     );
-
-    std::env::remove_var(DOCKER_BIN_ENV);
 }
