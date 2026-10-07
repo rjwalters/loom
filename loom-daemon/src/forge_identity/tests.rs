@@ -350,6 +350,9 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // W4-C: the choke point's class-aware chain (the same reviewed
         // routing step, with the router injected).
         "gh_invocation/reader_route_v2.rs",
+        // W7: the ETag store's W4-C deferrable chain (`ConditionalRead::
+        // deferrable`), the same reviewed routing step with the router injected.
+        "forge_etag_store/deferrable.rs",
         // #10391: `eta doctor` resolves (never uses) a reader per repo to say
         // whether one exists; it makes no forge call at all.
         "eta/doctor_facts.rs",

@@ -7265,7 +7265,7 @@ captain that dispatches nothing still runs it:
   consistency check compares each page's issue numbers, not whole rows, so a
   comment on an open issue does not abort it; an issue opened or closed
   across a page boundary mid-walk does.
-- **Shed, never the writer**: a rate-limited or refused reader is withdrawn
+- **Shed when out of budget**: a rate-limited or refused reader is withdrawn
   and the next reader asked. When every reader that can see the repo is out
   of budget the walk is shed (no request, an `o=shed` row, the facade event
   `intake.listing_shed`) and the repo waits for the next pass. Only with no
