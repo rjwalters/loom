@@ -1,5 +1,17 @@
 use super::*;
 
+/// Serializes every test in this module that forks (a `git` fixture, a
+/// `Command::spawn`) or holds an account lease. `fork()` copies every open
+/// descriptor, so a fork racing a held lease keeps the `flock` alive in the
+/// child until it execs and `Lease::acquire` reads busy (issue #10798). One
+/// lock for the forkers and the lease holders, not a global `#[serial]`.
+pub(super) fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FORK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection() {
     use repository::credential_username;
@@ -81,6 +93,7 @@ impl RepoFixture {
 
 #[test]
 fn independent_clone_reuses_without_alternates_and_keeps_private_worktrees() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     let revision = f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -105,6 +118,7 @@ fn independent_clone_reuses_without_alternates_and_keeps_private_worktrees() {
 
 #[test]
 fn dirty_root_and_dirty_worktree_are_preserved() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -130,6 +144,7 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 
 #[test]
 fn unpushed_and_detached_commits_survive_refused_reuse() {
+    let _fork = fork_guard();
     let f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
@@ -147,6 +162,7 @@ fn unpushed_and_detached_commits_survive_refused_reuse() {
 
 #[test]
 fn mismatched_identity_unknown_work_and_alternates_are_refused() {
+    let _fork = fork_guard();
     let mut f = RepoFixture::new();
     f.prepare().unwrap();
     f.args.repository.push_str("-other");
@@ -294,6 +310,7 @@ fn actual_mounts_privilege_and_volume_driver_options_are_enforced() {
 
 #[test]
 fn symlinked_git_objects_and_refs_are_refused_without_modification() {
+    let _fork = fork_guard();
     use std::os::unix::fs::symlink;
     for component in ["objects", "refs"] {
         let f = RepoFixture::new();
@@ -314,6 +331,7 @@ fn symlinked_git_objects_and_refs_are_refused_without_modification() {
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
+    let _fork = fork_guard();
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("account-a");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
@@ -345,6 +363,7 @@ fn account_lease_is_exclusive_across_role_sweep_interactive_and_repo_claims() {
 #[test]
 #[serial_test::serial(private_workspace_fork)]
 fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner() {
+    let _fork = fork_guard();
     let root = tempfile::tempdir().unwrap();
     let lease = lease::Lease::acquire(root.path()).unwrap();
     let job = lease::Job {

@@ -412,6 +412,7 @@ mod tests {
 
     #[test]
     fn logical_repository_normalizes_ssh_https_and_dot_git() {
+        let _fork = super::super::tests::fork_guard();
         for remote in [
             "git@github.com:2AMLogic/gf180-parasynth.git",
             "https://github.com/2AMLogic/gf180-parasynth.git",
@@ -430,6 +431,7 @@ mod tests {
 
     #[test]
     fn only_shared_accounts_and_private_clones_of_this_repository_serve_it() {
+        let _fork = super::super::tests::fork_guard();
         let root = tempfile::tempdir().unwrap();
         let here = "https://github.com/2AMLogic/gf180-parasynth";
         let shared = root.path().join("shared");
@@ -459,6 +461,7 @@ mod tests {
     fn pool_selection_never_draws_a_private_clone_of_another_repository() {
         use super::super::super::account_registry::select_codex_account_where;
         use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
         let here = "https://github.com/2AMLogic/gf180-parasynth";
         let ws = workspace_with_origin(&format!("{here}.git"));
         let shared_root = tempfile::tempdir().unwrap();
@@ -536,18 +539,20 @@ mod tests {
     #[test]
     #[serial_test::serial(private_workspace_fork)]
     fn failed_spawn_releases_prepared_reservation_without_a_child() {
+        let _fork = super::super::tests::fork_guard();
         let dir = tempfile::tempdir().unwrap();
         let selection = reservation(dir.path());
         let mut command = Command::new("/nonexistent/loom-private-test");
         selection.apply(&mut command);
         assert!(command.spawn().is_err());
         drop(selection);
-        assert!(lease::Lease::acquire(dir.path()).is_ok());
+        lease::Lease::acquire(dir.path()).expect("lease must be free after a failed spawn");
         assert!(!dir.path().join("job.json").exists());
     }
     #[test]
     #[serial_test::serial(private_workspace_fork)]
     fn child_inherits_same_account_lock_after_dispatcher_drops_its_copy() {
+        let _fork = super::super::tests::fork_guard();
         let dir = tempfile::tempdir().unwrap();
         let selection = reservation(dir.path());
         let mut command = Command::new("sh");
@@ -559,7 +564,7 @@ mod tests {
         assert!(lease::Lease::acquire(dir.path()).is_err());
         assert!(dir.path().join("job.json").exists());
         assert!(child.wait().unwrap().success());
-        assert!(lease::Lease::acquire(dir.path()).is_ok());
+        lease::Lease::acquire(dir.path()).expect("lease must be free after the child exits");
         // Process exit releases the flock, not the durable uncertainty fence.
         assert!(dir.path().join("job.json").exists());
     }
