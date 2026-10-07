@@ -483,7 +483,10 @@ fn docker_boundary_blocks_api_and_keeps_git_transport() {
         eprintln!("skip: docker unavailable");
         return;
     }
-    let b = boundary();
+    // A real, reachable gateway: the positive probe must pass for real.
+    let mut live = policy("required", None);
+    live["github"]["apiOrigin"] = json!("https://github.com");
+    let b = Boundary::from_policy(&live).unwrap();
     let sidecar = establish_with(
         &RealDocker,
         &b,
@@ -514,6 +517,8 @@ fn docker_boundary_blocks_api_and_keeps_git_transport() {
     };
     assert_ne!(run("curl -sS --max-time 5 https://api.github.com/zen"), Some(0));
     assert_ne!(run("curl -sS -6 --max-time 5 https://api.github.com/zen"), Some(0));
+    // The worker holds no network capability: it cannot remove the rules.
+    assert_ne!(run("iptables -F LOOM_FORGE_EGRESS"), Some(0));
     assert_eq!(run("git ls-remote https://github.com/rjwalters/loom HEAD >/dev/null"), Some(0));
     RealDocker.run(&["rm".into(), "-f".into(), sidecar.name], Duration::from_secs(20));
 }
