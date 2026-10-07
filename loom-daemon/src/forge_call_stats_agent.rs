@@ -71,10 +71,12 @@ pub fn worker_sink_dir() -> Option<PathBuf> {
 /// `LOOM_*` by-name forwarding already carries the variable itself.
 ///
 /// The value is an env var, so it is not trusted to name a read-write
-/// mount: it must resolve to this host's sink directory
-/// ([`host_sink_dir`](super::host_sink_dir)) and that directory must be
-/// private (a real directory owned by us, mode `0700`). Anything else —
-/// `/`, `$HOME`, `/var/run` — yields no mount.
+/// mount. Comparing it with [`host_sink_dir`](super::host_sink_dir) proves
+/// nothing: this process resolves its own sink from the same variable. So
+/// the directory itself must look like a sink: an absolute, real directory
+/// that is private (owned by us, mode `0700`) and holds nothing but sink
+/// files ([`is_sink_entry`]). `/`, `/var/run`, `/tmp` and a home directory
+/// all fail that, so they get no mount, and nothing about them is changed.
 #[must_use]
 pub fn docker_mount_args(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<String> {
     let Some(dir) = env(SINK_DIR_ENV)
@@ -83,18 +85,66 @@ pub fn docker_mount_args(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Ve
     else {
         return Vec::new();
     };
-    if !dir.is_absolute() || !dir.is_dir() {
+    if !dir.is_absolute() {
         return Vec::new();
     }
-    let Some(sink) = super::host_sink_dir() else {
+    if !is_owner_only_dir(&dir) || !holds_only_sink_files(&dir) {
         return Vec::new();
-    };
-    match (dir.canonicalize(), sink.canonicalize()) {
-        (Ok(want), Ok(have))
-            if want == have && crate::forge_etag_store::private_dir(&want, false) => {}
-        _ => return Vec::new(),
     }
     vec!["-v".to_string(), format!("{0}:{0}", dir.display())]
+}
+
+/// `dir` is a real directory (a symlink is refused, not followed), owned by
+/// us, with no group/other bits. A pure check: unlike
+/// `forge_etag_store::private_dir`, it never tightens the mode of what it
+/// inspects, so a refused directory is left exactly as it was.
+fn is_owner_only_dir(dir: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid only reads the caller's effective user id.
+        let owned = meta.uid() == unsafe { libc::geteuid() };
+        meta.is_dir() && owned && meta.permissions().mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_dir()
+    }
+}
+
+/// Whether every entry of `dir` is a regular sink file.
+fn holds_only_sink_files(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|e| {
+        e.is_ok_and(|e| {
+            e.file_type().is_ok_and(|t| t.is_file())
+                && e.file_name().to_str().is_some_and(is_sink_entry)
+        })
+    })
+}
+
+/// A name the sink itself writes: `calls-<hour>.jsonl`, the bucket book's
+/// snapshot, or that snapshot's in-flight temp file
+/// (`crate::forge_bucket_book::persist`).
+#[must_use]
+pub fn is_sink_entry(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let snapshot = crate::forge_bucket_book::SNAPSHOT_FILE;
+    name == snapshot
+        || name
+            .strip_prefix("calls-")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .is_some_and(|h| digits(h.strip_prefix('-').unwrap_or(h)))
+        || name
+            .strip_prefix('.')
+            .and_then(|n| n.strip_prefix(snapshot))
+            .and_then(|n| n.strip_prefix('.'))
+            .is_some_and(digits)
 }
 
 /// The `ag`/`vi` keys, flattened into the sink line; both absent off-front.
@@ -208,6 +258,82 @@ mod tests {
         super::super::set_test_sink_dir(None);
     }
 
+    /// Review S1, reopened by the generic variable: `container-args`
+    /// resolves its own sink from the same variable it is asked to mount,
+    /// so a private directory named there (a home directory, say) used to
+    /// pass as "the host sink". Only a directory holding nothing but sink
+    /// files is mounted.
+    #[cfg(unix)]
+    #[test]
+    fn docker_mount_refuses_a_private_directory_that_is_not_a_sink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display().to_string();
+        let env = |k: &str| (k == SINK_DIR_ENV).then(|| std::ffi::OsString::from(&d));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // What the container-args process sees: its sink IS the named dir.
+        super::super::set_test_sink_dir(Some(dir.path().to_path_buf()));
+        for name in [
+            "calls-493000.jsonl",
+            "bucket-book.json",
+            ".bucket-book.json.4242",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        assert_eq!(docker_mount_args(env), ["-v".to_string(), format!("{d}:{d}")]);
+        // A home directory: ours, and full of other things — refused, and
+        // left at its own mode (never tightened by the check).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join(".profile"), "").unwrap();
+        assert!(docker_mount_args(env).is_empty(), "a 0755 home");
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the refused directory's mode is untouched");
+        std::fs::remove_file(dir.path().join(".profile")).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+        assert!(docker_mount_args(env).is_empty(), "a sub-directory");
+        std::fs::remove_dir(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".bashrc"), "").unwrap();
+        assert!(docker_mount_args(env).is_empty(), "a foreign file");
+        std::fs::remove_file(dir.path().join(".bashrc")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("calls-1.jsonl")).unwrap();
+        assert!(docker_mount_args(env).is_empty(), "a symlink named like a sink file");
+        std::fs::remove_file(dir.path().join("calls-1.jsonl")).unwrap();
+        // The directory itself reached through a symlink.
+        let link = tempfile::tempdir().unwrap();
+        let alias = link.path().join("sink");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        let a = alias.display().to_string();
+        let via_link = |k: &str| (k == SINK_DIR_ENV).then(|| std::ffi::OsString::from(&a));
+        assert!(docker_mount_args(via_link).is_empty(), "a symlinked sink");
+        super::super::set_test_sink_dir(None);
+    }
+
+    #[test]
+    fn sink_entries_are_only_what_the_sink_writes() {
+        for ok in [
+            "calls-0.jsonl",
+            "calls-493000.jsonl",
+            "calls--1.jsonl",
+            "bucket-book.json",
+        ] {
+            assert!(is_sink_entry(ok), "{ok}");
+        }
+        assert!(is_sink_entry(".bucket-book.json.12"));
+        for bad in [
+            "calls-.jsonl",
+            "calls-1.json",
+            "calls-1x.jsonl",
+            ".bucket-book.json.",
+            ".bucket-book.json.x",
+            "bucket-book.json.bak",
+            ".ssh",
+            "docker.sock",
+        ] {
+            assert!(!is_sink_entry(bad), "{bad}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn docker_mount_refuses_a_non_private_sink() {
@@ -220,8 +346,9 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!crate::forge_etag_store::private_dir(dir.path(), false));
         assert!(docker_mount_args(env).is_empty());
-        // The sink is off: nothing is mounted even for an existing directory.
         super::super::set_test_sink_dir(None);
-        assert!(docker_mount_args(env).is_empty());
+        // A sink exported as off names no directory at all.
+        let off = |k: &str| (k == SINK_DIR_ENV).then(|| std::ffi::OsString::from("off"));
+        assert!(docker_mount_args(off).is_empty());
     }
 }

@@ -316,7 +316,11 @@ fn container_args_parity_mount_the_agent_front_sink_read_write() {
         assert_eq!(args[args.len() - 2..], ["-v".to_string(), spec.clone()], "{args:?}");
     }
     crate::forge_call_stats::set_test_sink_dir(None);
-    assert!(Admission::default().docker_args(&lookup).is_empty());
+    // A sink exported as off names no directory, so nothing is mounted.
+    let off = |k: &str| -> Option<std::ffi::OsString> {
+        (k == "LOOM_FORGE_CALL_STATS_DIR").then(|| "off".into())
+    };
+    assert!(Admission::default().docker_args(off).is_empty());
 }
 
 #[test]
