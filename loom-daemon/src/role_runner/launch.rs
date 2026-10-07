@@ -10,6 +10,38 @@ mod session_down;
 // #10364: likewise a tick refused because the running container does not
 // mount the tick's working directory (a repo registered after it was created).
 mod session_mount_stale;
+// #10743: the launch's trace context + opt-in Claude Code OTel env.
+#[cfg(test)]
+mod observability_tests;
+
+/// Stamp a role tick's launch with its `loom.role_attempt` trace context
+/// (#9438), then — opt-in, default-off — the Claude Code OTel env (#10743), in
+/// that order, exactly as the sweep path does: the `TRACEPARENT` exported
+/// first is what parents the session's own spans inside this tick's trace.
+/// With the opt-in off this only clears the variables Loom owns there.
+///
+/// The tick's context is mirrored to the standard `TRACEPARENT` (the variable
+/// Claude Code's `-p` sessions read) exactly as the sweep path's
+/// `observability::tracing::prepare_child` does, and removed when the tick has
+/// none, so an ambient daemon value can never parent this session.
+pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path, role: &str) {
+    use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
+    let execution = crate::observability::lifecycle::role_command(cmd);
+    let context = cmd
+        .get_envs()
+        .find(|(name, _)| *name == TRACEPARENT_ENV)
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string));
+    match context {
+        Some(context) => cmd.env(W3C_TRACEPARENT_ENV, context),
+        None => cmd.env_remove(W3C_TRACEPARENT_ENV),
+    };
+    crate::observability::claude_code_telemetry::prepare_scheduled_child(
+        cmd,
+        workspace_root,
+        role,
+        execution.as_deref(),
+    );
+}
 
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
@@ -203,7 +235,7 @@ pub(super) fn run_role_with_timeout(
         cmd.process_group(0);
     }
 
-    crate::observability::lifecycle::role_command(&mut cmd);
+    apply_role_observability(&mut cmd, workspace_root, role);
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
     if let Some(selection) = &selection {

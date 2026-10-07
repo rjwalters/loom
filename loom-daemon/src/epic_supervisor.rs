@@ -1192,6 +1192,9 @@ pub fn spawn_multi_supervisor_thread(
 // Concrete runtime adapters (forge-backed source + spawn dispatcher)
 // ============================================================================
 
+// #10743: the singleton role-dispatch command, testable without spawning.
+mod role_spawn;
+
 /// Concrete [`EpicSource`] / [`EpicDispatcher`] implementations that wire the
 /// supervisor to the live forge (`gh`) and the daemon's [`SweepRegistry`].
 ///
@@ -1206,7 +1209,6 @@ pub mod forge {
     use anyhow::{anyhow, Context, Result};
     use serde::Deserialize;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
     /// The `loom:epic-phase` child marker embedded in a child issue body,
@@ -1422,15 +1424,8 @@ pub mod forge {
             );
             // Spawn-and-wait: the burst must complete before we return so the
             // supervisor's #3707 guard genuinely serializes it.
-            let mut cmd = Command::new(&self.spawn_bin);
-            cmd.arg("-p")
-                .arg(&shape.prompt)
-                .arg("--model")
-                .arg(&model)
-                .arg("--dangerously-skip-permissions")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+            let mut cmd =
+                super::role_spawn::command(&self.spawn_bin, &repo_root, epic, shape, &model);
             let status = cmd.status().with_context(|| {
                 format!(
                     "failed to spawn {} for {} on epic #{epic}",
