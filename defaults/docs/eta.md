@@ -655,7 +655,7 @@ after quick-tern. The method is `eta::conformal_ipcw::calibrate_drift_aware`.
 
   Nothing here is live-coverage evidence.
 
-**The wrapper over any `land` base** (#10524, slice 4;
+**The wrapper over any `land` base** (#10524, slice 5;
 `eta::conformal_wrap::IpcwWrap`). This is quick-tern's and swift-tern's
 calibration with the base as a parameter. It runs the base and re-identifies
 the explanation. It then calibrates the explanation against the base's own

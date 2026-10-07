@@ -1,4 +1,4 @@
-//! The IPCW conformal wrapper over any `land` base (#10524, slice 4): parity
+//! The IPCW conformal wrapper over any `land` base (#10524, slice 5): parity
 //! with the shipped quick-tern / swift-tern over twin-otter-b, a different
 //! base calibrated on its own rows only, the point-in-time leak test, the
 //! recompute through a simulator base (held-heron), the refusals, and the

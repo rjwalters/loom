@@ -1,4 +1,4 @@
-//! The IPCW conformal wrapper over **any** `land` base (#10524, slice 4).
+//! The IPCW conformal wrapper over **any** `land` base (#10524, slice 5).
 //!
 //! `land-2026-10-06-quick-tern` and `-swift-tern` are the two IPCW
 //! calibrators ([`super::conformal_ipcw`]) hard-wired over

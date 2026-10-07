@@ -6,13 +6,14 @@
 use std::path::Path;
 
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use loom_daemon::eta::backtest;
 use loom_daemon::eta::conformal_wrap::{self, Calibrator, IpcwWrap};
 use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::walk_forward::{DatedFits, WalkForward};
 use loom_daemon::eta::{Heuristic, Provenance};
 
-/// `eta backtest --wrap NAME` (#10524, slice 4): `base` IPCW-wrapped
+/// `eta backtest --wrap NAME` (#10524, slice 5): `base` IPCW-wrapped
 /// ([`IpcwWrap`]) as `<base>+<NAME>`, with `base`'s own replayed estimates
 /// added to `history.calibration` as its evidence (leak-free, as
 /// [`with_replay_calibration`]; skipped for a base that already has them).
@@ -44,11 +45,22 @@ pub(super) fn wrap_for_backtest<'a>(
         let replayed = backtest::calibration_from_replay(&base, history, cases, loom);
         history.calibration.extend(replayed);
     }
+    // One small leaked string per one-shot CLI run: `IpcwWrap` needs a `&'static` id.
     let id: &'static str = Box::leak(calibrator.wrapped_id(base_id).into_boxed_str());
     match IpcwWrap::new(id, base, calibrator) {
         Some(wrapped) => Ok(Box::new(wrapped)),
         None => bail!("--wrap: {base_id} does not predict `land`; only a land base is calibrated"),
     }
+}
+
+/// Parse `eta backtest --since` (RFC 3339) into a UTC instant.
+pub(super) fn parse_since(raw: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    raw.map(|raw| {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| anyhow::anyhow!("invalid --since {raw:?}: {e}"))
+    })
+    .transpose()
 }
 
 /// Load the `--fit-dir` coefficient files for `eta backtest` (#10524);

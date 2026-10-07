@@ -446,14 +446,7 @@ impl EtaBacktestArgs {
                 registry.ids().join(", ")
             );
         };
-        let since = match &self.since {
-            Some(raw) => Some(
-                DateTime::parse_from_rfc3339(raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| anyhow::anyhow!("invalid --since {raw:?}: {e}"))?,
-            ),
-            None => None,
-        };
+        let since = super::eta_replay_cmd::parse_since(self.since.as_deref())?;
         let filter = Filter {
             since,
             repo: self.repo.as_deref(),
