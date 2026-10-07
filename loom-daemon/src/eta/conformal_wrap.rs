@@ -1,0 +1,155 @@
+//! The IPCW conformal wrapper over **any** `land` base (#10524, slice 4).
+//!
+//! `land-2026-10-06-quick-tern` and `-swift-tern` are the two IPCW
+//! calibrators ([`super::conformal_ipcw`]) hard-wired over
+//! `land-2026-10-04-twin-otter-b`. [`IpcwWrap`] is the same wrapper with the
+//! base as a parameter: it runs the base, re-identifies the explanation as
+//! its own, and calibrates it against the base's own track record
+//! (`calibration` rows whose `heuristic` is the base's id). Over twin-otter-b
+//! it is quick-tern (or swift-tern) byte for byte; that parity is pinned by
+//! a test, so the wrapper evaluated here is the one that ships.
+//!
+//! # Why it is not registered
+//!
+//! The `land` shadow budget (#10525, 13 per kind) is full once the in-flight
+//! `land` candidates land, and a calibrated base needs evidence before it
+//! deserves a slot. So this slice wraps bases **offline**: `eta backtest
+//! --wrap ipcw|ipcw-drift` scores `<base>+ipcw` on the replay set, and
+//! `--compare <base>` pairs it against the unwrapped base. That is the
+//! comparison the #10524 acceptance asks for ("pinball no worse than the
+//! unwrapped base, paired CI"), for the priority model (#10508), the hazard
+//! simulator (#10523) or any other `land` base.
+//!
+//! Registering a wrapped base later is a new datestamped id built from this
+//! type ([`IpcwWrap::new`] takes a `&'static str` id); ids stay immutable.
+//!
+//! # Rules
+//!
+//! - **`land` only.** The calibration evidence is landings; [`IpcwWrap::new`]
+//!   refuses any other kind.
+//! - **Never twice.** A base whose explanation already carries a
+//!   `calibration` or `recalibration` record (calm-plover, quick-tern,
+//!   swift-tern) is left as the base answered, only re-identified: a second
+//!   shift would overwrite the first record and the explanation would no
+//!   longer recompute.
+//! - **Degrades to the base.** A refusal, a base without p90, or too few
+//!   effective landings is the base's answer unchanged (re-identified, with
+//!   no `calibration` record), as for quick-tern.
+//! - **Point-in-time.** Exactly [`super::conformal_ipcw`]'s: no estimate
+//!   made at or after `as_of`, and no outcome known at or after it, is used
+//!   as an event.
+//!
+//! Pure: no clock, no file, no forge.
+
+use super::conformal_ipcw;
+use super::heuristics::{LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN};
+use super::history::StageSamples;
+use super::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
+
+/// The registered `land` heuristics that already calibrate their own
+/// estimate. Wrapping one is the identity (see "Never twice"), so `eta
+/// backtest --wrap` refuses them.
+pub const CALIBRATED: &[&str] = &[LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN];
+
+/// Which IPCW calibrator wraps the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Calibrator {
+    /// [`conformal_ipcw::calibrate`]: quick-tern's.
+    Ipcw,
+    /// [`conformal_ipcw::calibrate_drift_aware`]: swift-tern's.
+    IpcwDrift,
+}
+
+impl Calibrator {
+    /// Every calibrator, in [`Self::name`] order.
+    pub const ALL: [Calibrator; 2] = [Calibrator::Ipcw, Calibrator::IpcwDrift];
+
+    /// The name `eta backtest --wrap` takes, and the suffix of an offline
+    /// wrapped id (`<base>+<name>`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Calibrator::Ipcw => "ipcw",
+            Calibrator::IpcwDrift => "ipcw-drift",
+        }
+    }
+
+    /// The calibrator named `name`, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name.trim())
+    }
+
+    /// The id an offline wrap of `base` reports under: `<base>+<name>`.
+    /// Never a registered id (`+` appears in none).
+    #[must_use]
+    pub fn wrapped_id(self, base: &str) -> String {
+        format!("{base}+{}", self.name())
+    }
+}
+
+/// `base`'s estimate, calibrated by IPCW split-conformal against `base`'s
+/// own track record, under the id `id`.
+#[derive(Debug, Clone)]
+pub struct IpcwWrap<H> {
+    id: &'static str,
+    base: H,
+    calibrator: Calibrator,
+}
+
+impl<H: Heuristic> IpcwWrap<H> {
+    /// `base` wrapped as `id`; `None` unless `base` predicts `land`.
+    #[must_use]
+    pub fn new(id: &'static str, base: H, calibrator: Calibrator) -> Option<Self> {
+        (base.kind() == Kind::Land).then_some(IpcwWrap {
+            id,
+            base,
+            calibrator,
+        })
+    }
+
+    /// The wrapped base's id: the `heuristic` its calibration rows carry.
+    #[must_use]
+    pub fn base_id(&self) -> &'static str {
+        self.base.id()
+    }
+}
+
+impl<H: Heuristic> Heuristic for IpcwWrap<H> {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Land
+    }
+
+    /// A candidate (#10525), as quick-tern.
+    fn tier(&self) -> Tier {
+        Tier::Candidate
+    }
+
+    /// As its base.
+    fn models_hold(&self) -> bool {
+        self.base.models_hold()
+    }
+
+    fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
+        let mut explanation = self.base.estimate(input, history);
+        explanation.heuristic = self.id.to_string();
+        explanation.estimate_id = estimate_id(&input.subject, Kind::Land, self.id, input.as_of);
+        if explanation.result.is_none()
+            || explanation.calibration.is_some()
+            || explanation.recalibration.is_some()
+        {
+            return explanation;
+        }
+        let base = self.base.id();
+        match self.calibrator {
+            Calibrator::Ipcw => conformal_ipcw::calibrate(explanation, &history.calibration, base),
+            Calibrator::IpcwDrift => {
+                conformal_ipcw::calibrate_drift_aware(explanation, &history.calibration, base)
+            }
+        }
+    }
+}
