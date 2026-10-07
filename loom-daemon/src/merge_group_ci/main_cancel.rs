@@ -81,16 +81,28 @@ fn ends_cancel_endpoint(line: &str) -> bool {
     })
 }
 
+/// Whether `line` has the shell words `run` and `cancel` adjacent. Bash
+/// splits on any run of blanks (`gh run  cancel`, `gh run<TAB>cancel`) and
+/// ignores quoting around a word, so compare tokens rather than a substring.
+fn has_run_cancel_words(line: &str) -> bool {
+    let words: Vec<&str> = line
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| matches!(c, '"' | '\'')))
+        .collect();
+    words.windows(2).any(|w| w[0] == "run" && w[1] == "cancel")
+}
+
 /// Whether a step's body or action cancels workflow runs. Shell comment
 /// lines (`# ...`) are skipped for every pattern, so a step that only
 /// *mentions* cancelling (`# never gh run cancel here`) is not a cancel step.
 #[must_use]
 pub fn is_cancel_step(step: &Step) -> bool {
     let run_cancels = step.run.as_deref().is_some_and(|r| {
-        r.lines().any(|l| {
+        // A trailing backslash continues the command on the next line.
+        r.replace("\\\n", " ").lines().any(|l| {
             let l = l.trim();
             !l.starts_with('#')
-                && (l.contains("run cancel")
+                && (has_run_cancel_words(l)
                     || l.contains("force-cancel")
                     || ends_cancel_endpoint(l))
         })
@@ -560,6 +572,43 @@ jobs:
     steps:
       - run: cargo test
 "#;
+
+    fn run_step(cmd: &str) -> Step {
+        Step {
+            index: 0,
+            line: 0,
+            name: None,
+            uses: None,
+            run: Some(cmd.to_string()),
+            if_cond: None,
+            with: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Bash splits on any blanks and joins backslash continuations, so these
+    /// all run `gh run cancel`; the detector must not key on one spelling
+    /// (#10677 review).
+    #[test]
+    fn cancel_step_detects_any_shell_whitespace() {
+        for cmd in [
+            "__GH__ run  cancel 123",
+            "__GH__ run\tcancel 123",
+            "__GH__   run   cancel 123",
+            "__GH__ run \\\n  cancel 123",
+            "__GH__ run \"cancel\" 123",
+            "__GH__ 'run' cancel 123",
+        ] {
+            assert!(is_cancel_step(&run_step(cmd)), "{cmd:?}");
+        }
+        for cmd in [
+            "__GH__ run list",
+            "# __GH__ run  cancel 123",
+            "__GH__ run cancelled",
+        ] {
+            assert!(!is_cancel_step(&run_step(cmd)), "{cmd:?}");
+        }
+    }
 
     #[test]
     fn pr_only_cancellation_is_clean() {
