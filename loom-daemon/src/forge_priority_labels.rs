@@ -297,6 +297,24 @@ fn post_audits(root: &Path, slug: &str, pr: u32, outcome: &Outcome) -> anyhow::R
     )
 }
 
+/// The audit comment for a PR the daemon itself just opened (the recovery
+/// fallback, which has no `create-pr.sh` to post it): the same
+/// [`audit_target`] / write-scope-vetted [`post_audits`] path as `--audit-pr`.
+/// Returns the number of comments posted.
+///
+/// # Errors
+///
+/// `pr_url` is not a PR reference, or the write-scope gate denied its repo.
+pub fn audit_created_pr(root: &Path, body: &str, pr_url: &str) -> anyhow::Result<usize> {
+    let (pr, repo) = audit_target(Some(pr_url), None).map_err(anyhow::Error::msg)?;
+    let (Some(pr), Some(slug)) = (pr, repo.or_else(|| ambient_repo(root))) else {
+        return Ok(0);
+    };
+    let issues = source_issues(body, Some(&slug));
+    let outcome = collect_live(root, Some(&slug), &issues);
+    post_audits(root, &slug, pr, &outcome)
+}
+
 /// Arguments for the `forge priority-labels` verb ([`cli_entrypoint`]).
 pub struct PriorityLabelsArgs {
     /// Explicit issue numbers (added to whatever the body names).
