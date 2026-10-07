@@ -284,6 +284,7 @@ mod tests {
             provider_options: std::collections::BTreeMap::new(),
             provider_definition: std::collections::BTreeMap::new(),
             allowed_efforts: Vec::new(),
+            billing: None,
         }
     }
 

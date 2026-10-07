@@ -107,6 +107,9 @@ pub struct TickFacts {
     /// The tick's per-model usage (#9303); attempt-scoped usage joins the
     /// story only when exactly one target is stitched ([`super::usage`]).
     pub tokens_by_model: Option<Vec<crate::script_helpers::sweep_experiment::ModelUsageTotals>>,
+    /// How the tick was billed (#10749); copied onto the story spans and their
+    /// attempt-scoped usage.
+    pub llm_billing: Option<crate::observability::llm_billing::LlmBilling>,
 }
 
 /// Join `facts`' tick to the stories of `targets`. Blocking and best-effort:
@@ -235,6 +238,9 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             attributes.insert(key.to_string(), value);
         }
+    }
+    if let Some(billing) = &facts.llm_billing {
+        billing.stamp(&mut attributes);
     }
     // #9420: a story copy is the whole tick's interval, so it carries the same
     // dwell-conditioning flag as the tick's own root. A story copy only exists

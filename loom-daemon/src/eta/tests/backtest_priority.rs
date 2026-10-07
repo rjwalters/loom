@@ -168,3 +168,74 @@ fn a_record_without_linked_star_round_trips_unchanged() {
     let back: PrCaseRecord = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
     assert_eq!(back, with);
 }
+
+mod fill_linked {
+    use super::*;
+    use crate::eta::backtest::fill_linked_stars;
+    use crate::eta::star::{IssueStarChange, RepoStar, StarInputs, StarLink};
+
+    fn stars(synced_through: Option<chrono::DateTime<chrono::Utc>>) -> StarInputs {
+        let mut star = RepoStar::default();
+        star.links.insert(
+            1,
+            vec![StarLink {
+                issue: 11,
+                known_at: t(10),
+            }],
+        );
+        star.issue_stars = vec![
+            IssueStarChange {
+                issue: 11,
+                at: t(20),
+                starred: true,
+            },
+            IssueStarChange {
+                issue: 11,
+                at: t(4000),
+                starred: false,
+            },
+            // After the PR merged: never read into the record.
+            IssueStarChange {
+                issue: 11,
+                at: t(9000),
+                starred: true,
+            },
+        ];
+        star.links_from = Some(t(-10));
+        star.issue_events_from = Some(t(-10));
+        star.synced_through = synced_through;
+        let mut inputs = StarInputs::default();
+        inputs.repos.insert(A.to_string(), star);
+        inputs
+    }
+
+    fn unread(repo: &str) -> PrCaseRecord {
+        let mut r = subject_record();
+        r.repo = repo.to_string();
+        r.linked_star = None;
+        r
+    }
+
+    #[test]
+    fn a_covered_record_gets_the_flips_before_its_end() {
+        let mut records = [unread(A)];
+        assert_eq!(fill_linked_stars(&mut records, &stars(None), t(99_999)), 1);
+        assert_eq!(records[0].linked_star, Some(vec![t(20), t(4000)]));
+    }
+
+    #[test]
+    fn an_uncovered_record_stays_unread_never_unstarred() {
+        // Another repo (no cache), and a repo whose cache ends before the PR did.
+        let mut records = [unread(B), unread(A)];
+        assert_eq!(fill_linked_stars(&mut records, &stars(Some(t(100))), t(99_999)), 0);
+        assert_eq!(records[0].linked_star, None);
+        assert_eq!(records[1].linked_star, None);
+    }
+
+    #[test]
+    fn a_record_that_already_carries_a_read_is_untouched() {
+        let mut records = [subject_record()];
+        assert_eq!(fill_linked_stars(&mut records, &stars(None), t(99_999)), 0);
+        assert_eq!(records[0].linked_star, Some(Vec::new()));
+    }
+}

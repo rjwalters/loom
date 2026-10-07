@@ -67,8 +67,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod pr_cases;
 pub use pr_cases::{
     cases_from_pr_history, cases_from_pr_records, cases_from_pr_records_with_roster,
-    parse_pr_records, pr_case_entries, PrCaseEntries, PrCaseExclusion, PrCaseRecord, PrCaseSummary,
-    RefusedEntry,
+    fill_linked_stars, parse_pr_records, pr_case_entries, PrCaseEntries, PrCaseExclusion,
+    PrCaseRecord, PrCaseSummary, RefusedEntry,
 };
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),

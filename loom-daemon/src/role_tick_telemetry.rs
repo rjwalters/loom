@@ -751,6 +751,17 @@ fn emit_correlated(
     // The launch record's runtime, else the resolved-runtime marker (#8594);
     // absent (unknown, never guessed) for a Claude tick with neither.
     let story_runtime = usage_runtime.clone().flatten();
+    // #10749: how the tick was billed — read once, stamped on the usage spans
+    // and the story copies. A launch record's own class wins; otherwise a
+    // Claude/Codex tick is classified by runtime (and a metered backstop tap).
+    let llm_billing = tick.result.spawned().then(|| {
+        tick_llm_billing(
+            runtime_attribution.as_ref(),
+            story_runtime.as_deref(),
+            tick.preference_tap.as_deref(),
+            &role_log,
+        )
+    });
     // #9303: the tick's per-model usage, kept for its usage spans below.
     let tokens_by_model = scan
         .as_ref()
@@ -782,6 +793,7 @@ fn emit_correlated(
             &tick.role,
             tick.ended_at,
             story_runtime.as_deref(),
+            llm_billing.as_ref(),
             rows,
         );
     }
@@ -808,9 +820,55 @@ fn emit_correlated(
             runtime: story_runtime,
             model: tick.model.clone(),
             tokens_by_model,
+            llm_billing,
         };
         story::emit(&tick.root, &facts, &targets);
     }
+}
+
+/// Whether the role log's last preference marker records a metered-backstop
+/// slot (`backstop=`, #8555) — the tick fell through to a governed metered tap.
+fn log_records_metered_backstop(log: &str) -> bool {
+    log.lines()
+        .rev()
+        .find(|line| line.contains("LOOM_RUNTIME_PREFERENCE"))
+        .is_some_and(|line| line.contains(" backstop="))
+}
+
+/// The billing class of one spawned role tick (#10749). Never a guess: a
+/// runtime this cannot classify is reported `unknown`.
+fn tick_llm_billing(
+    attribution: Option<&crate::launch_record::RuntimeAttribution>,
+    usage_runtime: Option<&str>,
+    preference_tap: Option<&str>,
+    role_log: &Path,
+) -> crate::observability::llm_billing::LlmBilling {
+    use crate::observability::llm_billing::LlmBilling;
+    if let Some(attribution) = attribution {
+        if let Some(billing) = attribution.llm_billing.as_deref().and_then(|b| {
+            LlmBilling::parse(
+                b,
+                attribution.llm_credential_kind.as_deref(),
+                attribution.profile.as_deref(),
+            )
+        }) {
+            return billing;
+        }
+    }
+    let profile = attribution.and_then(|a| a.profile.clone()).or_else(|| {
+        preference_tap
+            .and_then(|tap| tap.split_once(':'))
+            .map(|(_, p)| p.to_string())
+    });
+    let metered = std::fs::read_to_string(role_log)
+        .map(|log| log_records_metered_backstop(&log))
+        .unwrap_or(false);
+    // No launch record and no resolved-runtime marker is a Claude tick.
+    let runtime = attribution
+        .map(|a| a.runtime.as_str())
+        .or(usage_runtime)
+        .unwrap_or("claude");
+    LlmBilling::for_runtime(runtime, profile.as_deref(), metered)
 }
 
 /// A [`RoleTickResult`]'s serialized name (`success`, `failure`, …) — the
