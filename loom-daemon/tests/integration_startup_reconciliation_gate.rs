@@ -272,6 +272,7 @@ fn wait_for_heartbeat_file(socket_path: &Path) {
 #[tokio::test]
 #[serial]
 async fn test_socket_pidfile_and_heartbeat_are_ready_during_slow_startup_reconciliation() {
+    let _real_record = common::RealFallbackRecordGuard::new();
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("daemon.sock");
     let pid_file = temp_dir.path().join(".daemon.pid");
