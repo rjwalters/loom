@@ -14,20 +14,21 @@
 #
 # It points LOOM_SESSION_LOCK_DIR inside the temp root and installs the EXIT
 # trap, which fails the suite if the real lock directory changed during the
-# run (its listing, or anything in it newer than the start), then removes the
-# temp root. The suite's own exit status is otherwise kept.
+# run (its entries, or it or anything in it newer than the start; `ls -lA`,
+# so a change to `~/.loom` itself is not counted), then removes the temp
+# root. The suite's own exit status is otherwise kept.
 
 _lss_root="$1"
 _lss_real="${HOME}/.loom/session-locks"
 export LOOM_SESSION_LOCK_DIR="${_lss_root}/session-locks"
-_lss_before="$(ls -la "$_lss_real" 2>&1)"
+_lss_before="$(ls -lA "$_lss_real" 2>&1)"
 : >"${_lss_root}/session-locks.marker"
 
 _lss_exit() {
     local rc=$?
     local newer
     newer="$(find "$_lss_real" -newer "${_lss_root}/session-locks.marker" 2>/dev/null)"
-    if [[ "$(ls -la "$_lss_real" 2>&1)" != "$_lss_before" || -n "$newer" ]]; then
+    if [[ "$(ls -lA "$_lss_real" 2>&1)" != "$_lss_before" || -n "$newer" ]]; then
         echo "FAIL: this suite wrote under the real ${_lss_real} (#10364)" >&2
         rc=1
     fi
