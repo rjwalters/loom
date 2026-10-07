@@ -220,7 +220,7 @@ fn external_review_path_from_listings_to_merge() {
     assert_eq!(merge_row.duration_sec, Some(200), "observed entry: a real sample");
     assert_eq!(
         merged.outcomes.len(),
-        27,
+        28,
         "two estimates x land-v1 + the land-v2, calm-plover, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, both twin-otter, land-v4, little-v0 and tandem-wren shadows"
     );
     for outcome in &merged.outcomes {
