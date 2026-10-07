@@ -2291,6 +2291,10 @@ jobs:
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
         run: bash defaults/scripts/check-labels-drift.sh
+      # #10013 / PR #10053: proves the registry half of the drift check runs
+      # (identical labels.yml copies that both diverge from labels.json fail).
+      - name: Test labels.yml registry drift check (#10013)
+        run: bash defaults/scripts/tests/test-check-labels-drift.sh
       - name: Check label descriptions fit GitHub's 100-char limit (#4335)
         run: bash defaults/scripts/check-label-descriptions.sh
       - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
