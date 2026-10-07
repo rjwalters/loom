@@ -109,6 +109,24 @@ if [[ "$1" == "api" ]]; then
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}\n'
     exit 0
   fi
+  # #10581 cross-host arbitration: DELETE of a withdrawn comment is recorded;
+  # the comments listing (post-jq shape: {id,u,b} lines) is served from scenario
+  # files — rivals-pre.jsonl always, rivals-post.jsonl only once this caller has
+  # posted (last-body.txt exists), plus this caller's own comment (own-id/own-user).
+  if [[ "$*" == *"-X DELETE"* ]]; then
+    printf '%s\n' "$*" >> "$LOOM_TEST_STUB_DIR/deleted.log"; exit 0
+  fi
+  if [[ "$*" =~ repos/[^/\ ]+/[^/\ ]+/issues/[0-9]+/comments ]]; then
+    [[ -f "$LOOM_TEST_STUB_DIR/comments-read-fail" ]] && exit 1
+    [[ -f "$LOOM_TEST_STUB_DIR/rivals-pre.jsonl" ]] && cat "$LOOM_TEST_STUB_DIR/rivals-pre.jsonl"
+    if [[ -f "$LOOM_TEST_STUB_DIR/last-body.txt" ]]; then
+      [[ -f "$LOOM_TEST_STUB_DIR/rivals-post.jsonl" ]] && cat "$LOOM_TEST_STUB_DIR/rivals-post.jsonl"
+      [[ -f "$LOOM_TEST_STUB_DIR/own-hidden" ]] || jq -cn --rawfile b "$LOOM_TEST_STUB_DIR/last-body.txt" \
+        --argjson id "$(cat "$LOOM_TEST_STUB_DIR/own-id" 2>/dev/null || echo 1000)" \
+        --arg u "$(cat "$LOOM_TEST_STUB_DIR/own-user" 2>/dev/null || echo bot)" '{id:$id,u:$u,b:$b}'
+    fi
+    exit 0
+  fi
   # A paginated list endpoint with a server-side --jq filter over an empty
   # array produces no output at all.
   printf ''
@@ -235,7 +253,9 @@ reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
     "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
-    "$STUB_DIR/gate-answer" "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log"
+    "$STUB_DIR/gate-answer" "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log" \
+    "$STUB_DIR"/rivals-pre.jsonl "$STUB_DIR"/rivals-post.jsonl "$STUB_DIR"/own-id "$STUB_DIR"/own-user "$STUB_DIR"/own-hidden \
+    "$STUB_DIR"/comments-read-fail "$STUB_DIR"/deleted.log
 }
 
 run_pv() {
@@ -592,6 +612,62 @@ assert_eq "8" "$EXIT_CODE" "label transition failure -> exit 8"
 assert_contains "$OUTPUT" "Repair: gh pr edit 306" "repair command is printed"
 assert_contains "$OUTPUT" "forge verdict-labels 306 --repo owner/repo --verdict approved" "re-run command is printed"
 assert_eq "306" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the comment itself was posted"
+
+# --- Cross-host arbitration (#10581): two callers on different hosts both passed the
+# gate's read (the mock gate says PROCEED) before either comment existed; the lowest
+# same-author comment id wins deterministically on both sides.
+rival() { # id user verdict [sha] -> one {id,u,b} line
+  jq -cn --argjson id "$1" --arg u "$2" --arg b "<!-- loom:verdict-sha sha=${4:-abc1234} verdict=$3 -->" '{id:$id,u:$u,b:$b}'
+}
+# Host B (changes-requested, id 1000) loses to host A's approval (id 500).
+reset_state
+rival 500 bot approved > "$STUB_DIR/rivals-post.jsonl"
+run_pv 310 changes-requested abc1234 --body "please fix"
+assert_eq "12" "$EXIT_CODE" "lower-id rival with a different verdict wins -> exit 12"
+assert_contains "$(cat "$STUB_DIR/deleted.log" 2>/dev/null)" "repos/owner/repo/issues/comments/1000" "loser withdraws its own comment"
+assert_eq "" "$(grep -c 'verdict-labels' "$STUB_DIR/daemon-calls.log" 2>/dev/null | grep -v '^0$' || true)" "loser applies no labels"
+# Host A (approved, id 500) beats the later rival (id 1000): keeps its comment, applies labels.
+reset_state
+echo 500 > "$STUB_DIR/own-id"; rival 1000 bot changes-requested > "$STUB_DIR/rivals-post.jsonl"
+run_pv 311 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "lowest id wins -> exit 0"
+assert_eq "" "$(cat "$STUB_DIR/deleted.log" 2>/dev/null || true)" "winner withdraws nothing"
+assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-labels 311" "winner applies its labels"
+# A same-verdict loser withdraws the duplicate but still applies the (idempotent) labels.
+reset_state
+rival 500 bot approved > "$STUB_DIR/rivals-post.jsonl"
+run_pv 312 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "identical-verdict loser -> exit 0"
+assert_contains "$(cat "$STUB_DIR/deleted.log" 2>/dev/null)" "issues/comments/1000" "duplicate withdrawn"
+assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-labels 312" "duplicate still applies labels"
+# A different author's marker never displaces this caller's verdict.
+reset_state
+rival 500 mallory changes-requested > "$STUB_DIR/rivals-post.jsonl"
+run_pv 313 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "third-party marker is not a rival -> exit 0"
+assert_eq "" "$(cat "$STUB_DIR/deleted.log" 2>/dev/null || true)" "third-party marker withdraws nothing"
+# A marker for another head is not a rival either.
+reset_state
+rival 500 bot changes-requested deadbee > "$STUB_DIR/rivals-post.jsonl"
+run_pv 314 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "other-head marker is not a rival -> exit 0"
+# A verdict already visible BEFORE the gate is the gate's call, not a race.
+reset_state
+rival 500 bot changes-requested > "$STUB_DIR/rivals-pre.jsonl"
+run_pv 315 approved abc1234 --body "ok" --overrules-prior "each earlier point no longer blocks: fixed in the reviewed head, re-verified"
+assert_eq "0" "$EXIT_CODE" "pre-gate verdict is not arbitrated -> exit 0"
+assert_eq "" "$(cat "$STUB_DIR/deleted.log" 2>/dev/null || true)" "pre-gate verdict withdraws nothing"
+# The post-write re-read cannot find our comment -> fail closed, no labels.
+reset_state
+touch "$STUB_DIR/own-hidden"
+run_pv 316 approved abc1234 --body "ok"
+assert_eq "12" "$EXIT_CODE" "unfindable own comment -> exit 12"
+assert_eq "" "$(grep -c 'verdict-labels' "$STUB_DIR/daemon-calls.log" 2>/dev/null | grep -v '^0$' || true)" "no labels when arbitration could not run"
+# The posted body carries the per-call nonce next to the marker.
+reset_state
+run_pv 317 approved abc1234 --body "ok"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-nonce " "body carries the arbitration nonce"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->" "marker still present beside the nonce"
 
 # --- Summary ---
 echo ""

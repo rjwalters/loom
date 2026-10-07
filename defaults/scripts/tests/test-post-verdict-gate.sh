@@ -61,6 +61,9 @@ if [[ "${1:-}" == "api" ]]; then
   case "$method $path" in
     "GET repos/owner/repo/issues/"*/comments)
       cat "$D/comments.json"; exit 0 ;;
+    "GET repos/owner/repo/issues/"*/comments\?*)
+      # #10581 cross-host arbitration re-read (post-jq shape; ids follow post order)
+      jq -c 'to_entries[] | {id: (1000 + .key), u: .value.user.login, b: .value.body}' "$D/comments.json"; exit 0 ;;
     "GET repos/owner/repo/issues/"*/labels\?*)
       [[ -f "$D/labels-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
       jq -R '{name: .}' < "$D/labels.txt" | jq -s .; exit 0 ;;
