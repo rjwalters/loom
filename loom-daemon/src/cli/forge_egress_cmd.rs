@@ -74,8 +74,14 @@ pub(crate) enum EgressAction {
         /// The worker image the container will run (also the canary's image).
         #[arg(long)]
         image: String,
-        /// Map `host.docker.internal` (credential proxy path).
-        #[arg(long)]
+        /// Map `host.docker.internal` (credential proxy path); takes `0`/`1`
+        /// so `spawn-claude.sh` passes its flag value in one line.
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            value_parser = clap::builder::BoolishValueParser::new(),
+            default_value_t = false
+        )]
         add_host_gateway: bool,
         /// Remove the sidecar when this host pid exits.
         #[arg(long)]

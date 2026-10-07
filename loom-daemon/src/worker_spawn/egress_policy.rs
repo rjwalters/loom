@@ -94,30 +94,49 @@ pub struct Boundary {
     pub allowed_hosts: Vec<String>,
     /// The canary, run inside the container.
     pub canary: String,
+    /// Positive control, run only after a blocked canary: the allowed
+    /// gateway must be reachable, so a blocked canary cannot be a dead network.
+    pub positive_probe: String,
     /// The policy document, for the C1 finding classifier.
     policy: Value,
 }
 
 impl Boundary {
-    /// `Some` only under `enforcement.api = required` for a loaded
-    /// env/machine policy; `None` for everything else (inert).
-    #[must_use]
-    pub fn from_egress(egress: &WorkerEgress) -> Option<Self> {
+    /// `Ok(Some)` only under `enforcement.api = required` for a loaded
+    /// env/machine policy; `Ok(None)` for everything else (inert). A
+    /// `required` policy that cannot be read or parsed here is NOT inert: the
+    /// file was valid at admission, so it changed since, and the worker must
+    /// not start without the boundary.
+    ///
+    /// # Errors
+    /// `runtime.unverifiable` when a `required` policy cannot be re-read.
+    pub fn from_egress(egress: &WorkerEgress) -> Result<Option<Self>, Box<Finding>> {
         if !egress.required {
-            return None;
+            return Ok(None);
         }
-        let text = std::fs::read_to_string(&egress.policy_file).ok()?;
-        Self::from_policy(&serde_json::from_str(&text).ok()?)
+        let unreadable = |why: String| {
+            refusal(
+                "runtime.unverifiable",
+                format!("the required policy {} {why}", egress.policy_file.display()),
+            )
+        };
+        let text = std::fs::read_to_string(&egress.policy_file)
+            .map_err(|e| unreadable(format!("could not be re-read ({e})")))?;
+        let policy = serde_json::from_str(&text)
+            .map_err(|e| unreadable(format!("is no longer valid JSON ({e})")))?;
+        Ok(Self::from_policy(&policy))
     }
 
     /// [`Self::from_egress`] over an already-parsed policy document.
     #[must_use]
     pub fn from_policy(policy: &Value) -> Option<Self> {
         let mut allowed = Vec::new();
-        let api = expected_api_host(policy);
+        let origin = expected_api_host(policy);
         // A port (`host:8443`) is not part of the DNS name.
-        let api = api.split(':').next().unwrap_or("").to_string();
+        let api = origin.split(':').next().unwrap_or("").to_string();
+        let mut probe_target = GIT_HOST.to_string();
         if !api.is_empty() && !BLOCKED_HOSTS.contains(&api.as_str()) {
+            probe_target = origin;
             allowed.push(api);
         }
         if !allowed.iter().any(|h| h == GIT_HOST) {
@@ -129,6 +148,7 @@ impl Boundary {
             .unwrap_or(DEFAULT_CANARY)
             .to_string();
         Some(Self {
+            positive_probe: format!("curl -sS --max-time 5 -o /dev/null https://{probe_target}/"),
             blocked_hosts: BLOCKED_HOSTS.iter().map(|h| (*h).to_string()).collect(),
             allowed_hosts: allowed,
             canary,
@@ -238,6 +258,15 @@ render() {{
 apply() {{
   fam=$1 ipt=iptables
   [ "$fam" = v6 ] && ipt=ip6tables
+  # A resolution that found no blocked address (a DNS blip) must not replace
+  # the chain with an empty one, and the allowed side must resolve in IPv4.
+  # Keep the previous rules and fail; IPv6 with no AAAA at all and no chain
+  # yet has nothing to block.
+  if [ -z "$(collect "$fam" "$LOOM_EGRESS_BLOCKED")" ]; then
+    if [ "$fam" = v6 ] && ! "$ipt" -n -L "$CHAIN" >/dev/null 2>&1; then return 0; fi
+    return 1
+  fi
+  if [ "$fam" = v4 ] && [ -z "$(collect "$fam" "$LOOM_EGRESS_ALLOWED")" ]; then return 1; fi
   v4v6=$(render "$fam" 1)
   if ! printf '%s\n' "$v4v6" | "$ipt-restore" --noflush 2>/dev/null; then
     printf '%s\n' "$(render "$fam" 0)" | "$ipt-restore" --noflush || return 1
@@ -317,9 +346,13 @@ impl Docker for RealDocker {
     }
 }
 
-/// Classify the canary's exit status. `docker run`'s own failures (125) and
-/// "command not found"/"cannot execute" (126/127 — an image without `curl`)
-/// are not a verdict: they are [`CanaryOutcome::NotRun`], never `Blocked`.
+/// Classify the canary's exit status. Only a failure that says the
+/// connection was refused/reset can be a verdict of `Blocked`. `docker run`'s
+/// own failures (125), "command not found"/"cannot execute" (126/127 — an
+/// image without `curl`), a timeout (124/137, curl 28), and curl's failures
+/// that never reached the network path (usage/init 1-3, DNS 5/6, TLS trust
+/// 58/60/77) prove nothing about the boundary: they are
+/// [`CanaryOutcome::NotRun`], never `Blocked`.
 #[must_use]
 pub fn classify_canary(result: Option<(i32, String)>) -> CanaryOutcome {
     match result {
@@ -329,7 +362,24 @@ pub fn classify_canary(result: Option<(i32, String)>) -> CanaryOutcome {
         Some((126 | 127, _)) => {
             CanaryOutcome::NotRun("the canary's tool is missing from the image")
         }
+        Some((124 | 137 | 28, _)) => CanaryOutcome::NotRun("the canary timed out"),
+        Some((1..=3 | 5 | 6 | 58 | 60 | 77, _)) => CanaryOutcome::NotRun(
+            "the canary failed before reaching the network (DNS, TLS or usage error)",
+        ),
         Some(_) => CanaryOutcome::Blocked,
+    }
+}
+
+/// Fold the positive control into a blocked canary: the allowed gateway must
+/// answer, or the block proves nothing.
+#[must_use]
+pub fn require_positive(outcome: CanaryOutcome, positive: Option<(i32, String)>) -> CanaryOutcome {
+    match (outcome, positive) {
+        (CanaryOutcome::Blocked, Some((0, _))) => CanaryOutcome::Blocked,
+        (CanaryOutcome::Blocked, _) => {
+            CanaryOutcome::NotRun("the allowed gateway was not reachable, so the block is unproven")
+        }
+        (other, _) => other,
     }
 }
 
@@ -361,6 +411,11 @@ pub fn sidecar_args(
         "--rm",
         "--name",
         name,
+        // The worker image ends in a non-root USER; iptables needs uid 0 in
+        // the container even with NET_ADMIN. Only the sidecar is root, with
+        // no other capability; the worker keeps its image user.
+        "--user",
+        "0:0",
         "--cap-drop",
         "ALL",
         "--cap-add",
@@ -434,7 +489,7 @@ pub fn establish(
     image: &str,
     opts: &Options,
 ) -> Result<Option<Sidecar>, Box<Finding>> {
-    let Some(boundary) = Boundary::from_egress(egress) else {
+    let Some(boundary) = Boundary::from_egress(egress)? else {
         return Ok(None);
     };
     let sidecar_image = std::env::var(SIDECAR_IMAGE_ENV)
@@ -510,23 +565,28 @@ pub fn establish_with(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let canary = docker.run(
-        &[
-            "run".into(),
-            "--rm".into(),
-            "--network".into(),
-            format!("container:{name}"),
-            "--cap-drop".into(),
-            "ALL".into(),
-            "--entrypoint".into(),
-            "sh".into(),
-            image.into(),
-            "-c".into(),
-            boundary.canary.clone(),
-        ],
-        CANARY_BOUND,
-    );
-    let outcome = classify_canary(canary);
+    let probe = |cmd: &str| {
+        docker.run(
+            &[
+                "run".into(),
+                "--rm".into(),
+                "--network".into(),
+                format!("container:{name}"),
+                "--cap-drop".into(),
+                "ALL".into(),
+                "--entrypoint".into(),
+                "sh".into(),
+                image.into(),
+                "-c".into(),
+                cmd.into(),
+            ],
+            CANARY_BOUND,
+        )
+    };
+    let mut outcome = classify_canary(probe(&boundary.canary));
+    if outcome == CanaryOutcome::Blocked {
+        outcome = require_positive(outcome, probe(&boundary.positive_probe));
+    }
     if let Some(finding) = canary_findings(boundary, outcome).into_iter().next() {
         remove();
         return Err(Box::new(finding));

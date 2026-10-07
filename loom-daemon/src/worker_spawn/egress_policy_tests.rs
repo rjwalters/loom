@@ -75,11 +75,33 @@ fn boundary_is_inert_unless_required() {
         credential_file: None,
         required: false,
     };
-    assert!(Boundary::from_egress(&egress).is_none());
-    // `required` with an unreadable policy is also not a boundary to render.
+    assert!(Boundary::from_egress(&egress).unwrap().is_none());
     egress.required = true;
-    egress.policy_file = Path::new("/nonexistent/policy.json").into();
-    assert!(Boundary::from_egress(&egress).is_none());
+    assert!(Boundary::from_egress(&egress).unwrap().is_some());
+}
+
+#[test]
+fn required_policy_that_cannot_be_reread_aborts_instead_of_going_inert() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("policy.json");
+    let egress = |policy_file: std::path::PathBuf| WorkerEgress {
+        launcher: "/x/gh".into(),
+        upstream_gh: None,
+        policy_file,
+        credential_file: None,
+        required: true,
+    };
+    // Gone since admission.
+    let f =
+        Boundary::from_egress(&egress(Path::new("/nonexistent/policy.json").into())).unwrap_err();
+    assert_eq!(f.code, "runtime.unverifiable");
+    // Replaced with invalid JSON since admission.
+    std::fs::write(&file, "{not json").unwrap();
+    let f = Boundary::from_egress(&egress(file.clone())).unwrap_err();
+    assert_eq!(f.code, "runtime.unverifiable");
+    // `establish` surfaces the same refusal and never reaches docker.
+    let f = establish(&egress(file), "img", &Options::default()).unwrap_err();
+    assert_eq!(f.code, "runtime.unverifiable");
 }
 
 #[test]
@@ -161,17 +183,65 @@ printf '%s\n' "$input" > "$CAP/{fam}""#
 }
 
 #[test]
+fn script_refuses_to_install_when_the_blocked_hosts_do_not_resolve() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let write = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // DNS blip: only the allowed host answers.
+    write("getent", r#"[ "$2" = github.com ] && echo "140.82.114.4  STREAM g""#);
+    write("iptables-restore", "cat > \"$CAP/restored\"");
+    write("ip6tables-restore", "cat > /dev/null");
+    write("iptables", "exit 0");
+    write("ip6tables", "exit 1");
+    let cap = tempfile::tempdir().unwrap();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(sidecar_script())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("CAP", cap.path())
+        .env("LOOM_EGRESS_ONCE", "1")
+        .env("LOOM_EGRESS_BLOCKED", "api.github.com uploads.github.com")
+        .env("LOOM_EGRESS_ALLOWED", "github.com")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(70), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!cap.path().join("restored").exists(), "no empty chain is installed");
+}
+
+#[test]
 fn canary_exit_status_classification() {
     assert_eq!(classify_canary(Some((0, String::new()))), CanaryOutcome::Open);
-    assert_eq!(classify_canary(Some((7, String::new()))), CanaryOutcome::Blocked);
-    assert_eq!(classify_canary(Some((28, String::new()))), CanaryOutcome::Blocked);
-    for code in [125, 126, 127] {
+    // Connection refused/reset (7), TLS reset mid-handshake (35, 56): blocked.
+    for code in [7, 35, 56] {
+        assert_eq!(classify_canary(Some((code, String::new()))), CanaryOutcome::Blocked, "{code}");
+    }
+    // Inconclusive: docker/tool errors, timeouts, DNS (6), TLS trust (60),
+    // usage/config errors (2).
+    for code in [125, 126, 127, 124, 137, 28, 6, 60, 2] {
         assert!(
             matches!(classify_canary(Some((code, String::new()))), CanaryOutcome::NotRun(_)),
             "{code}"
         );
     }
     assert!(matches!(classify_canary(None), CanaryOutcome::NotRun(_)));
+    // A block with a dead allowed gateway is unproven.
+    assert_eq!(
+        require_positive(CanaryOutcome::Blocked, Some((0, String::new()))),
+        CanaryOutcome::Blocked
+    );
+    for positive in [Some((7, String::new())), Some((6, String::new())), None] {
+        assert!(matches!(
+            require_positive(CanaryOutcome::Blocked, positive),
+            CanaryOutcome::NotRun(_)
+        ));
+    }
+    assert_eq!(require_positive(CanaryOutcome::Open, None), CanaryOutcome::Open);
 }
 
 #[test]
@@ -205,6 +275,7 @@ struct Fake {
     ready: Option<(i32, String)>,
     running: &'static str,
     canary: Option<(i32, String)>,
+    positive: Option<(i32, String)>,
 }
 
 impl Fake {
@@ -215,6 +286,7 @@ impl Fake {
             ready: Some((0, String::new())),
             running: "true",
             canary,
+            positive: Some((0, String::new())),
         }
     }
     fn removed(&self) -> bool {
@@ -233,6 +305,7 @@ impl Docker for Fake {
             Some("exec") => self.ready.clone(),
             Some("inspect") => Some((0, self.running.into())),
             Some("run") if args.contains(&"-d".to_string()) => self.start.clone(),
+            Some("run") if args.last() == Some(&boundary().positive_probe) => self.positive.clone(),
             Some("run") => self.canary.clone(),
             _ => None,
         }
@@ -270,6 +343,47 @@ fn blocked_canary_admits_the_worker_into_the_sidecar() {
         .find(|c| c.contains(&"-d".to_string()))
         .unwrap();
     assert!(start.contains(&"NET_ADMIN".to_string()) && start.contains(&"ALL".to_string()));
+    // The positive control ran against the allowed gateway.
+    assert!(calls
+        .iter()
+        .any(|c| c.last() == Some(&boundary().positive_probe)));
+}
+
+#[test]
+fn blocked_canary_without_a_reachable_gateway_is_unverifiable() {
+    for positive in [
+        Some((6, "could not resolve".into())),
+        Some((7, String::new())),
+        None,
+    ] {
+        let mut fake = Fake::ok(Some((7, "curl: (7)".into())));
+        fake.positive = positive;
+        assert_eq!(go(&fake).unwrap_err().code, "runtime.unverifiable");
+        assert!(fake.removed());
+    }
+}
+
+#[test]
+fn dns_tls_and_config_failures_do_not_verify_the_boundary() {
+    for code in [6, 60, 2, 28] {
+        let fake = Fake::ok(Some((code, String::new())));
+        assert_eq!(go(&fake).unwrap_err().code, "runtime.unverifiable", "{code}");
+        assert!(fake.removed());
+    }
+}
+
+#[test]
+fn positive_probe_targets_the_api_origin_else_git() {
+    assert_eq!(
+        boundary().positive_probe,
+        "curl -sS --max-time 5 -o /dev/null https://github-proxy.example.com:8443/"
+    );
+    let mut p = policy("required", None);
+    p["github"]["apiOrigin"] = json!("https://api.github.com");
+    assert_eq!(
+        Boundary::from_policy(&p).unwrap().positive_probe,
+        "curl -sS --max-time 5 -o /dev/null https://github.com/"
+    );
 }
 
 #[test]
@@ -329,6 +443,23 @@ fn sidecar_args_carry_hosts_and_gateway_only_when_asked() {
         30,
     );
     assert!(gw.contains(&"host.docker.internal:host-gateway".to_string()));
+}
+
+#[test]
+fn sidecar_runs_as_root_with_only_the_network_capabilities() {
+    let a = sidecar_args("n", "img", &boundary(), &Options::default(), 30);
+    let at = |flag: &str| a.iter().position(|x| x == flag).unwrap();
+    assert_eq!(a[at("--user") + 1], "0:0");
+    assert_eq!(a[at("--cap-drop") + 1], "ALL");
+    let caps: Vec<_> = a
+        .windows(2)
+        .filter(|w| w[0] == "--cap-add")
+        .map(|w| w[1].as_str())
+        .collect();
+    assert_eq!(caps, ["NET_ADMIN", "NET_RAW"]);
+    // The worker's network args set no identity or capability.
+    let net = Sidecar { name: "n".into() }.network_args();
+    assert!(!net.iter().any(|x| x == "--user" || x == "--cap-add"));
 }
 
 /// Real-docker matrix; skips cleanly without Docker or the opt-in image

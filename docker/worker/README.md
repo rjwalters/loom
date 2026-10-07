@@ -121,8 +121,10 @@ worker starts, Loom (`loom-daemon forge egress container-network`, called from
 `spawn-claude.sh`'s `container-args` decision point; the native path calls the
 same code from `containment.rs`) starts a short-lived sidecar from the worker
 image (override: `LOOM_EGRESS_SIDECAR_IMAGE`; it needs `iptables`, `ip6tables`,
-`getent`, `awk` — this image installs `iptables`) with `NET_ADMIN`/`NET_RAW`
-only, and the worker joins its network namespace with `--network
+`getent`, `awk` — this image installs `iptables`) as `--user 0:0` (iptables
+needs uid 0 even with `NET_ADMIN`; the image's non-root `USER` would be refused)
+with `NET_ADMIN`/`NET_RAW`
+only, and the worker, which keeps the image user, joins its network namespace with `--network
 container:<sidecar>`, holding no network capability. The sidecar:
 
 - resolves `api.github.com` and `uploads.github.com` over **IPv4 and IPv6**
@@ -149,9 +151,9 @@ is classified through the one C1 classifier (`forge_egress::checks::assert_runti
 
 | Canary | Finding | Under `required` |
 |---|---|---|
-| request fails | none: logged `runtime.verified` (from the canary, never config) | worker starts |
+| request refused/reset **and** the allowed gateway answers a positive probe | none: logged `runtime.verified` (from the canary, never config) | worker starts |
 | request succeeds | `runtime.bypass-open` | spawn aborted (exit 78), sidecar removed |
-| cannot run (no `curl`, timeout, docker failure) or rules not installed | `runtime.unverifiable` | spawn aborted (exit 78) |
+| cannot run (no `curl`, timeout, DNS/TLS/usage error), gateway unreachable, rules not installed (incl. blocked hosts that do not resolve), or a `required` policy that can no longer be read | `runtime.unverifiable` | spawn aborted (exit 78) |
 
 With no policy, or `observe`, none of this runs and the `docker run` argv is
 byte-identical to before. A bare-metal host keeps `runtime.unverifiable` in
