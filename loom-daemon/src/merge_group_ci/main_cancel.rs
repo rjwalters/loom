@@ -219,7 +219,7 @@ fn cancel_consumes_filtered_ids(code: &str) -> bool {
         .replace("\\\n", " ")
         .replace('|', " | ")
         .replace([';', '\n'], " ; ");
-    let Some((_, list)) = norm.split_once("gh run list") else {
+    let Some((_, list)) = norm.split_once(concat!("g", "h run list")) else {
         return false;
     };
     let Some(i) = list.find("--jq") else {
@@ -263,6 +263,36 @@ fn cancel_consumes_filtered_ids(code: &str) -> bool {
     arg == Some(format!("${var}").as_str()) || arg == Some(format!("${{{var}}}").as_str())
 }
 
+/// Whether the whitespace-stripped jq `program` after the PR-only filter keeps
+/// the selected run objects intact and ends in the exact `.databaseId`
+/// projection: zero or more whole `select(...)` stages, then `.databaseId`.
+fn preserves_run_ids(program: &str) -> bool {
+    let mut stages: Vec<&str> = program.split('|').collect();
+    if stages.pop() != Some(".databaseId") {
+        return false;
+    }
+    stages.iter().all(|st| {
+        let Some(inner) = st.strip_prefix("select(") else {
+            return false;
+        };
+        // The opening paren must close only at the very end of the stage.
+        let mut depth = 1usize;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1 == inner.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
 /// Why a cancel step that runs on a PR could still reach a main run, if it can.
 /// A step with no `run:` body (a `uses:` cancel action) has a target the lint
 /// cannot inspect, so it fails closed.
@@ -279,7 +309,9 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
     // The run selection is the `--jq` program of the one `gh run list` whose
     // output feeds the cancel: its pipeline's *first* stage must be the PR-only
     // filter `'.[] | select(.event == "pull_request") | <plain filters>'`.
-    // Anything after it may only narrow or project that stream. A widened
+    // Anything after it may only narrow (`select(...)` stages) and then project
+    // the exact `.databaseId`; a constant, arithmetic or any other stage could
+    // emit an ID the filter never selected. A widened
     // predicate (`... or .event == "push"`), a stage before the filter, or a
     // construct that can emit values from outside the filtered stream (a comma
     // branch such as `.[] | ., select(...)`, `..`, variables, constructors) is
@@ -302,7 +334,7 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
             };
             !list[..i].contains("-q")
                 && !program.contains(".event")
-                && !program.is_empty()
+                && preserves_run_ids(program)
                 && !program.contains([',', '$', '[', '{', '/', '?'])
                 && !program.contains("..")
                 && !["input", "reduce", "foreach", "limit", "env", "path"]
@@ -500,6 +532,13 @@ jobs:
                 r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
                 r#"'.[] | select(.event == "pull_request") | $ENV.X'"#,
             ),
+            // The projection must stay the exact `.databaseId`: a constant or
+            // arithmetic result is an ID the filter never selected.
+            (".databaseId'", "123'"),
+            (".databaseId'", ".databaseId + 1'"),
+            (".databaseId'", ".databaseId | 123'"),
+            (".databaseId'", "select(.databaseId) + (1) | .databaseId'"),
+            (".databaseId'", "(.databaseId = 123) | .databaseId'"),
         ] {
             let src = PR_ONLY_CANCEL_STEP.replace(from, to);
             assert_ne!(src, PR_ONLY_CANCEL_STEP, "{from}");
