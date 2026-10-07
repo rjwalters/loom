@@ -346,8 +346,9 @@ impl Docker for RealDocker {
     }
 }
 
-/// Classify the canary's exit status. Only a failure that says the
-/// connection was refused/reset can be a verdict of `Blocked`. `docker run`'s
+/// Classify the canary's exit status. Only an explicit allowlist of curl
+/// statuses (7 refused, 35 TLS connect, 55/56 send/recv reset) can be a
+/// verdict of `Blocked`; every other failure is `NotRun`. `docker run`'s
 /// own failures (125), "command not found"/"cannot execute" (126/127 — an
 /// image without `curl`), a timeout (124/137, curl 28), and curl's failures
 /// that never reached the network path (usage/init 1-3, DNS 5/6, TLS trust
@@ -366,7 +367,12 @@ pub fn classify_canary(result: Option<(i32, String)>) -> CanaryOutcome {
         Some((1..=3 | 5 | 6 | 58 | 60 | 77, _)) => CanaryOutcome::NotRun(
             "the canary failed before reaching the network (DNS, TLS or usage error)",
         ),
-        Some(_) => CanaryOutcome::Blocked,
+        // curl: 7 couldn't connect (refused), 35 TLS connect error, 55/56
+        // send/recv failure (reset). The only statuses that evidence a block.
+        Some((7 | 35 | 55 | 56, _)) => CanaryOutcome::Blocked,
+        Some(_) => {
+            CanaryOutcome::NotRun("the canary failed in a way that is not evidence of a block")
+        }
     }
 }
 

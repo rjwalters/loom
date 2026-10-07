@@ -218,8 +218,18 @@ fn script_refuses_to_install_when_the_blocked_hosts_do_not_resolve() {
 fn canary_exit_status_classification() {
     assert_eq!(classify_canary(Some((0, String::new()))), CanaryOutcome::Open);
     // Connection refused/reset (7), TLS reset mid-handshake (35, 56): blocked.
-    for code in [7, 35, 56] {
+    for code in [7, 35, 55, 56] {
         assert_eq!(classify_canary(Some((code, String::new()))), CanaryOutcome::Blocked, "{code}");
+    }
+    // Unrelated statuses never become a block, even when the positive
+    // gateway probe succeeds (so they cannot reach `runtime.verified`).
+    for code in [4, 42, 52, 99, 255] {
+        let outcome = classify_canary(Some((code, String::new())));
+        assert!(matches!(outcome, CanaryOutcome::NotRun(_)), "{code}");
+        assert!(
+            matches!(require_positive(outcome, Some((0, String::new()))), CanaryOutcome::NotRun(_)),
+            "{code}"
+        );
     }
     // Inconclusive: docker/tool errors, timeouts, DNS (6), TLS trust (60),
     // usage/config errors (2).
