@@ -78,12 +78,12 @@ fn a_hold_in_the_daemons_fallback_root_is_shown_and_lifted_by_the_cli() {
 
     // The pass reads exactly these roots' profiles for the hold.
     let pass_roots = session_hold_roots::hold_roots(&registered, Some(daemon_root.path()));
-    assert_eq!(peers, pass_roots);
 
-    let lifecycle =
-        SessionLifecycle::new(workspace.path(), FakeRunner::default(), None).with_peer_roots(peers);
+    let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None)
+        .with_peer_roots(peers.clone());
     let status = lifecycle.status("alice").unwrap();
     assert!(status.held, "the fallback root's hold is shown: {status:?}");
+    assert_eq!(peers, pass_roots, "the CLI's set is the pass's");
     assert!(!lifecycle.start("alice").unwrap().held);
     assert!(!held(&fallback_profile), "and lifted by the operator start");
 }

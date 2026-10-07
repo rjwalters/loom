@@ -30,15 +30,18 @@
 //! sidecar is per **account**, not per registered root. When two roots do
 //! resolve the same account name to different directories, a hold in any of
 //! them holds the account ([`held_across`]), and an operator start deletes
-//! the hold in every one it can see (its own root and the registered peers,
-//! [`account_profiles`]). A hold file that exists but cannot be parsed —
+//! the hold in every one it can see (its own root and its peers,
+//! [`account_profiles`]). Which roots those are is one definition shared with
+//! the reconcile pass, [`super::session_hold_roots`] (#10661). A hold file
+//! that exists but cannot be parsed —
 //! including an empty one left by a crash mid-write — counts as held (a
 //! deliberate stop fails safe: down).
 //!
-//! The stop/reconcile race (a pass whose hold check ran just before `stop`
+//! The stop/reconcile races (a pass whose hold check ran just before `stop`
 //! wrote the hold, so its `docker start` lands between `stop`'s `docker
-//! stop` and `docker rm`) is closed in `SessionLifecycle::stop`, which
-//! retries the stop+rm once when `rm` finds the container running again.
+//! stop` and `docker rm`, or its `docker run` lands after a `stop` that saw
+//! no container) are closed in `SessionLifecycle::stop`
+//! (`session_lifecycle/stop.rs`), which retries once.
 
 use std::path::{Path, PathBuf};
 
