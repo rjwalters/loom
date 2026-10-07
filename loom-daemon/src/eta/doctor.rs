@@ -687,7 +687,7 @@ fn published_fit(now: DateTime<Utc>, p: &PubStatus, check: &str) -> Check {
         {
             Check::ok("fit", check, detail)
         }
-        FetchKind::Absent => Check::skip(
+        FetchKind::Absent if publish_failed.is_none() => Check::skip(
             "fit",
             check,
             format!("{detail}: nothing published, this host uses its own fit or refuses no_model"),

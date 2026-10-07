@@ -403,6 +403,26 @@ fn published_fit_v2_is_its_own_check_independent_of_v1() {
 }
 
 #[test]
+fn v2_publish_error_after_an_absent_fetch_warns() {
+    let mut f = healthy();
+    // Absent without an error stays a skip.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Absent),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // Absent store followed by a failed captain upload is a warning.
+    f.fit.published_v2.publish_error = Some("403".into());
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("403"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
 fn the_authority_is_printed_and_a_missing_one_warns() {
     let ok = authority(&healthy().config.authority);
     assert_eq!(ok.status, Status::Ok);
