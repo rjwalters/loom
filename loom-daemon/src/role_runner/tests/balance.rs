@@ -116,14 +116,78 @@ fn champion_goes_first_when_budget_is_tight() {
 }
 
 #[test]
+fn allocator_config_carries_demand_reserve() {
+    let on = AllocatorConfig::new(&BalanceConfig::default(), &DemandConfig::default());
+    assert!(on.reserve, "demandWidth.reserve defaults to true");
+    let off = AllocatorConfig::new(
+        &BalanceConfig::default(),
+        &DemandConfig {
+            reserve: false,
+            ..DemandConfig::default()
+        },
+    );
+    assert!(!off.reserve);
+    assert_eq!(
+        (off.per_run, off.max_per_repo, off.non_pr_floor),
+        (on.per_run, on.max_per_repo, on.non_pr_floor)
+    );
+}
+
+#[test]
+fn reserve_false_skips_the_champion_first_pass() {
+    // Two merge-debt repos, plus review / ready demand that outbids a
+    // champion (merge demand is 1 per PR, unweighted) in the marginal pass.
+    let repos = vec![
+        (root("a"), pipe(30, 0, 1, 0)),
+        (root("b"), pipe(0, 0, 1, 2)),
+    ];
+    let reserving = AllocatorConfig {
+        non_pr_floor: 0,
+        reserve: true,
+        ..AllocatorConfig::default()
+    };
+    let not_reserving = AllocatorConfig {
+        reserve: false,
+        ..reserving
+    };
+    for budget in [0, 1, 2, 3, 6, 20] {
+        let on = allocate(&repos, budget, &reserving);
+        let off = allocate(&repos, budget, &not_reserving);
+        assert!(total(&on) <= budget, "reserve=true budget {budget}");
+        assert!(total(&off) <= budget, "reserve=false budget {budget}");
+    }
+    // reserve=true: both champions are preallocated before any judge/builder.
+    let on = allocate(&repos, 2, &reserving);
+    assert_eq!((slots(&on, "a", "champion"), slots(&on, "b", "champion")), (1, 1));
+    assert_eq!(total(&on), 2);
+    // reserve=false: no preallocation — the two slots go by marginal value
+    // (judge demand 30 outbids builder 2 and champion 1), so no champion gets one.
+    let off = allocate(&repos, 2, &not_reserving);
+    assert_eq!((slots(&off, "a", "champion"), slots(&off, "b", "champion")), (0, 0));
+    assert_eq!(slots(&off, "a", "judge") + slots(&off, "b", "builder"), 2);
+    assert_eq!(total(&off), 2);
+    // Width/demand allocation is otherwise intact: with room to spare, the
+    // champions still win their slot in the marginal pass.
+    let off = allocate(&repos, 20, &not_reserving);
+    assert_eq!((slots(&off, "a", "champion"), slots(&off, "b", "champion")), (1, 1));
+    assert_eq!(slots(&off, "a", "judge"), 4);
+}
+
+#[test]
 fn total_never_exceeds_the_budget() {
     let repos: Vec<_> = (0..12)
         .map(|i| (root(&format!("r{i:02}")), pipe(i * 3, i * 2, i, 20)))
         .collect();
-    for budget in [0, 1, 3, 7, 15, 40, 500] {
-        let allocs = allocate(&repos, budget, &AllocatorConfig::default());
-        assert!(total(&allocs) <= budget, "budget {budget}");
-        assert_eq!(allocs.len(), repos.len() * ROLES.len());
+    for reserve in [true, false] {
+        let cfg = AllocatorConfig {
+            reserve,
+            ..AllocatorConfig::default()
+        };
+        for budget in [0, 1, 3, 7, 15, 40, 500] {
+            let allocs = allocate(&repos, budget, &cfg);
+            assert!(total(&allocs) <= budget, "budget {budget} reserve {reserve}");
+            assert_eq!(allocs.len(), repos.len() * ROLES.len());
+        }
     }
     assert_eq!(total(&allocate(&repos, 0, &AllocatorConfig::default())), 0);
 }
@@ -230,7 +294,34 @@ fn queue_counts_ready_and_building_per_root() {
         row(9, 7, Some(Qd::Dispatched)),
     ];
     let counts = queue_counts(&queue, 3, &[false, false, true]);
-    assert_eq!(counts, vec![(Some(2), Some(1)), (Some(1), Some(0)), (None, None)]);
+    // A halted root admits nothing: ready is a known zero, building unobserved.
+    assert_eq!(counts, vec![(Some(2), Some(1)), (Some(1), Some(0)), (Some(0), None)]);
+}
+
+#[test]
+fn halted_repo_gets_no_builder_floor() {
+    let halted = RepoPipeline {
+        ready: Some(0),
+        ..pipe(0, 0, 0, 0)
+    };
+    let allocs = allocate(&[(root("a"), halted)], 5, &AllocatorConfig::default());
+    assert_eq!(slots(&allocs, "a", "builder"), 0);
+    assert_eq!(find(&allocs, "a", "builder").trigger, Trigger::Ready);
+}
+
+#[test]
+fn unobserved_ready_paused_reason_names_no_ready_count() {
+    let p = RepoPipeline {
+        review: Some(2),
+        changes: Some(0),
+        merge: Some(0),
+        ..RepoPipeline::default()
+    };
+    let allocs = allocate(&[(root("a"), p)], 5, &AllocatorConfig::default());
+    let b = find(&allocs, "a", "builder");
+    assert_eq!(b.slots, 0);
+    assert!(b.reason.contains("ready queue unobserved"), "{}", b.reason);
+    assert!(!b.reason.contains("ready 1"), "{}", b.reason);
 }
 
 #[test]

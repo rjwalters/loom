@@ -20,12 +20,14 @@
 //! - **Pipeline state** ([`RepoPipeline`]). Review / changes / merge are each
 //!   repo's **fresh** demand-ledger totals ([`DemandLedger::repo_debt`]);
 //!   ready / building come from the work finder's own tick queue (rows it has
-//!   already listed — [`queue_counts`]). No forge call is added. `None` is an
+//!   already listed — [`queue_counts`]; a halted repo reads ready as a known
+//!   zero). No forge call is added. `None` is an
 //!   unobserved axis and **fails open**: the role gets a one-slot floor, never
 //!   zero for lack of data.
 //! - **Allocation** ([`allocate`]). Champion first: every repo with merge
 //!   debt gets its one champion slot before anything else, up to
-//!   `budget − nonPrFloor` (the demand module's reservation cap). Every other
+//!   `budget − nonPrFloor` (the demand module's reservation cap) — skipped
+//!   entirely when `demandWidth.reserve` is `false`. Every other
 //!   slot goes, one at a time, to the `(repo, role)` with the highest
 //!   marginal value `demand / (slots + 1)`, where judge demand is review debt
 //!   × `reviewWeight`, doctor demand is changes debt × `reviewWeight`, and
@@ -141,6 +143,10 @@ pub struct AllocatorConfig {
     pub max_per_repo: usize,
     /// `demandWidth.nonPrFloor` — slots the champion-first pass leaves free.
     pub non_pr_floor: usize,
+    /// `demandWidth.reserve` — `false` skips the champion-first pass
+    /// ("keeps the width but reserves nothing"); champions then compete in
+    /// the marginal pass like every other role.
+    pub reserve: bool,
 }
 
 impl AllocatorConfig {
@@ -152,6 +158,7 @@ impl AllocatorConfig {
             per_run: demand.per_run.max(1),
             max_per_repo: demand.max.max(1),
             non_pr_floor: demand.non_pr_floor,
+            reserve: demand.reserve,
         }
     }
 }
@@ -307,10 +314,17 @@ fn builder_want(p: &RepoPipeline, cfg: &AllocatorConfig) -> Want {
             demand: 0.0,
             cap: 0,
             trigger: Trigger::Debt(axis),
-            why: format!(
-                "builds paused — review+changes debt {pr_debt} × weight {:.2} ≥ ready {ready}",
-                cfg.review_weight
-            ),
+            why: match p.ready {
+                Some(n) => format!(
+                    "builds paused — review+changes debt {pr_debt} × weight {:.2} ≥ ready {n}",
+                    cfg.review_weight
+                ),
+                None => format!(
+                    "builds paused — ready queue unobserved, review+changes debt {pr_debt} × \
+                     weight {:.2} outweighs the one-slot floor",
+                    cfg.review_weight
+                ),
+            },
         };
     }
     let why = match p.ready {
@@ -365,7 +379,9 @@ pub fn allocate(
 
     // Champion first: each repo with merge debt, deepest first, gets its one
     // slot before anything else — capped like the demand reservation.
+    // `demandWidth.reserve: false` reserves nothing: no prepass at all.
     let mut champions: Vec<usize> = (0..wants.len())
+        .filter(|_| cfg.reserve)
         .filter(|&i| wants[i].1 == 0 && wants[i].2.trigger == Trigger::Debt(DebtAxis::Merge))
         .filter(|&i| wants[i].2.cap > 0)
         .collect();
@@ -424,8 +440,9 @@ pub fn allocate(
 }
 
 /// `(ready, building)` per root from the work finder's tick queue — rows it
-/// already listed, so no forge call. A halted root (nothing admittable was
-/// listed) reads `None` on both.
+/// already listed, so no forge call. A halted root admits nothing, so its
+/// ready count is a known zero (not a fail-open floor); its building count
+/// is unobserved (`None`).
 #[must_use]
 pub fn queue_counts(
     queue: &[TickQueueRow],
@@ -456,7 +473,7 @@ pub fn queue_counts(
     (0..roots)
         .map(|i| {
             if halted.get(i).copied().unwrap_or(false) {
-                (None, None)
+                (Some(0), None)
             } else {
                 (Some(ready[i]), Some(building[i]))
             }

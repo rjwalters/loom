@@ -4635,11 +4635,13 @@ Wiring it into admission is #10815.
   demand-ledger totals (the same per-repo read as the build back-off). Ready
   and building counts come from the rows the work finder already listed this
   tick (ready = dispatched or deferred; building = `in_flight`); a halted repo
-  reads both as unobserved. Untriaged issues are not observed yet.
+  reads ready as a known zero (it admits nothing) and building as unobserved. Untriaged issues are not observed yet.
 - **Fail open.** An unobserved input gives that role a one-slot `floor`, never
   zero for lack of data.
 - **Champion first.** Every repo with merge debt gets its champion slot before
   anything else, deepest queue first, up to `budget − demandWidth.nonPrFloor`.
+  With `demandWidth.reserve: false` there is no champion-first pass; champions
+  compete in the marginal pass like every other role.
 - **Marginal value.** Each remaining slot goes to the `(repo, role)` with the
   highest `demand / (slots + 1)`: judge demand is review debt × `reviewWeight`,
   doctor demand is changes debt × `reviewWeight`, builder demand is ready
@@ -5472,7 +5474,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
 | `autonomous.workFinder.buildBackoff.hostLow` | *(config only)* | absent (off) | Release the host ceiling when the host total is strictly below this. A crossed or half-set `hostHigh`/`hostLow` pair leaves the ceiling off (one `WARN`). **Live** |
 | `autonomous.balance.enabled` | `LOOM_BALANCE_ENABLED` | `false` | Per-repo balance allocator, **shadow mode** (#10630 Slice 1): logs one champion/judge/doctor/builder allocation per tick; changes no admission. **Live**. See [Per-repo balance allocator](#per-repo-balance-allocator-shadow-mode-autonomousbalance-10630) |
-| `autonomous.balance.reviewWeight` | `LOOM_BALANCE_REVIEW_WEIGHT` | `1.0` | Bias of the allocator: `> 1` toward review (judge/doctor), `< 1` toward building. Must be a finite number `> 0`, else default. **Live** |
+| `autonomous.balance.reviewWeight` | `LOOM_BALANCE_REVIEW_WEIGHT` | `1.0` | Bias of the allocator: `> 1` toward review (judge/doctor), `< 1` toward building. Must be a finite number `> 0`, else the next tier. **Live** |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default. This is the **generation-1** TTL; a relapse serves an escalated one (see `ttlMaxSecs`) |
