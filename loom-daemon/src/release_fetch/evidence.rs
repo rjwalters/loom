@@ -102,6 +102,9 @@ pub enum EvidenceOutcome {
     RefusedUnavailable,
     /// A signature was checked and did not verify. Tamper evidence.
     SignatureInvalid,
+    /// A signature exists but the verifier never answered (timeout /
+    /// uncollectable output). Fail-closed abort, but NOT tamper evidence.
+    SignatureInconclusive,
     /// The artifact did not match its published `.sha256`. Tamper evidence.
     ChecksumMismatch,
     /// Published signature material would not download (#8197). NOT tampering.

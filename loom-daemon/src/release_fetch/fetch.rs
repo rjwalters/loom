@@ -511,7 +511,11 @@ pub(super) fn verify_core(
 
     facts.signature_state = sig_result.state;
     if sig_result.outcome == signature::Outcome::Failed {
-        facts.outcome = EvidenceOutcome::SignatureInvalid;
+        facts.outcome = if sig_result.inconclusive {
+            EvidenceOutcome::SignatureInconclusive
+        } else {
+            EvidenceOutcome::SignatureInvalid
+        };
         return FetchOutcome::VerificationFailed {
             lines: vec![
                 sig_result.message,
