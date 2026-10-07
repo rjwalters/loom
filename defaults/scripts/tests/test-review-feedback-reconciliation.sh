@@ -212,12 +212,6 @@ case "$endpoint" in
     }
     emit_pages 'reviews-page-*.json'
     ;;
-  */issues/*/comments*)
-    # #10581 cross-host arbitration re-reads the issue comments after posting:
-    # serve back this caller's own just-posted comment, no rivals.
-    [[ -f "$FIX/last-body.txt" ]] && jq -cn --rawfile b "$FIX/last-body.txt" '{id:1000,u:"bot",b:$b}'
-    exit 0
-    ;;
   */pulls/*/comments*)
     [[ -f "$FIX/fail-inline" ]] && {
       echo "stub gh: simulated inline-comment read failure" >&2
@@ -261,6 +255,7 @@ fi
 [[ "${1:-} ${2:-}" == "forge verdict-gate" ]] && { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
 [[ "${1:-} ${2:-}" == "forge verdict-labels" ]] && { echo "LOOM-VERDICT-LABELS OK"; exit 0; }
 [[ "${1:-} ${2:-}" == "forge verdict-lock" ]] && exit 0
+[[ "${1:-} ${2:-}" == "forge verdict-reconcile" ]] && { echo "LOOM-VERDICT-RECONCILE STABLE"; exit 0; }
 echo "mock loom-daemon: forge comment not under test here" >&2
 exit 127
 MOCK

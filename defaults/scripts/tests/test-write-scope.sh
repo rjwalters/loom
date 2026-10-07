@@ -43,15 +43,8 @@ cat > "$STUB/gh" <<'EOF'
 printf '%s\n' "$*" >> "$GH_LOG"
 case "$1 $2" in
   "api graphql") echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' ;;
-  "api "*)
-    # #10581: post-verdict.sh re-reads the issue comments after posting (cross-host
-    # arbitration) and must find its own comment again; every other read is empty.
-    if [[ "$*" == *"/issues/"*"/comments"* && -f "$GH_LOG.body" ]]; then
-      jq -cn --rawfile b "$GH_LOG.body" '{id:1000,u:"bot",b:$b}'
-    else printf ''; fi ;;
-  "pr comment"|"issue comment")
-    prev=""; for a in "$@"; do [[ "$prev" == "--body" ]] && printf '%s' "$a" > "$GH_LOG.body"; prev="$a"; done
-    echo "https://github.com/x/y/pull/1#issuecomment-1" ;;
+  "api "*) printf '' ;;
+  "pr comment"|"issue comment") echo "https://github.com/x/y/pull/1#issuecomment-1" ;;
 esac
 exit 0
 EOF
@@ -66,7 +59,7 @@ mk_daemon() { # <name> <body>
 }
 mk_daemon daemon-old 'echo "error: unrecognized subcommand '\''may-write'\''" >&2; exit 2'
 mk_daemon daemon-deny 'echo "the credential in use cannot write to me/solo (repository role \`pull\`)" >&2; exit 1'
-mk_daemon daemon-allow 'echo "me/widgets"; exit 0'
+mk_daemon daemon-allow '[[ "${2:-}" == verdict-reconcile ]] && { echo "LOOM-VERDICT-RECONCILE STABLE"; exit 0; }; echo "me/widgets"; exit 0'
 mk_daemon daemon-silent 'exit 0'
 NO_DAEMON="$WORK/no-such-loom-daemon"
 

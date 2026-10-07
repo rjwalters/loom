@@ -59,6 +59,40 @@ pub(crate) fn verdict_gate(
         );
     }
     let (line, code) = decision.render();
+    // What this caller's gate saw, for `verdict-reconcile` to compare against.
+    let seen = comments
+        .as_deref()
+        .map_or(0, |c| gate::count_markers(c, sha, opposite_of(kind)));
+    println!("{line} seen-opposite={seen}");
+    std::process::exit(code)
+}
+
+fn opposite_of(kind: VerdictKind) -> VerdictKind {
+    match kind {
+        VerdictKind::Approved => VerdictKind::ChangesRequested,
+        VerdictKind::ChangesRequested => VerdictKind::Approved,
+    }
+}
+
+/// `forge verdict-reconcile` (read-only): after the post and label transition,
+/// re-read the PR and say whether a rival verdict landed at the same head
+/// after this caller's gate read (a cross-host race the host lock cannot see).
+pub(crate) fn verdict_reconcile(
+    pr: u64,
+    repo: &str,
+    verdict: &str,
+    sha: &str,
+    seen_opposite: usize,
+) -> Result<()> {
+    let kind = verdict_or_exit("verdict-reconcile", verdict);
+    let root = super::forge_identity_cmd::workspace();
+    let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
+        repo,
+        &pr.to_string(),
+        &root,
+        false,
+    );
+    let (line, code) = gate::reconcile(kind, sha, seen_opposite, comments.as_deref()).render();
     println!("{line}");
     std::process::exit(code)
 }

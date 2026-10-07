@@ -61,9 +61,6 @@ if [[ "${1:-}" == "api" ]]; then
   case "$method $path" in
     "GET repos/owner/repo/issues/"*/comments)
       cat "$D/comments.json"; exit 0 ;;
-    "GET repos/owner/repo/issues/"*/comments\?*)
-      # #10581 cross-host arbitration re-read (post-jq shape; ids follow post order)
-      jq -c 'to_entries[] | {id: (1000 + .key), u: .value.user.login, b: .value.body}' "$D/comments.json"; exit 0 ;;
     "GET repos/owner/repo/issues/"*/labels\?*)
       [[ -f "$D/labels-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
       jq -R '{name: .}' < "$D/labels.txt" | jq -s .; exit 0 ;;
@@ -86,6 +83,13 @@ fi
 if [[ "${1:-} ${2:-}" == "repo view" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "${1:-} ${2:-}" == "issue comment" ]]; then
   [[ -f "$D/post-delay" ]] && sleep 2
+  # A rival Judge on ANOTHER host passed its gate read before either of us wrote
+  # (the host lock cannot order it); its comment lands just before ours.
+  if [[ -f "$D/rival-verdict" ]]; then
+    jq --arg b "rival review\n\n<!-- loom:verdict-sha sha=$(cat "$D/cur-sha") verdict=$(cat "$D/rival-verdict") -->" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '. + [{body: $b, created_at: $t, user: {login: "rival-judge", type: "User"}, author_association: "MEMBER"}]' \
+      "$D/comments.json" > "$D/c.tmp" && mv "$D/c.tmp" "$D/comments.json"
+  fi
   echo "$3" >> "$D/posted.log"
   jq --arg b "$body" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '. + [{body: $b, created_at: $t, user: {login: "a-judge", type: "User"}, author_association: "MEMBER"}]' \
@@ -126,7 +130,7 @@ OVERRULE="the flaky check was re-run green on this head; the size concern was wi
 state() {
   printf '%s' "$1" > "$STUB_DIR/comments.json"; shift
   printf '%s\n' "$@" | sed '/^$/d' > "$STUB_DIR/labels.txt"
-  rm -f "$STUB_DIR"/labels-*-fail "$STUB_DIR/posted.log"
+  rm -f "$STUB_DIR"/labels-*-fail "$STUB_DIR/posted.log" "$STUB_DIR/rival-verdict"
 }
 cr_at() { # a trusted changes-requested marker for $1, posted $2 seconds ago
   local t; t="$(date -u -d "@$(($(date +%s) - $2))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$(($(date +%s) - $2))" +%Y-%m-%dT%H:%M:%SZ)"
@@ -246,6 +250,29 @@ check "exit 9" 9 "$RC"
 check "nothing posted" "" "$POSTED"
 check "foreign lock left alone" yes "$([[ -d "$STUB_DIR/locks/owner_repo-10702" ]] && echo yes)"
 rmdir "$STUB_DIR/locks/owner_repo-10702"
+
+echo "== cross-host race: a rival changes-requested lands after our gate read (#10581) =="
+state "[]" loom:review-requested loom:reviewing
+printf changes-requested > "$STUB_DIR/rival-verdict"
+pv 10710 approved "$HEAD" --body "Approved."
+check "the losing approval exits 7" 7 "$RC"
+contains "says it was superseded" "$OUT" "SUPERSEDED"
+check "only the changes-requested label remains" "loom:changes-requested " "$LABELS"
+LAST="$(jq -r '.[-1].body' "$STUB_DIR/comments.json")"
+contains "newest marker is changes-requested" "$LAST" "verdict=changes-requested -->"
+
+echo "== cross-host race: a rival approval lands after our changes-requested gate read =="
+state "[]" loom:review-requested loom:reviewing
+printf approved > "$STUB_DIR/rival-verdict"
+pv 10711 changes-requested "$HEAD" --body "Please fix."
+check "changes-requested exits 0" 0 "$RC"
+check "changes-requested labels, never loom:pr" "loom:changes-requested " "$LABELS"
+
+echo "== no race: an unrelated earlier verdict at another head changes nothing =="
+state "$(cr_at "$MOVED" 60)" loom:review-requested loom:reviewing
+pv 10712 approved "$HEAD" --body "Approved."
+check "exit 0" 0 "$RC"
+check "loom:pr only" "loom:pr " "$LABELS"
 
 echo ""
 echo "test-post-verdict-gate: $PASSED passed, $FAILED failed"

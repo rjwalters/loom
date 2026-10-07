@@ -620,14 +620,39 @@ pub(crate) enum ForgeAction {
         verdict: String,
     },
 
+    /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
+    /// --seen-opposite N` (#10581) — read-only post-write arbitration. The host
+    /// lock cannot order two hosts, so after posting and labelling each caller
+    /// re-reads: if more opposite-verdict same-head markers exist than its gate
+    /// saw (`seen-opposite=N` on the gate line), a rival landed concurrently.
+    /// Changes-requested wins. Prints `LOOM-VERDICT-RECONCILE
+    /// STABLE|PREVAILS|SUPERSEDED|UNREAD`; exits 0, 0, 11 (an approval that
+    /// lost: post a superseding marker, flip the labels) or 1.
+    #[command(name = "verdict-reconcile")]
+    VerdictReconcile {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name`.
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+        /// The head SHA the verdict was rendered against.
+        #[arg(long)]
+        sha: String,
+        /// Opposite-verdict same-head markers the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_opposite: usize,
+    },
+
     /// `forge verdict-lock acquire|release <pr> --repo R` (#10581) — the
     /// per-PR host lock `post-verdict.sh` holds across its gate read, comment
     /// post and label transition, so a rival verdict cannot land in between
     /// and two identical callers cannot both pass the dedupe read. `acquire`
     /// waits up to `LOOM_VERDICT_LOCK_WAIT_SECS` (90) and exits 9 on timeout
     /// (fail closed); a lock older than 5 minutes is reaped. Host-local only:
-    /// independent hosts share no lock, so cross-host the gate's read is the
-    /// only guard.
+    /// independent hosts share no lock; `verdict-reconcile` arbitrates cross-host.
     #[command(name = "verdict-lock")]
     VerdictLock {
         /// `acquire` or `release`.
@@ -868,6 +893,21 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }
         ForgeAction::VerdictLock { action, pr, repo } => {
             return super::forge_verdict_cmd::verdict_lock(&action, pr, &repo);
+        }
+        ForgeAction::VerdictReconcile {
+            pr,
+            repo,
+            verdict,
+            sha,
+            seen_opposite,
+        } => {
+            return super::forge_verdict_cmd::verdict_reconcile(
+                pr,
+                &repo,
+                &verdict,
+                &sha,
+                seen_opposite,
+            );
         }
         ForgeAction::VerdictLabels { pr, repo, verdict } => {
             return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);

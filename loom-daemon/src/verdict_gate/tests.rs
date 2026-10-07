@@ -181,3 +181,69 @@ fn label_names_reads_rest_shapes() {
     assert_eq!(label_names(&issue).unwrap(), labels(&["loom:pr"]));
     assert!(label_names(&json!({"message": "Not Found"})).is_none());
 }
+
+// --- cross-host arbitration (#10581) ----------------------------------------
+
+#[test]
+fn count_markers_counts_only_this_head_and_verdict() {
+    let cs = vec![
+        comment(HEAD, "changes-requested", "2026-10-06T13:40:00Z"),
+        comment(HEAD, "changes-requested", "2026-10-06T13:41:00Z"),
+        comment(HEAD, "approved", "2026-10-06T13:42:00Z"),
+        comment(OTHER, "changes-requested", "2026-10-06T13:43:00Z"),
+    ];
+    assert_eq!(count_markers(&cs, HEAD, VerdictKind::ChangesRequested), 2);
+    assert_eq!(count_markers(&cs, HEAD, VerdictKind::Approved), 1);
+    assert_eq!(count_markers(&cs, &HEAD[..10], VerdictKind::Approved), 1);
+}
+
+/// Two callers both read an empty forge (gate saw 0 opposite markers) and both
+/// wrote. Whichever of them re-reads, changes-requested wins.
+#[test]
+fn two_callers_that_both_passed_the_gate_converge_on_changes_requested() {
+    let both = vec![
+        comment(HEAD, "approved", "2026-10-06T13:46:00Z"),
+        comment(HEAD, "changes-requested", "2026-10-06T13:46:01Z"),
+    ];
+    let approver = reconcile(VerdictKind::Approved, HEAD, 0, Some(&both));
+    assert!(matches!(approver, Reconciled::Superseded(_)), "{approver:?}");
+    assert_eq!(approver.render().1, EXIT_SUPERSEDED);
+    let rejecter = reconcile(VerdictKind::ChangesRequested, HEAD, 0, Some(&both));
+    assert!(matches!(rejecter, Reconciled::Prevails(_)), "{rejecter:?}");
+    assert_eq!(rejecter.render().1, 0);
+}
+
+/// The store-then-load argument: the earlier writer may not see the later one,
+/// but the later one always sees the earlier one, and CR still wins.
+#[test]
+fn the_earlier_writer_may_miss_its_rival_and_the_later_one_still_arbitrates() {
+    let only_approval = vec![comment(HEAD, "approved", "2026-10-06T13:46:00Z")];
+    assert_eq!(
+        reconcile(VerdictKind::Approved, HEAD, 0, Some(&only_approval)),
+        Reconciled::Stable
+    );
+    assert!(matches!(
+        reconcile(VerdictKind::ChangesRequested, HEAD, 0, Some(&only_approval)),
+        Reconciled::Prevails(_)
+    ));
+}
+
+#[test]
+fn an_opposite_marker_the_gate_already_saw_is_not_a_race() {
+    // An approval that overruled an earlier changes-requested (gate saw 1).
+    let cs = vec![
+        comment(HEAD, "changes-requested", "2026-10-06T13:00:00Z"),
+        comment(HEAD, "approved", "2026-10-06T13:46:00Z"),
+    ];
+    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 1, Some(&cs)), Reconciled::Stable);
+    // Another head's verdicts are irrelevant.
+    let other = vec![comment(OTHER, "changes-requested", "2026-10-06T13:46:00Z")];
+    assert_eq!(reconcile(VerdictKind::Approved, HEAD, 0, Some(&other)), Reconciled::Stable);
+}
+
+#[test]
+fn an_unread_reconcile_is_never_stable() {
+    let r = reconcile(VerdictKind::Approved, HEAD, 0, None);
+    assert_eq!(r, Reconciled::Unread);
+    assert_ne!(r.render().1, 0);
+}

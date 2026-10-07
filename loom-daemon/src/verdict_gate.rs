@@ -20,6 +20,12 @@
 //!   verifies the result, so a failure is loud instead of a verdict with no
 //!   label.
 //!
+//! - [`reconcile`] — after posting and labelling. The per-PR lock is host-local,
+//!   so two hosts can both pass the gate read before either writes. Each caller
+//!   re-reads the forge after its write and compares the opposite-verdict marker
+//!   count to what its gate saw; changes-requested deterministically wins, so
+//!   every interleaving converges on the same outcome.
+//!
 //! The exact-head CI read (#10485) is deliberately NOT here: that gate reads
 //! check runs through `forge wait-checks`. This one only reads what the forge
 //! already says about the PR (comments and labels).
@@ -52,6 +58,12 @@ pub const GATE_SENTINEL: &str = "LOOM-VERDICT-GATE";
 
 /// The first token of a successful label transition.
 pub const LABELS_SENTINEL: &str = "LOOM-VERDICT-LABELS";
+
+/// The first token of a reconcile answer.
+pub const RECONCILE_SENTINEL: &str = "LOOM-VERDICT-RECONCILE";
+
+/// Exit code for a reconcile that found the caller's approval superseded.
+pub const EXIT_SUPERSEDED: i32 = 11;
 
 /// A `<!-- loom:verdict-sha ... -->` marker read back from a comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +150,93 @@ pub fn latest_marker_for(records: &[Value], sha: &str) -> Option<PriorMarker> {
         }
     }
     latest
+}
+
+/// How many trusted markers for `sha` carry `verdict`. A count, not a
+/// timestamp: it compares forge state to forge state, so host clock skew
+/// cannot matter.
+#[must_use]
+pub fn count_markers(records: &[Value], sha: &str, verdict: VerdictKind) -> usize {
+    let Ok(re) = regex::Regex::new(
+        r"<!-- loom:verdict-sha sha=([0-9a-f]{7,40}) verdict=(approved|changes-requested) -->",
+    ) else {
+        return 0;
+    };
+    records
+        .iter()
+        .filter_map(|r| r.get("body").and_then(Value::as_str))
+        .flat_map(|body| re.captures_iter(body))
+        .filter(|cap| same_sha(&cap[1], sha) && parse_verdict(&cap[2]) == Some(verdict))
+        .count()
+}
+
+/// What a caller's post-write re-read concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// No rival verdict landed after the gate read.
+    Stable,
+    /// A rival changes-requested landed at the same head after the gate read
+    /// and this caller approved: the approval loses (changes-requested is the
+    /// safe side). The caller must post a superseding marker and flip labels.
+    Superseded(String),
+    /// This caller posted changes-requested and a rival approval landed after
+    /// its gate read: changes-requested wins; re-assert its labels.
+    Prevails(String),
+    /// The re-read failed. Never treated as stable.
+    Unread,
+}
+
+impl Reconciled {
+    /// The one-line answer `post-verdict.sh` parses, and the exit code.
+    #[must_use]
+    pub fn render(&self) -> (String, i32) {
+        match self {
+            Self::Stable => (format!("{RECONCILE_SENTINEL} STABLE"), 0),
+            Self::Prevails(m) => (format!("{RECONCILE_SENTINEL} PREVAILS {m}"), 0),
+            Self::Superseded(m) => {
+                (format!("{RECONCILE_SENTINEL} SUPERSEDED {m}"), EXIT_SUPERSEDED)
+            }
+            Self::Unread => {
+                (format!("{RECONCILE_SENTINEL} UNREAD the PR's comments could not be re-read"), 1)
+            }
+        }
+    }
+}
+
+/// Arbitrate two verdicts at one head that both passed their gate read before
+/// either wrote (two hosts share no lock). `seen_opposite` is the number of
+/// opposite-verdict same-head markers the caller's gate saw; any extra now
+/// arrived concurrently. Deterministic: changes-requested wins, so whichever
+/// order the writes interleave, every caller converges on the same outcome.
+/// Each caller writes before it re-reads, so at least one of two racing
+/// callers sees the other.
+#[must_use]
+pub fn reconcile(
+    verdict: VerdictKind,
+    sha: &str,
+    seen_opposite: usize,
+    comments: Option<&[Value]>,
+) -> Reconciled {
+    let Some(comments) = comments else {
+        return Reconciled::Unread;
+    };
+    let opposite = match verdict {
+        VerdictKind::Approved => VerdictKind::ChangesRequested,
+        VerdictKind::ChangesRequested => VerdictKind::Approved,
+    };
+    let now = count_markers(comments, sha, opposite);
+    if now <= seen_opposite {
+        return Reconciled::Stable;
+    }
+    let msg = format!(
+        "{} concurrent {} verdict(s) landed at {sha} after the gate read",
+        now - seen_opposite,
+        opposite.marker_token()
+    );
+    match verdict {
+        VerdictKind::Approved => Reconciled::Superseded(msg),
+        VerdictKind::ChangesRequested => Reconciled::Prevails(msg),
+    }
 }
 
 /// Everything [`decide`] looks at. `comments` / `labels` are `None` when the
