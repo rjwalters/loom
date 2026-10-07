@@ -648,6 +648,7 @@ mod tests {
             superseded: &[],
             unticked: &[],
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &[],
             enumerate_error: None,
@@ -712,6 +713,7 @@ mod tests {
             unevaluated: &[],
             enumerate_error: None,
             cost: &cost,
+            archived: Some(false),
         };
         let (mut err, mut out) = (Vec::new(), Vec::new());
         render(&mut err, &mut out, &s, true);
