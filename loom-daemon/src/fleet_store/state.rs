@@ -11,6 +11,10 @@
 //!     state: paused         # a host entry overrides the fleet default
 //! ```
 //!
+//! When the store has the compiled `fleet.json` (#10705), the same document is
+//! its `state` section ([`resolve_snapshot`]); `fleet/state.yml` is read only
+//! when `fleet.json` is absent.
+//!
 //! `running` dispatches normally, `paused` keeps the daemon up without new
 //! dispatch, `stopped` means the daemon is meant to be down. This module reads
 //! and reports it; [`crate::fleet_state`] is what *enforces* it on a live host
@@ -19,6 +23,8 @@
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::fetch::Snapshot;
 
 /// A desired run state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,20 +83,53 @@ pub struct HostState {
 
 /// Resolve `host`'s desired state from the text of `fleet/state.yml`.
 pub fn resolve(text: &str, host: &str) -> Result<HostState> {
-    let doc = super::yaml::parse(text).map_err(|e| anyhow!("fleet/state.yml: {e:#}"))?;
+    let doc = super::yaml::parse(text).map_err(|e| anyhow!("{}: {e:#}", super::STATE_PATH))?;
+    resolve_value(&doc, host, super::STATE_PATH)
+}
+
+/// Resolve `host`'s desired state from a store snapshot: `fleet.json`'s
+/// `state` when the store has it, else `fleet/state.yml`. `Ok(None)` when it
+/// has neither. A present but invalid `fleet.json` is an error and never falls
+/// back to `fleet/state.yml`.
+pub fn resolve_snapshot(snapshot: &Snapshot, host: &str) -> Result<Option<HostState>> {
+    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
+        let source = format!("{} `state`", super::FLEET_JSON_PATH);
+        return resolve_value(doc.state(), host, &source).map(Some);
+    }
+    let Some(text) = snapshot.text(super::STATE_PATH)? else {
+        return Ok(None);
+    };
+    resolve(&text, host).map(Some)
+}
+
+/// The message for a snapshot with no run state at all
+/// ([`resolve_snapshot`] returned `Ok(None)`).
+#[must_use]
+pub fn missing_message(snapshot: &Snapshot) -> String {
+    format!(
+        "the store has neither {} nor {} (commit {})",
+        super::FLEET_JSON_PATH,
+        super::STATE_PATH,
+        snapshot.short_commit()
+    )
+}
+
+/// Resolve `host`'s desired state from a parsed run-state document.
+/// `source_name` names the document in messages.
+fn resolve_value(doc: &Value, host: &str, source_name: &str) -> Result<HostState> {
     let top = doc
         .as_object()
-        .ok_or_else(|| anyhow!("fleet/state.yml: top level must be a mapping"))?;
+        .ok_or_else(|| anyhow!("{source_name}: top level must be a mapping"))?;
     let host_entry = match top.get("hosts") {
         None | Some(Value::Null) => None,
         Some(Value::Object(hosts)) => hosts.get(host),
-        Some(_) => bail!("fleet/state.yml: `hosts` must be a mapping"),
+        Some(_) => bail!("{source_name}: `hosts` must be a mapping"),
     };
     let (entry, source) = match host_entry.filter(|e| e.get("state").is_some()) {
         Some(e) => (e, "host"),
         None => match top.get("fleet") {
             Some(f) if f.get("state").is_some() => (f, "fleet"),
-            _ => bail!("fleet/state.yml sets no state for `{host}` and no `fleet.state` default"),
+            _ => bail!("{source_name} sets no state for `{host}` and no `fleet.state` default"),
         },
     };
     let raw = entry
@@ -98,7 +137,7 @@ pub fn resolve(text: &str, host: &str) -> Result<HostState> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let state = RunState::parse(raw).ok_or_else(|| {
-        anyhow!("fleet/state.yml: `{raw}` is not running, paused or stopped ({source} entry)")
+        anyhow!("{source_name}: `{raw}` is not running, paused or stopped ({source} entry)")
     })?;
     let text_field = |k: &str| {
         entry

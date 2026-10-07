@@ -384,14 +384,8 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let text = loaded.snapshot.text(store::ROSTER_PATH)?.ok_or_else(|| {
-        anyhow!(
-            "the store has no {} (commit {})",
-            store::ROSTER_PATH,
-            loaded.snapshot.short_commit()
-        )
-    })?;
-    let parsed = roster::parse(&text, home)?;
+    let parsed = roster::from_snapshot(&loaded.snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 

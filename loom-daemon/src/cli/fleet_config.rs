@@ -464,15 +464,9 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
     // Fail closed: the roster carries the firewall inputs, so it is read only
     // from a snapshot the forge confirmed current in this invocation.
     let loaded = ctx.load(Policy::FailClosed)?;
-    let text = loaded.snapshot.text(store::ROSTER_PATH)?.ok_or_else(|| {
-        anyhow!(
-            "the store has no {} (commit {})",
-            store::ROSTER_PATH,
-            loaded.snapshot.short_commit()
-        )
-    })?;
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
-    let parsed = roster::parse(&text, &home)?;
+    let parsed = roster::from_snapshot(&loaded.snapshot, &home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
     let registry_path = registry::default_registry_path()?;
     let reg = WorkspaceRegistry::load(&registry_path)?;
     let registered: Vec<Registered> = reg
@@ -546,11 +540,8 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
 fn cmd_state(ctx: &Ctx, host: Option<String>, json: bool, offline: bool) -> Result<i32> {
     let host = resolve_host(host)?;
     let loaded = ctx.load(policy(offline))?;
-    let text = loaded
-        .snapshot
-        .text(store::STATE_PATH)?
-        .ok_or_else(|| anyhow!("the store has no {}", store::STATE_PATH))?;
-    let hs = state::resolve(&text, &host)?;
+    let hs = state::resolve_snapshot(&loaded.snapshot, &host)?
+        .ok_or_else(|| anyhow!(state::missing_message(&loaded.snapshot)))?;
     if json {
         let mut v = serde_json::to_value(&hs)?;
         v["commit"] = loaded.snapshot.manifest.commit.clone().into();

@@ -10,6 +10,12 @@
 //!   ([`crate::config_resolver::LOCAL_CONFIG_REL`]). A store without that file
 //!   leaves the local tier untouched.
 //!
+//! When the store has the compiled `fleet.json` (#10705), the three inputs are
+//! its `config.defaults`, `config.hosts.<host>.defaults` and
+//! `config.hosts.<host>.local` instead, with the same merge and the same
+//! "host overlay required, local tier optional" rules; the legacy files are
+//! read only when `fleet.json` is absent.
+//!
 //! Drift is **semantic**: a target whose parsed JSON equals the rendered value
 //! is in sync regardless of formatting, and is not rewritten (so a no-op render
 //! never churns backups). A write keeps exactly one timestamped backup of the
@@ -66,6 +72,29 @@ pub fn render(
     local_path: &Path,
 ) -> Result<Vec<Target>> {
     super::validate_host(host)?;
+    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
+        let overlay = doc.host_defaults(host).ok_or_else(|| {
+            anyhow!(
+                "host `{host}` is not in the store (no config.hosts.{host}.defaults in {} at \
+                 commit {}); set LOOM_HOST_ID or pass --host",
+                super::FLEET_JSON_PATH,
+                snapshot.short_commit()
+            )
+        })?;
+        let mut out = vec![Target {
+            tier: Tier::Machine,
+            path: machine_path.to_path_buf(),
+            value: crate::config_resolver::deep_merge(doc.fleet_defaults(), overlay),
+        }];
+        if let Some(local) = doc.host_local(host) {
+            out.push(Target {
+                tier: Tier::Local,
+                path: local_path.to_path_buf(),
+                value: local.clone(),
+            });
+        }
+        return Ok(out);
+    }
     let base = require_object(snapshot, super::FLEET_DEFAULTS_PATH)?.ok_or_else(|| {
         anyhow!(
             "the store has no {} (commit {})",
