@@ -563,8 +563,16 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/release/loom-daemon dist/loom-daemon-linux-amd64
+      # Deliberately NO layer cache (ci-principles rule 10: this is the cold-
+      # build observation); it only shares ci.yml's APT_MIRROR and the
+      # Dockerfile's apt retries, and every docker build is capped at 10 min
+      # so a mirror stall fails at its own step (#10822).
       - name: Build the loom-worker image
-        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-daily .
+        timeout-minutes: 10
+        run: |
+          docker build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            -t ghcr.io/rjwalters/loom-worker:ci-daily .
       - name: loom-worker smoke
         if: ${{ !cancelled() }}
         run: ./docker/worker/test-image.sh ghcr.io/rjwalters/loom-worker:ci-daily
@@ -574,22 +582,28 @@ jobs:
       - name: loom-worker run-job seam test
         if: ${{ !cancelled() }}
         run: ./docker/worker/test-run-job.sh ghcr.io/rjwalters/loom-worker:ci-daily
-      - name: Build and smoke the loom-worker-session image
+      - name: Build the loom-worker-session image
+        id: session-build
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: |
-          set -euo pipefail
           docker build -f docker/session/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
             -t loom-worker-session:ci-daily .
-          ./docker/session/test-image.sh loom-worker-session:ci-daily
-      - name: Build and smoke the loom-worker-native image
+      - name: loom-worker-session smoke
+        if: ${{ !cancelled() && steps.session-build.outcome == 'success' }}
+        run: ./docker/session/test-image.sh loom-worker-session:ci-daily
+      - name: Build the loom-worker-native image
+        id: native-build
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: |
-          set -euo pipefail
           docker build -f docker/native/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-daily \
             -t loom-worker-native:ci-daily .
-          ./docker/native/test-image.sh loom-worker-native:ci-daily
+      - name: loom-worker-native smoke
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        run: ./docker/native/test-image.sh loom-worker-native:ci-daily
 
   # ===========================================================================
   # How failures surface: one tracking issue per failing job.

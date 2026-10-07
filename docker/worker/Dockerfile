@@ -76,6 +76,36 @@ ARG DEBIAN_FRONTEND=noninteractive
 # NOT install a Rust/Node/Python toolchain: this base image is language-agnostic
 # by design (see README "What this image deliberately does NOT include") —
 # per-repo build-gate toolchains are a downstream `FROM` layer's job.
+#
+# apt resilience (#10822): on 2026-10-07 `archive.ubuntu.com` served
+# `apt-get update` in 418 s and packages at ~40 s each, and with apt's default
+# of zero retries and no per-request timeout a single stalled mirror ate the
+# whole 30-min CI job. `80-loom-retries` makes apt retry each fetch and give up
+# on a dead connection after 30 s; it ships in the published image too, where
+# it is harmless for a downstream `FROM` layer's own `apt-get`.
+#
+# APT_MIRROR (optional, default EMPTY = upstream `archive.ubuntu.com`, so the
+# published image is unchanged): when set, rewrites the `archive.ubuntu.com`
+# URIs in ubuntu:24.04's deb822 `ubuntu.sources`. CI passes the runner-local
+# Azure mirror (`http://azure.archive.ubuntu.com/ubuntu`). `security.ubuntu.com`
+# and the `cli.github.com` repo are not rewritten — the retries cover them. An
+# arm64 base uses `ports.ubuntu.com`, which has nothing to rewrite, so a set
+# APT_MIRROR there only warns.
+ARG APT_MIRROR=
+RUN printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/80-loom-retries \
+    && apt-config dump | grep -E '^Acquire::(Retries|https?::Timeout) ' \
+    && if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s#http://archive\.ubuntu\.com/ubuntu/\?#${APT_MIRROR%/}/#g" /etc/apt/sources.list.d/ubuntu.sources; \
+        if grep -qF "${APT_MIRROR%/}/" /etc/apt/sources.list.d/ubuntu.sources; then \
+            echo "APT_MIRROR: archive.ubuntu.com -> ${APT_MIRROR%/}/"; \
+        else \
+            echo "APT_MIRROR=${APT_MIRROR} set but ubuntu.sources has no archive.ubuntu.com URI to rewrite; using upstream sources" >&2; \
+        fi; \
+    fi
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
         build-essential \
@@ -93,7 +123,7 @@ RUN apt-get update -qq \
         unzip \
         less \
     && mkdir -p -m 755 /etc/apt/keyrings \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update -qq \
