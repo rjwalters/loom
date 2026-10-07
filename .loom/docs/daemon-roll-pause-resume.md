@@ -1,14 +1,13 @@
 # Daemon Roll: Pause-and-Resume Contract for In-Flight Work (D2)
 
 Design spike for #10714, part of tracker #10698 (Phase 2, step 2). It implements
-operator decision **D2** (2026-10-07): a floor-driven or repo-ahead roll does not
-wait for in-flight work to reach zero. The daemon pauses its in-flight work,
+operator decision **D2** (2026-10-07): a roll does not wait for in-flight work
+to reach zero, whatever triggered it. The daemon pauses its in-flight work,
 restarts onto the new binary, and the new process resumes that work.
 
 **Status: proposal, revised for the operator decisions of 2026-10-07 (recorded
-on #10714 and #10698).** Those decisions answer §12 Q1, Q2 and Q7; Q3-Q6 are
-still open. The operator must review this doc before #10715 (implementation) is
-curated. No runtime behaviour changes until #10715 lands.
+on #10714 and #10698).** Those decisions answer every §12 question (Q1-Q7).
+The operator must review this doc before #10715 (implementation) is curated. No runtime behaviour changes until #10715 lands.
 
 This is a repo-local design doc (it is on the `ORPHAN_ALLOWLIST` in
 `scripts/check-docs-defaults-parity.sh`). It is never installed into consumer
@@ -30,7 +29,7 @@ without a prefix are under `loom-daemon/src/`.
 - [9. Requeue-and-record rules](#9-requeue-and-record-rules)
 - [10. Survey: existing machinery, reuse vs new](#10-survey-existing-machinery-reuse-vs-new)
 - [11. Step 3 touch list (#10715)](#11-step-3-touch-list-10715)
-- [12. Open questions for the operator](#12-open-questions-for-the-operator)
+- [12. Operator questions (all answered)](#12-operator-questions-all-answered)
 
 ## 1. Summary of decisions
 
@@ -69,9 +68,18 @@ without a prefix are under `loom-daemon/src/`.
    `claim_reconciliation.rs:551`). Stopping an agent also stops its lease
    renewal loop, so H4 refreshes each paused item's lease once, at pause time. A
    manifest older than the TTL is stale: its items are requeued, never resumed.
-7. **Ordinary autoUpdate rolls keep today's wait-for-zero drain.** Pause-and-roll
-   applies only to floor-driven, repo-ahead and restart-only-config rolls
-   (§12, Q3, still open).
+7. **One roll machine for every trigger.** Floor, repo-ahead,
+   restart-only-config and ordinary autoUpdate rolls all share the same
+   H3→H4→H5 pause-and-roll path (operator decision, 2026-10-07, Q3). There is
+   no separate wait-for-zero drain path. Today's `drain_roll` and `roll_stall`
+   machinery is replaced (§10, §11).
+8. **Budgets are starting values.** The pause budget, verify probation, resume
+   budget, manifest max age and `minResumableAgeSecs` ship with the defaults
+   below. Each is configurable and is reported in telemetry (§7, §9), so they
+   can be tuned from experience (Q4).
+9. **No transition guards.** Until #10716 lands, a resumed agent is assumed
+   compatible with the new daemon and the workspace. The design adds no
+   machinery to guard that window (Q5).
 
 ## 2. What "pause" means
 
@@ -166,7 +174,7 @@ rule (§2) and the requeue rules (§9).
 
 | Kind | Quiesce point | Persisted fields | Resume procedure (H5) | Cross-version safety check | Unresumable rule |
 |---|---|---|---|---|---|
-| **Daemon-dispatched sweep** (Claude Code or Codex; host process or session container) | Pause request, then the **safe point** (§2), then a tree stop (§5). Bounded by the pause budget. | `issue`, `pr`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle` (runtime, session id, session store, account, model, effort, cwd, container), `safe_point`, `checkpoint_phase`, `worktree`, `claim`, `lease_comment_id`, `lease_refreshed_at`, `log_path`, `overflow`, `stopped_at` | Before the work finder's first tick, relaunch through the spawn script in the recorded worktree with `--resume <session_id>` (Codex: `exec resume <session_id>`, inside the recorded container for session-exec items) and the resume prompt (§2). It gets a new registry entry (`Running`, owned `Child`, `resume_of = <old id>`), a new lease renewal loop and a new journal entry. The claim is kept. | The manifest is no older than `roll.max_age_secs`. The issue's freshest lease record is still this host's. The issue is open and not parked (dispatch guards 2.5/2.7). The worktree exists at `worktree.path` on `worktree.branch`, at `worktree.head`. The session store is reachable. For session-exec items, the container is up and its mounts match (`session_exec/host.rs:226-252`). Until #10716: the workspace is assumed compatible (§12, Q5). | Young: reset. Missed the pause budget: requeue. No session id captured: requeue. Any check fails, or the relaunch exits without starting the session: requeue with the matching reason. |
+| **Daemon-dispatched sweep** (Claude Code or Codex; host process or session container) | Pause request, then the **safe point** (§2), then a tree stop (§5). Bounded by the pause budget. | `issue`, `pr`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle` (runtime, session id, session store, account, model, effort, cwd, container), `safe_point`, `checkpoint_phase`, `worktree`, `claim`, `lease_comment_id`, `lease_refreshed_at`, `log_path`, `overflow`, `stopped_at` | Before the work finder's first tick, relaunch through the spawn script in the recorded worktree with `--resume <session_id>` (Codex: `exec resume <session_id>`, inside the recorded container for session-exec items) and the resume prompt (§2). It gets a new registry entry (`Running`, owned `Child`, `resume_of = <old id>`), a new lease renewal loop and a new journal entry. The claim is kept. | The manifest is no older than `roll.max_age_secs`. The issue's freshest lease record is still this host's. The issue is open and not parked (dispatch guards 2.5/2.7). The worktree exists at `worktree.path` on `worktree.branch`, at `worktree.head`. The session store is reachable. For session-exec items, the container is up and its mounts match (`session_exec/host.rs:226-252`). No compatibility check before #10716 (§12, Q5). | Young: reset. Missed the pause budget: requeue. No session id captured: requeue. Any check fails, or the relaunch exits without starting the session: requeue with the matching reason. |
 | **Role run** (`role_runner`: Champion, Curator, Judge, Auditor, Guide, Doctor) | Same as a sweep. New ticks are already skipped while the drain flag is set (`role_runner.rs:3245-3255`). | `role`, `root`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle`, `safe_point`, `timeout_remaining_secs`, `claim` (from the role's claim breadcrumb, if any), `holds_issue_creation_mutex`, `log_path`, `stopped_at` | Relaunch from the session id in `root`, as for a sweep. Seed the role runner's `InProgressGuard` with `(root, role)` so no duplicate run starts. The new run's timeout is `timeout_remaining_secs`: the roll does not count against the run's budget. If the run held the issue-creation mutex, seed the mutex as held by the resumed run (#3707). Role runs have no registry entry today (`ipc.rs:152-154`); this is the first place they are counted across a restart. | The session store is reachable, and the role is still enabled for `root` in the new config. | As for a sweep. A requeued role run releases the claim named in its breadcrumb (§9). With no breadcrumb, the role's own staleness rule (for example `LOOM_STALE_TREATING_MINUTES`) releases it. In both cases the next scheduled tick redoes the work. |
 | **Epic supervisor** | Not an agent. It stops ticking (drain flag, `epic_supervisor.rs:476-480`). | Nothing of its own. Its issue-creation mutex holder is a role run (row above). | Re-derive every epic from the forge (monotone derived state, `epic_supervisor.rs:43-50`). | n/a | n/a. If the mutex holder was requeued, the mutex is free and the next tick's derivation recovers. The machine-wide filing lock (`filing_lock.rs`) is file-based and survives the restart. |
 | **Worktree** (`.loom/worktrees/issue-N`) | None. It is on-disk state and is never paused or touched by the roll. | `path`, `branch`, `head`, `dirty`, carried on the owning item | Reused by the resumed agent. Until H5 completes, the worktree reaper and the orphan-process reaper must treat every worktree named in a live manifest as **owned** (`orphan_process_reaper.rs` fail-safes). | None needed. Git state does not depend on the binary version. | Never deleted by the roll. If its item was reset or requeued, it becomes ordinary stale state under the existing worktree reaper's rules. A later dispatch reuses it under `worktree.sh`'s existing rules. |
@@ -226,10 +234,12 @@ The contract:
    and recorded as `roll.item.residue_reaped` before the item is resumed. This
    is why the manifest records `scope_unit`, which neither the lock nor the
    journal records today.
-5. **Out of scope for #10715, but the same rule applies:** the general case
-   from 2am#3255, where an agent exits without any roll and its dev servers keep
-   the scope alive. It needs a periodic pass ("scope whose main pid is gone →
-   reap") that does not depend on the manifest (§12, Q6).
+5. **Out of scope here:** the general case from 2am#3255, where an agent exits
+   without any roll and its dev servers keep the scope alive. It has its own
+   issue, rjwalters/loom#10802 ("General cleanup: reap agent process residue
+   (dev servers, orphaned children) after any agent exit"), which specifies the
+   general reaper. This design only tears down and verifies trees for items in
+   the manifest (§12, Q6).
 
 ## 6. The pause manifest (schema v1)
 
@@ -349,9 +359,9 @@ matching the other `autoUpdate` knobs).
 
 ### H3 Staged
 
-- **Entry:** the binary on disk equals the pinned target (#10709), the running
-  `CARGO_PKG_VERSION` is below it (#10710), and `target_source` is `floor`,
-  `repo_ahead` or `config_restart`.
+- **Entry:** the binary on disk equals the pinned target (#10709) and the running
+  `CARGO_PKG_VERSION` is below it (#10710). Every `target_source` enters here:
+  `floor`, `repo_ahead`, `config_restart` and `autoupdate`.
 - **Exit to H4:** immediately, in the same tick, if all of these hold: a
   supervisor is detected (`daemon_update/supervisor.rs`), with the same
   precondition `handle_drain_request` already enforces for relaunch drains
@@ -363,9 +373,9 @@ matching the other `autoUpdate` knobs).
   - An operator then-exit drain is active: it wins (as #4521 does today). The
     host stops, and the next start resumes from the manifest as an ordinary
     H5.
-  - `target_source = autoupdate`: today's drain path, unchanged
-    (`auto_update/drain_trigger.rs:123`, `ipc/drain_roll.rs`,
-    `auto_update/roll_stall.rs:127,167`).
+  - There is no drain fallback for any `target_source`. A roll that cannot
+    proceed (no supervisor, pause failure) goes to H7 and alerts. It never waits
+    for the in-flight count to reach zero.
 
 ### H4 Pausing
 
@@ -409,11 +419,14 @@ matching the other `autoUpdate` knobs).
   When the daemon exits, no agent process is running.
 - **Timeout:** `pauseBudgetSecs`, default **120 s**. It covers the safe-point
   wait (steps 4-7). The forge writes in steps 6 and 8 get the remainder of the
-  budget, with a floor of 30 s. A forge write not done in that time stays in
+  budget, with a floor of 30 s. Every budget in this section is reported in the
+  `daemon.roll.item` events and in `status --json`, next to the observed
+  durations, so the defaults can be tuned (Q4). A forge write not done in that time stays in
   the manifest as `status = planned` and H5 finishes it. A slow forge must not
   block the roll. Under stop semantics the budget sets the trade-off: any tool
   call that runs longer than the budget (a long build or test run, for example)
-  makes its agent miss the safe point, and that agent is requeued (§12, Q4).
+  makes its agent miss the safe point, and that agent is requeued. The default is
+  a starting value, tuned from the `pause-budget-missed` counts (§12, Q4).
 - **Failure edges:**
   - The manifest write in step 3 fails (disk full, permissions): **abort the
     pause.** Nothing has been signalled yet, so clear the flag, resume
@@ -601,10 +614,10 @@ Reasons are a closed set:
 | Machinery | Where | Use in this design |
 |---|---|---|
 | Dispatch-pause flag and its producers | `ipc/drain_state.rs:28`, `:443`; `work_finder.rs:3102`; `role_runner.rs:3248`; `epic_supervisor.rs:476-480`; `ipc.rs:706` | **Reuse as is.** H4 and H5 hold dispatch with this flag. |
-| `DrainOrigin` (Operator / AutoUpdate) | `ipc/drain_state.rs:65` | **Extend.** Add `PauseRoll`, whose completion condition is "every item stopped or requeued, manifest written" instead of "in-flight == 0". |
+| `DrainOrigin` (Operator / AutoUpdate) | `ipc/drain_state.rs:65` | **Extend.** Add `PauseRoll`, whose completion condition is "every item stopped or requeued, manifest written" instead of "in-flight == 0". It is the origin for every automatic roll. The operator origin and its then-exit drain are unchanged. |
 | Drain supervisor, exit codes, supervisor detection, then-exit precedence | `ipc/drain_supervisor.rs:44`, `:308`, `:498-562` | **Reuse.** The exit path and the then-exit escalation (#4521) are unchanged. |
-| Wait-for-zero roll policy (#6007 re-arm, abandon budget) and stall suppression | `ipc/drain_roll.rs:32-45`, `:139`; `auto_update/roll_stall.rs:127`, `:167` | **Unchanged**, for `autoupdate` rolls only. A pause roll bypasses it. |
-| Roll trigger trait | `auto_update/drain_trigger.rs:22` (`DrainTrigger`), `:123` (`IpcDrainTrigger::trigger`) | **Extend** with `trigger_pause_roll(target)`. Supersede (#8514) keeps working: a newer target during H3 replaces the old one, and once H4 has started it is too late to supersede. |
+| Wait-for-zero roll policy (#6007 re-arm, abandon budget) and stall suppression | `ipc/drain_roll.rs:32-45`, `:139`; `auto_update/roll_stall.rs:127`, `:167` | **Replaced.** No roll waits for zero any more (Q3). Pause-and-roll's bounded budgets and H7 alerts take over the job of the abandon budget and stall suppression. Remove it (§11, PR 2). |
+| Roll trigger trait | `auto_update/drain_trigger.rs:22` (`DrainTrigger`), `:123` (`IpcDrainTrigger::trigger`) | **Replace** the drain trigger with `trigger_pause_roll(target)`, used by every `target_source`. Supersede (#8514) keeps working: a newer target during H3 replaces the old one, and once H4 has started it is too late to supersede. |
 | Claude Code launch | `defaults/scripts/spawn-claude.sh` | **Extend.** Pin `--session-id` (a uuid generated at dispatch and recorded in `owner.json`). Add the resume launch mode (`--resume <id>` plus the resume prompt). Export `LOOM_DAEMON_ITEM_ID`. |
 | Codex launch | `defaults/scripts/spawn-codex.sh:1200-1224` | **Extend.** Capture `session id:` while the session runs and write it into the item's handle file. Add the resume mode (`exec resume <id>`) with the account's `CODEX_HOME`. |
 | Hook wiring (Claude `PreToolUse`; Codex managed `pre_tool_use`) | `.claude/settings.json`; `.loom/hooks/hook-wiring.sh`; `defaults/scripts/provision-codex-hooks.sh` | **Extend.** Add a match-all pause hook and the post-tool-use ledger (§2). Hook timeouts must exceed the park window. |
@@ -686,9 +699,15 @@ depends on it.
 
 **PR 2: H3/H4 pause (old-binary side).**
 
-- `loom-daemon/src/auto_update.rs`: route `floor`, `repo_ahead` and
-  `config_restart` targets to the pause path. `autoupdate` is unchanged.
-- `loom-daemon/src/auto_update/drain_trigger.rs`: `trigger_pause_roll`.
+- `loom-daemon/src/auto_update.rs`: route every target (`floor`, `repo_ahead`,
+  `config_restart`, `autoupdate`) to the pause path.
+- `loom-daemon/src/auto_update/drain_trigger.rs`: replace the drain trigger
+  (`DrainTrigger`, `IpcDrainTrigger::trigger`) with `trigger_pause_roll`.
+- **Remove the replaced wait-for-zero machinery:** `loom-daemon/src/ipc/drain_roll.rs`
+  (the #6007 re-arm and abandon budget) and
+  `loom-daemon/src/auto_update/roll_stall.rs` (stall suppression), plus their
+  call sites and config keys. Keep the operator drain and its then-exit path
+  (`ipc/drain_supervisor.rs`) unchanged.
 - `loom-daemon/src/ipc/drain_state.rs`, `ipc/drain_supervisor.rs`:
   `DrainOrigin::PauseRoll` and its completion condition.
 - `loom-daemon/src/auto_update/pause_roll.rs` (new): H4 steps 1-10, the budget,
@@ -709,10 +728,12 @@ depends on it.
   - A manifest write failure aborts the pause with nothing signalled.
   - A forge write that runs past the budget is deferred to H5.
   - A then-exit drain wins.
-  - The existing drain tests stay green, unchanged:
+  - The operator-drain tests stay green, unchanged:
     `loom-daemon/tests/integration_drain_then_exit.rs`,
     `integration_drain_exit_then_watchdog_recovers.rs`,
-    `src/auto_update/tests/supersede_tick.rs`, `src/ipc/drain_state_tests.rs`.
+    `src/ipc/drain_state_tests.rs`. Tests that cover only the removed
+    `drain_roll` and `roll_stall` behaviour are deleted, and
+    `src/auto_update/tests/supersede_tick.rs` is adapted to the pause trigger.
 
 **PR 3: H5 resume (new-binary side) and rollback safety.**
 
@@ -747,10 +768,10 @@ depends on it.
     does not double-dispatch.
 
 **Not in #10715:** the H5 health and rollback mechanics (#9735); general
-agent-exit residue reaping (§12, Q6); the #9452 watchdog fix for ordinary
-restarts (§4); the autoUpdate roll mode (§12, Q3).
+agent-exit residue reaping (rjwalters/loom#10802); the #9452 watchdog fix for
+ordinary restarts (§4).
 
-## 12. Open questions for the operator
+## 12. Operator questions (all answered)
 
 1. **Carry as "pause".** **Answered 2026-10-07: no carry.** Pause means every
    agent is brought to a resumable stop at a safe point and resumed from its
@@ -761,28 +782,23 @@ restarts (§4); the autoUpdate roll mode (§12, Q3).
    special case.** They pause at a safe point and resume by session id inside
    the still-running container. Session-exec ownership is unchanged, because
    the agent is stopped before the daemon exits anyway.
-3. **Ordinary autoUpdate rolls.** *Open.* D2 says the drain stays for them "if
-   at all". Recommendation: keep the drain in #10715. After one release of
-   fleet soak on floor rolls, flip autoUpdate to pause-and-roll behind
-   `autonomous.autoUpdate.rollMode = drain | pause`, and later retire
-   `roll_stall` for that path.
-4. **Defaults.** *Open.* Pause budget 120 s, verify probation 90 s, resume budget
-   120 s, and a manifest max age equal to the lease TTL (15 min). Are these
-   acceptable? (`minResumableAgeSecs = 300` was set by the operator and is not
-   part of this question.) Under stop semantics the pause budget decides how
-   many agents are requeued: any agent inside a tool call longer than the
-   budget misses its safe point. A longer budget (for example 300 s) means
-   fewer requeues and a slower roll. It also still fits under the 2/3-TTL
-   validation rule (300 + 90 + 120 = 510 s < 600 s). PR 1's live test and PR 2's
-   telemetry (`pause-budget-missed` counts) can inform the choice.
-5. **Compatibility before #10716.** *Open.* Until `supports_installed` exists,
-   a resumed agent is assumed compatible with the new daemon and with the
-   workspace's installed Loom, which is what every restart assumes today. Is
-   that acceptable, or should pause-and-roll wait for #10716?
-6. **Dev-server residue (2am#3255).** *Open.* #10715 tears down and verifies
-   trees only for items in the manifest. The general "agent exited, scope kept
-   alive by its dev servers" reaper, including deregistered workspaces, is a
-   separate issue. Recommendation: file it now, independent of #10698.
+3. **Ordinary autoUpdate rolls.** **Answered 2026-10-07: unify.** Ordinary
+   autoUpdate rolls also use pause-and-roll. There is no separate wait-for-zero
+   drain path. Floor, repo-ahead, restart-only-config and autoUpdate rolls all
+   share one H3→H4→H5 machine. The old `drain_roll` and `roll_stall` machinery is
+   replaced and removed (§10, §11 PR 2).
+4. **Defaults.** **Answered 2026-10-07: starting values.** Pause budget 120 s,
+   verify probation 90 s, resume budget 120 s, manifest max age equal to the
+   lease TTL (15 min), and `minResumableAgeSecs = 300` ship as proposed. All are
+   configurable and are reported in telemetry, and are tuned from experience
+   (§7, §9). The `pause-budget-missed` counts are the main signal.
+5. **Compatibility before #10716.** **Answered 2026-10-07: transition breakage
+   is acceptable.** Assume compatibility until #10716 lands. This design adds
+   no machinery to guard the transition (§1, §4).
+6. **Dev-server residue (2am#3255).** **Answered 2026-10-07: yes, its own
+   issue.** General cleanup of leftover agent processes is
+   rjwalters/loom#10802. This design covers only the manifest items' trees
+   (§5).
 7. **Role runs.** **Answered 2026-10-07: same rule as every other agent.** Role
    runs pause at a safe point and resume from their session, with the guard,
    the remaining timeout and the issue-creation mutex seeded. They are subject
