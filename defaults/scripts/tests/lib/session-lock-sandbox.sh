@@ -30,7 +30,9 @@
 # right after a step in which the real binary must have taken that
 # container's lock (at top level, not in a `$(...)` subshell). The lock must
 # then be in the suite's SANDBOX directory, which proves the redirect took
-# effect; if it is not, the suite fails at exit (#10661).
+# effect; if it is not, the suite fails at exit (#10661). Only suites pinned
+# to this checkout's build (lib/require-daemon-bin.sh) call it: a suite that
+# runs whatever `loom-daemon` is on PATH may get one predating the lock.
 
 _lss_root="$1"
 _lss_real="${HOME}/.loom/session-locks"
