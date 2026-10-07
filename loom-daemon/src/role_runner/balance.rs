@@ -33,8 +33,8 @@
 //!   changes))` — a repo deep in debt pauses its own builds, a debt-free repo
 //!   with ready work gets builders. Judge / doctor are capped per repo at
 //!   `clamp(ceil(debt / perRun), 1, max)` (the demand width formula, applied
-//!   to the repo's own debt). Ties break by role (champion, judge, doctor,
-//!   builder) then repo path, so the result is deterministic.
+//!   to the repo's own debt). Ties break by repo path, then role (champion,
+//!   judge, doctor, builder), so the result is deterministic.
 //! - **Bias** (`reviewWeight`, default `1.0`). Above 1 tilts the host toward
 //!   review (judge / doctor demand up, builds pause sooner); below 1 toward
 //!   building.
@@ -55,7 +55,8 @@ pub const REVIEW_WEIGHT_ENV: &str = "LOOM_BALANCE_REVIEW_WEIGHT";
 /// Default `reviewWeight`: review and build weighed evenly.
 pub const DEFAULT_REVIEW_WEIGHT: f64 = 1.0;
 
-/// The roles the allocator distributes slots across, in tie-break order.
+/// The roles the allocator distributes slots across, in tie-break order
+/// (within one repo; repos tie-break by path first).
 pub const ROLES: [&str; 4] = ["champion", "judge", "doctor", "builder"];
 
 /// `autonomous.balance`, resolved.

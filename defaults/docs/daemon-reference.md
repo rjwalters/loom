@@ -4647,8 +4647,8 @@ Wiring it into admission is #10815.
   debt gets doctors and no builders, a review-deep one gets judges, and a
   debt-free repo with ready work gets builders. Judge and doctor are capped per
   repo at `clamp(ceil(debt / demandWidth.perRun), 1, demandWidth.max)`;
-  champion at 1. Ties break by role (champion, judge, doctor, builder), then
-  repo path, so the output is deterministic.
+  champion at 1. Ties break by repo path, then role (champion, judge, doctor,
+  builder), so the output is deterministic.
 - **Budget.** This tick's work-finder cap plus the role-runner ceiling
   (`autonomous.roleRunner.maxConcurrent`). The total never exceeds it.
 - **Observability.** One `INFO` line per tick, carrying the Loom version and
