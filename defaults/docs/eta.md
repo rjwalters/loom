@@ -807,11 +807,13 @@ ids, newest fold day, refusals), and `current` stands when:
   behind the newest due day (stale);
 - a fold was compared against a different `current` (not comparable, so it is
   left out; after a promotion nobody is short-listed until new folds exist);
-- the candidate has fewer than 3 comparable paired days, or a non-finite
-  delta;
+- the candidate has fewer than 3 comparable paired days (a day with a
+  non-finite delta is not a decided day and is not counted);
 - the id is unknown, a baseline, retired, or already `current`.
 
 With fewer than two rankable candidates, only those rankable are short-listed.
+Nightly folds score `land` only, so `eta promote --kind start|finish` always
+refuses until folds exist for those kinds.
 
 **Retirement proposals (shipped, #10525).** `loom-daemon eta retire` reads
 the same folds (the newest 28 days) and **proposes** a retirement, never a
@@ -836,8 +838,11 @@ issue. `eta retire --file` files each new proposal with
 
 - first against this host's `.loom/state/eta/retirement-proposals.json`;
 - then against the forge, by a REST search for the key marker in any issue,
-  open or closed, so two hosts reading the same folds file one issue between
-  them, and a declined proposal is not re-filed.
+  open or closed, counting only issues by a trusted author
+  (`comment-trust.md`: anyone else's copy of the marker is ignored), so two
+  hosts reading the same folds file one issue between them, and a declined
+  proposal is not re-filed. GitHub's search index lags writes, so two hosts
+  racing within that window can still double-file.
 
 A failed search refuses the filing; it is retried on the next run. Nothing
 schedules `eta retire --file` yet: run it by hand or from cron.

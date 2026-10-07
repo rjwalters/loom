@@ -20,8 +20,8 @@
 //!   behind the newest due day: nobody is short-listed;
 //! - a fold compared against a different `current` than today's is not
 //!   comparable and is left out;
-//! - a candidate with fewer than [`MIN_RANK_DAYS`] paired days, or with a
-//!   non-finite delta, is not ranked and is refused;
+//! - a candidate with fewer than [`MIN_RANK_DAYS`] paired days is not ranked
+//!   and is refused (a day with a non-finite delta is not a decided day);
 //! - an id that is unknown, baseline or retired is refused;
 //! - ties break by id, so the order never depends on map iteration.
 //!

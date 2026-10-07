@@ -124,14 +124,16 @@ impl ProposalForge for ScriptForge<'_> {
             .current_dir(self.root)
             .args(["api", "-X", "GET", "search/issues", "-f"])
             .arg(format!("q={q}"))
-            .args(["--jq", ".items[0].html_url // empty"])
+            .args(["-f", "per_page=100"])
             .output()
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
-        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok((!url.is_empty()).then_some(url))
+        // The marker changes Loom's behaviour, so only a trusted author's
+        // issue counts as "already filed" (`comment-trust.md`, #9548).
+        let policy = loom_daemon::comment_trust::TrustPolicy::for_root(self.root);
+        first_trusted_url(&policy, &out.stdout)
     }
 
     fn file(&mut self, title: &str, body: &str) -> Result<String, String> {
@@ -157,5 +159,65 @@ impl ProposalForge for ScriptForge<'_> {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// The `html_url` of the first search hit `policy` believes. An unparseable
+/// reply is an error (the filing refuses), never "no hit".
+fn first_trusted_url(
+    policy: &loom_daemon::comment_trust::TrustPolicy,
+    search: &[u8],
+) -> Result<Option<String>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(search).map_err(|e| format!("unreadable search reply: {e}"))?;
+    let items = v
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("search reply has no `items`")?;
+    Ok(items
+        .iter()
+        .filter(|item| policy.trusts_json(item))
+        .find_map(|item| item.get("html_url").and_then(serde_json::Value::as_str))
+        .map(str::to_string))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_daemon::comment_trust::TrustPolicy;
+
+    fn policy() -> TrustPolicy {
+        TrustPolicy::for_root(Path::new("/nonexistent-loom-root"))
+    }
+
+    fn hit(url: &str, login: &str, assoc: &str) -> serde_json::Value {
+        serde_json::json!({
+            "html_url": url,
+            "user": {"login": login, "type": "User"},
+            "author_association": assoc,
+        })
+    }
+
+    #[test]
+    fn an_untrusted_issue_carrying_the_marker_is_not_already_filed() {
+        let reply = serde_json::json!({"items": [hit("https://x/1", "mallory", "NONE")]});
+        let got = first_trusted_url(&policy(), reply.to_string().as_bytes());
+        assert_eq!(got, Ok(None));
+    }
+
+    #[test]
+    fn a_trusted_hit_after_an_untrusted_one_counts() {
+        let reply = serde_json::json!({"items": [
+            hit("https://x/1", "mallory", "NONE"),
+            hit("https://x/2", "owner", "OWNER"),
+        ]});
+        let got = first_trusted_url(&policy(), reply.to_string().as_bytes());
+        assert_eq!(got, Ok(Some("https://x/2".to_string())));
+    }
+
+    #[test]
+    fn an_unreadable_reply_refuses_rather_than_reading_as_no_hit() {
+        assert!(first_trusted_url(&policy(), b"not json").is_err());
+        assert!(first_trusted_url(&policy(), b"{}").is_err());
     }
 }
