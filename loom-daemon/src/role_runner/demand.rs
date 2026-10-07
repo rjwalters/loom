@@ -167,7 +167,15 @@ pub struct DemandConfig {
     pub non_pr_floor: usize,
     /// `staleSecs` — ledger entries older than this are unobserved.
     pub stale_secs: u64,
+    /// `doctorMaxPerRepo` — the most doctor runs one repository may hold at
+    /// once, sized from that repository's own changes debt (#10632). `1` is
+    /// the classic one instance per `(repository, role)`.
+    pub doctor_max_per_repo: usize,
 }
+
+/// Hard bound on `doctorMaxPerRepo`: a typo cannot point a host's whole
+/// doctor budget at one repository's queue head many times over.
+pub const DOCTOR_MAX_PER_REPO_LIMIT: usize = 8;
 
 impl Default for DemandConfig {
     fn default() -> Self {
@@ -178,6 +186,7 @@ impl Default for DemandConfig {
             reserve: true,
             non_pr_floor: 1,
             stale_secs: 1800,
+            doctor_max_per_repo: 3,
         }
     }
 }
@@ -225,6 +234,8 @@ pub fn parse_demand_config(role_runner_block: &serde_json::Value) -> DemandConfi
         reserve: flag("reserve", d.reserve),
         non_pr_floor: count("nonPrFloor", d.non_pr_floor),
         stale_secs: positive("staleSecs").unwrap_or(d.stale_secs),
+        doctor_max_per_repo: count("doctorMaxPerRepo", d.doctor_max_per_repo)
+            .min(DOCTOR_MAX_PER_REPO_LIMIT),
     }
 }
 
@@ -370,6 +381,26 @@ impl DemandLedger {
     /// [`Self::host_debt`] as of `now`.
     #[must_use]
     pub fn host_debt_at(&self, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(None, now, stale)
+    }
+
+    /// `root`'s own debt over its entries no older than `stale` (#10624): the
+    /// per-repo read behind the #9410 build back-off's per-repo WIP limit. The
+    /// same fresh / fail-open rules as [`Self::host_debt`], restricted to one
+    /// root — a root with no fresh entry on an axis reads that axis `None`.
+    #[must_use]
+    pub fn repo_debt(&self, root: &Path, stale: Duration) -> HostDebt {
+        self.repo_debt_at(root, Instant::now(), stale)
+    }
+
+    /// [`Self::repo_debt`] as of `now`.
+    #[must_use]
+    pub fn repo_debt_at(&self, root: &Path, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(Some(root), now, stale)
+    }
+
+    /// The aggregate over every root (`only: None`) or one root.
+    fn debt_at(&self, only: Option<&Path>, now: Instant, stale: Duration) -> HostDebt {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut debt = HostDebt::default();
@@ -377,7 +408,10 @@ impl DemandLedger {
         // included, so a partially stale axis does not under-count the host
         // debt its width is sized from (#9414).
         let mut last_known = [0usize; DebtAxis::ALL.len()];
-        for ((_, axis), (count, at)) in entries.iter() {
+        for ((_, axis), (count, at)) in entries
+            .iter()
+            .filter(|((r, _), _)| only.is_none_or(|o| o == r))
+        {
             last_known[axis.index()] += count;
             if now.saturating_duration_since(*at) > stale {
                 continue;
@@ -404,7 +438,7 @@ impl DemandLedger {
         entries.retain(|(root, _), _| roots.contains(root));
     }
 
-    /// How many times the host debt has been read.
+    /// How many times the host or a repo debt has been read.
     #[must_use]
     pub fn reads(&self) -> usize {
         self.reads.load(Ordering::Relaxed)
@@ -551,6 +585,24 @@ pub fn record_merge_debt(probe: &DemandProbe, ledger: &DemandLedger, root: &Path
 pub fn width(debt: Option<usize>, cfg: &DemandConfig, phase1_budget: usize) -> usize {
     let upper = cfg.max.min(phase1_budget).max(1);
     debt.map_or(phase1_budget, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
+}
+
+/// How many runs of `role` one repository may hold at once (#10632), sized
+/// from **that repository's** own debt (`repo`, a
+/// [`DemandLedger::repo_debt`] reading): doctor gets
+/// `clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)`; every other
+/// role, and a doctor whose repository's changes axis is unobserved, gets the
+/// classic `1`. The host ceiling, the role's budget and the reservation still
+/// bound every lane, so this only lets a hot repository use slots the host
+/// already allows doctor.
+#[must_use]
+pub fn repo_lanes(role: &str, repo: &HostDebt, cfg: &DemandConfig) -> usize {
+    if role != "doctor" {
+        return 1;
+    }
+    let upper = cfg.doctor_max_per_repo.max(1);
+    repo.axis_width(DebtAxis::Changes)
+        .map_or(1, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
 }
 
 /// The slots a PR role wants held: `min(width, roots_with_debt)`, or 0 when
@@ -752,17 +804,37 @@ impl RoleRunGuard {
         budget: usize,
         plan: &ReservationPlan,
     ) -> RoleAdmission {
-        let key = (root, role);
+        Self::admit_lane_with_demand(set, root, role, 1, ceiling, budget, plan)
+    }
+
+    /// [`Self::admit_with_demand`] for a `(root, role)` that may hold up to
+    /// `lanes` runs at once (#10632): the run takes the lowest lane not in
+    /// flight, and is `InProgress` only when every lane is. `lanes = 1` is
+    /// exactly [`Self::admit_with_demand`]. Every lane counts against the host
+    /// ceiling, the role budget and the reservation like any other run.
+    #[must_use]
+    pub fn admit_lane_with_demand(
+        set: InProgressGuard,
+        root: PathBuf,
+        role: &'static str,
+        lanes: usize,
+        ceiling: usize,
+        budget: usize,
+        plan: &ReservationPlan,
+    ) -> RoleAdmission {
+        let key;
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
-            if guard.contains(&key) {
+            let free = (0..lanes.max(1)).find(|l| !guard.contains(&(root.clone(), role, *l)));
+            let Some(lane) = free else {
                 return RoleAdmission::InProgress;
-            }
+            };
+            key = (root, role, lane);
             let active = guard.len();
             if active >= ceiling {
                 return RoleAdmission::CeilingReached { active, ceiling };
             }
-            let active_of = |r: &str| guard.iter().filter(|(_, x)| *x == r).count();
+            let active_of = |r: &str| guard.iter().filter(|(_, x, _)| *x == r).count();
             let role_active = active_of(role);
             if role_active >= budget {
                 return RoleAdmission::RoleBudgetReached {

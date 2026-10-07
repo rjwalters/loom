@@ -13,7 +13,6 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use super::clean_owner::PrRowRest;
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -21,6 +20,7 @@ use super::safety::{
     check_uncommitted_changes, check_uncommitted_or_untracked_changes,
     find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::quarantine_stash_status::QUARANTINE_STASH_LABEL;
 
 /// Default grace period after PR merge before a worktree is eligible for
@@ -416,17 +416,24 @@ pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
 }
 
 /// Resolve the repository owner via the **REST** API
-/// (`gh api repos/{owner}/{repo} --jq .owner.login`).
+/// (`gh api repos/{owner}/{repo} --jq .owner.login`, `GH_REPO` stripped so
+/// gh names the checkout's own repo — W6).
 ///
 /// Used to build the `head=<owner>:<branch>` filter [`check_pr_merged_rest`]
 /// needs. Returns `None` on any failure so callers can fall back to the
 /// GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
-    let out = gh::bounded_counted(
-        "clean.repo_owner",
-        repo_root,
-        ["api", "repos/{owner}/{repo}", "--jq", ".owner.login"],
+    let out = gh::bounded_via(
+        GhInvocation::new(
+            Operation::new("clean.repo_owner"),
+            AccessIntent::Read,
+            GhTarget::None,
+            gh::GH_PROBE_TIMEOUT,
+        )
+        .args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
+        .current_dir(repo_root)
+        .strip_env("GH_REPO"),
     )?;
     if !out.status.success() {
         return None;
@@ -470,7 +477,7 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 /// [`select_pr_status`] for the preference order applied across rows.
 #[must_use]
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
-    match super::clean_owner::fetch_pr_rows(repo_root, owner, branch) {
+    match super::clean_owner::fetch_pr_rows(repo_root, owner, branch, None) {
         Ok(rows) => super::clean_owner::rows_status(&rows),
         Err(_) => PrStatus::Unknown,
     }
@@ -542,33 +549,17 @@ impl PrProbe {
 }
 
 /// The full single-PR REST probe behind [`check_pr_status_by_number_rest`]
-/// (issue #5939): one `gh api repos/{owner}/{repo}/pulls/<n>` call yielding
-/// both the eligibility status and the head SHA.
+/// (issue #5939): one `GET repos/<repo>/pulls/<n>` yielding both the
+/// eligibility status and the head SHA — a fresh, conditional read of the
+/// checkout's own repo through [`super::forge_state::pull_facts`] (W6).
 #[must_use]
 pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
-    let Some(out) = gh::bounded_hygiene(
-        "clean.pr_by_number_rest",
-        repo_root,
-        ["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")],
-    ) else {
-        return PrProbe::unknown();
-    };
-    if !out.status.success() {
-        return PrProbe::unknown();
-    }
-    let Ok(row) = serde_json::from_slice::<PrRowRest>(&out.stdout) else {
-        return PrProbe::unknown();
-    };
-    PrProbe {
-        status: classify_pr_row(
-            row.state.as_str(),
-            row.merged_at.as_deref(),
-            row.closed_at.as_deref(),
-        ),
-        head_sha: row
-            .head
-            .and_then(|h| h.sha)
-            .filter(|s| !s.trim().is_empty()),
+    match super::forge_state::pull_facts(repo_root, pr_num, "clean.pr_by_number_rest").ok() {
+        Some(f) => PrProbe {
+            status: f.status,
+            head_sha: f.head_sha,
+        },
+        None => PrProbe::unknown(),
     }
 }
 
@@ -1844,14 +1835,15 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         .collect();
     worktree_dirs.sort_by_key(std::fs::DirEntry::path);
 
-    let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
-    // #6653: REST is fine here even though `issue_state_fn` above uses the
-    // GraphQL-backed `gh issue view` — this probe is only ever consulted for
-    // a `PrStatus::NoPr` worktree (rare), so there is no meaningful GraphQL
-    // quota pressure to avoid the way there is for the reaper's per-tick,
-    // per-worktree probes.
-    let issue_closed_at_fn = |n: u32| gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
+    // W6 PR2 (`hygiene_pass`): the issue is the REST item read of the
+    // checkout's own repo, held for this pass (its `closed_at`, #6653, is the
+    // same body), and the PR status is the owner-confirmed REST listing with
+    // `gh pr list` as the last resort. `LOOM_HYGIENE_MEMO=0` restores
+    // `gh issue view` / `gh pr list`.
+    let pass = super::hygiene_pass::Pass::begin(repo_root);
+    let issue_state_fn = |n: u32| pass.clean_issue_state(n);
+    let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
+    let pr_status_fn = |n: u32| pass.clean_pr_status(n);
     let branch_reachable_fn =
         |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
     // #6652: one `git worktree list` per pass, not once per worktree.
@@ -1876,7 +1868,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
 
         println!("Checking worktree: issue-{issue_num}");
 
-        match classify_worktree(&worktree_path, issue_num, opts, &probes) {
+        // A decision that removes is confirmed by one fresh unconditional
+        // read first, and comes back as a skip when that read disagrees.
+        let decision = classify_worktree(&worktree_path, issue_num, opts, &probes);
+        match pass.gate(issue_num, opts.dry_run, decision) {
             WorktreeDecision::SkipInUse(reason) => {
                 println!("  {reason} - preserving");
                 stats.skipped_in_use += 1;
@@ -2360,7 +2355,8 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
             continue;
         };
 
-        let status = gh::issue_state(repo_root, issue_num);
+        // `CLOSED` deletes the branch: confirmed by a fresh read (W6 PR2).
+        let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
             "CLOSED" => {
                 let hint = sha_hint(repo_root, branch);

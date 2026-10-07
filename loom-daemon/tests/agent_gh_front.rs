@@ -28,6 +28,27 @@ case "$*" in
     printf '{"number": 42, "node_id": "I_1", "state": "open", "labels": [{"node_id": "LA_1", "name": "loom:issue", "description": null, "color": "fff"}]}\n'
     exit 0
     ;;
+  'api --include repos/o/r/pulls/42'|'api --include repos/o/r/pulls/43')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"p1"\r\n\r\n'
+    n="${3##*/}"
+    printf '{"number": %s, "head": {"ref": "feat-%s", "sha": "sha%s"}, "base": {"ref": "main"}}\n' "$n" "$n" "$n"
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha42/check-runs?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"c1"\r\n\r\n'
+    printf '{"total_count": 2, "check_runs": [{"name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-10-01T00:00:00Z", "completed_at": "2026-10-01T00:00:05Z", "details_url": "https://ci/build"}, {"name": "lint", "status": "completed", "conclusion": "failure", "started_at": "2026-10-01T00:00:01Z", "completed_at": "2026-10-01T00:01:01Z", "details_url": "https://ci/lint"}]}\n'
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha43/check-runs?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"c2"\r\n\r\n'
+    printf '{"total_count": 0, "check_runs": []}\n'
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha4'[23]'/status?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"s1"\r\n\r\n'
+    printf '{"state": "pending", "total_count": 0, "statuses": []}\n'
+    exit 0
+    ;;
   'api --include repos/o/r/issues?'*)
     printf 'HTTP/2.0 200 OK\r\nEtag: W/"l1"\r\n\r\n'
     printf '[{"number": 7, "title": "seven", "state": "open", "labels": [{"name": "loom:issue"}], "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "closed_at": null, "body": null, "user": {"login": "x"}}]\n'
@@ -91,6 +112,10 @@ impl Sandbox {
             "GH_REPO",
             "GH_HOST",
             "STUB_EXIT",
+            "GH_FORCE_TTY",
+            "CLICOLOR_FORCE",
+            "GH_DEBUG",
+            "DEBUG",
         ] {
             cmd.env_remove(k);
         }
@@ -179,6 +204,146 @@ fn list_is_etag_served_compact_with_gh_default_limit() {
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(calls[0].starts_with("api --include repos/o/r/issues?labels=loom:issue"));
     assert!(calls[1].contains("If-None-Match: W/\"l1\""), "{calls:?}");
+}
+
+const CHECKS: &[&str] = &["pr", "checks", "42", "--repo", "o/r"];
+
+#[test]
+fn pr_checks_is_served_from_rest_and_a_repeat_is_304_only() {
+    let s = Sandbox::new();
+    let want = "lint\tfail\t1m0s\thttps://ci/lint\t\nbuild\tpass\t5s\thttps://ci/build\t\n";
+    let first = s.gh(CHECKS, &[]);
+    assert_eq!((stdout(&first).as_str(), first.status.code()), (want, Some(1)), "{first:?}");
+    assert!(first.stderr.is_empty(), "{first:?}");
+    assert_eq!(
+        s.calls(),
+        [
+            "api --include repos/o/r/pulls/42",
+            "api --include repos/o/r/commits/sha42/check-runs?per_page=100",
+            "api --include repos/o/r/commits/sha42/status?per_page=100",
+        ]
+    );
+    // The repeat: three conditional requests, each answered 304 (no quota).
+    let second = s.gh(CHECKS, &[]);
+    assert_eq!((stdout(&second).as_str(), second.status.code()), (want, Some(1)));
+    let calls = s.calls();
+    assert_eq!(calls.len(), 6, "{calls:?}");
+    assert!(calls[3..].iter().all(|c| c.contains("If-None-Match: W/")), "{calls:?}");
+    assert_eq!(s.outcomes(), ["revalidated", "revalidated"]);
+
+    // `--json` over the same reads: compact, sorted keys, exit 0.
+    let json = s.gh(&["pr", "checks", "42", "-R", "o/r", "--json", "name,bucket"], &[]);
+    assert_eq!(
+        (stdout(&json).as_str(), json.status.code()),
+        (
+            "[{\"bucket\":\"fail\",\"name\":\"lint\"},{\"bucket\":\"pass\",\"name\":\"build\"}]\n",
+            Some(0)
+        )
+    );
+}
+
+#[test]
+fn pr_checks_with_no_checks_prints_gh_empty_read_signature() {
+    let s = Sandbox::new();
+    for args in [
+        &["pr", "checks", "43", "--repo", "o/r"][..],
+        &[
+            "pr",
+            "checks",
+            "43",
+            "--repo",
+            "o/r",
+            "--json",
+            "bucket,name",
+        ][..],
+    ] {
+        let out = s.gh(args, &[]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "no checks reported on the 'feat-43' branch\n"
+        );
+    }
+}
+
+#[test]
+fn pr_checks_shapes_it_cannot_reproduce_pass_through() {
+    let s = Sandbox::new();
+    for extra in [&["--watch"][..], &["--required"], &["--json", "workflow"]] {
+        let mut args = CHECKS.to_vec();
+        args.extend_from_slice(extra);
+        let out = s.gh(&args, &[]);
+        assert!(stdout(&out).contains("ARG:checks"), "{extra:?}: {out:?}");
+    }
+    // Forced colour changes gh's output; the escape hatches force a real call.
+    for env in [
+        ("CLICOLOR_FORCE", "1"),
+        ("LOOM_GH_NO_CACHE", "1"),
+        ("GH_CACHE_DISABLE", "1"),
+    ] {
+        let out = s.gh(CHECKS, &[env]);
+        assert!(stdout(&out).contains("ARG:checks"), "{env:?}: {out:?}");
+    }
+    assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
+}
+
+/// `pr view --json statusCheckRollup` is not served (#10516 slice B split,
+/// tracked in #10629): `gh` prints the GraphQL `contexts` order, which
+/// no REST read exposes, so the front cannot reproduce it exactly. It must reach
+/// the real `gh` byte-identically, with no REST read in front of it, with or
+/// without the escape hatches.
+#[test]
+fn pr_view_status_check_rollup_passes_through() {
+    let s = Sandbox::new();
+    let shapes: [&[&str]; 3] = [
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "statusCheckRollup",
+            "--repo",
+            "o/r",
+        ],
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "state,statusCheckRollup",
+            "-R",
+            "o/r",
+        ],
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "statusCheckRollup",
+            "--repo",
+            "o/r",
+            "--jq",
+            ".statusCheckRollup[].conclusion",
+        ],
+    ];
+    for args in shapes {
+        for env in [
+            None,
+            Some(("LOOM_GH_NO_CACHE", "1")),
+            Some(("GH_CACHE_DISABLE", "1")),
+        ] {
+            let out = s.gh(args, &env.into_iter().collect::<Vec<_>>());
+            let expected: String = args
+                .iter()
+                .map(|a| format!("ARG:{a}\n"))
+                .collect::<String>()
+                + "SENTINEL:1\nSTDIN:\n";
+            assert_eq!(stdout(&out), expected, "{args:?} {env:?}: {out:?}");
+        }
+    }
+    assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
+    assert!(s.outcomes().iter().all(|o| o == "bypass"), "{:?}", s.outcomes());
 }
 
 #[test]
@@ -406,4 +571,207 @@ fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
     assert!(at_launcher < at_front, "{line}");
     let status = sourced_status(&s.p("e.sh"), &with_policy);
     assert_eq!(status.trim(), format!("launcher: {}", managed.display()), "{status}");
+}
+
+/// W5: every passthrough is one forge-call ledger row, written before the
+/// exec, carrying the session's role and credential — and nothing of the argv.
+#[test]
+fn a_passthrough_is_one_ledger_row_under_the_sessions_role_and_bucket() {
+    let s = Sandbox::new();
+    let sink = s.p("sink").display().to_string();
+    // An owner-writer credential by path shape; no env token.
+    let cred = s
+        .p("ws/.loom/gh-config-by-owner/acme")
+        .display()
+        .to_string();
+    let base = [
+        ("LOOM_FORGE_CALL_STATS_DIR", sink.as_str()),
+        ("GH_CONFIG_DIR", cred.as_str()),
+        ("GH_TOKEN", ""),
+        ("GITHUB_TOKEN", ""),
+    ];
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut env = base.to_vec();
+        env.extend_from_slice(extra);
+        env
+    };
+    let builder = with(&[("LOOM_ROLE", "builder")]);
+
+    // A GraphQL-backed write and a REST read, both passed through untouched.
+    let created = s.gh(&["pr", "create", "--title", "a private title", "-R", "o/r"], &builder);
+    assert!(created.status.success(), "{created:?}");
+    assert!(
+        stdout(&created).contains("ARG:a private title"),
+        "argv reaches gh byte-identical"
+    );
+    let files = s.gh(&["api", "repos/o/r/pulls/1/files"], &builder);
+    assert!(files.status.success(), "{files:?}");
+    // A different role.
+    assert!(s
+        .gh(&["issue", "close", "3", "-R", "o/r"], &with(&[("LOOM_ROLE", "judge")]))
+        .status
+        .success());
+    // Not booked: a call the daemon's facade already booked, and a command
+    // that never reaches the API.
+    let marked = with(&[("LOOM_ROLE", "builder"), ("LOOM_GH_BOOKED", "1")]);
+    assert!(s
+        .gh(&["pr", "view", "1", "-R", "o/r"], &marked)
+        .status
+        .success());
+    assert!(s.gh(&["auth", "status"], &builder).status.success());
+    // Booked before the exec, so whatever the call's own outcome.
+    let failed = s.gh(
+        &["pr", "merge", "9", "-R", "o/r"],
+        &with(&[("LOOM_ROLE", "builder"), ("STUB_EXIT", "7")]),
+    );
+    assert_eq!(failed.status.code(), Some(7), "the exit status is the next gh's");
+
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for entry in std::fs::read_dir(s.p("sink")).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("calls-") {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                !text.contains("private title"),
+                "an argument value reached the ledger: {text}"
+            );
+            rows.extend(text.lines().map(|l| serde_json::from_str(l).unwrap()));
+        }
+    }
+    let key = |r: &serde_json::Value| {
+        ["c", "p", "ir", "rp", "co", "tk"]
+            .map(|k| r[k].as_str().unwrap_or("-").to_string())
+            .join(" ")
+    };
+    let got: Vec<String> = rows.iter().map(key).collect();
+    assert_eq!(
+        got,
+        [
+            "agent.gh.pr graphql agent-builder o/r acme writer",
+            "agent.gh.api core agent-builder o/r acme writer",
+            "agent.gh.issue graphql agent-judge o/r acme writer",
+            "agent.gh.pr graphql agent-builder o/r acme writer",
+        ]
+    );
+
+    // …and they show up in the per-bucket and per-role rollups.
+    let report = |by: &str| {
+        let out = s
+            .command(
+                Path::new(env!("CARGO_BIN_EXE_loom-daemon")),
+                &[
+                    "forge",
+                    "calls",
+                    "--since",
+                    "1h",
+                    "--by",
+                    by,
+                    "--sink-dir",
+                    sink.as_str(),
+                ],
+                &base,
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        stdout(&out)
+    };
+    let by_role = report("role");
+    let line = |text: &str, key: &str| {
+        text.lines()
+            .find(|l| l.split_whitespace().next() == Some(key))
+            .map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("no {key} row in:\n{text}"))
+    };
+    assert_eq!(line(&by_role, "agent-builder")[1], "3", "{by_role}");
+    assert_eq!(line(&by_role, "agent-judge")[1], "1", "{by_role}");
+    let by_bucket = report("bucket");
+    let bucket = |resource: &str| {
+        by_bucket
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .find(|w| w.len() > 4 && w[1] == "acme" && w[2] == resource)
+            .map(|w| w[4].to_string())
+    };
+    assert_eq!(bucket("graphql").as_deref(), Some("3"), "{by_bucket}");
+    assert_eq!(bucket("core").as_deref(), Some("1"), "{by_bucket}");
+    assert!(report("caller").contains("agent.gh.pr"));
+}
+
+/// W5: a session's `TMPDIR` is its own `<CLAUDE_CONFIG_DIR>/tmp`, which would
+/// move the default sink somewhere no host rollup reads. The spawner exports
+/// the host sink as `LOOM_FORGE_CALL_STATS_DIR`; with it, the front's row
+/// lands where the daemon's own `forge calls` finds it by default.
+#[test]
+fn a_session_row_lands_in_the_host_sink_not_under_the_session_tmpdir() {
+    let s = Sandbox::new();
+    // The daemon's world: its TMPDIR, and the sink that resolves from it.
+    let host_tmp = s.p("host-tmp");
+    let host_sink = host_tmp.join("loom-forge-call-stats");
+    // The session's world, as both spawn paths set it up.
+    let session_tmp = s.p("work/.loom/claude-config/builder-1/tmp");
+    std::fs::create_dir_all(&host_tmp).unwrap();
+    std::fs::create_dir_all(&session_tmp).unwrap();
+    let (host_tmp, host_sink_s, session_tmp_s) = (
+        host_tmp.display().to_string(),
+        host_sink.display().to_string(),
+        session_tmp.display().to_string(),
+    );
+    let rows_in = |dir: &Path| -> Vec<serde_json::Value> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("calls-") {
+                let text = std::fs::read_to_string(entry.path()).unwrap();
+                rows.extend(text.lines().map(|l| serde_json::from_str(l).unwrap()));
+            }
+        }
+        rows
+    };
+    let session_sink = session_tmp.join("loom-forge-call-stats");
+
+    // What the spawner exports: the host sink, and a BLANK booked marker —
+    // which must not stop a real agent call from being booked.
+    let exported = [
+        ("TMPDIR", session_tmp_s.as_str()),
+        ("LOOM_FORGE_CALL_STATS_DIR", host_sink_s.as_str()),
+        ("LOOM_GH_BOOKED", ""),
+        ("LOOM_ROLE", "builder"),
+        ("GH_TOKEN", ""),
+        ("GITHUB_TOKEN", ""),
+    ];
+    let out = s.gh(&["issue", "close", "1", "-R", "o/r"], &exported);
+    assert!(out.status.success(), "{out:?}");
+    let rows = rows_in(&host_sink);
+    assert_eq!(rows.len(), 1, "the row is in the host sink: {rows:?}");
+    assert_eq!(rows[0]["c"], "agent.gh.issue");
+    assert_eq!(rows[0]["ir"], "agent-builder");
+    assert!(rows_in(&session_sink).is_empty(), "nothing is written under the session TMPDIR");
+
+    // The host rollup, run as the daemon runs it — the daemon's TMPDIR, no
+    // override, no --sink-dir — counts it.
+    let mut report = s.command(
+        Path::new(env!("CARGO_BIN_EXE_loom-daemon")),
+        &["forge", "calls", "--since", "1h", "--by", "role"],
+        &[("TMPDIR", host_tmp.as_str())],
+    );
+    report.env_remove("LOOM_FORGE_CALL_STATS_DIR");
+    let report = report.output().unwrap();
+    assert!(report.status.success(), "{report:?}");
+    let text = stdout(&report);
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("agent-builder"))
+        .unwrap_or_else(|| panic!("no agent-builder row in the host rollup:\n{text}"));
+    assert_eq!(line.split_whitespace().nth(1), Some("1"), "{text}");
+
+    // The gap this closes: without the export the same call is booked under
+    // the session's private tmp, where that rollup never looks.
+    let mut bare = s.command(
+        &s.p("bin/gh"),
+        &["issue", "close", "2", "-R", "o/r"],
+        &[("TMPDIR", session_tmp_s.as_str()), ("LOOM_ROLE", "builder")],
+    );
+    bare.env_remove("LOOM_FORGE_CALL_STATS_DIR");
+    assert!(bare.output().unwrap().status.success());
+    assert_eq!(rows_in(&session_sink).len(), 1, "the unexported default follows TMPDIR");
+    assert_eq!(rows_in(&host_sink).len(), 1, "and the host sink did not see it");
 }

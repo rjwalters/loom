@@ -65,14 +65,31 @@ pub fn already_posted(comments: &[ForgeComment], key: &str, self_login: Option<&
 /// starred issue when this is an inheriting blocker.
 #[must_use]
 pub fn comment_body(ask: &OperatorAsk, host: &str, inherited_from: Option<u32>) -> String {
-    let why = inherited_from.map_or_else(
-        || "This issue is starred (`loom:operator-priority`)".to_string(),
-        |n| {
-            format!(
+    comment_body_for(ask, host, inherited_from, None)
+}
+
+/// [`comment_body`] for a row that may inherit an operator priority level
+/// (#10307): `level_from` is the source (`owner/repo#N`) and the inherited
+/// label of its level's row, so a new level needs no change here.
+#[must_use]
+pub fn comment_body_for(
+    ask: &OperatorAsk,
+    host: &str,
+    inherited_from: Option<u32>,
+    level_from: Option<(&str, &str)>,
+) -> String {
+    let why = if let Some((src, label)) = level_from {
+        format!("This issue blocks {src} and inherits its operator priority level (`{label}`)")
+    } else {
+        inherited_from.map_or_else(
+            || "This issue is starred (`loom:operator-priority`)".to_string(),
+            |n| {
+                format!(
                 "This issue blocks starred #{n} and inherits its star (`loom:operator-priority`)"
             )
-        },
-    );
+            },
+        )
+    };
     format!(
         "{}\n**Operator needed** — {why}, and no agent can move it further.\n\n{}\n\n\
          <sub>Posted once per cause by the loom-daemon liveness check on host `{host}` \
@@ -96,6 +113,9 @@ pub struct Target<'a> {
     /// The starred issue this row inherited its star from, when it is an
     /// inheriting blocker.
     pub inherited_from: Option<u32>,
+    /// The level >= 2 source this row inherits a level from (#10307), as
+    /// `owner/repo#N`, with the inherited label of that level's row.
+    pub level_from: Option<(&'a str, &'a str)>,
 }
 
 /// One fleet-comms escalation notice (#9321): the event-bus/Matrix half of an
@@ -217,7 +237,10 @@ impl Ledger {
         let outcome = if already_posted(&comments, &ask.key, me.as_deref()) {
             Outcome::FoundOnForge
         } else {
-            forge.post_comment(issue, &comment_body(ask, &self.host, target.inherited_from))?;
+            forge.post_comment(
+                issue,
+                &comment_body_for(ask, &self.host, target.inherited_from, target.level_from),
+            )?;
             let notice = Notice {
                 repo: repo.to_string(),
                 issue,

@@ -96,7 +96,8 @@ pub(crate) fn parse_terminal_result_after(
     Some(TerminalResult {
         provider,
         account,
-        category: fields.get("category")?.parse().ok()?,
+        // A `session-exec` refusal in the same region names its own cause.
+        category: crate::session_exec::refusal::category_of(region, &fields)?,
         exit_code: fields.get("exit_code")?.parse().ok()?,
         model,
     })

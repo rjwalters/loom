@@ -40,6 +40,7 @@ fn healthy() -> Facts {
                 unsupported_forge: false,
                 snapshot_as_of: Some(now() - Duration::minutes(20)),
                 backfill_since: None,
+                history: None,
             }],
             refresh_cycle: Some(RefreshCycleState {
                 started_at: now() - Duration::minutes(20),
@@ -55,6 +56,7 @@ fn healthy() -> Facts {
             today_exists: true,
             last_check: Some(fit_record("skipped", Some("today_exists"), 1)),
             published: PubStatus::default(),
+            published_v2: PubStatus::default(),
         },
         serving: ServingFacts {
             fit_loaded: true,
@@ -77,6 +79,7 @@ fn healthy() -> Facts {
             pending: 4,
             drift: Vec::new(),
         },
+        backtest: BacktestFacts::default(),
     }
 }
 
@@ -128,7 +131,8 @@ fn a_healthy_host_has_no_fail_or_warn_and_every_bad_status_has_a_remedy() {
             "fit",
             "serving",
             "snapshot_feed",
-            "outcomes"
+            "outcomes",
+            "backtest"
         ]
     );
 }
@@ -371,6 +375,55 @@ fn published_fit_states_map_to_status() {
 }
 
 #[test]
+fn published_fit_v2_is_its_own_check_independent_of_v1() {
+    let mut f = healthy();
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // A failing v2 lane warns on its own check and leaves v1's untouched.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Refused),
+        reason: Some("bad_fit".into()),
+        fit_id: Some("fitV2".into()),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("bad_fit"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+
+    // A healthy v2 lane is ok while v1 is absent.
+    f.fit.published_v2.kind = Some(FetchKind::Installed);
+    f.fit.published_v2.reason = None;
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Ok);
+    assert!(v2.detail.contains("fitV2"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
+fn v2_publish_error_after_an_absent_fetch_warns() {
+    let mut f = healthy();
+    // Absent without an error stays a skip.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Absent),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // Absent store followed by a failed captain upload is a warning.
+    f.fit.published_v2.publish_error = Some("403".into());
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("403"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
 fn the_authority_is_printed_and_a_missing_one_warns() {
     let ok = authority(&healthy().config.authority);
     assert_eq!(ok.status, Status::Ok);
@@ -396,6 +449,7 @@ fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
         heuristic: "land-v2".into(),
         n_recent,
         state,
+        adjusted: false,
     };
     f.outcomes.drift = vec![
         row("building", 2, DriftState::Unknown),
@@ -417,7 +471,142 @@ fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
     let drifted = find(&checks, "outcomes", "drift doctoring");
     assert_eq!(drifted.status, Status::Warn);
     assert!(drifted.remedy.is_some());
-    // Slice 1 does not apply the factor to served ETAs (#10563 review).
+    // Not serving brisk-petrel: the factor is not applied (#10563 review),
+    // and the doctor names the candidate that would apply it.
     assert!(drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
     assert!(!drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(drifted.detail.contains("brisk-petrel"), "{}", drifted.detail);
+}
+
+#[test]
+fn drift_says_served_etas_are_scaled_only_when_brisk_petrel_serves() {
+    use crate::eta::regime::DriftState;
+    let mut f = healthy();
+    f.outcomes.drift = vec![DriftFacts {
+        stage: "judging".into(),
+        heuristic: "land-2026-10-04-twin-otter-b".into(),
+        n_recent: 9,
+        state: DriftState::Drifted,
+        adjusted: true,
+    }];
+    let checks = evaluate(&f);
+    let drifted = find(&checks, "outcomes", "drift judging");
+    assert_eq!(drifted.status, Status::Warn);
+    assert!(drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(!drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
+}
+
+fn summary(ready: bool) -> crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+    crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+        summary_id: "s".into(),
+        heuristic: "land-v4".into(),
+        kind: "land".into(),
+        compared_to: "land-v1".into(),
+        as_of_day: "2026-10-04".into(),
+        cutoff: now(),
+        cases: 40,
+        days: 8,
+        wins: 7,
+        ties: 0,
+        win_rate: Some(0.875),
+        ci_low: Some(0.529),
+        ci_high: Some(0.978),
+        min_folds: 7,
+        gate_ready: ready,
+        gate_detail: "land-v4 wins".into(),
+        fitted_from: None,
+        cases_before_fit: 0,
+        fit_id: None,
+        loom: crate::eta::Provenance {
+            version: "0.0.0".into(),
+            revision: "0".repeat(40),
+            tree_state: "clean".into(),
+            complete: true,
+        },
+    }
+}
+
+#[test]
+fn the_backtest_scoreboard_lists_each_challenger_and_warns_when_stale() {
+    let mut f = healthy();
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: Some(crate::eta::nightly_folds::State {
+            written_at: hours_ago(5),
+            day: "2026-10-04".into(),
+            summaries: vec![summary(true)],
+        }),
+    };
+    let checks = evaluate(&f);
+    assert_eq!(find(&checks, "backtest", "nightly_folds").status, Status::Ok);
+    let row = find(&checks, "backtest", "scoreboard land-v4");
+    assert_eq!(row.status, Status::Ok);
+    assert!(
+        row.detail.contains("won 7/8") && row.detail.contains("READY"),
+        "{}",
+        row.render()
+    );
+
+    f.backtest.state.as_mut().unwrap().written_at = hours_ago(24 * 5);
+    let checks = evaluate(&f);
+    let c = find(&checks, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.remedy.as_deref().unwrap().contains("fleet.captain"), "{}", c.render());
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    f.data.gate = Gate::StandDown {
+        captain: "cap".into(),
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("cap"), "{}", c.render());
+
+    // Fail-closed with no captain: the doctor says how to turn it on.
+    f.data.gate = Gate::NoCaptain;
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("fleet.captain"), "{}", c.render());
+}
+
+/// #10520: the repo check reports the last SigNoz-primary pass's gap-fill
+/// request count, `0` when SigNoz covered it, and nothing when it never ran.
+#[test]
+fn the_repo_check_reports_the_gap_fill_request_count() {
+    use crate::eta::fleet_signoz_history::{HistoryNote, HistorySource};
+    let detail = |f: &Facts| {
+        evaluate(f)
+            .into_iter()
+            .find(|c| c.link == "data" && c.check == "repo acme/alpha")
+            .unwrap()
+    };
+    let f = healthy();
+    assert!(!detail(&f).detail.contains("gap-fill"), "SigNoz history off: nothing");
+
+    let mut f = healthy();
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::Signoz,
+        gap_fill_calls: 0,
+    });
+    let c = detail(&f);
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.detail.contains("history signoz, 0 gap-fill request(s)"), "{}", c.detail);
+
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::SignozGapFill,
+        gap_fill_calls: 12,
+    });
+    let c = detail(&f);
+    assert!(
+        c.detail
+            .contains("history signoz_gap_fill, 12 gap-fill request(s)"),
+        "{}",
+        c.detail
+    );
 }

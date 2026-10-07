@@ -100,15 +100,74 @@ pub(crate) fn handle_session_command(
         ProcessContainerRunner, SessionLifecycle, SessionStatus,
     };
 
+    /// The other roots of the one hold root set the reconcile pass also uses
+    /// (the registered workspaces plus the daemon's recorded fallback root,
+    /// #10661): an operator start lifts an operator hold in each one's
+    /// profile for the account, and status reads them (issue #10453).
+    fn peer_roots(workspace: &std::path::Path) -> Vec<PathBuf> {
+        use loom_daemon::tokens_pool::session_hold_roots as roots;
+        let registered = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            .map(|registry| registry.roots())
+            .unwrap_or_default();
+        let fallback = roots::recorded_daemon_fallback_root();
+        roots::cli_peer_roots(workspace, &registered, fallback.as_deref())
+    }
+
+    /// Operator `start`/`shell` (#10661): Ctrl-C/SIGTERM is forwarded to the
+    /// running `docker` child, and a missing image is pulled under its own
+    /// budget before a first `docker run` (the reconciler does neither).
+    fn prepare_operator_start(
+        lifecycle: &SessionLifecycle<ProcessContainerRunner>,
+        name: &str,
+        image: Option<&str>,
+    ) -> Result<()> {
+        use loom_daemon::tokens_pool::{docker_cli, operator_interrupt, session_lifecycle};
+        if let Err(error) = operator_interrupt::install() {
+            eprintln!("note: Ctrl-C will not reach the `docker` command ({error:#})");
+        }
+        if lifecycle.status(name)?.container_id.is_none() {
+            docker_cli::ensure_image_for_operator(
+                image.unwrap_or(session_lifecycle::DEFAULT_SESSION_IMAGE),
+            )?;
+        }
+        Ok(())
+    }
+
     fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
+        // The reconciler's fail-closed removal record (#10364), read from the
+        // profile so `SessionStatus` itself is unchanged.
+        let removal = loom_daemon::tokens_pool::session_drift_removal::read(std::slice::from_ref(
+            &status.codex_home,
+        ));
         if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
-        } else {
+            let mut value = serde_json::to_value(status)?;
+            value["drift_removal"] = serde_json::to_value(&removal)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        let removed = removal.as_ref().map(|r| {
+            let denied: Vec<String> = r.denied.iter().map(|p| p.display().to_string()).collect();
+            format!(
+                ", removed (denied mount: {}) at unix_ms={} by the session reconciler; it stays \
+                 down until the denial no longer applies or an operator `session start`",
+                denied.join(", "),
+                r.removed_at_unix_ms
+            )
+        });
+        {
             println!(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
                  mount={}, session_managed={}, workspace={}, workspace_mode={})",
                 status.name,
-                if status.running { "running" } else { "stopped" },
+                if status.running {
+                    "running"
+                } else if status.restarting {
+                    "restarting"
+                } else if status.held {
+                    "stopped, held (operator stop)"
+                } else {
+                    "stopped"
+                },
                 status.container_name,
                 status.container_id.as_deref().unwrap_or("-"),
                 status.image.as_deref().unwrap_or("-"),
@@ -122,6 +181,9 @@ pub(crate) fn handle_session_command(
                     .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
                 status.workspace_mode,
             );
+            if let Some(removed) = removed {
+                println!("{}: {}", status.name, removed.trim_start_matches(", "));
+            }
         }
         Ok(())
     }
@@ -165,7 +227,11 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
+            let peers = peer_roots(&workspace);
+            let pull = image.clone();
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
+                .with_peer_roots(peers);
+            prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
                 json,
@@ -182,21 +248,56 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lock = loom_daemon::tokens_pool::session_dispatch_lock::for_operator_stop;
+            let workspace_for_lock = workspace.clone();
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
+            // A dispatch that is only starting is invisible to `docker top`;
+            // it holds this lock (#10364). Kept until the stop is done.
+            let _no_dispatch = if force {
+                None
+            } else {
+                // The lock is keyed by the resolved account's container. A
+                // reference that does not resolve here is left to `stop`
+                // itself to report; a failed `docker inspect` must not abort
+                // the stop, so the container name is resolved from the
+                // accounts registry, not from `status` (no docker call).
+                let resolved = loom_daemon::tokens_pool::account_registry::account_inventory(
+                    &workspace_for_lock,
+                    loom_daemon::tokens_pool::account_registry::AccountProvider::Codex,
+                )
+                .ok()
+                .and_then(|inventory| {
+                    inventory.into_iter().find(|a| {
+                        loom_daemon::tokens_pool::account_registry::account_matches_reference(
+                            a, &name,
+                        )
+                    })
+                })
+                .map_or_else(|| name.clone(), |account| account.id.name);
+                let container =
+                    loom_daemon::tokens_pool::session_lifecycle::container_name(&resolved);
+                Some(lock(&container)?)
+            };
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }
         SessionAction::Status { name, json } => {
             if private::configured(&workspace, &name)? {
                 return print_private(&private::status(&workspace, &name)?, json);
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             print_session_status(&lifecycle.status(&name)?, json)
         }
         SessionAction::Attach { name } => {
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased tmux attach; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             let code = lifecycle.attach(&name)?;
             if code != 0 {
                 std::process::exit(code);
@@ -211,7 +312,10 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased shell; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
+            prepare_operator_start(&lifecycle, &name, None)?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);

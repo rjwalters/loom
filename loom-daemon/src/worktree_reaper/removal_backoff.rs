@@ -719,6 +719,7 @@ mod tests {
                 remove_was_called.set(true);
                 true
             },
+            &|_num| None,
         );
 
         assert!(!remove_was_called.get(), "a Skip* decision must never invoke the remover");
@@ -761,6 +762,7 @@ mod tests {
             &|_path, _num| crate::worktree_ops::clean::WorktreeDecision::RemoveWithQuarantine,
             &|_path, _num| None,
             &|_path, _num| true,
+            &|_num| None,
         );
 
         assert_eq!(report.removed, Vec::<u32>::new());
@@ -809,6 +811,7 @@ mod tests {
                 &move |_path, _num| decision.clone(),
                 &|_path, _num| None,
                 &|_path, _num| true,
+                &|_num| None,
             );
 
             assert!(

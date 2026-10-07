@@ -435,6 +435,9 @@ fn writing_a_fifteenth_file_keeps_the_newest_fourteen() {
     // The v2 file (#10508) goes beside an explicit --out.
     assert_eq!(report.v2_path, root.path().join("elsewhere.v2.json"));
     assert!(report.v2_path.exists());
+    // So does the v3 file (#10521).
+    assert_eq!(report.v3_path, root.path().join("elsewhere.v3.json"));
+    assert!(report.v3_path.exists());
     assert_eq!(names(&dir).len(), 16);
 
     let report = run::fit_and_write(root.path(), end(), None, false, &fitter()).unwrap();
@@ -444,10 +447,13 @@ fn writing_a_fifteenth_file_keeps_the_newest_fourteen() {
     old.push("notes.txt".to_string());
     // The v2 files' own directory, which v1 retention never touches.
     old.push("v2".to_string());
+    old.push("v3".to_string());
     old.sort();
     assert_eq!(names(&dir), old);
     assert_eq!(names(&dir.join("v2")), [path_for(end())]);
     assert_eq!(report.v2_path, dir.join("v2").join(path_for(end())));
+    assert_eq!(names(&dir.join("v3")), [path_for(end())]);
+    assert_eq!(report.v3_path, dir.join("v3").join(path_for(end())));
 }
 
 #[test]

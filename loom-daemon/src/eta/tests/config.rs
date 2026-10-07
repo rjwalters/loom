@@ -94,8 +94,72 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
             backfill_max_calls_per_cycle: 600,
             reserve_calls: 1500,
             backfill_days: 21,
+            gap_fill_max_calls_per_pass: 100,
             signoz: crate::eta::config::FleetSignozConfig::default(),
         }
+    );
+}
+
+#[test]
+fn signoz_history_primary_is_opt_in_and_the_gap_fill_budget_is_configurable() {
+    let c = resolve(&json!({}), no_env).fleet_refresh;
+    assert!(!c.signoz.history_primary, "off by default (FLAGS-OFF)");
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {"signoz": {"enabled": true}}}}}),
+        no_env,
+    )
+    .fleet_refresh;
+    assert!(
+        !c.signoz.history_primary,
+        "enabling SigNoz alone does not switch the history source"
+    );
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {
+            "gapFillMaxCallsPerPass": 7,
+            "signoz": {"historyPrimary": true}
+        }}}}),
+        no_env,
+    )
+    .fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 7);
+    assert!(c.signoz.history_primary, "opt-in via config");
+    let env = |k: &str| match k {
+        "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS" => Some("3".to_string()),
+        "LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY" => Some("1".to_string()),
+        _ => None,
+    };
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {"signoz": {"historyPrimary": false}}}}}),
+        env,
+    )
+    .fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 3, "env > config");
+    assert!(c.signoz.history_primary, "env > config");
+}
+
+/// A positive gap-fill budget must always make progress (#10520): one listing
+/// page plus one timeline page. Lower values, `0` included, are raised.
+#[test]
+fn the_gap_fill_budget_has_a_floor_of_one_listing_and_one_timeline_page() {
+    use crate::eta::config::MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS;
+    assert_eq!(MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS, 2);
+    for low in [0, 1] {
+        let c = resolve(
+            &json!({"autonomous": {"eta": {"fleetRefresh": {"gapFillMaxCallsPerPass": low}}}}),
+            no_env,
+        )
+        .fleet_refresh;
+        assert_eq!(c.gap_fill_max_calls_per_pass, 2, "config {low} is raised");
+    }
+    let env = |k: &str| (k == "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS").then(|| "0".to_string());
+    let c = resolve(&json!({}), env).fleet_refresh;
+    assert_eq!(c.gap_fill_max_calls_per_pass, 2, "env 0 is raised");
+    let at_floor = json!({"autonomous": {"eta": {"fleetRefresh": {"gapFillMaxCallsPerPass": 2}}}});
+    assert_eq!(
+        resolve(&at_floor, no_env)
+            .fleet_refresh
+            .gap_fill_max_calls_per_pass,
+        2
     );
 }
 

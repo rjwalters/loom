@@ -58,6 +58,7 @@ impl FakeRunner {
             ContainerState {
                 id: format!("{container}-id"),
                 running: true,
+                restarting: false,
                 started_at: Some("2026-09-05T00:00:00Z".into()),
                 image: Some("ghcr.io/rjwalters/loom-worker-session:test".into()),
                 workspace,
@@ -1181,3 +1182,9 @@ mod controls;
 /// Issue #10103: the accounts registry's daemon root owns App-token dirs.
 #[path = "session_lifecycle_owner_tests.rs"]
 mod owner;
+
+#[path = "session_lifecycle_stop_tests.rs"]
+mod stop_race;
+
+#[path = "session_lifecycle_hold_roots_tests.rs"]
+mod hold_roots;

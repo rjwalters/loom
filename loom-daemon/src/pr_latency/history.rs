@@ -41,8 +41,10 @@ impl PrState {
 ///
 /// Only the four kinds any segment needs. Anything else on the timeline is
 /// dropped at parse time rather than carried as an `Other` variant nobody
-/// reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// reads. Serializable so a budget-interrupted timeline can be checkpointed
+/// (#10520).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrEvent {
     /// A label was applied.
     Labeled { label: String, at: DateTime<Utc> },

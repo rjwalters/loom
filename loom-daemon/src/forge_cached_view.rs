@@ -429,7 +429,9 @@ pub fn build_output_via(
     })
 }
 
-/// [`fetch_conditional`] recorded against an explicit `caller`.
+/// [`fetch_conditional`] recorded against an explicit `caller`: the agent
+/// front's resolution (`repo_override`, else `LOOM_REPO`, else `cwd`'s
+/// origin) over [`fetch_view_for`].
 fn fetch_conditional_as(
     caller: &'static str,
     gh_bin: &Path,
@@ -442,28 +444,99 @@ fn fetch_conditional_as(
     let env_repo = std::env::var("LOOM_REPO").ok().filter(|s| !s.is_empty());
     let repo = repo_override.or(env_repo.as_deref());
     let target = store::resolve_target(cwd, repo);
+    let site = store::ConditionalRead::new(caller, view_op(entity));
+    let read = fetch_view_for(site, gh_bin, cwd, Some(dir), entity, number, &target);
+    match read.status {
+        ViewStatus::Fresh | ViewStatus::NotModified => read.body,
+        _ => None,
+    }
+}
+
+/// The HTTP outcome of one [`fetch_view_for`] read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewStatus {
+    /// `200`: the body is the forge's.
+    Fresh,
+    /// `304`: the body is the stored entry the sent `ETag` validated.
+    NotModified,
+    /// `404`.
+    NotFound,
+    /// `410`.
+    Gone,
+    /// Anything else: no answer (a `304` with no stored body, a failed
+    /// invocation, a non-200 exit, another status).
+    Failed,
+}
+
+/// What [`fetch_view_for`] answered: the status, the body on `200`/`304`,
+/// and gh's stderr — a [`ViewStatus::Failed`] caller feeds it to the
+/// rate-limit breaker (`rate_limit_breaker::global_observe_failure`), which
+/// classifies a refusal from that text alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewRead {
+    pub(crate) status: ViewStatus,
+    pub(crate) body: Option<String>,
+    pub(crate) stderr: String,
+}
+
+impl ViewRead {
+    fn failed(stderr: String) -> Self {
+        Self {
+            status: ViewStatus::Failed,
+            body: None,
+            stderr,
+        }
+    }
+}
+
+/// One view read of `entity` `number` against an explicit, already-resolved
+/// `target` — nothing here reads `LOOM_REPO` (W6: the hygiene read path names
+/// the checkout's own repo). With `dir` the read is conditional on the shared
+/// `view-{entity}-{n}-` entry (so it shares an `ETag` with the agents'
+/// `--cached` views and is dropped by `gh-cached --invalidate N`); with no
+/// `dir` it is unconditional and nothing is stored.
+pub(crate) fn fetch_view_for(
+    site: store::ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    dir: Option<&Path>,
+    entity: &str,
+    number: u32,
+    target: &store::Target,
+) -> ViewRead {
     let url = build_view_url(entity, target.repo.as_deref(), number);
-    let key = store::cache_key(cwd, &target, &url);
-    let path = entry_path(dir, entity, number, &key);
-    let prior = store::read_disk_entry(&path);
+    let path = dir.map(|d| entry_path(d, entity, number, &store::cache_key(cwd, target, &url)));
+    let prior = path.as_deref().and_then(store::read_disk_entry);
     let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
-    let site = store::ConditionalRead::new(caller, view_op(entity));
-    let (status, response, _stderr) =
-        store::fetch_conditional(site, gh_bin, cwd, &target, &url, prior_etag).ok()?;
-
+    let (status, response, stderr) =
+        match store::fetch_conditional(site, gh_bin, cwd, target, &url, prior_etag) {
+            Ok(out) => out,
+            Err(e) => return ViewRead::failed(format!("{e:#}")),
+        };
+    let answered = |status, body| ViewRead {
+        status,
+        body: Some(body),
+        stderr: String::new(),
+    };
+    let bare = |status| ViewRead {
+        status,
+        body: None,
+        stderr: String::new(),
+    };
     match response {
-        Some(r) if r.status == 304 => match prior {
-            Some(p) => Some(p.body),
-            None => {
-                let _ = std::fs::remove_file(&path);
-                None
+        Some(r) if r.status == 304 => match (prior, &path) {
+            (Some(p), _) => answered(ViewStatus::NotModified, p.body),
+            (None, Some(path)) => {
+                let _ = std::fs::remove_file(path);
+                ViewRead::failed(stderr)
             }
+            (None, None) => ViewRead::failed(stderr),
         },
         Some(r) if r.status == 200 && status.success() => {
-            if let Some(etag) = r.etag.clone() {
+            if let (Some(etag), Some(path), Some(dir)) = (r.etag.clone(), &path, dir) {
                 store::write_disk_entry(
-                    &path,
+                    path,
                     &store::DiskEntry {
                         etag,
                         body: r.body.clone(),
@@ -471,9 +544,11 @@ fn fetch_conditional_as(
                 );
                 prune_stale(dir);
             }
-            Some(r.body)
+            answered(ViewStatus::Fresh, r.body)
         }
-        _ => None,
+        Some(r) if r.status == 404 => bare(ViewStatus::NotFound),
+        Some(r) if r.status == 410 => bare(ViewStatus::Gone),
+        _ => ViewRead::failed(stderr),
     }
 }
 

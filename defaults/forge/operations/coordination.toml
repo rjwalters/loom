@@ -136,6 +136,9 @@ path = "loom-daemon/src/star_liveness/forge.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/sweep_registry/park_hold.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/singleton.rs"
 
 [[operation]]
 id = "issue.search"
@@ -224,6 +227,9 @@ path = "loom-daemon/src/fleet/drain_reset.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/sweep_registry/park_hold.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/intake_reconcile/singleton.rs"
 
 [[operation]]
 id = "issue.edit-body"

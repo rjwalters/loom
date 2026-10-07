@@ -1,0 +1,10 @@
+{
+  "number": 10532,
+  "head": {
+    "ref": "feature/issue-10492",
+    "sha": "dce613af4201c43d924d778459d2b89f87965e64"
+  },
+  "base": {
+    "ref": "main"
+  }
+}

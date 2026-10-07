@@ -7,9 +7,12 @@
 //!
 //! Slice 2a: the work-finder and hard-exclusion label sets (`PARK_LABELS`,
 //! `SKIP_LABELS`, `HARD_EXCLUSION_LABELS`, `CHAMPION_PATH_LABELS`) are
-//! [`LabelSet`]s derived from registry properties via [`embedded_set`]. The
-//! remaining daemon tables are not converted yet; `tests.rs` keeps each one in
-//! lockstep with the registry so converting it is a pure swap.
+//! [`LabelSet`]s derived from registry properties via [`embedded_set`].
+//!
+//! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels`, merge_pr
+//! `BLOCKING`, eta `HUMAN_GATED_LABELS` and queue_blocked `HOLD_LABELS` are
+//! derived too; `tests.rs` pins each to its previous literal. dep_classify's
+//! operator-only labels are single named consts, kept in lockstep by a test.
 //!
 //! Fields documented as inert (`stale_after_minutes`, `lifecycle`,
 //! `propagate`) have no consumer yet.

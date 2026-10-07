@@ -63,6 +63,7 @@ pub fn daemon_bin() -> PathBuf {
 /// | Sweep liveness journal | `~/.loom/sweeps.json` | a test daemon prunes/rewrites records describing the real daemon's live sweeps |
 /// | Watch registry + results log | `~/.loom/watches.json` | test watches leak into the real daemon's watch set |
 /// | Default sweep workspace | cwd | claim locks and worktree paths resolve inside the real checkout |
+/// | Session reconcile loop + its fallback-root record | `~/.loom/session-reconcile-fallback-root.json` | the real daemon's record points at a deleted temp dir (#10661); the loop itself acts on real Codex session containers |
 ///
 /// This is the confirmed mechanism behind the three #4275 dispatches that had
 /// no entry in the production daemon's log: a debug `loom-daemon` spawned by
@@ -84,7 +85,19 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         .env("LOOM_WATCH_RESULTS_LOG", fixture.join("watch-results.log"))
         // #9588: a then-exit drain moves the autonomy-desired marker aside —
         // never let a test daemon reach an inherited/real marker path.
-        .env("LOOM_AUTONOMY_MARKER", fixture.join("autonomy-desired"));
+        .env("LOOM_AUTONOMY_MARKER", fixture.join("autonomy-desired"))
+        // #10661: the Codex session reconcile loop (on by default) has no
+        // business in a test daemon — it would read the host's real Codex
+        // accounts and could `docker start` their containers — and at startup
+        // it records the daemon's fallback root for the CLI. Unredirected, that
+        // record (`~/.loom/session-reconcile-fallback-root.json`) would be
+        // overwritten with this fixture's soon-deleted path, silently
+        // degrading the real daemon's hold root set until it restarts.
+        .env("LOOM_SESSION_RECONCILE", "0")
+        .env(
+            "LOOM_SESSION_FALLBACK_ROOT_FILE",
+            fixture.join("session-reconcile-fallback-root.json"),
+        );
 }
 
 /// Process-wide loud-failing `gh` stub (#10088): prints its args to stderr,
@@ -682,4 +695,53 @@ pub fn capture_terminal_output(session_name: &str) -> Result<String> {
     }
 
     anyhow::bail!("tmux capture-pane failed after {MAX_RETRIES} attempts: {last_error}")
+}
+
+/// Guard (#10661): the real `~/.loom/session-reconcile-fallback-root.json`
+/// must not be created or rewritten while a test runs. A daemon writes it
+/// when its session reconcile loop starts; a test daemon that escaped
+/// [`isolate_daemon_state`] (or a relaunch with a hand-built env, as the
+/// watchdog test's) would overwrite the host daemon's record with a temp dir.
+/// Take one at the start of a test that spawns full daemons; it checks the
+/// record's presence and mtime when dropped (unless already panicking). The
+/// real file is only ever read. A host daemon restarting mid-test would trip
+/// it too; that is rare enough to accept, as for `.daemon.pid`.
+#[allow(dead_code)]
+pub struct RealFallbackRecordGuard {
+    path: PathBuf,
+    before: Option<std::time::SystemTime>,
+}
+
+#[allow(dead_code)]
+impl RealFallbackRecordGuard {
+    pub fn arm() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let path = home
+            .join(".loom")
+            .join("session-reconcile-fallback-root.json");
+        let before = Self::fingerprint(&path);
+        Self { path, before }
+    }
+
+    fn fingerprint(path: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    }
+}
+
+impl Drop for RealFallbackRecordGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let after = Self::fingerprint(&self.path);
+        assert_eq!(
+            after,
+            self.before,
+            "{} was created or rewritten during this test: a test daemon escaped \
+             isolate_daemon_state (#10661)",
+            self.path.display()
+        );
+    }
 }

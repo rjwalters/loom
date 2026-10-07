@@ -9,7 +9,7 @@
 //! open-linked-PR probe, the dispatch guards, the telemetry collector). The
 //! answer changes only on a rename, a transfer or a remote edit.
 //!
-//! # Two halves
+//! # Three layers
 //!
 //! 1. **The base repo** ([`base_repo`]) — resolved locally exactly as gh
 //!    resolves it ([`crate::write_scope::target::gh_target`]), zero forge
@@ -36,6 +36,13 @@
 //! repo) or merely drop data (the telemetry collector), `Unavailable` is
 //! treated like `Legacy`: last-known answer, else the pre-facts call.
 //!
+//! 3. **The installation snapshot** ([`installation`], W8) — per credential,
+//!    one conditional `GET installation/repositories` listing `id`,
+//!    `full_name` and `private` for every repo the installation reaches,
+//!    revalidated hourly. Telemetry visibility, the D32 repo identity and the
+//!    write-scope probe read it instead of one `GET repos/<nwo>` per repo. A
+//!    missing, stale or failed answer is never "public".
+//!
 //! # Kill switch
 //!
 //! `LOOM_REPO_FACTS=0` makes every migrated site issue exactly its previous
@@ -45,6 +52,7 @@
 mod base;
 mod confirm;
 mod crosscheck;
+pub(crate) mod installation;
 mod record;
 mod state;
 
@@ -127,6 +135,9 @@ pub(crate) struct Fact {
     /// The post-redirect owner login — what `.owner.login` returned.
     pub(crate) owner: String,
     pub(crate) name: String,
+    /// The forge's numeric repository id, when the record carries one: the
+    /// rename-proof identity a response's `base.repo.id` is checked against.
+    pub(crate) repo_id: Option<u64>,
     pub(crate) verified_at: i64,
     /// Read from the forge during this lookup (not remembered).
     pub(crate) fresh: bool,
@@ -186,6 +197,7 @@ pub(crate) fn canonical_with(gh: &Path, root: &Path, env: GhRepoEnv) -> Lookup {
         configured_nwo: base.nwo.clone(),
         owner: rec.canonical_owner.clone(),
         name: rec.canonical_name.clone(),
+        repo_id: rec.repo_id,
         verified_at: rec.verified_at,
         fresh,
     };

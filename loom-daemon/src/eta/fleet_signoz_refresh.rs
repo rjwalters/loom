@@ -493,6 +493,19 @@ impl ClickhouseHttp {
 
 impl SignozRead for ClickhouseHttp {
     fn page(&mut self, query: &PageQuery) -> Result<String, ReadError> {
+        self.post(OUTCOMES_SQL, query)
+    }
+}
+
+impl ClickhouseHttp {
+    /// `POST` `sql` with `query`'s parameters bound; the response body.
+    /// [`OUTCOMES_SQL`] here, and the timeline reader's own query
+    /// (`fleet_signoz_timeline_rows::TIMELINE_SQL`, #10519).
+    ///
+    /// # Errors
+    ///
+    /// The backend is unreachable or answered with an error status.
+    pub fn post(&self, sql: &'static str, query: &PageQuery) -> Result<String, ReadError> {
         let url = self.url(query)?;
         let password = self.password()?;
         let user = self.user.clone();
@@ -512,7 +525,7 @@ impl SignozRead for ClickhouseHttp {
                             .timeout(timeout)
                             .build()
                             .map_err(|e| ReadError::Unavailable(format!("client: {e}")))?;
-                        let mut request = client.post(url).body(OUTCOMES_SQL);
+                        let mut request = client.post(url).body(sql);
                         if let Some(user) = user {
                             request = request.header("X-ClickHouse-User", user);
                         }

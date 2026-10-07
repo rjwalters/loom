@@ -48,6 +48,7 @@ const DRAIN_EXIT_WAIT: Duration = Duration::from_secs(60);
 #[tokio::test]
 #[serial]
 async fn test_drain_then_exit_exits_143_and_stays_down() {
+    let _real_record = common::RealFallbackRecordGuard::arm();
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("daemon.sock");
     // An empty workspace registry + a scratch workspace root guarantee the

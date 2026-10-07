@@ -525,6 +525,7 @@ pub fn spawn_task(
     }
     log_fit(None, registry.fit(), &workspace_root);
     log_fit_v2(None, registry.fit_v2());
+    log_fit_v3(None, registry.fit_v3());
     let mut tracker = Tracker::new(loom);
     // Only the ETA authority restores (#10498); a pending estimate of a retired
     // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
@@ -1007,7 +1008,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, loaded_fit, snapshots) =
+    let ((history, events), repo_ids, (loaded_fit, roster), snapshots) =
         tokio::task::spawn_blocking(move || {
             let ids: BTreeMap<String, u64> = slugs
                 .iter()
@@ -1020,10 +1021,18 @@ pub(super) async fn record(
             let loaded_fit = (
                 fit::load_latest(&journal_root, listed_at),
                 fit::v2::load_latest_v2(&journal_root, listed_at),
+                fit::v3::load_latest_v3(&journal_root, listed_at),
             );
+            // #10586: the roster history the fit read, from the same cache.
+            let roster = crate::eta::roster_history::load_for(&journal_root, listed_at).0;
             // #10500: the label timeline serving dates first-seen PRs from.
             let snapshots = crate::eta::fleet::load_all(&journal_root);
-            (load_history(&history_roots, &journal_root, &host), ids, loaded_fit, snapshots)
+            (
+                load_history(&history_roots, &journal_root, &host),
+                ids,
+                (loaded_fit, roster),
+                snapshots,
+            )
         })
         .await
         .unwrap_or_default();
@@ -1053,12 +1062,14 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
-        let registered = (state.registry.fit_id(), state.registry.fit_v2_id());
+        let registered =
+            (state.registry.fit_id(), state.registry.fit_v2_id(), state.registry.fit_v3_id());
         if let Some(registry) = swap_fit(registered, loaded_fit) {
             if registry.fit_id() != state.registry.fit_id() {
                 log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
             }
             log_fit_v2(state.registry.fit_v2_id(), registry.fit_v2());
+            log_fit_v3(state.registry.fit_v3_id(), registry.fit_v3());
             state.registry = registry;
         }
         // #10207: every still-pending base estimate is a censored lower bound
@@ -1069,6 +1080,7 @@ pub(super) async fn record(
         );
         state.repo_ids.extend(repo_ids);
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
+        state.tracker.set_fleet_history(roster);
         state.tracker.friction = book;
         state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;
@@ -1157,6 +1169,7 @@ pub(super) async fn record(
         .map(|state| state.tracker.pending().to_vec())
         .unwrap_or_default();
     append_journal(workspace_root, &rows);
+    pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
     let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
@@ -1232,7 +1245,8 @@ mod authority;
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
-use fit_swap::{log_fit, log_fit_v2, swap_fit};
+mod pr_resolved;
+use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

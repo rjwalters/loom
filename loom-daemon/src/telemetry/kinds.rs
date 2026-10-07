@@ -164,6 +164,9 @@ pub mod auto_update_tick;
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
+/// `eta.backtest.fold` / `eta.backtest.summary` (#10492).
+pub mod eta_backtest;
+
 /// `eta.fit` (#10391).
 pub mod eta_fit;
 /// `eta.fleet_refresh` (#10263).
@@ -174,6 +177,9 @@ pub mod eta_snapshot;
 
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
+
+/// `pr.resolved` (#10519) — a PR's merge or close instant, from the ETA pass.
+pub mod pr_resolved;
 
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
@@ -406,6 +412,23 @@ macro_rules! telemetry_kind_table {
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A PR the ETA pass saw leave the review listings, with its merge
+            /// or close instant (Issue #10519). Built from rows the pass
+            /// already journals, so no new forge read. OTLP-only. See
+            /// [`pr_resolved`].
+            PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One heuristic's nightly walk-forward fold for one UTC day (Issue
+            /// #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestFold = "eta.backtest.fold" => $crate::telemetry::kinds::eta_backtest::EtaBacktestFoldRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One challenger's rolling backtest standing against `current`
+            /// (Issue #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestSummary = "eta.backtest.summary" => $crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

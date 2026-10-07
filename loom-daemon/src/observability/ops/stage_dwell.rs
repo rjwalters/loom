@@ -37,6 +37,16 @@
 //! sums scale with the host count, the mean (`dwell / samples`) does not.
 //! `loom.forge.stage_items{state}` counts the open items under each stage
 //! label, summed over this host's repos.
+//!
+//! # One sampler per fleet (W12)
+//!
+//! With `fleet.captainGauges` configured, the declared fleet captain samples
+//! (`stage-dwell` is one of its singleton jobs) and a dispatcher that opted
+//! in skips every repo the captain's fresh heartbeat covers: no listing and
+//! no per-item read for it, and its sampler state for the repo is dropped,
+//! so taking the repo back after a stale heartbeat starts from a baseline.
+//! See [`crate::observability::captain_gauges`]. Unconfigured, every host
+//! samples as before.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -76,6 +86,10 @@ pub const FETCH_BUDGET: usize = 8;
 
 /// Samples a pending PR lookup is retried before it is dropped.
 pub const MAX_TRIES: u8 = 3;
+
+/// This sampler's fleet-captain singleton job (W12,
+/// [`crate::observability::captain_gauges`]).
+const STAGE_JOB: &str = crate::observability::captain_gauges::STAGE_DWELL_JOB;
 
 /// Timeout for one per-item `gh api` read.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,6 +239,11 @@ pub struct Sampler {
     /// `(slug, number, label)` → labeled time; `None` = read, not found.
     label_times: HashMap<(String, u32, String), Option<DateTime<Utc>>>,
     last_at: Option<DateTime<Utc>>,
+    /// When each repo was last sampled (its listing was complete).
+    sampled_at: HashMap<String, DateTime<Utc>>,
+    /// A repo unsampled for longer than this is baselined instead of diffed
+    /// ([`Self::set_replay_bound`]). `None`: always diff.
+    replay_bound: Option<chrono::Duration>,
 }
 
 /// One dwell sample.
@@ -263,8 +282,20 @@ impl Sampler {
         found
     }
 
+    /// Bound how long a repo may go unsampled before its next sample is a
+    /// baseline (W12). The fleet captain sets its heartbeat's staleness bound:
+    /// once the captain has lost a repo for that long, every dispatcher has
+    /// fallen back, baselined and emitted the repo's transitions itself, so
+    /// diffing against the captain's pre-outage state would emit them a
+    /// second time. `None` (every other host) keeps catching up after an
+    /// outage, as before.
+    pub fn set_replay_bound(&mut self, bound: Option<chrono::Duration>) {
+        self.replay_bound = bound;
+    }
+
     /// Take one sample of every repo in `inputs` at `now`. A repo absent from
-    /// `inputs` (its listing failed) keeps its state untouched.
+    /// `inputs` (its listing failed) keeps its state untouched, unless a
+    /// replay bound says it is too old to keep ([`Self::set_replay_bound`]).
     pub fn sample(
         &mut self,
         inputs: &[RepoInput],
@@ -274,6 +305,17 @@ impl Sampler {
         let mut budget = FETCH_BUDGET;
         let mut samples = Vec::new();
         for input in inputs {
+            // Too long since this repo's last good sample: its state is not a
+            // base to diff against any more (see `set_replay_bound`).
+            let outage = self
+                .replay_bound
+                .zip(self.sampled_at.get(&input.slug))
+                .is_some_and(|(bound, last)| now - *last > bound);
+            if outage {
+                // Only the diff base: label times are facts and stay cached.
+                self.repos.remove(&input.slug);
+            }
+            self.sampled_at.insert(input.slug.clone(), now);
             let baseline = !self.repos.contains_key(&input.slug);
             let mut state = self.repos.remove(&input.slug).unwrap_or_default();
             self.sample_repo(&mut state, input, baseline, now, fetcher, &mut budget, &mut samples);
@@ -471,6 +513,17 @@ impl Sampler {
     pub fn last_at(&self) -> Option<DateTime<Utc>> {
         self.last_at
     }
+
+    /// Drop everything known about `slug`: its stage sets, pending samples
+    /// and cached label times. Used while the fleet captain samples the repo
+    /// (W12), so that when this host takes it back its first sample is a
+    /// fresh baseline rather than a diff against a stale one, which would
+    /// replay every transition it missed as new.
+    pub fn forget(&mut self, slug: &str) {
+        self.repos.remove(slug);
+        self.sampled_at.remove(slug);
+        self.label_times.retain(|(s, _, _), _| s != slug);
+    }
 }
 
 /// The metric points for one sample: the dwell delta pair per stage with a
@@ -583,6 +636,7 @@ pub(in crate::observability) async fn record(
     };
     let mut inputs = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut left_to_captain = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();
         let Some(slug) =
@@ -591,6 +645,11 @@ pub(in crate::observability) async fn record(
             continue;
         };
         if !seen.insert(slug.clone()) {
+            continue;
+        }
+        // W12: the fleet captain samples this repo and its data is fresh.
+        if crate::observability::captain_gauges::captain_covers(STAGE_JOB, &slug) {
+            left_to_captain.push(slug);
             continue;
         }
         let mut input = RepoInput {
@@ -628,10 +687,16 @@ pub(in crate::observability) async fn record(
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
         let sampler = guard.get_or_insert_with(Sampler::default);
+        sampler.set_replay_bound(crate::observability::captain_gauges::replay_bound());
+        for slug in &left_to_captain {
+            sampler.forget(slug);
+        }
         let previous = sampler.last_at();
         let samples = sampler.sample(&inputs, Utc::now(), &mut GhStageFetcher);
         drop(guard);
         sink.emit_metrics_since(stage_points(&samples, &inputs), previous);
+        let sampled = inputs.iter().map(|input| input.slug.clone());
+        crate::observability::captain_gauges::note_produced(STAGE_JOB, sampled, Utc::now());
     }));
 }
 

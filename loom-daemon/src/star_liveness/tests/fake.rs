@@ -21,6 +21,10 @@ pub struct Repo {
     pub comments: BTreeMap<u32, Vec<ForgeComment>>,
     /// Every comment posted through the fake: (number, body).
     pub posted: Vec<(u32, String)>,
+    /// Label listings made through the fake.
+    pub listings: usize,
+    /// The label of each listing, in order.
+    pub listed: Vec<String>,
     /// Comment reads made through the fake.
     pub comment_reads: usize,
     /// Issue searches made through the fake.
@@ -34,6 +38,16 @@ pub struct Repo {
     pub fail_remove: Vec<String>,
     /// Make every `post_comment` fail.
     pub fail_post: bool,
+    /// Native "blocked by" dependencies per issue (#10307).
+    pub blocked_by: BTreeMap<u32, Vec<(String, u32)>>,
+    /// Label writes made through the fake: (number, "+label" / "-label").
+    pub label_writes: Vec<(u32, String)>,
+    /// Body writes made through the fake: (number, new body).
+    pub body_writes: Vec<(u32, String)>,
+    /// Every body write fails (#10307 provenance-first).
+    pub fail_body_write: bool,
+    /// Every native dependency read fails (#10307: a 5xx or rate limit).
+    pub fail_blocked_by: bool,
 }
 
 /// A forge world: repos by slug.
@@ -42,7 +56,9 @@ pub struct World(pub Rc<RefCell<BTreeMap<String, Repo>>>);
 
 impl World {
     pub fn repo(&self, slug: &str) -> std::cell::RefMut<'_, Repo> {
-        std::cell::RefMut::map(self.0.borrow_mut(), |m| m.entry(slug.to_string()).or_default())
+        std::cell::RefMut::map(self.0.borrow_mut(), |m| {
+            m.entry(slug.to_ascii_lowercase()).or_default()
+        })
     }
 
     pub fn add(&self, slug: &str, item: RestIssue) {
@@ -78,7 +94,9 @@ pub struct FakeForge {
 
 impl StarForge for FakeForge {
     fn list_open(&mut self, label: &str) -> Result<Vec<RestIssue>> {
-        let repo = self.world.repo(&self.slug);
+        let mut repo = self.world.repo(&self.slug);
+        repo.listings += 1;
+        repo.listed.push(label.to_string());
         if repo.fail_listing {
             return Err(anyhow!("listing failed"));
         }
@@ -126,8 +144,22 @@ impl StarForge for FakeForge {
             .collect())
     }
 
+    fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        if self.world.repo(&self.slug).fail_blocked_by {
+            return Err(anyhow!("HTTP 502 from the dependency endpoint"));
+        }
+        Ok(self
+            .world
+            .repo(&self.slug)
+            .blocked_by
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        repo.label_writes.push((number, format!("+{label}")));
         let item = repo
             .items
             .get_mut(&number)
@@ -143,6 +175,7 @@ impl StarForge for FakeForge {
         if repo.fail_remove.iter().any(|l| l == label) {
             return Err(anyhow!("removing {label} from #{number} failed"));
         }
+        repo.label_writes.push((number, format!("-{label}")));
         if let Some(item) = repo.items.get_mut(&number) {
             item.labels.retain(|l| l != label);
         }
@@ -156,6 +189,20 @@ impl StarForge for FakeForge {
         }
         repo.posted.push((number, body.to_string()));
         repo.comments.entry(number).or_default().push(bot(body));
+        Ok(())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        if repo.fail_body_write {
+            return Err(anyhow!("HTTP 502 editing #{number}"));
+        }
+        repo.body_writes.push((number, body.to_string()));
+        let item = repo
+            .items
+            .get_mut(&number)
+            .ok_or_else(|| anyhow!("no #{number}"))?;
+        item.body = Some(body.to_string());
         Ok(())
     }
 }

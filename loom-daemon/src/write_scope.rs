@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod probe;
+mod probe_snapshot;
 pub(crate) mod target;
 
 use probe::{Permission, PermissionProbe};
@@ -390,3 +391,7 @@ pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod gitea_tests;

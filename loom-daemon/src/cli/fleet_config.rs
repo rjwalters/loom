@@ -72,6 +72,11 @@ enum FleetConfigCommand {
         /// Use the cached snapshot without contacting the forge.
         #[arg(long)]
         offline: bool,
+        /// Permit a lossy reduction: writing a machine tier that DROPS
+        /// top-level blocks the file on disk carries (the store never had
+        /// them). 2am#1653's clobber class — the refusal is the default.
+        #[arg(long)]
+        allow_reduce: bool,
     },
     /// Diff the store's `repos.yml` against the workspace registry (adds,
     /// removes, priority changes). Fails closed: no cached fallback.
@@ -200,7 +205,8 @@ fn run(args: FleetConfigArgs) -> Result<i32> {
             host,
             check,
             offline,
-        } => cmd_render(&ctx, host, check, offline),
+            allow_reduce,
+        } => cmd_render(&ctx, host, check, offline, allow_reduce),
         FleetConfigCommand::Roster { check, apply, json } => cmd_roster(&ctx, check, apply, json),
         FleetConfigCommand::State {
             host,
@@ -306,7 +312,13 @@ fn cmd_fetch(ctx: &Ctx, json: bool) -> Result<i32> {
     }
 }
 
-fn cmd_render(ctx: &Ctx, host: Option<String>, check: bool, offline: bool) -> Result<i32> {
+fn cmd_render(
+    ctx: &Ctx,
+    host: Option<String>,
+    check: bool,
+    offline: bool,
+    allow_reduce: bool,
+) -> Result<i32> {
     let host = resolve_host(host)?;
     let loaded = ctx.load(policy(offline))?;
     let machine_path = loom_daemon::config_resolver::private_defaults_path().ok_or_else(|| {
@@ -319,6 +331,37 @@ fn cmd_render(ctx: &Ctx, host: Option<String>, check: bool, offline: bool) -> Re
         .workspace
         .join(loom_daemon::config_resolver::LOCAL_CONFIG_REL);
     let targets = render::render(&loaded.snapshot, &host, &machine_path, &local_path)?;
+    // The lossy-reduction guard (2am#1653): a machine-tier target that would
+    // DROP top-level blocks the file on disk carries is refused unless the
+    // operator names it. The store is the tier's record of truth, so the
+    // blocks belong IN the store first (`fleet-config propose adopt`
+    // pushes them there) — a silent write that loses `runtimes`/`forge`/
+    // `autonomous`/`safehouse` for half a day is the failure this refuses.
+    for t in &targets {
+        let lost = render::lost_top_level_keys(t);
+        if lost.is_empty() {
+            continue;
+        }
+        let msg = format!(
+            "{} would DROP top-level block(s) the file on disk carries: {} — the store's \
+             fleet/defaults.json never had them. Add them to the store first \
+             (`fleet-config propose adopt` proposes exactly that), or pass \
+             --allow-reduce to accept the loss knowingly.",
+            t.tier.name(),
+            lost.join(", ")
+        );
+        if check {
+            // check reports drift already; make the reduction unmissable and
+            // fail the check (exit 2 = the CLI's error class)
+            eprintln!("LOSSY REDUCTION: {msg}");
+            return Ok(2);
+        }
+        if !allow_reduce {
+            eprintln!("REFUSED — lossy reduction: {msg}");
+            return Ok(2);
+        }
+        println!("--allow-reduce: accepting the dropped block(s): {}", lost.join(", "));
+    }
     println!("{} — host {host}", source_line(ctx, &loaded));
     if targets.iter().all(|t| t.tier != render::Tier::Local) {
         println!(

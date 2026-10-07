@@ -39,6 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
+use crate::forge_identity::{served, ReadClass};
 use crate::forge_listing::{parse_http_response, HttpResponse};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
@@ -220,6 +221,11 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
     }
 }
 
+mod deferrable;
+#[cfg(test)]
+pub(crate) use deferrable::install_test_route;
+pub(crate) use deferrable::ReadShed;
+
 /// Who issued a conditional read and which inventoried forge operation it
 /// serves (#9831).
 ///
@@ -235,6 +241,15 @@ pub(crate) struct ConditionalRead {
     pub(crate) op: crate::forge_call_stats::ForgeOp,
     /// The read's deadline; `None` = [`FETCH_TIMEOUT`].
     pub(crate) timeout: Option<std::time::Duration>,
+    /// The URL names ONE item (`issues/{n}`, `pulls/{n}`): a reader `404`
+    /// backed by recent coverage evidence for the same repo and endpoint
+    /// family is the item's answer, not a Coverage failure (W6,
+    /// [`crate::forge_identity::served`]).
+    pub(crate) item_scoped: bool,
+    /// How the read is treated when its readers run dry (W4-C).
+    /// [`ReadClass::Gate`], the default, retries on the writer;
+    /// a deferrable class is shed instead, see [`deferrable`].
+    pub(crate) class: ReadClass,
 }
 
 impl ConditionalRead {
@@ -244,7 +259,25 @@ impl ConditionalRead {
             caller,
             op,
             timeout: None,
+            item_scoped: false,
+            class: ReadClass::Gate,
         }
+    }
+
+    /// This read as a deferrable one of `class`: when every reader that can
+    /// see the repo is out of budget it fails with [`ReadShed`] and no
+    /// request, and is never retried on the writer for that reason.
+    #[must_use]
+    pub(crate) const fn deferrable(mut self, class: ReadClass) -> Self {
+        self.class = class;
+        self
+    }
+
+    /// Mark this read item-scoped (see [`ConditionalRead::item_scoped`]).
+    #[must_use]
+    pub(crate) const fn item_scoped(mut self) -> Self {
+        self.item_scoped = true;
+        self
     }
 
     /// This read bounded by `timeout` instead of [`FETCH_TIMEOUT`] (`None`
@@ -271,6 +304,10 @@ pub(crate) fn fetch_conditional(
     url: &str,
     etag: Option<&str>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    #[cfg(test)]
+    if let Some(route) = deferrable::test_route() {
+        return fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &*route);
+    }
     fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &|req| {
         crate::forge_identity::route_read(req, std::time::SystemTime::now())
     })
@@ -289,6 +326,9 @@ pub(crate) fn fetch_conditional_via(
         &crate::forge_identity::RouteRequest<'_>,
     ) -> crate::forge_identity::RouteDecision,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    if site.class != ReadClass::Gate && deferrable::shedding_enabled() {
+        return deferrable::fetch(site, gh_bin, cwd, target, url, etag, route);
+    }
     // #9537: a listing is a read, so it goes to the repo's reader App when one
     // is usable. On a credential failure the reader is withdrawn and the SAME
     // request is retried once on the writer, so a broken reader costs one
@@ -314,6 +354,8 @@ pub(crate) fn fetch_conditional_via(
         .into_credential()
     });
     let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let family = served::endpoint_family(url);
+    let now = std::time::SystemTime::now;
     let http_ok = |r: &FetchResult| {
         r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
     };
@@ -330,7 +372,7 @@ pub(crate) fn fetch_conditional_via(
                     target.repo.as_deref().unwrap_or_default(),
                 )
             });
-            run_fetch_with(
+            let fetched = run_fetch_with(
                 site,
                 gh_bin,
                 cwd,
@@ -341,10 +383,31 @@ pub(crate) fn fetch_conditional_via(
                 dir.is_some(),
                 role,
                 bucket.as_deref(),
-            )
+            );
+            if let (Some((_, app_id)), Some(_), Ok(r)) = (reader.as_ref(), dir, fetched.as_ref()) {
+                if matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304)) {
+                    served::note_reader_served(app_id, repo_of(target), family, now());
+                }
+            }
+            fetched
         },
         http_ok,
-        reader_failure,
+        |r: &FetchResult| {
+            let failure = reader_failure(r)?;
+            let item_404 = site.item_scoped
+                && failure == crate::forge_identity::Failure::Coverage
+                && r.1.as_ref().map(|h| h.status) == Some(404);
+            let covered = reader.as_ref().is_some_and(|(_, app_id)| {
+                served::reader_recently_served(app_id, repo_of(target), family, now())
+            });
+            if item_404 && covered {
+                // The reader covers this repo's `family`: the 404 is the
+                // item's own answer. No writer retry, no withdrawal (W6).
+                crate::forge_call_stats::counters::bump(served::ITEM_SCOPED_404);
+                return None;
+            }
+            Some(failure)
+        },
         |failure, _| {
             if let Some((_, app_id)) = &reader {
                 let repo = target.repo.as_deref().unwrap_or_default();
@@ -353,6 +416,11 @@ pub(crate) fn fetch_conditional_via(
             }
         },
     )
+}
+
+/// `target`'s `owner/repo`, or `""` (a placeholder read has no reader).
+fn repo_of(target: &Target) -> &str {
+    target.repo.as_deref().unwrap_or_default()
 }
 
 /// What a failed conditional read says about its credential. The parsed
@@ -611,7 +679,9 @@ pub(crate) fn credential_scope(cwd: Option<&Path>, target: &Target) -> String {
     credential_scope_with(owner_config.as_deref(), token.as_deref())
 }
 
-fn credential_scope_with(owner_config: Option<&Path>, token: Option<&str>) -> String {
+/// [`credential_scope`] with the config dir and env token given (the
+/// installation snapshots of [`crate::forge_repo_facts`] key on it too).
+pub(crate) fn credential_scope_with(owner_config: Option<&Path>, token: Option<&str>) -> String {
     let config = owner_config
         .map(|p| p.display().to_string())
         .or_else(|| {
@@ -735,6 +805,53 @@ pub(crate) fn cached_read(
     url: &str,
     prefix: &'static str,
 ) -> Result<CachedRead> {
+    cached_read_pinned(site, gh_bin, cwd, repo, url, prefix, ReadPin::default())
+}
+
+/// How a [`cached_read_pinned`] read departs from the reader-first,
+/// conditional default (W9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReadPin {
+    /// Serve it on the writer only, never a reader App: a read that must see
+    /// this daemon's own writes (W4-C), where a reader may lag them.
+    pub(crate) writer: bool,
+    /// Send no `If-None-Match`: the first read after this process wrote the
+    /// object, so a lagging replica's `304` cannot answer it. The `200`
+    /// still refreshes the entry.
+    pub(crate) unconditional: bool,
+}
+
+/// [`cached_read`] under `pin`.
+///
+/// # Errors
+/// As [`cached_get`].
+pub(crate) fn cached_read_pinned(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+    url: &str,
+    prefix: &'static str,
+    pin: ReadPin,
+) -> Result<CachedRead> {
+    let route = |req: &crate::forge_identity::RouteRequest<'_>| {
+        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+    };
+    cached_read_via(site, gh_bin, cwd, (repo, url, prefix), pin, &route)
+}
+
+/// [`cached_read_pinned`] with the reader routing injected. A writer pin
+/// never consults `route`.
+pub(crate) fn cached_read_via(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    (repo, url, prefix): (Option<&str>, &str, &'static str),
+    pin: ReadPin,
+    route: &dyn Fn(
+        &crate::forge_identity::RouteRequest<'_>,
+    ) -> crate::forge_identity::RouteDecision,
+) -> Result<CachedRead> {
     if crate::rate_limit_breaker::global_skip_pass(site.caller) {
         anyhow::bail!("rate-limit breaker is suppressing forge calls");
     }
@@ -742,13 +859,23 @@ pub(crate) fn cached_read(
     let key = daemon_cache_key(cwd, &target, url);
     let mem_key = format!("{prefix}{key}");
     let disk = daemon_store_dir().map(|d| entry_path_with_prefix(&d, prefix, &key));
-    let sent = get_cache()
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&mem_key).cloned())
-        .or_else(|| Some(std::sync::Arc::new(read_disk_entry(disk.as_deref()?)?)));
+    let sent = (!pin.unconditional)
+        .then(|| {
+            get_cache()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&mem_key).cloned())
+                .or_else(|| Some(std::sync::Arc::new(read_disk_entry(disk.as_deref()?)?)))
+        })
+        .flatten();
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
-    let (status, response, stderr) = fetch_conditional(site, gh_bin, cwd, &target, url, sent_etag)?;
+    let writer =
+        |_: &crate::forge_identity::RouteRequest<'_>| crate::forge_identity::RouteDecision::NoPool;
+    let route: &dyn Fn(
+        &crate::forge_identity::RouteRequest<'_>,
+    ) -> crate::forge_identity::RouteDecision = if pin.writer { &writer } else { route };
+    let (status, response, stderr) =
+        fetch_conditional_via(site, gh_bin, cwd, &target, url, sent_etag, route)?;
     let core_remaining = response.as_ref().and_then(|r| {
         let core = r
             .ratelimit
@@ -898,3 +1025,7 @@ mod tests {
 #[cfg(test)]
 #[path = "forge_etag_store_route_tests.rs"]
 mod route_tests;
+
+#[cfg(test)]
+#[path = "forge_etag_store_pin_tests.rs"]
+mod pin_tests;

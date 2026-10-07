@@ -86,6 +86,7 @@ const RESPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
 #[tokio::test]
 #[serial]
 async fn test_drain_exit0_then_watchdog_systemd_kickstart_recovers() {
+    let _real_record = common::RealFallbackRecordGuard::arm();
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_path = temp_dir.path().join("daemon.sock");
     let workspace_root = temp_dir.path().join("workspace");
@@ -332,6 +333,15 @@ esac
         .env(
             "LOOM_WATCH_RESULTS_LOG",
             temp_dir.path().join("watch-results.log"),
+        )
+        // #10661: the daemon this watchdog relaunches gets THIS env, not
+        // `isolate_daemon_state`'s, so the session reconcile loop and its
+        // fallback-root record must be pinned here too (else the relaunched
+        // daemon writes the real `~/.loom/session-reconcile-fallback-root.json`).
+        .env("LOOM_SESSION_RECONCILE", "0")
+        .env(
+            "LOOM_SESSION_FALLBACK_ROOT_FILE",
+            temp_dir.path().join("session-reconcile-fallback-root.json"),
         )
         .env("LOOM_ROLE_RUNNER", "0")
         .env("LOOM_WORK_FINDER", "0")

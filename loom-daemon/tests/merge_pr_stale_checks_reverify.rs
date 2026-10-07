@@ -2,7 +2,8 @@
 //! re-verification, end to end through the REAL binary.
 //!
 //! The library tests (`local_eval/tests.rs`) pin `evaluate()`; this pins the
-//! CLI wiring around it: the opt-in resolution (env > config > default off),
+//! CLI wiring around it: the enablement resolution (env > config > default
+//! on, #10465),
 //! the verdict promotion (STALE -> the CLEAN sentinel, exit 0), the merge-log
 //! line, the evidence comment's marker, and the fail-closed paths keeping the
 //! exact refusal. It drives `--from-stdin` with `"reverify": true`, the
@@ -304,11 +305,36 @@ fn opted_in_a_passing_merge_tree_turns_the_refusal_clean() {
     f.assert_tmp_empty("pass");
 }
 
-/// Off (the default), behavior is byte-identical to a payload that never
-/// asked for re-verification: same exit, stdout and stderr, no fetch, no temp
-/// files — whether the config is absent, false, or overridden off by env.
+/// Default-on (#10465): with no config, or an unparseable env value and no
+/// config, a passing merge tree turns the refusal clean exactly as an
+/// explicit opt-in does.
 #[test]
-fn off_by_default_the_output_is_byte_identical_to_today() {
+fn by_default_a_passing_merge_tree_turns_the_refusal_clean() {
+    if !prerequisites() {
+        return;
+    }
+    let f = fixture("ONE");
+    for (env, label) in [
+        (None, "no config"),
+        (Some("garbage"), "unparseable env, no config"),
+    ] {
+        f.config(None);
+        let before = f.snapshot();
+        let out = f.run(&f.payload(Some(true)), env);
+        let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "{label}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, format!("{CLEAN}\n"), "{label}: the sentinel and nothing else");
+        assert!(stderr.contains("verdict=pass"), "{label}: {stderr}");
+        assert_eq!(before, f.snapshot(), "{label}: (g) the primary repository changed");
+        f.assert_tmp_empty(label);
+    }
+}
+
+/// Off (explicitly, by config or env), behavior is byte-identical to a
+/// payload that never asked for re-verification: same exit, stdout and
+/// stderr, no fetch, no temp files.
+#[test]
+fn off_the_output_is_byte_identical_to_today() {
     let f = fixture("ONE");
     f.config(None);
     let before = f.snapshot();
@@ -321,10 +347,10 @@ fn off_by_default_the_output_is_byte_identical_to_today() {
     );
     assert!(text(&today.stdout).contains("Merge blocked"));
     for (cfg, env, label) in [
-        (None, None, "no config"),
         (Some(false), None, "config false"),
         (Some(true), Some("0"), "env 0 beats config true"),
-        (None, Some("garbage"), "unparseable env, no config"),
+        (None, Some("0"), "env 0, no config"),
+        (Some(false), Some("garbage"), "unparseable env falls through to config false"),
     ] {
         f.config(cfg);
         let got = f.run(&f.payload(Some(true)), env);
