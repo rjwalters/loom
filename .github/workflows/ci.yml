@@ -2140,6 +2140,13 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
+      # Moved out of shell-suite-tests by #8191's usage slice: merge-pr.sh's
+      # --help text is `loom-daemon merge-pr usage` now, so both suites that
+      # read --help pin this job's binary (--self-only) and FAIL without one.
+      - name: merge-pr --help (#8191)
+        run: bash defaults/scripts/tests/test-merge-pr-help.sh
+      - name: merge-pr --merge-method (#8845, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-merge-method.sh
       # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
       # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
       # whose decision is now `loom-daemon merge-pr issue-close-gate`, and drives
