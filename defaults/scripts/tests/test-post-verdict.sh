@@ -180,6 +180,16 @@ if [[ "${1:-} ${2:-}" == "forge wait-checks" ]]; then
   printf '%s\n' "$*" >> "$LOOM_TEST_STUB_DIR/wait-checks-calls.log"
   [[ -f "$LOOM_TEST_STUB_DIR/ci-absent" ]] && { echo "error: unrecognized subcommand 'wait-checks'" >&2; exit 2; }
   [[ -f "$LOOM_TEST_STUB_DIR/ci-garbage" ]] && { echo "<html>502 Bad Gateway</html>"; exit 0; }
+  # models the real reader: an empty rollup settles to NONE only given time
+  # for ~3 polls (--timeout >= 10); below that it reports TIMEOUT
+  if [[ -f "$LOOM_TEST_STUB_DIR/ci-empty" ]]; then
+    t=0; prev=""
+    for a in "$@"; do [[ "$prev" == "--timeout" ]] && t="$a"; prev="$a"; done
+    if [[ -f "$LOOM_TEST_STUB_DIR/ci-required" || "$t" -lt 10 ]]; then
+      echo "LOOM-CHECKS-TIMEOUT $(cat "$LOOM_TEST_STUB_DIR/cur-sha")"; exit 1
+    fi
+    echo "LOOM-CHECKS-NONE $(cat "$LOOM_TEST_STUB_DIR/cur-sha")"; exit 1
+  fi
   if [[ -f "$LOOM_TEST_STUB_DIR/ci-stdout" ]]; then
     cat "$LOOM_TEST_STUB_DIR/ci-stdout"
     [[ -f "$LOOM_TEST_STUB_DIR/ci-stderr" ]] && cat "$LOOM_TEST_STUB_DIR/ci-stderr" >&2
@@ -203,7 +213,7 @@ cd "$STUB_DIR/checkout"
 
 reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
-    "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent \
+    "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
     "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log"
 }
 
@@ -367,13 +377,25 @@ reset_state
 run_pv 300 approved "$CI_SHA_FULL" --body "ok"
 assert_eq "0" "$EXIT_CODE" "CI green on exact head -> approval posted"
 assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=$CI_SHA_FULL verdict=approved -->" "green: marker preserved"
-assert_contains "$(cat "$STUB_DIR/wait-checks-calls.log")" "forge wait-checks 300 --repo owner/repo --timeout 0" "green: one-snapshot read of the PR"
+assert_contains "$(cat "$STUB_DIR/wait-checks-calls.log")" "forge wait-checks 300 --repo owner/repo --timeout 20" "green: bounded snapshot read of the PR"
 
 # NONE (legitimately no CI, per the reader's zero-row settle) is accepted
 reset_state
 echo "LOOM-CHECKS-NONE $CI_SHA_FULL" > "$STUB_DIR/ci-stdout"
 run_pv 301 approved "$CI_SHA_FULL" --body "ok"
 assert_eq "0" "$EXIT_CODE" "reader NONE (settled: no required contexts) -> approval posted"
+
+# checkless repo against the real reader's settle behaviour (regression: a
+# --timeout 0 read of an empty rollup is TIMEOUT, which refused every approval)
+reset_state
+touch "$STUB_DIR/ci-empty"
+run_pv 310 approved "$CI_SHA_FULL" --body "ok"
+assert_eq "0" "$EXIT_CODE" "checkless repo settles to NONE within the default timeout -> approval posted"
+reset_state
+touch "$STUB_DIR/ci-empty" "$STUB_DIR/ci-required"
+run_pv 311 approved "$CI_SHA_FULL" --body "ok"
+assert_eq "5" "$EXIT_CODE" "empty rollup with required contexts stays TIMEOUT -> exit 5"
+no_comment "empty rollup + required"
 
 # pending
 reset_state

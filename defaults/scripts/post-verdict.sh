@@ -69,10 +69,11 @@
 #
 # Every `approved` verdict (fast paths included, same single chokepoint) also
 # requires every check on the exact reviewed head to be settled green. After the
-# review gate, this runs `loom-daemon forge wait-checks <pr> --timeout 0` (one
-# snapshot; the one status reader, never a second policy here) and branches on
+# review gate, this runs `loom-daemon forge wait-checks <pr> --timeout 20` (bounded
+# snapshot; override: LOOM_POST_VERDICT_CI_TIMEOUT; the one status reader, never a second policy here) and branches on
 # its first output LINE, never its exit code: GREEN proceeds; NONE proceeds
-# (the reader's zero-row settle: no required contexts, several empty reads);
+# (the reader's zero-row settle: no required contexts, ~3 empty polls, so the
+# timeout must stay >= the ~10 s settle window; 0 would read as TIMEOUT);
 # RED (any failing check, required or not; cancelled, timed_out,
 # action_required, stale and startup_failure count as failing; success,
 # neutral and skipped count as green) refuses with exit 6; TIMEOUT (pending,
@@ -356,7 +357,7 @@ fi
 REPO=""
 if [[ "$VERDICT" == "approved" ]]; then
   REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "post-verdict.sh: not posting the verdict on PR #$PR: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 4; }
-  CI_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge wait-checks "$PR" --repo "$REPO" --timeout 0 2>&1)" || true
+  CI_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge wait-checks "$PR" --repo "$REPO" --timeout "${LOOM_POST_VERDICT_CI_TIMEOUT:-20}" 2>&1)" || true
   CI_FIRST="${CI_OUT%%$'\n'*}"
   CI_TOKEN="${CI_FIRST%% *}"
   CI_SHA="$(printf '%s' "$CI_FIRST" | awk '{print $2}')"
