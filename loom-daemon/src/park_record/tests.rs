@@ -240,8 +240,8 @@ fn q(repo: &str, number: u64) -> BlockerRef {
 
 #[test]
 fn a_qualified_blocker_keeps_its_repo() {
-    let got = blockers("<!-- loom:park Blocked by: 2AMLogic/2am#1088 by=human -->");
-    assert_eq!(got, vec![q("2AMLogic/2am", 1088)]);
+    let got = blockers("<!-- loom:park Blocked by: example-org/tool-repo#202 by=human -->");
+    assert_eq!(got, vec![q("example-org/tool-repo", 202)]);
 }
 
 #[test]
@@ -261,11 +261,15 @@ fn a_qualified_ref_inside_the_reason_is_ignored() {
 
 #[test]
 fn qualified_records_round_trip() {
-    let park =
-        render_park(&[q("2AMLogic/2am", 1088), BlockerRef::local(5)], Some("human"), None, None);
-    assert!(park.contains("Blocked by: 2AMLogic/2am#1088"), "{park}");
+    let park = render_park(
+        &[q("example-org/tool-repo", 202), BlockerRef::local(5)],
+        Some("human"),
+        None,
+        None,
+    );
+    assert!(park.contains("Blocked by: example-org/tool-repo#202"), "{park}");
     assert_eq!(park.lines().count(), 2);
-    assert_eq!(blockers(&park), vec![BlockerRef::local(5), q("2AMLogic/2am", 1088)]);
+    assert_eq!(blockers(&park), vec![BlockerRef::local(5), q("example-org/tool-repo", 202)]);
 }
 
 #[test]
@@ -315,7 +319,7 @@ fn drop_blockers_keeps_an_inline_marker_line() {
 
 #[test]
 fn qualified_refs_are_detected_outside_the_reason_only() {
-    assert!(has_qualified_ref("<!-- loom:park Blocked by: 2AMLogic/loom-ui#1891 -->"));
+    assert!(has_qualified_ref("<!-- loom:park Blocked by: example-org/ui-repo#303 -->"));
     assert!(!has_qualified_ref(&render(&rec(5))));
     assert!(!has_qualified_ref(
         "<!-- loom:park Blocked by: #5 reason=\"after other/repo#9 lands\" -->"
