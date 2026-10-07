@@ -198,6 +198,16 @@ pub(super) struct PassContext {
 }
 
 impl PassContext {
+    /// An open PR's `(head, base)` branches as the feature reads last saw
+    /// them (#10526).
+    pub(super) fn open_pull_refs(
+        &self,
+        repo: &str,
+        pr: u32,
+    ) -> Option<(Option<String>, Option<String>)> {
+        self.reads.open_pull_refs(repo, pr)
+    }
+
     /// `pr`'s current-stage entry from the timeline (see [`Timeline::current`]).
     pub(super) fn timeline_dated(
         &self,

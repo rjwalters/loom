@@ -484,6 +484,46 @@ fn the_book_keeps_first_sight_as_known_at_and_drops_vanished_edges() {
     assert!(book.landed.is_empty());
 }
 
+#[test]
+fn an_edge_first_observed_after_as_of_is_invisible_at_as_of_whatever_the_source_said() {
+    // The source text was edited long before; the book first read it after
+    // `as_of`, so the estimate at `as_of` must not see the edge (#10526).
+    let mut book = DependencyBook::default();
+    book.set(&key(2), EdgeSource::ParkRecord, &[key(1)], as_of() + Duration::minutes(5));
+    let g = DependencyGraph {
+        edges: book.edges.clone(),
+        nodes: BTreeMap::new(),
+    };
+    assert!(g.parents(&key(2), as_of()).is_empty());
+    assert_eq!(g.parents(&key(2), as_of() + Duration::minutes(6)).len(), 1);
+}
+
+#[test]
+fn phase_parents_point_each_phase_at_the_nearest_lower_phase_of_its_own_epic() {
+    let mut book = DependencyBook::default();
+    for (issue, epic, phase) in [(1, 9, 1), (2, 9, 3), (3, 9, 3), (4, 8, 1), (5, 8, 2)] {
+        assert!(!book.set_phase(&key(issue), Some((epic, phase))));
+    }
+    let rows: BTreeMap<u32, Vec<u32>> = book
+        .phase_parents()
+        .into_iter()
+        .map(|(m, ps)| (m.issue, ps.iter().map(|p| p.issue).collect()))
+        .collect();
+    // Phase 2 is missing in epic 9: phase 3 waits on phase 1. Epics never
+    // cross; siblings in one phase never wait on each other.
+    assert_eq!(rows[&1], Vec::<u32>::new());
+    assert_eq!(rows[&2], vec![1]);
+    assert_eq!(rows[&3], vec![1]);
+    assert_eq!(rows[&4], Vec::<u32>::new());
+    assert_eq!(rows[&5], vec![4]);
+    // A removed marker reports it, once.
+    assert!(book.set_phase(&key(2), None));
+    assert!(!book.set_phase(&key(2), None));
+    // Cross-source reverse edges are visible to the cycle guard.
+    book.set(&key(2), EdgeSource::ParkRecord, &[key(1)], as_of());
+    assert!(book.waits_on(&key(2), &key(1)) && !book.waits_on(&key(1), &key(2)));
+}
+
 // ------------------------------------------------------------ registration
 
 #[test]
