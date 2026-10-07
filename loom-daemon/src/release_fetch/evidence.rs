@@ -194,8 +194,41 @@ pub fn public_text(s: &str) -> Option<String> {
         || t.starts_with('~')
         || t.contains('\\')
         || t.chars().any(char::is_control)
-        || is_token_shaped(t);
+        || is_token_shaped(t)
+        || has_dot_segment(t)
+        || !url_is_public(t);
     (!bad).then(|| t.to_string())
+}
+
+/// [`public_text`] for a signer identity or OIDC issuer: additionally rejects a
+/// bare relative filesystem path (a `/` with no URL scheme). Identities are
+/// URLs (workflow identities, issuers) or slash-free names (e-mail addresses).
+#[must_use]
+pub fn public_identity(s: &str) -> Option<String> {
+    let t = public_text(s)?;
+    (t.contains("://") || !t.contains('/')).then_some(t)
+}
+
+/// True when any `/`-separated segment is `.` or `..`.
+fn has_dot_segment(t: &str) -> bool {
+    t.split('/').any(|seg| seg == ".." || seg == ".")
+}
+
+/// For a value with a URL scheme: only `http(s)`, no userinfo, no query or
+/// fragment (either can carry a credential). Non-URL text passes.
+fn url_is_public(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("file:") {
+        return false;
+    }
+    let Some((scheme, rest)) = t.split_once("://") else {
+        return true;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.contains('@') && !t.contains('?') && !t.contains('#')
 }
 
 fn is_token_shaped(t: &str) -> bool {
@@ -292,10 +325,10 @@ impl SignatureEvidence {
                 .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())),
             signature_state: facts.signature_state.map(|s| s.as_str().to_string()),
             verification_method: method.map(str::to_string),
-            identity: identity.and_then(public_text),
+            identity: identity.and_then(public_identity),
             identity_regexp: identity_regexp
                 .and_then(|r| public_regexp(r, tag, policy.approved_workflow.as_deref())),
-            oidc_issuer: issuer.and_then(public_text),
+            oidc_issuer: issuer.and_then(public_identity),
             configured_workflow: policy.approved_workflow.as_deref().and_then(public_text),
             configured_workflow_applied: applied,
             source_revision: None,

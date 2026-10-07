@@ -381,6 +381,57 @@ fn sanitize_drops_path_and_token_shaped_public_text() {
     assert!(!r.tamper_evidence);
 }
 
+#[test]
+fn identity_and_issuer_reject_credential_urls_and_local_paths() {
+    use crate::release_fetch::signature::VerifiedBy;
+    let canaries = [
+        "https://demo:FAKE_PASSWORD@example.invalid/issuer",
+        "https://example.invalid/issuer?access_token=FAKE_CANARY",
+        "https://example.invalid/issuer#access_token=FAKE_CANARY",
+        "file:///Users/example/private/identity",
+        "../private/identity",
+        "private/identity",
+    ];
+    let record = |verified_by| {
+        SignatureEvidence::assemble(
+            "v1.0.0",
+            &SignaturePolicy {
+                require_signature: true,
+                approved_workflow: None,
+            },
+            &EvidenceFacts {
+                verified_by: Some(verified_by),
+                ..EvidenceFacts::default()
+            },
+            "host-a".to_string(),
+            crate::eta::Provenance::current(),
+            chrono::Utc::now(),
+        )
+    };
+    for bad in canaries {
+        let r = record(VerifiedBy::KeylessExactIdentity {
+            identity: bad.to_string(),
+            issuer: bad.to_string(),
+        });
+        assert!(r.identity.is_none() && r.oidc_issuer.is_none(), "{bad:?}");
+        let needle = bad.trim_start_matches("../");
+        assert!(!serde_json::to_string(&r).unwrap().contains(needle), "{bad:?}");
+        assert!(!r.stderr_line().contains(needle), "{bad:?}");
+    }
+    // Valid public identities and issuers are preserved.
+    let r = record(VerifiedBy::KeylessExactIdentity {
+        identity: "https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1.0.0"
+            .to_string(),
+        issuer: "https://token.actions.githubusercontent.com".to_string(),
+    });
+    assert!(r.identity.is_some() && r.oidc_issuer.is_some());
+    let r = record(VerifiedBy::KeylessExactIdentity {
+        identity: "releases@example.com".to_string(),
+        issuer: "https://accounts.example.com/".to_string(),
+    });
+    assert!(r.identity.is_some() && r.oidc_issuer.is_some());
+}
+
 fn sample(tag: &str) -> SignatureEvidence {
     SignatureEvidence::assemble(
         tag,
