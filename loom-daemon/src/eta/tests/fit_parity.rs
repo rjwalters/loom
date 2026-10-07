@@ -75,6 +75,7 @@ fn generate() -> Vec<TrainingRow> {
             rows.push(TrainingRow {
                 starred_any: None,
                 star_source: None,
+                planner_version: None,
                 stage,
                 group: format!("fixture#{}", rows.len()),
                 inputs,

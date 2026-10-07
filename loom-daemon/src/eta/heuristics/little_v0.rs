@@ -132,6 +132,7 @@ impl Heuristic for LittleV0 {
             queue: None,
             dependencies: None,
             regime_adjustment: None,
+            planner_version: None,
             held_heron: None,
         };
         let current = match &input.current {
