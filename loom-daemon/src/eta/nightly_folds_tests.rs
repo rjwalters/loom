@@ -11,6 +11,7 @@ use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::shadow::GateStatus;
 use crate::eta::tests::{history_a_envelopes, provenance};
 use crate::eta::Stage;
+use crate::telemetry::TelemetryRecord;
 use chrono::TimeZone;
 
 fn inputs() -> Inputs {
@@ -431,6 +432,118 @@ fn every_fixture_case_is_in_exactly_one_daily_cohort() {
     want.sort();
     folded.sort();
     assert_eq!(folded, want);
+}
+
+/// Two PRs closing one issue (#10626): A is predicted first and lands on
+/// `d + 1`, B is predicted later and lands on `d`. A waits two extra days in
+/// `merge`, so each of its stage entries is a day before B's. Returns their
+/// sweep records and the same `land` cases as the offline PR cache holds them.
+fn out_of_order_pair(d: NaiveDate) -> (Vec<TelemetryEnvelope>, Vec<ReplayCase>) {
+    let template = history_a_envelopes().remove(0);
+    let midnight = day_start(d);
+    let pair = [
+        (1, midnight + Duration::days(1) + Duration::hours(1), Duration::days(2)),
+        (2, midnight + Duration::hours(1), Duration::zero()),
+    ];
+    let envelopes: Vec<TelemetryEnvelope> = pair
+        .iter()
+        .map(|&(pr, landed, wait)| {
+            let mut e = template.clone();
+            e.emitted_at = landed;
+            let TelemetryRecord::SweepOutcome(r) = &mut e.record else {
+                panic!("the fixture's first line is a sweep.outcome");
+            };
+            r.issue = 6_000_000;
+            r.pr_number = Some(pr);
+            r.sweep_id = format!("sweep-out-of-order-{pr}");
+            let merge = r.phase_durations.last_mut().unwrap();
+            assert_eq!(merge.phase, "merge");
+            merge.duration_sec += wait.num_seconds();
+            r.total_duration_sec += wait.num_seconds();
+            e
+        })
+        .collect();
+    let cases = backtest::cases_from_envelopes(&envelopes)
+        .into_iter()
+        .filter(|c| c.kind == Kind::Land)
+        .collect();
+    (envelopes, cases)
+}
+
+/// #10626 (the #10532 Judge's probe): two PRs closing one issue overlap in
+/// every stage and land in the opposite order to their predictions. Keyed by
+/// issue and `as_of` rank alone, the later-predicted case was folded on both
+/// days and the earlier one never. Each is folded exactly once, on the day
+/// it lands, and the summary at the in-between cutoff holds the first-landed
+/// one once — whether the cases come from the PR cache, the sweep records,
+/// or both.
+#[test]
+fn same_issue_cases_landing_out_of_prediction_order_are_each_folded_once() {
+    let d = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+    let (envelopes, cases) = out_of_order_pair(d);
+    let key = |c: &ReplayCase| (c.subject.pr_number, c.stage, c.as_of);
+    let mut want: Vec<_> = cases
+        .iter()
+        .map(|c| (c.actual_at.date_naive(), key(c)))
+        .collect();
+    want.sort();
+    let mut first_landed: Vec<_> = want
+        .iter()
+        .filter(|(day, _)| *day == d)
+        .map(|(_, k)| *k)
+        .collect();
+    first_landed.sort();
+    assert!(!first_landed.is_empty() && first_landed.len() < want.len());
+    assert!(
+        cases.iter().all(|a| a.subject.pr_number != Some(1)
+            || cases
+                .iter()
+                .filter(|b| b.subject.pr_number == Some(2) && b.stage == a.stage)
+                .all(|b| a.as_of < b.as_of && a.actual_at > b.actual_at)),
+        "every A case is predicted before, and lands after, B's in its stage"
+    );
+
+    let sources = [
+        (
+            "pr cache",
+            Inputs {
+                pr_cases: cases.clone(),
+                ..Inputs::default()
+            },
+        ),
+        (
+            "sweep records",
+            Inputs {
+                envelopes: envelopes.clone(),
+                ..Inputs::default()
+            },
+        ),
+        (
+            "both",
+            Inputs {
+                envelopes: envelopes.clone(),
+                pr_cases: cases.clone(),
+                ..Inputs::default()
+            },
+        ),
+    ];
+    for (source, inputs) in sources {
+        let mut summary: Vec<_> = known_cases(&inputs, day_start(d) + Duration::days(1))
+            .iter()
+            .map(key)
+            .collect();
+        summary.sort();
+        assert_eq!(summary, first_landed, "{source}: known at d's cutoff");
+
+        let mut folded = Vec::new();
+        for offset in -1..=2 {
+            let day = d + Duration::days(offset);
+            let known = known_cases(&inputs, day_start(day) + Duration::days(1));
+            folded.extend(cohort(&inputs, day, &known).iter().map(|c| (day, key(c))));
+        }
+        folded.sort();
+        assert_eq!(folded, want, "{source}: each case once, on its landing day");
+    }
 }
 
 /// Finding 1's other half: the cross-midnight case is folded at the end of
