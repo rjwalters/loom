@@ -128,7 +128,7 @@ impl fmt::Display for TelemetryKindOtlp {
 /// version-level gate (the `ci.job.log` free-text precedent at `9`) pins a
 /// fresh literal in its row and documents the row in
 /// `defaults/docs/telemetry-schema.md`.
-pub const NEW_KIND_SCHEMA_VERSION: u32 = 13;
+pub const NEW_KIND_SCHEMA_VERSION: u32 = 12;
 
 /// One registry row, reflected at runtime — what [`TELEMETRY_KINDS`] is a slice
 /// of. Generated from the same table that generates the enum, so it can never
