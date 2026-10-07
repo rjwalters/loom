@@ -2934,6 +2934,7 @@ pub fn observe_and_fire_idle(
             root.display(),
             name
         );
+        triggers::log_idle_launch(root, name);
         tokio::spawn(async move {
             // Held for the whole invocation; the in-progress entry clears when
             // this guard drops (every exit path — success/failure/panic).
@@ -3993,6 +3994,10 @@ pub mod demand;
 // Pipeline-empty gate for hermit/architect idle generation (#10817) — see
 // `role_runner/idle_gate.rs`.
 pub mod idle_gate;
+
+// Event-driven curator/auditor/guide triggers (#10816) — see
+// `role_runner/triggers.rs`.
+pub mod triggers;
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;

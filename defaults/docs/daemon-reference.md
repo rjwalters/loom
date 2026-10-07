@@ -4627,6 +4627,37 @@ on its first tick after upgrade and stops admitting unstarred builds until its
 debt falls below `low`; that is the intended WIP limit. The escape hatches are
 `buildBackoff.enabled: false` and starring an issue.
 
+#### Event-driven curator, auditor and guide triggers (#10816)
+
+Opt-in (`autonomous.roleRunner.eventTriggers.enabled`, default `false`; env
+`LOOM_ROLE_EVENT_TRIGGERS` overrides, env > config > default; resolved per root,
+**live**). With it off, dispatch is unchanged. With it on, the interval timer
+still fires at `intervalSecs`, which becomes the *floor* on how often a trigger
+is re-checked, and the trigger decides whether an agent launches:
+
+| Role | Launches when | Input (no new forge write) |
+|---|---|---|
+| `auditor` | `origin/main` differs from the SHA its last **successful** run for this root saw | `git rev-parse refs/remotes/origin/main` on the already-fetched ref; no fetch |
+| `curator` | at least one open `loom:triage` issue (trigger `debt:untriaged`) | one ETag-cached `loom:triage` listing page |
+| `guide` | the open `loom:issue` + `loom:curated` issue-number set differs from the set its last successful run saw | the two ETag-cached label listings, every page |
+
+- **Fail open.** An input that cannot be read (git error, listing failure)
+  launches with trigger `floor`; the gate never skips on missing information.
+- **Quiet ceiling.** A role that has not launched successfully for a root in
+  `eventTriggers.maxQuietSecs` (default `86400`) launches with trigger `floor`,
+  so curator's approved-but-uncurated and blocked re-check passes, and a
+  primary clone nobody fetches, still get a daily pass.
+- **A failed run advances nothing.** The SHA / set is recorded only after a
+  run ends in success, so a failed audit retries on the next tick.
+- **Skips are not failures.** A skipped tick ends `QueueEmpty` (no agent spent,
+  `skipped_queue_empty` telemetry), never feeds the failure sentinel, and lets
+  the dispatcher hand its slot to a deferred root, like the judge/doctor queue
+  gate. Each gated tick logs one line with `role=`, `root=`, `trigger=`
+  (`event` / `debt:<axis>` / `idle` / `floor`) and `reason=`: launches at INFO,
+  skips at DEBUG. Idle-edge runs are never held back and log `trigger=idle`.
+- The last-seen state is in memory per `(root, role)`: a daemon restart forgets
+  it, so the first tick after a restart launches.
+
 #### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
 
 `autonomous.workFinder.maxConcurrent` is the only *policy* term in the cap, and
@@ -5480,6 +5511,8 @@ knobs not yet audited here.
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in — curator/judge/doctor 300s, champion/auditor/hermit 600s, guide 900s (5–15 min); `architect` 3600s, idle-addressable-only | Uniform override applied to every enabled role's cadence — **when either tier is set, every role logs the same interval and the per-role built-ins are entirely inert.** The boot log names which tier won: `role_runner: <role> interval=<n>s source=built-in|config:…|env:…` (#6204). Zero/invalid env → next tier |
 | `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace and every role** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. Since #9391 role loops dispatch repositories **concurrently** (one instance per `(repository, role)`), bounded by this ceiling plus the per-role `roleMaxConcurrent` budgets. A tick that reaches it stops admitting and logs one `WARN` summary line per role; the deferred roots retry next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.roleMaxConcurrent` | *(config only)* | `max(1, maxConcurrent / 2)` per role — **3** at the default ceiling | **Per-role budget under the host ceiling (#9391).** A `{"<role>": N}` object (e.g. `{"judge": 3, "champion": 3, "curator": 2}`) bounding how many runs of one role may be in flight across every workspace, so one role cannot take every slot. Keys are trimmed and lower-cased; a zero, negative or non-integer value is dropped per entry to the default; a value above the ceiling is clamped to it. Idle-edge runs count against it. Resolved from each root's own config and **live** (re-read every tick). See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
+| `autonomous.roleRunner.eventTriggers.enabled` | `LOOM_ROLE_EVENT_TRIGGERS` | `false` | **Event-driven curator/auditor/guide launches (#10816).** `true`: the interval fires as before but auditor launches only on a new `origin/main`, curator only with open `loom:triage` issues, guide only on a changed ready/backlog set; unobserved inputs fail open. A non-bool value drops to the default. Resolved per root, **live**. See [Event-driven curator, auditor and guide triggers](#event-driven-curator-auditor-and-guide-triggers-10816) |
+| `autonomous.roleRunner.eventTriggers.maxQuietSecs` | *(config only)* | `86400` | Quiet ceiling: a gated role that has not launched successfully for a root in this long launches anyway (trigger `floor`). Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.demandWidth.enabled` | *(config only)* | `true` | **Demand-weighted role admission (#9392).** `false` restores exactly the Phase 1 (#9391) admission: no demand-ledger reads, no reservation, no champion `loom:pr` count. A non-bool value drops to the default. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
 | `autonomous.roleRunner.demandWidth.perRun` | *(config only)* | `3` | `k` in the PR-role width `clamp(ceil(debt / k), 1, min(max, roleMaxConcurrent budget))`: queued PRs per role run. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.demandWidth.max` | *(config only)* | `4` | Upper clamp on judge, doctor and champion width. Still capped by the role's `roleMaxConcurrent` budget, so at the default ceiling of 7 (budget 3) it binds only where the budget is 4 or more — demand never raises a role above its budget. Zero, negative or non-integer drops to the default. **Live** |
