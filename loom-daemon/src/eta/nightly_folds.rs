@@ -117,6 +117,15 @@ pub fn day_path(root: &Path, day: NaiveDate) -> PathBuf {
     dir(root).join(format!("fold-{}.json", day.format("%Y-%m-%d")))
 }
 
+/// The marker that a day's records were durably queued for delivery. Computed
+/// state (`fold-<day>.json`) and delivered state are separate files so a
+/// restart between the two can recover and queue what was folded but never
+/// delivered.
+#[must_use]
+pub fn delivered_path(root: &Path, day: NaiveDate) -> PathBuf {
+    dir(root).join(format!("delivered-{}", day.format("%Y-%m-%d")))
+}
+
 /// The newest run's summaries, the `eta doctor` scoreboard's source.
 #[must_use]
 pub fn state_path(root: &Path) -> PathBuf {
@@ -238,6 +247,35 @@ pub fn done_days(root: &Path) -> BTreeSet<NaiveDate> {
             let name = e.file_name().into_string().ok()?;
             let stem = name.strip_prefix("fold-")?.strip_suffix(".json")?;
             NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
+        })
+        .collect()
+}
+
+/// Record that `day`'s records were durably queued.
+///
+/// # Errors
+/// The marker could not be written; the day stays pending.
+pub fn mark_delivered(root: &Path, day: NaiveDate) -> std::io::Result<()> {
+    super::health::write_atomic(&delivered_path(root, day), "delivered\n")
+}
+
+/// Every folded day whose records were not yet durably queued, oldest first,
+/// read back from the saved fold files. A file that no longer parses is
+/// skipped (and logged): it can never be delivered.
+#[must_use]
+pub fn pending_delivery(root: &Path) -> Vec<(NaiveDate, DayRecords)> {
+    done_days(root)
+        .into_iter()
+        .filter(|day| !delivered_path(root, *day).exists())
+        .filter_map(|day| {
+            let path = day_path(root, day);
+            let parsed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<DayRecords>(&text).ok());
+            if parsed.is_none() {
+                log::warn!("eta nightly folds: {} is unreadable; not delivered", path.display());
+            }
+            parsed.map(|records| (day, records))
         })
         .collect()
 }

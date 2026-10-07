@@ -14,6 +14,13 @@
 //!   exactly like ci-telemetry's singleton gate): `fleet.captain` must name a
 //!   host for the scoreboard to exist. The refusal is logged at `warn` and
 //!   listed in `host.health.captainless_singleton_jobs` (#9014).
+//! - **Durable delivery.** The saved `fold-<day>.json` is both the computed
+//!   state and the recovery context: each tick queues every folded day that
+//!   has no `delivered-<day>` marker ([`deliver_pending`]), with durable
+//!   offers, and writes the marker only after all of that day's records were
+//!   offered. A restart between fold and enqueue, a missing sink, or a failing
+//!   queue leaves the day pending; a partial retry re-offers records with the
+//!   same `fold_id` / `summary_id` for the collector to dedupe.
 //! - **Isolation.** The fold runs in `spawn_blocking`; a failure or panic is
 //!   logged at `warn` and retried on the next check. It never takes the ETA
 //!   tracker's state lock.
@@ -117,35 +124,63 @@ pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> Fol
     gate
 }
 
-/// Offer every record of `days` to `sink`, oldest day first, a record whose
-/// provenance does not validate dropped. Returns how many were offered.
-pub fn emit(sink: Option<&dyn QueueSink>, host_id: &str, days: &[DayRecords]) -> usize {
+/// Durably offer every record of `day` to `sink`, folds then summaries, a
+/// record whose provenance does not validate dropped (it can never be
+/// delivered, so it must not hold the day open). Returns how many were
+/// offered; the first failed offer stops and surfaces, leaving the day pending.
+/// Records already offered stay queued, and a retry re-offers them: each
+/// carries a stable id (`fold_id` / `summary_id`) for the collector to dedupe.
+///
+/// # Errors
+/// A durable offer failed.
+pub fn emit_day(sink: &dyn QueueSink, host_id: &str, day: &DayRecords) -> std::io::Result<usize> {
+    let mut offered = 0;
+    for fold in &day.folds {
+        if !fold.has_provenance() {
+            log::warn!("eta nightly folds: dropped eta.backtest.fold: invalid provenance");
+            continue;
+        }
+        sink.offer_durable(TelemetryEnvelope::new(
+            host_id,
+            TelemetryRecord::EtaBacktestFold(fold.clone()),
+        ))?;
+        offered += 1;
+    }
+    for summary in &day.summaries {
+        if !summary.has_provenance() {
+            log::warn!("eta nightly folds: dropped eta.backtest.summary: invalid provenance");
+            continue;
+        }
+        sink.offer_durable(TelemetryEnvelope::new(
+            host_id,
+            TelemetryRecord::EtaBacktestSummary(summary.clone()),
+        ))?;
+        offered += 1;
+    }
+    Ok(offered)
+}
+
+/// Queue every folded-but-undelivered day for `root`, oldest first, marking a
+/// day delivered only once all of its records were durably offered. With no
+/// `sink` nothing is consumed: the days stay pending until one is configured.
+/// A failed offer or marker write stops the pass (order is kept) and the day
+/// is retried next tick. Returns how many records were offered.
+pub fn deliver_pending(root: &Path, sink: Option<&dyn QueueSink>, host_id: &str) -> usize {
     let Some(sink) = sink else {
         return 0;
     };
     let mut offered = 0;
-    for day in days {
-        for fold in &day.folds {
-            if !fold.has_provenance() {
-                log::warn!("eta nightly folds: dropped eta.backtest.fold: invalid provenance");
-                continue;
+    for (day, records) in nightly_folds::pending_delivery(root) {
+        match emit_day(sink, host_id, &records) {
+            Ok(n) => offered += n,
+            Err(e) => {
+                log::warn!("eta nightly folds: queuing {} failed, will retry: {e}", records.day);
+                break;
             }
-            sink.offer(TelemetryEnvelope::new(
-                host_id,
-                TelemetryRecord::EtaBacktestFold(fold.clone()),
-            ));
-            offered += 1;
         }
-        for summary in &day.summaries {
-            if !summary.has_provenance() {
-                log::warn!("eta nightly folds: dropped eta.backtest.summary: invalid provenance");
-                continue;
-            }
-            sink.offer(TelemetryEnvelope::new(
-                host_id,
-                TelemetryRecord::EtaBacktestSummary(summary.clone()),
-            ));
-            offered += 1;
+        if let Err(e) = nightly_folds::mark_delivered(root, day) {
+            log::warn!("eta nightly folds: marking {} delivered failed: {e}", records.day);
+            break;
         }
     }
     offered
@@ -197,7 +232,14 @@ pub fn spawn_task(
                 continue;
             }
             let root = workspace_root.clone();
-            match tokio::task::spawn_blocking(move || fold_due(&root)).await {
+            let tick_sink = sink.clone();
+            let tick_host = host_id.clone();
+            let tick = move || {
+                let days = fold_due(&root);
+                deliver_pending(&root, tick_sink.as_deref(), &tick_host);
+                days
+            };
+            match tokio::task::spawn_blocking(tick).await {
                 Ok(days) => {
                     for day in &days {
                         log::info!(
@@ -207,7 +249,6 @@ pub fn spawn_task(
                             day.summaries.len()
                         );
                     }
-                    emit(sink.as_deref(), &host_id, &days);
                 }
                 Err(_) => {
                     log::warn!("eta nightly folds: the fold panicked, retrying next check");
@@ -300,34 +341,67 @@ mod tests {
         crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
     }
 
-    #[test]
-    fn emit_offers_every_fold_then_summary_and_nothing_without_a_sink() {
-        let root = tempfile::tempdir().unwrap();
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
-        let inputs = nightly_folds::Inputs::default();
-        let records = nightly_folds::run_day(
-            &inputs,
-            day,
+    /// Folds one day into `root` the way a tick does, returning its records.
+    fn fold_one_day(root: &Path) -> DayRecords {
+        let provenance = Provenance {
+            version: "0.0.0".into(),
+            revision: "a".repeat(40),
+            tree_state: "clean".into(),
+            complete: true,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut days = nightly_folds::run_due(
+            root,
+            now,
             None,
             &|h| h,
             &|_| crate::eta::Registry::builtin(),
-            &Provenance {
-                version: "0.0.0".into(),
-                revision: "a".repeat(40),
-                tree_state: "clean".into(),
-                complete: true,
-            },
+            &provenance,
         );
-        let sink = Collect::default();
-        let offered = emit(Some(&sink), "host", std::slice::from_ref(&records));
-        assert_eq!(offered, records.folds.len() + records.summaries.len());
-        let kinds: Vec<&str> = sink
-            .0
+        assert_eq!(days.len(), 1);
+        days.remove(0)
+    }
+
+    /// A sink whose durable offers fail until `healthy` is set.
+    struct Flaky {
+        inner: Collect,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+
+    impl QueueSink for Flaky {
+        fn offer(&self, envelope: TelemetryEnvelope) {
+            self.inner.offer(envelope);
+        }
+
+        fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+            if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.offer(envelope);
+                Ok(())
+            } else {
+                Err(std::io::Error::other("queue write failed"))
+            }
+        }
+    }
+
+    fn kinds(sink: &Collect) -> Vec<&'static str> {
+        sink.0
             .lock()
             .unwrap()
             .iter()
             .map(|e| e.record.kind())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_folded_day_is_queued_folds_then_summaries_and_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let records = fold_one_day(root.path());
+        let sink = Collect::default();
+        let offered = deliver_pending(root.path(), Some(&sink), "host");
+        assert_eq!(offered, records.folds.len() + records.summaries.len());
+        let kinds = kinds(&sink);
         assert_eq!(
             kinds.iter().filter(|k| **k == "eta.backtest.fold").count(),
             records.folds.len()
@@ -339,7 +413,76 @@ mod tests {
                 .count(),
             records.summaries.len()
         );
-        assert_eq!(emit(None, "host", std::slice::from_ref(&records)), 0);
-        drop(root);
+        let first_summary = kinds.iter().position(|k| *k == "eta.backtest.summary");
+        let last_fold = kinds.iter().rposition(|k| *k == "eta.backtest.fold");
+        if let (Some(summary), Some(fold)) = (first_summary, last_fold) {
+            assert!(fold < summary, "folds before summaries");
+        }
+        assert_eq!(deliver_pending(root.path(), Some(&sink), "host"), 0, "delivered once");
+    }
+
+    /// #10532 review: a restart after `fold-<day>.json` is written but before
+    /// the offer must not lose the day — `run_due` returns nothing for it, yet
+    /// the saved records are still queued.
+    #[test]
+    fn a_restart_between_fold_and_enqueue_still_delivers_the_day() {
+        let root = tempfile::tempdir().unwrap();
+        let records = fold_one_day(root.path());
+        let before = std::fs::read_to_string(nightly_folds::day_path(
+            root.path(),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+        ))
+        .unwrap();
+        // "Restart": nothing was offered, and the fold is not recomputed.
+        let sink = Collect::default();
+        assert_eq!(
+            deliver_pending(root.path(), Some(&sink), "host"),
+            records.folds.len() + records.summaries.len()
+        );
+        let after = std::fs::read_to_string(nightly_folds::day_path(
+            root.path(),
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(before, after, "the computed fold is unchanged");
+    }
+
+    #[test]
+    fn no_sink_retains_the_day_until_one_is_configured() {
+        let root = tempfile::tempdir().unwrap();
+        let records = fold_one_day(root.path());
+        assert_eq!(deliver_pending(root.path(), None, "host"), 0);
+        assert_eq!(nightly_folds::pending_delivery(root.path()).len(), 1);
+        let sink = Collect::default();
+        assert_eq!(
+            deliver_pending(root.path(), Some(&sink), "host"),
+            records.folds.len() + records.summaries.len()
+        );
+        assert!(nightly_folds::pending_delivery(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_failing_sink_keeps_the_day_pending_until_it_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let records = fold_one_day(root.path());
+        let sink = Flaky {
+            inner: Collect::default(),
+            healthy: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert_eq!(deliver_pending(root.path(), Some(&sink), "host"), 0);
+        assert_eq!(nightly_folds::pending_delivery(root.path()).len(), 1, "still pending");
+
+        sink.healthy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            deliver_pending(root.path(), Some(&sink), "host"),
+            records.folds.len() + records.summaries.len()
+        );
+        assert!(nightly_folds::pending_delivery(root.path()).is_empty());
+        assert_eq!(
+            sink.inner.0.lock().unwrap().len(),
+            records.folds.len() + records.summaries.len(),
+            "every record queued exactly once after recovery"
+        );
     }
 }
