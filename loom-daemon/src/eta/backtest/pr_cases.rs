@@ -803,6 +803,34 @@ pub fn cases_from_pr_records_with_roster(
     build_cases(records, Some(history))
 }
 
+/// Fill the unread `linked_star` of each record from the cached star events
+/// (#10372, #10508), so a forge-fetched or saved record carries the instants
+/// its linked issue's star turned on and off.
+///
+/// A record is read at its end (`merged_at`, else `closed_at`, else `now`),
+/// by [`crate::eta::star::RepoStar::linked_at`]: strictly-before facts only,
+/// and `None` (still unread, hence unknown, never unstarred) when the repo's
+/// cache does not cover that instant. A record that already carries
+/// `linked_star` is left as it is. Returns how many records were filled.
+pub fn fill_linked_stars(
+    records: &mut [PrCaseRecord],
+    stars: &crate::eta::star::StarInputs,
+    now: DateTime<Utc>,
+) -> usize {
+    let mut filled = 0;
+    for r in records.iter_mut().filter(|r| r.linked_star.is_none()) {
+        let Some(repo) = stars.repos.get(&r.repo.to_ascii_lowercase()) else {
+            continue;
+        };
+        let end = r.merged_at.or(r.closed_at).unwrap_or(now);
+        if let Some(linked) = repo.linked_at(r.number, end) {
+            r.linked_star = Some(linked.changes);
+            filled += 1;
+        }
+    }
+    filled
+}
+
 /// Shared body: `priority` is `None` for no priority inputs at all, else the
 /// roster history the builder reads.
 fn build_cases(

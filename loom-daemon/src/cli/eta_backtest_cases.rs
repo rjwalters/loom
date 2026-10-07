@@ -270,7 +270,18 @@ pub(crate) fn add_pr_cases(
 
     // The `eta-fit/v2` priority inputs (#10508): the cached fleet roster
     // history, or unknown (never today's `repos.yml`) when there is none.
-    let history = loom_daemon::eta::roster_history::load_for(root, chrono::Utc::now()).0;
+    let now = chrono::Utc::now();
+    let history = loom_daemon::eta::roster_history::load_for(root, now).0;
+    // The linked-issue star of each record, from the cached raw events where
+    // they cover it; otherwise the record stays unread (unknown).
+    let repos: Vec<String> = records
+        .iter()
+        .map(|r| r.repo.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let stars = loom_daemon::eta::star::StarInputs::load(root, &repos);
+    backtest::fill_linked_stars(&mut records, &stars, now);
     let (pr_cases, summary) = cases_from_pr_records_with_roster(&records, history.as_deref());
     let (merged, dropped) = backtest::merge_case_sets(base, pr_cases);
     Ok((merged, Some(describe(&summary, dropped))))
