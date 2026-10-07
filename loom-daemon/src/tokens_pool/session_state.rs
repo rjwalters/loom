@@ -9,12 +9,12 @@
 //! Liveness-aware selection (#10454, `session_lifecycle/liveness.rs`) reads
 //! it too since #10660: [`latest`] in the daemon, one [`snapshot`] in the
 //! out-of-process selector. The reconciler (#10453, `session_reconcile.rs`)
-//! still inspects each account itself; moving it, and mount-drift detection
-//! (#10364), onto [`snapshot`] / [`latest`] is a tracked follow-up, so there
-//! are two docker read paths until then. It has two layers:
+//! takes its own fresh [`snapshot`] each pass, and `loom-daemon status`
+//! reads [`latest`] (#10600). It has two layers:
 //!
-//! * [`classify_inspect`] and [`container_running`] are **pure** over one
-//!   `docker inspect` object, so every caller classifies the same way.
+//! * [`classify_inspect`], [`effective_drift`] and [`container_running`] are
+//!   **pure** over one `docker inspect` object, so every caller classifies
+//!   the same way.
 //! * [`snapshot`] is the **only I/O**: one bounded pass that reads every
 //!   `loom-codex-session-*` container at once (`docker ps -a` plus a single
 //!   `docker inspect` of the names it found, never one call per account) and
@@ -32,13 +32,26 @@
 //!   this is checked first; it is down, never `running` or `stale_mounts`.
 //! * `missing` — a successful snapshot holds no container by that name.
 //! * `stale_mounts` — running but its workspace mounts differ from what
-//!   `session start` would mount today ([`mount_drift`], #10364): it lacks a
-//!   registered root under its own workspace label (a repository registered
+//!   `session start` would mount today ([`effective_drift`], #10364): it lacks
+//!   a registered root under its own workspace label (a repository registered
 //!   after it was created), **or** it still mounts one that is no longer
 //!   registered (a deregistered repository, which Codex can still write with
-//!   its own sandbox off, #9979). A private-clone container
+//!   its own sandbox off, #9979), **or** it mounts one `session start` would
+//!   refuse today even though it is registered (the home directory, a
+//!   `firewall: true` repository). A private-clone container
 //!   (`loom.workspace-mode=private-clone`) mounts one repository volume, not
 //!   the registry, so it never gets a drift verdict.
+//!
+//! ## One drift definition (#10600)
+//!
+//! [`effective_drift`] is the only definition of "drifted". The gauge and the
+//! WARN tracker (through [`snapshot`]'s classification), `loom-daemon
+//! status`, the `workspace add/remove` report and the session reconciler all
+//! read it, so a container the reconciler is about to remove never reads
+//! `running` anywhere. Its inputs are [`DriftInputs`]. Missing information
+//! is never drift: an unreadable registry gives **no verdict** (the container
+//! reads `running`), and an unreadable fleet roster means nothing is
+//! `denied` (unknown is not denied), exactly as the reconciler acts.
 //!
 //! ## "Not found" is not "could not ask"
 //!
@@ -64,6 +77,7 @@ use super::session_lifecycle::{
     profile_control_destination, workspace_mount_roots, CONTAINER_CODEX_HOME, PROFILE_CONTROLS,
     WORKSPACE_LABEL,
 };
+pub use super::session_mount_gate::Denials;
 
 /// The name prefix every session container carries
 /// (`session_lifecycle::container_name`).
@@ -266,6 +280,120 @@ pub fn mount_drift(state: &Value, registered: &[PathBuf]) -> MountDrift {
     }
 }
 
+/// A container's drift as the session reconciler acts on it (#10364 Part B):
+/// the one definition of "drifted" (#10600).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveDrift {
+    /// [`mount_drift`], with every `denied` mount added to `extra`.
+    pub drift: MountDrift,
+    /// Mounted paths the denials positively refuse. Empty when the denials
+    /// could not be read (unknown is not denied).
+    pub denied: Vec<PathBuf>,
+}
+
+impl EffectiveDrift {
+    /// No drift in either direction, nothing denied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.drift.is_empty()
+    }
+
+    /// `extra` mounts that are not also `denied` (a deregistered repository).
+    #[must_use]
+    pub fn extra_not_denied(&self) -> Vec<PathBuf> {
+        self.drift
+            .extra
+            .iter()
+            .filter(|path| !self.denied.contains(path))
+            .cloned()
+            .collect()
+    }
+}
+
+/// [`mount_drift`] of `inspect` against `registered`, plus every workspace
+/// mount `denials` refuses today (the home directory or an ancestor, an
+/// overlap with a `firewall: true` repository) **even if it is still
+/// registered**: those count as `extra` and are listed in `denied`. `None`
+/// for `denials` (they could not be read) adds nothing. Empty for a
+/// private-clone or unlabelled container.
+#[must_use]
+pub fn effective_drift(
+    inspect: &Value,
+    registered: &[PathBuf],
+    denials: Option<&Denials>,
+) -> EffectiveDrift {
+    let mut drift = mount_drift(inspect, registered);
+    let denied: Vec<PathBuf> = denials.map_or_else(Vec::new, |denials| {
+        workspace_mounts(inspect)
+            .into_iter()
+            .filter(|mount| denials.check(std::slice::from_ref(mount)).is_err())
+            .collect()
+    });
+    for mount in &denied {
+        if !drift.extra.contains(mount) {
+            drift.extra.push(mount.clone());
+        }
+    }
+    drift.extra.sort();
+    EffectiveDrift { drift, denied }
+}
+
+/// What a drift verdict reads besides the container itself.
+#[derive(Clone, Copy)]
+pub struct DriftInputs<'a> {
+    /// The workspace registry's roots now; `None` when it could not be read,
+    /// which gives no verdict at all.
+    pub registered: Option<&'a [PathBuf]>,
+    /// The denials for a container's workspace label
+    /// ([`Denials::load`] in production). `Err`: cannot be decided, which
+    /// is neither "denied" nor "allowed".
+    pub denials_for: &'a dyn Fn(&Path) -> anyhow::Result<Denials>,
+}
+
+fn denials_not_read(_: &Path) -> anyhow::Result<Denials> {
+    anyhow::bail!("denials not read")
+}
+
+impl<'a> DriftInputs<'a> {
+    /// The production inputs: `registered` as read, and [`Denials::load`].
+    #[must_use]
+    pub fn new(registered: Option<&'a [PathBuf]>) -> Self {
+        Self {
+            registered,
+            denials_for: &Denials::load,
+        }
+    }
+
+    /// `registered` is known; the denials are not read (nothing is denied).
+    #[must_use]
+    pub fn registry(registered: &'a [PathBuf]) -> Self {
+        Self {
+            registered: Some(registered),
+            denials_for: &denials_not_read,
+        }
+    }
+
+    /// Nothing is known: no container gets a drift verdict (the
+    /// out-of-process selector, which only asks "is it down").
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            registered: None,
+            denials_for: &denials_not_read,
+        }
+    }
+
+    /// `inspect`'s [`effective_drift`], or `None` (no verdict) for a
+    /// private-clone or unlabelled container, or when the registry is unknown.
+    #[must_use]
+    pub fn verdict(&self, inspect: &Value) -> Option<EffectiveDrift> {
+        let registered = self.registered?;
+        let label = workspace_label(inspect).filter(|_| !is_private_clone(inspect))?;
+        let denials = (self.denials_for)(label).ok();
+        Some(effective_drift(inspect, registered, denials.as_ref()))
+    }
+}
+
 /// Whether dispatching into `state` with `--workdir workdir` would fail
 /// because no mount of the container covers the workdir (#10364): Docker's
 /// `chdir to cwd … no such file or directory`. Never for a private-clone
@@ -284,33 +412,47 @@ pub fn container_running(state: &Value) -> bool {
         && state["State"]["Restarting"] != Value::Bool(true)
 }
 
-/// Classify one `docker inspect` object (`None`: no such container) against
-/// the daemon's registered workspace roots.
+/// Classify one `docker inspect` object (`None`: no such container) with
+/// `inputs` ([`effective_drift`]).
 #[must_use]
-pub fn classify_inspect(state: Option<&Value>, registered: &[PathBuf]) -> SessionState {
-    let Some(state) = state else {
-        return SessionState::Missing;
-    };
+pub fn classify_inspect(state: Option<&Value>, inputs: &DriftInputs<'_>) -> SessionState {
+    state.map_or(SessionState::Missing, |state| state_with(state, inputs.verdict(state).as_ref()))
+}
+
+fn state_with(state: &Value, drift: Option<&EffectiveDrift>) -> SessionState {
     if state["State"]["Restarting"] == Value::Bool(true) {
-        return SessionState::Restarting;
-    }
-    if !container_running(state) {
-        return SessionState::Stopped;
-    }
-    if mount_drift(state, registered).is_empty() {
+        SessionState::Restarting
+    } else if !container_running(state) {
+        SessionState::Stopped
+    } else if drift.is_none_or(EffectiveDrift::is_empty) {
         SessionState::Running
     } else {
         SessionState::StaleMounts
     }
 }
 
-/// One container in an available snapshot: its state against the roots the
-/// snapshot was taken with, and the raw inspect object, so a caller that needs
-/// more (mount drift, #10364) never asks docker again.
+/// One container in an available snapshot: its state against the inputs the
+/// snapshot was taken with, its drift verdict, and the raw inspect object, so
+/// a caller that needs more never asks docker again.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
     pub state: SessionState,
     pub inspect: Value,
+    /// Its [`effective_drift`] (running or not); `None`: no verdict.
+    pub drift: Option<EffectiveDrift>,
+}
+
+impl Observed {
+    /// Classify one inspect object with `inputs`.
+    #[must_use]
+    pub fn of(inspect: Value, inputs: &DriftInputs<'_>) -> Self {
+        let drift = inputs.verdict(&inspect);
+        Self {
+            state: state_with(&inspect, drift.as_ref()),
+            inspect,
+            drift,
+        }
+    }
 }
 
 /// Every session container at one moment, or why docker could not say.
@@ -368,7 +510,7 @@ pub fn parse_ps_names(stdout: &str) -> Vec<String> {
 #[must_use]
 pub fn parse_inspect_array(
     stdout: &[u8],
-    registered: &[PathBuf],
+    inputs: &DriftInputs<'_>,
 ) -> Option<BTreeMap<String, Observed>> {
     let parsed: Value = serde_json::from_slice(stdout).ok()?;
     let objects = parsed.as_array()?;
@@ -377,13 +519,7 @@ pub fn parse_inspect_array(
             .iter()
             .filter_map(|object| {
                 let name = object["Name"].as_str()?.trim_start_matches('/');
-                Some((
-                    name.to_string(),
-                    Observed {
-                        state: classify_inspect(Some(object), registered),
-                        inspect: object.clone(),
-                    },
-                ))
+                Some((name.to_string(), Observed::of(object.clone(), inputs)))
             })
             .collect(),
     )
@@ -393,7 +529,7 @@ pub fn parse_inspect_array(
 /// `docker inspect` of all of them, both inside `deadline`. Blocking; run it
 /// off the async runtime (`spawn_blocking`).
 #[must_use]
-pub fn snapshot(docker: &str, registered: &[PathBuf], deadline: Duration) -> Snapshot {
+pub fn snapshot(docker: &str, inputs: &DriftInputs<'_>, deadline: Duration) -> Snapshot {
     let until = Instant::now() + deadline;
     let ps = match run_bounded(
         docker,
@@ -429,7 +565,7 @@ pub fn snapshot(docker: &str, registered: &[PathBuf], deadline: Duration) -> Sna
         Ok(ran) if !ran.success && !only_not_found(&ran.stderr) => {
             Snapshot::Unavailable(format!("docker inspect failed: {}", first_line(&ran.stderr)))
         }
-        Ok(ran) => parse_inspect_array(&ran.stdout, registered).map_or_else(
+        Ok(ran) => parse_inspect_array(&ran.stdout, inputs).map_or_else(
             || {
                 Snapshot::Unavailable(format!(
                     "docker inspect output did not parse: {}",
@@ -496,12 +632,30 @@ fn run_bounded(docker: &str, args: &[&str], until: Instant) -> Result<Ran, Strin
 static LATEST: Mutex<Option<(Instant, Arc<Snapshot>)>> = Mutex::new(None);
 
 /// Record `snapshot` as the newest one (the daemon's watch loop does this once
-/// per pass). `started` is when the snapshot began, so [`latest`]'s age is
-/// never understated by the time docker took to answer.
+/// per pass, and the reconciler right after it starts a container, #10600).
+/// `started` is when the snapshot began, so [`latest`]'s age is never
+/// understated by the time docker took to answer. A snapshot that began
+/// before the one already published is dropped: a slow watch pass finishing
+/// after the reconciler's fresher read must not replace it.
 pub fn publish(snapshot: Arc<Snapshot>, started: Instant) {
-    *LATEST
+    let mut guard = LATEST
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((started, snapshot));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.as_ref().is_none_or(|(at, _)| *at <= started) {
+        *guard = Some((started, snapshot));
+    }
+}
+
+/// The newest published snapshot and its age, however old (`None`: none
+/// published yet). For reporting staleness, never for a decision: a
+/// decision reads [`latest`].
+#[must_use]
+pub fn newest() -> Option<(Duration, Arc<Snapshot>)> {
+    LATEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|(at, snapshot)| (at.elapsed(), Arc::clone(snapshot)))
 }
 
 /// The newest published snapshot, if it is younger than `max_age`. `None`
@@ -585,10 +739,16 @@ mod tests {
         let ws = Ws::new(&["a", "b"]);
         let roots = ws.roots(&["a", "b"]);
         let up = inspect(true, Some(&ws.label()), &[ws.p("a"), ws.p("b")]);
-        assert_eq!(classify_inspect(Some(&up), &roots), SessionState::Running);
+        assert_eq!(
+            classify_inspect(Some(&up), &DriftInputs::registry(&roots)),
+            SessionState::Running
+        );
         let down = inspect(false, Some(&ws.label()), &[ws.p("a"), ws.p("b")]);
-        assert_eq!(classify_inspect(Some(&down), &roots), SessionState::Stopped);
-        assert_eq!(classify_inspect(None, &roots), SessionState::Missing);
+        assert_eq!(
+            classify_inspect(Some(&down), &DriftInputs::registry(&roots)),
+            SessionState::Stopped
+        );
+        assert_eq!(classify_inspect(None, &DriftInputs::registry(&roots)), SessionState::Missing);
     }
 
     #[test]
@@ -599,7 +759,7 @@ mod tests {
         assert_eq!(drift.missing, ws.roots(&["b"]));
         assert!(drift.extra.is_empty());
         assert_eq!(
-            classify_inspect(Some(&state), &ws.roots(&["a", "b"])),
+            classify_inspect(Some(&state), &DriftInputs::registry(&ws.roots(&["a", "b"]))),
             SessionState::StaleMounts
         );
     }
@@ -611,7 +771,10 @@ mod tests {
         let drift = mount_drift(&state, &ws.roots(&["a"]));
         assert!(drift.missing.is_empty());
         assert_eq!(drift.extra, ws.roots(&["gone"]));
-        assert_eq!(classify_inspect(Some(&state), &ws.roots(&["a"])), SessionState::StaleMounts);
+        assert_eq!(
+            classify_inspect(Some(&state), &DriftInputs::registry(&ws.roots(&["a"]))),
+            SessionState::StaleMounts
+        );
     }
 
     #[test]
@@ -684,7 +847,7 @@ mod tests {
         let mut looping = inspect(true, Some(&ws.label()), &[ws.p("a")]);
         looping["State"]["Restarting"] = json!(true);
         assert_eq!(
-            classify_inspect(Some(&looping), &roots),
+            classify_inspect(Some(&looping), &DriftInputs::registry(&roots)),
             SessionState::Restarting,
             "never running, and never stale_mounts despite the missing b mount"
         );
@@ -702,7 +865,10 @@ mod tests {
         roots.extend(other.roots(&["c"]));
         let up = inspect(true, Some(&ws.label()), &[ws.p("a"), ws.p("b")]);
         assert!(mount_drift(&up, &roots).is_empty());
-        assert_eq!(classify_inspect(Some(&up), &roots), SessionState::Running);
+        assert_eq!(
+            classify_inspect(Some(&up), &DriftInputs::registry(&roots)),
+            SessionState::Running
+        );
     }
 
     #[test]
@@ -710,7 +876,10 @@ mod tests {
         let ws = Ws::new(&["a"]);
         let up = inspect(true, None, &[ws.p("gone")]);
         assert!(mount_drift(&up, &ws.roots(&["a"])).is_empty());
-        assert_eq!(classify_inspect(Some(&up), &ws.roots(&["a"])), SessionState::Running);
+        assert_eq!(
+            classify_inspect(Some(&up), &DriftInputs::registry(&ws.roots(&["a"]))),
+            SessionState::Running
+        );
     }
 
     #[test]
@@ -727,7 +896,10 @@ mod tests {
         );
         assert!(is_private_clone(&state));
         assert!(mount_drift(&state, &ws.roots(&["a"])).is_empty());
-        assert_eq!(classify_inspect(Some(&state), &ws.roots(&["a"])), SessionState::Running);
+        assert_eq!(
+            classify_inspect(Some(&state), &DriftInputs::registry(&ws.roots(&["a"]))),
+            SessionState::Running
+        );
     }
 
     #[test]
@@ -779,13 +951,19 @@ mod tests {
         a["Name"] = json!("/loom-codex-session-a");
         let mut b = inspect(false, None, &[]);
         b["Name"] = json!("/loom-codex-session-b");
-        let map = parse_inspect_array(&serde_json::to_vec(&json!([a, b])).unwrap(), &[]).unwrap();
+        let map = parse_inspect_array(
+            &serde_json::to_vec(&json!([a, b])).unwrap(),
+            &DriftInputs::registry(&[]),
+        )
+        .unwrap();
         let snapshot = Snapshot::Available(map);
         assert_eq!(snapshot.state_of("loom-codex-session-a"), Some(SessionState::Running));
         assert_eq!(snapshot.state_of("loom-codex-session-b"), Some(SessionState::Stopped));
         assert_eq!(snapshot.state_of("loom-codex-session-c"), Some(SessionState::Missing));
         assert!(snapshot.inspect_of("loom-codex-session-a").is_some());
-        assert!(parse_inspect_array(b"Error: No such object", &[]).is_none());
+        assert!(
+            parse_inspect_array(b"Error: No such object", &DriftInputs::registry(&[])).is_none()
+        );
         let gone = Snapshot::Unavailable("docker down".into());
         assert_eq!(gone.state_of("loom-codex-session-a"), None);
     }
@@ -805,6 +983,11 @@ mod tests {
     fn latest_honours_max_age() {
         publish(Arc::new(Snapshot::Available(BTreeMap::new())), Instant::now());
         assert!(latest(LATEST_MAX_AGE).is_some());
+        // A snapshot that began earlier never replaces a newer one (#10600).
+        let older = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();
+        publish(Arc::new(Snapshot::Unavailable("older".into())), older);
+        let (age, _) = newest().unwrap();
+        assert!(age < Duration::from_secs(30), "the newer snapshot stays: {age:?}");
         std::thread::sleep(Duration::from_millis(20));
         assert!(latest(Duration::from_millis(1)).is_none(), "too old to use");
     }
@@ -836,7 +1019,7 @@ esac"#,
                     calls = calls.display()
                 ),
             );
-            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            let snap = snapshot(&docker, &DriftInputs::registry(&[]), Duration::from_secs(5));
             assert_eq!(snap.state_of("loom-codex-session-a"), Some(SessionState::Restarting));
             assert_eq!(snap.state_of("loom-codex-session-gone"), Some(SessionState::Missing));
             assert_eq!(std::fs::read_to_string(calls).unwrap(), "ps\ninspect\n");
@@ -854,7 +1037,7 @@ esac"#,
   inspect) echo '[]'; echo 'failed to connect to the docker API at unix:///var/run/docker.sock' >&2; exit 1 ;;
 esac"#,
             );
-            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            let snap = snapshot(&docker, &DriftInputs::registry(&[]), Duration::from_secs(5));
             assert!(
                 matches!(&snap, Snapshot::Unavailable(r) if r.contains("failed to connect")),
                 "{snap:?}"
@@ -866,7 +1049,7 @@ esac"#,
         fn no_containers_means_no_inspect_and_an_empty_available_map() {
             let dir = tempfile::tempdir().unwrap();
             let docker = fake(dir.path(), r#"[ "$1" = ps ] || exit 9"#);
-            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            let snap = snapshot(&docker, &DriftInputs::registry(&[]), Duration::from_secs(5));
             assert_eq!(snap, Snapshot::Available(BTreeMap::new()));
             assert_eq!(snap.state_of("loom-codex-session-a"), Some(SessionState::Missing));
         }
@@ -875,10 +1058,14 @@ esac"#,
         fn an_unreachable_docker_daemon_is_unavailable_not_missing() {
             let dir = tempfile::tempdir().unwrap();
             let docker = fake(dir.path(), "echo 'Cannot connect to the Docker daemon' >&2; exit 1");
-            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            let snap = snapshot(&docker, &DriftInputs::registry(&[]), Duration::from_secs(5));
             assert!(matches!(&snap, Snapshot::Unavailable(r) if r.contains("Cannot connect")));
             assert_eq!(snap.state_of("loom-codex-session-a"), None);
-            let absent = snapshot("/nonexistent/docker", &[], Duration::from_secs(5));
+            let absent = snapshot(
+                "/nonexistent/docker",
+                &DriftInputs::registry(&[]),
+                Duration::from_secs(5),
+            );
             assert!(matches!(absent, Snapshot::Unavailable(_)));
         }
 
@@ -887,7 +1074,7 @@ esac"#,
             let dir = tempfile::tempdir().unwrap();
             let docker = fake(dir.path(), "exec sleep 30");
             let started = Instant::now();
-            let snap = snapshot(&docker, &[], Duration::from_millis(300));
+            let snap = snapshot(&docker, &DriftInputs::registry(&[]), Duration::from_millis(300));
             assert!(matches!(&snap, Snapshot::Unavailable(r) if r.contains("timed out")));
             assert!(started.elapsed() < Duration::from_secs(5));
         }

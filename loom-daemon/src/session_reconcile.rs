@@ -95,6 +95,17 @@
 //! ([`SessionLifecycle::start_unless_held`]) and, before a drift recreate,
 //! a fresh inspect (same container id) plus the `docker top` in-flight check.
 //!
+//! # After a start: publish at once (#10600)
+//!
+//! A pass that started or recreated a container takes one more bounded
+//! snapshot and publishes it ([`session_state::publish`]), so liveness-aware
+//! selection sees the container at once instead of up to a watch interval
+//! later. Its outcomes are recorded for `loom-daemon status`
+//! ([`crate::session_status::record_pass`]). An operator's `accounts session
+//! start` runs in another process and cannot publish: selection sees that
+//! container at the watch's next pass (at most 60 s; never older than
+//! [`session_state::LATEST_MAX_AGE`]).
+//!
 //! # Mount drift (#10364 Part B)
 //!
 //! A running host-mode container whose workspace mounts differ from what the
@@ -120,7 +131,7 @@ use crate::tokens_pool::session_lifecycle::{
     ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, SESSION_POSTURE,
     SESSION_POSTURE_LABEL,
 };
-use crate::tokens_pool::session_state::{self, MountDrift, Snapshot};
+use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
@@ -976,9 +987,12 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .map(|(_, inv)| inv.as_slice())
             .collect::<Vec<_>>(),
     );
-    // One container read for the whole pass (every root), taken lazily.
-    let mut take =
-        || session_state::snapshot("docker", &registered, session_state::SNAPSHOT_DEADLINE);
+    // One container read for the whole pass (every root), taken lazily,
+    // classified with the shared drift definition (#10600).
+    let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
+    let read =
+        || session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+    let mut take = read;
     let mut observe = PassSnapshot::new(&mut take);
     let dispatch_locks = session_dispatch_lock::lock_dir();
     let mut seen = HashSet::new();
@@ -1044,6 +1058,12 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    if all.iter().any(|o| o.outcome.started()) {
+        // Selection reads the published snapshot: show it the start now.
+        let started = std::time::Instant::now();
+        session_state::publish(std::sync::Arc::new(read()), started);
+    }
+    crate::session_status::record_pass(&all, now);
     all
 }
 
@@ -1084,6 +1104,7 @@ pub fn spawn_task(fallback_root: PathBuf, interval: Duration) -> tokio::task::Jo
 /// start the loop, or return `None` when disabled.
 pub fn spawn_from_config(workspace: &Path) -> Option<tokio::task::JoinHandle<()>> {
     let config = read_config(workspace);
+    crate::session_status::set_reconciler_enabled(resolve_enabled(&config));
     if !resolve_enabled(&config) {
         log::debug!(
             "session_reconcile: disabled (LOOM_SESSION_RECONCILE=0 or \
