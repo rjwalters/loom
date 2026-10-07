@@ -24,6 +24,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("guards_status.rs", "loom:forge-egress"),
     ("host_affinity.rs", "loom:host:"),
     ("intake_reconcile.rs", "loom:"),
+    ("label_registry/mod.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
     ("merge_pr/chain_lock.rs", "loom:chain-head-lock"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
@@ -33,6 +34,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("observability/captain_gauges/facts.rs", "loom:"),
     ("observability/ops/stage_dwell.rs", "loom:"),
     ("observability/pick_journal.rs", "loom:"),
+    ("pr_planning.rs", "loom:"),
     ("premise_check/cli.rs", "loom:premise-check"),
     ("premise_check/record.rs", "loom:premise-check"),
     ("star_liveness/levels.rs", "loom:priority-inherited"),
@@ -88,6 +90,74 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Remove the brace-matched body of every inline `#[cfg(test)] mod name { .. }`
+/// and nothing else. Other `#[cfg(test)]` items (a `mod tests;` declaration, a
+/// `use`, a helper fn) are left in place, so the production code after them is
+/// still scanned.
+fn strip_inline_test_mods(text: &str) -> String {
+    let attr = Regex::new(
+        r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{",
+    )
+    .expect("regex");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(m) = attr.find(rest) {
+        out.push_str(&rest[..m.start()]);
+        let after = &rest[m.end()..];
+        let mut depth = 1usize;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn strip_keeps_production_code_after_non_inline_cfg_test_items() {
+    let src = "#[cfg(test)]\nmod tests;\nfn prod() { let _ = \"loom:prod\"; }\n\
+               #[cfg(test)]\nmod t { fn x() { let _ = \"loom:test}\"; } }\nfn after() { let _ = \"loom:after\"; }\n";
+    let body = strip_inline_test_mods(src);
+    assert!(body.contains("loom:prod"), "code after `mod tests;` must stay scanned");
+    assert!(body.contains("loom:after"), "code after an inline test mod must stay scanned");
+    assert!(!body.contains("loom:test"), "inline test mod body must be stripped");
+}
+
+#[test]
+fn guard_scans_label_heavy_files_past_their_first_cfg_test() {
+    let src = repo_root().join("loom-daemon/src");
+    let text = std::fs::read_to_string(src.join("work_finder.rs")).expect("read");
+    assert!(
+        strip_inline_test_mods(&text).lines().count() > 1000,
+        "work_finder.rs must be scanned well past its first #[cfg(test)]"
+    );
+}
+
 #[test]
 fn no_unregistered_loom_literal_in_non_test_daemon_source() {
     let reg = Registry::embedded();
@@ -99,14 +169,13 @@ fn no_unregistered_loom_literal_in_non_test_daemon_source() {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
     for f in files {
         let text = std::fs::read_to_string(&f).expect("read");
-        // Test modules sit at the end of the file by convention.
-        let body = text.split("#[cfg(test)]").next().unwrap_or("");
+        let body = strip_inline_test_mods(&text);
         let rel = f
             .strip_prefix(&src)
             .expect("under src")
             .to_string_lossy()
             .replace('\\', "/");
-        for m in re.captures_iter(body) {
+        for m in re.captures_iter(&body) {
             if reg.get(&m[1]).is_none() {
                 found.insert((rel.clone(), m[1].to_string()));
             }

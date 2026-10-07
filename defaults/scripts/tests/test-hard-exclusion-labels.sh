@@ -29,7 +29,7 @@
 # `loom-daemon/src/hard_exclusion.rs`'s
 # `rust_const_matches_shipped_shell_script` unit test, not here.
 #
-# Hermetic: no forge, no network, no daemon. Requires `jq` only for the
+# Hermetic: no forge, no network. Uses a loom-daemon on PATH if present, else the fallback array. Requires `jq` only for the
 # fragment-validity checks, which are skipped (with a note) when jq is absent.
 #
 # Usage:

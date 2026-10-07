@@ -65,6 +65,7 @@ HARD_EXCLUSION_LABELS=(
 _daemon="${LOOM_DAEMON_BIN:-}"
 [[ -n "$_daemon" && -x "$_daemon" ]] || _daemon="$(command -v loom-daemon 2>/dev/null || true)"
 if [[ -n "$_daemon" ]]; then
+  # requires-daemon: labels optional   a missing or older binary (pre-#10013 slice 1) falls back to the HARD_EXCLUSION_LABELS array above
   _queried=()
   if _q="$("$_daemon" labels list --property hard_exclusion 2>/dev/null)" && [[ -n "$_q" ]]; then
     while IFS= read -r _l; do [[ -n "$_l" ]] && _queried+=("$_l"); done <<<"$_q"
