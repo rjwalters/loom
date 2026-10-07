@@ -90,7 +90,7 @@
 //! the master `LOOM_STALE_CLAIM_RECONCILE` switch like the review-conflict
 //! pass. Read-only inspection: `loom-daemon merge-pr sequence-plan`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -139,6 +139,7 @@ pub mod landing;
 // The real-merge-conflict pair predicate edges require (#10350).
 #[path = "merge_sequence_conflict.rs"]
 pub mod conflict;
+pub use conflict::overlap_components_with;
 use conflict::Conflicts;
 
 /// The durable hold label this pass applies (defined by #9378).
@@ -306,51 +307,6 @@ pub fn overlap_components(
     files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> Vec<Vec<u32>> {
     overlap_components_with(eligible, files, &conflict::assume_conflict)
-}
-
-/// [`overlap_components`] where a shared-file pair is an edge only when the
-/// two PRs are stacked or `conflicts` says they really conflict (#10350).
-#[must_use]
-pub fn overlap_components_with(
-    eligible: &[&SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    conflicts: Conflicts<'_>,
-) -> Vec<Vec<u32>> {
-    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
-    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (i, a) in eligible.iter().enumerate() {
-        for b in &eligible[i + 1..] {
-            let shared = files
-                .get(&a.number)
-                .zip(files.get(&b.number))
-                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
-            let stacked = a.base_ref == b.head_ref || b.base_ref == a.head_ref;
-            if shared && (stacked || conflicts(a, b)) {
-                adj.entry(a.number).or_default().push(b.number);
-                adj.entry(b.number).or_default().push(a.number);
-            }
-        }
-    }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut out = Vec::new();
-    for start in &nums {
-        if seen.contains(start) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut queue = VecDeque::from([*start]);
-        seen.insert(*start);
-        while let Some(n) = queue.pop_front() {
-            component.push(n);
-            for next in adj.get(&n).into_iter().flatten() {
-                if seen.insert(*next) {
-                    queue.push_back(*next);
-                }
-            }
-        }
-        out.push(component);
-    }
-    out
 }
 
 /// Order one component's members: constraint edges first (trusted markers

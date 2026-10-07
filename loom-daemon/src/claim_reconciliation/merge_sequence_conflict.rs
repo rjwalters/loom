@@ -42,7 +42,7 @@
 //! predicate: the planner keeps them unconditionally.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -279,6 +279,51 @@ fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) 
             }
         }
     }
+}
+
+/// [`overlap_components`] where a shared-file pair is an edge only when the
+/// two PRs are stacked or `conflicts` says they really conflict (#10350).
+#[must_use]
+pub fn overlap_components_with(
+    eligible: &[&SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    conflicts: Conflicts<'_>,
+) -> Vec<Vec<u32>> {
+    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
+    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (i, a) in eligible.iter().enumerate() {
+        for b in &eligible[i + 1..] {
+            let shared = files
+                .get(&a.number)
+                .zip(files.get(&b.number))
+                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
+            let stacked = a.base_ref == b.head_ref || b.base_ref == a.head_ref;
+            if shared && (stacked || conflicts(a, b)) {
+                adj.entry(a.number).or_default().push(b.number);
+                adj.entry(b.number).or_default().push(a.number);
+            }
+        }
+    }
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut out = Vec::new();
+    for start in &nums {
+        if seen.contains(start) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::from([*start]);
+        seen.insert(*start);
+        while let Some(n) = queue.pop_front() {
+            component.push(n);
+            for next in adj.get(&n).into_iter().flatten() {
+                if seen.insert(*next) {
+                    queue.push_back(*next);
+                }
+            }
+        }
+        out.push(component);
+    }
+    out
 }
 
 #[cfg(test)]
