@@ -44,8 +44,13 @@ comment). **Skip the issue and write nothing** if it carries:
 - `loom:building`, or a `loom:curating` claim that is not yours. Run Curator's
   "Stale `loom:curating` Claim Check" (`claim-staleness.sh`) and stand down on
   `fresh`/`unknown`; reclaim only on `stale`, as for any Curator work.
-- no longer `loom:blocked`, or a body naming a blocker or reason: only remove
-  `loom:blocked-unnamed`.
+- no longer `loom:blocked`, or a body naming a blocker or reason **for the
+  current hold** (a record whose `at=` is not older than the latest
+  `loom:blocked` application, allowing for write slack): only remove
+  `loom:blocked-unnamed`. A reason record older than the current block is
+  stale; it does not end the drain, so continue to the named/kept/released
+  evaluation below. Stopping early would leave the issue bare, and the next
+  tick would queue it again.
 
 Claim with `loom:curating` before the first write (Curator's "Claiming Work")
 and release it when done.
@@ -70,5 +75,8 @@ the per-outcome count source for the dashboard.
 - Queued, then an operator adds `loom:operator-only` or a Builder adds
   `loom:building` before you run: **skip**, no write, even though the body and
   documentation verdict are unchanged.
+- A January reason record, then a bare re-block in October, queued by the tick:
+  the record is stale, so evaluate and finish with **named**, **kept** or
+  **released**. Never just drop the label (tick, drain and tick must converge).
 - A stale hold whose recorded cause is closed and nothing else open:
   **released**, no `loom:issue`, evidence comment.
