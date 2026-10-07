@@ -187,6 +187,18 @@ pub struct SignatureEvidence {
 /// characters, not a local path (`/…`, `~…`, `\`), not token-shaped.
 #[must_use]
 pub fn public_text(s: &str) -> Option<String> {
+    let t = s.trim();
+    let bad = t.is_empty()
+        || t.len() > 512
+        || t.starts_with('/')
+        || t.starts_with('~')
+        || t.contains('\\')
+        || t.chars().any(char::is_control)
+        || is_token_shaped(t);
+    (!bad).then(|| t.to_string())
+}
+
+fn is_token_shaped(t: &str) -> bool {
     const TOKEN_PREFIXES: &[&str] = &[
         "ghp_",
         "gho_",
@@ -197,15 +209,25 @@ pub fn public_text(s: &str) -> Option<String> {
         "sk-",
         "glpat-",
     ];
-    let t = s.trim();
-    let bad = t.is_empty()
-        || t.len() > 512
-        || t.starts_with('/')
-        || t.starts_with('~')
-        || t.contains('\\')
-        || t.chars().any(char::is_control)
-        || TOKEN_PREFIXES.iter().any(|p| t.contains(p));
-    (!bad).then(|| t.to_string())
+    TOKEN_PREFIXES.iter().any(|p| t.contains(p))
+}
+
+/// `Some(regexp)` only when the derived keyless identity regexp is safe to
+/// publish. It legitimately contains backslash escapes, so [`public_text`]
+/// cannot be applied directly; instead the inputs it embeds (workflow pin,
+/// tag) must each be public, and the unescaped text must not be token-shaped.
+fn public_regexp(regexp: &str, tag: &str, approved_workflow: Option<&str>) -> Option<String> {
+    let workflow_ok = approved_workflow
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .is_none_or(|w| public_text(w).is_some());
+    let unescaped: String = regexp.chars().filter(|&c| c != '\\').collect();
+    let bad = !workflow_ok
+        || public_text(tag).is_none()
+        || regexp.len() > 512
+        || regexp.chars().any(char::is_control)
+        || is_token_shaped(&unescaped);
+    (!bad).then(|| regexp.to_string())
 }
 
 impl SignatureEvidence {
@@ -271,7 +293,8 @@ impl SignatureEvidence {
             signature_state: facts.signature_state.map(|s| s.as_str().to_string()),
             verification_method: method.map(str::to_string),
             identity: identity.and_then(public_text),
-            identity_regexp: identity_regexp.map(str::to_string),
+            identity_regexp: identity_regexp
+                .and_then(|r| public_regexp(r, tag, policy.approved_workflow.as_deref())),
             oidc_issuer: issuer.and_then(public_text),
             configured_workflow: policy.approved_workflow.as_deref().and_then(public_text),
             configured_workflow_applied: applied,

@@ -298,6 +298,56 @@ fn sanitized_record_has_no_token_credential_path_or_env_value() {
 }
 
 #[test]
+#[serial]
+fn keyless_regexp_does_not_leak_rejected_workflow() {
+    for bad in [
+        "ghp_SECRETTOKEN123/release.yml",
+        "/Users/me/secret/release.yml",
+    ] {
+        let dir = tempdir();
+        let assets = signed_assets(&dir, BIN, true);
+        let fakebin = tempdir();
+        write_fake_gh(&fakebin, &assets);
+        write_script(&fakebin, "cosign", "exit 0\n");
+        let policy = SignaturePolicy {
+            require_signature: true,
+            approved_workflow: Some(bad.to_string()),
+        };
+        let (outcome, record) = run_evidence(&fakebin, &linux_inputs(&dir), &policy);
+        let line = cleanup(&outcome).expect("verified");
+        let v = assert_contract(&record);
+        assert_eq!(v["verification_method"], "cosign-keyless-identity-regexp");
+        assert!(v["identity_regexp"].is_null(), "{bad:?}");
+        assert!(v["configured_workflow"].is_null(), "{bad:?}");
+        let needle = bad.trim_start_matches('/');
+        assert!(!serde_json::to_string(&v).unwrap().contains(needle), "{bad:?}");
+        assert!(!line.contains(needle), "{bad:?}");
+    }
+    // A legitimate pin keeps its (escaped) regexp.
+    let r = SignatureEvidence::assemble(
+        "v1.0.0",
+        &SignaturePolicy {
+            require_signature: true,
+            approved_workflow: Some("release.yml".to_string()),
+        },
+        &EvidenceFacts {
+            verified_by: Some(crate::release_fetch::signature::VerifiedBy::KeylessIdentityRegexp {
+                regexp:
+                    r"^https://github\.com/o/r/\.github/workflows/release\.yml@refs/tags/v1\.0\.0$"
+                        .to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+                workflow_pinned: true,
+            }),
+            ..EvidenceFacts::default()
+        },
+        "host-a".to_string(),
+        crate::eta::Provenance::current(),
+        chrono::Utc::now(),
+    );
+    assert!(r.identity_regexp.is_some());
+}
+
+#[test]
 fn sanitize_drops_path_and_token_shaped_public_text() {
     for bad in [
         "/Users/me/.loom/release.yml",
