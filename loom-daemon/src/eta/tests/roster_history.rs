@@ -6,7 +6,8 @@ use super::fit_rows::{h, OTHER, REPO};
 use crate::eta::fit::features_v2::N_FEATURES_V2;
 use crate::eta::repo_priority::{repo_rank, revision_at, KnowBasis};
 use crate::eta::roster_history::{
-    load, sync, HistoryStatus, MAX_PAGES, MAX_STALE_HOURS, PER_PAGE, WINDOW_DAYS,
+    archive, load, sync, window_opens, HistoryStatus, ARCHIVE, MAX_PAGES, MAX_STALE_HOURS,
+    PER_PAGE, WINDOW_DAYS,
 };
 use crate::fleet_store::fetch::{Reply, Transport};
 use crate::fleet_store::StoreLocation;
@@ -21,6 +22,10 @@ pub(crate) struct FakeStore {
     pub(crate) commits: RefCell<Vec<(String, DateTime<Utc>, String)>>,
     pub(crate) offline: Cell<bool>,
     pub(crate) calls: RefCell<Vec<String>>,
+    /// The `If-None-Match` sent with each call, in call order.
+    pub(crate) sent_etags: RefCell<Vec<Option<String>>>,
+    /// Listings answered `304 Not Modified`.
+    pub(crate) not_modified: Cell<usize>,
 }
 
 pub(crate) fn location() -> StoreLocation {
@@ -45,6 +50,8 @@ impl FakeStore {
             commits: RefCell::new(Vec::new()),
             offline: Cell::new(false),
             calls: RefCell::new(Vec::new()),
+            sent_etags: RefCell::new(Vec::new()),
+            not_modified: Cell::new(0),
         }
     }
 
@@ -58,17 +65,30 @@ impl FakeStore {
         sha
     }
 
-    fn listing(&self, picked: Vec<(String, DateTime<Utc>)>) -> Reply {
+    /// A listing reply. Like GitHub's, its `ETag` is derived from the body,
+    /// and a matching `If-None-Match` is answered `304` with no body.
+    fn listing(&self, picked: Vec<(String, DateTime<Utc>)>, if_none_match: Option<&str>) -> Reply {
+        use sha2::{Digest, Sha256};
         let items: Vec<serde_json::Value> = picked
             .iter()
             .map(|(sha, at)| {
                 serde_json::json!({"sha": sha, "commit": {"committer": {"date": at.to_rfc3339()}}})
             })
             .collect();
+        let body = serde_json::Value::Array(items).to_string();
+        let etag = format!("W/\"{}\"", &hex::encode(Sha256::digest(body.as_bytes()))[..16]);
+        if if_none_match == Some(etag.as_str()) {
+            self.not_modified.set(self.not_modified.get() + 1);
+            return Reply {
+                status: 304,
+                etag: Some(etag),
+                body: String::new(),
+            };
+        }
         Reply {
             status: 200,
-            etag: None,
-            body: serde_json::Value::Array(items).to_string(),
+            etag: Some(etag),
+            body,
         }
     }
 }
@@ -87,8 +107,9 @@ fn time(raw: &str) -> DateTime<Utc> {
 }
 
 impl Transport for FakeStore {
-    fn get(&self, api_path: &str, _accept: Option<&str>, _etag: Option<&str>) -> Result<Reply> {
+    fn get(&self, api_path: &str, _accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
         self.calls.borrow_mut().push(api_path.to_string());
+        self.sent_etags.borrow_mut().push(etag.map(str::to_string));
         if self.offline.get() {
             bail!("network is unreachable");
         }
@@ -110,6 +131,7 @@ impl Transport for FakeStore {
                         .filter(|(_, at)| *at <= until)
                         .take(1)
                         .collect(),
+                    etag,
                 ));
             }
             let since = time(param(api_path, "since").unwrap());
@@ -122,6 +144,7 @@ impl Transport for FakeStore {
                     .skip((page - 1) * per)
                     .take(per)
                     .collect(),
+                etag,
             ));
         }
         if let Some(sha) = api_path.strip_prefix("repos/acme/fleet/contents/repos.yml?ref=") {
@@ -380,4 +403,228 @@ fn a_cache_of_another_store_offers_no_observations() {
     sync(&store, tmp.path(), &location(), h(2.0)).unwrap();
     let history = load(tmp.path(), h(2.0)).0.unwrap();
     assert!(history.iter().all(|r| r.basis() == KnowBasis::CommitDate));
+}
+
+// ---- Conditional listings: the forge budget (#10586) -----------------------
+
+#[test]
+fn the_window_opens_at_utc_midnight_so_a_days_listings_repeat() {
+    let morning = h(1.0) + Duration::days(30);
+    let evening = h(23.0) + Duration::days(30);
+    assert_eq!(window_opens(morning), window_opens(evening));
+    assert_eq!(window_opens(morning), h(0.0) + Duration::days(30 - WINDOW_DAYS));
+    assert_eq!(
+        window_opens(morning + Duration::days(1)),
+        window_opens(morning) + Duration::days(1)
+    );
+}
+
+#[test]
+fn an_unchanged_roster_costs_two_304s_and_still_counts_as_a_poll() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    store.commit(h(2.0), &roster_yaml(100, 10));
+    sync(&store, tmp.path(), &location(), h(3.0)).unwrap();
+    let history = load(tmp.path(), h(3.0)).0.unwrap();
+    let first = store.calls.borrow().len();
+    assert_eq!(first, 2 + 2, "two listings, two contents");
+
+    let report = sync(&store, tmp.path(), &location(), h(9.0)).unwrap();
+    assert_eq!((report.revisions, report.new, report.fetched), (2, 0, 0));
+    assert_eq!(store.calls.borrow().len() - first, 2, "the first page and the anchor only");
+    assert_eq!(store.not_modified.get(), 2);
+    assert!(store.sent_etags.borrow()[first..]
+        .iter()
+        .all(Option::is_some));
+    assert_eq!(load(tmp.path(), h(9.0)).0.unwrap(), history);
+    // The 304 poll moved `last_poll_at`: the cache vouches for 24 h from it.
+    let after = h(9.0) + Duration::hours(MAX_STALE_HOURS);
+    assert_eq!(load(tmp.path(), after).1.status, HistoryStatus::Loaded);
+}
+
+#[test]
+fn a_new_commit_breaks_the_304_and_is_observed_at_that_poll() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    sync(&store, tmp.path(), &location(), h(3.0)).unwrap();
+    sync(&store, tmp.path(), &location(), h(4.0)).unwrap();
+    assert_eq!(store.not_modified.get(), 2);
+    // Backdated to 1 h, pushed between the 4 h and 5 h polls.
+    store.commit(h(1.0), &roster_yaml(0, 100));
+    let report = sync(&store, tmp.path(), &location(), h(5.0)).unwrap();
+    assert_eq!((report.new, report.fetched), (1, 1));
+    let history = load(tmp.path(), h(5.0)).0.unwrap();
+    assert_eq!(history[1].observed_at, Some(h(5.0)));
+    let rank = |t| revision_at(&history, t).and_then(|r| repo_rank(r, REPO));
+    assert_eq!(rank(h(4.5)), Some(0.5), "not before the poll that saw it");
+}
+
+#[test]
+fn a_new_utc_day_lists_unconditionally() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    sync(&store, tmp.path(), &location(), h(20.0)).unwrap();
+    let first = store.calls.borrow().len();
+    sync(&store, tmp.path(), &location(), h(26.0)).unwrap();
+    assert_eq!(store.not_modified.get(), 0, "another day, another URL");
+    assert!(store.sent_etags.borrow()[first..]
+        .iter()
+        .all(Option::is_none));
+    // The next poll of the same day is conditional again.
+    sync(&store, tmp.path(), &location(), h(27.0)).unwrap();
+    assert_eq!(store.not_modified.get(), 2);
+}
+
+/// A forge that answers every listing `304`, cached or not.
+struct AlwaysNotModified<'a>(&'a FakeStore);
+
+impl Transport for AlwaysNotModified<'_> {
+    fn get(&self, api_path: &str, accept: Option<&str>, etag: Option<&str>) -> Result<Reply> {
+        if api_path.contains("/commits?") {
+            return Ok(Reply {
+                status: 304,
+                etag: None,
+                body: String::new(),
+            });
+        }
+        self.0.get(api_path, accept, etag)
+    }
+}
+
+#[test]
+fn a_304_with_nothing_cached_is_an_error_and_keeps_the_cache() {
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    let fresh = tempfile::tempdir().unwrap();
+    assert!(sync(&AlwaysNotModified(&store), fresh.path(), &location(), h(1.0)).is_err());
+    assert_eq!(load(fresh.path(), h(1.0)).1.status, HistoryStatus::Missing);
+
+    // An index from before cached listings existed has nothing to reuse.
+    let tmp = tempfile::tempdir().unwrap();
+    sync(&store, tmp.path(), &location(), h(1.0)).unwrap();
+    let index = tmp.path().join("index.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("listings");
+    std::fs::write(&index, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let before = std::fs::read(&index).unwrap();
+    assert!(load(tmp.path(), h(1.0)).0.is_some(), "an older index still loads");
+    assert!(sync(&AlwaysNotModified(&store), tmp.path(), &location(), h(2.0)).is_err());
+    assert_eq!(std::fs::read(&index).unwrap(), before);
+}
+
+// ---- The observation archive (#10586) ---------------------------------------
+
+/// The 10 h poll sees the 0 h commit (its first poll: no observation); the
+/// 30 h poll sees a commit backdated to 2 h, observed at 30 h.
+fn observed_twice(dir: &std::path::Path) -> FakeStore {
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    sync(&store, dir, &location(), h(10.0)).unwrap();
+    store.commit(h(2.0), &roster_yaml(0, 100));
+    sync(&store, dir, &location(), h(30.0)).unwrap();
+    store
+}
+
+#[test]
+fn the_archive_restores_observations_after_the_index_is_lost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = observed_twice(tmp.path());
+    let history = load(tmp.path(), h(30.0)).0.unwrap();
+    assert_eq!(history[1].observed_at, Some(h(30.0)));
+
+    std::fs::remove_file(tmp.path().join("index.json")).unwrap();
+    std::fs::remove_dir_all(tmp.path().join("blobs")).unwrap();
+    let report = sync(&store, tmp.path(), &location(), h(31.0)).unwrap();
+    assert_eq!((report.new, report.fetched), (0, 2), "re-fetched, not re-dated");
+    assert_eq!(load(tmp.path(), h(31.0)).0.unwrap(), history);
+
+    // The archive proves earlier polls: a commit first listed after the loss
+    // is observed at that poll, not read from its commit date.
+    std::fs::remove_file(tmp.path().join("index.json")).unwrap();
+    store.commit(h(3.0), &roster_yaml(100, 0));
+    sync(&store, tmp.path(), &location(), h(32.0)).unwrap();
+    let after = load(tmp.path(), h(32.0)).0.unwrap();
+    assert_eq!(after[..2], history[..]);
+    assert_eq!(after[2].observed_at, Some(h(32.0)));
+}
+
+#[test]
+fn the_archive_is_append_only_and_written_once_per_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = observed_twice(tmp.path());
+    let path = tmp.path().join(ARCHIVE);
+    let first = std::fs::read(&path).unwrap();
+    let lines = archive(tmp.path(), &location());
+    assert_eq!(lines.len(), 2);
+    assert_eq!((lines[0].first_listed_at, lines[0].observed_at), (h(10.0), None));
+    assert_eq!((lines[1].first_listed_at, lines[1].observed_at), (h(30.0), Some(h(30.0))));
+
+    // A torn line from a crash is skipped, and closed off by the next append.
+    std::fs::write(&path, [first.as_slice(), b"{\"repo\":\"acme/fl"].concat()).unwrap();
+    sync(&store, tmp.path(), &location(), h(40.0)).unwrap();
+    assert_eq!(archive(tmp.path(), &location()), lines, "nothing new, nothing written");
+    store.commit(h(35.0), &roster_yaml(1, 2));
+    sync(&store, tmp.path(), &location(), h(41.0)).unwrap();
+    let grown = std::fs::read(&path).unwrap();
+    assert!(grown.starts_with(&first), "earlier lines are never rewritten");
+    let now_lines = archive(tmp.path(), &location());
+    assert_eq!(now_lines[..2], lines[..]);
+    assert_eq!(now_lines.len(), 3);
+    assert_eq!(now_lines[2].observed_at, Some(h(41.0)));
+
+    // A commit ageing out of the window leaves the index, not the archive.
+    let late = h(41.0) + Duration::days(WINDOW_DAYS + 2);
+    store.commit(late - Duration::hours(1), &roster_yaml(3, 4));
+    sync(&store, tmp.path(), &location(), late).unwrap();
+    assert!(load(tmp.path(), late).0.unwrap().len() < 4);
+    assert_eq!(archive(tmp.path(), &location()).len(), 4);
+}
+
+#[test]
+fn an_index_older_than_the_archive_is_carried_into_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = observed_twice(tmp.path());
+    let history = load(tmp.path(), h(30.0)).0.unwrap();
+    std::fs::remove_file(tmp.path().join(ARCHIVE)).unwrap();
+    sync(&store, tmp.path(), &location(), h(31.0)).unwrap();
+    let lines = archive(tmp.path(), &location());
+    assert_eq!(lines.len(), 2);
+    assert_eq!((lines[0].first_listed_at, lines[0].observed_at), (h(30.0), None));
+    assert_eq!((lines[1].first_listed_at, lines[1].observed_at), (h(30.0), Some(h(30.0))));
+    std::fs::remove_file(tmp.path().join("index.json")).unwrap();
+    sync(&store, tmp.path(), &location(), h(32.0)).unwrap();
+    assert_eq!(load(tmp.path(), h(32.0)).0.unwrap(), history);
+}
+
+/// The leak test through the archive (#10586). A commit backdated before the
+/// cutoff, first seen after it, keeps that late observation when the index
+/// is lost and its observation can only come from the archive: the v2 rows
+/// and file stay byte-identical. Positive control: losing the archive as
+/// well leaves only the commit date, which does move the rows.
+#[test]
+fn an_observation_restored_from_the_archive_leaks_nothing_into_the_v2_fit() {
+    use super::fit_rows::cutoff;
+    let base_dir = tempfile::tempdir().unwrap();
+    polled_baseline(base_dir.path());
+    let base = fitted_v2(base_dir.path(), h(6.0));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = polled_baseline(tmp.path());
+    store.commit(h(6.5), &roster_yaml(0, 500));
+    sync(&store, tmp.path(), &location(), cutoff() + Duration::hours(1)).unwrap();
+    std::fs::remove_file(tmp.path().join("index.json")).unwrap();
+    let seen = cutoff() + Duration::hours(2);
+    sync(&store, tmp.path(), &location(), seen).unwrap();
+    assert_eq!(load(tmp.path(), seen).1.observed, 1);
+    assert_eq!(fitted_v2(tmp.path(), seen), base, "restored from the archive");
+
+    std::fs::remove_file(tmp.path().join("index.json")).unwrap();
+    std::fs::remove_file(tmp.path().join(ARCHIVE)).unwrap();
+    sync(&store, tmp.path(), &location(), seen).unwrap();
+    assert_eq!(load(tmp.path(), seen).1.observed, 0);
+    assert_ne!(fitted_v2(tmp.path(), seen).0, base.0, "commit dates alone do leak");
 }

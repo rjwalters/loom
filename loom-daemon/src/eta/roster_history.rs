@@ -15,13 +15,31 @@
 //! # Wire shape (GitHub REST, through [`Transport`])
 //!
 //! - `GET repos/{store}/commits?path=repos.yml&sha={ref}&since={S}&per_page=100&page={p}`,
-//!   paginated, with `S` = now − [`WINDOW_DAYS`] (the 14-day fit window plus
-//!   margin). More than [`MAX_PAGES`] pages is an error, not a silent cut.
+//!   paginated, with `S` = [`window_opens`]: now − [`WINDOW_DAYS`] (the
+//!   14-day fit window plus margin), aligned down to UTC midnight. More than
+//!   [`MAX_PAGES`] pages is an error, not a silent cut.
 //! - `GET repos/{store}/commits?path=repos.yml&sha={ref}&until={S}&per_page=1`:
 //!   the **anchor**, the revision in force when the window opens.
 //! - `GET repos/{store}/contents/repos.yml?ref={commit}` for each commit not
 //!   already cached. Contents are stored content-addressed by blob SHA, and
 //!   a commit is immutable, so no revision is fetched twice.
+//!
+//! Requests go through the store's [`Transport`]: in production
+//! `fleet_store::gh::GhTransport`, the reader App first (then the writer App,
+//! then ambient `gh` auth on a standalone install). No operator token, and no
+//! new credential.
+//!
+//! # Forge budget: conditional listings
+//!
+//! Because `S` is aligned to the UTC day, each listing URL repeats on every
+//! poll of that day. The index keeps each listing's `ETag` and the commits it
+//! listed ([`CachedListing`]). The next poll sends `If-None-Match`, and a
+//! `304` reuses the cached commits; a `304` with nothing cached is an error.
+//! On GitHub an authorized `304` does not count against the primary rate
+//! limit. So with `repos.yml` unchanged, a poll costs two conditional
+//! requests (the first page and the anchor) and no contents. A poll that
+//! answers `304` is still a successful poll, and moves `last_poll_at`. Each
+//! new UTC day opens with one unconditional listing.
 //!
 //! # Knowability convention
 //!
@@ -35,6 +53,27 @@
 //! counts only from when this host first saw it. A commit listed by the
 //! **first** poll a cache ever makes has no observation: it falls back to its
 //! commit date ([`KnowBasis::CommitDate`]), and coverage says how many did.
+//!
+//! # The observation archive
+//!
+//! The index is rewritten on every poll and pruned to the window, so on its
+//! own an observation would be lost when its commit ages out, or when the
+//! index is lost. Every commit's first sighting is therefore also appended to
+//! `observations.jsonl` ([`Observation`]) before the index is written. The
+//! archive is append-only and never pruned: one line per store, ref and
+//! commit, written once. It is the durable record of when this host first
+//! saw each revision, for backtests whose cutoffs are older than the window
+//! ([`archive`]).
+//!
+//! [`sync`] gives a listed commit its observation from the previous index
+//! when it has one, else from the archive. Only a commit in neither is
+//! *new*. So an index that is lost or unreadable does not re-date a commit
+//! that was already archived. An archive line for the store and ref is also
+//! proof that an earlier poll succeeded, because a line is written only by a
+//! poll whose listing succeeded. So after an index loss, a new commit is
+//! still observed at the poll that first lists it, exactly as with the
+//! index. A corrupt archive line is skipped. It is never read as an
+//! observation.
 //!
 //! # When the history is unknown
 //!
@@ -74,8 +113,13 @@ const INDEX: &str = "index.json";
 const BLOBS: &str = "blobs";
 const INDEX_VERSION: u32 = 1;
 
+/// The append-only observation archive, inside the cache directory.
+pub const ARCHIVE: &str = "observations.jsonl";
+
 /// The cache directory: `<root>/.loom/state/eta/roster-history`, beside the
-/// fleet snapshots and the fit files (ignored state, regenerable).
+/// fleet snapshots and the fit files. It is ignored state. The index and the
+/// blobs can be regenerated from the forge; the [`ARCHIVE`] cannot, because
+/// it records when this host saw each commit.
 #[must_use]
 pub fn dir(workspace_root: &Path) -> PathBuf {
     workspace_root
@@ -112,6 +156,52 @@ pub struct Index {
     pub last_poll_at: DateTime<Utc>,
     /// Revisions in history order, oldest first.
     pub commits: Vec<CommitEntry>,
+    /// The last poll's listings that carried an `ETag`, for conditional
+    /// re-requests. Absent from an index written before they existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listings: Vec<CachedListing>,
+}
+
+/// One commit as a listing named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedEntry {
+    /// The commit SHA.
+    pub sha: String,
+    /// Its committer date.
+    pub committed_at: DateTime<Utc>,
+}
+
+/// A listing request's last `200` answer, for [`sync`]'s conditional
+/// re-request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedListing {
+    /// The REST path, query included.
+    pub path: String,
+    /// The `ETag` the forge returned for it.
+    pub etag: String,
+    /// The commits it listed, as the forge ordered them (newest first).
+    pub commits: Vec<ListedEntry>,
+}
+
+/// One line of the [`ARCHIVE`]: a commit's first sighting by this host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    /// The store, `OWNER/REPO`.
+    pub repo: String,
+    /// The ref read.
+    pub reference: String,
+    /// The commit SHA.
+    pub sha: String,
+    /// Its committer date.
+    pub committed_at: DateTime<Utc>,
+    /// The blob SHA of its `repos.yml`.
+    pub blob: String,
+    /// The poll that first listed it.
+    pub first_listed_at: DateTime<Utc>,
+    /// Its observation (see the module docs). `None` when the poll that
+    /// first listed it was the first one for this store and ref.
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 /// What one [`sync`] did.
@@ -152,14 +242,31 @@ fn is_sha(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn list(transport: &dyn Transport, path: &str) -> Result<Vec<(String, DateTime<Utc>)>> {
-    let reply = transport.get(path, None, None)?;
+/// The listings cached by the previous poll, by path.
+type Cached<'a> = BTreeMap<&'a str, &'a CachedListing>;
+
+/// One listing request: conditional when `cached` has its path, and a `304`
+/// then answers with the cached commits. Returns the commits (newest first)
+/// and what to cache for the next poll.
+fn list(
+    transport: &dyn Transport,
+    path: &str,
+    cached: &Cached<'_>,
+) -> Result<(Vec<ListedEntry>, Option<CachedListing>)> {
+    let prior = cached.get(path).copied();
+    let reply = transport.get(path, None, prior.map(|c| c.etag.as_str()))?;
+    if reply.status == 304 {
+        let Some(prior) = prior else {
+            bail!("forge answered 304 Not Modified listing {path}, but nothing is cached for it");
+        };
+        return Ok((prior.commits.clone(), Some(prior.clone())));
+    }
     if reply.status != 200 {
         bail!("forge answered HTTP {} listing {path}", reply.status);
     }
     let listed: Vec<ListedCommit> =
         serde_json::from_str(&reply.body).context("malformed commit listing")?;
-    listed
+    let commits = listed
         .into_iter()
         .map(|c| {
             if !is_sha(&c.sha) {
@@ -170,9 +277,21 @@ fn list(transport: &dyn Transport, path: &str) -> Result<Vec<(String, DateTime<U
                 .committer
                 .and_then(|s| s.date)
                 .with_context(|| format!("commit {} has no committer date", c.sha))?;
-            Ok((c.sha, at))
+            Ok(ListedEntry {
+                sha: c.sha,
+                committed_at: at,
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let cache = reply
+        .etag
+        .filter(|e| !e.is_empty())
+        .map(|etag| CachedListing {
+            path: path.to_string(),
+            etag,
+            commits: commits.clone(),
+        });
+    Ok((commits, cache))
 }
 
 fn fetch_contents(
@@ -204,8 +323,18 @@ fn read_index(dir: &Path) -> Option<Index> {
         .filter(|i| i.version == INDEX_VERSION)
 }
 
+/// When the listed window opens at `now`: [`WINDOW_DAYS`] back, aligned
+/// down to UTC midnight, so the listing URLs repeat all day (see the module
+/// docs).
+#[must_use]
+pub fn window_opens(now: DateTime<Utc>) -> DateTime<Utc> {
+    let start = now - Duration::days(WINDOW_DAYS);
+    let secs = start.timestamp();
+    DateTime::from_timestamp(secs - secs.rem_euclid(86_400), 0).unwrap_or(start)
+}
+
 /// Poll the store and bring the cache in `dir` up to date (see the module
-/// docs). Any failure is an error and leaves the previous cache intact, and
+/// docs). Any failure is an error and leaves the previous index intact, and
 /// `last_poll_at` unmoved, so the next success records observations no
 /// earlier than it should.
 pub fn sync(
@@ -217,11 +346,22 @@ pub fn sync(
     // A cache of another store or ref has no observations to offer.
     let previous =
         read_index(dir).filter(|i| i.repo == location.repo && i.reference == location.reference);
-    let since = (now - Duration::days(WINDOW_DAYS)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let archived: BTreeMap<String, Observation> = archive(dir, location)
+        .into_iter()
+        .map(|o| (o.sha.clone(), o))
+        .collect();
+    // Either one proves an earlier poll of this store and ref succeeded.
+    let polled_before = previous.is_some() || !archived.is_empty();
+    let cached: Cached<'_> = previous
+        .as_ref()
+        .map(|i| i.listings.iter().map(|l| (l.path.as_str(), l)).collect())
+        .unwrap_or_default();
+    let since = window_opens(now).to_rfc3339_opts(SecondsFormat::Secs, true);
     let base =
         format!("repos/{}/commits?path={ROSTER_PATH}&sha={}", location.repo, location.reference);
     // Newest first, as the forge lists them.
     let mut listed = Vec::new();
+    let mut listings = Vec::new();
     for page in 1..=MAX_PAGES + 1 {
         if page > MAX_PAGES {
             bail!(
@@ -229,17 +369,19 @@ pub fn sync(
                 MAX_PAGES * PER_PAGE
             );
         }
-        let batch =
-            list(transport, &format!("{base}&since={since}&per_page={PER_PAGE}&page={page}"))?;
+        let path = format!("{base}&since={since}&per_page={PER_PAGE}&page={page}");
+        let (batch, cache) = list(transport, &path, &cached)?;
+        listings.extend(cache);
         let n = batch.len();
         listed.extend(batch);
         if n < PER_PAGE {
             break;
         }
     }
-    let anchor = list(transport, &format!("{base}&until={since}&per_page=1"))?;
+    let (anchor, cache) = list(transport, &format!("{base}&until={since}&per_page=1"), &cached)?;
+    listings.extend(cache);
     for a in anchor {
-        if !listed.iter().any(|(s, _)| *s == a.0) {
+        if !listed.iter().any(|l| l.sha == a.sha) {
             listed.push(a);
         }
     }
@@ -252,43 +394,115 @@ pub fn sync(
     let blob_dir = dir.join(BLOBS);
     let mut report = SyncReport::default();
     let mut commits = Vec::with_capacity(listed.len());
-    for (sha, committed_at) in listed {
-        if let Some(old) = known.get(sha.as_str()) {
-            if blob_dir.join(&old.blob).is_file() {
-                commits.push((*old).clone());
-                continue;
-            }
-        }
-        let (blob, body) = fetch_contents(transport, location, &sha)?;
-        write_atomic(&blob_dir.join(&blob), &body)?;
-        report.fetched += 1;
-        let observed_at = match known.get(sha.as_str()) {
-            Some(old) => old.observed_at,
+    let mut sightings = Vec::new();
+    for ListedEntry { sha, committed_at } in listed {
+        let old = known.get(sha.as_str()).copied();
+        let kept = archived.get(&sha);
+        let entry = match old.filter(|o| blob_dir.join(&o.blob).is_file()) {
+            Some(o) => o.clone(),
             None => {
-                report.new += 1;
-                previous.as_ref().map(|_| now)
+                let (blob, body) = fetch_contents(transport, location, &sha)?;
+                write_atomic(&blob_dir.join(&blob), &body)?;
+                report.fetched += 1;
+                let observed_at = match (old, kept) {
+                    (Some(o), _) => o.observed_at,
+                    (None, Some(a)) => a.observed_at,
+                    (None, None) => {
+                        report.new += 1;
+                        polled_before.then_some(now)
+                    }
+                };
+                CommitEntry {
+                    sha,
+                    committed_at,
+                    observed_at,
+                    blob,
+                }
             }
         };
-        commits.push(CommitEntry {
-            sha,
-            committed_at,
-            observed_at,
-            blob,
-        });
+        if kept.is_none() {
+            // A commit carried over from an index older than the archive was
+            // listed no later than its observation, or than that index's poll.
+            let first_listed_at = old
+                .and_then(|o| o.observed_at)
+                .or_else(|| old.and(previous.as_ref().map(|i| i.last_poll_at)))
+                .unwrap_or(now);
+            sightings.push(Observation {
+                repo: location.repo.clone(),
+                reference: location.reference.clone(),
+                sha: entry.sha.clone(),
+                committed_at: entry.committed_at,
+                blob: entry.blob.clone(),
+                first_listed_at,
+                observed_at: entry.observed_at,
+            });
+        }
+        commits.push(entry);
     }
     report.revisions = commits.len();
+    // The archive first: the index never records an observation the archive
+    // does not hold.
+    append_archive(dir, &sightings)?;
     let index = Index {
         version: INDEX_VERSION,
         repo: location.repo.clone(),
         reference: location.reference.clone(),
         last_poll_at: now,
         commits,
+        listings,
     };
     let mut body = serde_json::to_vec_pretty(&index)?;
     body.push(b'\n');
     write_atomic(&dir.join(INDEX), &body)?;
     prune_blobs(&blob_dir, &index);
     Ok(report)
+}
+
+/// The [`ARCHIVE`]'s observations of `location`'s store and ref, in the order
+/// they were written, one per commit (the first line wins). A line that does
+/// not parse is skipped. Disk only; an absent archive is empty.
+#[must_use]
+pub fn archive(dir: &Path, location: &StoreLocation) -> Vec<Observation> {
+    let Ok(raw) = std::fs::read_to_string(dir.join(ARCHIVE)) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Observation>(line).ok())
+        .filter(|o| {
+            o.repo == location.repo
+                && o.reference == location.reference
+                && is_sha(&o.sha)
+                && seen.insert(o.sha.clone())
+        })
+        .collect()
+}
+
+/// Append `lines` to the [`ARCHIVE`] in one write. A torn last line from an
+/// earlier crash is closed off first, so it stays one skipped line.
+fn append_archive(dir: &Path, lines: &[Observation]) -> Result<()> {
+    use std::io::Write as _;
+    if lines.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let path = dir.join(ARCHIVE);
+    let mut out = Vec::new();
+    if std::fs::read(&path).is_ok_and(|b| b.last().is_some_and(|&c| c != b'\n')) {
+        out.push(b'\n');
+    }
+    for line in lines {
+        serde_json::to_writer(&mut out, line)?;
+        out.push(b'\n');
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    file.write_all(&out)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("could not append to {}", path.display()))
 }
 
 fn prune_blobs(blob_dir: &Path, index: &Index) {

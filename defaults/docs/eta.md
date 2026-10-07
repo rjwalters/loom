@@ -1403,13 +1403,35 @@ for a fit or backtest to report.
   revision's `repos.yml` is cached content-addressed under
   `.loom/state/eta/roster-history/`. The fit (`fit::run`) and the tracker's
   pass (`Tracker::set_fleet_history`) both load that one cache, so the two
-  sides read one history value.
+  sides read one history value. Requests go through the store's
+  `GhTransport` (reader App first, then the writer App), never the operator
+  token.
+  - *Forge budget.* The window's `since` is aligned down to UTC midnight
+    (`window_opens`), so each listing URL repeats all day. The index keeps
+    each listing's `ETag` and commits, and the next poll sends
+    `If-None-Match`. A `304` reuses the cached commits; a `304` with nothing
+    cached is an error. With `repos.yml` unchanged, a poll is two conditional
+    requests (first page and anchor) and no contents. An authorized `304`
+    does not count against GitHub's primary rate limit. A `304` poll still
+    counts as a successful poll. Each UTC day opens with one unconditional
+    listing.
   - *Knowability convention.* `committed_at` is the committer date.
     `observed_at` is set only for a commit first listed by a poll that
     follows an earlier successful poll: it is that poll's time, a bound that
     is never early. So a backdated or late-pushed edit counts only from when
     it was seen. Commits listed by a cache's first poll have no observation
     and use their commit date. `FitReport.roster_history` counts each basis.
+  - *Observation archive.* Each commit's first sighting is also appended,
+    before the index is written, to `observations.jsonl` in the cache
+    directory: store, ref, sha, committer date, blob, `first_listed_at`, and
+    `observed_at`. The archive is append-only, one line per commit, and it is
+    never pruned with the window. That keeps the record of when this host
+    saw each revision for backtests older than the window
+    (`roster_history::archive`). A listed commit takes its observation from
+    the index, else from the archive, so a lost index does not re-date a
+    commit. An archive line also proves an earlier poll, so a commit first
+    listed after an index loss is still observed at that poll. A torn or
+    corrupt line is skipped.
   - *Unknown, never today's file.* The history is `None` when there is no
     cache (no `fleet.repo`, or no successful poll yet), when any cached
     revision is unreadable or not a valid roster, or when the last
