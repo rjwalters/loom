@@ -254,6 +254,7 @@ fn registered_beside_land_v2_never_current_and_listed_by_backtest_compare() {
         age_sec: 0,
         queue: vec![queue(Stage::ReviewWait, 4, 2.0, 12)],
         pr_flags: None,
+        priority: None,
     };
     let mut h = history();
     for stage in [

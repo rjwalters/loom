@@ -1423,6 +1423,24 @@ for a fit or backtest to report.
   `fleet_priority`, age, number. A starred, level-2, or higher-priority-repo
   issue is therefore earlier in the plan and gets an earlier start. No
   second ordering is defined for the ETA to drift from (#10528).
+- **Replayed priority inputs** (#10508). A replay case has no labels, so
+  keen-wren replayed priority-blind: its `features.priority` was absent.
+  `backtest::cases_from_pr_records_with_roster(records, history)` fills
+  `ReplayCase::priority` through the one builder
+  (`priority_inputs`), over the batch's own PR timelines: each PR's flags
+  and linked star are read strictly before the case's `as_of`, the roster
+  revision `KNOWABLE_LAG_SEC` earlier, and the neighbours are the PRs in
+  the batch standing in the case's stage at `as_of`. A `PrCaseRecord` may
+  carry `linked_star`, the instants a linked issue's star turned on and off
+  (alternating, first on). Absent means unread: an unstarred-by-label PR is
+  then unknown, never unstarred. `history = None` (no cache, stale, or
+  unreadable) leaves `repo_rank` and the fleet position unknown, never
+  today's `repos.yml`. `eta backtest --pr-history` / `--forge-pr-cases`
+  and the nightly folds pass the cached roster history. The plain
+  `cases_from_pr_records` is unchanged, and no case's other fields move.
+  Forge-fetched cases do not yet carry `linked_star`, so the star
+  inputs of the real walk-forward are known only through a PR's own labels
+  until a reader supplies it (remaining under #10508).
 - **Status.** keen-wren is registered in shadow (tier `candidate`,
   after `held-heron`, before the twin-otter pair). The captain's v2 file is
   published to the other hosts (see **Publishing the v2 file**, below).
