@@ -56,6 +56,8 @@ mod serve_parity;
 mod shadow;
 mod shadow_fleet;
 mod shadow_gate;
+mod shadow_lifecycle;
+mod shadow_stats;
 mod stall;
 mod star_parity;
 mod tracker;

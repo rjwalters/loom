@@ -239,10 +239,21 @@ impl Heuristic for AlwaysLate {
 }
 
 #[test]
-fn the_backtest_gate_needs_min_folds_decided_days_with_a_lower_bound_above_half() {
+fn the_backtest_gate_needs_min_folds_decided_days_with_a_majority_won() {
     let history = merge_wait_history(as_of());
+    // Nine cases a day, each its own issue, so the item-clustered primary
+    // test (#10525) has more than its 100 distinct items on either run and
+    // the day consistency check is what decides.
     let run = |days: i64| {
-        let cases: Vec<ReplayCase> = (0..days).map(|d| case_on(d, 0)).collect();
+        let cases: Vec<ReplayCase> = (0..days)
+            .flat_map(|d| {
+                (0..9).map(move |k| {
+                    let mut c = case_on(d, k * 60);
+                    c.subject.issue = (d * 100 + k) as u32 + 1;
+                    c
+                })
+            })
+            .collect();
         backtest::compare(
             &AlwaysLate,
             &GoodOnEvenDays,

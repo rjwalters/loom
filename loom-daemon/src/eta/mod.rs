@@ -150,6 +150,8 @@ pub mod roster_history;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
+pub mod shadow_lifecycle;
+pub mod shadow_stats;
 pub mod simulate;
 pub mod stage_queue;
 pub mod stall;

@@ -16,6 +16,7 @@ use crate::eta::shadow::{
     self, DaySums, DayWins, GateStatus, PairedStats, ShadowLedger, COVERAGE_MAX, COVERAGE_MIN,
     MIN_LIVE_PAIRS,
 };
+use crate::eta::shadow_stats::MIN_DISTINCT_ITEMS;
 use crate::eta::tracker::{PassAnswers, Resolved};
 use crate::eta::{explanation::EstimateResult, Heuristic, Kind, Stage};
 use chrono::{DateTime, Duration, Utc};
@@ -112,7 +113,20 @@ pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) 
         day.candidate_loss4_sec += candidate_mean;
     }
     let mean = |m: f64| (scored > 0).then_some(m);
+    // Every case is its own issue, so the item-clustered test sees `scored`
+    // independent items.
+    let items: crate::eta::offline::evaluate::IssueSums = (0..scored)
+        .map(|i| (format!("o/r#{i}"), (candidate_mean - current_mean, 1)))
+        .collect();
     let paired = Paired {
+        delta_pinball4_loss_sec: (scored > 0).then(|| {
+            crate::eta::offline::evaluate::bootstrap(
+                &items,
+                1_000,
+                crate::eta::offline::evaluate::BOOTSTRAP_SEED,
+            )
+        }),
+        delta4_items: scored,
         cases: scored,
         a_answered: scored,
         b_answered: scored,
@@ -139,11 +153,18 @@ pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) 
 /// [`shadow::MIN_FOLDS`], so a uniform win is a significant one.
 pub(super) const LEDGER_DAYS: i64 = 10;
 
+/// Live pairs, each its own item, that clear the primary test's distinct-item
+/// floor (#10525).
+pub(super) const PASSING_PAIRS: usize = MIN_DISTINCT_ITEMS;
+
+/// Backtest cases, each its own issue, likewise.
+pub(super) const BACKTEST_CASES: usize = MIN_DISTINCT_ITEMS + 20;
+
 /// A ledger with `pairs` identical observations spread over [`LEDGER_DAYS`]
-/// days: the candidate's paired loss (three- and four-quantile alike) is
-/// `candidate_loss`, `current`'s is `current_loss`, the candidate covers
-/// `covered` of them, nobody is late, and `pairs` tracker passes saw both
-/// sides answering.
+/// days, each of its own item (issue `10_000 + i`): the candidate's paired
+/// loss (three- and four-quantile alike) is `candidate_loss`, `current`'s is
+/// `current_loss`, the candidate covers `covered` of them, nobody is late,
+/// and `pairs` tracker passes saw both sides answering.
 pub(super) fn ledger_with(
     pairs: usize,
     current_loss: f64,
@@ -160,6 +181,9 @@ pub(super) fn ledger_with(
         // arithmetic, not about re-deriving pinball loss.
         set_score(&mut group[0], current_loss, true);
         set_score(&mut group[1], candidate_loss, i < covered);
+        for r in &mut group {
+            r.estimate.issue = 10_000 + i as u32;
+        }
         ledger.record(&current_land, &group);
     }
     let both_answering = PassAnswers {
@@ -368,7 +392,7 @@ fn the_ledger_round_trips_through_its_persisted_form() {
 
 /// Live evidence that would pass the live gate on its own.
 fn passing_live() -> PairedStats {
-    ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(Kind::Land, LAND_V1, LAND_V2)
+    ledger_with(PASSING_PAIRS, 100.0, 60.0, PASSING_PAIRS / 2).stats(Kind::Land, LAND_V1, LAND_V2)
 }
 
 #[test]
@@ -377,15 +401,15 @@ fn both_gates_passing_promotes() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(1000.0, 800.0, 40)),
+        Some(&comparison(1000.0, 800.0, BACKTEST_CASES)),
         &passing_live(),
         as_of(),
     );
     assert_eq!(decision.backtest.status, GateStatus::Passed);
     assert_eq!(decision.live.status, GateStatus::Passed);
     assert!(decision.promote, "{}", decision.reason);
-    assert_eq!(decision.backtest.candidate_scored, 40);
-    assert_eq!(decision.live.stats.pairs, MIN_LIVE_PAIRS);
+    assert_eq!(decision.backtest.candidate_scored, BACKTEST_CASES);
+    assert_eq!(decision.live.stats.pairs, PASSING_PAIRS);
 }
 
 #[test]
@@ -396,7 +420,7 @@ fn a_failing_backtest_gate_blocks_and_the_live_gate_is_not_even_consulted() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(800.0, 1000.0, 40)),
+        Some(&comparison(800.0, 1000.0, BACKTEST_CASES)),
         &passing_live(),
         as_of(),
     );
@@ -436,7 +460,7 @@ fn a_backtest_that_could_not_run_is_a_failure_not_a_pass() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(900.0, 900.0, 40)),
+        Some(&comparison(900.0, 900.0, BACKTEST_CASES)),
         &passing_live(),
         as_of(),
     );
@@ -445,8 +469,8 @@ fn a_backtest_that_could_not_run_is_a_failure_not_a_pass() {
 }
 
 #[test]
-fn a_passing_backtest_still_needs_fifty_live_pairs() {
-    let stats = ledger_with(MIN_LIVE_PAIRS - 1, 100.0, 60.0, (MIN_LIVE_PAIRS - 1) / 2).stats(
+fn a_passing_backtest_still_needs_the_distinct_item_floor_live() {
+    let stats = ledger_with(PASSING_PAIRS - 1, 100.0, 60.0, (PASSING_PAIRS - 1) / 2).stats(
         Kind::Land,
         LAND_V1,
         LAND_V2,
@@ -455,20 +479,20 @@ fn a_passing_backtest_still_needs_fifty_live_pairs() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(1000.0, 800.0, 40)),
+        Some(&comparison(1000.0, 800.0, BACKTEST_CASES)),
         &stats,
         as_of(),
     );
     assert_eq!(decision.backtest.status, GateStatus::Passed, "gate 1 was reached and passed");
     assert_eq!(decision.live.status, GateStatus::Failed);
     assert!(!decision.promote);
-    assert!(decision.live.detail.contains("49 live pair"), "{}", decision.live.detail);
+    assert!(decision.live.detail.contains("99 distinct item(s)"), "{}", decision.live.detail);
 }
 
 #[test]
 fn a_candidate_worse_live_or_outside_the_coverage_band_is_not_promoted() {
     let stats = |candidate_loss: f64, covered: usize| {
-        ledger_with(MIN_LIVE_PAIRS, 100.0, candidate_loss, covered).stats(
+        ledger_with(PASSING_PAIRS, 100.0, candidate_loss, covered).stats(
             Kind::Land,
             LAND_V1,
             LAND_V2,
@@ -479,40 +503,40 @@ fn a_candidate_worse_live_or_outside_the_coverage_band_is_not_promoted() {
             Kind::Land,
             LAND_V1,
             LAND_V2,
-            Some(&comparison(1000.0, 800.0, 40)),
+            Some(&comparison(1000.0, 800.0, BACKTEST_CASES)),
             s,
             as_of(),
         )
     };
 
     // Worse paired pinball loss, whatever the backtest said.
-    let worse = decide(&stats(101.0, MIN_LIVE_PAIRS / 2));
+    let worse = decide(&stats(101.0, PASSING_PAIRS / 2));
     assert_eq!(worse.live.status, GateStatus::Failed);
     assert!(!worse.promote);
     assert!(worse.live.detail.contains("worse"), "{}", worse.live.detail);
 
-    // Equal is "not worse", which the loss rule accepts — but a candidate
-    // that never once beats `current` has won no day, so the per-day win rate
-    // (#10233) still holds it back.
-    let equal = decide(&stats(100.0, MIN_LIVE_PAIRS / 2));
+    // Equal is "not worse", but the primary test (#10525) needs the paired
+    // difference's item-bootstrap interval to exclude 0 in the candidate's
+    // favour, and an exact tie cannot.
+    let equal = decide(&stats(100.0, PASSING_PAIRS / 2));
     assert!(!equal.promote);
-    assert!(equal.live.detail.contains("0 decided day"), "{}", equal.live.detail);
+    assert!(equal.live.detail.contains("does not exclude 0"), "{}", equal.live.detail);
 
     // Coverage below the band (over-wide intervals would read as coverage
     // ABOVE it; below means the intervals are too narrow).
-    let narrow = decide(&stats(60.0, (MIN_LIVE_PAIRS as f64 * 0.30) as usize));
+    let narrow = decide(&stats(60.0, (PASSING_PAIRS as f64 * 0.30) as usize));
     assert_eq!(narrow.live.status, GateStatus::Failed);
     assert!(!narrow.promote);
     assert!(narrow.live.detail.contains("outside"), "{}", narrow.live.detail);
 
     // Coverage above the band.
-    let wide = decide(&stats(60.0, (MIN_LIVE_PAIRS as f64 * 0.70) as usize));
+    let wide = decide(&stats(60.0, (PASSING_PAIRS as f64 * 0.70) as usize));
     assert_eq!(wide.live.status, GateStatus::Failed);
     assert!(!wide.promote);
 
     // Both edges of the band inclusive.
-    assert!(decide(&stats(60.0, (MIN_LIVE_PAIRS as f64 * COVERAGE_MIN) as usize)).promote);
-    assert!(decide(&stats(60.0, (MIN_LIVE_PAIRS as f64 * COVERAGE_MAX) as usize)).promote);
+    assert!(decide(&stats(60.0, (PASSING_PAIRS as f64 * COVERAGE_MIN) as usize)).promote);
+    assert!(decide(&stats(60.0, (PASSING_PAIRS as f64 * COVERAGE_MAX) as usize)).promote);
 }
 
 #[test]
@@ -521,7 +545,7 @@ fn every_decision_records_the_numbers_that_justified_it() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(1000.0, 800.0, 40)),
+        Some(&comparison(1000.0, 800.0, BACKTEST_CASES)),
         &passing_live(),
         as_of(),
     );
@@ -551,7 +575,7 @@ fn every_decision_records_the_numbers_that_justified_it() {
 fn a_flip_is_persisted_to_the_config_and_only_on_a_pass() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = crate::eta::config::promotion_config_path(dir.path());
-    let mut ledger = ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2);
+    let mut ledger = ledger_with(PASSING_PAIRS, 100.0, 60.0, PASSING_PAIRS / 2);
 
     // A failing gate writes nothing at all.
     let held = shadow::promote_if_ready(
@@ -559,7 +583,7 @@ fn a_flip_is_persisted_to_the_config_and_only_on_a_pass() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(800.0, 1000.0, 40)),
+        Some(&comparison(800.0, 1000.0, BACKTEST_CASES)),
         &config_path,
         as_of(),
     )
@@ -569,7 +593,7 @@ fn a_flip_is_persisted_to_the_config_and_only_on_a_pass() {
     assert!(!config_path.exists(), "a refusal touches nothing");
     assert_eq!(
         ledger.stats(Kind::Land, LAND_V1, LAND_V2).pairs,
-        MIN_LIVE_PAIRS,
+        PASSING_PAIRS,
         "the evidence is kept: the candidate may win later"
     );
 
@@ -579,7 +603,7 @@ fn a_flip_is_persisted_to_the_config_and_only_on_a_pass() {
         Kind::Land,
         LAND_V1,
         LAND_V2,
-        Some(&comparison(1000.0, 800.0, 40)),
+        Some(&comparison(1000.0, 800.0, BACKTEST_CASES)),
         &config_path,
         as_of(),
     )

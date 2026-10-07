@@ -2,10 +2,10 @@
 //! candidate-only promotion gate.
 
 use super::as_of;
-use super::shadow::{comparison, ledger_with};
+use super::shadow::{comparison, ledger_with, BACKTEST_CASES, PASSING_PAIRS};
 use crate::eta::config::resolve;
 use crate::eta::heuristics::{LAND_V1, LAND_V2, LAND_V3, LAND_V4, LITTLE_V0};
-use crate::eta::shadow::{self, GateStatus, PromotionDecision, MIN_LIVE_PAIRS};
+use crate::eta::shadow::{self, GateStatus, PromotionDecision};
 use crate::eta::shadow_fleet::{
     builtin_tier, check_budget, BudgetExceeded, DEFAULT_MAX_ACTIVE, RETIRED,
 };
@@ -185,12 +185,12 @@ fn max_active_follows_env_then_config_then_default_with_a_floor_of_one() {
 /// The same evidence that promotes a candidate, relabelled so `candidate` is
 /// the challenger against `current`.
 fn decide_with_passing_evidence(current: &str, candidate: &str) -> PromotionDecision {
-    let stats = ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(
+    let stats = ledger_with(PASSING_PAIRS, 100.0, 60.0, PASSING_PAIRS / 2).stats(
         Kind::Land,
         LAND_V1,
         LAND_V2,
     );
-    let mut evidence = comparison(1000.0, 800.0, 40);
+    let mut evidence = comparison(1000.0, 800.0, BACKTEST_CASES);
     evidence.a.heuristic = current.to_string();
     evidence.b.heuristic = candidate.to_string();
     evidence.better = Some(candidate.to_string());
