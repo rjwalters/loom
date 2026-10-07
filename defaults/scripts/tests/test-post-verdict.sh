@@ -215,8 +215,11 @@ if [[ "${1:-} ${2:-}" == "forge verdict-lock" ]]; then
 fi
 if [[ "${1:-} ${2:-}" == "forge verdict-reconcile" ]]; then
   printf '%s\n' "$*" >> "$D/daemon-calls.log"
-  [[ -f "$D/reconcile-answer" ]] || { echo "LOOM-VERDICT-RECONCILE STABLE"; exit 0; }
-  read -r rc line < "$D/reconcile-answer"; echo "$line"; exit "$rc"
+  # reconcile-answer.N answers the Nth call (an interleaving); else reconcile-answer
+  N="$(grep -c '^forge verdict-reconcile' "$D/daemon-calls.log")"
+  F="$D/reconcile-answer"; [[ -f "$F.$N" ]] && F="$F.$N"
+  [[ -f "$F" ]] || { echo "LOOM-VERDICT-RECONCILE STABLE"; exit 0; }
+  read -r rc line < "$F"; echo "$line"; exit "$rc"
 fi
 if [[ "${1:-} ${2:-}" == "forge verdict-labels" ]]; then
   printf '%s\n' "$*" >> "$D/daemon-calls.log"
@@ -240,7 +243,7 @@ reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
     "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
-    "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log"
+    "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR"/reconcile-answer.* "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log"
 }
 
 run_pv() {
@@ -648,6 +651,26 @@ echo "12 LOOM-VERDICT-RECONCILE DUPLICATE comment=7 an identical verdict landed 
 run_pv 325 approved abc1234 --body "ok"
 assert_eq "0" "$EXIT_CODE" "duplicate loser -> exit 0"
 assert_eq "0" "$(grep -c 'forge verdict-labels 325' "$STUB_DIR/daemon-calls.log")" "duplicate loser applies no labels (the winner owns them)"
+
+# Cross-host interleaving (#10581): the first reconcile is STABLE, then a rival
+# changes-requested lands before the label write; the post-label re-read must
+# supersede the approval and flip the labels, so loom:pr is not left standing.
+reset_state
+echo "0 LOOM-VERDICT-RECONCILE STABLE" > "$STUB_DIR/reconcile-answer.1"
+echo "11 LOOM-VERDICT-RECONCILE SUPERSEDED 1 concurrent changes-requested verdict(s) landed" > "$STUB_DIR/reconcile-answer.2"
+run_pv 326 approved abc1234 --body "ok"
+assert_eq "7" "$EXIT_CODE" "rival landing between reconcile and labels -> exit 7"
+assert_eq "2" "$(grep -c 'forge verdict-reconcile 326' "$STUB_DIR/daemon-calls.log")" "arbitration is re-run after the label write"
+CALLS="$(cat "$STUB_DIR/daemon-calls.log")"
+assert_eq "yes" "$([[ "$CALLS" == *"forge verdict-labels 326 --repo owner/repo --verdict approved"*"forge verdict-labels 326 --repo owner/repo --verdict changes-requested"* ]] && echo yes || echo no)" "the approval labels are followed by the changes-requested flip (final state converges)"
+
+# An unreadable post-label re-read is never left live.
+reset_state
+echo "0 LOOM-VERDICT-RECONCILE STABLE" > "$STUB_DIR/reconcile-answer.1"
+echo "1 LOOM-VERDICT-RECONCILE UNREAD x" > "$STUB_DIR/reconcile-answer.2"
+run_pv 327 approved abc1234 --body "ok"
+assert_eq "8" "$EXIT_CODE" "unread post-label arbitration -> exit 8"
+assert_contains "$OUTPUT" "loom:pr was withdrawn" "the approval is announced as withdrawn"
 
 # --- Summary ---
 echo ""

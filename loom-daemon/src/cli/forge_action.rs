@@ -1096,6 +1096,9 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // `--repo`, so a direct call (the repair command the script prints)
         // is vetted like every other write verb. `verdict-gate` only reads.
         ForgeAction::VerdictLabels { repo, .. } => Some(Some(repo.clone())),
+        // #10581: `verdict-reconcile` DELETEs the caller's duplicate verdict
+        // comment on the supplied `--repo`, so a direct call is vetted too.
+        ForgeAction::VerdictReconcile { repo, .. } => Some(Some(repo.clone())),
         _ => None,
     }
 }
@@ -1237,5 +1240,21 @@ mod write_target_tests {
             window_secs: 600,
         };
         assert_eq!(write_target(&gate), None);
+    }
+
+    /// #10581: `verdict-reconcile` can DELETE a comment, so a direct call
+    /// against an unmanaged repository is vetted before the handler runs.
+    #[test]
+    fn verdict_reconcile_is_vetted_against_its_repo() {
+        let reconcile = ForgeAction::VerdictReconcile {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+            sha: "a".repeat(40),
+            seen_opposite: 0,
+            seen_same_max_id: 0,
+            nonce: String::new(),
+        };
+        assert_eq!(write_target(&reconcile), Some(Some("unmanaged/repo".into())));
     }
 }
