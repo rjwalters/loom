@@ -9167,15 +9167,27 @@ across the registered roots:
   again just before a start. If a pass already past that check still
   `docker start`s the container between `stop`'s `docker stop` and its
   `docker rm`, the `rm` fails. `stop` then re-inspects, re-applies the
-  in-flight-exec refusal, and stops and removes the container once more. That
-  one retry suffices because every later start sees the hold. The same race
-  exists when `stop` finds **no** container: a pass may `docker run` one
-  right after the hold is written, leaving it running and held. So `stop`
-  inspects once more after writing the hold and stops and removes whatever is
-  there now (#10661). The in-flight-exec refusal applies (unless `--force`),
-  and the dispatch lock `stop` already holds covers the retry. If that
-  container is busy, `stop` refuses as usual. The hold stays, and a retry or
-  `--force` finishes the stop. `session status`
+  in-flight-exec refusal, and stops and removes the container once more. The
+  same race exists when `stop` finds **no** container: a pass may `docker
+  run` one right after the hold is written, leaving it running and held. So
+  `stop` inspects once more after writing the hold and stops and removes
+  whatever is there now (#10661). The in-flight-exec refusal applies (unless
+  `--force`), and the dispatch lock `stop` already holds covers the retry. If
+  that container is busy, `stop` refuses as usual. The hold stays, and a
+  retry or `--force` finishes the stop. `stop`'s retries alone are not
+  enough: a `docker run` already in flight (an image pull can take minutes)
+  can finish after both of `stop`'s inspects. So the guarantee is
+  two-sided. After its own `docker start` or `docker run` returns, the
+  pass checks the hold again. If it is now held, the pass stops and removes
+  the container it just started, and reports the account as held (no failure
+  is counted). Whichever side acts second sees the other: if the pass's check
+  comes after the hold was written, the pass removes its container; if it
+  comes before, its start finished before the hold existed, and `stop`'s
+  inspect sees the container. This undo follows `stop`'s rules too. It
+  takes the dispatch lock, waiting up to 30 s for a concurrent `stop` to
+  return, and never stops a container with an in-flight exec. In those
+  cases it leaves the container running, with a WARN naming
+  `accounts session stop`. `session status`
   shows `stopped, held (operator stop)`, and `session status --json` carries
   `"held": true|false`, a field added in #10453. The hold is per account: a
   hold, or `enabled=false`, in the account's profile in any **hold root**

@@ -40,8 +40,11 @@
 //! The stop/reconcile races (a pass whose hold check ran just before `stop`
 //! wrote the hold, so its `docker start` lands between `stop`'s `docker
 //! stop` and `docker rm`, or its `docker run` lands after a `stop` that saw
-//! no container) are closed in `SessionLifecycle::stop`
-//! (`session_lifecycle/stop.rs`), which retries once.
+//! no container) are closed from both sides: `SessionLifecycle::stop`
+//! inspects again after writing the hold (`session_lifecycle/stop.rs`), and
+//! the reconciler's start re-checks the hold after its own `docker
+//! start`/`run` returns and undoes the start if it is now held
+//! (`session_lifecycle/start.rs`).
 
 use std::path::{Path, PathBuf};
 

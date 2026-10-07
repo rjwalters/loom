@@ -116,7 +116,7 @@ use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_drift_removal::{self, DriftRemoval};
 use crate::tokens_pool::session_hold::{now_unix_ms, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
-    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, STOP_GRACE,
+    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, UndoLock, STOP_GRACE,
 };
 pub use crate::tokens_pool::session_mount_gate::Denials;
 /// One running container's drift as the reconciler acts on it:
@@ -449,7 +449,9 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         return Ok(Outcome::DriftRemoved { drift });
     }
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
-    recreate_container(lifecycle, name, &workspace, image, &is_held)?;
+    // This teardown still holds the container's dispatch lock exclusively.
+    let undo = UndoLock::HeldByCaller;
+    recreate_container(lifecycle, name, &workspace, image, &is_held, undo)?;
     account_mem.awaiting_confirm = true;
     account_mem.drift = DriftMemory {
         recreated: Some(drift.clone()),

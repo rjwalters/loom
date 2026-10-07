@@ -81,8 +81,11 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 /// (Issue #10454) — what lets selection pass over a down session account.
 pub mod liveness;
 
-// `stop` and its race handling (file-size ratchet, #7711; #10661).
+// `stop`, and the reconciler's hold-respecting start, with their race
+// handling (file-size ratchet, #7711; #10661).
+mod start;
 mod stop;
+pub use start::UndoLock;
 
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
@@ -1209,70 +1212,6 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             );
         }
         Ok(status)
-    }
-
-    /// The automated start the session reconciler uses (issue #10453): like
-    /// [`Self::start_with_workspace`], but it never lifts a hold or records
-    /// an operator choice, and it re-checks `is_held` after inspecting the
-    /// container and before any `docker start`/`run`, failing with
-    /// [`session_hold::OperatorHeld`] — so a `stop` that wrote its hold
-    /// while this was in flight is never undone.
-    pub fn start_unless_held(
-        &self,
-        name: &str,
-        workspace: Option<&Path>,
-        is_held: &dyn Fn() -> bool,
-    ) -> Result<SessionStatus> {
-        self.start_inner(name, workspace, Some(is_held))
-    }
-
-    fn start_inner(
-        &self,
-        name: &str,
-        workspace: Option<&Path>,
-        is_held: Option<&dyn Fn() -> bool>,
-    ) -> Result<SessionStatus> {
-        let account = find_codex_account(&self.workspace, name)?;
-        let name = account.id.name.as_str();
-        let profile = account.credential_reference;
-        let container = container_name(name);
-        let requested_workspace = workspace
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.workspace.clone());
-        match self.runner.inspect(&container)? {
-            Some(state) if state.running => {
-                // Already running: reuse it (idempotent `start`).
-                Self::check_workspace_match(name, &state, &requested_workspace)?;
-            }
-            Some(state) if state.restarting => bail!(
-                "session {name:?} ({container}) is restarting — Docker is backing off before \
-                 restarting a crashed container, so it is not reused. Recreate it: \
-                 `loom-daemon accounts session stop {name} --force`, then start it again \
-                 (issue #10453)"
-            ),
-            Some(state) => {
-                Self::check_workspace_match(name, &state, &requested_workspace)?;
-                if is_held.is_some_and(|held| held()) {
-                    return Err(session_hold::OperatorHeld.into());
-                }
-                self.runner.start_existing(&container)?;
-            }
-            None => {
-                if is_held.is_some_and(|held| held()) {
-                    return Err(session_hold::OperatorHeld.into());
-                }
-                ensure_profile_controls(&profile)?;
-                self.runner.create(
-                    &container,
-                    &self.image,
-                    &profile,
-                    &requested_workspace,
-                    &self.workspace,
-                )?;
-            }
-        }
-        mark_session_managed(&profile, &container)?;
-        self.status(name)
     }
 
     fn require_host_mode(state: &ContainerState) -> Result<()> {

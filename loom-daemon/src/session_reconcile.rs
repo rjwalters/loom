@@ -49,7 +49,10 @@
 //!   is skipped before any `docker` call (outcome `held (operator stop)`),
 //!   and re-checked after the inspect and inside the start itself
 //!   ([`SessionLifecycle::start_unless_held`]), so a pass racing a `stop`
-//!   never `docker start`s the container `stop` is about to `rm`. The hold
+//!   never `docker start`s the container `stop` is about to `rm`; and once
+//!   more after its own `docker start`/`run` returns, undoing that start if
+//!   a `stop` held the account meanwhile (`Held`, no failure counted;
+//!   #10661). The hold
 //!   is on disk (survives daemon restarts) and per account: holds and
 //!   `enabled=false` are collected across **every** registered root, plus
 //!   the daemon's fallback root, first ([`AccountIndex`] over
@@ -132,8 +135,8 @@ use crate::tokens_pool::private_workspace;
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
     container_name, is_session_managed, refresh_session_health_uncached, ContainerRunner,
-    ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, SESSION_POSTURE,
-    SESSION_POSTURE_LABEL,
+    ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
+    SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
 use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
@@ -752,6 +755,7 @@ pub fn recreate_container<R: ContainerRunner>(
     workspace: &Path,
     image: Option<String>,
     is_held: &dyn Fn() -> bool,
+    undo_lock: UndoLock<'_>,
 ) -> anyhow::Result<SessionStatus> {
     if is_held() {
         return Err(OperatorHeld.into());
@@ -765,7 +769,7 @@ pub fn recreate_container<R: ContainerRunner>(
         );
     }
     lifecycle.set_image(image);
-    let started = lifecycle.start_unless_held(name, Some(workspace), is_held);
+    let started = lifecycle.start_unless_held(name, Some(workspace), is_held, undo_lock);
     lifecycle.set_image(None);
     started
 }
@@ -907,7 +911,8 @@ fn reconcile_one<R: ContainerRunner>(
                     return Ok(out);
                 }
             }
-            lifecycle.start_unless_held(name, workspace.as_deref(), &is_held)?;
+            let undo = UndoLock::Take(ctx.dispatch_locks);
+            lifecycle.start_unless_held(name, workspace.as_deref(), &is_held, undo)?;
             mem.awaiting_confirm = true;
             log::warn!("session_reconcile: {container}: was stopped; resumed it (docker start)");
             Outcome::Resumed
@@ -924,7 +929,8 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
-            recreate_container(lifecycle, name, &workspace, recreate_image, &is_held)?;
+            let undo = UndoLock::Take(ctx.dispatch_locks);
+            recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
             mem.awaiting_confirm = true;
             log::warn!(
                 "session_reconcile: {container}: was missing; recreated it host-mounted \

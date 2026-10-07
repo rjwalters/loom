@@ -20,8 +20,17 @@
 //!   inspects once more *after* writing the hold, and stops and removes
 //!   whatever is there now, under the same refusal.
 //!
-//! One retry is enough in both cases: every start the pass makes after the
-//! hold is on disk sees it, so at most one start can be in flight.
+//! These retries are `stop`'s half of a **two-sided** guarantee; neither
+//! side alone closes the race. A start already in flight when the hold is
+//! written (`docker run` can take minutes on an image pull) can finish after
+//! both of `stop`'s inspects, so no fixed number of retries here would be
+//! enough. The other half is the reconciler's: it re-checks the hold after
+//! its own `docker start`/`run` returns and undoes the start if it is now
+//! held (`session_lifecycle/start.rs`). With `stop` writing the hold at T1
+//! and the reconciler re-checking at T2: if T2 is after T1, the reconciler
+//! sees the hold and removes its container; if T2 is before T1, its start
+//! had returned before the hold existed, so `stop`'s inspect after writing
+//! it sees the container and removes it.
 //!
 //! The busy refusal applies on every path unless `--force`. The dispatch lock
 //! (`session_dispatch_lock`) is the caller's: `accounts session stop` without
