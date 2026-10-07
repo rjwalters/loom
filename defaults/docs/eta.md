@@ -332,6 +332,17 @@ fixture. A behaviour change is a new id registered beside the old one
      is how far the promise moves as the work advances.
    - **convergence**: the median p25–p75 and p25–p90 widths of scored cases
      per bucket of the actual lead.
+   - **subsets** (`by_subset`, #10524): the **held** (`merge_hold`),
+     **starred** and **sequenced** cases apart, each with its coverage,
+     pinball, bias and late-surprise rate (`actual > p90`). The label
+     subsets read the PR's own labels in force at the case's `as_of` (a
+     later label never moves a case), so only forge label-timeline cases
+     (`--pr-history` / `--forge-pr-cases`) can be in them; compare them with
+     `labels_known`, the cases whose labels were reconstructed, not with
+     `overall`. A star that reaches the PR only through its linked issue is
+     not seen. The labels select cases only and are not fed to the
+     estimator. The section is absent when no case is held and none knows
+     its labels.
 3. **Let it run in shadow** — from the moment it is registered, the tracker
    estimates **every** heuristic of the kind at the same `as_of` for the same
    subject. Each is its own `eta.estimate`; only `current`'s carries
