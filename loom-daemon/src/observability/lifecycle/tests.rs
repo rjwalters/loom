@@ -130,6 +130,7 @@ fn restart_closes_only_provably_gone_processes_with_unknown_execution_result() {
             assert_eq!(s.context, span.record.context);
             assert_eq!(s.status, SpanStatus::Unset);
             assert_eq!(s.attributes["loom.result"], "process_lost");
+            assert_eq!(s.attributes["loom.failure_class"], "supervisor-lost");
             assert_eq!(s.attributes["loom.recovered"], "true");
             Ok(())
         })

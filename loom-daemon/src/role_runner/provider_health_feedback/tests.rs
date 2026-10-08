@@ -571,7 +571,7 @@ category=SESSION_DOWN exit_code=78 model=none'\n\
 }
 
 #[test]
-fn session_down_parses_and_a_generic_failure_keeps_the_generic_reason() {
+fn session_down_parses_and_a_generic_failure_carries_no_admission_reason() {
     use std::str::FromStr;
     assert_eq!(
         tokens_pool::health::TerminalClassification::from_str("SESSION_DOWN").unwrap(),
@@ -579,7 +579,9 @@ fn session_down_parses_and_a_generic_failure_keeps_the_generic_reason() {
     );
     let generic = RoleTickOutcome::Failure("`x` exited with 78: boom".into());
     let attrs = crate::observability::lifecycle::admission_attributes(&generic);
-    assert_eq!(attrs["loom.admission.reason"], "failure");
+    // #10640: a launched failure was admitted, so it carries no admission
+    // reason; only the session refusals above keep theirs.
+    assert!(!attrs.contains_key("loom.admission.reason"), "{attrs:?}");
 }
 
 /// #10364: a codex tick refused because the running session container does

@@ -1,6 +1,6 @@
 //! Completed trace records, grouped by the same host resource as logs/metrics.
 use super::mapping::{kv_string, nanos, resource_for_host};
-use crate::telemetry::trace::SpanStatus;
+use crate::telemetry::trace::{SpanStatus, STATUS_MESSAGE};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
@@ -26,6 +26,13 @@ pub(super) fn build_traces_request(
             continue;
         }
         let record = record.clone().bounded();
+        // #10640: the status description rides the record as an attribute
+        // (`SpanStatus` has no message); OTLP carries it as the status
+        // message, which the spec reserves for an `Error` status.
+        let message = match record.status {
+            SpanStatus::Error => record.attributes.get(STATUS_MESSAGE).cloned(),
+            SpanStatus::Unset | SpanStatus::Ok => None,
+        };
         let span = Span {
             trace_id: record.context.trace_id.bytes(),
             span_id: record.context.span_id.bytes(),
@@ -42,6 +49,7 @@ pub(super) fn build_traces_request(
             attributes: record
                 .attributes
                 .iter()
+                .filter(|(k, _)| k.as_str() != STATUS_MESSAGE)
                 .map(|(k, v)| kv_string(k, v))
                 .collect(),
             events: record
@@ -74,7 +82,7 @@ pub(super) fn build_traces_request(
                     SpanStatus::Ok => 1,
                     SpanStatus::Error => 2,
                 },
-                message: String::new(),
+                message: message.unwrap_or_default(),
             }),
             ..Default::default()
         };

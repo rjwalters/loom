@@ -161,6 +161,13 @@ pub struct SpanRecord {
     pub links: Vec<SpanLink>,
 }
 
+/// The span's one-line status description (#10640). [`SpanStatus`] carries
+/// no message, so the description rides the journalled record as this
+/// attribute; the OTLP encoder moves it into `Status.message` on an `Error`
+/// span instead of exporting it as an attribute. Writers put only a fixed
+/// template plus machine-derived values here, never log text.
+pub const STATUS_MESSAGE: &str = "loom.status_message";
+
 /// Applied again at export so a restored queue cannot bypass emission policy.
 pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
     attributes
@@ -186,6 +193,8 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.configured_model"
                     | "loom.result"
                     | "loom.failure_class"
+                    | "loom.exit_code"
+                    | STATUS_MESSAGE
                     | "loom.host.mem_total_bytes"
                     | "loom.host.mem_available_bytes"
                     | "loom.host.mem_compressed_bytes"

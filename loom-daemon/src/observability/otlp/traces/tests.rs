@@ -166,3 +166,41 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
         assert!(keys.iter().any(|k| k == key), "exported span lacks {key}");
     }
 }
+
+/// #10640: a failed span's one-line reason is the OTLP status message, not
+/// an exported attribute; an `Ok`/`Unset` span exports no message even when
+/// the attribute is present.
+#[test]
+fn the_status_message_attribute_becomes_the_error_status_message() {
+    let mut failed = span(TraceContext::root(true));
+    failed.status = SpanStatus::Error;
+    failed
+        .attributes
+        .insert("loom.failure_class".into(), "exit-1".into());
+    failed
+        .attributes
+        .insert(STATUS_MESSAGE.into(), "role child exited with code 1".into());
+    let mut ok = failed.clone();
+    ok.context = TraceContext::root(true);
+    ok.status = SpanStatus::Ok;
+    let request = build_traces_request(&[
+        TelemetryEnvelope::new("host", TelemetryRecord::Span(failed)),
+        TelemetryEnvelope::new("host", TelemetryRecord::Span(ok)),
+    ])
+    .unwrap();
+    let spans = &request.resource_spans[0].scope_spans[0].spans;
+    let status = spans[0].status.as_ref().unwrap();
+    assert_eq!(status.code, 2);
+    assert_eq!(status.message, "role child exited with code 1");
+    assert!(spans[0]
+        .attributes
+        .iter()
+        .any(|kv| kv.key == "loom.failure_class"));
+    for span in spans {
+        assert!(
+            span.attributes.iter().all(|kv| kv.key != STATUS_MESSAGE),
+            "the description is not also exported as an attribute"
+        );
+    }
+    assert_eq!(spans[1].status.as_ref().unwrap().message, "", "no description off Error");
+}

@@ -232,8 +232,9 @@ pub fn host_attributes() -> TraceAttributes {
 /// Fixed-reason admission attributes for one role tick outcome.
 ///
 /// The reason set here is a **closed taxonomy of literals**
-/// (`failure` / `runtime-rejected` / `no-token-pool` / `pool-exhausted` /
-/// `model-runtime-mismatch` / `load-ceiling`) — plus one additional literal,
+/// (`session-down` / `session-mount-stale` / `runtime-rejected` /
+/// `no-token-pool` / `pool-exhausted` / `model-runtime-mismatch` /
+/// `load-ceiling`) — plus one additional literal,
 /// `preflight-rejected`, emitted by a second site outside this function
 /// (`worker_spawn::run`'s preflight-rejection span) that does not go through
 /// a [`crate::role_runner::RoleTickOutcome`] at all. The free-form detail text that
@@ -245,6 +246,11 @@ pub fn host_attributes() -> TraceAttributes {
 /// an operator reports about: the measured load against the timeout ceiling,
 /// which pool gated and how large it was, and which capabilities the runtime
 /// lacked — all finite, machine-derived values.
+///
+/// A `Failure` other than those two session refusals carries **no** admission
+/// reason (#10640): it was admitted and launched, so the pre-#10640 `failure`
+/// literal only repeated `loom.result`. Why it failed is [`FAILURE_CLASS`],
+/// stamped from the observing site's [`RoleFailure`] by [`role_invocation`].
 ///
 /// Since #9420 the same close also carries [`ATTEMPT_WORKED`], read off the
 /// outcome's [`crate::telemetry::RoleTickResult::spawned`] — the existing,
@@ -270,9 +276,9 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
         {
             attrs.insert("loom.admission.reason".into(), "session-mount-stale".into());
         }
-        RoleTickOutcome::Failure(_) => {
-            attrs.insert("loom.admission.reason".into(), "failure".into());
-        }
+        // #10640: any other failure was admitted and launched — no admission
+        // reason; its cause is the `loom.failure_class` stamped on the close.
+        RoleTickOutcome::Failure(_) => {}
         RoleTickOutcome::RuntimeRejected(rejection) => {
             attrs.insert("loom.admission.reason".into(), "runtime-rejected".into());
             insert_nonempty_bounded(&mut attrs, "loom.runtime", &rejection.runtime);
@@ -883,6 +889,9 @@ fn recover_orphans(journal: &Journal) {
         },
         attributes(&[
             ("loom.result", "process_lost"),
+            // #10640: what recovery knows — the child and its supervisor both
+            // exited before either recorded a close. Status stays unset.
+            (role_failure::FAILURE_CLASS, "supervisor-lost"),
             ("loom.recovered", "true"),
             ("loom.timing_source", "recovery_observed"),
         ]),
@@ -1024,6 +1033,9 @@ pub struct RoleTrace {
     pub execution: String,
     /// When the root span started.
     pub started_at: chrono::DateTime<Utc>,
+    /// Why the tick failed, when it did (#10640) — the same class, code and
+    /// message its root span closed with, for the story copies.
+    pub failure: Option<RoleFailure>,
 }
 
 /// Run one role tick under its `loom.role_attempt` root span — **if it
@@ -1039,6 +1051,7 @@ pub fn role_invocation(
 ) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
     let started_at = Utc::now();
     let execution = role_execution_id(role, started_at);
+    role_failure::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
             root: root.to_path_buf(),
@@ -1048,21 +1061,35 @@ pub fn role_invocation(
         });
     });
     let outcome = invoke();
+    let noted = role_failure::take();
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
+    let failure = role_failure::for_outcome(&outcome, noted);
     let trace = Some(RoleTrace {
         context: span.context().clone(),
         execution: execution.clone(),
         started_at: span.active.record.started_at,
+        failure: failure.clone(),
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
     // The fixed-reason admission attributes (deferred-for-load vs rejected vs
-    // pool-gated vs mismatch) ride the finish alongside the host state there.
-    finish_execution(root, &execution, &result, admission_attributes(&outcome));
+    // pool-gated vs mismatch) ride the finish alongside the host state there,
+    // and a failure adds its class, exit code and status message (#10640).
+    let mut close = admission_attributes(&outcome);
+    if let Some(failure) = &failure {
+        close.extend(failure.attributes());
+    }
+    finish_execution(root, &execution, &result, close);
     (outcome, trace)
 }
+
+mod role_failure;
+pub use role_failure::{
+    note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
+    UNCLASSIFIED,
+};
 
 #[cfg(test)]
 mod tests;
