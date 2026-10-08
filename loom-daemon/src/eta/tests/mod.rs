@@ -37,6 +37,8 @@ mod fleet_signoz_timeline;
 mod fleet_signoz_timeline_sql;
 mod friction;
 mod held_heron;
+mod hold_kind;
+mod hold_marker_log;
 mod hold_parity;
 mod hold_serving;
 mod item_features;

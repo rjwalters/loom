@@ -113,6 +113,22 @@ pub fn fetch_pr_files(root: &Path, repo: &str, pr: u32) -> Option<Value> {
     )
 }
 
+/// One page of a repo's comment listing (#10958): `url` is the listing URL
+/// [`super::hold_marker_log::RepoCursor::url`] built, read as one conditional
+/// GET through the same ETag store, so a quiet repo costs a free `304`.
+#[must_use]
+pub fn fetch_comments_page(root: &Path, repo: &str, url: &str) -> Option<Value> {
+    let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let read = FeatureRead {
+        repo: repo.to_ascii_lowercase(),
+        kind: ReadKind::Issue,
+        number: 0,
+        sha: None,
+        base: None,
+    };
+    get(&gh_bin, root, &read, url, ops::COMMENT_LIST)
+}
+
 /// One conditional GET of `url` for `read`'s repo.
 fn get(gh_bin: &str, root: &Path, read: &FeatureRead, url: &str, op: ForgeOp) -> Option<Value> {
     let target = store::resolve_target(Some(root), Some(&read.repo));
