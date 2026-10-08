@@ -238,6 +238,10 @@ fn run_live(
         forge: &|root, nwo| -> Box<dyn ClaimForge> {
             Box::new(ClaimGh(GhTransport::new(root, nwo)))
         },
+        may_write: &|root, nwo| match crate::write_scope::repo_writable(root, nwo) {
+            crate::write_scope::Verdict::Allow(_) => Ok(()),
+            crate::write_scope::Verdict::Deny(why) => Err(why),
+        },
         gate: &|| super::host_gate(&HostGateInputs::live(enforcer)),
         clock: &Utc::now,
     };

@@ -293,6 +293,13 @@ impl<'f> Host<'f> {
             interval: INTERVAL,
             payload: &self.payload,
             nwo: &|root| (!root.join(".not-github").exists()).then(|| REPO.to_string()),
+            may_write: &|root, _| {
+                if root.join(".read-only-credential").exists() {
+                    Err("the credential has READ on acme/app, not WRITE".to_string())
+                } else {
+                    Ok(())
+                }
+            },
             forge: &move |_, _| -> Box<dyn ClaimForge> {
                 let hook = self.before_claim.borrow_mut().take();
                 if let Some(hook) = hook {
@@ -942,6 +949,29 @@ fn the_source_repo_a_non_github_remote_and_an_uninstalled_repo_are_skipped() {
     );
     assert!(fx.forge.calls.borrow().is_empty());
     assert!(pass.alerts.is_empty());
+}
+
+#[test]
+fn a_repo_this_host_may_not_write_is_reported_and_not_claimed() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    write(&host.root.join(".read-only-credential"), "");
+    let before = fx.origin_head();
+    for _ in 0..2 {
+        let pass = host.pass();
+        let report = only(&pass);
+        assert_eq!(report.state, WState::W1);
+        assert_eq!(
+            reason(report),
+            "not written from this host: the credential has READ on acme/app, not WRITE"
+        );
+        // This host's standing, not a failure of the repo: another host may
+        // be able to write it.
+        assert!(pass.alerts.is_empty());
+    }
+    assert!(host.memory.borrow().backoff.is_empty());
+    assert!(fx.forge.calls.borrow().is_empty(), "no claim without write scope");
+    assert_eq!(fx.origin_head(), before);
 }
 
 #[test]

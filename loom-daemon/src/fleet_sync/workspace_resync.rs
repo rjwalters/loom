@@ -342,6 +342,9 @@ pub struct Env<'a> {
     pub payload: &'a LazyPayload,
     /// `OWNER/REPO` of a workspace's origin; `None` when it is not GitHub.
     pub nwo: &'a dyn Fn(&Path) -> Option<String>,
+    /// May this host write to a workspace's repo at all (#9548: a managed
+    /// repo, and a credential with WRITE)? `Err` carries why not.
+    pub may_write: &'a dyn Fn(&Path, &str) -> std::result::Result<(), String>,
     /// The forge for a workspace's repo, under that repo's credentials.
     pub forge: &'a dyn Fn(&Path, &str) -> Box<dyn ClaimForge + 'a>,
     /// The host gate, read live each time it is called.
@@ -638,6 +641,22 @@ fn attempt(
     alerts: &mut Vec<Alert>,
 ) -> bool {
     let root = report.root.clone();
+    // Loom writes only to repositories it manages and can write (#9548). A
+    // refusal is this host's standing, not a failure: another host may hold
+    // a credential that can, so there is no backoff and no alert.
+    if let Err(why) = (env.may_write)(&root, &candidate.nwo) {
+        if memory
+            .noted
+            .insert(format!("scope:{}:{why}", root.display()))
+        {
+            log::warn!(
+                "workspace_resync: {}: not resynced from this host: {why} (reported once)",
+                candidate.nwo
+            );
+        }
+        report.reason = Some(format!("not written from this host: {why}"));
+        return false;
+    }
     let forge = (env.forge)(&root, &candidate.nwo);
     let version = env.running.to_string();
     let claimant = Claimant {
