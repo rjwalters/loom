@@ -1166,11 +1166,10 @@ mod tests {
         // seam against a real slot directory — the half that actually
         // regressed in PR #7334 — by asking whether a competing acquirer (a
         // `docker build` gate on this host) can steal the only slot mid-work.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("build-slot");
-        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, &dir);
+        // #11014: a per-test slot dir, restored (not unset) when the guard drops.
+        let slots = crate::build_slot::test_support::BuildSlotEnvGuard::isolated();
+        let dir = slots.dir().to_path_buf();
         std::env::set_var(crate::build_slot::BUILD_SLOTS_ENV, "1");
-        std::env::remove_var(crate::build_slot::BUILD_SLOT_HELD_ENV);
 
         let competitor = |label: &str| {
             crate::build_slot::acquire_in(
@@ -1199,9 +1198,6 @@ mod tests {
             competitor("after-the-pass").holds_slot(),
             "the lease must be released once the removal work has completed"
         );
-
-        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
-        std::env::remove_var(crate::build_slot::BUILD_SLOTS_ENV);
     }
 
     #[test]
