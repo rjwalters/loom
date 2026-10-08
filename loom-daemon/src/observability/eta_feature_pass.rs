@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::Utc;
 
 use super::{lock, ListedPr, PrView};
+use crate::eta::capacity_log::WriteClock;
 use crate::eta::pr_features::FEATURE_READ_BUDGET;
 use crate::eta::pr_file_log::{self, Candidate, ReadClock, FILE_READ_BUDGET};
 
@@ -58,9 +59,10 @@ pub(super) async fn run(
     count
 }
 
-/// Append this pass's live capacity rows (#10959): the authority's own pool,
-/// breaker and quota readings per repo. Only the ETA authority writes the
-/// series; a failed write is a lost observation, not a pass failure.
+/// Append the live capacity rows (#10959): the authority's own pool, breaker
+/// and quota readings per repo, on the first pass of each grid hour
+/// ([`WriteClock`]), then the gated compaction. Only the ETA authority writes
+/// the series; a failed write is a lost observation, not a pass failure.
 fn log_capacity(
     workspace_root: &Path,
     slugs: &[String],
@@ -72,19 +74,32 @@ fn log_capacity(
         return;
     }
     let now = Utc::now();
-    let rows: Vec<CapacityRow> = slugs
-        .iter()
-        .map(|slug| CapacityRow {
-            known_at: now,
-            repo: slug.clone(),
-            source: Source::Live,
-            features: with_stall(CapacityFeatures::default(), stall, slug, now),
-        })
-        .collect();
-    if let Err(e) = capacity_log::append(workspace_root, &rows) {
-        log::warn!("eta capacity log: could not append: {e}");
+    let Ok(mut clock) = capacity_clock().lock() else {
+        return;
+    };
+    if clock.take_live(now) {
+        let rows: Vec<CapacityRow> = slugs
+            .iter()
+            .map(|slug| CapacityRow {
+                known_at: now,
+                repo: slug.clone(),
+                source: Source::Live,
+                features: with_stall(CapacityFeatures::default(), stall, slug, now),
+            })
+            .collect();
+        if let Err(e) = capacity_log::append(workspace_root, &rows) {
+            log::warn!("eta capacity log: could not append: {e}");
+        }
     }
-    let _ = capacity_log::compact(workspace_root, now);
+    if let Err(e) = clock.compact(workspace_root, now) {
+        log::warn!("eta capacity log: could not compact: {e}");
+    }
+}
+
+/// This process's capacity-log write cadence ([`WriteClock`]).
+fn capacity_clock() -> &'static Mutex<WriteClock> {
+    static CLOCK: OnceLock<Mutex<WriteClock>> = OnceLock::new();
+    CLOCK.get_or_init(|| Mutex::new(WriteClock::default()))
 }
 
 /// When this process last read each PR's file list ([`ReadClock`]).

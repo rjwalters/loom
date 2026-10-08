@@ -20,7 +20,9 @@
 //!   0` counts 0 slots (it is live, with no capacity); a host that stated
 //!   nothing is not counted. When hosts have been seen but none is live the
 //!   fleet has 0 slots; when none was ever seen the value is `None`.
-//! - `hosts_live`: the hosts counted above (stated or not).
+//! - `hosts_live`: the hosts counted above (stated or not); like
+//!   `slots_fleet`, 0 when hosts were seen but none is live and `None` when
+//!   none was ever seen (a live row, which reads no timeline, is `None`).
 //! - `running_fleet` / `slot_util_fleet`: the live hosts' `running` count and
 //!   `running / slots` (`None` when slots are 0 or unknown).
 //! - `main_red`: some latest workflow run of the default branch concluded
@@ -60,7 +62,7 @@ pub const CI_DURATION_WINDOW_SEC: i64 = 24 * 3600;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapacityFeatures {
-    pub hosts_live: u32,
+    pub hosts_live: Option<u32>,
     pub slots_fleet: Option<u32>,
     pub running_fleet: Option<u32>,
     pub slot_util_fleet: Option<f64>,
@@ -91,8 +93,8 @@ pub fn build(timeline: &Timeline, repo: &str) -> CapacityFeatures {
         .values()
         .filter(|h| h.tick_at >= live_from && h.tick_at <= as_of)
         .collect();
-    out.hosts_live = u32::try_from(live.len()).unwrap_or(u32::MAX);
     if !timeline.hosts.is_empty() {
+        out.hosts_live = Some(u32::try_from(live.len()).unwrap_or(u32::MAX));
         let slots: u32 = live.iter().filter_map(|h| h.capacity.max_concurrent).sum();
         let running: u32 = live.iter().filter_map(|h| h.capacity.running).sum();
         out.slots_fleet = Some(slots);

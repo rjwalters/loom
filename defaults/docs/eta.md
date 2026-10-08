@@ -3278,12 +3278,19 @@ shadow, no `eta.estimate` field yet.
 - **The log.** `capacity.jsonl` beside the fleet snapshots
   (`eta/capacity_log.rs`, mirroring `pr-files.jsonl`). One row per
   `{known_at, repo, source}`; `source: live` rows are the ETA authority's own
-  pool/breaker/quota readings, appended each feature pass; `source: backfill`
-  rows are derived hourly from SigNoz `queue.snapshot` and `ci.*` rows keyed by
-  `observed_timestamp`, by the fleet refresh task (96 instants per pass,
-  oldest first, skipping instants already logged). Readers take
-  `latest_before(as_of)`: strictly earlier than `as_of`, live beating backfill
-  at one instant.
+  pool/breaker/quota readings, appended on the first feature pass of each
+  grid hour (the backfill's cadence; timeline fields are `None` on them);
+  `source: backfill` rows are derived hourly from SigNoz `queue.snapshot` and
+  `ci.*` rows keyed by `observed_timestamp`, by the fleet refresh task (96
+  instants per pass, oldest first, skipping instants already logged; the log
+  is parsed once per refresh cycle). Readers take `latest_before(as_of)`:
+  strictly earlier than `as_of`, live beating backfill at one instant.
+- **Retention.** `RETAIN_DAYS` is 28 (twice the fit's 14-day window, so a
+  walk-forward fold one window back still has a window behind it); the
+  backfill never reaches further back. Compaction is size-gated (a
+  `metadata` read per pass; the file is read only above 8 MiB), examined at
+  most once a day per process, and rewrites only when rows aged out. Steady
+  state is about 48 rows per repo per day of retention.
 - **Coverage.** `capacity_log::uncovered` reports the families short of a
   window via `Coverage::covers(Family::Queue | Family::Ci, cutoff, days)`.
 - **Not in slice 1.** Fleet-wide pool/breaker for non-authority hosts (needs a

@@ -6,8 +6,9 @@ use crate::eta::capacity_features::{
     build, merge_stall, with_stall, CapacityFeatures, QUEUE_TICK_SEC, SINCE_MAIN_GREEN_CAP_SEC,
 };
 use crate::eta::capacity_log::{
-    append, backfill, backfill_instants, backfilled_instants, latest_before, load,
-    missing_instants, uncovered, CapacityRow, Source as LogSource,
+    append, backfill, backfill_instants, backfilled_instants, compact, compact_above,
+    latest_before, load, log_path, missing_instants, uncovered, CapacityRow, Source as LogSource,
+    WriteClock, BACKFILL_PER_PASS, RETAIN_DAYS,
 };
 use crate::eta::fleet_signoz_refresh::{FileRows, Limits, SignozRead};
 use crate::eta::fleet_signoz_timeline::{Family, Timeline};
@@ -96,26 +97,28 @@ fn slots_sum_live_hosts_and_a_stale_host_is_not_live() {
         snapshot("b", 1_100, 1_105, Some(8), 5),
     ];
     let f = build(&Timeline::build(&rows, t(1_110)), REPO);
-    assert_eq!((f.hosts_live, f.slots_fleet, f.running_fleet), (2, Some(12), Some(6)));
+    assert_eq!((f.hosts_live, f.slots_fleet, f.running_fleet), (Some(2), Some(12), Some(6)));
     // a's tick is more than two intervals old at 1 201 s: no longer live.
     let f = build(&Timeline::build(&rows, t(QUEUE_TICK_SEC * 2 + 1)), REPO);
-    assert_eq!(f.hosts_live, 1);
+    assert_eq!(f.hosts_live, Some(1));
     let f = build(&Timeline::build(&rows, t(1_110 + 600)), REPO);
-    assert_eq!((f.hosts_live, f.slots_fleet), (1, Some(8)));
+    assert_eq!((f.hosts_live, f.slots_fleet), (Some(1), Some(8)));
     assert_eq!(f.slot_util_fleet, Some(5.0 / 8.0));
 }
 
 #[test]
 fn zero_slots_are_zero_and_no_hosts_are_unknown() {
     let f = build(&Timeline::build(&[snapshot("a", 0, 5, Some(0), 0)], t(60)), REPO);
-    assert_eq!((f.hosts_live, f.slots_fleet, f.slot_util_fleet), (1, Some(0), None));
+    assert_eq!((f.hosts_live, f.slots_fleet, f.slot_util_fleet), (Some(1), Some(0), None));
     // A host that stated nothing counts as live but adds no slots.
     let f = build(&Timeline::build(&[snapshot("a", 0, 5, None, 0)], t(60)), REPO);
-    assert_eq!((f.hosts_live, f.slots_fleet), (1, Some(0)));
+    assert_eq!((f.hosts_live, f.slots_fleet), (Some(1), Some(0)));
     // Hosts seen, none live: zero capacity. Never seen: unknown.
     let rows = [snapshot("a", 0, 5, Some(4), 0)];
-    assert_eq!(build(&Timeline::build(&rows, t(10_000)), REPO).slots_fleet, Some(0));
-    assert_eq!(build(&Timeline::build(&[], t(10_000)), REPO).slots_fleet, None);
+    let seen = build(&Timeline::build(&rows, t(10_000)), REPO);
+    assert_eq!((seen.hosts_live, seen.slots_fleet), (Some(0), Some(0)));
+    let never = build(&Timeline::build(&[], t(10_000)), REPO);
+    assert_eq!((never.hosts_live, never.slots_fleet), (None, None));
 }
 
 #[test]
@@ -281,10 +284,11 @@ fn the_stall_fields_are_the_authoritys_and_merge_by_field() {
 
 #[test]
 fn backfill_skips_an_empty_prefix_and_reaches_later_hours() {
-    // First queue observation 10 days into a 60-day window: far more than
+    // First queue observation 8 days into the retained window (the 60-day
+    // history is clamped to RETAIN_DAYS = 28): far more than
     // BACKFILL_PER_PASS empty hours precede it.
     let listed = t(60 * 86_400);
-    let rows = vec![snapshot("a", 10 * 86_400, 10 * 86_400 + 5, Some(4), 1)];
+    let rows = vec![snapshot("a", 40 * 86_400, 40 * 86_400 + 5, Some(4), 1)];
     let timeline = Timeline::build(&rows, listed);
     let mut have = BTreeSet::new();
     let first_pass = backfill(&rows, REPO, &backfill_instants(&timeline, listed, 60, &have));
@@ -309,4 +313,136 @@ fn capacity_lands_when_labels_and_lifecycle_are_uncovered() {
         Load::Uncovered(_, capacity) => assert!(!capacity.is_empty()),
         other => panic!("expected Uncovered, got {other:?}"),
     }
+}
+
+fn log_row(known_at: DateTime<Utc>, source: LogSource) -> CapacityRow {
+    CapacityRow {
+        known_at,
+        repo: REPO.to_string(),
+        source,
+        features: CapacityFeatures::default(),
+    }
+}
+
+#[test]
+fn compaction_below_the_size_gate_never_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = t(400 * 86_400);
+    // Every row is past retention, but the file is small: left alone.
+    let old: Vec<_> = (0..50)
+        .map(|h| log_row(t(h * 3_600), LogSource::Backfill))
+        .collect();
+    append(dir.path(), &old).unwrap();
+    let before = std::fs::read(log_path(dir.path())).unwrap();
+    for _ in 0..3 {
+        assert_eq!(compact(dir.path(), now).unwrap(), None, "size-gated, not read");
+    }
+    assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), before);
+    // No log at all is a no-op too.
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(compact(empty.path(), now).unwrap(), None);
+}
+
+#[test]
+fn compaction_above_the_gate_bounds_the_log_to_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = t(100 * 86_400);
+    // Hourly rows over 60 days, half of them past the 28-day retention.
+    let rows: Vec<_> = (0..60 * 24)
+        .map(|h| log_row(now - Duration::hours(h), LogSource::Backfill))
+        .collect();
+    append(dir.path(), &rows).unwrap();
+    let dropped = compact_above(dir.path(), now, 1).unwrap();
+    let kept = load(dir.path());
+    let from = now - Duration::days(RETAIN_DAYS);
+    assert!(kept.iter().all(|r| r.known_at >= from));
+    assert_eq!(kept.len(), rows.iter().filter(|r| r.known_at >= from).count());
+    assert_eq!(dropped, Some(rows.len() - kept.len()));
+    // A second pass has nothing to drop and does not rewrite.
+    let before = std::fs::read(log_path(dir.path())).unwrap();
+    assert_eq!(compact_above(dir.path(), now, 1).unwrap(), Some(0));
+    assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), before);
+}
+
+#[test]
+fn the_write_clock_thins_live_rows_and_compaction_examinations() {
+    let mut clock = WriteClock::default();
+    let hour = Utc.with_ymd_and_hms(2026, 10, 1, 10, 0, 0).unwrap();
+    // Twelve five-minute passes in one hour write live rows once.
+    let due = (0..12)
+        .filter(|i| clock.take_live(hour + Duration::minutes(5 * i)))
+        .count();
+    assert_eq!(due, 1);
+    assert!(clock.take_live(hour + Duration::hours(1)));
+    // A day of passes writes at most one live row per grid hour.
+    let mut clock = WriteClock::default();
+    let day = (0..288)
+        .filter(|i| clock.take_live(hour + Duration::minutes(5 * i)))
+        .count();
+    assert_eq!(day, 24);
+
+    // An examined log is not reread until COMPACT_EVERY_HOURS pass, even
+    // while it stays over the size gate.
+    let dir = tempfile::tempdir().unwrap();
+    let big: Vec<_> = (0..40_000)
+        .map(|i| log_row(hour - Duration::minutes(i), LogSource::Live))
+        .collect();
+    append(dir.path(), &big).unwrap();
+    assert!(
+        std::fs::metadata(log_path(dir.path())).unwrap().len()
+            > crate::eta::capacity_log::COMPACT_ABOVE_BYTES
+    );
+    let mut clock = WriteClock::default();
+    assert_eq!(clock.compact(dir.path(), hour).unwrap(), Some(0));
+    assert_eq!(
+        clock
+            .compact(dir.path(), hour + Duration::minutes(5))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        clock
+            .compact(dir.path(), hour + Duration::hours(23))
+            .unwrap(),
+        None
+    );
+    assert!(clock
+        .compact(dir.path(), hour + Duration::hours(24))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn a_live_row_does_not_claim_zero_live_hosts() {
+    let stall = StallSnapshot {
+        observed_at: t(0),
+        budgets: BTreeMap::new(),
+        writers: BTreeMap::new(),
+        breaker: None,
+        pool: PoolReading {
+            usable: 2,
+            total: 3,
+        },
+    };
+    let live = with_stall(CapacityFeatures::default(), &stall, REPO, t(60));
+    assert_eq!(live.hosts_live, None);
+    let json = serde_json::to_value(log_row_with(live)).unwrap();
+    assert!(json["features"]["hosts_live"].is_null(), "unknown, not 0: {json}");
+}
+
+fn log_row_with(features: CapacityFeatures) -> CapacityRow {
+    CapacityRow {
+        features,
+        ..log_row(t(60), LogSource::Live)
+    }
+}
+
+#[test]
+fn backfill_never_reaches_past_retention() {
+    let listed = t(90 * 86_400);
+    let rows = vec![snapshot("a", 0, 5, Some(4), 1)];
+    let timeline = Timeline::build(&rows, listed);
+    let got = backfill_instants(&timeline, listed, 90, &BTreeSet::new());
+    assert_eq!(got.len(), BACKFILL_PER_PASS);
+    assert!(got[0] > listed - Duration::days(RETAIN_DAYS));
 }

@@ -24,11 +24,26 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Rows older than this are dropped when the log is compacted.
-pub const RETAIN_DAYS: i64 = 120;
+/// Rows older than this are dropped when the log is compacted, and the
+/// backfill never reaches further back (so compaction and backfill cannot
+/// churn the same instants).
+///
+/// Twice the daily fit's [`super::fit::WINDOW_DAYS`]: an estimate at `as_of`
+/// reads one window back, and a walk-forward fold replaying an instant one
+/// window ago needs a second window behind *that* (the reasoning of
+/// [`super::fleet::RETENTION_DAYS`], at the fit's window). With one live and
+/// one backfill row per repo per hour, that bounds the steady state at about
+/// `48 × RETAIN_DAYS` rows per repo.
+pub const RETAIN_DAYS: i64 = 2 * super::fit::WINDOW_DAYS;
 
-/// Compact once the log holds more than this many rows.
-const COMPACT_ABOVE: usize = 50_000;
+/// Below this size the log is not even read for compaction (one `metadata`
+/// call per pass).
+pub const COMPACT_ABOVE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The log is examined for compaction at most this often per process, so a
+/// log whose retained rows alone exceed [`COMPACT_ABOVE_BYTES`] is not
+/// reparsed every pass.
+pub const COMPACT_EVERY_HOURS: i64 = 24;
 
 /// Backfill grid step.
 pub const BACKFILL_STEP_SEC: i64 = 3600;
@@ -99,26 +114,97 @@ pub fn append(workspace_root: &Path, rows: &[CapacityRow]) -> std::io::Result<()
         .write_all(out.as_bytes())
 }
 
-/// Rewrite the log without rows older than [`RETAIN_DAYS`], once it is large.
+/// Rewrite the log without rows older than [`RETAIN_DAYS`], once it is larger
+/// than [`COMPACT_ABOVE_BYTES`]. `None` when the size gate skipped it without
+/// reading the file; else the rows dropped (0 leaves the file untouched).
 ///
 /// # Errors
 ///
 /// The rewrite failed.
-pub fn compact(workspace_root: &Path, now: DateTime<Utc>) -> std::io::Result<()> {
-    let all = load(workspace_root);
-    if all.len() <= COMPACT_ABOVE {
-        return Ok(());
+pub fn compact(workspace_root: &Path, now: DateTime<Utc>) -> std::io::Result<Option<usize>> {
+    compact_above(workspace_root, now, COMPACT_ABOVE_BYTES)
+}
+
+/// [`compact`] at an explicit size gate.
+///
+/// # Errors
+///
+/// The rewrite failed.
+pub fn compact_above(
+    workspace_root: &Path,
+    now: DateTime<Utc>,
+    above_bytes: u64,
+) -> std::io::Result<Option<usize>> {
+    let path = log_path(workspace_root);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > above_bytes => {}
+        _ => return Ok(None),
     }
+    let all = load(workspace_root);
     let from = now - Duration::days(RETAIN_DAYS);
+    let kept: Vec<&CapacityRow> = all.iter().filter(|r| r.known_at >= from).collect();
+    let dropped = all.len() - kept.len();
+    if dropped == 0 {
+        return Ok(Some(0));
+    }
     let mut out = String::new();
-    for r in all.iter().filter(|r| r.known_at >= from) {
+    for r in kept {
         out.push_str(&serde_json::to_string(r).map_err(std::io::Error::other)?);
         out.push('\n');
     }
-    let path = log_path(workspace_root);
     let tmp = path.with_extension("jsonl.tmp");
     std::fs::write(&tmp, out)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    Ok(Some(dropped))
+}
+
+/// The authority's per-process write cadence for the log: one live row per
+/// repo per [`BACKFILL_STEP_SEC`] grid hour (the backfill's cadence; the fit
+/// reads [`latest_before`], so the five-minute passes in between add no
+/// information), and a compaction examined at most every
+/// [`COMPACT_EVERY_HOURS`].
+#[derive(Debug, Default)]
+pub struct WriteClock {
+    live_hour: Option<DateTime<Utc>>,
+    examined_at: Option<DateTime<Utc>>,
+}
+
+impl WriteClock {
+    /// Whether this pass writes live rows: the first pass of each grid hour.
+    pub fn take_live(&mut self, now: DateTime<Utc>) -> bool {
+        let Ok(hour) = now.duration_trunc(Duration::seconds(BACKFILL_STEP_SEC)) else {
+            return false;
+        };
+        if self.live_hour.is_some_and(|h| h >= hour) {
+            return false;
+        }
+        self.live_hour = Some(hour);
+        true
+    }
+
+    /// [`compact`], unless the log was examined within
+    /// [`COMPACT_EVERY_HOURS`].
+    ///
+    /// # Errors
+    ///
+    /// The rewrite failed.
+    pub fn compact(
+        &mut self,
+        workspace_root: &Path,
+        now: DateTime<Utc>,
+    ) -> std::io::Result<Option<usize>> {
+        if self
+            .examined_at
+            .is_some_and(|at| now - at < Duration::hours(COMPACT_EVERY_HOURS))
+        {
+            return Ok(None);
+        }
+        let got = compact(workspace_root, now);
+        if !matches!(got, Ok(None)) {
+            self.examined_at = Some(now);
+        }
+        got
+    }
 }
 
 /// The latest row of `repo` known strictly before `as_of` (a live row beats a
@@ -165,8 +251,8 @@ pub fn missing_instants(
     out
 }
 
-/// The grid instants of the `history_days` window ending at `listed_at` that
-/// are worth backfilling: [`missing_instants`] from the first instant at which
+/// The grid instants of the `history_days` window (at most [`RETAIN_DAYS`])
+/// ending at `listed_at` that are worth backfilling: [`missing_instants`] from the first instant at which
 /// `timeline` knows queue or CI, so a long empty prefix cannot fill every pass's
 /// [`BACKFILL_PER_PASS`] budget and pin the scan there. Empty when neither is
 /// known.
@@ -184,7 +270,7 @@ pub fn backfill_instants(
     else {
         return Vec::new();
     };
-    let window = listed_at - Duration::days(history_days);
+    let window = listed_at - Duration::days(history_days.min(RETAIN_DAYS));
     let from = window.max(first - Duration::seconds(BACKFILL_STEP_SEC));
     missing_instants(from, listed_at, have)
 }

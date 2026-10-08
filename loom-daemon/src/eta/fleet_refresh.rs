@@ -484,6 +484,14 @@ pub fn run_cycle_with(
     };
     let mut halted: Option<StopReason> = None;
     let mut reserve_installs: BTreeSet<Installation> = BTreeSet::new();
+    // The capacity log (#10959), parsed once per cycle rather than per repo:
+    // each repo reads only its own backfilled instants, which no other repo's
+    // pass appends.
+    let capacity_rows = if signoz.is_some() {
+        super::capacity_log::load(root)
+    } else {
+        Vec::new()
+    };
     for p in planned {
         let repo = &p.target.repo;
         // A skipped repo still reports the snapshot it is left with, so a
@@ -553,8 +561,7 @@ pub fn run_cycle_with(
         let state = p.state.unwrap_or_else(|| RefreshState::new(repo));
         let load = signoz.as_mut().map(|(reader, limits)| {
             let window = pass_window(&state, p.kind, budgets.backfill_days, now);
-            let have =
-                super::capacity_log::backfilled_instants(&super::capacity_log::load(root), repo);
+            let have = super::capacity_log::backfilled_instants(&capacity_rows, repo);
             signoz_history::load(repo, &mut **reader, *limits, window, budgets.backfill_days, &have)
         });
         let plan = walk.apply(load, budgets.gap_fill);
