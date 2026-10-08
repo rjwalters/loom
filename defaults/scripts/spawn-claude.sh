@@ -451,7 +451,7 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         # it from ever colliding with the real unit this spawn will create,
         # regardless of how quickly systemd garbage-collects the probe scope.
         _scope_slice="loom-agents.slice"
-        _scope_unit="loom-agent-$$-${RANDOM}${RANDOM}.scope"
+        _scope_unit="${LOOM_AGENT_SCOPE_UNIT:-loom-agent-$$-${RANDOM}${RANDOM}.scope}"
         _scope_probe_unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope"
         _scope_props=(--slice="$_scope_slice")
         # Probe with a trivial `true` invocation first: a real scope create +
@@ -1247,6 +1247,28 @@ if [[ "$_loom_print_mode" == "true" ]]; then
     export LOOM_HEADLESS_SESSION=1
 fi
 unset _loom_print_mode
+
+# --- Session pinning and roll resume (issue #10830) ---
+# Pause-and-roll (docs/design/daemon-roll-pause-resume.md) resumes a paused
+# agent from its saved session, so the daemon pins every Claude session id at
+# dispatch (LOOM_CLAUDE_SESSION_ID) and a resume launch passes
+# LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT. `loom-daemon agent-resume
+# claude-args` validates them and prints the arguments to append, NUL-separated:
+# `--session-id <id>`, or `--resume <id> <prompt>` (the caller then passes no
+# prompt of its own). A daemon too old to answer costs only the pin (the session
+# runs unpinned and a roll requeues it); a resume it cannot build is refused.
+# The session id is pinned once here: claude-wrapper.sh turns it into --resume
+# on a retry, because Claude refuses a second launch with the same id.
+if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
+    _resume_args_file="$(mktemp -t loom-resume-args.XXXXXX 2>/dev/null || mktemp)"
+    if ! "$(loom_resolve_self_daemon_bin)" agent-resume claude-args >"$_resume_args_file"; then
+        [[ -z "${LOOM_RESUME_SESSION_ID:-}" ]] || { log_error "spawn-claude: cannot build the resume launch (loom-daemon agent-resume claude-args, #10830)"; rm -f "$_resume_args_file"; exit 78; }
+        log_warn "spawn-claude: session id not pinned (loom-daemon agent-resume claude-args unavailable); a daemon roll will requeue this session instead of resuming it (#10830)"
+        : >"$_resume_args_file"
+    fi
+    while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
+    rm -f "$_resume_args_file"
+fi
 
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command

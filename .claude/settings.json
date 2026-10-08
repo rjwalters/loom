@@ -31,6 +31,37 @@
             "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PreToolUse guard-mcp-tools.sh; G=$W/.loom/hooks/guard-mcp-tools.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: guard-mcp-tools.sh is not installed in this Loom workspace ($W/.loom/hooks/guard-mcp-tools.sh); re-run scripts/install-loom.sh.\" >&2; [ \"${LOOM_GUARD_WIRING_FAILOPEN:-0}\" = \"1\" ] && exit 0; printf %s \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Loom hook guard-mcp-tools.sh is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/guard-mcp-tools.sh), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\\\"}}\"; exit 0'"
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PreToolUse roll-pause.sh; G=$W/.loom/hooks/roll-pause.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: roll-pause.sh is not installed in this Loom workspace ($W/.loom/hooks/roll-pause.sh); re-run scripts/install-loom.sh.\" >&2; [ \"${LOOM_GUARD_WIRING_FAILOPEN:-0}\" = \"1\" ] && exit 0; printf %s \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Loom hook roll-pause.sh is not installed in this workspace (no .loom/hooks/hook-wiring.sh and no .loom/hooks/roll-pause.sh), but .loom/hooks/ exists, so this workspace does carry per-repo hook copies and expects this one. A missing guard is a broken install, not an opt-out, and this session runs without permission prompts. Repair: re-run scripts/install-loom.sh (or .loom/scripts/check-guards-installed.sh), then restart Claude Code. Set LOOM_GUARD_WIRING_FAILOPEN=1 in the environment to downgrade this deny to a warning.\\\"}}\"; exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PostToolUse roll-pause.sh; G=$W/.loom/hooks/roll-pause.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: roll-pause.sh is not installed in this Loom workspace ($W/.loom/hooks/roll-pause.sh); re-run scripts/install-loom.sh.\" >&2; exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'R=$(git rev-parse --git-common-dir 2>/dev/null); R=${R:+$(cd \"$R/..\" 2>/dev/null && pwd)}; W=${R:-${CLAUDE_PROJECT_DIR:-$PWD}}; L=$W/.loom/hooks/hook-wiring.sh; [ -r \"$L\" ] && LOOM_PROJECT_ROOT=$W exec bash \"$L\" PostToolUseFailure roll-pause.sh; G=$W/.loom/hooks/roll-pause.sh; [ -x \"$G\" ] && exec \"$G\"; [ -r \"$G\" ] && exec bash \"$G\"; [ -d \"$W/.loom/hooks\" ] || exit 0; echo \"[loom] BROKEN GUARD INSTALL: roll-pause.sh is not installed in this Loom workspace ($W/.loom/hooks/roll-pause.sh); re-run scripts/install-loom.sh.\" >&2; exit 0'"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
