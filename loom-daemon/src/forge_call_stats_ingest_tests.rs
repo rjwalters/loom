@@ -23,7 +23,7 @@ fn append(path: &Path, text: &str) {
 /// A W5 passthrough row as the front writes it.
 fn passthrough(t: i64) -> String {
     format!(
-        r#"{{"t":{t},"c":"agent.gh.pr","p":"graphql","o":"ok","op":"unknown","pv":"github","og":"github.com","rp":"Acme/widget","ir":"agent-builder","ro":"target","ca":"app-4486636","co":"Acme","tk":"writer","rr":"graphql","ag":"builder","vi":"passthrough"}}"#
+        r#"{{"t":{t},"c":"agent.gh.pr","p":"graphql","o":"ok","op":"unknown","pv":"github","og":"github.com","rp":"Acme/widget","ir":"agent-builder","ro":"target","ca":"app-4486636","co":"Acme","ci":"55501","tk":"writer","rr":"graphql","ag":"builder","vi":"passthrough"}}"#
     ) + "\n"
 }
 
@@ -68,10 +68,12 @@ fn only_new_stamped_rows_are_ingested_and_never_twice() {
         ("acme", "acme")
     );
     assert_eq!((pr.labels.resource.as_str(), pr.labels.outcome), ("graphql", CallOutcome::Ok));
+    assert_eq!(pr.labels.installation, "55501");
     let view = &got.calls[1];
     assert_eq!((view.agent, view.via), ("judge", "served"));
     assert_eq!(view.labels.outcome, CallOutcome::NotModified);
     assert_eq!(view.labels.op, "issue.view");
+    assert_eq!(view.labels.installation, "-", "no ci: no installation");
     assert!(drain(sink.path(), &mut cursors, NOW).calls.is_empty(), "never re-emitted");
 }
 
@@ -145,6 +147,7 @@ fn labels_are_re_derived_never_copied() {
     let hostile = passthrough(NOW)
         .replace("app-4486636", "ghp_secret")
         .replace(r#""co":"Acme""#, r#""co":"../../etc""#)
+        .replace(r#""ci":"55501""#, r#""ci":"1;rm -rf""#)
         .replace("Acme/widget", "evil owner/x")
         .replace(r#""ir":"agent-builder""#, r#""ir":"agent-$(id)""#)
         .replace(r#""op":"unknown""#, r#""op":"Issue View!""#)
@@ -154,6 +157,7 @@ fn labels_are_re_derived_never_copied() {
     let got = drain(sink.path(), &mut cursors, NOW);
     let l = &got.calls[0].labels;
     assert_eq!(l.account, "unknown");
+    assert_eq!(l.installation, "-");
     assert_eq!((l.cred_owner.as_str(), l.target_owner.as_str()), ("unknown", "unknown"));
     assert_eq!((l.role.as_str(), l.op.as_str()), ("agent-other", "unknown"));
     assert_eq!(l.resource, "graphql", "an invalid rr falls back to the pool");

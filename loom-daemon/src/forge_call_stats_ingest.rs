@@ -252,6 +252,7 @@ fn validate(row: &SinkLine, source: Source, now: i64) -> Option<AgentCall> {
         role: identity_role(row.ir.as_deref()),
         account: account(row.at.ca.as_deref()),
         cred_owner: owner(row.at.co.as_deref()),
+        installation: installation(row.at.ci.as_deref()),
         target_owner: owner(
             row.rp
                 .as_deref()
@@ -325,6 +326,14 @@ fn account(ca: Option<&str>) -> String {
             })
     });
     ca.filter(|_| ok).unwrap_or(UNKNOWN).to_string()
+}
+
+/// The App installation id (#10571): 1–20 digits, else
+/// [`NO_INSTALLATION`](crate::forge_bucket_book::NO_INSTALLATION).
+fn installation(ci: Option<&str>) -> String {
+    ci.filter(|id| (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(crate::forge_bucket_book::NO_INSTALLATION)
+        .to_string()
 }
 
 /// A lowercase `[a-z0-9._-]` token of at most `max` bytes.

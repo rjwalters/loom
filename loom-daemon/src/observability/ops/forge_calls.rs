@@ -112,6 +112,7 @@ type Key = (
     &'static str,
     &'static str,
 );
+
 type Series = BTreeMap<Key, u64>;
 
 /// The daemon's own series and the ingested agent series, capped apart.
@@ -152,7 +153,8 @@ fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, 
         } else {
             AGENT_OVERFLOW_CALLER.to_string()
         };
-        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9)    } else {
+        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9)
+    } else {
         key
     };
     let slot = store.entry(key).or_default();
