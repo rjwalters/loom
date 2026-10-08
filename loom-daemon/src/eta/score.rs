@@ -192,6 +192,12 @@ pub struct EstimateSummary {
     /// (#10210) — whether or not the heuristic applied its term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_cause: Option<StallCause>,
+    /// The estimate's per-stage forecast (#10929), kept so its outcome can be
+    /// attributed by stage ([`super::stage_forecast::attribute_scored`]) and
+    /// the live snapshot can draw it. Empty for a heuristic that forecasts no
+    /// stage, and on a summary persisted before the field existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_predictions: super::stage_forecast::StagePredictions,
 }
 
 /// One stage's predicted duration quartiles.
@@ -245,6 +251,7 @@ impl EstimateSummary {
                 .as_ref()
                 .is_some_and(|r| r.tail_extrapolated),
             stall_cause: explanation.stalled.as_ref().map(|s| s.cause),
+            stage_predictions: explanation.stage_predictions.clone(),
         }
     }
 

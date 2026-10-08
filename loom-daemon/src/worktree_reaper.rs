@@ -851,6 +851,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
 pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
     let report = reap_worktrees_only(repo_root, config);
 
+    // #10995: aborted-fetch debris (`.git/objects/pack/tmp_pack_*`,
+    // `objects/??/tmp_obj_*`). Cheap and precise, so it runs before the
+    // pressure-gated deep pass, which then sees the bytes it freed.
+    let _ = crate::git_tmp_reclaim::run_for(repo_root);
+
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
     // free. Fires only under disk pressure, holds the machine build slot, and

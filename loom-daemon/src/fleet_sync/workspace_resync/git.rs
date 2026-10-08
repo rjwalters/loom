@@ -100,6 +100,20 @@ fn network_failure(what: &str, stderr: &[u8]) -> anyhow::Error {
     }
 }
 
+/// The fetch was skipped because the checkout's volume is below the disk
+/// floor (#10995). Not [`Unreachable`]: the remote answered, so this must not
+/// count toward a host network outage nor grow the repo's backoff.
+#[derive(Debug)]
+pub(super) struct LowDisk(pub(super) String);
+
+impl std::fmt::Display for LowDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LowDisk {}
+
 /// Prefix of the throwaway worktree's directory name; the pid follows.
 pub(super) const WORKTREE_PREFIX: &str = ".resync-";
 
@@ -230,8 +244,15 @@ pub(super) fn tracking_head(root: &Path, branch: &str) -> Option<String> {
 ///
 /// # Errors
 /// [`Unreachable`] when the fetch got no answer; [`Refused`] when the remote
-/// refused the repo.
+/// refused the repo; [`LowDisk`] when it was skipped below the disk floor.
 pub(super) fn fetch(root: &Path, branch: &str) -> Result<String> {
+    // Below the disk floor a fetch can abort mid-pack and leave a partial
+    // tmp_pack_* behind (#10995). Reported as `LowDisk`, never `Unreachable`:
+    // it says nothing about the remote, so it must not feed the host's
+    // network-outage accounting or the repo's backoff.
+    if let Some(reason) = crate::fetch_headroom::skip_reason(root) {
+        return Err(LowDisk(reason).into());
+    }
     // An explicit refspec, so the remote-tracking ref moves even in a clone
     // whose configured fetch refspec does not cover this branch. Behind `--`
     // because the branch name is the remote's. `--no-write-fetch-head`: this
@@ -517,4 +538,24 @@ pub(super) fn classify_rejection(stderr: &str) -> Option<Push> {
     }
     (lower.contains("non-fast-forward") || lower.contains("fetch first"))
         .then_some(Push::NonFastForward)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod fetch_headroom_tests {
+    use super::*;
+    use crate::fetch_headroom::test_override::with_free_gb;
+
+    #[test]
+    fn below_the_floor_the_fetch_is_skipped_as_low_disk_not_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = with_free_gb(1, || fetch(tmp.path(), "main")).unwrap_err();
+        assert!(err.downcast_ref::<Unreachable>().is_none(), "not a network failure");
+        let low = err.downcast_ref::<LowDisk>().expect("a LowDisk skip");
+        assert!(low.0.contains("skipped git fetch"), "{}", low.0);
+
+        // Above the floor git really runs (and, in a non-repo, fails).
+        let err = with_free_gb(10_000, || fetch(tmp.path(), "main")).unwrap_err();
+        assert!(!format!("{err:#}").contains("skipped git fetch"), "{err:#}");
+    }
 }

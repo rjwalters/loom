@@ -80,6 +80,7 @@ fn summary(
         stage_quartiles: Vec::new(),
         tail_extrapolated: false,
         stall_cause: None,
+        stage_predictions: Default::default(),
     }
 }
 
@@ -898,4 +899,43 @@ fn rows_too_large_for_the_budget_are_cut_by_bytes() {
     assert!(bytes > MAX_RECORD_BYTES - 2 * row - 1_024, "cut early: {bytes} B");
     // The survivors are the first by issue number.
     assert_eq!(record.rows.last().unwrap().issue, u32::try_from(record.rows.len()).unwrap());
+}
+
+/// #10929: a row's own stage forecast never costs a row. It rides in row
+/// order while it fits, before any alternate, and the record stays within
+/// the budget.
+#[test]
+fn stage_forecasts_ride_before_alternates_and_never_cost_a_row() {
+    use crate::eta::stage_forecast::StagePrediction;
+    use crate::telemetry::kinds::eta_snapshot::MAX_RECORD_BYTES;
+    let (mut selected, alternates) = fleet(700, |i| (Kind::Land, (i % 5 != 4).then_some(3_600)));
+    let forecast = |entry: i64| StagePrediction {
+        entry_p50: entry,
+        entry_p90: entry * 3,
+        dwell_p50: 2_400,
+        dwell_p90: 10_800,
+        alloc: 2_000,
+        reach_pct: 100,
+    };
+    for estimate in selected.iter_mut().filter(|e| e.p50_sec.is_some()) {
+        estimate.stage_predictions = [
+            (Stage::ReviewWait, forecast(0)),
+            (Stage::Doctor, forecast(2_400)),
+            (Stage::MergeWait, forecast(4_800)),
+        ]
+        .into();
+    }
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), 700, "a forecast never costs a row");
+    assert!(wire_bytes(&record) <= MAX_RECORD_BYTES);
+    let staged = record.rows.iter().filter(|r| !r.stages.is_empty()).count();
+    assert_eq!(staged, 560, "every estimating row keeps its forecast");
+    assert!(record.rows[..560].iter().all(|r| r.stages.len() == 3));
+    assert!(
+        record.rows[560..].iter().all(|r| r.stages.is_empty()),
+        "refusals forecast nothing"
+    );
+    let row = &record.rows[0].stages[&Stage::Doctor];
+    assert_eq!((row.entry_p50, row.entry_p90, row.reach_pct), (2_400, 7_200, 100));
+    assert_alternates_are_a_prefix(&record);
 }

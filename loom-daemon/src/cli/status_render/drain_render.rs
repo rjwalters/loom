@@ -42,6 +42,10 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             // and observed durations. `null` unless this is a pause roll.
             "pause": r.pause,
         })),
+        // #10832: the pause manifest this process found at startup and what H5
+        // did with it (phase, step, per-reason requeue counts, durations).
+        // `null` when the process started without one.
+        "resume": report.pause_resume,
         // #8652: `{ "YYYY-MM-DD": secs }`, UTC days, live pause included. `{}`
         // when nothing was recorded (and from a pre-#8652 daemon).
         "paused_by_day": report.drain_paused_by_day,
@@ -77,6 +81,11 @@ pub fn paused_by_day_line(report: &DaemonStatusReport) -> Option<String> {
 /// live roll state (no drain active, or a pre-#8514 daemon).
 #[must_use]
 pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
+    // #10832: an H5 resume hold is not a roll waiting on anything; say what
+    // it is doing instead.
+    if let Some(resume) = report.pause_resume.as_ref().filter(|r| r.holding) {
+        return Some(resume_line(resume));
+    }
     let roll = report.drain_roll.as_ref()?;
     // #9588: say WHY dispatch is paused before anything else.
     let state = if roll.startup_hold {
@@ -117,6 +126,29 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
         roll.in_flight,
         roll.refusals,
     ))
+}
+
+/// The human line for an H5 resume in progress (#10832).
+fn resume_line(resume: &loom_daemon::auto_update::pause_resume::PauseResumeStatus) -> String {
+    let requeued: u32 = resume.requeued_by_reason.values().sum();
+    format!(
+        "       roll RESUMING (H5 {}, manifest {}, phase {}) — dispatch held while this daemon \
+         verifies its health and resumes {} paused agent(s): {} resumed, {requeued} requeued so \
+         far [{} → {}, running {}{}]",
+        resume.step,
+        resume.manifest_id.as_deref().unwrap_or("?"),
+        resume.phase.as_deref().unwrap_or("?"),
+        resume.items,
+        resume.resumed,
+        resume.from_version.as_deref().unwrap_or("?"),
+        resume.to_version.as_deref().unwrap_or("?"),
+        resume.running_version,
+        if resume.resumed_on.as_deref() == Some("rollback") {
+            ", ROLLBACK"
+        } else {
+            ""
+        },
+    )
 }
 
 /// The human line for a pause roll's H4 pause (#10831).
@@ -207,6 +239,41 @@ mod tests {
             startup_hold: false,
             pause: None,
         }
+    }
+
+    /// #10832: the resume state is in `--json` whether or not a hold is
+    /// active, and an active hold renders as a resume, not as an armed roll.
+    #[test]
+    fn a_resume_reports_its_manifest_phase_and_per_reason_counts() {
+        let mut report = report_with(None);
+        assert_eq!(drain_json(&report)["resume"], serde_json::Value::Null);
+        report.pause_resume = Some(loom_daemon::auto_update::pause_resume::PauseResumeStatus {
+            manifest_id: Some("rp-1".to_string()),
+            phase: Some("resumed".to_string()),
+            step: "done".to_string(),
+            load: "loaded".to_string(),
+            items: 3,
+            resumed: 2,
+            requeued_by_reason: [("lease-lost".to_string(), 1)].into_iter().collect(),
+            resumed_on: Some("rollback".to_string()),
+            pause_to_resume_secs: Some(140),
+            ..Default::default()
+        });
+        let value = drain_json(&report);
+        assert_eq!(value["resume"]["manifest_id"], "rp-1");
+        assert_eq!(value["resume"]["phase"], "resumed");
+        assert_eq!(value["resume"]["requeued_by_reason"]["lease-lost"], 1);
+        assert_eq!(value["resume"]["resumed_on"], "rollback");
+        assert_eq!(value["resume"]["pause_to_resume_secs"], 140);
+        assert!(roll_line(&report).is_none(), "finished: nothing is held");
+
+        let resume = report.pause_resume.as_mut().unwrap();
+        resume.holding = true;
+        resume.step = "probation".to_string();
+        resume.phase = Some("paused".to_string());
+        let line = roll_line(&report).unwrap();
+        assert!(line.contains("RESUMING") && line.contains("probation"), "{line}");
+        assert!(line.contains("2 resumed, 1 requeued") && line.contains("ROLLBACK"), "{line}");
     }
 
     /// #10831: a pause roll reports its H4 progress in `--json` and renders a

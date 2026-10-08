@@ -43,6 +43,11 @@ libc = "0.2"
 # existing `reqwest` client (reusing `super::sender`'s drain/retry loop), so
 # no gRPC transport stack is pulled in.
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["logs", "metrics", "trace", "gen-tonic-messages", "with-serde"], optional = true }
+# Binary OTLP decoding for the agent telemetry relay's receiver (#10964).
+# `opentelemetry-proto` above already compiles `prost` in (its message types
+# derive `prost::Message`); naming it directly only brings the trait into
+# scope, so the lockfile gains no package.
+prost = { version = "0.14", default-features = false, optional = true }
 
 tempfile = "3.27"
 # `.tar.zst` transcript archiving (#8494): `tar` builds/reads the archive
@@ -83,4 +88,4 @@ harness = false
 # Off by default — enabling it selects `OtlpExporter` (see
 # `observability.exporter = "otlp"`); a plain `cargo build`/`cargo test` never
 # pulls in `opentelemetry-proto`.
-otlp = ["dep:opentelemetry-proto"]
+otlp = ["dep:opentelemetry-proto", "dep:prost"]
