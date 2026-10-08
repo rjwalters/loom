@@ -377,6 +377,15 @@ pub enum MetricName {
     /// Rows with non-empty alternates in the last built eta.snapshot.
     #[serde(rename = "loom.eta.health.snapshot_alternates_rows")]
     EtaHealthSnapshotAlternatesRows,
+    /// Rows the last built eta.snapshot dropped at its cap (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_rows_truncated")]
+    EtaHealthSnapshotRowsTruncated,
+    /// Rows the last built eta.snapshot sent without their alternates (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_alternates_truncated")]
+    EtaHealthSnapshotAlternatesTruncated,
+    /// Compact JSON size of the last built eta.snapshot (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_bytes")]
+    EtaHealthSnapshotBytes,
     /// Pending estimates evicted by the MAX_PENDING cap since process start.
     #[serde(rename = "loom.eta.health.pending_over_cap")]
     EtaHealthPendingOverCap,
@@ -475,6 +484,11 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "loom.eta.health.refresh_repos",
             Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
+            Self::EtaHealthSnapshotRowsTruncated => "loom.eta.health.snapshot_rows_truncated",
+            Self::EtaHealthSnapshotAlternatesTruncated => {
+                "loom.eta.health.snapshot_alternates_truncated"
+            }
+            Self::EtaHealthSnapshotBytes => "loom.eta.health.snapshot_bytes",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
@@ -564,6 +578,9 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "{repository}",
             Self::EtaHealthSnapshotRows => "{row}",
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
+            Self::EtaHealthSnapshotRowsTruncated => "{row}",
+            Self::EtaHealthSnapshotAlternatesTruncated => "{row}",
+            Self::EtaHealthSnapshotBytes => "By",
             Self::EtaHealthPendingOverCap => "{estimate}",
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
@@ -658,6 +675,14 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesRows => {
                 "Rows with non-empty alternates in the last built eta.snapshot."
             }
+            Self::EtaHealthSnapshotRowsTruncated => {
+                "Rows the last built eta.snapshot dropped at its row cap or byte budget; \
+                 above 0, the dashboard has no fresh ETA for them."
+            }
+            Self::EtaHealthSnapshotAlternatesTruncated => {
+                "Rows the last built eta.snapshot sent without their alternates (byte budget)."
+            }
+            Self::EtaHealthSnapshotBytes => "Compact JSON size of the last built eta.snapshot.",
             Self::EtaHealthPendingOverCap => {
                 "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
                  whole series only when distinct series exceed the cap."
