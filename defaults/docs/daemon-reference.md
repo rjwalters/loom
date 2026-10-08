@@ -9181,6 +9181,57 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 
 See `loom-daemon/src/scratch_reclaim.rs`.
 
+#### Aborted-fetch `.git/objects` temp-file reclaim (#10995)
+
+**What was leaking.** A `git fetch` that runs out of disk aborts and leaves its
+partial download as `objects/pack/tmp_pack_*` (loose: `objects/??/tmp_obj_*`).
+Git removes those only in a `gc`/`prune` older than `gc.pruneExpire` (two
+weeks), and the daemon retries its fetches every tick, so a full disk fed
+itself (35 GiB of `size-garbage` in one checkout on loom-worker-1).
+
+**What it removes, and the gates.** Only regular files named `tmp_pack_*`
+directly in `<git-common-dir>/objects/pack`, or `tmp_obj_*` directly in a
+two-hex-digit `objects/??` directory; real packs, `tmp_idx_*`, symlinks and
+every other path are never candidates. A file must be at least `graceMinutes`
+old (default 60, floor 5). The whole checkout is skipped while any `git`
+process has its cwd or an open file in the checkout, its common dir or a linked
+worktree (Linux: `/proc`; elsewhere: `lsof -c git`), and also when that probe
+cannot answer. Each pass that finds debris logs `category=git_tmp_pack` with
+the file count and `bytes_freed`.
+
+**Where it runs.** The scheduled `worktreeReaper` tick and the eager
+below-floor tier (both before the deep clean, with a shared 10-minute per-repo
+cooldown), and `loom-daemon clean` (no cooldown; `--dry-run` reports without
+deleting).
+
+**Fetch precheck.** The daemon's managed-checkout fetches (main-health gate,
+workspace resync, `loom-daemon update`) are skipped and logged when the
+checkout's volume is below `diskWarnFreeGb`. The main-health gate reports the
+skip as the `low-disk` unevaluated class, never as a git failure or a red
+`main`; an unmeasurable volume never skips a fetch.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "gitTmpReclaim": {
+        "enabled": true,
+        "graceMinutes": 60,
+        "minIntervalSecs": 600
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_GIT_TMP_RECLAIM` | `autonomous.worktreeReaper.gitTmpReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_GIT_TMP_RECLAIM_GRACE_MINUTES` | `autonomous.worktreeReaper.gitTmpReclaim.graceMinutes` | env > config > default | `60` (min 5) |
+| `LOOM_GIT_TMP_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.gitTmpReclaim.minIntervalSecs` | env > config > default | `600` (10 min) |
+
+See `loom-daemon/src/git_tmp_reclaim.rs` and `loom-daemon/src/fetch_headroom.rs`.
+
 #### Guarded native-harness launch state reclaim (#8650, dedup + path fix #8693)
 
 **What was leaking.** Every guarded native harness launch (pi / opencode /
