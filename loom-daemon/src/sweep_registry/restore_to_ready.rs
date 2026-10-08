@@ -28,8 +28,14 @@
 //! The state probe is [`SweepRegistry::fetch_issue_signals`]'s `closed` field — one
 //! REST `gh api` read on the independent pool, breaker-gated, the same cost
 //! shape as the complexity read this terminal path already pays.
+//!
+//! Issue #10955 adds one more carve-out of the same shape: an issue that did
+//! not carry `loom:issue` when it was claimed does not gain it on release.
+//! See [`prior_label`].
 
 use super::*;
+
+mod prior_label;
 
 impl SweepRegistry {
     /// [`restore_label_to_ready`](Self::restore_label_to_ready) with the
@@ -58,6 +64,11 @@ impl SweepRegistry {
             // contract: `None` falls back to the unconditional restore.
             self.fetch_issue_signals(issue).closed
         };
+        // Issue #10955: last of all, and only when the re-add would otherwise
+        // happen — did the claim take `loom:issue` away in the first place?
+        // Only a positive "no" skips the re-add (see `prior_label`).
+        let never_ready = !(parked || is_pr || closed == Some(true))
+            && self.claim_took_ready_label(issue) == Some(false);
         let mut args = vec![
             "issue".to_string(),
             "edit".to_string(),
@@ -90,6 +101,12 @@ impl SweepRegistry {
                  CLOSED — the merge already disposed of it (#9463). Removing the stale \
                  `loom:building` claim only, NOT re-adding the `loom:issue` queue label \
                  to a closed issue."
+            );
+        } else if never_ready {
+            log::info!(
+                "sweep_registry: restore_label_to_ready for #{issue} found the issue did \
+                 not carry `loom:issue` when it was claimed — removing the stale \
+                 `loom:building` claim only, NOT adding a queue label it never had (#10955)"
             );
         } else {
             args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
