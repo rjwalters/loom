@@ -4,8 +4,9 @@
 //! Exit codes: `0` pass / gate not configured; `1` failed, attempts remain
 //! (output tail printed — fix and re-run); `4` attempts exhausted
 //! (`preflight_unresolved`, claim released, open NO PR); `5` timed out
-//! (#10860: not a failure, claim kept); `7` (`--check`) no passing receipt
-//! for the current `HEAD`.
+//! (#10860: not a failure, claim kept); `6` deferred, the host is above the
+//! load threshold (#10955: nothing ran, claim kept); `7` (`--check`) no
+//! passing receipt for the current `HEAD`.
 
 use std::path::PathBuf;
 
@@ -45,6 +46,20 @@ impl PreflightArgs {
         match &verdict {
             Verdict::Disabled => eprintln!("preflight: no enabled buildGate — skipped"),
             Verdict::Pass => eprintln!("preflight: PASS"),
+            Verdict::PassFlaky { tests } => eprintln!(
+                "preflight: PASS (flaky, passed on retry: {}) — CI does not retry; consider filing the flake",
+                tests.join(", ")
+            ),
+            Verdict::Deferred {
+                load_per_cpu,
+                threshold,
+                waited_secs,
+                max_secs,
+            } => println!(
+                "preflight: DEFERRED — host load {load_per_cpu} per CPU is above the gate threshold {threshold}; \
+                 the gate was NOT run (not a failure, not a timeout; claim kept). Re-run in a few minutes. \
+                 Deferred {waited_secs}s so far; after {max_secs}s of deferral it runs regardless."
+            ),
             Verdict::Failed { attempt, max, tail } => {
                 println!("preflight: FAILED (attempt {attempt}/{max}) — fix the cause, commit, re-run.\n{tail}");
             }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use super::{drain_roll, DrainState};
+use super::{drain_status, DrainState};
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::status_section::{SectionSet, StatusSection};
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Request};
@@ -297,7 +297,7 @@ pub(super) fn overlay_drain(report: &mut DaemonStatusReport, drain: &DrainState)
     // report already carries, so the two can never disagree. (`drain` is one
     // of the sections that walks the roots, so that list is populated
     // whenever the drain section is served.)
-    report.drain_roll = drain_roll::roll_status(&snap, report.in_flight.len(), Utc::now());
+    report.drain_roll = drain_status::roll_status(&snap, report.in_flight.len(), Utc::now());
     report.drain_paused_by_day = drain.paused_by_day(Utc::now()); // #8652
     report.drain_note = snap.note;
 }

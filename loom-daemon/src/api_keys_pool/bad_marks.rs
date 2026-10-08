@@ -148,10 +148,52 @@ pub fn normalize_model_class(raw: &str) -> Option<String> {
 
 #[must_use]
 pub fn epoch_now() -> u64 {
+    #[cfg(test)]
+    if let Some(pinned) = test_clock::pinned() {
+        return pinned;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A per-thread override of [`epoch_now`] for tests (#10955). Marks carry
+/// whole seconds, so a test that compares two writes is only deterministic
+/// when it decides which second each one lands in.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PINNED: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn pinned() -> Option<u64> {
+        PINNED.with(Cell::get)
+    }
+
+    /// Pins this thread's clock to `now` until the returned guard is dropped.
+    #[must_use]
+    pub(crate) fn pin(now: u64) -> Pin {
+        PINNED.with(|c| c.set(Some(now)));
+        Pin
+    }
+
+    pub(crate) struct Pin;
+
+    impl Pin {
+        /// Move the pinned clock to `now`.
+        pub(crate) fn set(&self, now: u64) {
+            PINNED.with(|c| c.set(Some(now)));
+        }
+    }
+
+    impl Drop for Pin {
+        fn drop(&mut self) {
+            PINNED.with(|c| c.set(None));
+        }
+    }
 }
 
 fn marks_path(root: &Path, provider: &str) -> PathBuf {

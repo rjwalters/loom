@@ -82,6 +82,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_timeline"
         | "guard.open_pr_timeline"
         | "outcome.label_timeline"
+        | "restore.label_timeline"
         | "sequence.label_timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"

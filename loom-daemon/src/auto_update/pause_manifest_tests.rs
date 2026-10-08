@@ -50,6 +50,7 @@ fn sample() -> PauseManifest {
                 effort: Some("high".into()),
                 cwd: Some("/r/.loom/worktrees/issue-10714".into()),
                 container: None,
+                sandbox: None,
                 resume_count: 0,
                 resume_of: None,
             }),

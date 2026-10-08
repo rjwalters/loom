@@ -1,6 +1,6 @@
 //! Window consumption across restarts (Issue #10713, #10188 item 2).
 //!
-//! `consumed` and `timed_out` used to start at `None` in every process, so a
+//! `consumed` used to start at `None` in every process, so a
 //! daemon restarted while its window was still open (most often by the very
 //! roll that consumed it) could arm a second roll in the same window. These
 //! methods let `persisted_state` save and restore them. A child module so the
@@ -33,7 +33,6 @@ impl WindowGate {
             period_secs: period.as_secs(),
             offset_secs: offset.as_secs(),
             consumed: self.consumed,
-            timed_out: self.timed_out,
         })
     }
 
@@ -52,7 +51,6 @@ impl WindowGate {
             return false;
         }
         self.consumed = saved.consumed;
-        self.timed_out = saved.timed_out;
         true
     }
 }

@@ -44,9 +44,12 @@
 //!    `update_available: true` for a day+). After `deferDeadlineSecs` of
 //!    continuous deferral the loop rebuilds anyway, at **reduced CPU priority**
 //!    (`nice(19)`), so the stampede is mitigated rather than merely postponed.
-//! 5. **In-flight sweeps survive** — the roll goes through #4090's **drain**
-//!    path, not a bare restart, so dispatched sweeps finish first and stay in
-//!    the registry rather than being orphaned as bare processes.
+//! 5. **In-flight work is paused, never orphaned** — the roll goes through
+//!    pause-and-roll ([`pause_roll`], #10831), not a bare restart: every
+//!    daemon-dispatched agent is stopped at a safe point and recorded in the
+//!    pause manifest (or requeued, with a reason), and only then does the
+//!    daemon exit for its supervised relaunch. Before #10831 the roll waited
+//!    for in-flight work to reach zero instead, which a busy host never did.
 //! 6. **Flags replay exactly** — the restart exits into launchd
 //!    `KeepAlive:SuccessfulExit`, which relaunches from the plist's persisted
 //!    `ProgramArguments`/`EnvironmentVariables`, so the daemon comes back with
@@ -270,18 +273,6 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
-    /// `autonomous.autoUpdate.rollStallDeadlines` — how many drain deadlines may
-    /// expire, summed across roll lifetimes, with the in-flight sweep count
-    /// never improving before the roll is declared unsatisfiable and abandoned
-    /// (#8998). A zero/invalid value is dropped to `None`: `0` would declare
-    /// every armed roll unsatisfiable on sight.
-    pub roll_stall_deadlines: Option<u32>,
-    /// `autonomous.autoUpdate.rollStallCooldownSecs` — how long a standing
-    /// unsatisfiability declaration may stand before it expires and one more
-    /// bounded roll attempt is released (#9010). A zero/invalid value is dropped
-    /// to `None`: `0` would clear a declaration on the tick it was made, which is
-    /// #8998's livelock re-entered through the knob.
-    pub roll_stall_cooldown_secs: Option<u64>,
     /// #9132's window knobs (`rollWindowSecs`, `rollWindowOffsetSecs`, `launchdLiveReload`).
     pub roll_window: roll_window::RollWindowConfig,
 }
@@ -311,15 +302,6 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .filter(|&s| s > 0),
         defer_deadline_secs: block
             .get("deferDeadlineSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        roll_stall_deadlines: block
-            .get("rollStallDeadlines")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0),
-        roll_stall_cooldown_secs: block
-            .get("rollStallCooldownSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         roll_window: roll_window::RollWindowConfig::from_block(block),
@@ -578,42 +560,31 @@ mod artifact_verdict;
 
 pub use artifact_verdict::{classify_artifact, ArtifactVerdict};
 
-/// The roll trigger (`DrainTrigger`/`IpcDrainTrigger`) and the pure
-/// supersede-not-stack decision — both moved to sibling modules (#8514) because
-/// this file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
-mod drain_trigger;
-// `pub` because `DrainTrigger::armed_roll` names `supersede::ArmedRoll` in a
+/// The roll trigger (`RollTrigger`/`IpcRollTrigger`, #10831) and the pure
+/// supersede-not-stack decision (#8514), in sibling modules.
+mod roll_trigger;
+// `pub` because `RollTrigger::armed_roll` names `supersede::ArmedRoll` in a
 // publicly re-exported trait.
 pub mod supersede;
 
-pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
+pub use roll_trigger::{IpcRollTrigger, RollTrigger};
 
-/// #10712: floor-driven roll targets (target selection, settle skip, stall).
-pub mod floor_roll;
-/// #10830: pause-and-roll (design `docs/design/daemon-roll-pause-resume.md`): the
-/// pause manifest (§6) and the H4 resume/requeue classifier. Not called from the
-/// roll path yet (#10831/#10832).
+/// Pause-and-roll (design `docs/design/daemon-roll-pause-resume.md`): the
+/// pause manifest (§6) and the resume/requeue classifier (#10830), and the H4
+/// pause every roll trigger goes through (#10831). The resume side is #10832.
 pub mod pause_classify;
 pub mod pause_manifest;
-/// #10713: `auto_update_state.json` (settle clocks, window, typed stall).
+pub mod pause_roll;
+/// #10713: `auto_update_state.json` (settle clocks, window).
 pub mod persisted_state;
-/// #8998's unsatisfiable-drain detector. A sibling module for the same two
-/// reasons #8513/#8514 were: this file is over
-/// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
-/// whole value is that it terminates belongs next to the tests that prove it.
-pub mod roll_stall;
+pub use pause_roll::RollTarget;
+/// #10712: floor-driven roll targets (target selection, settle skip, stall).
+pub mod floor_roll;
 /// #9132: schedule-driven rolls (window, per-host offset, one arm per window).
 pub mod roll_window;
-/// #10713: the stall detector's state as a typed value (`StallState`).
-pub mod stall_state;
 /// The loop's resolved knob set, bundled — see the module doc for why a fourth
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
-pub use roll_stall::{
-    resolve_roll_stall_cooldown, resolve_roll_stall_deadlines, RollStallReport,
-    AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV, AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
-    DEFAULT_ROLL_STALL_COOLDOWN_SECS, DEFAULT_ROLL_STALL_DEADLINES,
-};
 pub use tuning::TickTuning;
 
 /// A record of the last artifact this daemon actually installed, persisted so
@@ -644,18 +615,26 @@ const ARTIFACT_ROLL_RECORD_FILE: &str = "auto-update-artifact-roll.json";
 /// `~/.loom`). Exists for tests and for a host whose state home is elsewhere.
 pub const AUTO_UPDATE_STATE_DIR_ENV: &str = "LOOM_AUTO_UPDATE_STATE_DIR";
 
-/// Resolve the artifact-roll record path: `$LOOM_AUTO_UPDATE_STATE_DIR` when
-/// set and non-empty, else `~/.loom/`. `None` when neither resolves (no home
-/// directory) — the loop then runs record-less, which only costs the
-/// loop-suppression above, never correctness of the fetch itself.
+/// The auto-update state dir: `$LOOM_AUTO_UPDATE_STATE_DIR` when set and
+/// non-empty, else `~/.loom/`. `None` when neither resolves (no home
+/// directory). Shared by the artifact-roll record and the pause manifest
+/// (#10831), so both always live side by side.
 #[must_use]
-fn artifact_roll_record_path() -> Option<PathBuf> {
+pub fn state_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var(AUTO_UPDATE_STATE_DIR_ENV) {
         if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir.trim()).join(ARTIFACT_ROLL_RECORD_FILE));
+            return Some(PathBuf::from(dir.trim()));
         }
     }
-    dirs::home_dir().map(|h| h.join(".loom").join(ARTIFACT_ROLL_RECORD_FILE))
+    dirs::home_dir().map(|h| h.join(".loom"))
+}
+
+/// Resolve the artifact-roll record path under [`state_dir`]. `None` runs the
+/// loop record-less, which only costs the loop-suppression above, never
+/// correctness of the fetch itself.
+#[must_use]
+fn artifact_roll_record_path() -> Option<PathBuf> {
+    state_dir().map(|d| d.join(ARTIFACT_ROLL_RECORD_FILE))
 }
 
 /// Read the persisted artifact-roll record. Soft-fails to `None` on a missing
@@ -1242,11 +1221,6 @@ pub struct AutoUpdateState {
     /// surface — a persistently stale-repo host is stuck exactly as a
     /// terminal/backoff one is, just for a different reason.
     stale_repo: stale_repo::StaleRepoStreak,
-    /// #8998's episode tracker: drain deadlines counted **across** roll
-    /// lifetimes, so a roll that is abandoned and re-armed (or superseded onto a
-    /// newer release, which restarts #6007's paused-dispatch budget) cannot hide
-    /// the fact that its wait condition is unreachable.
-    roll_stall: roll_stall::RollStallTracker,
     /// #9132's schedule gate (inert unless `rollWindowSecs` is configured).
     window: roll_window::WindowGate,
     /// #10712: the fleet floor's basis and last verdict (inert while unset).
@@ -1275,32 +1249,6 @@ impl AutoUpdateState {
             artifact_record_path: path,
             ..Self::default()
         }
-    }
-
-    /// Set #8998's unsatisfiability threshold (the resolved
-    /// `rollStallDeadlines` knob). A builder rather than a `new` argument so
-    /// every existing construction site — and every test — keeps the default.
-    #[must_use]
-    pub fn with_roll_stall_deadlines(mut self, deadlines: u32) -> Self {
-        self.roll_stall.set_threshold(deadlines);
-        self
-    }
-
-    /// Whether #8998's episode is running, i.e. whether a tick with no armed
-    /// roll still has to read the in-flight count to advance (or clear) it.
-    fn roll_stall_active(&self) -> bool {
-        self.roll_stall.is_active()
-    }
-
-    /// Fold one tick's view of the armed roll into #8998's tracker. `Some` once
-    /// the roll's wait condition is unsatisfiable.
-    fn observe_roll_stall(
-        &mut self,
-        now: DateTime<Utc>,
-        armed: Option<&supersede::ArmedRoll>,
-        in_flight: usize,
-    ) -> Option<RollStallReport> {
-        self.roll_stall.observe(now, armed, in_flight)
     }
 
     /// Decide this tick, artifact first (Issue #7609).
@@ -1743,16 +1691,17 @@ impl AutoUpdateState {
                     self.backoff_until = None;
                     self.backoff = None;
                     self.last_roll = Some(Utc::now());
-                    format!("{installed} + provisioned; drain-and-restart triggered")
+                    format!("{installed} + provisioned; pause-and-roll triggered")
                 } else {
-                    // The binary IS provisioned, but the drain was refused
-                    // (e.g. no supervisor). Do not treat as a build failure —
-                    // launchd will pick up the fresh binary on the next
-                    // supervised restart. Surface it without backing off.
+                    // The binary IS provisioned, but the pause-and-roll could
+                    // not start (no supervisor, no state directory, or the
+                    // previous roll's manifest is still live). Do not treat as
+                    // a build failure — the fresh binary is picked up on the
+                    // next supervised restart. Surface it without backing off.
                     self.last_roll = Some(Utc::now());
                     format!(
-                        "{installed} + provisioned, but drain-and-restart was refused (no \
-                         supervisor?) — restart manually to run the fresh binary"
+                        "{installed} + provisioned, but the pause-and-roll could not start (no \
+                         supervisor? see the daemon log) — restart manually to run the fresh binary"
                     )
                 }
             }

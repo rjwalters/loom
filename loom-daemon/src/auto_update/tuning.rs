@@ -6,10 +6,12 @@
 //! loop. #8998 adds a fourth knob, which is the point at which a positional list
 //! stops being the right shape.
 //!
-//! Bundling them also keeps the knob set extensible from *one* place: a fifth
+//! Bundling them also keeps the knob set extensible from *one* place: another
 //! knob is a field here plus a line in [`TickTuning::resolve`], not a new
-//! parameter threaded through `daemon_service.rs` — which is exactly how #9010's
-//! `rollStallCooldownSecs` landed, one commit later. That matters because
+//! parameter threaded through `daemon_service.rs`. (#8998's and #9010's stall
+//! knobs lived here until #10831 removed the wait-for-zero roll they tuned;
+//! the pause-and-roll budgets are resolved per roll by
+//! [`super::pause_roll::PauseRollTuning`].) That matters because
 //! `daemon_service.rs` and `auto_update.rs` are both over
 //! `.loom/docs/file-size-policy.md`'s ratchet threshold, and the sanctioned way
 //! to add to a frozen file is a new sibling module like this one.
@@ -30,15 +32,6 @@ pub struct TickTuning {
     pub settle: Duration,
     /// Gate 4's bound on deferring a rebuild for in-flight sweeps (#4929).
     pub defer_deadline: Duration,
-    /// #8998's unsatisfiability threshold: how many drain deadlines may expire,
-    /// summed across roll lifetimes, with the in-flight count never improving
-    /// before the roll is abandoned instead of re-armed.
-    pub roll_stall_deadlines: u32,
-    /// #9010's bound on that suppression: how long a standing declaration may
-    /// stand before it expires on time and releases one more bounded roll
-    /// attempt, so a host that never *samples* `in_flight == 0` is stale for a
-    /// bounded period rather than indefinitely.
-    pub roll_stall_cooldown: Duration,
     /// #9132's schedule: window period, per-host offset, launchd live-reload
     /// opt-in. `period: None` (the default) leaves rolls arming on every build.
     pub roll_window: super::roll_window::RollWindowTuning,
@@ -52,8 +45,6 @@ impl TickTuning {
             interval: super::resolve_interval(config),
             settle: super::resolve_settle(config),
             defer_deadline: super::resolve_defer_deadline(config),
-            roll_stall_deadlines: super::resolve_roll_stall_deadlines(config),
-            roll_stall_cooldown: super::resolve_roll_stall_cooldown(config),
             roll_window: super::roll_window::RollWindowTuning::resolve(
                 &config.roll_window,
                 super::resolve_interval(config),
@@ -67,13 +58,10 @@ impl TickTuning {
     #[must_use]
     pub fn describe(&self) -> String {
         format!(
-            "interval={}s, settle={}s, deferDeadline={}s, rollStallDeadlines={}, \
-             rollStallCooldown={}s, {}",
+            "interval={}s, settle={}s, deferDeadline={}s, {}",
             self.interval.as_secs(),
             self.settle.as_secs(),
             self.defer_deadline.as_secs(),
-            self.roll_stall_deadlines,
-            self.roll_stall_cooldown.as_secs(),
             self.roll_window.describe()
         )
     }
@@ -85,19 +73,16 @@ mod tests {
     use crate::auto_update::roll_window::{RollWindowConfig, RollWindowTuning};
     use crate::auto_update::{
         DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS, DEFAULT_AUTO_UPDATE_INTERVAL_SECS,
-        DEFAULT_AUTO_UPDATE_SETTLE_SECS, DEFAULT_ROLL_STALL_COOLDOWN_SECS,
-        DEFAULT_ROLL_STALL_DEADLINES,
+        DEFAULT_AUTO_UPDATE_SETTLE_SECS,
     };
     use serial_test::serial;
 
     /// Every env override the resolvers read, cleared so a tier test measures the
     /// tier it means to.
-    const ENV_VARS: [&str; 8] = [
+    const ENV_VARS: [&str; 6] = [
         crate::auto_update::AUTO_UPDATE_INTERVAL_ENV,
         crate::auto_update::AUTO_UPDATE_SETTLE_ENV,
         crate::auto_update::AUTO_UPDATE_DEFER_DEADLINE_ENV,
-        crate::auto_update::AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
-        crate::auto_update::AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV,
         crate::auto_update::roll_window::ROLL_WINDOW_SECS_ENV,
         crate::auto_update::roll_window::ROLL_WINDOW_OFFSET_SECS_ENV,
         crate::auto_update::roll_window::LAUNCHD_LIVE_RELOAD_ENV,
@@ -116,11 +101,6 @@ mod tests {
             tuning.defer_deadline,
             Duration::from_secs(DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS)
         );
-        assert_eq!(tuning.roll_stall_deadlines, DEFAULT_ROLL_STALL_DEADLINES);
-        assert_eq!(
-            tuning.roll_stall_cooldown,
-            Duration::from_secs(DEFAULT_ROLL_STALL_COOLDOWN_SECS)
-        );
         // Windowing is opt-in: the default leaves the arm-on-build behaviour intact.
         assert_eq!(tuning.roll_window.period, None);
         assert!(!tuning.roll_window.launchd_live_reload);
@@ -137,8 +117,6 @@ mod tests {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
-            roll_stall_deadlines: Some(5),
-            roll_stall_cooldown_secs: Some(10_800),
             roll_window: RollWindowConfig {
                 period_secs: Some(21_600),
                 offset_secs: Some(900),
@@ -151,8 +129,6 @@ mod tests {
                 interval: Duration::from_secs(120),
                 settle: Duration::from_secs(30),
                 defer_deadline: Duration::from_secs(7200),
-                roll_stall_deadlines: 5,
-                roll_stall_cooldown: Duration::from_secs(10_800),
                 roll_window: RollWindowTuning {
                     period: Some(Duration::from_secs(21_600)),
                     offset: Duration::from_secs(900),
@@ -165,8 +141,7 @@ mod tests {
         // The description is what both startup log lines render, so pin it.
         assert_eq!(
             tuning.describe(),
-            "interval=120s, settle=30s, deferDeadline=7200s, rollStallDeadlines=5, \
-             rollStallCooldown=10800s, \
+            "interval=120s, settle=30s, deferDeadline=7200s, \
              rollWindow=21600s, rollWindowOffset=900s, launchdLiveReload=true"
         );
     }
