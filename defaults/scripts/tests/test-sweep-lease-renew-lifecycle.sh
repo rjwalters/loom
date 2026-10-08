@@ -420,7 +420,8 @@ wait_patches 3
 kill "$LOOP" "$WATCH" 2> /dev/null
 assert_eq "0" "$(cat "$STUB_DIR/state-calls.log" 2> /dev/null | wc -l | tr -d ' ')" "(y8) no state read when the daemon lacks the verb"
 assert_eq "true" "$([[ "$(patch_n)" -ge 3 ]] && echo true || echo false)" "(y8) renewal unchanged without the verb"
-assert_eq "1" "$(grep -c 'lease renewer' "$STUB_DIR/renewer-args.log" 2> /dev/null)" "(y8) the verb is probed once per start, not per cycle"
+# #10203's per-start `sanitize-exec --check` probe is a separate verb; exclude it.
+assert_eq "1" "$(grep -v 'sanitize-exec' "$STUB_DIR/renewer-args.log" 2> /dev/null | grep -c 'lease renewer')" "(y8) the verb is probed once per start, not per cycle"
 
 # (y9) #10348: dispatched start -> no state read, still gated, ends with the watch pid.
 reset_state
