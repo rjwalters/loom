@@ -637,3 +637,28 @@ fn a_queued_issue_that_gains_a_legacy_daemon_hold_loses_the_marker() {
     assert!(r.cleared.is_empty());
     assert_eq!(r.already_queued, 1);
 }
+
+#[test]
+fn a_queued_issue_that_gains_a_permanent_block_comment_loses_the_marker() {
+    let mut w = World::new();
+    w.add(7, "No blocker recorded.", &[]);
+    assert_eq!(w.run().queued, vec![7]);
+    // Body and labels are unchanged; only a permanent-block comment arrives.
+    let labels = w.park.items[&7].labels.clone();
+    let l: Vec<&str> = labels.iter().map(String::as_str).collect();
+    w.gather.rows.clear();
+    w.gather.unnamed.clear();
+    w.park.writes.clear();
+    w.add(7, "No blocker recorded.", &l[1..]);
+    w.extra
+        .comments
+        .insert(7, vec![trusted("<!-- loom:permanent-block -->\nkeep")]);
+    let r = w.run();
+    assert_eq!(r.cleared, vec![7]);
+    assert_eq!(r.already_queued, 0);
+    assert_eq!(skipped(&r, "permanent"), 1);
+    assert_eq!(w.park.writes, vec![format!("remove #7 {UNNAMED_LABEL}")]);
+    assert!(w.park.items[&7]
+        .labels
+        .contains(&"loom:blocked".to_string()));
+}

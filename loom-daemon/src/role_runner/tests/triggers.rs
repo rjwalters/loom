@@ -148,6 +148,15 @@ fn curator_work_observation_counts_pending_revision_requests() {
 }
 
 #[test]
+fn curator_work_observation_counts_the_blocked_unnamed_queue() {
+    // A repository whose only pending Curator work is `loom:blocked-unnamed`
+    // (#10558) must be observed, or event triggers wait out the quiet ceiling.
+    assert!(CURATOR_WORK_LABELS.contains(&"loom:blocked-unnamed"));
+    let d = should_launch("curator", &inputs(Observation::Count(1), None));
+    assert!(d.launches(), "{d:?}");
+}
+
+#[test]
 fn curator_launches_with_untriaged_issues() {
     let d = should_launch("curator", &inputs(Observation::Count(3), None));
     assert!(d.launches(), "{d:?}");

@@ -321,14 +321,26 @@ pub fn run(
         match (queued, doc) {
             (true, Doc::Undocumented) => {
                 // The queue marker must not outlive a legacy daemon hold that
-                // arrived after it was applied: the comment veto otherwise
-                // lives only in `queue()`.
+                // arrived after it was applied: the comment vetoes otherwise
+                // live only in `queue()`. A permanent-block comment added
+                // after queueing clears the marker too (`loom:blocked` stays).
                 let body = row.body.as_deref().unwrap_or_default();
-                let held = extra
-                    .comments(n)
-                    .map_err(|e| format!("comment read failed: {e}"))
-                    .and_then(|c| legacy_hold_veto(extra, policy, n, body, &c));
-                match held {
+                let comments = match extra.comments(n) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        report.unread(n, format!("comment read failed: {e}"));
+                        continue;
+                    }
+                };
+                if comments
+                    .iter()
+                    .any(|c| comment_body(c).contains(PERMANENT_BLOCK_MARKER))
+                {
+                    clear(park, n, cfg.dry_run, &mut cap, &mut report);
+                    report.skip(Skip::Permanent);
+                    continue;
+                }
+                match legacy_hold_veto(extra, policy, n, body, &comments) {
                     Ok(true) => {
                         clear(park, n, cfg.dry_run, &mut cap, &mut report);
                         report.skip(Skip::DaemonHold);

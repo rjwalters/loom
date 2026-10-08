@@ -393,10 +393,10 @@ removing the label or auto-releasing the issue.
 
 **Workflow**:
 1. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1
-2. If no results, use Priority 2
+2. If no results, use Priority 2, then drain `loom:blocked-unnamed` (below)
 3. Take the first result — the query now returns oldest-first (`sort_by(.createdAt)`), so no manual age comparison is needed
 4. Enhance and mark as `loom:curated`
-5. **If neither Priority 1 nor Priority 2 yields a candidate**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a downstream consumer (e.g. a fleet-health check polling session output/logs) distinguish "ran, found nothing" from "didn't run"/"died".
+5. **If no priority or the drain yields a candidate**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a fleet-health check distinguish "ran, found nothing" from "didn't run"/"died".
 
 ## Claiming Work
 
@@ -1814,8 +1814,8 @@ never edit. Bounds: `.loom/docs/promotion-throughput.md`.
 
 ## Draining `loom:blocked-unnamed` (#10558)
 
-The daemon labels `loom:blocked-unnamed` a `loom:blocked` issue naming no blocker
-or reason. Query `gh issue list --label loom:blocked-unnamed` oldest first, at
+The daemon labels a `loom:blocked` issue naming no blocker or reason
+`loom:blocked-unnamed`. Query `gh issue list --label loom:blocked-unnamed` oldest first, at
 most **3 per pass**; procedure and outcomes (named, kept, released):
 `.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
