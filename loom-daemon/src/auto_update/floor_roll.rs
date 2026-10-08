@@ -1,33 +1,33 @@
-//! Floor-driven roll targets (Issue #10712, part of #10698).
+//! Floor-driven roll targets (Issue #10712, part of #10698), and since #10885
+//! the only thing that moves a fleet host.
 //!
-//! `autonomous.autoUpdate` follows the newest release only after the settle
-//! gate, and every new target restarts that quiet period. A fleet that needs
-//! hosts on a version therefore had no way to force it. The fleet floor
-//! (`loom_min_version`, read by [`crate::fleet_sync::loom_min_version`]) is
-//! that lever, and this module is where the self-update loop acts on it.
+//! The fleet floor (`loom_min_version`, read as three values by
+//! [`crate::fleet_sync::floor_knowledge`]) is the fleet's lever for moving
+//! hosts, and this module is where the self-update loop acts on it. The loop
+//! compares the floor with the running version at startup and on every tick,
+//! and acts on that tick. There is no roll window and no per-host jitter.
 //!
 //! # The rule
 //!
-//! - **Floor unset, or the running version already meets it:** nothing here
-//!   changes a decision. The tick is byte-for-byte what it was.
-//! - **Running below the floor, and a release satisfies it:** the roll is
-//!   *floor-driven*. Its target is the newest release at or above the floor,
-//!   pinned to that exact tag (#10709), and it skips the settle gate. A
-//!   supersede of a floor-driven roll does not re-wait settle either, because
-//!   the tick that re-arms it is still floor-driven. Backoff, terminal
-//!   failures and the roll window are kept. The roll itself is the same
-//!   pause-and-roll every trigger uses (#10831), recorded with
-//!   `target_source = floor`.
-//! - **Running below the floor, and no release satisfies it** (most likely a
-//!   typo in the store): a typed stall ([`FloorStallReport`]) is recorded and
-//!   alerted at ERROR, and the host **keeps dispatching** on its current
-//!   version. The floor never refuses work. Ordinary autoUpdate decisions
-//!   still apply, unchanged. The stall stands on every tick, but its ERROR
-//!   line is rate-limited and survives a restart (#10866, [`alert`]).
-//! - **Running below the floor, and this tick cannot tell** (no release
-//!   resolved, or the latest one's version is not `X.Y.Z`): noted, never
-//!   alerted. A stall already standing is kept, so a flaky resolver does not
-//!   toggle the alert (#10866).
+//! | Floor knowledge | Running vs floor | This tick |
+//! |---|---|---|
+//! | no fleet store | n/a | Opt-in `autoUpdate`, unchanged: artifact path and source path behind the settle gate and its ceiling. `target_source = autoupdate`. |
+//! | unknown | n/a | No version roll. The note says the floor is not known and why. Fail closed. |
+//! | set | below; the newest release is at or above it | Floor roll now, no settle, pinned to that release's exact tag (#10709). `target_source = floor`. |
+//! | set | below; the newest release is below it | The typed stall ([`FloorStallReport`]), alerted at ERROR. No roll; dispatch continues. |
+//! | set | below; no comparable release resolved | No roll; the next tick asks again. A standing stall is kept (#10866). |
+//! | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists. |
+//! | set, but a version does not parse | n/a | No version roll, one WARN. |
+//!
+//! A host with a fleet store therefore never chases the latest release and
+//! never rebuilds itself from source: it moves when `loom_min_version` moves.
+//! Backoff and terminal failures still apply to a floor roll. The roll itself
+//! is the same pause-and-roll every trigger uses (#10831).
+//!
+//! "The newest release" is what [`super::AutoUpdateProbe::resolve_artifact`]
+//! resolves: the forge's latest release, and only when it publishes this
+//! platform's binary and its `.sha256`. A tag with no assets yet does not
+//! resolve, so it is never a target; the host waits for the next tick.
 //!
 //! # One roll path, one comparator
 //!
@@ -40,9 +40,17 @@
 //! "Newest release at or above the floor" is the resolved latest release when
 //! that meets the floor: releases are monotonic, so if the latest one is below
 //! the floor, no release satisfies it.
+//!
+//! # Other demands (#10719, #10720)
+//!
+//! A repo ahead of this daemon and a restart-only config change are separate
+//! roll demands that act in every row of the table above. Neither is produced
+//! here yet. [`select_target`] is the seam: a repo-ahead target joins the
+//! floor target there as another candidate.
 
 use super::ArtifactInfo;
 use crate::fleet_store::floor::parse_triple;
+use crate::fleet_sync::FloorKnowledge;
 
 /// The stall this loop can declare (Issue #10712): the fleet floor
 /// (`loom_min_version`) is above the running version and above every published
@@ -50,7 +58,8 @@ use crate::fleet_store::floor::parse_triple;
 ///
 /// There is nothing to abandon: no roll is armed for an unsatisfiable floor,
 /// and **nothing is paused** for it. The host keeps dispatching on its current
-/// version and ordinary autoUpdate rolls still apply. The report exists so the
+/// version and does not roll (#10885: a fleet host does not fall back to the
+/// newest release). The report exists so the
 /// stall is typed, alerted at ERROR, and visible in `status`, instead of a
 /// floor that silently does nothing. (Moved here when #10831 removed the
 /// stall-suppression module with the wait-for-zero roll machinery.)
@@ -77,8 +86,8 @@ impl FloorStallReport {
             "FLEET FLOOR UNSATISFIABLE: loom_min_version {floor} is above every published release \
              (newest {newest}), so this host (running {running}) cannot roll to it. Most likely a \
              typo in the fleet store's loom_min_version. DISPATCH CONTINUES on {running}: the \
-             floor never refuses work, and ordinary autoUpdate rolls still apply. Fix the floor, \
-             or publish a release at or above {floor}."
+             floor never refuses work, and this host does not roll until the floor can be met. \
+             Fix the floor, or publish a release at or above {floor}."
         )
     }
 }
@@ -93,7 +102,8 @@ pub mod alert;
 pub enum TargetSource {
     /// The running version is below the fleet floor: roll now, no settle.
     Floor,
-    /// An ordinary autoUpdate roll: settle, roll window and ceiling apply.
+    /// An ordinary autoUpdate roll on a host with no fleet store: the settle
+    /// gate and its ceiling apply.
     AutoUpdate,
 }
 
@@ -177,12 +187,29 @@ pub fn select_target(
 /// What the fleet floor says about this host on one tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FloorVerdict {
-    /// No floor in force, or it cannot be compared (an unparseable floor or
-    /// running version): no effect, which is exactly the pre-floor behaviour.
+    /// No fleet store: not a fleet host. The floor has no effect and the tick
+    /// is ordinary opt-in autoUpdate.
     #[default]
-    Unset,
-    /// The running version is at or above the floor: no effect.
-    Satisfied,
+    NoStore,
+    /// A fleet store is configured but the floor is not known (#10885). No
+    /// version roll: a host that may have a floor must not chase latest.
+    Unknown {
+        /// Why it is not known.
+        why: String,
+    },
+    /// A floor is set, but it or the running version is not `X.Y.Z`, so they
+    /// cannot be compared. No version roll. Not reachable with a release
+    /// build and a validated store.
+    Uncomparable {
+        /// The floor in force.
+        floor: String,
+    },
+    /// The running version is at or above the floor: no roll, whatever newer
+    /// release exists.
+    Satisfied {
+        /// The floor in force.
+        floor: String,
+    },
     /// Below the floor, and `target` (the newest release) satisfies it.
     Below {
         /// The floor in force.
@@ -209,15 +236,25 @@ pub enum FloorVerdict {
 
 /// Classify the floor against the running version and the newest release.
 #[must_use]
-pub fn floor_verdict(floor: Option<&str>, running: &str, newest: Option<&Release>) -> FloorVerdict {
-    let Some(floor) = floor else {
-        return FloorVerdict::Unset;
+pub fn floor_verdict(
+    knowledge: &FloorKnowledge,
+    running: &str,
+    newest: Option<&Release>,
+) -> FloorVerdict {
+    let floor = match knowledge {
+        FloorKnowledge::NoStore => return FloorVerdict::NoStore,
+        FloorKnowledge::Unknown(why) => return FloorVerdict::Unknown { why: why.clone() },
+        FloorKnowledge::Set(floor) => floor.as_str(),
     };
     let (Some(min), Some(run)) = (parse_triple(floor), parse_triple(running)) else {
-        return FloorVerdict::Unset;
+        return FloorVerdict::Uncomparable {
+            floor: floor.to_string(),
+        };
     };
     if run >= min {
-        return FloorVerdict::Satisfied;
+        return FloorVerdict::Satisfied {
+            floor: floor.to_string(),
+        };
     }
     let Some(newest) = newest else {
         return FloorVerdict::Unresolved {
@@ -252,7 +289,7 @@ pub fn floor_verdict(floor: Option<&str>, running: &str, newest: Option<&Release
 /// (see [`Self::observe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FloorState {
-    floor: Option<String>,
+    knowledge: FloorKnowledge,
     running: String,
     verdict: FloorVerdict,
     /// #10866: the stall last alerted on. `Some` only while that stall
@@ -261,10 +298,10 @@ pub struct FloorState {
 }
 
 impl FloorState {
-    /// Set this tick's basis: the floor in force and the running version
-    /// (`env!("CARGO_PKG_VERSION")` in production). A changed basis drops the
-    /// previous verdict and alert record, so removing the floor clears a
-    /// stall at once.
+    /// Set this tick's basis: what is known about the floor and the running
+    /// version (`env!("CARGO_PKG_VERSION")` in production). A changed basis
+    /// drops the previous verdict and alert record, so fixing the floor
+    /// clears a stall at once.
     ///
     /// One exception (#10866): the first call after a restart is a change from
     /// the default basis, and an alert record restored from disk whose floor
@@ -272,17 +309,88 @@ impl FloorState {
     /// the last-known verdict, so the restart neither drops the stall nor logs
     /// it again. A restored record for any other basis is dropped like the
     /// rest.
-    pub fn set_basis(&mut self, floor: Option<String>, running: &str) {
-        if self.floor != floor || self.running != running {
-            self.floor = floor;
-            self.running = running.to_string();
-            self.alert = self.alert.take().filter(|a| {
-                Some(&a.report.floor) == self.floor.as_ref() && a.report.running == running
-            });
-            self.verdict = self
-                .alert
-                .as_ref()
-                .map_or(FloorVerdict::Unset, |a| FloorVerdict::Unsatisfiable(a.report.clone()));
+    ///
+    /// #10885: a basis under which a fleet host cannot be compared with its
+    /// floor is logged at WARN here, once per change, not once per tick.
+    pub fn set_basis(&mut self, knowledge: FloorKnowledge, running: &str) {
+        if self.knowledge == knowledge && self.running == running {
+            return;
+        }
+        self.knowledge = knowledge;
+        self.running = running.to_string();
+        let floor = self.floor().map(str::to_string);
+        self.alert = self
+            .alert
+            .take()
+            .filter(|a| Some(&a.report.floor) == floor.as_ref() && a.report.running == running);
+        self.verdict = match &self.alert {
+            Some(a) => FloorVerdict::Unsatisfiable(a.report.clone()),
+            // Classified from the basis alone until [`Self::observe`] sees
+            // this tick's release, so a stall from the old basis is gone at
+            // once.
+            None => floor_verdict(&self.knowledge, running, None),
+        };
+        match &self.verdict {
+            FloorVerdict::Unknown { why } => log::warn!(
+                "auto_update: the fleet floor is not known ({why}) — no version roll until it is; \
+                 a fleet host never falls back to chasing the latest release"
+            ),
+            FloorVerdict::Uncomparable { floor } => log::warn!(
+                "auto_update: the fleet floor {floor:?} and the running version {running:?} are \
+                 not both X.Y.Z, so they cannot be compared — no version roll"
+            ),
+            _ => {}
+        }
+    }
+
+    /// The floor in force, when one is set.
+    #[must_use]
+    pub fn floor(&self) -> Option<&str> {
+        match &self.knowledge {
+            FloorKnowledge::Set(floor) => Some(floor),
+            _ => None,
+        }
+    }
+
+    /// Whether this host reads a fleet store (#10885). A fleet host rolls only
+    /// for the floor: [`Self::observe`] returning a target is the one version
+    /// roll it makes.
+    #[must_use]
+    pub fn fleet_host(&self) -> bool {
+        self.knowledge != FloorKnowledge::NoStore
+    }
+
+    /// Why a fleet host is not rolling this tick (#10885), for the tick's
+    /// skip reason. `unchased` names a newer release, a re-published artifact
+    /// or a source HEAD that exists and is deliberately not acted on.
+    #[must_use]
+    pub fn hold_reason(&self, unchased: Option<&str>) -> String {
+        let running = &self.running;
+        match &self.verdict {
+            FloorVerdict::Satisfied { floor } => format!(
+                "fleet floor {floor} is met by running {running}{} — a fleet host rolls only \
+                 when loom_min_version moves",
+                unchased.map_or_else(String::new, |what| format!("; not chasing {what}"))
+            ),
+            FloorVerdict::Unknown { why } => format!(
+                "fleet floor not known ({why}) — no version roll until it is (a fleet host \
+                 never falls back to chasing the latest release)"
+            ),
+            FloorVerdict::Uncomparable { floor } => format!(
+                "fleet floor {floor:?} and running version {running:?} are not both X.Y.Z and \
+                 cannot be compared — no version roll"
+            ),
+            // The note suffix says the rest for these.
+            FloorVerdict::Unsatisfiable(_) => {
+                "no release meets the fleet floor — not rolling".to_string()
+            }
+            FloorVerdict::Unresolved { .. } => {
+                "below the fleet floor with no release to roll to this tick — not rolling"
+                    .to_string()
+            }
+            FloorVerdict::Below { .. } | FloorVerdict::NoStore => {
+                "no version roll this tick".to_string()
+            }
         }
     }
 
@@ -296,7 +404,7 @@ impl FloorState {
     /// that happens, because [`Self::set_basis`] resets the verdict on a
     /// change. Every other reading replaces the verdict.
     pub fn observe(&mut self, newest: Option<&Release>) -> Option<Release> {
-        let seen = floor_verdict(self.floor.as_deref(), &self.running, newest);
+        let seen = floor_verdict(&self.knowledge, &self.running, newest);
         let keep_stall = matches!(seen, FloorVerdict::Unresolved { .. })
             && matches!(self.verdict, FloorVerdict::Unsatisfiable(_));
         if !keep_stall {
@@ -324,7 +432,8 @@ impl FloorState {
     /// Who is driving a roll decided on this tick's observation (#10831: the
     /// `target_source` the pause manifest records). Below a satisfiable floor
     /// every roll is floor-driven, whichever release it lands on
-    /// ([`select_target`]); otherwise it is an ordinary autoUpdate roll.
+    /// ([`select_target`]); otherwise it is an ordinary autoUpdate roll, which
+    /// only a host with no fleet store makes (#10885).
     #[must_use]
     pub fn roll_source(&self) -> TargetSource {
         match &self.verdict {
@@ -362,7 +471,8 @@ impl FloorState {
     }
 
     /// The suffix a tick's `status` note carries while the host is below the
-    /// floor, `""` when the floor is unset or met. A floor-driven roll's note
+    /// floor, `""` otherwise (a held tick's own reason names the floor; see
+    /// [`Self::hold_reason`]). A floor-driven roll's note
     /// is the roll's outcome, so this is what names its cause there.
     #[must_use]
     pub fn note_suffix(&self) -> String {
@@ -467,19 +577,41 @@ mod tests {
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.900", TargetSource::Floor));
     }
 
+    fn set(floor: &str) -> FloorKnowledge {
+        FloorKnowledge::Set(floor.to_string())
+    }
+
     #[test]
     fn floor_verdict_table() {
         let newest = rel("0.19.900");
-        assert_eq!(floor_verdict(None, "0.19.800", Some(&newest)), FloorVerdict::Unset);
-        // Uncomparable inputs are no floor, never a stall.
-        assert_eq!(floor_verdict(Some("0.19"), "0.19.800", Some(&newest)), FloorVerdict::Unset);
-        assert_eq!(floor_verdict(Some("0.19.850"), "dev", Some(&newest)), FloorVerdict::Unset);
         assert_eq!(
-            floor_verdict(Some("0.19.800"), "0.19.800", Some(&newest)),
-            FloorVerdict::Satisfied
+            floor_verdict(&FloorKnowledge::NoStore, "0.19.800", Some(&newest)),
+            FloorVerdict::NoStore
+        );
+        // #10885: an unknown floor is its own verdict, never "no floor".
+        assert_eq!(
+            floor_verdict(&FloorKnowledge::Unknown("why".to_string()), "0.19.800", Some(&newest)),
+            FloorVerdict::Unknown {
+                why: "why".to_string()
+            }
+        );
+        // Uncomparable inputs are never a stall, and never "no floor" either.
+        for (floor, running) in [("0.19", "0.19.800"), ("0.19.850", "dev")] {
+            assert_eq!(
+                floor_verdict(&set(floor), running, Some(&newest)),
+                FloorVerdict::Uncomparable {
+                    floor: floor.to_string()
+                }
+            );
+        }
+        assert_eq!(
+            floor_verdict(&set("0.19.800"), "0.19.800", Some(&newest)),
+            FloorVerdict::Satisfied {
+                floor: "0.19.800".to_string()
+            }
         );
         assert_eq!(
-            floor_verdict(Some("0.19.850"), "0.19.800", Some(&newest)),
+            floor_verdict(&set("0.19.850"), "0.19.800", Some(&newest)),
             FloorVerdict::Below {
                 floor: "0.19.850".to_string(),
                 target: newest.clone(),
@@ -487,11 +619,11 @@ mod tests {
         );
         // A release exactly at the floor satisfies it.
         assert!(matches!(
-            floor_verdict(Some("0.19.900"), "0.19.800", Some(&newest)),
+            floor_verdict(&set("0.19.900"), "0.19.800", Some(&newest)),
             FloorVerdict::Below { .. }
         ));
         assert_eq!(
-            floor_verdict(Some("0.19.999"), "0.19.800", Some(&newest)),
+            floor_verdict(&set("0.19.999"), "0.19.800", Some(&newest)),
             FloorVerdict::Unsatisfiable(FloorStallReport {
                 floor: "0.19.999".to_string(),
                 running: "0.19.800".to_string(),
@@ -499,7 +631,7 @@ mod tests {
             })
         );
         assert_eq!(
-            floor_verdict(Some("0.19.850"), "0.19.800", None),
+            floor_verdict(&set("0.19.850"), "0.19.800", None),
             FloorVerdict::Unresolved {
                 floor: "0.19.850".to_string(),
                 unparsed: None,
@@ -514,7 +646,7 @@ mod tests {
             };
             for floor in ["0.19.850", "0.19.999"] {
                 assert_eq!(
-                    floor_verdict(Some(floor), "0.19.800", Some(&odd)),
+                    floor_verdict(&set(floor), "0.19.800", Some(&odd)),
                     FloorVerdict::Unresolved {
                         floor: floor.to_string(),
                         unparsed: Some(version.to_string()),
@@ -530,7 +662,7 @@ mod tests {
     #[test]
     fn an_unresolved_tick_keeps_a_standing_stall() {
         let mut state = FloorState::default();
-        state.set_basis(Some("9.0.0".to_string()), "0.19.800");
+        state.set_basis(FloorKnowledge::Set("9.0.0".to_string()), "0.19.800");
         // No prior stall: unresolved is just unresolved.
         assert_eq!(state.observe(None), None);
         assert!(matches!(state.verdict(), FloorVerdict::Unresolved { .. }));
@@ -559,23 +691,23 @@ mod tests {
         state.observe(Some(&rel("0.19.900")));
         state.observe(None);
         assert!(state.stall().is_some());
-        state.set_basis(None, "0.19.800");
+        state.set_basis(FloorKnowledge::NoStore, "0.19.800");
         assert!(state.stall().is_none());
         assert_eq!(state.observe(None), None);
-        assert_eq!(state.verdict(), &FloorVerdict::Unset);
+        assert_eq!(state.verdict(), &FloorVerdict::NoStore);
     }
 
     #[test]
     fn a_changed_basis_drops_the_stall() {
         let mut state = FloorState::default();
-        state.set_basis(Some("9.0.0".to_string()), "0.19.800");
+        state.set_basis(FloorKnowledge::Set("9.0.0".to_string()), "0.19.800");
         assert_eq!(state.observe(Some(&rel("0.19.900"))), None);
         assert!(state.stall().is_some());
         // Same basis next tick: the stall stands until the next observation.
-        state.set_basis(Some("9.0.0".to_string()), "0.19.800");
+        state.set_basis(FloorKnowledge::Set("9.0.0".to_string()), "0.19.800");
         assert!(state.stall().is_some());
         // The operator fixes the typo: cleared before anything is observed.
-        state.set_basis(None, "0.19.800");
+        state.set_basis(FloorKnowledge::NoStore, "0.19.800");
         assert!(state.stall().is_none());
         assert_eq!(state.note_suffix(), "");
     }
