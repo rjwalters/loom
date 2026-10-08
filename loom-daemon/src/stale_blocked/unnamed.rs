@@ -403,11 +403,13 @@ fn comment_body(c: &Value) -> String {
 }
 
 /// Whether a trusted legacy PR-less-retry / quarantine hold comment vetoes the
-/// issue. Only for a pre-#10161 hold, i.e. no daemon record in the body. A hold
-/// comment older than the latest `loom:blocked` belongs to a released hold and
-/// must not veto a later bare re-block; an undated comment or unreadable label
-/// time still vetoes (fail safe). Shared by the queue write and the
-/// already-queued reconciliation, so a marker never outlives this veto.
+/// issue. Only for a pre-#10161 hold, i.e. no *current* daemon record in the
+/// body: a record older than the latest `loom:blocked` belongs to a released
+/// hold (the same currency rule as [`documentation`]) and does not hide a
+/// current legacy comment. A hold comment older than the latest `loom:blocked`
+/// likewise must not veto a later bare re-block; an undated comment or
+/// unreadable label time still vetoes (fail safe). Shared by the queue write
+/// and the already-queued reconciliation, so a marker never outlives this veto.
 fn legacy_hold_veto(
     extra: &mut dyn ReleaseForge,
     policy: &TrustPolicy,
@@ -415,7 +417,13 @@ fn legacy_hold_veto(
     body: &str,
     comments: &[Value],
 ) -> Result<bool, String> {
-    if parse(body).iter().any(is_daemon_hold) {
+    let labeled_at = extra
+        .last_labeled_at(n, BLOCKED_LABEL)
+        .map_err(|e| format!("label-event read failed: {e}"))?;
+    if parse(body).iter().any(|r| {
+        is_daemon_hold(r)
+            && super::hold::documents_current_block(r.at.as_deref(), labeled_at.as_deref())
+    }) {
         return Ok(false);
     }
     let holds: Vec<&Value> = comments
@@ -426,12 +434,6 @@ fn legacy_hold_veto(
             b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
         })
         .collect();
-    if holds.is_empty() {
-        return Ok(false);
-    }
-    let labeled_at = extra
-        .last_labeled_at(n, BLOCKED_LABEL)
-        .map_err(|e| format!("label-event read failed: {e}"))?;
     Ok(holds.iter().any(|c| {
         super::hold::reviews_current_block(
             c.get("created_at").and_then(Value::as_str),

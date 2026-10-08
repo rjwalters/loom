@@ -237,6 +237,74 @@ fn a_legacy_hold_posted_after_the_label_still_vetoes() {
     assert!(w.park.writes.is_empty());
 }
 
+/// A daemon hold record from a released hold, older than the current label.
+fn stale_daemon_hold_body() -> String {
+    format!(
+        "No blocker recorded.\n{}",
+        crate::sweep_registry::park_hold::render_hold_record(
+            crate::sweep_registry::park_hold::PRLESS_HOLD_REASON,
+            "2026-01-01T00:00:00Z",
+        )
+    )
+}
+
+fn legacy_hold_comment(at: &str) -> Value {
+    json!({
+        "body": format!("{QUARANTINE_COMMENT_MARKER}\nheld"),
+        "user": {"login": "someone"},
+        "author_association": "MEMBER",
+        "created_at": at,
+    })
+}
+
+#[test]
+fn a_current_legacy_hold_vetoes_despite_a_historical_daemon_record() {
+    let mut w = World::new();
+    w.add(5, &stale_daemon_hold_body(), &[]);
+    w.extra
+        .comments
+        .insert(5, vec![legacy_hold_comment("2026-10-02T00:00:00Z")]);
+    w.extra
+        .blocked_at
+        .insert(5, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert!(r.queued.is_empty());
+    assert!(w.park.writes.is_empty());
+
+    // Already queued: the marker is cleared, `loom:blocked` preserved.
+    let mut w = World::new();
+    w.add(6, &stale_daemon_hold_body(), &[UNNAMED_LABEL]);
+    w.extra
+        .comments
+        .insert(6, vec![legacy_hold_comment("2026-10-02T00:00:00Z")]);
+    w.extra
+        .blocked_at
+        .insert(6, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert_eq!(r.cleared, vec![6]);
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert_eq!(w.park.writes, vec![format!("remove #6 {UNNAMED_LABEL}")]);
+    assert!(w.park.items[&6]
+        .labels
+        .contains(&"loom:blocked".to_string()));
+}
+
+#[test]
+fn a_historical_daemon_record_and_comment_permit_a_later_bare_reblock() {
+    let mut w = World::new();
+    w.add(5, &stale_daemon_hold_body(), &[]);
+    w.extra
+        .comments
+        .insert(5, vec![legacy_hold_comment("2026-01-01T00:00:00Z")]);
+    w.extra
+        .blocked_at
+        .insert(5, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert_eq!(skipped(&r, "daemon-hold"), 0);
+    assert_eq!(r.queued, vec![5]);
+}
+
 #[test]
 fn permanent_operator_and_claimed_issues_are_skipped() {
     let mut w = World::new();
@@ -402,8 +470,8 @@ fn a_stale_reason_record_does_not_document_a_bare_re_block() {
 }
 
 /// #10161: a current body daemon-hold record is skipped structurally; a
-/// released one (older than the label) is not, and once a body record exists
-/// its legacy comment no longer vetoes either.
+/// released one (older than the label) is not, and a legacy comment from that
+/// released hold no longer vetoes either.
 #[test]
 fn only_a_current_body_daemon_hold_is_skipped() {
     use crate::sweep_registry::park_hold::{render_hold_record, PRLESS_HOLD_REASON};
@@ -412,9 +480,15 @@ fn only_a_current_body_daemon_hold_is_skipped() {
     w.extra.blocked_at.insert(1, "2026-10-06T00:00:05Z".into());
     w.add(2, &render_hold_record(PRLESS_HOLD_REASON, "2026-01-01T00:00:00Z"), &[]);
     w.extra.blocked_at.insert(2, "2026-10-06T00:00:00Z".into());
-    w.extra
-        .comments
-        .insert(2, vec![trusted(&format!("{PRLESS_HOLD_COMMENT_MARKER}\nheld"))]);
+    w.extra.comments.insert(
+        2,
+        vec![json!({
+            "body": format!("{PRLESS_HOLD_COMMENT_MARKER}\nheld"),
+            "user": {"login": "someone"},
+            "author_association": "MEMBER",
+            "created_at": "2026-01-01T00:00:00Z",
+        })],
+    );
     let r = w.run();
     assert_eq!(skipped(&r, "daemon-hold"), 1);
     assert_eq!(r.queued, vec![2]);

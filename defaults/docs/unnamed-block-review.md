@@ -14,8 +14,8 @@ drains it.
 The tick never labels an issue that carries: a `loom:operator`,
 `loom:operator-only` or other operator-hold label; `loom:curating` or
 `loom:building`; a `<!-- loom:permanent-block` marker (#8742); a current
-daemon-hold body record (#10161); or, with no such record, a trusted legacy
-PR-less-retry / quarantine hold comment. It removes the label once the issue is
+daemon-hold body record (#10161); or, with no such current record, a trusted
+legacy PR-less-retry / quarantine hold comment. It removes the label once the issue is
 no longer `loom:blocked` or no longer Undocumented.
 
 Park records are append-only, so only the **current** hold's record counts: a
@@ -44,7 +44,7 @@ comment). **Skip the issue and write nothing** if it carries:
 - `loom:building`, or a `loom:curating` claim that is not yours. Run Curator's
   "Stale `loom:curating` Claim Check" (`claim-staleness.sh`) and stand down on
   `fresh`/`unknown`; reclaim only on `stale`, as for any Curator work.
-- a **current** daemon hold with no body record: a trusted comment carrying a
+- a **current** daemon hold with no current body record: a trusted comment carrying a
   legacy PR-less-retry or quarantine marker (`<!-- loom:prless-retry-kind=hold`
   or `Auto-quarantined by loom-daemon`) whose `created_at` is not older than
   the latest `loom:blocked` application. An older one belongs to a released
@@ -83,7 +83,8 @@ the per-outcome count source for the dashboard.
   `loom:building` before you run: **skip**, no write, even though the body and
   documentation verdict are unchanged.
 - Queued, then the daemon adds a current legacy quarantine / PR-less-retry hold
-  comment (no body record) before you run: **skip**, no write. The tick also
+  comment (no current body record; a stale one from a released hold does not
+  count) before you run: **skip**, no write. The tick also
   strips the queue label; `loom:blocked` stays intact.
 - A January reason record, then a bare re-block in October, queued by the tick:
   the record is stale, so evaluate and finish with **named**, **kept** or
