@@ -61,6 +61,15 @@ zstd = "0.14.0"
 # tree directly rather than deserializing a profile's config into typed structs.
 toml_edit = "0.25"
 
+[build-dependencies]
+# The install payload (#10717): `build.rs` packs the tracked `defaults/` tree
+# into a `.tar.zst` that the binary embeds, so a resync installs the files of
+# the RUNNING release, never whatever `~/GitHub/loom` happens to hold. Same
+# two crates (and versions) as the runtime dependencies above, so the lockfile
+# gains no new package.
+tar = "0.4.46"
+zstd = "0.14.0"
+
 [dev-dependencies]
 tokio-test = "0.4"
 serial_test = "4.0"
