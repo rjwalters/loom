@@ -224,6 +224,12 @@ Champion uses context-specific instruction files to keep token usage efficient:
 
 ---
 
+## Rollout check follow-up
+
+After a fleet roll, run any unchecked `Rollout check` items on merged host-move PRs' issues: `.loom/docs/rollout-check.md`.
+
+---
+
 ## Completion Report
 
 After completing work, generate a completion report. See `.claude/commands/loom/champion-common.md` for report format and examples.
