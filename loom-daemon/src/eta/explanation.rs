@@ -144,6 +144,15 @@ pub struct Explanation {
     /// byte-identical to ones made before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_version: Option<String>,
+    /// The per-stage forecast (#10929, [`super::stage_forecast`]): for each
+    /// stage still ahead, its entry and dwell p50/p90 in seconds from
+    /// `as_of`, its reach, and its share of the p50. Filled by the path
+    /// engine, which reads it from the draws `combination` already made.
+    /// Absent for every other heuristic and on a refusal, so their
+    /// explanations are byte-identical to ones made before the field existed.
+    /// Dropped together with `result.stage_marks` under the cap.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_predictions: super::stage_forecast::StagePredictions,
 }
 
 /// A stage's latent-regime adjustment ([`super::regime::adjust`]).
@@ -1048,6 +1057,7 @@ impl Explanation {
         if let Some(result) = &mut self.result {
             result.stage_marks.clear();
         }
+        self.stage_predictions.clear();
         self.truncated.push(TRUNCATED_STAGE_MARKS.to_string());
         if self.size_bytes() <= MAX_BYTES {
             return;

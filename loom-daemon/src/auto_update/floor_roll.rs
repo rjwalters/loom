@@ -15,7 +15,9 @@
 //!   pinned to that exact tag (#10709), and it skips the settle gate. A
 //!   supersede of a floor-driven roll does not re-wait settle either, because
 //!   the tick that re-arms it is still floor-driven. Backoff, terminal
-//!   failures, the roll window and the existing drain are kept.
+//!   failures and the roll window are kept. The roll itself is the same
+//!   pause-and-roll every trigger uses (#10831), recorded with
+//!   `target_source = floor`.
 //! - **Running below the floor, and no release satisfies it** (most likely a
 //!   typo in the store): a typed stall ([`FloorStallReport`]) is recorded and
 //!   alerted at ERROR, and the host **keeps dispatching** on its current
@@ -39,9 +41,47 @@
 //! that meets the floor: releases are monotonic, so if the latest one is below
 //! the floor, no release satisfies it.
 
-use super::roll_stall::FloorStallReport;
 use super::ArtifactInfo;
 use crate::fleet_store::floor::parse_triple;
+
+/// The stall this loop can declare (Issue #10712): the fleet floor
+/// (`loom_min_version`) is above the running version and above every published
+/// release, so no roll can satisfy it.
+///
+/// There is nothing to abandon: no roll is armed for an unsatisfiable floor,
+/// and **nothing is paused** for it. The host keeps dispatching on its current
+/// version and ordinary autoUpdate rolls still apply. The report exists so the
+/// stall is typed, alerted at ERROR, and visible in `status`, instead of a
+/// floor that silently does nothing. (Moved here when #10831 removed the
+/// stall-suppression module with the wait-for-zero roll machinery.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorStallReport {
+    /// The floor in force, `X.Y.Z`.
+    pub floor: String,
+    /// The running version, below the floor.
+    pub running: String,
+    /// The newest published release's version, also below the floor.
+    pub newest: String,
+}
+
+impl FloorStallReport {
+    /// The ERROR line and `status` note.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let Self {
+            floor,
+            running,
+            newest,
+        } = self;
+        format!(
+            "FLEET FLOOR UNSATISFIABLE: loom_min_version {floor} is above every published release \
+             (newest {newest}), so this host (running {running}) cannot roll to it. Most likely a \
+             typo in the fleet store's loom_min_version. DISPATCH CONTINUES on {running}: the \
+             floor never refuses work, and ordinary autoUpdate rolls still apply. Fix the floor, \
+             or publish a release at or above {floor}."
+        )
+    }
+}
 
 /// #10866: the rate limit on the unsatisfiable-floor ERROR line and the
 /// record of it that `auto_update_state.json` carries across a restart.
@@ -279,6 +319,18 @@ impl FloorState {
         let auto = Release::of(info);
         select_target(&self.running, floor_target, Some(&auto))
             .unwrap_or_else(|| Target::new(&auto, TargetSource::AutoUpdate))
+    }
+
+    /// Who is driving a roll decided on this tick's observation (#10831: the
+    /// `target_source` the pause manifest records). Below a satisfiable floor
+    /// every roll is floor-driven, whichever release it lands on
+    /// ([`select_target`]); otherwise it is an ordinary autoUpdate roll.
+    #[must_use]
+    pub fn roll_source(&self) -> TargetSource {
+        match &self.verdict {
+            FloorVerdict::Below { .. } => TargetSource::Floor,
+            _ => TargetSource::AutoUpdate,
+        }
     }
 
     /// The last verdict.

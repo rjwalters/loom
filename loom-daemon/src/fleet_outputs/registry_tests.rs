@@ -57,10 +57,12 @@ fn re(s: &str) -> regex::Regex {
     regex::Regex::new(s).unwrap()
 }
 
-/// Singleton job names in source: every `SINGLETON_JOB_NAME` const, the
-/// `captain_gauges` `*_JOB` consts, and string literals at call sites.
+/// Singleton job names in source: every `*JOB_NAME` const (not only
+/// `SINGLETON_JOB_NAME`: `eta::retire_filing::JOB_NAME` gates on the captain
+/// too), the `captain_gauges` `*_JOB` consts, and string literals at call
+/// sites.
 fn discovered_jobs(srcs: &[(String, String)]) -> BTreeSet<String> {
-    let konst = re(r#"const SINGLETON_JOB_NAME: &str = "([^"]+)""#);
+    let konst = re(r#"const (?:[A-Z]+_)*JOB_NAME: &str = "([^"]+)""#);
     let gauge = re(r#"const [A-Z_]+_JOB: &str = "([^"]+)""#);
     let literal = re(r#"\b(?:arm|record_owned)_singleton_job\(\s*"([^"]+)""#);
     let mut found = BTreeSet::new();
@@ -113,7 +115,8 @@ fn singleton_registry_job_owner_callers_record_a_named_job() {
 #[test]
 fn singleton_registry_covers_every_singleton_job() {
     let jobs = discovered_jobs(&sources());
-    assert!(jobs.len() >= 7, "scan found too few jobs: {jobs:?}");
+    assert!(jobs.len() >= 8, "scan found too few jobs: {jobs:?}");
+    assert!(jobs.contains(crate::eta::retire_filing::JOB_NAME), "{jobs:?}");
     let known: BTreeSet<&str> = SINGLETON_OUTPUTS
         .iter()
         .filter(|o| o.gate == Gate::SingletonJob)
@@ -174,6 +177,13 @@ fn singleton_registry_rows_are_well_formed() {
             o.gate == Gate::EtaAuthority,
             o.job == ETA_AUTHORITY,
             "{}: gate/job mismatch",
+            o.record_kind
+        );
+    }
+    for o in SINGLETON_OUTPUTS {
+        assert!(
+            !o.enabled_by.is_empty() && o.enabled_by.iter().all(|k| !k.trim().is_empty()),
+            "{}: every registered job is config-gated; name its toggles",
             o.record_kind
         );
     }

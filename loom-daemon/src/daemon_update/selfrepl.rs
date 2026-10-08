@@ -20,6 +20,12 @@
 //! [`super::provision::install_to`] goes one step further than unlinking:
 //! it writes the new file in full beside the destination and `rename`s it
 //! over the path (#10708), so the path is never absent or partial either.
+//! The machine-level path (`provision_machine_daemon`, the shell) does the
+//! same since #10983: it no longer runs `install`/`cp` onto the destination
+//! but calls [`super::provision::stage`] and [`super::provision::publish`]
+//! through `loom-daemon install-binary`. Both paths also keep the binary
+//! they replace as `<dest>.previous` (see [`super::provision::txn`]); the
+//! process running this update keeps executing its old inode either way.
 //! Nothing here ever reaches for `File::create` on the destination. On
 //! Linux, `open(O_WRONLY)` on a running executable fails with `ETXTBSY`
 //! anyway; on macOS it does not, so "the kernel would have stopped us" is not

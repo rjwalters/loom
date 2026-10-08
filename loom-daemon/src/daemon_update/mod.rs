@@ -835,8 +835,8 @@ fn stage_two(a: &Args, s: Stage) -> ! {
         run_verifiers(Some(&dest));
     } else if let Some(script) = provision_script.as_ref() {
         // The machine-level destination is the one that IS this binary on a
-        // normal fleet host — see `selfrepl` for why the write below is an
-        // unlink-and-create and why every check after it re-execs the path.
+        // normal fleet host — see `selfrepl` for why the write below is a
+        // rename (#10983) and why every check after it re-execs the path.
         selfrepl::announce_if_self(&provision_target);
         match provision::provision_machine_daemon(script, &new_bin, &s.roots.repo_root) {
             provision::ProvisionOutcome::Provisioned(dest) => {

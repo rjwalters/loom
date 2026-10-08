@@ -87,7 +87,7 @@ const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 ///   persisted group is the only handle on any surviving descendants. Every
 ///   consumer re-checks `group_has_members` before signalling, so a fully-dead
 ///   group is a no-op.
-fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+pub(super) fn spawned_leader_pgid(pid: u32) -> Option<u32> {
     if !cfg!(unix) {
         return None;
     }
@@ -1752,6 +1752,9 @@ impl SweepRegistry {
             }
         }
 
+        // #10974: a daemon roll is pausing agents; nothing new may start.
+        self.roll_gate.admit(kind)?;
+
         // Forge egress admission (#9984): a fresh `forge egress assert`. Under
         // `enforcement.api = required` a routing finding refuses the dispatch
         // here, before any claim/label/account/log/spawn side effect, and the
@@ -2553,6 +2556,7 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            mid_spawn: self.roll_gate.enter(),
         })))
     }
 
@@ -2589,6 +2593,7 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,

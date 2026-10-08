@@ -55,7 +55,8 @@ use crate::install_compat::Version;
 pub enum NotCurrent {
     /// New dispatch is paused: a drain, a roll's pause, or a fleet hold (H4).
     Draining,
-    /// A roll is retained across a refused drain and will re-arm (H2/H3).
+    /// A pause roll is armed, committed or in progress, so a restart is
+    /// coming (H3/H4, #10831).
     RollPending,
     /// The binary on disk is not the one this process runs (H3).
     Staged,
@@ -128,7 +129,9 @@ pub struct HostGateInputs {
     pub verified: bool,
     /// The drain flag is set, or the fleet state holds this host.
     pub draining: bool,
-    /// The drain descriptor retains a roll.
+    /// A roll is coming: a pause roll is armed, committed or in progress
+    /// (#10831, [`crate::fleet_state::DrainFacts::roll_in_progress`]). Not a
+    /// fleet-state `paused` hold or an operator drain; those are `draining`.
     pub roll_pending: bool,
     /// The running binary's file was replaced or removed since boot.
     pub staged: bool,
@@ -211,7 +214,7 @@ impl HostGateInputs {
     /// The signals as they are right now.
     #[must_use]
     pub fn live(enforcer: &dyn Enforcer) -> Self {
-        let (draining, roll_pending) = enforcer.drain_facts();
+        let facts = enforcer.drain_facts();
         let update = crate::auto_update::global_status_snapshot();
         let running = Version::parse(env!("CARGO_PKG_VERSION"));
         let floor = crate::fleet_sync::loom_min_version()
@@ -223,8 +226,8 @@ impl HostGateInputs {
             release_build: !provenance.refuted(),
             release_verified: Stamp::this_binary().is_some_and(|s| s.release_build),
             verified: VERIFIED.load(Ordering::Relaxed),
-            draining,
-            roll_pending,
+            draining: facts.draining,
+            roll_pending: facts.roll_in_progress,
             // An unreadable identity at boot proves nothing either way.
             staged: boot_exe()
                 .get()
@@ -301,7 +304,7 @@ fn run_live(
     // Once per process (the answer is cached; a lookup with no answer is
     // retried with backoff), and only from a host that could write: one with
     // `fleet.autoApply` off or dispatch paused asks nobody.
-    if mode == Mode::Write && !enforcer.drain_facts().0 {
+    if mode == Mode::Write && !enforcer.drain_facts().draining {
         let found = crate::release_provenance::ensure(Utc::now(), inputs.interval, &|repo, tag| {
             // The release-resolve machinery: `gh api`, peeling an
             // annotated tag to the commit it names.

@@ -249,6 +249,53 @@ fn concurrent_creators_observe_one_identity() {
     assert!(values.iter().all(|v| v == &values[0]));
 }
 
+/// A second open file description holding the store's directory lock, the
+/// way a forked child holds it between `fork` and `exec`.
+fn hold_store_lock(root: &std::path::Path) -> std::fs::File {
+    let dir = root.join(".loom/logs/trace-context");
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    held
+}
+
+/// #10955: a lock that is released a moment later (an inherited descriptor
+/// closing at `exec`) is waited out instead of failing the caller.
+#[test]
+fn a_briefly_held_store_lock_is_waited_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = hold_store_lock(dir.path());
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(held);
+    });
+    let store = TraceStore::new(dir.path());
+    store
+        .load_or_create(dir.path(), "sweep-issue-10955")
+        .unwrap();
+    releaser.join().unwrap();
+}
+
+/// … and the wait is bounded: a lock that stays held is still an error, soon.
+#[test]
+fn a_store_lock_that_stays_held_is_reported_busy_within_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = hold_store_lock(dir.path());
+    let store = TraceStore::new(dir.path());
+    let started = std::time::Instant::now();
+    let error = store
+        .load_or_create(dir.path(), "sweep-issue-10955")
+        .unwrap_err();
+    assert_eq!(error.to_string(), "trace context store busy");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400), "it waited");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "it gave up");
+}
+
 pub(crate) fn span(context: TraceContext) -> SpanRecord {
     let now = Utc::now();
     SpanRecord {

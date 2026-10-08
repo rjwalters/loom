@@ -45,6 +45,9 @@
 //!   OTel environment a *spawned worker's own* Claude Code session needs in
 //!   order to emit `claude_code.llm_request` / `claude_code.tool` sub-spans
 //!   into the trace [`tracing::prepare_child`] already propagates.
+//! - [`agent_relay`] (Issue #10964) — opt-in, default-off: a loopback OTLP
+//!   receiver (`otlp::relay`) for the agent sessions this daemon launches,
+//!   which binds their identity, scrubs them, and forwards to the `otlp` sink.
 //! - [`daemon_event`] (Issue #8760, G4 of #8714) — a second, narrower
 //!   [`crate::event_bus::EventBus`] subscriber alongside [`collector`],
 //!   covering the four named topics that carried no telemetry record kind
@@ -100,6 +103,7 @@
 //! than requiring — or risking — a value copied verbatim from a different
 //! host (#5336).
 
+pub mod agent_relay;
 pub mod backfill;
 pub mod captain_gauges;
 pub mod claude_code_telemetry;
@@ -1078,6 +1082,9 @@ pub fn spawn_task(
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
+    // The OTLP sinks whose senders started, for the agent relay (#10964).
+    #[cfg(feature = "otlp")]
+    let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
         let queue_path = queue_path_for(&workspace_root, name, sole);
@@ -1199,6 +1206,11 @@ pub fn spawn_task(
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
+            #[cfg(feature = "otlp")]
+            relay_sinks.push(otlp::relay::Sink {
+                endpoint: endpoint.clone(),
+                headers_file: entry.headers_file.clone(),
+            });
             otlp_queues.push(queue.clone());
         } else {
             native_queues.push(queue.clone());
@@ -1232,6 +1244,10 @@ pub fn spawn_task(
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     let mut ops_handles = Vec::new();
+    // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
+    // that just started — it cannot add or start an exporter either.
+    #[cfg(feature = "otlp")]
+    ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);

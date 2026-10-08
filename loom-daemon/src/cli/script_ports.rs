@@ -331,6 +331,12 @@ pub(crate) enum ScriptPortCommand {
     /// self-replacement design and why `resolve_daemon_bin()` is the wrong
     /// helper for the post-roll version check.
     DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
+    /// The atomic binary write behind `provision-daemon.sh` (#10983): `stage`
+    /// a candidate beside the destination, then `publish` it by rename,
+    /// keeping the binary it replaces. The script requires it; see
+    /// `cli/install_binary.rs`.
+    #[command(subcommand)]
+    InstallBinary(super::install_binary::InstallBinaryCommand),
 
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
@@ -611,6 +617,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::Host(cmd) => cmd.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::InstallBinary(cmd) => cmd.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
