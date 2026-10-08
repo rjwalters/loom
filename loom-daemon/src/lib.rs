@@ -205,6 +205,7 @@ pub mod forge_merge_queue;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_priority_labels;
+pub mod forge_probe;
 pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub(crate) mod forge_repo_facts;

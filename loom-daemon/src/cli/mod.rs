@@ -64,6 +64,7 @@ mod forge_identity_cmd;
 pub(crate) mod forge_inventory_cmd;
 mod forge_merge_queue_cmd;
 mod forge_parent_cmd;
+pub(crate) mod forge_probe_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
