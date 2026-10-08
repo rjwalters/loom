@@ -1462,7 +1462,8 @@ the config tiers, so a change takes effect on the next tick without a restart.
 Absent means no floor; a malformed value (not a string, not canonical `X.Y.Z`) keeps the
 last good floor and is reported as a fleet-sync error. It appears as
 `floor` in `fleet-sync-status.json` and on the `Fleet store:` status block.
-Nothing acts on it yet (#10698).
+The self-update loop rolls a host below it (#10712), and the workspace resync
+treats an installed version below it as too old (#10718).
 
 **`fleet/state.yml`**:
 
@@ -1713,6 +1714,83 @@ reports `hold`, not `stop`. `status --json` carries `fleet_store.state`
 (desired, provenance, `by`/`since`/`reason`) and `fleet_store.enforced`
 (`proceed` / `hold` / `stop`); a transition — never the steady state — is also
 published on the event bus as `fleet.sync.state`.
+
+### Workspace resync (#10718)
+
+The same timer also keeps each registered repo's installed Loom at the version
+the daemon is **running**. It runs once at startup (after the startup pass,
+once the drain state exists) and then every `fleet.syncIntervalSecs`. Nothing
+else schedules it, and it does not wait for a roll window.
+
+Each pass fetches every registered workspace's default branch, reads
+`.loom/install-metadata.json` from that branch (never the working tree) and
+classifies it:
+
+| State | Meaning | What the pass does |
+|---|---|---|
+| `W0` | the installed files equal this daemon's payload | nothing |
+| `W1` | compatible, but the files differ | tries the claim |
+| `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first |
+| `W4` | the installed files need a newer daemon | reports only |
+| `repo-ahead` | installed by a newer daemon, or at a version that cannot be ordered | reports only |
+| `skipped` | the Loom source repo, a non-GitHub origin, or no Loom on the default branch | nothing |
+
+- **An empty payload diff is `W0`, whatever the stamp says.** A resync that
+  changes no installed file writes nothing, so a daemon-only release makes no
+  claim and no commit, and a stamp that is old or lacks `requires_daemon` over
+  matching files is left alone.
+- **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
+  They are left to the host roll (#10719).
+- **Only from H0.** A host claims and writes only when all of these hold: it is
+  a release build, a fleet-sync pass has completed, dispatch is not paused (a
+  drain, a roll's pause or a fleet hold), no roll is retained, the binary on
+  disk is still the one running, self-update is not in backoff or terminal, and
+  the running version is not below `loom_min_version`. The gate is checked
+  again immediately before the push. A host that fails it still classifies and
+  reports. A newer release merely existing is not a reason to wait.
+- **Writes need `fleet.autoApply`**, like every other timer write.
+
+A stale workspace is resynced under a per-repo claim, the ref
+`refs/loom/resync-claim`:
+
+- The first host to create the ref wins. The others pass until their next tick,
+  with no error and no alert.
+- The claim commit records the host, the version and the time. A claim older
+  than `max(10 x syncIntervalSecs, 15 min)` may be taken over. Takeover goes
+  through a ticket ref, `refs/loom/resync-takeover/<stale sha>`, which only one
+  host can create: GitHub does not enforce fast-forward on refs outside
+  `refs/heads/`, so an update of the claim ref cannot pick a winner.
+- The holder releases the claim when it is done, and only while the ref is
+  still its own commit.
+
+The resync itself runs in a throwaway detached worktree
+(`.loom/worktrees/.resync-<pid>`) off `origin/<default>`, never the checkout
+agents work in. It makes one commit (`chore(loom): resync installed Loom to
+v<version>`, with `Loom-Resync-Host` and `Loom-Resync-Version` trailers) and
+pushes it without `--force`. At most one repo is resynced per pass.
+
+| Outcome | Result |
+|---|---|
+| push accepted | `W0` |
+| nothing left to write once the claim is held | `W0`, no commit |
+| branch moved | re-read and retried once, then next tick |
+| host left H0, or the claim was taken over, before the push | abandoned, no push; not a failure |
+| branch protection or a ruleset refused the push | backoff of 6h, alert at once |
+| any other failure | backoff from one sync interval, doubling, capped at 6h; alert from the third in a row |
+
+Alerts are logged at `error` and published on the event bus as
+`fleet_sync.workspace_resync`. The backoff is in memory and resets on restart.
+Each workspace's state and reason appear on the `Fleet store:` status block and
+under `workspaces` in `fleet-sync-status.json`.
+
+The resync covers the payload surfaces only: `.loom/{roles,scripts,hooks,docs,runtimes}/`,
+`.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc` and
+`.claude/commands/loom/`. It does not yet touch `.loom/config.json`,
+`.loom/CLAUDE.md`, `.gitignore`, `.agents/skills/`, `.claude/README.md`,
+`.claude/biome.jsonc`, `.github/CONFIGURATION.md`, or the retired-file sweep and
+`package.json` edit that `resync-installed.sh` performs (#10895). It also does not
+fast-forward a host's own checkout (#10869), so a host keeps running its old
+installed scripts until that checkout is updated.
 
 ### ETA fit publication branch (#10395)
 

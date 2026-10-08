@@ -430,6 +430,13 @@ pub trait Enforcer: Send + Sync {
 
     /// Drain and exit (`stopped`). `true` when the drain was accepted.
     fn stop(&self, reason: String) -> bool;
+
+    /// `(dispatch is paused for any reason, a roll is retained)`: what the
+    /// workspace resync's host gate reads (#10718). The default knows only
+    /// about this mechanism's own hold.
+    fn drain_facts(&self) -> (bool, bool) {
+        (self.is_held(), false)
+    }
 }
 
 /// The production [`Enforcer`]: #4090's drain primitives, nothing new.
@@ -480,6 +487,10 @@ impl Enforcer for IpcEnforcer {
 
     fn is_held(&self) -> bool {
         self.drain.is_fleet_held()
+    }
+
+    fn drain_facts(&self) -> (bool, bool) {
+        (self.drain.is_draining(), self.drain.snapshot().roll_pending)
     }
 
     fn stop(&self, reason: String) -> bool {

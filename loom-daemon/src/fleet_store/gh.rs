@@ -184,6 +184,34 @@ impl GhTransport {
         }
     }
 
+    /// One read under the WRITER credential, skipping the reader (#10718).
+    ///
+    /// For a ref this transport itself wrote: a reader App that is not
+    /// installed on the repo answers `404`, which a caller would take for
+    /// "the ref is gone". Reading under the identity that created the ref
+    /// cannot disagree with the write that follows.
+    ///
+    /// # Errors
+    /// `gh` could not complete the request at all; any HTTP status is `Ok`.
+    pub(crate) fn get_as_writer(&self, api_path: &str) -> Result<Reply> {
+        let (response, stderr, _) = self.run(&self.writer(), api_path, None, None)?;
+        let response = response.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gh api {api_path} failed before an HTTP response: {}",
+                if stderr.is_empty() {
+                    "no output"
+                } else {
+                    &stderr
+                }
+            )
+        })?;
+        Ok(Reply {
+            status: response.status,
+            etag: response.etag,
+            body: response.body,
+        })
+    }
+
     /// One write call (`gh api --method POST/PUT … --input <file>`), always
     /// under the writer credential — never the reader, which is never granted
     /// write scope on the store (see the module docs). Any HTTP status,
@@ -200,15 +228,18 @@ impl GhTransport {
             .write_all(payload.as_bytes())
             .and_then(|()| input.flush())
             .context("writing the gh api request body")?;
-        let inv = self
+        let mut inv = self
             .invocation(
                 "fleet_store_write",
                 ops::GIT_WRITE_REFS_AND_CONTENTS,
                 AccessIntent::Write,
                 &cred,
             )
-            .args(["api", "--include", "--method", method, api_path, "--input"])
-            .arg(input.path());
+            .args(["api", "--include", "--method", method, api_path]);
+        // A DELETE carries no body (#10718: deleting the resync claim ref).
+        if method != "DELETE" {
+            inv = inv.arg("--input").arg(input.path());
+        }
         let out = self.output(inv)?;
         let response =
             crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));

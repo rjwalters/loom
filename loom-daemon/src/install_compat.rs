@@ -187,7 +187,10 @@ pub enum Compat {
     Compatible,
     /// No usable claim recorded: `loom_version` or `requires_daemon` is
     /// absent or not a version. Every install before #10716 lands here. It
-    /// keeps dispatching as today, and its first resync writes the fields.
+    /// keeps dispatching as today. The first resync that changes a file
+    /// writes the fields; one whose files already match the payload writes
+    /// nothing, so such an install stays `ResyncOwed` and the workspace pass
+    /// treats its empty diff as W0 (#10718).
     ResyncOwed,
     /// The installed `loom_version` is below this daemon's
     /// `supports_installed`, or below the fleet floor.

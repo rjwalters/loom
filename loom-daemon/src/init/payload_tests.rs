@@ -12,8 +12,8 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 use super::payload::{
-    apply, materialize_payload, materialize_with, resync_gate, resync_workspace_with, Payload,
-    ResyncOutcome, ResyncRefusal, Stamp,
+    apply, gate_metadata, materialize_payload, materialize_with, resync_gate,
+    resync_workspace_with, Payload, ResyncOutcome, ResyncRefusal, Stamp,
 };
 use super::{install_payload_files, InitReport};
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, INSTALL_METADATA_PATH};
@@ -591,6 +591,92 @@ fn interrupted_before_the_stamp_is_not_an_empty_diff() {
     assert!(meta.get("resync_pending").is_none());
     // Converged: the next one is a true no-op.
     assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), ResyncOutcome::Unchanged);
+}
+
+/// #10718: `loom_version` is stamped last, so a tree a NEWER daemon was
+/// part-way through still reads as the old release. Without the marker's
+/// version an older daemon would "complete" that run from its own payload and
+/// roll the newer files back.
+#[test]
+fn an_interrupted_resync_by_a_newer_daemon_is_refused_and_nothing_is_written() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+    // 0.19.881 got as far as one file before it died.
+    write(&ws.join(".loom/roles/builder.md"), "builder, as of 0.19.881\n");
+    let mut meta = meta_json(&ws);
+    meta["resync_pending"] = "0.19.881".into();
+    write(&ws.join(META), &serde_json::to_string_pretty(&meta).unwrap());
+
+    let before = freeze(&ws);
+    let older = Payload::from_defaults(defaults.clone(), stamp("0.19.880"));
+    assert_eq!(
+        resync_workspace_with(&older, &ws).unwrap(),
+        ResyncOutcome::Refused(ResyncRefusal::PendingAheadOfDaemon {
+            pending: v("0.19.881"),
+            running: v("0.19.880"),
+        })
+    );
+    // `apply` checks for itself, whatever the caller did.
+    let diff = materialize_with(&older, &ws).unwrap();
+    assert!(matches!(
+        apply(&ws, &diff).unwrap(),
+        ResyncOutcome::Refused(ResyncRefusal::PendingAheadOfDaemon { .. })
+    ));
+    assert!(touched(&ws, &before, &snapshot(&ws)).is_empty());
+    assert_eq!(
+        fs::read_to_string(ws.join(".loom/roles/builder.md")).unwrap(),
+        "builder, as of 0.19.881\n"
+    );
+
+    // The daemon that started it, or a newer one, completes it.
+    let same = Payload::from_defaults(defaults, stamp("0.19.881"));
+    assert!(matches!(
+        resync_workspace_with(&same, &ws).unwrap(),
+        ResyncOutcome::Applied { .. }
+    ));
+    assert!(meta_json(&ws).get("resync_pending").is_none());
+}
+
+#[test]
+fn the_pending_marker_is_gated_like_a_version() {
+    let daemon = DaemonCompat {
+        running: v("0.19.880"),
+        supports_installed: v("0.19.0"),
+        floor: None,
+    };
+    let meta = |pending: &str| {
+        format!(
+            r#"{{"loom_version":"0.19.870","requires_daemon":"0.19.772","resync_pending":{pending}}}"#
+        )
+    };
+    assert_eq!(gate_metadata(&meta(r#""0.19.880""#), &daemon), Ok(Compat::Compatible));
+    assert_eq!(gate_metadata(&meta(r#""0.19.800""#), &daemon), Ok(Compat::Compatible));
+    assert_eq!(gate_metadata(&meta("null"), &daemon), Ok(Compat::Compatible));
+    let ahead = gate_metadata(&meta(r#""0.19.881""#), &daemon).unwrap_err();
+    assert!(ahead.repo_ahead_of_daemon(), "{ahead}");
+    // A marker that cannot be ordered may be newer: refuse.
+    for unordered in [r#""0.20.0-rc1""#, r#""""#, "true", "7"] {
+        assert!(
+            matches!(
+                gate_metadata(&meta(unordered), &daemon),
+                Err(ResyncRefusal::UnrecognizedVersion {
+                    field: "resync_pending",
+                    ..
+                })
+            ),
+            "{unordered}"
+        );
+    }
+    // The existing refusals still come first.
+    assert!(matches!(
+        gate_metadata("[]", &daemon),
+        Err(ResyncRefusal::UnreadableMetadata(_))
+    ));
+    assert!(matches!(
+        gate_metadata(r#"{"loom_version":"0.19.900","resync_pending":"0.19.901"}"#, &daemon),
+        Err(ResyncRefusal::RepoAheadOfDaemon { .. })
+    ));
 }
 
 #[test]
