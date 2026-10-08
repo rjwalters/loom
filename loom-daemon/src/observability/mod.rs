@@ -1254,7 +1254,8 @@ pub fn spawn_task(
     let eta_handle =
         eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
     // #10414: the ETA pass runs inside the collector's 5-minute pass, which
-    // beats it after each `eta::record`; registered only when ETA is on.
+    // beats it from `eta::record` only when the pass emitted (#10898); registered
+    // only when ETA is on.
     if eta_handle.is_some() {
         crate::task_liveness::register(
             crate::task_liveness::ETA_PASS,

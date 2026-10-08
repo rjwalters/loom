@@ -251,13 +251,141 @@ pub(super) fn gate_delivery(
     Delivered::default()
 }
 
-/// [`gate_delivery`] with this process's authority flag.
+/// What one authority pass amounts to for liveness (#10898).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PassOutcome {
+    /// Beat `task_alive{eta_pass}`: this host is the authority and its
+    /// delivery path works (an exporter is registered, or a dry run).
+    pub beat: bool,
+    /// Records were actually offered to an exporter this pass.
+    pub emitted: bool,
+}
+
+/// Judge a pass. "Alive" means "emitted", not "the loop finished": a
+/// non-authority host never beats, and an authority with no exporter (the
+/// 2026-10-07 incident) drops every record, so it does not beat either. Pure.
+pub(super) fn pass_outcome(
+    authority: bool,
+    exporter: bool,
+    dry_run: bool,
+    delivered: &Delivered,
+) -> PassOutcome {
+    let records = delivered.emitted + delivered.refused + delivered.outcomes;
+    PassOutcome {
+        beat: authority && (dry_run || exporter),
+        emitted: authority && exporter && !dry_run && records > 0,
+    }
+}
+
+/// [`gate_delivery`] with this process's authority flag, then the liveness
+/// beat and emit heartbeat. `coverage` is a full pass's `(repos covered, open
+/// review PRs)`; `None` for a between-passes bus delivery, which refreshes
+/// the last emit but neither beats nor changes the recorded coverage.
 pub(super) fn deliver_checked(
     emissions: Vec<Emission>,
     outcomes: Vec<Resolved>,
     host_id: &str,
     dry_run: bool,
+    coverage: Option<(usize, usize)>,
 ) -> Delivered {
     let loom = Provenance::current();
-    gate_delivery(active(), emissions, outcomes, &loom, host_id, dry_run, sink())
+    let delivered = gate_delivery(active(), emissions, outcomes, &loom, host_id, dry_run, sink());
+    let pass = pass_outcome(active(), sink().is_some(), dry_run, &delivered);
+    if pass.beat && coverage.is_some() {
+        crate::task_liveness::beat_if_registered(crate::task_liveness::ETA_PASS);
+    }
+    if active() {
+        let root = lock().as_ref().map(|s| s.workspace_root.clone());
+        if let Some(root) = root {
+            let prev = crate::eta::emit_heartbeat::read(&root);
+            let fallback = prev
+                .as_ref()
+                .map_or((0, 0), |p| (p.repos_covered, p.open_prs));
+            let (repos, prs) = coverage.map_or(fallback, |(r, p)| (r as u64, p as u64));
+            let now = chrono::Utc::now();
+            let next = crate::eta::emit_heartbeat::next(
+                prev.as_ref(),
+                host_id,
+                now,
+                pass.emitted,
+                repos,
+                prs,
+            );
+            crate::eta::emit_heartbeat::write(&root, &next);
+        }
+    }
+    delivered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivered(emitted: usize) -> Delivered {
+        Delivered {
+            emitted,
+            ..Delivered::default()
+        }
+    }
+
+    #[test]
+    fn a_non_authority_host_never_beats() {
+        let out = pass_outcome(false, true, false, &delivered(3));
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: false,
+                emitted: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_authority_with_a_delivered_batch_beats_and_emits() {
+        let out = pass_outcome(true, true, false, &delivered(3));
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: true,
+                emitted: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_incident_authority_without_an_exporter_does_not_beat() {
+        // Authority covering 2 repos, records computed, no OTLP exporter.
+        let out = pass_outcome(true, false, false, &delivered(40));
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: false,
+                emitted: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_dry_run_beats_but_never_counts_as_an_emit() {
+        let out = pass_outcome(true, false, true, &delivered(3));
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: true,
+                emitted: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_authority_with_an_exporter_and_nothing_to_say_beats_without_emitting() {
+        let out = pass_outcome(true, true, false, &Delivered::default());
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: true,
+                emitted: false
+            }
+        );
+    }
 }

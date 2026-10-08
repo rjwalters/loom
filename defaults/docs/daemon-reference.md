@@ -3032,6 +3032,7 @@ conditions, each keyed and alerted independently:
 | `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
 | `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing starred) | which term, the effective vs. configured cap, how many starred issues wait; free disk / RAM or add capacity |
 | `star-backlog` | more than 3x the effective cap of starred issues waiting on this host (#10214) | the count, the oldest star and a new star's FIFO position; unstar or re-rank, or add capacity |
+| `eta-authority-silent` | this host is the ETA authority, ETA is on, and it has emitted no ETA record for 2 h while review PRs are open (or the daemon has run 2 h without one) (#10898) | `eta doctor` `config.last_emit`; usually no OTLP exporter configured (`eta.estimate` is OTLP-only) |
 
 An unreachable status changes nothing (unknown is not healthy). A condition must
 hold `debounceTicks` consecutive ticks before one `Started` alert; one `Cleared`

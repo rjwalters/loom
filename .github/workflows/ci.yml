@@ -685,6 +685,11 @@ jobs:
       # deadline-vs-registry no-drift check runs in the ordinary test job.
       - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
+      # #10898: the ETA-not-emitted critical alert. A missing signal must fire:
+      # zero eta.estimate logs while review PRs are open has to read as value=1
+      # (one row, never an empty result SigNoz would treat as healthy).
+      - name: Verify the SigNoz ETA-not-emitted alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_eta_not_emitted_alert -- --ignored --nocapture
       # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
       # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
       # heuristic is promoted on. eta_artifacts.rs already pins every attribute

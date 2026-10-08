@@ -181,6 +181,10 @@ pub struct Facts {
     pub snapshot_stats: Option<SnapshotStats>,
     /// Cumulative cap evictions; `None` before the first ETA pass.
     pub pending_over_cap: Option<u64>,
+    /// This host is the ETA authority (#10898).
+    pub is_authority: bool,
+    /// The authority's emit heartbeat; only read on the authority.
+    pub emit: Option<crate::eta::emit_heartbeat::Heartbeat>,
     /// Items bucket keys exported on earlier passes; zeroed when absent now.
     pub prev_items: BTreeSet<ItemKey>,
     /// Refresh stop reasons exported on earlier passes; zeroed when absent now.
@@ -274,6 +278,28 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
     if let Some(n) = facts.pending_over_cap {
         out.push(MetricPoint::int(MetricName::EtaHealthPendingOverCap, count(n)));
     }
+    out.extend(authority_points(facts));
+    out
+}
+
+/// The `loom.eta.authority*` gauges (#10898). Always the 1/0 authority flag;
+/// repos covered and last-emit age only on the authority, and the age only
+/// once something was emitted (unknown is not zero). Pure.
+fn authority_points(facts: &Facts) -> Vec<MetricPoint> {
+    let mut out = vec![MetricPoint::int(
+        MetricName::EtaAuthority,
+        i64::from(facts.is_authority),
+    )];
+    if !facts.is_authority {
+        return out;
+    }
+    let hb = facts.emit.as_ref();
+    if let Some(hb) = hb {
+        out.push(MetricPoint::int(MetricName::EtaAuthorityReposCovered, count(hb.repos_covered)));
+    }
+    if let Some(age) = crate::eta::emit_heartbeat::last_emit_age_secs(hb, facts.now) {
+        out.push(MetricPoint::int(MetricName::EtaAuthorityLastEmitAgeSeconds, age));
+    }
     out
 }
 
@@ -333,8 +359,15 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
             .as_str()
             .into(),
     };
+    let is_authority =
+        crate::eta::authority::resolve_with(root, host_id, |k| std::env::var(k).ok())
+            .is_authority();
     Facts {
         now,
+        is_authority,
+        emit: is_authority
+            .then(|| crate::eta::emit_heartbeat::read(root))
+            .flatten(),
         items: super::super::eta::health_items(),
         fit_cutoff: crate::eta::fit::coeffs::load_latest(root, now).map(|f| f.as_of),
         fit_check,

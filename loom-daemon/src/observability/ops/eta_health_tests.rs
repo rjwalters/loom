@@ -160,10 +160,12 @@ fn unknown_is_not_zero() {
         now: now(),
         ..Facts::default()
     });
-    // Only fit_loaded = 0 is a measured fact here.
-    assert_eq!(p.len(), 1);
+    // Only fit_loaded = 0 and the (non-)authority flag are measured here.
+    assert_eq!(p.len(), 2);
     assert_eq!(p[0].name, MetricName::EtaHealthFitLoaded);
     assert_eq!(value(&p[0]), 0);
+    assert_eq!(p[1].name, MetricName::EtaAuthority);
+    assert_eq!(value(&p[1]), 0);
 }
 
 #[test]
@@ -360,4 +362,48 @@ fn a_refresh_stop_reason_that_disappears_is_zeroed() {
     assert_eq!(at(&first, "no_reader"), Some(2));
     assert_eq!(at(&second, "complete"), Some(3));
     assert_eq!(at(&second, "no_reader"), Some(0));
+}
+
+// ---- loom.eta.authority* (#10898) -----------------------------------------
+
+fn emit_facts(is_authority: bool, last_emit_mins_ago: Option<i64>) -> Facts {
+    let hb = crate::eta::emit_heartbeat::Heartbeat {
+        host: "robb-studio".into(),
+        pass_at: now(),
+        last_emit_at: last_emit_mins_ago.map(|m| now() - Duration::minutes(m)),
+        repos_covered: 2,
+        open_prs: 4,
+    };
+    Facts {
+        now: now(),
+        is_authority,
+        emit: Some(hb),
+        ..Facts::default()
+    }
+}
+
+#[test]
+fn the_authority_reports_its_flag_repos_covered_and_last_emit_age() {
+    let p = points(&emit_facts(true, Some(90)));
+    let flag = find(&p, MetricName::EtaAuthority, None);
+    assert_eq!(flag.len(), 1);
+    assert_eq!(value(flag[0]), 1);
+    assert_eq!(value(find(&p, MetricName::EtaAuthorityReposCovered, None)[0]), 2);
+    assert_eq!(value(find(&p, MetricName::EtaAuthorityLastEmitAgeSeconds, None)[0]), 90 * 60);
+}
+
+#[test]
+fn an_authority_that_never_emitted_has_no_age_not_a_zero_age() {
+    let p = points(&emit_facts(true, None));
+    assert_eq!(value(find(&p, MetricName::EtaAuthority, None)[0]), 1);
+    assert!(find(&p, MetricName::EtaAuthorityLastEmitAgeSeconds, None).is_empty());
+    assert_eq!(find(&p, MetricName::EtaAuthorityReposCovered, None).len(), 1);
+}
+
+#[test]
+fn a_follower_reports_only_the_zero_flag() {
+    let p = points(&emit_facts(false, Some(5)));
+    assert_eq!(value(find(&p, MetricName::EtaAuthority, None)[0]), 0);
+    assert!(find(&p, MetricName::EtaAuthorityReposCovered, None).is_empty());
+    assert!(find(&p, MetricName::EtaAuthorityLastEmitAgeSeconds, None).is_empty());
 }

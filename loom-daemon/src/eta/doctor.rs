@@ -12,6 +12,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+pub use super::doctor_authority::AuthorityFacts;
+use super::doctor_authority::{authority, authority_coverage, last_emit};
 use crate::eta::fit::publish::{FetchKind, PubStatus};
 use crate::eta::fit::run;
 use crate::eta::health::RefreshCycleState;
@@ -82,15 +84,15 @@ impl Check {
         }
     }
 
-    fn ok(link: &'static str, check: &str, detail: impl Into<String>) -> Self {
+    pub(super) fn ok(link: &'static str, check: &str, detail: impl Into<String>) -> Self {
         Self::new(link, check, Status::Ok, detail.into())
     }
 
-    fn skip(link: &'static str, check: &str, detail: impl Into<String>) -> Self {
+    pub(super) fn skip(link: &'static str, check: &str, detail: impl Into<String>) -> Self {
         Self::new(link, check, Status::Skip, detail.into())
     }
 
-    fn bad(
+    pub(super) fn bad(
         link: &'static str,
         check: &str,
         status: Status,
@@ -154,27 +156,6 @@ pub struct ConfigFacts {
     pub native_exporter: bool,
     /// The fleet's ETA authority as this host resolves it (#10498).
     pub authority: AuthorityFacts,
-}
-
-/// The ETA authority resolution as the doctor sees it (#10498).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorityFacts {
-    /// The authority host id, `None` when no host qualifies.
-    pub host: Option<String>,
-    /// Why (`explicit`, `fleet_refresh`, `lowest_id_fallback`, `no_candidate`).
-    pub reason: String,
-    /// This host is the authority.
-    pub is_local: bool,
-    /// Other qualifying hosts: a conflict when non-empty.
-    pub others: Vec<String>,
-    /// The resolver's one-line explanation.
-    pub detail: String,
-    /// The last authority pass against the cached fleet roster (#10897);
-    /// [`State::Unknown`](crate::eta::coverage::State::Unknown) when no pass
-    /// was recorded here or the roster is unknown.
-    pub coverage: crate::eta::coverage::Coverage,
-    /// The host whose pass `coverage` describes (this host's view).
-    pub coverage_host: Option<String>,
 }
 
 /// One repo in the `data` link.
@@ -404,6 +385,7 @@ fn config(f: &Facts) -> Vec<Check> {
     });
     out.push(authority(&c.authority));
     out.push(authority_coverage(&c.authority));
+    out.push(last_emit(&c.authority, f.now));
     out.push(if c.otlp_exporter {
         Check::ok("config", "otlp_exporter", "an OTLP exporter is configured")
     } else {
@@ -427,52 +409,6 @@ fn config(f: &Facts) -> Vec<Check> {
         )
     });
     out
-}
-
-/// #10498: which host is the fleet's one ETA authority, and why.
-fn authority(a: &AuthorityFacts) -> Check {
-    if a.host.is_none() || !a.others.is_empty() {
-        return Check::bad(
-            "config",
-            "authority",
-            Status::Warn,
-            format!("ETA authority: {}", a.detail),
-            "set fleet.etaAuthority (or LOOM_ETA_AUTHORITY) to the one host that should emit \
-             eta.* records",
-        );
-    }
-    Check::ok("config", "authority", format!("ETA authority: {}", a.detail))
-}
-
-/// #10897: the authority's last pass against the fleet roster. Prints the
-/// host the view belongs to, since a non-authority host only has its own.
-fn authority_coverage(a: &AuthorityFacts) -> Check {
-    use crate::eta::coverage::State;
-    let whose = a.coverage_host.as_deref().unwrap_or("this host");
-    match a.coverage.state {
-        State::Unknown => Check::skip(
-            "config",
-            "authority_coverage",
-            format!(
-                "authority coverage unknown: no authority pass recorded on this host or no \
-                 fleet roster cached (fleet.repo); reporting {whose}'s view"
-            ),
-        ),
-        State::Full => Check::ok(
-            "config",
-            "authority_coverage",
-            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
-        ),
-        State::Short => Check::bad(
-            "config",
-            "authority_coverage",
-            Status::Warn,
-            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
-            "move fleet.etaAuthority to a host that manages every roster repo (other hosts \
-             keep emitting the uncovered repos meanwhile; declare fleet.etaAuthorityCovers once \
-             it is fixed), or wait for the workspace-less authority (#10897 Slice 2)",
-        ),
-    }
 }
 
 fn data(f: &Facts) -> Vec<Check> {

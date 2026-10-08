@@ -435,7 +435,7 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
         }
         None => Vec::new(),
     };
-    authority::deliver_checked(emissions, effects.outcomes, &host_id, dry_run);
+    authority::deliver_checked(emissions, effects.outcomes, &host_id, dry_run, None);
     stage_outcome::emit(stages, &host_id, dry_run);
 }
 
@@ -1140,7 +1140,9 @@ pub(super) async fn record(
     pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
     let stages = stage_outcome::build(&rows, &pending, &outcomes, now);
     stage_outcome::emit(stages, &host_id, dry_run);
-    let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
+    let coverage = (repos.len(), repos.iter().map(|r| r.3.len()).sum());
+    let delivered =
+        authority::deliver_checked(emissions, outcomes, &host_id, dry_run, Some(coverage));
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
     log::info!(

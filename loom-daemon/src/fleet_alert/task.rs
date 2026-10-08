@@ -168,6 +168,18 @@ pub fn run_tick(
     ctx: &TickContext<'_>,
     now: DateTime<Utc>,
 ) -> Vec<Transition> {
+    run_tick_with(state, sinks, ctx, now, Vec::new())
+}
+
+/// [`run_tick`] plus `extra` conditions observed outside the status report
+/// (the ETA authority's silence, #10898).
+pub fn run_tick_with(
+    state: &mut AlertState,
+    sinks: &[Box<dyn AlertSink>],
+    ctx: &TickContext<'_>,
+    now: DateTime<Utc>,
+    extra: Vec<super::Condition>,
+) -> Vec<Transition> {
     let TickContext {
         status,
         window,
@@ -185,6 +197,7 @@ pub fn run_tick(
     if let Some(watch) = outputs {
         observed.extend(super::outputs::conditions(watch, now));
     }
+    observed.extend(extra);
     let transitions = state.step(now, &observed);
     for t in &transitions {
         for sink in sinks {
@@ -219,6 +232,7 @@ pub fn spawn(
     bus: Option<Arc<crate::event_bus::EventBus>>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let settings = Settings::resolve(&workspace_root);
+    let _ = crate::eta::emit_heartbeat::process_started();
     if !settings.enabled {
         log::debug!(
             "fleet_alert: disabled (set autonomous.fleetAlert.enabled or {})",
@@ -262,6 +276,10 @@ pub fn spawn(
             loop {
                 let status = fetch_status(&socket_path);
                 let pool_dir = status.as_ref().and_then(|s| s.token_pool_dir.clone());
+                let now = Utc::now();
+                let extra = super::eta_emit::evaluate(&workspace_root, &host, now)
+                    .into_iter()
+                    .collect();
                 let ctx = TickContext {
                     status: status.as_ref(),
                     window,
@@ -270,7 +288,7 @@ pub fn spawn(
                     // The real fleet-store/SigNoz OutputSource is a follow-up.
                     outputs: None,
                 };
-                let transitions = run_tick(&mut state, &sinks, &ctx, Utc::now());
+                let transitions = run_tick_with(&mut state, &sinks, &ctx, now, extra);
                 if !transitions.is_empty() {
                     state.save(&state_path);
                 }

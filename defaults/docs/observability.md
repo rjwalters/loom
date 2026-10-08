@@ -824,7 +824,16 @@ collector pass, the daemon exports `loom.daemon.task_alive{task}`. The value
 is `1` while the loop has beaten within its staleness window. That window is
 two intervals plus 60 s, and the self-update loop adds its 35-minute tick
 bound. The value is `0` once the loop has gone quiet past that window or has
-marked itself dead. So a loop that exited, or whose blocking cycle never
+marked itself dead. `eta_pass` is the one exception to "the loop finished" (#10898): it beats
+only when the pass *emitted*, meaning this host is the ETA authority and its
+delivery path works (an OTLP exporter, or a dry run). A non-authority host, or
+an authority with no exporter, never beats, so it reads `0` instead of healthy.
+The authority also exports `loom.eta.authority` (`1`/`0`),
+`loom.eta.authority.repos_covered` and `loom.eta.authority.last_emit_age_seconds`,
+keeps a local emit heartbeat (`.loom/state/eta/health/last-emit.json`) that
+`eta doctor` prints as `config.last_emit` (FAIL past 2 h), raises the
+`eta-authority-silent` fleet-alert condition, and is watched across hosts by
+the SigNoz rule `alerts/eta-not-emitted.json` (critical). So a loop that exited, or whose blocking cycle never
 returns, reads `0` within one window. Before #10414 it simply went silent.
 `loom.daemon.task_faults{task,reason}` counts `panic` (an iteration panicked
 and the loop caught it), `overrun` (an iteration ran past the loop's own

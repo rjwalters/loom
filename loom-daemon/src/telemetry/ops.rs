@@ -398,6 +398,15 @@ pub enum MetricName {
     /// Pending estimates evicted by the MAX_PENDING cap since process start.
     #[serde(rename = "loom.eta.health.pending_over_cap")]
     EtaHealthPendingOverCap,
+    /// 1 when this host is the ETA authority, else 0 (#10898).
+    #[serde(rename = "loom.eta.authority")]
+    EtaAuthority,
+    /// Repos the authority's last ETA pass covered (#10898).
+    #[serde(rename = "loom.eta.authority.repos_covered")]
+    EtaAuthorityReposCovered,
+    /// Seconds since the authority last emitted ETA records (#10898).
+    #[serde(rename = "loom.eta.authority.last_emit_age_seconds")]
+    EtaAuthorityLastEmitAgeSeconds,
     // ---- Codex session containers (Issue #10455) ---------------------------
     /// Per session-managed Codex account, one point per `state` ∈ `running`,
     /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
@@ -500,6 +509,9 @@ impl MetricName {
             }
             Self::EtaHealthSnapshotBytes => "loom.eta.health.snapshot_bytes",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
+            Self::EtaAuthority => "loom.eta.authority",
+            Self::EtaAuthorityReposCovered => "loom.eta.authority.repos_covered",
+            Self::EtaAuthorityLastEmitAgeSeconds => "loom.eta.authority.last_emit_age_seconds",
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
@@ -594,6 +606,9 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesTruncated => "{row}",
             Self::EtaHealthSnapshotBytes => "By",
             Self::EtaHealthPendingOverCap => "{estimate}",
+            Self::EtaAuthority => "1",
+            Self::EtaAuthorityReposCovered => "{repository}",
+            Self::EtaAuthorityLastEmitAgeSeconds => "s",
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
@@ -699,6 +714,12 @@ impl MetricName {
             Self::EtaHealthPendingOverCap => {
                 "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
                  whole series only when distinct series exceed the cap."
+            }
+            Self::EtaAuthority => "1 when this host is the ETA authority, else 0.",
+            Self::EtaAuthorityReposCovered => "Repos the authority's last ETA pass covered.",
+            Self::EtaAuthorityLastEmitAgeSeconds => {
+                "Time since the authority last offered ETA records to an exporter; omitted \
+                 before the first emit."
             }
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \

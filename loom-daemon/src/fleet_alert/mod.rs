@@ -33,6 +33,7 @@ use crate::types::DaemonStatusReport;
 pub mod capacity;
 pub mod causes;
 pub mod outputs;
+pub mod eta_emit;
 pub mod state;
 pub mod task;
 

@@ -76,6 +76,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
                 detail: r.describe(),
                 coverage: last_pass_coverage(root, now),
                 coverage_host: crate::eta::coverage::read_last_pass(root).map(|p| p.host),
+                emit: super::emit_heartbeat::read(root),
             }
         },
     };

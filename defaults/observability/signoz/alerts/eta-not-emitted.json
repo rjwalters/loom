@@ -1,0 +1,34 @@
+{
+  "alert": "Loom ETA not emitted",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "2h0m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "SELECT toDateTime(intDiv({{.end_timestamp_ms}}, 1000)) AS ts,\n       if(e.emitted = 0 AND p.open_prs > 0, 1, 0) AS value\nFROM (\n  SELECT count() AS emitted\n  FROM signoz_logs.logs_v2\n  WHERE mapContains(attributes_string, 'loom.eta.estimate_id')\n    AND timestamp >= toUInt64({{.start_timestamp_ms}}) * 1000000\n    AND timestamp < toUInt64({{.end_timestamp_ms}}) * 1000000\n) AS e\nCROSS JOIN (\n  SELECT sum(v) AS open_prs\n  FROM (\n    SELECT s.fingerprint AS fingerprint, argMax(s.value, s.unix_milli) AS v\n    FROM signoz_metrics.samples_v4 AS s\n    INNER JOIN signoz_metrics.time_series_v4 AS t USING (fingerprint)\n    WHERE s.metric_name = 'loom.forge.stage_items'\n      AND JSONExtractString(t.labels, 'state') IN ('review_requested', 'changes_requested', 'pr')\n      AND s.unix_milli >= {{.start_timestamp_ms}}\n      AND s.unix_milli < {{.end_timestamp_ms}}\n    GROUP BY s.fingerprint\n  )\n) AS p",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "critical",
+    "loom_signal": "eta_not_emitted"
+  },
+  "annotations": {
+    "summary": "Loom ETA records are not being emitted",
+    "description": "No eta.estimate record reached SigNoz from any host in the last 2 h while review-stage PRs are open (loom.forge.stage_items). The query always returns one row, so a fully missing signal fires rather than reading as healthy. Run `loom-daemon eta doctor` on the ETA authority host: check config.authority, the 'last emit' line, and that an OTLP exporter is configured. Issue #10898 (incident 2026-10-07/08: authority covered 2 repos with no OTLP exporter for ~31 h)."
+  },
+  "disabled": false
+}

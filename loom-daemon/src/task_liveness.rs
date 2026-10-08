@@ -44,6 +44,8 @@ pub const AUTO_UPDATE: &str = "auto_update";
 /// Task name of the ETA fleet snapshot refresh.
 pub const ETA_FLEET_REFRESH: &str = "eta_fleet_refresh";
 /// Task name of the 5-minute ETA pass (run by the observability collector).
+/// Beats only when the pass *emitted* (authority with a working delivery
+/// path), not merely when the loop finished (#10898).
 pub const ETA_PASS: &str = "eta_pass";
 /// Task name of the Codex session-container watch (#10600): its snapshot is
 /// what dispatch selection and `loom-daemon status` read.

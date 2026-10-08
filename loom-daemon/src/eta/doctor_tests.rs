@@ -37,6 +37,13 @@ fn healthy() -> Facts {
                     missing: Vec::new(),
                 },
                 coverage_host: Some("robb-studio".into()),
+                emit: Some(crate::eta::emit_heartbeat::Heartbeat {
+                    host: "robb-studio".into(),
+                    pass_at: now(),
+                    last_emit_at: Some(now() - Duration::minutes(10)),
+                    repos_covered: 2,
+                    open_prs: 3,
+                }),
             },
         },
         data: DataFacts {
@@ -443,6 +450,7 @@ fn the_authority_is_printed_and_a_missing_one_warns() {
         detail: "none (no_candidate)".into(),
         coverage: crate::eta::coverage::Coverage::default(),
         coverage_host: None,
+        emit: None,
     };
     let warn = authority(&none);
     assert_eq!(warn.status, Status::Warn);
