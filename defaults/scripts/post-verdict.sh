@@ -454,9 +454,10 @@ FULL_BODY="$FULL_BODY
 # (which cannot name the release a PR lands in). A binary without them (scripts
 # rolled ahead of the daemon; in the loom repo .loom/scripts symlinks into
 # defaults/scripts, so a `git pull` is a script roll, possibly ahead of the daemon
-# release) posts either verdict on the legacy path below: main's pre-#10581
-# behaviour, so a script roll never stalls the fleet's approvals. It takes no
-# lock, so exit 9 keeps meaning "the lock is held".
+# release) posts either verdict on the legacy path below: the pre-#10581 posting
+# plus a label write (for an approval, exactly the one main's Judge prompt makes),
+# so a script roll never stalls the fleet's approvals. It takes no lock, so exit 9
+# keeps meaning "the lock is held".
 MISSING_VERBS=""
 for verb in verdict-lock verdict-gate verdict-labels verdict-reconcile; do
   "${LOOM_DAEMON_BIN:-loom-daemon}" forge "$verb" --help >/dev/null 2>&1 || MISSING_VERBS="$MISSING_VERBS forge $verb"
@@ -482,12 +483,17 @@ fi
 # verdict posts via the daemon chokepoint when a binary resolves — dashboard
 # footer included — and via the gh ladder when it does not.
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
-# The legacy path (no verdict verbs, see the probe above): post, then the label
-# flip the Judge used to make by hand. loom:ci-failure is left as it is; the
-# exact-head CI gate above already refused an approval on a red head.
+# The legacy path (no verdict verbs, see the probe above): post, then one label
+# write. An approval's is exactly main's Judge-prompt write (+loom:pr, minus the
+# queue/claim labels). It never removes loom:changes-requested: without the gate
+# and reconcile, a rival same-head rejection must leave both labels so
+# merge-pr.sh's contradiction guard (#8112) refuses the merge (#4560). A
+# changes-requested also strips loom:pr (stricter than main, the safe side).
+# loom:ci-failure is left as it is; the exact-head CI gate above already refused
+# an approval on a red head.
 if [[ -n "$MISSING_VERBS" ]]; then
   if [[ "$VERDICT" == "approved" ]]; then
-    LEGACY_LABELS=(--add-label loom:pr --remove-label loom:changes-requested --remove-label loom:review-requested --remove-label loom:reviewing)
+    LEGACY_LABELS=(--add-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing)
   else
     LEGACY_LABELS=(--add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing)
   fi

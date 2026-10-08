@@ -280,7 +280,7 @@ chmod +x "$STUB_DIR/old-daemon"
 echo "== a daemon without the verdict verbs posts an approval on the legacy path (round 4) =="
 state "[]" loom:review-requested loom:reviewing loom:changes-requested loom:ci-failure
 LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" pv 10720 approved "$HEAD" --body "Approved."
-check "exit 0 (main's pre-#10581 approval behaviour)" 0 "$RC"
+check "exit 0 (the legacy approval posts)" 0 "$RC"
 contains "loud warning" "$OUT" "legacy path"
 contains "names the binary" "$OUT" "$STUB_DIR/old-daemon"
 contains "names its --version" "$OUT" "loom-daemon 0.19.870 (pre-10581)"
@@ -288,7 +288,8 @@ contains "names the missing verbs" "$OUT" "forge verdict-lock forge verdict-gate
 contains "says roll the daemon" "$OUT" "roll loom-daemon to a build that includes #10684"
 check "comment posted" 10720 "$POSTED"
 contains "verdict marker on the posted body" "$(jq -r '.[-1].body' "$STUB_DIR/comments.json")" "verdict=approved -->"
-check "ends with loom:pr; loom:ci-failure is left alone" "loom:ci-failure loom:pr " "$LABELS"
+check "loom:pr added; loom:changes-requested and loom:ci-failure left alone" "loom:changes-requested loom:ci-failure loom:pr " "$LABELS"
+contains "a rival rejection's label survives, so merge-pr.sh's #8112 guard sees the contradiction" "$LABELS" "loom:changes-requested"
 check "no lock taken" "" "$(ls "$STUB_DIR/locks" 2>/dev/null)"
 
 echo "== the legacy approval still refuses a moved head (exit 5) =="

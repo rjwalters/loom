@@ -717,8 +717,8 @@ assert_contains "$OUTPUT" "gh pr edit 328 --repo owner/repo --remove-label loom:
 
 # --- T17: a daemon without the #10581 verbs (capability probe, round 2) -----
 
-# An approval posts on the legacy path (round 4: main's pre-#10581 behaviour,
-# so a script roll ahead of the daemon release never stalls approvals), loudly,
+# An approval posts on the legacy path (round 4, so a script roll ahead of the
+# daemon release never stalls approvals) with main's Judge-prompt label write,
 # naming the binary and its --version; no verdict verb is called.
 reset_state
 touch "$STUB_DIR/old-daemon"
@@ -733,7 +733,8 @@ assert_not_contains "$OUTPUT" "older than" "no guessed version floor"
 assert_eq "330" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "approval comment posted"
 assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=approved" "the verdict-sha marker is still appended"
 assert_eq "" "$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "verb-less daemon: no lock, gate or label call"
-assert_contains "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "pr edit 330 --repo owner/repo --add-label loom:pr --remove-label loom:changes-requested --remove-label loom:review-requested --remove-label loom:reviewing" "legacy path: the approval label flip"
+assert_contains "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "pr edit 330 --repo owner/repo --add-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing" "legacy path: main's approval label write"
+assert_not_contains "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "--remove-label loom:changes-requested" "legacy approval never removes loom:changes-requested (#4560/#8112)"
 
 # The legacy approval still runs the #10485 final head compare.
 reset_state
