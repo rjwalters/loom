@@ -8,6 +8,10 @@ use super::*;
 
 pub(super) mod child_env_markers;
 
+// Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
+mod lease_renewal_start;
+use lease_renewal_start::lease_renewal_start_command;
+
 /// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
 /// daemon-spawned sweep child is a headless `claude -p` session; in print mode
 /// the harness reaps still-running background tasks (the sweep's Builder/Judge
@@ -3224,30 +3228,8 @@ fn run_lease_renewal_start(
         );
         return None;
     }
-    let mut cmd = Command::new(&script);
-    cmd.arg("start")
-        .arg(issue.to_string())
-        .arg("--watch-pid")
-        .arg(child_pid.to_string())
-        // Exact-match targeting (#6485): without BOTH of these the loop
-        // falls back to "newest lease wins" and can spend the sweep
-        // renewing a PEER dispatcher's lease comment while this claim's
-        // own `updated_at` never advances. The daemon knows both values
-        // exactly — it published them itself in `write_lease_comment`.
-        .arg("--host")
-        .arg(host)
-        .arg("--sweep-id")
-        .arg(sweep_id)
-        // Same workspace every other forge mutation in this registry runs
-        // in, so `gh` resolves this repo in a multi-workspace daemon
-        // (#3928/#3937).
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        // Piped and read below purely to capture the loop pid `start`
-        // prints. Safe to read to EOF: the detached loop redirects its OWN
-        // stdout to /dev/null, so nothing holds this pipe open past
-        // `start`'s return.
-        .stdout(Stdio::piped());
+    let mut cmd =
+        lease_renewal_start_command(&script, issue, sweep_id, child_pid, host, workspace_root);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)

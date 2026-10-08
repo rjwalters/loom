@@ -106,6 +106,7 @@ fn required_mode_record_has_available_fields_and_not_available_markers() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let (outcome, record) = run_evidence(&fakebin, &linux_inputs(&dir), &policy);
     let line = cleanup(&outcome).expect("verified");
@@ -261,6 +262,7 @@ fn sanitized_record_has_no_token_credential_path_or_env_value() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let (outcome, record) = run_evidence(&fakebin, &inputs, &policy);
     let line = cleanup(&outcome).expect("verified in key mode");
@@ -312,6 +314,7 @@ fn keyless_regexp_does_not_leak_rejected_workflow() {
         let policy = SignaturePolicy {
             require_signature: true,
             approved_workflow: Some(bad.to_string()),
+            ..SignaturePolicy::default()
         };
         let (outcome, record) = run_evidence(&fakebin, &linux_inputs(&dir), &policy);
         let line = cleanup(&outcome).expect("verified");
@@ -329,6 +332,7 @@ fn keyless_regexp_does_not_leak_rejected_workflow() {
         &SignaturePolicy {
             require_signature: true,
             approved_workflow: Some("release.yml".to_string()),
+            ..SignaturePolicy::default()
         },
         &EvidenceFacts {
             verified_by: Some(crate::release_fetch::signature::VerifiedBy::KeylessIdentityRegexp {
@@ -367,6 +371,7 @@ fn sanitize_drops_path_and_token_shaped_public_text() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("/Users/me/secret/release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let r = SignatureEvidence::assemble(
         "v1.0.0",
@@ -398,6 +403,7 @@ fn identity_and_issuer_reject_credential_urls_and_local_paths() {
             &SignaturePolicy {
                 require_signature: true,
                 approved_workflow: None,
+                ..SignaturePolicy::default()
             },
             &EvidenceFacts {
                 verified_by: Some(verified_by),

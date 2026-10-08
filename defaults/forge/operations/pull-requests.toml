@@ -241,6 +241,9 @@ path = "defaults/.claude/commands/loom/judge.md"
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
+[[operation.callers]]
 kind = "script"
 path = "scripts/ci-image-inputs.sh"
 

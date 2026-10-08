@@ -382,6 +382,17 @@ pub fn fleet_eta_authority(repo_root: &Path) -> Option<String> {
     }
 }
 
+const FLEET_ETA_AUTHORITY_COVERS_KEY: &str = "fleet.etaAuthorityCovers";
+
+/// What the committed config declares about the ETA authority's repos
+/// (#10897): `fleet.etaAuthorityCovers` is `"all"` or a list of `owner/repo`
+/// slugs. Soft-fails to undeclared like [`fleet_eta_authority`].
+#[must_use]
+pub fn fleet_eta_authority_covers(repo_root: &Path) -> crate::eta::coverage::Declared {
+    let effective = resolve_effective_config(repo_root);
+    crate::eta::coverage::parse_declared(get_path(&effective, FLEET_ETA_AUTHORITY_COVERS_KEY))
+}
+
 const FLEET_CAPTAIN_ARM_TTL_SECS_KEY: &str = "fleet.captainArmTtlSecs";
 
 /// Env override for [`fleet_captain_arm_ttl_secs`], following the

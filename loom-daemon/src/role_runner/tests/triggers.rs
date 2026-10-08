@@ -140,6 +140,14 @@ fn curator_skips_with_zero_untriaged_issues() {
 }
 
 #[test]
+fn curator_work_observation_counts_pending_revision_requests() {
+    // A revision request carries `loom:needs-revision`, not `loom:triage`; with
+    // zero triage issues it must still be observed, or the gate skips Curator.
+    assert!(CURATOR_WORK_LABELS.contains(&"loom:triage"));
+    assert!(CURATOR_WORK_LABELS.contains(&"loom:needs-revision"));
+}
+
+#[test]
 fn curator_launches_with_untriaged_issues() {
     let d = should_launch("curator", &inputs(Observation::Count(3), None));
     assert!(d.launches(), "{d:?}");

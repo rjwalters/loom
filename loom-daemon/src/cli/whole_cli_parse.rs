@@ -22,7 +22,7 @@ pub(crate) const MAIN_THREAD_STACK: usize = 8 << 20;
 ///
 /// A stack overflow aborts the whole test process, but the abort message
 /// names the thread: `thread '<name>' has overflowed its stack`.
-fn on_stack<T: Send + 'static>(
+pub(crate) fn on_stack<T: Send + 'static>(
     name: &str,
     stack: usize,
     f: impl FnOnce() -> T + Send + 'static,

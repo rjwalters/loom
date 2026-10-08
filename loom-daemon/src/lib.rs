@@ -308,6 +308,8 @@ pub mod role_validation;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;
+#[cfg(test)]
+pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
 /// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
 /// module rather than a `safehouse::` submodule: `safehouse.rs` is an
@@ -385,6 +387,8 @@ pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
 pub mod verdict_equivalence;
+/// The verdict-time gate and label transition behind `post-verdict.sh` (#10581).
+pub mod verdict_gate;
 /// The stale-verdict notice both stale-clear paths post (#9709).
 pub mod verdict_stale_notice;
 pub mod watch_registry;

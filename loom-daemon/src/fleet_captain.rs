@@ -349,6 +349,27 @@ pub fn arm_singleton_job(job_name: &str, root: &Path, current_host_id: &str) -> 
     }
 }
 
+/// Record `job_name` for a singleton job whose owner is not `fleet.captain`:
+/// the ETA jobs follow an explicit `fleet.etaAuthority` (#10918,
+/// [`crate::eta::job_owner`]). The caller has already decided whether the job
+/// runs here. `armed_here` lists it in the armed registry, and anything else
+/// removes it. The job has an owner either way, so it is never listed as
+/// captainless.
+pub fn record_owned_singleton_job(job_name: &str, armed_here: bool) {
+    captainless_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(job_name);
+    if armed_here {
+        armed_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_name.to_string());
+    } else {
+        disarm_singleton_job(job_name);
+    }
+}
+
 // ============================================================================
 // Durable shell-arm registry (cross-process, for host.health) — #8901
 // ============================================================================

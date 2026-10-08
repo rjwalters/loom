@@ -55,6 +55,10 @@ pub const TRIGGER_CALLER: &str = "role_event_trigger";
 /// The curator's debt axis name, as it appears in a trigger label.
 pub const UNTRIAGED_AXIS: &str = "untriaged";
 
+/// Labels that mean Curator has queued work: new issues and Champion's
+/// revision requests (#10753), which never carry `loom:triage`.
+pub const CURATOR_WORK_LABELS: [&str; 2] = ["loom:triage", "loom:needs-revision"];
+
 /// The resolved `autonomous.roleRunner.eventTriggers` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventTriggerConfig {
@@ -435,17 +439,29 @@ pub fn observe_origin_main(root: &Path) -> Observation {
 /// page: a count of at least one is all the curator gate needs, so one
 /// ETag-cached page per tick, usually a free `304`.
 fn observe_untriaged(root: &Path) -> Observation {
-    match crate::forge_listing::list_issues_cached_as(
-        TRIGGER_CALLER,
-        &concurrent_dispatch::gate_gh_bin(),
-        Some(root),
-        None,
-        "loom:triage",
-        "open",
-    ) {
-        Ok(rows) => Observation::Count(rows.iter().filter(|r| !r.is_pull_request).count()),
-        Err(e) => Observation::Unobserved(format!("loom:triage listing failed: {e}")),
+    let gh = concurrent_dispatch::gate_gh_bin();
+    let mut total = 0;
+    // Champion's NEEDS REVISION requests (`loom:needs-revision`, #10753) are
+    // Curator work that never carries `loom:triage`, so they count too.
+    for label in CURATOR_WORK_LABELS {
+        match crate::forge_listing::list_issues_cached_as(
+            TRIGGER_CALLER,
+            &gh,
+            Some(root),
+            None,
+            label,
+            "open",
+        ) {
+            Ok(rows) => total += count_issue_rows(rows.iter().map(|r| r.is_pull_request)),
+            Err(e) => return Observation::Unobserved(format!("{label} listing failed: {e}")),
+        }
     }
+    Observation::Count(total)
+}
+
+/// Issues (not pull requests) among the listed rows.
+fn count_issue_rows(is_pull_request: impl Iterator<Item = bool>) -> usize {
+    is_pull_request.filter(|pr| !pr).count()
 }
 
 /// The open ready (`loom:issue`) and backlog (`loom:curated`) issue-number
