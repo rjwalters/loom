@@ -712,25 +712,48 @@ fn a_passthrough_is_one_ledger_row_under_the_sessions_role_and_bucket() {
         assert!(out.status.success(), "{out:?}");
         stdout(&out)
     };
-    let by_role = report("role");
-    let line = |text: &str, key: &str| {
-        text.lines()
-            .find(|l| l.split_whitespace().next() == Some(key))
-            .map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("no {key} row in:\n{text}"))
+    // Cells are located by their header name, never by position, so a new
+    // column (INSTALLATION, #10571) cannot shift what a lookup reads.
+    let table = |text: &str, first: &str| -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut lines = text
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>());
+        let header = lines
+            .find(|w| w.first() == Some(&first))
+            .unwrap_or_else(|| panic!("no {first} header in:\n{text}"));
+        lines
+            .filter(|w| w.len() == header.len())
+            .map(|w| {
+                header
+                    .iter()
+                    .map(|h| (*h).to_string())
+                    .zip(w.iter().map(|c| (*c).to_string()))
+                    .collect()
+            })
+            .collect()
     };
-    assert_eq!(line(&by_role, "agent-builder")[1], "3", "{by_role}");
-    assert_eq!(line(&by_role, "agent-judge")[1], "1", "{by_role}");
+    let by_role = report("role");
+    let role = |key: &str| {
+        table(&by_role, "ROLE")
+            .into_iter()
+            .find(|r| r["ROLE"] == key)
+            .unwrap_or_else(|| panic!("no {key} row in:\n{by_role}"))
+    };
+    assert_eq!(role("agent-builder")["CHARGED"], "3", "{by_role}");
+    assert_eq!(role("agent-judge")["CHARGED"], "1", "{by_role}");
     let by_bucket = report("bucket");
     let bucket = |resource: &str| {
-        by_bucket
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>())
-            .find(|w| w.len() > 4 && w[1] == "acme" && w[2] == resource)
-            .map(|w| w[4].to_string())
+        table(&by_bucket, "ACCOUNT")
+            .into_iter()
+            .find(|r| r["CRED_OWNER"] == "acme" && r["RESOURCE"] == resource)
+            .unwrap_or_else(|| panic!("no acme/{resource} bucket in:\n{by_bucket}"))
     };
-    assert_eq!(bucket("graphql").as_deref(), Some("3"), "{by_bucket}");
-    assert_eq!(bucket("core").as_deref(), Some("1"), "{by_bucket}");
+    assert_eq!(bucket("graphql")["CHARGED"], "3", "{by_bucket}");
+    assert_eq!(bucket("core")["CHARGED"], "1", "{by_bucket}");
+    // The agent rows carry the installation end to end (#10571): this
+    // fixture's credential dir has no identity sidecar, so it is `-`.
+    assert_eq!(bucket("graphql")["INSTALLATION"], "-", "{by_bucket}");
+    assert_eq!(bucket("core")["INSTALLATION"], "-", "{by_bucket}");
     assert!(report("caller").contains("agent.gh.pr"));
 }
 
