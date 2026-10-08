@@ -210,6 +210,8 @@ pub fn session_pid_from_env() -> Option<u32> {
 pub struct ExportPlan {
     /// OTLP endpoints that passed the daemon's own policy pass.
     pub endpoints: Vec<String>,
+    /// Each endpoint's `headers_file` path, same order (#10961). Paths only.
+    pub headers_files: Vec<Option<String>>,
     /// Where the ingest key lives. Read only by the detached tailer.
     pub key_file: String,
     pub batch_size: usize,
@@ -237,7 +239,10 @@ pub fn export_plan(workspace_root: &Path) -> Result<ExportPlan, String> {
     if !super::resolve_enabled(&live) {
         return Err("live output is not enabled (observability.liveOutput.enabled)".to_string());
     }
-    let endpoints = super::super::planned_otlp_endpoints(&config);
+    let (endpoints, headers_files): (Vec<_>, Vec<_>) =
+        super::super::planned_otlp_exporters(&config)
+            .into_iter()
+            .unzip();
     if endpoints.is_empty() {
         return Err(
             "no usable OTLP exporter is configured (session.output is OTLP-only)".to_string()
@@ -248,6 +253,7 @@ pub fn export_plan(workspace_root: &Path) -> Result<ExportPlan, String> {
     };
     Ok(ExportPlan {
         endpoints,
+        headers_files,
         key_file,
         batch_size: super::super::resolve_batch_size(&config),
         flush_interval: Duration::from_secs(super::super::resolve_flush_interval_secs(&config)),
@@ -1251,9 +1257,12 @@ fn build_sink(
     let mut queues = Vec::new();
     let mut files = Vec::new();
     for (index, endpoint) in plan.endpoints.iter().enumerate() {
-        let Ok(exporter) =
-            super::super::otlp::OtlpExporter::new(endpoint.clone(), ingest_key.to_string())
-        else {
+        let headers_file = plan.headers_files.get(index).and_then(Option::as_deref);
+        let Ok(exporter) = super::super::otlp::OtlpExporter::with_headers_file(
+            endpoint.clone(),
+            ingest_key.to_string(),
+            headers_file,
+        ) else {
             continue;
         };
         let file = queue_dir.join(format!("{key}.otlp-{index}.jsonl"));
