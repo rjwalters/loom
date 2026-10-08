@@ -239,7 +239,7 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
             match serde_json::from_str::<serde_json::Value>(body.trim())
                 .ok()
                 .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
-                .filter(|v| !v.trim().is_empty())
+                .filter(|v| !v.trim().is_empty() && is_clean(v, &secrets_of(cfg)))
             {
                 Some(v) => v,
                 // No observed version = no version-qualified evidence: stop
@@ -406,7 +406,8 @@ fn issue_create(
         .as_ref()
         .and_then(|v| v.get("number").and_then(|n| n.as_u64()));
     let base = |outcome: &str, observed: String| {
-        let (outcome, observed, actor) = with_actor(http, &cfg.writer_token, outcome, observed);
+        let (outcome, observed, actor) =
+            with_actor(http, &cfg.writer_token, &secrets_of(cfg), outcome, observed);
         CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
@@ -523,6 +524,7 @@ fn issue_comment_readback(
     let (outcome, observed, actor) = with_actor(
         http,
         &cfg.writer_token,
+        &secrets_of(cfg),
         if seen && (200..=299).contains(&rcode) {
             OUTCOME_PASS
         } else {
@@ -555,10 +557,11 @@ fn issue_comment_readback(
 fn with_actor(
     http: &dyn ProbeHttp,
     token: &str,
+    secrets: &[&str],
     outcome: &str,
     observed: String,
 ) -> (String, String, Option<String>) {
-    let actor = actor_of(http, token);
+    let actor = actor_of(http, token, secrets);
     if outcome == OUTCOME_PASS && actor.is_none() {
         return (
             OUTCOME_FAIL.into(),
@@ -571,7 +574,11 @@ fn with_actor(
     (outcome.into(), observed, actor)
 }
 
-fn actor_of(http: &dyn ProbeHttp, token: &str) -> Option<String> {
+/// The login comes from the server and lands in a published receipt, so one
+/// that carries a run credential (or URL userinfo) is unusable evidence: it
+/// resolves to `None` (a case then fails closed) rather than to a redacted
+/// placeholder that could pass for a real actor.
+fn actor_of(http: &dyn ProbeHttp, token: &str, secrets: &[&str]) -> Option<String> {
     let (code, body) = http.request("GET", "user", token, None).ok()?;
     if !(200..=299).contains(&code) {
         return None;
@@ -579,6 +586,19 @@ fn actor_of(http: &dyn ProbeHttp, token: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body.trim())
         .ok()
         .and_then(|v| v.get("login").and_then(|l| l.as_str()).map(String::from))
+        .filter(|l| is_clean(l, secrets))
+}
+
+/// True when redaction would leave `s` unchanged, i.e. it embeds no credential.
+fn is_clean(s: &str, secrets: &[&str]) -> bool {
+    redact_secrets(s, secrets) == s
+}
+
+fn secrets_of(cfg: &RunnerConfig) -> [&str; 2] {
+    [
+        cfg.writer_token.as_str(),
+        cfg.readonly_token.as_deref().unwrap_or(""),
+    ]
 }
 
 /// Describe a response body without echoing it: a server may reflect a
@@ -622,13 +642,7 @@ fn redact_secrets(s: &str, secrets: &[&str]) -> String {
 
 /// Redact the run's writer/readonly tokens from a transport error.
 fn scrub(cfg: &RunnerConfig, s: &str) -> String {
-    redact_secrets(
-        s,
-        &[
-            cfg.writer_token.as_str(),
-            cfg.readonly_token.as_deref().unwrap_or(""),
-        ],
-    )
+    redact_secrets(s, &secrets_of(cfg))
 }
 
 fn now_secs() -> u64 {
@@ -923,10 +937,10 @@ mod tests {
     fn with_actor_keeps_a_non_pass_outcome_and_a_resolved_actor() {
         let mut http = FakeHttp::new();
         http.push("user", vec![Ok((200, r#"{"login":"w"}"#.into()))]);
-        let (o, _, a) = with_actor(&http, "t", OUTCOME_PASS, "ok".into());
+        let (o, _, a) = with_actor(&http, "t", &[], OUTCOME_PASS, "ok".into());
         assert_eq!((o.as_str(), a.as_deref()), (OUTCOME_PASS, Some("w")));
         let down = FakeHttp::new();
-        let (o, obs, a) = with_actor(&down, "t", OUTCOME_FAIL, "bad".into());
+        let (o, obs, a) = with_actor(&down, "t", &[], OUTCOME_FAIL, "bad".into());
         assert_eq!((o.as_str(), obs.as_str(), a), (OUTCOME_FAIL, "bad", None));
     }
 
@@ -1100,6 +1114,35 @@ mod tests {
         http.push("issues", vec![Err(format!("curl exit 35: {FAKE_WRITER}"))]);
         let results = run(&leaky_cfg(), &http).unwrap();
         assert_clean(&serde_json::to_string(&results).unwrap());
+    }
+
+    #[test]
+    fn successful_version_and_login_do_not_echo_credentials() {
+        // A 200 version carrying a token is unusable evidence: the run stops.
+        for v in [FAKE_WRITER, FAKE_RO] {
+            let mut http = FakeHttp::new();
+            http.push("version", vec![Ok((200, format!(r#"{{"version":"{v}"}}"#)))]);
+            let err = run(&leaky_cfg(), &http).unwrap_err();
+            assert_clean(&format!("{err} {err:?}"));
+            assert!(err.to_string().contains("without a usable version"), "{err}");
+        }
+
+        // A 200 login carrying a token yields no actor: the PASS fails closed.
+        for l in [FAKE_WRITER, FAKE_RO, "https://u:pw@h"] {
+            let mut http = FakeHttp::new();
+            http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+            http.push("issues", vec![Ok((201, r#"{"number":7}"#.into()))]);
+            http.push("user", vec![Ok((200, format!(r#"{{"login":"{l}"}}"#)))]);
+            let results = run(&leaky_cfg(), &http).unwrap();
+            let receipt = serde_json::to_string(&results).unwrap();
+            assert_clean(&receipt);
+            assert!(!receipt.contains("u:pw"), "{receipt}");
+            assert!(results.iter().all(|r| r.actor.is_none()), "{receipt}");
+            assert!(
+                results.iter().all(|r| r.outcome != OUTCOME_PASS),
+                "no PASS without actor evidence: {receipt}"
+            );
+        }
     }
 
     #[test]
