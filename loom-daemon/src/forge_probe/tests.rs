@@ -12,6 +12,7 @@ struct FakeHttp {
     routes: Vec<(&'static str, std::cell::RefCell<Queue>)>,
     calls: std::cell::Cell<u32>,
     log: std::cell::RefCell<Vec<(String, String)>>,
+    bodies: std::cell::RefCell<Vec<(String, Option<String>)>>,
 }
 
 struct Queue {
@@ -25,6 +26,7 @@ impl FakeHttp {
             routes: Vec::new(),
             calls: std::cell::Cell::new(0),
             log: std::cell::RefCell::new(Vec::new()),
+            bodies: std::cell::RefCell::new(Vec::new()),
         }
     }
     fn push(&mut self, path_part: &'static str, responses: Vec<Result<(u16, String), String>>) {
@@ -44,8 +46,11 @@ impl ProbeHttp for FakeHttp {
         method: &str,
         path: &str,
         _token: &str,
-        _body: Option<&str>,
+        body: Option<&str>,
     ) -> Result<(u16, String), String> {
+        self.bodies
+            .borrow_mut()
+            .push((format!("{method} {path}"), body.map(str::to_string)));
         self.calls.set(self.calls.get() + 1);
         self.log
             .borrow_mut()
@@ -147,7 +152,7 @@ fn issue_create_passes_on_2xx_with_a_number_and_records_the_disposable_number() 
         "issues",
         vec![
             Ok((201, r#"{"number": 12}"#.into())),
-            Ok((200, issue_json(12, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+            Ok((200, issue_json(12, "loomp-testrun: issue-create", DISPOSABLE_BODY))),
         ],
     );
     http.push("user", vec![Ok((200, r#"{"login":"probe-writer"}"#.into()))]);
@@ -183,7 +188,7 @@ fn issue_create_row(readback: Result<(u16, String), String>) -> CaseResult {
 
 #[test]
 fn issue_create_fails_when_the_readback_is_missing_or_mismatched() {
-    let ns_title = "loomp-loomp-testrun: issue-create";
+    let ns_title = "loomp-testrun: issue-create";
     for readback in [
         Ok((404, r#"{"message":"not found"}"#.into())),
         Ok((200, "not json".into())),
@@ -239,7 +244,7 @@ fn a_passing_case_without_actor_evidence_fails_closed() {
             "issues",
             vec![
                 Ok((201, r#"{"number": 12}"#.into())),
-                Ok((200, issue_json(12, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+                Ok((200, issue_json(12, "loomp-testrun: issue-create", DISPOSABLE_BODY))),
             ],
         );
         http.push("user", vec![user]);
@@ -300,7 +305,7 @@ fn comment_readback_requires_the_marker_on_read() {
         "issues",
         vec![
             Ok((201, r#"{"number": 7}"#.into())),
-            Ok((200, issue_json(7, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+            Ok((200, issue_json(7, "loomp-testrun: issue-create", DISPOSABLE_BODY))),
         ],
     );
     // comments GET: marker absent -> FAIL
@@ -318,8 +323,40 @@ fn comment_readback_requires_the_marker_on_read() {
 #[test]
 fn disposable_titles_carry_the_run_namespace() {
     let cfg = cfg(true);
-    assert!(issue_title(&cfg, "issue-create").starts_with("loomp-loomp-testrun:"));
+    assert!(issue_title(&cfg, "issue-create").starts_with("loomp-testrun:"));
     assert!(issue_title(&cfg, "issue-create").contains("issue-create"));
+}
+
+#[test]
+fn issue_title_uses_run_ns_as_the_full_namespace_without_a_second_prefix() {
+    let mut c = cfg(true);
+    assert_eq!(issue_title(&c, "issue-create"), "loomp-testrun: issue-create");
+    c.run_ns = "qual-custom".into();
+    assert_eq!(issue_title(&c, "issue-create"), "qual-custom: issue-create");
+}
+
+#[test]
+fn issue_create_post_payload_carries_the_exact_title() {
+    let mut http = FakeHttp::new();
+    http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+    http.push(
+        "issues",
+        vec![
+            Ok((201, r#"{"number": 12}"#.into())),
+            Ok((200, issue_json(12, "qual-custom: issue-create", DISPOSABLE_BODY))),
+        ],
+    );
+    let mut c = cfg(true);
+    c.run_ns = "qual-custom".into();
+    c.only = vec!["issue-create".into()];
+    run(&c, &http).unwrap();
+    let bodies = http.bodies.borrow();
+    let post = bodies
+        .iter()
+        .find(|(k, b)| k.starts_with("POST") && k.ends_with("/issues") && b.is_some())
+        .expect("issue POST recorded");
+    let payload: serde_json::Value = serde_json::from_str(post.1.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["title"], "qual-custom: issue-create");
 }
 
 #[test]
@@ -456,7 +493,7 @@ fn successful_version_and_login_do_not_echo_credentials() {
             "issues",
             vec![
                 Ok((201, r#"{"number":7}"#.into())),
-                Ok((200, issue_json(7, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+                Ok((200, issue_json(7, "loomp-testrun: issue-create", DISPOSABLE_BODY))),
             ],
         );
         http.push("user", vec![Ok((200, serde_json::json!({ "login": login }).to_string()))]);

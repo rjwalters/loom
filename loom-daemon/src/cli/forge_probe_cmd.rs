@@ -40,8 +40,8 @@ pub(crate) struct ForgeProbeArgs {
     /// never by the runner. Defaults to `$GITEA_QUAL_ORG/loomp-test`.
     #[arg(long, value_name = "ORG/REPO")]
     repo: Option<String>,
-    /// Run namespace stamped into every disposable title
-    /// (`loomp-<ns>: …`). Defaults to `$GITEA_QUAL_RUN_NS`, else
+    /// Full run namespace stamped into every disposable title
+    /// (`<run-ns>: <case>`; no extra prefix is added). Defaults to `$GITEA_QUAL_RUN_NS`, else
     /// `loomp-<unix-seconds>` so repeated runs never collide.
     #[arg(long, value_name = "NS")]
     run_ns: Option<String>,
