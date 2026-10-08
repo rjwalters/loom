@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::auto_update::supersede::ArmedRoll;
+use crate::auto_update::RollTarget;
 use serial_test::serial;
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -31,41 +32,30 @@ fn fetch(version: &str) -> TickDecision {
     }
 }
 
-/// A trigger with an optional armed roll; records abandons and, like
-/// `DrainState::abort()`, clears the roll when abandoned.
+/// A trigger with an optional armed roll.
 #[derive(Default)]
 struct FakeTrigger {
     armed: Mutex<Option<ArmedRoll>>,
-    abandons: Mutex<Vec<String>>,
 }
 
 impl FakeTrigger {
-    fn with(target: &str, pending: bool) -> Self {
+    fn with(target: &str, committed: bool) -> Self {
         Self {
             armed: Mutex::new(Some(ArmedRoll {
                 target: Some(target.to_string()),
-                pending,
+                committed,
                 then_exit: false,
-                refusals: u32::from(pending),
             })),
-            abandons: Mutex::default(),
         }
-    }
-    fn abandon_count(&self) -> usize {
-        self.abandons.lock().unwrap().len()
     }
 }
 
-impl DrainTrigger for FakeTrigger {
-    fn trigger(&self) -> bool {
+impl RollTrigger for FakeTrigger {
+    fn trigger_pause_roll(&self, _target: &RollTarget) -> bool {
         true
     }
     fn armed_roll(&self) -> Option<ArmedRoll> {
         self.armed.lock().unwrap().clone()
-    }
-    fn abandon_roll(&self, reason: &str) -> bool {
-        self.abandons.lock().unwrap().push(reason.to_string());
-        self.armed.lock().unwrap().take().is_some()
     }
 }
 
@@ -393,7 +383,7 @@ fn non_arming_decisions_pass_through_untouched() {
 }
 
 #[test]
-fn a_timed_out_drain_resumes_dispatch_and_nothing_rearms_until_the_next_window() {
+fn a_roll_that_ended_without_a_restart_is_not_rearmed_until_the_next_window() {
     let mut g = gate();
     let open = HOUR as i64 + 60;
     // Window 0: the roll arms.
@@ -401,30 +391,21 @@ fn a_timed_out_drain_resumes_dispatch_and_nothing_rearms_until_the_next_window()
     g.begin_tick(at(open), &idle, Duration::ZERO);
     assert!(matches!(g.gate(at(open), fetch("0.19.3")), TickDecision::FetchArtifact { .. }));
 
-    // The drain survives one tick, then times out and goes pending (#6007).
-    let draining = FakeTrigger::with("v0.19.3@abc", false);
-    g.begin_tick(at(open + 900), &draining, Duration::ZERO);
-    assert_eq!(draining.abandon_count(), 0, "a first-attempt drain is left alone");
+    // The next tick sees it armed: dispatch is paused by the update.
+    let pausing = FakeTrigger::with("v0.19.3@abc", false);
+    g.begin_tick(at(open + 900), &pausing, Duration::ZERO);
     assert!(g.status().unwrap().dispatch_paused_by_update);
-    *draining.armed.lock().unwrap() = Some(ArmedRoll {
-        target: Some("v0.19.3@abc".to_string()),
-        pending: true,
-        then_exit: false,
-        refusals: 1,
-    });
-    g.begin_tick(at(open + 1200), &draining, Duration::ZERO);
-    assert_eq!(draining.abandon_count(), 1, "the pending roll is abandoned: dispatch resumes");
-    assert!(draining.armed_roll().is_none());
-    assert!(!g.status().unwrap().dispatch_paused_by_update);
 
+    // The roll ended without a restart (aborted before it stopped anything).
     // Several more ticks AND newer releases in the same window: never re-armed.
     for (n, version) in ["0.19.3", "0.19.4", "0.19.5"].into_iter().enumerate() {
         let now = at(open + 1200 + 60 * (n as i64 + 1));
         g.begin_tick(now, &idle, Duration::ZERO);
+        assert!(!g.status().unwrap().dispatch_paused_by_update);
         let TickDecision::Skip(reason) = g.gate(now, fetch(version)) else {
-            panic!("re-armed inside the window that already timed out");
+            panic!("re-armed inside a window that was already used");
         };
-        assert!(reason.starts_with("drain timed out, waiting for next window"), "{reason}");
+        assert!(reason.contains("already armed"), "{reason}");
     }
 
     // Window 1 (t = 7h+): eligible again, against whatever is on disk then.
@@ -483,28 +464,25 @@ fn a_retarget_never_arms_after_the_window_has_closed() {
 }
 
 #[test]
-fn an_operator_teardown_drain_is_never_abandoned_or_counted_as_an_update_pause() {
+fn an_operator_teardown_drain_is_never_counted_as_an_update_pause() {
     let mut g = gate();
     let teardown = FakeTrigger::default();
     *teardown.armed.lock().unwrap() = Some(ArmedRoll {
         target: None,
-        pending: true,
+        committed: true,
         then_exit: true,
-        refusals: 3,
     });
     g.begin_tick(at(HOUR as i64 + 60), &teardown, Duration::ZERO);
-    assert_eq!(teardown.abandon_count(), 0, "operator holds stay authoritative");
     assert!(!g.status().unwrap().dispatch_paused_by_update);
     // An untargeted operator `restart --drain` is likewise left alone.
     let operator = FakeTrigger::default();
     *operator.armed.lock().unwrap() = Some(ArmedRoll {
         target: None,
-        pending: true,
+        committed: true,
         then_exit: false,
-        refusals: 2,
     });
     g.begin_tick(at(HOUR as i64 + 120), &operator, Duration::ZERO);
-    assert_eq!(operator.abandon_count(), 0);
+    assert!(!g.status().unwrap().dispatch_paused_by_update);
 }
 
 #[test]

@@ -21,12 +21,12 @@
 //!   hash of the host id modulo the period ([`derive_offset`]) — the same on every
 //!   restart, spread across the period for distinct hosts.
 //! * **One arm per window.** A new build outside an open window arms nothing. Once
-//!   a roll has been armed in a window, a drain that times out (the roll goes
-//!   *pending*, #6007) is **abandoned** so dispatch resumes, and nothing re-arms
-//!   until the next window — however many ticks or releases pass in between.
-//!   Composes with #8998 (abandon on unsatisfiable), #9010 (cooldown) and #8514
-//!   (a still-draining roll overtaken by a newer release is retargeted, once,
-//!   inside the same open window).
+//!   a roll has been armed in a window, nothing re-arms until the next window —
+//!   however many ticks or releases pass in between. Composes with #8514 (an
+//!   armed roll overtaken by a newer release before it has stopped any agent is
+//!   retargeted, once, inside the same open window). Since #10831 an armed roll
+//!   is a pause roll bounded by its pause budget, so there is no timed-out
+//!   drain left to abandon here.
 //! * **Settle is bypassed** while a window is configured: the window *is* the
 //!   batching mechanism, and a commit-quiescence gate would let a busy `main`
 //!   starve a host forever (the 2026-10-03 field report).
@@ -48,7 +48,7 @@
 //!
 //! Everything time-dependent takes an injected `now`; nothing here sleeps.
 
-use super::drain_trigger::DrainTrigger;
+use super::roll_trigger::RollTrigger;
 use super::TickDecision;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -338,8 +338,6 @@ pub struct WindowGate {
     tuning: RollWindowTuning,
     /// Index of the latest window a roll was armed in.
     consumed: Option<i64>,
-    /// Index of the window whose drain timed out and was abandoned.
-    timed_out: Option<i64>,
     /// Set for the tick on which #8514 discarded a still-draining roll, so the
     /// replacement for the newer release may arm inside the same window.
     retarget: bool,
@@ -388,9 +386,9 @@ impl WindowGate {
     }
 
     /// Start-of-tick bookkeeping. Observes any armed roll (consuming the current
-    /// window), abandons one whose drain has timed out so dispatch resumes, and
-    /// returns the settle window the tick should use (zero while windowed).
-    pub fn begin_tick<T: DrainTrigger>(
+    /// window) and returns the settle window the tick should use (zero while
+    /// windowed).
+    pub fn begin_tick<T: RollTrigger>(
         &mut self,
         now: DateTime<Utc>,
         trigger: &T,
@@ -408,20 +406,8 @@ impl WindowGate {
             .filter(|roll| !roll.then_exit && roll.target.is_some());
         self.paused_by_update = owned.is_some();
         self.armed_target = owned.and_then(|roll| roll.target.clone());
-        if let Some(roll) = owned {
+        if owned.is_some() {
             self.consumed = Some(index);
-            if roll.pending {
-                let reason = format!(
-                    "drain timed out, waiting for next window ({}): dispatch resumed",
-                    window_start(index + 1, period, offset).format("%Y-%m-%dT%H:%M:%SZ")
-                );
-                log::warn!("auto_update: {reason}");
-                if trigger.abandon_roll(&reason) {
-                    self.timed_out = Some(index);
-                    self.paused_by_update = false;
-                    self.armed_target = None;
-                }
-            }
         }
         self.refresh(now);
         Duration::ZERO
@@ -455,9 +441,7 @@ impl WindowGate {
             return decision;
         }
         let next = next_window_open(now, period, offset).format("%Y-%m-%dT%H:%M:%SZ");
-        let reason = if self.timed_out == Some(index) {
-            format!("drain timed out, waiting for next window: {target} deferred to {next}")
-        } else if open {
+        let reason = if open {
             format!(
                 "scheduled wait: this window's roll was already armed; {target} waits for {next}"
             )

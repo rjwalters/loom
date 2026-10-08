@@ -73,12 +73,7 @@ pub const FROZEN_V1_CORE: &[&str] = &[
 /// `~/.loom/` (the directory `auto-update-artifact-roll.json` uses).
 #[must_use]
 pub fn manifest_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(super::AUTO_UPDATE_STATE_DIR_ENV) {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir.trim()).join(MANIFEST_FILE));
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".loom").join(MANIFEST_FILE))
+    super::state_dir().map(|d| d.join(MANIFEST_FILE))
 }
 
 macro_rules! open_enum {
@@ -204,6 +199,10 @@ pub struct ResumeHandle {
     /// `{name, account}` for a session-exec item.
     #[serde(default)]
     pub container: Option<serde_json::Value>,
+    /// The Codex sandbox mode of the original launch (#10831), so H5 resumes
+    /// under the same one instead of re-deriving it.
+    #[serde(default)]
+    pub sandbox: Option<String>,
     #[serde(default)]
     pub resume_count: u32,
     #[serde(default)]

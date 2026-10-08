@@ -113,7 +113,6 @@ fn optional_fields_are_omitted_not_fabricated() {
 fn severity_tracks_whether_the_host_is_converging() {
     let cases = [
         (TickDecisionKind::Panic, None, SeverityNumber::Error),
-        (TickDecisionKind::RollStall, None, SeverityNumber::Warn),
         (TickDecisionKind::StaleRepo, None, SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("retryable"), SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("success"), SeverityNumber::Info),

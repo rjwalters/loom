@@ -79,11 +79,8 @@ struct Trigger {
     armed: Mutex<Option<ArmedRoll>>,
 }
 
-impl DrainTrigger for Trigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, _target: Option<&str>) -> bool {
+impl RollTrigger for Trigger {
+    fn trigger_pause_roll(&self, _target: &RollTarget) -> bool {
         true
     }
     fn roll_in_progress(&self) -> bool {
@@ -117,8 +114,6 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         interval,
         settle,
         defer_deadline: Duration::from_secs(3600),
-        roll_stall_deadlines: 3,
-        roll_stall_cooldown: Duration::from_secs(3600),
         roll_window: roll_window::RollWindowTuning::default(),
     }
 }
@@ -188,16 +183,15 @@ fn a_tick_with_a_roll_already_armed_reports_drain_wait_and_the_drain() {
                 ArtifactResolution::Resolved(info) => info,
                 ArtifactResolution::Unresolved(_) => unreachable!(),
             })),
-            pending: true,
+            committed: true,
             then_exit: false,
-            refusals: 1,
         })),
     };
     let status = AutoUpdateStatus::new(true);
     let summary = run_tick(&mut state(&dir), &status, &mut probe, &trigger, NOW, NOW);
     assert_eq!(summary.decision, TickDecisionKind::DrainWait, "{}", summary.note);
     assert!(summary.drain.armed && summary.drain.pending);
-    assert_eq!(summary.drain.refusals, 1);
+    assert_eq!(summary.drain.refusals, 0, "no deadline refusals are counted any more");
 }
 
 /// The #10414 failure mode: before the fix a panicking tick ended the loop

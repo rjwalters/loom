@@ -430,3 +430,48 @@ fn only_one_pass_runs_at_a_time() {
     assert!(unwound.is_err());
     assert!(super::super::host::begin(&slot).is_some(), "the next tick's pass starts");
 }
+
+// ----------------------------------------------------------------------------
+// Where the host gate's drain facts come from (#10974)
+// ----------------------------------------------------------------------------
+
+/// An enforcer that reports fixed drain facts and does nothing else.
+struct Facts(crate::fleet_state::DrainFacts);
+
+impl crate::fleet_state::Enforcer for Facts {
+    fn hold(&self, _note: String) -> bool {
+        false
+    }
+    fn release(&self) -> bool {
+        false
+    }
+    fn is_held(&self) -> bool {
+        false
+    }
+    fn stop(&self, _reason: String) -> bool {
+        false
+    }
+    fn drain_facts(&self) -> crate::fleet_state::DrainFacts {
+        self.0
+    }
+}
+
+/// `roll_pending` is a pause roll armed, committed or in progress (#10831's
+/// `DrainState::pause_roll_in_progress`), and nothing else: a fleet-state
+/// `paused` hold or an operator drain is `draining` only.
+#[test]
+fn the_host_gate_reads_a_pause_roll_as_roll_pending_and_a_hold_as_draining() {
+    use crate::fleet_state::DrainFacts;
+    let roll = HostGateInputs::live(&Facts(DrainFacts {
+        draining: true,
+        roll_in_progress: true,
+    }));
+    assert!(roll.draining && roll.roll_pending);
+    let hold = HostGateInputs::live(&Facts(DrainFacts {
+        draining: true,
+        roll_in_progress: false,
+    }));
+    assert!(hold.draining && !hold.roll_pending);
+    let idle = HostGateInputs::live(&Facts(DrainFacts::default()));
+    assert!(!idle.draining && !idle.roll_pending);
+}
