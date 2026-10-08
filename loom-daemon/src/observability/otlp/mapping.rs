@@ -634,16 +634,20 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::AutoUpdateTick(_)
         | TelemetryRecord::TokenRankingRefresh(_)
         | TelemetryRecord::PassSummary(_)
-        | TelemetryRecord::PassVerdict(_) => {
+        | TelemetryRecord::PassVerdict(_)
+        | TelemetryRecord::FleetState(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
             // start). Issue #10752: one pass / one artifact verdict (when
-            // decided). Each `log_parts` is `None` for every other kind.
+            // decided). Issue #10196: one fleet-state snapshot (rows +
+            // census; anchor/delta scalars ride as `loom.fleet.*`
+            // attributes). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
-                .or_else(|| pass::log_parts(r))?;
+                .or_else(|| pass::log_parts(r))
+                .or_else(|| fleet_state::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -652,15 +656,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #10212: body is the record's JSON (the ranked candidates).
             let (event_name, severity, at, attributes, body) =
                 pick_decision::log_parts(&envelope.record)?;
-            time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::FleetState(_) => {
-            // Issue #10196: the body is the record's JSON (rows + census);
-            // anchor/delta scalars ride as `loom.fleet.*` attributes.
-            let (event_name, severity, at, attributes, body) =
-                fleet_state::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
