@@ -238,6 +238,11 @@ pub struct PayloadDiff {
     stamp_pending: bool,
     stamp: Stamp,
     staging: TempDir,
+    /// Surfaces left exactly as the workspace has them because their own
+    /// file there is unusable. None is in the lists above. The caller that
+    /// knows which repo this is reports them
+    /// ([`surfaces::log_skipped_once`]).
+    pub(crate) skipped_surfaces: Vec<surfaces::Skipped>,
 }
 
 impl PayloadDiff {
@@ -515,7 +520,8 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
 
     let mut shipped =
         install_into(payload.defaults(), stage).map_err(|e| anyhow!("stage the payload: {e}"))?;
-    surfaces::stage_extras(payload.defaults(), stage, &mut shipped)
+    let mut skipped_surfaces = Vec::new();
+    surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
         .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     let ownership = OwnershipBoundary::load(dest);
@@ -526,6 +532,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         stamp_pending: resync_is_pending(dest),
         stamp: payload.stamp().clone(),
         staging,
+        skipped_surfaces,
     };
     let mut staged = BTreeMap::new();
     let mut installed = BTreeMap::new();

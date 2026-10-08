@@ -1907,11 +1907,26 @@ a second resync at the same release writes nothing.
 | files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
 
 A path pinned in `.loom/resync-ignore` is never written or removed, in either
-form the shell resync accepts (`.agents/skills/loom-x/SKILL.md` or
-`agents-skills/loom-x/SKILL.md`, `.claude/commands/loom/x.md` or
-`commands/loom/x.md`). A symlink, or a surface reached through a symlinked
+form the shell resync accepts (`.agents/skills/loom-<name>/SKILL.md` or
+`agents-skills/loom-<name>/SKILL.md`, `.claude/commands/loom/<name>.md` or
+`commands/loom/<name>.md`). A symlink, or a surface reached through a symlinked
 directory, is left alone. A file the repo's ignore rules exclude is never
 committed.
+
+Removing a dropped skill is something only the daemon resync does (the shell
+resync never removes one), and it goes by the marker, not by who wrote the
+file: a copy of a Loom skill kept under another `loom-<name>/` directory with
+the marker line still in it is removed on the next resync. To keep a customised
+skill, detach it: delete the `<!-- loom-managed-skill -->` line from its
+`SKILL.md` (or pin the path). Loom then never writes or removes it.
+
+One file a resync cannot use does not stop the rest. A `.gitignore` or guide
+that is not UTF-8, or a directory where a `SKILL.md` or `.claude/biome.jsonc`
+should be, is skipped: the daemon logs one warning naming the repo and the
+path, never writes or removes that file, and resyncs every other surface. A
+guide with no `**Installation Date**:` line is logged once per repo at `info`,
+since it stays at its old template until the repo is reinstalled. Both are
+logged once per repo and path for the life of the daemon, not once per tick.
 
 The first resync after a host moves to a release with these surfaces can commit
 more than usual in each repo: the skills are backfilled, and a guide rendered

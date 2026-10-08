@@ -1506,6 +1506,19 @@ pub(super) fn install_agent_skills(
     workspace_path: &Path,
     report: &mut InitReport,
 ) -> Result<(), String> {
+    install_agent_skills_where(defaults_path, workspace_path, report, &mut |_, _| true)
+}
+
+/// [`install_agent_skills`], for only the skills `usable` accepts. It is
+/// given each destination and its repo-relative name before anything is read
+/// or written there; a skill it rejects is not touched at all. The daemon
+/// resync uses it to step over a destination it cannot write (#10895).
+pub(super) fn install_agent_skills_where(
+    defaults_path: &Path,
+    workspace_path: &Path,
+    report: &mut InitReport,
+    usable: &mut dyn FnMut(&Path, &str) -> bool,
+) -> Result<(), String> {
     // Dogfood detection: `defaults/` sits directly under the target, i.e. this
     // install is writing into the Loom source repo itself. Deliberately a
     // path-shape test rather than a flag — the Rust scaffolding path has no
@@ -1530,6 +1543,9 @@ pub(super) fn install_agent_skills(
         };
         let dst = workspace_path.join(".agents").join("skills").join(rel);
         let report_name = format!(".agents/skills/{}", rel.display());
+        if !usable(&dst, &report_name) {
+            continue;
+        }
 
         // Read as bytes: a destination that exists but is not UTF-8 is a file
         // without the marker (the consumer's), not an absent one (#10895).

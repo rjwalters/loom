@@ -27,9 +27,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
-use super::super::scaffolding::install_agent_skills;
+use super::super::scaffolding::install_agent_skills_where;
 use super::super::templates::{render_dotloom_guide, LoomMetadata};
 use super::super::{update_gitignore, InitReport};
 use crate::agent_skills;
@@ -198,9 +199,35 @@ pub(super) fn pin_names(path: &str) -> Vec<String> {
     names
 }
 
+/// One surface a resync left exactly as the workspace has it, because the
+/// step could not be done there. The rest of the payload still resyncs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Skipped {
+    /// Repo-relative path.
+    pub(crate) path: String,
+    /// Why it was left alone.
+    pub(crate) why: SkipReason,
+}
+
+/// Why a surface was skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    /// The workspace's own file cannot be merged into or replaced: it is not
+    /// a regular file (a directory sits at the path), or it is not UTF-8.
+    Unusable(String),
+    /// A guide with no `**Installation Date**:` line cannot be re-rendered
+    /// exactly, so it stays at whatever template it was rendered from.
+    NoInstallDate,
+}
+
 /// Run every extra step over `stage`, which already holds the workspace's
 /// copy of each surface and the installer step's output. Paths a step wrote
 /// are added to `shipped` (the files this payload ships).
+///
+/// A surface whose own file in the workspace is unusable (see
+/// [`SkipReason`]) is added to `skipped` and left byte for byte as it is: it
+/// is never written and never removed, and every other surface still
+/// resyncs. One odd file must not hold the whole repo at an older release.
 ///
 /// # Errors
 /// A step could not read the payload or write staging. Nothing outside
@@ -209,24 +236,41 @@ pub(super) fn stage_extras(
     defaults: &Path,
     stage: &Path,
     shipped: &mut BTreeSet<String>,
+    skipped: &mut Vec<Skipped>,
 ) -> Result<(), String> {
     for surface in EXTRA_SURFACES {
         let dst = stage.join(surface.path);
+        if surface.rule == Rule::MarkerGatedSkills {
+            stage_skills(defaults, stage, shipped, skipped)?;
+            continue;
+        }
+        if let Some(why) = not_a_file(&dst) {
+            skipped.push(Skipped::unusable(surface.path, why));
+            continue;
+        }
         let present = is_regular_file(&dst);
         let wrote = match surface.rule {
-            Rule::MarkerGatedSkills => {
-                stage_skills(defaults, stage, shipped)?;
-                false
-            }
+            Rule::MarkerGatedSkills => false,
             Rule::CopyIfPresent => present && copy_file(&defaults.join(surface.path), &dst)?,
             Rule::CopyOrBackfill => copy_file(&defaults.join(surface.path), &dst)?,
             Rule::GitignoreBlock => {
-                if present {
-                    update_gitignore(stage)?;
+                // `update_gitignore` fails on a file that is not UTF-8. Such
+                // a file is the repo's to keep, not a reason to stop.
+                match fs::read_to_string(&dst) {
+                    Ok(_) if present => {
+                        update_gitignore(stage)?;
+                        true
+                    }
+                    Err(e) if present => {
+                        skipped.push(Skipped::unusable(surface.path, &e.to_string()));
+                        false
+                    }
+                    _ => false,
                 }
-                present
             }
-            Rule::DatedGuide => present && stage_guide(&defaults.join(surface.path), &dst)?,
+            Rule::DatedGuide => {
+                present && stage_guide(&defaults.join(surface.path), &dst, surface.path, skipped)?
+            }
         };
         if wrote {
             shipped.insert(surface.path.to_string());
@@ -235,8 +279,70 @@ pub(super) fn stage_extras(
     sweep_retired(defaults, stage, shipped)
 }
 
+impl Skipped {
+    fn unusable(path: &str, why: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            why: SkipReason::Unusable(why.to_string()),
+        }
+    }
+}
+
 fn is_regular_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Something other than a regular file sits at `path` (staging never holds a
+/// symlink, so in practice a directory). `None` when it is a regular file or
+/// absent.
+fn not_a_file(path: &Path) -> Option<&'static str> {
+    fs::symlink_metadata(path)
+        .is_ok_and(|m| !m.file_type().is_file())
+        .then_some("not a regular file")
+}
+
+/// The `(repo, path)` pairs already reported by [`log_skipped_once`].
+fn reported() -> &'static Mutex<BTreeSet<(PathBuf, String)>> {
+    static REPORTED: OnceLock<Mutex<BTreeSet<(PathBuf, String)>>> = OnceLock::new();
+    REPORTED.get_or_init(Mutex::default)
+}
+
+/// Is this the first report of `path` in `repo` since the daemon started?
+fn first_report(repo: &Path, path: &str) -> bool {
+    reported()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((repo.to_path_buf(), path.to_string()))
+}
+
+/// Log each surface a resync of `repo` skipped, once per repo and path per
+/// daemon lifetime: the condition is the repo's to fix and does not change
+/// from one tick to the next, so repeating it would only bury it. An
+/// unusable file is a WARN; a guide that can never be refreshed is INFO, so a
+/// permanently stale one is visible without being an alarm.
+///
+/// The caller names the repo: staging runs over an export or a throwaway
+/// worktree, whose path says nothing to an operator.
+pub(crate) fn log_skipped_once(repo: &Path, skipped: &[Skipped]) {
+    for skip in skipped {
+        if !first_report(repo, &skip.path) {
+            continue;
+        }
+        match &skip.why {
+            SkipReason::Unusable(why) => log::warn!(
+                "resync: {}: {} is skipped ({why}); it is left as is and the rest of the \
+                 payload still resyncs",
+                repo.display(),
+                skip.path
+            ),
+            SkipReason::NoInstallDate => log::info!(
+                "resync: {}: {} records no install date, so it is not re-rendered and stays \
+                 at its current template; reinstall to refresh it",
+                repo.display(),
+                skip.path
+            ),
+        }
+    }
 }
 
 /// Copy `src` over `dst`. `false` when the payload does not ship `src`.
@@ -257,6 +363,7 @@ fn stage_skills(
     defaults: &Path,
     stage: &Path,
     shipped: &mut BTreeSet<String>,
+    skipped: &mut Vec<Skipped>,
 ) -> Result<(), String> {
     // A payload whose skills cannot be generated says nothing about which
     // skills exist, so nothing is written and (above all) nothing is removed.
@@ -265,7 +372,22 @@ fn stage_skills(
         return Ok(());
     };
     let mut report = InitReport::default();
-    install_agent_skills(defaults, stage, &mut report)?;
+    // A directory at a `SKILL.md` path, or a file where the skill's own
+    // directory should be, is the workspace's: that one skill is skipped.
+    let mut usable = |dst: &Path, rel: &str| {
+        let odd = not_a_file(dst).or_else(|| {
+            dst.ancestors()
+                .skip(1)
+                .take_while(|dir| *dir != stage && dir.starts_with(stage))
+                .any(|dir| fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()))
+                .then_some("a file sits where its directory should be")
+        });
+        if let Some(why) = odd {
+            skipped.push(Skipped::unusable(rel, why));
+        }
+        odd.is_none()
+    };
+    install_agent_skills_where(defaults, stage, &mut report, &mut usable)?;
     shipped.extend(report.added.into_iter().chain(report.updated));
 
     let generated: BTreeSet<String> = skills.iter().map(|s| format!("loom-{}", s.name)).collect();
@@ -331,13 +453,23 @@ pub(super) fn unreproducible_placeholders(template: &str) -> Vec<String> {
 /// Re-render the guide at `dst` from `template_path`, keeping the install
 /// date `dst` already records. `false` (and `dst` untouched) when that cannot
 /// be done exactly: no template, no recorded date, or a template that needs
-/// a value only the installer has.
-fn stage_guide(template_path: &Path, dst: &Path) -> Result<bool, String> {
+/// a value only the installer has. A guide left alone for a reason in the
+/// workspace's own file is added to `skipped` under `rel`.
+fn stage_guide(
+    template_path: &Path,
+    dst: &Path,
+    rel: &str,
+    skipped: &mut Vec<Skipped>,
+) -> Result<bool, String> {
     let Ok(template) = fs::read_to_string(template_path) else {
         return Ok(false);
     };
-    let Ok(existing) = fs::read_to_string(dst) else {
-        return Ok(false);
+    let existing = match fs::read_to_string(dst) {
+        Ok(existing) => existing,
+        Err(e) => {
+            skipped.push(Skipped::unusable(rel, &e.to_string()));
+            return Ok(false);
+        }
     };
     let blocked = unreproducible_placeholders(&template);
     if !blocked.is_empty() {
@@ -348,7 +480,10 @@ fn stage_guide(template_path: &Path, dst: &Path) -> Result<bool, String> {
         return Ok(false);
     }
     let Some(date) = recorded_install_date(&existing) else {
-        log::debug!("resync: {} records no install date; left as is", dst.display());
+        skipped.push(Skipped {
+            path: rel.to_string(),
+            why: SkipReason::NoInstallDate,
+        });
         return Ok(false);
     };
     let metadata = LoomMetadata {

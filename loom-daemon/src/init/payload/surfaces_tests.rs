@@ -344,6 +344,133 @@ fn gitignore_block_is_merged_never_recorded_and_never_created() {
     assert_eq!(diff_paths(&payload(&defaults), &ws), empty());
 }
 
+/// Make two surfaces stale, so a test can see the rest of the payload
+/// resync past a surface that is skipped. Returns their paths, sorted.
+fn two_stale_surfaces(ws: &Path, defaults: &Path) -> Vec<String> {
+    let judge = ".agents/skills/loom-judge/SKILL.md";
+    write(
+        &ws.join(judge),
+        &generated_skill(defaults, "judge").replace("The judge role.", "old"),
+    );
+    write(&ws.join(".claude/README.md"), "claude readme v1\n");
+    strings(&[judge, ".claude/README.md"])
+}
+
+fn skipped_paths(p: &Payload, ws: &Path) -> Vec<(String, bool)> {
+    materialize_with(p, ws)
+        .unwrap()
+        .skipped_surfaces
+        .into_iter()
+        .map(|s| (s.path, matches!(s.why, SkipReason::Unusable(_))))
+        .collect()
+}
+
+#[test]
+fn a_gitignore_that_is_not_utf8_is_skipped_and_the_rest_resyncs() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = current_workspace(tmp.path(), &defaults);
+    let odd: &[u8] = b"node_modules/\n\xff\xfe latin\xe9\n# >>> loom-managed\n.loom/old\n";
+    fs::write(ws.join(".gitignore"), odd).unwrap();
+    let stale = two_stale_surfaces(&ws, &defaults);
+
+    let p = payload(&defaults);
+    // The file is not in the diff in any role: not written, not removed.
+    assert_eq!(diff_paths(&p, &ws), (vec![], stale, vec![]));
+    assert_eq!(skipped_paths(&p, &ws), vec![(".gitignore".to_string(), true)]);
+
+    let outcome = resync_workspace_with(&p, &ws).unwrap();
+    assert!(matches!(outcome, ResyncOutcome::Applied { .. }), "{outcome:?}");
+    assert_eq!(fs::read(ws.join(".gitignore")).unwrap(), odd);
+    assert_eq!(read(&ws.join(".claude/README.md")), "claude readme v2\n");
+    assert_eq!(
+        read(&ws.join(".agents/skills/loom-judge/SKILL.md")),
+        generated_skill(&defaults, "judge")
+    );
+    assert!(!installed_files(&ws).contains(&".gitignore".to_string()));
+    assert_eq!(diff_paths(&p, &ws), empty());
+    assert_eq!(resync_workspace_with(&p, &ws).unwrap(), ResyncOutcome::Unchanged);
+    assert_eq!(fs::read(ws.join(".gitignore")).unwrap(), odd);
+}
+
+#[test]
+fn a_directory_at_a_skill_path_is_skipped_and_the_rest_resyncs() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = current_workspace(tmp.path(), &defaults);
+    let skill = ".agents/skills/loom-builder/SKILL.md";
+    fs::remove_file(ws.join(skill)).unwrap();
+    let inside = ws.join(skill).join("notes.txt");
+    let kept = format!("{}\nthe repo's own\n", crate::agent_skills::MARKER);
+    write(&inside, &kept);
+    let stale = two_stale_surfaces(&ws, &defaults);
+
+    let p = payload(&defaults);
+    assert_eq!(diff_paths(&p, &ws), (vec![], stale, vec![]));
+    assert_eq!(skipped_paths(&p, &ws), vec![(skill.to_string(), true)]);
+
+    let outcome = resync_workspace_with(&p, &ws).unwrap();
+    assert!(matches!(outcome, ResyncOutcome::Applied { .. }), "{outcome:?}");
+    assert!(ws.join(skill).is_dir(), "still the repo's directory");
+    assert_eq!(read(&inside), kept);
+    assert_eq!(read(&ws.join(".claude/README.md")), "claude readme v2\n");
+    assert_eq!(
+        read(&ws.join(".agents/skills/loom-judge/SKILL.md")),
+        generated_skill(&defaults, "judge")
+    );
+    assert!(!installed_files(&ws).contains(&skill.to_string()));
+    assert_eq!(diff_paths(&p, &ws), empty());
+    assert_eq!(resync_workspace_with(&p, &ws).unwrap(), ResyncOutcome::Unchanged);
+}
+
+#[test]
+fn other_odd_destinations_are_skipped_too() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = current_workspace(tmp.path(), &defaults);
+    // A regular file where a skill's directory should be, and a directory
+    // where a backfilled single file should be.
+    fs::remove_dir_all(ws.join(".agents/skills/loom-builder")).unwrap();
+    write(&ws.join(".agents/skills/loom-builder"), "a file, not a directory\n");
+    fs::remove_file(ws.join(".claude/biome.jsonc")).unwrap();
+    write(&ws.join(".claude/biome.jsonc/inner.json"), "{}\n");
+    let before = freeze(&ws);
+
+    let p = payload(&defaults);
+    assert_eq!(diff_paths(&p, &ws), empty());
+    assert_eq!(
+        skipped_paths(&p, &ws),
+        vec![
+            (".agents/skills/loom-builder/SKILL.md".to_string(), true),
+            (".claude/biome.jsonc".to_string(), true),
+        ]
+    );
+    assert_eq!(resync_workspace_with(&p, &ws).unwrap(), ResyncOutcome::Unchanged);
+    assert_eq!(before, snapshot(&ws));
+}
+
+#[test]
+fn a_guide_with_no_date_is_reported_and_each_skip_is_logged_once_per_repo() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = current_workspace(tmp.path(), &defaults);
+    write(&ws.join(".loom/CLAUDE.md"), "# a guide with no date line\n");
+    let p = payload(&defaults);
+    assert_eq!(skipped_paths(&p, &ws), vec![(".loom/CLAUDE.md".to_string(), false)]);
+    assert_eq!(diff_paths(&p, &ws), empty());
+
+    // Once per repo and path for the life of the process, however many
+    // ticks (or default-branch commits) stage it again.
+    let (repo_a, repo_b) = (tmp.path().join("a"), tmp.path().join("b"));
+    assert!(first_report(&repo_a, ".loom/CLAUDE.md"));
+    assert!(!first_report(&repo_a, ".loom/CLAUDE.md"));
+    assert!(first_report(&repo_a, ".loom/AGENTS.md"));
+    assert!(first_report(&repo_b, ".loom/CLAUDE.md"));
+    let skipped = materialize_with(&p, &ws).unwrap().skipped_surfaces;
+    log_skipped_once(&repo_a, &skipped);
+    assert!(!first_report(&repo_a, ".loom/CLAUDE.md"));
+}
+
 #[test]
 fn guides_keep_their_install_date_and_change_only_with_the_template() {
     let tmp = TempDir::new().unwrap();
@@ -527,7 +654,8 @@ fn the_real_guides_rendered_by_init_are_an_empty_diff() {
     for name in ["CLAUDE.md", "AGENTS.md"] {
         let dst = staged.join(".loom").join(name);
         write(&dst, &read(&ws.join(".loom").join(name)));
-        assert!(stage_guide(&defaults.join(".loom").join(name), &dst).unwrap());
+        let template = defaults.join(".loom").join(name);
+        assert!(stage_guide(&template, &dst, name, &mut Vec::new()).unwrap());
         assert_eq!(read(&dst), read(&ws.join(".loom").join(name)), "{name}");
     }
 }

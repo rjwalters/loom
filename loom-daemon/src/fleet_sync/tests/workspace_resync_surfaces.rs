@@ -66,7 +66,9 @@ fn a_repo_whose_only_drift_is_its_skills_gets_exactly_one_commit() {
     assert_eq!(changed, vec![SKILL.to_string(), INSTALL_METADATA_PATH.to_string()]);
     // The backfilled skill is recorded, so a later release can retire it.
     assert!(fx.origin_file(INSTALL_METADATA_PATH).contains(SKILL));
-    // A file the repo owns in a covered directory is as it was.
+    // `.claude/README.md` is still "theirs" only because this fixture's
+    // payload does not ship the file. The real payload does ship it, and a
+    // resync overwrites an existing one (`Rule::CopyIfPresent`).
     assert_eq!(fx.origin_file(".claude/README.md"), "theirs");
 
     // The next tick, and the one after a restart, write nothing more.
