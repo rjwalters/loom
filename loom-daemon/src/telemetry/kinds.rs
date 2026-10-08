@@ -187,10 +187,10 @@ pub mod pr_resolved;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
-/// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
-pub mod token_ranking_refresh;
 /// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
 pub mod fleet_state;
+/// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
+pub mod token_ranking_refresh;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
