@@ -15,7 +15,7 @@ use super::coordination::Case;
 use super::*;
 
 const REPO: &str = "repos/qual-org/loomp-test/";
-const NS_PREFIX: &str = "loomp-loomp-testrun: ";
+const NS_PREFIX: &str = "loomp-testrun: ";
 const TOKEN: &str = "FAKE-WRITER-TOKEN-coordination";
 
 #[derive(Default)]
@@ -693,12 +693,12 @@ fn receipts_never_carry_the_token_even_from_a_reflecting_server() {
 fn cleanup_touches_only_this_run_namespace() {
     let http = conforming();
     http.seed(&format!("{NS_PREFIX}fixture"), 2); // #1, #2: ours
-    http.seed("loomp-loomp-testrun2: other run", 1); // #3
-    http.seed("loomp-loomp-testru: prefix of ours", 1); // #4
+    http.seed("loomp-testrun2: other run", 1); // #3
+    http.seed("loomp-testru: prefix of ours", 1); // #4
     http.seed("unrelated", 1); // #5
     for name in [
         format!("{NS_PREFIX}labels ✓"),
-        "loomp-loomp-testrun2: x".into(),
+        "loomp-testrun2: x".into(),
         "loom:issue".into(),
     ] {
         let id = http.id();
@@ -764,4 +764,15 @@ fn a_second_run_on_fresh_resources_reproduces_the_outcomes() {
         .iter()
         .filter(|i| i.title == "foreign")
         .all(|i| i.state == "open"));
+}
+
+/// #9945: `run_ns` is the full namespace. Cleanup's prefix must be exactly
+/// the prefix of every disposable title, or a live run leaks its fixtures.
+#[test]
+fn cleanup_prefix_matches_disposable_titles() {
+    let c = cfg(true, &[]);
+    let prefix = super::cleanup::namespace_prefix(&c);
+    assert_eq!(prefix, NS_PREFIX);
+    assert!(issue_title(&c, "issue-create").starts_with(&prefix));
+    assert!(!prefix.starts_with("loomp-loomp-"), "{prefix}");
 }

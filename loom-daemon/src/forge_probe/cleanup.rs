@@ -1,7 +1,7 @@
 //! Run-scoped cleanup and injected transport faults (#9789 slice 2).
 //!
 //! **Cleanup is scoped to one run namespace.** It closes open issues and
-//! deletes labels whose name/title begins with exactly `loomp-<ns>: ` — the
+//! deletes labels whose name/title begins with exactly `<run-ns>: ` — the
 //! prefix every disposable resource of the run carries, delimiter included,
 //! so namespace `a` can never touch `ab`'s resources. Issues are closed, not
 //! deleted (deleting needs admin and destroys evidence). Every close is read
@@ -64,9 +64,11 @@ impl CleanupReport {
     }
 }
 
-/// The exact prefix this run's disposable resources carry.
+/// The exact prefix this run's disposable resources carry. `run_ns` is the
+/// full namespace (#9945): no extra `loomp-` is added, so this matches
+/// `issue_title` exactly.
 pub fn namespace_prefix(cfg: &RunnerConfig) -> String {
-    format!("loomp-{}: ", cfg.run_ns)
+    format!("{}: ", cfg.run_ns)
 }
 
 /// Close this run's open fixture issues and delete its labels. Refuses

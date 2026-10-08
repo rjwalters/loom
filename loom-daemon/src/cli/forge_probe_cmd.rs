@@ -75,7 +75,7 @@ pub(crate) struct ForgeProbeArgs {
     )]
     inject_page_fault: Option<u32>,
     /// Skip the run-scoped cleanup after a `--live-write` run (leaves this
-    /// run's `loomp-<ns>: ` issues open and labels in place for inspection).
+    /// run's `<run-ns>: ` issues open and labels in place for inspection).
     #[arg(long)]
     keep_resources: bool,
 }

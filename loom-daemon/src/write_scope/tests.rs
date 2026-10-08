@@ -570,7 +570,7 @@ fn daemon_write_paths_are_scoped() {
         (
             "forge_probe/cleanup.rs",
             NotAWrite(
-                "closes/deletes only this probe run's `loomp-<ns>: ` resources in the \
+                "closes/deletes only this probe run's `<run-ns>: ` resources in the \
                  candidate instance's disposable repo, behind --live-write — never the \
                  daemon's managed forge (#9789)",
             ),

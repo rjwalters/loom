@@ -21,6 +21,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use super::cleanup::namespace_prefix;
 use super::{
     body_shape, issue_title, now_secs, scrub, secrets_of, with_actor, CaseResult, ProbeEntryView,
     ProbeHttp, RunnerConfig, OUTCOME_FAIL, OUTCOME_PASS, OUTCOME_UNKNOWN, OUTCOME_UNSUPPORTED,
@@ -418,7 +419,7 @@ fn issue_list(c: &Case) -> CaseOutcome {
 /// `issue-search`: a body-marker fixture appears in the first page of the
 /// search endpoint within a bounded eventual window.
 fn issue_search(c: &Case) -> CaseOutcome {
-    let marker = format!("loomp-search-{}", c.cfg.run_ns);
+    let marker = format!("{}-search", c.cfg.run_ns);
     let title = issue_title(c.cfg, "issue-search");
     let n = c.fixture("issue-search", &marker)?;
     let path = format!("repos/issues/search?q={marker}&type=issues&state=all");
@@ -453,7 +454,7 @@ fn issue_search(c: &Case) -> CaseOutcome {
 /// removal, both read back on the issue.
 fn issue_edit_labels(c: &Case) -> CaseOutcome {
     let n = c.fixture("issue-edit-labels", "labels fixture")?;
-    let name = format!("loomp-{}: labels ✓", c.cfg.run_ns);
+    let name = format!("{}labels ✓", namespace_prefix(c.cfg));
     let id = c.create_label(&name, "probe")?;
     let issue = format!("repos/{}/issues/{n}", c.repo());
     let labels_on = |c: &Case| -> Result<Vec<(u64, String)>, ForgeOutcome> {
@@ -569,7 +570,7 @@ fn issue_close_with_reason(c: &Case) -> CaseOutcome {
 /// complete list. Both lists must reach a provable end: a failed walk after
 /// the delete must never read as "deleted".
 fn label_sync_catalogue(c: &Case) -> CaseOutcome {
-    let name = format!("loomp-{}: catalogue", c.cfg.run_ns);
+    let name = format!("{}catalogue", namespace_prefix(c.cfg));
     let id = c.create_label(&name, "probe")?;
     let label = format!("repos/{}/labels/{id}", c.repo());
     let list = format!("repos/{}/labels", c.repo());
