@@ -826,8 +826,13 @@ two intervals plus 60 s, and the self-update loop adds its 35-minute tick
 bound. The value is `0` once the loop has gone quiet past that window or has
 marked itself dead. `eta_pass` is the one exception to "the loop finished" (#10898): it beats
 only when the pass *emitted*, meaning this host is the ETA authority and its
-delivery path works (an OTLP exporter, or a dry run). A non-authority host, or
-an authority with no exporter, never beats, so it reads `0` instead of healthy.
+delivery path works (an OTLP exporter, or a dry run). A #10897 fallback emitter
+(a non-authority host emitting the repos the authority is not declared to cover)
+counts as emitting too. With open review PRs in scope, a pass that offered no
+record (for example every estimate rejected for invalid provenance) does not beat
+even with an exporter; the deliberate exemptions are a quiet fleet (no open review
+PRs, nothing to estimate) and a dry run. A host that runs no ETA pass, or an emitter with no
+exporter, never beats, so it reads `0` instead of healthy.
 The authority also exports `loom.eta.authority` (`1`/`0`),
 `loom.eta.authority.repos_covered` and `loom.eta.authority.last_emit_age_seconds`,
 keeps a local emit heartbeat (`.loom/state/eta/health/last-emit.json`) that

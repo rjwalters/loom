@@ -266,24 +266,35 @@ pub(super) struct Coverage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PassOutcome {
     /// Beat `task_alive{eta_pass}`: this host is the authority and its
-    /// delivery path works (an exporter is registered, or a dry run).
+    /// delivery path works (an exporter is registered, or a dry run) and,
+    /// with an exporter, either a record was offered or there was no work.
     pub beat: bool,
     /// Records were actually offered to an exporter this pass.
     pub emitted: bool,
 }
 
-/// Judge a pass. "Alive" means "emitted", not "the loop finished": a
-/// non-authority host never beats, and an authority with no exporter (the
-/// 2026-10-07 incident) drops every record, so it does not beat either. Pure.
+/// Judge a pass. "Alive" means "emitted", not "the loop finished": a host
+/// that runs no ETA pass never beats, and an emitter with no exporter (the
+/// 2026-10-07 incident) drops every record, so it does not beat either.
+/// `authority` is [`active`]: the authority, or a #10897 fallback emitter
+/// (which really emits its uncovered repos). Its heartbeat is only *read* on
+/// the resolved authority (doctor, gauges, fleetAlert).
+///
+/// `open_prs` is the number of open review PRs the pass observed. With an
+/// exporter, a pass that saw work (`open_prs > 0`) but offered no record
+/// (e.g. every estimate rejected for invalid provenance) does not beat. The
+/// deliberate exemptions are a quiet fleet (`open_prs == 0`, nothing to
+/// estimate) and a dry run (no exporter by design). Pure.
 pub(super) fn pass_outcome(
     authority: bool,
     exporter: bool,
     dry_run: bool,
+    open_prs: usize,
     delivered: &Delivered,
 ) -> PassOutcome {
     let records = delivered.emitted + delivered.refused + delivered.outcomes;
     PassOutcome {
-        beat: authority && (dry_run || exporter),
+        beat: authority && (dry_run || (exporter && (records > 0 || open_prs == 0))),
         emitted: authority && exporter && !dry_run && records > 0,
     }
 }
@@ -300,7 +311,8 @@ pub(super) fn deliver_checked(
 ) -> Delivered {
     let loom = Provenance::current();
     let delivered = gate_delivery(active(), emissions, outcomes, &loom, host_id, dry_run, sink());
-    let pass = pass_outcome(active(), sink().is_some(), dry_run, &delivered);
+    let open_prs = coverage.map_or(0, |c| c.prs);
+    let pass = pass_outcome(active(), sink().is_some(), dry_run, open_prs, &delivered);
     // An incomplete pass (failed listings) saw unavailable inputs, not a
     // healthy queue, so it does not beat.
     if pass.beat && coverage.is_some_and(|c| c.complete) {
@@ -344,7 +356,7 @@ mod tests {
 
     #[test]
     fn a_non_authority_host_never_beats() {
-        let out = pass_outcome(false, true, false, &delivered(3));
+        let out = pass_outcome(false, true, false, 0, &delivered(3));
         assert_eq!(
             out,
             PassOutcome {
@@ -356,7 +368,7 @@ mod tests {
 
     #[test]
     fn the_authority_with_a_delivered_batch_beats_and_emits() {
-        let out = pass_outcome(true, true, false, &delivered(3));
+        let out = pass_outcome(true, true, false, 0, &delivered(3));
         assert_eq!(
             out,
             PassOutcome {
@@ -369,7 +381,7 @@ mod tests {
     #[test]
     fn the_incident_authority_without_an_exporter_does_not_beat() {
         // Authority covering 2 repos, records computed, no OTLP exporter.
-        let out = pass_outcome(true, false, false, &delivered(40));
+        let out = pass_outcome(true, false, false, 0, &delivered(40));
         assert_eq!(
             out,
             PassOutcome {
@@ -381,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_beats_but_never_counts_as_an_emit() {
-        let out = pass_outcome(true, false, true, &delivered(3));
+        let out = pass_outcome(true, false, true, 0, &delivered(3));
         assert_eq!(
             out,
             PassOutcome {
@@ -393,7 +405,7 @@ mod tests {
 
     #[test]
     fn an_authority_with_an_exporter_and_nothing_to_say_beats_without_emitting() {
-        let out = pass_outcome(true, true, false, &Delivered::default());
+        let out = pass_outcome(true, true, false, 0, &Delivered::default());
         assert_eq!(
             out,
             PassOutcome {
@@ -404,6 +416,42 @@ mod tests {
     }
 
     #[test]
+    fn open_prs_with_an_exporter_but_every_record_rejected_does_not_beat() {
+        // Complete listing, 5 open review PRs, exporter registered, but every
+        // estimate was dropped for invalid provenance: nothing was offered.
+        let all_invalid = Delivered {
+            invalid: 5,
+            ..Delivered::default()
+        };
+        let out = pass_outcome(true, true, false, 5, &all_invalid);
+        assert_eq!(
+            out,
+            PassOutcome {
+                beat: false,
+                emitted: false
+            }
+        );
+    }
+
+    #[test]
+    fn open_prs_with_a_partly_delivered_batch_still_beat() {
+        let mixed = Delivered {
+            emitted: 2,
+            invalid: 3,
+            ..Delivered::default()
+        };
+        let out = pass_outcome(true, true, false, 5, &mixed);
+        assert!(out.beat && out.emitted);
+    }
+
+    #[test]
+    fn a_dry_run_with_open_prs_and_no_records_still_beats() {
+        // Deliberate exemption: a dry run has no exporter by design.
+        let out = pass_outcome(true, false, true, 5, &Delivered::default());
+        assert!(out.beat && !out.emitted);
+    }
+
+    #[test]
     fn failed_listings_with_no_exporter_raise_the_silent_alert_after_the_threshold() {
         // The #10906 review path: an exporter-less authority whose listings
         // keep failing writes "0 PRs, incomplete" heartbeats. That is not a
@@ -411,7 +459,7 @@ mod tests {
         use chrono::{Duration, TimeZone, Utc};
         let t0 = Utc.with_ymd_and_hms(2026, 10, 8, 0, 0, 0).unwrap();
         let started = t0 - Duration::hours(40);
-        let out = pass_outcome(true, false, false, &Delivered::default());
+        let out = pass_outcome(true, false, false, 0, &Delivered::default());
         assert!(!out.beat && !out.emitted);
         let now = t0 + Duration::hours(3);
         let failed = crate::eta::emit_heartbeat::next(None, "h", now, out.emitted, 0, 0, false);
