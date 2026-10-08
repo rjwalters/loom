@@ -22,10 +22,14 @@ fn kv_bool(key: &str, value: bool) -> KeyValue {
     )
 }
 
-/// The severity a decision warrants: a panic is an error. A stall, a
+/// The severity a decision warrants: a panic is an error, and so is an
+/// unsatisfiable fleet floor (#10712), whatever the tick decided. A stall, a
 /// stale-repo resolution and a non-success roll outcome are warnings,
 /// because each means the host is not converging. Everything else is info.
 fn severity(r: &AutoUpdateTickRecord) -> SeverityNumber {
+    if r.floor_stall.is_some() {
+        return SeverityNumber::Error;
+    }
     match r.decision {
         TickDecisionKind::Panic => SeverityNumber::Error,
         TickDecisionKind::RollStall | TickDecisionKind::StaleRepo => SeverityNumber::Warn,

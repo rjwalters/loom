@@ -20,8 +20,8 @@
 //! - **The fleet version floor** (`loom_min_version`, #10711): every pass reads
 //!   it from the snapshot into a process-wide value ([`loom_min_version`]),
 //!   not into the config tiers, so a change takes effect on the next tick with
-//!   no restart. A malformed value keeps the last good floor and alerts. Nothing
-//!   consumes the floor yet (#10698).
+//!   no restart. A malformed value keeps the last good floor and alerts. The
+//!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712).
 //!
 //! # Invariants this module keeps
 //!
@@ -557,7 +557,8 @@ fn set_floor(floor: Option<String>) {
 /// The fleet-wide minimum Loom version (`loom_min_version`, `X.Y.Z`) in force
 /// on this host, as of the last fleet-sync pass; `None` when the store sets
 /// none, when no pass has run, or when `fleet.repo` is unset. Updated every
-/// tick without a restart. Nothing consumes it yet (#10698).
+/// tick without a restart. The self-update loop reads it every tick to drive
+/// floor rolls ([`crate::auto_update::floor_roll`], #10712).
 #[must_use]
 pub fn loom_min_version() -> Option<String> {
     floor_cell().lock().ok().and_then(|g| g.clone().flatten())

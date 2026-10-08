@@ -29,6 +29,7 @@ fn record() -> AutoUpdateTickRecord {
             refusals: 1,
             target: Some("artifact:0.19.731:feedface".to_string()),
         },
+        floor_stall: None,
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {
@@ -125,6 +126,28 @@ fn severity_tracks_whether_the_host_is_converging() {
         let log = log_record_for(&envelope).unwrap();
         assert_eq!(log.severity_number, expected as i32, "{decision:?} {outcome:?}");
     }
+}
+
+#[test]
+fn an_unsatisfiable_floor_is_an_error_whatever_the_tick_decided() {
+    // #10712: the floor alert rides on any decision, including a healthy fetch.
+    for decision in [
+        TickDecisionKind::Skip,
+        TickDecisionKind::Defer,
+        TickDecisionKind::Fetch,
+    ] {
+        let mut tick = record();
+        tick.decision = decision;
+        tick.floor_stall = Some("FLEET FLOOR UNSATISFIABLE: ...".to_string());
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::AutoUpdateTick(tick));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.severity_number, SeverityNumber::Error as i32, "{decision:?}");
+        let body = log.body.and_then(|b| b.value);
+        assert!(matches!(body, Some(Value::StringValue(b)) if b.contains("floor_stall")));
+    }
+    // And absent, the field is not serialized at all (no-floor records are unchanged).
+    let body = serde_json::to_string(&record()).unwrap();
+    assert!(!body.contains("floor_stall"), "{body}");
 }
 
 #[test]
