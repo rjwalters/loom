@@ -143,6 +143,11 @@ pub struct AutoUpdateTickRecord {
     pub in_flight: Option<u64>,
     /// The drain armed at tick start.
     pub drain: DrainSnapshot,
+    /// #10712: the fleet floor is above every published release, so this host
+    /// cannot reach it (the alert text). Absent when the floor is unset,
+    /// satisfied, or being rolled to. Raises the record's severity to ERROR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_stall: Option<String>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.

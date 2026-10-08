@@ -36,6 +36,9 @@ pub struct TickSummary {
     pub in_flight: Option<usize>,
     /// The drain armed at tick start.
     pub drain: DrainSnapshot,
+    /// #10712: the unsatisfiable-floor stall standing after this tick, as its
+    /// alert text. Raises the record to ERROR.
+    pub floor_stall: Option<String>,
 }
 
 impl TickSummary {
@@ -56,6 +59,7 @@ impl TickSummary {
                 refusals: roll.refusals,
                 target: roll.target.clone(),
             }),
+            floor_stall: None,
         }
     }
 
@@ -107,6 +111,7 @@ pub fn record(
         hours_behind: summary.check.as_ref().and_then(|c| c.hours_behind),
         in_flight: summary.in_flight.map(|n| n as u64),
         drain: summary.drain.clone(),
+        floor_stall: summary.floor_stall.clone(),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,
