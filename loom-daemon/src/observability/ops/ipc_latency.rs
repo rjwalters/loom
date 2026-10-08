@@ -22,8 +22,11 @@
 //! Independent of the OTLP export, a request that takes longer than
 //! [`SLOW_REQUEST_WARN`] is logged at WARN, so a host without an exporter
 //! still records the stall in `daemon.log`. The kinds in
-//! [`SLOW_WARN_EXEMPT_KINDS`] are excluded: `DaemonStatus` already logs its own
-//! phase breakdown when slow (`status_budget::record_status_build`), and
+//! [`SLOW_WARN_EXEMPT_KINDS`] are excluded: `DaemonStatus` and its
+//! section-scoped form `DaemonStatusSections` (`status --json --section`,
+//! #10787 — its own kind, so cheap sectioned calls never dilute the full
+//! build's series) already log their own phase breakdown when slow
+//! (`status_budget::record_status_build`), and
 //! `CancelSweep` (waits the caller's SIGTERM grace, 30 s by default) and
 //! `DispatchSweep` (polls up to 5 s for token capture) are slow by design on a
 //! healthy daemon. Their latency is still exported.
@@ -46,7 +49,12 @@ pub const INVALID_KIND: &str = "invalid";
 pub const SLOW_REQUEST_WARN: Duration = Duration::from_secs(5);
 
 /// Request kinds never logged by the slow-request WARN (see the module docs).
-pub const SLOW_WARN_EXEMPT_KINDS: &[&str] = &["DaemonStatus", "CancelSweep", "DispatchSweep"];
+pub const SLOW_WARN_EXEMPT_KINDS: &[&str] = &[
+    "DaemonStatus",
+    "DaemonStatusSections",
+    "CancelSweep",
+    "DispatchSweep",
+];
 
 /// Whether a `kind` request that took `elapsed` gets the slow-request WARN.
 #[must_use]

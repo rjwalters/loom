@@ -5325,8 +5325,14 @@ fn test_build_daemon_status_with_drain_overlays_state() {
     let drain = DrainState::new();
 
     // No drain ⇒ overlay is a no-op.
-    let report =
-        build_daemon_status_with_drain(&pool, &health, &root, &test_credential_preflight(), &drain);
+    let report = build_daemon_status_with_drain(
+        &pool,
+        &health,
+        &root,
+        &test_credential_preflight(),
+        &drain,
+        &crate::status_section::SectionSet::all(),
+    );
     assert!(!report.draining);
     assert_eq!(report.drain_deadline, None);
 
@@ -5335,8 +5341,14 @@ fn test_build_daemon_status_with_drain_overlays_state() {
         DrainBegin::Started { deadline, .. } => deadline,
         other => panic!("expected Started, got {other:?}"),
     };
-    let report =
-        build_daemon_status_with_drain(&pool, &health, &root, &test_credential_preflight(), &drain);
+    let report = build_daemon_status_with_drain(
+        &pool,
+        &health,
+        &root,
+        &test_credential_preflight(),
+        &drain,
+        &crate::status_section::SectionSet::all(),
+    );
     assert!(report.draining);
     assert_eq!(report.drain_deadline, Some(deadline));
 

@@ -26,6 +26,7 @@ mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
+use loom_daemon::status_section::{SectionSet, StatusSection as Section};
 use loom_daemon::types::{DaemonStatusReport, SweepKind};
 use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
 
@@ -218,6 +219,31 @@ pub(crate) fn build_status_json_value(
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
+) -> serde_json::Value {
+    let all = SectionSet::all();
+    build_status_json_value_for(
+        report,
+        token_usage,
+        update,
+        pipeline,
+        protection,
+        worktree_disk,
+        &all,
+    )
+}
+
+/// [`build_status_json_value`] keeping only the top-level keys of `sections`
+/// (`status --json --section`, #10787). The host-local blocks after the
+/// literal are not even probed unless selected; the full set keeps every key,
+/// so the default payload is exactly [`build_status_json_value`]'s.
+pub(crate) fn build_status_json_value_for(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+    update: &self_update::SelfUpdateStatus,
+    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    protection: Option<&daemon_install_state::ProtectionReport>,
+    worktree_disk: Option<&[WorktreeDiskSummary]>,
+    sections: &SectionSet,
 ) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
     let mut value = serde_json::json!({
@@ -761,23 +787,31 @@ pub(crate) fn build_status_json_value(
     // Fleet-store sync (#9596) — client-side and host-local, like `protection`
     // above, and inserted only when this host actually has a snapshot, so a
     // host with no `fleet.repo` emits exactly the payload it always did.
-    if let Some(s) = loom_daemon::fleet_sync::probe_status() {
+    let fleet_store = sections
+        .has(Section::FleetStore)
+        .then(loom_daemon::fleet_sync::probe_status);
+    if let Some(s) = fleet_store.flatten() {
         value["fleet_store"] = fleet_store_line::json(Some(&s));
     }
     // Pending-restart marker (#9597) — a restart-required `fleet-config
     // render` change this daemon's pid has not yet picked up. Same
     // client-side/host-local shape as the fleet-store block above, inserted
     // only when there is one to report.
-    let pending_restart = pending_restart_line::json(report.daemon_pid);
-    if !pending_restart.is_null() {
-        value["pending_restart"] = pending_restart;
+    if sections.has(Section::PendingRestart) {
+        let pending_restart = pending_restart_line::json(report.daemon_pid);
+        if !pending_restart.is_null() {
+            value["pending_restart"] = pending_restart;
+        }
     }
     // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
     // always present; unconfigured hosts carry the policy.unconfigured notice.
-    let forge_egress = forge_egress_line::json();
-    if !forge_egress.is_null() {
+    let forge_egress = sections
+        .has(Section::ForgeEgress)
+        .then(forge_egress_line::json);
+    if let Some(forge_egress) = forge_egress.filter(|v| !v.is_null()) {
         value["forge_egress"] = forge_egress;
     }
+    sections.retain_keys(&mut value);
     value
 }
 
@@ -789,9 +823,17 @@ pub(crate) fn print_status_json(
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
+    sections: &SectionSet,
 ) -> Result<()> {
-    let combined =
-        build_status_json_value(report, token_usage, update, pipeline, protection, worktree_disk);
+    let combined = build_status_json_value_for(
+        report,
+        token_usage,
+        update,
+        pipeline,
+        protection,
+        worktree_disk,
+        sections,
+    );
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
 }

@@ -177,3 +177,66 @@ async fn a_light_request_answers_while_slow_status_builds_occupy_every_worker() 
         assert!(matches!(reply, Response::DaemonStatus(_)), "status reply: {reply:?}");
     }
 }
+
+/// **Issue #10787.** `DaemonStatusSections` through the real connection
+/// handler: the reply is a `DaemonStatus` frame whose requested sections are
+/// built while the per-repo rows (which nothing requested) are not, and the
+/// plain `DaemonStatus` frame on the same socket still builds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn a_sectioned_request_builds_only_what_it_names() {
+    use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::env::set_var(REGISTRY_PATH_ENV, dir.path().join("no-such-workspaces.json"));
+    let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+    let socket = dir.path().join("daemon.sock");
+    serve_socket(&socket, &root);
+
+    let ask = |line: &'static str| {
+        let socket = socket.clone();
+        tokio::task::spawn_blocking(move || round_trip(&socket, line))
+    };
+    let sectioned = ask(
+        r#"{"type":"DaemonStatusSections","payload":{"sections":["daemon_build","auto_update"]}}"#,
+    )
+    .await
+    .unwrap();
+    let full = ask(r#"{"type":"DaemonStatus"}"#).await.unwrap();
+    let unknown =
+        ask(r#"{"type":"DaemonStatusSections","payload":{"sections":["no_such_section"]}}"#)
+            .await
+            .unwrap();
+    std::env::remove_var(REGISTRY_PATH_ENV);
+    match prev_shared {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+    }
+
+    match serde_json::from_str::<Response>(&sectioned).unwrap() {
+        Response::DaemonStatus(report) => {
+            assert_eq!(
+                report.daemon_build_commit.as_deref(),
+                Some(crate::self_update::BUILT_COMMIT)
+            );
+            assert!(report.per_repo.is_empty(), "per-repo rows built for {sectioned}");
+        }
+        other => panic!("expected DaemonStatus, got {other:?}"),
+    }
+    match serde_json::from_str::<Response>(&full).unwrap() {
+        Response::DaemonStatus(report) => assert_eq!(report.per_repo.len(), 1),
+        other => panic!("expected DaemonStatus, got {other:?}"),
+    }
+    // A section this daemon does not know is a parse error frame — what a
+    // newer CLI maps to "daemon too old for --section" — not a full build.
+    assert!(
+        matches!(
+            serde_json::from_str::<Response>(&unknown).unwrap(),
+            Response::StructuredError(_)
+        ),
+        "unknown section reply: {unknown}"
+    );
+}
