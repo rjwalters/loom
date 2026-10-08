@@ -127,6 +127,15 @@ pub trait StarForge {
     /// The search failed.
     fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<SearchHit>>;
 
+    /// The events that put the star on an item, from its timeline: each
+    /// `labeled` event for the star and each trusted star comment
+    /// ([`super::inherited_star::star_events_from_timeline`]). Read only for
+    /// an item whose star propagation might own (#10012 §3).
+    ///
+    /// # Errors
+    /// The read failed.
+    fn star_events(&mut self, number: u32) -> Result<Vec<super::inherited_star::StarEvent>>;
+
     /// This daemon's own forge login, when the forge can name it (an App
     /// installation token cannot). Used only to trust its own markers.
     fn self_login(&mut self) -> Option<String> {
@@ -262,6 +271,8 @@ fn url_encode(s: &str) -> String {
 /// Comment pages are fetched until one is short; a hard cap bounds a runaway.
 const COMMENT_PAGE: usize = 100;
 const COMMENT_MAX_PAGES: usize = 50;
+/// Timeline pages read for one ownership check (#10012 §3).
+const TIMELINE_MAX_PAGES: usize = 20;
 
 #[derive(serde::Deserialize)]
 struct RawUser {
@@ -365,6 +376,28 @@ impl StarForge for GhStarForge {
             return Ok(Vec::new());
         };
         Ok(parse_blocked_by(&body, &self.slug))
+    }
+
+    fn star_events(&mut self, number: u32) -> Result<Vec<super::inherited_star::StarEvent>> {
+        let me = self.self_login();
+        let mut all = Vec::new();
+        for page in 1..=TIMELINE_MAX_PAGES {
+            let url =
+                format!("{}/timeline?per_page={COMMENT_PAGE}&page={page}", self.issue_path(number));
+            let Some(body) = self.cached_get(ops::TIMELINE_READ, &url)? else {
+                return Err(anyhow!("gh api {url} failed: HTTP 404"));
+            };
+            let raw: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow!("parse timeline page {page} of {url}: {e}"))?;
+            let n = raw.as_array().map_or(0, Vec::len);
+            all.extend(super::inherited_star::star_events_from_timeline(&raw, me.as_deref()));
+            if n < COMMENT_PAGE {
+                return Ok(all);
+            }
+        }
+        // A timeline longer than the cap: the newest events are unread, and
+        // the owner rule keys on the latest one. Refuse rather than guess.
+        Err(anyhow!("timeline of #{number} exceeds {TIMELINE_MAX_PAGES} pages"))
     }
 
     fn self_login(&mut self) -> Option<String> {

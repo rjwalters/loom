@@ -317,7 +317,8 @@ fn building_priority_and_held_rows_are_never_touched() {
     b31.state = "closed".into();
     world.add(slug, b31);
     world.add(slug, pr(32, 30, &["loom:changes-requested"]));
-    let r = Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
+    let r =
+        Host::without_propagation("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
     for n in [10, 30] {
         let row = r.rows.iter().find(|row| row.issue == n).unwrap();
         assert_eq!((row.stage, row.ask.clone()), (LandingStage::StaleBlock, None), "#{n}");
@@ -405,9 +406,11 @@ fn an_inherited_unnamed_block_keeps_its_approval_and_gets_no_handoff() {
         assert_eq!(ask.kind, AskKind::BlockedUnnamed);
         assert!(ask.text.contains("blocks starred #10"), "{}", ask.text);
         assert!(!ask.text.contains("is starred"), "#11 is not starred: {}", ask.text);
+        // The `Blocked by #11` link is a parent/child edge, so the pass
+        // also writes the inherited star as the label (#10012 §2).
         assert_eq!(
             labels(&world, slug, 11),
-            vec!["loom:curated", "loom:issue", BLOCKED],
+            vec!["loom:curated", "loom:issue", BLOCKED, STAR],
             "approval and block both kept (minute {minute})"
         );
     }
@@ -434,14 +437,14 @@ fn an_inherited_all_closed_block_is_unblocked_without_calling_it_starred() {
     b12.state = "closed".into();
     world.add(slug, b12);
     Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
-    assert_eq!(labels(&world, slug, 11), vec!["loom:curated"]);
+    // Unblocked, and the inherited star materialized (#10012 §2).
+    assert_eq!(labels(&world, slug, 11), vec!["loom:curated", STAR]);
     let posted = world.posted(slug);
     let body = &posted
         .iter()
-        .find(|(n, _)| *n == 11)
+        .find(|(n, b)| *n == 11 && b.contains(&stale::unblocked_marker("#12")))
         .expect("one unblock comment")
         .1;
-    assert!(body.contains(&stale::unblocked_marker("#12")), "{body}");
     assert!(body.contains("inherits the star through #10"), "{body}");
     assert!(!body.contains("starred issue"), "{body}");
     assert!(!body.contains("starred issues come first"), "{body}");

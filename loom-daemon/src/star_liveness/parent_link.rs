@@ -102,6 +102,24 @@ pub fn star_child(
     if existing.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL) {
         return Ok(StarOutcome::AlreadyStarred);
     }
+    write_inherited_star(forge, parent, child, starred_at)?;
+    Ok(StarOutcome::Starred)
+}
+
+/// Write the star on `child` with its inherited audit comment naming `root`
+/// (no reads, no checks: the caller decided). The materialization pass
+/// ([`super::materialize`]) and [`star_child`] share it.
+///
+/// # Errors
+/// The label write or the audit post failed (a failed post rolls the label
+/// back, so no star is left without provenance).
+pub fn write_inherited_star(
+    forge: &mut dyn StarForge,
+    root: u32,
+    child: u32,
+    starred_at: Option<&str>,
+) -> Result<()> {
+    let parent = root;
     forge.add_label(child, OPERATOR_PRIORITY_LABEL)?;
     // The star is ours (it was absent a line ago), so this labeling generation
     // has no audit yet: always post, never dedupe against an older comment
@@ -119,7 +137,7 @@ pub fn star_child(
             )),
         });
     }
-    Ok(StarOutcome::Starred)
+    Ok(())
 }
 
 /// `gh api` arguments that create the native sub-issue link, given the
