@@ -34,6 +34,8 @@
 //! share is measurable. Every passthrough is one row too ([`ledger`], W5):
 //! `agent.gh.<command>`, with the session's role and credential, so agent
 //! spend lands in the same per-bucket rollup (`loom-daemon forge calls`).
+//! Both kinds of row are stamped with the agent role and `served` /
+//! `passthrough` ([`crate::forge_call_stats::agent`], #10607).
 //! `forge_etag_store::fetch_conditional` already routes served reads to a
 //! repo's reader App when one is configured (#9537).
 
@@ -176,6 +178,10 @@ pub fn run(raw: &[OsString]) -> i32 {
         // journaled for its `pick.decision`. Parses argv only; a no-op outside
         // a role tick.
         crate::observability::pick_journal::record_gh_actions(raw);
+        // #10607: every row this process writes — served (the facade's) or
+        // passthrough (`ledger`) — carries the agent role and `served` /
+        // `passthrough` (`ag` / `vi`).
+        crate::forge_call_stats::agent::set_agent_role(std::env::var("LOOM_ROLE").ok().as_deref());
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();

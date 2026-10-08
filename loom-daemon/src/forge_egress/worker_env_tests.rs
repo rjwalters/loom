@@ -285,6 +285,44 @@ fn legacy_args_only_without_a_managed_launcher() {
     assert_eq!(Admission::default().docker_args(lookup(&[])), ["-v", mount.as_str()]);
 }
 
+/// #10607: `container-args` parity-mounts the agent `gh` front's sink
+/// read-write under every admission, so `spawn-claude.sh` never grows.
+#[test]
+fn container_args_parity_mount_the_agent_front_sink_read_write() {
+    let sink = tempfile::tempdir().unwrap();
+    let dir = sink.path().to_path_buf();
+    let lookup = move |k: &str| -> Option<std::ffi::OsString> {
+        (k == "LOOM_FORGE_CALL_STATS_DIR").then(|| dir.clone().into_os_string())
+    };
+    let spec = format!("{0}:{0}", sink.path().display());
+    // The mount is only for the daemon's own (private) sink, never an
+    // arbitrary directory an env var names.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(sink.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+    let (_fx, egress) = Fx::new("required");
+    let managed = Admission {
+        configured: true,
+        egress: Some(egress),
+        warnings: vec![],
+    };
+    for args in [
+        managed.docker_args(&lookup),
+        Admission::default().docker_args(&lookup),
+    ] {
+        assert_eq!(args[args.len() - 2..], ["-v".to_string(), spec.clone()], "{args:?}");
+    }
+    crate::forge_call_stats::set_test_sink_dir(None);
+    // A sink exported as off names no directory, so nothing is mounted.
+    let off = |k: &str| -> Option<std::ffi::OsString> {
+        (k == "LOOM_FORGE_CALL_STATS_DIR").then(|| "off".into())
+    };
+    assert!(Admission::default().docker_args(off).is_empty());
+}
+
 #[test]
 fn container_launcher_must_resolve_to_the_launcher() {
     let (_fx, egress) = Fx::new("required");

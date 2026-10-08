@@ -54,6 +54,19 @@ case "$*" in
     printf '[{"number": 7, "title": "seven", "state": "open", "labels": [{"name": "loom:issue"}], "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "closed_at": null, "body": null, "user": {"login": "x"}}]\n'
     exit 0
     ;;
+  'wait-for-signal')
+    trap 'echo TERM >> "$STUB_LOG.sig"; exit 42' TERM
+    : > "$STUB_LOG.ready"
+    while :; do sleep 0.05; done
+    ;;
+  'die-by-signal')
+    kill -TERM $$
+    ;;
+  'wait-forever')
+    echo $$ > "$STUB_LOG.pid"
+    : > "$STUB_LOG.ready"
+    while :; do sleep 0.05; done
+    ;;
 esac
 for a in "$@"; do printf 'ARG:%s\n' "$a"; done
 printf 'SENTINEL:%s\n' "$LOOM_GH_FRONT_ACTIVE"
@@ -116,6 +129,12 @@ impl Sandbox {
             "CLICOLOR_FORCE",
             "GH_DEBUG",
             "DEBUG",
+            "LOOM_FORGE_CALL_STATS_DIR",
+            "LOOM_GH_BOOKED",
+            "LOOM_ROLE",
+            "GH_CONFIG_DIR",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
         ] {
             cmd.env_remove(k);
         }
@@ -145,6 +164,24 @@ impl Sandbox {
                 let v: serde_json::Value = serde_json::from_str(l).unwrap();
                 v["x-loom-cache"].as_str().unwrap().to_string()
             })
+            .collect()
+    }
+}
+
+impl Sandbox {
+    /// The agent rows (`ag` set) the front wrote into `sink`.
+    fn agent_rows(&self) -> Vec<serde_json::Value> {
+        let Ok(dir) = std::fs::read_dir(self.p("sink")) else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .flat_map(|e| {
+                let text = std::fs::read_to_string(e.path()).unwrap();
+                text.lines()
+                    .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| v.get("ag").is_some())
             .collect()
     }
 }
@@ -774,4 +811,191 @@ fn a_session_row_lands_in_the_host_sink_not_under_the_session_tmpdir() {
     assert!(bare.output().unwrap().status.success());
     assert_eq!(rows_in(&session_sink).len(), 1, "the unexported default follows TMPDIR");
     assert_eq!(rows_in(&host_sink).len(), 1, "and the host sink did not see it");
+}
+
+/// #10607: a passthrough's one ledger row (W5) is stamped with the agent
+/// role and `passthrough`, and the call keeps its streams and exit status.
+#[test]
+fn a_passthrough_ledger_row_carries_the_agent_role_and_via() {
+    let s = Sandbox::new();
+    let sink = s.p("sink").display().to_string();
+    let env = [
+        ("LOOM_FORGE_CALL_STATS_DIR", sink.as_str()),
+        ("LOOM_ROLE", "builder"),
+        ("STUB_EXIT", "3"),
+    ];
+    let out = s.gh(
+        &[
+            "pr",
+            "create",
+            "--title",
+            "t",
+            "--body",
+            "secret body",
+            "-R",
+            "o/r",
+        ],
+        &env,
+    );
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert!(stdout(&out).starts_with("ARG:pr\nARG:create\n"), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "stub stderr\n");
+    let rows = s.agent_rows();
+    assert_eq!(rows.len(), 1, "one row per passthrough: {rows:?}");
+    let r = &rows[0];
+    assert_eq!((&r["c"], &r["ir"]), (&"agent.gh.pr".into(), &"agent-builder".into()));
+    assert_eq!((&r["ag"], &r["vi"]), (&"builder".into(), &"passthrough".into()));
+    // Booked before the exec, so charged whatever the call's own exit.
+    assert_eq!((&r["o"], &r["p"]), (&"ok".into(), &"graphql".into()));
+    assert_eq!(
+        (&r["rp"], &r["ro"], &r["ca"]),
+        (&"o/r".into(), &"target".into(), &"ambient".into())
+    );
+    let raw = std::fs::read_dir(s.p("sink"))
+        .unwrap()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect::<String>();
+    assert!(
+        !raw.contains("secret body") && !raw.contains("--title"),
+        "argv never reaches the row: {raw}"
+    );
+    // Every row in the sink, stamped or not: still exactly one.
+    assert_eq!(raw.lines().count(), 1, "no unstamped duplicate: {raw}");
+}
+
+/// #10607: a served read keeps its facade row, now stamped `served`.
+#[test]
+fn a_served_issue_view_row_carries_the_agent_role_and_via() {
+    let s = Sandbox::new();
+    let sink = s.p("sink").display().to_string();
+    let env = [
+        ("LOOM_FORGE_CALL_STATS_DIR", sink.as_str()),
+        ("LOOM_ROLE", "Judge"),
+    ];
+    for _ in 0..2 {
+        assert_eq!(stdout(&s.gh(VIEW, &env)), VIEW_JSON);
+    }
+    let rows = s.agent_rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|r| r["c"] == "agent_gh_front" && r["ag"] == "judge" && r["vi"] == "served"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[1]["o"], "not_modified", "{rows:?}");
+    // An unset role (an interactive session) is `none`, never absent.
+    s.gh(&["issue", "close", "1"], &[("LOOM_FORGE_CALL_STATS_DIR", sink.as_str())]);
+    assert_eq!(s.agent_rows().last().unwrap()["ag"], "none");
+}
+
+/// #10607: recording can fail; the call cannot notice.
+#[test]
+fn an_unwritable_sink_never_changes_the_calls_streams_or_exit_status() {
+    let s = Sandbox::new();
+    std::fs::write(s.p("not-a-dir"), "x").unwrap();
+    let bad = s.p("not-a-dir").display().to_string();
+    let args = ["issue", "edit", "42", "--add-label", "x"];
+    let base = s.gh(&args, &[("STUB_EXIT", "4")]);
+    let out = s.gh(
+        &args,
+        &[
+            ("STUB_EXIT", "4"),
+            ("LOOM_FORGE_CALL_STATS_DIR", bad.as_str()),
+            ("LOOM_ROLE", "builder"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!((out.stdout, out.stderr), (base.stdout, base.stderr));
+}
+
+/// #10607: a passthrough is an `exec`, so a signal aimed at the front is a
+/// signal to `gh`, and a `gh` killed by a signal is the front killed by it.
+/// Pins that contract for any future change to how passthroughs run.
+#[test]
+fn signals_are_forwarded_and_a_signal_death_is_mirrored() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Sandbox::new();
+    let mut child = s
+        .command(&s.p("bin/gh"), &["wait-for-signal"], &[])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = s.p("calls.log.ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(std::time::Instant::now() < deadline, "the stub never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(42), "the stub's TERM trap ran and its code came back");
+    assert_eq!(std::fs::read_to_string(s.p("calls.log.sig")).unwrap(), "TERM\n");
+
+    let out = s.gh(&["die-by-signal"], &[]);
+    assert_eq!(out.status.signal(), Some(15), "{out:?}");
+}
+
+/// #10607 review S2: `kill -9 <front>` must kill `gh` too, as it does while a
+/// passthrough is an `exec` — a front that became `gh`'s parent would orphan it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sigkilled_front_does_not_leave_an_orphaned_gh() {
+    let s = Sandbox::new();
+    let mut front = s
+        .command(&s.p("bin/gh"), &["wait-forever"], &[])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = s.p("calls.log.ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(std::time::Instant::now() < deadline, "the stub never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pid = std::fs::read_to_string(s.p("calls.log.pid"))
+        .unwrap()
+        .trim()
+        .to_string();
+    // Gone = no /proc entry, or a zombie nobody has reaped yet.
+    let alive = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|st| {
+            !st.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        })
+    };
+    assert!(alive(), "the stub is running before the kill");
+    front.kill().unwrap(); // SIGKILL
+    front.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive() {
+        assert!(std::time::Instant::now() < deadline, "gh {pid} outlived its SIGKILLed front");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// #10607 review S3: every spawn path exports the host sink as
+/// `LOOM_FORGE_CALL_STATS_DIR` (W5), so a Builder's `cargo test` would pass it
+/// to every `loom-daemon` test binary, and their fake-`gh` rows would land in
+/// the real sink. Cargo resets it for whatever it runs in this repository.
+#[test]
+fn cargo_never_hands_a_test_binary_the_inherited_forge_call_sink() {
+    let config = include_str!("../../.cargo/config.toml");
+    let reset = r#"LOOM_FORGE_CALL_STATS_DIR = { value = "", force = true }"#;
+    assert!(
+        config.lines().any(|l| l.trim() == reset),
+        ".cargo/config.toml [env] must force-reset the sink variable"
+    );
+    assert_eq!(
+        std::env::var("LOOM_FORGE_CALL_STATS_DIR").unwrap_or_default(),
+        "",
+        "a test process inherited a forge-call sink"
+    );
 }
