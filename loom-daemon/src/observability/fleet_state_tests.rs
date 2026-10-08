@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::{build_view, decide, needs_anchor, Emitted, FleetInput, FleetStateSink};
-use crate::eta::tracker::{LiveItem, RepoPrCensus};
+use crate::eta::tracker::live::LiveItem;
+use crate::eta::tracker::RepoPrCensus;
 use crate::eta::Stage;
 use crate::observability::queue::QueueSink;
 use crate::telemetry::kinds::fleet_state::{FleetSlot, ANCHOR_INTERVAL_SECS, MAX_ROWS};

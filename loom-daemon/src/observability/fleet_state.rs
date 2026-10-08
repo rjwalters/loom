@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use chrono::{DateTime, Duration, Utc};
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
-use crate::eta::tracker::{LiveItem, RepoPrCensus};
+use crate::eta::tracker::live::LiveItem;
+use crate::eta::tracker::RepoPrCensus;
 use crate::eta::Stage;
 use crate::telemetry::kinds::fleet_state::{
     FleetPrCensus, FleetSlot, FleetSlots, FleetStateRecord, FleetStateRepo, FleetStateRow,
