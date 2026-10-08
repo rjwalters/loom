@@ -241,9 +241,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             let target = RollTarget {
                 source: match state.floor.roll_source() {
                     floor_roll::TargetSource::Floor => pause_manifest::TargetSource::Floor,
-                    floor_roll::TargetSource::AutoUpdate => {
-                        pause_manifest::TargetSource::AutoUpdate
-                    }
+                    // #10719: only a workspace that needs a newer daemon drives it.
+                    _ if state.repo_ahead.driving() => pause_manifest::TargetSource::RepoAhead,
+                    _ => pause_manifest::TargetSource::AutoUpdate,
                 },
                 to_version: Some(version.clone()),
                 to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
@@ -270,7 +270,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
     // alert is never a gate: nothing above was held back for it, no pause is
     // started for it, and dispatch is untouched.
-    let note = format!("{note}{}", state.floor.note_suffix());
+    let note = format!("{note}{}{}", state.floor.note_suffix(), state.repo_ahead.note_suffix());
     // #10866: the note and the record's `floor_stall` are state and are set on
     // every tick the stall stands. Only the ERROR line is rate-limited.
     summary.floor_alerted = state
@@ -288,6 +288,18 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             );
         }
         summary.floor_stall = Some(stall.note());
+    }
+    // #10719: a repo-ahead demand no release satisfies is the same kind of
+    // stall. It arms nothing; the record's stall field names it when the
+    // floor has none of its own.
+    let ahead_alert = state
+        .repo_ahead
+        .alert_due(last_check, floor_roll::alert::REMINDER);
+    if let Some(stall) = state.repo_ahead.stall() {
+        if ahead_alert {
+            log::error!("auto_update: {stall}");
+        }
+        summary.floor_stall.get_or_insert(stall);
     }
 
     status.publish(state.snapshot(true, last_check, note.clone(), &artifact));
@@ -342,6 +354,10 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state
         .floor
         .set_basis(crate::fleet_sync::loom_min_version(), env!("CARGO_PKG_VERSION"));
+    // #10719: and the highest daemon version a registered workspace needs.
+    state
+        .repo_ahead
+        .set_basis(floor_roll::repo_ahead::Demand::live(), env!("CARGO_PKG_VERSION"));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline)
     }));

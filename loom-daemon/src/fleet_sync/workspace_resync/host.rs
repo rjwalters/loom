@@ -341,8 +341,14 @@ fn run_live(
         overdue: &|| started.elapsed() >= PASS_DEADLINE,
         heads: &super::heads::live,
     };
-    let pass = super::run(&env, &registered_roots(), mode, &mut guard);
+    let mut pass = super::run(&env, &registered_roots(), mode, &mut guard);
+    // #10719: rebuild the dispatch holds and the roll demand from this pass.
+    let seen = super::observations(&env, &pass, &mut guard);
     drop(guard);
+    let held = crate::workspace_hold::apply(&seen, running, Utc::now(), bus);
+    for workspace in &mut pass.workspaces {
+        workspace.hold = held.get(&workspace.root).cloned();
+    }
     if let Some(bus) = bus {
         for alert in &pass.alerts {
             let payload = serde_json::to_value(alert).unwrap_or(serde_json::Value::Null);

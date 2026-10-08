@@ -1217,6 +1217,8 @@ pub struct AutoUpdateState {
     window: roll_window::WindowGate,
     /// #10712: the fleet floor's basis and last verdict (inert while unset).
     floor: floor_roll::FloorState,
+    /// #10719: the repo-ahead demand's basis and last verdict (inert while unset).
+    repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
 }
@@ -1275,6 +1277,7 @@ impl AutoUpdateState {
                 // streak from a previous tick no longer applies (#8513).
                 self.stale_repo.reset();
                 self.floor.observe(None);
+                self.repo_ahead.observe(None);
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
                     TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
@@ -1310,6 +1313,10 @@ impl AutoUpdateState {
         let verdict = classify_artifact(info);
         // #10712: below a satisfiable fleet floor, this release is the floor target.
         let floor_target = self.floor.observe(Some(&floor_roll::Release::of(info)));
+        // #10719: so is it for a workspace that needs a newer daemon.
+        let ahead_target = self
+            .repo_ahead
+            .observe(Some(&floor_roll::Release::of(info)));
         // Issue #8513: the streak counts only genuinely CONSECUTIVE
         // stale-repo ticks, so anything else this tick resolved drops it —
         // but the reset must not run before the `StaleRepo` arm increments,
@@ -1396,7 +1403,9 @@ impl AutoUpdateState {
         }
         // #10712: a floor-driven roll skips settle (and so does its supersede,
         // which re-decides here still floor-driven); autoUpdate rolls do not.
-        let selected = self.floor.select(floor_target.as_ref(), info);
+        let selected = self
+            .floor
+            .select(floor_target.as_ref(), ahead_target.as_ref(), info);
         if selected.source == floor_roll::TargetSource::AutoUpdate {
             if let Some(skip) = self.settle_gate(now, settle) {
                 return skip;
@@ -1407,7 +1416,11 @@ impl AutoUpdateState {
         // the host is busy, exactly as the post-deadline path used to do,
         // minus the wait. `defer_deadline` is consumed by `decide_source` only.
         TickDecision::FetchArtifact {
-            why: format!("{why}{}", self.floor.why_suffix(&selected)),
+            why: format!(
+                "{why}{}{}",
+                self.floor.why_suffix(&selected),
+                self.repo_ahead.why_suffix(&selected)
+            ),
             version: selected.version,
             tag: selected.tag,
             low_priority: in_flight > 0,

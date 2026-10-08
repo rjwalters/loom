@@ -150,6 +150,8 @@ mod watchdog;
 // Several submodules (e.g. `stacking`) only contribute inherent
 // `impl SweepRegistry` methods with nothing free-standing to import, so the
 // glob below is a no-op for them -- harmless, silenced explicitly.
+/// #10719: the typed refusal for a held workspace, beside the other dispatch errors.
+pub use crate::workspace_hold::WorkspaceHeldDispatchError;
 #[allow(unused_imports)]
 pub use crash_signals::*;
 #[allow(unused_imports)]

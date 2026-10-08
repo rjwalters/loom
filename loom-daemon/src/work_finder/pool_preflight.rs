@@ -627,6 +627,13 @@ pub(crate) fn preflight_cause(
 /// failed claim-label flip, so without this a root whose `gh` target is an
 /// `upstream` it cannot label still got sweeps, and their comments landed
 /// there.
+///
+/// # The workspace hold (Issue #10719)
+///
+/// A root whose installed Loom cannot work with this daemon
+/// ([`crate::workspace_hold`]) is held with [`HaltCause::InstallIncompatible`]
+/// or [`HaltCause::DaemonTooOld`], and yields no probe. Being a term here is
+/// also what keeps the red-main fix lane out of a held workspace.
 pub fn preflight_held_causes_per_root(
     workspaces: &WorkspacePool,
     roots: &[PathBuf],
@@ -645,10 +652,12 @@ pub fn preflight_held_causes_per_root(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pool_held = fold_peer_pool_hold(state, &registry, &observation);
             let gate = registry.preflight_dispatch_gate(now);
-            let (held, cause) = if crate::write_scope::gate_root(root, "dispatch") {
-                preflight_cause(pool_held, gate)
-            } else {
+            let (held, cause) = if !crate::write_scope::gate_root(root, "dispatch") {
                 (true, Some(HaltCause::WriteScope))
+            } else if let Some(hold) = crate::workspace_hold::hold_for(root) {
+                (true, Some(hold.kind.halt_cause()))
+            } else {
+                preflight_cause(pool_held, gate)
             };
             causes.push(cause);
             if !held && matches!(gate, PreflightDispatchGate::Probe) {

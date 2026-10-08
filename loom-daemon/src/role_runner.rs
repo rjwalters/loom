@@ -3392,6 +3392,7 @@ pub fn spawn_multi_role_task(
         // Missing-root warn-once-per-period state (#4326), shared discipline
         // with `work_finder` via `filter_missing_roots`.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        let mut held_roots_logged: HashSet<PathBuf> = HashSet::new();
         let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
             spec,
             interval,
@@ -3458,6 +3459,8 @@ pub fn spawn_multi_role_task(
             // warn-and-skip, never auto-remove (`loom-daemon status` flags it,
             // `workspace remove` clears it).
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
+            // #10719: no role tick starts in a held workspace (W3/W4).
+            let roots = crate::workspace_hold::filter_held(roots, &mut held_roots_logged);
             let _report = dispatcher.dispatch_tick(roots, &in_progress);
         }
     })

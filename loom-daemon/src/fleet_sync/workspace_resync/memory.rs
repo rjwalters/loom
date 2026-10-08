@@ -102,6 +102,9 @@ pub struct Memory {
     pub(super) resynced: HashMap<PathBuf, (String, String)>,
     /// Workspaces whose remote (or forge) did not answer when last asked.
     pub(super) down: HashSet<PathBuf>,
+    /// Whether the payload differs from each checkout's installed files, per
+    /// (HEAD, stamp): the checkout half of the dispatch hold (#10719).
+    pub(super) checkout: HashMap<PathBuf, (String, bool)>,
     outage: Outage,
     /// Passes in a row whose head query failed, and whether that was alerted.
     head_query: (u32, bool),

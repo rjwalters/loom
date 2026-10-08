@@ -824,11 +824,11 @@ fn a_repo_ahead_of_the_daemon_is_never_claimed_or_written() {
             WState::W4,
             "requires daemon 0.19.890 > running 0.19.880",
         ),
-        // Cannot be ordered, so it may be newer.
+        // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
         (
             "0.20.0-rc1",
             Some("0.19.772"),
-            WState::RepoAhead,
+            WState::W4,
             "installed loom_version \"0.20.0-rc1\" is not MAJOR.MINOR.PATCH; it may be newer \
              than this daemon",
         ),
@@ -1132,6 +1132,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: Some("0.19.800".to_string()),
                 requires_daemon: None,
                 reason: Some("claim held by host-b since 2026-10-08T12:00:00Z".to_string()),
+                hold: None,
             },
             WorkspaceReport {
                 root: PathBuf::from("/src/lib"),
@@ -1140,6 +1141,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: None,
                 requires_daemon: None,
                 reason: None,
+                hold: None,
             },
         ],
         ..WorkspacePass::default()
@@ -1166,3 +1168,5 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 mod bounds;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
+#[path = "workspace_resync_hold.rs"]
+mod hold_pass;

@@ -12,13 +12,18 @@
 //! | W0 | the default branch's installed files equal this daemon's payload | nothing |
 //! | W1 | compatible, files differ | try the claim |
 //! | W3 | too old for this daemon or the floor, files differ | as W1, first |
-//! | W4 | the files need a newer daemon | report only |
-//! | repo-ahead | installed by a newer daemon, or a version that cannot be ordered | report only |
+//! | W4 | the files need a newer daemon, or record a version that cannot be ordered | report only |
+//! | repo-ahead | installed by a newer daemon, and still compatible with this one | report only |
 //!
 //! An empty payload diff is W0 whatever the version stamp says: a resync that
 //! changes no file writes nothing, so a stamp that is old or lacks
 //! `requires_daemon` over matching files is never rewritten and must not be
-//! waited for. W4 and repo-ahead are left to the host roll (#10719).
+//! waited for.
+//!
+//! W3 and W4 hold new dispatch into the workspace, and W4 makes this host a
+//! roll candidate ([`crate::workspace_hold`], #10719). A repo that is only
+//! repo-ahead is neither held nor a reason to roll: this host keeps working
+//! it and never resyncs it downward.
 //!
 //! W2 is the resync itself, under the per-repo claim
 //! ([`crate::fleet_store::resync_claim`]): a throwaway detached worktree off
@@ -97,6 +102,7 @@
 
 mod git;
 pub mod heads;
+mod hold;
 mod host;
 mod memory;
 mod w2;
@@ -156,9 +162,10 @@ pub enum WState {
     W2,
     /// Too old for this daemon or the floor.
     W3,
-    /// Needs a newer daemon than this one.
+    /// Needs a newer daemon than this one, or records a version that cannot
+    /// be ordered against it (so it may).
     W4,
-    /// Installed by a newer daemon, or at a version that cannot be ordered.
+    /// Installed by a newer daemon whose files still work with this one.
     #[serde(rename = "repo-ahead")]
     RepoAhead,
     /// Not a workspace this pass manages (see the reason).
@@ -185,8 +192,8 @@ impl WState {
         }
     }
 
-    /// The repo is ahead of this daemon: the input to #10719's
-    /// `repo_ahead_target` and its `daemon-too-old` hold.
+    /// The repo is ahead of this daemon, so this host never resyncs it.
+    /// Only [`Self::W4`] holds dispatch and asks for a roll (#10719).
     #[must_use]
     pub fn repo_ahead(self) -> bool {
         matches!(self, Self::W4 | Self::RepoAhead)
@@ -209,6 +216,9 @@ pub struct WorkspaceReport {
     pub requires_daemon: Option<String>,
     /// Why it is in that state, or what this pass did about it.
     pub reason: Option<String>,
+    /// The dispatch hold standing on it, if any (#10719).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<crate::workspace_hold::WorkspaceHold>,
 }
 
 /// A failure that needs a person: published on [`ALERT_TOPIC`].
@@ -288,7 +298,12 @@ impl WorkspacePass {
                 .reason
                 .as_deref()
                 .map_or_else(String::new, |r| format!(" ({r})"));
-            lines.push(format!("  workspace {name}: {}{reason}{installed}", w.state.as_str()));
+            let hold = w
+                .hold
+                .as_ref()
+                .map_or_else(String::new, |h| format!("; {}: {}", h.note(), h.detail));
+            lines
+                .push(format!("  workspace {name}: {}{reason}{installed}{hold}", w.state.as_str()));
         }
         lines
     }
@@ -570,7 +585,19 @@ fn report_for(root: &Path) -> WorkspaceReport {
         installed: None,
         requires_daemon: None,
         reason: None,
+        hold: None,
     }
+}
+
+/// What a finished pass tells the dispatch hold (#10719): both copies of
+/// every workspace in `pass`. Reads each checkout's install metadata; no
+/// network.
+pub fn observations(
+    env: &Env<'_>,
+    pass: &WorkspacePass,
+    memory: &mut Memory,
+) -> Vec<crate::workspace_hold::Observation> {
+    hold::observe(env, &pass.workspaces, (env.gate)(), memory)
 }
 
 fn stamp(at: DateTime<Utc>) -> String {
@@ -850,7 +877,9 @@ fn refused(refusal: &ResyncRefusal) -> (WState, Option<String>) {
         ResyncRefusal::RepoAheadOfDaemon { installed, running } => {
             (WState::RepoAhead, Some(format!("installed {installed} > running {running}")))
         }
-        ResyncRefusal::PendingAheadOfDaemon { .. } | ResyncRefusal::UnrecognizedVersion { .. } => {
+        // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
+        ResyncRefusal::UnrecognizedVersion { .. } => (WState::W4, Some(refusal.to_string())),
+        ResyncRefusal::PendingAheadOfDaemon { .. } => {
             (WState::RepoAhead, Some(refusal.to_string()))
         }
         other => (WState::Unknown, Some(other.to_string())),
