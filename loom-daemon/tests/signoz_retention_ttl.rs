@@ -120,6 +120,10 @@ const SIBLING_ARTIFACTS: &[(&str, &str)] = &[
         "alerts/queue-starvation.json",
         include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json"),
     ),
+    (
+        "alerts/fleet-singleton-output.json",
+        include_str!("../../defaults/observability/signoz/alerts/fleet-singleton-output.json"),
+    ),
 ];
 
 /// Monotonic suffix so two tests in one process never collide on a container

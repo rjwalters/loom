@@ -1,0 +1,36 @@
+{
+  "alert": "Loom fleet singleton output missing",
+  "alertType": "LOGS_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "72h0m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.start_timestamp_ms}}) AS start_ms,\n  toInt64({{.end_timestamp_ms}}) AS end_ms,\n  registry AS (\n    SELECT row.1 AS kind, row.2 AS scope, toInt64(row.3) AS deadline_sec, row.4 AS closed_by\n    FROM (SELECT arrayJoin([\n      ('eta.fleet_refresh', 'per_repo', 7200, ''),\n      ('eta.backtest.fold', 'fleet_wide', 172800, ''),\n      ('eta.fit', 'fleet_wide', 172800, ''),\n      ('eta.estimate', 'per_active_repo', 3600, 'eta.outcome')\n    ]) AS row)\n  ),\n  records AS (\n    SELECT attributes_string['loom.kind'] AS kind,\n           attributes_string['loom.repo'] AS repo,\n           attributes_number['loom.issue'] AS issue,\n           toInt64(intDiv(timestamp, 1000000)) AS at_ms,\n           mapContains(attributes_string, 'loom.eta.no_estimate_reason') AS refused,\n           attributes_string['loom.eta.kind'] AS eta_kind\n    FROM signoz_logs.distributed_logs_v2\n    WHERE timestamp >= toUInt64({{.start_timestamp_ms}}) * 1000000\n      AND timestamp < toUInt64({{.end_timestamp_ms}}) * 1000000\n      AND attributes_string['loom.kind'] IN (\n        SELECT kind FROM registry UNION ALL SELECT closed_by FROM registry WHERE closed_by != '')\n  ),\n  per_repo AS (\n    SELECT kind, repo, max(at_ms) AS last_ms\n    FROM records\n    WHERE kind IN (SELECT kind FROM registry WHERE scope != 'fleet_wide')\n    GROUP BY kind, repo\n  ),\n  items AS (\n    SELECT kind, repo, issue, max(at_ms) AS last_ms, argMax(refused, at_ms) AS refused_now\n    FROM records\n    WHERE kind IN (SELECT kind FROM registry WHERE scope = 'per_active_repo')\n    GROUP BY kind, repo, issue\n  ),\n  closures AS (\n    SELECT g.kind AS kind, c.repo AS repo, c.issue AS issue, max(c.at_ms) AS closed_ms\n    FROM records AS c\n    INNER JOIN registry AS g ON c.kind = g.closed_by\n    WHERE c.eta_kind = 'land'\n    GROUP BY kind, repo, issue\n  ),\n  owing AS (\n    SELECT i.kind AS kind, i.repo AS repo,\n           max(NOT i.refused_now\n               AND NOT (c.closed_ms > 0 AND c.closed_ms + g.deadline_sec * 1000 >= i.last_ms)) AS owed\n    FROM items AS i\n    INNER JOIN registry AS g ON i.kind = g.kind\n    LEFT JOIN closures AS c ON i.kind = c.kind AND i.repo = c.repo AND i.issue = c.issue\n    GROUP BY kind, repo\n  ),\n  series AS (\n    SELECT g.kind AS kind, '' AS repo, g.deadline_sec AS deadline_sec,\n           if(g.scope = 'fleet_wide', max(p.at_ms), 0) AS last_ms,\n           countIf(p.kind != '') AS seen,\n           1 AS judged\n    FROM registry AS g\n    LEFT JOIN records AS p ON p.kind = g.kind\n    GROUP BY g.kind, g.scope, g.deadline_sec\n    UNION ALL\n    SELECT r.kind, r.repo, g.deadline_sec, r.last_ms, 1,\n           if(g.scope = 'per_active_repo', o.owed, 1)\n    FROM per_repo AS r\n    INNER JOIN registry AS g ON r.kind = g.kind\n    LEFT JOIN owing AS o ON r.kind = o.kind AND r.repo = o.repo\n  )\nSELECT toDateTime(intDiv(end_ms, 1000)) AS ts,\n       kind,\n       repo,\n       toFloat64(multiIf(\n         seen = 0, intDiv(end_ms - start_ms, 1000),\n         judged = 0 OR (repo = '' AND last_ms = 0), 0,\n         intDiv(end_ms - last_ms, 1000)) - deadline_sec) AS value\nFROM series\nORDER BY kind, repo",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0,
+    "alertOnAbsent": true,
+    "absentFor": 15
+  },
+  "labels": {
+    "severity": "critical",
+    "loom_signal": "fleet_singleton_output"
+  },
+  "annotations": {
+    "summary": "Loom fleet singleton output {{$labels.kind}} missing",
+    "description": "The fleet singleton output {{$labels.kind}} (repo {{$labels.repo}}; empty means the whole fleet) is {{$value}} s past its deadline. Each deadline is 2 x the row's cadence in loom-daemon's fleet_outputs::SINGLETON_OUTPUTS (or the row's own override), embedded in the query and kept equal to it by signoz_fleet_singleton_output_alert.rs. This rule checks the OUTPUT, never which host owns the job, so a job that moved to a host that does not produce it (or has no OTLP exporter) fires the same as a stalled one. An output with no record at all in the 72 h window fires. Find the producing host with `loom-daemon eta doctor` (ETA rows) or the fleet captain's armed singleton jobs, and check that it has an OTLP exporter. Issue #10916 (incident 2026-10-07/08: 28 of ~30 repos had no eta.estimate for ~31 h while every host looked healthy)."
+  },
+  "disabled": false
+}

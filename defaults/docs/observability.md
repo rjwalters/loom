@@ -536,6 +536,20 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
+**Fleet singleton outputs (#10916).** A one-host fleet job can stop producing
+while every host looks healthy (2026-10-07: 28 of ~30 repos had no
+`eta.estimate` for ~31 h). `defaults/observability/signoz/alerts/fleet-singleton-output.json`
+is the cross-host detector: over the logs table it takes the newest record per
+`loom.kind` (and per `loom.repo` for per-repo rows) and fires when one is older
+than its row's deadline in `fleet_outputs::SINGLETON_OUTPUTS` (2 x cadence, or
+the row's override). It checks the output, never the owning host, and a kind
+with no record in the 72 h window fires. An `eta.estimate` repo is judged only
+while it owes estimates: an item stops owing once a `land` `eta.outcome` closes
+it or its newest estimate is a refusal. `signoz_fleet_singleton_output_alert.rs`
+asserts each embedded deadline equals the registry's. Captain-gauge rows (a
+fleet-store heartbeat, not a log kind) and the Warning `ci.run` row are not in
+this critical rule. The in-daemon `fleet_alert` path is #10924.
+
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
