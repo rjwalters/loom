@@ -169,6 +169,49 @@ fn a_clear_is_not_undone_by_the_durable_floor() {
     assert!(!reg.prless_retry_held(10_642));
 }
 
+/// A clear must survive a daemon restart: two deaths, a clear (open PR here,
+/// with no PR-bearing outcome written), a restart, then one more death counts
+/// as one — not three.
+#[test]
+#[serial]
+fn a_clear_survives_a_daemon_restart() {
+    clear_repo_env();
+    let dir = tempdir().unwrap();
+    {
+        let (mut reg, _) = fixture_registry(dir.path());
+        phaseless_death(&mut reg, 10_642, 0);
+        phaseless_death(&mut reg, 10_642, 1);
+        reg.note_prless_terminal_outcome(10_642, "sweep-other", Some(OpenPrProbe::Open(1)), "n/a");
+        assert_eq!(reg.prless_release_count(10_642), 0);
+    }
+    let (mut reg, _) = fixture_registry(dir.path());
+    phaseless_death(&mut reg, 10_642, 2);
+    assert_eq!(
+        reg.prless_release_count(10_642),
+        1,
+        "deaths before a clear must not count again after a restart"
+    );
+    assert!(!reg.prless_retry_held(10_642));
+}
+
+/// A self-reported no-op clears through the same path and must also survive
+/// a restart.
+#[test]
+#[serial]
+fn a_noop_clear_survives_a_daemon_restart() {
+    clear_repo_env();
+    let dir = tempdir().unwrap();
+    {
+        let (mut reg, _) = fixture_registry(dir.path());
+        phaseless_death(&mut reg, 10_642, 0);
+        phaseless_death(&mut reg, 10_642, 1);
+        assert!(reg.clear_prless_retry(10_642));
+    }
+    let (mut reg, _) = fixture_registry(dir.path());
+    phaseless_death(&mut reg, 10_642, 2);
+    assert_eq!(reg.prless_release_count(10_642), 1);
+}
+
 /// A landed record in the journal ends the durable streak too, so a restart
 /// after a landing does not count the deaths that preceded it.
 #[test]

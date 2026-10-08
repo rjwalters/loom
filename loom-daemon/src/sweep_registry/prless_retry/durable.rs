@@ -32,9 +32,9 @@
 //! - a record carrying a PR (a landing) ends the streak;
 //! - so does any in-process clear ([`SweepRegistry::clear_prless_retry`]: an
 //!   open linked PR, an observed merge, a self-reported no-op) — its instant
-//!   is kept in [`PrlessTally`] and records older than it are not counted.
-//!   (Lost on restart, like the rest of the in-memory state; the landing rule
-//!   above is the durable half of the same idea.)
+//!   is kept in [`PrlessTally`] and also persisted to a small sidecar file
+//!   next to the journal ([`clear_marks_path`]), so records older than it are
+//!   not counted even after a daemon restart.
 //!
 //! Other PR-less outcomes in between (a substantive failure, a no-op exit)
 //! are skipped rather than counted or treated as a clear, so the floor never
@@ -48,6 +48,7 @@ use crate::telemetry::{
     TelemetryRecord, NO_PHASE_SIGNAL_CLASS,
 };
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
 /// How far back the durable floor counts `no-phase-signal` deaths (Issue
 /// #10642): one day.
@@ -90,6 +91,23 @@ impl PrlessTally {
     }
 }
 
+/// The sidecar that persists each issue's clear instant: the journal's file
+/// name plus `.prless-clears.json`, in the same directory.
+fn clear_marks_path(journal: &Path) -> PathBuf {
+    let mut name = journal.file_name().unwrap_or_default().to_os_string();
+    name.push(".prless-clears.json");
+    journal.with_file_name(name)
+}
+
+/// Read the persisted clear instants; a missing or unreadable file is empty
+/// (the floor then falls back to the window alone, never errors).
+fn read_clear_marks(path: &Path) -> HashMap<u32, DateTime<Utc>> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 /// The durable count for one outcome, and the cause its record carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoPhaseStreak {
@@ -101,6 +119,33 @@ pub(crate) struct NoPhaseStreak {
 }
 
 impl SweepRegistry {
+    /// Note that `issue`'s tally was cleared at `at`: in memory, and in the
+    /// sidecar so the floor still honours it after a daemon restart.
+    pub(crate) fn note_prless_cleared(&mut self, issue: u32, at: DateTime<Utc>) {
+        self.prless_retry.note_cleared(issue, at);
+        let path = clear_marks_path(&self.config.resolve_outcome_telemetry_path());
+        let horizon = at - chrono::Duration::seconds(NO_PHASE_STREAK_WINDOW_SECS);
+        let mut marks = read_clear_marks(&path);
+        marks.retain(|_, t| *t >= horizon);
+        marks.insert(issue, at);
+        let tmp = path.with_extension("json.tmp");
+        let written = serde_json::to_vec(&marks)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&tmp, bytes)?;
+                std::fs::rename(&tmp, &path)
+            });
+        if let Err(e) = written {
+            log::warn!(
+                "could not persist PR-less clear mark for issue #{issue} to {}: {e}",
+                path.display()
+            );
+        }
+    }
+
     /// Record a PR-less release for `sweep_id`'s outcome, floored by the
     /// durable `no-phase-signal` count when that outcome is one (Issue
     /// #10642). Any other outcome is recorded exactly as
@@ -130,11 +175,14 @@ impl SweepRegistry {
         now: DateTime<Utc>,
     ) -> Option<NoPhaseStreak> {
         let window_start = now - chrono::Duration::seconds(NO_PHASE_STREAK_WINDOW_SECS);
-        let since = self
-            .prless_retry
-            .cleared_at(issue)
-            .map_or(window_start, |cleared| cleared.max(window_start));
         let path = self.config.resolve_outcome_telemetry_path();
+        let persisted = read_clear_marks(&clear_marks_path(&path))
+            .get(&issue)
+            .copied();
+        let since = [self.prless_retry.cleared_at(issue), persisted]
+            .into_iter()
+            .flatten()
+            .fold(window_start, std::cmp::max);
         let envelopes = crate::sweep_outcomes::read_all_outcome_telemetry(&path);
         streak_from(&envelopes, issue, sweep_id, since)
     }

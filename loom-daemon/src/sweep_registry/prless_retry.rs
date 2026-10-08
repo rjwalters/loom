@@ -771,7 +771,7 @@ impl SweepRegistry {
     pub(crate) fn clear_prless_retry(&mut self, issue: u32) -> bool {
         // #10642: remember WHEN, so the durable floor never counts the
         // journal records this clear just excused.
-        self.prless_retry.note_cleared(issue, Utc::now());
+        self.note_prless_cleared(issue, Utc::now());
         self.prless_retry.remove(&issue).is_some()
     }
 
