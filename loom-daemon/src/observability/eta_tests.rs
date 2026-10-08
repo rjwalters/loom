@@ -232,6 +232,7 @@ fn part_of_slice_pr_keeps_its_fleet_state_row_with_no_active_sweep() {
         state: "open".to_string(),
         body: Some(body.to_string()),
         author: None,
+        author_association: None,
         is_pull_request: true,
     };
     let repo = "rjwalters/loom";
