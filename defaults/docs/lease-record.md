@@ -193,6 +193,15 @@ pid — exactly what `--watch-pid` wants
 any one marker admits the publish; `--force` semantics are unchanged, and a
 blank marker still refuses.
 
+**Call-site parity and observable outcome (#10570).** `worktree.sh`'s
+`_wt_lease_claim` uses the same `${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}`
+chain as the CLAUDE.md recipe; it previously omitted `LOOM_AGENT_SESSION_PID`
+(falling to `$PPID`, a short-lived tool shell, so renewal self-terminated and
+the lease aged out) and sent stderr to `/dev/null`, hiding the one-line
+`lease ensure: ...` outcome. Exit 0 never certifies publication; read that line
+(`Renewing` = published and renewed; anything else = no fresh lease, so another
+host's orphan recovery may reclaim the claim after its grace period).
+
 **Why the second writer exists.** `/loom:sweep`'s in-session path dispatches
 its Builder through the Task tool, one level deep, deliberately (the skill's
 own "CRITICAL: One level deep" rule). Those Builders are subagents of the
