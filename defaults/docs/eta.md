@@ -1782,6 +1782,42 @@ extension keeps `fleet::load_all`'s `*.json` listing to snapshots alone).
   (`Tracker::set_file_snapshots`); both pass `files: Some(..)` to
   `loop_features`. Snapshots older than 120 days are dropped when the log
   grows past 20 000 entries.
+- **Diff stat (#10960 slice 1).** Each snapshot also carries `additions`,
+  `deletions` (summed over the page's entries; no extra call) and `listed`
+  (the entry count, kept even when the page is incomplete, so a PR of 100+
+  files reads as huge). Older lines parse them as unknown.
+
+#### Size and scope predictors (#10960)
+
+`eta::scope_features` derives a PR's size and scope from the same log,
+through one builder the fit (`fit::rows::Assembled::scope`, at `t - lag`)
+and serving (`Tracker::scope_features_of`, at `now - lag`, recorded on
+`eta.estimate` as `features.scope`) both call. **No heuristic reads them
+yet**: they are the size/scope block of the next fit schema (`eta-fit/v4`,
+shared with #10959's capacity block), behind one new shadow once the log
+covers a full 14-day window (about 2026-10-21; churn about 2026-10-28).
+
+| column | meaning |
+|---|---|
+| `log_lines`, `lines_known` | `ln(1 + additions + deletions)` of the PR's latest whole list before `as_of` |
+| `log_files` | `ln(1 + files)`; for a huge PR `ln(1 + listed)`, a lower bound |
+| `huge` | the latest read listed 100+ entries (paths unknown, size known to be large) |
+| `scope_known` | the latest observation is a whole list, so the flags below are known |
+| `docs_only` | every path ends `.md` / `.txt` or is under top-level `docs/` |
+| `tests_only` | every path is under a `tests/` directory or named `*_tests.rs`, `*.test.ts`, `test-*.sh` |
+| `touches_rust`, `touches_ts`, `touches_shell` | some path ends `.rs`; `.ts` / `.tsx`; `.sh` |
+| `touches_critical` | some path contains a Champion critical-file pattern (`scope_features::CRITICAL_PATTERNS`; a test pins it to `champion-pr-merge.md`'s array), so it predicts entering the critical-file hold |
+| `log_churn_7d`, `churn_known` | distinct paths of this PR touched by a repo PR that **merged** in `[as_of - 7 d, as_of)`, from those PRs' lists known before `as_of` |
+
+Unknown is never small: no read yet, no log loaded, or a later incomplete
+read gives `scope_known = 0` (an older whole list is not served as current),
+and a merged PR in the window whose list is unknown leaves the churn
+unknown rather than lower. Story points (#10896) and the pre-PR issue-size
+proxies are out of this block: the fit is PR-level. No shadow is registered
+yet, so the land-heuristic budget (14 of `DEFAULT_MAX_ACTIVE = 14`) is
+unchanged; the `eta-fit/v4` shadow that reads this block retires
+`land-2026-10-06-loop-kite` (or names the shadow it displaces) once its
+walk-forward against `land-2026-10-04-twin-otter-b` shows no regression.
 
 ### Dependency-aware ETAs (#10510)
 

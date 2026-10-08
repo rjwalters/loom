@@ -813,6 +813,13 @@ pub struct Features {
     /// not in [`Features::NAMES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loops: Option<crate::eta::loop_features::LoopFeatures>,
+    /// The size and scope predictors (#10960), built by the one builder the
+    /// fit calls ([`crate::eta::scope_features`]) over the logged file lists
+    /// at `as_of − LAG`. Recorded for analysis; read by no heuristic yet.
+    /// Absent when the item has no PR or no file log is loaded, and then not
+    /// in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::eta::scope_features::ScopeFeatures>,
     /// The host's REST (`core`) rate-limit calls left (#10232).
     #[serde(default)]
     pub ratelimit_core_remaining: Option<u32>,

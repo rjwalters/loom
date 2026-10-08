@@ -93,6 +93,7 @@ fn assembled(n: usize, exits: usize) -> Assembled {
         priority: Vec::new(),
         priority_inputs,
         loops,
+        scope: Vec::new(),
         stats: RowStats::default(),
         data_through: fit_as_of(),
     }

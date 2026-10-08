@@ -156,6 +156,7 @@ pub mod regime;
 pub mod repo_priority;
 pub mod retire_filing;
 pub mod roster_history;
+pub mod scope_features;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
