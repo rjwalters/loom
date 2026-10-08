@@ -1,0 +1,34 @@
+{
+  "alert": "Loom host worktree disk low",
+  "alertType": "LOGS_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "10m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "SELECT toStartOfInterval(toDateTime(intDiv(timestamp, 1000000000)), INTERVAL 1 MINUTE) AS ts,\n       if(JSONExtractString(body, 'host_id') != '', JSONExtractString(body, 'host_id'), attributes_string['loom.record.host_id']) AS host,\n       max(toUInt8(JSONExtractFloat(body, 'worktree_root_free_gb') < 30\n                   OR (JSONExtractFloat(body, 'worktree_root_total_gb') > 0\n                       AND JSONExtractFloat(body, 'worktree_root_free_gb') / JSONExtractFloat(body, 'worktree_root_total_gb') < 0.1))) AS value\nFROM signoz_logs.distributed_logs_v2\nWHERE resources_string['service.name'] = 'loom-ui-d1-export'\n  AND JSONExtractString(body, 'kind') = 'host.health'\n  AND JSONHas(body, 'worktree_root_free_gb')\n  AND timestamp >= {{.start_timestamp_nano}}\n  AND timestamp < {{.end_timestamp_nano}}\nGROUP BY ts, host\nORDER BY ts",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "2",
+    "target": 0
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "host_disk_low"
+  },
+  "annotations": {
+    "summary": "Loom host worktree disk low",
+    "description": "Host {{$labels.host}} reports worktree_root_free_gb below 30 GB or below 10% of worktree_root_total_gb in every host.health record for 10 min (loom-ui-d1-export). A host with no worktree_root_free_gb is unknown, not low. Free space: `loom-daemon clean`/`loom-clean --force`, see troubleshooting.md 'Worker disk full'. Issue #10973."
+  },
+  "disabled": false
+}
