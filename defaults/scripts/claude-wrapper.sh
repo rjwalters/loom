@@ -202,6 +202,11 @@ _write_exit_sidecar() {
     fi
 }
 
+# #10830: keep the pinned session id in a non-exported local and drop the env
+# var, so the claude CLI (and every Bash call it makes) never inherits it.
+_PINNED_SESSION_ID="${LOOM_CLAUDE_SESSION_ID:-}"
+unset LOOM_CLAUDE_SESSION_ID
+
 # Logging helpers
 log_info() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [INFO] $*" >&2
@@ -2542,7 +2547,7 @@ run_with_retry() {
         # Claude refuses a second launch with an id whose transcript exists
         # ("Session ID ... is already in use"). Once it does, every retry resumes
         # the same session instead, which also keeps the id the daemon recorded.
-        compgen -G "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/${LOOM_CLAUDE_SESSION_ID:-none}.jsonl" >/dev/null && set -- "${@/#--session-id/--resume}"
+        compgen -G "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/${_PINNED_SESSION_ID:-none}.jsonl" >/dev/null && set -- "${@/#--session-id/--resume}"
         write_retry_state "running" "${attempt}"
 
         # Run Claude CLI, capturing both stdout and stderr

@@ -1269,6 +1269,13 @@ if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
     while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
     rm -f "$_resume_args_file"
 fi
+# The dispatch identity is consumed: left exported it would reach the agent's own
+# Bash calls, and a nested spawn-claude.sh would reuse the parent's session id and
+# collide on its scope unit (the scope was named at the systemd-run probe above).
+# LOOM_CLAUDE_SESSION_ID is dropped below, on the direct path only, because
+# claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
+# a nested agent shares the item's pause state.
+unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT
 
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
@@ -1418,4 +1425,5 @@ if ! command -v claude >/dev/null 2>&1; then
     exit 127
 fi
 echo "# LOOM_CLI_START runtime=claude" >&2
+unset LOOM_CLAUDE_SESSION_ID # #10830: pinned via --session-id above; must not reach nested spawns
 exec ${SLEEP_INHIBIT_WRAP[@]+"${SLEEP_INHIBIT_WRAP[@]}"} ${CPU_QUOTA_WRAP[@]+"${CPU_QUOTA_WRAP[@]}"} claude "${PASSTHROUGH_ARGS[@]}"

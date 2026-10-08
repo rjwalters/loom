@@ -1111,6 +1111,8 @@ else
     CODEX_ARGS+=(${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"})
 fi
 [[ "$HAS_PROMPT" != "true" ]] || CODEX_ARGS+=(${LOOM_RESUME_SESSION_ID:+"$LOOM_RESUME_SESSION_ID"} "$PROMPT")
+# The resume identity is consumed (argv above); a nested spawn must not inherit it (#10830).
+unset LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT
 
 # --- Session-exec invocation assembly (issue #6926) ---
 # Bare-metal: `codex <CODEX_ARGS...>`. Session-exec: `docker exec <container>
