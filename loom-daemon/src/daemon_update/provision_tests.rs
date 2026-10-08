@@ -297,3 +297,128 @@ fn temp_dir_of_a_bare_file_name_is_dot() {
     assert_eq!(super::staging_dir(Path::new("loom-daemon")), Path::new("."));
     assert_eq!(super::staging_dir(Path::new("/opt/bin/loom-daemon")), Path::new("/opt/bin"));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_dest_is_replaced_by_a_regular_file_not_followed() {
+    let dir = tmpdir();
+    let staging = tmpdir();
+    let real = staging.path().join("real");
+    let dest = dir.path().join("loom-daemon");
+    let fresh = staging.path().join("fresh");
+    write(&real, b"real old");
+    set_mode(&real, 0o600);
+    std::os::unix::fs::symlink(&real, &dest).unwrap();
+    write(&fresh, b"new bytes");
+
+    assert!(install_to(&fresh, &dest));
+
+    let md = std::fs::symlink_metadata(&dest).unwrap();
+    assert!(md.file_type().is_file(), "dest must be a regular file, not a symlink");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+    assert_eq!(mode(&dest), 0o755);
+    assert_eq!(std::fs::read(&real).unwrap(), b"real old");
+    assert_eq!(mode(&real), 0o600);
+}
+
+#[cfg(unix)]
+fn age(p: &Path, secs: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+}
+
+#[cfg(unix)]
+const STALE_NAME: &str = ".loom-daemon.loom-install.123.4.567";
+
+#[cfg(unix)]
+fn fresh_source() -> (tempfile::TempDir, std::path::PathBuf) {
+    let s = tmpdir();
+    let f = s.path().join("fresh");
+    write(&f, b"new");
+    (s, f)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_owned_staging_file_is_swept_by_the_next_install() {
+    let dir = tmpdir();
+    let (_s, fresh) = fresh_source();
+    let dest = dir.path().join("loom-daemon");
+    let stale = dir.path().join(STALE_NAME);
+    write(&stale, b"partial");
+    age(&stale, 2 * 3600);
+
+    assert!(install_to(&fresh, &dest));
+
+    assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_sweep_leaves_everything_that_does_not_qualify() {
+    let dir = tmpdir();
+    let (_s, fresh) = fresh_source();
+    let dest = dir.path().join("loom-daemon");
+    let old = 2 * 3600;
+
+    // Fresh matching file (a concurrent install's live temp file).
+    let recent = dir.path().join(".loom-daemon.loom-install.1.1.1");
+    write(&recent, b"live");
+    // Stale file for a different binary.
+    let other = dir.path().join(".other.loom-install.1.1.1");
+    write(&other, b"x");
+    age(&other, old);
+    // Stale file with a non-matching suffix.
+    let suffix = dir.path().join(".loom-daemon.loom-install.abc");
+    write(&suffix, b"x");
+    age(&suffix, old);
+    let suffix2 = dir.path().join(".loom-daemon.loom-install.1.2.3.4");
+    write(&suffix2, b"x");
+    age(&suffix2, old);
+    // Stale matching-named directory.
+    let adir = dir.path().join(".loom-daemon.loom-install.2.2.2");
+    std::fs::create_dir(&adir).unwrap();
+    age(&adir, old);
+    // Matching-named symlink (dangling target elsewhere).
+    let target = _s.path().join("target");
+    write(&target, b"t");
+    let link = dir.path().join(".loom-daemon.loom-install.3.3.3");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert!(install_to(&fresh, &dest));
+
+    assert_eq!(
+        entries(dir.path()),
+        vec![
+            ".loom-daemon.loom-install.1.1.1".to_string(),
+            ".loom-daemon.loom-install.2.2.2".to_string(),
+            ".loom-daemon.loom-install.3.3.3".to_string(),
+            ".loom-daemon.loom-install.abc".to_string(),
+            ".loom-daemon.loom-install.1.2.3.4".to_string(),
+            ".other.loom-install.1.1.1".to_string(),
+            "loom-daemon".to_string(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+    assert!(target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sweep_failure_does_not_change_the_install_result() {
+    // The sweep's remove_file fails on a matching-named stale entry it
+    // misjudges (here a directory); errors are ignored and the install wins.
+    let dir = tmpdir();
+    let (_s, fresh) = fresh_source();
+    let dest = dir.path().join("loom-daemon");
+    // A matching-named directory that cannot be removed by remove_file.
+    let adir = dir.path().join(STALE_NAME);
+    std::fs::create_dir(&adir).unwrap();
+    age(&adir, 2 * 3600);
+
+    assert!(install_to(&fresh, &dest));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+}

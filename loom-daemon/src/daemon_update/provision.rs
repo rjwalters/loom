@@ -151,6 +151,15 @@ exit "$rc"
 /// renamed, the install fails, the temp file is removed, and `dest` is left
 /// as it was.
 ///
+/// A symlinked `dest` is REPLACED by a regular file, not followed (same as
+/// GNU `install`): the rename swaps the directory entry, so the link's target
+/// is left untouched. Pin `LOOM_DAEMON_BIN` to the real path (for example
+/// `~/.local/bin/loom-daemon`), not to a symlink such as worker-1's
+/// `/usr/local/bin/loom-daemon`, or the link is silently turned into a file.
+///
+/// Each install first sweeps stale temp files a killed earlier install left
+/// next to `dest` (see [`sweep_stale_staging`]).
+///
 /// `true` on success, `false` on any failure.
 pub fn install_to(new_bin: &Path, dest: &Path) -> bool {
     atomic_install(new_bin, dest).is_ok()
@@ -161,6 +170,7 @@ fn atomic_install(new_bin: &Path, dest: &Path) -> std::io::Result<()> {
     // anything is created next to `dest`.
     let mut src = std::fs::File::open(new_bin)?;
     let dir = staging_dir(dest);
+    sweep_stale_staging(dir, dest);
     let (tmp_path, mut tmp) = create_staging_file(dir, dest)?;
     let staged = StagedFile(Some(tmp_path.clone()));
 
@@ -194,6 +204,74 @@ fn staging_dir(dest: &Path) -> &Path {
         _ => Path::new("."),
     }
 }
+
+/// Age after which a leftover staging file is considered orphaned.
+const STALE_STAGING_SECS: u64 = 3600;
+
+/// Does `name` look like `.{base}.loom-install.<digits>.<digits>.<digits>`?
+fn is_staging_name(name: &str, base: &str) -> bool {
+    let prefix = format!(".{base}.loom-install.");
+    let Some(rest) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Best-effort removal of orphaned `.{base}.loom-install.*` files beside
+/// `dest` (a kill between write and rename leaves one). Only regular files
+/// (not symlinks or directories) owned by the effective user and older than
+/// [`STALE_STAGING_SECS`] are removed; the age gate also protects a
+/// concurrent install's live temp file. No pid liveness (pids are reused).
+/// Every error is ignored: a sweep failure never fails an install.
+#[cfg(unix)]
+fn sweep_stale_staging(dir: &Path, dest: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(base) = dest.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let max_age = std::time::Duration::from_secs(STALE_STAGING_SECS);
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_staging_name(&name, &base) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !md.file_type().is_file() || md.uid() != euid {
+            continue;
+        }
+        let stale = md
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        out::say(&format!(
+            "Removed {removed} stale install temp file(s) next to {}",
+            dest.display()
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_stale_staging(_dir: &Path, _dest: &Path) {}
 
 /// Create a new, uniquely named temp file next to `dest`.
 ///

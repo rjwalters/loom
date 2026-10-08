@@ -223,6 +223,10 @@ Environment:
                          same resolution as loom-daemon-start.sh). When set,
                          the fresh binary is provisioned directly to this
                          exact path instead of the machine-level default.
+                         A symlinked dest is replaced by a regular file (like
+                         GNU install), so pin the real path (e.g.
+                         ~/.local/bin/loom-daemon), not a symlink such as
+                         /usr/local/bin/loom-daemon.
   LOOM_DAEMON_BIN_DIR   Machine-level install dir (default ~/.local/bin),
                          forwarded to provision-daemon.sh.
   LOOM_SKIP_STALE_ENTRY_POINT_CHECK  1/true/yes suppresses the advisory
