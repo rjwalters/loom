@@ -900,6 +900,16 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
 /// starred issues (`None` when a listing failed or the repo lists no PR).
 type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
 
+/// An unresolved repo identity (a cold-cache forge lookup that failed or timed
+/// out) is an unobserved repo: it could be in scope with open PRs, so the pass
+/// is marked incomplete rather than reading as a quiet fleet (#10898).
+fn note_slug_resolution(slug: Option<String>, listings_complete: &mut bool) -> Option<String> {
+    if slug.is_none() {
+        *listings_complete = false;
+    }
+    slug
+}
+
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
 /// when ETA is disabled.
 pub(super) async fn record(
@@ -924,9 +934,9 @@ pub(super) async fn record(
     // PR count is a lower bound rather than an observed (possibly empty) queue.
     let mut listings_complete = true;
     for root in &roots {
-        let Some(slug) =
-            super::collector::resolve_repo_slug_cached(slug_cache, &root.to_string_lossy()).await
-        else {
+        let resolved =
+            super::collector::resolve_repo_slug_cached(slug_cache, &root.to_string_lossy()).await;
+        let Some(slug) = note_slug_resolution(resolved, &mut listings_complete) else {
             continue;
         };
         if !seen.insert(slug.to_ascii_lowercase()) {

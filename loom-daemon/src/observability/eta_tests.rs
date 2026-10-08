@@ -501,3 +501,34 @@ fn an_unknown_roster_raises_nothing_and_changes_no_gating() {
     // The authority itself never takes a fallback scope.
     assert_eq!(scope_for(true, Some(&roster_of(3)), &Declared::Undeclared), None);
 }
+
+/// #10898: an unresolved repo identity is an unobserved repo, not a quiet
+/// fleet. The pass must come out incomplete, and that must keep an overdue
+/// silence alert and the liveness beat from reading a healthy empty queue.
+#[test]
+fn an_unresolved_repo_identity_makes_the_pass_incomplete() {
+    use crate::eta::emit_heartbeat::{next, SILENT_AFTER};
+    use crate::fleet_alert::eta_emit::condition;
+
+    let mut complete = true;
+    assert_eq!(note_slug_resolution(Some(REPO.into()), &mut complete).as_deref(), Some(REPO));
+    assert!(complete, "a resolved identity leaves the pass complete");
+    assert_eq!(note_slug_resolution(None, &mut complete), None);
+    assert!(!complete, "an unresolved identity marks the pass incomplete");
+
+    // Every lookup failed: zero repos, zero PRs, incomplete.
+    let cov = authority::Coverage {
+        repos: 0,
+        prs: 0,
+        complete,
+    };
+    let started = Utc::now() - chrono::Duration::hours(40);
+    let now = Utc::now();
+    let later = now + SILENT_AFTER + chrono::Duration::minutes(1);
+    let hb = next(None, "h", later, false, cov.repos as u64, cov.prs as u64, cov.complete);
+    assert!(condition(Some(&hb), later, started).is_some(), "silence must stand");
+
+    // The healthy counterpart: a successful empty listing is a quiet fleet.
+    let quiet = next(None, "h", later, false, 1, 0, true);
+    assert!(condition(Some(&quiet), later, started).is_none());
+}
