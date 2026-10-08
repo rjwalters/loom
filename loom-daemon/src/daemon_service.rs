@@ -2036,6 +2036,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Default OFF (side effects on the running process). Cloned handles here because
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
+    auto_update::removed_settings::warn_if_set(&auto_update_config);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
         let tuning = auto_update::TickTuning::resolve(&auto_update_config);
         log::info!("auto_update: enabled ({})", tuning.describe());

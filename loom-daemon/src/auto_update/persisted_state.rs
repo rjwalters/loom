@@ -7,8 +7,12 @@
 //! - **The settle ceiling** (#10418). `first_stale_since` bounds how long a
 //!   steady release stream can defer a roll, at `6 × settleSecs`. On the AWS
 //!   workers that is 24 h, and every restart started it again.
-//! - **Roll-window consumption** (#10188 item 2). A restart inside an open window
-//!   forgot the window was already used and could arm a second roll in it.
+//!
+//! (It also persisted which roll window had been used, #10188 item 2. #10885
+//! removed roll windows, and with them the `window` field: an older file's
+//! `window` key is ignored on load and dropped on the next write. The schema
+//! version is unchanged, so a rollback onto a binary that still has windows
+//! reads this binary's file, finds no `window`, and keeps the settle clocks.)
 //!
 //! (It also persisted the #8998/#9010 stall detector's state. #10831 removed
 //! that detector with the wait-for-zero roll it guarded, and with it the
@@ -35,11 +39,7 @@
 //!
 //! # What a restart keeps
 //!
-//! The roll-window consumption is always restored (when the schedule is
-//! unchanged): the restart that completes a roll is exactly the one that must
-//! not re-arm in the same window.
-//!
-//! The unsatisfiable-floor alert record (#10866) is always handed back too. It
+//! The unsatisfiable-floor alert record (#10866) is always handed back. It
 //! is valid for its floor and running version, not for a build commit, and
 //! [`FloorState::set_basis`](super::floor_roll::FloorState::set_basis) keeps it
 //! on the first tick only if both still match.
@@ -78,14 +78,12 @@ pub struct PersistedState {
     /// The settle-window clocks.
     #[serde(default)]
     pub settle: SettleClocks,
-    /// Roll-window consumption, `None` when windowing was off.
-    #[serde(default)]
-    pub window: Option<WindowConsumption>,
     /// #10866: the last unsatisfiable-floor alert, absent when no such stall
     /// stands. It outlives a binary change. An older binary ignores the key,
     /// and a file without it loads as `None`, so the schema version is
-    /// unchanged. (The drain detector's `stall` key was removed by #10831; a
-    /// file that still carries it loads, and the key is ignored.)
+    /// unchanged. (The drain detector's `stall` key was removed by #10831 and
+    /// the roll window's `window` key by #10885; a file that still carries
+    /// either loads, and the key is ignored.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_stall: Option<FloorStallState>,
 }
@@ -105,19 +103,6 @@ pub struct SettleClocks {
     /// When gate 4 first deferred in the current busy run (#4929).
     #[serde(default)]
     pub deferred_since: Option<DateTime<Utc>>,
-}
-
-/// Which roll windows have been used. Indices are relative to the schedule
-/// (`period_secs`, `offset_secs`) recorded with them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WindowConsumption {
-    /// The window period in force when saved.
-    pub period_secs: u64,
-    /// The per-host offset in force when saved.
-    pub offset_secs: u64,
-    /// Index of the latest window a roll was armed in.
-    #[serde(default)]
-    pub consumed: Option<i64>,
 }
 
 /// What loading the state file found. Every outcome but [`Self::Loaded`] means
@@ -260,7 +245,6 @@ impl AutoUpdateState {
                 first_stale_since: wall(self.first_stale_since),
                 deferred_since: wall(self.deferred_since),
             },
-            window: self.window.consumption(),
             floor_stall: self.floor.stall_state(),
         }
     }
@@ -274,13 +258,6 @@ impl AutoUpdateState {
         now_utc: DateTime<Utc>,
         binary: &str,
     ) -> String {
-        let window = match &saved.window {
-            Some(consumption) if self.window.restore_consumption(consumption) => {
-                "window consumption"
-            }
-            Some(_) => "no window consumption (the schedule changed or windowing is off)",
-            None => "no window consumption (none saved)",
-        };
         // #10866: before the binary check. A floor stall depends on the floor
         // and the running version, which `set_basis` compares on the first tick.
         let floor = match &saved.floor_stall {
@@ -296,8 +273,8 @@ impl AutoUpdateState {
         self.floor.restore_stall_state(saved.floor_stall);
         if saved.binary != binary {
             return format!(
-                "restored {window}; settle clocks DROPPED because the binary \
-                 changed ({} -> {binary}), i.e. a roll completed since they were saved{floor}",
+                "settle clocks DROPPED because the binary changed ({} -> {binary}), i.e. a roll \
+                 completed since they were saved{floor}",
                 saved.binary
             );
         }
@@ -314,7 +291,7 @@ impl AutoUpdateState {
         self.deferred_since = instant(deferred_since);
         let since = first_stale_since
             .map_or_else(|| "none".to_string(), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        format!("restored settle clocks (streak since {since}), {window}{floor}")
+        format!("restored settle clocks (streak since {since}){floor}")
     }
 
     /// Enable persistence at `path` and restore whatever it holds. Logs exactly
@@ -340,7 +317,7 @@ impl AutoUpdateState {
             }
             LoadOutcome::Corrupt(why) => log::warn!(
                 "auto_update: saved update state at {shown} is corrupt ({why}); starting empty — \
-                 the settle ceiling and window consumption restart from now"
+                 the settle ceiling restarts from now"
             ),
             LoadOutcome::UnknownVersion(version) => log::warn!(
                 "auto_update: saved update state at {shown} has schema_version {version}, this \
@@ -350,26 +327,13 @@ impl AutoUpdateState {
         self.persist = Persistence { path: Some(path) };
     }
 
-    /// Called just before the tick starts a roll: record the roll window it
-    /// consumes and persist, ahead of the restart the roll may perform at once.
-    /// Pass the result to [`Self::end_roll_arm`].
-    #[must_use]
-    pub(super) fn begin_roll_arm(&mut self, outcome: &RebuildOutcome) -> Option<Option<i64>> {
-        if !matches!(outcome, RebuildOutcome::Success) {
-            return None; // nothing is armed after a failed roll
-        }
-        let prior = self.window.mark_armed();
-        if prior.is_some() {
+    /// Called just before the tick arms a roll: write the state ahead of the
+    /// restart the roll may perform at once, which the end-of-tick save would
+    /// not survive. Nothing is armed after a failed install, so nothing is
+    /// written for one.
+    pub(super) fn persist_before_arm(&self, outcome: &RebuildOutcome) {
+        if matches!(outcome, RebuildOutcome::Success) {
             self.persist_state();
-        }
-        prior
-    }
-
-    /// Called after the arm attempt: a drain that was not armed gives the
-    /// window back. The end-of-tick save then records the corrected state.
-    pub(super) fn end_roll_arm(&mut self, prior: Option<Option<i64>>, armed: bool) {
-        if let (false, Some(prior)) = (armed, prior) {
-            self.window.unmark_armed(prior);
         }
     }
 
@@ -383,7 +347,7 @@ impl AutoUpdateState {
         if let Err(e) = store(path, &state) {
             log::warn!(
                 "auto_update: could not persist update state to {}: {e} (a restart now resets \
-                 the settle ceiling and window consumption)",
+                 the settle ceiling)",
                 path.display()
             );
         }
