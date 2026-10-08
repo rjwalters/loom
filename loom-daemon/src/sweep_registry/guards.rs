@@ -2725,14 +2725,15 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            6,
+            7,
             "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
              probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
              nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
              `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
              the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
-             (an unverifiable state fails open to the restore) — then the edit — 5 calls) to \
-             invoke gh six times total; got cwds: {cwds:?}"
+             (an unverifiable state fails open to the restore) — Issue #10955's label-history \
+             read (an empty history fails open to the restore) — then the edit — 6 calls) to \
+             invoke gh seven times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
