@@ -133,11 +133,11 @@
 #       hold; stderr carries the repair command (#10581)
 #   9 - the per-PR verdict lock is held by another verdict transaction on
 #       this host (loom-daemon forge verdict-lock, #10581); nothing was posted
-#  10 - approval refused: the resolved loom-daemon lacks the #10581 verdict
-#       verbs (a capability probe, not a version guess); stderr names the
-#       binary and its --version. Roll loom-daemon. Nothing was posted. A
-#       changes-requested verdict on such a daemon takes the legacy path
-#       instead (posted, labels via gh pr edit, loud warning).
+#
+#   A resolved loom-daemon without the #10581 verdict verbs (a capability
+#   probe, not a version guess) takes the legacy path for either verdict: the
+#   pre-#10581 posting plus a `gh pr edit` label flip, with a loud warning
+#   naming the binary and its --version. Its exits are 0 / 1 / 5 / 8 above.
 #
 # NOTE: GitHub-specific (uses `gh pr comment`), like create-pr.sh /
 # merge-pr.sh. On a Gitea forge, post the equivalent comment via that forge's
@@ -453,9 +453,10 @@ FULL_BODY="$FULL_BODY
 # binary that will run them, so the answer never depends on a version number
 # (which cannot name the release a PR lands in). A binary without them (scripts
 # rolled ahead of the daemon; in the loom repo .loom/scripts symlinks into
-# defaults/scripts, so a `git pull` is a script roll) refuses an approval
-# (exit 10) and posts a changes-requested on the legacy path below; neither
-# reaches the lock, so exit 9 keeps meaning "the lock is held".
+# defaults/scripts, so a `git pull` is a script roll, possibly ahead of the daemon
+# release) posts either verdict on the legacy path below: main's pre-#10581
+# behaviour, so a script roll never stalls the fleet's approvals. It takes no
+# lock, so exit 9 keeps meaning "the lock is held".
 MISSING_VERBS=""
 for verb in verdict-lock verdict-gate verdict-labels verdict-reconcile; do
   "${LOOM_DAEMON_BIN:-loom-daemon}" forge "$verb" --help >/dev/null 2>&1 || MISSING_VERBS="$MISSING_VERBS forge $verb"
@@ -463,23 +464,11 @@ done
 if [[ -n "$MISSING_VERBS" ]]; then
   BIN_VERSION="$("${LOOM_DAEMON_BIN:-loom-daemon}" --version 2>/dev/null)" || BIN_VERSION=""
   WHY="the daemon binary $(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" || echo "${LOOM_DAEMON_BIN:-loom-daemon} (not found)") (version: ${BIN_VERSION%%$'\n'*}) lacks${MISSING_VERBS} (#10581)"
-  # An approval on such a binary is refused outright: exit 10, nothing posted.
-  if [[ "$VERDICT" == "approved" ]]; then
-    echo "post-verdict.sh: REFUSING to post an approval on PR #$PR: $WHY. Roll loom-daemon to a build that includes #10684, then ./.loom/scripts/resync-installed.sh. Nothing was posted." >&2
-    exit 10
-  fi
-  # changes-requested without the verbs: post through the shared transport, then
-  # the exclusive transition verdict-labels would make. It cannot merge anything,
-  # so availability wins over the gate (no lock, gate or arbitration); loudly.
-  echo "post-verdict.sh: WARNING — $WHY. Posting the changes-requested verdict on PR #$PR on the legacy path (no verdict gate, lock or cross-host arbitration); roll loom-daemon to a build that includes #10684." >&2
-  source "$SCRIPT_DIR/lib/forge-helpers.sh"
-  forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1
-  forge_gh_perm_safe pr edit "$PR" --repo "$REPO" --add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing >/dev/null && exit 0
-  echo "post-verdict.sh: the changes-requested verdict on PR #$PR is posted, but its label transition did not complete. Repair: gh pr edit $PR --repo $REPO --add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing" >&2
-  exit 8
+  echo "post-verdict.sh: WARNING — $WHY. Posting the $VERDICT verdict on PR #$PR on the legacy path (no verdict gate, lock, cross-host arbitration or exclusive verdict-label gating); roll loom-daemon to a build that includes #10684 to get them." >&2
+else
+  "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock: another verdict transaction on PR #$PR holds it on this host (or the lock directory is unwritable); nothing was posted (#10581). Retry on a later pass." >&2; exit 9; }
+  trap '"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock release "$PR" --repo "$REPO"' EXIT
 fi
-"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock: another verdict transaction on PR #$PR holds it on this host (or the lock directory is unwritable); nothing was posted (#10581). Retry on a later pass." >&2; exit 9; }
-trap '"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock release "$PR" --repo "$REPO"' EXIT
 # Final compare (#10485): the head must still be the reviewed one right before
 # the write; an unreadable head is a refusal, never a pass.
 if [[ "$VERDICT" == "approved" ]]; then
@@ -493,12 +482,26 @@ fi
 # verdict posts via the daemon chokepoint when a binary resolves — dashboard
 # footer included — and via the gh ladder when it does not.
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
+# The legacy path (no verdict verbs, see the probe above): post, then the label
+# flip the Judge used to make by hand. loom:ci-failure is left as it is; the
+# exact-head CI gate above already refused an approval on a red head.
+if [[ -n "$MISSING_VERBS" ]]; then
+  if [[ "$VERDICT" == "approved" ]]; then
+    LEGACY_LABELS=(--add-label loom:pr --remove-label loom:changes-requested --remove-label loom:review-requested --remove-label loom:reviewing)
+  else
+    LEGACY_LABELS=(--add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing)
+  fi
+  forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1
+  forge_gh_perm_safe pr edit "$PR" --repo "$REPO" "${LEGACY_LABELS[@]}" >/dev/null && exit 0
+  echo "post-verdict.sh: the $VERDICT verdict on PR #$PR is posted, but its label transition did not complete. Repair: gh pr edit $PR --repo $REPO ${LEGACY_LABELS[*]}" >&2
+  exit 8
+fi
 # Verdict gate + label transition (#10581): the logic is the daemon's
 # (loom_daemon::verdict_gate); only a positive sentinel lets an approval post.
 # The verdict verbs (verdict-gate/-labels/-lock/-reconcile, #10581) first ship in
 # the build that merges #10684; no version floor is declared for them, because the
 # capability probe above checks them on the resolved binary. Roll loom-daemon
-# before (or with) these scripts: an approval on a daemon without them exits 10.
+# before (or with) these scripts: until then, verdicts take the legacy path.
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;

@@ -717,19 +717,32 @@ assert_contains "$OUTPUT" "gh pr edit 328 --repo owner/repo --remove-label loom:
 
 # --- T17: a daemon without the #10581 verbs (capability probe, round 2) -----
 
-# An approval is refused before the lock: exit 10 (not 9), naming the binary
-# and its --version, nothing posted, no verdict verb called.
+# An approval posts on the legacy path (round 4: main's pre-#10581 behaviour,
+# so a script roll ahead of the daemon release never stalls approvals), loudly,
+# naming the binary and its --version; no verdict verb is called.
 reset_state
 touch "$STUB_DIR/old-daemon"
 run_pv 330 approved abc1234 --body "ok"
-assert_eq "10" "$EXIT_CODE" "verb-less daemon + approval -> exit 10 (distinct from a held lock's 9)"
+assert_eq "0" "$EXIT_CODE" "verb-less daemon + approval -> posted on the legacy path"
+assert_contains "$OUTPUT" "legacy path" "the degraded path is loud"
 assert_contains "$OUTPUT" "$STUB_DIR/loom-daemon" "names the resolved binary"
 assert_contains "$OUTPUT" "loom-daemon 0.19.870 (mock)" "names the binary's own --version"
 assert_contains "$OUTPUT" "forge verdict-lock" "names the missing verbs"
-assert_contains "$OUTPUT" "Roll loom-daemon" "says to roll the daemon"
+assert_contains "$OUTPUT" "roll loom-daemon" "says to roll the daemon"
 assert_not_contains "$OUTPUT" "older than" "no guessed version floor"
-no_comment "verb-less daemon (approve)"
+assert_eq "330" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "approval comment posted"
+assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=approved" "the verdict-sha marker is still appended"
 assert_eq "" "$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "verb-less daemon: no lock, gate or label call"
+assert_contains "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "pr edit 330 --repo owner/repo --add-label loom:pr --remove-label loom:changes-requested --remove-label loom:review-requested --remove-label loom:reviewing" "legacy path: the approval label flip"
+
+# The legacy approval still runs the #10485 final head compare.
+reset_state
+touch "$STUB_DIR/old-daemon"
+echo "fffffff0000000000000000000000000000000ff" > "$STUB_DIR/final-head"
+run_pv 333 approved abc1234 --body "ok"
+assert_eq "5" "$EXIT_CODE" "verb-less daemon + moved head -> exit 5"
+no_comment "verb-less daemon (moved head)"
+assert_eq "" "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "moved head: no label flip"
 
 # A changes-requested still posts, on the legacy path, loudly.
 reset_state

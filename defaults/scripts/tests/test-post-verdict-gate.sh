@@ -277,17 +277,27 @@ exec "$REAL_DAEMON" "\$@"
 OLD
 chmod +x "$STUB_DIR/old-daemon"
 
-echo "== a daemon without the verdict verbs refuses an approval, distinct from a held lock =="
-state "[]" loom:review-requested loom:reviewing
+echo "== a daemon without the verdict verbs posts an approval on the legacy path (round 4) =="
+state "[]" loom:review-requested loom:reviewing loom:changes-requested loom:ci-failure
 LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" pv 10720 approved "$HEAD" --body "Approved."
-check "exit 10 (a held lock is 9)" 10 "$RC"
+check "exit 0 (main's pre-#10581 approval behaviour)" 0 "$RC"
+contains "loud warning" "$OUT" "legacy path"
 contains "names the binary" "$OUT" "$STUB_DIR/old-daemon"
 contains "names its --version" "$OUT" "loom-daemon 0.19.870 (pre-10581)"
 contains "names the missing verbs" "$OUT" "forge verdict-lock forge verdict-gate forge verdict-labels forge verdict-reconcile"
-contains "says roll the daemon" "$OUT" "Roll loom-daemon"
-check "nothing posted" "" "$POSTED"
-check "labels untouched" "loom:review-requested loom:reviewing " "$LABELS"
+contains "says roll the daemon" "$OUT" "roll loom-daemon to a build that includes #10684"
+check "comment posted" 10720 "$POSTED"
+contains "verdict marker on the posted body" "$(jq -r '.[-1].body' "$STUB_DIR/comments.json")" "verdict=approved -->"
+check "ends with loom:pr; loom:ci-failure is left alone" "loom:ci-failure loom:pr " "$LABELS"
 check "no lock taken" "" "$(ls "$STUB_DIR/locks" 2>/dev/null)"
+
+echo "== the legacy approval still refuses a moved head (exit 5) =="
+state "[]" loom:review-requested
+printf %s "$HEAD" > "$STUB_DIR/cur-sha"
+OUT="$(LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" "$POST_VERDICT" 10723 approved "$MOVED" --body "Approved." 2>&1)"; RC=$?
+check "exit 5" 5 "$RC"
+check "nothing posted" "" "$(cat "$STUB_DIR/posted.log" 2>/dev/null)"
+check "labels untouched" "loom:review-requested " "$(tr '\n' ' ' < "$STUB_DIR/labels.txt")"
 
 echo "== a daemon without the verdict verbs still posts changes-requested (legacy path) =="
 state "[]" loom:pr loom:reviewing loom:review-requested loom:ci-failure
