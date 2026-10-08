@@ -642,21 +642,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::AutoUpdateTick(_) | TelemetryRecord::TokenRankingRefresh(_) => {
-            // Issue #10414: one self-update decision, stamped at the tick's
-            // start; the body is the record's JSON. Issue #10744: one
-            // token-ranking refresh round, same shape.
-            let (event_name, severity, at, attributes, body) =
-                auto_update::log_parts(&envelope.record)
-                    .or_else(|| token_ranking::log_parts(&envelope.record))?;
-            time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::PassSummary(_) | TelemetryRecord::PassVerdict(_) => {
-            // Issue #10752: one pass / one artifact verdict, stamped when
-            // decided; the body is the record's JSON.
-            let (event_name, severity, at, attributes, body) = pass::log_parts(&envelope.record)?;
+        TelemetryRecord::AutoUpdateTick(_)
+        | TelemetryRecord::TokenRankingRefresh(_)
+        | TelemetryRecord::PassSummary(_)
+        | TelemetryRecord::PassVerdict(_) => {
+            // One record, stamped at its own time; the body is the record's
+            // JSON. Issue #10414: one self-update decision (the tick's start).
+            // Issue #10744: one token-ranking refresh round (the round's
+            // start). Issue #10752: one pass / one artifact verdict (when
+            // decided). Each `log_parts` is `None` for every other kind.
+            let r = &envelope.record;
+            let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
+                .or_else(|| token_ranking::log_parts(r))
+                .or_else(|| pass::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
