@@ -240,6 +240,9 @@ path = "defaults/.claude/commands/loom/judge.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "pr.commits-and-compare"
@@ -279,6 +282,9 @@ path = "loom-daemon/src/forge_tree_unchanged.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/blame-issue.sh"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "git.fetch-branch"
