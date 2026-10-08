@@ -3008,7 +3008,8 @@ not one per host.
   them: `"all"` keeps the other hosts silent (the healthy case); a list of
   `owner/repo` slugs silences just those; **undeclared is unverifiable, so
   other hosts keep emitting every roster repo they manage** (duplicates, each
-  stamped with its emitter in `loom.eta.authority`, beat 28 of 30 repos
+  stamped with its emitter in `loom.eta.fallback` (never `loom.eta.authority`,
+  so a fallback host cannot read as the authority emitting, #10898), beat 28 of 30 repos
   missing). Re-evaluated every pass. `eta doctor` (`config.authority_coverage`)
   reports the last recorded authority pass against the roster.
   Workspace-less authority coverage is Slice 2.

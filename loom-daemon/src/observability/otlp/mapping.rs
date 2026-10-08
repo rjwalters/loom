@@ -621,7 +621,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // daemon saw it (knowable-at).
             let (event_name, severity, at, mut attributes, body) =
                 eta::log_parts(&envelope.record)?;
-            eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
+            eta::push_authority(
+                &mut attributes,
+                &envelope.record,
+                &envelope.host_id,
+                crate::observability::eta::emitting_as_fallback(),
+            );
             time_unix_nano = at;
             if let Some(observed) = eta::observed_at(&envelope.record) {
                 observed_time_unix_nano = nanos(observed);

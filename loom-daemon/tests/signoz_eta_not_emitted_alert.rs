@@ -66,6 +66,9 @@ fn the_query_reads_the_signals_the_emitters_produce_and_is_window_bounded() {
     for needle in [
         "signoz_logs.logs_v2",
         "loom.eta.estimate_id",
+        "loom.eta.outcome",
+        "loom.eta.authority",
+        "loom.eta.fallback",
         "loom.forge.stage_items",
         "review_requested",
         "{{.start_timestamp_ms}}",
@@ -142,6 +145,29 @@ fn estimate_log(ts_ms: i64) -> String {
     format!(
         "INSERT INTO signoz_logs.logs_v2 (timestamp, body, attributes_string) VALUES \
          ({}, '{{}}', map('loom.eta.estimate_id', 'e-{ts_ms}'));\n",
+        ts_ms * 1_000_000
+    )
+}
+
+/// An `eta.estimate` from a #10897 fallback host: it covers repos the
+/// authority is not declared to cover, and is stamped `loom.eta.fallback`
+/// (never `loom.eta.authority`) by `push_authority`.
+fn fallback_estimate_log(ts_ms: i64) -> String {
+    format!(
+        "INSERT INTO signoz_logs.logs_v2 (timestamp, body, attributes_string) VALUES \
+         ({}, '{{}}', map('loom.eta.estimate_id', 'e-{ts_ms}', 'loom.eta.fallback', \
+         'loom-worker-2'));\n",
+        ts_ms * 1_000_000
+    )
+}
+
+/// An `eta.outcome`: it carries `loom.eta.estimate_id` too, but it is a
+/// resolution, not an estimate arriving.
+fn outcome_log(ts_ms: i64) -> String {
+    format!(
+        "INSERT INTO signoz_logs.logs_v2 (timestamp, body, attributes_string) VALUES \
+         ({}, '{{}}', map('loom.eta.estimate_id', 'e-{ts_ms}', 'loom.eta.outcome', 'hit', \
+         'loom.eta.authority', 'loom-worker-1'));\n",
         ts_ms * 1_000_000
     )
 }
@@ -223,4 +249,53 @@ fn estimates_outside_the_half_open_window_do_not_count() {
 fn non_review_stages_are_not_open_prs() {
     let out = values(&open_prs(1, "building", 9));
     assert!(!fires(&out), "building issues are not review-stage PRs: {out:?}");
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn outcomes_alone_are_not_estimates_arriving() {
+    let scenario =
+        format!("{}{}", open_prs(1, "review_requested", 3), outcome_log(START_MS + 600_000));
+    let out = values(&scenario);
+    assert!(fires(&out), "an eta.outcome must not read as an estimate emitted: {out:?}");
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn estimates_without_the_authority_stamp_do_not_mask_a_silent_authority() {
+    // A pre-#10498 host still emitting while the real authority is silent.
+    let scenario = format!(
+        "{}{}",
+        open_prs(1, "review_requested", 3),
+        unstamped_estimate_log(START_MS + 600_000)
+    );
+    let out = values(&scenario);
+    assert!(fires(&out), "unstamped estimates must not mask silence: {out:?}");
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn a_fallback_host_emitting_for_other_repos_does_not_mask_a_silent_authority() {
+    // The authority has no exporter; a fallback host keeps emitting for other
+    // repos while PRs are open on the authority's repos.
+    let scenario = format!(
+        "{}{}",
+        open_prs(1, "review_requested", 3),
+        fallback_estimate_log(START_MS + 600_000)
+    );
+    let out = values(&scenario);
+    assert!(fires(&out), "fallback estimates must not mask a silent authority: {out:?}");
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn a_fallback_host_does_not_suppress_a_healthy_authority_either() {
+    let scenario = format!(
+        "{}{}{}",
+        open_prs(1, "review_requested", 3),
+        fallback_estimate_log(START_MS + 600_000),
+        estimate_log(START_MS + 900_000)
+    );
+    let out = values(&scenario);
+    assert!(!fires(&out), "an emitting authority must read healthy: {out:?}");
 }

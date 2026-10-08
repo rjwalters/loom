@@ -56,13 +56,17 @@ fn opt_int(attributes: &mut Vec<KeyValue>, key: &str, value: Option<i64>) {
 
 /// #10498: only the fleet's ETA authority emits estimates, outcomes and
 /// stage outcomes (#10929), so the emitting host *is* the authority. Pushes
-/// `loom.eta.authority` for those three kinds; a no-op for every other record. Kept here, not in the caller,
+/// `loom.eta.authority` for those three kinds; a no-op for every other record.
+/// #10898: a #10897 fallback host emits too, but is not the authority: it gets
+/// `loom.eta.fallback` instead, so its traffic can never read as the authority
+/// emitting. Kept here, not in the caller,
 /// because this file is the one place `loom.eta.*` attributes are produced
 /// (`tests/eta_artifacts.rs` scans it).
 pub(super) fn push_authority(
     attributes: &mut Vec<KeyValue>,
     record: &TelemetryRecord,
     host_id: &str,
+    fallback: bool,
 ) {
     if matches!(
         record,
@@ -70,7 +74,12 @@ pub(super) fn push_authority(
             | TelemetryRecord::EtaOutcome(_)
             | TelemetryRecord::EtaStageOutcome(_)
     ) {
-        attributes.push(kv_string("loom.eta.authority", host_id.to_string()));
+        let key = if fallback {
+            "loom.eta.fallback"
+        } else {
+            "loom.eta.authority"
+        };
+        attributes.push(kv_string(key, host_id.to_string()));
     }
 }
 
@@ -488,6 +497,18 @@ mod tests {
             .find(|kv| kv.key == key)
             .and_then(|kv| kv.value.as_ref())
             .and_then(|v| v.value.clone())
+    }
+
+    #[test]
+    fn a_fallback_emitter_is_not_stamped_as_the_authority() {
+        let rec = TelemetryRecord::EtaEstimate(record());
+        let keys = |fallback| {
+            let mut attributes = Vec::new();
+            super::push_authority(&mut attributes, &rec, "host-x", fallback);
+            attributes.into_iter().map(|kv| kv.key).collect::<Vec<_>>()
+        };
+        assert_eq!(keys(false), ["loom.eta.authority"]);
+        assert_eq!(keys(true), ["loom.eta.fallback"]);
     }
 
     #[test]

@@ -1234,6 +1234,13 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
 }
 
 mod authority;
+
+/// #10898: whether this host currently emits ETA records only as a #10897
+/// fallback rather than as the resolved authority.
+#[must_use]
+pub fn emitting_as_fallback() -> bool {
+    authority::is_fallback()
+}
 mod estimate_pass;
 use estimate_pass::estimate_locked;
 #[path = "eta_marker_pass.rs"]
