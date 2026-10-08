@@ -529,10 +529,14 @@ pub struct ArtifactInfo {
     pub asset_sha256: Option<String>,
     /// The release target triple this host resolved to.
     pub target: Option<String>,
-    /// The installed binary's version, as `loom-daemon --version` reports it.
+    /// The version the verdict compares against: since #10710 the RUNNING
+    /// process's own version (see [`native_probe::with_running_basis`]).
     pub installed_version: Option<String>,
-    /// The installed binary's own sha256 (of the file on disk).
+    /// The on-disk binary's sha256 — only when it is the running version's
+    /// file; `None` when a different version is staged there (#10710).
     pub installed_sha256: Option<String>,
+    /// The on-disk binary's `--version` — diagnostic only (#10710).
+    pub on_disk_version: Option<String>,
 }
 
 /// The result of one artifact-resolution attempt.
@@ -1351,7 +1355,10 @@ impl AutoUpdateState {
         let (target, why) = match verdict {
             ArtifactVerdict::UpToDate { version, why } => {
                 self.clear_tracking();
-                return TickDecision::Skip(format!("artifact {version}: {why} → up to date"));
+                let staged = native_probe::staged_note(info);
+                return TickDecision::Skip(format!(
+                    "artifact {version}: {why}{staged} → up to date"
+                ));
             }
             ArtifactVerdict::StaleRepo {
                 artifact,
@@ -1372,8 +1379,9 @@ impl AutoUpdateState {
             } => (
                 artifact_target_id(&artifact, info),
                 format!(
-                    "artifact {artifact} > installed {} → fetching",
-                    installed.as_deref().unwrap_or("<none>")
+                    "artifact {artifact} > installed {}{} → fetching",
+                    installed.as_deref().unwrap_or("<none>"),
+                    native_probe::staged_note(info)
                 ),
             ),
             ArtifactVerdict::ShaDiffers {

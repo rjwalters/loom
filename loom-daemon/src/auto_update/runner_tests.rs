@@ -104,6 +104,7 @@ fn newer(version: &str, installed: &str) -> ArtifactResolution {
         target: Some("x86_64-unknown-linux-gnu".to_string()),
         installed_version: Some(installed.to_string()),
         installed_sha256: Some("b".repeat(64)),
+        on_disk_version: None,
     })
 }
 
