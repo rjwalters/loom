@@ -245,8 +245,17 @@ fn changed_paths(worktree: &Path) -> Option<Vec<String>> {
         git_out(worktree, &["merge-base", "HEAD", "origin/main"]).filter(|b| !b.is_empty())?;
     let mut paths = Vec::new();
     for args in [
-        &["diff", "--name-only", "-z", base.as_str(), "HEAD"][..],
-        &["diff", "--name-only", "-z", "HEAD"],
+        // `--no-renames`: a rename lists both its source and destination,
+        // so moving a file out of a scope's inputs still touches the scope.
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base.as_str(),
+            "HEAD",
+        ][..],
+        &["diff", "--no-renames", "--name-only", "-z", "HEAD"],
         &["ls-files", "--others", "--exclude-standard", "-z"],
     ] {
         let out = git_out(worktree, args)?;
@@ -261,11 +270,23 @@ fn changed_paths(worktree: &Path) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
+/// The variable `build-gate.sh` reads to drop its installer suite.
+const INSTALLER_SUITE_ENV: &str = "LOOM_BUILD_GATE_INSTALLER_SUITE";
+
 /// Environment for the gate command from the path scopes: `Some("")` drops a
 /// suite whose inputs the diff does not touch (announced on stderr); `None`
 /// removes the variable so the suite runs. Every scope runs when the changed
-/// set is unknown or empty (fail safe).
+/// set is unknown or empty (fail safe). `INSTALLER_SUITE_ENV` is always
+/// present, so a value inherited from the caller can never skip silently.
 fn scope_env(worktree: &Path) -> Vec<(String, Option<String>)> {
+    let mut env = scoped_env(worktree);
+    if !env.iter().any(|(k, _)| k == INSTALLER_SUITE_ENV) {
+        env.push((INSTALLER_SUITE_ENV.to_string(), None));
+    }
+    env
+}
+
+fn scoped_env(worktree: &Path) -> Vec<(String, Option<String>)> {
     let scopes = path_scopes(worktree);
     if scopes.is_empty() {
         return Vec::new();
@@ -696,6 +717,35 @@ mod tests {
         commit_file(d.path(), "loom-daemon/src/foo.rs");
         commit_file(d.path(), "defaults/x");
         assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
+    }
+
+    #[test]
+    fn rename_out_of_inputs_counts_as_changed() {
+        let d = scoped_repo();
+        commit_file(d.path(), "defaults/docs/x.md");
+        git_in(d.path(), &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(d.path(), &["mv", "defaults/docs/x.md", "x.md"]);
+        // Staged rename (the `diff HEAD` leg) …
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
+        // … and committed (the merge-base leg).
+        git_in(d.path(), &["commit", "-q", "-m", "mv"]);
+        assert!(matches!(run_in_episode(d.path(), "e2"), Verdict::Failed { .. }));
+    }
+
+    #[test]
+    fn installer_suite_env_is_always_set_explicitly() {
+        let unset = (INSTALLER_SUITE_ENV.to_string(), None);
+        // No scopes configured, and only malformed scopes: removed, never inherited.
+        let d = repo(Some(r#"{"enabled":true,"command":"true"}"#));
+        assert_eq!(scope_env(d.path()), vec![unset.clone()]);
+        let d = repo(Some(
+            r#"{"enabled":true,"command":"true","preflightPathScopes":[{"env":"LOOM_BUILD_GATE_INSTALLER_SUITE"}]}"#,
+        ));
+        assert_eq!(scope_env(d.path()), vec![unset.clone()]);
+        // A configured scope that runs: removed exactly once.
+        let d = scoped_repo();
+        commit_file(d.path(), "defaults/x");
+        assert_eq!(scope_env(d.path()), vec![unset]);
     }
 
     #[test]

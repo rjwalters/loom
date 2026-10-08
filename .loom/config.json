@@ -56,7 +56,11 @@
           "defaults/*",
           ".github/labels.yml",
           "loom-daemon/src/init/*",
+          "loom-daemon/src/worker_spawn/*",
+          "loom-daemon/src/runtime_admission*",
           "loom-daemon/src/preflight.rs",
+          "loom-daemon/src/main_health_gate.rs",
+          ".claude/settings.json",
           ".loom/config.json"
         ]
       }
