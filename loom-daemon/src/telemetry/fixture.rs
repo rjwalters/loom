@@ -173,7 +173,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
         envelopes: vec![],
         manifest: json!({
             "schema_version":1,"synthetic":true,"run_id":run_id,"host_id":host,
-            "resource_attributes":{"service.name":"loom-daemon","service.instance.id":host,"host.id":host},
+            "resource_attributes":{"service.name":"loom-daemon","service.instance.id":host,"host.id":host,"host.name":host},
             "start_time":start,"sampling":"all","backend_verification":"not_performed",
             "identity_policy":"same run-id and start-time replay identical envelopes; change run-id for a distinct trial",
             "log_identity_fields":["host.id","trace_id","span_id","time_unix_nano","event_name"],
