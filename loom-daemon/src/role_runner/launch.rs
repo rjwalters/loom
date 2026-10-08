@@ -296,6 +296,12 @@ pub(super) fn run_role_with_timeout(
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
+    // #8370: this run's Loom-owned CARGO_TARGET_DIR. `worker_spawn` creates
+    // it (or not: an operator CARGO_TARGET_DIR, no Cargo.toml); the guard
+    // removes it when this function returns, which is only ever after the
+    // child has exited or been killed, on every outcome.
+    let run_target = crate::run_target_dir::RunDirGuard::plan(workspace_root, role, &item);
+    run_target.apply(&mut cmd);
     let runtime = admission.map(|a| a.runtime.as_str());
     let session = match resume {
         None => sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime),

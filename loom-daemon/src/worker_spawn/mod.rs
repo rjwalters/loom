@@ -659,13 +659,37 @@ fn run_preflight(
     // role-runner tick or an interactive spawn (no single worktree to attribute
     // a target dir to), and a no-op on a host whose cargo output is not
     // redirected outside the worktree in the first place.
-    if let Some(dir) = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
+    let per_worktree = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
         root,
         nonempty_env("LOOM_SWEEP_CLAIM_OWNED").as_deref(),
         nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
-    ) {
-        command.env("CARGO_TARGET_DIR", &dir);
+    );
+    if let Some(dir) = &per_worktree {
+        command.env("CARGO_TARGET_DIR", dir);
         let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8458)", dir.display());
+    }
+    // #8370: every other run gets a Loom-owned dir under `.loom/targets/`, so
+    // the agent never improvises one nothing reclaims. `exec()` below keeps
+    // this pid, so the owner file names the harness for the whole run.
+    let run_id = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp());
+    let (ambient, planned, role) = (
+        nonempty_env("CARGO_TARGET_DIR"),
+        nonempty_env(crate::run_target_dir::RUN_TARGET_DIR_ENV),
+        nonempty_env("LOOM_ROLE"),
+    );
+    let run_inputs = crate::run_target_dir::SpawnInputs {
+        per_worktree: per_worktree.as_deref(),
+        ambient: ambient.as_deref(),
+        containerized: nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+        planned: planned.as_deref(),
+        role: role.as_deref(),
+        run_id: &run_id,
+    };
+    if let Some(dir) = crate::run_target_dir::decide(root, &run_inputs)
+        .and_then(|dir| crate::run_target_dir::provision(&dir, std::process::id()))
+    {
+        command.env("CARGO_TARGET_DIR", &dir);
+        let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8370)", dir.display());
     }
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {
