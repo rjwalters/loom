@@ -3,8 +3,9 @@
 //! (`observability::eta_nightly_folds`, `nightlyFolds.retirementFiling`).
 //!
 //! The rule and its evidence are [`super::shadow_lifecycle`]. This module
-//! reads the saved folds, resolves the candidates, gates on `fleet.captain`
-//! (fail-closed) and talks to the forge. It never unregisters a heuristic:
+//! reads the saved folds, resolves the candidates, gates on the folds' owner
+//! (the explicit `fleet.etaAuthority`, else `fleet.captain`, fail-closed;
+//! #10918) and talks to the forge. It never unregisters a heuristic:
 //! retiring one stays a code change (#10484).
 
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use chrono::{DateTime, Utc};
 
 use super::shadow_lifecycle::{self as lifecycle, FilingReport, ProposalForge, RetirementProposal};
 use super::{Kind, Registry, Tier};
+use crate::eta::job_owner::Owner;
 use crate::fleet_captain::CaptainGate;
 
 /// The singleton job name filing is gated under (`fleet.captain`).
@@ -69,19 +71,36 @@ pub fn require_captain(gate: &CaptainGate) -> Result<(), String> {
     Err(format!("refusing to file retirement proposals: {}", gate.message(JOB_NAME)))
 }
 
-/// File `proposals` through `forge`, **after** the captain gate. Search-then-
-/// create is not atomic on the forge, so only the captain files (#8848).
+/// Filing follows the nightly folds (#10918): the explicit ETA authority
+/// files, every other host refuses; with no explicit authority,
+/// [`require_captain`].
+///
+/// # Errors
+/// This host is not the owner.
+pub fn require_owner(owner: &Owner) -> Result<(), String> {
+    match owner {
+        Owner::Authority => Ok(()),
+        Owner::AuthorityElsewhere { authority } => Err(format!(
+            "refusing to file retirement proposals: the ETA authority ({authority}, \
+             fleet.etaAuthority) folds and files (#10918)"
+        )),
+        Owner::Captain(gate) => require_captain(gate),
+    }
+}
+
+/// File `proposals` through `forge`, **after** the owner gate. Search-then-
+/// create is not atomic on the forge, so only one host files (#8848).
 ///
 /// # Errors
 /// The gate refuses, or [`lifecycle::file_proposals`] fails.
 pub fn file_gated(
     root: &Path,
-    gate: &CaptainGate,
+    owner: &Owner,
     proposals: &[RetirementProposal],
     now: DateTime<Utc>,
     forge: &mut dyn ProposalForge,
 ) -> Result<FilingReport, String> {
-    require_captain(gate)?;
+    require_owner(owner)?;
     lifecycle::file_proposals(root, proposals, now, forge)
 }
 
@@ -95,9 +114,9 @@ pub fn file_for_root(
     host_id: &str,
     proposals: &[RetirementProposal],
 ) -> Result<FilingReport, String> {
-    let gate = crate::fleet_captain::resolve_gate_for_root(root, host_id);
-    // Refuse before anything else: a non-captain does not even look.
-    require_captain(&gate)?;
+    let owner = crate::eta::job_owner::resolve_for_root(root, host_id);
+    // Refuse before anything else: a non-owner does not even look.
+    require_owner(&owner)?;
     let Some(script) = issue_script(root) else {
         return Err(format!(
             "no executable .loom/scripts/create-issue.sh under {}",
@@ -114,7 +133,7 @@ pub fn file_for_root(
         }
     };
     let mut forge = ScriptForge { root, script, slug };
-    file_gated(root, &gate, proposals, Utc::now(), &mut forge)
+    file_gated(root, &owner, proposals, Utc::now(), &mut forge)
 }
 
 /// The scheduled run (`nightlyFolds.retirementFiling`): derive the proposals
@@ -250,6 +269,19 @@ mod tests {
     fn an_unreadable_reply_refuses_rather_than_reading_as_no_hit() {
         assert!(first_trusted_url(&policy(), b"not json").is_err());
         assert!(first_trusted_url(&policy(), b"{}").is_err());
+    }
+
+    #[test]
+    fn an_explicit_authority_files_and_the_captain_refuses() {
+        use crate::eta::job_owner::resolve;
+        assert!(require_owner(&resolve(Some("w1"), Some("cap"), "w1")).is_ok());
+        let err = require_owner(&resolve(Some("w1"), Some("cap"), "cap")).unwrap_err();
+        assert!(err.contains("ETA authority (w1"), "{err}");
+        assert!(
+            require_owner(&resolve(None, Some("cap"), "cap")).is_ok(),
+            "unchanged without it"
+        );
+        assert!(require_owner(&resolve(None, None, "cap")).is_err(), "still fail-closed");
     }
 
     #[test]

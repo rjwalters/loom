@@ -406,6 +406,26 @@ pub enum Request {
     /// the IPC handler, so the `loom-daemon status` CLI shells out to
     /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
     DaemonStatus,
+    /// `DaemonStatus` for only the named top-level sections of
+    /// `status --json` (Issue #10787, `loom-daemon status --json --section`).
+    /// The daemon runs only the build phases those sections need — notably
+    /// it skips the `O(roots)` per-root walk unless a section reads it (see
+    /// [`crate::status_section::SectionSet`]). The reply is the same
+    /// `Response::DaemonStatus`; fields of unrequested sections are
+    /// unspecified (typically their defaults) and the CLI emits only the
+    /// requested keys.
+    ///
+    /// A separate variant rather than a field on `DaemonStatus`, so the
+    /// existing `{"type":"DaemonStatus"}` frame and every client sending it
+    /// are untouched, an older daemon rejects this frame with a parse error
+    /// the CLI can name ("daemon too old for --section") instead of silently
+    /// answering with a full build, and the IPC latency metrics
+    /// (`loom.daemon.ipc.*`) label it with its own `kind`,
+    /// `DaemonStatusSections`, so cheap sectioned calls do not dilute the
+    /// full build's latency series.
+    DaemonStatusSections {
+        sections: Vec<crate::status_section::StatusSection>,
+    },
     // ========================================================================
     // Workspace Registry Requests (Issue #3926 — phase 1 of #3835)
     // ========================================================================

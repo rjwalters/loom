@@ -502,12 +502,18 @@ pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, de
     let commit = metadata.commit.as_deref().unwrap_or("unknown");
     let source = derive_loom_source(defaults_dir);
 
-    let obj = json!({
+    let mut obj = json!({
         "loom_version": version,
         "loom_commit": commit,
         "install_date": metadata.install_date,
         "installed_files": [],
     });
+    // The compatibility contract (#10716): the oldest daemon these files work
+    // with. Omitted rather than `null` when unknown; a reader treats either as
+    // "not recorded", which classifies as a resync owed.
+    if let Some(req) = &metadata.requires_daemon {
+        obj["requires_daemon"] = json!(req);
+    }
 
     match serde_json::to_string_pretty(&obj) {
         Ok(mut contents) => {
@@ -723,6 +729,7 @@ mod tests {
             version: Some(version.to_string()),
             commit: Some(commit.to_string()),
             install_date: "2026-07-27".to_string(),
+            requires_daemon: Some("0.19.772".to_string()),
         }
     }
 
@@ -743,6 +750,7 @@ mod tests {
         assert_eq!(v["loom_version"], "0.15.0");
         assert_eq!(v["loom_commit"], "ebf4fc55");
         assert_eq!(v["install_date"], "2026-07-27");
+        assert_eq!(v["requires_daemon"], "0.19.772", "#10716 contract field");
         assert!(v["installed_files"].is_array());
         // #5624: install-metadata.json is committed, so it must never carry
         // the installing machine's absolute path.
@@ -813,6 +821,7 @@ mod tests {
             version: None,
             commit: None,
             install_date: "2026-07-27".to_string(),
+            requires_daemon: None,
         };
         write_install_metadata(workspace, &meta, &defaults);
 
@@ -821,6 +830,31 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["loom_version"], "unknown");
         assert_eq!(v["loom_commit"], "unknown");
+        assert!(v.get("requires_daemon").is_none(), "an unknown claim is omitted, not null");
+    }
+
+    #[test]
+    fn written_metadata_round_trips_through_the_contract_reader() {
+        // #10716: what init writes is what the daemon's reader classifies.
+        use crate::install_compat::{classify, Compat, DaemonCompat, InstallMeta, Version};
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        let defaults = workspace.join("srcroot").join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+        write_install_metadata(workspace, &metadata("0.19.876", "abc1234"), &defaults);
+
+        let raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let meta = InstallMeta::parse(&raw).unwrap();
+        assert_eq!(meta.loom_version.as_deref(), Some("0.19.876"));
+        assert_eq!(meta.requires_daemon.as_deref(), Some("0.19.772"));
+        let daemon = DaemonCompat {
+            running: Version::parse("0.19.876").unwrap(),
+            supports_installed: Version::parse("0.19.0").unwrap(),
+            floor: None,
+        };
+        assert_eq!(classify(&meta, &daemon), Compat::Compatible);
     }
 
     #[test]

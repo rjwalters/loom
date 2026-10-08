@@ -55,7 +55,14 @@ type ItemKey = (String, String, String);
 
 /// The closed refresh-gate vocabulary: every state is emitted each pass
 /// (one at 1, the rest at 0) so a transition never leaves two states active.
-const GATE_STATES: [&str; 4] = ["captain", "stand_down", "no_captain", "disabled"];
+/// `authority`: this host refreshes as the explicit ETA authority (#10918).
+const GATE_STATES: [&str; 5] = [
+    "captain",
+    "authority",
+    "stand_down",
+    "no_captain",
+    "disabled",
+];
 
 static HEALTH: Mutex<Option<EtaHealth>> = Mutex::new(None);
 
@@ -71,7 +78,7 @@ impl EtaHealth {
     /// counts are kept from the last tick that actually refreshed.
     pub fn tick(&mut self, state: &crate::eta::health::RefreshCycleState) {
         self.tick = Some((state.started_at, state.gate.clone()));
-        if state.gate != "stand_down" {
+        if !matches!(state.gate.as_str(), "stand_down" | "disabled") {
             self.refresh_repos = state.stop_reasons.clone();
         }
     }
@@ -286,7 +293,6 @@ fn snapshot_ages(
 /// Gather the facts for `root` as of `now` from `health` (whose snapshot
 /// `as_of` cache this pass refreshes). Blocking (file reads).
 fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) -> Facts {
-    let eta = crate::eta::config::read(root);
     let snapshots = snapshot_ages(root, &mut health.ages);
     let (tick, repos, fit_check, snapshot_rows) = (
         health.tick.clone(),
@@ -299,13 +305,9 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
     // task does not run at all.
     let gate = match &tick {
         Some((_, gate)) => gate.clone(),
-        None if !super::super::eta_fleet_refresh::should_spawn(&eta) => "disabled".into(),
-        None => match crate::fleet_captain::resolve_gate_for_root(root, host_id) {
-            crate::fleet_captain::CaptainGate::Armed { .. } => "captain",
-            crate::fleet_captain::CaptainGate::Refused { .. } => "stand_down",
-            crate::fleet_captain::CaptainGate::NoCaptainDeclared => "no_captain",
-        }
-        .into(),
+        None => super::super::eta_fleet_refresh::preview_gate(root, host_id)
+            .as_str()
+            .into(),
     };
     Facts {
         now,

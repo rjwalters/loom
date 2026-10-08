@@ -128,8 +128,14 @@ pub const MIN_FLEET_REFRESH_BACKFILL_DAYS: i64 = super::fit::WINDOW_DAYS + 1;
 /// fleet snapshots fresh ahead of the daily fit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetRefreshConfig {
-    /// Run the task at all (also requires `autonomous.eta.enabled`).
+    /// Refresh on this host (also requires `autonomous.eta.enabled`). The
+    /// explicit ETA authority refreshes even when this is `false` from config
+    /// (#10918); see [`Self::env_enabled`].
     pub enabled: bool,
+    /// The raw `LOOM_ETA_FLEET_REFRESH_ENABLED` override, when set. An env
+    /// `false` is the hard stop: the task is not spawned at all, on the ETA
+    /// authority too (#10918).
+    pub env_enabled: Option<bool>,
     /// Seconds between cycles.
     pub interval_secs: u64,
     /// Forge calls per cycle for refresh passes, host-wide.
@@ -151,6 +157,7 @@ impl Default for FleetRefreshConfig {
     fn default() -> Self {
         FleetRefreshConfig {
             enabled: true,
+            env_enabled: None,
             interval_secs: DEFAULT_FLEET_REFRESH_INTERVAL_SECS,
             max_calls_per_cycle: DEFAULT_FLEET_REFRESH_MAX_CALLS,
             backfill_max_calls_per_cycle: DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS,
@@ -395,10 +402,10 @@ fn resolve_fleet_refresh(
     if let Some(v) = get("enabled").and_then(serde_json::Value::as_bool) {
         c.enabled = v;
     }
-    if let Some(v) = env("LOOM_ETA_FLEET_REFRESH_ENABLED")
+    c.env_enabled = env("LOOM_ETA_FLEET_REFRESH_ENABLED")
         .as_deref()
-        .and_then(parse_bool)
-    {
+        .and_then(parse_bool);
+    if let Some(v) = c.env_enabled {
         c.enabled = v;
     }
     let u64_key = |slot: &mut u64, key: &str, var: &str| {

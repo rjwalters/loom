@@ -40,7 +40,7 @@
 //! to replace it.
 
 use super::evidence::{self, EvidenceFacts, EvidenceOutcome};
-use super::{checksum, glibc, signature};
+use super::{checksum, glibc, signature, source};
 use crate::cmd_out::{self, CmdOutcome};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -91,6 +91,11 @@ pub struct SignaturePolicy {
     /// Optional approved workflow path for the keyless identity pin; also the
     /// "policy revision" recorded in the evidence line.
     pub approved_workflow: Option<String>,
+    /// Approved source anchor (#10473), required mode only; see [`source`].
+    pub approved_source_anchor: source::AnchorSetting,
+    /// Local adoption record for tag-movement / asset-replacement detection
+    /// (#10473); `None` disables it.
+    pub adoption_record: Option<PathBuf>,
 }
 
 impl SignaturePolicy {
@@ -98,10 +103,18 @@ impl SignaturePolicy {
     /// has no config-file knobs, see daemon-reference).
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_values(
-            std::env::var(REQUIRE_SIGNATURE_ENV).ok().as_deref(),
-            std::env::var(APPROVED_WORKFLOW_ENV).ok().as_deref(),
-        )
+        Self {
+            approved_source_anchor: source::parse_anchor(
+                std::env::var(source::APPROVED_SOURCE_ANCHOR_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            adoption_record: source::default_record_path(),
+            ..Self::from_values(
+                std::env::var(REQUIRE_SIGNATURE_ENV).ok().as_deref(),
+                std::env::var(APPROVED_WORKFLOW_ENV).ok().as_deref(),
+            )
+        }
     }
 
     #[must_use]
@@ -116,6 +129,7 @@ impl SignaturePolicy {
         Self {
             require_signature,
             approved_workflow,
+            ..Self::default()
         }
     }
 }
@@ -212,7 +226,18 @@ impl Drop for ScratchDir {
     }
 }
 
-fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], dest: &Path) -> bool {
+/// Download the assets of release `tag` matching `patterns` into `dest`
+/// (`gh release download --clobber`, through [`crate::gh_invocation::GhInvocation`]
+/// so the call is counted). `true` on success. Also used by the
+/// install-compat CI proof (`crate::install_compat_harness`).
+#[must_use]
+pub fn download(
+    repo_root: &Path,
+    repo_slug: &str,
+    tag: &str,
+    patterns: &[&str],
+    dest: &Path,
+) -> bool {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade, so the download is counted.
     let op = Operation::new("release.download");
@@ -550,6 +575,34 @@ pub(super) fn verify_core(
             return FetchOutcome::VerificationFailed { lines };
         }
     }
+    // ---- source revision / tag movement gate (#10473), same position ----
+    let asset_sha = if policy.require_signature {
+        crate::release_resolve::host::sha256_file(&bin_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let gate_inputs = source::GateInputs {
+        slug: inputs.repo_slug,
+        tag: inputs.tag,
+        target: inputs.target,
+        asset_sha256: &asset_sha,
+        anchor: &policy.approved_source_anchor,
+        record_path: policy.adoption_record.as_deref(),
+    };
+    let mut source_report = None;
+    if policy.require_signature {
+        let api = |path: &str| source::gh_api(inputs.repo_root, path);
+        match source::gate(&api, &gate_inputs) {
+            Ok(r) => source_report = Some(r),
+            Err(refusal) => {
+                facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+                facts.source = Some(refusal.partial);
+                let mut lines = refusal.lines;
+                lines.push(ABORT_LINE.to_string());
+                return FetchOutcome::VerificationFailed { lines };
+            }
+        }
+    }
 
     // ---- GLIBC compatibility: the 2026-09-24 incident's fix (#8837) ----
     //
@@ -568,6 +621,18 @@ pub(super) fn verify_core(
         };
     }
 
+    // Persist the adoption pin BEFORE the candidate is executed below: a
+    // failed write refuses the artifact rather than adopting it unpinned.
+    if let Some(report) = source_report.as_ref() {
+        if let Err(refusal) = source::record_adoption(report, &gate_inputs) {
+            facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+            facts.source = Some(refusal.partial);
+            let mut lines = refusal.lines;
+            lines.push(ABORT_LINE.to_string());
+            return FetchOutcome::VerificationFailed { lines };
+        }
+    }
+
     let version_output = read_version_output(&bin_path);
     let commit = crate::release_resolve::semver::extract_commit(&version_output);
     let had_authority = sig_result.had_authority;
@@ -580,6 +645,7 @@ pub(super) fn verify_core(
     // The `LOOM_SIGNATURE_EVIDENCE` line (required mode) is appended by
     // `evidence::fetch_and_verify_with_evidence` from these facts.
     let signature_line = sig_result.message;
+    facts.source = source_report;
     facts.signature_state = Some(signature_state);
     facts.outcome = EvidenceOutcome::Verified;
     let glibc_line = glibc_result.message;

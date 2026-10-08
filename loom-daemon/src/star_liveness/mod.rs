@@ -152,10 +152,10 @@ pub struct Settings {
     pub propagate: bool,
     /// `materializeLabels`: whether the pass writes the inherited star as the
     /// `loom:operator-priority` label (and its PR's), and takes it back once
-    /// the root loses its star (#10012 §2–§3, [`materialize`]). **Off by
-    /// default**: an opt-in until the fleet has run it, since a revert leaves
-    /// the labels it added. Needs `propagate` and `escalate` too; with it off
-    /// the inherited star stays an in-memory ordering, as before.
+    /// the root loses its star (#10012 §2–§3, [`materialize`]). **On by
+    /// default** (operator ruling on #10012); `false` (or env `0`) opts out.
+    /// Needs `propagate` and `escalate` too; with it off the inherited star
+    /// stays an in-memory ordering.
     pub materialize_labels: bool,
     /// `levelCaps`: the most open issues fleet-wide (as this host sees it)
     /// that may carry each level's operator label (#10307), by level. Over
@@ -214,7 +214,7 @@ impl Default for Settings {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
             pools_grace: Duration::from_secs(DEFAULT_POOLS_GRACE_MINUTES * 60),
             propagate: true,
-            materialize_labels: false,
+            materialize_labels: true,
             level_caps: LevelCaps::default(),
         }
     }

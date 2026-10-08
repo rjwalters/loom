@@ -172,7 +172,7 @@ echo "=== install, reinstall, and resync paths all carry the configs ==="
 # (`.claude/biome.jsonc` needs no dedicated call — setup_repository_scaffolding
 # copies the whole defaults/.claude/ tree.)
 assert_true "loom-daemon init walks defaults/.loom/ (copies .loom/biome.jsonc)" \
-  "$(grep -qE '^[[:space:]]*sync_loom_payload_tree\(&defaults' "$INIT_RS" && echo true || echo false)"
+  "$(grep -qE '^[[:space:]]*sync_loom_payload_tree\(&?defaults' "$INIT_RS" && echo true || echo false)"
 scaffolded_line="$(grep -E '^const LOOM_TREE_SCAFFOLDED_FILES: .*\];$' "$INIT_RS" || true)"
 assert_true "biome.jsonc is not diverted from the defaults/.loom/ walk" \
   "$([[ -n "$scaffolded_line" && "$scaffolded_line" != *biome.jsonc* ]] && echo true || echo false)"

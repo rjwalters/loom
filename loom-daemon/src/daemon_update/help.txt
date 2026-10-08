@@ -212,6 +212,20 @@ Environment:
                          derived keyless identity to this workflow file
                          (e.g. release.yml) instead of `[^@]+`. Default:
                          unset.
+  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR  Required-mode companion
+                         (#10473): a full 40-hex commit SHA. The release tag
+                         must resolve to it or a descendant (gh api compare:
+                         identical/ahead), else REFUSED before the candidate
+                         runs. Distinct refusals: configuration error (short
+                         or non-hex anchor), source assurance unavailable
+                         (gh/API failure -- not tampering), not a descendant
+                         of approved source, tag movement, asset replacement.
+                         The last two compare against a local adoption record
+                         (~/.loom/daemon-update/release-adoption.json) written
+                         on each required-mode success; it lives on this
+                         host, so it catches drift, not a host compromise.
+                         Default: unset (evidence reports
+                         source_check=not_configured).
   LOOM_PID_FILE         #6386: the pid file consulted for liveness detection,
                          TIER 1 -- ahead of the $PWD/machine-derived
                          "<state home>/.daemon.pid". Same precedence

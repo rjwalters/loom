@@ -188,7 +188,7 @@ fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
         "remove_with": l.remove_with, "lifecycle": l.lifecycle,
     });
     if let Some(p) = &l.propagate {
-        v["propagate"] = p.clone();
+        v["propagate"] = serde_json::to_value(p).unwrap_or_default();
     }
     v
 }

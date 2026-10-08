@@ -102,7 +102,7 @@ cat > "$STUB_DIR/watcher-report" <<'STUB'
 #!/usr/bin/env bash
 watcher=""
 for _ in $(seq 1 300); do
-    watcher="$(pgrep -f "capture-codex .*--handle-file $1 " | head -1)"
+    watcher="$(pgrep -f "capture-codex .*--handle-file $1 " | sed -n 1p)"
     [[ -z "$watcher" ]] || break
     sleep 0.1
 done
