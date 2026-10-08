@@ -144,7 +144,7 @@ use super::fleet_fetch::{history, timeline_url, ListedPr, PER_PAGE};
 use super::fleet_refresh::{self, Pass, RepoReport, StopReason, Walk};
 use super::fleet_signoz_refresh::{ClickhouseHttp, Limits, SignozRead};
 use super::fleet_signoz_timeline::{Family, ItemTimeline, Timeline};
-use super::fleet_signoz_timeline_rows::{walk, Lifecycle, Target, TimelineHttp, Transition};
+use super::fleet_signoz_timeline_rows::{walk, Lifecycle, Row, Target, TimelineHttp, Transition};
 use super::star::{is_star_label, IssueStarChange};
 use crate::forge_call_stats::ops::TIMELINE_READ;
 use crate::pr_latency::timeline::parse_timeline_page;
@@ -372,8 +372,9 @@ impl Plan {
 #[derive(Debug, Clone)]
 pub enum Load {
     Covered(Plan),
-    /// Reachable, but not back to the window's start.
-    Uncovered(String),
+    /// Reachable, but not back to the window's start; the capacity backfill
+    /// rows (#10959) are independent of that gate and still land.
+    Uncovered(String, Vec<super::capacity_log::CapacityRow>),
     /// The walk failed; never treated as covered.
     Unavailable(String),
 }
@@ -399,25 +400,37 @@ pub fn load(
             ))
         }
     };
-    let timeline = Timeline::build(&rows, listed_at);
+    from_rows(repo, &rows, (listed_at, since), history_days, capacity_have)
+}
+
+/// [`load`]'s verdict over already-walked `rows`.
+pub(super) fn from_rows(
+    repo: &str,
+    rows: &[Row],
+    (listed_at, since): (DateTime<Utc>, DateTime<Utc>),
+    history_days: i64,
+    capacity_have: &std::collections::BTreeSet<DateTime<Utc>>,
+) -> Load {
+    let timeline = Timeline::build(rows, listed_at);
+    let instants =
+        super::capacity_log::backfill_instants(&timeline, listed_at, history_days, capacity_have);
+    let capacity = super::capacity_log::backfill(rows, repo, &instants);
     for family in [Family::Labels, Family::Lifecycle] {
         if !timeline.coverage.covers(family, listed_at, history_days) {
             let first = timeline
                 .coverage
                 .first(family)
                 .map_or_else(|| "none".to_string(), |at| at.to_rfc3339());
-            return Load::Uncovered(format!(
-                "{family:?} rows start at {first}, after the {history_days}-day window's start"
-            ));
+            return Load::Uncovered(
+                format!(
+                    "{family:?} rows start at {first}, after the {history_days}-day window's start"
+                ),
+                capacity,
+            );
         }
     }
     let mut covered = plan(&timeline, listed_at, since);
-    let instants = super::capacity_log::missing_instants(
-        listed_at - Duration::days(history_days),
-        listed_at,
-        capacity_have,
-    );
-    covered.capacity = super::capacity_log::backfill(&rows, repo, &instants);
+    covered.capacity = capacity;
     Load::Covered(covered)
 }
 
@@ -721,7 +734,10 @@ impl Walk<'_> {
                 }
                 Some(plan)
             }
-            Load::Uncovered(why) => {
+            Load::Uncovered(why, capacity) => {
+                if let Err(e) = super::capacity_log::append(self.root, &capacity) {
+                    log::warn!("eta fleet refresh: {repo}: could not log capacity backfill: {e}");
+                }
                 log::info!(
                     "eta fleet refresh: {repo}: SigNoz does not cover the window ({why}); \
                      forge gap-fill, at most {gap_budget} call(s) this cycle"

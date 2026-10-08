@@ -165,6 +165,30 @@ pub fn missing_instants(
     out
 }
 
+/// The grid instants of the `history_days` window ending at `listed_at` that
+/// are worth backfilling: [`missing_instants`] from the first instant at which
+/// `timeline` knows queue or CI, so a long empty prefix cannot fill every pass's
+/// [`BACKFILL_PER_PASS`] budget and pin the scan there. Empty when neither is
+/// known.
+#[must_use]
+pub fn backfill_instants(
+    timeline: &Timeline,
+    listed_at: DateTime<Utc>,
+    history_days: i64,
+    have: &BTreeSet<DateTime<Utc>>,
+) -> Vec<DateTime<Utc>> {
+    let Some(first) = [Family::Queue, Family::Ci]
+        .iter()
+        .filter_map(|f| timeline.coverage.first(*f))
+        .min()
+    else {
+        return Vec::new();
+    };
+    let window = listed_at - Duration::days(history_days);
+    let from = window.max(first - Duration::seconds(BACKFILL_STEP_SEC));
+    missing_instants(from, listed_at, have)
+}
+
 /// The families of `timeline` that do not reach back `window_days` before
 /// `cutoff` ([`super::fleet_signoz_timeline::Coverage::covers`]).
 #[must_use]

@@ -6,8 +6,8 @@ use crate::eta::capacity_features::{
     build, merge_stall, with_stall, CapacityFeatures, QUEUE_TICK_SEC, SINCE_MAIN_GREEN_CAP_SEC,
 };
 use crate::eta::capacity_log::{
-    append, backfill, backfilled_instants, latest_before, load, missing_instants, uncovered,
-    CapacityRow, Source as LogSource,
+    append, backfill, backfill_instants, backfilled_instants, latest_before, load,
+    missing_instants, uncovered, CapacityRow, Source as LogSource,
 };
 use crate::eta::fleet_signoz_refresh::{FileRows, Limits, SignozRead};
 use crate::eta::fleet_signoz_timeline::{Family, Timeline};
@@ -277,4 +277,36 @@ fn the_stall_fields_are_the_authoritys_and_merge_by_field() {
     };
     let merged = merge_stall(base, &live);
     assert_eq!((merged.slots_fleet, merged.pool_exhausted), (Some(4), Some(true)));
+}
+
+#[test]
+fn backfill_skips_an_empty_prefix_and_reaches_later_hours() {
+    // First queue observation 10 days into a 60-day window: far more than
+    // BACKFILL_PER_PASS empty hours precede it.
+    let listed = t(60 * 86_400);
+    let rows = vec![snapshot("a", 10 * 86_400, 10 * 86_400 + 5, Some(4), 1)];
+    let timeline = Timeline::build(&rows, listed);
+    let mut have = BTreeSet::new();
+    let first_pass = backfill(&rows, REPO, &backfill_instants(&timeline, listed, 60, &have));
+    assert!(!first_pass.is_empty(), "the first pass must reach knowable hours");
+    have.extend(first_pass.iter().map(|r| r.known_at));
+    let second = backfill(&rows, REPO, &backfill_instants(&timeline, listed, 60, &have));
+    assert!(second.iter().all(|r| !have.contains(&r.known_at)));
+    assert!(second
+        .iter()
+        .all(|r| r.known_at > first_pass.last().unwrap().known_at));
+}
+
+#[test]
+fn capacity_lands_when_labels_and_lifecycle_are_uncovered() {
+    use crate::eta::fleet_signoz_history::{from_rows, Load};
+    let listed = t(60 * 86_400);
+    let rows = vec![
+        snapshot("a", 10 * 86_400, 10 * 86_400 + 5, Some(4), 1),
+        run(1, "success", 10 * 86_400 + 10, 10 * 86_400 + 20, 5),
+    ];
+    match from_rows(REPO, &rows, (listed, listed - Duration::hours(1)), 60, &BTreeSet::new()) {
+        Load::Uncovered(_, capacity) => assert!(!capacity.is_empty()),
+        other => panic!("expected Uncovered, got {other:?}"),
+    }
 }
