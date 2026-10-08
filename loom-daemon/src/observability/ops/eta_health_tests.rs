@@ -45,6 +45,7 @@ fn est(issue: u32, kind: Kind, heuristic: &str, mins: i64, refused: bool) -> Est
         stage_quartiles: Vec::new(),
         tail_extrapolated: false,
         stall_cause: None,
+        stage_predictions: Default::default(),
     }
 }
 

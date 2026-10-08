@@ -32,7 +32,30 @@
           "as_of": "2026-10-01T11:58:00Z",
           "no_estimate_reason": "no_model"
         }
-      ]
+      ],
+      "stages": {
+        "review_wait": {
+          "entry_p50": 0,
+          "entry_p90": 0,
+          "dwell_p50": 2400,
+          "dwell_p90": 10800,
+          "reach_pct": 100
+        },
+        "doctor": {
+          "entry_p50": 2700,
+          "entry_p90": 9000,
+          "dwell_p50": 1800,
+          "dwell_p90": 5400,
+          "reach_pct": 30
+        },
+        "merge_wait": {
+          "entry_p50": 2700,
+          "entry_p90": 12600,
+          "dwell_p50": 600,
+          "dwell_p90": 3600,
+          "reach_pct": 100
+        }
+      }
     },
     {
       "repo": "acme/secret-app",

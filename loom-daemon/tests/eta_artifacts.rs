@@ -330,6 +330,16 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
                 no_estimate_reason: Some(loom_daemon::eta::NoEstimateReason::NoModel),
             },
         ],
+        stages: std::collections::BTreeMap::from([(
+            loom_daemon::eta::Stage::ReviewWait,
+            loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotStage {
+                entry_p50: 0,
+                entry_p90: 0,
+                dwell_p50: 2_400,
+                dwell_p90: 10_800,
+                reach_pct: 100,
+            },
+        )]),
     };
     let record = EtaSnapshotRecord {
         as_of: row.as_of,
@@ -382,6 +392,18 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         assert!(
             documented(field),
             "the eta.snapshot alternate's `{field}` is not documented in telemetry-schema.md"
+        );
+    }
+    // #10929: each per-stage forecast field, too.
+    for field in serde_json::to_value(row.stages.values().next().unwrap())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        assert!(
+            documented(field),
+            "the eta.snapshot stage forecast's `{field}` is not documented in telemetry-schema.md"
         );
     }
     // The routing decision, which is the one thing a dashboard cannot infer

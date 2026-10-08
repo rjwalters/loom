@@ -237,6 +237,19 @@ impl SweepRegistry {
             &mut cmd,
             &self.config.workspace_root,
         );
+        // #10964: opt-in, default-off — point the session's own OTLP export
+        // at this daemon's loopback relay. After the block above (which
+        // clears the endpoint it owns) and a no-op unless a receiver runs.
+        crate::observability::agent_relay::prepare_sweep_child(
+            &mut cmd,
+            &self.config.workspace_root,
+            runtime_admission.map(|a| a.runtime.as_str()),
+            match kind {
+                SweepKind::Issue(issue) => Some(*issue),
+                SweepKind::PrSet(_) => None,
+            },
+            sweep_id,
+        );
         // #9027: stamp the sweep's commits with the D33 provenance trailers
         // (a git-env hooksPath override that chains to the repo's own hooks).
         crate::provenance::hooks::prepare_child(

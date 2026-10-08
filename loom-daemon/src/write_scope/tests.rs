@@ -618,6 +618,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
+        (
+            "observability/otlp/relay/server.rs",
+            NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let writes = regex::Regex::new(
