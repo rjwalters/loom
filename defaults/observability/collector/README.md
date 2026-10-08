@@ -109,7 +109,8 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 `organization.id`, per-metric `model`, tool/event names, etc.) are **not**
 `loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
 still applies unmodified to this path — it keeps only the resource keys
-(`service.name`, `service.version`, `service.instance.id`, `host.id`) and the
+(`service.name`, `service.version`, `service.instance.id`, `host.id`,
+`host.name`) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
 `metric_statements` datapoint keys listed under "Privacy and remote
 deployment" below. Anything else Claude Code sends — including
