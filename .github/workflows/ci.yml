@@ -107,16 +107,11 @@ jobs:
     permissions:
       pull-requests: read
       actions: write
-      # The image-input checkout below (#10825).
-      contents: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
       workflows: ${{ steps.filter.outputs.workflows }}
-      # Not a paths-filter group: scripts/ci-image-inputs.sh is the one
-      # definition of an image input, shared with `changes-push` (#10825).
-      docker: ${{ steps.images.outputs.docker }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -245,11 +240,32 @@ jobs:
           echo "daemon needed=true"
           echo "needed=true" >> "$GITHUB_OUTPUT"
 
-      # Do the image jobs run? (#10825) The same script `changes-push` runs on
-      # main, so PR and push agree on what an image input is: docker/**, the
-      # .dockerignore-allowlisted private-control files under defaults/ (which
-      # the former `docker` paths group missed), the run-job seam (#7853) and
-      # ci.yml. A failed listing fails CLOSED (docker=true).
+  # Detect Image Inputs (PR): do the image jobs run on this pull request?
+  # (#10825) The same script `changes-push` runs on main, so PR and push agree
+  # on what an image input is: docker/**, the .dockerignore-allowlisted
+  # private-control files under defaults/ (which the former `docker` paths
+  # group missed), the run-job seam (#7853) and ci.yml. A failed listing fails
+  # CLOSED (docker=true).
+  #
+  # A job of its own, deliberately NOT a step of `changes`: on a PR the
+  # checkout below is the merge ref, so scripts/ci-image-inputs.sh is
+  # UNMERGED PR CODE, and `changes` holds `actions: write` for its
+  # superseded-run cancellation. Running a PR-head script there would hand a
+  # same-repository contributor a write-capable Actions token. This job's token
+  # is read-only (contents + pull-requests); keep it that way, and never run
+  # PR-head code in a job that retains a write permission.
+  changes-images:
+    # merge-group-audit: pr-only -- the image-input decision only trims PR runs; push is decided by changes-push and merge_group runs every image job unconditionally
+    name: Detect Image Inputs (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
@@ -348,8 +364,8 @@ jobs:
 
   release-build:
     name: Release Build Check
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-images]
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes-images.outputs.docker == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
@@ -2715,7 +2731,7 @@ jobs:
     # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
     # they do: always on merge_group; on push only when `changes-push` found an
     # image input since the last green push run, or did not succeed (fails
-    # closed); on a PR when `changes.docker` is true (#10825). `release-build`'s
+    # closed); on a PR when `changes-images.docker` is true (#10825). `release-build`'s
     # gate must stay a superset of this one (see its comment).
     #
     # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
@@ -2732,11 +2748,11 @@ jobs:
     # export from failing the build. The published `:latest` is not used as
     # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
     # never match.
-    needs: [changes, changes-push, release-build]
+    needs: [changes, changes-images, changes-push, release-build]
     if: >-
       always() && (github.event_name == 'merge_group' ||
       (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -2806,12 +2822,12 @@ jobs:
     # shared by all four image jobs): `merge_group` FIRST, so the merge-group
     # audit proves it runs there unconditionally; on push, `changes-push`'s
     # diff since the last green push run, run anyway unless that job
-    # succeeded with docker=false; on a PR, `changes.docker`.
-    needs: [changes, changes-push, worker-base-image]
+    # succeeded with docker=false; on a PR, `changes-images.docker`.
+    needs: [changes, changes-images, changes-push, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
       (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2855,11 +2871,11 @@ jobs:
     # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
     # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
     # published image, which a PR's Dockerfile changes are not in.
-    needs: [changes, changes-push, worker-base-image]
+    needs: [changes, changes-images, changes-push, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
       (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2904,11 +2920,11 @@ jobs:
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: [changes, changes-push, worker-base-image]
+    needs: [changes, changes-images, changes-push, worker-base-image]
     if: >-
       always() && (github.event_name == 'merge_group' ||
       (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
-      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2962,6 +2978,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - changes-images
       - changes-push
       - build-daemon
       - release-build

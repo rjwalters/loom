@@ -266,7 +266,7 @@ fn repo_ci_yml_preserves_pull_request_and_push_coverage() {
     assert!(!w.trigger("pull_request").unwrap().path_filtered);
     let r = run(&w, &[]);
     for j in &r.jobs {
-        if j.id == "changes" {
+        if j.id == "changes" || j.id == "changes-images" {
             assert!(j.pr_only_marker.is_some());
             assert_eq!(j.states[&Event::PullRequest], RunState::Runs);
             continue;

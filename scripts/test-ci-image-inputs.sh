@@ -110,17 +110,25 @@ jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
 cp = jobs["changes-push"]
 assert cp["if"].strip() == "github.event_name == 'push'", "changes-push must be push-only"
 assert any("ci-image-inputs.sh push" in s.get("run", "") for s in cp["steps"]), "changes-push must run the script"
-assert any("ci-image-inputs.sh pr" in s.get("run", "") for s in jobs["changes"]["steps"]), "changes must run the script"
+ci = jobs["changes-images"]
+assert ci["if"].strip() == "github.event_name == 'pull_request'", "changes-images must be PR-only"
+assert any("ci-image-inputs.sh pr" in s.get("run", "") for s in ci["steps"]), "changes-images must run the script"
+# The script is unmerged PR code on a pull_request checkout: it must never run in
+# a job holding a write permission (the old `changes` job has actions: write).
+assert not any("ci-image-inputs.sh" in s.get("run", "") or "ci-image-inputs.sh" in str(s.get("with", "")) for s in jobs["changes"]["steps"]), "changes (actions: write) must not run or check out PR-head code"
+perms = ci.get("permissions", {})
+assert perms and all(v == "read" for v in perms.values()), f"changes-images must be read-only: {perms}"
 gate = ("always() && (github.event_name == 'merge_group' || (github.event_name == 'push' && "
         "(needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) || "
-        "(github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))")
+        "(github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))")
 for j in ("worker-base-image", "worker-image-smoke", "session-image-smoke", "native-image-smoke"):
     assert " ".join(jobs[j]["if"].split()) == gate, f"{j}: image gate drifted: {jobs[j]['if']}"
     assert "changes-push" in jobs[j]["needs"], f"{j} must need changes-push"
+    assert "changes-images" in jobs[j]["needs"], f"{j} must need changes-images"
 # release-build produces the binary worker-base-image downloads: its gate must
 # stay a superset (unconditional on push and merge_group, backend||docker on PRs).
 rb = " ".join(jobs["release-build"]["if"].split())
-for frag in ("github.event_name == 'push' ||", "github.event_name == 'merge_group' ||", "needs.changes.outputs.docker == 'true'"):
+for frag in ("github.event_name == 'push' ||", "github.event_name == 'merge_group' ||", "needs.changes-images.outputs.docker == 'true'"):
     assert frag in rb, f"release-build gate must keep `{frag}` (superset of the image gate)"
 print("ok: ci.yml image-gate wiring")
 PY
