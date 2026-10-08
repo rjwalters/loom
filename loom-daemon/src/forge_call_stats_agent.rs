@@ -20,13 +20,17 @@
 //!
 //! Where rows land: every spawn path exports the host sink as the generic
 //! `LOOM_FORGE_CALL_STATS_DIR` ([`crate::agent_session::isolation`], one
-//! mechanism for the tmux, `agent-spawn` and `spawn-worker` paths), and a
-//! container parity-mounts it read-write ([`docker_mount_args`],
-//! `worker_spawn::containment`). Inside a container the front writes only
-//! when its uid owns the directory (MOUNT-CONTRACT §3, uid 1000); otherwise
-//! its rows are dropped silently, by design. `cargo` runs in this repository
-//! reset the variable (`.cargo/config.toml` `[env]`), so a Builder's test
-//! binaries never write fake-stub rows into the host sink they inherited.
+//! mechanism for the tmux, `agent-spawn` and `spawn-worker` paths). A
+//! container sees that same path, but what is mounted there read-write is
+//! only the sink's [`CONTAINED_SUBDIR`] ([`container_mount`],
+//! [`docker_mount_args`], `worker_spawn::containment`): the daemon's own
+//! rows and the bucket-book snapshot stay out of every container's reach,
+//! and the daemon reads the subdirectory as untrusted input
+//! ([`super::ingest`]). Inside a container the front writes only when its
+//! uid owns the directory (MOUNT-CONTRACT §3, uid 1000); otherwise its rows
+//! are dropped silently, by design. `cargo` runs in this repository reset
+//! the variable (`.cargo/config.toml` `[env]`), so a Builder's test binaries
+//! never write fake-stub rows into the host sink they inherited.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -38,6 +42,11 @@ pub const PASSTHROUGH_CALLER_PREFIX: &str = "agent.gh.";
 
 /// The sink-directory override every spawn path exports (W5).
 pub const SINK_DIR_ENV: &str = "LOOM_FORGE_CALL_STATS_DIR";
+
+/// The sink subdirectory a container's front writes into (#10607 slice B):
+/// mounted read-write at the sink's own path inside the container, so the
+/// container never sees — let alone rewrites or prunes — the host's rows.
+pub const CONTAINED_SUBDIR: &str = "contained";
 
 /// The closed `ag` vocabulary besides `other` / `none`.
 pub const ROLES: &[&str] = &[
@@ -90,10 +99,29 @@ pub fn is_mountable_sink(dir: &std::path::Path) -> bool {
     dir.is_absolute() && is_owner_only_dir(dir) && holds_only_sink_files(dir)
 }
 
-/// `-v <dir>:<dir>` (read-write) for a `docker run` whose environment
-/// (`env`, injectable) names the daemon's own sink in [`SINK_DIR_ENV`] —
-/// what `forge egress container-args` adds for `spawn-claude.sh`, whose
-/// `LOOM_*` by-name forwarding already carries the variable itself.
+/// `(host source, container path)` of the sink mount for a container whose
+/// sink is `sink` (already [`is_mountable_sink`]): the host's
+/// `<sink>/`[`CONTAINED_SUBDIR`], created owner-only when absent, mounted
+/// at `<sink>` — so the container's `LOOM_FORGE_CALL_STATS_DIR` (the same
+/// path as the host's) resolves, and nothing else of the sink is visible.
+/// `None` when the subdirectory is not a private real directory of ours.
+#[must_use]
+pub fn container_mount(sink: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    let contained = sink.join(CONTAINED_SUBDIR);
+    if std::fs::symlink_metadata(&contained).is_err() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let _ = builder.create(&contained);
+    }
+    is_owner_only_dir(&contained).then(|| (contained, sink.to_path_buf()))
+}
+
+/// `-v <dir>/contained:<dir>` (read-write) for a `docker run` whose
+/// environment (`env`, injectable) names the daemon's own sink in
+/// [`SINK_DIR_ENV`] — what `forge egress container-args` adds for
+/// `spawn-claude.sh`, whose `LOOM_*` by-name forwarding already carries the
+/// variable itself ([`container_mount`]).
 ///
 /// The value is an env var, so it is not trusted to name a read-write
 /// mount. Comparing it with [`host_sink_dir`](super::host_sink_dir) proves
@@ -113,7 +141,12 @@ pub fn docker_mount_args(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Ve
     if !is_mountable_sink(&dir) {
         return Vec::new();
     }
-    vec!["-v".to_string(), format!("{0}:{0}", dir.display())]
+    container_mount(&dir).map_or_else(Vec::new, |(host, at)| {
+        vec![
+            "-v".to_string(),
+            format!("{}:{}", host.display(), at.display()),
+        ]
+    })
 }
 
 /// `dir` is a real directory (a symlink is refused, not followed), owned by
@@ -137,15 +170,22 @@ fn is_owner_only_dir(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Whether every entry of `dir` is a regular sink file.
+/// Whether every entry of `dir` is a regular sink file, or the real
+/// [`CONTAINED_SUBDIR`] directory.
 fn holds_only_sink_files(dir: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     entries.into_iter().all(|e| {
         e.is_ok_and(|e| {
-            e.file_type().is_ok_and(|t| t.is_file())
-                && e.file_name().to_str().is_some_and(is_sink_entry)
+            let name = e.file_name();
+            let Ok(kind) = e.file_type() else {
+                return false;
+            };
+            if kind.is_dir() {
+                return name == CONTAINED_SUBDIR;
+            }
+            kind.is_file() && name.to_str().is_some_and(is_sink_entry)
         })
     })
 }
@@ -263,7 +303,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        assert_eq!(docker_mount_args(env(Some(&d))), ["-v".to_string(), format!("{d}:{d}")]);
+        assert_eq!(
+            docker_mount_args(env(Some(&d))),
+            ["-v".to_string(), format!("{d}/{CONTAINED_SUBDIR}:{d}")]
+        );
         for none in [
             None,
             Some(""),
@@ -302,7 +345,13 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
-        assert_eq!(docker_mount_args(env), ["-v".to_string(), format!("{d}:{d}")]);
+        let mount = ["-v".to_string(), format!("{d}/{CONTAINED_SUBDIR}:{d}")];
+        assert_eq!(docker_mount_args(env), mount);
+        // The contained subdirectory it created is the one directory a sink
+        // may hold; the sink is still mountable with it in place.
+        assert!(dir.path().join(CONTAINED_SUBDIR).is_dir());
+        assert_eq!(docker_mount_args(env), mount);
+        std::fs::remove_dir(dir.path().join(CONTAINED_SUBDIR)).unwrap();
         // A home directory: ours, and full of other things — refused, and
         // left at its own mode (never tightened by the check).
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();

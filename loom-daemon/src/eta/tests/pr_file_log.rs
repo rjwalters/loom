@@ -68,6 +68,9 @@ fn the_plan_reads_never_read_first_then_the_stalest_within_budget() {
             files: vec![],
             head_sha: None,
             complete: true,
+            additions: None,
+            deletions: None,
+            listed: None,
         },
         FileSnapshot {
             repo: "O/R".into(),
@@ -76,6 +79,9 @@ fn the_plan_reads_never_read_first_then_the_stalest_within_budget() {
             files: vec![],
             head_sha: None,
             complete: true,
+            additions: None,
+            deletions: None,
+            listed: None,
         },
     ];
     let cands = [
@@ -104,6 +110,9 @@ fn a_pr_not_updated_since_its_last_read_is_left_alone() {
         files: vec![],
         head_sha: None,
         complete: true,
+        additions: None,
+        deletions: None,
+        listed: None,
     }];
     let clock = ReadClock::default();
     assert!(plan(&[cand(1, Some(5)), cand(1, Some(4))], &log, &clock, 9).is_empty());
@@ -287,6 +296,9 @@ fn the_log_round_trips_beside_the_fleet_snapshots_and_compacts() {
         files: vec!["x".into()],
         head_sha: None,
         complete: true,
+        additions: None,
+        deletions: None,
+        listed: None,
     };
     let b = FileSnapshot {
         repo: "o/r".into(),
@@ -295,6 +307,9 @@ fn the_log_round_trips_beside_the_fleet_snapshots_and_compacts() {
         files: vec![],
         head_sha: None,
         complete: true,
+        additions: None,
+        deletions: None,
+        listed: None,
     };
     append(root, std::slice::from_ref(&a)).unwrap();
     append(root, std::slice::from_ref(&b)).unwrap();
@@ -309,4 +324,62 @@ fn the_log_round_trips_beside_the_fleet_snapshots_and_compacts() {
     assert_eq!(load(root).len(), 2);
     // Its extension keeps the snapshot listing to snapshots alone.
     assert!(crate::eta::fleet::load_all(root).is_empty());
+}
+
+fn stat_body(entries: &[(&str, u64, u64)]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|(f, a, d)| json!({ "filename": f, "additions": a, "deletions": d }))
+            .collect(),
+    )
+}
+
+#[test]
+fn a_whole_page_sums_the_per_file_diff_stat_and_records_listed() {
+    let page = parse_page(&stat_body(&[("a.rs", 6, 26), ("b.rs", 4, 0)])).unwrap();
+    assert_eq!(page.additions, Some(10));
+    assert_eq!(page.deletions, Some(26));
+    assert_eq!(page.listed, 2);
+    // An entry without the stat makes the totals unknown, not partial.
+    let mixed = parse_page(&json!([
+        { "filename": "a.rs", "additions": 1, "deletions": 1 },
+        { "filename": "b.rs" }
+    ]))
+    .unwrap();
+    assert_eq!((mixed.additions, mixed.deletions, mixed.listed), (None, None, 2));
+}
+
+#[test]
+fn a_full_page_keeps_listed_but_no_paths_or_partial_totals() {
+    let rows: Vec<Value> = (0..MAX_LISTED_FILES)
+        .map(|i| json!({ "filename": format!("f{i}"), "additions": 1, "deletions": 1 }))
+        .collect();
+    let page = parse_page(&Value::Array(rows)).unwrap();
+    assert!(page.files.is_none());
+    assert_eq!((page.additions, page.deletions), (None, None));
+    assert_eq!(page.listed as usize, MAX_LISTED_FILES);
+}
+
+#[test]
+fn a_changed_stat_with_equal_paths_is_logged_and_old_lines_parse_as_unknown() {
+    let fetch_a = |_: &Candidate| Some(stat_body(&[("a.rs", 1, 1)]));
+    let fetch_b = |_: &Candidate| Some(stat_body(&[("a.rs", 9, 1)]));
+    let mut clock = ReadClock::default();
+    let first = refresh(&[cand(1, None)], &[], &mut clock, 6, || t(1), fetch_a);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].additions, Some(1));
+    assert_eq!(first[0].listed, Some(1));
+    let same = refresh(&[cand(1, Some(2))], &first, &mut clock, 6, || t(3), fetch_a);
+    assert!(same.is_empty());
+    let changed = refresh(&[cand(1, Some(4))], &first, &mut clock, 6, || t(5), fetch_b);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].additions, Some(9));
+
+    let old: FileSnapshot = serde_json::from_str(
+        r#"{"repo":"o/r","pr":1,"known_at":"2026-10-07T00:00:00Z","files":["a.rs"]}"#,
+    )
+    .unwrap();
+    assert_eq!((old.additions, old.deletions, old.listed), (None, None, None));
+    assert!(old.complete);
 }
