@@ -204,7 +204,7 @@ impl ProbeHttp for LiveHttp {
             return Err(format!(
                 "curl exit {}: {}",
                 output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
+                redact_secrets(String::from_utf8_lossy(&output.stderr).trim(), &[token])
             ));
         }
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -248,8 +248,8 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
                     let why = ForgeOutcome::Unknown {
                         operation: "server.version".into(),
                         why: format!(
-                            "GET version answered 200 without a usable version: {}",
-                            truncate(&body)
+                            "GET version answered 200 without a usable version ({})",
+                            body_shape(&body)
                         ),
                     };
                     return Err(anyhow::anyhow!("{why}"));
@@ -267,7 +267,7 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
         Err(e) => {
             let why = ForgeOutcome::Unknown {
                 operation: "server.version".into(),
-                why: format!("version probe transport fault: {e}"),
+                why: format!("version probe transport fault: {}", scrub(cfg, &e)),
             };
             return Err(anyhow::anyhow!("{why}"));
         }
@@ -399,7 +399,7 @@ fn issue_create(
         .request("POST", &format!("repos/{}/issues", cfg.repo), &cfg.writer_token, Some(&body))
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
-            why: e,
+            why: scrub(cfg, &e),
         })?;
     let created = serde_json::from_str::<serde_json::Value>(resp.trim()).ok();
     let number = created
@@ -431,7 +431,7 @@ fn issue_create(
                 .request("GET", &format!("repos/{}/issues/{n}", cfg.repo), &cfg.writer_token, None)
                 .map_err(|e| ForgeOutcome::Unknown {
                     operation: view.id.clone(),
-                    why: e,
+                    why: scrub(cfg, &e),
                 })?;
             let read = serde_json::from_str::<serde_json::Value>(rresp.trim()).ok();
             let matches = (200..=299).contains(&rcode)
@@ -445,7 +445,7 @@ fn issue_create(
             } else {
                 Ok(base(
                     OUTCOME_FAIL,
-                    format!("issue #{n} read-back mismatch (HTTP {rcode}): {}", truncate(&rresp)),
+                    format!("issue #{n} read-back mismatch (HTTP {rcode}; {})", body_shape(&rresp)),
                 ))
             }
         }
@@ -453,7 +453,7 @@ fn issue_create(
             operation: view.id.clone(),
             principal: crate::forge_contract::CredentialRef("env:GITEA_QUAL_WRITER_TOKEN".into()),
         }),
-        _ => Ok(base(OUTCOME_FAIL, format!("HTTP {code}: {}", truncate(&resp)))),
+        _ => Ok(base(OUTCOME_FAIL, format!("HTTP {code} ({})", body_shape(&resp)))),
     }
 }
 
@@ -492,12 +492,12 @@ fn issue_comment_readback(
         )
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
-            why: e,
+            why: scrub(cfg, &e),
         })?;
     if !(200..=299).contains(&code) {
         return Err(ForgeOutcome::Unknown {
             operation: view.id.clone(),
-            why: format!("comment POST answered {code}: {}", truncate(&resp)),
+            why: format!("comment POST answered {code} ({})", body_shape(&resp)),
         });
     }
     let (rcode, rresp) = http
@@ -509,7 +509,7 @@ fn issue_comment_readback(
         )
         .map_err(|e| ForgeOutcome::Unknown {
             operation: view.id.clone(),
-            why: e,
+            why: scrub(cfg, &e),
         })?;
     let seen = serde_json::from_str::<serde_json::Value>(rresp.trim())
         .ok()
@@ -581,13 +581,54 @@ fn actor_of(http: &dyn ProbeHttp, token: &str) -> Option<String> {
         .and_then(|v| v.get("login").and_then(|l| l.as_str()).map(String::from))
 }
 
-fn truncate(s: &str) -> String {
-    let t = s.trim().replace('\n', " ");
-    if t.chars().count() > 120 {
-        format!("{}…", t.chars().take(120).collect::<String>())
+/// Describe a response body without echoing it: a server may reflect a
+/// request credential back, and receipts are published (#9789). Only the
+/// size and whether it parsed as JSON survive.
+fn body_shape(s: &str) -> String {
+    let kind = if serde_json::from_str::<serde_json::Value>(s.trim()).is_ok() {
+        "JSON"
     } else {
-        t
+        "non-JSON"
+    };
+    format!("{kind} body, {} bytes, not echoed", s.len())
+}
+
+/// Replace every non-empty secret in `s` with `[redacted]` and blank any
+/// `user:pass@` URL userinfo.
+fn redact_secrets(s: &str, secrets: &[&str]) -> String {
+    let mut out = s.to_string();
+    for sec in secrets.iter().filter(|x| !x.is_empty()) {
+        out = out.replace(sec, "[redacted]");
     }
+    let mut res = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        res.push_str(head);
+        let end = tail
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(at) => {
+                res.push_str("[redacted]@");
+                rest = &tail[at + 1..];
+            }
+            None => rest = tail,
+        }
+    }
+    res.push_str(rest);
+    res
+}
+
+/// Redact the run's writer/readonly tokens from a transport error.
+fn scrub(cfg: &RunnerConfig, s: &str) -> String {
+    redact_secrets(
+        s,
+        &[
+            cfg.writer_token.as_str(),
+            cfg.readonly_token.as_deref().unwrap_or(""),
+        ],
+    )
 }
 
 fn now_secs() -> u64 {
@@ -994,6 +1035,78 @@ mod tests {
         assert!(head.contains("content-type: application/json"), "headers: {head}");
         let decoded: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(decoded["title"], "loomp-review: issue-create");
+    }
+
+    const FAKE_WRITER: &str = "FAKE-WRITER-TOKEN-do-not-use";
+    const FAKE_RO: &str = "FAKE-READONLY-TOKEN-do-not-use";
+
+    fn leaky_cfg() -> RunnerConfig {
+        let mut c = cfg(true);
+        c.writer_token = FAKE_WRITER.into();
+        c.readonly_token = Some(FAKE_RO.into());
+        c
+    }
+
+    fn assert_clean(text: &str) {
+        assert!(!text.contains(FAKE_WRITER), "writer token leaked: {text}");
+        assert!(!text.contains(FAKE_RO), "readonly token leaked: {text}");
+    }
+
+    #[test]
+    fn version_failures_do_not_echo_credentials() {
+        let echoed = format!("bad token {FAKE_WRITER} / {FAKE_RO}");
+        for answer in [
+            Ok((200, echoed.clone())),
+            Ok((401, echoed.clone())),
+            Err(format!("curl exit 7: {echoed} https://u:{FAKE_WRITER}@h/x")),
+        ] {
+            let mut http = FakeHttp::new();
+            http.push("version", vec![answer]);
+            let err = run(&leaky_cfg(), &http).unwrap_err();
+            assert_clean(&format!("{err} {err:?}"));
+        }
+    }
+
+    #[test]
+    fn create_and_readback_failures_do_not_echo_credentials() {
+        let echoed = format!("{{\"message\":\"{FAKE_WRITER} {FAKE_RO}\"}}");
+        let mut http = FakeHttp::new();
+        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+        http.push("issues", vec![Ok((500, echoed.clone()))]);
+        http.push("user", vec![Ok((200, r#"{"login":"bot"}"#.into()))]);
+        let results = run(&leaky_cfg(), &http).unwrap();
+        let receipt = serde_json::to_string(&results).unwrap();
+        assert_clean(&receipt);
+        assert!(receipt.contains("HTTP 500"), "status must survive: {receipt}");
+
+        // Create succeeds, read-back returns an echoing mismatch.
+        let mut http = FakeHttp::new();
+        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+        http.push(
+            "issues",
+            vec![
+                Ok((201, r#"{"number":7}"#.into())),
+                Ok((200, echoed.clone())),
+            ],
+        );
+        http.push("user", vec![Ok((200, r#"{"login":"bot"}"#.into()))]);
+        let results = run(&leaky_cfg(), &http).unwrap();
+        let receipt = serde_json::to_string(&results).unwrap();
+        assert_clean(&receipt);
+
+        // Transport fault carrying the token in its message.
+        let mut http = FakeHttp::new();
+        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+        http.push("issues", vec![Err(format!("curl exit 35: {FAKE_WRITER}"))]);
+        let results = run(&leaky_cfg(), &http).unwrap();
+        assert_clean(&serde_json::to_string(&results).unwrap());
+    }
+
+    #[test]
+    fn redact_secrets_blanks_tokens_and_url_userinfo() {
+        let out = redact_secrets("a SECRET b https://user:pw@host/p c", &["SECRET", ""]);
+        assert!(!out.contains("SECRET") && !out.contains("user:pw"), "{out}");
+        assert!(out.contains("https://[redacted]@host/p"), "{out}");
     }
 
     #[test]
