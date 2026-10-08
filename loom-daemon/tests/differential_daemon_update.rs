@@ -850,7 +850,25 @@ const TAG_PIN_HELP_LINE: &str =
 /// entry, which follows the `--fetch` entry in the help text).
 const TAG_PIN_ANCHOR: &str = "  ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch ";
 
+/// The 4 lines #10789 added under `LOOM_DAEMON_BIN` in `--help`, warning
+/// that a symlinked dest is replaced by a regular file. Spelled out here,
+/// independently of `help.txt`, so the class below verifies the EXACT intended
+/// text rather than "whatever the port prints".
+const SYMLINKED_DEST_HELP_BLOCK: &str =
+    "                         A symlinked dest is replaced by a regular file (like
+                         GNU install), so pin the real path (e.g.
+                         ~/.local/bin/loom-daemon), not a symlink such as
+                         /usr/local/bin/loom-daemon.
+";
+
+/// The line the symlinked-dest block sits directly in front of: the
+/// `LOOM_DAEMON_BIN_DIR` entry, which follows the `LOOM_DAEMON_BIN` entry.
+const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
+
 /// Divergence classes, each recognised by MECHANISM.
+// Every class so far is a documented `--help` addition, so the shared
+// `HelpDocuments` prefix names the mechanism rather than repeating the type.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum Divergence {
     /// MECHANISM: #10470 added documentation for the opt-in required-signature
@@ -872,6 +890,15 @@ enum Divergence {
     /// without it resolution is the newest release as before. Any other
     /// difference (an extra, misplaced, or tampered line) stays unexplained.
     HelpDocumentsTagPin,
+    /// MECHANISM: #10789 added a warning to the `LOOM_DAEMON_BIN` entry in
+    /// `--help` that a symlinked dest is replaced by a regular file, which the
+    /// frozen pre-port shell cannot contain. The port's stdout must equal the
+    /// shell's stdout with exactly [`SYMLINKED_DEST_HELP_BLOCK`] inserted
+    /// immediately before the single `LOOM_DAEMON_BIN_DIR` entry (that is, at
+    /// the end of the `LOOM_DAEMON_BIN` entry). Exit code and stderr must be
+    /// identical. Risk direction: documentation only. Any other difference (an
+    /// extra, misplaced, or tampered block) stays unexplained.
+    HelpDocumentsSymlinkedDest,
 }
 
 /// Classify one difference, or return `Err` for "unexplained".
@@ -885,10 +912,15 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     if shell.stdout == port.stdout {
         return Ok(Vec::new());
     }
-    // `--help` now carries both documented additions, so accept each one alone
-    // or both together — never anything else.
-    let additions: [(Divergence, &str, &str); 2] = [
+    // `--help` now carries several documented additions, so accept any
+    // combination of them — never anything else.
+    let additions: [(Divergence, &str, &str); 3] = [
         (Divergence::HelpDocumentsTagPin, TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE),
+        (
+            Divergence::HelpDocumentsSymlinkedDest,
+            SYMLINKED_DEST_ANCHOR,
+            SYMLINKED_DEST_HELP_BLOCK,
+        ),
         (
             Divergence::HelpDocumentsRequireSignature,
             HELP_BLOCK_ANCHOR,
@@ -1082,6 +1114,104 @@ fn the_tag_pin_help_divergence_class_is_narrow() {
     };
     assert_eq!(
         classify(&anchorless, &with_stdout(format!("{TAG_PIN_HELP_LINE}no usage block\n"))),
+        Err(())
+    );
+}
+
+/// The symlinked-dest class admits exactly the intended block, alone or
+/// together with the other additions, and nothing else.
+#[test]
+fn the_symlinked_dest_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!(
+            "Usage:\n  ./.loom/scripts/cli/loom-daemon-update.sh --fetch  f\n{TAG_PIN_ANCHOR} d\n\
+             Environment:\n  LOOM_DAEMON_BIN       Path to the binary\n\
+             {SYMLINKED_DEST_ANCHOR}  dir\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"
+        ),
+        stderr: String::new(),
+    };
+    let with_stdout = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let link_only = with_stdout(base.stdout.replace(
+        &format!("\n{SYMLINKED_DEST_ANCHOR}"),
+        &format!("\n{SYMLINKED_DEST_HELP_BLOCK}{SYMLINKED_DEST_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &link_only), Ok(vec![Divergence::HelpDocumentsSymlinkedDest]));
+
+    // All three additions together, as the real `--help` output now has.
+    let all = with_stdout(
+        link_only
+            .stdout
+            .replace(
+                &format!("\n{TAG_PIN_ANCHOR}"),
+                &format!("\n{TAG_PIN_HELP_LINE}{TAG_PIN_ANCHOR}"),
+            )
+            .replace(
+                &format!("\n{HELP_BLOCK_ANCHOR}"),
+                &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+            ),
+    );
+    assert_eq!(
+        classify(&base, &all),
+        Ok(vec![
+            Divergence::HelpDocumentsTagPin,
+            Divergence::HelpDocumentsSymlinkedDest,
+            Divergence::HelpDocumentsRequireSignature
+        ])
+    );
+
+    // An extra unrelated change alongside the block.
+    assert_eq!(classify(&base, &with_stdout(format!("{}extra\n", link_only.stdout))), Err(()));
+    // The block in the wrong place.
+    let misplaced = with_stdout(format!("{SYMLINKED_DEST_HELP_BLOCK}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // The block twice.
+    let doubled = with_stdout(link_only.stdout.replace(
+        SYMLINKED_DEST_HELP_BLOCK,
+        &format!("{SYMLINKED_DEST_HELP_BLOCK}{SYMLINKED_DEST_HELP_BLOCK}"),
+    ));
+    assert_eq!(classify(&base, &doubled), Err(()));
+    // A tampered block.
+    let tampered = with_stdout(
+        link_only
+            .stdout
+            .replace("replaced by a regular file", "followed"),
+    );
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered block next to the other good additions.
+    let all_tampered = with_stdout(all.stdout.replace("pin the real path", "pin any path"));
+    assert_eq!(classify(&base, &all_tampered), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..link_only.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..link_only.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no env block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(&anchorless, &with_stdout(format!("{SYMLINKED_DEST_HELP_BLOCK}no env block\n"))),
         Err(())
     );
 }
