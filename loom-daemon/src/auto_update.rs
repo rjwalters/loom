@@ -580,6 +580,7 @@ pub use roll_trigger::{IpcRollTrigger, RollTrigger};
 /// pause every roll trigger goes through (#10831). The resume side is #10832.
 pub mod pause_classify;
 pub mod pause_manifest;
+pub mod pause_resume;
 pub mod pause_roll;
 /// #10713: `auto_update_state.json` (settle clocks, window).
 pub mod persisted_state;

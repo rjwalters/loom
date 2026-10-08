@@ -87,7 +87,7 @@ const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 ///   persisted group is the only handle on any surviving descendants. Every
 ///   consumer re-checks `group_has_members` before signalling, so a fully-dead
 ///   group is a no-op.
-fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+pub(super) fn spawned_leader_pgid(pid: u32) -> Option<u32> {
     if !cfg!(unix) {
         return None;
     }

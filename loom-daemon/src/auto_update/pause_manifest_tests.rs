@@ -53,6 +53,7 @@ fn sample() -> PauseManifest {
                 sandbox: None,
                 resume_count: 0,
                 resume_of: None,
+                lease_sweep_id: None,
             }),
             safe_point: None,
             checkpoint_phase: Some("builder".into()),
