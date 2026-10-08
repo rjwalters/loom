@@ -92,7 +92,7 @@ cat > "$STUB/loom-daemon" <<STUB
 #!/usr/bin/env bash
 case "\$1 \${2:-}" in
     "retry-classify account-exhaustion") grep -qiE "hit your (session )?limit" && exit 0 || exit 1 ;;
-    "retry-classify auth-dead") grep -q "401 Invalid bearer token" && exit 0 || exit 1 ;;
+    "retry-classify auth-dead") grep -qE "401 Invalid bearer token|OAuth token revoked" && exit 0 || exit 1 ;;
     "retry-classify session-limit") grep -q "concurrent sessions" && exit 0 || exit 1 ;;
     "retry-classify "*) exit 1 ;;
     "worker proxy-rotate")
@@ -149,6 +149,7 @@ run_wrapper() {
         LOOM_STARTUP_MONITOR_WINDOW=1 \
         PATH="$STUB:$PATH" \
         bash "$WRAPPER" -p "ping" 2>&1
+    echo "$?" > "$WS/.last_rc"
     set -e
 }
 
@@ -198,6 +199,24 @@ assert_contains "TOKENS mark-bad alpha" "$calls" "an unproxied launch still bad-
 assert_contains "TOKENS_SELECT" "$calls" "an unproxied launch still re-selects in-process"
 assert_not_contains "PROXY_ROTATE" "$calls" "an unproxied launch never calls proxy-rotate"
 assert_contains "stub-claude success as beta token=tok-beta" "$out" "the unproxied retry runs on the re-selected token"
+
+echo ""
+echo "7. #10294: 'OAuth token revoked' (no auxiliary verb) rotates, no backoff"
+REVOKED="Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator."
+out="$(run_wrapper "$PLACEHOLDER" "$REVOKED")"
+calls="$(cat "$CALLS")"
+assert_contains "PROXY_ROTATE --reason auth-dead" "$calls" "the revoked token asks the proxy for an auth-dead rotation"
+assert_not_contains "TOKENS" "$calls" "no in-container token mutation"
+assert_not_contains "Transient error" "$out" "no transient backoff for a revoked token"
+assert_contains "stub-claude success as beta" "$out" "the alternate account is attempted immediately"
+
+echo ""
+echo "8. #10294: revoked token and no alternate account -> exit 78"
+out="$(run_wrapper "$PLACEHOLDER" "$REVOKED" PROXY_REFUSE=1)"
+assert_contains "ACCOUNT_POOL_EXHAUSTED" "$out" "sentinel still emitted"
+assert_eq_rc() { :; }
+rc="$(cat "$WS/.last_rc")"
+if [[ "$rc" == "78" ]]; then echo "  PASS: exit 78 when no alternate account"; TESTS_RUN=$((TESTS_RUN+1)); TESTS_PASSED=$((TESTS_PASSED+1)); else echo "  FAIL: expected exit 78, got $rc"; TESTS_RUN=$((TESTS_RUN+1)); TESTS_FAILED=$((TESTS_FAILED+1)); fi
 
 echo ""
 echo "==================================="
