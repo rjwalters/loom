@@ -260,8 +260,9 @@ pub fn build_daemon_status(
 
 /// Like [`super::build_daemon_status_for`] but overlays the live
 /// drain-and-restart state (Issue #4090) so `loom-daemon status` can surface
-/// `DRAINING (n remaining, deadline …)`. The IPC status handler calls this;
-/// the base builder stays drain-agnostic for its existing tests.
+/// `DRAINING (n remaining, deadline …)`. The base builder stays drain-agnostic
+/// for its existing tests. The IPC status handler does the same in two steps
+/// — a shared build, then [`overlay_drain`] per request (#10861).
 #[must_use]
 pub fn build_daemon_status_with_drain(
     workspace_pool: &Arc<WorkspacePool>,
@@ -278,6 +279,16 @@ pub fn build_daemon_status_with_drain(
         credential_preflight,
         sections,
     );
+    overlay_drain(&mut report, drain);
+    report
+}
+
+/// Overlay the live drain state onto a built `report`: one
+/// [`DrainState::snapshot`], not `O(roots)`. Separate from the build so the
+/// IPC handler can apply it to each request's copy of a shared build
+/// (#10861): a `status` that joins a build begun before a `drain` still
+/// reports the drain.
+pub(super) fn overlay_drain(report: &mut DaemonStatusReport, drain: &DrainState) {
     let snap = drain.snapshot();
     report.draining = drain.is_draining();
     report.drain_deadline = snap.deadline;
@@ -289,7 +300,6 @@ pub fn build_daemon_status_with_drain(
     report.drain_roll = drain_status::roll_status(&snap, report.in_flight.len(), Utc::now());
     report.drain_paused_by_day = drain.paused_by_day(Utc::now()); // #8652
     report.drain_note = snap.note;
-    report
 }
 
 #[cfg(test)]

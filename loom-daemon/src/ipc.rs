@@ -427,6 +427,9 @@ pub struct IpcServer {
     /// flag is OR'd into the dispatch producers' halt checks; the IPC handler
     /// sets/aborts it and the `DaemonStatus` snapshot renders it.
     drain_state: Arc<DrainState>,
+    /// The `DaemonStatus` builds in flight (#10861): concurrent requests for
+    /// the same section set share one build. See `status_off_runtime`.
+    status_flights: Arc<status_off_runtime::StatusFlights>,
 }
 
 impl IpcServer {
@@ -454,6 +457,7 @@ impl IpcServer {
             fallback_root,
             credential_preflight: Arc::new(credential_preflight),
             drain_state,
+            status_flights: Arc::default(),
         }
     }
 
@@ -531,6 +535,7 @@ impl IpcServer {
                     let fallback = self.fallback_root.clone();
                     let credential_preflight = self.credential_preflight.clone();
                     let drain = self.drain_state.clone();
+                    let flights = self.status_flights.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
                             stream,
@@ -543,6 +548,7 @@ impl IpcServer {
                             fallback,
                             credential_preflight,
                             drain,
+                            flights,
                         )
                         .await
                         {
@@ -570,6 +576,7 @@ async fn handle_client(
     fallback_root: PathBuf,
     credential_preflight: Arc<CredentialPreflightReport>,
     drain_state: Arc<DrainState>,
+    status_flights: Arc<status_off_runtime::StatusFlights>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -638,11 +645,13 @@ async fn handle_client(
         // `health_states` halt flags, which the dispatcher does not receive.
         // The build is `O(roots)` and can take minutes on a busy host, so it
         // runs on the blocking pool, never inline on a tokio worker (#10765),
-        // and a panic in it still yields an error frame (#4279). See
-        // `status_off_runtime`. `DaemonStatusSections` (#10787) is the same
-        // build scoped to the requested sections — see `status_scope`.
+        // concurrent requests share one build (#10861), and a panic in it
+        // still yields an error frame (#4279). See `status_off_runtime`.
+        // `DaemonStatusSections` (#10787) is the same build scoped to the
+        // requested sections — see `status_scope`.
         if let Some(sections) = status_scope::requested_sections(&request) {
             let response = status_off_runtime::serve(
+                &status_flights,
                 &workspace_pool,
                 &health_states,
                 &fallback_root,

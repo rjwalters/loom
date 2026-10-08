@@ -45,6 +45,8 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.samples_min",
     "loom.eta.horizon_bucket",
     "loom.eta.no_estimate_reason",
+    // #10903: why this host's planner did not dispatch a placed ready row.
+    "loom.eta.not_here",
     "loom.eta.outcome",
     "loom.eta.outcome_source",
     "loom.eta.lead_sec",
