@@ -71,6 +71,12 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The installed-Loom / daemon compatibility contract (#10716): `show`
+    /// this daemon's claims (and a repo's), `check` them across adjacent
+    /// releases in CI. Here, not in a script, per the shell-language policy.
+    #[command(subcommand)]
+    InstallCompat(super::install_compat_cli::InstallCompatCommand),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -562,6 +568,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::Eta(cmd) => cmd.run(),
@@ -975,6 +982,12 @@ pub(crate) enum MergePrCommand {
     /// the shell falls back to the budget on any fault — see
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
+
+    /// The post-`--auto`-wait re-read decision (#8410/#8896, #8191 slice):
+    /// stdin is the uncached PR payload; prints MERGED / NO-HEAD / MOVED <sha>
+    /// / CLEAR + labels. The shell refuses on any other output — see
+    /// `cli::merge_pr_revalidate_head`.
+    RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
 }
 
 impl MergePrCommand {
@@ -1024,6 +1037,7 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

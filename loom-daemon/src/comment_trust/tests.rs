@@ -237,6 +237,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // gh_lifecycle.rs`) filters through `TrustPolicy::for_root` before
         // `extract_latest_verdict_sha` sees a body.
         ("forge_merge_queue/lifecycle_tests.rs", "test fixture"),
+        // #10581: parses markers out of bodies `forge_verdict_cmd` already read
+        // through `fetch_trusted_comments`; it fetches nothing itself.
+        ("verdict_gate.rs", "parses already-filtered bodies"),
+        ("verdict_gate/tests.rs", "test"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

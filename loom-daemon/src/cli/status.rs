@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 
 use loom_daemon::daemon_install_state::{self, InstallStateReport};
 use loom_daemon::self_update;
+use loom_daemon::status_section::StatusSection;
 use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
 use super::common::resolve_socket_path;
@@ -218,11 +219,22 @@ pub(crate) async fn query_daemon_status(
     socket_path: &Path,
     timeout_info: &StatusTimeoutInfo,
 ) -> Result<DaemonStatusReport> {
-    match query_daemon_status_once(socket_path, timeout_info).await {
+    query_daemon_status_for(socket_path, timeout_info, &Request::DaemonStatus).await
+}
+
+/// [`query_daemon_status`] for any status `request` — `DaemonStatus`, or the
+/// section-scoped `DaemonStatusSections` (#10787).
+pub(crate) async fn query_daemon_status_for(
+    socket_path: &Path,
+    timeout_info: &StatusTimeoutInfo,
+    request: &Request,
+) -> Result<DaemonStatusReport> {
+    let request = serde_json::to_string(request)?;
+    match query_daemon_status_once(socket_path, timeout_info, &request).await {
         Ok(report) => Ok(report),
         Err(StatusAttemptError::DroppedBeforeReply(_first)) => {
             // One bounded reconnect retry — the transient case only.
-            query_daemon_status_once(socket_path, timeout_info)
+            query_daemon_status_once(socket_path, timeout_info, &request)
                 .await
                 .map_err(StatusAttemptError::into_inner)
         }
@@ -235,6 +247,7 @@ pub(crate) async fn query_daemon_status(
 async fn query_daemon_status_once(
     socket_path: &Path,
     timeout_info: &StatusTimeoutInfo,
+    request_json: &str,
 ) -> std::result::Result<DaemonStatusReport, StatusAttemptError> {
     let timeout = timeout_info.timeout;
     let stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
@@ -251,7 +264,6 @@ async fn query_daemon_status_once(
     // Linux RST drop) — the timeout wrapper below routes each `Err(_)` through
     // `classify_roundtrip_error` to decide whether it is the retryable drop.
     let roundtrip = async move {
-        let request_json = serde_json::to_string(&Request::DaemonStatus)?;
         writer.write_all(request_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -267,7 +279,7 @@ async fn query_daemon_status_once(
                     // signature (and its callers' field accesses) stays unchanged.
                     Response::DaemonStatus(report) => Ok(Some(*report)),
                     Response::Error { message } => Err(anyhow!("daemon error: {message}")),
-                    other => Err(anyhow!("unexpected response: {other:?}")),
+                    other => Err(sections::unexpected_response(other)),
                 }
             }
         }
@@ -380,16 +392,18 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
 /// load-scaled default and `LOOM_DAEMON_IPC_TIMEOUT_MS`. `None` (the default)
 /// resolves the timeout via [`resolve_status_timeout`] instead — see that
 /// function for the full precedence order.
-pub(crate) async fn handle_status_command(
-    json: bool,
-    pipeline: bool,
-    timeout_secs: Option<u64>,
-) -> Result<()> {
+///
+/// `--section` (#10787, [`sections`]) scopes the daemon's build and this
+/// function's client-side collectors to the selected sections.
+pub(crate) async fn handle_status_command(args: sections::StatusArgs) -> Result<()> {
+    let (json, pipeline, selected) = (args.json, args.pipeline, args.selection());
     let socket_path = resolve_socket_path()?;
-    let timeout_info = resolve_status_timeout(timeout_secs);
+    let timeout_info = resolve_status_timeout(args.timeout_secs);
 
-    let report = match query_daemon_status(&socket_path, &timeout_info).await {
+    let request = sections::request(&selected);
+    let report = match query_daemon_status_for(&socket_path, &timeout_info, &request).await {
         Ok(report) => report,
+        Err(e) if sections::is_daemon_too_old(&e) => sections::exit_daemon_too_old(&e),
         Err(_) if crate::cli::host::report_disabled(json) => return Ok(()),
         Err(e) => {
             // Issue #4069 (AC3 of #4011): classify WHY the daemon is
@@ -416,19 +430,19 @@ pub(crate) async fn handle_status_command(
     // does NOT perform inside the IPC handler; collect it client-side here —
     // but against the SAME pool directory the daemon itself resolved (#4292),
     // not one independently re-derived from this CLI invocation's own cwd.
-    let token_usage = collect_token_usage(report.token_pool_dir.as_deref());
+    let token_usage = sections::token_usage(&selected, &report);
 
     // Self-update staleness (#3968): purely local, read-only — compares the
     // commit baked into THIS `loom-daemon status` binary against the source
     // checkout's current HEAD, when that checkout is still on this machine.
     // Advisory only; never triggers a rebuild or restart (see
     // `.loom/scripts/cli/loom-daemon-update.sh` for the opt-in update flow).
-    let update = self_update::check();
+    let update = sections::self_update_status(&selected);
 
     // Forge-side pipeline snapshot (#3977) — opt-in, fetched in the same
     // priority order as `report.per_repo` so the rendered table lines up with
     // the "Managed repos" dispatch table above it.
-    let pipeline_snapshots = if pipeline {
+    let pipeline_snapshots = if pipeline && selected.has(StatusSection::Pipeline) {
         let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
         let source = Arc::new(loom_daemon::pipeline_snapshot::GhPipelineSource::new());
         Some(loom_daemon::pipeline_snapshot::collect_pipeline_snapshots(source, roots).await)
@@ -444,7 +458,7 @@ pub(crate) async fn handle_status_command(
     // to this CLI process, so nothing is plumbed through the IPC report.
     // Read-only, and never fails the command: an unanswerable probe degrades to
     // `unknown` and `status` still exits 0.
-    let protection = daemon_install_state::probe_protection();
+    let protection = sections::protection(&selected);
 
     // Worktree footprint per managed repo (#5939) — a host-local filesystem
     // walk, deliberately client-side for the same reason the per-token probe
@@ -456,7 +470,7 @@ pub(crate) async fn handle_status_command(
     let worktree_disk: Vec<loom_daemon::worktree_disk_status::WorktreeDiskSummary> = report
         .per_repo
         .iter()
-        .filter(|r| !r.root_missing)
+        .filter(|r| selected.has(StatusSection::Worktrees) && !r.root_missing)
         .map(|r| loom_daemon::worktree_disk_status::collect_worktree_disk_summary(&r.root))
         .collect();
 
@@ -468,6 +482,7 @@ pub(crate) async fn handle_status_command(
             pipeline_snapshots.as_deref(),
             protection.as_ref(),
             Some(&worktree_disk),
+            &selected,
         )?;
     } else {
         print_status_human(
@@ -1369,6 +1384,7 @@ mod reported_started_at_tests {
 
 #[cfg(test)]
 pub(crate) mod sample_report;
+pub(crate) mod sections;
 
 #[cfg(test)]
 pub(crate) mod status_client_tests {

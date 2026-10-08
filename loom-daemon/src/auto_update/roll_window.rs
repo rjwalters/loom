@@ -349,6 +349,11 @@ pub struct WindowGate {
     armed_target: Option<String>,
     deferral: Option<String>,
     status: Option<RollWindowStatus>,
+    /// #10713: the window index this tick's [`Self::gate`] let an arming
+    /// decision through in. Promoted to `consumed` by `mark_armed` once the
+    /// drain is actually armed, so the consumption is recorded (and persisted)
+    /// before the roll's own restart can end the process.
+    armable: Option<i64>,
 }
 
 impl WindowGate {
@@ -428,6 +433,7 @@ impl WindowGate {
         let Some((period, offset, open_for)) = self.enabled() else {
             return decision;
         };
+        self.armable = None;
         let target = match &decision {
             TickDecision::FetchArtifact { version, .. } => Some(version.clone()),
             TickDecision::Rebuild { .. } => Some("source rebuild".to_string()),
@@ -442,6 +448,7 @@ impl WindowGate {
         let open = window_is_open(now, period, offset, open_for);
         let spent = self.consumed == Some(index) && !self.retarget;
         if open && !spent {
+            self.armable = Some(index);
             self.waiting_target = None;
             self.deferral = None;
             self.refresh(now);
@@ -494,6 +501,9 @@ impl WindowGate {
         self.status.clone()
     }
 }
+
+// #10713: window consumption <-> the persisted `WindowConsumption`.
+mod persist;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

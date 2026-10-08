@@ -106,7 +106,12 @@ fn every_label_survives_the_ops_label_policy() {
 #[test]
 fn slow_by_design_kinds_do_not_trigger_the_slow_request_warn() {
     let slow = SLOW_REQUEST_WARN + Duration::from_secs(25);
-    for kind in ["DaemonStatus", "CancelSweep", "DispatchSweep"] {
+    for kind in [
+        "DaemonStatus",
+        "DaemonStatusSections",
+        "CancelSweep",
+        "DispatchSweep",
+    ] {
         assert!(!warns_when_slow(kind, slow), "{kind} is slow by design");
     }
     assert!(warns_when_slow("ListWorkspaces", SLOW_REQUEST_WARN));

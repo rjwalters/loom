@@ -2649,9 +2649,10 @@ without an inherited marker, so that star reads as the operator's and is not
 auto-removed on unstar (it fails safe). Closing it needs a `loom-daemon`
 subcommand posting the marker, tracked in #10592.
 
-**What travels to children (#10012 §6).** One table in code
-(`star_liveness::propagation_rules`) says which labels go from a parent to
-its children, always downward. The star goes to child issues and their PRs and
+**What travels to children (#10012 §6).** Each label's `propagate` field in
+`defaults/labels.json` (#10013) says whether it goes from a parent to its
+children, always downward; `star_liveness::propagation_rules` derives its
+table from it. The star goes to child issues and their PRs and
 is removed with the parent's star. `external` goes to child issues and is
 removed when no ancestor carries it any more, so a child of an unapproved
 outside submission cannot get past the maintainer gate. A `tier:*` label is
@@ -2664,9 +2665,9 @@ human put on the child, and never after an incomplete walk. The
 (`loom:blocked`, `loom:operator`, `loom:operator-only` and its sub-kinds,
 `loom:needs-capability`), claim, lifecycle and PR-lane labels, proposal kinds,
 `loom:epic-phase`, `loom:heavy`, `points:*`, the retired `loom:urgent`, and the
-#10307 level labels, which reach blockers by their own pass. A unit test fails
-when a `defaults/labels.json` label is in neither the table nor the
-never-propagate list. The pass writes only the star so far (above); it
+#10307 level labels, which reach blockers by their own pass: all carry
+`propagate: null`, and a unit test fails if a hold, claim, lifecycle, PR-lane,
+proposal, structural, size or resource label gets a rule. The pass writes only the star so far (above); it
 writes no `external` or `tier:*` label yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
@@ -12145,8 +12146,65 @@ seams):
 | `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a **key-signed** Linux `.sig` (one published without a `.pem`) |
 | `LOOM_DAEMON_UPDATE_COSIGN_IDENTITY` | Pin one exact expected keyless signer identity instead of the derived regexp |
 | `LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER` | Expected keyless certificate issuer (default `https://token.actions.githubusercontent.com`) |
-| `LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE` | `1`/`true`/`yes`/`on` selects **required** signature mode (#10470): an unsigned release (`SIGNATURE=skipped`) or one whose signature cannot be checked here (`SIGNATURE=unavailable`) is refused before provisioning, with distinct messages, and a sanitized `LOOM_SIGNATURE_EVIDENCE {...}` line is emitted on success: tag, asset sha256, signature state, and what the verifier that actually succeeded checked (`verification_method` = `codesign` / `cosign-key` / `cosign-keyless-identity` / `cosign-keyless-identity-regexp`; `identity`, `identity_regexp` and `oidc_issuer` are populated only by the keyless verifier that checked them and are `null` for codesign and key mode, which establish no GitHub workflow identity). Default off = the **present-only** compatibility mode (#5054), unchanged |
+| `LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE` | `1`/`true`/`yes`/`on` selects **required** signature mode (#10470): an unsigned release (`SIGNATURE=skipped`) or one whose signature cannot be checked here (`SIGNATURE=unavailable`) is refused before provisioning, with distinct messages, and a sanitized `LOOM_SIGNATURE_EVIDENCE {...}` line is emitted on success (the full schema-versioned record, see [Signature evidence record](#signature-evidence-record-loom_signature_evidence-10474)): tag, asset sha256, signature state, and what the verifier that actually succeeded checked (`verification_method` = `codesign` / `cosign-key` / `cosign-keyless-identity` / `cosign-keyless-identity-regexp`; `identity`, `identity_regexp` and `oidc_issuer` are populated only by the keyless verifier that checked them and are `null` for codesign and key mode, which establish no GitHub workflow identity). Default off = the **present-only** compatibility mode (#5054), unchanged |
 | `LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW` | Optional, with required mode: pin the derived keyless identity to this workflow file (regex-escaped) instead of `[^@]+`; a workflow rename then needs an explicit policy update. Recorded in the evidence line as `configured_workflow`, with `configured_workflow_applied` true only when a keyless regexp actually enforced it (false for codesign, key mode and an exact-identity override) |
+| `LOOM_SIGNATURE_EVIDENCE_JOURNAL_PATH` | Override where the durable signature-evidence journal is written (default `<repo>/.loom/logs/signature-evidence.jsonl`, only when the checkout already has a `.loom/`). See [Signature evidence record](#signature-evidence-record-loom_signature_evidence-10474) |
+
+#### Signature evidence record (`LOOM_SIGNATURE_EVIDENCE`, #10474)
+
+Every fetch-and-verify (`loom-daemon update` artifact path and
+`loom-daemon release-fetch`) produces **one** schema-versioned, sanitized
+evidence record, in **both** policy modes and for **every** verdict, so a drift
+monitor can see what each host adopted and spot a host still in present-only
+mode. Producer side only: ingestion into an access inventory / drift monitor
+belongs to the fleet-inventory repo, not here.
+
+- **Primary channel: a host-local JSONL journal**,
+  `<repo>/.loom/logs/signature-evidence.jsonl` (one record per line, rotated to
+  `.1` past 1 MiB; `LOOM_SIGNATURE_EVIDENCE_JOURNAL_PATH` overrides). Chosen over
+  an OTLP log record because the fetch runs in short-lived `update` /
+  `release-fetch` processes rather than the daemon that owns the exporter, a
+  journal survives an unreachable collector, and it needs no collector
+  `transform/privacy` allowlist change. A journal write failure is logged and
+  never changes the update's verdict or exit code.
+- **stderr `LOOM_SIGNATURE_EVIDENCE {json}`**: unchanged in *when* it prints
+  (required mode, verified artifact only — present-only stderr is untouched)
+  and additive-only in *what* it carries: it is now the same record, a strict
+  superset of the original nine keys with identical meanings.
+
+`LOOM_SIGNATURE_EVIDENCE` not-available fields (explicit `null` + `*_status: "not_available"`, never fabricated): `source_revision` (#10473), `policy_revision` / `approval_provenance` / `root_domain_scope` (#10472).
+
+Schema (`schema_version: 1`; adding a field is not a breaking change, so
+consumers must ignore unknown keys):
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | `1` |
+| `recorded_at` | RFC 3339 UTC timestamp |
+| `host_id` | The host's telemetry identity (`LOOM_HOST_ID` precedence, same as OTLP records) |
+| `loom` | Deciding build's provenance: `version`, `revision`, `tree_state`, `complete` |
+| `policy_mode` | `required` or `present-only` |
+| `outcome` | `verified` / `refused_unsigned` / `refused_unavailable` / `signature_invalid` / `checksum_mismatch` / `signature_material_unavailable` / `glibc_incompatible` / `download_failed` |
+| `tamper_evidence` | `true` only for `signature_invalid` and `checksum_mismatch`; a tooling gap (`refused_unavailable`) is never tampering |
+| `tag` | Release tag fetched |
+| `asset_sha256` | Digest of the checksum-verified binary; `null` when the checksum did not match or no binary was downloaded |
+| `signature_state` | `verified` / `skipped` / `unavailable`; `null` when no state was established (invalid signature, earlier failure) |
+| `verification_method` | `codesign` / `cosign-key` / `cosign-keyless-identity` / `cosign-keyless-identity-regexp`; `null` unless a verifier succeeded |
+| `identity`, `identity_regexp`, `oidc_issuer` | Populated only by the keyless verifier that checked them; `null` for codesign and key mode |
+| `configured_workflow` | `LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW` as configured (the current policy-revision proxy) |
+| `configured_workflow_applied` | Whether that pin was enforced by this verification |
+| `source_revision` + `source_revision_status` | Always `null` + `"not_available"` — filled by #10473 (adopted source revision / tag ancestry) |
+| `policy_revision` + `policy_revision_status` | Always `null` + `"not_available"` — filled by #10472 (recorded, monotonic assurance policy) |
+| `approval_provenance` + `approval_provenance_status` | Always `null` + `"not_available"` — filled by #10472 (provider authority map) |
+| `root_domain_scope` + `root_domain_scope_status` | Always `null` + `"not_available"` — filled by #10472 (provider authority map) |
+
+**Sanitized:** only public release facts, the host identity and build
+provenance. No token, credential, local filesystem path (e.g. the cosign
+public-key path) or other environment value is recorded; the free-text fields
+that do come from configuration (`identity`, `oidc_issuer`,
+`configured_workflow`) are dropped to `null` if path- or token-shaped. Blocked
+fields are never invented: the record never claims a check that did not run.
+Source: `loom-daemon/src/release_fetch/evidence.rs`.
 
 **No new daemon config keys.** The autonomous self-update loop
 (`autonomous.autoUpdate.*`) needs no new knobs. Since Issue #7609 it drives its

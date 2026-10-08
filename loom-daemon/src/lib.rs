@@ -231,6 +231,8 @@ pub mod idle_exit;
 pub mod inbox_config;
 pub mod inflight;
 pub mod init;
+pub mod install_compat;
+pub mod install_compat_harness;
 pub mod install_self_check;
 pub mod intake_reconcile;
 pub mod ipc;
@@ -333,6 +335,10 @@ pub mod stash_retirement;
 /// frozen by the file-size ratchet, and stating the model once is what keeps
 /// the daemon-side budget and the client-side probe budget from drifting.
 pub mod status_budget;
+/// The named top-level sections of `status --json` and the build phases each
+/// needs (#10787): one list for `--section` parsing, `--help`, the wire request
+/// and the renderer's key filter.
+pub mod status_section;
 /// `points:*` story-point size labels (#9432, epic #9429) — the one parser both
 /// telemetry consumers (`sweep.started` at dispatch, `sweep.outcome` at the
 /// terminal transition) resolve points through, including the daemon-side
@@ -379,6 +385,8 @@ pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
 pub mod verdict_equivalence;
+/// The verdict-time gate and label transition behind `post-verdict.sh` (#10581).
+pub mod verdict_gate;
 /// The stale-verdict notice both stale-clear paths post (#9709).
 pub mod verdict_stale_notice;
 pub mod watch_registry;

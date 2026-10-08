@@ -360,3 +360,20 @@ fn every_outcome_explains_itself() {
         assert!(line.contains("8193"), "{o:?} does not name the issue: {line}");
     }
 }
+
+/// #10570: `worktree.sh`'s attended call site must use the same runtime-neutral
+/// pid chain as the documented claim recipe, and must not swallow stderr (the
+/// one-line outcome is the only observable publication/renewal result).
+#[test]
+fn worktree_sh_call_site_matches_documented_pid_chain() {
+    let src = include_str!("../../../../defaults/scripts/worktree.sh");
+    let line = src
+        .lines()
+        .find(|l| l.starts_with("_wt_lease_claim()"))
+        .expect("_wt_lease_claim definition");
+    assert!(
+        line.contains(r#"--watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}""#),
+        "pid chain drifted: {line}"
+    );
+    assert!(!line.contains("2>&1"), "stderr outcome must stay visible: {line}");
+}

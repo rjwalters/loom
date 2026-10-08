@@ -134,34 +134,10 @@ enum Commands {
     /// (Issue #3891 — follow-up to #3813 Phase D). Note: dispatch does not
     /// consider token-pool capacity — the token axis only affects spawn-time
     /// account *selection*, not this concurrency ceiling.
-    Status {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-
-        /// Also show the forge-side pipeline snapshot per managed repo (Issue
-        /// #3977): open, dispatchable `loom:issue` (queued — park-labeled
-        /// rows excluded, #4825), open `loom:building`
-        /// (claimed), open PRs by `loom:review-requested` /
-        /// `loom:changes-requested` / `loom:pr`, and PRs merged in the last
-        /// 24h. Opt-in because it makes several `gh` calls per managed repo
-        /// (client-side, after the fast IPC round-trip) rather than being
-        /// bundled into the default view.
-        #[arg(long)]
-        pipeline: bool,
-
-        /// Override the status IPC round-trip budget in seconds (Issue
-        /// #6011). Without this, the timeout defaults to 5s on an unloaded
-        /// host and scales up automatically with observed 1-minute load
-        /// average (capped at 30s) — a saturated host that is merely slow to
-        /// answer, not actually wedged, would otherwise be misclassified as
-        /// unreachable before it ever got a chance to respond. Also
-        /// overridable via `LOOM_DAEMON_IPC_TIMEOUT_MS` (shared with
-        /// `dispatch`'s ack budget) as a raise-only floor; this flag takes
-        /// precedence over both when set.
-        #[arg(long)]
-        timeout_secs: Option<u64>,
-    },
+    ///
+    /// `--json --section <a,b,...>` (#10787) returns only those top-level
+    /// sections, and the daemon builds only what they need.
+    Status(cli::status::sections::StatusArgs),
 
     /// Show the peer-claim view: which issues this host currently sees a
     /// peer host claiming, by which host and with what remaining TTL, plus
@@ -2526,7 +2502,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Forge { action } => handle_forge_command(action),
-        Commands::Status { .. } => {
+        Commands::Status(_) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Status is handled in main() before handle_cli_command")

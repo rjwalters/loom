@@ -727,6 +727,13 @@ path = "loom-daemon/src/release_resolve/resolve.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/release_fetch/fetch.rs"
+# The install-compat CI proof (#10716) resolves the oldest release at or
+# above REQUIRES_DAEMON and downloads its binary. A delayed publication is
+# skipped (the new daemon stands in), so it never blocks a merge; a forge
+# outage during the lookup fails the step on purpose, as a proof step.
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/install_compat_harness.rs"
 
 [[operation]]
 id = "release.publish"

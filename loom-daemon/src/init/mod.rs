@@ -21,9 +21,12 @@
 //! - [`scaffolding`]: Repository scaffolding setup (CLAUDE.md, .claude/, etc.)
 //! - [`post_init`]: Post-initialization operations (manifest, gitignore)
 //! - [`repo_owned`]: Ownership boundary for the reinstall clean sweep (#5971)
+//! - [`payload`]: The install payload embedded in this binary, and the resync
+//!   that diffs and applies it (#10717)
 
 mod file_ops;
 pub(crate) mod git;
+pub mod payload;
 mod post_init;
 mod repo_owned;
 mod retired;
@@ -233,75 +236,11 @@ pub fn initialize_workspace_with_mode(
     // `worktree.root`. A bare `fs::copy` from the template would silently drop
     // those keys — see `merge_config_file`.
     merge_config_file(&defaults, &loom_path, mode, &mut report)?;
-    copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
-
-    // `.loom/pricing.json` (#8177): the model rate card
-    // `activity::pricing_card` loads at runtime, so a vendor price change can
-    // reach the fleet on a resync rather than on a Loom release.
-    //
-    // Loom PAYLOAD, not consumer configuration: overwritten wholesale here and
-    // on every resync (contrast `merge_config_file` above). The manifest
-    // generator (scripts/install/manifest.sh) translates `defaults/pricing.json`
-    // to `.loom/pricing.json` and registers it as Loom-installed, so this copy
-    // must exist or the installer's post-install metadata-vs-disk check fails
-    // with "MISSING: .loom/pricing.json" and rolls the install back.
-    //
-    // A repo that somehow ends up without it is not broken: loom-daemon falls
-    // back to the rate card compiled into the binary and logs the fallback at
-    // warn level.
-    copy_single_file(&defaults, &loom_path, "pricing.json", ".loom/pricing.json", &mut report)?;
-
-    // Ownership evidence for the reinstall clean sweep (issue #5971). Read
-    // BEFORE any sync, because `write_install_metadata` below overwrites
-    // `.loom/install-metadata.json` with a stub whose `installed_files` is
-    // empty — reading it later would discard the previous install's record.
-    let ownership = OwnershipBoundary::load(workspace);
-
-    // Sync managed directories (clean stale Loom-owned files on reinstall,
-    // then copy fresh; repo-owned content is preserved and reported)
-    sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &ownership, &mut report)?;
-    sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &ownership, &mut report)?;
-    sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &ownership, &mut report)?;
-    // `docs` ships static reference documentation (e.g. ci-integration.md
-    // from issue #3333). Sync alongside other managed dirs so installed
-    // repos always carry the latest copy.
-    sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &ownership, &mut report)?;
-    // `runtimes` ships the per-runtime capability manifests consumed by
-    // `runtime_admission::roots()` (#4688). This directory was declared in
-    // the install manifest (scripts/install/manifest.sh) since #4183 but
-    // never actually synced by this Rust-native path — every fresh install
-    // and Rust-native reinstall left `.loom/runtimes/` unpopulated, which
-    // made the admission gate fall through to a nonexistent
-    // `defaults/runtimes/...` on every consumer dispatch.
-    sync_managed_dir(&defaults, &loom_path, "runtimes", is_reinstall, &ownership, &mut report)?;
-
-    // Materialize `defaults/.loom/` -> `<workspace>/.loom/` by WALKING the
-    // source tree (#9123). Every entry is discovered, none is named here:
-    // this is the copy-side counterpart of the `find defaults/ -type f` walk
-    // in `scripts/install/manifest.sh::_emit_installed_files_manifest`, which
-    // registers everything under `defaults/.loom/` as Loom-installed. The two
-    // enumerations are now the same enumeration, so a file added to
-    // `defaults/.loom/` cannot be recorded in `install-metadata.json` while
-    // never reaching disk.
-    //
-    // Members of that tree and the issues that put them there, for grep value
-    // — none of these names appears in the walk itself: `.loom/bin/loom` (the
-    // CLI wrapper), `.loom/biome.jsonc` (#6031 — the nested Biome config that
-    // takes the whole machine-managed `.loom/` tree out of a consumer's
-    // repo-wide `biome check .`, without which the shipped Workflow-tool
-    // experiment script is a hard PARSE error and every installer-emitted JSON
-    // stamp is a perpetual format diff), `.loom/credentials.md.example`
-    // (#9123 — the file whose absence exposed this divergence), and the
-    // template-substituted `.loom/CLAUDE.md` / `.loom/AGENTS.md` that
-    // `setup_repository_scaffolding` writes instead (see
-    // `LOOM_TREE_SCAFFOLDED_FILES`). All are Loom payload, overwritten
-    // wholesale on reinstall — contrast `merge_config_file` above, which
-    // exists because `.loom/config.json` is consumer configuration.
-    sync_loom_payload_tree(&defaults, &loom_path, is_reinstall, &ownership, &mut report)?;
-
-    make_shell_scripts_executable(&loom_path.join("hooks"));
-    make_shell_scripts_executable(&loom_path.join("scripts"));
-    make_shell_scripts_executable(&loom_path.join("bin"));
+    // The Loom payload proper: every file this step writes is a verbatim
+    // function of `defaults/` and the previous install's ownership record.
+    // `payload::materialize_payload` (#10717) runs this same step into a
+    // staging tree, so a resync and an install cannot disagree about it.
+    install_payload_files(workspace, &defaults, &loom_path, is_reinstall, &mut report)?;
 
     // Update .gitignore and setup scaffolding
     update_gitignore(workspace)?;
@@ -350,6 +289,95 @@ pub fn initialize_workspace_with_mode(
     generate_manifest(workspace);
 
     Ok(report)
+}
+
+/// Install the Loom payload files into `loom_path` (`<workspace>/.loom`): the
+/// README, the rate card, the managed directories and the `defaults/.loom/`
+/// walk, then the executable bits.
+///
+/// Split out of [`initialize_workspace_with_mode`] for #10717: the resync in
+/// [`payload`] runs exactly this step into a staging copy of a workspace to
+/// learn what this binary would install, so the two can never drift apart.
+/// Consumer configuration (`config.json`) and the template-substituted
+/// scaffolding are deliberately not part of it.
+fn install_payload_files(
+    workspace: &Path,
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    copy_single_file(defaults, loom_path, ".loom-README.md", ".loom/README.md", report)?;
+
+    // `.loom/pricing.json` (#8177): the model rate card
+    // `activity::pricing_card` loads at runtime, so a vendor price change can
+    // reach the fleet on a resync rather than on a Loom release.
+    //
+    // Loom PAYLOAD, not consumer configuration: overwritten wholesale here and
+    // on every resync (contrast `merge_config_file` above). The manifest
+    // generator (scripts/install/manifest.sh) translates `defaults/pricing.json`
+    // to `.loom/pricing.json` and registers it as Loom-installed, so this copy
+    // must exist or the installer's post-install metadata-vs-disk check fails
+    // with "MISSING: .loom/pricing.json" and rolls the install back.
+    //
+    // A repo that somehow ends up without it is not broken: loom-daemon falls
+    // back to the rate card compiled into the binary and logs the fallback at
+    // warn level.
+    copy_single_file(defaults, loom_path, "pricing.json", ".loom/pricing.json", report)?;
+
+    // Ownership evidence for the reinstall clean sweep (issue #5971). Read
+    // BEFORE any sync, because `write_install_metadata` below overwrites
+    // `.loom/install-metadata.json` with a stub whose `installed_files` is
+    // empty — reading it later would discard the previous install's record.
+    let ownership = OwnershipBoundary::load(workspace);
+
+    // Sync managed directories (clean stale Loom-owned files on reinstall,
+    // then copy fresh; repo-owned content is preserved and reported)
+    sync_managed_dir(defaults, loom_path, "roles", is_reinstall, &ownership, report)?;
+    sync_managed_dir(defaults, loom_path, "scripts", is_reinstall, &ownership, report)?;
+    sync_managed_dir(defaults, loom_path, "hooks", is_reinstall, &ownership, report)?;
+    // `docs` ships static reference documentation (e.g. ci-integration.md
+    // from issue #3333). Sync alongside other managed dirs so installed
+    // repos always carry the latest copy.
+    sync_managed_dir(defaults, loom_path, "docs", is_reinstall, &ownership, report)?;
+    // `runtimes` ships the per-runtime capability manifests consumed by
+    // `runtime_admission::roots()` (#4688). This directory was declared in
+    // the install manifest (scripts/install/manifest.sh) since #4183 but
+    // never actually synced by this Rust-native path — every fresh install
+    // and Rust-native reinstall left `.loom/runtimes/` unpopulated, which
+    // made the admission gate fall through to a nonexistent
+    // `defaults/runtimes/...` on every consumer dispatch.
+    sync_managed_dir(defaults, loom_path, "runtimes", is_reinstall, &ownership, report)?;
+
+    // Materialize `defaults/.loom/` -> `<workspace>/.loom/` by WALKING the
+    // source tree (#9123). Every entry is discovered, none is named here:
+    // this is the copy-side counterpart of the `find defaults/ -type f` walk
+    // in `scripts/install/manifest.sh::_emit_installed_files_manifest`, which
+    // registers everything under `defaults/.loom/` as Loom-installed. The two
+    // enumerations are now the same enumeration, so a file added to
+    // `defaults/.loom/` cannot be recorded in `install-metadata.json` while
+    // never reaching disk.
+    //
+    // Members of that tree and the issues that put them there, for grep value
+    // — none of these names appears in the walk itself: `.loom/bin/loom` (the
+    // CLI wrapper), `.loom/biome.jsonc` (#6031 — the nested Biome config that
+    // takes the whole machine-managed `.loom/` tree out of a consumer's
+    // repo-wide `biome check .`, without which the shipped Workflow-tool
+    // experiment script is a hard PARSE error and every installer-emitted JSON
+    // stamp is a perpetual format diff), `.loom/credentials.md.example`
+    // (#9123 — the file whose absence exposed this divergence), and the
+    // template-substituted `.loom/CLAUDE.md` / `.loom/AGENTS.md` that
+    // `setup_repository_scaffolding` writes instead (see
+    // `LOOM_TREE_SCAFFOLDED_FILES`). All are Loom payload, overwritten
+    // wholesale on reinstall — contrast `merge_config_file` above, which
+    // exists because `.loom/config.json` is consumer configuration.
+    sync_loom_payload_tree(defaults, loom_path, is_reinstall, &ownership, report)?;
+
+    make_shell_scripts_executable(&loom_path.join("hooks"));
+    make_shell_scripts_executable(&loom_path.join("scripts"));
+    make_shell_scripts_executable(&loom_path.join("bin"));
+
+    Ok(())
 }
 
 /// Remove `verification_failures` entries whose path appears in `preserved`.
@@ -1163,3 +1191,7 @@ mod loom_payload_tree_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod session_mode_init_tests;
+// #10717: the resync payload's diff/apply tests.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod payload_tests;

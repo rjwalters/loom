@@ -165,3 +165,38 @@ fn without_a_window_the_loop_is_unchanged() {
     assert!(status.snapshot().roll_window.is_none());
     assert!(status.snapshot().note.unwrap().contains("settle"));
 }
+
+/// #10713 / #10188 item 2: the tick that arms a roll writes the window's
+/// consumption to disk itself, because the roll's restart can end the process
+/// before any later tick would record it.
+#[test]
+fn the_arming_tick_persists_the_consumed_window_before_the_roll_can_restart() {
+    use crate::auto_update::persisted_state::{load, LoadOutcome, STATE_FILE};
+    let (fetch, rebuild) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let mut probe = probe(&fetch, &rebuild);
+    let trigger = ArmingTrigger::default();
+    let status = AutoUpdateStatus::new(true);
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(STATE_FILE);
+    let mut state = windowed_state(tmp.path(), 60);
+    state.attach_persistence(Some(path.clone()));
+
+    tick(&mut state, &status, &mut probe, &trigger);
+    assert_eq!(*trigger.arms.lock().unwrap(), 1);
+    let LoadOutcome::Loaded(saved) = load(&path) else {
+        panic!("the arming tick wrote the state file");
+    };
+    assert!(saved.window.expect("windowing is on").consumed.is_some());
+
+    // The "restarted" daemon: a fresh state on the same schedule, no roll armed.
+    let mut restarted = windowed_state(tmp.path(), 60);
+    restarted.attach_persistence(Some(path));
+    let fresh_trigger = ArmingTrigger::default();
+    tick(&mut restarted, &status, &mut probe, &fresh_trigger);
+    assert_eq!(
+        *fresh_trigger.arms.lock().unwrap(),
+        0,
+        "one roll per window, across the restart"
+    );
+    assert_eq!(fetch.load(Ordering::SeqCst), 1);
+}

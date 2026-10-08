@@ -44,8 +44,11 @@ pub struct Step {
     pub line: usize,
     pub name: Option<String>,
     pub uses: Option<String>,
+    /// The `run:` script body, when the step has one.
+    pub run: Option<String>,
     pub if_cond: Option<String>,
     pub with: Vec<(String, String)>,
+    pub env: Vec<(String, String)>,
 }
 
 impl Step {
@@ -305,9 +308,24 @@ fn job(id: &str, line: usize, n: &Node, block: &[&str]) -> Job {
                     line: st.entries().first().map_or(line, |e| e.line),
                     name: st.get("name").and_then(Node::as_str).map(str::to_string),
                     uses: st.get("uses").and_then(Node::as_str).map(str::to_string),
+                    run: st.get("run").and_then(Node::as_str).map(str::to_string),
                     if_cond: st.get("if").and_then(Node::as_str).map(str::to_string),
                     with: st
                         .get("with")
+                        .map(|w| {
+                            w.entries()
+                                .iter()
+                                .map(|e| {
+                                    (
+                                        e.key.clone(),
+                                        e.value.as_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    env: st
+                        .get("env")
                         .map(|w| {
                             w.entries()
                                 .iter()

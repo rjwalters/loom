@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use super::DrainState;
 use crate::main_health_gate::WorkspaceHealthStates;
+use crate::status_section::SectionSet;
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Response};
 use crate::workspace_pool::WorkspacePool;
 
@@ -33,14 +34,17 @@ use crate::workspace_pool::WorkspacePool;
 pub(super) static TEST_BUILD_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The `DaemonStatus` reply for the IPC handler: the CPU-sample pre-warm
-/// (#4031) and the report build, both on the blocking pool.
+/// The `DaemonStatus` / `DaemonStatusSections` reply for the IPC handler: the
+/// CPU-sample pre-warm (#4031) and the report build, both on the blocking
+/// pool. `sections` scopes the build (#10787); the pre-warm runs only when
+/// `dynamic_cap` (the one section reporting the sample) is requested.
 pub(super) async fn serve(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &Arc<WorkspaceHealthStates>,
     fallback_root: &Path,
     credential_preflight: &Arc<CredentialPreflightReport>,
     drain_state: &Arc<DrainState>,
+    sections: SectionSet,
 ) -> Response {
     let (pool, health, credentials, drain) = (
         workspace_pool.clone(),
@@ -52,12 +56,21 @@ pub(super) async fn serve(
     daemon_status_response(move || {
         // The macOS `iostat` read sleeps ~1s (#4031). A panic in it is not a
         // status failure: the build falls back to the last cached sample.
-        let _ = std::panic::catch_unwind(crate::cpu_headroom::refresh_cpu_util_cache);
+        if sections.needs_cpu_sample() {
+            let _ = std::panic::catch_unwind(crate::cpu_headroom::refresh_cpu_util_cache);
+        }
         #[cfg(test)]
         std::thread::sleep(std::time::Duration::from_millis(
             TEST_BUILD_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst),
         ));
-        super::build_daemon_status_with_drain(&pool, &health, &root, &credentials, &drain)
+        super::build_daemon_status_with_drain(
+            &pool,
+            &health,
+            &root,
+            &credentials,
+            &drain,
+            &sections,
+        )
     })
     .await
 }
