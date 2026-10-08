@@ -2092,6 +2092,13 @@ kinds (and `eta.snapshot`, `eta.fit`); every record carries the attribute
 `host_id`. `uniqExact(host.id)` over `eta.*` in the last hour is `1`. See
 [`eta.md`](eta.md#one-eta-authority-per-fleet-fleetetaauthority-10498).
 
+**Ready rows this host does not dispatch (#10903).** An `eta.estimate` for a
+ready row the authority's own planner gave no position, but the fleet can
+dispatch, carries `loom.eta.not_here`. Its value is the row's disposition, for
+example `peer_claim` or `workspace_halted:token_pool`, and it equals the
+explanation's `path.dispatch.not_here`. See
+[`eta.md`](eta.md#the-model).
+
 **Provenance is required on both.** `version`, the full 40-hex `revision`
 (or `unknown` for a tarball build), `tree_state` and `complete` (a full SHA
 and a `clean`/`dirty` tree) of the computing daemon,

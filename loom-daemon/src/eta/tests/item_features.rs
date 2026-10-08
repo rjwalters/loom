@@ -99,6 +99,8 @@ fn row(issue: u32, facts: IssueRow) -> ReadyRow {
         },
         disposition: QueueDisposition::DeferredCapacity,
         facts,
+        rank: 1,
+        detail: None,
     }
 }
 
