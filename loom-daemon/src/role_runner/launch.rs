@@ -43,6 +43,10 @@ pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path,
     );
 }
 
+// #10640: why a launched tick failed, for its `loom.role_attempt` span.
+mod failure_class;
+use crate::observability::lifecycle::note_role_failure;
+
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
 /// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
@@ -265,7 +269,11 @@ pub(super) fn run_role_with_timeout(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return RoleTickOutcome::Failure(format!("could not spawn `{}`: {e}", script.display()))
+            note_role_failure(failure_class::launch_failed(&e));
+            return RoleTickOutcome::Failure(format!(
+                "could not spawn `{}`: {e}",
+                script.display()
+            ));
         }
     };
     if let Some(selection) = &selection {
@@ -305,6 +313,7 @@ pub(super) fn run_role_with_timeout(
                 // `toolless_launch`'s module doc for the four conditions.
                 if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
                     log::warn!("role_runner: {detail}");
+                    note_role_failure(failure_class::toolless_launch());
                     return RoleTickOutcome::Failure(detail);
                 }
                 // Issue #10003: exit 0 is not evidence a CODEX tick did
@@ -317,6 +326,7 @@ pub(super) fn run_role_with_timeout(
                     let verdict = sandbox_noop::detect(&log_path, admission, &tick_anchor);
                     if let Some(detail) = sandbox_noop::apply(verdict, &admitted.runtime, now) {
                         log::warn!("role_runner: role={role} {detail}");
+                        note_role_failure(failure_class::sandbox_unavailable());
                         return RoleTickOutcome::Failure(detail);
                     }
                 }
@@ -334,6 +344,7 @@ pub(super) fn run_role_with_timeout(
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
                 let detail = describe_role_failure(&full_log, &log_path, &tick_anchor);
+                note_role_failure(failure_class::exited(status, &full_log, &tick_anchor));
                 // Issue #8443: same terminal-record feedback on a non-zero
                 // exit — this is the path a `TOKEN_EXHAUSTED` death actually
                 // takes.
@@ -372,15 +383,22 @@ pub(super) fn run_role_with_timeout(
                     // deterministically.
                     let load_per_core =
                         load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
-                    return terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
+                    let outcome =
+                        terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
+                    // A load-saturated ceiling is `skipped_load`, not a failure.
+                    if matches!(outcome, RoleTickOutcome::Failure(_)) {
+                        note_role_failure(failure_class::timed_out(timeout));
+                    }
+                    return outcome;
                 }
                 std::thread::sleep(INVOCATION_POLL_INTERVAL);
             }
             Err(e) => {
+                note_role_failure(failure_class::wait_failed(&e));
                 return RoleTickOutcome::Failure(format!(
                     "could not poll `{}`: {e}",
                     script.display()
-                ))
+                ));
             }
         }
     }

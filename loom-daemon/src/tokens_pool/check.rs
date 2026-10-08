@@ -79,6 +79,7 @@ use std::process::{Command, Stdio};
 use chrono::{DateTime, Utc};
 
 use super::account_registry::AccountProvider;
+use super::round_summary::RoundTrace;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror check.py)
@@ -829,17 +830,6 @@ pub fn probe_account_with_blocking(
     }
 }
 
-/// Lowercase provider label used in `.ranking`/`--json`-visible error text
-/// (e.g. `"no_probe_adapter:codex"`). Not [`AccountProvider`]'s
-/// `Display`/`FromStr` — those are design D8/D9 scope (#5609), out of bounds
-/// for this issue.
-fn provider_label(provider: AccountProvider) -> &'static str {
-    match provider {
-        AccountProvider::Claude => "claude",
-        AccountProvider::Codex => "codex",
-    }
-}
-
 /// Dispatch a discovered account to its provider's probe (design D6a, issue
 /// #5608).
 ///
@@ -888,7 +878,8 @@ fn dispatch_probe(
         }
         other => {
             let mut r = AccountResult::new(name, "unsupported");
-            r.error = Some(format!("no_probe_adapter:{}", provider_label(other)));
+            // `AccountProvider`'s lowercase `Display` (`claude` / `codex`).
+            r.error = Some(format!("no_probe_adapter:{other}"));
             r
         }
     }
@@ -1088,6 +1079,7 @@ struct OverdueReprobe<'a> {
     opts: &'a CheckOptions<'a>,
     transport: &'a dyn ProbeTransport,
     discovered: std::cell::OnceCell<HashMap<String, (String, AccountProvider)>>,
+    trace: &'a RoundTrace,
 }
 
 impl OverdueReprobe<'_> {
@@ -1116,6 +1108,7 @@ impl OverdueReprobe<'_> {
         } else {
             None
         };
+        self.trace.record(name, token, *provider);
         let result = dispatch_probe(
             name,
             token,
@@ -1126,6 +1119,7 @@ impl OverdueReprobe<'_> {
             self.transport,
             blocking.as_ref(),
         );
+        self.trace.record_result(name, &result.status);
         // A 401 here is the whole point of the re-probe: the account was
         // never quota-exhausted, its credential was revoked. Record it so the
         // knowledge outlives this process — `.ranking` is rewritten every 10
@@ -1158,6 +1152,18 @@ pub fn run_check(
     opts: &CheckOptions,
     transport: &dyn ProbeTransport,
 ) -> ProbeReport {
+    run_check_traced(tokens_dir, opts, transport, &RoundTrace::default())
+}
+
+/// [`run_check`], recording into `trace` which accounts were probed and
+/// whether claude-monitor served the ranking (issue #10744, see
+/// [`super::round_summary`]).
+pub fn run_check_traced(
+    tokens_dir: &Path,
+    opts: &CheckOptions,
+    transport: &dyn ProbeTransport,
+    trace: &RoundTrace,
+) -> ProbeReport {
     if matches!(opts.source, Source::Auto | Source::Monitor) {
         // Issue #7420: under `auto` (the default, and what the daemon's
         // periodic `tokens check --ranking` refresh runs), a monitor row
@@ -1171,6 +1177,7 @@ pub fn run_check(
             opts,
             transport,
             discovered: std::cell::OnceCell::new(),
+            trace,
         };
         let reprobe_fn = |name: &str| reprobe.probe(name);
         let hook: Option<&dyn Fn(&str) -> AccountResult> = if opts.source == Source::Auto {
@@ -1185,6 +1192,7 @@ pub fn run_check(
             Utc::now(),
             hook,
         ) {
+            trace.mark_monitor_served();
             return report;
         }
         if opts.source == Source::Monitor {
@@ -1219,7 +1227,8 @@ pub fn run_check(
         } else {
             None
         };
-        results.push(dispatch_probe(
+        trace.record(name, token, *provider);
+        let result = dispatch_probe(
             name,
             token,
             *provider,
@@ -1228,7 +1237,9 @@ pub fn run_check(
             DEFAULT_TIMEOUT_SECONDS,
             transport,
             blocking.as_ref(),
-        ));
+        );
+        trace.record_result(name, &result.status);
+        results.push(result);
     }
 
     let report = build_report(results);

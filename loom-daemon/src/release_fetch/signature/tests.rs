@@ -281,6 +281,53 @@ fn linux_key_mode_invalid_signature_fails_closed() {
     );
 }
 
+/// A completed nonzero `cosign verify-blob` is tamper evidence; one that never
+/// answers (timeout) is a block but NOT tamper evidence (#10474).
+#[test]
+#[serial]
+fn linux_key_mode_verdict_vs_timeout_inconclusive_flag() {
+    let run = |script: &str| {
+        let dir = tempdir();
+        let fakebin = tempdir();
+        write_script(&fakebin, "cosign", script);
+        let bin = fake_bin_target(&dir.join("loom-daemon-x86_64-unknown-linux-gnu"));
+        let sig = dir.join("loom-daemon-x86_64-unknown-linux-gnu.sig");
+        std::fs::write(&sig, b"sig").unwrap();
+        let pubkey = dir.join("cosign.pub");
+        std::fs::write(&pubkey, b"key").unwrap();
+        let mut result = None;
+        with_fake_bin(&fakebin, || {
+            with_short_verify_timeout(1_000, || {
+                result = Some(verify(&VerifyInputs {
+                    target: "x86_64-unknown-linux-gnu",
+                    bin_path: &bin,
+                    sig_path: Some(&sig),
+                    cert_path: None,
+                    repo_root: &dir,
+                    repo_slug: "rjwalters/loom",
+                    tag: "v0.16.0",
+                    cosign_pubkey_env: Some(pubkey.to_str().unwrap()),
+                    cosign_identity_env: None,
+                    cosign_oidc_issuer_env: None,
+                }));
+            });
+        });
+        result.unwrap()
+    };
+
+    let rejected = run(
+        "if [[ \"$1\" == version ]]; then exit 0; fi\nif [[ \"$1\" == verify-blob ]]; then exit 1; fi\nexit 0\n",
+    );
+    assert_eq!(rejected.outcome, Outcome::Failed);
+    assert!(!rejected.inconclusive, "a completed rejection is tamper evidence");
+
+    let hung = run(
+        "if [[ \"$1\" == version ]]; then exit 0; fi\nif [[ \"$1\" == verify-blob ]]; then sleep 120; fi\nexit 0\n",
+    );
+    assert_eq!(hung.outcome, Outcome::Failed, "still fail-closed");
+    assert!(hung.inconclusive, "a verifier that never answered is not tamper evidence");
+}
+
 /// #5054, the core regression this whole slice exists for: keyless
 /// verification runs by DEFAULT with no env override, against the DERIVED
 /// signer identity (repo slug + release tag) and the GitHub Actions issuer.

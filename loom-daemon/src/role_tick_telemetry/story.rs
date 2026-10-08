@@ -57,9 +57,10 @@ use crate::telemetry::trace::{
     SpanLink, SpanName, SpanRecord, SpanStatus, TraceAttributes, STORY_KEY_VERSION,
 };
 
-/// Every attribute key a story span can carry, besides provenance. Each must
-/// survive the daemon's span allowlist and the gateway's span `keep_keys`
-/// (contract-tested).
+/// Every attribute key a story span can carry, besides provenance and — on a
+/// failed tick's copy — [`crate::observability::lifecycle::ROLE_FAILURE_ATTRIBUTE_KEYS`]
+/// (#10640). Each must survive the daemon's span allowlist and the gateway's
+/// span `keep_keys` (contract-tested).
 pub const STORY_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.role",
     "loom.issue",
@@ -242,6 +243,10 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
     }
     if let Some(billing) = &facts.llm_billing {
         billing.stamp(&mut attributes);
+    }
+    // #10640: a failed tick's copy says why, exactly as its root does.
+    if let Some(failure) = &facts.trace.failure {
+        attributes.extend(failure.attributes());
     }
     // #9420: a story copy is the whole tick's interval, so it carries the same
     // dwell-conditioning flag as the tick's own root. A story copy only exists

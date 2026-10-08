@@ -21,6 +21,12 @@
 //!   SIGNATURE=<verified|skipped|unavailable -- see
 //!              release_fetch::signature::SignatureState>
 //!
+//! Every run (any exit code) also appends one schema-versioned evidence
+//! record to `<repo-root>/.loom/logs/signature-evidence.jsonl` when that
+//! checkout has a `.loom/` (#10474, see `release_fetch::evidence`). In
+//! required mode the stderr `LOOM_SIGNATURE_EVIDENCE {json}` line on success
+//! is that same record.
+//!
 //! Keys are ADDITIVE ONLY. `SIGNATURE=` (#8197) was appended after
 //! `HAD_AUTHORITY=`, and every existing consumer of `BIN_PATH`/`TMP_DIR`/
 //! `VERSION_OUTPUT`/`COMMIT` reads keys by name from a `while IFS='='` loop
@@ -50,7 +56,7 @@
 
 use anyhow::Result;
 use loom_daemon::release_fetch::{
-    fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,
+    evidence, fetch_and_verify_with_evidence, FetchInputs, FetchOutcome, SignaturePolicy,
 };
 use std::path::PathBuf;
 
@@ -96,7 +102,12 @@ impl ReleaseFetchArgs {
             cosign_oidc_issuer_env: std::env::var("LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER").ok(),
         };
 
-        match fetch_and_verify_with_policy(&inputs, &SignaturePolicy::from_env()) {
+        // #10474: journal the evidence record for every verdict, in both
+        // policy modes, before exiting (best-effort; never changes the exit).
+        let (outcome, record) =
+            fetch_and_verify_with_evidence(&inputs, &SignaturePolicy::from_env());
+        let _ = evidence::record(&root, &record);
+        match outcome {
             FetchOutcome::Verified {
                 artifact,
                 checksum_line,

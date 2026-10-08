@@ -1941,7 +1941,7 @@ fn diff_touches_globs(
 /// `*.sh`). A pattern containing no `/` matches by **basename** anywhere in
 /// the tree (so `*.rs` matches `loom-daemon/src/main.rs`); a pattern
 /// containing `/` matches the full path.
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let candidate = if pattern.contains('/') {
         path
     } else {

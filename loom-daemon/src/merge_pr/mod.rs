@@ -277,6 +277,7 @@ pub mod remove_gate;
 pub mod response;
 pub mod retarget_children;
 pub mod retries_used;
+pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;

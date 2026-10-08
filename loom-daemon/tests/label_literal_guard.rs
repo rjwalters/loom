@@ -250,3 +250,76 @@ fn label_shell_scripts_name_only_registered_labels() {
     let stale: Vec<_> = allowed.difference(&found).collect();
     assert!(stale.is_empty(), "SCRIPT_ALLOWLIST entries no longer needed: {stale:?}");
 }
+
+/// Pull the `loom:` names off the first non-comment line of `script` that
+/// matches `anchor` (a `for ... in ...; do` loop that hand-lists a label set).
+fn loop_label_set(script: &str, anchor: &Regex) -> BTreeSet<String> {
+    let text = std::fs::read_to_string(repo_root().join("defaults/scripts").join(script))
+        .unwrap_or_else(|e| panic!("{script}: {e}"));
+    let line = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .find(|l| anchor.is_match(l))
+        .unwrap_or_else(|| panic!("{script}: no line matching {anchor}"));
+    let re = Regex::new(r"loom:[a-z][a-z0-9-]*").expect("regex");
+    re.find_iter(line).map(|m| m.as_str().to_string()).collect()
+}
+
+fn names_with(prop: &str) -> BTreeSet<String> {
+    Registry::embedded()
+        .with_property(prop)
+        .unwrap_or_else(|| panic!("unknown property {prop}"))
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `verdict-staleness-guard.sh` hand-lists the PR explicit-hold labels. That
+/// set is not one registry property, so pin it to its two registry bounds:
+/// every parking label is in it, and every member is a `hold` label. A new
+/// park label or a de-held member fails here until the script is updated.
+#[test]
+fn verdict_staleness_guard_hold_set_is_bounded_by_the_registry() {
+    let anchor = Regex::new(r"for held in ").expect("regex");
+    let set = loop_label_set("verdict-staleness-guard.sh", &anchor);
+    assert!(!set.is_empty());
+    let park = names_with("park");
+    let hold = names_with("hold");
+    let missing_park: Vec<_> = park.difference(&set).collect();
+    assert!(
+        missing_park.is_empty(),
+        "park label(s) {missing_park:?} missing from verdict-staleness-guard.sh hold_label()"
+    );
+    let not_hold: Vec<_> = set.difference(&hold).collect();
+    assert!(
+        not_hold.is_empty(),
+        "verdict-staleness-guard.sh hold_label() lists non-hold label(s) {not_hold:?}"
+    );
+}
+
+/// `warn-operator-gated.sh` flags a dependency carrying one of two labels; both
+/// must stay operator-gate labels in the registry.
+#[test]
+fn warn_operator_gated_dep_labels_are_operator_gate_labels() {
+    let anchor = Regex::new(r"for dep_label in ").expect("regex");
+    let set = loop_label_set("warn-operator-gated.sh", &anchor);
+    assert!(!set.is_empty());
+    let gate = names_with("operator_gate");
+    let outside: Vec<_> = set.difference(&gate).collect();
+    assert!(
+        outside.is_empty(),
+        "warn-operator-gated.sh dep labels {outside:?} are not operator_gate in the registry"
+    );
+}
+
+/// `check-promotion-landed.sh` treats `loom:building`/`loom:blocked` as
+/// "promotion landed and progressed"; both must stay `skip` labels (work in
+/// flight or parked) in the registry, or that rule needs revisiting.
+#[test]
+fn check_promotion_landed_progress_labels_are_registered_skip_labels() {
+    let anchor = Regex::new(r#"select\(\.name=="loom:building""#).expect("regex");
+    let set = loop_label_set("check-promotion-landed.sh", &anchor);
+    let skip = names_with("skip");
+    let outside: Vec<_> = set.difference(&skip).collect();
+    assert!(outside.is_empty(), "later-lifecycle labels {outside:?} are not skip labels");
+}

@@ -93,6 +93,7 @@ pub mod profile_sharing;
 pub mod ranking_weekly;
 pub mod rng;
 pub mod rotation;
+pub mod round_summary;
 pub mod select;
 pub mod session_dispatch_lock;
 pub mod session_drift_removal;

@@ -590,6 +590,8 @@ pub mod floor_roll;
 /// roll path yet (#10831/#10832).
 pub mod pause_classify;
 pub mod pause_manifest;
+/// #10713: `auto_update_state.json` (settle clocks, window, typed stall).
+pub mod persisted_state;
 /// #8998's unsatisfiable-drain detector. A sibling module for the same two
 /// reasons #8513/#8514 were: this file is over
 /// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
@@ -597,6 +599,8 @@ pub mod pause_manifest;
 pub mod roll_stall;
 /// #9132: schedule-driven rolls (window, per-host offset, one arm per window).
 pub mod roll_window;
+/// #10713: the stall detector's state as a typed value (`StallState`).
+pub mod stall_state;
 /// The loop's resolved knob set, bundled — see the module doc for why a fourth
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
@@ -1239,6 +1243,8 @@ pub struct AutoUpdateState {
     window: roll_window::WindowGate,
     /// #10712: the fleet floor's basis and last verdict (inert while unset).
     floor: floor_roll::FloorState,
+    /// #10713: where this state is persisted (disabled unless attached).
+    persist: persisted_state::Persistence,
 }
 
 impl AutoUpdateState {
@@ -1593,8 +1599,9 @@ impl AutoUpdateState {
         if !quiet_settled && !ceiling_settled {
             // #10414: name both clocks. A fleet whose release cadence is shorter
             // than `settle` never satisfies the quiet period, so the ceiling is
-            // the real roll time — and it is in-memory, restarted by a daemon
-            // restart. Without this, 48 identical notes hid a ~24 h lag.
+            // the real roll time. It was in-memory until #10713 persisted it
+            // (a restart onto the same binary keeps it). Without this, 48
+            // identical notes hid a ~24 h lag.
             let left = |since: Option<Instant>, window: Duration| {
                 since.map_or(window, |s| window.saturating_sub(now.duration_since(s)))
             };
