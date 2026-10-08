@@ -28,6 +28,7 @@
 - [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
 - [Per-workspace priority tiers (#3946)](#per-workspace-priority-tiers-3946)
 - [Forge-side pipeline snapshot (`status --pipeline`, #3977)](#forge-side-pipeline-snapshot-status---pipeline-3977)
+- [Section-scoped status (`status --json --section`, #10787)](#section-scoped-status-status---json---section-10787)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
 - [ETA tracker (`autonomous.eta`, #9289)](#eta-tracker-autonomouseta-9289)
 - [Reaper task](#reaper-task)
@@ -2826,6 +2827,72 @@ managed repo, fetched *after* the IPC round-trip completes:
   `with_merge_window(Duration)` widens/narrows the merge-throughput window from
   its 24h default. A masked-off metric is left `None`; a caller that masks a
   metric off simply must not read it.
+
+## Section-scoped status (`status --json --section`, #10787)
+
+A full `loom-daemon status --json` builds the whole report — `O(registered
+repos)`, 10–21 s across ~58 repos on a busy dispatcher — and then runs the
+CLI's own collectors (the per-account token probe, the git staleness check,
+the worktree disk walk). A caller that reads two or three fields can ask for
+only those:
+
+```bash
+loom-daemon status --json --section daemon_build,auto_update
+loom-daemon status --json --section drain --section in_flight
+```
+
+- **Names** — `--section` takes the payload's top-level keys, comma-separated
+  and repeatable, and requires `--json`. A section that groups several keys is
+  named for its base key: `in_flight` is `in_flight` + `in_flight_count`, and
+  `preflight_advisory`, `observability` and `role_runner` group their
+  `*_`-prefixed keys. `loom-daemon status --help` lists every valid name; an
+  unknown one is a usage error (exit 2) naming them all.
+- **Output** — the same JSON object with only the selected keys. Without
+  `--section` the output is unchanged.
+- **What it skips** — the daemon builds only the phases a selected section
+  reads (`loom_daemon::status_section::SectionSet`), and the CLI skips its
+  collectors for unselected sections. `daemon_build`, `auto_update` and the
+  other process-level sections walk no registered repo at all.
+- **What still walks every repo** — anything derived from the live sweep list:
+  `in_flight`, `unregistered_locked`, `stale_sweeps`, `capacity_bound`,
+  `role_agents` and `drain` (the last three for the in-flight count), plus
+  `per_repo`, `worktrees` and `pipeline`, which also run the per-repo detail
+  phases. Do not pick `drain` or `role_agents` as a "cheap" poll.
+- **Interactions** — `pipeline` still needs `--pipeline` (else `null`). The
+  autonomy-mismatch exit code applies only when `protection` is selected.
+- **Wire** — a selection is sent as `Request::DaemonStatusSections { sections
+  }`; a selection naming every section is sent as the plain `DaemonStatus`
+  frame. The reply is the same `Response::DaemonStatus`. The daemon refuses a
+  frame with an empty `sections` list with an error reply.
+- **Version skew** — an unreachable daemon gets the usual unreachable payload
+  (`--section` ignored). A daemon older than the CLI rejects the frame, which
+  the CLI reports as `daemon too old for --section` (exit 1).
+
+### Concurrent status requests share one build (#10861)
+
+A status build cannot be cancelled once it has started, so a client that
+times out and retries used to leave its first build running and start a
+second. The daemon now runs **at most one build per section set at a time**
+(`ipc/status_off_runtime.rs`): a request that arrives while a build for the
+same set is in flight waits for that build's report.
+
+- **Keyed by section set.** Order and duplicates do not matter, and an
+  all-sections request shares the full build. Different sets never wait on
+  each other, so `--section daemon_build,auto_update` still answers quickly
+  while a full build is running.
+- **In flight only.** A finished report is never reused: a request arriving
+  after a build has completed starts a new one, so `status` straight after
+  `drain` / `halt` / `release` reflects the action. A request that *joins* a
+  build can receive a snapshot whose build began up to one build-duration
+  earlier.
+- **Drain is always live.** The `drain` block is overlaid per request, after
+  the shared build, so it is current even on a joined build.
+- **Failures.** If the shared build panics or its task does not complete,
+  every waiting request gets an error reply (never a dropped connection), and
+  the next request builds afresh.
+- **Telemetry.** `loom.daemon.ipc.requests{kind=DaemonStatus}` still counts
+  every request; `loom.daemon.ipc.status_builds{outcome}` counts the builds
+  ([`telemetry-schema.md`](telemetry-schema.md)).
 
 ## One-shot fleet vitals (`loom-daemon health`, #4761)
 

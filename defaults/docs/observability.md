@@ -724,6 +724,16 @@ log their own phase breakdown, and `CancelSweep` / `DispatchSweep` (slow by
 design: the SIGTERM grace and the token-capture poll). See
 [`telemetry-schema.md`](telemetry-schema.md) for the labels.
 
+**Status builds (#10861).** Concurrent `DaemonStatus` requests for the same
+section set share one build, so the latency series above are per request: a
+request that joined a running build reports only the time it waited.
+`loom.daemon.ipc.status_builds{outcome}` counts the builds (`ok`, `panic`,
+`join_error`). `requests{kind=DaemonStatus}` divided by `status_builds` is the
+coalescing ratio; a ratio well above 1 means callers are retrying or polling
+faster than the build completes. A non-zero `panic` count means status
+callers received error frames; the cause is one ERROR line per build in
+`daemon.log`.
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in

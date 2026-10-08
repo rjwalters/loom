@@ -346,6 +346,12 @@ pub enum MetricName {
     /// IPC requests answered since the previous point, by `kind`.
     #[serde(rename = "loom.daemon.ipc.requests")]
     DaemonIpcRequests,
+    /// `DaemonStatus` builds finished since the previous point, by `outcome`
+    /// (`ok` / `panic` / `join_error`). Concurrent status requests share one
+    /// build (Issue #10861), so `requests / status_builds` is the coalescing
+    /// ratio.
+    #[serde(rename = "loom.daemon.ipc.status_builds")]
+    DaemonIpcStatusBuilds,
     // ---- ETA pipeline health (Issue #10391) ------------------------------
     /// Live ETA items on this host, by kind, heuristic and answered/refusal reason.
     #[serde(rename = "loom.eta.health.items")]
@@ -463,6 +469,7 @@ impl MetricName {
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
             Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
             Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
+            Self::DaemonIpcStatusBuilds => "loom.daemon.ipc.status_builds",
             Self::EtaHealthItems => "loom.eta.health.items",
             Self::EtaHealthFitLoaded => "loom.eta.health.fit_loaded",
             Self::EtaHealthFitAgeSeconds => "loom.eta.health.fit_age_seconds",
@@ -510,7 +517,8 @@ impl MetricName {
             | Self::ForgeFacadeEvents
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
-            | Self::DaemonIpcRequests => MetricKind::DeltaCounter,
+            | Self::DaemonIpcRequests
+            | Self::DaemonIpcStatusBuilds => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -554,6 +562,7 @@ impl MetricName {
             Self::DaemonTaskFaults => "{fault}",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
             Self::DaemonIpcRequests => "{request}",
+            Self::DaemonIpcStatusBuilds => "{build}",
             Self::EtaHealthItems => "{item}",
             Self::EtaHealthFitLoaded => "1",
             Self::EtaHealthFitAgeSeconds => "s",
@@ -642,6 +651,7 @@ impl MetricName {
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
             Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
+            Self::DaemonIpcStatusBuilds => "DaemonStatus builds finished, by outcome.",
             Self::EtaHealthItems => {
                 "Live ETA items on this host, by kind, heuristic and answered/refusal reason."
             }
