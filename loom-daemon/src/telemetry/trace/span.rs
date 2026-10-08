@@ -195,6 +195,10 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.failure_class"
                     | "loom.exit_code"
                     | STATUS_MESSAGE
+                    // Issue #10642: the cause on a `no-phase-signal` sweep.
+                    | "loom.no_phase.exit"
+                    | "loom.no_phase.last_step"
+                    | "loom.no_phase.reason"
                     | "loom.host.mem_total_bytes"
                     | "loom.host.mem_available_bytes"
                     | "loom.host.mem_compressed_bytes"

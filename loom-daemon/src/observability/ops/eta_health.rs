@@ -38,8 +38,8 @@ pub struct EtaHealth {
     refresh_repos: BTreeMap<String, u64>,
     /// The last fit check: when it started and its outcome or skip reason.
     fit_check: Option<(DateTime<Utc>, String)>,
-    /// Rows, and rows with alternates, of the last built `eta.snapshot`.
-    snapshot_rows: Option<(u64, u64)>,
+    /// The last built `eta.snapshot`'s size and cuts.
+    snapshot_stats: Option<SnapshotStats>,
     /// Pending estimates the cap evicted since start; `None` before a pass.
     pending_over_cap: Option<u64>,
     /// Cached fleet snapshot `as_of`, keyed by file, re-read on an mtime change.
@@ -48,6 +48,22 @@ pub struct EtaHealth {
     /// rather than left at its last nonzero value on the backend.
     emitted_items: BTreeSet<ItemKey>,
     emitted_reasons: BTreeSet<String>,
+}
+
+/// The last built `eta.snapshot`, as the `loom.eta.health.snapshot_*` gauges
+/// report it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// Rows sent.
+    pub rows: u64,
+    /// Of those, rows with alternates.
+    pub alternates_rows: u64,
+    /// Rows dropped by the row cap or the byte budget (#10928).
+    pub rows_truncated: u64,
+    /// Rows sent without their alternates by the byte budget (#10928).
+    pub alternates_truncated: u64,
+    /// The record's compact JSON size in bytes (#10928).
+    pub bytes: u64,
 }
 
 /// `(kind, heuristic, reason)` of one items bucket.
@@ -88,9 +104,9 @@ impl EtaHealth {
         self.fit_check = Some((started_at, reason.to_string()));
     }
 
-    /// Record the last built `eta.snapshot`: its rows and those with alternates.
-    pub fn snapshot(&mut self, rows: u64, alternates_rows: u64) {
-        self.snapshot_rows = Some((rows, alternates_rows));
+    /// Record the last built `eta.snapshot`'s size and cuts.
+    pub fn snapshot(&mut self, stats: SnapshotStats) {
+        self.snapshot_stats = Some(stats);
     }
 }
 
@@ -123,8 +139,8 @@ pub fn note_fit_check(started_at: DateTime<Utc>, reason: &str) {
 
 /// Record the last built `eta.snapshot` in the global state
 /// ([`EtaHealth::snapshot`]).
-pub fn note_snapshot(rows: u64, alternates_rows: u64) {
-    with(|h| h.snapshot(rows, alternates_rows));
+pub fn note_snapshot(stats: SnapshotStats) {
+    with(|h| h.snapshot(stats));
 }
 
 /// Live items per `(kind, heuristic, reason)`: the newest estimate per
@@ -162,7 +178,7 @@ pub struct Facts {
     pub gate: Option<String>,
     pub last_tick: Option<DateTime<Utc>>,
     pub refresh_repos: BTreeMap<String, u64>,
-    pub snapshot_rows: Option<(u64, u64)>,
+    pub snapshot_stats: Option<SnapshotStats>,
     /// Cumulative cap evictions; `None` before the first ETA pass.
     pub pending_over_cap: Option<u64>,
     /// Items bucket keys exported on earlier passes; zeroed when absent now.
@@ -243,9 +259,17 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
             MetricPoint::int(MetricName::EtaHealthRefreshRepos, count(n)).label("reason", reason),
         );
     }
-    if let Some((rows, alternates)) = facts.snapshot_rows {
-        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotRows, count(rows)));
-        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotAlternatesRows, count(alternates)));
+    if let Some(stats) = facts.snapshot_stats {
+        let gauges = [
+            (MetricName::EtaHealthSnapshotRows, stats.rows),
+            (MetricName::EtaHealthSnapshotAlternatesRows, stats.alternates_rows),
+            (MetricName::EtaHealthSnapshotRowsTruncated, stats.rows_truncated),
+            (MetricName::EtaHealthSnapshotAlternatesTruncated, stats.alternates_truncated),
+            (MetricName::EtaHealthSnapshotBytes, stats.bytes),
+        ];
+        for (name, n) in gauges {
+            out.push(MetricPoint::int(name, count(n)));
+        }
     }
     if let Some(n) = facts.pending_over_cap {
         out.push(MetricPoint::int(MetricName::EtaHealthPendingOverCap, count(n)));
@@ -294,11 +318,11 @@ fn snapshot_ages(
 /// `as_of` cache this pass refreshes). Blocking (file reads).
 fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) -> Facts {
     let snapshots = snapshot_ages(root, &mut health.ages);
-    let (tick, repos, fit_check, snapshot_rows) = (
+    let (tick, repos, fit_check, snapshot_stats) = (
         health.tick.clone(),
         health.refresh_repos.clone(),
         health.fit_check.clone(),
-        health.snapshot_rows,
+        health.snapshot_stats,
     );
     // Before the first tick the gate is what the read-only resolver says it
     // would be (it never arms the singleton job), or `disabled` when the
@@ -318,7 +342,7 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
         gate: Some(gate),
         last_tick: tick.map(|(at, _)| at),
         refresh_repos: repos,
-        snapshot_rows,
+        snapshot_stats,
         pending_over_cap: health.pending_over_cap,
         prev_items: health.emitted_items.clone(),
         prev_reasons: health.emitted_reasons.clone(),

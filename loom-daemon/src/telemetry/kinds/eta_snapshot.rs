@@ -42,20 +42,30 @@ use serde::{Deserialize, Serialize};
 use crate::eta::{Kind, NoEstimateReason, Stage, Tier};
 use crate::telemetry::RepoVisibility;
 
-/// Most rows one record carries. Rows past this are counted in
-/// [`EtaSnapshotRecord::rows_truncated`] and
-/// [`EtaSnapshotRecord::rows_truncated_by_kind`]; the cut is by priority
+/// Most rows one record carries. Rows past this (or past
+/// [`MAX_RECORD_BYTES`]) are counted in [`EtaSnapshotRecord::rows_truncated`]
+/// and [`EtaSnapshotRecord::rows_truncated_by_kind`]; the cut is by priority
 /// (`land` with `p50`, `land` refusals, then `start`/`finish`), not sort order.
 ///
-/// Measured (#10052): a serialized row is ~245 bytes for a short slug (~350 with long slugs), so 200 rows is ~50-70 KB.
-/// With `alternates` (#10390) a `land` row carrying the 13 [`MAX_ALTERNATES`]
-/// is ~2.9 KB with long ids (#10549, #10521), so a full record is at most
-/// ~600 KB,
-/// well under the dashboard's 2 MiB value limit.
-/// The record lands as one `eta:<hostId>` dashboard state value, so the cap
-/// is held rather than raised: priority cutting, not a bigger record, is
-/// what keeps every repo's `land` rows in.
-pub const MAX_ROWS: usize = 200;
+/// 2000 since #10928 (was 200): one ETA authority (#10498) now emits the
+/// whole fleet's rows in one record, 682 live on 2026-10-08, when 200 dropped
+/// about 70% of them. A row without alternates measures 230 B on average
+/// (244 B at most) live, so 2000 rows are about 0.5 MB. The byte bound is
+/// [`MAX_RECORD_BYTES`], not this count.
+pub const MAX_ROWS: usize = 2000;
+
+/// Most bytes of compact JSON one record serializes to (#10928). Rows are
+/// admitted first, in cut-priority order; shadow `alternates` are then
+/// attached in the same order while the record stays within this budget,
+/// and rows that lost theirs are counted in
+/// [`EtaSnapshotRecord::alternates_truncated`].
+///
+/// The record lands as one `eta:<hostId>` dashboard state value (a Durable
+/// Object value, 2 MiB at most), so 1 MiB keeps half of it free. It also
+/// keeps several queued snapshots inside one `/ingest` POST (5 MiB), which
+/// the sender bounds by bytes as well (`observability::sender`). Measured
+/// live: an alternate is about 177 B, so a land row with 13 is about 2.5 KB.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// Most alternates one row carries; mirrors loom-ui's `MAX_ALTERNATES`
 /// (`src/etaState.ts`), which slices before it filters. 13 since #10521
@@ -164,11 +174,21 @@ pub struct EtaSnapshotRecord {
     /// that the exporter stalled.
     pub as_of: DateTime<Utc>,
     /// One row per `(repo, issue, kind)` this host currently estimates, in
-    /// `(repo, issue, kind)` order. At most [`MAX_ROWS`], chosen by priority.
+    /// cut-priority order (`land` with `p50`, `land` refusals, then
+    /// `start`/`finish`), and `(repo, issue, kind)` order within a rank
+    /// (#10928): a reader that keeps only a prefix keeps the rows that matter
+    /// most. At most [`MAX_ROWS`] and [`MAX_RECORD_BYTES`].
     pub rows: Vec<EtaSnapshotRow>,
-    /// Rows dropped by the [`MAX_ROWS`] cap.
+    /// Rows dropped by the [`MAX_ROWS`] cap or the [`MAX_RECORD_BYTES`]
+    /// budget.
     #[serde(default)]
     pub rows_truncated: usize,
+    /// Rows sent without the shadow `alternates` they have, because those did
+    /// not fit in [`MAX_RECORD_BYTES`] (#10928). Rows keep their alternates
+    /// in row order, so these are always the lowest-priority rows. 0 from
+    /// older daemons.
+    #[serde(default)]
+    pub alternates_truncated: usize,
     /// [`Self::rows_truncated`] broken down by [`Kind`], so a truncation that
     /// dropped `land` rows is visible. Absent when nothing was dropped and
     /// from older daemons.

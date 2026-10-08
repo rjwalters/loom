@@ -39,12 +39,18 @@
 //! unchanged): the restart that completes a roll is exactly the one that must
 //! not re-arm in the same window.
 //!
+//! The unsatisfiable-floor alert record (#10866) is always handed back too. It
+//! is valid for its floor and running version, not for a build commit, and
+//! [`FloorState::set_basis`](super::floor_roll::FloorState::set_basis) keeps it
+//! on the first tick only if both still match.
+//!
 //! The settle clocks are restored only when the binary that saved them is the
 //! one running now. A different binary means a roll completed (or an operator
 //! installed one), which ends the stale streak, as a successful roll always
 //! has. Restoring them there would make the next release roll at once on a
 //! ceiling that belongs to the previous one.
 
+use super::floor_roll::alert::FloorStallState;
 use super::{AutoUpdateState, RebuildOutcome};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -75,6 +81,13 @@ pub struct PersistedState {
     /// Roll-window consumption, `None` when windowing was off.
     #[serde(default)]
     pub window: Option<WindowConsumption>,
+    /// #10866: the last unsatisfiable-floor alert, absent when no such stall
+    /// stands. It outlives a binary change. An older binary ignores the key,
+    /// and a file without it loads as `None`, so the schema version is
+    /// unchanged. (The drain detector's `stall` key was removed by #10831; a
+    /// file that still carries it loads, and the key is ignored.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_stall: Option<FloorStallState>,
 }
 
 /// The settle gate's clocks, as wall-clock times.
@@ -248,6 +261,7 @@ impl AutoUpdateState {
                 deferred_since: wall(self.deferred_since),
             },
             window: self.window.consumption(),
+            floor_stall: self.floor.stall_state(),
         }
     }
 
@@ -267,10 +281,23 @@ impl AutoUpdateState {
             Some(_) => "no window consumption (the schedule changed or windowing is off)",
             None => "no window consumption (none saved)",
         };
+        // #10866: before the binary check. A floor stall depends on the floor
+        // and the running version, which `set_basis` compares on the first tick.
+        let floor = match &saved.floor_stall {
+            Some(stall) => format!(
+                "; unsatisfiable-floor alert for floor {} on {} (last logged {}), kept if the \
+                 first tick finds the same floor and running version",
+                stall.floor,
+                stall.running,
+                stall.last_alerted_at.format("%Y-%m-%dT%H:%M:%SZ")
+            ),
+            None => String::new(),
+        };
+        self.floor.restore_stall_state(saved.floor_stall);
         if saved.binary != binary {
             return format!(
                 "restored {window}; settle clocks DROPPED because the binary \
-                 changed ({} -> {binary}), i.e. a roll completed since they were saved",
+                 changed ({} -> {binary}), i.e. a roll completed since they were saved{floor}",
                 saved.binary
             );
         }
@@ -287,7 +314,7 @@ impl AutoUpdateState {
         self.deferred_since = instant(deferred_since);
         let since = first_stale_since
             .map_or_else(|| "none".to_string(), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        format!("restored settle clocks (streak since {since}), {window}")
+        format!("restored settle clocks (streak since {since}), {window}{floor}")
     }
 
     /// Enable persistence at `path` and restore whatever it holds. Logs exactly

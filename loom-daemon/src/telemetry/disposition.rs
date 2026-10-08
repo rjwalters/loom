@@ -91,6 +91,12 @@ const BUILD_WORK_PHASES: [&str; 4] = ["builder", "judge", "doctor", "merge"];
 /// bounded no matter what a future checkpoint marker spells.
 const KNOWN_PHASES: [&str; 5] = ["curator", "builder", "judge", "doctor", "merge"];
 
+/// The synthesized class for a failure with no classifier label, no phase
+/// history, and a duration too long to call a spawn death (Issue #10642 reads
+/// it back to attach a cause and to count these deaths toward the PR-less
+/// retry hold).
+pub const NO_PHASE_SIGNAL_CLASS: &str = "unclassified:no-phase-signal";
+
 /// What a sweep actually did, independent of how its process ended (Issue
 /// #9441) — the axis [`SweepResult`] cannot express.
 ///
@@ -428,7 +434,7 @@ fn synthesized_failure_class(
             SweepResult::Success => "unclassified:success-without-pr".to_string(),
             SweepResult::Blocked => "unclassified:blocked-on-human-decision".to_string(),
             _ => signals.last_phase_label().map_or_else(
-                || "unclassified:no-phase-signal".to_string(),
+                || NO_PHASE_SIGNAL_CLASS.to_string(),
                 |phase| format!("unclassified:after-{phase}"),
             ),
         },

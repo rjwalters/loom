@@ -22,7 +22,12 @@
 //!   typo in the store): a typed stall ([`FloorStallReport`]) is recorded and
 //!   alerted at ERROR, and the host **keeps dispatching** on its current
 //!   version. The floor never refuses work. Ordinary autoUpdate decisions
-//!   still apply, unchanged.
+//!   still apply, unchanged. The stall stands on every tick, but its ERROR
+//!   line is rate-limited and survives a restart (#10866, [`alert`]).
+//! - **Running below the floor, and this tick cannot tell** (no release
+//!   resolved, or the latest one's version is not `X.Y.Z`): noted, never
+//!   alerted. A stall already standing is kept, so a flaky resolver does not
+//!   toggle the alert (#10866).
 //!
 //! # One roll path, one comparator
 //!
@@ -77,6 +82,10 @@ impl FloorStallReport {
         )
     }
 }
+
+/// #10866: the rate limit on the unsatisfiable-floor ERROR line and the
+/// record of it that `auto_update_state.json` carries across a restart.
+pub mod alert;
 
 /// Who chose a roll target. The settle gate consults this, so a decision
 /// needs no clock to say whether settle applies.
@@ -183,12 +192,18 @@ pub enum FloorVerdict {
     },
     /// Below the floor, and no release satisfies it.
     Unsatisfiable(FloorStallReport),
-    /// Below the floor, but no release resolved this tick, so whether one
-    /// satisfies it is unknown. Noted, not alerted: a resolution failure is
-    /// already reported on its own, and the next tick asks again.
+    /// Below the floor, but this tick cannot say whether a release satisfies
+    /// it: none resolved, or the latest one's version does not parse. Noted,
+    /// not alerted: a resolution failure is already reported on its own, and
+    /// the next tick asks again. [`FloorState::observe`] does not let this
+    /// replace a standing [`Self::Unsatisfiable`] (#10866).
     Unresolved {
         /// The floor in force.
         floor: String,
+        /// The latest release's version when one resolved but is not a plain
+        /// `X.Y.Z` (e.g. `0.20.0-rc1`), so it cannot be compared with the
+        /// floor. `None` when no release resolved at all.
+        unparsed: Option<String>,
     },
 }
 
@@ -207,48 +222,90 @@ pub fn floor_verdict(floor: Option<&str>, running: &str, newest: Option<&Release
     let Some(newest) = newest else {
         return FloorVerdict::Unresolved {
             floor: floor.to_string(),
+            unparsed: None,
         };
     };
-    if parse_triple(&newest.version).is_some_and(|v| v >= min) {
-        FloorVerdict::Below {
+    match parse_triple(&newest.version) {
+        // #10866: a version the floor's own parser rejects says nothing about
+        // whether a release satisfies the floor, so it is not a stall.
+        None => FloorVerdict::Unresolved {
+            floor: floor.to_string(),
+            unparsed: Some(newest.version.clone()),
+        },
+        Some(v) if v >= min => FloorVerdict::Below {
             floor: floor.to_string(),
             target: newest.clone(),
-        }
-    } else {
-        FloorVerdict::Unsatisfiable(FloorStallReport {
+        },
+        Some(_) => FloorVerdict::Unsatisfiable(FloorStallReport {
             floor: floor.to_string(),
             running: running.to_string(),
             newest: newest.version.clone(),
-        })
+        }),
     }
 }
 
-/// The loop's floor bookkeeping: the basis set at the start of each tick and
-/// the last verdict, which carries the typed stall between ticks.
+/// The loop's floor bookkeeping: the basis set at the start of each tick, the
+/// last verdict, and the record of the last unsatisfiable-floor alert.
+///
+/// The verdict carries the typed stall between ticks, and is the last *known*
+/// one: a tick that cannot classify the floor leaves a standing stall in place
+/// (see [`Self::observe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FloorState {
     floor: Option<String>,
     running: String,
     verdict: FloorVerdict,
+    /// #10866: the stall last alerted on. `Some` only while that stall
+    /// stands, or between a restore and the first [`Self::set_basis`].
+    alert: Option<alert::FloorAlert>,
 }
 
 impl FloorState {
     /// Set this tick's basis: the floor in force and the running version
     /// (`env!("CARGO_PKG_VERSION")` in production). A changed basis drops the
-    /// previous verdict, so removing the floor clears a stall at once.
+    /// previous verdict and alert record, so removing the floor clears a
+    /// stall at once.
+    ///
+    /// One exception (#10866): the first call after a restart is a change from
+    /// the default basis, and an alert record restored from disk whose floor
+    /// and running version are the new basis is kept. Its stall is seeded as
+    /// the last-known verdict, so the restart neither drops the stall nor logs
+    /// it again. A restored record for any other basis is dropped like the
+    /// rest.
     pub fn set_basis(&mut self, floor: Option<String>, running: &str) {
         if self.floor != floor || self.running != running {
             self.floor = floor;
             self.running = running.to_string();
-            self.verdict = FloorVerdict::Unset;
+            self.alert = self.alert.take().filter(|a| {
+                Some(&a.report.floor) == self.floor.as_ref() && a.report.running == running
+            });
+            self.verdict = self
+                .alert
+                .as_ref()
+                .map_or(FloorVerdict::Unset, |a| FloorVerdict::Unsatisfiable(a.report.clone()));
         }
     }
 
     /// Classify against this tick's newest release (`None` when none
     /// resolved) and return the floor target when the host is below a
     /// satisfiable floor.
+    ///
+    /// #10866: an [`FloorVerdict::Unresolved`] reading does not replace a
+    /// standing [`FloorVerdict::Unsatisfiable`], so a tick whose resolver
+    /// failed keeps the stall and its alert. The basis is unchanged whenever
+    /// that happens, because [`Self::set_basis`] resets the verdict on a
+    /// change. Every other reading replaces the verdict.
     pub fn observe(&mut self, newest: Option<&Release>) -> Option<Release> {
-        self.verdict = floor_verdict(self.floor.as_deref(), &self.running, newest);
+        let seen = floor_verdict(self.floor.as_deref(), &self.running, newest);
+        let keep_stall = matches!(seen, FloorVerdict::Unresolved { .. })
+            && matches!(self.verdict, FloorVerdict::Unsatisfiable(_));
+        if !keep_stall {
+            self.verdict = seen;
+        }
+        if self.stall().is_none() {
+            // A stall that returns later is a new start.
+            self.alert = None;
+        }
         match &self.verdict {
             FloorVerdict::Below { target, .. } => Some(target.clone()),
             _ => None,
@@ -315,9 +372,20 @@ impl FloorState {
                 self.running, target.tag
             ),
             FloorVerdict::Unsatisfiable(report) => format!(" [{}]", report.note()),
-            FloorVerdict::Unresolved { floor } => format!(
+            FloorVerdict::Unresolved {
+                floor,
+                unparsed: None,
+            } => format!(
                 " [running {} is below the fleet floor {floor}, but no release resolved this \
                  tick to roll to]",
+                self.running
+            ),
+            FloorVerdict::Unresolved {
+                floor,
+                unparsed: Some(version),
+            } => format!(
+                " [running {} is below the fleet floor {floor}, but the latest release's version \
+                 {version:?} is not X.Y.Z, so it cannot be compared with the floor this tick]",
                 self.running
             ),
             _ => String::new(),
@@ -433,9 +501,68 @@ mod tests {
         assert_eq!(
             floor_verdict(Some("0.19.850"), "0.19.800", None),
             FloorVerdict::Unresolved {
-                floor: "0.19.850".to_string()
+                floor: "0.19.850".to_string(),
+                unparsed: None,
             }
         );
+        // #10866: a latest version the floor's parser rejects is unresolved,
+        // never a stall, whichever side of the floor it "looks" like.
+        for version in ["0.19.900-rc1", "v0.19.900", "garbage"] {
+            let odd = Release {
+                tag: "vX".to_string(),
+                version: version.to_string(),
+            };
+            for floor in ["0.19.850", "0.19.999"] {
+                assert_eq!(
+                    floor_verdict(Some(floor), "0.19.800", Some(&odd)),
+                    FloorVerdict::Unresolved {
+                        floor: floor.to_string(),
+                        unparsed: Some(version.to_string()),
+                    },
+                    "{version} against {floor}"
+                );
+            }
+        }
+    }
+
+    /// #10866 item 4: an unresolved tick keeps a standing stall; every other
+    /// reading replaces it.
+    #[test]
+    fn an_unresolved_tick_keeps_a_standing_stall() {
+        let mut state = FloorState::default();
+        state.set_basis(Some("9.0.0".to_string()), "0.19.800");
+        // No prior stall: unresolved is just unresolved.
+        assert_eq!(state.observe(None), None);
+        assert!(matches!(state.verdict(), FloorVerdict::Unresolved { .. }));
+        assert!(state.stall().is_none());
+        assert!(state.note_suffix().contains("no release resolved"));
+
+        assert_eq!(state.observe(Some(&rel("0.19.900"))), None);
+        let stall = state.stall().cloned().unwrap();
+        // Resolution fails, then the latest version is unparseable.
+        let odd = Release {
+            tag: "v1.0.0-rc1".to_string(),
+            version: "1.0.0-rc1".to_string(),
+        };
+        for newest in [None, Some(&odd)] {
+            assert_eq!(state.observe(newest), None);
+            assert_eq!(state.stall(), Some(&stall), "{newest:?}");
+            assert!(state.note_suffix().contains("FLEET FLOOR UNSATISFIABLE"));
+        }
+        // A fresh unsatisfiable reading updates `newest`.
+        state.observe(Some(&rel("0.19.901")));
+        assert_eq!(state.stall().unwrap().newest, "0.19.901");
+        // A satisfying release clears it.
+        assert_eq!(state.observe(Some(&rel("9.0.0"))), Some(rel("9.0.0")));
+        assert!(state.stall().is_none());
+        // So does removing the floor, with the stall standing again first.
+        state.observe(Some(&rel("0.19.900")));
+        state.observe(None);
+        assert!(state.stall().is_some());
+        state.set_basis(None, "0.19.800");
+        assert!(state.stall().is_none());
+        assert_eq!(state.observe(None), None);
+        assert_eq!(state.verdict(), &FloorVerdict::Unset);
     }
 
     #[test]

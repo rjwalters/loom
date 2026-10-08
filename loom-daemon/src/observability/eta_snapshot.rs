@@ -37,7 +37,8 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::score::EstimateSummary;
 use crate::eta::Kind;
 use crate::telemetry::kinds::eta_snapshot::{
-    EtaSnapshotAlternate, EtaSnapshotRecord, EtaSnapshotRow, MAX_ALTERNATES, MAX_ROWS,
+    EtaSnapshotAlternate, EtaSnapshotRecord, EtaSnapshotRow, MAX_ALTERNATES, MAX_RECORD_BYTES,
+    MAX_ROWS,
 };
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 
@@ -223,13 +224,19 @@ fn cap_rank(estimate: &EstimateSummary) -> u8 {
     }
 }
 
+/// Bytes [`MAX_RECORD_BYTES`] keeps back for the record's own fields
+/// (`as_of`, the counters, `rows_truncated_by_kind`, the keys and brackets),
+/// so the rows and alternates can be budgeted on their own sizes. Those
+/// fields serialize to under 300 B.
+const RECORD_OVERHEAD_BYTES: usize = 1024;
+
 /// Build the record for `selected` (already in row order). `visibility` tags
 /// each repo; a repo absent from it is [`RepoVisibility::Private`], the
 /// safe default.
 ///
 /// The [`MAX_ROWS`] cap is applied by priority ([`cap_rank`]), not by sort
 /// order, so no repo loses its `land` estimates for sorting late (#10052);
-/// the survivors are then restored to `(repo, issue, kind)` order. Pure.
+/// the rows stay in that priority order on the wire (#10928). Pure.
 #[must_use]
 pub fn build_record(
     selected: &[EstimateSummary],
@@ -240,6 +247,13 @@ pub fn build_record(
 
 /// [`build_record`] with each row's shadow `alternates` attached (#10390).
 /// Alternates never count as rows: a row cut by the cap takes them with it.
+///
+/// Bounded by [`MAX_RECORD_BYTES`] (#10928) in two passes over the rows in
+/// priority order: rows without their alternates are admitted until
+/// [`MAX_ROWS`] or the budget, and then each admitted row keeps its
+/// alternates while they still fit. The first row whose alternates do not
+/// fit, and every row after it, is sent without them and counted in
+/// `alternates_truncated`: a row's ETA outranks every row's shadow estimates.
 #[must_use]
 pub fn build_record_with(
     selected: &[EstimateSummary],
@@ -252,58 +266,96 @@ pub fn build_record_with(
         .max()
         .unwrap_or_else(chrono::Utc::now);
     let mut ranked: Vec<&EstimateSummary> = selected.iter().collect();
-    // Stable: within a rank the incoming (repo, issue, kind) order holds.
-    ranked.sort_by_key(|estimate| cap_rank(estimate));
+    ranked.sort_by_cached_key(|estimate| {
+        let repo = estimate.repo.to_ascii_lowercase();
+        (cap_rank(estimate), repo, estimate.issue, estimate.kind)
+    });
+    let mut used = RECORD_OVERHEAD_BYTES;
+    // (row, its size without alternates, its size with them)
+    let mut admitted: Vec<(EtaSnapshotRow, usize, usize)> = Vec::new();
+    for estimate in ranked.iter().take(MAX_ROWS) {
+        let mut row = to_row(estimate, alternates, visibility);
+        let alts = std::mem::take(&mut row.alternates);
+        // `+ 1`: the comma between rows.
+        let bare = super::sender::json_len(&row) + 1;
+        if used + bare > MAX_RECORD_BYTES {
+            break;
+        }
+        used += bare;
+        row.alternates = alts;
+        let full = super::sender::json_len(&row) + 1;
+        admitted.push((row, bare, full));
+    }
     let mut rows_truncated_by_kind: BTreeMap<Kind, usize> = BTreeMap::new();
-    for dropped in ranked.iter().skip(MAX_ROWS) {
+    for dropped in ranked.iter().skip(admitted.len()) {
         *rows_truncated_by_kind.entry(dropped.kind).or_insert(0) += 1;
     }
-    ranked.truncate(MAX_ROWS);
-    ranked.sort_by_cached_key(|estimate| {
-        (estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind)
-    });
-    let rows: Vec<EtaSnapshotRow> = ranked
+    let mut alternates_truncated = 0;
+    let mut fits = true;
+    let rows: Vec<EtaSnapshotRow> = admitted
         .into_iter()
-        .map(|estimate| EtaSnapshotRow {
-            repo: estimate.repo.clone(),
-            visibility: visibility
-                .get(&estimate.repo)
-                .copied()
-                .unwrap_or(RepoVisibility::Private),
-            issue: estimate.issue,
-            pr: estimate.pr_number,
-            kind: estimate.kind,
-            p25: estimate.p25_sec,
-            p50: estimate.p50_sec,
-            p75: estimate.p75_sec,
-            heuristic: estimate.heuristic.clone(),
-            estimate_id: estimate.estimate_id.clone(),
-            as_of: estimate.as_of,
-            stage: estimate.stage,
-            no_estimate_reason: estimate.no_estimate_reason,
-            alternates: alternates
-                .get(&(estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind))
-                .into_iter()
-                .flatten()
-                .map(|alt| EtaSnapshotAlternate {
-                    heuristic: alt.heuristic.clone(),
-                    tier: crate::eta::shadow_fleet::builtin_tier(&alt.heuristic),
-                    estimate_id: alt.estimate_id.clone(),
-                    as_of: alt.as_of,
-                    p25: alt.p25_sec,
-                    p50: alt.p50_sec,
-                    p75: alt.p75_sec,
-                    p90: alt.p90_sec,
-                    no_estimate_reason: alt.no_estimate_reason,
-                })
-                .collect(),
+        .map(|(mut row, bare, full)| {
+            if row.alternates.is_empty() {
+                return row;
+            }
+            fits = fits && used + (full - bare) <= MAX_RECORD_BYTES;
+            if fits {
+                used += full - bare;
+            } else {
+                row.alternates.clear();
+                alternates_truncated += 1;
+            }
+            row
         })
         .collect();
     EtaSnapshotRecord {
         as_of,
         rows_truncated: selected.len().saturating_sub(rows.len()),
+        alternates_truncated,
         rows_truncated_by_kind,
         rows,
+    }
+}
+
+/// One row for `estimate`, with every alternate it has.
+fn to_row(
+    estimate: &EstimateSummary,
+    alternates: &Alternates,
+    visibility: &HashMap<String, RepoVisibility>,
+) -> EtaSnapshotRow {
+    EtaSnapshotRow {
+        repo: estimate.repo.clone(),
+        visibility: visibility
+            .get(&estimate.repo)
+            .copied()
+            .unwrap_or(RepoVisibility::Private),
+        issue: estimate.issue,
+        pr: estimate.pr_number,
+        kind: estimate.kind,
+        p25: estimate.p25_sec,
+        p50: estimate.p50_sec,
+        p75: estimate.p75_sec,
+        heuristic: estimate.heuristic.clone(),
+        estimate_id: estimate.estimate_id.clone(),
+        as_of: estimate.as_of,
+        stage: estimate.stage,
+        no_estimate_reason: estimate.no_estimate_reason,
+        alternates: alternates
+            .get(&(estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind))
+            .into_iter()
+            .flatten()
+            .map(|alt| EtaSnapshotAlternate {
+                heuristic: alt.heuristic.clone(),
+                tier: crate::eta::shadow_fleet::builtin_tier(&alt.heuristic),
+                estimate_id: alt.estimate_id.clone(),
+                as_of: alt.as_of,
+                p25: alt.p25_sec,
+                p50: alt.p50_sec,
+                p75: alt.p75_sec,
+                p90: alt.p90_sec,
+                no_estimate_reason: alt.no_estimate_reason,
+            })
+            .collect(),
     }
 }
 
@@ -338,6 +390,23 @@ pub fn decide(
 /// `current` heuristic id, and each kind's registered heuristic ids.
 pub type SnapshotInput = (Vec<EstimateSummary>, BTreeMap<Kind, String>, RegisteredIds);
 
+/// The `loom.eta.health.snapshot_*` gauges' view of a built record. Pure.
+#[must_use]
+pub fn stats(record: &EtaSnapshotRecord) -> super::ops::eta_health::SnapshotStats {
+    let with_alternates = record
+        .rows
+        .iter()
+        .filter(|r| !r.alternates.is_empty())
+        .count();
+    super::ops::eta_health::SnapshotStats {
+        rows: record.rows.len() as u64,
+        alternates_rows: with_alternates as u64,
+        rows_truncated: record.rows_truncated as u64,
+        alternates_truncated: record.alternates_truncated as u64,
+        bytes: super::sender::json_len(record) as u64,
+    }
+}
+
 /// Emit this host's current estimate set when a native sink is registered,
 /// ETA is enabled, the tracker holds at least one current estimate, and that
 /// set has changed since the previous snapshot.
@@ -361,19 +430,25 @@ pub(super) async fn record() {
         }
     }
     let record = build_record_with(&selected, &alternates, &visibility);
+    let stats = stats(&record);
     log::debug!(
-        "eta.snapshot: {} row(s) ({} truncated: {:?}), as_of={}",
+        "eta.snapshot: {} row(s) ({} truncated: {:?}; {} without their alternates), {} B, as_of={}",
         record.rows.len(),
         record.rows_truncated,
         record.rows_truncated_by_kind,
+        record.alternates_truncated,
+        stats.bytes,
         record.as_of
     );
-    let with_alternates = record
-        .rows
-        .iter()
-        .filter(|r| !r.alternates.is_empty())
-        .count();
-    super::ops::eta_health::note_snapshot(record.rows.len() as u64, with_alternates as u64);
+    if record.rows_truncated > 0 {
+        log::warn!(
+            "eta.snapshot: dropped {} row(s) {:?} at the {MAX_ROWS}-row / {MAX_RECORD_BYTES}-byte cap; \
+             the dashboard has no fresh ETA for them (#10928)",
+            record.rows_truncated,
+            record.rows_truncated_by_kind,
+        );
+    }
+    super::ops::eta_health::note_snapshot(stats);
     sink.push(record);
     *LAST_EMITTED
         .lock()

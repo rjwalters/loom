@@ -123,10 +123,11 @@ fn only_the_current_heuristics_newest_estimate_per_item_is_a_row() {
         .collect();
     assert_eq!(
         rows,
+        // Cut-priority order (#10928): `land` estimates, then the rest.
         vec![
             (PRIVATE_REPO, 42, Kind::Land, Some(7_200)),
-            (REPO, 9329, Kind::Finish, Some(900)),
             (REPO, 9329, Kind::Land, Some(1_800)),
+            (REPO, 9329, Kind::Finish, Some(900)),
         ]
     );
     assert!(
@@ -427,15 +428,22 @@ fn the_cap_keeps_land_rows_of_every_repo_and_drops_start_finish_first() {
         .rows
         .iter()
         .any(|r| r.repo == "a/early" && r.kind == Kind::Land && r.p50.is_none()));
-    // Re-sorted by (repo, issue, kind) after the cut.
+    // Sent in cut-priority order, then (repo, issue, kind) (#10928): the land
+    // estimates lead, so a reader keeping only a prefix keeps them.
+    let rank = |r: &crate::telemetry::kinds::eta_snapshot::EtaSnapshotRow| match r.kind {
+        Kind::Land if r.p50.is_some() => 0,
+        Kind::Land => 1,
+        _ => 2,
+    };
     let keys: Vec<_> = record
         .rows
         .iter()
-        .map(|r| (r.repo.clone(), r.issue, r.kind))
+        .map(|r| (rank(r), r.repo.clone(), r.issue, r.kind))
         .collect();
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(keys, sorted);
+    assert!(record.rows[..10].iter().all(|r| r.repo == "z/late"));
     // Dropped counts: start/finish only, no land.
     assert_eq!(record.rows_truncated, selected.len() - super::MAX_ROWS);
     assert_eq!(record.rows_truncated_by_kind.get(&Kind::Land), None);
@@ -464,7 +472,8 @@ fn a_serialized_row_stays_within_the_measured_budget() {
     let selected = select_current(&pending, &current());
     let record = build_record(&selected, &visibility());
     let bytes = serde_json::to_vec(&record.rows[0]).unwrap().len();
-    // MAX_ROWS is sized on ~250-350 B/row (~50-70 KB/record); see its doc comment.
+    // MAX_ROWS is sized on ~250-350 B/row (~0.5-0.7 MB at 2000 rows), under
+    // MAX_RECORD_BYTES with no alternates at all; see its doc comment.
     assert!(bytes < 500, "row grew to {bytes} bytes");
 }
 
@@ -618,6 +627,7 @@ fn rows_without_alternates_omit_the_key_and_budgets_hold() {
     eprintln!("{MAX_ALTERNATES}-alternate row: {row} B; 200-row record: {all} B");
     assert!(row < 3 * 1_024, "row grew to {row} bytes");
     assert!(all < 768 * 1_024, "record grew to {all} bytes");
+    assert_eq!(record.alternates_truncated, 0, "200 full rows fit the budget");
 }
 
 #[test]
@@ -715,4 +725,177 @@ fn alternates_carry_each_heuristics_tier() {
     let wire = serde_json::to_value(&record.rows[0]).unwrap();
     assert_eq!(wire["alternates"][0]["tier"], "candidate");
     assert_eq!(wire["alternates"][1]["tier"], "baseline");
+}
+
+// ---------------------------------------------------------------------------
+// The fleet-authority budget (#10928): one host emits the whole fleet's rows.
+// ---------------------------------------------------------------------------
+
+/// A fleet-authority-shaped estimate set: `items` items over 58 repos with
+/// production-length slugs and 16-hex estimate ids, `shape(i)` giving each
+/// item's kind and `p50`. Every `land` item also has a pending estimate from
+/// every registered land shadow (refusing when the row refuses), so each
+/// `land` row carries the full alternate list, as live rows do.
+fn fleet(
+    items: u32,
+    shape: impl Fn(u32) -> (Kind, Option<i64>),
+) -> (Vec<EstimateSummary>, super::Alternates) {
+    let land_ids = registered().remove(&Kind::Land).unwrap();
+    let current = current();
+    let mut pending = Vec::new();
+    for i in 0..items {
+        let repo = format!("2AMLogic/fleet-repo-{:02}", i % 58);
+        let (kind, p50) = shape(i);
+        let heuristics: Vec<&String> = match kind {
+            Kind::Land => land_ids.iter().collect(),
+            _ => vec![&current[&kind]],
+        };
+        for heuristic in heuristics {
+            let mut estimate = summary(&repo, 1000 + i, kind, heuristic, 0, p50.map(|p| p + 60));
+            estimate.estimate_id = format!("{:016x}", pending.len() * 7919 + 1);
+            pending.push(estimate);
+        }
+    }
+    let selected = select_current(&pending, &current);
+    let alternates = select_alternates(&pending, &current, &registered());
+    (selected, alternates)
+}
+
+fn wire_bytes(record: &crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord) -> usize {
+    serde_json::to_vec(record).unwrap().len()
+}
+
+/// The rows that carry alternates are a prefix of the rows: the budget
+/// gives them to the highest-priority rows first.
+fn assert_alternates_are_a_prefix(
+    record: &crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord,
+) {
+    let with = record
+        .rows
+        .iter()
+        .filter(|r| !r.alternates.is_empty())
+        .count();
+    assert!(record.rows[..with].iter().all(|r| !r.alternates.is_empty()));
+    assert!(record.rows[with..].iter().all(|r| r.alternates.is_empty()));
+}
+
+/// Today's fleet (682 rows live on 2026-10-08, 482 of them dropped at the
+/// old 200-row cap), all `land`: every row is sent, and the record stays
+/// within the 1 MiB budget by sending the lowest-priority rows' alternates
+/// no further.
+#[test]
+fn a_700_row_fleet_is_sent_whole_within_the_byte_budget() {
+    use crate::telemetry::kinds::eta_snapshot::MAX_RECORD_BYTES;
+    let (selected, alternates) = fleet(700, |i| (Kind::Land, (i % 5 != 4).then_some(3_600)));
+    assert_eq!(selected.len(), 700);
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), 700);
+    assert_eq!(record.rows_truncated, 0);
+    assert!(record.rows_truncated_by_kind.is_empty());
+
+    let bytes = wire_bytes(&record);
+    assert!(bytes <= MAX_RECORD_BYTES, "{bytes} B over the {MAX_RECORD_BYTES} B budget");
+    let envelope = crate::telemetry::TelemetryEnvelope::new(
+        "loom-worker-1",
+        crate::telemetry::TelemetryRecord::EtaSnapshot(record.clone()),
+    );
+    let enveloped = serde_json::to_vec(&envelope).unwrap().len();
+    assert!(enveloped <= MAX_RECORD_BYTES + 1_024, "{enveloped} B enveloped");
+    assert_eq!(super::stats(&record).bytes, bytes as u64);
+
+    let with = record
+        .rows
+        .iter()
+        .filter(|r| !r.alternates.is_empty())
+        .count();
+    assert_eq!(with + record.alternates_truncated, 700, "every land row has shadows");
+    assert!(with >= 300, "only {with} rows kept their alternates");
+    assert!(record.alternates_truncated > 0, "700 full rows exceed 1 MiB");
+    assert_alternates_are_a_prefix(&record);
+    // The estimating land rows lead; the refusals (every fifth) follow.
+    assert!(record.rows[..560].iter().all(|r| r.p50.is_some()));
+    assert!(record.rows[560..].iter().all(|r| r.p50.is_none()));
+    let stats = super::stats(&record);
+    eprintln!(
+        "700-row fleet: {bytes} B ({enveloped} B enveloped), {} rows with alternates, {} without",
+        stats.alternates_rows, stats.alternates_truncated
+    );
+}
+
+/// The headroom: a fleet of the full 2000-row cap is still sent whole.
+#[test]
+fn a_2000_row_fleet_is_sent_whole() {
+    use crate::telemetry::kinds::eta_snapshot::{MAX_RECORD_BYTES, MAX_ROWS};
+    let (selected, alternates) = fleet(u32::try_from(MAX_ROWS).unwrap(), |i| match i % 4 {
+        0 | 1 => (Kind::Land, Some(3_600)),
+        2 => (Kind::Land, None),
+        _ => (Kind::Start, Some(600)),
+    });
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), MAX_ROWS);
+    assert_eq!(record.rows_truncated, 0);
+    let bytes = wire_bytes(&record);
+    assert!(bytes <= MAX_RECORD_BYTES, "{bytes} B");
+    assert_alternates_are_a_prefix(&record);
+    eprintln!(
+        "2000-row fleet: {bytes} B, {} rows with alternates",
+        super::stats(&record).alternates_rows
+    );
+}
+
+/// Past the row cap the lowest-priority rows go, and the rest keep the
+/// priority order.
+#[test]
+fn past_the_cap_the_lowest_priority_rows_go_and_the_order_holds() {
+    use crate::telemetry::kinds::eta_snapshot::{MAX_RECORD_BYTES, MAX_ROWS};
+    let items = u32::try_from(MAX_ROWS).unwrap() + 99;
+    let (selected, alternates) = fleet(items, |i| match i % 3 {
+        0 => (Kind::Start, Some(600)),
+        1 => (Kind::Land, None),
+        _ => (Kind::Land, Some(3_600)),
+    });
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), MAX_ROWS);
+    assert_eq!(record.rows_truncated, 99);
+    assert_eq!(
+        record.rows_truncated_by_kind,
+        std::collections::BTreeMap::from([(Kind::Start, 99)])
+    );
+    assert!(wire_bytes(&record) <= MAX_RECORD_BYTES);
+    let rank = |r: &crate::telemetry::kinds::eta_snapshot::EtaSnapshotRow| match r.kind {
+        Kind::Land if r.p50.is_some() => 0,
+        Kind::Land => 1,
+        _ => 2,
+    };
+    let keys: Vec<_> = record
+        .rows
+        .iter()
+        .map(|r| (rank(r), r.repo.to_ascii_lowercase(), r.issue, r.kind))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
+    assert_alternates_are_a_prefix(&record);
+}
+
+/// Rows alone are held to the byte budget too: with slugs long enough that
+/// 2000 bare rows exceed 1 MiB, rows are cut by bytes and counted.
+#[test]
+fn rows_too_large_for_the_budget_are_cut_by_bytes() {
+    use crate::telemetry::kinds::eta_snapshot::{MAX_RECORD_BYTES, MAX_ROWS};
+    let long = "r".repeat(600);
+    let pending: Vec<EstimateSummary> = (0..u32::try_from(MAX_ROWS).unwrap())
+        .map(|i| summary(&format!("o/{long}"), i + 1, Kind::Land, "land-v1", 0, Some(600)))
+        .collect();
+    let selected = select_current(&pending, &current());
+    let record = build_record(&selected, &visibility());
+    let row = serde_json::to_vec(&record.rows[0]).unwrap().len();
+    assert!(record.rows.len() < MAX_ROWS);
+    assert_eq!(record.rows_truncated, MAX_ROWS - record.rows.len());
+    assert_eq!(record.rows_truncated_by_kind.get(&Kind::Land), Some(&record.rows_truncated));
+    let bytes = wire_bytes(&record);
+    assert!(bytes <= MAX_RECORD_BYTES, "{bytes} B");
+    assert!(bytes > MAX_RECORD_BYTES - 2 * row - 1_024, "cut early: {bytes} B");
+    // The survivors are the first by issue number.
+    assert_eq!(record.rows.last().unwrap().issue, u32::try_from(record.rows.len()).unwrap());
 }
