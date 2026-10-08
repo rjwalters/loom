@@ -407,7 +407,7 @@ fn execute_case(
 /// The disposable issue title every write case uses: namespace-prefixed so
 /// cleanup can find (only) this run's resources.
 fn issue_title(cfg: &RunnerConfig, case: &str) -> String {
-    format!("loomp-{}: {case}", cfg.run_ns)
+    format!("{}: {case}", cfg.run_ns)
 }
 
 const DISPOSABLE_BODY: &str =
