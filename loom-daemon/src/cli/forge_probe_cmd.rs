@@ -12,8 +12,9 @@
 //! |---|---|
 //! | 0 | every required row executed and passed |
 //! | 1 | the qualification verdict is not clean — a required row is
-//!     unknown, failed, or unsupported. Slice 1 runs on the full matrix,
-//!     so this is the expected exit until the slice-2 matrix lands. |
+//!     unknown, failed, or unsupported — or the run-scoped cleanup of a
+//!     `--live-write` run was incomplete. Only the coordination profile
+//!     executes so far, so this is the expected exit on the full matrix. |
 //! | 2 | could not run: missing config, missing credential, or a
 //!     transport fault on the version probe |
 //!
@@ -26,7 +27,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::forge_probe::{run, verdict, LiveHttp, RunnerConfig};
+use loom_daemon::forge_probe::cleanup::{cleanup, FaultInjector};
+use loom_daemon::forge_probe::{run, verdict, LiveHttp, ProbeHttp, RunnerConfig};
 
 #[derive(clap::Args)]
 pub(crate) struct ForgeProbeArgs {
@@ -63,6 +65,19 @@ pub(crate) struct ForgeProbeArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     timeout: u64,
+    /// Fail every list read of page N (a transport fault injected by the
+    /// runner, e.g. 2 for the page-two-failure check). Affected rows carry
+    /// `injected_fault: true` — never a service observation.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    inject_page_fault: Option<u32>,
+    /// Skip the run-scoped cleanup after a `--live-write` run (leaves this
+    /// run's `loomp-<ns>: ` issues open and labels in place for inspection).
+    #[arg(long)]
+    keep_resources: bool,
 }
 
 impl ForgeProbeArgs {
@@ -120,7 +135,14 @@ impl ForgeProbeArgs {
             origin: cfg.origin.clone(),
             timeout: cfg.timeout,
         };
-        let results = match run(&cfg, &http) {
+        let injector = self
+            .inject_page_fault
+            .map(|page| FaultInjector { inner: &http, page });
+        let transport: &dyn ProbeHttp = match &injector {
+            Some(i) => i,
+            None => &http,
+        };
+        let results = match run(&cfg, transport) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("forge-probe: could not run: {e:#}");
@@ -128,14 +150,35 @@ impl ForgeProbeArgs {
             }
         };
         println!("{}", serde_json::to_string_pretty(&results)?);
+        // Cleanup always uses the un-injected transport: a fault injected
+        // for evidence must not leave this run's fixtures behind.
+        let mut cleanup_ok = true;
+        if cfg.live_write && !self.keep_resources {
+            match cleanup(&cfg, &http) {
+                Ok(report) => {
+                    cleanup_ok = report.is_clean();
+                    eprintln!("forge-probe: cleanup {}", serde_json::to_string(&report)?);
+                }
+                Err(e) => {
+                    cleanup_ok = false;
+                    eprintln!("forge-probe: cleanup could not run: {e:#}");
+                }
+            }
+        }
         let (ok, unknown, failed, unsupported) = verdict(&results);
+        let injected = results.iter().filter(|r| r.injected_fault).count();
         eprintln!(
             "forge-probe: verdict {} — {} case(s) run, {unknown} unknown, {failed} failed, \
-             {unsupported} unsupported (required rows only)",
+             {unsupported} unsupported (required rows only); {injected} row(s) injected-fault{}",
             if ok { "GO" } else { "NO-GO" },
-            results.len()
+            results.len(),
+            if cleanup_ok {
+                ""
+            } else {
+                "; cleanup INCOMPLETE"
+            }
         );
-        if ok {
+        if ok && cleanup_ok {
             Ok(())
         } else {
             std::process::exit(1);

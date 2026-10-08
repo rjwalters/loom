@@ -24,8 +24,14 @@
 //! The transport is a trait: the live implementation shells `curl` with the
 //! Authorization header written to stdin (never argv — #5982), and tests
 //! script a fake. Cases are matched on the manifest's `test_id`
-//! (`forge-probe::<group>::<name>`); a handler absent for slice 1 leaves
-//! its row `unknown` with the reason recorded.
+//! (`forge-probe::<group>::<name>`); a row without a handler stays
+//! `unknown` with the reason recorded.
+//!
+//! Slice 2 (`coordination.rs`): every `required-coordination` row has a
+//! self-contained handler with semantic readback and complete-pagination
+//! rules; `cleanup.rs` adds run-namespace-scoped cleanup and the
+//! `--inject-page-fault` transport wrapper whose rows are flagged
+//! `injected_fault` (never confusable with a service observation).
 
 use std::time::Duration;
 
@@ -65,6 +71,9 @@ pub struct CaseResult {
     pub observed: String,
     /// Why a case did not run (slice boundary, transport fault, refusal).
     pub notes: Vec<String>,
+    /// True when the row's outcome came from a fault the runner injected
+    /// (`--inject-page-fault`), not from an observation of the service.
+    pub injected_fault: bool,
 }
 
 impl CaseResult {
@@ -86,6 +95,7 @@ impl CaseResult {
             expected: String::new(),
             observed: String::new(),
             notes: vec![why.to_string()],
+            injected_fault: false,
         }
     }
 }
@@ -313,9 +323,13 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
             class: entry.class.to_string(),
         };
         if entry.profile != "required-coordination" {
-            // Slice 1 runs the coordination profile only; other profiles
+            // Slices 1-2 run the coordination profile only; other profiles
             // stay unexecuted in the receipt so coverage stays honest.
-            results.push(CaseResult::unknown(&view, "profile not in slice 1", &server_version));
+            results.push(CaseResult::unknown(
+                &view,
+                "profile not yet executed (coordination slices only)",
+                &server_version,
+            ));
             continue;
         }
         if !cfg.only.is_empty()
@@ -338,19 +352,28 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
         let outcome = execute_case(&view, test_id, cfg, http, &server_version);
         results.push(match outcome {
             Ok(r) => r,
-            Err(o) => CaseResult {
-                test_id: test_id.clone(),
-                operation: entry.id.clone(),
-                risk: entry.risk.to_string(),
-                disposition: entry.disposition.to_string(),
-                outcome: OUTCOME_UNKNOWN.into(),
-                server_version: server_version.clone(),
-                actor: None,
-                at: now_secs(),
-                expected: "a definitive answer".into(),
-                observed: o.to_string(),
-                notes: vec!["transport/protocol fault — recorded, not retried".into()],
-            },
+            Err(o) => {
+                let observed = o.to_string();
+                let injected = observed.contains(cleanup::INJECTED_PREFIX);
+                CaseResult {
+                    test_id: test_id.clone(),
+                    operation: entry.id.clone(),
+                    risk: entry.risk.to_string(),
+                    disposition: entry.disposition.to_string(),
+                    outcome: OUTCOME_UNKNOWN.into(),
+                    server_version: server_version.clone(),
+                    actor: None,
+                    at: now_secs(),
+                    expected: "a definitive answer".into(),
+                    observed,
+                    notes: vec![if injected {
+                        "INJECTED transport fault — not an observation of the service".into()
+                    } else {
+                        "transport/protocol fault — recorded, not retried".into()
+                    }],
+                    injected_fault: injected,
+                }
+            }
         });
     }
     Ok(results)
@@ -379,6 +402,7 @@ fn execute_case(
             expected: "a live write".into(),
             observed: "refused: live-write not opted in (--live-write)".into(),
             notes: vec!["safety: read-only by default (#9789)".into()],
+            injected_fault: false,
         });
     }
     match test_id {
@@ -388,19 +412,26 @@ fn execute_case(
         "forge-probe::coordination::comment-create" => {
             issue_comment_readback(test_id, view, cfg, http, server_version)
         }
-        other => Ok(CaseResult {
-            test_id: other.to_string(),
-            operation: view.id.clone(),
-            risk: view.risk.clone(),
-            disposition: view.disposition.clone(),
-            outcome: OUTCOME_UNKNOWN.into(),
-            server_version: server_version.to_string(),
-            actor: None,
-            at: now_secs(),
-            expected: "a recorded pass/fail/unsupported".into(),
-            observed: String::new(),
-            notes: vec!["case handler not implemented — slice 2 (#9789 matrix)".into()],
-        }),
+        other => {
+            coordination::dispatch(other, view, cfg, http, server_version).unwrap_or_else(|| {
+                Ok(CaseResult {
+                    test_id: other.to_string(),
+                    operation: view.id.clone(),
+                    risk: view.risk.clone(),
+                    disposition: view.disposition.clone(),
+                    outcome: OUTCOME_UNKNOWN.into(),
+                    server_version: server_version.to_string(),
+                    actor: None,
+                    at: now_secs(),
+                    expected: "a recorded pass/fail/unsupported".into(),
+                    observed: String::new(),
+                    notes: vec![
+                        "case handler not implemented yet (#9789 matrix, later slice)".into(),
+                    ],
+                    injected_fault: false,
+                })
+            })
+        }
     }
 }
 
@@ -453,6 +484,7 @@ fn issue_create(
         notes: number
             .map(|n| vec![format!("disposable issue number: {n}")])
             .unwrap_or_default(),
+        injected_fault: false,
     }
     };
     match (code, number) {
@@ -579,6 +611,7 @@ fn issue_comment_readback(
         expected: format!("comment read-back contains {marker:?}"),
         observed,
         notes: vec![format!("disposable issue number: {number}")],
+        injected_fault: false,
     })
 }
 
@@ -705,5 +738,10 @@ pub fn verdict(results: &[CaseResult]) -> (bool, usize, usize, usize) {
     (unknown == 0 && failed == 0 && unsupported == 0, unknown, failed, unsupported)
 }
 
+pub mod cleanup;
+mod coordination;
+
+#[cfg(test)]
+mod coordination_tests;
 #[cfg(test)]
 mod tests;
