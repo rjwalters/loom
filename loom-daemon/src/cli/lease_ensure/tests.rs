@@ -579,6 +579,159 @@ fn the_deferred_lock_admits_a_single_owner() {
     assert!(deferred::try_lock(&lock).is_some(), "released on drop");
 }
 
+/// Exit 4 (a peer's lease is fresh) until the test drops `peer-expired`, then
+/// publish under whatever `--sweep-id` the caller passed. Every call's argv is
+/// appended, so the test can tell which session ever published.
+const PUBLISH_UNTIL_PEER_EXPIRES: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> publish-calls
+[ -e peer-expired ] || { echo "SKIP: fresh peer lease" >&2; exit 4; }
+echo "host-abc12345 ${4:-sweep-insession-fallback}"
+"#;
+
+/// A real process to stand in for a watched agent session.
+fn session_process() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap()
+}
+
+/// Wait up to `secs` for `done`, polling.
+fn eventually(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + std::time::Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    done()
+}
+
+/// #10570 review: session A's deferred publisher holds the issue lock and is
+/// asleep; A dies; session B is declined and calls `spawn` BEFORE A wakes and
+/// releases. B must still get a publisher of its own, and it must publish
+/// once the peer lease expires, with no further `lease ensure` call. Before
+/// the fix, B's `spawn` saw A's lock, reported "already waiting" and launched
+/// nothing; A then woke, saw its dead session and exited, leaving B leaseless
+/// (the #10161 failure again). Drives the real `spawn_with` / `run_with`
+/// lock wiring, with real processes as the two watched sessions; only the
+/// launch is a thread rather than an exec of the daemon binary.
+#[test]
+fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
+    let dir = checkout(PUBLISH_UNTIL_PEER_EXPIRES, RENEW_OK);
+    let poll = std::time::Duration::from_millis(50);
+    let mut session_a = session_process();
+    let mut session_b = session_process();
+    let session = |child: &std::process::Child, retry_interval| LeaseEnsureArgs {
+        watch_pid: child.id(),
+        force: true,
+        retry_interval,
+        ..args(&dir)
+    };
+    // A sleeps a full backed-off interval between attempts: it is "asleep"
+    // for the whole test unless its sliced sleep notices its session died.
+    let a = session(&session_a, 300);
+    let b = session(&session_b, 1);
+    let launch = |args: &LeaseEnsureArgs| {
+        let args = LeaseEnsureArgs {
+            workspace: args.workspace.clone(),
+            ..*args
+        };
+        let handle = std::thread::spawn(move || deferred::run_with(&args, &in_session(), poll));
+        Ok::<_, std::io::Error>(handle)
+    };
+
+    let mut a_thread = None;
+    let line = deferred::spawn_with(&a, |args| {
+        a_thread = Some(launch(args)?);
+        Ok(1)
+    });
+    assert!(line.contains("will retry"), "{line}");
+    let a_id = session_sweep_id(a.watch_pid).expect("A's session identity");
+    let b_id = session_sweep_id(b.watch_pid).expect("B's session identity");
+    let log = || {
+        let root = loom_daemon::repo_root::resolve_repo_root(&a.workspace).unwrap();
+        fs::read_to_string(deferred::log_path(&root, 8193)).unwrap_or_default()
+    };
+    assert!(
+        eventually(10, || log().contains("owns issue")),
+        "A never took the lock: {}",
+        log()
+    );
+    // A owns the lock and is asleep: its first attempt is 300 s out.
+
+    // B is declined and arrives while A still holds the lock.
+    let mut b_thread = None;
+    let line = deferred::spawn_with(&b, |args| {
+        b_thread = Some(launch(args)?);
+        Ok(2)
+    });
+    assert!(
+        line.contains("deferred publisher 2 will retry") && line.contains("another session"),
+        "B must get its own publisher, not 'already waiting': {line}"
+    );
+    // Once B's publisher is waiting, a second call from the SAME session is
+    // still deduplicated.
+    assert!(eventually(10, || log().contains("waiting for another session")), "{}", log());
+    let again = deferred::spawn_with(&b, |_| panic!("same session must not launch twice"));
+    assert!(again.contains("already waiting"), "{again}");
+
+    // A dies while asleep.
+    session_a.kill().unwrap();
+    session_a.wait().unwrap();
+    assert_eq!(
+        a_thread.unwrap().join().unwrap(),
+        Some(deferred::DeferredEnd::SessionEnded),
+        "A must release within a poll of its session ending, not after 300 s"
+    );
+
+    // The peer lease expires; B publishes with no further `lease ensure`.
+    fs::write(dir.path().join("peer-expired"), "").unwrap();
+    let b_end = b_thread.unwrap().join().unwrap();
+    session_b.kill().unwrap();
+    session_b.wait().unwrap();
+
+    assert_eq!(
+        b_end,
+        Some(deferred::DeferredEnd::Settled(Outcome::Renewing {
+            host: "host-abc12345".to_string(),
+            sweep_id: b_id.clone(),
+            loop_pid: Some("424242".to_string()),
+        }))
+    );
+    let calls = fs::read_to_string(dir.path().join("publish-calls")).unwrap();
+    assert!(!calls.contains(&a_id), "A's dead session must never publish: {calls}");
+    assert!(argv(&dir, "renew-argv").unwrap().contains(&b_id));
+}
+
+/// While the owner's session is alive it keeps the issue lock: a waiting
+/// publisher for another session gives up when its own session ends, never
+/// running a second retry loop beside the owner.
+#[test]
+fn a_waiting_publisher_ends_with_its_own_session_while_the_owner_lives() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let owner = deferred::try_lock(&deferred::lock_path(&root, 8193))
+        .expect("stand-in owner takes the issue lock");
+    let mut session = session_process();
+    let a = LeaseEnsureArgs {
+        watch_pid: session.id(),
+        force: true,
+        ..args(&dir)
+    };
+    let waiter = std::thread::spawn(move || {
+        deferred::run_with(&a, &in_session(), std::time::Duration::from_millis(50))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    session.kill().unwrap();
+    session.wait().unwrap();
+
+    assert_eq!(waiter.join().unwrap(), Some(deferred::DeferredEnd::SessionEnded));
+    assert!(argv(&dir, "publish-argv").is_none(), "no attempt without the issue lock");
+    drop(owner);
+}
+
 /// Outcomes land in a per-issue log, since `worktree.sh` callers rarely read
 /// stderr and the detached publisher has none.
 #[test]

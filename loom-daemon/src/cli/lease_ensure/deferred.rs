@@ -24,8 +24,11 @@
 //! peer's lease is never superseded: while it stays fresh, every attempt is
 //! declined exactly as before. There is no new lease format or protocol.
 //!
-//! One deferred publisher per issue per checkout (an exclusive `flock`), and
-//! every outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`,
+//! One deferred publisher owns the retry per issue per checkout (an exclusive
+//! `flock`), and at most one exists per watched session. A different
+//! session's caller is never turned away by the owner's lock: its own
+//! publisher waits for that lock, and an owner whose session dies releases it
+//! within one poll ([`run_with`]). Every outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`,
 //! because `worktree.sh` callers rarely read stderr and the detached child
 //! has none.
 
@@ -78,10 +81,26 @@ pub(crate) fn log_path(root: &Path, issue: u64) -> PathBuf {
         .join(format!("issue-{issue}.log"))
 }
 
-/// The single-owner lock of the deferred publisher for `issue`.
-fn lock_path(root: &Path, issue: u64) -> PathBuf {
+/// The single-owner lock of the deferred publisher for `issue`: whoever
+/// holds it is the one publisher retrying for this issue in this checkout.
+pub(super) fn lock_path(root: &Path, issue: u64) -> PathBuf {
     log_path(root, issue).with_extension("deferred.lock")
 }
+
+/// The per-session lock: at most one deferred publisher (owning or waiting)
+/// per watched session per issue, so a session's repeated `lease ensure`
+/// calls do not stack publishers.
+fn session_lock_path(root: &Path, issue: u64, watch_pid: u32) -> PathBuf {
+    let key = super::session_sweep_id(watch_pid).unwrap_or_else(|| format!("s{watch_pid}"));
+    log_path(root, issue).with_extension(format!("deferred.{key}.lock"))
+}
+
+/// How often a deferred publisher re-checks its watched session while asleep,
+/// and how often a waiting one re-probes the issue lock. This bounds the
+/// handoff gap when the owning session dies (#10570 review): the owner
+/// releases the issue lock within one poll of its session ending, not after a
+/// full retry interval of up to 300 s.
+const DEFAULT_POLL: Duration = Duration::from_secs(5);
 
 /// Append one timestamped outcome line. Best effort: a log is diagnostics.
 pub(crate) fn record(workspace: &str, issue: u64, line: &str) {
@@ -103,21 +122,55 @@ pub(crate) fn record(workspace: &str, issue: u64, line: &str) {
 
 /// Spawn the detached deferred publisher; returns the line to report.
 pub(crate) fn spawn(args: &LeaseEnsureArgs) -> String {
+    spawn_with(args, launch_process)
+}
+
+/// [`spawn`] with the launch injected, so tests drive the real ownership
+/// decision without exec'ing the daemon binary.
+///
+/// Only a publisher for the SAME watched session suppresses a launch. One
+/// owned by a different session is no proof this session has a retry
+/// scheduled: that owner may be asleep with its session already dead, and
+/// would exit without ever publishing for this one (#10570 review). So a
+/// different session always gets its own publisher, which waits for the
+/// issue lock.
+pub(crate) fn spawn_with(
+    args: &LeaseEnsureArgs,
+    launch: impl FnOnce(&LeaseEnsureArgs) -> std::io::Result<u32>,
+) -> String {
     let issue = args.issue;
-    // Probe (and immediately release) the single-owner lock, so a second
-    // call reports the publisher already waiting instead of a redundant one.
+    let mut waits = false;
     if let Ok(root) = loom_daemon::repo_root::resolve_repo_root(&args.workspace) {
-        if try_lock(&lock_path(&root, issue)).is_none() {
-            return format!("issue #{issue}: a deferred publisher is already waiting for it");
+        // Probe (and immediately release) both locks.
+        if try_lock(&session_lock_path(&root, issue, args.watch_pid)).is_none() {
+            return format!(
+                "issue #{issue}: a deferred publisher for this session (pid {}) is already \
+                 waiting for it",
+                args.watch_pid
+            );
         }
+        waits = try_lock(&lock_path(&root, issue)).is_none();
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return format!("could not start a deferred publisher for issue #{issue}: {e}"),
-    };
-    let mut command = Command::new(exe);
+    match launch(args) {
+        Ok(pid) => format!(
+            "issue #{issue}: deferred publisher {pid} will retry every {}s while pid {} lives{} \
+             (log: .loom/logs/lease-ensure/issue-{issue}.log)",
+            args.retry_interval,
+            args.watch_pid,
+            if waits {
+                ", once another session's deferred publisher for this issue stops"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => format!("could not start a deferred publisher for issue #{issue}: {e}"),
+    }
+}
+
+fn launch_process(args: &LeaseEnsureArgs) -> std::io::Result<u32> {
+    let mut command = Command::new(std::env::current_exe()?);
     command
-        .args(["lease", "ensure", &issue.to_string(), "--deferred"])
+        .args(["lease", "ensure", &args.issue.to_string(), "--deferred"])
         .args(["--watch-pid", &args.watch_pid.to_string()])
         .args(["--max-age", &args.max_age.to_string()])
         .args(["--retry-interval", &args.retry_interval.to_string()])
@@ -133,52 +186,103 @@ pub(crate) fn spawn(args: &LeaseEnsureArgs) -> String {
         command.process_group(0);
     }
     super::mark_inherited_fds_cloexec();
-    match command.spawn() {
-        Ok(child) => format!(
-            "issue #{issue}: deferred publisher {} will retry every {}s while pid {} lives \
-             (log: .loom/logs/lease-ensure/issue-{issue}.log)",
-            child.id(),
-            args.retry_interval,
-            args.watch_pid
-        ),
-        Err(e) => format!("could not start a deferred publisher for issue #{issue}: {e}"),
-    }
+    command.spawn().map(|child| child.id())
 }
 
-/// The `--deferred` entry point: take the per-issue lock, then retry.
+/// The `--deferred` entry point.
 pub(crate) fn run(args: &LeaseEnsureArgs) {
-    let Ok(root) = loom_daemon::repo_root::resolve_repo_root(&args.workspace) else {
-        return;
+    run_with(args, &SessionEnv::from_process(), DEFAULT_POLL);
+}
+
+/// Take this session's lock, wait (bounded) for the issue's owner lock, then
+/// retry. `None` when a publisher for this session already exists.
+///
+/// The wait is bounded by this session's own liveness and the age cap, and an
+/// owner whose session has died releases within one `poll` (its sleep is
+/// sliced), so a live session's declined publish is never orphaned behind a
+/// dead one. While the owner's session lives it keeps the lock: one publisher
+/// per issue, and a live peer's lease is still never superseded.
+pub(crate) fn run_with(
+    args: &LeaseEnsureArgs,
+    env: &SessionEnv,
+    poll: Duration,
+) -> Option<DeferredEnd> {
+    let root = loom_daemon::repo_root::resolve_repo_root(&args.workspace).ok()?;
+    let note = |line: &str| record(&args.workspace, args.issue, line);
+    let Some(_session) = try_lock(&session_lock_path(&root, args.issue, args.watch_pid)) else {
+        note("deferred publisher already waiting for this issue in this session; exiting");
+        return None;
     };
-    let Some(_held) = try_lock(&lock_path(&root, args.issue)) else {
-        record(
-            &args.workspace,
-            args.issue,
-            "deferred publisher already waiting for this issue; exiting",
-        );
-        return;
-    };
-    let ident = super::super::lease_renewer::start_identity(args.watch_pid);
     let pid = args.watch_pid;
+    let ident = super::super::lease_renewer::start_identity(pid);
+    let alive = || {
+        loom_daemon::live_claim::pid_is_live_process(pid)
+            && (ident.is_none() || super::super::lease_renewer::start_identity(pid) == ident)
+    };
+    let cap = if args.max_age == 0 {
+        DEFAULT_MAX_AGE_SECS
+    } else {
+        args.max_age
+    };
     let started = Instant::now();
+    let mut announced = false;
+    let _owner = loop {
+        if let Some(f) = try_lock(&lock_path(&root, args.issue)) {
+            break f;
+        }
+        if !announced {
+            note(&format!(
+                "deferred publisher for pid {pid} waiting for another session's publisher to stop"
+            ));
+            announced = true;
+        }
+        let end = if !alive() {
+            Some(DeferredEnd::SessionEnded)
+        } else if started.elapsed().as_secs() >= cap {
+            Some(DeferredEnd::CapReached)
+        } else {
+            None
+        };
+        if let Some(end) = end {
+            note(&end.describe(args.issue));
+            return Some(end);
+        }
+        std::thread::sleep(poll);
+    };
+    note(&format!("deferred publisher for pid {pid} owns issue #{}'s retry", args.issue));
+    // Time spent waiting comes off the cap, so the claim stays inside it.
+    let remaining = cap.saturating_sub(started.elapsed().as_secs());
+    if remaining == 0 {
+        note(&DeferredEnd::CapReached.describe(args.issue));
+        return Some(DeferredEnd::CapReached);
+    }
+    let owned = LeaseEnsureArgs {
+        max_age: remaining,
+        workspace: args.workspace.clone(),
+        ..*args
+    };
+    let since = Instant::now();
     let end = retry_loop(
-        args,
-        &SessionEnv::from_process(),
-        || started.elapsed().as_secs(),
-        |secs| std::thread::sleep(Duration::from_secs(secs)),
-        || {
-            loom_daemon::live_claim::pid_is_live_process(pid)
-                && (ident.is_none() || super::super::lease_renewer::start_identity(pid) == ident)
-        },
-        |o| {
-            record(
-                &args.workspace,
-                args.issue,
-                &format!("deferred attempt: {}", o.describe(args.issue)),
-            )
-        },
+        &owned,
+        env,
+        || since.elapsed().as_secs(),
+        |secs| sleep_while(Duration::from_secs(secs), poll, alive),
+        alive,
+        |o| note(&format!("deferred attempt: {}", o.describe(args.issue))),
     );
-    record(&args.workspace, args.issue, &end.describe(args.issue));
+    note(&end.describe(args.issue));
+    Some(end)
+}
+
+/// Sleep for `total`, waking every `poll` to stop early once `alive` fails.
+fn sleep_while(total: Duration, poll: Duration, alive: impl Fn() -> bool) {
+    let deadline = Instant::now() + total;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        if left.is_zero() || !alive() {
+            return;
+        }
+        std::thread::sleep(left.min(poll));
+    }
 }
 
 pub(super) fn try_lock(path: &Path) -> Option<std::fs::File> {
