@@ -25,13 +25,19 @@
 //!
 //! A run that hits `timeoutSeconds` is [`Verdict::TimedOut`], not a check
 //! failure: it names the `[build-gate]` stage that was running, never counts
-//! toward the failure cap and never releases the claim.
+//! toward the failure cap and never releases the claim. The whole gate
+//! process tree is torn down first ([`tree_kill`], #10955), and timeouts have
+//! a cap of their own, after which the episode runs the gate no more.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+mod flaky;
+mod load_defer;
+mod tree_kill;
 
 /// Default `buildGate.preflightMaxAttempts`.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -46,6 +52,9 @@ pub const EXIT_UNRESOLVED: i32 = 4;
 /// Exit code: the gate ran out of `timeoutSeconds` (#10860) — not a check
 /// failure, the claim is kept.
 pub const EXIT_TIMED_OUT: i32 = 5;
+/// Exit code: the host is above the load threshold, so the gate was not
+/// started (#10955) — neither a failure nor a timeout, the claim is kept.
+pub const EXIT_DEFERRED: i32 = 6;
 /// Exit code from `check`: no passing receipt for the current `HEAD`.
 pub const EXIT_NOT_PASSED: i32 = 7;
 
@@ -56,6 +65,10 @@ pub enum Verdict {
     Disabled,
     /// The command exited 0; a receipt was written.
     Pass,
+    /// The command exited 0, but only because `tests` failed once and passed
+    /// on nextest's retry (#10955). A receipt was written; the names are
+    /// reported so the flake is not silent.
+    PassFlaky { tests: Vec<String> },
     /// The command failed and `attempt < max`: fix and re-run.
     Failed {
         attempt: u32,
@@ -70,13 +83,24 @@ pub enum Verdict {
     },
     /// The command was killed at `timeoutSeconds` (#10860). `attempt` counts
     /// this episode's timeouts, separately from failures; at `attempt >= max`
-    /// the Builder opens no PR, but the claim is still kept. `stage` is the
-    /// `[build-gate]` stage that was running, when the log names one.
+    /// the Builder opens no PR, but the claim is still kept, and a further run
+    /// in the same episode returns this verdict without running the command
+    /// (#10955). `stage` is the `[build-gate]` stage that was running, when
+    /// the log names one.
     TimedOut {
         attempt: u32,
         max: u32,
         stage: Option<String>,
         tail: String,
+    },
+    /// The host is above the load threshold, so the gate was not run
+    /// (#10955). Neither counter moves and the claim is kept; once deferrals
+    /// in this episode span `max_secs` the gate runs regardless.
+    Deferred {
+        load_per_cpu: String,
+        threshold: String,
+        waited_secs: u64,
+        max_secs: u64,
     },
 }
 
@@ -85,10 +109,11 @@ impl Verdict {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Disabled | Self::Pass => 0,
+            Self::Disabled | Self::Pass | Self::PassFlaky { .. } => 0,
             Self::Failed { .. } => EXIT_FAILED,
             Self::Unresolved { .. } => EXIT_UNRESOLVED,
             Self::TimedOut { .. } => EXIT_TIMED_OUT,
+            Self::Deferred { .. } => EXIT_DEFERRED,
         }
     }
 
@@ -114,6 +139,10 @@ struct State {
     timed_out_attempts: u32,
     #[serde(default)]
     passed_head: Option<String>,
+    /// Epoch seconds of this episode's first load deferral in the current
+    /// streak (#10955); cleared whenever the gate runs.
+    #[serde(default)]
+    deferred_since: Option<u64>,
 }
 
 /// Identifier of the current Builder dispatch episode: the sweep id the daemon
@@ -170,19 +199,14 @@ pub fn max_attempts(worktree: &Path) -> u32 {
         .unwrap_or(DEFAULT_MAX_ATTEMPTS)
 }
 
-/// SIGKILL the gate's whole process group (it leads its own, see
-/// [`run_command`]) and reap the shell, so nothing from this attempt outlives
-/// it to overlap a retry or a re-dispatched Builder.
+/// Tear down the gate's whole process tree and reap the shell, so nothing
+/// from this attempt outlives it to overlap a retry or a re-dispatched Builder
+/// (#10955: SIGTERM, a grace, then SIGKILL; see [`tree_kill`]).
 fn kill_gate_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: plain syscall; negative pid targets the group we created.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+    let left = tree_kill::kill_tree(child, tree_kill::TERM_GRACE);
+    if left > 0 {
+        eprintln!("preflight: {left} gate process(es) were still alive after SIGKILL");
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// One `buildGate.preflightPathScopes` entry (#10860): a gate suite that
@@ -343,7 +367,7 @@ fn run_command(
     cwd: &Path,
     timeout: Duration,
     env: &[(String, Option<String>)],
-) -> Result<(), RunError> {
+) -> Result<Vec<String>, RunError> {
     let log = std::env::temp_dir().join(format!("loom-preflight-{}.log", uuid::Uuid::new_v4()));
     let out = std::fs::File::create(&log)
         .map_err(|e| RunError::Failed(format!("cannot create output file: {e}")))?;
@@ -363,13 +387,9 @@ fn run_command(
             None => cmd.env_remove(k),
         };
     }
-    // Own process group, so a timeout can kill the whole gate subtree (the
-    // shell's compiler/test descendants), not just `sh`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    // Own session (hence own process group), so a timeout can find and kill
+    // the whole gate tree, including stages in other process groups (#10955).
+    tree_kill::own_session(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| RunError::Failed(format!("failed to spawn '{command}': {e}")))?;
@@ -378,8 +398,12 @@ fn run_command(
     let note = loop {
         match child.try_wait() {
             Ok(Some(s)) if s.success() => {
+                // Read the retried-and-passed tests before the log goes.
+                let flaky = std::fs::read(&log)
+                    .map(|b| flaky::flaky_tests(&String::from_utf8_lossy(&b)))
+                    .unwrap_or_default();
                 let _ = std::fs::remove_file(&log);
-                return Ok(());
+                return Ok(flaky);
             }
             Ok(Some(s)) => break format!("command exited with {s}"),
             Ok(None) if start.elapsed() >= timeout => {
@@ -416,13 +440,19 @@ fn run_command(
 /// Run the pre-flight gate in `worktree`, recording the outcome.
 #[must_use]
 pub fn run(worktree: &Path) -> Verdict {
-    run_in_episode(worktree, &episode_id())
+    run_with_load(worktree, &episode_id(), load_defer::HostLoad::sample(), load_defer::epoch_now())
 }
 
-/// [`run`] with an explicit dispatch episode. Attempts are bounded within one
-/// episode; entering a new one resets the budget.
+/// [`run`] with an explicit dispatch episode and no load reading (so it never
+/// defers). Attempts are bounded within one episode; entering a new one
+/// resets the budget.
 #[must_use]
 pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
+    run_with_load(worktree, episode, load_defer::HostLoad::UNKNOWN, load_defer::epoch_now())
+}
+
+/// [`run_in_episode`] with a host-load reading taken at `now` (#10955).
+fn run_with_load(worktree: &Path, episode: &str, host: load_defer::HostLoad, now: u64) -> Verdict {
     let Some(cfg) = crate::main_health_gate::read_build_gate_config(worktree) else {
         return Verdict::Disabled;
     };
@@ -432,6 +462,7 @@ pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
         st.episode = episode.to_string();
         st.failed_attempts = 0;
         st.timed_out_attempts = 0;
+        st.deferred_since = None;
     }
     if st.failed_attempts >= max {
         // Already terminal: a further run must not reopen the loop.
@@ -441,14 +472,50 @@ pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
             tail: String::new(),
         };
     }
+    if st.timed_out_attempts >= max {
+        // #10955: the timeout cap is terminal for the episode as well. Without
+        // this a caller could re-run a full `timeoutSeconds` gate forever on a
+        // host that cannot finish it. The claim is still kept.
+        return Verdict::TimedOut {
+            attempt: st.timed_out_attempts,
+            max,
+            stage: None,
+            tail: String::new(),
+        };
+    }
+    match load_defer::decide(worktree, host, now, &mut st.deferred_since) {
+        load_defer::Decision::Defer {
+            load_per_cpu,
+            threshold,
+            waited_secs,
+            max_secs,
+        } => {
+            save(worktree, &st);
+            return Verdict::Deferred {
+                load_per_cpu,
+                threshold,
+                waited_secs,
+                max_secs,
+            };
+        }
+        load_defer::Decision::Run { forced: true } => eprintln!(
+            "preflight: host still above the load threshold, but deferrals have reached \
+             buildGate.maxDeferSeconds — running the gate anyway"
+        ),
+        load_defer::Decision::Run { forced: false } => {}
+    }
     let env = scope_env(worktree);
     match run_command(&cfg.command, worktree, cfg.timeout, &env) {
-        Ok(()) => {
+        Ok(flaky) => {
             st.failed_attempts = 0;
             st.timed_out_attempts = 0;
             st.passed_head = git_out(worktree, &["rev-parse", "HEAD"]);
             save(worktree, &st);
-            Verdict::Pass
+            if flaky.is_empty() {
+                Verdict::Pass
+            } else {
+                Verdict::PassFlaky { tests: flaky }
+            }
         }
         Err(RunError::TimedOut { stage, tail }) => {
             st.timed_out_attempts += 1;
@@ -668,9 +735,131 @@ mod tests {
         ));
         let t = Instant::now();
         assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::TimedOut { .. }));
-        assert!(t.elapsed() < Duration::from_secs(2));
+        // The 1 s budget plus the teardown's own bound (#10955: a SIGTERM
+        // grace, then SIGKILL; `ps` snapshots are slow on a loaded host).
+        assert!(t.elapsed() < Duration::from_secs(1) + tree_kill::TERM_GRACE * 2);
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!d.path().join("marker").exists(), "descendant outlived the timeout");
+    }
+
+    /// #10955: the shape GNU `timeout` gives a gate stage (a process group
+    /// of its own) must not survive the timeout.
+    #[test]
+    fn timeout_kills_a_descendant_in_another_process_group() {
+        let cmd = r#"perl -e 'setpgrp(0,0); sleep 3; open(F,">","marker"); print F "survived"; close F' & wait"#;
+        let gate = serde_json::json!({"enabled": true, "command": cmd, "timeoutSeconds": 1});
+        let d = repo(Some(&gate.to_string()));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::TimedOut { .. }));
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!d.path().join("marker").exists(), "descendant outlived the timeout");
+    }
+
+    /// #10955: a gate that passed only on a retry passes, writes a receipt,
+    /// consumes no attempt, and names the flaky test.
+    #[test]
+    fn a_pass_on_retry_names_the_flaky_test_and_costs_no_attempt() {
+        let cmd = "echo '        FLAKY 2/2 [   0.020s] loom-daemon a::flaky_one'";
+        let gate = serde_json::json!({"enabled": true, "command": cmd});
+        let d = repo(Some(&gate.to_string()));
+        let v = run_in_episode(d.path(), "e1");
+        assert_eq!(
+            v,
+            Verdict::PassFlaky {
+                tests: vec!["loom-daemon a::flaky_one".to_string()]
+            }
+        );
+        assert_eq!(v.exit_code(), 0);
+        assert!(check(d.path()));
+        assert_eq!(load(d.path()).failed_attempts, 0);
+        // A test that failed on its retry too still fails, and counts.
+        let cmd = "echo '        FLAKY 2/2 [   0.020s] loom-daemon a::flaky_one'; exit 100";
+        let gate = serde_json::json!({"enabled": true, "command": cmd});
+        let d = repo(Some(&gate.to_string()));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { attempt: 1, .. }));
+        assert_eq!(load(d.path()).failed_attempts, 1);
+    }
+
+    fn loaded(per_cpu: f64) -> load_defer::HostLoad {
+        load_defer::HostLoad {
+            loadavg_1m: Some(per_cpu * 10.0),
+            cpus: 10,
+        }
+    }
+
+    /// #10955: above the load threshold the gate is not started; nothing is
+    /// counted; after the max-defer window it runs regardless.
+    #[test]
+    fn a_loaded_host_defers_without_running_and_the_deferral_is_bounded() {
+        let gate = serde_json::json!({
+            "enabled": true, "command": "echo ran >> runs",
+            "loadThreshold": 0.9, "maxDeferSeconds": 600,
+        });
+        let d = repo(Some(&gate.to_string()));
+        let runs = || {
+            std::fs::read_to_string(d.path().join("runs"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let t0 = 1_000_000;
+        let v = run_with_load(d.path(), "e1", loaded(2.5), t0);
+        assert_eq!(
+            v,
+            Verdict::Deferred {
+                load_per_cpu: "2.50".into(),
+                threshold: "0.90".into(),
+                waited_secs: 0,
+                max_secs: 600,
+            }
+        );
+        assert_eq!(v.exit_code(), EXIT_DEFERRED);
+        assert!(!v.releases_claim());
+        let v = run_with_load(d.path(), "e1", loaded(2.5), t0 + 599);
+        assert!(
+            matches!(
+                v,
+                Verdict::Deferred {
+                    waited_secs: 599,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert_eq!(runs(), 0, "a deferral must not run the gate");
+        let st = load(d.path());
+        assert_eq!((st.failed_attempts, st.timed_out_attempts), (0, 0));
+        assert!(!check(d.path()));
+        // The window has run out: it runs although the host is still loaded.
+        assert_eq!(run_with_load(d.path(), "e1", loaded(2.5), t0 + 600), Verdict::Pass);
+        assert_eq!(runs(), 1);
+        // A fresh streak starts after a run …
+        assert!(matches!(
+            run_with_load(d.path(), "e1", loaded(2.5), t0 + 700),
+            Verdict::Deferred { waited_secs: 0, .. }
+        ));
+        // … and below the threshold, or with no reading, it simply runs.
+        assert_eq!(run_with_load(d.path(), "e1", loaded(0.5), t0 + 701), Verdict::Pass);
+        assert_eq!(
+            run_with_load(d.path(), "e1", load_defer::HostLoad::UNKNOWN, t0 + 702),
+            Verdict::Pass
+        );
+        assert_eq!(runs(), 3);
+    }
+
+    /// #10955: a terminal episode stays terminal under load (no deferral
+    /// masks it), and a disabled gate never defers.
+    #[test]
+    fn caps_and_disabled_win_over_a_deferral() {
+        let d = repo(Some(
+            r#"{"enabled":true,"command":"exit 1","preflightMaxAttempts":1,"loadThreshold":0.9}"#,
+        ));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
+        assert!(matches!(
+            run_with_load(d.path(), "e1", loaded(5.0), 1),
+            Verdict::Unresolved { .. }
+        ));
+        let d = repo(None);
+        assert_eq!(run_with_load(d.path(), "e1", loaded(5.0), 1), Verdict::Disabled);
     }
 
     fn git_in(p: &Path, a: &[&str]) {
@@ -826,12 +1015,12 @@ mod tests {
     #[test]
     fn timeouts_are_not_failures() {
         let d = repo(Some(
-            r#"{"enabled":true,"command":"test -f fast || sleep 5","timeoutSeconds":1,"preflightMaxAttempts":2}"#,
+            r#"{"enabled":true,"command":"test -f fast || sleep 5","timeoutSeconds":1,"preflightMaxAttempts":3}"#,
         ));
-        for n in 1..=3 {
+        for n in 1..=2 {
             let v = run_in_episode(d.path(), "e1");
             assert!(
-                matches!(v, Verdict::TimedOut { attempt, max: 2, .. } if attempt == n),
+                matches!(v, Verdict::TimedOut { attempt, max: 3, .. } if attempt == n),
                 "{v:?}"
             );
             assert_eq!(v.exit_code(), EXIT_TIMED_OUT);
@@ -843,6 +1032,53 @@ mod tests {
         assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Pass);
         assert_eq!(load(d.path()).timed_out_attempts, 0);
         assert!(check(d.path()));
+    }
+
+    /// #10955: at the timeout cap a further run in the same episode does not
+    /// execute the gate; a new episode does.
+    #[test]
+    fn the_timeout_cap_stops_further_runs_in_the_episode() {
+        let d = repo(Some(
+            r#"{"enabled":true,"command":"echo ran >> runs; test -f fast || sleep 5","timeoutSeconds":1,"preflightMaxAttempts":2}"#,
+        ));
+        let runs = || {
+            std::fs::read_to_string(d.path().join("runs"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        for n in 1..=2 {
+            let v = run_in_episode(d.path(), "e1");
+            assert!(
+                matches!(v, Verdict::TimedOut { attempt, max: 2, .. } if attempt == n),
+                "{v:?}"
+            );
+        }
+        assert_eq!(runs(), 2);
+        // Capped: answered at once, without running — even once it would pass.
+        std::fs::write(d.path().join("fast"), "").unwrap();
+        let t = Instant::now();
+        let v = run_in_episode(d.path(), "e1");
+        assert!(
+            matches!(
+                v,
+                Verdict::TimedOut {
+                    attempt: 2,
+                    max: 2,
+                    stage: None,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert!(t.elapsed() < Duration::from_millis(900), "the gate was run again");
+        assert_eq!(runs(), 2, "the gate was run again");
+        assert_eq!(v.exit_code(), EXIT_TIMED_OUT);
+        assert!(!v.releases_claim());
+        assert_eq!(load(d.path()).failed_attempts, 0);
+        // A new dispatch episode starts a fresh budget.
+        assert_eq!(run_in_episode(d.path(), "e2"), Verdict::Pass);
+        assert_eq!(runs(), 3);
     }
 
     mod release {

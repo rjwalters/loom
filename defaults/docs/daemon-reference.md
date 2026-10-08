@@ -1738,6 +1738,9 @@ Nothing else schedules it, and it does not wait for a roll window.
 A pass runs on its own task and the timer never waits for it, so it cannot
 delay the fleet-store sync, the floor, or `paused`/`stopped` enforcement. Only
 one pass runs at a time: while one is still running, the next tick starts none.
+A pass still running at the fifth tick in a row is one `pass-stuck` alert. After
+15 minutes the task stops waiting for it and frees the slot; until the old pass
+ends, each new one does nothing and says so on the status block.
 
 Each pass reads `.loom/install-metadata.json` from every registered
 workspace's default branch (never the working tree) and classifies it:
@@ -1783,26 +1786,36 @@ claims or writes. If the tag lookup gets no answer, the host reports
 `this daemon's release tag is not verified yet`, pushes nothing, and retries on
 a later tick (one sync interval apart at first, doubling, capped at one hour).
 
-**What a pass costs.** The verdict is cached per default-branch commit and
-running version, in process memory.
+**What a pass costs.** Every pass checks every workspace's default-branch
+head (#10987), so a change made by anyone is classified on the next tick. The
+verdict is cached per default-branch commit and running version, in process
+memory.
 
-| Workspace | Per tick |
+| Case | Per tick |
 |---|---|
-| any, on a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
-| settled (`W0`, `W4`, `repo-ahead`, not installed) | nothing for 15 sync intervals, then one `git ls-remote` of the default branch |
-| stale (`W1`, `W3`) | one `git ls-remote` |
+| a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
+| a host that may write | one GraphQL query per repo owner, naming every repo's default branch and head (100 repos per query) |
+| head is the cached commit | nothing more: no git child, no fetch |
 | head moved since the cached verdict | one `git fetch` of the default branch, only if the clone does not already have the commit |
+| the query failed, or does not cover a repo | one `git ls-remote` for each such repo, 8 at a time |
+| the rate-limit breaker is open | nothing is asked; the pass reports from the cache and says so |
 
-A restart empties the cache, and the running version only changes with a
-restart, so startup and a version change both check every workspace. At
-60 repos and 5 hosts with a 60s interval, the steady state is about 1,200
-`git ls-remote` an hour fleet-wide and no `git fetch`.
+The query runs under the writer App through `gh api graphql` and costs one
+point on that installation's GraphQL bucket (not the REST core bucket); a
+`POST` has no ETag, so an unchanged fleet still pays it. An installation token
+sees one owner's repos, hence one query per owner. At 60 repos and 5 hosts
+with a 60s interval that is 300 queries an hour per owner fleet-wide (600 for
+two owners), no `git ls-remote` and no `git fetch`. A query that fails in
+three passes in a row while the remotes still answer is one `head-query`
+alert. A restart empties the cache, so startup and a version change both
+evaluate every workspace.
 
-**A pass is bounded.** Classification stops asking the network after 45s; the
-workspaces it did not reach keep their last verdict and are first in the next
-pass. Every git child has a timeout: 15s for `ls-remote`, 30s for a fetch, 60s
-for the worktree checkout, the commit and the push, 20s for local plumbing.
-Three remotes in a row that do not answer end the pass's network use.
+**A pass is bounded.** Classification stops after 45s; the workspaces it did
+not reach keep their last verdict and are first in the next pass. No resync
+starts more than 120s into a pass. Every child has a timeout: 15s for the head
+query and for `ls-remote`, 30s for a fetch, 60s for the worktree checkout, the
+commit and the push, 20s for local plumbing. Three remotes in a row that do
+not answer end the pass's network use.
 
 A stale workspace is resynced under a per-repo claim, the ref
 `refs/loom/resync-claim`:
@@ -1836,12 +1849,12 @@ credential is a repo admin can bypass branch protection.
 
 **A repo cannot be resynced in a loop.** Whatever makes a repo stale again (a
 host on the same version with other files, a person or a tool undoing the
-resync), it gets at most one daemon resync commit per version, from any host,
-and at most one per `max(10 x syncIntervalSecs, 15 min)`. The record is the
-default branch itself: the last 300 commits are searched for
+resync), it gets at most one daemon resync commit per version, from any host.
+The record is the default branch itself: the last 300 commits are searched for
 `Loom-Resync-Version`. A workspace that is stale again at a version it was
 already resynced to is left alone, reported as `resync-loop`, and alerted once.
-The next release resyncs it.
+The next release resyncs it. There is no wait between resyncs to different
+versions: a host never installs a version older than the repo's.
 
 | Outcome | Result |
 |---|---|
@@ -1850,9 +1863,9 @@ The next release resyncs it.
 | branch moved | re-read and retried once, then next tick |
 | host left H0, or the claim was taken over, before the claim or the push | abandoned, no push; not a failure |
 | already resynced to this version | `resync-loop`: no push, one alert per repo and version |
-| another resync landed within the cooldown | waits; not a failure |
 | branch protection or a ruleset refused the push | backoff of 6h; one alert per repo, then logged only |
 | a remote or the forge did not answer | backoff for that repo, no alert for it; one `network` alert for the host per outage, from the third failing pass |
+| the forge or the remote refuses one repo (deleted, renamed, or the credential may not read it) | backoff for that repo and a `repo-access` alert from the third in a row; never counted as an outage |
 | any other failure | backoff from one sync interval, doubling, capped at 6h; alert from the third in a row |
 
 Alerts are logged at `error` and published on the event bus as

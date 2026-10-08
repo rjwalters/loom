@@ -1,6 +1,7 @@
 //! More tests for the workspace resync (#10718): what a pass costs, how it
 //! is bounded, the loop bound, and the guards. Same fixtures as the parent.
 
+use super::super::git::{classify_rejection, Push};
 use super::*;
 
 // ----------------------------------------------------------------------------
@@ -16,62 +17,50 @@ fn current() -> Seed {
 }
 
 #[test]
-fn an_unchanged_workspace_is_never_fetched_and_is_probed_only_when_due() {
+fn an_unchanged_workspace_costs_its_line_in_the_head_query_and_nothing_else() {
     let fx = Fixture::new(current());
     let host = Host::new(&fx, "host-a");
-    let recheck = recheck_after(INTERVAL);
-    assert_eq!(recheck, Duration::from_secs(15 * 60));
 
-    // Startup: nothing is cached, so the remote is asked for its head. The
-    // clone already has that commit, so nothing is fetched.
+    // Startup: nothing is cached. The forge names the head, the clone already
+    // has that commit, so nothing is fetched.
     let first = host.pass();
     assert_eq!(only(&first).state, WState::W0);
-    assert_eq!((first.probes, first.fetches), (1, 0));
+    assert_eq!(network(&first), (1, 0, 0));
 
-    // The first confirmation is back-dated by a per-repo offset (so repos do
-    // not all come due together). A full window later it is certainly due.
-    host.advance(recheck);
-    let due = host.pass();
-    assert_eq!((due.probes, due.fetches), (1, 0), "one ls-remote, head unchanged");
-
-    // Inside the window the workspace costs nothing at all: every tick.
-    for _ in 0..14 {
+    // Every tick after that asks again (#10987: there is no recheck window),
+    // and the answer is the commit already evaluated: one request, no git
+    // child on the network, no fetch, no second diff.
+    for _ in 0..20 {
         host.advance(INTERVAL);
         let tick = host.pass();
         assert_eq!(only(&tick).state, WState::W0);
-        assert_eq!((tick.probes, tick.fetches), (0, 0));
+        assert_eq!(network(&tick), (1, 0, 0));
     }
-    host.advance(INTERVAL);
-    let again = host.pass();
-    assert_eq!((again.probes, again.fetches), (1, 0), "due again after 15 ticks");
+    assert_eq!(host.heads.requests.get(), 21, "one head query per tick");
     assert_eq!(host.unpacked.get(), 1, "and the payload was diffed once in all");
     assert!(fx.forge.calls.borrow().is_empty());
 }
 
 #[test]
-fn a_moved_head_is_fetched_once_and_reclassified() {
+fn a_change_made_outside_this_daemon_is_classified_on_the_next_tick() {
     let fx = Fixture::new(current());
     let host = Host::new(&fx, "host-a");
-    host.pass();
-    host.advance(recheck_after(INTERVAL));
-    host.pass();
+    assert_eq!(only(&host.pass()).state, WState::W0);
 
     // Someone undoes part of the install on the default branch.
     fx.push_from_seed("old script back", |seed| {
         write(&seed.join(".loom/scripts/a.sh"), "#!/bin/sh\necho old\n");
     });
-    // Not seen until the workspace is due...
     host.advance(INTERVAL);
-    let unseen = host.pass_with(Mode::Write, &|| Ok(()), None);
-    assert_eq!((only(&unseen).state, unseen.probes, unseen.fetches), (WState::W0, 0, 0));
-    // ...then one probe finds the new head and one fetch brings it in.
-    host.advance(recheck_after(INTERVAL));
+    // A host that may not write asks nobody, so it still sees the old head.
     let seen = host.pass_with(Mode::Check, &|| Ok(()), None);
-    assert_eq!(only(&seen).state, WState::W0, "check mode asks nobody");
+    assert_eq!((only(&seen).state, network(&seen)), (WState::W0, (0, 0, 0)), "check mode");
     let seen = host.pass_with(Mode::Write, &|| Err(NotCurrent::Draining), None);
-    assert_eq!(only(&seen).state, WState::W0, "nor does a paused host");
+    assert_eq!((only(&seen).state, network(&seen)), (WState::W0, (0, 0, 0)), "paused");
+    // The very next pass that may write sees the new head in its one query,
+    // fetches it once, and resyncs in the same pass.
     let seen = host.pass();
-    assert_eq!((seen.probes, seen.fetches), (1, 1));
+    assert_eq!(network(&seen), (1, 0, 1));
     assert_eq!(only(&seen).state, WState::W0, "resynced in the same pass: {seen:?}");
     assert_eq!(fx.origin_file(".loom/scripts/a.sh"), "#!/bin/sh\necho new");
 }
@@ -85,7 +74,7 @@ fn a_host_that_may_not_write_asks_no_remote_at_all() {
     // `fleet.autoApply` off.
     let check = host.pass_with(Mode::Check, &|| Ok(()), None);
     assert_eq!(only(&check).state, WState::W1, "classified from the clone's own ref");
-    assert_eq!((check.probes, check.fetches), (0, 0));
+    assert_eq!(network(&check), (0, 0, 0));
     // `paused` (the drain flag), and every other reason a host is not in H0.
     for why in [
         NotCurrent::Draining,
@@ -94,9 +83,10 @@ fn a_host_that_may_not_write_asks_no_remote_at_all() {
     ] {
         let pass = host.pass_with(Mode::Write, &|| Err(why), None);
         assert_eq!(only(&pass).state, WState::W1);
-        assert_eq!((pass.probes, pass.fetches), (0, 0), "{why}");
+        assert_eq!(network(&pass), (0, 0, 0), "{why}");
         assert!(pass.alerts.is_empty());
     }
+    assert_eq!(host.heads.requests.get(), 0, "the batched head query included");
     assert!(host.memory.borrow().backoff.is_empty(), "nothing failed: nothing was asked");
     assert!(fx.forge.calls.borrow().is_empty());
 }
@@ -115,7 +105,7 @@ fn a_pass_that_runs_out_of_time_stops_and_the_next_one_starts_where_it_stopped()
     let first = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
     let states: Vec<WState> = first.workspaces.iter().map(|w| w.state).collect();
     assert_eq!(states, vec![WState::W0, WState::Unknown, WState::Unknown]);
-    assert_eq!(first.probes, 1, "only the first workspace was asked about");
+    assert_eq!(network(&first), (1, 0, 0), "one query names every head");
     assert_eq!(reason(&first.workspaces[1]), "not checked yet: the pass ran out of time");
     assert_eq!(first.workspaces[1].repo.as_deref(), Some(REPO), "still listed, in order");
     assert_eq!(host.memory.borrow().cursor, 1);
@@ -125,7 +115,7 @@ fn a_pass_that_runs_out_of_time_stops_and_the_next_one_starts_where_it_stopped()
     let second = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
     let states: Vec<WState> = second.workspaces.iter().map(|w| w.state).collect();
     assert_eq!(states, vec![WState::W0, WState::W0, WState::Unknown]);
-    assert_eq!(second.probes, 1);
+    assert_eq!(network(&second), (1, 0, 0));
     assert_eq!(host.memory.borrow().cursor, 2);
     let third = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
     let states: Vec<WState> = third.workspaces.iter().map(|w| w.state).collect();
@@ -134,7 +124,7 @@ fn a_pass_that_runs_out_of_time_stops_and_the_next_one_starts_where_it_stopped()
     let fourth = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
     let states: Vec<WState> = fourth.workspaces.iter().map(|w| w.state).collect();
     assert_eq!(states, vec![WState::W0, WState::W0, WState::W0]);
-    assert_eq!(fourth.probes, 0);
+    assert_eq!(network(&fourth), (1, 0, 0));
 }
 
 #[test]
@@ -161,18 +151,23 @@ fn unreachable_remotes_are_one_alert_for_the_host_not_one_per_repo() {
         // Past every hold and backoff an outage can set.
         host.advance(Duration::from_secs(7 * 60 * 60));
     }
-    // Three remotes in a row that do not answer end a pass's asking.
-    assert_eq!(probes, vec![3, 3, 3, 3]);
-    assert_eq!(alerts, vec![("network", None)], "one alert, for the host, on the third pass");
+    // The head query got no answer, so the remotes were asked directly, all
+    // four at once. Three in a row that do not answer end the pass's asking.
+    assert_eq!(probes, vec![4, 4, 4, 4]);
+    assert_eq!(
+        alerts,
+        vec![("network", None)],
+        "one alert, for the host, on the third pass; the failed query is part of the outage"
+    );
     assert!(fx.forge.calls.borrow().is_empty(), "no claim during an outage");
 
     // While no remote answers, the host stays off the network for a while.
     let fx = Fixture::new(STALE);
     let host = Host::new(&fx, "host-a");
     git(&host.root, &["remote", "set-url", "origin", "/nonexistent/origin.git"]);
-    assert_eq!(host.pass().probes, 1);
+    assert_eq!(network(&host.pass()), (1, 1, 0));
     host.advance(Duration::from_secs(30));
-    assert_eq!(host.pass().probes, 0, "inside the hold");
+    assert_eq!(network(&host.pass()), (0, 0, 0), "inside the hold");
 }
 
 // ----------------------------------------------------------------------------
@@ -234,7 +229,8 @@ fn two_hosts_on_one_version_with_different_payloads_cannot_ping_pong() {
     fx.push_from_seed("the other payload, by hand", |seed| {
         write(&seed.join(".loom/scripts/a.sh"), "#!/bin/sh\necho from a feature branch\n");
     });
-    a.advance(recheck_after(INTERVAL));
+    // Seen on host-a's very next tick: there is no recheck window.
+    a.advance(INTERVAL);
     let pass = a.pass();
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
@@ -243,7 +239,7 @@ fn two_hosts_on_one_version_with_different_payloads_cannot_ping_pong() {
     assert_eq!(pass.alerts[0].kind, "resync-loop");
     assert_eq!(fx.origin_commits(), commits + 2, "the person's commit and no other");
     // To host-b the repo now matches its own payload: nothing to do.
-    b.advance(recheck_after(INTERVAL));
+    b.advance(INTERVAL);
     assert_eq!(only(&b.pass()).state, WState::W0);
     assert_eq!(fx.origin_commits(), commits + 2);
     assert_eq!(fx.forge.calls.borrow().len(), calls);
@@ -274,39 +270,37 @@ fn a_second_resync_at_one_version_is_refused_under_the_claim_too() {
 }
 
 #[test]
-fn a_repo_is_not_resynced_twice_within_the_cooldown_whatever_the_version() {
-    assert_eq!(cooldown(INTERVAL), Duration::from_secs(15 * 60));
+fn a_newer_version_is_installed_at_once_and_each_version_lands_once() {
+    // #10987: there is no wait between two resyncs. The bound is one commit
+    // per version, and a host never installs a version older than the repo's.
     let fx = Fixture::new(STALE);
     let a = Host::new(&fx, "host-a");
-    // Resync commits carry real committer times, so these hosts run on the
-    // real clock.
-    a.now.set(Utc::now());
     assert_eq!(only(&a.pass()).state, WState::W0);
     let commits = fx.origin_commits();
 
-    // A newer release lands a minute later with a file changed.
+    // A newer release, with a file changed, lands on host-b a moment later.
     let newer = defaults(&fx.tmp.path().canonicalize().unwrap().join("newer"), true);
     write(&newer.join("docs/d.md"), "doc, revised\n");
     let b = Host::running(&fx, "host-b", "0.19.881", newer);
-    b.now.set(Utc::now() + ChronoDuration::minutes(1));
-    let pass = b.pass();
-    let report = only(&pass);
-    assert_eq!(report.state, WState::W1, "{report:?}");
-    assert!(
-        reason(report).starts_with("resynced recently; cooling down until "),
-        "{report:?}"
-    );
-    assert!(pass.alerts.is_empty(), "waiting is not a failure");
-    assert!(b.memory.borrow().backoff.is_empty());
-    assert_eq!(fx.origin_commits(), commits);
-
-    // After the cooldown the newer version is installed: a different version
-    // is not a loop.
-    b.now.set(Utc::now() + ChronoDuration::minutes(17));
     let pass = b.pass();
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
-    assert_eq!(fx.origin_commits(), commits + 1);
+    assert!(pass.alerts.is_empty());
+    assert_eq!(fx.origin_commits(), commits + 1, "installed on its first tick");
     assert_eq!(fx.origin_file(".loom/docs/d.md"), "doc, revised");
+
+    // host-a, still on the older version, sees that on its next tick and
+    // leaves it alone: it never downgrades, so the two cannot alternate.
+    for _ in 0..3 {
+        a.advance(INTERVAL);
+        b.advance(INTERVAL);
+        let pass = a.pass();
+        let report = only(&pass);
+        assert_eq!(report.state, WState::RepoAhead, "{report:?}");
+        assert_eq!(reason(report), "installed 0.19.881 > running 0.19.880");
+        assert_eq!(only(&b.pass()).state, WState::W0);
+        assert!(pass.alerts.is_empty());
+    }
+    assert_eq!(fx.origin_commits(), commits + 1, "one commit per version, and no more");
 }
 
 // ----------------------------------------------------------------------------
@@ -390,6 +384,30 @@ fn a_default_branch_name_git_would_read_as_an_option_is_not_used() {
     assert_eq!(super::super::git::default_branch(&host.root).as_deref(), Some("main"));
     let pass = host.pass();
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
+}
+
+#[test]
+fn a_failed_push_is_read_as_moved_protected_or_neither() {
+    let moved = " ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs";
+    assert_eq!(classify_rejection(moved), Some(Push::NonFastForward));
+    let stale = " ! [rejected]        HEAD -> main (non-fast-forward)";
+    assert_eq!(classify_rejection(stale), Some(Push::NonFastForward));
+    let raced = " ! [remote rejected] HEAD -> main (cannot lock ref 'refs/heads/main')";
+    assert_eq!(classify_rejection(raced), Some(Push::NonFastForward));
+    let ruleset = "remote: error: GH013: Repository rule violations found for refs/heads/main.\n \
+                   ! [remote rejected] HEAD -> main (push declined due to repository rule violations)";
+    assert_eq!(
+        classify_rejection(ruleset),
+        Some(Push::Protected(
+            "error: GH013: Repository rule violations found for refs/heads/main.".to_string()
+        ))
+    );
+    let hook = " ! [remote rejected] HEAD -> main (pre-receive hook declined)";
+    assert_eq!(classify_rejection(hook), Some(Push::Protected(hook.trim().to_string())));
+    assert_eq!(
+        classify_rejection("fatal: unable to access 'https://…': Could not resolve host"),
+        None
+    );
 }
 
 #[test]

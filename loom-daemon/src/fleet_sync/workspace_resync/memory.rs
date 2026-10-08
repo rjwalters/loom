@@ -1,13 +1,13 @@
 //! What a host remembers between workspace passes (#10718): the per-repo
-//! verdict that lets an unchanged repo cost nothing, the per-repo backoff,
-//! the state of a network outage, and what this process has already resynced.
+//! verdict that lets an unchanged repo cost nothing beyond its line in the
+//! head query, the per-repo backoff, the state of a network outage, and what
+//! this process has already resynced.
 //!
 //! All of it is process memory. A restart (which is also how the running
 //! version changes) starts from nothing, so the first pass after one checks
 //! every workspace.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,21 +15,9 @@ use chrono::{DateTime, Utc};
 
 use super::{Alert, WState, WorkspaceReport, ALERT_AFTER, BACKOFF_CAP};
 
-/// A settled workspace's remote head is looked at again after this many sync
-/// intervals. See [`recheck_after`].
-pub const RECHECK_TICKS: u32 = 15;
-
 /// Longest a host stays off the network after passes in which no remote
 /// answered.
 pub const OUTAGE_HOLD_CAP: Duration = Duration::from_secs(30 * 60);
-
-/// How long a settled verdict (`W0`, `W4`, `repo-ahead`, not installed) is
-/// trusted before the remote head is looked at again: [`RECHECK_TICKS`] sync
-/// intervals. A stale workspace (`W1`, `W3`) is looked at every tick.
-#[must_use]
-pub fn recheck_after(interval: Duration) -> Duration {
-    interval.saturating_mul(RECHECK_TICKS)
-}
 
 fn chrono_of(d: Duration) -> chrono::Duration {
     chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
@@ -54,12 +42,6 @@ pub(super) struct Verdict {
     pub(super) installed: Option<String>,
     pub(super) requires_daemon: Option<String>,
     pub(super) reason: Option<String>,
-    /// When the remote last confirmed `commit` is the head. `None` for a
-    /// verdict read from the local remote-tracking ref only.
-    pub(super) probed_at: Option<DateTime<Utc>>,
-    /// The loop bound refused this workspace at this commit: nothing will be
-    /// tried until the head moves, so it is rechecked like a settled one.
-    pub(super) held: bool,
 }
 
 impl Verdict {
@@ -75,16 +57,6 @@ impl Verdict {
         report.requires_daemon.clone_from(&self.requires_daemon);
         report.reason.clone_from(&self.reason);
     }
-
-    /// Should the remote be asked for its head now?
-    pub(super) fn probe_due(&self, now: DateTime<Utc>, interval: Duration) -> bool {
-        if self.stale() && !self.held {
-            // Another host may be resyncing it right now.
-            return true;
-        }
-        self.probed_at
-            .is_none_or(|at| now < at || now - at >= chrono_of(recheck_after(interval)))
-    }
 }
 
 /// How a failure counts.
@@ -95,6 +67,10 @@ pub(super) enum FailureKind {
     /// This repo's remote did not answer. Backed off, never alerted per
     /// repo: the pass reports unreachable remotes once, for the host.
     Unreachable,
+    /// The forge or the remote answered and refused this repo: it was deleted
+    /// or renamed, or the credential may not read it. This repo's failure
+    /// alone, alerted as `repo-access`; never part of a network outage.
+    Refused,
     /// Anything else.
     Other,
 }
@@ -127,6 +103,11 @@ pub struct Memory {
     /// Workspaces whose remote (or forge) did not answer when last asked.
     pub(super) down: HashSet<PathBuf>,
     outage: Outage,
+    /// Passes in a row whose head query failed, and whether that was alerted.
+    head_query: (u32, bool),
+    /// The rate-limit breaker was open at the last pass (said once per time
+    /// it opens).
+    breaker_open: bool,
 }
 
 impl Memory {
@@ -158,7 +139,9 @@ impl Memory {
             .saturating_add(1);
         let delay = match kind {
             FailureKind::Protected => BACKOFF_CAP,
-            FailureKind::Unreachable | FailureKind::Other => Self::delay(interval, failures),
+            FailureKind::Unreachable | FailureKind::Refused | FailureKind::Other => {
+                Self::delay(interval, failures)
+            }
         };
         let next_attempt = now + chrono_of(delay);
         self.backoff.insert(
@@ -175,13 +158,14 @@ impl Memory {
                 .noted
                 .insert(format!("protected:{}", report.root.display())),
             FailureKind::Unreachable => false,
-            FailureKind::Other => failures >= ALERT_AFTER,
+            FailureKind::Refused | FailureKind::Other => failures >= ALERT_AFTER,
         };
         let alert = alerts.then(|| Alert {
             root: report.root.clone(),
             repo: report.repo.clone(),
             kind: match kind {
                 FailureKind::Protected => "branch-protection",
+                FailureKind::Refused => "repo-access",
                 FailureKind::Unreachable | FailureKind::Other => "failure",
             },
             failures,
@@ -191,9 +175,7 @@ impl Memory {
         (next_attempt, alert)
     }
 
-    /// Remember what `root` is at `commit`. `probed` says the remote just
-    /// confirmed that commit is the head.
-    #[allow(clippy::too_many_arguments)] // one record; each argument is a field
+    /// Remember what `root` is at `commit`.
     pub(super) fn settle(
         &mut self,
         root: &Path,
@@ -201,24 +183,7 @@ impl Memory {
         commit: &str,
         version: &str,
         report: &WorkspaceReport,
-        probed: bool,
-        now: DateTime<Utc>,
-        interval: Duration,
     ) {
-        let before = self.verdicts.get(root);
-        let probed_at = if probed {
-            // The first confirmation is back-dated by a per-repo offset, so
-            // sixty repos first seen in one pass are not all rechecked in
-            // the same later pass.
-            Some(match before.and_then(|v| v.probed_at) {
-                Some(_) => now,
-                None => now - chrono_of(spread(root, recheck_after(interval))),
-            })
-        } else {
-            before
-                .filter(|v| v.commit == commit)
-                .and_then(|v| v.probed_at)
-        };
         self.verdicts.insert(
             root.to_path_buf(),
             Verdict {
@@ -229,24 +194,56 @@ impl Memory {
                 installed: report.installed.clone(),
                 requires_daemon: report.requires_daemon.clone(),
                 reason: report.reason.clone(),
-                probed_at,
-                held: false,
             },
         );
     }
 
-    /// The remote confirmed `root`'s cached commit is still the head.
-    pub(super) fn confirm(&mut self, root: &Path, now: DateTime<Utc>) {
-        if let Some(v) = self.verdicts.get_mut(root) {
-            v.probed_at = Some(now);
-        }
+    /// Note whether the rate-limit breaker is open this pass. Returns whether
+    /// that is news: it just opened, or just closed.
+    pub(super) fn note_breaker(&mut self, open: bool) -> bool {
+        std::mem::replace(&mut self.breaker_open, open) != open
     }
 
-    /// The loop bound refused `root` at its cached commit.
-    pub(super) fn hold(&mut self, root: &Path) {
-        if let Some(v) = self.verdicts.get_mut(root) {
-            v.held = true;
+    /// Fold one pass's head query into its record. `failure` is why it got
+    /// no usable answer while the network was otherwise there; `failing`
+    /// says it failed at all (during an outage it did, and that is the
+    /// outage's to report: the run neither grows nor ends). Returns whether
+    /// this is the first failure of a run (worth a warning), and the one
+    /// alert a run of [`ALERT_AFTER`] failing passes gets.
+    pub(super) fn note_head_query(
+        &mut self,
+        failure: Option<&str>,
+        failing: bool,
+        interval: Duration,
+        now: DateTime<Utc>,
+    ) -> (bool, Option<Alert>) {
+        let Some(detail) = failure else {
+            if !failing {
+                self.head_query = (0, false);
+            }
+            return (false, None);
+        };
+        let (streak, alerted) = &mut self.head_query;
+        *streak = streak.saturating_add(1);
+        if *streak == 1 {
+            return (true, None);
         }
+        if *streak < ALERT_AFTER || *alerted {
+            return (false, None);
+        }
+        *alerted = true;
+        let alert = Alert {
+            root: PathBuf::new(),
+            repo: None,
+            kind: "head-query",
+            failures: *streak,
+            detail: format!(
+                "the batched default-branch head query has failed in {streak} passes in a row, \
+                 so every repo's remote is asked with git ls-remote instead: {detail}"
+            ),
+            next_attempt: now + chrono_of(interval),
+        };
+        (false, Some(alert))
     }
 
     /// Is the host staying off the network after an outage?
@@ -300,12 +297,4 @@ impl Memory {
             next_attempt,
         })
     }
-}
-
-/// A stable per-repo offset in `[0, window)`.
-fn spread(root: &Path, window: Duration) -> Duration {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    let secs = window.as_secs().max(1);
-    Duration::from_secs(hasher.finish() % secs)
 }

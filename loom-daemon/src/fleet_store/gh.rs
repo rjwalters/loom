@@ -158,11 +158,23 @@ impl GhTransport {
         intent: AccessIntent,
         cred: &Credential,
     ) -> GhInvocation {
+        self.invocation_within(op, forge_op, intent, cred, GH_TIMEOUT)
+    }
+
+    /// [`Self::invocation`] with its own deadline.
+    fn invocation_within(
+        &self,
+        op: &'static str,
+        forge_op: ForgeOp,
+        intent: AccessIntent,
+        cred: &Credential,
+        timeout: Duration,
+    ) -> GhInvocation {
         let dir = match cred {
             Credential::ConfigDir { dir, .. } => Some(dir.as_path()),
             Credential::Ambient => None,
         };
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+        GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout)
             .forge_op(forge_op)
             .identity_scope(None, Some(&self.repo))
             .program(&self.gh_bin)
@@ -210,6 +222,61 @@ impl GhTransport {
             etag: response.etag,
             body: response.body,
         })
+    }
+
+    /// One GraphQL read under the WRITER credential (#10987): the workspace
+    /// resync's batched default-branch head query, one request for every
+    /// repo of one owner. The writer for the same reason as
+    /// [`Self::get_as_writer`]: a reader App that is not installed on a repo
+    /// answers `NOT_FOUND` for it, which would read as "the repo is gone".
+    ///
+    /// Returns the response body. `gh` exits non-zero when the answer carries
+    /// any `errors` entry and still prints the partial `data`, so the caller
+    /// parses the body and judges each alias. A failed request is shown to
+    /// the rate-limit breaker; one with no body at all is an error.
+    ///
+    /// # Errors
+    /// `gh` could not run, timed out, or printed no body.
+    pub(crate) fn graphql_as_writer(
+        &self,
+        forge_op: ForgeOp,
+        query: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let cred = self.writer();
+        let field = format!("query={query}");
+        let inv = self
+            .invocation_within("fleet_store_graphql", forge_op, AccessIntent::Read, &cred, timeout)
+            .args(["api", "graphql", "-f", field.as_str()]);
+        let out = match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(_) => anyhow::bail!("the GraphQL query timed out after {}s", timeout.as_secs()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to invoke {}", self.gh_bin));
+            }
+        };
+        *self.last_used.borrow_mut() = Some(cred);
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !out.status.success() {
+            // A GraphQL rate limit is a `200` whose body says so: the breaker
+            // reads both. A per-alias `NOT_FOUND` does not trip it.
+            crate::rate_limit_breaker::global_observe_failure(
+                &format!("{stderr}\n{body}"),
+                "fleet_store",
+            );
+        }
+        if body.is_empty() {
+            anyhow::bail!(
+                "the GraphQL query got no answer: {}",
+                if stderr.is_empty() {
+                    "no output"
+                } else {
+                    &stderr
+                }
+            );
+        }
+        Ok(body)
     }
 
     /// One write call (`gh api --method POST/PUT … --input <file>`), always
