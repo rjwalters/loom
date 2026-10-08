@@ -72,12 +72,17 @@ impl Admission {
 
     /// The container's `gh` credential arguments: the managed launcher's
     /// [`WorkerEgress::docker_args`], else [`legacy_docker_args`] (`env` is
-    /// the variable lookup, injectable for tests).
+    /// the variable lookup, injectable for tests) — plus the agent `gh`
+    /// front's sink mount when `env` names one (#10607).
     #[must_use]
     pub fn docker_args(&self, env: impl Fn(&str) -> Option<OsString>) -> Vec<String> {
-        self.egress
+        let mut out = self
+            .egress
             .as_ref()
-            .map_or_else(|| legacy_docker_args(env), WorkerEgress::docker_args)
+            .map_or_else(|| legacy_docker_args(&env), WorkerEgress::docker_args);
+        // #10607: the agent `gh` front's sink, read-write, so its rows reach the daemon.
+        out.extend(crate::forge_call_stats::agent::docker_mount_args(env));
+        out
     }
 }
 

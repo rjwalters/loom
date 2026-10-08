@@ -133,6 +133,32 @@ docker build -f docker/worker/Dockerfile -t loom-worker:dev .
 ./docker/worker/test-image.sh loom-worker:dev
 ```
 
+### apt resilience and `APT_MIRROR` (#10822)
+
+The image writes `/etc/apt/apt.conf.d/80-loom-retries` (`Acquire::Retries
+"5"`, 30 s http/https timeouts) before its first `apt-get`, so one stalled
+fetch is retried instead of hanging the build. The file stays in the
+published image, where it only affects a downstream layer's own `apt-get`.
+
+| Build arg | Default | Effect |
+|-----------|---------|--------|
+| `APT_MIRROR` | empty (upstream `archive.ubuntu.com`) | When set, rewrites the `archive.ubuntu.com` URIs in `/etc/apt/sources.list.d/ubuntu.sources` to this mirror. `security.ubuntu.com` and `cli.github.com` are untouched. Release builds do not set it, so the published image keeps upstream sources. |
+
+CI (`.github/workflows/ci.yml` job `worker-base-image`, and `ci-daily.yml`)
+passes the GitHub runners' Azure mirror:
+
+```bash
+docker build -f docker/worker/Dockerfile \
+  --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+  -t loom-worker:dev .
+```
+
+In `ci.yml` the base image is built once per run by `worker-base-image`, with
+a registry layer cache at `ghcr.io/rjwalters/loom-worker:buildcache` (read on
+every run, written only from pushes to `main`); the three image smokes load
+that build instead of rebuilding it. `:buildcache` is a BuildKit cache
+manifest, not a runnable image -- do not `docker pull` it.
+
 ## Versioning and publishing
 
 `.github/workflows/release.yml` builds and pushes a multi-arch

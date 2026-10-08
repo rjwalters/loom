@@ -330,7 +330,11 @@ fn with_live<R>(
 /// The daemon's periodic pass: reconcile every pending queued PR so a drop or
 /// a merge is seen within one successful tick. No-op in direct mode.
 pub fn daemon_tick(gh: &Path, root: &Path) {
-    let Live::Ran(res) = with_live(gh, root, |c, _| sweep(c)) else {
+    let gh_s = gh.to_string_lossy().to_string();
+    let Live::Ran(res) = with_live(gh, root, |c, f| {
+        super::group_run::tick_groups(&gh_s, f);
+        sweep(c)
+    }) else {
         return;
     };
     match res {

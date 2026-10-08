@@ -264,7 +264,7 @@ jobs:
   release-build:
     name: Release Build Check
     needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.docker == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
@@ -272,6 +272,15 @@ jobs:
     # merge. They now use the shared debug build, so without this job such a
     # break would first surface in the post-merge release workflow. Nothing
     # waits on it, so it stays off the critical path.
+    #
+    # It is ALSO the one release build per CI run (#10824): the binary is
+    # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
+    # stages it into the Docker build context, so the image smokes no longer
+    # build their own. That makes the shipped `--features otlp` binary the one
+    # the smokes exercise (they previously ran a non-shipped default-feature
+    # build). The `if:` is the UNION of `backend` and `docker` so a docker-only
+    # PR still produces the artifact; keep it a superset of `worker-base-image`'s
+    # gate (#10825 narrows that one).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -283,6 +292,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --package loom-daemon --features otlp
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: target/release/loom-daemon
+          if-no-files-found: error
+          retention-days: 1
 
   node-packages:
     name: Node Packages (MCP server, dashboard)
@@ -326,6 +341,34 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
+      # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
+      # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
+      # these tests never execute there; the full default-feature suite runs
+      # nightly (ci-daily.yml `full-suite`). The names are DERIVED from source
+      # (a test attribute between the cfg and the fn), never hand-listed
+      # (ci-principles rules 7 and 9); an empty derivation or an empty
+      # selection fails. This is an additional run, not a filterset that skips
+      # work.
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run the cfg(not(otlp)) tests (default features)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          names=$(grep -rl 'cfg(not(feature = "otlp"))' loom-daemon/src | sort | xargs awk '
+            /#\[cfg\(not\(feature = "otlp"\)\)\]/ { pend=1; ist=0; next }
+            pend && /#\[(tokio::)?test/ { ist=1; next }
+            pend && /^[ \t]*(pub )?(async )?fn / {
+              if (ist) { l=$0; sub(/.*fn /, "", l); sub(/\(.*/, "", l); print l }
+              pend=0; next }
+            pend && /^[ \t]*(#\[|\/\/|$)/ { next }
+            { pend=0 }
+          ' | sort -u)
+          test -n "$names" || { echo "derived no cfg(not(otlp)) tests" >&2; exit 1; }
+          echo "derived tests:"; echo "$names"
+          filter=$(echo "$names" | sed 's|.*|test(/::&$/)|' | paste -sd'|' - | sed 's/|/ | /g')
+          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail -E "$filter"
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -378,7 +421,7 @@ jobs:
         with:
           tool: nextest
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
         # the only surface that carries per-test durations out of a finished
@@ -395,9 +438,9 @@ jobs:
         # with `ci-test-timings` and pairs on
         # `-<family>-<k>-<N>`, where `<family>` is this job's display name with
         # its `(k/N)` suffix stripped and slugified
-        # (`ci_telemetry::nextest::job_family_slug`; `ci.yml` has TWO
-        # nextest-partition families both sharding 1..3, so the family is what
-        # disambiguates them). Renaming this artifact — or renaming the job
+        # (`ci_telemetry::nextest::job_family_slug`; the family keeps the
+        # pairing key unambiguous against any other job sharding 1..3).
+        # Renaming this artifact — or renaming the job
         # without renaming the artifact — silently stops test spans, which
         # `ci_telemetry::tests::test_spans` asserts against this file. See
         # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
@@ -432,10 +475,12 @@ jobs:
       # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
       # just its non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      # The feature's full nextest run lives in the partitioned
-      # backend-otlp-tests job below (#9065). It is NOT deduplicated against
-      # Rust Unit Tests: `otlp` is not purely additive -- two tests are
-      # `#[cfg(not(feature = "otlp"))]` -- so neither run subsumes the other.
+      # The feature's full nextest run lives in the partitioned Rust Unit Tests
+      # job (#10823): the whole workspace runs once, with the shipped `otlp`
+      # configuration. `otlp` is not purely additive -- some tests are
+      # `#[cfg(not(feature = "otlp"))]` -- so the default-feature coverage is
+      # the targeted step in backend-lint-and-check plus ci-daily.yml's
+      # `full-suite`.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -540,49 +585,6 @@ jobs:
       # ones that restore 30 days -- unapplied.
       - name: Verify the SigNoz retention statements against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
-
-  backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
-    # The whole loom-daemon suite with `--features otlp`, partitioned three
-    # ways for the same reason and by the same mechanism as Rust Unit Tests
-    # (#9065): 211s of test execution on one runner was the critical path.
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
-        # The denominator is `strategy.job-total`, never a literal: editing
-        # this list alone cannot silently drop a slice (a gap such as [1, 3]
-        # yields an out-of-range k/N, which fails loudly).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
-        with:
-          tool: nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
-      - name: Upload per-test timings (#9456)
-        # Same contract as the `Rust Unit Tests` leg above, with this job's own
-        # family slug: the poller pairs `ci-test-timings-<family>-<k>-<N>` on
-        # the family, because both nextest-partition families shard 1..3 and
-        # `(kind, k, N)` alone would match two jobs. See
-        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ci-test-timings-rust-otlp-feature-tests-${{ matrix.partition }}-${{ strategy.job-total }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-          retention-days: 14
 
   structural-checks:
     name: Structural Checks
@@ -693,6 +695,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the release decision and release.yml wiring (#10826)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-release-decision.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -2408,6 +2413,9 @@ jobs:
           docker pull ubuntu:24.04
           cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
       - name: Verify account-private clones and exclusive jobs with Docker fixtures
+        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
+        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
+        timeout-minutes: 10
         # Owner-only synthetic profiles must belong to the session image's UID.
         # Build as runner; execute only this fixture as UID 1000 with Docker access.
         # Stage public inputs outside the runner's owner-only home. Account
@@ -2539,35 +2547,122 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  worker-base-image:
+    name: Build loom-worker base image
+    # The ONE build of docker/worker/Dockerfile per CI run (#10822). The three
+    # image smokes below each used to rebuild it (plus their own release
+    # loom-daemon build); they now `needs:` this job and `docker load` the
+    # tarball it uploads, under the exact tags they used before
+    # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
+    # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
+    # they do (#10825 owns changing that condition).
+    #
+    # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
+    # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB
+    # on 2026-10-07; the #9065 eviction problem in this file's header), and an
+    # apt layer there would evict rust-cache entries and be evicted in turn.
+    # The registry cache costs no Actions-cache budget, survives 7-day
+    # eviction (which matters once #10825 makes these jobs rare on main), and
+    # the package is public, so every run -- fork PRs included -- reads it
+    # anonymously. It is WRITTEN only from a push to main in rjwalters/loom
+    # (mirrors rust-cache's `save-if`): a fork PR's token cannot push to
+    # ghcr.io/rjwalters/*, and a same-repo PR must not be able to seed the
+    # cache main builds from. `ignore-error=true` keeps a registry hiccup on
+    # export from failing the build. The published `:latest` is not used as
+    # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
+    # never match.
+    needs: [changes, release-build]
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+      WRITE_BUILDCACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # --- Binary staging seam (#10824) -------------------------------------
+      # The Linux release binary the Dockerfile COPYs comes from the single
+      # `Release Build Check` build (`--features otlp`, the shipped config),
+      # not a build of our own. download-artifact fails on a missing artifact,
+      # so a failed producer turns this job red rather than skipped.
+      # upload-artifact drops the executable bit, hence the chmod.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: dist
+      - name: Stage dist/loom-daemon-linux-amd64
+        run: |
+          set -euo pipefail
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
+      # --- end binary staging seam ------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR (buildcache writer, main pushes only)
+        if: env.WRITE_BUILDCACHE == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the loom-worker base image
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cache_to=()
+          if [[ "$WRITE_BUILDCACHE" == "true" ]]; then
+            cache_to=(--cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true")
+          fi
+          docker buildx build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
+            "${cache_to[@]}" \
+            --output type=docker,dest=/tmp/loom-worker-base.tar \
+            -t loom-worker:ci-smoke \
+            -t ghcr.io/rjwalters/loom-worker:ci-smoke \
+            .
+      - name: Upload the base image for the smoke jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base.tar
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
   worker-image-smoke:
     name: loom-worker Image Smoke Test
-    needs: changes
+    # Consumes the image `worker-base-image` built (#10822). `always()` keeps
+    # this job RUNNING when that producer failed, so the first step turns it
+    # red instead of skipped (ci-principles rule 7).
+    needs: [changes, worker-base-image]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no image to test."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
-      # cross-compile matrix has no place in a per-PR smoke test; the release
-      # workflow's own `build-daemon` matrix already covers every published
-      # target, this job only needs the one Linux artifact the Dockerfile
-      # actually consumes.
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker image (no push)
-        run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect loom-worker:ci-smoke >/dev/null
       - name: Run the smoke test
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
       - name: Run the mount-contract worktree-correctness test
@@ -2585,33 +2680,36 @@ jobs:
     # Mirrors worker-image-smoke exactly (same `changes.docker` gate — this
     # image is FROM loom-worker, so any docker/** change, including a
     # loom-worker-only one, is worth re-validating this layer against): #6899,
-    # Epic #6896 Phase 1. Builds the base loom-worker image locally first
-    # (needed as this Dockerfile's FROM target) rather than pulling
-    # ghcr.io/rjwalters/loom-worker — a PR's Dockerfile changes are not
-    # published anywhere to pull from, and this keeps the check hermetic.
-    needs: changes
+    # Epic #6896 Phase 1. Its FROM target is the base image this run's
+    # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
+    # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
+    # published image, which a PR's Dockerfile changes are not in.
+    needs: [changes, worker-base-image]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no FROM target."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image (local FROM target)
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker base image (no push, local FROM target)
-        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-session image (no push)
+        timeout-minutes: 10
         run: |
           docker build -f docker/session/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
@@ -2622,40 +2720,42 @@ jobs:
   native-image-smoke:
     name: loom-worker-native Image Smoke Test
     # Mirrors session-image-smoke exactly (#8403, Epic #6896 Phase 3): same
-    # `changes.docker` gate, same local base-image rebuild as this
-    # Dockerfile's FROM target (a PR's Dockerfile changes are published
-    # nowhere to pull from), same timeout. A sibling job rather than a matrix
-    # over the two overlay images on purpose — a matrix would couple two
-    # independent deliverables' failure modes, and CI here is deliberately
-    # dumb and reliable.
+    # `changes.docker` gate, same FROM target (the base image this run's
+    # `worker-base-image` built, #10822), same timeout. A sibling job rather
+    # than a matrix over the two overlay images on purpose — a matrix would
+    # couple two independent deliverables' failure modes, and CI here is
+    # deliberately dumb and reliable.
     #
     # This leg is where the pinned-CLI claim is actually made: the version
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: changes
+    needs: [changes, worker-base-image]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no FROM target."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image (local FROM target)
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker base image (no push, local FROM target)
-        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-native image (no push)
+        timeout-minutes: 10
         run: |
           docker build -f docker/native/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
@@ -2688,7 +2788,6 @@ jobs:
       - backend-lint-and-check
       - backend-tests
       - backend-otlp-feature
-      - backend-otlp-tests
       - structural-checks
       - daemon-checks
       - install-surface-checks
@@ -2699,6 +2798,7 @@ jobs:
       - installer-tests
       - codex-adapter-smoke
       - shell-suite-tests
+      - worker-base-image
       - worker-image-smoke
       - session-image-smoke
       - native-image-smoke

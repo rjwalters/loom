@@ -101,6 +101,16 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// #10256: evaluate and post `loom/merge-authorization` for the merge
+    /// group commit (run from the `merge_group` workflow or the daemon).
+    /// Exit 0 = success posted; 1 = failure posted; 6 = pending posted;
+    /// 3 = nothing confirmed posted. Every non-zero exit blocks the merge.
+    GroupCheck {
+        #[arg(long, value_name = "SHA")]
+        commit: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
     /// #10256: the required `loom/merge-authorization` check body for the PR
     /// head a merge group was built from. Exit 0 = success, 1 = failure
     /// (any unknown fact, outage or forge error fails).
@@ -202,6 +212,7 @@ pub(crate) fn run(action: MergeQueueAction) -> ! {
             repo,
         },
         MergeQueueAction::Revoke { pr, reason, repo } => MergeQueueCmd::Revoke { pr, reason, repo },
+        MergeQueueAction::GroupCheck { commit, repo } => MergeQueueCmd::GroupCheck { commit, repo },
         MergeQueueAction::AuthorizeCheck { pr, pr_head, repo } => {
             MergeQueueCmd::AuthorizeCheck { pr, pr_head, repo }
         }

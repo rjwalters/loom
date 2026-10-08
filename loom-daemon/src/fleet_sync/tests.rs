@@ -869,7 +869,15 @@ fn the_floor_half_reads_the_refreshed_cache_without_a_forge_request() {
 
     // A store change lands on the next pass with no restart.
     let mut files = forge.files.borrow().clone();
-    files.insert("fleet.json".to_string(), r#"{"loom_min_version":"0.19.900"}"#.to_string());
+    let compiled = json!({
+        "_generated": {"schema_version": 1},
+        "root": "/srv/src",
+        "repos": [],
+        "state": {},
+        "config": {"defaults": {}},
+        "loom_min_version": "0.19.900"
+    });
+    files.insert("fleet.json".to_string(), compiled.to_string());
     *forge.files.borrow_mut() = files;
     config_pass(
         &forge,
@@ -943,4 +951,101 @@ fn no_floor_leaves_the_status_line_unchanged() {
     let status = sample_status();
     let block = render_line(Some(&status), Utc::now()).expect("block");
     assert!(!block.contains("loom_min_version"), "{block}");
+}
+
+// ------------------------------------------------------------------------
+// The process-wide floor (#10792). The floor cell, the status cell and
+// `LOOM_SOCKET_PATH` are process-wide, so these tests are serialized with the
+// other tests that point the loom dir at a temp directory.
+// ------------------------------------------------------------------------
+
+/// Run `f` with `LOOM_SOCKET_PATH` pointing into a fresh temp dir and both
+/// process-wide cells empty; restore the environment and empty them after.
+fn with_clean_process_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+    let dir = tempfile::tempdir().expect("dir");
+    let prior = std::env::var("LOOM_SOCKET_PATH").ok();
+    std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));
+    let reset = || {
+        *floor_cell().lock().unwrap() = None;
+        *cell().lock().unwrap() = None;
+    };
+    reset();
+    let out = f(dir.path());
+    reset();
+    match prior {
+        Some(p) => std::env::set_var("LOOM_SOCKET_PATH", p),
+        None => std::env::remove_var("LOOM_SOCKET_PATH"),
+    }
+    out
+}
+
+/// Write a snapshot carrying `floor` to the status file only (not the cell).
+fn write_status_with_floor(floor: &str) {
+    let mut status = sample_status();
+    status.floor = resolve_floor(valid(floor), None);
+    write_status(&status_path().expect("status path"), &status).expect("write");
+}
+
+#[test]
+#[serial_test::serial(loom_socket_path_env)]
+fn clear_status_forgets_the_floor() {
+    with_clean_process_state(|_| {
+        set_floor(Some("0.19.830".to_string()));
+        assert_eq!(loom_min_version().as_deref(), Some("0.19.830"));
+        clear_status();
+        assert_eq!(loom_min_version(), None);
+        // Back to "no pass has run", not `Some(None)`: nothing is carried.
+        assert_eq!(*floor_cell().lock().unwrap(), None);
+        assert_eq!(last_good_floor(), None);
+    });
+}
+
+#[test]
+#[serial_test::serial(loom_socket_path_env)]
+fn clear_status_also_drops_the_snapshot_so_the_floor_cannot_come_back() {
+    with_clean_process_state(|_| {
+        let mut status = sample_status();
+        status.floor = resolve_floor(valid("0.19.830"), None);
+        publish(&status);
+        assert_eq!(last_good_floor().as_deref(), Some("0.19.830"));
+        clear_status();
+        assert_eq!(last_good_floor(), None);
+        assert_eq!(probe_status(), None);
+    });
+}
+
+#[test]
+#[serial_test::serial(loom_socket_path_env)]
+fn last_good_floor_reads_the_status_file_when_the_cell_is_empty() {
+    with_clean_process_state(|_| {
+        assert_eq!(last_good_floor(), None, "nothing anywhere");
+        write_status_with_floor("0.19.830");
+        assert_eq!(last_good_floor().as_deref(), Some("0.19.830"));
+    });
+}
+
+#[test]
+#[serial_test::serial(loom_socket_path_env)]
+fn last_good_floor_prefers_the_cell_and_does_not_touch_the_file() {
+    with_clean_process_state(|_| {
+        write_status_with_floor("0.19.830");
+        // A resolved "no floor" wins over the file's stale value.
+        set_floor(None);
+        assert_eq!(last_good_floor(), None);
+        set_floor(Some("0.19.900".to_string()));
+        assert_eq!(last_good_floor().as_deref(), Some("0.19.900"));
+    });
+}
+
+#[test]
+#[serial_test::serial(loom_socket_path_env)]
+fn a_malformed_floor_right_after_a_restart_carries_the_floor_from_the_snapshot() {
+    with_clean_process_state(|_| {
+        write_status_with_floor("0.19.830");
+        // New process: the cell is empty, the file is what the old one left.
+        let pass = resolve_floor(malformed(), last_good_floor().as_deref());
+        assert_eq!(pass.floor.as_deref(), Some("0.19.830"));
+        assert!(pass.carried);
+        assert!(pass.error.is_some());
+    });
 }

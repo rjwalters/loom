@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use super::sink::sink_file;
 use super::*;
 use crate::forge_listing::parse_http_response;
 
@@ -21,6 +22,7 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         ir: None,
         ib: None,
         at: CallAttribution::default(),
+        ag: agent::AgentStamp::default(),
     })
     .unwrap()
 }
@@ -47,6 +49,7 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         ir: identity.role.clone(),
         ib: identity.bucket.clone(),
         at: CallAttribution::default(),
+        ag: agent::AgentStamp::default(),
     })
     .unwrap()
 }

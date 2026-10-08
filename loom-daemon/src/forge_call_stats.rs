@@ -63,7 +63,6 @@
 //!    establish exhaustiveness on their own.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -72,14 +71,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
 
+#[path = "forge_call_stats_agent.rs"]
+pub mod agent;
 #[path = "forge_call_stats_buckets.rs"]
 pub mod buckets;
 #[path = "forge_call_stats_counters.rs"]
 pub mod counters;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
+#[path = "forge_call_stats_sink.rs"]
+mod sink;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
 pub use ops::ForgeOp;
+use sink::{append, read_since};
 
 /// The rolling window `status` reports (the last hour).
 pub const WINDOW_SECS: i64 = 3600;
@@ -473,6 +477,7 @@ pub fn record_attributed(
         ir: identity.role.clone(),
         ib: identity.bucket.clone(),
         at: attribution.clone(),
+        ag: agent::stamp(caller),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -527,6 +532,9 @@ struct SinkLine {
     /// absent and a pre-W1 reader ignores them.
     #[serde(flatten, default)]
     at: CallAttribution,
+    /// The agent `gh` front's `ag`/`vi` stamp (#10607); absent on daemon rows.
+    #[serde(flatten, default)]
+    ag: agent::AgentStamp,
 }
 
 /// Which credential and which billed bucket one row spent (W1). Recorded by
@@ -821,72 +829,11 @@ pub fn host_sink_dir() -> Option<PathBuf> {
     sink_dir()
 }
 
-fn sink_file(dir: &Path, hour: i64) -> PathBuf {
-    dir.join(format!("calls-{hour}.jsonl"))
-}
-
-fn append(dir: &Path, line: &SinkLine) -> std::io::Result<()> {
-    // Same owner-only rules as the ETag store: a 0700 dir we own, 0600 files.
-    if !crate::forge_etag_store::private_dir(dir, true) {
-        return Err(std::io::Error::other("untrusted sink dir"));
-    }
-    let mut buf = serde_json::to_vec(line)?;
-    buf.push(b'\n');
-    let hour = line.t.div_euclid(3600);
-    let path = sink_file(dir, hour);
-    let mut create = std::fs::OpenOptions::new();
-    create.append(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
-    let (mut file, fresh) = match create.open(&path) {
-        Ok(f) => (f, true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            (std::fs::OpenOptions::new().append(true).open(&path)?, false)
-        }
-        Err(e) => return Err(e),
-    };
-    // One write of one short line: atomic under O_APPEND.
-    file.write_all(&buf)?;
-    if fresh {
-        prune(dir, hour);
-    }
-    Ok(())
-}
-
-/// Remove sink files more than [`RETAIN_HOURS`] older than `current_hour`.
-fn prune(dir: &Path, current_hour: i64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let hour = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("calls-"))
-            .and_then(|n| n.strip_suffix(".jsonl"))
-            .and_then(|n| n.parse::<i64>().ok());
-        if hour.is_some_and(|h| h < current_hour - RETAIN_HOURS) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
 /// Aggregate the sink's last [`WINDOW_SECS`] as of `now` (missing hour files
 /// simply contribute nothing).
 fn read_window(dir: &Path, now: i64) -> Aggregate {
     let since = now - WINDOW_SECS;
     aggregate_lines(read_since(dir, since, now).lines(), since)
-}
-
-/// The raw sink text of every hour file covering `since..=now`.
-fn read_since(dir: &Path, since: i64, now: i64) -> String {
-    let mut raw = String::new();
-    for hour in since.div_euclid(3600)..=now.div_euclid(3600) {
-        if let Ok(text) = std::fs::read_to_string(sink_file(dir, hour)) {
-            raw.push_str(&text);
-        }
-    }
-    raw
 }
 
 /// One operation ID as the sink observed it (Issue #9831).

@@ -424,6 +424,10 @@ pub(crate) struct EtaBacktestArgs {
     /// (#10528). Diagnostic; not with `--compare`.
     #[arg(long, conflicts_with = "compare")]
     pub adaptation: bool,
+    /// Score `--heuristic` IPCW-wrapped (`ipcw` or `ipcw-drift`) as
+    /// `ID+NAME`; `--compare` stays unwrapped (#10524).
+    #[arg(long, value_name = "NAME")]
+    pub wrap: Option<String>,
 
     /// Opt-in `land` cases from merged PRs' label timelines (#9579).
     #[command(flatten)]
@@ -442,14 +446,7 @@ impl EtaBacktestArgs {
                 registry.ids().join(", ")
             );
         };
-        let since = match &self.since {
-            Some(raw) => Some(
-                DateTime::parse_from_rfc3339(raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| anyhow::anyhow!("invalid --since {raw:?}: {e}"))?,
-            ),
-            None => None,
-        };
+        let since = super::eta_replay_cmd::parse_since(self.since.as_deref())?;
         let filter = Filter {
             since,
             repo: self.repo.as_deref(),
@@ -461,13 +458,20 @@ impl EtaBacktestArgs {
         }
         let loom = Provenance::current();
         backtest::with_replay_calibration(|id| fits.heuristic(id), &mut history, &cases, &loom);
+        let heuristic = super::eta_replay_cmd::wrap_for_backtest(
+            heuristic,
+            self.wrap.as_deref(),
+            &mut history,
+            &cases,
+            &loom,
+        )?;
+        let heuristic = heuristic.as_ref();
 
         if let Some(other_id) = &self.compare {
             let Some(other) = fits.heuristic(other_id) else {
                 bail!("unknown heuristic id {:?} (known: {})", other_id, registry.ids().join(", "));
             };
-            let comparison =
-                backtest::compare(&heuristic, &other, &history, &cases, filter, &loom)?;
+            let comparison = backtest::compare(heuristic, &other, &history, &cases, filter, &loom)?;
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
@@ -477,7 +481,7 @@ impl EtaBacktestArgs {
         }
 
         let run = backtest::runner(self.adaptation);
-        let report = run(&heuristic, &history, &cases, filter, &loom);
+        let report = run(heuristic, &history, &cases, filter, &loom);
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {

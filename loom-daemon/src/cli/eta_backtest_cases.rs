@@ -376,6 +376,7 @@ mod tests {
             json: false,
             fit_dir: None,
             adaptation: false,
+            wrap: None,
             pr_cases: cases,
         }
     }
