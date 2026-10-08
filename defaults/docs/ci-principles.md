@@ -180,6 +180,12 @@ first build, the whole release target matrix minus signing, every
 parallelism 1 and 8 and on macOS/bash 3.2, `nextest` three times over for
 flakes, Rust beta, and the Docker smokes without their path filter.
 
+One job is not a speed trade-off paid back but a proof `ci.yml` cannot make
+(#10868): `Compatibility Floor (SUPPORTS_INSTALLED)` runs the compatibility
+contract's direction A against the release `SUPPORTS_INSTALLED` names, where
+`ci.yml` tests only the release just before the change
+([`release-cadence.md`](release-cadence.md), "Compatibility contract").
+
 The full **default-feature** suite runs only here (#10823): `ci.yml`'s
 `Rust Unit Tests` legs run the whole workspace with `--features
 loom-daemon/otlp` (the shipped configuration), and the PR gate adds only a

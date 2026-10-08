@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::install_compat_harness::{
-    hard_floors, invoked_files_from_source, optional_subs, parse_detector_list,
-    subcommand_unrecognized,
+    floors_above_claim, hard_floors, installed_shell_files, invoked_files_from_source,
+    optional_subs, parse_detector_list, subcommand_unrecognized,
 };
 use std::path::PathBuf;
 
@@ -238,6 +238,60 @@ fn every_invoked_file_ships_in_defaults() {
         let rel = f.strip_prefix(".loom/").unwrap();
         assert!(defaults.join(rel).is_file(), "{f} is not shipped as defaults/{rel}");
     }
+}
+
+/// #10868: the CI harness makes the same check (`install-compat check`), but
+/// in a job that is not required. This is the copy `cargo test` runs. It uses
+/// the harness's own walk and floor parser, so the two cannot disagree about
+/// which files count.
+#[test]
+fn no_shipped_hard_floor_is_above_requires_daemon() {
+    let defaults = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../defaults");
+    let scripts = installed_shell_files(&defaults).unwrap();
+    let floors = scripts
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|text| hard_floors(&text))
+        .count();
+    assert!(
+        floors > 0,
+        "found no `# requires-daemon: <sub> >= <version>` floor under {} ({} shell files): \
+         the walk or the marker changed, and this test would pass on anything",
+        defaults.display(),
+        scripts.len()
+    );
+    let over = floors_above_claim(&defaults, &scripts, v(REQUIRES_DAEMON));
+    assert!(
+        over.is_empty(),
+        "raise REQUIRES_DAEMON in install_compat.rs to the highest floor \
+         (defaults/docs/release-cadence.md, \"Compatibility contract\"):\n{}",
+        over.join("\n")
+    );
+}
+
+#[test]
+fn a_floor_above_the_claim_is_reported_and_test_suites_are_not_walked() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("defaults");
+    std::fs::create_dir_all(tree.join("scripts/tests")).unwrap();
+    std::fs::write(
+        tree.join("scripts/a.sh"),
+        "# requires-daemon: forge >= 0.19.707\n# requires-daemon: lease >= 0.19.900\n",
+    )
+    .unwrap();
+    std::fs::write(tree.join("scripts/tests/t.sh"), "# requires-daemon: x >= 9.9.9\n").unwrap();
+    std::fs::write(tree.join("scripts/notes.md"), "# requires-daemon: y >= 9.9.9\n").unwrap();
+    let scripts = installed_shell_files(&tree).unwrap();
+    assert_eq!(scripts, [tree.join("scripts/a.sh")]);
+
+    let over = floors_above_claim(&tree, &scripts, v("0.19.772"));
+    assert_eq!(over.len(), 1, "{over:?}");
+    assert!(over[0].contains("defaults/scripts/a.sh"), "{over:?}");
+    assert!(over[0].contains("lease >= 0.19.900"), "{over:?}");
+    assert!(over[0].contains("above REQUIRES_DAEMON 0.19.772"), "{over:?}");
+
+    // At the floor is not above it.
+    assert!(floors_above_claim(&tree, &scripts, v("0.19.900")).is_empty());
 }
 
 // ---- harness parsing --------------------------------------------------------
