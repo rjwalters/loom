@@ -228,17 +228,16 @@ else
         "the revision queue lists level 2 (direct, inherited), then the star, then the rest, skipping the claimed #25"
 fi
 # Backlog > 30 (gh default page) and priority levels: the queue must see every row, level 2 first.
-python3 -I - "$FIXTURE_DIR/backlog.json" <<'PY'
-import json, sys
-rows = [{"number": 100 + i, "title": "rev %d" % i, "createdAt": "2026-09-%02dT00:00:00Z" % (i + 1),
-         "labels": [{"name": "loom:curated"}, {"name": "loom:needs-revision"}]} for i in range(31)]
-rows[0]["labels"].append({"name": "loom:operator-priority"})            # oldest, ordinary star, outside newest 30
-rows.append({"number": 200, "title": "newer direct level 2", "createdAt": "2026-10-05T00:00:00Z",
-             "labels": [{"name": "loom:operator-high-priority"}, {"name": "loom:needs-revision"}]})
-rows.append({"number": 201, "title": "newest inherited level 2", "createdAt": "2026-10-06T00:00:00Z",
-             "labels": [{"name": "loom:high-priority-inherited"}, {"name": "loom:needs-revision"}]})
-json.dump(rows, open(sys.argv[1], "w"))
-PY
+jq -n '
+  [range(0; 31) | {number: (100 + .), title: "rev \(.)",
+                   createdAt: "2026-09-\(. + 1 | tostring | if length < 2 then "0" + . else . end)T00:00:00Z",
+                   labels: [{name: "loom:curated"}, {name: "loom:needs-revision"}]}]
+  | (.[0].labels += [{name: "loom:operator-priority"}])   # oldest, ordinary star, outside newest 30
+  + [{number: 200, title: "newer direct level 2", createdAt: "2026-10-05T00:00:00Z",
+      labels: [{name: "loom:operator-high-priority"}, {name: "loom:needs-revision"}]},
+     {number: 201, title: "newest inherited level 2", createdAt: "2026-10-06T00:00:00Z",
+      labels: [{name: "loom:high-priority-inherited"}, {name: "loom:needs-revision"}]}]
+' >"$FIXTURE_DIR/backlog.json"
 if [[ -s "$FIXTURE_DIR/curator-q.sh" ]]; then
     BACKLOG="$( cd "$FIXTURE_DIR" && PATH="$FIXTURE_DIR/bin:$PATH" LOOM_TEST_ISSUES="$FIXTURE_DIR/backlog.json" bash curator-q.sh 2>&1 | numbers_of )"
     assert_eq "#200 #201 #100 #101" "$(printf '%s\n' "$BACKLOG" | cut -d' ' -f1-4)" \
