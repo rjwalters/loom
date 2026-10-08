@@ -33,7 +33,7 @@ impl Drop for StoreOn {
 /// ETag; exit 1 while `fail-view` exists), the open-PR listing as empty, the
 /// unconditional `--jq` reads as an open, label-less issue, and `repo view`.
 /// `views.log` records `view <n> sent=<If-None-Match>` per conditional read
-/// and `legacy` per unconditional one.
+/// and `legacy` per unconditional one (the no-op hold's own REST read, #10156, is not a guard read).
 fn snapshot_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
     let views = ws.join("views.log");
     let fake_gh = ws.join("fake-gh.sh");
@@ -63,7 +63,7 @@ if [[ "$1" == "api" && "$2" == "--include" ]]; then
   exit 0
 fi
 if [[ "$1" == "api" && "$2" == repos/* ]]; then
-  if [[ "$*" == *is_pr* || "$*" == *labels* ]]; then echo legacy >> "{views}"; fi
+  if [[ "$*" != *"body: .body"* && ( "$*" == *is_pr* || "$*" == *labels* ) ]]; then echo legacy >> "{views}"; fi
   printf '%s\n' '{{"state":"open","is_pr":false}}'
   exit 0
 fi
