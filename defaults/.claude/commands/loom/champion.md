@@ -160,6 +160,10 @@ gh pr list \
 
 Ignore any that also carry `loom:operator-only` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
 
+### Rollout Check Pass (every pass, max 3 items)
+
+Search issue comments for `"rollout-check-pending"`. Items without a `loom:rollout-check-done` marker are pending, and are due 24h after their PR's `mergedAt`. Run each due signal and comment the done marker with the observed value. On a mismatch or an unqueryable signal, add `loom:operator`. Query and markers: `.loom/docs/rollout-check.md`.
+
 ### No Work Available
 
 If no queues have work, report "No work for Champion" and stop.
@@ -221,12 +225,6 @@ Champion uses context-specific instruction files to keep token usage efficient:
 | `champion-common.md` | Shared utilities | Completion reporting |
 
 **How to use**: When you find work at a given priority level, read the corresponding context file for detailed instructions on how to proceed.
-
----
-
-## Rollout check follow-up
-
-After a fleet roll, run any unchecked `Rollout check` items on merged host-move PRs' issues: `.loom/docs/rollout-check.md`.
 
 ---
 

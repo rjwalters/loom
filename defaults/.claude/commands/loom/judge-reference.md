@@ -175,7 +175,7 @@ The run command is the Step 4 scoped one narrowed to that path (`run-tests.sh <p
 | PR touches only docs/markdown | Skip test execution entirely (no code changes) |
 | PR touches files in multiple languages | Run scoped tests for each language independently |
 | No test framework detected | Note absence in evaluation; check if project has tests at all |
-| PR touches shared utilities | Scoped tools may miss downstream tests — note this risk in evaluation |
+| PR touches shared utilities | Scoped tools may miss downstream tests — note the risk; suspected missed coverage alone does not block approval |
 
 **Key principle**: Scoped execution is an optimization, not a replacement for CI — the full suite still runs there (step 8 verifies CI status); this just gives the Judge faster local feedback. Duration/confidence comparison: `.loom/docs/judge-reference-rationale.md`.
 
@@ -187,7 +187,7 @@ The run command is the Step 4 scoped one narrowed to that path (`run-tests.sh <p
 
 **Request changes** when `## Rollout check` is missing, or vague ("verify in prod"). A passing section names a runnable production signal (SigNoz query, metric, daemon command) and its expected value after the fleet rolls.
 
-On approval, record the section on the linked issue as an unchecked follow-up item; Champion runs it after the roll. Procedure and escalation: `.loom/docs/rollout-check.md`.
+On approval, comment it on the linked issue under `<!-- loom:rollout-check-pending pr=<PR> -->`; Champion runs it after the roll. Format and escalation: `.loom/docs/rollout-check.md`.
 
 ---
 
