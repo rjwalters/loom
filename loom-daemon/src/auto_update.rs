@@ -585,6 +585,11 @@ pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
 
 /// #10712: floor-driven roll targets (target selection, settle skip, stall).
 pub mod floor_roll;
+/// #10830: pause-and-roll (design `docs/design/daemon-roll-pause-resume.md`): the
+/// pause manifest (§6) and the H4 resume/requeue classifier. Not called from the
+/// roll path yet (#10831/#10832).
+pub mod pause_classify;
+pub mod pause_manifest;
 /// #10713: `auto_update_state.json` (settle clocks, window, typed stall).
 pub mod persisted_state;
 /// #8998's unsatisfiable-drain detector. A sibling module for the same two
