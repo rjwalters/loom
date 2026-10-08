@@ -6,8 +6,29 @@
 //! nothing: they are added here, beside the verbs they sit with.
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use std::path::PathBuf;
+
+/// `forge priority-labels` flags. A separate `Args` struct (not inline variant
+/// fields) so clap's derived `ForgeAction` parser keeps its stack frame small:
+/// inline fields pushed the full-`Cli` parse tests past the 2 MiB test-thread
+/// stack (`fatal runtime error: stack overflow`, #10546).
+#[derive(Args, Debug)]
+pub(crate) struct PriorityLabelsCli {
+    /// Read the PR body from PATH (`-` = stdin); its closing refs and
+    /// this repo's `Loom-Issue:` trailers name the issues.
+    #[arg(long, value_name = "PATH")]
+    body_file: Option<PathBuf>,
+    /// An issue to copy from (repeatable), besides the body's.
+    #[arg(long = "issue", value_name = "N")]
+    issues: Vec<u32>,
+    /// The PR's `owner/repo` (default: the checkout's).
+    #[arg(long, value_name = "OWNER/REPO")]
+    repo: Option<String>,
+    /// Post the inherited-star audit comment on this created PR.
+    #[arg(long, value_name = "URL|OWNER/REPO#N|N")]
+    audit_pr: Option<String>,
+}
 
 /// Sub-actions for `loom-daemon forge`.
 ///
@@ -66,6 +87,16 @@ pub(crate) enum ForgeAction {
         #[arg(value_name = "ISSUE")]
         issue: u32,
     },
+
+    /// `forge priority-labels [--body-file PATH] [--issue N]... [--repo NWO]
+    /// [--audit-pr URL]` (#10518) — the priority labels (the operator star and
+    /// its levels) a new PR copies from every issue its body closes; one per
+    /// line. `Part of #N` copies nothing. A failed lookup warns on stderr,
+    /// naming the issue, and still exits 0 (fail open). `--audit-pr` posts the
+    /// `inherited_from=#N` audit comment on the created PR. See
+    /// `loom_daemon::forge_priority_labels`.
+    #[command(name = "priority-labels")]
+    PriorityLabels(PriorityLabelsCli),
 
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue
@@ -765,6 +796,21 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &source,
             );
         }
+        ForgeAction::PriorityLabels(PriorityLabelsCli {
+            body_file,
+            issues,
+            repo,
+            audit_pr,
+        }) => {
+            return loom_daemon::forge_priority_labels::cli_entrypoint(
+                loom_daemon::forge_priority_labels::PriorityLabelsArgs {
+                    issues,
+                    body_file,
+                    repo,
+                    audit_pr,
+                },
+            );
+        }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
@@ -883,6 +929,9 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // write verbs — its `--repo` is exactly the `Option<String>` shape
         // `may_write_from` wants.
         ForgeAction::Comment { repo, .. } => Some(repo.clone()),
+        // #10518: `priority-labels --audit-pr` is NOT vetted here: its target
+        // can come from the audit URL, so `forge_priority_labels` resolves it
+        // once and vets that exact repo itself before posting.
         // #10255: the queue mutations write (dormant today, vetted anyway).
         ForgeAction::MergeQueue { action } => match &action.0 {
             super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }

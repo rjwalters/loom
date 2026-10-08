@@ -95,7 +95,7 @@ fn a_snapshot_round_trips_through_the_sink_dir() {
 }
 
 #[test]
-fn every_gauge_carries_an_owner_and_role_label() {
+fn every_gauge_carries_an_owner_installation_and_role_label() {
     use crate::observability::ops::ratelimit::{bucket_points, quota_points};
     use crate::telemetry::ops::MetricName;
     let reading = Reading {
@@ -108,7 +108,10 @@ fn every_gauge_carries_an_owner_and_role_label() {
     };
     let points = bucket_points(
         &[
-            (BucketKey::new("app-1", "acme", Resource::Core), reading),
+            (
+                BucketKey::new("app-1", "acme", Resource::Core).with_installation(Some("11")),
+                reading,
+            ),
             (BucketKey::new("app-2", "beta", Resource::Graphql), reading),
         ],
         "app-1",
@@ -122,7 +125,13 @@ fn every_gauge_carries_an_owner_and_role_label() {
                 | MetricName::GithubRateLimitReset
         ));
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["account", "owner", "resource", "role"], "{p:?}");
+        assert_eq!(keys, ["account", "installation", "owner", "resource", "role"], "{p:?}");
+        let want = if p.labels["account"] == "app-1" {
+            "11"
+        } else {
+            NO_INSTALLATION
+        };
+        assert_eq!(p.labels["installation"], want, "{p:?}");
     }
     assert!(points
         .iter()

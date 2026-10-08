@@ -16,6 +16,7 @@ use loom_daemon::install_compat::{
     self, classify, harness, DaemonCompat, Version, DAEMON_INVOKED_INSTALLED_FILES,
     REQUIRES_DAEMON, SUPPORTS_INSTALLED,
 };
+use loom_daemon::release_resolve::host;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
@@ -43,9 +44,23 @@ pub(crate) struct CheckArgs {
     /// The checkout under test. Defaults to the current directory.
     #[arg(long, value_name = "PATH", default_value = ".")]
     repo_root: PathBuf,
-    /// The binary of release `requires_daemon`, for direction B.
-    #[arg(long, value_name = "BIN")]
+    /// A daemon binary for direction B: the oldest release at or above
+    /// `requires_daemon` (releases skip versions, so not always that exact one).
+    #[arg(long, value_name = "BIN", conflicts_with = "fetch_old_daemon")]
     old_daemon: Option<PathBuf>,
+    /// Download direction B's daemon instead: the oldest published release at
+    /// or above `requires_daemon` that carries `--asset`. When none is
+    /// published yet, the new daemon stands in for it. Uses `gh`.
+    #[arg(long)]
+    fetch_old_daemon: bool,
+    /// `owner/repo` to fetch from. Defaults to `$GITHUB_REPOSITORY`, then the
+    /// repo root's `origin`.
+    #[arg(long, value_name = "OWNER/REPO", requires = "fetch_old_daemon")]
+    release_repo: Option<String>,
+    /// The release asset to fetch. Defaults to `loom-daemon-<this host's
+    /// target triple>`.
+    #[arg(long, value_name = "NAME", requires = "fetch_old_daemon")]
+    asset: Option<String>,
     /// The previous release's tag. Defaults to the newest `v*` tag at or
     /// below `VERSION`.
     #[arg(long, value_name = "TAG")]
@@ -124,10 +139,35 @@ impl CheckArgs {
             Version::parse(&text)
                 .ok_or_else(|| anyhow::anyhow!("{name} {text:?} is not MAJOR.MINOR.PATCH"))
         };
+        let old_daemon = if let Some(bin) = self.old_daemon {
+            harness::OldDaemon::Given(bin)
+        } else if self.fetch_old_daemon {
+            let repo = self
+                .release_repo
+                .or_else(|| {
+                    std::env::var("GITHUB_REPOSITORY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| host::repo_slug(&self.repo_root))
+                .ok_or_else(|| anyhow::anyhow!("--fetch-old-daemon: pass --release-repo"))?;
+            let asset = match self.asset {
+                Some(a) => a,
+                None => format!(
+                    "loom-daemon-{}",
+                    host::target_triple().ok_or_else(|| anyhow::anyhow!(
+                        "--fetch-old-daemon: unrecognized host platform; pass --asset"
+                    ))?
+                ),
+            };
+            harness::OldDaemon::Fetch { repo, asset }
+        } else {
+            harness::OldDaemon::Absent
+        };
         let opts = harness::CheckOptions {
             repo_root: self.repo_root,
             new_daemon: std::env::current_exe()?,
-            old_daemon: self.old_daemon,
+            old_daemon,
             prev_ref: self.prev_ref,
             supports_installed: claim(
                 self.supports_installed,

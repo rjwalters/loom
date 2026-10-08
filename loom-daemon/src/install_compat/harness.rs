@@ -14,9 +14,15 @@
 //!   in the new daemon, and every file the new daemon executes must exist in
 //!   its installed tree.
 //! * **B: the new installed files against the oldest daemon `REQUIRES_DAEMON`
-//!   claims.** Same two checks the other way round, against that release's
-//!   binary. The files that OLD daemon executes are read from that release's
-//!   copy of `install_compat.rs`; a release predating #10716 declares none.
+//!   claims.** Same two checks the other way round, against a release binary.
+//!   That binary is the OLDEST PUBLISHED release at or above `REQUIRES_DAEMON`,
+//!   not necessarily `v{REQUIRES_DAEMON}` itself: releases skip versions
+//!   (`release-cadence.md`), and a fleet host can only run a published one.
+//!   While no release at or above it is published (the PR that raises the
+//!   claim, and `main` between that merge and the next release), the new
+//!   daemon stands in. The files that OLD daemon executes are read from that
+//!   release's copy of `install_compat.rs`; a release predating #10716
+//!   declares none.
 //!
 //! "Exists" for a subcommand means `<daemon> <sub> --help` exits 0. The
 //! `(file, subcommand)` pairs come from `check-daemon-subcommand-versions.sh
@@ -27,6 +33,8 @@
 //! A violated claim is a [`Report::violations`] entry, and the CLI exits 1.
 
 use super::Version;
+use crate::release_fetch::checksum;
+use crate::release_resolve::resolve::asset_names;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -47,9 +55,8 @@ pub struct CheckOptions {
     pub repo_root: PathBuf,
     /// The new daemon (built from `repo_root`).
     pub new_daemon: PathBuf,
-    /// A binary of release `requires_daemon`. `None` is allowed only when the
-    /// claim names the unreleased version this change ships as.
-    pub old_daemon: Option<PathBuf>,
+    /// Where direction B's old daemon comes from.
+    pub old_daemon: OldDaemon,
     /// The previous release, as a git ref. `None` resolves it from the tags.
     pub prev_ref: Option<String>,
     /// The new daemon's `SUPPORTS_INSTALLED` claim.
@@ -58,6 +65,96 @@ pub struct CheckOptions {
     pub requires_daemon: Version,
     /// The installed files the new daemon executes.
     pub invoked_files: Vec<String>,
+}
+
+/// Where direction B's old daemon comes from.
+#[derive(Debug, Clone)]
+pub enum OldDaemon {
+    /// No binary. Passes only while no release tag at or above
+    /// `requires_daemon` exists, so the new daemon stands in.
+    Absent,
+    /// `--old-daemon`: a binary the caller downloaded. It must report a
+    /// version at or above `requires_daemon` with no release tag between the
+    /// two, i.e. the oldest release that satisfies the claim.
+    Given(PathBuf),
+    /// `--fetch-old-daemon`: download the oldest release at or above
+    /// `requires_daemon` that publishes `asset` and `<asset>.sha256` from
+    /// `repo`, verifying the checksum. A tag whose release has no such asset
+    /// yet (still uploading, #8515) is skipped. None published: the new daemon
+    /// stands in.
+    Fetch {
+        /// `owner/repo` the releases live in.
+        repo: String,
+        /// The binary asset name, e.g. `loom-daemon-x86_64-unknown-linux-gnu`.
+        asset: String,
+    },
+}
+
+/// The most release asset listings one `--fetch-old-daemon` run asks the
+/// forge for (one `gh release view` each). Normally the first candidate
+/// answers; only a release still uploading costs a second. A run that
+/// exhausts this fails rather than guessing.
+pub const MAX_RELEASE_LOOKUPS: usize = 5;
+
+/// Which published release direction B runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldRelease {
+    /// The oldest release at or above the claim that carries the asset.
+    Published(Version, String),
+    /// No release at or above the claim carries it yet.
+    Unpublished,
+}
+
+/// Release tags (`v*` names, one per line, as `git tag -l` prints them) at or
+/// above `req`, oldest first. Non-version names are ignored.
+#[must_use]
+pub fn tags_at_or_above(tags: &str, req: Version) -> Vec<(Version, String)> {
+    let mut out: Vec<(Version, String)> = tags
+        .lines()
+        .map(str::trim)
+        .filter_map(|t| Version::parse(t).map(|v| (v, t.to_string())))
+        .filter(|(v, _)| *v >= req)
+        .collect();
+    out.sort();
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// The oldest of `candidates` (oldest first, from [`tags_at_or_above`]) whose
+/// release carries the asset. `has_asset` answers one tag: `Some(true)`,
+/// `Some(false)` (no such asset, or not yet), or `None` when the forge could
+/// not say, which is an error rather than a skip so an outage never silently
+/// demotes the check to the stand-in path.
+///
+/// This is the `release.resolve-and-fetch` forge operation
+/// (`defaults/forge/operations/fleet-delivery.toml`), whose note says a
+/// delayed publication must never become a required merge check. A delayed
+/// one never does here: an unpublished or still-uploading release is skipped
+/// and the new daemon stands in. A forge OUTAGE during the lookup turns the
+/// step red by design, because this is a proof step and must not pass
+/// without having proven anything.
+///
+/// # Errors
+/// An unanswerable lookup, or [`MAX_RELEASE_LOOKUPS`] candidates without the
+/// asset.
+pub fn pick_oldest_published(
+    candidates: &[(Version, String)],
+    mut has_asset: impl FnMut(&str) -> Option<bool>,
+) -> Result<OldRelease> {
+    for (i, (v, tag)) in candidates.iter().enumerate() {
+        anyhow::ensure!(
+            i < MAX_RELEASE_LOOKUPS,
+            "the {MAX_RELEASE_LOOKUPS} oldest release tags at or above {} publish no daemon \
+             asset; pass --old-daemon instead",
+            candidates[0].0
+        );
+        match has_asset(tag) {
+            Some(true) => return Ok(OldRelease::Published(*v, tag.clone())),
+            Some(false) => {}
+            None => anyhow::bail!("could not list the assets of release {tag}"),
+        }
+    }
+    Ok(OldRelease::Unpublished)
 }
 
 /// The outcome of one run.
@@ -93,7 +190,7 @@ pub fn run(opts: &CheckOptions) -> Result<Report> {
 
     let mut probe = Probe::default();
     direction_a(opts, version, &mut probe, &mut report)?;
-    direction_b(opts, version, &new_tree, &new_scripts, &mut probe, &mut report)?;
+    direction_b(opts, &new_tree, &new_scripts, &mut probe, &mut report)?;
     Ok(report)
 }
 
@@ -169,37 +266,78 @@ fn direction_a(
 
 fn direction_b(
     opts: &CheckOptions,
-    version: Version,
     new_tree: &Path,
     scripts: &[PathBuf],
     probe: &mut Probe,
     report: &mut Report,
 ) -> Result<()> {
     let req = opts.requires_daemon;
-    let label = format!("B (new installed files vs daemon {req})");
-    let (daemon, invoked) = if let Some(old) = &opts.old_daemon {
-        match binary_version(old) {
-            Some(v) if v == req => {}
-            other => {
+    let candidates = tags_at_or_above(&release_tags(&opts.repo_root)?, req);
+    // Keeps a fetched binary alive until the probes below have run.
+    let scratch = tempfile::Builder::new()
+        .prefix("install-compat-old-")
+        .tempdir()?;
+    let old = match &opts.old_daemon {
+        OldDaemon::Given(bin) => match given_daemon(bin, req, &candidates) {
+            Ok(v) => Some((bin.clone(), v)),
+            Err(why) => {
+                report.violations.push(format!("B (daemon {req}): {why}"));
+                return Ok(());
+            }
+        },
+        OldDaemon::Fetch { repo, asset } => {
+            let sha = format!("{asset}.sha256");
+            let picked = pick_oldest_published(&candidates, |tag| {
+                asset_names(&opts.repo_root, repo, Some(tag))
+                    .map(|names| names.contains(asset) && names.contains(&sha))
+            })?;
+            match picked {
+                OldRelease::Published(v, tag) => {
+                    let bin = download_release_binary(
+                        &opts.repo_root,
+                        repo,
+                        &tag,
+                        asset,
+                        scratch.path(),
+                    )?;
+                    if binary_version(&bin) != Some(v) {
+                        report.violations.push(format!(
+                            "B (daemon {req}): {asset} from release {tag} does not report version {v}"
+                        ));
+                        return Ok(());
+                    }
+                    Some((bin, v))
+                }
+                OldRelease::Unpublished => None,
+            }
+        }
+        OldDaemon::Absent => {
+            if let Some((_, tag)) = candidates.first() {
                 report.violations.push(format!(
-                    "{label}: {} reports version {}, not the claimed {req}",
-                    old.display(),
-                    other.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                    "B (daemon {req}): no binary given; pass --old-daemon <loom-daemon from \
+                     release {tag}> or --fetch-old-daemon"
                 ));
                 return Ok(());
             }
+            None
         }
-        (old.clone(), old_invoked_files(&opts.repo_root, req, report)?)
-    } else if req > version {
-        report.notes.push(format!(
-            "{label}: {req} is unreleased (this change), so the new daemon stands in for it"
-        ));
-        (opts.new_daemon.clone(), opts.invoked_files.clone())
+    };
+    let (label, daemon, invoked) = if let Some((bin, v)) = old {
+        let label = if v == req {
+            format!("B (new installed files vs daemon {req})")
+        } else {
+            format!(
+                "B (new installed files vs daemon {v}, the oldest published release at or above {req})"
+            )
+        };
+        let invoked = old_invoked_files(&opts.repo_root, v, report)?;
+        (label, bin, invoked)
     } else {
-        report.violations.push(format!(
-            "{label}: no binary given; pass --old-daemon <loom-daemon from release v{req}>"
+        let label = format!("B (new installed files vs daemon {req})");
+        report.notes.push(format!(
+            "{label}: no release at or above {req} is published yet, so the new daemon stands in for it"
         ));
-        return Ok(());
+        (label, opts.new_daemon.clone(), opts.invoked_files.clone())
     };
     let missing = probe.missing_subcommands(&opts.repo_root, &daemon, scripts)?;
     record_missing(&label, &missing, new_tree, report);
@@ -212,9 +350,78 @@ fn direction_b(
     Ok(())
 }
 
-/// The files daemon `req` executes, from that release's copy of this module.
-fn old_invoked_files(repo_root: &Path, req: Version, report: &mut Report) -> Result<Vec<String>> {
-    let spec = format!("v{req}:{COMPAT_SOURCE_PATH}");
+/// Check a caller-supplied old daemon: it must report a version at or above
+/// `req`, and no release tag may lie between the two (that one is older and
+/// still satisfies the claim). Returns the version it reports.
+fn given_daemon(
+    bin: &Path,
+    req: Version,
+    candidates: &[(Version, String)],
+) -> std::result::Result<Version, String> {
+    let v = match binary_version(bin) {
+        Some(v) if v >= req => v,
+        other => {
+            return Err(format!(
+                "{} reports version {}, below the claimed {req}",
+                bin.display(),
+                other.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            ))
+        }
+    };
+    if let Some((_, tag)) = candidates.iter().find(|(c, _)| *c < v) {
+        return Err(format!(
+            "{} reports version {v}, but release {tag} is older and still at or above {req}; \
+             pass that one",
+            bin.display()
+        ));
+    }
+    Ok(v)
+}
+
+/// Download `asset` and `<asset>.sha256` from release `tag` into `dest`,
+/// verify the checksum, and make the binary executable.
+fn download_release_binary(
+    repo_root: &Path,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+    dest: &Path,
+) -> Result<PathBuf> {
+    let sha = format!("{asset}.sha256");
+    let out = Command::new(crate::gh_invocation::gh_bin())
+        .current_dir(repo_root)
+        .args([
+            "release", "download", tag, "-R", repo, "-p", asset, "-p", &sha, "-D",
+        ])
+        .arg(dest)
+        .stdin(Stdio::null())
+        .output()
+        .context("running gh release download")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gh release download {tag} {asset} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let bin = dest.join(asset);
+    anyhow::ensure!(
+        checksum::verify(&bin, &dest.join(&sha)),
+        "{asset} from release {tag} does not match its .sha256"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(bin)
+}
+
+/// The files daemon `release` executes, from that release's copy of this module.
+fn old_invoked_files(
+    repo_root: &Path,
+    release: Version,
+    report: &mut Report,
+) -> Result<Vec<String>> {
+    let spec = format!("v{release}:{COMPAT_SOURCE_PATH}");
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -229,7 +436,7 @@ fn old_invoked_files(repo_root: &Path, req: Version, report: &mut Report) -> Res
         Ok(files)
     } else {
         report.notes.push(format!(
-            "daemon {req} predates the invoked-file declaration; only subcommands are checked"
+            "daemon {release} predates the invoked-file declaration; only subcommands are checked"
         ));
         Ok(Vec::new())
     }
@@ -456,14 +663,25 @@ fn extract_defaults(repo_root: &Path, git_ref: &str, dest: &Path) -> Result<()> 
         .with_context(|| format!("unpacking {git_ref}:defaults"))
 }
 
-/// The newest `v*` tag whose version is at or below `version`.
-fn newest_tag_at_or_below(repo_root: &Path, version: Version) -> Result<String> {
+/// Every `v*` tag in the checkout, one per line.
+fn release_tags(repo_root: &Path) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .args(["tag", "-l", "v*"])
-        .output()?;
-    String::from_utf8_lossy(&out.stdout)
+        .output()
+        .context("running git tag")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git tag -l failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The newest `v*` tag whose version is at or below `version`.
+fn newest_tag_at_or_below(repo_root: &Path, version: Version) -> Result<String> {
+    release_tags(repo_root)?
         .lines()
         .filter_map(|t| Version::parse(t).map(|v| (v, t.to_string())))
         .filter(|(v, _)| *v <= version)
@@ -490,3 +708,6 @@ fn display(file: &Path, tree: &Path) -> String {
         .display()
         .to_string()
 }
+
+#[cfg(test)]
+mod tests;

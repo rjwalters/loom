@@ -432,6 +432,7 @@ fn an_app_host_books_its_probe_and_emits_no_owner_less_point() {
     let host = ProbeHost::App {
         account: "app-1034301".to_string(),
         owner: "acme-10343".to_string(),
+        installation: Some("77".to_string()),
     };
     let points = probe_points(
         &host,
@@ -460,9 +461,10 @@ fn an_app_host_books_its_probe_and_emits_no_owner_less_point() {
     assert_eq!(exported.len(), 6);
     for p in &exported {
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["account", "owner", "resource", "role"], "{p:?}");
+        assert_eq!(keys, ["account", "installation", "owner", "resource", "role"], "{p:?}");
         assert_eq!(p.labels["role"], "writer");
         assert_eq!(p.labels["owner"], "acme-10343");
+        assert_eq!(p.labels["installation"], "77");
     }
 }
 
@@ -472,6 +474,7 @@ fn an_app_host_never_books_the_breakers_fallback_reading() {
     let host = ProbeHost::App {
         account: "app-1034302".to_string(),
         owner: "acme".to_string(),
+        installation: None,
     };
     let points = probe_points(&host, None, || Some(live_budget(4999)), || "x".to_string());
     assert!(points.is_empty());
@@ -502,26 +505,43 @@ fn an_ambient_host_exports_its_probe_or_fallback_as_owner_dash_role_ambient() {
 
 /// #10343 review: the 60 s probe is booked under exactly the key the
 /// reader-refresh probe pass already uses for the same `.loom/gh-config`
-/// directory — it introduces no new `(account, owner)` derivation (#10571
-/// tracks keys that can still carry two buckets).
+/// directory — it introduces no derivation of its own. Since #10571 that
+/// key is the identity minted into the directory (its sidecar) when there
+/// is one, the roster and remote otherwise.
 #[test]
 fn the_tick_probe_books_under_the_primary_probe_targets_key() {
     let root = tempfile::tempdir().unwrap();
     let primary = crate::credential_preflight::github_app_gh_config_dir(root.path());
     std::fs::create_dir_all(&primary).unwrap();
     std::fs::write(primary.join("hosts.yml"), "github.com:\n").unwrap();
-    let targets =
-        crate::forge_bucket_book::probe_targets(root.path(), std::time::SystemTime::now());
-    let target = targets
-        .iter()
-        .find(|t| t.dir == primary)
-        .expect("primary target");
-    assert_eq!(
-        probe_host_for(root.path(), true),
-        ProbeHost::App {
-            account: target.account.clone(),
-            owner: target.owner.clone(),
-        }
-    );
+    let same_key = |want_installation: Option<&str>| {
+        let targets =
+            crate::forge_bucket_book::probe_targets(root.path(), std::time::SystemTime::now());
+        let target = targets
+            .iter()
+            .find(|t| t.dir == primary)
+            .expect("primary target");
+        assert_eq!(target.installation.as_deref(), want_installation);
+        assert_eq!(
+            probe_host_for(root.path(), true),
+            ProbeHost::App {
+                account: target.account.clone(),
+                owner: target.owner.clone(),
+                installation: target.installation.clone(),
+            }
+        );
+    };
+    same_key(None);
+    let side = crate::forge_identity::Sidecar {
+        app_id: "4486636".into(),
+        installation_id: "151241341".into(),
+        owner: Some("2amlogic".into()),
+        role: crate::forge_identity::SidecarRole::Writer,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        ..Default::default()
+    };
+    crate::forge_identity::sidecar::write_sidecar(&primary, &side).unwrap();
+    same_key(Some("151241341"));
+    assert_eq!(writer_account_for(root.path()), "app-4486636");
     assert_eq!(probe_host_for(root.path(), false), ProbeHost::Ambient);
 }

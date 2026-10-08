@@ -1372,10 +1372,13 @@ jobs:
       # #10716 (tracker #10698 D3/D4): prove the two claims across adjacent
       # releases. A: the previous release's installed files against this
       # daemon (skipped when SUPPORTS_INSTALLED declares the break). B: this
-      # tree's installed files against the release REQUIRES_DAEMON names,
-      # downloaded here. A violated claim exits 1. The logic is
-      # `loom-daemon install-compat check`; this step only fetches the old
-      # binary. fetch-depth: 0 above supplies the release tags. Not
+      # tree's installed files against the oldest PUBLISHED release at or
+      # above REQUIRES_DAEMON (releases skip versions, so not always
+      # v$REQUIRES_DAEMON itself), downloaded by --fetch-old-daemon; while
+      # none is published the new daemon stands in. A violated claim exits 1.
+      # All of it, the release lookup included, is
+      # `loom-daemon install-compat check`. fetch-depth: 0 above supplies the
+      # release tags. Not
       # path-filtered: a change to `defaults/` alone can break claim B. Here,
       # not in the required Daemon Checks, because its verdict also depends on
       # release tags and assets, which no stale-check input set can model.
@@ -1384,17 +1387,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          req="$(./target/debug/loom-daemon install-compat show --json | jq -r .requires_daemon)"
-          old_args=()
-          if git rev-parse -q --verify "refs/tags/v$req" >/dev/null; then
-            asset=loom-daemon-x86_64-unknown-linux-gnu
-            gh release download "v$req" --repo "$GITHUB_REPOSITORY" -p "$asset" -p "$asset.sha256" -D "$RUNNER_TEMP/compat-old"
-            (cd "$RUNNER_TEMP/compat-old" && sha256sum -c "$asset.sha256")
-            chmod +x "$RUNNER_TEMP/compat-old/$asset"
-            old_args=(--old-daemon "$RUNNER_TEMP/compat-old/$asset")
-          fi
-          ./target/debug/loom-daemon install-compat check --repo-root . "${old_args[@]}"
+          ./target/debug/loom-daemon install-compat check --repo-root . \
+            --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
+            --asset loom-daemon-x86_64-unknown-linux-gnu
 
   repo-hygiene:
     name: Repo Hygiene Checks

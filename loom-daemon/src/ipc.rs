@@ -585,6 +585,9 @@ async fn handle_client(
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {
+        // #10765: read-to-response-written latency by request kind, recorded
+        // when this iteration ends (`observability::ops::ipc_latency`).
+        let mut latency = crate::observability::ops::ipc_latency::RequestTimer::start();
         // Parse the incoming frame. A malformed payload (garbage JSON, a
         // missing required field, or an unknown `type` tag) is a per-request
         // protocol error, NOT a fatal connection error: emit a structured
@@ -601,6 +604,7 @@ async fn handle_client(
                 continue;
             }
         };
+        latency.set_kind(&line);
         log::debug!("Request: {request:?}");
 
         // SubscribeEvents is the only structurally-different request: it
@@ -609,6 +613,7 @@ async fn handle_client(
         // connection is dedicated to the stream until the client closes
         // it (or the bus drops).
         if let Request::SubscribeEvents { topics } = request {
+            latency.disarm();
             stream_events(&event_bus, &mut writer, topics).await?;
             // After streaming ends (client disconnect or bus closed) the
             // connection has no more useful state — exit the loop.
@@ -641,52 +646,19 @@ async fn handle_client(
         // DaemonStatus (Issue #3891) is handled here rather than in the
         // synchronous `handle_request` dispatcher because it reads the per-repo
         // `health_states` halt flags, which the dispatcher does not receive.
-        // The report is cheap to build (per-repo registry snapshots + a few pure
-        // filesystem reads for the dynamic-cap inputs); per-token usage is left
-        // to the CLI (a slow network probe) so this handler never blocks.
+        // The build is `O(roots)` and can take minutes on a busy host, so it
+        // runs on the blocking pool, never inline on a tokio worker (#10765),
+        // and a panic in it still yields an error frame (#4279). See
+        // `status_off_runtime`.
         if let Request::DaemonStatus = request {
-            // Pre-warm the memoized CPU idle-fraction sample off the runtime
-            // (#4031): the macOS `iostat` read sleeps ~1s, so it must never run
-            // inline on a tokio worker. `build_daemon_status` then reads the
-            // freshly-cached value without blocking. A memoized-fresh sample
-            // (within the TTL) makes this a no-op. `spawn_blocking` join errors
-            // are non-fatal — the status falls back to the last cached value.
-            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            // Build the report under a panic guard (#4279). This connection runs
-            // in a detached `tokio::spawn` (see the accept loop): a panic while
-            // building the status would unwind the task and drop the socket with
-            // ZERO bytes written, so the client reads a silent EOF that a
-            // stdout-capturing monitor misreads as an empty/"no workspaces"
-            // status. The registry-lock poisoning that used to cause exactly this
-            // is now recovered in `build_daemon_status`, but the guard makes the
-            // invariant unconditional: a `DaemonStatus` request always leaves the
-            // handler having written either the report or an explicit error frame
-            // (the daemon logs the panic cause either way). `build_daemon_status`
-            // is synchronous, so `catch_unwind` never spans an `.await`.
-            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_daemon_status_with_drain(
-                    &workspace_pool,
-                    &health_states,
-                    &fallback_root,
-                    &credential_preflight,
-                    &drain_state,
-                )
-            }));
-            let response = match built {
-                // `Response::DaemonStatus` is boxed (issue #4292) to keep the
-                // enum small; box the guarded report here.
-                Ok(report) => Response::DaemonStatus(Box::new(report)),
-                Err(panic) => {
-                    let cause = describe_panic(panic.as_ref());
-                    log::error!(
-                        "DaemonStatus handler panicked while building the report: {cause}; \
-                         replying with an error frame instead of dropping the connection"
-                    );
-                    Response::Error {
-                        message: format!("daemon failed to build status report: {cause}"),
-                    }
-                }
-            };
+            let response = status_off_runtime::serve(
+                &workspace_pool,
+                &health_states,
+                &fallback_root,
+                &credential_preflight,
+                &drain_state,
+            )
+            .await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -3684,6 +3656,7 @@ fn handle_remove_watch(id: &str) -> Response {
 }
 
 mod roster_status;
+mod status_off_runtime;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]

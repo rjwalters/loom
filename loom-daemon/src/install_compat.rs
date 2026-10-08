@@ -210,6 +210,14 @@ pub enum Compat {
 ///    rule ("no `requires_daemon` means compatible but owed a resync") only
 ///    holds while the daemon still supports that version.
 /// 3. Any claim missing or unparseable means a resync is owed.
+///
+/// `Compatible` and `ResyncOwed` say nothing about the resync's direction.
+/// A present but unparseable `requires_daemon` lands in `ResyncOwed`, and a
+/// recorded `loom_version` above the running daemon is not checked here at
+/// all. So the resync itself (#10717, #10718) must refuse whenever the
+/// installed `loom_version` is above the running daemon, whatever
+/// `requires_daemon` parses to: that resync would be the downgrade step 1
+/// rules out.
 #[must_use]
 pub fn classify(installed: &InstallMeta, daemon: &DaemonCompat) -> Compat {
     let requires = installed

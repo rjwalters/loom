@@ -1095,6 +1095,8 @@ mod roll_stall;
 mod roll_window_tick;
 // Running-version roll basis (#10710).
 mod running_basis;
+// Floor-driven roll targets (#10712).
+mod floor_roll;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

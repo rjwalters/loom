@@ -429,10 +429,7 @@ pub fn script_runner_factory() -> RunnerFactory {
 #[must_use]
 pub fn forge_queue_probe() -> QueueProbe {
     Arc::new(|root, labels| {
-        let gh_bin = std::env::var("LOOM_GH_BIN")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
+        let gh_bin = gate_gh_bin();
         for label in labels {
             let rows = crate::forge_listing::list_issues_cached_as(
                 QUEUE_GATE_CALLER,
@@ -455,6 +452,16 @@ pub fn forge_queue_probe() -> QueueProbe {
         }
         Ok(false)
     })
+}
+
+/// The `gh` binary the gate listings use: `LOOM_GH_BIN` when set, else the
+/// resolved default.
+#[must_use]
+pub fn gate_gh_bin() -> PathBuf {
+    std::env::var("LOOM_GH_BIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from)
 }
 
 /// Run one admitted invocation on the blocking thread: the queue gate, then
@@ -530,6 +537,9 @@ pub struct RoleDispatcher {
     /// The Doctor-queue read and stale-verdict guard an assigned lane uses
     /// (#10632).
     lane_probe: lanes::LaneProbe,
+    /// The curator/auditor/guide event-trigger probe and ledger (#10816).
+    trigger_probe: triggers::TriggerProbe,
+    trigger_ledger: &'static triggers::TriggerLedger,
     in_flight: JoinSet<FinishedRun>,
     /// Which root each task runs, so a panicked task still names its root.
     running: HashMap<Id, PathBuf>,
@@ -574,6 +584,21 @@ impl RoleDispatcher {
         )
         .with_demand(demand::global(), demand::forge_merge_probe())
         .with_lane_probe(lanes::LaneProbe::forge())
+        .with_triggers(triggers::forge_trigger_probe(), triggers::global())
+    }
+
+    /// Use `probe` and `ledger` for the event triggers (#10816).
+    /// [`Self::with_decide`] defaults to [`triggers::no_trigger_probe`], which
+    /// never reads git or the forge (an enabled gate then fails open).
+    #[must_use]
+    pub fn with_triggers(
+        mut self,
+        probe: triggers::TriggerProbe,
+        ledger: &'static triggers::TriggerLedger,
+    ) -> Self {
+        self.trigger_probe = probe;
+        self.trigger_ledger = ledger;
+        self
     }
 
     /// Use `lane_probe` for assigned doctor lanes (#10632). [`Self::with_decide`]
@@ -619,6 +644,8 @@ impl RoleDispatcher {
             ledger: demand::global(),
             merge_probe: demand::no_merge_probe(),
             lane_probe: lanes::LaneProbe::none(),
+            trigger_probe: triggers::no_trigger_probe(),
+            trigger_ledger: triggers::global(),
             in_flight: JoinSet::new(),
             running: HashMap::new(),
             failing_roots: HashMap::new(),
@@ -771,6 +798,8 @@ impl RoleDispatcher {
         let factory = Arc::clone(&self.runner_factory);
         let probe = Arc::clone(&self.queue_probe);
         let (ledger, merge_probe) = (self.ledger, Arc::clone(&self.merge_probe));
+        let (trigger_probe, trigger_ledger) =
+            (Arc::clone(&self.trigger_probe), self.trigger_ledger);
         let task_root = root.clone();
         let handle = self.in_flight.spawn_blocking(move || {
             // Held for the run's real lifetime; dropped on every exit path,
@@ -781,8 +810,21 @@ impl RoleDispatcher {
             crate::observability::pick_decision::clear_gate_listings();
             let mut runner = factory(task_root.clone());
             let lane = lane.as_ref().map(|(p, l)| (p, *l));
-            let outcome =
-                run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval, lane);
+            // Curator/auditor/guide event trigger (#10816); a no-op unless
+            // this root enables `eventTriggers`.
+            let triggers_cfg = if triggers::is_triggered_role(name) {
+                triggers::read_event_trigger_config(&task_root)
+            } else {
+                triggers::EventTriggerConfig::default()
+            };
+            let outcome = triggers::run_with_trigger_gate(
+                triggers_cfg,
+                &trigger_probe,
+                trigger_ledger,
+                &task_root,
+                name,
+                || run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval, lane),
+            );
             if name == "champion" {
                 // Count-only, after the run: it never gates champion (#9392).
                 demand::record_merge_debt(&merge_probe, ledger, &task_root);

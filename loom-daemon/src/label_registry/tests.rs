@@ -286,3 +286,29 @@ fn lockstep_dep_classify_operator_only_kinds() {
         .collect();
     assert_eq!(requiring, set(base.remove_with.iter().map(String::as_str)));
 }
+
+#[test]
+fn derived_eta_operator_hold_sets_match_the_previous_literals() {
+    use crate::eta::labels::{
+        MERGE_HOLD_COMPANION_LABELS, MERGE_HOLD_LABELS, OPERATOR_HOLD_LABELS,
+    };
+    assert_eq!(
+        set(MERGE_HOLD_LABELS.iter().copied()),
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-decision"
+        ])
+    );
+    assert_eq!(*MERGE_HOLD_COMPANION_LABELS, ["loom:operator-mechanical"]);
+    // Order is load-bearing: `operator_hold_label` reports the first match.
+    assert_eq!(
+        *OPERATOR_HOLD_LABELS,
+        [
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-decision",
+            "loom:operator-mechanical"
+        ]
+    );
+}

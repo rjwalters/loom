@@ -18,6 +18,7 @@ use super::forge::{GhStarForge, StarForge};
 use super::inherit::{self, Inherited};
 use super::intents::{self, AppliedIds, StarIntent};
 use super::levels;
+use super::materialize;
 use super::progress::{self, Tracker, Watched};
 use super::stale;
 use super::Settings;
@@ -218,9 +219,29 @@ impl LivenessState {
                 recorded_starred_at: &recorded,
             };
             let mut forge = forges(&repo.root, &repo.slug);
-            let result = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals)
+            let mut evaluator = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals)
                 .with_propagate(settings.propagate)
-                .run();
+                .with_materialize(settings.materialize_labels);
+            let result = evaluator.run();
+            let plan = std::mem::take(&mut evaluator.plan);
+            drop(evaluator);
+            // #10012 §2–§3: write the inherited star, and take back the ones
+            // whose root lost its star. Off unless `materializeLabels` is on
+            // (default off; no plan otherwise), and off with `escalate` (no
+            // forge writes) or `propagate` (no plan).
+            if settings.materialize_labels
+                && settings.escalate
+                && result.is_ok()
+                && !plan.is_empty()
+            {
+                let done = materialize::apply(
+                    forge.as_mut(),
+                    &repo.slug,
+                    &plan,
+                    materialize::MAX_STAR_WRITES_PER_PASS,
+                );
+                log::debug!("star_liveness: {} star propagation: {done:?}", repo.slug);
+            }
             match result {
                 Ok(rows) => {
                     if !rows.is_empty() {

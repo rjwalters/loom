@@ -51,7 +51,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::credential_preflight::{GithubAppMinter, GithubAppOutcome};
@@ -71,6 +71,11 @@ pub use withdrawal::{
 #[path = "forge_identity/served.rs"]
 pub mod served;
 
+#[path = "forge_identity/sidecar.rs"]
+pub mod sidecar;
+use sidecar::publish;
+pub use sidecar::{read_sidecar, Sidecar, SidecarRole, SIDECAR};
+
 #[path = "forge_identity/route.rs"]
 pub mod route;
 pub use route::{route_read, ExhaustCause, Placement, ReadClass, RouteDecision, RouteRequest};
@@ -87,9 +92,6 @@ pub const READER_MIN_REMAINING: Duration = Duration::from_secs(120);
 /// are hot (every listing poll), config changes are rare, and a stale roster
 /// only ever means "the old reader set for one more minute".
 const ROSTER_TTL: Duration = Duration::from_secs(60);
-
-/// The sidecar written next to a reader's `hosts.yml`.
-const SIDECAR: &str = "identity.json";
 
 /// The daemon's workspace root, recorded by [`spawn_reader_refresh`]. Reads
 /// resolve their roster and reader directories against it; outside a daemon
@@ -657,26 +659,6 @@ pub fn reader_dir(workspace_root: &Path, owner: &str, reader: &Identity) -> Path
     forge_read_pool::gh_config_dir_for_owner_app(workspace_root, owner, &reader.app_id)
 }
 
-/// What [`refresh_reader_credentials`] records beside a reader's token.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Sidecar {
-    /// The reader App id.
-    pub app_id: String,
-    /// Its slug, when known.
-    pub slug: Option<String>,
-    /// The installation the token belongs to.
-    pub installation_id: String,
-    /// The token's expiry (RFC 3339, from the minter).
-    pub expires_at: String,
-}
-
-/// The sidecar in `dir`, if readable.
-#[must_use]
-pub fn read_sidecar(dir: &Path) -> Option<Sidecar> {
-    serde_json::from_str(&std::fs::read_to_string(dir.join(SIDECAR)).ok()?).ok()
-}
-
 /// Whether `dir` holds a reader token usable at `now`.
 #[must_use]
 pub fn dir_is_fresh(dir: &Path, now: SystemTime) -> bool {
@@ -1020,7 +1002,7 @@ pub fn refresh_reader_credentials(
                     ..
                 } => {
                     let dir = reader_dir(workspace_root, &owner, reader);
-                    publish(&dir, &token, reader, &installation_id, &expires_at)
+                    publish(&dir, &token, reader, &owner, &installation_id, &expires_at)
                         .map(|()| expires_at)
                         .map_err(|e| format!("could not publish to {}: {e}", dir.display()))
                 }
@@ -1049,28 +1031,6 @@ pub fn refresh_reader_credentials(
         }
     }
     out
-}
-
-/// Publish the token (via the writer's own atomic delivery), then the
-/// sidecar. The sidecar is written last, so a reader of the directory never
-/// sees a fresh sidecar in front of a stale token.
-fn publish(
-    dir: &Path,
-    token: &str,
-    reader: &Identity,
-    installation_id: &str,
-    expires_at: &str,
-) -> std::io::Result<()> {
-    crate::credential_preflight::publish_github_app_token(dir, token)?;
-    let side = Sidecar {
-        app_id: reader.app_id.clone(),
-        slug: reader.slug.clone(),
-        installation_id: installation_id.to_string(),
-        expires_at: expires_at.to_string(),
-    };
-    let tmp = dir.join(format!("{SIDECAR}.tmp"));
-    std::fs::write(&tmp, serde_json::to_vec(&side).unwrap_or_default())?;
-    std::fs::rename(tmp, dir.join(SIDECAR))
 }
 
 /// Keep every reader's token fresh for every managed owner: one pass now,

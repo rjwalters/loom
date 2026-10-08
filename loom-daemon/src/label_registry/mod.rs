@@ -58,6 +58,8 @@ pub const BOOL_PROPERTIES: &[&str] = &[
     "hard_exclusion",
     "champion_path",
     "human_gated",
+    "merge_hold",
+    "operator_hold",
     "contradicts_approval",
 ];
 
@@ -97,6 +99,10 @@ pub struct Label {
     pub hard_exclusion: bool,
     pub champion_path: bool,
     pub human_gated: bool,
+    /// Operator holds that make an approved PR's wait a merge hold (#10218).
+    pub merge_hold: bool,
+    /// Operator holds: a human is needed before the item moves (#10210).
+    pub operator_hold: bool,
     /// 1-based position in the order labels that contradict `loom:pr` are
     /// reported; `None` = does not contradict.
     pub contradicts_approval: Option<u32>,
@@ -136,6 +142,8 @@ impl Label {
             "hard_exclusion" => self.hard_exclusion,
             "champion_path" => self.champion_path,
             "human_gated" => self.human_gated,
+            "merge_hold" => self.merge_hold,
+            "operator_hold" => self.operator_hold,
             "contradicts_approval" => self.contradicts_approval.is_some(),
             _ => return None,
         })

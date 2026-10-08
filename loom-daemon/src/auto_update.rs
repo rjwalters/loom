@@ -583,6 +583,8 @@ pub mod supersede;
 
 pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
 
+/// #10712: floor-driven roll targets (target selection, settle skip, stall).
+pub mod floor_roll;
 /// #8998's unsatisfiable-drain detector. A sibling module for the same two
 /// reasons #8513/#8514 were: this file is over
 /// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
@@ -1230,6 +1232,8 @@ pub struct AutoUpdateState {
     roll_stall: roll_stall::RollStallTracker,
     /// #9132's schedule gate (inert unless `rollWindowSecs` is configured).
     window: roll_window::WindowGate,
+    /// #10712: the fleet floor's basis and last verdict (inert while unset).
+    floor: floor_roll::FloorState,
 }
 
 impl AutoUpdateState {
@@ -1311,6 +1315,7 @@ impl AutoUpdateState {
                 // No artifact resolved this tick at all — any stale-repo
                 // streak from a previous tick no longer applies (#8513).
                 self.stale_repo.reset();
+                self.floor.observe(None);
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
                     TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
@@ -1344,6 +1349,8 @@ impl AutoUpdateState {
         settle: Duration,
     ) -> TickDecision {
         let verdict = classify_artifact(info);
+        // #10712: below a satisfiable fleet floor, this release is the floor target.
+        let floor_target = self.floor.observe(Some(&floor_roll::Release::of(info)));
         // Issue #8513: the streak counts only genuinely CONSECUTIVE
         // stale-repo ticks, so anything else this tick resolved drops it —
         // but the reset must not run before the `StaleRepo` arm increments,
@@ -1428,17 +1435,22 @@ impl AutoUpdateState {
         if let Some(skip) = self.terminal_or_backoff_gate(now) {
             return skip;
         }
-        if let Some(skip) = self.settle_gate(now, settle) {
-            return skip;
+        // #10712: a floor-driven roll skips settle (and so does its supersede,
+        // which re-decides here still floor-driven); autoUpdate rolls do not.
+        let selected = self.floor.select(floor_target.as_ref(), info);
+        if selected.source == floor_roll::TargetSource::AutoUpdate {
+            if let Some(skip) = self.settle_gate(now, settle) {
+                return skip;
+            }
         }
         // NO in-flight gate here (Issue #8252): a fetch is not a build, so it
         // is never deferred behind the build-stampede guard — only niced when
         // the host is busy, exactly as the post-deadline path used to do,
         // minus the wait. `defer_deadline` is consumed by `decide_source` only.
         TickDecision::FetchArtifact {
-            version: info.version.clone(),
-            tag: info.tag.clone(),
-            why,
+            why: format!("{why}{}", self.floor.why_suffix(&selected)),
+            version: selected.version,
+            tag: selected.tag,
             low_priority: in_flight > 0,
         }
     }
