@@ -2457,7 +2457,9 @@ Each row:
 
 **`stages` (#10929)** is additive: `schema_version` stays 12. It feeds the
 dashboard's Time-stage track (loom-ui#2753). It sits on the row only, never
-on an alternate. Each entry holds whole seconds from the row's `as_of`:
+on an alternate. Like `alternates[]`, it never costs a row under the 1 MiB
+budget (#10928). The forecasts ride in row order while they fit, and before
+any alternate. Each entry holds whole seconds from the row's `as_of`:
 
 | Field | Type | Notes |
 |---|---|---|

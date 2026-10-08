@@ -98,6 +98,7 @@ fn eta_outcome() -> EtaOutcomeRecord {
         outcome_source: "pulls_read".to_string(),
         outcome_resolution_sec: Some(120),
         result: None,
+        attribution: None,
     }
 }
 
@@ -211,6 +212,10 @@ fn samples() -> Vec<TelemetryRecord> {
         ),
         TelemetryRecord::EtaEstimate(eta_estimate()),
         TelemetryRecord::EtaOutcome(eta_outcome()),
+        wire(json!({"kind": "eta.stage_outcome", "repo": "rjwalters/loom", "issue": 1,
+                    "stage": "review_wait", "left_at": AT, "exit": "pass",
+                    "event": "label.transition", "observed_at": AT, "open_estimates": 0,
+                    "loom": p})),
         wire(json!({"kind": "session.output", "schema": 1, "runtime": "claude",
                     "category": "output", "stream": "assistant", "stream_id": "s",
                     "sequence": 0, "event_id": "e", "source_at": AT, "observed_at": AT,

@@ -61,6 +61,7 @@ fn a_stage_outcome_is_stamped_when_left_observed_at_the_pass_and_names_the_autho
         assert!(
             ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
                 || [
+                    "loom.kind",
                     "loom.repo",
                     "loom.record_id",
                     "loom.pr_number",
