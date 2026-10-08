@@ -636,13 +636,12 @@ fn registering_a_fifteenth_land_heuristic_fails_loudly() {
     assert!(land - 1 <= crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
 }
 
-/// #10521: `land-2026-10-06-loop-kite` is the fourteenth land heuristic, so
-/// the daemon carries 13 alternates. A loom-ui still slicing at the old 12
-/// drops only the 13th by id: with the shipped registry and the default
-/// `current`, `little-v0`, a baseline the chooser never offers. So either
-/// deploy order loses no candidate.
+/// #10521 made `land-2026-10-06-loop-kite` the fourteenth land heuristic
+/// (13 alternates); #10949 retired the three IPCW arms, so `land` registers
+/// 11 and a snapshot row carries 10 alternates. Every one attaches, and a
+/// loom-ui still slicing at the old 12 drops none of them.
 #[test]
-fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_only_a_baseline() {
+fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_none() {
     let registered = registered();
     let pending: Vec<EstimateSummary> = registered[&Kind::Land]
         .iter()
@@ -651,14 +650,15 @@ fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_only_a_basel
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
     assert_eq!(list.len(), registered[&Kind::Land].len() - 1, "the daemon drops none");
-    let past_old_cap: Vec<&str> = list[12..].iter().map(|e| e.heuristic.as_str()).collect();
-    assert_eq!(past_old_cap, ["little-v0"]);
-    assert_eq!(Registry::builtin().tier_of("little-v0"), Some(crate::eta::Tier::Baseline));
+    assert_eq!(list.len(), 10, "the IPCW arms are no longer alternates (#10949)");
+    assert!(list.len() <= 12, "an old twelve-slice loom-ui drops none");
 }
 
 /// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
 /// live shadow set, #10549 `land-2026-10-04-fresh-tide`, #10528
-/// `land-2026-10-04-twin-otter`, and #10489 `land-2026-10-06-calm-plover`. Pending
+/// `land-2026-10-04-twin-otter`, #10489 `land-2026-10-06-calm-plover`, and
+/// #10949 the IPCW arms `land-2026-10-06-quick-tern`, `-swift-tern` and
+/// `-bold-lark`. Pending
 /// estimates restored from disk that still name them are never offered as
 /// `alternates[]`; the live shadows are.
 #[test]
@@ -669,6 +669,9 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         "land-2026-10-04-fresh-tide",
         "land-2026-10-04-twin-otter",
         "land-2026-10-06-calm-plover",
+        "land-2026-10-06-quick-tern",
+        "land-2026-10-06-swift-tern",
+        "land-2026-10-06-bold-lark",
     ];
     let registered = registered();
     for id in retired {
@@ -682,6 +685,9 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         summary(REPO, 1, Kind::Land, "land-2026-10-04-fresh-tide", 0, Some(500)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-twin-otter", 0, Some(400)),
         summary(REPO, 1, Kind::Land, "land-2026-10-06-calm-plover", 0, Some(400)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-quick-tern", 0, Some(300)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-swift-tern", 0, Some(300)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-bold-lark", 0, Some(300)),
     ];
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];

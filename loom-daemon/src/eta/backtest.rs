@@ -749,7 +749,7 @@ pub fn calibration_from_replay(
 }
 
 /// Give the calibrating `land` heuristics (`land-2026-10-06-even-lark`,
-/// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
+/// #10489, over `land-v2`; an offline IPCW wrap, #10524, over
 /// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
 /// whose regime residuals are the same `-b` rows) their calibration evidence
 /// from the replay itself: each [`super::heuristics::CALIBRATION_BASES`]

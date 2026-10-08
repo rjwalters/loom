@@ -595,9 +595,10 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 ///
 /// A twin-otter explanation (#10243) has no stage grids: it recomputes
 /// through its own `twin_otter` record (the adapted input, the config and
-/// the model slice) with the seed in `combination`. A calibrated one
-/// (`land-2026-10-06-quick-tern`, #10524) then applies its recorded shift
-/// like any other.
+/// the model slice) with the seed in `combination`. A calibrated one (an
+/// IPCW-wrapped base, #10524, such as the retired
+/// `land-2026-10-06-quick-tern`) then applies its recorded shift like any
+/// other.
 ///
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.

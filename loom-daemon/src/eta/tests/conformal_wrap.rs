@@ -1,8 +1,8 @@
-//! The IPCW conformal wrapper over any `land` base (#10524, slice 5): parity
-//! with the shipped quick-tern / swift-tern over twin-otter-b, a different
-//! base calibrated on its own rows only, the point-in-time leak test, the
-//! recompute through a simulator base (held-heron), the refusals, and the
-//! offline backtest wiring. Nothing new is registered.
+//! The IPCW conformal wrapper over any `land` base (#10524, slice 5): the
+//! retired quick-tern / swift-tern reproduced offline over twin-otter-b, a
+//! different base calibrated on its own rows only, the point-in-time leak
+//! test, the recompute through a simulator base (held-heron), the refusals,
+//! and the offline backtest wiring. No IPCW arm is registered (#10949).
 
 use super::conformal_ipcw::{at, bytes, fixture, obs, DAY};
 use super::held_heron::{held, heron, hold_history};
@@ -14,9 +14,8 @@ use crate::eta::conformal_ipcw::{METHOD, METHOD_DRIFT};
 use crate::eta::conformal_wrap::{Calibrator, IpcwWrap, CALIBRATED};
 use crate::eta::explanation::RegimeAdjustment;
 use crate::eta::heuristics::{
-    LandQuickTern, LandSwiftTern, LandTwinOtterB, LandV2, StartV1, CALIBRATION_BASES,
-    LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_HELD_HERON, LAND_QUICK_TERN, LAND_SWIFT_TERN,
-    LAND_TWIN_OTTER_B, LAND_V2,
+    LandTwinOtterB, LandV2, StartV1, CALIBRATION_BASES, LAND_BOLD_LARK, LAND_EVEN_LARK,
+    LAND_HELD_HERON, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TWIN_OTTER_B, LAND_V2,
 };
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::regime;
@@ -54,8 +53,11 @@ fn v2_ipcw() -> IpcwWrap<LandV2> {
     IpcwWrap::new(V2_IPCW, LandV2, Calibrator::Ipcw).expect("land-v2 is a land base")
 }
 
+/// The retired quick-tern and swift-tern (#10949) are this wrapper over
+/// twin-otter-b; it still reproduces them offline, under their ids, and
+/// neither is registered.
 #[test]
-fn over_twin_otter_b_the_wrapper_is_quick_tern_and_swift_tern_byte_for_byte() {
+fn over_twin_otter_b_the_wrapper_reproduces_the_retired_quick_tern_and_swift_tern() {
     for fit in [None, Some(Arc::new(fixture_fit(fit_as_of())))] {
         // A pre-PR stage: twin-otter-b answers with or without a fit.
         let input = input_at(Stage::SweepBuilder, 0, 0);
@@ -64,21 +66,22 @@ fn over_twin_otter_b_the_wrapper_is_quick_tern_and_swift_tern_byte_for_byte() {
             evidence(LAND_TWIN_OTTER_B, Stage::SweepBuilder, 3.0),
         );
 
-        let quick = LandQuickTern::new(fit.clone()).estimate(&input, &history);
-        assert_eq!(quick.calibration.as_ref().expect("calibrated").method, METHOD);
-        let wrapped =
-            IpcwWrap::new(LAND_QUICK_TERN, LandTwinOtterB::new(fit.clone()), Calibrator::Ipcw)
-                .unwrap();
-        assert_eq!(wrapped.base_id(), LAND_TWIN_OTTER_B);
-        assert_eq!(bytes(&wrapped.estimate(&input, &history)), bytes(&quick));
-        assert_eq!(wrapped.models_hold(), LandQuickTern::new(fit.clone()).models_hold());
-
-        let swift = LandSwiftTern::new(fit.clone()).estimate(&input, &history);
-        assert_eq!(swift.calibration.as_ref().unwrap().method, METHOD_DRIFT);
-        let wrapped =
-            IpcwWrap::new(LAND_SWIFT_TERN, LandTwinOtterB::new(fit.clone()), Calibrator::IpcwDrift)
-                .unwrap();
-        assert_eq!(bytes(&wrapped.estimate(&input, &history)), bytes(&swift));
+        for (id, calibrator, method) in [
+            (LAND_QUICK_TERN, Calibrator::Ipcw, METHOD),
+            (LAND_SWIFT_TERN, Calibrator::IpcwDrift, METHOD_DRIFT),
+        ] {
+            let wrapped = IpcwWrap::new(id, LandTwinOtterB::new(fit.clone()), calibrator).unwrap();
+            assert_eq!(wrapped.base_id(), LAND_TWIN_OTTER_B);
+            assert_eq!(wrapped.models_hold(), LandTwinOtterB::new(fit.clone()).models_hold());
+            let e = wrapped.estimate(&input, &history);
+            assert_eq!(e.heuristic, id);
+            assert_eq!(e.calibration.as_ref().expect("calibrated").method, method);
+            assert_eq!(run_explanation(&e), e.quantiles_with_p90(), "{id} recomputes");
+        }
+    }
+    let registry = Registry::builtin();
+    for id in [LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_BOLD_LARK] {
+        assert!(registry.get(id).is_none(), "{id} is retired (#10949)");
     }
 }
 
@@ -271,22 +274,17 @@ fn refusals_never_twice_and_nothing_registered() {
         super::ready::history_ready(),
         evidence(LAND_TWIN_OTTER_B, Stage::SweepBuilder, 3.0),
     );
-    let quick = LandQuickTern::default().estimate(&input, &history);
-    let twice = IpcwWrap::new("quick+ipcw", LandQuickTern::default(), Calibrator::Ipcw)
+    let quick_tern =
+        || IpcwWrap::new(LAND_QUICK_TERN, LandTwinOtterB::default(), Calibrator::Ipcw).unwrap();
+    let quick = quick_tern().estimate(&input, &history);
+    assert!(quick.calibration.is_some());
+    let twice = IpcwWrap::new("quick+ipcw", quick_tern(), Calibrator::Ipcw)
         .unwrap()
         .estimate(&input, &history);
     assert_eq!(twice.calibration, quick.calibration);
     assert_eq!(twice.quantiles_with_p90(), quick.quantiles_with_p90());
     assert_eq!(twice.heuristic, "quick+ipcw");
-    assert_eq!(
-        CALIBRATED,
-        [
-            LAND_EVEN_LARK,
-            LAND_QUICK_TERN,
-            LAND_SWIFT_TERN,
-            LAND_BOLD_LARK
-        ]
-    );
+    assert_eq!(CALIBRATED, [LAND_EVEN_LARK]);
 
     // Names round-trip; a wrapped id is never a registered one.
     for c in Calibrator::ALL {
@@ -303,7 +301,8 @@ fn refusals_never_twice_and_nothing_registered() {
 /// Every registered `land` heuristic that calibrates its own estimate is in
 /// [`CALIBRATED`], so `eta backtest --wrap` refuses it by name rather than
 /// scoring the identity under a `+ipcw` id. bold-lark (keen-wren's IPCW
-/// calibrator) was missing from the list (#10747 review).
+/// calibrator) was missing from the list (#10747 review). Since the IPCW
+/// shadows were retired (#10949), no registered heuristic calibrates by IPCW.
 #[test]
 fn calibrated_lists_every_registered_self_calibrating_land_heuristic() {
     let input = input_at(Stage::SweepBuilder, 0, 0);
@@ -324,10 +323,24 @@ fn calibrated_lists_every_registered_self_calibrating_land_heuristic() {
     for id in &calibrating {
         assert!(CALIBRATED.contains(id), "{id} calibrates itself but is not in CALIBRATED");
     }
-    // Not vacuous: the IPCW calibrators did calibrate on this evidence.
-    for id in [LAND_QUICK_TERN, LAND_BOLD_LARK] {
-        assert!(calibrating.contains(&id), "{id} did not calibrate: {calibrating:?}");
-    }
+    // No IPCW arm is registered (#10949): no registered `land` heuristic
+    // records an IPCW calibration on this evidence ...
+    let ipcw: Vec<&str> = registry
+        .for_kind(Kind::Land)
+        .filter(|h| {
+            h.estimate(&input, &history)
+                .calibration
+                .is_some_and(|c| c.method == METHOD || c.method == METHOD_DRIFT)
+        })
+        .map(|h| h.id())
+        .collect();
+    assert!(ipcw.is_empty(), "registered IPCW arms: {ipcw:?}");
+    // ... though the same evidence does calibrate an offline wrap, so the
+    // check is not vacuous.
+    let offline = IpcwWrap::new(LAND_QUICK_TERN, LandTwinOtterB::default(), Calibrator::Ipcw)
+        .unwrap()
+        .estimate(&input, &history);
+    assert_eq!(offline.calibration.map(|c| c.method).as_deref(), Some(METHOD));
     for id in CALIBRATED {
         assert!(registry.registers(Kind::Land, id), "{id} is not a registered land heuristic");
     }
