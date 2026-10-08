@@ -134,6 +134,8 @@ fn at_stage(stage: Stage) -> EstimateInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: input.as_of,
+        not_here: None,
+        held_until: None,
     });
     input
 }
@@ -486,6 +488,8 @@ fn keen_wren_ready_wait_follows_the_real_dispatch_order() {
                 tick_interval_secs: 60,
                 saturation_held: false,
                 plan_at: as_of() - Duration::seconds(30),
+                not_here: None,
+                held_until: None,
             }));
             let e = wren.estimate(&input, &history);
             let path = e.path.as_ref().expect("a path");
