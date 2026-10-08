@@ -47,6 +47,10 @@ pub(crate) struct ResumeHandle {
     pub(crate) cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) container: Option<String>,
+    /// The Codex sandbox mode of the original launch (#10831), merged from
+    /// the live-captured handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox: Option<String>,
     #[serde(default)]
     pub(crate) resume_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +189,7 @@ pub(crate) fn merge_captured(handle: &mut ResumeHandle, captured: &resume::Captu
         (&mut handle.session_store, &captured.session_store),
         (&mut handle.account, &captured.account),
         (&mut handle.container, &captured.container),
+        (&mut handle.sandbox, &captured.sandbox),
     ] {
         if slot.is_none() {
             slot.clone_from(value);

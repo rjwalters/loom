@@ -3,7 +3,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::drain_roll::{drain_timeout_action, TimeoutAction};
 use super::super::drain_supervisor::drain_timeout_hold_note;
 use super::*;
 
@@ -12,19 +11,6 @@ fn started_deadline(b: DrainBegin) -> chrono::DateTime<Utc> {
         DrainBegin::Started { deadline, .. } => deadline,
         other => panic!("expected Started, got {other:?}"),
     }
-}
-
-/// AC1/AC3: operator drains HOLD on timeout; only the auto-update roll keeps
-/// #6007's retain-then-abandon path.
-#[test]
-fn timeout_action_depends_on_origin() {
-    assert_eq!(drain_timeout_action(DrainOrigin::Operator, true), TimeoutAction::HoldPaused);
-    assert_eq!(drain_timeout_action(DrainOrigin::Operator, false), TimeoutAction::HoldPaused);
-    assert_eq!(drain_timeout_action(DrainOrigin::AutoUpdate, false), TimeoutAction::RetainRoll);
-    assert_eq!(
-        drain_timeout_action(DrainOrigin::AutoUpdate, true),
-        TimeoutAction::ResumeDispatch
-    );
 }
 
 /// AC1: a timed-out operator drain (then-exit AND relaunch) stays paused and
@@ -59,27 +45,6 @@ fn an_operator_timeout_holds_dispatch_paused() {
         assert!(!drain.is_draining());
         assert!(!drain.snapshot().timed_out);
     }
-}
-
-/// AC3: the auto-update roll keeps #6007's pending-roll semantics — its
-/// deadline refusal re-arms instead of holding forever.
-#[test]
-fn an_auto_update_timeout_keeps_the_pending_roll_path() {
-    let drain = DrainState::new();
-    let _ = drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::AutoUpdate);
-    let started = drain.snapshot().started_at.unwrap();
-    match drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)) {
-        RollRefusal::Deferred { attempt, .. } => assert_eq!(attempt, 1),
-        other => panic!("expected Deferred, got {other:?}"),
-    }
-    assert!(drain.snapshot().roll_pending);
-    assert!(!drain.snapshot().timed_out);
-    // …and once the budget is spent it abandons and resumes dispatch.
-    match drain.refuse_roll_deadline(started + chrono::Duration::seconds(4 * 1800)) {
-        RollRefusal::Abandoned { .. } => {}
-        other => panic!("expected Abandoned, got {other:?}"),
-    }
-    assert!(!drain.is_draining());
 }
 
 /// AC2: `--force-after-timeout` escalates a first-attempt drain; the deadline
@@ -129,9 +94,9 @@ fn force_escalates_a_timed_out_hold_to_now() {
 /// AC1: an operator request promotes an auto-update roll one way, and the
 /// auto-updater can then neither label nor abort it.
 #[test]
-fn an_operator_request_promotes_an_auto_update_roll() {
+fn an_operator_request_promotes_a_pause_roll() {
     let drain = DrainState::new();
-    let _ = drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::AutoUpdate);
+    let _ = drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::PauseRoll);
     drain.set_roll_target(Some("v1".to_string()));
     assert_eq!(drain.snapshot().roll_target.as_deref(), Some("v1"));
 
@@ -146,7 +111,7 @@ fn an_operator_request_promotes_an_auto_update_roll() {
     assert_eq!(snap.roll_target, None, "no longer a supersedable roll");
 
     // An auto-update request never demotes it.
-    match drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::AutoUpdate) {
+    match drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::PauseRoll) {
         DrainBegin::AlreadyDraining {
             origin_promoted, ..
         } => assert!(!origin_promoted),
@@ -154,15 +119,15 @@ fn an_operator_request_promotes_an_auto_update_roll() {
     }
     drain.set_roll_target(Some("v2".to_string()));
     assert_eq!(drain.snapshot().roll_target, None);
-    assert!(!drain.abort_auto_update_roll(), "the auto-updater cannot end an operator drain");
+    assert!(!drain.abort_pause_roll(), "the auto-updater cannot end an operator drain");
     assert!(drain.is_draining());
 }
 
 #[test]
 fn the_auto_updater_can_still_end_its_own_roll() {
     let drain = DrainState::new();
-    let _ = drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::AutoUpdate);
-    assert!(drain.abort_auto_update_roll());
+    let _ = drain.begin_as(Duration::from_secs(1800), false, false, DrainOrigin::PauseRoll);
+    assert!(drain.abort_pause_roll());
     assert!(!drain.is_draining());
 }
 

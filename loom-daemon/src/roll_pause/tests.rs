@@ -187,3 +187,35 @@ fn request_and_withdraw_round_trip() {
     withdraw(&dir).unwrap();
     assert!(!is_requested(&dir));
 }
+
+/// #10831 (Judge on #10864): a call another guard hook denied leaves a ledger
+/// entry with no post-tool-use event. Past the stale limit it stops counting,
+/// so the agent can still reach a safe point; a fresh entry still counts.
+#[test]
+fn a_stale_inflight_entry_no_longer_blocks_the_safe_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = env(tmp.path(), Some("item"));
+    let dir = item_dir(tmp.path(), "item");
+    assert_eq!(run_hook(&e, &pre("Bash", "denied")), HookOutcome::Allow);
+    assert_eq!(inflight_count_with(&dir, None, Duration::from_secs(600)), 1);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        inflight_count_with(&dir, None, Duration::from_millis(10)),
+        0,
+        "an entry older than the stale limit is not executing"
+    );
+}
+
+/// #10831 (Judge on #10864): the park window is clamped below Claude Code's
+/// 60 s hook timeout whatever the env asks for.
+#[test]
+#[serial_test::serial(roll_pause_env)]
+fn the_park_window_is_clamped_below_the_hook_timeout() {
+    std::env::set_var(PARK_SECS_ENV, "600");
+    let e = HookEnv::from_env(None);
+    std::env::remove_var(PARK_SECS_ENV);
+    assert_eq!(e.park, Duration::from_secs(MAX_PARK_SECS));
+}
+
+// The clamp is only a clamp while it is under Claude Code's 60 s hook timeout.
+const _: () = assert!(MAX_PARK_SECS < 60);

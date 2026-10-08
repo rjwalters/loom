@@ -82,10 +82,12 @@ fn probe(artifact: ArtifactResolution, fetch_calls: &Arc<AtomicUsize>) -> Artifa
 }
 
 /// Optionally armed with a pending roll to an older release (so a newer one
-/// supersedes it); records every `trigger_for` target and supersede.
+/// supersedes it); records every `trigger_pause_roll` target, its
+/// `target_source`, and every supersede.
 struct Trigger {
     armed: Mutex<Option<ArmedRoll>>,
     targets: Mutex<Vec<Option<String>>>,
+    sources: Mutex<Vec<pause_manifest::TargetSource>>,
     supersedes: Mutex<Vec<(String, String)>>,
 }
 
@@ -93,27 +95,22 @@ impl Trigger {
     fn new(pending: bool) -> Self {
         let armed = pending.then(|| ArmedRoll {
             target: Some("v0.19.850@cccc".to_string()),
-            pending: true,
+            committed: false,
             then_exit: false,
-            refusals: 1,
         });
         Self {
             armed: Mutex::new(armed),
             targets: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
             supersedes: Mutex::new(Vec::new()),
         }
     }
 }
 
-impl DrainTrigger for Trigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, target: Option<&str>) -> bool {
-        self.targets
-            .lock()
-            .unwrap()
-            .push(target.map(str::to_string));
+impl RollTrigger for Trigger {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        self.targets.lock().unwrap().push(target.label.clone());
+        self.sources.lock().unwrap().push(target.source.clone());
         true
     }
     fn roll_in_progress(&self) -> bool {
@@ -161,6 +158,15 @@ fn decision_table_floor_x_settle_x_supersede() {
                 let pinned = format!("v{NEWEST}@{SHA_B}");
                 let expected: Vec<Option<String>> = if rolls { vec![Some(pinned)] } else { vec![] };
                 assert_eq!(*trigger.targets.lock().unwrap(), expected, "{case}");
+                // #10831: floor-driven and autoUpdate rolls take the same pause
+                // trigger; only the recorded `target_source` differs.
+                let source = if floor == Floor::Below {
+                    pause_manifest::TargetSource::Floor
+                } else {
+                    pause_manifest::TargetSource::AutoUpdate
+                };
+                let sources: Vec<_> = if rolls { vec![source] } else { vec![] };
+                assert_eq!(*trigger.sources.lock().unwrap(), sources, "{case}");
                 let kind = if rolls {
                     TickDecisionKind::Fetch
                 } else {
@@ -225,13 +231,12 @@ fn a_supersede_of_a_floor_driven_roll_does_not_re_wait_settle() {
         DEFER,
     );
     assert_eq!(first.load(Ordering::SeqCst), 1, "the floor roll goes out at once");
-    // The drain for it times out and the roll goes pending.
+    // Its pause is armed and has not stopped anything yet.
     let target = trigger.targets.lock().unwrap()[0].clone();
     *trigger.armed.lock().unwrap() = Some(ArmedRoll {
         target,
-        pending: true,
+        committed: false,
         then_exit: false,
-        refusals: 1,
     });
     // A newer release lands; the host still runs 0.19.800, below the floor.
     let second = Arc::new(AtomicUsize::new(0));
@@ -315,8 +320,9 @@ fn an_autoupdate_roll_still_honours_the_roll_window() {
     assert!(note.contains("scheduled wait"), "{note}");
 }
 
-/// An unsatisfiable floor alerts and keeps the work gate open: no drain is
-/// armed, dispatch is not paused, and the tick carries the typed stall.
+/// An unsatisfiable floor alerts and keeps the work gate open: no pause is
+/// started (through the production trigger), dispatch is not paused, and the
+/// tick carries the typed stall.
 #[tokio::test]
 async fn an_unsatisfiable_floor_alerts_and_keeps_dispatching() {
     let tmp = tempfile::tempdir().unwrap();
@@ -325,7 +331,7 @@ async fn an_unsatisfiable_floor_alerts_and_keeps_dispatching() {
     let pool = Arc::new(WorkspacePool::new(bus.clone(), tokio::runtime::Handle::current()));
     let drain = Arc::new(DrainState::new());
     let trigger =
-        IpcDrainTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
+        IpcRollTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
     let mut state = floored(tmp.path(), Floor::Unsatisfiable);
     // The newest release is the running one: nothing for autoUpdate to do.
     let fetch_calls = Arc::new(AtomicUsize::new(0));

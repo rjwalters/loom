@@ -248,30 +248,20 @@ pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// #8652's persisted per-UTC-day paused-dispatch ledger — write-side only.
 pub mod drain_ledger;
-/// The pending-roll policy (#6007) and its live status projection (#8514) —
-/// extracted to a sibling module because this file is over
-/// `.loom/docs/file-size-policy.md`'s threshold and frozen, and because the
-/// projection belongs next to the policy whose state it renders. Re-exported
-/// verbatim so every existing `crate::ipc::…` caller is unchanged.
-pub mod drain_roll;
+/// The live drain/pause-roll status projection (#8514, #10831).
+pub mod drain_status;
+pub use drain_status::{DrainRollStatus, PauseRollStatus, MAX_DRAIN_PENDING_BUDGET_SECS};
 
-pub use drain_roll::{
-    drain_pending_budget, drain_refusal_decision, drain_refusal_path, drain_timeout_action,
-    DrainRollStatus, RefusalDecision, RefusalPath, TimeoutAction, DRAIN_PENDING_BUDGET_MULTIPLIER,
-    MAX_DRAIN_PENDING_BUDGET_SECS, MAX_DRAIN_RETRY_WINDOW_SECS, MIN_DRAIN_RETRY_WINDOW_SECS,
-};
-
-/// The drain state machine (#4090 … #9588) — see the module doc.
+/// The drain state machine (#4090 … #10831) — see the module doc.
 pub mod drain_state;
 pub use drain_state::{
-    evaluate_drain_tick, DrainBegin, DrainDescriptor, DrainOrigin, DrainState, DrainTick,
-    RollRefusal,
+    evaluate_drain_tick, AbortOutcome, DrainBegin, DrainDescriptor, DrainOrigin, DrainState,
+    DrainTick, PauseOwnership,
 };
 /// `DrainAndRestartDaemon` handling and the drain supervisor — see the module doc.
 pub mod drain_supervisor;
 pub use drain_supervisor::{
-    drain_complete_log_line, drain_exit_code, drain_roll_abandoned_note, drain_roll_pending_note,
-    drain_timeout_hold_note, drain_timeout_refuse_note, handle_drain_request,
+    drain_complete_log_line, drain_exit_code, drain_timeout_hold_note, handle_drain_request,
     list_in_flight_sweeps,
 };
 
@@ -756,19 +746,21 @@ async fn handle_client(
         }
 
         if let Request::AbortDrain = request {
-            let was_draining = drain_state.abort();
+            let outcome = drain_state.abort_checked();
+            let was_draining = outcome == AbortOutcome::Aborted;
             let _ = event_bus.publish_generic(
                 "daemon.drain.aborted",
                 serde_json::json!({ "was_draining": was_draining }),
             );
-            let message = if was_draining {
-                "drain aborted — dispatch resumed; no restart will fire (even if in-flight \
-                 later reaches zero). Any operator-stop record was cleared (#9588)."
-                    .to_string()
-            } else {
-                "no drain in progress — nothing to abort (no-op; any stale operator-stop record \
-                 was cleared, #9588)."
-                    .to_string()
+            let message = match outcome {
+                AbortOutcome::Aborted => "drain aborted — dispatch resumed; no restart will fire \
+                     (even if in-flight later reaches zero). Any operator-stop record was cleared \
+                     (#9588)."
+                    .to_string(),
+                AbortOutcome::NotActive => "no drain in progress — nothing to abort (no-op; any \
+                     stale operator-stop record was cleared, #9588)."
+                    .to_string(),
+                AbortOutcome::Refused(why) => why, // #10831: a committed pause roll
             };
             let response = Response::DaemonDrain {
                 accepted: was_draining,
@@ -1781,7 +1773,7 @@ pub fn build_daemon_status_with_drain(
     // #8514: the live roll projection — "roll pending since T, dispatch paused
     // for D, N in flight" — computed against the same in-flight list this
     // report already carries, so the two can never disagree.
-    report.drain_roll = drain_roll::roll_status(&snap, report.in_flight.len(), Utc::now());
+    report.drain_roll = drain_status::roll_status(&snap, report.in_flight.len(), Utc::now());
     report.drain_paused_by_day = drain.paused_by_day(Utc::now()); // #8652
     report.drain_note = snap.note;
     report

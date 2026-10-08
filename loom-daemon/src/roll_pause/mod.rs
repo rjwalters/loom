@@ -35,6 +35,8 @@
 //! A file per in-flight call, not a counter, so concurrent hooks never race on
 //! a read-modify-write: the count is the directory listing.
 
+pub mod hold;
+pub mod live_runs;
 pub mod resume;
 
 use std::io::Write;
@@ -64,6 +66,22 @@ pub const POLL_MS_ENV: &str = "LOOM_ROLL_PAUSE_POLL_MS";
 /// the tree within seconds of the safe-point record, so this only bounds the
 /// case where it does not.
 pub const DEFAULT_PARK_SECS: u64 = 50;
+/// The longest park [`PARK_SECS_ENV`] may ask for (#10831). Claude Code's hook
+/// timeout is 60 s and the generated hook entries set none, so a longer park
+/// would turn the pause into a hook-timeout error instead of a decision: the
+/// env value is clamped here rather than trusted.
+pub const MAX_PARK_SECS: u64 = 55;
+/// An in-flight ledger entry older than this no longer counts as executing
+/// (#10831). A call that another guard hook denied gets its pre-tool-use
+/// entry here but never a post-tool-use event, so without an age limit it
+/// would hold the ledger open and the agent could never reach a safe point.
+/// The default is above Claude Code's longest Bash timeout (10 min), so a
+/// genuinely running call is never aged out; a denied entry younger than this
+/// still blocks the safe point, and the daemon then requeues the agent at the
+/// pause budget (`pause-budget-missed`) rather than wait.
+pub const DEFAULT_INFLIGHT_STALE_SECS: u64 = 660;
+/// Env override for [`DEFAULT_INFLIGHT_STALE_SECS`].
+pub const INFLIGHT_STALE_SECS_ENV: &str = "LOOM_ROLL_PAUSE_INFLIGHT_STALE_SECS";
 const DEFAULT_POLL_MS: u64 = 500;
 
 pub const REQUEST_FILE: &str = "request";
@@ -145,6 +163,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // #10831: make the rename itself durable, not only the file's bytes.
+    // Best-effort where a directory cannot be opened for sync.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -181,15 +204,39 @@ pub fn read_safe_point(item_dir: &Path) -> Option<SafePoint> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Number of leaf tool calls currently executing, excluding `except`.
+/// Number of leaf tool calls currently executing, excluding `except`. Entries
+/// older than the in-flight stale limit ([`INFLIGHT_STALE_SECS_ENV`]) are not
+/// counted: they are calls that never got a post-tool-use event (#10831).
 #[must_use]
 pub fn inflight_count(item_dir: &Path, except: Option<&str>) -> usize {
+    let stale = Duration::from_secs(
+        std::env::var(INFLIGHT_STALE_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_INFLIGHT_STALE_SECS),
+    );
+    inflight_count_with(item_dir, except, stale)
+}
+
+/// [`inflight_count`] with an explicit stale limit.
+#[must_use]
+pub fn inflight_count_with(item_dir: &Path, except: Option<&str>, stale: Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(item_dir.join(INFLIGHT_DIR)) else {
         return 0;
     };
+    let now = std::time::SystemTime::now();
     entries
         .filter_map(Result::ok)
         .filter(|e| except.is_none_or(|k| e.file_name().to_string_lossy() != k))
+        .filter(|e| {
+            // An unreadable mtime counts as executing: never age out a call
+            // we cannot date.
+            e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_none_or(|age| age < stale)
+        })
         .count()
 }
 
@@ -224,7 +271,7 @@ impl HookEnv {
             item,
             pause_root,
             ledger: var(LEDGER_ENV).is_none_or(|v| v.trim() != "0"),
-            park: Duration::from_secs(secs(PARK_SECS_ENV, DEFAULT_PARK_SECS)),
+            park: Duration::from_secs(secs(PARK_SECS_ENV, DEFAULT_PARK_SECS).min(MAX_PARK_SECS)),
             poll: Duration::from_millis(secs(POLL_MS_ENV, DEFAULT_POLL_MS).max(10)),
             runtime: var(RUNTIME_ENV).unwrap_or_else(|| "claude".to_string()),
             harness_pid,

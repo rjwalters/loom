@@ -163,6 +163,9 @@ pub struct CapturedHandle {
     pub account: Option<String>,
     #[serde(default)]
     pub container: Option<String>,
+    /// The Codex sandbox mode of the original launch (#10831).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
     pub captured_at: String,

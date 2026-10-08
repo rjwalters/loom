@@ -3,8 +3,6 @@
 
 use super::*;
 use crate::auto_update::roll_window::{RollWindowTuning, WindowGate};
-use crate::auto_update::stall_state::StallEpisode;
-use crate::auto_update::supersede::ArmedRoll;
 use crate::auto_update::{ArtifactInfo, ArtifactResolution, TickDecision, TickInputs, UpdateCheck};
 use chrono::TimeZone;
 
@@ -71,17 +69,7 @@ fn decide(
 /// Settle 10s, so the ceiling (6x) is 60s.
 const SETTLE: Duration = Duration::from_secs(10);
 
-fn pending_roll(refusals: u32) -> ArmedRoll {
-    ArmedRoll {
-        target: Some("v0.19.2@aaaa".to_string()),
-        pending: true,
-        then_exit: false,
-        refusals,
-    }
-}
-
-/// A state with every persisted field set: settle clocks, a consumed window,
-/// and a standing unsatisfiable declaration.
+/// A state with every persisted field set: settle clocks and a consumed window.
 fn populated(now: Instant, now_utc: DateTime<Utc>) -> AutoUpdateState {
     let mut state = empty();
     state.window = open_window(now_utc);
@@ -97,9 +85,6 @@ fn populated(now: Instant, now_utc: DateTime<Utc>) -> AutoUpdateState {
     );
     assert!(matches!(gated, TickDecision::Rebuild { .. }));
     assert!(state.window.mark_armed().is_some());
-    state.roll_stall.set_threshold(1);
-    let report = state.roll_stall.observe(now_utc, Some(&pending_roll(1)), 3);
-    assert!(report.is_some(), "threshold 1: one deadline declares");
     state
 }
 
@@ -110,14 +95,13 @@ fn a_saved_state_round_trips_through_the_file_and_back_into_a_fresh_state() {
     let (now, now_utc) = (Instant::now(), fixed_utc());
     let original = populated(now, now_utc);
     let saved = original.persisted_state(now, now_utc, BIN);
-    assert!(matches!(saved.stall, StallState::Unsatisfiable { .. }));
     assert!(saved.window.as_ref().unwrap().consumed.is_some());
 
     store(&path, &saved).unwrap();
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(raw["schema_version"], 1);
-    assert_eq!(raw["stall"]["kind"], "unsatisfiable");
+    assert!(raw.get("stall").is_none(), "#10831: no stall state is persisted any more");
 
     let LoadOutcome::Loaded(loaded) = load(&path) else {
         panic!("a freshly written file loads");
@@ -126,11 +110,9 @@ fn a_saved_state_round_trips_through_the_file_and_back_into_a_fresh_state() {
 
     let mut restarted = empty();
     restarted.window = open_window(now_utc);
-    restarted.roll_stall.set_threshold(1);
     let note = restarted.apply_persisted_state(*loaded, now, now_utc, BIN);
     assert!(note.starts_with("restored settle clocks"), "{note}");
     assert_eq!(restarted.persisted_state(now, now_utc, BIN), saved);
-    assert_eq!(restarted.roll_stall, original.roll_stall);
     assert_eq!(restarted.first_stale_since, original.first_stale_since);
 }
 
@@ -142,7 +124,6 @@ fn a_missing_file_is_missing_and_attaching_starts_empty() {
     let mut state = empty();
     state.attach_persistence(Some(path));
     assert!(state.first_stale_since.is_none());
-    assert_eq!(state.roll_stall.stall_state(), StallState::default());
 }
 
 #[test]
@@ -248,7 +229,7 @@ fn a_restart_keeps_the_settle_ceiling_so_a_steady_release_stream_still_rolls() {
 }
 
 #[test]
-fn a_new_binary_keeps_window_consumption_but_drops_settle_clocks_and_stall() {
+fn a_new_binary_keeps_window_consumption_but_drops_settle_clocks() {
     let (now, now_utc) = (Instant::now(), fixed_utc());
     let saved = populated(now, now_utc).persisted_state(now, now_utc, BIN);
 
@@ -258,7 +239,6 @@ fn a_new_binary_keeps_window_consumption_but_drops_settle_clocks_and_stall() {
     assert!(note.contains("DROPPED"), "{note}");
     let after = rolled.persisted_state(now, now_utc, "0.19.901+def");
     assert_eq!(after.settle, SettleClocks::default());
-    assert_eq!(after.stall, StallState::default());
     assert_eq!(after.window, saved.window);
 }
 
@@ -327,41 +307,32 @@ fn window_consumption_from_a_different_schedule_is_ignored() {
         period_secs: DAY / 2,
         offset_secs: 0,
         consumed: Some(5),
-        timed_out: None,
     };
     assert!(!gate.restore_consumption(&other));
     assert_eq!(gate.consumption().unwrap().consumed, None);
     assert!(!WindowGate::default().restore_consumption(&other), "windowing off");
 }
 
+/// #10831: a file written before the stall detector was removed still carries
+/// a `stall` object (and `window.timed_out`). Both are ignored, not an error.
 #[test]
-fn every_stall_variant_round_trips_through_the_tracker() {
-    let episode = StallEpisode {
-        since: fixed_utc(),
-        carried_deadlines: 2,
-        live_refusals: Some(1),
-        floor: Some(3),
-        deadlines_at_floor: 1,
-        target: Some("v0.19.2@aaaa".to_string()),
-        retries: 4,
+fn a_file_with_the_removed_stall_state_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    std::fs::write(
+        &path,
+        r#"{"schema_version":1,"saved_at":"2026-10-07T12:00:00Z","binary":"0.19.900+abc",
+            "settle":{"tracked_target":"artifact:0.19.2:aaaa"},
+            "window":{"period_secs":86400,"offset_secs":0,"consumed":3,"timed_out":3},
+            "stall":{"kind":"unsatisfiable","episode":{"since":"2026-10-07T11:00:00Z"},
+                     "declared_at":"2026-10-07T11:30:00Z"}}"#,
+    )
+    .unwrap();
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("an older file must still load");
     };
-    for stall in [
-        StallState::None { retries: 0 },
-        StallState::None { retries: 2 },
-        StallState::DrainDeadlines {
-            episode: episode.clone(),
-        },
-        StallState::Unsatisfiable {
-            episode,
-            declared_at: fixed_utc() + chrono::Duration::seconds(30),
-        },
-    ] {
-        let mut state = empty();
-        state.roll_stall.restore_stall_state(stall.clone());
-        assert_eq!(state.roll_stall.stall_state(), stall);
-        let json = serde_json::to_string(&stall).unwrap();
-        assert_eq!(serde_json::from_str::<StallState>(&json).unwrap(), stall);
-    }
+    assert_eq!(loaded.settle.tracked_target.as_deref(), Some("artifact:0.19.2:aaaa"));
+    assert_eq!(loaded.window.unwrap().consumed, Some(3));
 }
 
 #[test]
@@ -408,14 +379,12 @@ fn attach_restores_a_file_written_by_this_binary_and_persist_writes_it_back() {
     state.window = open_window(now_utc);
     state.attach_persistence(Some(path.clone()));
     assert!(state.first_stale_since.is_some());
-    assert!(matches!(state.roll_stall.stall_state(), StallState::Unsatisfiable { .. }));
 
     std::fs::remove_file(&path).unwrap();
     state.persist_state();
     let LoadOutcome::Loaded(rewritten) = load(&path) else {
         panic!("persist_state rewrites the file");
     };
-    assert_eq!(rewritten.stall, saved.stall);
     assert_eq!(rewritten.window, saved.window);
 }
 

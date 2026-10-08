@@ -135,6 +135,7 @@ mod quarantine_escalation;
 pub(crate) mod reaper;
 mod restore_to_ready;
 pub(crate) mod resume_handle;
+pub(crate) mod roll_requeue;
 mod spawn_process;
 mod stacking;
 #[cfg(test)]

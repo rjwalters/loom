@@ -702,7 +702,7 @@ under `Task liveness:` in `loom-daemon status`, and as `task_liveness` in
 silent: that means the sampler or the whole daemon stopped. The self-update
 loop also emits one `auto_update.tick` log per tick. It records the decision
 (`skip`, `defer`, `stale_repo`, `fetch`, `rebuild`, `drain_wait`,
-`roll_stall`, `panic`), the installed and target versions, the defer reason,
+`panic`), the installed and target versions, the defer reason,
 the drain state and the deciding build's version and revision. A host that
 stops converging now says why on every tick. See
 [`telemetry-schema.md` → `auto_update.tick`](telemetry-schema.md#auto_updatetick).

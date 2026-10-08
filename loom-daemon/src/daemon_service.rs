@@ -2020,8 +2020,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
     // source checkout advances past the commit this binary was built from, the
     // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
-    // and rolls onto the fresh binary via #4090's drain path — in-flight sweeps
-    // finish first and survive in the registry. Gated on a clean tree, a settle
+    // and rolls onto the fresh binary via pause-and-roll (#10831) — every
+    // in-flight agent is paused at a safe point or requeued, then the daemon
+    // restarts. Gated on a clean tree, a settle
     // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
     // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
     //
@@ -2039,7 +2040,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             workspace_pool.clone(),
             sweep_workspace.clone(),
         );
-        let trigger = auto_update::IpcDrainTrigger::new(
+        let trigger = auto_update::IpcRollTrigger::new(
             drain_state.clone(),
             workspace_pool.clone(),
             sweep_workspace.clone(),

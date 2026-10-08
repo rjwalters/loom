@@ -2,16 +2,19 @@
 //!
 //! Before this module every clock and counter in [`AutoUpdateState`] lived in
 //! memory, so any restart (an operator unsticking a host, a crash, or the roll's
-//! own restart) reset three things that are meant to accumulate:
+//! own restart) reset things that are meant to accumulate:
 //!
 //! - **The settle ceiling** (#10418). `first_stale_since` bounds how long a
 //!   steady release stream can defer a roll, at `6 × settleSecs`. On the AWS
 //!   workers that is 24 h, and every restart started it again.
 //! - **Roll-window consumption** (#10188 item 2). A restart inside an open window
 //!   forgot the window was already used and could arm a second roll in it.
-//! - **The stall detector** (#8998/#9010). A restart dropped a standing
-//!   unsatisfiable declaration, so the next tick paused dispatch for another
-//!   budget the detector had already counted as hopeless.
+//!
+//! (It also persisted the #8998/#9010 stall detector's state. #10831 removed
+//! that detector with the wait-for-zero roll it guarded, and with it the
+//! `stall` field: an older file's `stall` key is ignored on load. Pause-and-roll
+//! needs no stall state across its own restart: a roll no longer waits on
+//! anything a restart could forget.)
 //!
 //! # Format and location
 //!
@@ -36,14 +39,12 @@
 //! unchanged): the restart that completes a roll is exactly the one that must
 //! not re-arm in the same window.
 //!
-//! The settle clocks and the stall episode are restored only when the binary
-//! that saved them is the one running now. A different binary means a roll
-//! completed (or an operator installed one), which ends the stale streak, as a
-//! successful roll always has, and proves the drain was satisfiable, which is
-//! what clears a stall episode. Restoring them there would make the next release
-//! roll at once on a ceiling that belongs to the previous one.
+//! The settle clocks are restored only when the binary that saved them is the
+//! one running now. A different binary means a roll completed (or an operator
+//! installed one), which ends the stale streak, as a successful roll always
+//! has. Restoring them there would make the next release roll at once on a
+//! ceiling that belongs to the previous one.
 
-use super::stall_state::StallState;
 use super::{AutoUpdateState, RebuildOutcome};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -74,9 +75,6 @@ pub struct PersistedState {
     /// Roll-window consumption, `None` when windowing was off.
     #[serde(default)]
     pub window: Option<WindowConsumption>,
-    /// The unsatisfiable-roll detector's state.
-    #[serde(default)]
-    pub stall: StallState,
 }
 
 /// The settle gate's clocks, as wall-clock times.
@@ -107,9 +105,6 @@ pub struct WindowConsumption {
     /// Index of the latest window a roll was armed in.
     #[serde(default)]
     pub consumed: Option<i64>,
-    /// Index of the window whose drain timed out and was abandoned.
-    #[serde(default)]
-    pub timed_out: Option<i64>,
 }
 
 /// What loading the state file found. Every outcome but [`Self::Loaded`] means
@@ -253,7 +248,6 @@ impl AutoUpdateState {
                 deferred_since: wall(self.deferred_since),
             },
             window: self.window.consumption(),
-            stall: self.roll_stall.stall_state(),
         }
     }
 
@@ -275,7 +269,7 @@ impl AutoUpdateState {
         };
         if saved.binary != binary {
             return format!(
-                "restored {window}; settle clocks and stall state DROPPED because the binary \
+                "restored {window}; settle clocks DROPPED because the binary \
                  changed ({} -> {binary}), i.e. a roll completed since they were saved",
                 saved.binary
             );
@@ -291,11 +285,9 @@ impl AutoUpdateState {
         self.stale_since = instant(stale_since);
         self.first_stale_since = instant(first_stale_since);
         self.deferred_since = instant(deferred_since);
-        let stall = stall_kind(&saved.stall);
-        self.roll_stall.restore_stall_state(saved.stall);
         let since = first_stale_since
             .map_or_else(|| "none".to_string(), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        format!("restored settle clocks (streak since {since}), {window}, stall state {stall}")
+        format!("restored settle clocks (streak since {since}), {window}")
     }
 
     /// Enable persistence at `path` and restore whatever it holds. Logs exactly
@@ -321,7 +313,7 @@ impl AutoUpdateState {
             }
             LoadOutcome::Corrupt(why) => log::warn!(
                 "auto_update: saved update state at {shown} is corrupt ({why}); starting empty — \
-                 the settle ceiling, window consumption and stall state restart from now"
+                 the settle ceiling and window consumption restart from now"
             ),
             LoadOutcome::UnknownVersion(version) => log::warn!(
                 "auto_update: saved update state at {shown} has schema_version {version}, this \
@@ -331,7 +323,7 @@ impl AutoUpdateState {
         self.persist = Persistence { path: Some(path) };
     }
 
-    /// Called just before the tick arms a drain: record the roll window it
+    /// Called just before the tick starts a roll: record the roll window it
     /// consumes and persist, ahead of the restart the roll may perform at once.
     /// Pass the result to [`Self::end_roll_arm`].
     #[must_use]
@@ -364,19 +356,10 @@ impl AutoUpdateState {
         if let Err(e) = store(path, &state) {
             log::warn!(
                 "auto_update: could not persist update state to {}: {e} (a restart now resets \
-                 the settle ceiling, window consumption and stall state)",
+                 the settle ceiling and window consumption)",
                 path.display()
             );
         }
-    }
-}
-
-/// The variant name, for the restore log line.
-fn stall_kind(stall: &StallState) -> &'static str {
-    match stall {
-        StallState::None { .. } => "none",
-        StallState::DrainDeadlines { .. } => "drain_deadlines",
-        StallState::Unsatisfiable { .. } => "unsatisfiable",
     }
 }
 

@@ -256,9 +256,9 @@ pub(super) fn run_role_with_timeout(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let runtime = admission.map(|a| a.runtime.as_str());
-    if let Some(session) =
-        sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime)
-    {
+    let session =
+        sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime);
+    if let Some(session) = &session {
         session.apply_env(&mut cmd);
     }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
@@ -286,6 +286,24 @@ pub(super) fn run_role_with_timeout(
     // tap; every bail-out before this point dropped it, releasing it.
     crate::runtime_preference::handoff::attach(backstop, pid);
     crate::observability::lifecycle::role_child_spawned(pid);
+    // #10831: list this run for the pause-and-roll H4 snapshot until it ends
+    // (every return below drops the guard).
+    let _live_run = session.as_ref().map(|s| {
+        crate::roll_pause::live_runs::register(crate::roll_pause::live_runs::LiveRun {
+            item_id: s.item_id.clone(),
+            role: role.to_string(),
+            root: workspace_root.to_path_buf(),
+            pid,
+            started_at: chrono::Utc::now(),
+            runtime: s.runtime.clone(),
+            claude_session_id: s.claude_session_id.clone(),
+            scope_unit: s.scope_unit.clone(),
+            pause_root: s.pause_root.clone(),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            timeout,
+            started_mono: Instant::now(),
+        })
+    });
 
     let start = Instant::now();
     loop {

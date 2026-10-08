@@ -36,6 +36,26 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+/// The transitions currently holding an issue-creation mutex, across every
+/// per-workspace instance (#10831). A held `tokio` mutex cannot be inspected
+/// from outside, so each acquire and release is mirrored here; the
+/// pause-and-roll H4 snapshot reads it through [`holder_snapshot`] to mark the
+/// role run that holds the mutex (`holds_issue_creation_mutex`, design
+/// `docs/design/daemon-roll-pause-resume.md` §4).
+static HOLDERS: std::sync::Mutex<Vec<CreatesIssuesTransition>> = std::sync::Mutex::new(Vec::new());
+
+fn holders() -> std::sync::MutexGuard<'static, Vec<CreatesIssuesTransition>> {
+    HOLDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Every transition whose burst holds an issue-creation mutex right now.
+#[must_use]
+pub fn holder_snapshot() -> Vec<CreatesIssuesTransition> {
+    holders().clone()
+}
+
 /// An issue-creating (`creates_issues=True`) transition shape.
 ///
 /// The three fields identify a label-graph edge (source state, destination
@@ -165,6 +185,7 @@ impl IssueCreationMutex {
         );
         let mut guard = Arc::clone(&self.inner).lock_owned().await;
         guard.current = Some(transition);
+        holders().push(transition);
         IssueCreationGuard { guard }
     }
 
@@ -181,6 +202,7 @@ impl IssueCreationMutex {
         match Arc::clone(&self.inner).try_lock_owned() {
             Ok(mut guard) => {
                 guard.current = Some(transition);
+                holders().push(transition);
                 Some(IssueCreationGuard { guard })
             }
             Err(_) => None,
@@ -234,7 +256,12 @@ impl Drop for IssueCreationGuard {
         // Mark the burst complete and clear the in-flight marker before the
         // underlying lock is released.
         self.guard.completed_bursts = self.guard.completed_bursts.saturating_add(1);
-        self.guard.current = None;
+        if let Some(held) = self.guard.current.take() {
+            let mut all = holders();
+            if let Some(at) = all.iter().position(|t| *t == held) {
+                all.remove(at);
+            }
+        }
     }
 }
 
@@ -294,6 +321,17 @@ mod tests {
         }
         assert!(!m.is_held());
         assert_eq!(m.completed_bursts().await, 1);
+    }
+
+    /// #10831: the holder is visible to the pause-and-roll snapshot while the
+    /// burst runs. (Only presence is asserted: other tests in this binary hold
+    /// the same transitions concurrently.)
+    #[tokio::test]
+    async fn test_holder_snapshot_lists_a_live_holder() {
+        let mutex = IssueCreationMutex::new();
+        let guard = mutex.acquire(CHAMPION_EPIC_DECOMP).await;
+        assert!(holder_snapshot().contains(&CHAMPION_EPIC_DECOMP));
+        drop(guard);
     }
 
     #[tokio::test]

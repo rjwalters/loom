@@ -1346,7 +1346,7 @@ pub struct DaemonStatusReport {
     /// transition) these are always queryable, so a host idling behind a roll
     /// is visible to a single `loom-daemon status --json`.
     #[serde(default)]
-    pub drain_roll: Option<crate::ipc::drain_roll::DrainRollStatus>,
+    pub drain_roll: Option<crate::ipc::drain_status::DrainRollStatus>,
     /// Cumulative dispatch-paused seconds attributable to drain-and-restart
     /// rolls, per UTC day (Issue #8652), from a ledger persisted across the
     /// restart a successful roll performs. Includes the elapsed portion of an

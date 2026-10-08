@@ -47,10 +47,11 @@ pub fn liveness_window(interval: Duration) -> Duration {
 }
 
 /// Run one full tick: publish `last_check`, probe, decide, and — on a `Rebuild`
-/// decision — rebuild and (on success) trigger the drain-and-restart. Pure of
+/// or `FetchArtifact` decision — install and (on success) trigger the
+/// pause-and-roll (#10831: the one roll path for every trigger). Pure of
 /// spawning concerns so tests can drive it directly. Returns what the tick
 /// decided, for the `auto_update.tick` record (#10414).
-pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
+pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state: &mut AutoUpdateState,
     status: &AutoUpdateStatus,
     probe: &mut P,
@@ -61,60 +62,17 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     let now = Instant::now();
     let last_check = Utc::now();
     let settle = state.window.begin_tick(last_check, trigger, settle);
-    // Issue #8998: before either cooperating with an armed roll or arming a new
-    // one, ask whether the condition it waits for (in-flight reaches zero) is
-    // reachable at all. The in-flight count is read only when there is an
-    // episode to advance — a roll is armed, or one was declared unsatisfiable
-    // and we are waiting for the host to go quiet — so an ordinary up-to-date
-    // tick pays nothing extra for this.
     let armed = trigger.armed_roll();
     let mut summary = TickSummary::new(armed.as_ref());
-    if armed.is_some() || state.roll_stall_active() {
-        let stall_in_flight = probe.in_flight_sweeps();
-        summary.in_flight = Some(stall_in_flight);
-        let stall = state.observe_roll_stall(last_check, armed.as_ref(), stall_in_flight);
-        // Issue #9010: a standing declaration that has stood for its full cooldown
-        // is dropped inside `observe` (returning `None`, so this tick falls through
-        // and arms a roll normally). Surface that as its own WARN rather than
-        // letting the suppression end silently — an operator watching a host that
-        // stopped updating needs to see the retry being spent as well as the
-        // declaration that preceded it.
-        if let Some(retry) = state.take_roll_stall_retry_note() {
-            log::warn!("auto_update: {retry}");
-        }
-        if let Some(report) = stall {
-            let note = report.note();
-            log::warn!("auto_update: {note}");
-            // Only ever a roll this loop armed and labelled with an artifact
-            // target. `observe` already refuses to advance — or to re-report — an
-            // episode while a teardown or an untargeted operator drain is armed,
-            // but this is the call that actually reaches `DrainState::abort()`,
-            // so it re-states the ownership test rather than trusting an
-            // invariant asserted one module away. Gating on `armed.is_some()`
-            // instead is what let a latched declaration cancel an operator's
-            // teardown within one tick (the defect PR #9004 shipped first).
-            if armed
-                .as_ref()
-                .is_some_and(|roll| !roll.then_exit && roll.target.is_some())
-            {
-                trigger.abandon_roll(&note);
-            }
-            let armed_artifact = probe.resolve_artifact();
-            status.publish(state.snapshot(true, last_check, note.clone(), &armed_artifact));
-            return summary.finish(TickDecisionKind::RollStall, note, &armed_artifact, None);
-        }
-    }
-    // Issue #6007: cooperate with the drain rather than racing it. A roll that is
-    // already armed — including one *retained* across a refused deadline
-    // (dispatch paused, restart re-arming itself at quiescence) — needs no second
-    // rebuild; the binary is provisioned and the restart is coming.
+    // Cooperate with a roll or drain that is already armed rather than racing
+    // it: the binary is provisioned and the restart is coming, so no second
+    // install is needed.
     //
-    // Issue #8514 narrows that skip by exactly one case: a **pending** roll
-    // whose artifact has since been overtaken by a newer release is superseded
-    // rather than waited out, so the host does not spend its paused-dispatch
-    // budget converging on a binary that is already stale. Every other shape —
-    // a first-attempt drain, a teardown, an untargeted operator drain, no newer
-    // artifact — still skips, byte-for-byte as before.
+    // Issue #8514 narrows that skip by exactly one case: a pause roll that has
+    // not stopped any agent yet, whose artifact has since been overtaken by a
+    // newer release, is superseded rather than completed onto a binary that is
+    // already stale. Every other shape — a pause that has already stopped
+    // agents, a teardown, an operator drain, no newer artifact — still skips.
     if trigger.roll_in_progress() {
         let armed_artifact = probe.resolve_artifact();
         match supersede::decide_armed_roll(armed.as_ref(), &armed_artifact) {
@@ -228,11 +186,12 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 );
             }
             let outcome = probe.rebuild(low_priority);
-            // `None`: a source-path roll has no release-artifact identity, so it
-            // is never a supersede candidate (#8514).
+            // A source-path roll: the checkout is ahead of the running binary
+            // (`repo_ahead`). It has no release-artifact identity, so it is
+            // never a supersede candidate (#8514).
             let window_arm = state.begin_roll_arm(&outcome); // #10713
-            let drain_accepted =
-                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_for(None);
+            let drain_accepted = matches!(outcome, RebuildOutcome::Success)
+                && trigger.trigger_pause_roll(&RollTarget::repo_ahead());
             state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
@@ -275,12 +234,24 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 // produced from a `Resolved` artifact.
                 ArtifactResolution::Unresolved(_) => ArtifactInfo::default(),
             };
-            // #8514: label the roll with the artifact identity it is rolling to,
-            // so a later tick can tell a still-current pending roll from one a
-            // newer release has overtaken.
+            // #10831: floor-driven and ordinary autoUpdate rolls take the same
+            // pause path; only the recorded `target_source` differs. #8514: the
+            // label is the artifact identity a later tick compares against to
+            // tell a still-current roll from one a newer release has overtaken.
+            let target = RollTarget {
+                source: match state.floor.roll_source() {
+                    floor_roll::TargetSource::Floor => pause_manifest::TargetSource::Floor,
+                    floor_roll::TargetSource::AutoUpdate => {
+                        pause_manifest::TargetSource::AutoUpdate
+                    }
+                },
+                to_version: Some(version.clone()),
+                to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
+                label: Some(supersede::artifact_roll_target(&info)),
+            };
             let window_arm = state.begin_roll_arm(&outcome); // #10713
-            let drain_accepted = matches!(outcome, RebuildOutcome::Success)
-                && trigger.trigger_for(Some(&supersede::artifact_roll_target(&info)));
+            let drain_accepted =
+                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_pause_roll(&target);
             state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
@@ -297,8 +268,8 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     };
     // #10712: a host below the fleet floor says so on whatever the tick
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
-    // alert is never a gate: nothing above was held back for it and dispatch
-    // is untouched.
+    // alert is never a gate: nothing above was held back for it, no pause is
+    // started for it, and dispatch is untouched.
     let note = format!("{note}{}", state.floor.note_suffix());
     if let Some(stall) = state.floor.stall() {
         log::error!("auto_update: {}", stall.note());
@@ -342,7 +313,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// One tick under `catch_unwind`, emitting its `auto_update.tick` record. A
 /// panic is published as the status note and reported as `decision = panic`;
 /// the caller's loop continues either way (#10414).
-pub(super) fn guarded_tick<P: AutoUpdateProbe, T: DrainTrigger>(
+pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state: &mut AutoUpdateState,
     status: &AutoUpdateStatus,
     probe: &mut P,
@@ -398,14 +369,12 @@ pub fn spawn_auto_update_task<P, T>(
 ) -> tokio::task::JoinHandle<()>
 where
     P: AutoUpdateProbe + Send + 'static,
-    T: DrainTrigger + Send + Sync + 'static,
+    T: RollTrigger + Send + Sync + 'static,
 {
     register_global_status(status.clone());
     log::info!("auto_update: starting loop ({})", tuning.describe());
     task_liveness::register(AUTO_UPDATE, tuning.interval, liveness_window(tuning.interval));
-    let mut state = AutoUpdateState::new()
-        .with_roll_stall_deadlines(tuning.roll_stall_deadlines)
-        .with_roll_stall_cooldown(tuning.roll_stall_cooldown);
+    let mut state = AutoUpdateState::new();
     state.window = roll_window::WindowGate::new(tuning.roll_window);
     // #10713: after the window, so its consumption can be checked against it.
     state.attach_persistence(persisted_state::default_path());
@@ -423,7 +392,7 @@ pub(super) async fn run_loop<P, T>(
     tuning: TickTuning,
 ) where
     P: AutoUpdateProbe + Send + 'static,
-    T: DrainTrigger + Send + Sync + 'static,
+    T: RollTrigger + Send + Sync + 'static,
 {
     let mut ticker = tokio::time::interval(tuning.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

@@ -1203,7 +1203,7 @@ trap "rm -f '$_stderr_file' '$_stderr_file.cancel'" EXIT
 #     copy of the descriptor open in the new process.
 # The handle path is consumed once the watcher is forked, so it is unset on the
 # same line: a nested spawn's watcher would overwrite this session's handle.
-[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || exec "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 & unset LOOM_RESUME_HANDLE_FILE
+[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || LOOM_CODEX_SANDBOX_MODE="${SANDBOX_MODE:-}" exec "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 & unset LOOM_RESUME_HANDLE_FILE
 set +e
 echo "# LOOM_CLI_START runtime=codex" >&2
 if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then

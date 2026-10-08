@@ -487,7 +487,7 @@ impl Enforcer for IpcEnforcer {
         // to a real supervised drain: `begin_as` replaces a `startup_hold`
         // rather than acking it, and only a supervisor can perform the exit.
         // Enter the runtime so that spawn resolves one from a blocking thread —
-        // the same reason `IpcDrainTrigger` does (#4090).
+        // the same reason the auto-updater's roll trigger does (#4090).
         let _guard = self.handle.enter();
         log::warn!("fleet_state: {reason}");
         let resp = crate::ipc::handle_drain_request(
