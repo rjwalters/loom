@@ -82,12 +82,52 @@ fn a_row_only_this_host_cannot_dispatch_is_placed_by_comparator_rank() {
     ];
     let got = placements(&rows);
     assert_eq!(&got[..3], &[Placement::Waiting, Placement::Waiting, Placement::Waiting]);
-    // Rank 3: ranks 1 and 2 are ahead (positions 1 and 3).
-    assert_eq!(got[3], placed(4, 2, "host_constraint"));
+    // Rank 3: ranks 1 and 2 are ahead (positions 1 and 3), so it takes
+    // position 4, behind the three rows at positions 1..=3.
+    assert_eq!(got[3], placed(4, 3, "host_constraint"));
     // Rank 9: every waiting row is ahead.
     assert_eq!(got[4], placed(4, 3, "peer_claim"));
     // Rank 0: nothing ahead, so it takes position 1.
     assert_eq!(got[5], placed(1, 0, "workspace_commands_missing"));
+}
+
+#[test]
+fn a_placed_row_is_never_ahead_of_a_waiting_row_ranked_before_it() {
+    // The shaped order: low rank, high position (the issue-review
+    // counterexample), plus a placed row between them.
+    let rows = [
+        waiting(10, 1, 3),
+        waiting(11, 8, 1),
+        waiting(12, 9, 2),
+        blocked(20, 5, QueueDisposition::HostConstraint),
+        blocked(21, 10, QueueDisposition::PeerClaim),
+        blocked(22, 2, QueueDisposition::DispatchError),
+    ];
+    let got = placements(&rows);
+    for (i, p) in rows.iter().enumerate().filter(|(i, _)| *i >= 3) {
+        let Placement::Placed(placed_row) = &got[i] else {
+            panic!("row {} not placed", p.issue);
+        };
+        // `ahead` agrees with the slot the row takes.
+        assert_eq!(placed_row.position, placed_row.ahead + 1, "row {}", p.issue);
+        for (w, wr) in rows.iter().enumerate().take(3) {
+            let wp = wr.plan.position.unwrap();
+            let w_ahead = rows[..3]
+                .iter()
+                .filter(|r| r.plan.position.unwrap() < wp)
+                .count() as u32;
+            if wr.rank < p.rank {
+                assert!(
+                    placed_row.ahead > w_ahead,
+                    "row {} (ahead {}) vs waiting {} (ahead {w_ahead})",
+                    p.issue,
+                    placed_row.ahead,
+                    rows[w].issue
+                );
+            }
+        }
+    }
+    assert_eq!(got[3], placed(4, 3, "host_constraint"));
 }
 
 #[test]

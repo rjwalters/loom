@@ -35,9 +35,11 @@
 //!
 //! A not-here or time-held row is slotted into the planner's order by the
 //! work finder's own comparator rank (`rank`, the bare `candidate_cmp`
-//! order): `ahead` is the number of **waiting** rows ranked before it, and
-//! `position` is one past the highest planner position among them (the
-//! position it would take). Only waiting rows count as ahead, because only
+//! order): `position` is one past the highest planner position among the
+//! **waiting** rows ranked before it (the position it would take), and `ahead`
+//! is the number of waiting rows at or before that slot, so the two always
+//! agree and a placed row is never estimated ahead of a waiting row ranked
+//! before it. Only waiting rows count as ahead, because only
 //! they compete for this host's slots, which are what `start-v1`'s turnover
 //! draws model. That is why waiting rows' inputs are unchanged. Fleet
 //! capacity is #10944.
@@ -144,7 +146,7 @@ pub fn placements(rows: &[ReadyRow]) -> Vec<Placement> {
                 let last = before.clone().map(|(_, p)| *p).max().unwrap_or(0);
                 Placement::Placed(Placed {
                     position: last.saturating_add(1),
-                    ahead: to_u32(before.count()),
+                    ahead: to_u32(waiting.iter().filter(|(_, p)| *p <= last).count()),
                     not_here,
                     held_until,
                 })
