@@ -153,3 +153,48 @@ fn this_test_build_is_not_a_release_build() {
     let stamp = crate::init::payload::Stamp::this_binary().unwrap();
     assert!(!stamp.release_build);
 }
+
+#[test]
+fn the_tag_is_read_from_the_marker_bytes() {
+    assert_eq!(tag_from_marker(b"loom-release-build-tag=v0.19.925;"), "v0.19.925");
+    assert_eq!(tag_from_marker(b"loom-release-build-tag=;"), "");
+    assert_eq!(tag_from_marker(b"loom-release-build-tag=v0.19.925"), "");
+    assert_eq!(tag_from_marker(b"other=v0.19.925;"), "");
+    assert_eq!(tag_from_marker(&[0xff, 0xfe]), "");
+    // The process-wide tag comes from the static marker, and is the stamp
+    // `build_stamp.rs` baked in.
+    assert_eq!(MARKER.as_slice(), MARKER_TEXT.as_bytes());
+    assert_eq!(built_release_tag(), env!("LOOM_DAEMON_RELEASE_TAG"));
+}
+
+/// `release.yml` greps the built artifact for the marker (#10992). Check the
+/// same on this test binary. This catches the marker going missing at any
+/// optimization level the tests are built with (CI's release-mode builds
+/// included); a debug build keeps even a folded `const`, so the read path is
+/// pinned by the next test too.
+#[test]
+fn this_binary_carries_its_release_marker() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let bytes = std::fs::read(&exe).expect("read the test binary");
+    let found = bytes
+        .utf8_chunks()
+        .any(|chunk| chunk.valid().contains(MARKER_TEXT));
+    assert!(found, "{} does not carry {MARKER_TEXT:?}", exe.display());
+}
+
+/// The marker survives optimization only because [`built_release_tag`] reads
+/// the `#[used]` static through `black_box` (#10992). A refactor back to a
+/// plain string constant passes every other test and fails only on a
+/// release run, so pin the read path here.
+#[test]
+fn the_tag_is_derived_from_a_runtime_read_of_the_marker() {
+    let source = include_str!("release_provenance.rs");
+    assert!(source.contains("#[used]\nstatic MARKER: [u8; MARKER_TEXT.len()]"));
+    let body = source
+        .split("pub fn built_release_tag() -> &'static str {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("built_release_tag body");
+    assert!(body.contains("std::hint::black_box(&MARKER)"), "{body}");
+    assert!(!body.contains("MARKER_TEXT."), "{body}");
+}
