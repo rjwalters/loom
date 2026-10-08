@@ -256,6 +256,7 @@ jobs:
             /.dockerignore
             /scripts/ci-image-inputs.sh
           sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Decide whether the image jobs run
         id: images
         env:
@@ -294,6 +295,7 @@ jobs:
             /.dockerignore
             /scripts/ci-image-inputs.sh
           sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Decide whether the image jobs run (diff since the last green push run)
         id: images
         env:

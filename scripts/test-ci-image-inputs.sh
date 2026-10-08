@@ -76,6 +76,8 @@ push "push: docker change since last green -> true" true "docker/worker/Dockerfi
 push "push: rename out of docker/ -> true" true "docker/worker/old.sh" FAKE_RUNS="$GREEN" \
   FAKE_API='{"status":"ahead","files":[{"filename":"scripts/new.sh","previous_filename":"docker/worker/old.sh"}]}'
 push "push: identical to last green -> false" false "" FAKE_RUNS="$GREEN" FAKE_API='{"status":"identical","files":[]}'
+push "push: compare with no files key -> true" true "no readable file list" FAKE_RUNS="$GREEN" FAKE_API='{"status":"ahead"}'
+push "push: compare with null files -> true" true "no readable file list" FAKE_RUNS="$GREEN" FAKE_API='{"status":"ahead","files":null}'
 push "push: no green run -> true" true "no green" FAKE_RUNS='[]' FAKE_API='{}'
 push "push: run list fails -> true" true "could not list" FAKE_RUNS_RC=1 FAKE_API='{}'
 push "push: compare fails -> true" true "failed" FAKE_RUNS="$GREEN" FAKE_API_RC=1 FAKE_API='{}'

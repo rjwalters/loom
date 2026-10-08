@@ -30,9 +30,10 @@
 #
 # Fails CLOSED to `docker=true`, with the reason on stderr, when: there is no
 # green run to diff against, the base is not an ancestor of the commit, the
-# forge call fails or returns unparseable data, the file list may be truncated
-# (compare caps at 300 files, the PR files API at 3000), or `.dockerignore` is
-# unreadable. Only a usage error exits non-zero.
+# forge call fails or returns unparseable data (including a compare reply with
+# no `files` array), the file list may be truncated (compare caps at 300 files,
+# the PR files API at 3000; a list of exactly the cap also fails closed), or
+# `.dockerignore` is unreadable. Only a usage error exits non-zero.
 #
 # Usage:
 #   ci-image-inputs.sh push --repo OWNER/NAME --sha SHA --branch BRANCH [--workflow FILE]
@@ -145,7 +146,10 @@ cmd_push() {
       return 0
       ;;
   esac
-  if ! tsv="$(jq -r '.files // [] | .[] | [.filename, (.previous_filename // "")] | @tsv' <<<"$cmp")"; then
+  # `files` is optional in the compare schema: a missing or null list is NOT an
+  # empty diff, so require an array before reading it (fail closed).
+  if ! jq -e '.files | type == "array"' <<<"$cmp" >/dev/null 2>&1 \
+    || ! tsv="$(jq -r '.files[] | [.filename, (.previous_filename // "")] | @tsv' <<<"$cmp")"; then
     decide "compare $base...$sha returned no readable file list" </dev/null
     return 0
   fi
