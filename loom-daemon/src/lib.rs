@@ -231,6 +231,8 @@ pub mod idle_exit;
 pub mod inbox_config;
 pub mod inflight;
 pub mod init;
+pub mod install_compat;
+pub mod install_compat_harness;
 pub mod install_self_check;
 pub mod intake_reconcile;
 pub mod ipc;

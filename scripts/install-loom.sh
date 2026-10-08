@@ -1887,7 +1887,7 @@ LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\"/\\\"}"
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
-  "loom_commit": "${LOOM_COMMIT}",
+  "loom_commit": "${LOOM_COMMIT}",$(loom_source_requires_daemon_field "$LOOM_ROOT" 2>/dev/null)
   "install_date": "$(date +%Y-%m-%d)",
   "loom_source_remote": "${LOOM_SOURCE_REMOTE}",
   "installed_files": ${INSTALLED_FILES_JSON}

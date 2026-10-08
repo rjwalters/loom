@@ -71,6 +71,7 @@ mod guards_status;
 pub(crate) mod health;
 pub(crate) mod host;
 pub(crate) mod inflight;
+pub(crate) mod install_compat_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;
