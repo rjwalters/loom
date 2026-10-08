@@ -175,6 +175,15 @@ pub(super) fn attempt(
             return false;
         }
     }
+    // The disk floor, before any claim (#10995): the first thing done under
+    // the claim is a fetch, and below the floor that fetch is skipped. So no
+    // claim is taken for it and no forge request spent. Not a failure: no
+    // backoff, no alert, and the next candidate (perhaps on another volume)
+    // still gets its turn.
+    if let Some(low) = crate::fetch_headroom::skip_reason(&root) {
+        skip_low_disk(report, &low);
+        return false;
+    }
     // The gate again, immediately before the claim: classification may have
     // taken a while, and a pause or a roll may have started since.
     if let Err(why) = (env.gate)() {
@@ -273,8 +282,17 @@ fn settle_current(
     memory.settle(root, branch, commit, &version, report);
 }
 
+/// Report a resync that was not tried because the checkout's volume is below
+/// the disk floor (#10995). It says nothing about the remote or the repo, so
+/// it is not counted anywhere: the state stays what classification found.
+fn skip_low_disk(report: &mut WorkspaceReport, low: &str) {
+    log::info!("workspace_resync: {}: low-disk: {low}", report.root.display());
+    report.reason = Some(format!("low-disk: {low}"));
+}
+
 /// Count a failed attempt: an unreachable remote or forge for the host (one
-/// alert for the outage), anything else against the repo.
+/// alert for the outage), anything else against the repo. A fetch skipped
+/// below the disk floor is not a failure and is counted against neither.
 fn fail_attempt(
     env: &Env<'_>,
     nwo: &str,
@@ -283,6 +301,15 @@ fn fail_attempt(
     memory: &mut Memory,
     scan: &mut Scan,
 ) {
+    // The disk fell below the floor after the check in `attempt` (#10995).
+    // The claim, if one was held, is already released by its guard.
+    if let Some(low) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<git::LowDisk>())
+    {
+        skip_low_disk(report, &low.0);
+        return;
+    }
     let detail = format!("{error:#}");
     let unreachable = error.chain().any(|cause| {
         cause.downcast_ref::<git::Unreachable>().is_some()
