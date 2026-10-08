@@ -2199,23 +2199,24 @@ record's JSON. The scalars ride as `loom.auto_update.*` attributes
 allowlists). The record time is the tick's start. Provenance is required:
 `loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
-never emitted. Severity is `ERROR` for `panic`. It is `WARN` for `roll_stall`,
+never emitted. Severity is `ERROR` for `panic`. It is `WARN` for
 `stale_repo` and a fetch or rebuild that did not succeed, and `INFO`
-otherwise.
+otherwise. (#10831 removed the stall decision along with the wait-for-zero
+roll it reported; no record carries it any more.)
 
 | Field | Type | Notes |
 |---|---|---|
 | `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
 | `started_at` | RFC3339 | the tick's start |
-| `decision` | string | `skip` (nothing to roll onto), `defer` (a newer target exists, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, roll window), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll is already armed), `roll_stall` (#8998), `panic` (the tick panicked; the loop keeps running) |
+| `decision` | string | `skip` (nothing to roll onto), `defer` (a newer target exists, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, roll window), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
 | `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
 | `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
-| `roll_armed` | bool | the fetch or rebuild succeeded and its drain-and-restart was accepted |
+| `roll_armed` | bool | the fetch or rebuild succeeded and its pause-and-roll started (#10831) |
 | `installed_version` | string? | the installed binary's version as the artifact probe read it, else the running build's |
 | `target_version` / `target_published_at` | string? | the newest release artifact resolved for this host |
 | `commits_behind` / `hours_behind` | integer? | source-checkout staleness, when the tick read it |
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
-| `drain` | object | `{armed, pending, refusals, target?}`: the drain armed at tick start |
+| `drain` | object | `{armed, pending, refusals, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) and `refusals` is always `0` |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |
 | `loom` | object | the deciding (running) daemon's provenance (required) |

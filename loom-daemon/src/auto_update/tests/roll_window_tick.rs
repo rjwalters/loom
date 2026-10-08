@@ -12,35 +12,20 @@ use std::sync::Mutex;
 
 const DAY: u64 = 86_400;
 
-/// Arms on `trigger_for` (labelled, not yet pending) exactly like the daemon, and
-/// clears on `abandon_roll` like `DrainState::abort()`.
+/// Arms on `trigger_pause_roll` (labelled, nothing stopped yet) like the daemon.
 #[derive(Default)]
 struct ArmingTrigger {
     armed: Mutex<Option<ArmedRoll>>,
     arms: Mutex<usize>,
-    abandons: Mutex<usize>,
 }
 
-impl ArmingTrigger {
-    fn go_pending(&self) {
-        if let Some(roll) = self.armed.lock().unwrap().as_mut() {
-            roll.pending = true;
-            roll.refusals = 1;
-        }
-    }
-}
-
-impl DrainTrigger for ArmingTrigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, target: Option<&str>) -> bool {
+impl RollTrigger for ArmingTrigger {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
         *self.arms.lock().unwrap() += 1;
         *self.armed.lock().unwrap() = Some(ArmedRoll {
-            target: target.map(str::to_string),
-            pending: false,
+            target: target.label.clone(),
+            committed: false,
             then_exit: false,
-            refusals: 0,
         });
         true
     }
@@ -49,10 +34,6 @@ impl DrainTrigger for ArmingTrigger {
     }
     fn armed_roll(&self) -> Option<ArmedRoll> {
         self.armed.lock().unwrap().clone()
-    }
-    fn abandon_roll(&self, _reason: &str) -> bool {
-        *self.abandons.lock().unwrap() += 1;
-        self.armed.lock().unwrap().take().is_some()
     }
 }
 
@@ -120,7 +101,7 @@ fn a_new_build_outside_the_window_fetches_and_arms_nothing_and_status_says_why()
 }
 
 #[test]
-fn an_open_window_arms_once_then_a_timed_out_drain_is_abandoned_and_not_rearmed() {
+fn an_open_window_arms_once_and_a_roll_that_ended_without_a_restart_is_not_rearmed() {
     let (fetch, rebuild) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let mut probe = probe(&fetch, &rebuild);
     let trigger = ArmingTrigger::default();
@@ -133,21 +114,23 @@ fn an_open_window_arms_once_then_a_timed_out_drain_is_abandoned_and_not_rearmed(
     assert_eq!(fetch.load(Ordering::SeqCst), 1);
     assert_eq!(*trigger.arms.lock().unwrap(), 1);
 
-    // The drain times out (goes pending): the next tick abandons it so dispatch resumes.
-    trigger.go_pending();
+    // The next tick sees the armed roll (the window is now spent) and leaves it.
     tick(&mut state, &status, &mut probe, &trigger);
-    assert_eq!(*trigger.abandons.lock().unwrap(), 1);
-    assert!(trigger.armed_roll().is_none(), "dispatch resumed");
-    assert_eq!(fetch.load(Ordering::SeqCst), 1);
+    assert_eq!(*trigger.arms.lock().unwrap(), 1);
 
-    // More ticks in the same (still open) window: no re-arm.
+    // The roll ends without a restart (an operator aborted the pause before it
+    // stopped anything). More ticks in the same, still open, window: no re-arm.
+    trigger.armed.lock().unwrap().take();
     for _ in 0..3 {
         tick(&mut state, &status, &mut probe, &trigger);
     }
     assert_eq!(fetch.load(Ordering::SeqCst), 1, "no re-fetch in a spent window");
     assert_eq!(*trigger.arms.lock().unwrap(), 1, "no re-arm in a spent window");
     let note = status.snapshot().note.unwrap();
-    assert!(note.starts_with("drain timed out, waiting for next window"), "{note}");
+    assert!(
+        note.starts_with("scheduled wait: this window's roll was already armed"),
+        "{note}"
+    );
 }
 
 #[test]

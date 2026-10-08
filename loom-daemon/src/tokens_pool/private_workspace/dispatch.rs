@@ -546,7 +546,21 @@ mod tests {
         selection.apply(&mut command);
         assert!(command.spawn().is_err());
         drop(selection);
-        lease::Lease::acquire(dir.path()).expect("lease must be free after a failed spawn");
+        // #10955: the child that failed to exec held fd 198 without
+        // close-on-exec. On macOS such a child's `flock` can outlive its reap
+        // by up to ~1 s under load (measured; a failed exec holding only
+        // close-on-exec descriptors never does), so the release is waited for,
+        // within a bound, rather than read once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match lease::Lease::acquire(dir.path()) {
+                Ok(_) => break,
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    panic!("lease must be free after a failed spawn: {e}")
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
         assert!(!dir.path().join("job.json").exists());
     }
     #[test]

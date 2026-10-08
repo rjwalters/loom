@@ -86,3 +86,32 @@ fn a_repo_whose_remote_is_backed_off_is_listed_for_the_checkout_step() {
     let pass = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
     assert!(pass.backing_off.is_empty(), "{pass:?}");
 }
+
+/// Which backoffs keep the checkout step off a remote: one that did not
+/// answer and one that refused the read. A refused push (`Protected`) still
+/// serves reads, and `Other` is not a network signal, so both are still asked.
+#[test]
+fn only_an_unreachable_or_refused_backoff_is_listed_for_the_checkout_step() {
+    let now = Utc::now();
+    let cases = [
+        ("unreachable", FailureKind::Unreachable, true),
+        ("refused", FailureKind::Refused, true),
+        ("protected", FailureKind::Protected, false),
+        ("other", FailureKind::Other, false),
+    ];
+    let mut memory = Memory::default();
+    let mut roots = Vec::new();
+    for (name, kind, _) in cases {
+        let root = PathBuf::from(format!("/nonexistent/{name}"));
+        let (next_attempt, _) = memory.fail(&report_for(&root), kind, name, INTERVAL, now);
+        assert!(next_attempt > now, "{name}: it is backed off");
+        roots.push(root);
+    }
+    let listed = memory.remotes_backed_off(&roots, now);
+    for ((name, _, expected), root) in cases.iter().zip(&roots) {
+        assert_eq!(listed.contains(root), *expected, "{name}: {listed:?}");
+    }
+    // Every backoff has ended by then: nothing is listed.
+    let later = now + ChronoDuration::hours(48);
+    assert!(memory.remotes_backed_off(&roots, later).is_empty());
+}

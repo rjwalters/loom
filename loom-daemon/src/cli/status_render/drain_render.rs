@@ -38,6 +38,9 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "origin": r.origin,
             "timed_out": r.timed_out,
             "startup_hold": r.startup_hold,
+            // #10831: the H4 pause's step, budgets, per-reason requeue counts
+            // and observed durations. `null` unless this is a pause roll.
+            "pause": r.pause,
         })),
         // #8652: `{ "YYYY-MM-DD": secs }`, UTC days, live pause included. `{}`
         // when nothing was recorded (and from a pre-#8652 daemon).
@@ -81,7 +84,12 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
     } else if roll.timed_out {
         "TIMED OUT, dispatch held PAUSED until the stragglers finish (operator drain — \
          `--abort-drain` resumes, `--drain --force-after-timeout` cancels them)"
+    } else if let Some(pause) = &roll.pause {
+        // #10831: a pause roll does not wait for in-flight work; say what it
+        // is doing instead.
+        return Some(pause_line(roll, pause));
     } else if roll.roll_pending {
+        // Only a pre-#10831 daemon still reports a retained roll.
         "PENDING"
     } else {
         "armed"
@@ -109,6 +117,50 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
         roll.in_flight,
         roll.refusals,
     ))
+}
+
+/// The human line for a pause roll's H4 pause (#10831).
+fn pause_line(
+    roll: &loom_daemon::ipc::DrainRollStatus,
+    pause: &loom_daemon::ipc::PauseRollStatus,
+) -> String {
+    let requeued: u32 = pause.requeued_by_reason.values().sum();
+    let reasons = if pause.requeued_by_reason.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            pause
+                .requeued_by_reason
+                .iter()
+                .map(|(reason, n)| format!("{reason}: {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "       roll PAUSING agents (H4 step {}/10{}) — {} of a {} pause budget, {} agent(s): {} \
+         paused, {requeued} requeued{reasons}, {} exited{}{}",
+        pause.step,
+        if pause.stopped {
+            ", committed: cannot be aborted"
+        } else {
+            ", nothing stopped yet"
+        },
+        human_secs(roll.paused_secs),
+        human_secs(pause.budget_secs),
+        pause.items,
+        pause.paused,
+        pause.exited,
+        pause
+            .to_version
+            .as_deref()
+            .map_or_else(String::new, |v| format!(" [to {v}]")),
+        pause
+            .target_source
+            .as_deref()
+            .map_or_else(String::new, |s| format!(" [source: {s}]")),
+    )
 }
 
 /// `3720` → `1h2m`. Compact because this is appended to an already-long line.
@@ -153,7 +205,45 @@ mod tests {
             origin: "auto-update".to_string(),
             timed_out: false,
             startup_hold: false,
+            pause: None,
         }
+    }
+
+    /// #10831: a pause roll reports its H4 progress in `--json` and renders a
+    /// line that says what it is doing, not "waiting for in-flight".
+    #[test]
+    fn a_pause_roll_reports_its_step_budget_and_per_reason_counts() {
+        let mut roll = pending_roll();
+        roll.roll_pending = false;
+        roll.refusals = 0;
+        roll.budget_secs = 120;
+        roll.paused_secs = 40;
+        roll.origin = "pause-roll".to_string();
+        roll.pause = Some(loom_daemon::ipc::PauseRollStatus {
+            step: 5,
+            stopped: true,
+            budget_secs: 120,
+            items: 3,
+            paused: 1,
+            to_version: Some("0.19.900".to_string()),
+            target_source: Some("floor".to_string()),
+            requeued_by_reason: [("young-agent-reset".to_string(), 1)].into_iter().collect(),
+            ..Default::default()
+        });
+        let value = drain_json(&report_with(Some(roll.clone())));
+        assert_eq!(value["roll"]["roll_pending"], serde_json::json!(false));
+        assert_eq!(value["roll"]["refusals"], serde_json::json!(0));
+        assert_eq!(value["roll"]["pause"]["step"], serde_json::json!(5));
+        assert_eq!(value["roll"]["pause"]["budget_secs"], serde_json::json!(120));
+        assert_eq!(
+            value["roll"]["pause"]["requeued_by_reason"]["young-agent-reset"],
+            serde_json::json!(1)
+        );
+        let line = roll_line(&report_with(Some(roll))).unwrap();
+        assert!(line.contains("PAUSING agents (H4 step 5/10, committed"), "{line}");
+        assert!(line.contains("40s of a 2m0s pause budget"), "{line}");
+        assert!(line.contains("young-agent-reset: 1"), "{line}");
+        assert!(line.contains("[source: floor]"), "{line}");
     }
 
     #[test]

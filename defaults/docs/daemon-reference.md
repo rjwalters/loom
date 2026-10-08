@@ -233,9 +233,16 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.started`     | Drain supervisor (#4090)       | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
 | `daemon.drain.completed`   | Drain supervisor (#4090)       | `{in_flight}` (always `0`) |
 | `daemon.drain.aborted`     | Daemon IPC (#4090)             | `{was_draining}` |
-| `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, roll_pending?, attempts?, elapsed_secs?}` |
-| `daemon.drain.roll_pending` | Drain supervisor (#6007)      | `{in_flight, attempt, window_secs, budget_secs}` |
+| `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, origin?, paused?, stragglers?}` |
 | `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
+| `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
+| `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
+| `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
+| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
+| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`; a standing refusal is published once, then at most every 5 minutes) |
+| `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
+| `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 | `operator_priority.escalation` | Star-liveness pass (#9321)   | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
@@ -250,14 +257,13 @@ Four of the `daemon.drain.*` topics were authorized by **#4090** for the schedul
 drain-and-restart primitive — `started` when a drain is accepted, `completed`
 when the last in-flight sweep finishes (right before the supervised relaunch),
 `aborted` when an operator cancels a drain, and `timeout` when the deadline is
-reached *terminally* (`forced` distinguishes a refusal from a force-cancel
-restart). **#6007** adds a fifth, `roll_pending`: a relaunch drain whose deadline
-passed with work still in flight now **retains** the roll (dispatch stays paused,
-the restart re-arms itself at quiescence) and publishes `roll_pending` per re-arm;
-`timeout` then fires only if the whole paused-dispatch budget is spent and the roll
-is abandoned. **#8514** adds a sixth, `superseded`: the auto-update loop discarded
-a *pending* roll because a newer release artifact had overtaken the one it was
-armed for, and re-armed for that newer artifact instead. See
+reached (`forced` distinguishes an operator drain held paused from a
+force-cancel restart). **#8514** adds `superseded`: the auto-update loop discarded
+an armed roll that had not stopped any agent yet because a newer release artifact
+had overtaken the one it was armed for, and re-armed for that newer artifact
+instead. **#10831** removed `daemon.drain.roll_pending` (no roll is retained
+across a deadline any more) and added the `daemon.roll.*` topics: every automatic
+roll now pauses its agents and restarts, and narrates that here. See
 [Supervised restart primitive](#supervised-restart-primitive-4054) below.
 They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
@@ -1763,8 +1769,9 @@ workspace's default branch (never the working tree) and classifies it:
 - **Only from H0.** A host claims and writes only when all of these hold: it is
   a verified official release build (below), a fleet-sync pass has completed,
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
-  `paused` reaches it), no roll is retained, the binary on disk is still the one
-  running, self-update is not in backoff or terminal, and the running version
+  `paused` reaches it), no pause roll is armed, committed or in progress
+  (#10831; reported as `roll pending`, and never set by a fleet hold or an
+  operator drain), the binary on disk is still the one running, self-update is not in backoff or terminal, and the running version
   is not below `loom_min_version`. The gate is read at the start of the pass,
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
@@ -1993,8 +2000,9 @@ For each workspace the first rule that matches ends the attempt:
   gate's reset is a no-op. They are not mutually excluded: this step checks
   for a gate run before an attempt and again right before the merge, which
   narrows the race but does not close it. Both writers are the daemon's own and
-  both only bring the checkout to `origin/<default>`, so a race converges. A checkout left dirty by the retired shell resync
-  shows up once and needs a one-time clean-up.
+  both only bring the checkout to `origin/<default>`, so a race converges. A
+  checkout left dirty by the retired shell resync shows up once and needs a
+  one-time clean-up.
 - **Not the fleet-refresh task.** `eta-fleet-refresh` (#10263) refreshes ETA
   snapshots through the forge API on the fleet captain. It runs no git command
   in any checkout and is unrelated to this step.
@@ -6037,8 +6045,10 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
-| `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
-| `autonomous.autoUpdate.rollStallCooldownSecs` | `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS` | `21600` (6h) | Bounds the `rollStallDeadlines` suppression above in TIME as well as by the `in_flight == 0` sample (#9010): once a standing unsatisfiability declaration has stood for this long, it is dropped and the next tick arms a roll for **one** more bounded attempt — if the host still cannot drain, the detector re-declares after `rollStallDeadlines` more deadlines rather than cycling, so the cost is one paused-dispatch budget per cooldown period instead of unbounded staleness on a host whose `in_flight == 0` sample never lands. Zero/invalid → default, exactly like `rollStallDeadlines`: a `0` would clear a declaration on the tick it was made, re-entering #8998's livelock through the knob. Set it very large to make the retry effectively unreachable |
+| ~~`autonomous.autoUpdate.rollStallDeadlines`~~, ~~`autonomous.autoUpdate.rollStallCooldownSecs`~~ | ~~`LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES`~~, ~~`LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`~~ | — | **Removed by #10831.** They tuned the unsatisfiable-drain detector (#8998/#9010) of the wait-for-zero roll, which no longer exists: every automatic roll is now a pause-and-roll bounded by `pauseRoll.pauseBudgetSecs`. Both keys and both env vars are ignored if still set. |
+| `autonomous.autoUpdate.pauseRoll.pauseBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_PAUSE_BUDGET_SECS` | `120` | Pause-and-roll H4 (#10831, design §7): how long a roll waits for its agents to reach a safe point. An agent that has not parked by then (a tool call longer than the budget, a runtime whose image has no pause hook) is stopped and requeued with `pause-budget-missed`. Read per roll, **no restart**. Validated together with the two keys below: the three must sum to less than two thirds of the lease TTL (`LOOM_LEASE_TTL_MINUTES`, default 15 min → under 600s), or the combination is **rejected** (ERROR + `daemon.roll.config_rejected`) and the defaults are used. |
+| `autonomous.autoUpdate.pauseRoll.verifyProbationSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_VERIFY_PROBATION_SECS` | `90` | Pause-and-roll H5 health probation, consumed by the resume side (#10832). Validated and reported here so the lease bound holds for the whole pause→resume window. |
+| `autonomous.autoUpdate.pauseRoll.resumeBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_RESUME_BUDGET_SECS` | `120` | Pause-and-roll H5 resume budget, consumed by the resume side (#10832). Validated and reported here. |
 | `autonomous.autoUpdate.pauseRoll.minResumableAgeSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_MIN_RESUMABLE_AGE_SECS` | `300` (5 min) | Pause-and-roll (#10830, design `docs/design/daemon-roll-pause-resume.md` §2): an agent whose session first started less than this long ago is reset (killed and requeued with reason `young-agent-reset`) at a roll instead of being paused and resumed. The age is measured from the session's first start, carried across earlier roll resumes. `0` disables the rule. Resolved now but **not yet consumed**: no roll pauses agents until #10831/#10832 land |
 | `autonomous.autoUpdate.rollWindowSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS` | *(off)* | Period of the scheduled roll window (#9132). **Unset/zero/invalid → no window**: rolls arm on every new build exactly as before (opt-in; this default preserves existing behaviour). When set, a new build arms **nothing** outside an open window, the settle gate is bypassed (the window is the batching mechanism, so a busy `main` cannot starve the host), and at most one roll arms per window — see [Scheduled roll windows](#scheduled-roll-windows-9132). **Restart required** |
 | `autonomous.autoUpdate.rollWindowOffsetSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS` | derived from host id | Where window 0 opens within the period. Zero/invalid → the **derived** offset: `fnv1a(host_id) mod period`, stable across restarts and spread across hosts. An explicit value is reduced modulo the period, so the offset is always `< rollWindowSecs`. Only meaningful with `rollWindowSecs`. **Restart required** |
@@ -12200,13 +12210,9 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     fires when in-flight reaches zero. It never resumes on its own — only
     `restart --abort-drain` does. `status` shows `timed_out`/`origin`;
     `fleet drain` maps a held remote to its exit code `2`.
-  - **The auto-update roll** keeps the roll **pending**: dispatch stays paused
-    and the restart fires the instant in-flight reaches zero. Retry windows
-    widen geometrically (`base × 2ⁿ`, capped at 2h each) within a total
-    paused-dispatch budget of `4 × --timeout` (capped at 4h); once spent the
-    roll is **abandoned** and dispatch resumes, so a version roll nobody asked
-    for can never starve a host of work. An operator request against it
-    promotes it to an operator drain (one-way).
+  - **An automatic roll is not a drain of this kind any more (#10831).** It
+    never reaches this deadline: it is a `pause-roll` drain bounded by its pause
+    budget, described under "Automatic rolls pause and roll" below.
   - **Escalation (#9588):** a later `restart --drain --force-after-timeout`
     escalates ANY active drain in place — the deadline only moves earlier
     (`now` for a held or pending drain) — and `--then-exit` escalates
@@ -12216,128 +12222,100 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     never revives past it, startup healing never re-arms the marker, and a
     supervised relaunch (`RunAtLoad`, reboot) comes up with dispatch **held**.
     `restart --abort-drain` restores the marker; an explicit start clears it.
-  Why this asymmetry: on a host that is actually working, resuming dispatch at the
-  deadline handed the admission window straight back to the work finder, which
-  admitted more sweeps, which made the *next* drain strictly harder to satisfy. In
-  the 2026-08-11 fleet roll three of four hosts never activated the new binary for
-  exactly this reason (in-flight went `1 → refused → 3`), and the only workarounds
-  were an operator-guessed `--timeout 7200` or destroying work with
-  `--force-after-timeout`. Both refusal notes (rendered by `loom-daemon status` as
-  `Drain: not draining (last: …)`, or on the line under `Drain: DRAINING …` while a
-  roll is pending) name the exact local retry —
-  `loom-daemon restart --drain --force-after-timeout --timeout <secs>` — so an
-  operator is never left guessing at a nonexistent bare `drain` subcommand or the
-  unrelated `fleet drain <ssh_host>` remote worker-decommission command (#5340;
-  see "`fleet drain`" above — same word, different command, different host).
-- **The auto-update loop cooperates rather than racing (#6007).** While any roll is
-  armed — including one retained across a refused deadline — `auto_update`'s tick
-  skips instead of rebuilding again: the binary is already provisioned and the
-  restart is already coming, and a redundant `cargo build` would compete for CPU
-  with the very in-flight sweeps the pending roll is waiting on.
-- **…but a superseded pending roll is replaced, not waited out (#8514).** That
-  skip was unconditional, so a release published mid-pause was ignored until the
-  armed roll finished or spent its budget — on a multi-release day a host could
-  sit paused for up to the whole budget converging on a binary that was already
-  stale. A tick now compares the release it resolves against the identity the
-  armed roll was triggered for (its tag + published asset checksum, recorded by
-  `DrainState::set_roll_target`) and **supersedes** a stale one: the roll is
-  discarded through the same `--abort-drain` primitive (flag cleared, generation
-  bumped, #6007's pending bookkeeping reset — dispatch resumes while the new
-  artifact is fetched), then re-armed for the newer artifact, publishing
-  `daemon.drain.superseded`. Deliberately narrow — every other shape still skips
-  exactly as before: a **first-attempt** drain (still inside its own deadline), a
-  **then-exit teardown**, an **untargeted** operator `restart --drain`, and any
-  tick whose resolved artifact is unresolved, already installed, or older
-  (#8513's stale-repo shape).
-- **…and a roll whose wait condition is unsatisfiable is abandoned rather than
-  re-armed forever (#8998).** #6007's budget bounds **one drain**. It does not
-  bound the *sequence* — arm → refuse → retain → abandon → arm again — and each
-  new release restarted the budget from zero (a #8514 supersede restarted it
-  mid-pause, too). On 2026-09-25 two fleet dispatchers spent **21 hours** in that
-  cycle (72 and 65 consecutive "a drain-and-restart roll is already armed …
-  skipping this tick" ticks) and never once rolled; the blocker was a
-  genuinely-working 9h32m analog-simulation sweep (`sky130-sar-adc#431`), so
-  "wait for in-flight to reach zero" was structurally unachievable on that host.
-  Because `draining: true` suppresses **role spawns** as well as sweep dispatch,
-  one host produced zero role ticks for 4h20m.
-  `auto_update` now counts drain deadline expiries **across roll lifetimes** and
-  tracks the lowest in-flight count seen at any of them. Once
-  `rollStallDeadlines` (default 3) deadlines have expired with that floor never
-  improving, the roll is **abandoned** — through the same `--abort-drain`
-  primitive a supersede uses, so dispatch (and role spawns) resume and #6007's
-  bookkeeping is fully reset — and **no new roll is armed** until in-flight is
-  observed at zero. **Be precise about what clears it**, because "self-clearing"
-  is easy to over-read: the *fast path* is an auto-update tick that *samples*
-  `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence (default 900s)
-  and **with dispatch running**. That is strictly harder to hit than the drain's
-  own quiescence watch, which is continuous *and* observes a paused dispatcher
-  where in-flight can only fall: once dispatch resumes, a cap-12 dispatcher
-  refills the in-flight set as soon as the long sweep ends, so a 900s sample can
-  miss every lull. **The declaration also expires on TIME (#9010).** Once it has
-  stood for `rollStallCooldownSecs` (default 21600s / 6h; env
-  `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`, `env > config > default`, a
-  zero/invalid value dropped on both tiers exactly like `rollStallDeadlines`,
-  since a `0` would clear a declaration on the tick it was made) the whole
-  episode is dropped and the next tick arms a roll normally, for **one** more
-  bounded attempt. If the host still cannot drain, the detector re-declares
-  after `rollStallDeadlines` more deadlines rather than cycling, so the cost is
-  one bounded paused-dispatch budget per cooldown period, not a continuous one —
-  staleness is **bounded**, not indefinite. A cooldown-released retry logs its
-  own WARN (`RELEASING ONE BOUNDED RETRY`) naming how many cooldown retries have
-  already been spent since the host was last seen idle; that count is zeroed by
-  the next `in_flight == 0` sample, so a host that recovers and later stalls
-  again starts from "retry 1". The finding is logged at WARN, published as
-  `auto_update_note`, recorded as `drain_note`, and emitted on the bus as
-  `daemon.drain.roll_unsatisfiable`; it names the deadline count, the in-flight
-  floor, how long the **stalled episode** has run (which spans ticks with
-  nothing armed — it is not the live roll's armed duration), the cooldown
-  window and retries already spent, and the three operator actions
-  (`loom-daemon list` to find the sweep, `loom-daemon cancel --sweep <id>`, or
-  `restart --drain --force-after-timeout` to force through).
-  **The fail-safe is untouched: no sweep is ever cancelled**, and the pre-update
-  binary keeps running — the change trades a silent indefinite livelock for one
-  loud, actionable state, not for a cancelled sweep. Deliberately narrow in the
-  same way #8514 is: an episode only advances for a **relaunch** roll this daemon
-  armed and **labelled with an artifact target**, so a `fleet drain` teardown and
-  an operator's untargeted `restart --drain` are never abandoned by the loop.
-  That holds **while a declaration is standing, too** — the ownership test runs
-  ahead of the sticky flag in `RollStallTracker::observe`, and the abandonment in
-  `run_tick` re-tests it before calling `abort()`, so a drain armed *after* the
-  declaration latches is left alone rather than cancelled on the next tick. Both
-  halves are needed: `fleet drain` detects a remote refusal by observing
-  `drain.draining == false`, so aborting an operator's teardown would leave the
-  host running and be read as a refusal nobody is told about. What this does
-  **not** do is let such a host update:
-  #8998's other two directions (age-excluding a long sweep from the drain
-  condition; dropping the full-drain requirement for artifact rolls) are the
-  work that would, and both change safety-relevant semantics.
-- **Worst-case pause, per path — and why the two paths keep sharing one budget
-  (#8514).** The budget constants (`DRAIN_PENDING_BUDGET_MULTIPLIER` = 4,
-  `MAX_DRAIN_PENDING_BUDGET_SECS` = 4h, `MAX_DRAIN_RETRY_WINDOW_SECS` = 2h, all in
-  `loom-daemon/src/ipc/drain_roll.rs`) are deliberately **shared** between the
-  automatic auto-update roll and an operator-issued `restart --drain --timeout`,
-  because the budget is already derived from the *requested* timeout and the two
-  paths request different ones:
-
-  | Path | Requested timeout | Pending budget | Worst case dispatch stays paused |
-  |---|---|---|---|
-  | Auto-update roll (`IpcDrainTrigger::trigger`, `timeout_secs = None`) | `DEFAULT_DRAIN_TIMEOUT_SECS` = 1800s | `4 × 1800s` = **2h** | 2h, then abandon + dispatch resumes |
-  | `restart --drain` (no `--timeout`) | 1800s | 2h | as above |
-  | `restart --drain --timeout 60` | 60s | 240s | 4m |
-  | `restart --drain --timeout 7200` | 7200s | `min(4 × 7200, 4h)` = **4h** | 4h (the absolute cap) |
-
-  A separate, smaller constant for the automatic path was considered and
-  **rejected**: abandoning sooner does not shorten the pause a busy host
-  experiences, it only makes it *repeat* sooner. Abandon resumes dispatch, but the
-  artifact is still not installed, so the next auto-update tick re-arms the roll
-  and re-pauses dispatch — a 30m budget would oscillate pause/resume every 30m
-  instead of every 2h, adding drain-supervisor churn and more `daemon.drain.*`
-  noise for no extra dispatch throughput. The multi-release day the issue actually
-  reported is fixed by the supersede bullet above (the pause now ends when a newer
-  release lands, not when a timer expires), and the previously-invisible pause is
-  fixed by the live `drain.roll` fields in the observability bullet below.
-  Operators who *do* want a shorter automatic bound should shorten the **timeout**
-  (which the budget follows), not the multiplier.
+  The hold note (rendered by `loom-daemon status` under `Drain: DRAINING …`)
+  names the exact local commands — `loom-daemon restart --drain
+  --force-after-timeout` to cancel the stragglers, `loom-daemon restart
+  --abort-drain` to resume — so an operator is never left guessing at a
+  nonexistent bare `drain` subcommand or the unrelated `fleet drain <ssh_host>`
+  remote worker-decommission command (#5340; see "`fleet drain`" above — same
+  word, different command, different host).
+- **Automatic rolls pause and roll (#10831).** Every automatic roll — a
+  floor-driven roll (`floor`), a source rebuild because the checkout is ahead
+  (`repo_ahead`), a restart-only config change (`config_restart`) and an ordinary
+  autoUpdate roll (`autoupdate`) — goes through one trigger
+  (`trigger_pause_roll`) and one path. **No automatic roll waits for in-flight
+  work to reach zero.** The design is `docs/design/daemon-roll-pause-resume.md`
+  (in the Loom repository); this is the old-binary side (H3 → H4), and the resume
+  side (H5) is #10832.
+  - **What it does (H4).** It sets the same dispatch-pause flag, with origin
+    `pause-roll`, then: closes dispatch in every registry and in the role
+    runner (a dispatch that had already passed the flag is refused too) and
+    waits, for at most 30s, for any dispatch that is mid-spawn to be recorded;
+    snapshots every daemon-dispatched agent (sweeps in every managed root, plus role runs);
+    writes the pause manifest (`roll-pause-manifest.json` in the auto-update
+    state dir, `phase = pausing`) **before signalling anything**; stops at once
+    every agent it will not resume; asks the rest to stop at a **safe point** (a
+    moment between tool calls, via the `roll-pause` hook) and stops each one's
+    whole process tree as soon as its safe-point record **for this pause**
+    appears (a record left by an earlier pause that stood down is never
+    trusted); refreshes each
+    paused agent's lease once; requeues whatever has not parked when
+    `pauseRoll.pauseBudgetSecs` runs out; does the requeue forge writes; rewrites
+    the manifest with `phase = paused`; and exits for the supervised relaunch.
+  - **Who is requeued, and how it is recorded.** An agent younger than
+    `pauseRoll.minResumableAgeSecs` (`young-agent-reset`), one with no resumable
+    session (`session-not-resumable`), and one that missed the budget
+    (`pause-budget-missed`). Each requeue restores the label through the usual
+    claim-restore path (a closed issue is never re-queued, a parked one stays
+    parked), posts **one comment** naming the roll (`from → to`), the phase and
+    age reached, the reason and whether a worktree with uncommitted edits is
+    left, and emits `daemon.roll.item`. A forge write that does not finish in
+    the forge window (what is left of the budget, at least 30s) is left
+    `planned` in the manifest for the next start; a slow forge never blocks the
+    roll.
+  - **What is never touched.** A paused or requeued sweep's claim lock
+    (`owner.json`), journal entry and checkpoint. They are what a binary that
+    cannot read the manifest recovers from (ordinary restart recovery), so H4
+    never deletes them, and the sweep reaper leaves a sweep alone once the
+    pause has taken it over.
+  - **Process trees.** Stopping an agent stops everything it started: the
+    recorded systemd scope when it really exists (`systemctl --user stop`), and
+    always a freeze-first kill of its process group and its descendants
+    (followed through `setsid`). Nothing else is signalled: a process is not
+    part of the tree because it runs in the agent's worktree, the daemon, its
+    ancestors and its other children are excluded before descendants are
+    followed, and a pid is signalled only while its start time is still the one
+    recorded at the snapshot (a recycled pid is left alone). A recorded
+    scope unit that was never created falls back to that tree kill. A
+    containerized (session-exec) agent's invocation is cancelled through the
+    spawn script's `.cancel` marker; the session container keeps running.
+  - **What can stop it.** No supervisor (nothing would relaunch the daemon), no
+    state directory for the manifest, or a manifest from the previous roll that
+    is still live: the roll is **refused** (`daemon.roll.refused`, ERROR) and
+    nothing is paused. A manifest that cannot be written aborts the pause before
+    anything is signalled and dispatch resumes (`daemon.roll.pause_failed`).
+    There is no drain fallback in any of these cases. While the previous
+    roll's manifest stays live the refusal repeats on every tick; it is logged
+    and published once per manifest, then at most every 5 minutes.
+  - **It always ends.** Every command H4 runs is bounded, and the pause as a
+    whole has a deadline: its settle window, `pauseBudgetSecs`, the 30s forge
+    floor and a 90s margin (270s with the defaults). Past it, a pause that has
+    stopped nothing is ended, its requests, holds and manifest are removed and
+    dispatch resumes (`daemon.roll.pause_failed`); one that has already stopped
+    an agent kills what is left by process group, records those agents
+    `requeue` / `planned` / `pause-budget-missed` in the manifest (left at
+    `phase = pausing`, which the next start finishes) and restarts
+    (`daemon.roll.forced`). Dispatch is never left paused with
+    `--abort-drain` refused.
+  - **Operator commands during a pause.** Until the pause has stopped an agent,
+    `restart --drain` promotes it to an ordinary operator drain (the pause
+    withdraws its requests, deletes its manifest and stops nothing) and
+    `restart --abort-drain` cancels it. Once it has stopped an agent, a
+    `restart --drain` is acknowledged without changing anything, an
+    `--abort-drain` is **refused** with a message naming the step, and the roll
+    completes. `--then-exit` always wins: the daemon finishes the pause, writes
+    `phase = paused` and stays down; the next start resumes from the manifest.
+  - **A newer release supersedes an armed roll (#8514)** only until the pause
+    has stopped an agent; after that it is too late and the roll completes.
+  - **Floor rolls (#10712)** take this same path. They still skip the settle
+    gate and still honour the roll window; an unsatisfiable floor still starts
+    no roll, pauses nothing, and alerts at ERROR while dispatch continues.
+  - **Removed with the wait-for-zero roll:** the retained ("pending") roll and
+    its re-arm/abandon budget (#6007), the unsatisfiable-drain detector and its
+    cooldown (#8998/#9010, `rollStallDeadlines` / `rollStallCooldownSecs`), the
+    `daemon.drain.roll_pending` and `daemon.drain.roll_unsatisfiable` events, and
+    the stall decision of the `auto_update.tick` record. The trade-off those managed is now the pause
+    budget's: a tool call longer than the budget costs its agent a requeue.
 - **Supervision proof is checked up front (AC5):** on an unsupervised host the
   request is refused **before** dispatch is paused (`accepted: false`), so a caller
   can detect nothing happened and no silent outage is introduced.
@@ -12353,11 +12331,19 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   below. Since **#8514** the roll state is also **live and queryable** rather than
   only a one-shot note: `status --json`'s `drain.roll` object (`null` when no
   drain is active) carries `roll_pending`, `started_at`, `paused_secs`,
-  `budget_secs`, `refusals`, `in_flight`, `target` and `then_exit`, and the human
-  renderer prints the same under the `Drain: DRAINING …` line as
-  `roll PENDING since T — dispatch paused Dm of a 2h0m budget, N in flight, …`.
-  That is what makes a host idling behind a roll visible from one poll — and, by
-  diffing `paused_secs` across polls, whether the pause is still advancing.
+  `budget_secs`, `refusals`, `in_flight`, `target`, `then_exit`, `origin`,
+  `timed_out`, `startup_hold` and `pause`. **Since #10831** `roll_pending` is
+  always `false` and `refusals` always `0` (no roll is retained across a
+  deadline; both stay in the object so older readers still parse it),
+  `budget_secs` is the pause budget for a `pause-roll` drain and `0` otherwise,
+  and `origin` reads `operator` or `pause-roll`. `pause` is `null` except during
+  a pause roll, when it carries the H4 `step` (1-10), `stopped` (whether an
+  abort is still possible), `budget_secs`, `min_resumable_age_secs`,
+  `manifest_id`, `target_source`, `to_version`, `items`, `paused`, `exited`,
+  `requeued_by_reason` (a count per reason), `deferred_forge_writes`, and the
+  observed `settle_secs` / `stop_secs`. The human renderer prints
+  `roll PAUSING agents (H4 step N/10, …)` for it. That is what makes a host
+  paused behind a roll visible from one poll.
 - **Cumulative paused time per host per day (#8652).** `status --json`'s
   `drain.paused_by_day` is `{ "YYYY-MM-DD": secs }` — dispatch-paused seconds per
   **UTC** day, including the elapsed portion of a pause in progress; the text
@@ -12871,7 +12857,7 @@ daemon **installs and restarts itself** onto a fresher binary without operator
 action, instead of only surfacing the read-only "update available" hint above.
 It is the *deciding + sequencing* layer — it reuses `loom-daemon-update.sh`
 (driven with `--no-restart`, plus `--fetch` on the artifact path) for the
-fetch-or-rebuild/provision and the #4090 drain primitive for the restart,
+fetch-or-rebuild/provision and pause-and-roll (#10831) for the restart,
 reimplementing neither. Since Issue #7609 a published Release artifact is what
 drives a roll, and the source checkout is only the fallback — see
 [Artifact-first auto-update ticks](#artifact-first-auto-update-ticks-7609)
@@ -12879,10 +12865,9 @@ below.
 
 **Opt-in, default OFF** (it has side effects on the running process). Enable via
 `autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
-window, stampede-gate deadline, and unsatisfiable-drain threshold/cooldown with
-`intervalSecs` (default 900) / `settleSecs` (default 600) / `deferDeadlineSecs`
-(default 21600) / `rollStallDeadlines` (default 3) / `rollStallCooldownSecs`
-(default 21600, #9010). All six knobs resolve **env > config > default** through
+window and stampede-gate deadline with `intervalSecs` (default 900) /
+`settleSecs` (default 600) / `deferDeadlineSecs` (default 21600), and the roll's
+pause with the `pauseRoll.*` budgets (#10831). All knobs resolve **env > config > default** through
 `config_resolver`, so the `.loom-project/` tier is honored like every other
 `autonomous.*` block.
 
