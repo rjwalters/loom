@@ -58,6 +58,20 @@ assert_eq() {
 # forked printf|grep pipeline) so a transient fork/exec failure under
 # run-ci-suites.sh's parallel suite pool can never masquerade as a genuine
 # content mismatch (#7819, #7874).
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="$3"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$haystack" != *"$needle"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: $msg"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: $msg"
+    echo "    Unexpected substring: '$needle'"
+    echo "    In: '$haystack'"
+  fi
+}
+
 assert_contains() {
   local haystack="$1" needle="$2" msg="$3"
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -99,6 +113,9 @@ STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 # with a clean, complete, EMPTY review state -> the gate reports CLEAR and the
 # marker assertions below exercise exactly what they did before.
 if [[ "$1" == "api" ]]; then
+  # #10581 round 2: scenario files fail a label DELETE / a label read.
+  [[ " $* " == *" -X DELETE "* && -f "$LOOM_TEST_STUB_DIR/delete-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
+  [[ "$*" == *"/labels?"* && -f "$LOOM_TEST_STUB_DIR/labels-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
   # #10485: the final head compare reads `repos/O/R/pulls/N --jq .head.sha`.
   if [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls/[0-9]+$ ]]; then
     [[ -f "$LOOM_TEST_STUB_DIR/final-head-fail" ]] && exit 1
@@ -119,6 +136,11 @@ if [[ "$1" == "repo" && "$2" == "view" ]]; then
   exit 0
 fi
 
+if [[ "$1" == "pr" && "$2" == "edit" ]]; then
+  printf '%s\n' "$*" >> "$LOOM_TEST_STUB_DIR/pr-edit.log"
+  [[ -f "$LOOM_TEST_STUB_DIR/pr-edit-fail" ]] && { echo "stub gh: pr edit failed" >&2; exit 1; }
+  exit 0
+fi
 if [[ "$1" == "issue" && "$2" == "comment" ]]; then
   # #9774: post-verdict.sh posts through forge_gh_comment_rl_safe, which is
   # `gh issue comment` shaped (a PR IS an issue for comments) — same capture
@@ -203,6 +225,14 @@ if [[ "${1:-} ${2:-}" == "forge wait-checks" ]]; then
   exit 0
 fi
 D="$LOOM_TEST_STUB_DIR"
+# The #10581 capability probe asks `forge <verb> --help`. Answered here (and
+# not logged) so the scenario files below drive only the real calls; with
+# old-daemon present it answers like a binary that predates the verbs.
+if [[ "${1:-}" == forge && "${2:-}" == verdict-* && "${3:-}" == --help ]]; then
+  [[ -f "$D/old-daemon" ]] && { echo "error: unrecognized subcommand '$2'" >&2; exit 2; }
+  exit 0
+fi
+if [[ "${1:-}" == --version ]]; then echo "loom-daemon 0.19.870 (mock)"; exit 0; fi
 if [[ "${1:-} ${2:-}" == "forge verdict-gate" ]]; then
   printf '%s\n' "$*" >> "$D/daemon-calls.log"
   [[ -f "$D/gate-answer" ]] || { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
@@ -243,7 +273,8 @@ reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
     "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
-    "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR"/reconcile-answer.* "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log"
+    "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR"/reconcile-answer.* "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log" \
+    "$STUB_DIR/old-daemon" "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail" "$STUB_DIR/pr-edit.log" "$STUB_DIR/pr-edit-fail"
 }
 
 run_pv() {
@@ -671,6 +702,53 @@ echo "1 LOOM-VERDICT-RECONCILE UNREAD x" > "$STUB_DIR/reconcile-answer.2"
 run_pv 327 approved abc1234 --body "ok"
 assert_eq "8" "$EXIT_CODE" "unread post-label arbitration -> exit 8"
 assert_contains "$OUTPUT" "loom:pr was withdrawn" "the approval is announced as withdrawn"
+
+# ... but only when the withdrawal actually happened (#10581 round 2): a failed
+# DELETE with an unreadable label state says so and prints the manual removal.
+reset_state
+echo "0 LOOM-VERDICT-RECONCILE STABLE" > "$STUB_DIR/reconcile-answer.1"
+echo "1 LOOM-VERDICT-RECONCILE UNREAD x" > "$STUB_DIR/reconcile-answer.2"
+touch "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail"
+run_pv 328 approved abc1234 --body "ok"
+assert_eq "8" "$EXIT_CODE" "unread re-arbitration + failed DELETE -> exit 8"
+assert_not_contains "$OUTPUT" "loom:pr was withdrawn" "a failed DELETE is never reported as a withdrawal"
+assert_contains "$OUTPUT" "could NOT be withdrawn" "the failed withdrawal is announced"
+assert_contains "$OUTPUT" "gh pr edit 328 --repo owner/repo --remove-label loom:pr" "the manual removal command is printed"
+
+# --- T17: a daemon without the #10581 verbs (capability probe, round 2) -----
+
+# An approval is refused before the lock: exit 10 (not 9), naming the binary
+# and its --version, nothing posted, no verdict verb called.
+reset_state
+touch "$STUB_DIR/old-daemon"
+run_pv 330 approved abc1234 --body "ok"
+assert_eq "10" "$EXIT_CODE" "verb-less daemon + approval -> exit 10 (distinct from a held lock's 9)"
+assert_contains "$OUTPUT" "$STUB_DIR/loom-daemon" "names the resolved binary"
+assert_contains "$OUTPUT" "loom-daemon 0.19.870 (mock)" "names the binary's own --version"
+assert_contains "$OUTPUT" "forge verdict-lock" "names the missing verbs"
+assert_contains "$OUTPUT" "Roll loom-daemon" "says to roll the daemon"
+assert_not_contains "$OUTPUT" "older than" "no guessed version floor"
+no_comment "verb-less daemon (approve)"
+assert_eq "" "$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "verb-less daemon: no lock, gate or label call"
+
+# A changes-requested still posts, on the legacy path, loudly.
+reset_state
+touch "$STUB_DIR/old-daemon"
+run_pv 331 changes-requested abc1234 --body "please fix"
+assert_eq "0" "$EXIT_CODE" "verb-less daemon + changes-requested -> posted on the legacy path"
+assert_contains "$OUTPUT" "legacy path" "the degraded path is loud"
+assert_eq "331" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "changes-requested comment posted"
+assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=changes-requested" "the verdict-sha marker is still appended"
+assert_eq "" "$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "legacy path: no verdict verb called"
+assert_contains "$(cat "$STUB_DIR/pr-edit.log" 2>/dev/null || true)" "pr edit 331 --repo owner/repo --add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing" "legacy path: the exclusive changes-requested transition"
+
+# ... and a failed label step there is loud: exit 8 with the repair command.
+reset_state
+touch "$STUB_DIR/old-daemon" "$STUB_DIR/pr-edit-fail"
+run_pv 332 changes-requested abc1234 --body "please fix"
+assert_eq "8" "$EXIT_CODE" "legacy path label failure -> exit 8"
+assert_eq "332" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the comment itself was posted"
+assert_contains "$OUTPUT" "Repair: gh pr edit 332 --repo owner/repo --add-label loom:changes-requested" "repair command is printed"
 
 # --- Summary ---
 echo ""

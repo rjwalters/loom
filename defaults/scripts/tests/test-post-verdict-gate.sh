@@ -83,6 +83,17 @@ if [[ "${1:-}" == "api" ]]; then
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "repo view" ]]; then echo "owner/repo"; exit 0; fi
+# The legacy changes-requested path (#10581 round 2): one `gh pr edit`.
+if [[ "${1:-} ${2:-}" == "pr edit" ]]; then
+  [[ -f "$D/labels-write-fail" ]] && { echo "HTTP 403" >&2; exit 1; }
+  for ((i = 3; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+      --add-label) grep -qxF "${args[i + 1]}" "$D/labels.txt" || echo "${args[i + 1]}" >> "$D/labels.txt" ;;
+      --remove-label) grep -vxF "${args[i + 1]}" "$D/labels.txt" > "$D/labels.tmp"; mv "$D/labels.tmp" "$D/labels.txt" ;;
+    esac
+  done
+  exit 0
+fi
 if [[ "${1:-} ${2:-}" == "issue comment" ]]; then
   [[ -f "$D/post-delay" ]] && sleep 2
   # A rival Judge on ANOTHER host passed its gate read before either of us wrote
@@ -252,6 +263,48 @@ check "exit 9" 9 "$RC"
 check "nothing posted" "" "$POSTED"
 check "foreign lock left alone" yes "$([[ -d "$STUB_DIR/locks/owner_repo-10702" ]] && echo yes)"
 rmdir "$STUB_DIR/locks/owner_repo-10702"
+
+# A binary that predates the #10581 verbs, answering the way an older clap
+# build does (exit 2, "unrecognized subcommand"); every other verb is the real one.
+cat > "$STUB_DIR/old-daemon" <<OLD
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "--version "*) echo "loom-daemon 0.19.870 (pre-10581)"; exit 0 ;;
+  "forge wait-checks") echo "LOOM-CHECKS-GREEN \$(cat "$STUB_DIR/cur-sha")"; exit 0 ;;
+  "forge verdict-"*) printf "error: unrecognized subcommand '%s'\n\nUsage: loom-daemon forge <COMMAND>\n" "\$2" >&2; exit 2 ;;
+esac
+exec "$REAL_DAEMON" "\$@"
+OLD
+chmod +x "$STUB_DIR/old-daemon"
+
+echo "== a daemon without the verdict verbs refuses an approval, distinct from a held lock =="
+state "[]" loom:review-requested loom:reviewing
+LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" pv 10720 approved "$HEAD" --body "Approved."
+check "exit 10 (a held lock is 9)" 10 "$RC"
+contains "names the binary" "$OUT" "$STUB_DIR/old-daemon"
+contains "names its --version" "$OUT" "loom-daemon 0.19.870 (pre-10581)"
+contains "names the missing verbs" "$OUT" "forge verdict-lock forge verdict-gate forge verdict-labels forge verdict-reconcile"
+contains "says roll the daemon" "$OUT" "Roll loom-daemon"
+check "nothing posted" "" "$POSTED"
+check "labels untouched" "loom:review-requested loom:reviewing " "$LABELS"
+check "no lock taken" "" "$(ls "$STUB_DIR/locks" 2>/dev/null)"
+
+echo "== a daemon without the verdict verbs still posts changes-requested (legacy path) =="
+state "[]" loom:pr loom:reviewing loom:review-requested loom:ci-failure
+LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" pv 10721 changes-requested "$HEAD" --body "Please fix."
+check "exit 0" 0 "$RC"
+contains "loud warning" "$OUT" "legacy path"
+check "comment posted" 10721 "$POSTED"
+contains "verdict marker on the posted body" "$(jq -r '.[-1].body' "$STUB_DIR/comments.json")" "verdict=changes-requested -->"
+check "exclusive changes-requested labels, loom:ci-failure kept" "loom:ci-failure loom:changes-requested " "$LABELS"
+
+echo "== the legacy path's label failure is loud (exit 8, repair command) =="
+state "[]" loom:pr loom:reviewing
+touch "$STUB_DIR/labels-write-fail"
+LOOM_DAEMON_BIN="$STUB_DIR/old-daemon" pv 10722 changes-requested "$HEAD" --body "Please fix."
+check "exit 8" 8 "$RC"
+check "the comment was posted" 10722 "$POSTED"
+contains "repair command" "$OUT" "Repair: gh pr edit 10722 --repo owner/repo --add-label loom:changes-requested --remove-label loom:pr"
 
 echo "== cross-host race: a rival changes-requested lands after our gate read (#10581) =="
 state "[]" loom:review-requested loom:reviewing

@@ -128,11 +128,16 @@
 #       (loom_write_repo, lib/forge-helpers.sh, #9548); nothing was posted
 #   7 - refused by the verdict gate (#10581): loom:ci-failure on an approval,
 #       a same-head changes-requested verdict not overruled, an unread PR
-#       state, or a daemon without the verb; nothing was posted
+#       state, or a gate that gave no answer; nothing was posted
 #   8 - the comment is posted (or deduped) but the label transition did not
 #       hold; stderr carries the repair command (#10581)
-#   9 - the per-PR verdict lock could not be taken (loom-daemon forge
-#       verdict-lock, #10581); nothing was posted
+#   9 - the per-PR verdict lock is held by another verdict transaction on
+#       this host (loom-daemon forge verdict-lock, #10581); nothing was posted
+#  10 - approval refused: the resolved loom-daemon lacks the #10581 verdict
+#       verbs (a capability probe, not a version guess); stderr names the
+#       binary and its --version. Roll loom-daemon. Nothing was posted. A
+#       changes-requested verdict on such a daemon takes the legacy path
+#       instead (posted, labels via gh pr edit, loud warning).
 #
 # NOTE: GitHub-specific (uses `gh pr comment`), like create-pr.sh /
 # merge-pr.sh. On a Gitea forge, post the equivalent comment via that forge's
@@ -141,7 +146,7 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,139p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,144p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -443,7 +448,25 @@ FULL_BODY="$FULL_BODY
 # two identical callers cannot both pass the dedupe read. Fail closed (exit 9).
 # Host-local: independent hosts share no lock, so the final step below
 # (verdict-reconcile) re-reads the forge and arbitrates a cross-host race.
-"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock; nothing was posted (#10581). A loom-daemon older than 0.19.875 has no verdict-lock: roll loom-daemon together with ./.loom/scripts/resync-installed.sh." >&2; exit 9; }
+#
+# Capability probe first (#10581): the verdict verbs are asked for by name on the
+# binary that will run them, so the answer never depends on a version number
+# (which cannot name the release a PR lands in). A binary without them (scripts
+# rolled ahead of the daemon; in the loom repo .loom/scripts symlinks into
+# defaults/scripts, so a `git pull` is a script roll) refuses an approval
+# (exit 10) and posts a changes-requested on the legacy path below; neither
+# reaches the lock, so exit 9 keeps meaning "the lock is held".
+MISSING_VERBS=""; for verb in verdict-lock verdict-gate verdict-labels verdict-reconcile; do "${LOOM_DAEMON_BIN:-loom-daemon}" forge "$verb" --help >/dev/null 2>&1 || MISSING_VERBS="$MISSING_VERBS forge $verb"; done
+# changes-requested without the verbs: post through the shared transport, then the
+# exclusive transition verdict-labels would make. It cannot merge anything, so
+# availability wins over the gate (no lock, gate or arbitration); loudly.
+if [[ -n "$MISSING_VERBS" ]]; then
+  WHY="the daemon binary $(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || echo "${LOOM_DAEMON_BIN:-loom-daemon} (not found)") (version: $(V="$("${LOOM_DAEMON_BIN:-loom-daemon}" --version 2>/dev/null)"; printf '%s' "${V%%$'\n'*}")) lacks${MISSING_VERBS} (#10581)"; [[ "$VERDICT" == "approved" ]] && { echo "post-verdict.sh: REFUSING to post an approval on PR #$PR: $WHY. Roll loom-daemon to a build that includes #10684, then ./.loom/scripts/resync-installed.sh. Nothing was posted." >&2; exit 10; }
+  echo "post-verdict.sh: WARNING — $WHY. Posting the changes-requested verdict on PR #$PR on the legacy path (no verdict gate, lock or cross-host arbitration); roll loom-daemon to a build that includes #10684." >&2; source "$SCRIPT_DIR/lib/forge-helpers.sh"; forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1
+  forge_gh_perm_safe pr edit "$PR" --repo "$REPO" --add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing >/dev/null && exit 0
+  echo "post-verdict.sh: the changes-requested verdict on PR #$PR is posted, but its label transition did not complete. Repair: gh pr edit $PR --repo $REPO --add-label loom:changes-requested --remove-label loom:pr --remove-label loom:review-requested --remove-label loom:reviewing" >&2; exit 8
+fi
+"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock: another verdict transaction on PR #$PR holds it on this host (or the lock directory is unwritable); nothing was posted (#10581). Retry on a later pass." >&2; exit 9; }
 trap '"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock release "$PR" --repo "$REPO"' EXIT
 # Final compare (#10485): the head must still be the reviewed one right before
 # the write; an unreadable head is a refusal, never a pass.
@@ -460,8 +483,10 @@ fi
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # Verdict gate + label transition (#10581): the logic is the daemon's
 # (loom_daemon::verdict_gate); only a positive sentinel lets an approval post.
-# requires-daemon: forge >= 0.19.875   verdict-gate, verdict-labels, verdict-lock and verdict-reconcile (#10581) first ship in the build that merges #10684 (0.19.875 = the base VERSION it was rebased on, 0.19.874, + 1 patch). An older binary fails the lock step (exit 9, nothing posted), so every Judge on that host stalls.
-# Roll together: this script and loom-daemon must move as a pair. On a host, roll loom-daemon to >= 0.19.875 FIRST (or in the same step) and only then run ./.loom/scripts/resync-installed.sh; never resync these scripts ahead of the daemon. In a checkout where .loom/scripts symlinks into defaults/scripts (the loom repo itself), a `git pull` past #10684 IS the script roll.
+# The verdict verbs (verdict-gate/-labels/-lock/-reconcile, #10581) first ship in
+# the build that merges #10684; no version floor is declared for them, because the
+# capability probe above checks them on the resolved binary. Roll loom-daemon
+# before (or with) these scripts: an approval on a daemon without them exits 10.
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
@@ -483,8 +508,7 @@ superseded_approval() {
 
 <!-- loom:verdict-sha sha=$SHA verdict=changes-requested -->" 1 || true
   "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict changes-requested >/dev/null 2>&1 || echo "post-verdict.sh: could not flip the labels; run: loom-daemon forge verdict-labels $PR --repo $REPO --verdict changes-requested" >&2
-  echo "post-verdict.sh: the approval on PR #$PR was SUPERSEDED by a concurrent changes-requested verdict at the same head; it does not stand: $1" >&2
-  exit 7
+  echo "post-verdict.sh: the approval on PR #$PR was SUPERSEDED by a concurrent changes-requested verdict at the same head; it does not stand: $1" >&2; exit 7
 }
 SEEN_OPP=0 SEEN_SAME=0; [[ "$VG_OUT" =~ seen-opposite=([0-9]+) ]] && SEEN_OPP="${BASH_REMATCH[1]}"; [[ "$VG_OUT" =~ seen-same-max-id=([0-9]+) ]] && SEEN_SAME="${BASH_REMATCH[1]}"
 RC_RC=0; RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-reconcile "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --seen-opposite "$SEEN_OPP" --seen-same-max-id "$SEEN_SAME" --nonce "$NONCE" 2>&1)" || RC_RC=$?
@@ -492,8 +516,7 @@ case "$RC_RC:$RC_OUT" in
   "0:LOOM-VERDICT-RECONCILE STABLE"*|"0:LOOM-VERDICT-RECONCILE PREVAILS"*) ;; # PREVAILS: our labels below win over a rival approval's
   "12:LOOM-VERDICT-RECONCILE DUPLICATE"*) echo "post-verdict.sh: an identical $VERDICT verdict landed first on PR #$PR at $SHA; this duplicate comment was withdrawn and no labels were touched (#10581): $RC_OUT" >&2; exit 0 ;;
   "11:LOOM-VERDICT-RECONCILE SUPERSEDED"*) superseded_approval "$RC_OUT" ;;
-  *) printf 'post-verdict.sh: %s verdict on PR #%s posted, but the cross-host reconcile was unconfirmed (#10581): %s\n' "$VERDICT" "$PR" "${RC_OUT:0:300}" >&2
-     [[ "$VERDICT" == "approved" ]] && { echo "The approval is NOT live (no loom:pr applied). Re-run this command; the gate dedupes the comment and retries the arbitration." >&2; exit 8; } ;; # changes-requested: labels below, the safe side
+  *) printf 'post-verdict.sh: %s verdict on PR #%s posted, but the cross-host reconcile was unconfirmed (#10581): %s\n' "$VERDICT" "$PR" "${RC_OUT:0:300}" >&2; [[ "$VERDICT" == "approved" ]] && { echo "The approval is NOT live (no loom:pr applied). Re-run this command; the gate dedupes the comment and retries the arbitration." >&2; exit 8; } ;; # changes-requested: labels below, the safe side
 esac
 VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }
 # Post-label re-arbitration (#10581): the reconcile above ran BEFORE the label
@@ -507,7 +530,6 @@ if [[ "$VERDICT" == "approved" ]]; then
   case "$RC2_RC:$RC2_OUT" in
     "0:LOOM-VERDICT-RECONCILE STABLE"*|"12:LOOM-VERDICT-RECONCILE DUPLICATE"*) ;;
     "11:LOOM-VERDICT-RECONCILE SUPERSEDED"*) superseded_approval "$RC2_OUT" ;;
-    *) gh api -X DELETE "repos/$REPO/issues/$PR/labels/loom%3Apr" >/dev/null 2>&1 || true
-       echo "post-verdict.sh: the approval on PR #$PR was posted and labelled, but the post-label re-arbitration was unconfirmed (#10581): ${RC2_OUT:0:300}. loom:pr was withdrawn; the approval is NOT live. Re-run this command." >&2; exit 8 ;;
+    *) WITHDRAWN="loom:pr was withdrawn; the approval is NOT live"; gh api -X DELETE "repos/$REPO/issues/$PR/labels/loom%3Apr" >/dev/null 2>&1 || WITHDRAWN="loom:pr could NOT be withdrawn (the DELETE failed), so the unconfirmed approval may still be actionable. Remove it now: gh pr edit $PR --repo $REPO --remove-label loom:pr"; echo "post-verdict.sh: the approval on PR #$PR was posted and labelled, but the post-label re-arbitration was unconfirmed (#10581): ${RC2_OUT:0:300}. $WITHDRAWN. Re-run this command." >&2; exit 8 ;;
   esac
 fi
