@@ -1264,8 +1264,9 @@ jobs:
   install-surface-checks:
     name: Install Surface Checks
     # Agent Skills Sync Check and Fresh Install Link Check on the shared debug
-    # daemon (#9065). NOT required: they were not required as separate jobs
-    # either. The job itself runs on every PR; its two gates are behind
+    # daemon (#9065), plus the Compatibility Contract (#10716). NOT required:
+    # they were not required as separate jobs either; CI Result aggregates
+    # this job. The job itself runs on every PR; its two gates are behind
     # `daemon != 'false'` (#9113), never behind a file-group filter (path
     # filtering is an optimisation, ci-principles.md rule 3). Both read only
     # `defaults/`, which a dashboard-only PR cannot touch.
@@ -1366,6 +1367,34 @@ jobs:
       - name: Check intra-repo links in the freshly installed tree
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
+
+      # component: Compatibility Contract
+      # #10716 (tracker #10698 D3/D4): prove the two claims across adjacent
+      # releases. A: the previous release's installed files against this
+      # daemon (skipped when SUPPORTS_INSTALLED declares the break). B: this
+      # tree's installed files against the release REQUIRES_DAEMON names,
+      # downloaded here. A violated claim exits 1. The logic is
+      # `loom-daemon install-compat check`; this step only fetches the old
+      # binary. fetch-depth: 0 above supplies the release tags. Not
+      # path-filtered: a change to `defaults/` alone can break claim B. Here,
+      # not in the required Daemon Checks, because its verdict also depends on
+      # release tags and assets, which no stale-check input set can model.
+      - name: Compatibility contract across adjacent releases (#10716)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          req="$(./target/debug/loom-daemon install-compat show --json | jq -r .requires_daemon)"
+          old_args=()
+          if git rev-parse -q --verify "refs/tags/v$req" >/dev/null; then
+            asset=loom-daemon-x86_64-unknown-linux-gnu
+            gh release download "v$req" --repo "$GITHUB_REPOSITORY" -p "$asset" -p "$asset.sha256" -D "$RUNNER_TEMP/compat-old"
+            (cd "$RUNNER_TEMP/compat-old" && sha256sum -c "$asset.sha256")
+            chmod +x "$RUNNER_TEMP/compat-old/$asset"
+            old_args=(--old-daemon "$RUNNER_TEMP/compat-old/$asset")
+          fi
+          ./target/debug/loom-daemon install-compat check --repo-root . "${old_args[@]}"
 
   repo-hygiene:
     name: Repo Hygiene Checks
