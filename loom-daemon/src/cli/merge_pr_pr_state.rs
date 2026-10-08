@@ -4,9 +4,9 @@
 //! # Protocol
 //!
 //! Prints exactly one line, `LOOM-PR-STATE MERGED|CLOSED|OPEN`, and exits 0.
-//! The shell acts only on MERGED (exit 0) or CLOSED (refuse); any other
-//! outcome, including a missing or older daemon, proceeds as OPEN because the
-//! later gates and the forge's merge call refuse such a PR anyway.
+//! The shell acts on MERGED (exit 0), CLOSED (refuse) or OPEN (proceed); any
+//! other outcome, including a missing or older daemon, falls back to the
+//! retired shell PR_MERGED/PR_STATE predicate, so exit codes never change.
 
 use anyhow::Result;
 

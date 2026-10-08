@@ -13,11 +13,14 @@
 //!
 //! # Fail direction
 //!
-//! The shell acts only on a positively received MERGED or CLOSED; anything
-//! else (missing or older daemon, non-zero exit, off-protocol output) proceeds
-//! as OPEN. That is safe: the gates that follow and the forge's own merge call
-//! both refuse a PR that is already merged or closed, so a lost verdict costs a
-//! different error message, never a wrong merge.
+//! The shell acts on a positively received MERGED or CLOSED and proceeds on
+//! OPEN. Anything else (missing or older daemon, non-zero exit, off-protocol
+//! output) falls back to the retired shell predicate (`PR_MERGED == true` ->
+//! exit 0, `PR_STATE == closed` -> refuse), the same pattern as
+//! `revalidate-head`. Proceeding instead would not be safe: later gates (e.g.
+//! `redate-checks` under `--auto --redate-stale-checks`) can write to a
+//! terminal PR's branch before the forge refuses the merge, and the
+//! already-merged exit 0 that re-runs rely on would be lost.
 
 /// Where the PR is in its lifecycle, for the purposes of this gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
