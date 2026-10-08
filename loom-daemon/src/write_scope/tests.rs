@@ -418,6 +418,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        ("fleet_sync/workspace_resync/host.rs", Gated),
+        (
+            "fleet_store/resync_claim.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         ("star_liveness/task.rs", Gated),
         (

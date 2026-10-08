@@ -852,9 +852,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
     // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
     // modules its production code reaches (`agent_skills`, `install_compat`,
-    // `proc_exec`, `self_update`), and the dispatch chain. MUST grow if the checker
-    // starts using another module — `daemon_surface_tests.rs` fails until it
-    // does. The script also runs `scripts/cargo-target-dir.sh`.
+    // `proc_exec`, `release_provenance`, `self_update`), and the dispatch chain.
+    // MUST grow if the checker starts using another module —
+    // `daemon_surface_tests.rs` fails until it does. The script also runs
+    // `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
         global: &[
@@ -866,6 +867,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/install_compat.rs",
             "loom-daemon/src/install_compat/**",
             "loom-daemon/src/proc_exec.rs",
+            "loom-daemon/src/release_provenance.rs",
             "loom-daemon/src/self_update.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
