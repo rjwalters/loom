@@ -126,6 +126,14 @@ pub fn tags_at_or_above(tags: &str, req: Version) -> Vec<(Version, String)> {
 /// not say, which is an error rather than a skip so an outage never silently
 /// demotes the check to the stand-in path.
 ///
+/// This is the `release.resolve-and-fetch` forge operation
+/// (`defaults/forge/operations/fleet-delivery.toml`), whose note says a
+/// delayed publication must never become a required merge check. A delayed
+/// one never does here: an unpublished or still-uploading release is skipped
+/// and the new daemon stands in. A forge OUTAGE during the lookup turns the
+/// step red by design, because this is a proof step and must not pass
+/// without having proven anything.
+///
 /// # Errors
 /// An unanswerable lookup, or [`MAX_RELEASE_LOOKUPS`] candidates without the
 /// asset.
