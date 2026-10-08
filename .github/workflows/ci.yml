@@ -680,6 +680,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the release decision and release.yml wiring (#10826)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-release-decision.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
