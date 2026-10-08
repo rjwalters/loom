@@ -349,6 +349,27 @@ host readings, a genuine reset, 1 s reset jitter, two interleaved windows, an
 owner-less legacy point). Queries 0–4 have also been run read-only against the
 live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
 
+### Pass activity
+
+`pass-queries.sql` (#10752) answers "what did the daemon's hold-cleanup pass
+do?" from the `pass.summary` / `pass.verdict` logs and the `invoke github`
+spans stamped with `github.caller`: (1) per mechanism and repo over 24 h, the
+passes run and refused, blocks released and re-parked, skips by reason, write
+cap hits and the GitHub calls by operation, in one statement; (2) the newest
+verdict per artifact, which says why each one is still held; (3) every
+`loom:blocked` removal the loom-ui webhook export saw, matched to the pass
+verdict that made it (empty when no pass did). Run it like the queries above:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < pass-queries.sql
+```
+
+Its keys are guarded by `telemetry/kinds/pass_tests.rs`, and the OTLP mapping
+tests check each key is read from the attribute map its type lands in. All
+three statements were run read-only against the live store on 2026-10-07,
+before any daemon shipped the records: (1) and (2) returned no rows, and (3) matched 109 removals in 24 h,
+none of them attributed yet.
+
 ### Measured usage queries
 
 `usage-queries.sql` (#8528) is the SigNoz half of ClickStack's "Loom measured

@@ -339,6 +339,7 @@ pub(super) fn record(
         &cred,
         identity.role.as_deref().unwrap_or("unknown"),
     )
+    .with_repo(identity.repo.as_deref())
 }
 
 /// Record a shed read (W4-C): no request was sent, so the row charges

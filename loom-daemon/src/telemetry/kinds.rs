@@ -175,6 +175,9 @@ pub mod eta_fleet_refresh;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
+pub mod pass;
+
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
@@ -429,6 +432,18 @@ macro_rules! telemetry_kind_table {
             /// One challenger's rolling backtest standing against `current`
             /// (Issue #10492). OTLP-only. See [`eta_backtest`].
             EtaBacktestSummary = "eta.backtest.summary" => $crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One pass over a workspace's artifacts (Issue #10752): mechanism,
+            /// mode, outcome, counts by verdict and skip reason, write cap,
+            /// duration and GitHub calls. OTLP-only. See [`pass`].
+            PassSummary = "pass.summary" => $crate::telemetry::kinds::pass::PassSummaryRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One artifact's verdict in a pass (Issue #10752): repo#n, verdict,
+            /// reason, blockers with their states, labels changed. OTLP-only.
+            /// See [`pass`].
+            PassVerdict = "pass.verdict" => $crate::telemetry::kinds::pass::PassVerdictRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

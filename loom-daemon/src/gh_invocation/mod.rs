@@ -36,6 +36,9 @@
 //!   one writer retry on a credential failure; every row records the identity
 //!   role (`reader` / `writer` / `writer-fallback`).
 //!
+//! - [`caller_scope`] (#10752) — the daemon pass an execution serves, as the
+//!   span's `github.caller`; writes also name their target number and repo.
+//!
 //! - [`paged`] (W5) — opt-in, off by default (`LOOM_GH_PAGE_WALK=1`): a
 //!   REST `gh api --paginate` read is walked page by page, each page its own
 //!   execution and accounting row, so the ledger charges what GitHub
@@ -49,6 +52,7 @@ pub mod accounting;
 mod affinity;
 pub mod api_kind;
 pub mod billing;
+pub mod caller_scope;
 pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
