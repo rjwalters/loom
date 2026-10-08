@@ -4,7 +4,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-const LEASE_FD: i32 = 198;
+/// The one descriptor a private dispatch hands its account lease down on.
+/// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
+pub(crate) const LEASE_FD: i32 = 198;
 
 pub struct Selection {
     pub name: String,

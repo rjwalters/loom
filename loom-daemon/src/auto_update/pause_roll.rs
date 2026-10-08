@@ -359,9 +359,12 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         safe_point: None,
         checkpoint_phase: c.checkpoint_phase.clone(),
         worktree: c.worktree.clone(),
-        claim: c
-            .issue
-            .map(|_| serde_json::json!({ "label": "loom:building", "on": "issue" })),
+        // A sweep's claim is its issue's `loom:building`; a role run's is
+        // whatever its claim breadcrumb recorded (#10832), if anything.
+        claim: c.issue.map_or_else(
+            || c.role_claim().map(|claim| claim.manifest_value()),
+            |_| Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),
+        ),
         lease_comment_id: None,
         lease_refreshed_at: None,
         log_path: c.log_path.clone(),
@@ -1030,6 +1033,19 @@ pub fn start_pause_roll(
             );
         }
         _ => {}
+    }
+    // #10832: the last roll to this same target did not take (the host came
+    // back on the old binary). Do not pause every agent for it again at once.
+    let held_back = manifest_path.parent().and_then(|dir| {
+        super::pause_resume::attempt::gate(
+            dir,
+            target.to_version.as_deref(),
+            target.to_artifact_sha256.as_deref(),
+            staged_at,
+        )
+    });
+    if let Some(why) = held_back {
+        return refuse("roll-attempt-backoff", why);
     }
     let (tuning, rejected) = PauseRollTuning::resolve(fallback_root);
     if let Some(why) = rejected {

@@ -1,9 +1,9 @@
 //! The pause manifest, schema v1 (issue #10830; design
 //! `docs/design/daemon-roll-pause-resume.md` §6).
 //!
-//! A roll records every in-flight agent here before it stops any of them (H4),
-//! and the new binary resumes or requeues from it (H5). Nothing calls this
-//! from the roll path yet: PR 2 (#10831) writes it, PR 3 (#10832) reads it.
+//! A roll records every in-flight agent here before it stops any of them (H4,
+//! `pause_roll`, #10831), and the next start resumes or requeues from it (H5,
+//! `pause_resume`, #10832).
 //!
 //! # Compatibility rules (§6), and how they are enforced
 //!
@@ -207,6 +207,11 @@ pub struct ResumeHandle {
     pub resume_count: u32,
     #[serde(default)]
     pub resume_of: Option<String>,
+    /// The sweep id the claim's lease record is published under, when it is
+    /// not the item's own id (#10832): a run that was itself resumed keeps
+    /// renewing the record its first dispatch wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_sweep_id: Option<String>,
 }
 
 /// The safe point an item reached before it was stopped.

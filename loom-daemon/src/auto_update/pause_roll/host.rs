@@ -59,6 +59,16 @@ impl Candidate {
         u64::try_from((now - started).num_seconds()).ok()
     }
 
+    /// The claim label a role run took, from its claim breadcrumb (#10832).
+    /// `None` for a sweep, and for a role run that took none.
+    #[must_use]
+    pub fn role_claim(&self) -> Option<roll_pause::claim_breadcrumb::ClaimBreadcrumb> {
+        if self.kind != ItemKind::RoleRun {
+            return None;
+        }
+        roll_pause::claim_breadcrumb::read(self.pause_dir.as_deref()?)
+    }
+
     /// The process-tree identity the teardown works from.
     #[must_use]
     pub fn tree_spec(&self) -> TreeSpec {
@@ -147,6 +157,7 @@ fn manifest_handle(h: &crate::sweep_registry::resume_handle::ResumeHandle) -> Re
         sandbox: h.sandbox.clone(),
         resume_count: h.resume_count,
         resume_of: h.resume_of.clone(),
+        lease_sweep_id: h.lease_sweep_id.clone(),
     }
 }
 
@@ -166,7 +177,21 @@ fn role_candidate(run: &roll_pause::live_runs::LiveRun, holders: &[String]) -> C
         sandbox: None,
         resume_count: 0,
         resume_of: None,
+        lease_sweep_id: None,
     };
+    // #10832: a run that was itself resumed keeps its lineage and the store,
+    // account, container and sandbox its session was recorded with.
+    if let Some(launch) = &run.resume {
+        handle.resume_count = launch.resume_count;
+        handle.resume_of = Some(launch.resume_of.clone());
+        handle.session_store.clone_from(&launch.session_store);
+        handle.account.clone_from(&launch.account);
+        handle.sandbox.clone_from(&launch.sandbox);
+        handle.container = launch
+            .container
+            .as_ref()
+            .map(|name| serde_json::json!({ "name": name, "account": launch.account }));
+    }
     // A Codex role run's session id is captured after launch.
     if let Some(captured) = roll_pause::resume::read_handle(&item_dir.join(roll_pause::HANDLE_FILE))
     {
@@ -174,13 +199,19 @@ fn role_candidate(run: &roll_pause::live_runs::LiveRun, holders: &[String]) -> C
         {
             handle.session_id = Some(captured.session_id.clone());
         }
-        handle.session_store = captured.session_store.clone();
-        handle.account = captured.account.clone();
-        handle.sandbox = captured.sandbox.clone();
-        handle.container = captured
-            .container
-            .as_ref()
-            .map(|name| serde_json::json!({ "name": name, "account": captured.account }));
+        for (slot, value) in [
+            (&mut handle.session_store, &captured.session_store),
+            (&mut handle.account, &captured.account),
+            (&mut handle.sandbox, &captured.sandbox),
+        ] {
+            if value.is_some() {
+                slot.clone_from(value);
+            }
+        }
+        if let Some(name) = &captured.container {
+            handle.container =
+                Some(serde_json::json!({ "name": name, "account": captured.account }));
+        }
     }
     Candidate {
         id: run.item_id.clone(),
@@ -329,14 +360,35 @@ impl PauseHost for DaemonPauseHost {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sr.lease_refresh_identity()
         };
-        crate::sweep_registry::roll_requeue::refresh_lease_once(&root, &host, issue, &c.id, timeout)
+        // #10832: a run that was itself resumed renews the lease record its
+        // first dispatch published.
+        let lease_id = c
+            .resume_handle
+            .as_ref()
+            .and_then(|h| h.lease_sweep_id.as_deref())
+            .unwrap_or(&c.id);
+        crate::sweep_registry::roll_requeue::refresh_lease_once(
+            &root, &host, issue, lease_id, timeout,
+        )
     }
 
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String> {
         let Some(issue) = c.issue else {
-            // A role run's claim breadcrumb arrives with the resume side
-            // (#10832); until then its own staleness rule releases any claim
-            // label it took (design §9). The record is the event and manifest.
+            // A role run gives back the claim its breadcrumb names (#10832,
+            // design §9). With no breadcrumb, the role's own staleness rule
+            // releases whatever it took; the record is the event and manifest.
+            let Some(claim) = c.role_claim() else {
+                return Ok(());
+            };
+            crate::role_runner::roll_resume::release_claim(
+                &c.repo,
+                &crate::write_scope::default_gh(),
+                &claim,
+                &notice.comment_body(),
+            )?;
+            if let Some(dir) = &c.pause_dir {
+                roll_pause::claim_breadcrumb::clear(dir);
+            }
             return Ok(());
         };
         let registry = self.pool.get_or_provision(&c.repo);

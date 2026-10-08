@@ -8,8 +8,8 @@
 //! daemon and the hook share, and (in [`resume`]) the session handles and the
 //! resume prompt the spawn scripts use.
 //!
-//! Nothing here is called from the roll path yet. PR 2 (#10831) writes pause
-//! requests and polls safe points; PR 3 (#10832) resumes.
+//! H4 (#10831) writes pause requests and polls safe points; H5 (#10832)
+//! resumes. [`suppress`] keeps restart recovery off paused agents in between.
 //!
 //! # Inert by construction
 //!
@@ -31,13 +31,16 @@
 //! | `parked/<key>` | hook | one file per parked call |
 //! | `safe-point.json` | hook | written once, atomically, when a call parks with an empty ledger |
 //! | `handle.json` | spawn script | the live-captured resume handle (Codex) |
+//! | `claim.json` | hook | the claim label the agent took, if any ([`claim_breadcrumb`]) |
 //!
 //! A file per in-flight call, not a counter, so concurrent hooks never race on
 //! a read-modify-write: the count is the directory listing.
 
+pub mod claim_breadcrumb;
 pub mod hold;
 pub mod live_runs;
 pub mod resume;
+pub mod suppress;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -422,6 +425,9 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
     let dir = item_dir(&env.pause_root, item);
     let key = ledger_key(&payload);
     let count_it = env.ledger && !is_container_call(tool);
+    // #10832: note a claim label the agent takes or releases, so a requeue can
+    // release exactly that claim.
+    claim_breadcrumb::observe(&dir, field("hook_event_name"), &payload, env.ledger);
     match field("hook_event_name") {
         "PostToolUse" | "PostToolUseFailure" => {
             let _ = std::fs::remove_file(dir.join(INFLIGHT_DIR).join(&key));

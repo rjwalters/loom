@@ -1010,6 +1010,9 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    /// Set by [`roll_resume`] when this runner relaunches a session a daemon
+    /// roll paused (#10832), instead of starting a fresh tick.
+    roll_resume: Option<roll_resume::RoleRollResume>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -1025,6 +1028,7 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            roll_resume: None,
         }
     }
 
@@ -1089,6 +1093,8 @@ impl ScriptRoleInvocationRunner {
 }
 
 mod invocation;
+/// #10832: resuming a role run a daemon roll paused.
+pub(crate) mod roll_resume;
 
 /// The per-role log file every invocation — real or skipped — writes to:
 /// `<logs_dir>/role-<role>.log`.

@@ -142,6 +142,11 @@ pub struct DrainDescriptor {
     /// never touching a #9588 operator-stop hold — a local `restart --drain
     /// --then-exit` is a different operator action and wins locally.
     pub fleet_hold: bool,
+    /// `true` while dispatch is held because this daemon started with a live
+    /// pause manifest (#10832): H5 is verifying the new binary and resuming the
+    /// paused agents. No supervisor is behind it, so a real drain request
+    /// replaces it; the `resume` child module places and releases it.
+    pub resume_hold: bool,
 }
 
 /// Outcome of [`DrainState::begin`].
@@ -503,7 +508,7 @@ impl DrainState {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         // A startup hold (#9588) has no supervisor behind it, so a drain request
         // replaces it with a real, supervised drain rather than acking it.
-        if inner.active && !inner.startup_hold {
+        if inner.active && !inner.startup_hold && !inner.resume_hold {
             let escalated = then_exit && !inner.then_exit;
             let force_escalated = force_after_timeout && !inner.force_after_timeout;
             let origin_promoted = origin == DrainOrigin::Operator
@@ -587,9 +592,10 @@ impl DrainState {
         };
         inner.timed_out = false;
         inner.startup_hold = false;
-        // #9598: a real, supervised drain replaces a fleet-state hold — the
-        // operator's terminal action (relaunch / stay down) now owns the pause,
-        // so the store must not be able to release it out from under them.
+        inner.resume_hold = false; // #10832: H5 sees the hold gone and stops relaunching
+                                   // #9598: a real, supervised drain replaces a fleet-state hold — the
+                                   // operator's terminal action (relaunch / stay down) now owns the pause,
+                                   // so the store must not be able to release it out from under them.
         inner.fleet_hold = false;
         // Set the flag while holding the descriptor lock so status can never
         // observe `flag=true` with `active=false`.
@@ -628,6 +634,9 @@ impl DrainState {
             drop(inner);
             self.clear_operator_stop();
             return AbortOutcome::NotActive;
+        }
+        if inner.resume_hold {
+            return AbortOutcome::Refused(resume::ABORT_REFUSED.to_string());
         }
         if inner.origin == DrainOrigin::PauseRoll {
             if let Some(p) = inner.pause.as_ref().filter(|p| p.stopped) {
@@ -690,7 +699,9 @@ impl DrainState {
     /// a drain was aborted.
     pub fn abort_pause_roll(&self) -> bool {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        // (#10832: an H5 resume hold is not a roll the updater armed.)
         if !inner.active
+            || inner.resume_hold
             || inner.origin != DrainOrigin::PauseRoll
             || inner.then_exit
             || inner.pause.as_ref().is_some_and(|p| p.stopped)
@@ -812,6 +823,8 @@ pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -
 /// #10831: the pause roll's step/commit transitions.
 #[path = "drain_pause.rs"]
 mod pause;
+#[path = "drain_resume.rs"]
+mod resume;
 pub use pause::PauseOwnership;
 
 #[cfg(test)]

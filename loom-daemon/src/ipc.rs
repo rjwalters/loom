@@ -1501,6 +1501,7 @@ pub fn build_daemon_status_for(
         drain_note: None,
         drain_roll: None,
         drain_paused_by_day: BTreeMap::new(),
+        pause_resume: crate::auto_update::pause_resume::status(), // #10832
         // Autonomous self-update loop status (#4055) — read from the
         // process-global snapshot the loop publishes each tick. The loop is
         // process-global (exactly one per daemon, never a per-workspace

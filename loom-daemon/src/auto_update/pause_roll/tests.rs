@@ -214,6 +214,7 @@ fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate {
             sandbox: None,
             resume_count: 0,
             resume_of: None,
+            lease_sweep_id: None,
         }),
         worktree: None,
         checkpoint_phase: Some("builder".to_string()),

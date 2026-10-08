@@ -56,6 +56,82 @@ pub fn holder_snapshot() -> Vec<CreatesIssuesTransition> {
     holders().clone()
 }
 
+/// Holds seeded for runs a daemon roll resumed (#10832), by workspace root.
+/// See [`seed_hold`].
+static SEEDED: std::sync::Mutex<Vec<(std::path::PathBuf, CreatesIssuesTransition)>> =
+    std::sync::Mutex::new(Vec::new());
+static SEEDED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn seeds() -> std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, CreatesIssuesTransition)>> {
+    SEEDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A hold on a workspace's issue creation carried across a daemon roll
+/// (#10832; design `docs/design/daemon-roll-pause-resume.md` §4 "Role run").
+///
+/// The mutex lives in memory, so a restart frees it. A role run that held it
+/// when a roll paused it is resumed from its saved session and carries on with
+/// its `gh issue create` burst, with nothing holding the mutex for it: the
+/// next issue-creating transition would interleave with that burst, which is
+/// the #3707 hazard. H5 therefore seeds a hold for the resumed run before it
+/// relaunches it. While a seeded hold for a workspace is alive, that
+/// workspace's [`IssueCreationMutex`] ([`IssueCreationMutex::for_root`])
+/// refuses [`IssueCreationMutex::try_acquire`] and
+/// [`IssueCreationMutex::acquire`] waits; dropping the hold (the resumed run
+/// ended) lifts it.
+#[derive(Debug)]
+pub struct SeededHold {
+    root: std::path::PathBuf,
+    transition: CreatesIssuesTransition,
+}
+
+impl SeededHold {
+    /// The transition this hold stands in for.
+    #[must_use]
+    pub fn transition(&self) -> CreatesIssuesTransition {
+        self.transition
+    }
+}
+
+impl Drop for SeededHold {
+    fn drop(&mut self) {
+        let mut all = holders();
+        if let Some(at) = all.iter().position(|t| *t == self.transition) {
+            all.remove(at);
+        }
+        drop(all);
+        let mut seeded = seeds();
+        if let Some(at) = seeded
+            .iter()
+            .position(|(r, t)| *r == self.root && *t == self.transition)
+        {
+            seeded.remove(at);
+        }
+        SEEDED_COUNT.store(seeded.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Seed a hold for a resumed run of `role` in the workspace at `root` that
+/// held the mutex when it was paused. `None` when `role` has no
+/// issue-creating transition. The hold is listed by [`holder_snapshot`], so a
+/// second roll records the resumed run as the holder again.
+#[must_use]
+pub fn seed_hold(root: &std::path::Path, role: &str) -> Option<SeededHold> {
+    let transition = *CREATES_ISSUES_TRANSITIONS
+        .iter()
+        .find(|t| t.role.eq_ignore_ascii_case(role))?;
+    holders().push(transition);
+    let mut seeded = seeds();
+    seeded.push((root.to_path_buf(), transition));
+    SEEDED_COUNT.store(seeded.len(), std::sync::atomic::Ordering::SeqCst);
+    Some(SeededHold {
+        root: root.to_path_buf(),
+        transition,
+    })
+}
+
 /// An issue-creating (`creates_issues=True`) transition shape.
 ///
 /// The three fields identify a label-graph edge (source state, destination
@@ -156,6 +232,9 @@ struct GateState {
 #[derive(Clone)]
 pub struct IssueCreationMutex {
     inner: Arc<Mutex<GateState>>,
+    /// The workspace this instance serializes, when it was built with
+    /// [`Self::for_root`]. Only such an instance honours a [`SeededHold`].
+    root: Option<std::path::PathBuf>,
 }
 
 impl IssueCreationMutex {
@@ -164,7 +243,27 @@ impl IssueCreationMutex {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(GateState::default())),
+            root: None,
         }
+    }
+
+    /// [`Self::new`] for the workspace at `root` (#10832): this instance also
+    /// honours a hold [`seed_hold`] placed for that workspace.
+    #[must_use]
+    pub fn for_root(root: &std::path::Path) -> Self {
+        Self {
+            root: Some(root.to_path_buf()),
+            ..Self::new()
+        }
+    }
+
+    /// Whether a run resumed after a roll holds this workspace's mutex.
+    fn seeded(&self) -> bool {
+        SEEDED_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && self
+                .root
+                .as_ref()
+                .is_some_and(|root| seeds().iter().any(|(r, _)| r == root))
     }
 
     /// Acquire the mutex for an issue-creating `transition`, waiting if another
@@ -183,6 +282,10 @@ impl IssueCreationMutex {
             is_issue_creating(transition),
             "acquire() called with a non-creates_issues transition: {transition}"
         );
+        // #10832: a run resumed after a roll may still be mid-burst.
+        while self.seeded() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         let mut guard = Arc::clone(&self.inner).lock_owned().await;
         guard.current = Some(transition);
         holders().push(transition);
@@ -199,6 +302,9 @@ impl IssueCreationMutex {
             is_issue_creating(transition),
             "try_acquire() called with a non-creates_issues transition: {transition}"
         );
+        if self.seeded() {
+            return None; // #10832: held for a run resumed after a roll
+        }
         match Arc::clone(&self.inner).try_lock_owned() {
             Ok(mut guard) => {
                 guard.current = Some(transition);
@@ -209,10 +315,11 @@ impl IssueCreationMutex {
         }
     }
 
-    /// True if an issue-creating burst currently holds the mutex.
+    /// True if an issue-creating burst currently holds the mutex (including a
+    /// hold seeded for a run resumed after a roll, #10832).
     #[must_use]
     pub fn is_held(&self) -> bool {
-        self.inner.try_lock().is_err()
+        self.seeded() || self.inner.try_lock().is_err()
     }
 
     /// Number of issue-creating bursts that have completed (guard dropped).
@@ -332,6 +439,37 @@ mod tests {
         let guard = mutex.acquire(CHAMPION_EPIC_DECOMP).await;
         assert!(holder_snapshot().contains(&CHAMPION_EPIC_DECOMP));
         drop(guard);
+    }
+
+    /// #10832: a hold seeded for a run resumed after a roll keeps its
+    /// workspace's mutex held until the run ends, and no other workspace's.
+    #[tokio::test]
+    async fn test_a_seeded_hold_keeps_its_workspaces_mutex_held_until_dropped() {
+        let root = std::path::PathBuf::from("/seed-test/repo-a");
+        let mine = IssueCreationMutex::for_root(&root);
+        let other = IssueCreationMutex::for_root(std::path::Path::new("/seed-test/repo-b"));
+        assert!(seed_hold(&root, "judge").is_none(), "judge creates no issues");
+
+        let hold = seed_hold(&root, "champion").expect("champion decomposes epics");
+        assert_eq!(hold.transition(), CHAMPION_EPIC_DECOMP);
+        assert!(mine.is_held());
+        assert!(mine.try_acquire(ARCHITECT_PROPOSAL).is_none());
+        assert!(holder_snapshot().contains(&CHAMPION_EPIC_DECOMP));
+        assert!(other.try_acquire(ARCHITECT_PROPOSAL).is_some(), "another workspace is free");
+        assert!(IssueCreationMutex::new()
+            .try_acquire(HERMIT_PROPOSAL)
+            .is_some());
+
+        // `acquire` waits for the resumed run to end.
+        let waiter = tokio::spawn({
+            let mine = mine.clone();
+            async move { mine.acquire(AUDITOR_PROPOSAL).await.transition() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        drop(hold);
+        assert_eq!(waiter.await.unwrap(), AUDITOR_PROPOSAL);
+        assert!(!mine.is_held());
     }
 
     #[tokio::test]
