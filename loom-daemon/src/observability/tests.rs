@@ -757,10 +757,11 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // (either/or with the standalone refit task, so one handle).
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10492: the nightly backtest-folds task (on by default).
+    // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
     assert_eq!(
         handles.len(),
-        9,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414)"
+        10,
+        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -914,10 +915,11 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10492: the nightly backtest-folds task (on by default).
+    // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
     assert_eq!(
         handles.len(),
-        8,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414)"
+        9,
+        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
     );
     for handle in handles {
         handle.abort();

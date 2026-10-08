@@ -19,11 +19,14 @@
 //! closed, code-defined set — never a path, repo or issue). A frame that did
 //! not parse is labelled `invalid`.
 //!
-//! Independent of the OTLP export, a request other than `DaemonStatus` that
-//! takes longer than [`SLOW_REQUEST_WARN`] is logged at WARN, so a host
-//! without an exporter still records the stall in `daemon.log`. `DaemonStatus`
-//! is excluded there because its build already logs its own phase breakdown
-//! when slow (`status_budget::record_status_build`).
+//! Independent of the OTLP export, a request that takes longer than
+//! [`SLOW_REQUEST_WARN`] is logged at WARN, so a host without an exporter
+//! still records the stall in `daemon.log`. The kinds in
+//! [`SLOW_WARN_EXEMPT_KINDS`] are excluded: `DaemonStatus` already logs its own
+//! phase breakdown when slow (`status_budget::record_status_build`), and
+//! `CancelSweep` (waits the caller's SIGTERM grace, 30 s by default) and
+//! `DispatchSweep` (polls up to 5 s for token capture) are slow by design on a
+//! healthy daemon. Their latency is still exported.
 //!
 //! Naming: these sit beside `loom.daemon.task_alive` / `task_faults`
 //! ([`super::liveness`]) under `loom.daemon.*`. The self-update loop's
@@ -41,6 +44,15 @@ pub const INVALID_KIND: &str = "invalid";
 /// A non-status request slower than this is logged at WARN. Matches the 5 s
 /// IPC budget the watchdog's probe reports against.
 pub const SLOW_REQUEST_WARN: Duration = Duration::from_secs(5);
+
+/// Request kinds never logged by the slow-request WARN (see the module docs).
+pub const SLOW_WARN_EXEMPT_KINDS: &[&str] = &["DaemonStatus", "CancelSweep", "DispatchSweep"];
+
+/// Whether a `kind` request that took `elapsed` gets the slow-request WARN.
+#[must_use]
+pub fn warns_when_slow(kind: &str, elapsed: Duration) -> bool {
+    elapsed >= SLOW_REQUEST_WARN && !SLOW_WARN_EXEMPT_KINDS.contains(&kind)
+}
 
 /// How often the series are exported.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
@@ -72,10 +84,11 @@ fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
 }
 
 /// Record one answered request of `kind` that took `elapsed`. Logs a slow
-/// non-status request at WARN; accumulates for export only when ops signals
-/// are exported (OTLP), so a host without an exporter pays one atomic check.
+/// request at WARN unless its kind is exempt ([`warns_when_slow`]);
+/// accumulates for export only when ops signals are exported (OTLP), so a
+/// host without an exporter pays one atomic check.
 pub fn record(kind: &str, elapsed: Duration) {
-    if elapsed >= SLOW_REQUEST_WARN && kind != "DaemonStatus" {
+    if warns_when_slow(kind, elapsed) {
         log::warn!(
             "ipc: {kind} request took {elapsed:?} from read to response written \
              (over {SLOW_REQUEST_WARN:?}) — the daemon is alive but slow to answer (#10765)"

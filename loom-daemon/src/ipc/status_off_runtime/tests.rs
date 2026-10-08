@@ -132,7 +132,15 @@ async fn a_light_request_answers_while_slow_status_builds_occupy_every_worker() 
     let socket = dir.path().join("daemon.sock");
     serve_socket(&socket, &root);
 
+    /// Resets the process-global build delay even if this test panics.
+    struct ResetBuildDelay;
+    impl Drop for ResetBuildDelay {
+        fn drop(&mut self) {
+            TEST_BUILD_DELAY_MS.store(0, Ordering::SeqCst);
+        }
+    }
     TEST_BUILD_DELAY_MS.store(u64::try_from(BUILD_DELAY.as_millis()).unwrap(), Ordering::SeqCst);
+    let reset_delay = ResetBuildDelay;
     let status_callers: Vec<_> = (0..2)
         .map(|_| {
             let socket = socket.clone();
@@ -150,7 +158,7 @@ async fn a_light_request_answers_while_slow_status_builds_occupy_every_worker() 
         .into_iter()
         .map(|h| h.join().unwrap())
         .collect();
-    TEST_BUILD_DELAY_MS.store(0, Ordering::SeqCst);
+    drop(reset_delay);
     std::env::remove_var(REGISTRY_PATH_ENV);
     match prev_shared {
         Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
