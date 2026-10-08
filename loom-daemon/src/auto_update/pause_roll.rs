@@ -14,7 +14,9 @@
 //!
 //! # H4, in order (design §7)
 //!
-//! 1. Wait for `Pending` dispatches to settle.
+//! 1. Close dispatch (no sweep and no role run starts from here on), then
+//!    wait for the dispatches that are mid-spawn to be recorded
+//!    (`sweep_registry::roll_gate`), bounded by the settle window.
 //! 2. Snapshot every in-flight agent (sweeps across all managed roots, plus
 //!    role runs) and classify each with [`super::pause_classify`]: younger than
 //!    `minResumableAgeSecs` is `requeue` (`young-agent-reset`), no session id
@@ -23,8 +25,9 @@
 //!    A failed write aborts the pause: nothing was signalled, dispatch resumes,
 //!    and the failure is alerted (H7 `pause-failed`).
 //! 4. Tear down the `requeue` items at once.
-//! 5. Raise the pause request for the `resume` items and poll for safe-point
-//!    records; stop each tree once its record appears.
+//! 5. Raise the pause request for the `resume` items and poll for the
+//!    safe-point record **that answers this request**; stop each tree once it
+//!    appears. A record left by an earlier pause is never trusted.
 //! 6. Refresh each paused item's lease once, so the next start has a full TTL.
 //! 7. At the budget deadline, tear down whatever is still `stopping` and
 //!    requeue it (`pause-budget-missed`).
@@ -64,6 +67,16 @@
 //!
 //! See `ipc/drain_pause.rs`. The pause checks who owns the drain at every step
 //! boundary and commits (under the drain lock) before it stops any tree.
+//!
+//! # H4 always ends
+//!
+//! Every external command H4 runs is bounded (`teardown::run_bounded`, the
+//! forge timeouts), and the run as a whole has a deadline
+//! ([`PauseRollTuning::h4_deadline`]) its supervisor enforces
+//! ([`supervise::expire`]). A pause that passes it before the commit is ended
+//! and dispatch resumes; one that passes it after the commit is finished by
+//! force ([`ledger::RunLedger::force_finish`]) and the daemon restarts.
+//! Dispatch is never left paused with an abort refused.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,19 +86,22 @@ use chrono::{DateTime, Utc};
 
 use super::pause_classify::{self, ClassifyInput};
 use super::pause_manifest::{
-    self, Disposition, ItemStatus, LoadOutcome, ManifestEvent, ManifestItem, PauseManifest, Phase,
-    Roll, SafePointRecord, TargetSource, WrittenBy,
+    self, Disposition, ItemStatus, ManifestEvent, ManifestItem, PauseManifest, Phase, Roll,
+    SafePointRecord, TargetSource, WrittenBy,
 };
-use crate::event_bus::EventBus;
-use crate::ipc::{DrainBegin, DrainState, PauseOwnership, PauseRollStatus};
+use crate::ipc::{DrainState, PauseOwnership};
 use crate::roll_pause;
 use crate::sweep_registry::roll_requeue::RollRequeueNotice;
-use crate::workspace_pool::WorkspacePool;
 
 pub(crate) mod host;
+pub(crate) mod ledger;
+mod refusal;
+mod supervise;
 pub(crate) mod teardown;
 
 use host::{Candidate, PauseHost};
+use ledger::RunLedger;
+pub use supervise::start_pause_roll;
 
 /// Requeue reason: the agent had not reached a safe point when the pause
 /// budget ran out.
@@ -105,8 +121,13 @@ pub const RESUME_BUDGET_ENV: &str = "LOOM_AUTO_UPDATE_PAUSE_ROLL_RESUME_BUDGET_S
 /// The least time the forge writes of steps 6 and 8 get, whatever is left of
 /// the budget (design §7 "Timeout").
 const FORGE_FLOOR: Duration = Duration::from_secs(30);
-/// The longest step 1 waits for `Pending` dispatches to settle.
+/// The longest step 1 waits for mid-spawn dispatches to be recorded. A
+/// dispatch is mid-spawn for at most `TOKEN_NAME_CAPTURE_TIMEOUT` (5 s).
 const PENDING_SETTLE_MAX: Duration = Duration::from_secs(30);
+/// What H4 may take beyond its settle window, pause budget and forge floor
+/// before its supervisor ends it: the teardowns that run after the budget
+/// deadline (a few seconds each) and scheduling slack.
+const H4_DEADLINE_MARGIN: Duration = Duration::from_secs(90);
 
 /// What a roll is rolling to, and who asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,10 +172,12 @@ pub struct PauseRollTuning {
     pub lease_ttl: Duration,
     /// How often H4 polls for safe-point records.
     pub poll: Duration,
-    /// The longest step 1 waits for `Pending` dispatches.
+    /// The longest step 1 waits for mid-spawn dispatches.
     pub pending_settle: Duration,
     /// The least time the forge writes get.
     pub forge_floor: Duration,
+    /// H4's allowance beyond settle + budget + forge floor ([`Self::h4_deadline`]).
+    pub deadline_margin: Duration,
 }
 
 impl PauseRollTuning {
@@ -170,7 +193,24 @@ impl PauseRollTuning {
             poll: Duration::from_secs(1),
             pending_settle: PENDING_SETTLE_MAX,
             forge_floor: FORGE_FLOOR,
+            deadline_margin: H4_DEADLINE_MARGIN,
         }
+    }
+
+    /// How long step 1 waits for mid-spawn dispatches.
+    #[must_use]
+    pub fn settle_window(&self) -> Duration {
+        self.pending_settle.min(self.pause_budget / 2)
+    }
+
+    /// The longest H4 may run before its supervisor ends it: the settle
+    /// window, the pause budget, the forge floor and the margin. With the
+    /// defaults that is 30 + 120 + 30 + 90 = 270 s. H5 then has its probation
+    /// and resume budget (90 + 120 s), so the whole roll stays at 480 s, under
+    /// the 600 s the budget validation allows against a 15-minute lease.
+    #[must_use]
+    pub fn h4_deadline(&self) -> Duration {
+        self.settle_window() + self.pause_budget + self.forge_floor + self.deadline_margin
     }
 
     /// Reject a budget combination that could outlive the lease (design §7
@@ -350,7 +390,9 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         issue: c.issue,
         pr: None,
         pid: c.pid,
-        pid_started_at: c.run_started_at.map(rfc3339),
+        // The observed process start when the snapshot has one (it is the
+        // identity the teardown checks), else the registry's record.
+        pid_started_at: c.proc_started_at.or(c.run_started_at).map(rfc3339),
         pgid: c.pgid,
         scope_unit: c.scope_unit.clone(),
         agent_started_at: c.agent_started_at,
@@ -383,8 +425,8 @@ struct Run<'a> {
     plan: &'a PausePlan,
     manifest: PauseManifest,
     work: Vec<Work>,
-    /// Whether the manifest file exists on disk.
-    written: bool,
+    /// What this run has created, shared with its supervisor.
+    ledger: &'a RunLedger,
 }
 
 impl Run<'_> {
@@ -408,11 +450,7 @@ impl Run<'_> {
     /// the next start can finish.
     fn save(&mut self) -> std::io::Result<()> {
         self.manifest.items = self.work.iter().map(|w| w.item.clone()).collect();
-        let result = pause_manifest::save(&self.plan.manifest_path, &self.manifest);
-        if result.is_ok() {
-            self.written = true;
-        }
-        result
+        self.ledger.save(&self.manifest)
     }
 
     fn save_best_effort(&mut self) {
@@ -477,17 +515,11 @@ impl Run<'_> {
     }
 
     /// Undo a pause that has stopped nothing: withdraw every pause request,
-    /// hand the sweeps back to the reaper, delete the manifest.
+    /// hand the sweeps back to the reaper, delete the manifest. Only this
+    /// run's: a superseded run that gets here late leaves its replacement's
+    /// manifest, requests and holds alone ([`RunLedger::undo`]).
     fn stand_down(&mut self, promoted: bool) -> H4Outcome {
-        for w in &self.work {
-            if let Some(dir) = &w.cand.pause_dir {
-                let _ = roll_pause::withdraw(dir);
-            }
-            self.host.hold(&w.cand, false);
-        }
-        if self.written {
-            let _ = std::fs::remove_file(&self.plan.manifest_path);
-        }
+        self.ledger.undo(self.host.as_ref());
         log::warn!(
             "pause_roll: standing down before any agent was stopped ({}): pause requests \
              withdrawn, manifest deleted, nothing stopped",
@@ -539,6 +571,15 @@ impl Run<'_> {
                 .as_deref()
                 .map_or_else(String::new, |n| format!(", {n}; used the process tree"))
         );
+        // The teardown signalled less than the recorded tree (a recycled pid,
+        // or no process table): say so in the log and in the manifest.
+        let detail = match &report.reach_note {
+            Some(note) => {
+                log::error!("pause_roll: {id}: {note}");
+                format!("{detail}; {note}")
+            }
+            None => detail,
+        };
         self.event(Some(&id), "stopped", Some(detail));
         true
     }
@@ -564,16 +605,52 @@ enum ForgeDone {
     Requeue(usize, Result<(), String>),
 }
 
+/// Reopens dispatch for a run that ends without restarting the daemon (it
+/// stood down, failed, or panicked). A run that ends `Paused` keeps it closed:
+/// the process is about to exit.
+struct DispatchClosed {
+    host: Arc<dyn PauseHost>,
+    run: String,
+    keep: bool,
+}
+
+impl Drop for DispatchClosed {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.host.close_dispatch(false, &self.run);
+        }
+    }
+}
+
+/// [`run_h4_with`] with a ledger of its own, for callers with no supervisor.
+#[cfg(test)]
+pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PausePlan) -> H4Outcome {
+    let ledger = RunLedger::new(new_manifest_id(Utc::now()), plan.manifest_path.clone());
+    run_h4_with(drain, host, plan, &ledger)
+}
+
 /// Run H4 (design §7). Blocking; call it off the async runtime.
 ///
 /// `drain` must already hold a [`crate::ipc::DrainOrigin::PauseRoll`] drain of
-/// generation `plan.generation` ([`DrainState::begin_pause_roll`]).
+/// generation `plan.generation` ([`DrainState::begin_pause_roll`]). `ledger`
+/// names the run (its manifest id) and records what it creates, so the
+/// supervisor can undo or finish a run that cannot do so itself.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PausePlan) -> H4Outcome {
+pub(crate) fn run_h4_with(
+    drain: &DrainState,
+    host: Arc<dyn PauseHost>,
+    plan: &PausePlan,
+    ledger: &RunLedger,
+) -> H4Outcome {
     let tuning = plan.tuning;
     let started = Instant::now();
     let pause_started_at = Utc::now();
-    let manifest_id = new_manifest_id(pause_started_at);
+    let manifest_id = ledger.id().to_string();
+    let mut gate = DispatchClosed {
+        host: Arc::clone(&host),
+        run: manifest_id.clone(),
+        keep: false,
+    };
     let mut run = Run {
         drain,
         host,
@@ -611,7 +688,7 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
             events: Vec::new(),
         },
         work: Vec::new(),
-        written: false,
+        ledger,
     };
     // Every step boundary is an ownership check. Until something is stopped,
     // losing the drain means standing down.
@@ -625,12 +702,27 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
         };
     }
 
-    // ---- Step 1: let Pending dispatches settle --------------------------------
+    // ---- Step 1: close dispatch, then let mid-spawn dispatches be recorded ----
+    // From here nothing new starts. A dispatch whose child is already spawned
+    // is not in the registry yet; with the gate closed that count only falls.
     enter!(1);
-    let settle_until = started + tuning.pending_settle.min(tuning.pause_budget / 2);
-    while run.host.pending_dispatches() > 0 && Instant::now() < settle_until {
+    run.host.close_dispatch(true, &manifest_id);
+    let settle_until = started + tuning.settle_window();
+    let mut unsettled = run.host.pending_dispatches();
+    while unsettled > 0 && Instant::now() < settle_until {
         std::thread::sleep(tuning.poll);
         enter!(1);
+        unsettled = run.host.pending_dispatches();
+    }
+    if unsettled > 0 {
+        // A dispatch is mid-spawn for seconds at most, so this is a stuck
+        // spawn. Its agent is not in the snapshot; say so where the next
+        // start will read it.
+        log::error!(
+            "pause_roll: {unsettled} dispatch(es) still mid-spawn after the {}s settle window;              their agents are NOT in this pause's manifest and are left to restart recovery",
+            tuning.settle_window().as_secs()
+        );
+        run.event(None, "unsettled_dispatches", Some(unsettled.to_string()));
     }
     let settle_secs = started.elapsed().as_secs();
 
@@ -650,6 +742,8 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
             safe_point_wait_ms: None,
         })
         .collect();
+    let cands: Vec<Candidate> = run.work.iter().map(|w| w.cand.clone()).collect();
+    ledger.set_candidates(&cands);
     let items = u32::try_from(run.work.len()).unwrap_or(u32::MAX);
     drain.pause_update(plan.generation, |p| {
         p.items = items;
@@ -687,8 +781,11 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
     }
     // The manifest records every agent: take them over from the reaper, so a
     // tree this pause stops keeps its lock, journal entry and checkpoint.
-    for w in &run.work {
-        run.host.hold(&w.cand, true);
+    {
+        let _artefacts = ledger::artefacts();
+        for w in &run.work {
+            run.host.hold(&w.cand, true, &manifest_id);
+        }
     }
 
     // ---- Step 4: tear down the requeue items at once --------------------------
@@ -725,6 +822,9 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
         to_version: plan.target.to_version.clone(),
         manifest_id: Some(manifest_id.clone()),
     };
+    // Under the artefacts lock: a superseded run standing down late checks
+    // "is this request mine?" before it deletes, and must not interleave.
+    let artefacts = ledger::artefacts();
     for idx in 0..run.work.len() {
         let w = &mut run.work[idx];
         if w.item.disposition != Disposition::Resume {
@@ -744,6 +844,7 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
             log::warn!("pause_roll: {}: could not raise the pause request", w.item.id);
         }
     }
+    drop(artefacts);
     run.save_best_effort();
 
     let stopping = |run: &Run<'_>| {
@@ -766,7 +867,11 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
         let mut progressed = false;
         for idx in pending {
             let dir = run.work[idx].cand.pause_dir.clone();
-            let safe_point = dir.as_deref().and_then(roll_pause::read_safe_point);
+            // Only a record that answers THIS request: one left by an earlier
+            // pause describes a call that has since been released.
+            let safe_point = dir
+                .as_deref()
+                .and_then(|d| roll_pause::read_safe_point_for(d, &request));
             if let Some(sp) = safe_point {
                 if !run.stop(idx) {
                     let promoted =
@@ -805,7 +910,7 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
                 w.item.reason = Some("exited-before-safe-point".to_string());
                 w.item.stopped_at = Some(Utc::now());
                 if let Some(dir) = &w.cand.pause_dir {
-                    let _ = roll_pause::withdraw(dir);
+                    roll_pause::withdraw_for(dir, &manifest_id);
                 }
                 let id = w.item.id.clone();
                 run.event(Some(&id), "exited", None);
@@ -930,9 +1035,11 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
     drain.pause_enter_step(plan.generation, 9);
     for w in &run.work {
         // The trees are gone; a leftover request would park the next session
-        // that reuses this item dir. The safe-point record stays for H5.
+        // that reuses this item dir. The safe point is in the manifest; the
+        // record on disk answers only this request and is never read for
+        // another.
         if let Some(dir) = &w.cand.pause_dir {
-            let _ = roll_pause::withdraw(dir);
+            roll_pause::withdraw_for(dir, &manifest_id);
         }
     }
     run.manifest.phase = Phase::Paused;
@@ -958,248 +1065,11 @@ pub(crate) fn run_h4(drain: &DrainState, host: Arc<dyn PauseHost>, plan: &PauseP
             "total_secs": started.elapsed().as_secs(),
         }),
     );
+    // The daemon exits from here: dispatch stays closed.
+    gate.keep = true;
     H4Outcome::Paused {
         manifest_id,
         then_exit,
-    }
-}
-
-/// H3 Staged → H4: start a pause roll to `target` (design §7 "H3 Staged").
-///
-/// Returns `true` when a restart is now coming: this call started the pause,
-/// or a drain was already in progress (an operator drain wins; the staged
-/// binary is picked up when that drain's restart fires, and a then-exit
-/// teardown stops the daemon instead, which is logged).
-///
-/// Returns `false`, having paused nothing, when the roll cannot proceed. There
-/// is **no drain fallback**: a roll that cannot pause never waits for the
-/// in-flight count to reach zero. It is alerted (H7) and retried on a later
-/// tick.
-///
-/// Must be called inside a tokio runtime context: it spawns the supervisor.
-pub fn start_pause_roll(
-    drain: &Arc<DrainState>,
-    workspace_pool: &Arc<WorkspacePool>,
-    fallback_root: &Path,
-    event_bus: &Arc<EventBus>,
-    target: &RollTarget,
-) -> bool {
-    let staged_at = Utc::now();
-    let refuse = |state: &str, why: String| {
-        log::error!("pause_roll: roll NOT started (H7 {state}): {why}");
-        let _ = event_bus.publish_generic(
-            "daemon.roll.refused",
-            serde_json::json!({
-                "state": state,
-                "reason": why,
-                "target_source": target.source.as_str(),
-                "to_version": target.to_version,
-            }),
-        );
-        false
-    };
-    let Some(supervisor) = crate::ipc::detect_supervisor() else {
-        return refuse(
-            "unsupervised",
-            "no supervisor detected (LOOM_DAEMON_SUPERVISOR unset), so nothing would relaunch the \
-             daemon after the pause. Dispatch was NOT paused. Restart manually to run the staged \
-             binary."
-                .to_string(),
-        );
-    };
-    let Some(manifest_path) = pause_manifest::manifest_path() else {
-        return refuse(
-            "pause-failed",
-            "no state directory resolves for the pause manifest (no home directory and \
-             LOOM_AUTO_UPDATE_STATE_DIR unset); work is never stopped without being recorded"
-                .to_string(),
-        );
-    };
-    // A manifest from an earlier pause that is still within its lease window
-    // belongs to a resume that has not finished (or, before #10832, to
-    // restart recovery that is still running). Do not pause again on top of it.
-    match pause_manifest::load(&manifest_path, staged_at) {
-        LoadOutcome::Loaded(m) if !matches!(m.phase, Phase::Resumed | Phase::Abandoned) => {
-            return refuse(
-                "resume-pending",
-                format!(
-                    "pause manifest {} ({}, phase {}) from the previous roll is still live; the \
-                     next roll waits until it is resumed or older than its {}s max age",
-                    m.manifest_id,
-                    manifest_path.display(),
-                    m.phase.as_str(),
-                    m.roll.max_age_secs
-                ),
-            );
-        }
-        _ => {}
-    }
-    // #10832: the last roll to this same target did not take (the host came
-    // back on the old binary). Do not pause every agent for it again at once.
-    let held_back = manifest_path.parent().and_then(|dir| {
-        super::pause_resume::attempt::gate(
-            dir,
-            target.to_version.as_deref(),
-            target.to_artifact_sha256.as_deref(),
-            staged_at,
-        )
-    });
-    if let Some(why) = held_back {
-        return refuse("roll-attempt-backoff", why);
-    }
-    let (tuning, rejected) = PauseRollTuning::resolve(fallback_root);
-    if let Some(why) = rejected {
-        log::error!("pause_roll: {why}");
-        let _ = event_bus
-            .publish_generic("daemon.roll.config_rejected", serde_json::json!({ "reason": why }));
-    }
-    let progress = PauseRollStatus {
-        budget_secs: tuning.pause_budget.as_secs(),
-        min_resumable_age_secs: tuning.min_resumable_age_secs,
-        target_source: Some(target.source.as_str().to_string()),
-        to_version: target.to_version.clone(),
-        ..PauseRollStatus::default()
-    };
-    match drain.begin_pause_roll(tuning.pause_budget, progress) {
-        DrainBegin::Started { generation, .. } => {
-            drain.set_roll_target(target.label.clone());
-            let plan = PausePlan {
-                target: target.clone(),
-                tuning,
-                manifest_path,
-                from_version: env!("CARGO_PKG_VERSION").to_string(),
-                generation,
-                staged_at,
-                supervisor: Some(supervisor),
-            };
-            let _ = event_bus.publish_generic(
-                "daemon.roll.pause_started",
-                serde_json::json!({
-                    "target_source": target.source.as_str(),
-                    "to_version": target.to_version,
-                    "from_version": plan.from_version,
-                    "pause_budget_secs": tuning.pause_budget.as_secs(),
-                    "verify_probation_secs": tuning.verify_probation.as_secs(),
-                    "resume_budget_secs": tuning.resume_budget.as_secs(),
-                    "min_resumable_age_secs": tuning.min_resumable_age_secs,
-                }),
-            );
-            log::warn!(
-                "pause_roll: H4 pausing for a {} roll to {} (budget {}s): every in-flight agent is \
-                 stopped at a safe point or requeued, then the daemon restarts",
-                target.source.as_str(),
-                target.to_version.as_deref().unwrap_or("the rebuilt binary"),
-                tuning.pause_budget.as_secs()
-            );
-            let host: Arc<dyn PauseHost> = Arc::new(host::DaemonPauseHost::new(
-                workspace_pool.clone(),
-                fallback_root.to_path_buf(),
-                event_bus.clone(),
-            ));
-            tokio::spawn(supervise(
-                drain.clone(),
-                workspace_pool.clone(),
-                fallback_root.to_path_buf(),
-                event_bus.clone(),
-                host,
-                plan,
-            ));
-            true
-        }
-        DrainBegin::AlreadyDraining {
-            active_then_exit, ..
-        } => {
-            if active_then_exit {
-                log::warn!(
-                    "pause_roll: an operator then-exit (teardown) drain is in progress and wins: \
-                     the daemon will STOP when drained and will NOT relaunch into the staged \
-                     binary. Start it again to pick up the update."
-                );
-            } else {
-                log::warn!(
-                    "pause_roll: a drain is already in progress; it wins, and its restart picks \
-                     up the staged binary. No pause was started."
-                );
-            }
-            true
-        }
-    }
-}
-
-/// The pause supervisor: run H4 off the runtime, then act on how it ended.
-async fn supervise(
-    drain: Arc<DrainState>,
-    workspace_pool: Arc<WorkspacePool>,
-    fallback_root: PathBuf,
-    event_bus: Arc<EventBus>,
-    host: Arc<dyn PauseHost>,
-    plan: PausePlan,
-) {
-    let generation = plan.generation;
-    let h4_drain = drain.clone();
-    let joined = tokio::task::spawn_blocking(move || run_h4(&h4_drain, host, &plan)).await;
-    let outcome = match joined {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            log::error!("pause_roll: the H4 task failed ({e})");
-            let committed = drain.snapshot().pause.is_some_and(|p| p.stopped);
-            if !committed {
-                if drain.pause_ownership(generation) == PauseOwnership::Ours {
-                    drain.resolve_timeout(format!(
-                        "PAUSE FAILED (H7 pause-failed): the pause task failed ({e}) before any \
-                         agent was stopped; dispatch resumed"
-                    ));
-                }
-                return;
-            }
-            // Agents were already stopped: the restart is the only way they
-            // are picked up again (the manifest on disk says `pausing`, which
-            // the next start can finish).
-            H4Outcome::Paused {
-                manifest_id: "unknown".to_string(),
-                then_exit: drain.then_exit(),
-            }
-        }
-    };
-    match outcome {
-        H4Outcome::Paused {
-            manifest_id,
-            then_exit,
-        } => {
-            // #8652: close the paused interval BEFORE exiting — the exit is
-            // what would otherwise lose it.
-            drain.close_paused_interval(Utc::now());
-            if then_exit {
-                log::warn!(
-                    "pause_roll: pause complete (manifest {manifest_id}, phase paused); an \
-                     operator then-exit won, so exiting {} and staying down. The next start \
-                     resumes or requeues the recorded agents.",
-                    crate::ipc::drain_exit_code(true)
-                );
-                crate::observability::shutdown::exit(crate::ipc::drain_exit_code(true)).await;
-            }
-            let sup = crate::restart_verify::detect_and_spawn_verifier(std::process::id());
-            log::warn!(
-                "pause_roll: pause complete (manifest {manifest_id}, phase paused); exiting {} \
-                 for a {sup}-supervised relaunch onto the staged binary",
-                crate::ipc::drain_exit_code(false)
-            );
-            crate::observability::shutdown::exit(crate::ipc::drain_exit_code(false)).await;
-        }
-        H4Outcome::StoodDown { promoted: true } => {
-            // Rule 1 of the operator interplay: the drain is now an operator
-            // drain with no supervisor of its own. Supervise it.
-            crate::ipc::drain_supervisor::run_drain_supervisor(
-                drain,
-                workspace_pool,
-                fallback_root,
-                event_bus,
-                generation,
-                crate::ipc::DRAIN_POLL_INTERVAL,
-            )
-            .await;
-        }
-        H4Outcome::StoodDown { promoted: false } | H4Outcome::Failed(_) => {}
     }
 }
 
@@ -1207,3 +1077,13 @@ async fn supervise(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_roll/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "pause_roll/hardening_tests.rs"]
+mod hardening_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "pause_roll/handoff_tests.rs"]
+mod handoff_tests;

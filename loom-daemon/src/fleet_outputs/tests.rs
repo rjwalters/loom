@@ -5,6 +5,7 @@ use chrono::TimeZone;
 struct Fake {
     fleet: BTreeMap<&'static str, DateTime<Utc>>,
     repos: BTreeMap<&'static str, BTreeMap<String, DateTime<Utc>>>,
+    expected: BTreeMap<&'static str, Vec<String>>,
 }
 impl OutputSource for Fake {
     fn last_seen(&self, k: &str) -> Option<DateTime<Utc>> {
@@ -12,6 +13,9 @@ impl OutputSource for Fake {
     }
     fn last_seen_per_repo(&self, k: &str) -> BTreeMap<String, DateTime<Utc>> {
         self.repos.get(k).cloned().unwrap_or_default()
+    }
+    fn expected_repos(&self, k: &str) -> Option<Vec<String>> {
+        self.expected.get(k).cloned()
     }
 }
 
@@ -42,7 +46,7 @@ fn whole_fleet_at(at: DateTime<Utc>, r: &[String]) -> Fake {
             Scope::FleetWide => {
                 f.fleet.insert(o.record_kind, at);
             }
-            Scope::PerRepo => {
+            Scope::PerRepo | Scope::PerActiveRepo => {
                 f.repos
                     .insert(o.record_kind, r.iter().map(|n| (n.clone(), at)).collect());
             }
@@ -176,4 +180,107 @@ fn future_timestamp_is_not_stale() {
     let mut f = Fake::default();
     f.fleet.insert("k", now() + chrono::Duration::minutes(1));
     assert!(evaluate(&[FLEET], &f, &[], now()).is_empty());
+}
+
+#[test]
+fn far_future_timestamp_does_not_mask_an_outage() {
+    let mut f = Fake::default();
+    f.fleet.insert("k", now() + chrono::Duration::days(1));
+    assert_eq!(evaluate(&[FLEET], &f, &[], now()).len(), 1);
+}
+
+/// Finding 1: `eta.estimate` is per tracked item, so repos with nothing to
+/// estimate emit nothing on a healthy fleet.
+#[test]
+fn idle_repo_does_not_fire_eta_estimate() {
+    let row = row_for("eta.estimate");
+    assert_eq!(row.scope, Scope::PerActiveRepo);
+    let r = roster(30);
+    let mut f = Fake::default();
+    // 29 repos emit; repo29 is idle and has no estimable item.
+    f.repos
+        .insert("eta.estimate", r.iter().take(29).map(|n| (n.clone(), ago(5))).collect());
+    f.expected
+        .insert("eta.estimate", r.iter().take(29).cloned().collect());
+    assert!(evaluate(&[row], &f, &r, now()).is_empty());
+}
+
+#[test]
+fn all_abstaining_repo_does_not_fire_eta_estimate() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let mut f = Fake::default();
+    // Only repo0 has an estimable item; the other 29 only abstain/refuse.
+    f.repos
+        .insert("eta.estimate", BTreeMap::from([(r[0].clone(), ago(5))]));
+    f.expected.insert("eta.estimate", vec![r[0].clone()]);
+    assert!(evaluate(&[row], &f, &r, now()).is_empty());
+    // Fully idle fleet: nothing expected, nothing emitted.
+    let mut idle = Fake::default();
+    idle.expected.insert("eta.estimate", Vec::new());
+    assert!(evaluate(&[row], &idle, &r, now()).is_empty());
+}
+
+#[test]
+fn expected_repo_gone_silent_still_fires_eta_estimate() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let mut f = Fake::default();
+    f.repos
+        .insert("eta.estimate", r.iter().take(29).map(|n| (n.clone(), ago(5))).collect());
+    // repo29 HAS estimable items but is silent.
+    f.expected.insert("eta.estimate", r.clone());
+    let c = evaluate(&[row], &f, &r, now());
+    assert_eq!(c.len(), 1);
+    assert!(c[0].headline.contains("29 of 30"));
+}
+
+#[test]
+fn unknown_expected_set_falls_back_to_roster() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let mut f = Fake::default();
+    f.repos
+        .insert("eta.estimate", r.iter().take(29).map(|n| (n.clone(), ago(5))).collect());
+    assert_eq!(evaluate(&[row], &f, &r, now()).len(), 1);
+}
+
+/// 10-07 with an expected set: 28 of 30 repos had live items and went silent.
+#[test]
+fn replay_10_07_fires_with_expected_set() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let mut f = Fake::default();
+    f.repos.insert(
+        "eta.estimate",
+        r.iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), if i < 2 { ago(5) } else { ago(31 * 60) }))
+            .collect(),
+    );
+    f.expected.insert("eta.estimate", r.clone());
+    let c = evaluate(&[row], &f, &r, now());
+    assert_eq!(c.len(), 1);
+    assert!(c[0].headline.contains("2 of 30"));
+}
+
+/// Finding 2: gauges are judged against `maxAgeSecs` (1800s), not 2x the
+/// 600s publish cadence.
+#[test]
+fn captain_gauges_tolerate_one_missed_publish() {
+    for kind in [
+        "captain-gauges/v1:stage-dwell",
+        "captain-gauges/v1:star-facts",
+        "captain-gauges/v1:queue-blocked",
+    ] {
+        let row = row_for(kind);
+        assert_eq!(row.deadline(), Duration::from_secs(1800));
+        let mut f = Fake::default();
+        f.fleet
+            .insert(kind, now() - chrono::Duration::seconds(1500));
+        assert!(evaluate(&[row], &f, &[], now()).is_empty(), "{kind}");
+        f.fleet
+            .insert(kind, now() - chrono::Duration::seconds(1801));
+        assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
+    }
 }

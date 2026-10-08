@@ -593,9 +593,13 @@ impl SweepRegistry {
     pub(crate) fn abandon_roll_resume(&mut self, sweep_id: &str) {
         if let Some(mut child) = self.children.remove(sweep_id) {
             let pid = child.id();
+            // This registry's own unreaped child: the pid cannot have been
+            // recycled, and it started no later than now. That is the
+            // identity the teardown checks before it signals anything.
             let spec = crate::auto_update::pause_roll::teardown::TreeSpec {
                 pid: Some(pid),
                 pgid: Some(pid),
+                recorded_started_at: Some(Utc::now()),
                 ..Default::default()
             };
             let _ = crate::auto_update::pause_roll::teardown::teardown_tree(

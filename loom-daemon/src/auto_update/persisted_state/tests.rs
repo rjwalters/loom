@@ -2,6 +2,8 @@
 //! every bad file, and keeps the settle ceiling across a restart.
 
 use super::*;
+use crate::auto_update::floor_roll::alert::REMINDER;
+use crate::auto_update::floor_roll::Release;
 use crate::auto_update::roll_window::{RollWindowTuning, WindowGate};
 use crate::auto_update::{ArtifactInfo, ArtifactResolution, TickDecision, TickInputs, UpdateCheck};
 use chrono::TimeZone;
@@ -405,4 +407,190 @@ fn a_wall_time_older_than_the_monotonic_clock_clamps_rather_than_panics() {
     // A saved time in the future (the wall clock stepped back) reads as now.
     let ahead = to_instant(fixed_utc() + chrono::Duration::hours(1), now, fixed_utc());
     assert_eq!(ahead, now);
+}
+
+// ---- #10866: the unsatisfiable-floor alert record ----
+
+const FLOOR: &str = "9.0.0";
+const RUNNING: &str = "0.19.900";
+
+fn below(version: &str) -> Release {
+    Release {
+        tag: format!("v{version}"),
+        version: version.to_string(),
+    }
+}
+
+/// A state whose unsatisfiable floor was alerted at `at`.
+fn floor_stalled(at: DateTime<Utc>) -> AutoUpdateState {
+    let mut state = empty();
+    state.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+    state.floor.observe(Some(&below("0.19.950")));
+    assert!(state.floor.alert_due(at, REMINDER), "the stall starts");
+    state
+}
+
+/// Save `state` to a file, load it, and apply it to a fresh state running
+/// `binary`.
+fn restart(state: &AutoUpdateState, saved_at: DateTime<Utc>, binary: &str) -> AutoUpdateState {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let now = Instant::now();
+    store(&path, &state.persisted_state(now, saved_at, BIN)).unwrap();
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("a freshly written file loads");
+    };
+    let mut restarted = empty();
+    let note = restarted.apply_persisted_state(*loaded, now, saved_at, binary);
+    assert!(note.contains("unsatisfiable-floor alert for floor 9.0.0"), "{note}");
+    restarted
+}
+
+fn mins(n: i64) -> chrono::Duration {
+    chrono::Duration::minutes(n)
+}
+
+#[test]
+fn a_floor_stall_round_trips_at_schema_version_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let t0 = fixed_utc();
+    let saved = floor_stalled(t0).persisted_state(Instant::now(), t0, BIN);
+    store(&path, &saved).unwrap();
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["schema_version"], 1);
+    assert_eq!(raw["floor_stall"]["floor"], FLOOR);
+    assert_eq!(raw["floor_stall"]["running"], RUNNING);
+    assert_eq!(raw["floor_stall"]["newest"], "0.19.950");
+    assert_eq!(raw["floor_stall"]["declared_at"], raw["floor_stall"]["last_alerted_at"]);
+
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("a freshly written file loads");
+    };
+    assert_eq!(*loaded, saved);
+    assert!(loaded.floor_stall.is_some());
+}
+
+#[test]
+fn a_restart_inside_the_reminder_interval_does_not_alert_again() {
+    let t0 = fixed_utc();
+    let mut b = restart(&floor_stalled(t0), t0 + mins(5), BIN);
+    b.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+    assert!(b.floor.stall().is_some(), "the stall stands before anything is observed");
+    b.floor.observe(Some(&below("0.19.950")));
+    assert!(!b.floor.alert_due(t0 + mins(10), REMINDER));
+    assert!(b.floor.stall().is_some());
+    assert!(b.floor.note_suffix().contains("FLEET FLOOR UNSATISFIABLE"));
+    // The reminder is due an hour after the alert before the restart, not an
+    // hour after the restart.
+    assert!(!b.floor.alert_due(t0 + mins(59), REMINDER));
+    assert!(b.floor.alert_due(t0 + mins(61), REMINDER));
+    let record = b.floor.stall_state().unwrap();
+    assert_eq!((record.declared_at, record.last_alerted_at), (t0, t0 + mins(61)));
+}
+
+#[test]
+fn a_restart_whose_first_tick_is_unresolved_still_reports_the_stall() {
+    let t0 = fixed_utc();
+    let mut b = restart(&floor_stalled(t0), t0 + mins(5), BIN);
+    b.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+    b.floor.observe(None);
+    assert!(b.floor.stall().is_some());
+    assert!(b.floor.note_suffix().contains("FLEET FLOOR UNSATISFIABLE"));
+    assert!(!b.floor.alert_due(t0 + mins(10), REMINDER));
+    assert!(b.floor.alert_due(t0 + mins(61), REMINDER));
+}
+
+#[test]
+fn a_new_binary_on_the_same_version_keeps_the_floor_stall() {
+    let t0 = fixed_utc();
+    let a = floor_stalled(t0);
+    let saved = a.persisted_state(Instant::now(), t0, BIN);
+    let mut b = empty();
+    let note = b.apply_persisted_state(saved, Instant::now(), t0, "0.19.900+def");
+    assert!(note.contains("DROPPED"), "{note}");
+    assert!(note.contains("unsatisfiable-floor alert"), "{note}");
+    b.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+    assert_eq!(b.floor.stall(), a.floor.stall());
+    b.floor.observe(Some(&below("0.19.950")));
+    assert!(!b.floor.alert_due(t0 + mins(10), REMINDER));
+}
+
+#[test]
+fn a_floor_stall_saved_under_another_basis_is_dropped_and_alerts_as_new() {
+    let t0 = fixed_utc();
+    for (floor, running) in [("9.0.1", RUNNING), (FLOOR, "0.19.901")] {
+        let mut b = restart(&floor_stalled(t0), t0 + mins(5), BIN);
+        b.floor.set_basis(Some(floor.to_string()), running);
+        assert!(b.floor.stall().is_none(), "{floor} {running}");
+        assert_eq!(b.floor.stall_state(), None, "{floor} {running}");
+        b.floor.observe(Some(&below("0.19.950")));
+        assert!(b.floor.alert_due(t0 + mins(10), REMINDER), "{floor} {running}: a new start");
+        assert_eq!(b.floor.stall_state().unwrap().declared_at, t0 + mins(10));
+    }
+    // The operator removed the floor while the daemon was down.
+    let mut b = restart(&floor_stalled(t0), t0 + mins(5), BIN);
+    b.floor.set_basis(None, RUNNING);
+    b.floor.observe(Some(&below("0.19.950")));
+    assert!(b.floor.stall().is_none());
+    assert!(!b.floor.alert_due(t0 + mins(10), REMINDER));
+}
+
+/// A file written by a release between #10866 and #10831 carries both the
+/// removed drain detector's `stall` and the floor alert's `floor_stall`. The
+/// first is ignored; the second is kept, binary change or not.
+#[test]
+fn a_file_with_both_the_removed_stall_and_a_floor_stall_keeps_the_floor_alert() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let t0 = fixed_utc();
+    let saved = floor_stalled(t0).persisted_state(Instant::now(), t0, BIN);
+    let mut raw = serde_json::to_value(&saved).unwrap();
+    raw["stall"] = serde_json::json!({
+        "kind": "unsatisfiable",
+        "episode": {"since": "2026-10-07T11:00:00Z"},
+        "declared_at": "2026-10-07T11:30:00Z",
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("a file carrying both keys must load");
+    };
+    assert_eq!(*loaded, saved, "`stall` is ignored and nothing else is lost");
+    for binary in [BIN, "0.19.999+other"] {
+        let mut b = empty();
+        let LoadOutcome::Loaded(loaded) = load(&path) else {
+            panic!("reload");
+        };
+        let note = b.apply_persisted_state(*loaded, Instant::now(), t0 + mins(5), binary);
+        assert!(note.contains("unsatisfiable-floor alert"), "{binary}: {note}");
+        b.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+        assert!(b.floor.stall().is_some(), "{binary}: the floor alert is kept");
+    }
+}
+
+#[test]
+fn a_file_without_a_floor_stall_key_loads_with_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(STATE_FILE);
+    let (now, now_utc) = (Instant::now(), fixed_utc());
+    // What a #10877-only binary writes: no stall, so no key at all.
+    let saved = populated(now, now_utc).persisted_state(now, now_utc, BIN);
+    assert_eq!(saved.floor_stall, None);
+    store(&path, &saved).unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("floor_stall"), "{raw}");
+
+    let LoadOutcome::Loaded(loaded) = load(&path) else {
+        panic!("a file without the key loads");
+    };
+    assert_eq!(loaded.floor_stall, None);
+    let mut restarted = empty();
+    restarted.window = open_window(now_utc);
+    let note = restarted.apply_persisted_state(*loaded, now, now_utc, BIN);
+    assert!(!note.contains("floor"), "{note}");
+    restarted.floor.set_basis(Some(FLOOR.to_string()), RUNNING);
+    assert!(restarted.floor.stall().is_none());
 }

@@ -291,6 +291,15 @@ pub(super) fn run_role_with_timeout(
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
+    // #10974: nothing new starts once a roll's pause is requested. The permit
+    // is held until the run is registered, so the pause's snapshot cannot
+    // fall between this spawn and that registration.
+    let Some(launch_permit) = crate::roll_pause::live_runs::begin_launch(workspace_root) else {
+        return RoleTickOutcome::Failure(
+            "role launch refused: the daemon is pausing every agent for a version roll (#10831)"
+                .to_string(),
+        );
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -313,8 +322,9 @@ pub(super) fn run_role_with_timeout(
     crate::observability::lifecycle::role_child_spawned(pid);
     // #10831: list this run for the pause-and-roll H4 snapshot until it ends
     // (every return below drops the guard).
-    let _live_run = session.as_ref().map(|s| {
-        crate::roll_pause::live_runs::register(crate::roll_pause::live_runs::LiveRun {
+    let live_run = session
+        .as_ref()
+        .map(|s| crate::roll_pause::live_runs::LiveRun {
             item_id: s.item_id.clone(),
             role: role.to_string(),
             root: workspace_root.to_path_buf(),
@@ -333,8 +343,17 @@ pub(super) fn run_role_with_timeout(
             timeout,
             started_mono: Instant::now(),
             resume: s.resume.clone(),
-        })
-    });
+        });
+    // Registering consumes the permit. With no pause identity there is nothing
+    // to register, and the permit must still be released here: it holds the
+    // launch gate's lock.
+    let _live_run = match live_run {
+        Some(run) => Some(launch_permit.register(run)),
+        None => {
+            drop(launch_permit);
+            None
+        }
+    };
 
     let start = Instant::now();
     loop {

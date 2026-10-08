@@ -12,9 +12,21 @@
 //!
 //! Registration is an RAII [`LiveRunGuard`]: every return path of the role
 //! launcher drops it, so a finished run never lingers here.
+//!
+//! # The launch gate (Judge finding 3 on #10974)
+//!
+//! A role tick checks the drain flag when it starts, then prepares for a
+//! while before it spawns. A roll requested in between would snapshot before
+//! the run is registered and miss it. So a launch takes a [`LaunchPermit`]
+//! immediately before its spawn and registers through it: the permit holds
+//! the gate's lock across "spawn, then register", and is refused once H4 has
+//! closed the gate for the run's root ([`close_launches`], which takes the
+//! same lock). When `close_launches` returns, no launch for those roots is in
+//! progress and every run that did start is in [`snapshot`]. Like the sweep
+//! gate, a root is closed *by* a pause run and reopens when no run holds it.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -84,6 +96,70 @@ impl Drop for LiveRunGuard {
     }
 }
 
+/// Closed roots, each with the pause runs holding it closed.
+type ClosedRoots = BTreeMap<PathBuf, BTreeSet<String>>;
+
+/// The key that closes the gate for **every** root. The daemon's pause closes
+/// this, not a list of roots, so a role launch is refused however its
+/// workspace path happens to be spelled.
+#[must_use]
+pub fn all_roots() -> PathBuf {
+    PathBuf::new()
+}
+
+fn closed_roots() -> &'static Mutex<ClosedRoots> {
+    static CLOSED: OnceLock<Mutex<ClosedRoots>> = OnceLock::new();
+    CLOSED.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Permission to spawn one role run. Holds the launch gate's lock: take it
+/// immediately before the spawn and end it with [`LaunchPermit::register`]
+/// (or drop it when the spawn failed).
+#[derive(Debug)]
+pub struct LaunchPermit {
+    _gate: std::sync::MutexGuard<'static, ClosedRoots>,
+}
+
+impl LaunchPermit {
+    /// Register the spawned run, then release the gate.
+    #[must_use]
+    pub fn register(self, run: LiveRun) -> LiveRunGuard {
+        register(run)
+    }
+}
+
+/// A permit to launch a role run in `root`, or `None` while a roll's pause
+/// has closed the gate for it.
+#[must_use]
+pub fn begin_launch(root: &Path) -> Option<LaunchPermit> {
+    let closed = closed_roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let refused = closed.contains_key(root) || closed.contains_key(&all_roots());
+    (!refused).then(|| LaunchPermit { _gate: closed })
+}
+
+/// Close the launch gate for `roots` on behalf of pause run `owner`, or take
+/// `owner`'s hold off them. Waits for any launch that is between its spawn
+/// and its registration.
+pub fn close_launches(roots: &[PathBuf], owner: &str, closed: bool) {
+    let mut map = closed_roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for root in roots {
+        if closed {
+            map.entry(root.clone())
+                .or_default()
+                .insert(owner.to_string());
+        } else if let Some(owners) = map.get_mut(root) {
+            owners.remove(owner);
+            if owners.is_empty() {
+                map.remove(root);
+            }
+        }
+    }
+}
+
 /// Register a live role run until the returned guard is dropped.
 #[must_use]
 pub fn register(run: LiveRun) -> LiveRunGuard {
@@ -135,6 +211,44 @@ mod tests {
         assert!(snapshot().iter().any(|r| r.item_id == id));
         drop(guard);
         assert!(!snapshot().iter().any(|r| r.item_id == id));
+    }
+
+    /// #10974: a closed gate refuses a launch for its roots only, and a
+    /// launch that got its permit is registered before the gate can close.
+    #[test]
+    fn a_closed_gate_refuses_launches_for_its_roots_until_reopened() {
+        let root = PathBuf::from("/r/launch-gate-test");
+        let other = PathBuf::from("/r/launch-gate-test-other");
+        let id = "role-judge-launch-gate-test";
+        let permit = begin_launch(&root).expect("the gate starts open");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                close_launches(std::slice::from_ref(&root), "rp-old", true);
+                // What H4 reads next: the run that held the permit is listed.
+                let _ = tx.send(snapshot().iter().any(|r| r.item_id == id));
+            })
+        };
+        // The close waits for the launch in progress.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let guard = permit.register(LiveRun {
+            root: root.clone(),
+            ..run(id)
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), "registered before the close");
+        closer.join().unwrap();
+
+        assert!(begin_launch(&root).is_none(), "closed for the paused root");
+        assert!(begin_launch(&other).is_some(), "another root is untouched");
+        // A replacement run closes it too; the old run's late stand-down
+        // does not reopen it.
+        close_launches(std::slice::from_ref(&root), "rp-new", true);
+        close_launches(std::slice::from_ref(&root), "rp-old", false);
+        assert!(begin_launch(&root).is_none(), "still closed by the replacement");
+        close_launches(std::slice::from_ref(&root), "rp-new", false);
+        assert!(begin_launch(&root).is_some(), "reopened once no run holds it");
+        drop(guard);
     }
 
     #[test]

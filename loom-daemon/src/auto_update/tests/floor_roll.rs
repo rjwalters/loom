@@ -14,6 +14,7 @@
 use super::*;
 use crate::auto_update::roll_window::{RollWindowTuning, WindowGate};
 use crate::auto_update::supersede::ArmedRoll;
+use crate::auto_update::tick_telemetry::TickSummary;
 use crate::telemetry::kinds::auto_update_tick::TickDecisionKind;
 use std::sync::Mutex;
 
@@ -353,4 +354,72 @@ async fn an_unsatisfiable_floor_alerts_and_keeps_dispatching() {
     assert_eq!(summary.floor_stall, Some(stall.note()));
     let note = status.snapshot().note.unwrap_or_default();
     assert!(note.contains("DISPATCH CONTINUES"), "{note}");
+}
+
+/// One tick with settle 0 and a fresh fetch counter; returns the summary and
+/// the published note.
+fn tick(state: &mut AutoUpdateState, artifact: ArtifactResolution) -> (TickSummary, String) {
+    let status = AutoUpdateStatus::new(true);
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let mut probe = probe(artifact, &fetch_calls);
+    let trigger = Trigger::new(false);
+    let summary = run_tick(state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+    (summary, status.snapshot().note.unwrap_or_default())
+}
+
+/// The newest release is the running one: nothing for autoUpdate to do.
+fn current() -> ArtifactResolution {
+    resolved(artifact(RUNNING, Some(RUNNING), Some(SHA_A), Some(SHA_A)))
+}
+
+/// #10866 item 1: the ERROR line is logged when the stall starts and not on
+/// the next tick, while the stall itself is reported on both.
+#[test]
+fn a_standing_unsatisfiable_floor_alerts_once_and_is_reported_every_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Unsatisfiable);
+    let alerted: Vec<bool> = (0..2)
+        .map(|n| {
+            let (summary, note) = tick(&mut state, current());
+            assert!(summary.floor_stall.is_some(), "tick {n}");
+            assert!(note.contains("DISPATCH CONTINUES"), "tick {n}: {note}");
+            summary.floor_alerted
+        })
+        .collect();
+    assert_eq!(alerted, [true, false]);
+}
+
+/// #10866 item 4: a tick whose release resolution fails keeps the standing
+/// stall and its note, and is not a new alert.
+#[test]
+fn an_unresolved_tick_keeps_the_unsatisfiable_floor_alert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Unsatisfiable);
+    let (first, _) = tick(&mut state, current());
+    assert!(first.floor_alerted);
+
+    let (second, note) = tick(&mut state, unresolved());
+    assert_eq!(second.floor_stall, first.floor_stall);
+    assert!(second.floor_stall.is_some());
+    assert!(note.contains("FLEET FLOOR UNSATISFIABLE"), "{note}");
+    assert!(note.contains("DISPATCH CONTINUES"), "{note}");
+    assert!(!second.floor_alerted);
+}
+
+/// #10866 item 3: a latest release whose version the floor's parser rejects
+/// is "unresolved", never an unsatisfiable floor.
+#[test]
+fn an_unparseable_latest_version_is_unresolved_not_a_stall() {
+    for floor in [Floor::Below, Floor::Unsatisfiable] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = floored(tmp.path(), floor);
+        let odd = resolved(artifact("0.19.900-rc1", Some(RUNNING), Some(SHA_A), Some(SHA_A)));
+        let (summary, note) = tick(&mut state, odd);
+        assert_eq!(summary.floor_stall, None, "{floor:?}");
+        assert!(!summary.floor_alerted, "{floor:?}");
+        assert!(state.floor.stall().is_none(), "{floor:?}");
+        assert!(note.contains("is below the fleet floor"), "{floor:?}: {note}");
+        assert!(note.contains("0.19.900-rc1"), "{floor:?}: {note}");
+        assert!(!note.contains("FLEET FLOOR UNSATISFIABLE"), "{floor:?}: {note}");
+    }
 }

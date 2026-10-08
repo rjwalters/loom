@@ -165,3 +165,34 @@ fn spawn_h5(
         log::info!("pause_resume: H5 ended: {outcome:?}");
     });
 }
+
+#[cfg(test)]
+mod tests {
+    /// The startup order H5 depends on (design §7 H5 "Entry", #10979), pinned
+    /// on the daemon's own startup source: recovery is held off before the
+    /// first registry is reconstructed; the drain state (with any fleet
+    /// `paused` hold the startup fleet-sync pass found) exists before H5 is
+    /// spawned; and H5 holds dispatch before any dispatch producer starts.
+    #[test]
+    fn startup_arms_before_recovery_and_holds_before_any_producer() {
+        let src = include_str!("../../daemon_service.rs");
+        let at = |needle: &str| {
+            src.find(needle)
+                .unwrap_or_else(|| panic!("daemon_service.rs no longer contains `{needle}`"))
+        };
+        let arm = at("auto_update::pause_resume::arm_at_startup()");
+        let spawn = at("h5.spawn(");
+        assert!(arm < at("sweep.reconstruct()"), "armed before the first reconstruct");
+        assert!(arm < at("spawn_startup_passes("), "and before startup claim reconciliation");
+        assert!(arm < at("seed_capacity_from_journal("), "and before the journal capacity seed");
+        assert!(at("fleet_state::wire(") < spawn, "the fleet hold is applied before H5 starts");
+        for producer in [
+            "epic_supervisor::spawn_multi_supervisor_thread(",
+            "spawn_multi_work_finder_task(",
+            "spawn_multi_role_task(",
+            "spawn_auto_update_task(",
+        ] {
+            assert!(spawn < at(producer), "H5 holds dispatch before `{producer}`");
+        }
+    }
+}

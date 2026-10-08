@@ -28,6 +28,7 @@
 - [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
 - [Per-workspace priority tiers (#3946)](#per-workspace-priority-tiers-3946)
 - [Forge-side pipeline snapshot (`status --pipeline`, #3977)](#forge-side-pipeline-snapshot-status---pipeline-3977)
+- [Section-scoped status (`status --json --section`, #10787)](#section-scoped-status-status---json---section-10787)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
 - [ETA tracker (`autonomous.eta`, #9289)](#eta-tracker-autonomouseta-9289)
 - [Reaper task](#reaper-task)
@@ -237,8 +238,9 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
 | `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
 | `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
-| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items}` (the manifest could not be written; nothing was signalled) |
-| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`) |
+| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
+| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`; a standing refusal is published once, then at most every 5 minutes) |
 | `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
 | `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
 | `daemon.roll.item` (`stage: "resume"`) | Pause-and-roll resume (#10832) | `{stage, manifest_id, item_id, new_item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, running_version, resumed_on, verify_probation_secs, resume_budget_secs, forge}` (one per agent H5 resumed, requeued, completed or handed to restart recovery) |
@@ -2849,6 +2851,72 @@ managed repo, fetched *after* the IPC round-trip completes:
   `with_merge_window(Duration)` widens/narrows the merge-throughput window from
   its 24h default. A masked-off metric is left `None`; a caller that masks a
   metric off simply must not read it.
+
+## Section-scoped status (`status --json --section`, #10787)
+
+A full `loom-daemon status --json` builds the whole report — `O(registered
+repos)`, 10–21 s across ~58 repos on a busy dispatcher — and then runs the
+CLI's own collectors (the per-account token probe, the git staleness check,
+the worktree disk walk). A caller that reads two or three fields can ask for
+only those:
+
+```bash
+loom-daemon status --json --section daemon_build,auto_update
+loom-daemon status --json --section drain --section in_flight
+```
+
+- **Names** — `--section` takes the payload's top-level keys, comma-separated
+  and repeatable, and requires `--json`. A section that groups several keys is
+  named for its base key: `in_flight` is `in_flight` + `in_flight_count`, and
+  `preflight_advisory`, `observability` and `role_runner` group their
+  `*_`-prefixed keys. `loom-daemon status --help` lists every valid name; an
+  unknown one is a usage error (exit 2) naming them all.
+- **Output** — the same JSON object with only the selected keys. Without
+  `--section` the output is unchanged.
+- **What it skips** — the daemon builds only the phases a selected section
+  reads (`loom_daemon::status_section::SectionSet`), and the CLI skips its
+  collectors for unselected sections. `daemon_build`, `auto_update` and the
+  other process-level sections walk no registered repo at all.
+- **What still walks every repo** — anything derived from the live sweep list:
+  `in_flight`, `unregistered_locked`, `stale_sweeps`, `capacity_bound`,
+  `role_agents` and `drain` (the last three for the in-flight count), plus
+  `per_repo`, `worktrees` and `pipeline`, which also run the per-repo detail
+  phases. Do not pick `drain` or `role_agents` as a "cheap" poll.
+- **Interactions** — `pipeline` still needs `--pipeline` (else `null`). The
+  autonomy-mismatch exit code applies only when `protection` is selected.
+- **Wire** — a selection is sent as `Request::DaemonStatusSections { sections
+  }`; a selection naming every section is sent as the plain `DaemonStatus`
+  frame. The reply is the same `Response::DaemonStatus`. The daemon refuses a
+  frame with an empty `sections` list with an error reply.
+- **Version skew** — an unreachable daemon gets the usual unreachable payload
+  (`--section` ignored). A daemon older than the CLI rejects the frame, which
+  the CLI reports as `daemon too old for --section` (exit 1).
+
+### Concurrent status requests share one build (#10861)
+
+A status build cannot be cancelled once it has started, so a client that
+times out and retries used to leave its first build running and start a
+second. The daemon now runs **at most one build per section set at a time**
+(`ipc/status_off_runtime.rs`): a request that arrives while a build for the
+same set is in flight waits for that build's report.
+
+- **Keyed by section set.** Order and duplicates do not matter, and an
+  all-sections request shares the full build. Different sets never wait on
+  each other, so `--section daemon_build,auto_update` still answers quickly
+  while a full build is running.
+- **In flight only.** A finished report is never reused: a request arriving
+  after a build has completed starts a new one, so `status` straight after
+  `drain` / `halt` / `release` reflects the action. A request that *joins* a
+  build can receive a snapshot whose build began up to one build-duration
+  earlier.
+- **Drain is always live.** The `drain` block is overlaid per request, after
+  the shared build, so it is current even on a joined build.
+- **Failures.** If the shared build panics or its task does not complete,
+  every waiting request gets an error reply (never a dropped connection), and
+  the next request builds afresh.
+- **Telemetry.** `loom.daemon.ipc.requests{kind=DaemonStatus}` still counts
+  every request; `loom.daemon.ipc.status_builds{outcome}` counts the builds
+  ([`telemetry-schema.md`](telemetry-schema.md)).
 
 ## One-shot fleet vitals (`loom-daemon health`, #4761)
 
@@ -6330,6 +6398,18 @@ nothing to do" must never accrete toward a `loom:blocked` hold, and
 `noopCooldown` is the right brake for it. Defaults **on**; disable with
 `LOOM_WORK_FINDER_PRLESS_RETRY=0` or
 `autonomous.workFinder.prlessRetry.enabled = false`.
+
+**Phaseless deaths have a durable floor (#10642).** The tally above is
+in-memory: a daemon restart resets it, and a streak more than `maxBackoffSecs`
+old goes cold. Sweeps that die before any phase checkpoint with no classifier
+label (`failure_class = unclassified:no-phase-signal`, ~90 s each) slipped
+through both on `2AMLogic/2am` — 278 in a day, one issue 47 times. For that
+class only, this host's own count of such deaths for the issue in the last 24 h
+is read back from the `sweep.outcome` journal and used as a lower bound on the
+consecutive count, so the hold lands at `threshold` per issue per day
+regardless of restarts or spacing. A landing in the journal, or any clear above
+(open PR, merge, self-reported no-op), ends that count. The hold comment
+carries the record's `no_phase_cause` (exit code, last step, reason).
 
 **Verified-open-PR memo (#6788).** The three brakes above bound how often an
 issue is *re-dispatched*. A fourth, narrower problem sits one layer down, in the
@@ -11839,13 +11919,17 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   (in the Loom repository). H3 → H4 below is the old binary's side; the next
   start's side (H5, #10832) follows it.
   - **What it does (H4).** It sets the same dispatch-pause flag, with origin
-    `pause-roll`, then: waits for `Pending` dispatches to settle; snapshots every
-    daemon-dispatched agent (sweeps in every managed root, plus role runs);
+    `pause-roll`, then: closes dispatch in every registry and in the role
+    runner (a dispatch that had already passed the flag is refused too) and
+    waits, for at most 30s, for any dispatch that is mid-spawn to be recorded;
+    snapshots every daemon-dispatched agent (sweeps in every managed root, plus role runs);
     writes the pause manifest (`roll-pause-manifest.json` in the auto-update
     state dir, `phase = pausing`) **before signalling anything**; stops at once
     every agent it will not resume; asks the rest to stop at a **safe point** (a
     moment between tool calls, via the `roll-pause` hook) and stops each one's
-    whole process tree as soon as its safe-point record appears; refreshes each
+    whole process tree as soon as its safe-point record **for this pause**
+    appears (a record left by an earlier pause that stood down is never
+    trusted); refreshes each
     paused agent's lease once; requeues whatever has not parked when
     `pauseRoll.pauseBudgetSecs` runs out; does the requeue forge writes; rewrites
     the manifest with `phase = paused`; and exits for the supervised relaunch.
@@ -11867,8 +11951,12 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     pause has taken it over.
   - **Process trees.** Stopping an agent stops everything it started: the
     recorded systemd scope when it really exists (`systemctl --user stop`), and
-    always a freeze-first kill of its process group, its descendants (followed
-    through `setsid`) and every process working in its worktree. A recorded
+    always a freeze-first kill of its process group and its descendants
+    (followed through `setsid`). Nothing else is signalled: a process is not
+    part of the tree because it runs in the agent's worktree, the daemon, its
+    ancestors and its other children are excluded before descendants are
+    followed, and a pid is signalled only while its start time is still the one
+    recorded at the snapshot (a recycled pid is left alone). A recorded
     scope unit that was never created falls back to that tree kill. A
     containerized (session-exec) agent's invocation is cancelled through the
     spawn script's `.cancel` marker; the session container keeps running.
@@ -11878,7 +11966,19 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     did not take and is still backing off: the roll is **refused** (`daemon.roll.refused`, ERROR) and
     nothing is paused. A manifest that cannot be written aborts the pause before
     anything is signalled and dispatch resumes (`daemon.roll.pause_failed`).
-    There is no drain fallback in any of these cases.
+    There is no drain fallback in any of these cases. While the previous
+    roll's manifest stays live the refusal repeats on every tick; it is logged
+    and published once per manifest, then at most every 5 minutes.
+  - **It always ends.** Every command H4 runs is bounded, and the pause as a
+    whole has a deadline: its settle window, `pauseBudgetSecs`, the 30s forge
+    floor and a 90s margin (270s with the defaults). Past it, a pause that has
+    stopped nothing is ended, its requests, holds and manifest are removed and
+    dispatch resumes (`daemon.roll.pause_failed`); one that has already stopped
+    an agent kills what is left by process group, records those agents
+    `requeue` / `planned` / `pause-budget-missed` in the manifest (left at
+    `phase = pausing`, which the next start finishes) and restarts
+    (`daemon.roll.forced`). Dispatch is never left paused with
+    `--abort-drain` refused.
   - **Operator commands during a pause.** Until the pause has stopped an agent,
     `restart --drain` promotes it to an ordinary operator drain (the pause
     withdraws its requests, deletes its manifest and stops nothing) and
@@ -11892,8 +11992,12 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     crash) holds dispatch and, in order: keeps restart recovery off the paused
     agents (`reconstruct`, dead-pid claim reclaim, the sweep reaper and the
     orphan-process and worktree reapers all skip the manifest's items, from
-    their first pass); reaps anything of a paused agent's process tree that is
-    still alive (`daemon.roll.item.residue_reaped`); **refreshes the lease of
+    their first pass); reaps anything of a paused agent's recorded process tree
+    that is still alive (`daemon.roll.item.residue_reaped`: the recorded pid
+    and its group, only while the pid is still the recorded process, and the
+    scope unit; never by worktree, so a pause H4 had to finish by force is
+    re-checked rather than trusted, and a session whose old tree survives the
+    reap is requeued, not resumed); **refreshes the lease of
     every agent it will resume, first**; then waits out **health probation**
     (`pauseRoll.verifyProbationSecs`: IPC answering and the heartbeat fresh,
     sustained). Only then does it relaunch each paused agent **from its saved
@@ -11949,9 +12053,15 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   - **Operator commands during H5.** `restart --abort-drain` is **refused**
     while H5 holds dispatch (the hold ends by itself, within the probation and
     resume budgets). A real `restart --drain` replaces the hold; H5 then stops
-    relaunching and the next start finishes the manifest. A hold already in
-    force at startup (an operator stop, a fleet `paused` state) is respected:
-    H5 waits for it and resumes nothing meanwhile.
+    relaunching and the next start finishes the manifest. An operator stop
+    already in force at startup is respected: H5 waits for it, resumes nothing
+    meanwhile, and gives the claims back once the manifest is stale.
+  - **A fleet-paused host (#10979).** A fleet `paused` state lets in-flight
+    work finish, and the paused agents are in-flight work: H5 resumes them
+    under the fleet hold and releases nothing, so the host does not dispatch
+    after H5. The startup fleet-sync pass re-applies `paused` before H5 is
+    spawned; a `paused` that arrives while H5 holds dispatch takes the hold
+    over in place.
   - **Where to look.** `status --json` → `drain.resume`: the manifest id and
     phase, the H5 step, `resumed_on`, counts of resumed / completed / recovered
     agents, requeues by reason, and the observed `probation_secs`,

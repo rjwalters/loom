@@ -3,6 +3,9 @@
 
 use super::fake_host::FakeHost;
 use super::*;
+use crate::auto_update::pause_resume::test_support::{
+    arm_for, fake_gh, gh_calls, real_registry, RegistryHost,
+};
 
 /// Rollback safety, end to end through H3: the old binary comes back, runs
 /// H5 on the manifest of the roll that did not take, and the very next roll
@@ -65,153 +68,6 @@ async fn the_old_binary_does_not_pause_again_for_the_target_that_just_failed() {
 // Integration: real registries, real processes, the real recovery passes
 // ============================================================================
 
-/// A [`ResumeHost`] over one real sweep registry (the production sweep ops).
-struct RegistryHost {
-    registry: Arc<Mutex<SweepRegistry>>,
-    events: Mutex<Vec<(String, serde_json::Value)>>,
-    drain: DrainState,
-    launches: Mutex<Vec<String>>,
-}
-
-impl RegistryHost {
-    fn new(registry: SweepRegistry) -> Arc<Self> {
-        Arc::new(Self {
-            registry: Arc::new(Mutex::new(registry)),
-            events: Mutex::default(),
-            drain: DrainState::new(),
-            launches: Mutex::default(),
-        })
-    }
-}
-
-impl ResumeHost for RegistryHost {
-    fn hold_dispatch(&self) -> bool {
-        self.drain.hold_for_roll_resume("resuming".to_string())
-    }
-    fn dispatch_held(&self) -> bool {
-        self.drain.is_roll_resume_held()
-    }
-    fn health_sample(&self) -> Result<(), String> {
-        Ok(())
-    }
-    fn safe_point(&self, item: &ManifestItem) -> Option<SafePointRecord> {
-        host::disk_safe_point(item)
-    }
-    fn reap_residue(&self, item: &ManifestItem, scope_only: bool) -> TeardownReport {
-        host::reap_residue(item, scope_only)
-    }
-    fn refresh_lease(&self, item: &ManifestItem, timeout: Duration) -> Result<(), String> {
-        sweeps::refresh_lease(&self.registry, item, timeout)
-    }
-    fn already_resumed(&self, item: &ManifestItem) -> Option<String> {
-        sweeps::already_resumed(&self.registry, item)
-    }
-    fn check(
-        &self,
-        item: &ManifestItem,
-        launch: &RollResumeLaunch,
-    ) -> Result<(), RollResumeRefusal> {
-        sweeps::check(&self.registry, item, launch)
-    }
-    fn launch(
-        &self,
-        item: &ManifestItem,
-        launch: &RollResumeLaunch,
-        _wait: Duration,
-    ) -> Result<Launched, RollResumeRefusal> {
-        self.launches.lock().unwrap().push(item.id.clone());
-        sweeps::launch(&self.registry, item, launch)
-    }
-    fn liveness(&self, item: &ManifestItem, launched: &Launched) -> Liveness {
-        sweeps::liveness(&self.registry, item, launched)
-    }
-    fn abandon(&self, _item: &ManifestItem, launched: &Launched) {
-        sweeps::abandon(&self.registry, launched);
-    }
-    fn settle(&self, manifest_id: &str, item: &ManifestItem, new_item_id: &str) {
-        roll_pause::suppress::release_item(manifest_id, &item.id);
-        roll_pause::hold::release(new_item_id);
-    }
-    fn requeue(
-        &self,
-        item: &ManifestItem,
-        notice: &RollRequeueNotice,
-        forge: bool,
-    ) -> Result<(), String> {
-        sweeps::requeue(&self.registry, item, notice, forge)
-    }
-    fn recover(&self, manifest_id: &str, item: &ManifestItem) {
-        roll_pause::suppress::release_item(manifest_id, &item.id);
-        sweeps::recover(&self.registry, item);
-    }
-    fn finish(&self, manifest_id: &str, note: &str) {
-        roll_pause::suppress::disarm(manifest_id);
-        self.drain.release_roll_resume_hold(note.to_string());
-    }
-    fn emit(&self, topic: &str, payload: serde_json::Value) {
-        self.events
-            .lock()
-            .unwrap()
-            .push((topic.to_string(), payload));
-    }
-    fn publish(&self, _status: &PauseResumeStatus) {}
-}
-
-fn executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    if let Ok(f) = std::fs::File::open(path) {
-        let _ = f.sync_all();
-    }
-}
-
-/// A fake `gh` that logs every call. Issues are open; `labels` are every
-/// issue's labels; there are no lease records.
-fn fake_gh(root: &Path, labels: &str) -> (PathBuf, PathBuf) {
-    let (gh, log) = (root.join("fake-gh.sh"), root.join("gh.log"));
-    executable(
-        &gh,
-        &format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\n\
-             if [[ \"$1\" == repo && \"$2\" == view ]]; then echo rjwalters/loom; exit 0; fi\n\
-             if [[ \"$1\" == issue && \"$2\" == view ]]; then echo false; exit 0; fi\n\
-             if [[ \"$1\" == api && \"$*\" == */comments* ]]; then exit 0; fi\n\
-             if [[ \"$1\" == api && \"$*\" == *is_pr* ]]; then echo '{state}'; exit 0; fi\n\
-             if [[ \"$1\" == api && \"$2\" == repos/* ]]; then printf '%s\\n' {labels}; exit 0; fi\n\
-             exit 0\n",
-            log = log.display(),
-            state = test_support::state_probe_json("open", false),
-        ),
-    );
-    (gh, log)
-}
-
-/// A spawn script that stays up like a session, or exits with `exit`.
-fn spawn_bin(root: &Path, body: &str) -> PathBuf {
-    let scripts = root.join(".loom").join("scripts");
-    std::fs::create_dir_all(&scripts).unwrap();
-    let bin = scripts.join("spawn-claude.sh");
-    executable(&bin, &format!("#!/usr/bin/env bash\n{body}\n"));
-    bin
-}
-
-fn real_registry(root: &Path, gh: Option<PathBuf>, spawn_body: &str) -> SweepRegistry {
-    let mut config = SweepRegistryConfig::new(root.to_path_buf());
-    config.spawn_bin = Some(spawn_bin(root, spawn_body));
-    config.skip_label_flip = gh.is_none();
-    config.gh_bin = gh;
-    config.journal_path = Some(root.join("sweeps.json"));
-    if !config.skip_label_flip {
-        // A resume re-admits the recorded runtime, as a dispatch does.
-        test_support::install_runtime_admission_fixture(root);
-    }
-    SweepRegistry::new(config)
-}
-
-fn gh_calls(log: &Path) -> String {
-    std::fs::read_to_string(log).unwrap_or_default()
-}
-
 /// Leave `issue` as H4 leaves a paused sweep and return its manifest item.
 fn paused_on_disk(
     reg: &SweepRegistry,
@@ -248,20 +104,6 @@ fn lock_file(root: &Path, issue: u32) -> PathBuf {
     root.join(format!(".loom/locks/issue-{issue}/owner.json"))
 }
 
-fn held(root: &Path, m: &PauseManifest) {
-    roll_pause::suppress::arm(
-        &m.manifest_id,
-        m.items
-            .iter()
-            .map(|i| roll_pause::suppress::HeldItem {
-                id: i.id.clone(),
-                repo: root.to_path_buf(),
-                issue: i.issue,
-            })
-            .collect(),
-    );
-}
-
 /// AC, end to end over a real registry: while the manifest is live, restart
 /// recovery (`reconstruct`), the reaper, the live-claim probe behind claim
 /// reconciliation and a fresh dispatch are all blocked for its items; H5 then
@@ -286,7 +128,7 @@ fn a_live_manifest_blocks_recovery_until_h5_resumes_or_requeues_each_item() {
     write(&plan, &m);
 
     // ---- Edge 1: armed before the first recovery pass ----------------------
-    held(&root, &m);
+    arm_for(&root, &m);
     assert!(!roll_pause::suppress::host_verified());
     assert_eq!(reg.reconstruct().unwrap(), 0, "no Crashed entry for a paused item");
     assert!(
@@ -502,7 +344,7 @@ fn a_pre_10715_binary_recovers_every_claim_and_a_later_start_does_not_double_dis
     let mut stale = m.clone();
     stale.roll.pause_started_at = Utc::now() - chrono::Duration::seconds(1000);
     write(&plan, &stale);
-    held(&root, &stale);
+    arm_for(&root, &stale);
     let host = RegistryHost::new(reg);
     let status = finished(run_h5(host.clone(), &plan));
 
@@ -536,7 +378,7 @@ fn a_later_start_inside_the_ttl_re_checks_the_claim_before_resuming() {
     reg.reap_once();
     let before = gh_calls(&gh_log);
 
-    held(&root, &m);
+    arm_for(&root, &m);
     let host = RegistryHost::new(reg);
     let status = finished(run_h5(host.clone(), &plan));
 
@@ -634,10 +476,10 @@ fn a_resumed_sweeps_liveness_is_read_from_its_child_and_its_own_log_region() {
     );
 }
 
-/// The residue spec never names a pid that is not provably the recorded
-/// process, and an H4-requeued item contributes only its own scope.
+/// Teardown reach at H5 (PR 2's rule): the residue of an item is its recorded
+/// pid and group, identity-checked, and its scope. Never its worktree.
 #[test]
-fn the_residue_spec_is_identity_checked_and_scoped() {
+fn the_residue_spec_is_the_recorded_identity_and_never_the_worktree() {
     let dir = tempfile::tempdir().unwrap();
     let mut it = sweep(dir.path(), "s-1", 1);
     it.scope_unit = Some("loom-agent-s-1.scope".to_string());
@@ -647,18 +489,95 @@ fn the_residue_spec_is_identity_checked_and_scoped() {
         head: None,
         dirty: None,
     });
-    // The recorded pid is dead: never signalled, whatever reuses the number.
-    let spec = host::residue_spec(&it, false);
-    assert_eq!((spec.pid, spec.pgid), (None, None));
+    let observed = Utc::now() - chrono::Duration::seconds(42);
+    it.pid_started_at = Some(rfc3339(observed));
+    let spec = host::residue_spec(&it);
+    assert_eq!((spec.pid, spec.pgid), (it.pid, it.pgid));
+    assert_eq!(spec.pid_started_at.map(rfc3339), Some(rfc3339(observed)));
+    assert_eq!(spec.recorded_started_at, it.run_started_at);
     assert_eq!(spec.scope_unit.as_deref(), Some("loom-agent-s-1.scope"));
-    assert!(spec.worktree.is_some());
-    assert!(host::residue_spec(&it, true).worktree.is_none(), "scope-only");
-    // This test process is alive, but started long before "now": a recorded
-    // start time in the future of the process's own start pairs with it.
-    it.pid = Some(std::process::id());
-    it.pgid = Some(std::process::id());
-    it.run_started_at = Some(Utc::now());
-    assert_eq!(host::residue_spec(&it, false).pid, Some(std::process::id()));
-    it.run_started_at = None;
-    assert_eq!(host::residue_spec(&it, false).pid, None, "no recorded start, no identity");
+    // `TreeSpec` has no worktree seed at all: nothing to assert but its shape.
+    let crate::auto_update::pause_roll::teardown::TreeSpec {
+        pid: _,
+        pid_started_at: _,
+        recorded_started_at: _,
+        pgid: _,
+        scope_unit: _,
+    } = spec;
+}
+
+/// A long-lived process in its own group, as an agent's leader is.
+fn live_process() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("300").process_group(0);
+    cmd.spawn().unwrap()
+}
+
+/// A forced H4 finish records a kill it never verified (`requeue`, `planned`,
+/// `pause-budget-missed`, `stopped_at` set, `phase = pausing`). H5 must not
+/// take that on trust. An agent that is in fact still alive, and still the
+/// recorded process, is stopped before its claim is released; a live process
+/// that merely wears the recorded pid number (another start time) is never
+/// signalled.
+#[test]
+fn an_unverified_forced_kill_is_re_checked_by_pid_and_start_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let plan = plan(&root);
+    let mut survivor = live_process();
+    let mut stranger = live_process();
+    let starts =
+        crate::auto_update::pause_roll::teardown::observe_starts(&[survivor.id(), stranger.id()]);
+    let forced = |id: &str, issue: u32, child: &std::process::Child, started: DateTime<Utc>| {
+        let mut it = sweep(&root, id, issue);
+        it.disposition = Disposition::Requeue;
+        it.status = ItemStatus::Planned;
+        it.reason = Some(REASON_BUDGET_MISSED.to_string());
+        it.safe_point = None;
+        it.pid = Some(child.id());
+        it.pgid = Some(child.id());
+        it.pid_started_at = Some(rfc3339(started));
+        it.run_started_at = Some(started);
+        it
+    };
+    let really_ours = forced("survived", 401, &survivor, starts[&survivor.id()]);
+    // The same pid number, but the manifest recorded a process that started
+    // an hour before this one: the number was recycled.
+    let recycled =
+        forced("recycled", 402, &stranger, starts[&stranger.id()] - chrono::Duration::hours(1));
+    let mut m = manifest("rp-forced", Phase::Pausing, vec![really_ours, recycled]);
+    m.roll.pause_completed_at = None;
+    m.events.push(ManifestEvent {
+        at: rfc3339(Utc::now()),
+        by_version: Some("0.19.887".to_string()),
+        item: None,
+        event: "h4_forced".to_string(),
+        detail: Some("the pause did not finish within its H4 deadline".to_string()),
+    });
+    write(&plan, &m);
+    let host = RegistryHost::new(real_registry(&root, None, "sleep 300"));
+
+    let status = finished(run_h5(host.clone(), &plan));
+
+    assert!(
+        test_support::wait_for_condition(20_000, || matches!(survivor.try_wait(), Ok(Some(_)))),
+        "the agent the forced kill missed is still running"
+    );
+    assert!(matches!(stranger.try_wait(), Ok(None)), "a recycled pid number was signalled");
+    assert_eq!(status.residue_reaped, 1);
+    assert_eq!(status.requeued_by_reason[REASON_BUDGET_MISSED], 2);
+    let done = archived(&plan, "rp-forced");
+    assert_eq!(done.phase, Phase::Resumed);
+    assert!(done.events.iter().any(|e| e.event == "h4_forced"), "H4's events are kept");
+    assert!(done
+        .events
+        .iter()
+        .any(|e| e.event == "residue_reaped" && e.item.as_deref() == Some("survived")));
+    assert!(!done
+        .events
+        .iter()
+        .any(|e| e.event == "residue_reaped" && e.item.as_deref() == Some("recycled")));
+    let _ = stranger.kill();
+    let _ = stranger.wait();
 }

@@ -135,6 +135,7 @@ mod quarantine_escalation;
 pub(crate) mod reaper;
 mod restore_to_ready;
 pub(crate) mod resume_handle;
+pub(crate) mod roll_gate;
 pub(crate) mod roll_requeue;
 pub(crate) mod roll_resume;
 mod spawn_process;
@@ -679,7 +680,7 @@ pub struct SweepRegistry {
     /// self-reported conclusion), [`dispatch_backoff`](Self::dispatch_backoff)
     /// (a crash/no-progress cadence), [`decline_cooldown`](Self::decline_cooldown)
     /// (a standing question) and the quarantine tally (a fast-crash brake).
-    prless_retry: HashMap<u32, PrlessRetryState>,
+    prless_retry: PrlessTally,
     /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
     /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
     /// consumed only by it. See [`OpenPrMemoEntry`] and
@@ -848,6 +849,8 @@ pub struct SweepRegistry {
     /// tie-break, spawn failure) never wedges the key against a later,
     /// legitimate same-key dispatch.
     inflight_idempotency: HashMap<String, SweepId>,
+    /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
+    roll_gate: roll_gate::RollGate,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1073,6 +1076,8 @@ pub struct PreparedIssueDispatch {
     /// `None` for an unsized issue, a defective points label set, or a skipped
     /// label read — never `0`.
     pub(crate) story_points: Option<u32>,
+    /// #10974: counts this dispatch as mid-spawn until it is dropped (`roll_gate`).
+    pub(crate) mid_spawn: roll_gate::MidSpawn,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
@@ -1177,7 +1182,7 @@ impl SweepRegistry {
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
-            prless_retry: HashMap::new(),
+            prless_retry: PrlessTally::default(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -1188,6 +1193,7 @@ impl SweepRegistry {
             activity_window: None,
             owner_repo_cache: Mutex::new(None),
             inflight_idempotency: HashMap::new(),
+            roll_gate: roll_gate::RollGate::default(),
         }
     }
 

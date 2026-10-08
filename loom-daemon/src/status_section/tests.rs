@@ -96,6 +96,36 @@ fn root_phases_follow_the_sections_that_read_them() {
     assert!(all.needs_cpu_sample() && all.needs_token_probe());
 }
 
+/// Every section derived from the live sweep list walks the roots. Dropping
+/// one from [`SectionSet::walks_roots`] would not fail a build — it would
+/// silently report zero in flight (`drain`'s roll projection,
+/// `role_agents.total_with_sweeps`, `capacity_bound`) or an empty list.
+#[test]
+fn every_section_reading_the_sweep_list_walks_the_roots() {
+    for section in [
+        StatusSection::InFlight,
+        StatusSection::Drain,
+        StatusSection::RoleAgents,
+        StatusSection::CapacityBound,
+        StatusSection::StaleSweeps,
+        StatusSection::UnregisteredLocked,
+    ] {
+        let set = SectionSet::only([section]);
+        assert!(set.walks_roots(), "{section} must walk the registered roots");
+        assert!(!set.walks_root_detail(), "{section} reads no per-repo row");
+    }
+}
+
+/// Only a selection naming no section is empty: not the full set, and not
+/// an all-sections selection (which is the full set).
+#[test]
+fn only_a_selection_of_no_section_is_empty() {
+    assert!(SectionSet::only([]).is_empty());
+    assert!(!SectionSet::all().is_empty());
+    assert!(!SectionSet::only([StatusSection::Drain]).is_empty());
+    assert!(!SectionSet::only(StatusSection::all().iter().copied()).is_empty());
+}
+
 #[test]
 fn retain_keys_is_a_no_op_for_the_full_set_and_filters_otherwise() {
     let full = serde_json::json!({

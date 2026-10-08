@@ -54,6 +54,7 @@ fn sweep_outcome_omits_complexity_when_no_marker_was_read() {
         complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,

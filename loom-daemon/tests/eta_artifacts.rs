@@ -335,6 +335,7 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         as_of: row.as_of,
         rows: vec![row.clone()],
         rows_truncated: 0,
+        alternates_truncated: 0,
         rows_truncated_by_kind: Default::default(),
     };
     let section = SCHEMA_DOC

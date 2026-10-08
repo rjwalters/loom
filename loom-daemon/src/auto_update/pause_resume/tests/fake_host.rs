@@ -24,6 +24,8 @@ pub(super) struct FakeHost {
     pub(super) parked: Mutex<BTreeSet<String>>,
     /// Items with residue.
     pub(super) residue: Mutex<BTreeSet<String>>,
+    /// Pids that survive the residue reap.
+    pub(super) survivors: Mutex<Vec<u32>>,
     /// Items whose requeue forge write fails.
     pub(super) requeue_fails: Mutex<BTreeSet<String>>,
     /// Health samples that fail before health holds.
@@ -61,16 +63,13 @@ impl FakeHost {
 }
 
 impl ResumeHost for FakeHost {
-    fn hold_dispatch(&self) -> bool {
+    fn hold_dispatch(&self) -> ResumeHold {
         let mut blocked = self.hold_blocked.lock().unwrap();
         if *blocked > 0 {
             *blocked -= 1;
-            return false;
+            return ResumeHold::Blocked;
         }
-        self.drain.hold_for_roll_resume("resuming".to_string())
-    }
-    fn dispatch_held(&self) -> bool {
-        self.drain.is_roll_resume_held()
+        self.drain.roll_resume_hold("resuming".to_string())
     }
     fn health_sample(&self) -> Result<(), String> {
         self.log("health".to_string());
@@ -81,7 +80,7 @@ impl ResumeHost for FakeHost {
         }
         Ok(())
     }
-    fn safe_point(&self, item: &ManifestItem) -> Option<SafePointRecord> {
+    fn safe_point(&self, item: &ManifestItem, _request: &PauseRequest) -> Option<SafePointRecord> {
         self.parked
             .lock()
             .unwrap()
@@ -92,11 +91,12 @@ impl ResumeHost for FakeHost {
                 parked_summary: None,
             })
     }
-    fn reap_residue(&self, item: &ManifestItem, scope_only: bool) -> TeardownReport {
-        self.log(format!("residue {}{}", item.id, if scope_only { " scope-only" } else { "" }));
+    fn reap_residue(&self, item: &ManifestItem) -> TeardownReport {
+        self.log(format!("residue {}", item.id));
         if self.residue.lock().unwrap().contains(&item.id) {
             return TeardownReport {
                 pids: vec![4242, 4243],
+                survivors: self.survivors.lock().unwrap().clone(),
                 ..TeardownReport::default()
             };
         }

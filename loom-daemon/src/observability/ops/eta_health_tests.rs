@@ -111,7 +111,13 @@ fn full_fixture_emits_every_gauge_with_its_labels_and_values() {
         gate: Some("captain".into()),
         last_tick: Some(now() - Duration::minutes(5)),
         refresh_repos: BTreeMap::from([("no_reader".to_string(), 2)]),
-        snapshot_rows: Some((7, 3)),
+        snapshot_stats: Some(SnapshotStats {
+            rows: 7,
+            alternates_rows: 3,
+            rows_truncated: 2,
+            alternates_truncated: 4,
+            bytes: 9_000,
+        }),
         ..Facts::default()
     };
     let p = points(&facts);
@@ -136,6 +142,9 @@ fn full_fixture_emits_every_gauge_with_its_labels_and_values() {
     assert_eq!(value(repos[0]), 2);
     assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotRows, None)[0]), 7);
     assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotAlternatesRows, None)[0]), 3);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotRowsTruncated, None)[0]), 2);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotAlternatesTruncated, None)[0]), 4);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotBytes, None)[0]), 9_000);
     for point in &p {
         assert!(point
             .labels
@@ -243,7 +252,11 @@ fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
     )
     .unwrap();
     health.fit_check(now() - Duration::minutes(20), "no_snapshots");
-    health.snapshot(4, 1);
+    health.snapshot(SnapshotStats {
+        rows: 4,
+        alternates_rows: 1,
+        ..SnapshotStats::default()
+    });
     let (_, c) = capture(|| {
         export(dir.path(), "test-host", now(), &mut health);
         // The second pass reuses the mtime cache.

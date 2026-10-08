@@ -29,12 +29,33 @@
 //! | `request` | daemon | a pause is requested; removing it withdraws the request |
 //! | `inflight/<key>` | hook | one file per executing leaf tool call (the ledger) |
 //! | `parked/<key>` | hook | one file per parked call |
-//! | `safe-point.json` | hook | written once, atomically, when a call parks with an empty ledger |
+//! | `safe-point.json` | hook | written once per request, atomically, when a call parks with an empty ledger |
 //! | `handle.json` | spawn script | the live-captured resume handle (Codex) |
 //! | `claim.json` | hook | the claim label the agent took, if any ([`claim_breadcrumb`]) |
 //!
 //! A file per in-flight call, not a counter, so concurrent hooks never race on
 //! a read-modify-write: the count is the directory listing.
+//!
+//! # A safe point answers one request (Judge finding 2 on #10974)
+//!
+//! A safe-point record says "this agent is parked, with nothing running, for
+//! *this* pause request". It says nothing about a later request: by then the
+//! parked call has been released and the agent is running again. So the
+//! record carries the id of the request it answered
+//! ([`SafePoint::request_id`], the request's `manifest_id`), and:
+//!
+//! - the daemon accepts a record only for its current request
+//!   ([`read_safe_point_for`]);
+//! - the hook removes the record when its parked call is released (the
+//!   request was withdrawn), and replaces a record left by another request;
+//! - a pause that stands down removes its own record with its request
+//!   ([`stand_down`]), and a new request clears whatever record it finds
+//!   ([`request_pause`]).
+//!
+//! A record with no id comes from a hook older than this rule (a session
+//! container on an older image). It is accepted only when it was written at or
+//! after the request was raised; `request_pause` has already removed any that
+//! predates it.
 
 pub mod claim_breadcrumb;
 pub mod hold;
@@ -151,6 +172,10 @@ pub struct SafePoint {
     #[serde(default)]
     pub session_id: Option<String>,
     pub runtime: String,
+    /// The `manifest_id` of the pause request this record answers. `None`
+    /// from a hook that predates the field, or for a request with no id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Write `bytes` to `path` atomically: a temp file in the same directory,
@@ -174,13 +199,53 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Raise a pause request for an item (daemon side).
+/// Raise a pause request for an item (daemon side). A safe-point record
+/// already in the item dir answered an earlier request and is removed first:
+/// no call can be parked for a request that does not exist yet.
 ///
 /// # Errors
 /// When the request cannot be written.
 pub fn request_pause(item_dir: &Path, request: &PauseRequest) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(request).map_err(std::io::Error::other)?;
+    clear_safe_point(item_dir);
     write_atomic(&item_dir.join(REQUEST_FILE), &body)
+}
+
+/// The item's pause request, if one is raised and readable.
+#[must_use]
+pub fn read_request(item_dir: &Path) -> Option<PauseRequest> {
+    let raw = std::fs::read_to_string(item_dir.join(REQUEST_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Remove the item's safe-point record, whatever request it answered.
+pub fn clear_safe_point(item_dir: &Path) {
+    let _ = std::fs::remove_file(item_dir.join(SAFE_POINT_FILE));
+}
+
+/// Whether the request on disk is the one `manifest_id` raised. A request
+/// that cannot be read is nobody's.
+fn request_is(item_dir: &Path, manifest_id: &str) -> bool {
+    read_request(item_dir).is_some_and(|r| r.manifest_id.as_deref() == Some(manifest_id))
+}
+
+/// Withdraw the pause request `manifest_id` raised, and only that one: a
+/// request another pause has raised since is left alone. The safe-point
+/// record stays (the manifest of a completed pause refers to it).
+pub fn withdraw_for(item_dir: &Path, manifest_id: &str) {
+    if request_is(item_dir, manifest_id) {
+        let _ = withdraw(item_dir);
+    }
+}
+
+/// Undo `manifest_id`'s pause of one item: withdraw its request and remove
+/// the safe-point record that answered it. A request or record belonging to
+/// another pause is left alone.
+pub fn stand_down(item_dir: &Path, manifest_id: &str) {
+    withdraw_for(item_dir, manifest_id);
+    if read_safe_point(item_dir).is_some_and(|sp| sp.request_id.as_deref() == Some(manifest_id)) {
+        clear_safe_point(item_dir);
+    }
 }
 
 /// Withdraw a pause request. Parked calls are then released (allowed).
@@ -200,11 +265,29 @@ pub fn is_requested(item_dir: &Path) -> bool {
     item_dir.join(REQUEST_FILE).is_file()
 }
 
-/// The item's safe-point record, if the hook has written one.
+/// The item's safe-point record, if the hook has written one. It may answer
+/// any request: a caller acting on it wants [`read_safe_point_for`].
 #[must_use]
 pub fn read_safe_point(item_dir: &Path) -> Option<SafePoint> {
     let raw = std::fs::read_to_string(item_dir.join(SAFE_POINT_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// The item's safe-point record **for `request`**, or `None` when there is no
+/// record or it answered another request (see the module doc).
+#[must_use]
+pub fn read_safe_point_for(item_dir: &Path, request: &PauseRequest) -> Option<SafePoint> {
+    let sp = read_safe_point(item_dir)?;
+    let answers = match (&sp.request_id, &request.manifest_id) {
+        (Some(have), Some(want)) => have == want,
+        // A hook that predates the id: only a record no older than the request.
+        (None, _) => {
+            let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+            matches!((at(&sp.reached_at), at(&request.requested_at)), (Some(r), Some(q)) if r >= q)
+        }
+        (Some(_), None) => false,
+    };
+    answers.then_some(sp)
 }
 
 /// Number of leaf tool calls currently executing, excluding `except`. Entries
@@ -388,12 +471,17 @@ fn touch(path: &Path) {
     let _ = std::fs::write(path, b"");
 }
 
-/// Write the safe-point record unless one already exists. Exactly one parked
-/// call wins: the record is linked into place, which fails if it exists.
+/// Write the safe-point record unless one already exists for the same
+/// request. Exactly one parked call wins: the record is linked into place,
+/// which fails if it exists. A record that answered another request is stale
+/// and is removed first.
 fn write_safe_point(dir: &Path, sp: &SafePoint) {
     let target = dir.join(SAFE_POINT_FILE);
     if target.exists() {
-        return;
+        if read_safe_point(dir).is_some_and(|have| have.request_id == sp.request_id) {
+            return;
+        }
+        let _ = std::fs::remove_file(&target);
     }
     let Ok(body) = serde_json::to_vec(sp) else {
         return;
@@ -455,14 +543,25 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
             .to_string(),
     );
     let deadline = Instant::now() + env.park;
+    // The request this call is parked for. Re-read on every poll: a pause
+    // that stood down and a new one raised between two polls is a new request.
+    let mut request_id = read_request(&dir).and_then(|r| r.manifest_id);
     loop {
         if !is_requested(&dir) {
-            // Withdrawn (an aborted pause): release the call.
+            // Withdrawn (an aborted pause): release the call. The agent is
+            // about to run again, so a safe point recorded for that request
+            // no longer holds.
             let _ = std::fs::remove_file(&parked);
+            if read_safe_point(&dir).is_some_and(|sp| sp.request_id == request_id) {
+                clear_safe_point(&dir);
+            }
             if count_it {
                 touch(&dir.join(INFLIGHT_DIR).join(&key));
             }
             return HookOutcome::Allow;
+        }
+        if let Some(request) = read_request(&dir) {
+            request_id = request.manifest_id;
         }
         if !env.ledger || inflight_count(&dir, Some(&key)) == 0 {
             let session = field("session_id");
@@ -476,6 +575,7 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
                     harness_pid: env.harness_pid,
                     session_id: (!session.is_empty()).then(|| session.to_string()),
                     runtime: env.runtime.clone(),
+                    request_id: request_id.clone(),
                 },
             );
         }

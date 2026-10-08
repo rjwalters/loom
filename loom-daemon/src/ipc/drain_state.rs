@@ -261,6 +261,17 @@ impl DrainState {
     /// operator's, not the store's.
     pub fn hold_for_fleet_state(&self, note: String) -> bool {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        // #10832: an H5 resume hold ends by itself, and the store's `paused`
+        // must outlive it. The fleet hold takes the pause over in place, so
+        // dispatch is never open between H5 finishing and the next sync pass.
+        if inner.active && inner.resume_hold {
+            inner.resume_hold = false;
+            inner.startup_hold = true;
+            inner.fleet_hold = true;
+            inner.origin = DrainOrigin::Operator;
+            inner.note = Some(note);
+            return true;
+        }
         if inner.active {
             return false;
         }
@@ -826,6 +837,7 @@ mod pause;
 #[path = "drain_resume.rs"]
 mod resume;
 pub use pause::PauseOwnership;
+pub use resume::ResumeHold;
 
 #[cfg(test)]
 #[path = "drain_state_tests.rs"]

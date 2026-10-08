@@ -73,7 +73,7 @@ pub fn arm(manifest_id: &str, items: Vec<HeldItem>) {
         })
         .collect();
     for item in &items {
-        super::hold::hold(&item.id);
+        super::hold::hold(&item.id, manifest_id);
     }
     let mut map = live();
     map.insert(manifest_id.to_string(), items);
@@ -87,7 +87,7 @@ pub fn release_item(manifest_id: &str, item_id: &str) {
         items.retain(|i| i.id != item_id);
     }
     drop(map);
-    super::hold::release(item_id);
+    super::hold::release(item_id, manifest_id);
 }
 
 /// Disarm the gate for `manifest_id`: every item it still holds goes back to
@@ -98,7 +98,7 @@ pub fn disarm(manifest_id: &str) {
     ARMED.store(map.len(), Ordering::SeqCst);
     drop(map);
     for item in items {
-        super::hold::release(&item.id);
+        super::hold::release(&item.id, manifest_id);
     }
 }
 

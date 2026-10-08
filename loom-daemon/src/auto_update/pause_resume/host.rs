@@ -15,10 +15,10 @@ use super::{PauseResumeStatus, REASON_SESSION_DOWN, REASON_STORE};
 use crate::auto_update::pause_manifest::{ItemKind, ManifestItem, SafePointRecord};
 use crate::auto_update::pause_roll::teardown::{self, TeardownReport, TreeSpec};
 use crate::event_bus::EventBus;
-use crate::ipc::DrainState;
+use crate::ipc::{DrainState, ResumeHold};
 use crate::role_runner::roll_resume::{self as role_resume, RoleResumeHandle, RoleResumeState};
 use crate::role_runner::InProgressGuard;
-use crate::roll_pause::{self, claim_breadcrumb};
+use crate::roll_pause::{self, claim_breadcrumb, PauseRequest};
 use crate::sweep_registry::resume_handle::RollResumeLaunch;
 use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 use crate::sweep_registry::roll_resume::{
@@ -27,6 +27,9 @@ use crate::sweep_registry::roll_resume::{
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::workspace_pool::WorkspacePool;
+
+/// The reaper-hold owner of a resumed sweep H5 has not confirmed yet.
+pub(crate) const RESUME_HOLD_OWNER: &str = "h5-resume";
 
 /// A relaunched item H5 is still confirming.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,20 +58,19 @@ pub enum Liveness {
 /// The host side of H5. `Send + Sync` because forge writes run on worker
 /// threads the orchestrator can stop waiting for.
 pub(crate) trait ResumeHost: Send + Sync {
-    /// Hold dispatch for H5. `false` while another hold or drain is in force.
-    fn hold_dispatch(&self) -> bool;
-    /// Whether H5's own hold is in place.
-    fn dispatch_held(&self) -> bool;
+    /// Make sure dispatch is held for H5, and say by whom. Called at every
+    /// checkpoint: it places H5's own hold when nothing holds dispatch.
+    fn hold_dispatch(&self) -> ResumeHold;
     /// One health sample: IPC answering, heartbeat fresh.
     ///
     /// # Errors
     /// What is unhealthy.
     fn health_sample(&self) -> Result<(), String>;
-    /// The safe-point record on disk for an item H4 never marked `paused`.
-    fn safe_point(&self, item: &ManifestItem) -> Option<SafePointRecord>;
-    /// Reap whatever is still alive of `item`'s tree. `scope_only` limits it
-    /// to the item's own scope unit and identity-checked process.
-    fn reap_residue(&self, item: &ManifestItem, scope_only: bool) -> TeardownReport;
+    /// The safe-point record on disk for an item H4 never marked `paused`,
+    /// when it answers `request` (the pause that wrote the manifest).
+    fn safe_point(&self, item: &ManifestItem, request: &PauseRequest) -> Option<SafePointRecord>;
+    /// Reap whatever is still alive of `item`'s recorded process tree.
+    fn reap_residue(&self, item: &ManifestItem) -> TeardownReport;
     /// Refresh `item`'s lease record once.
     ///
     /// # Errors
@@ -147,27 +149,25 @@ pub(crate) fn sweep_spec(item: &ManifestItem, launch: &RollResumeLaunch) -> Opti
     })
 }
 
-/// The identity-checked process tree of `item`: its recorded pid and group
-/// only when that pid is still the process the manifest recorded (a pid number
-/// reused since the pause must never be signalled), its scope unit, and,
-/// unless `scope_only`, its worktree.
-pub(crate) fn residue_spec(item: &ManifestItem, scope_only: bool) -> TreeSpec {
-    let same_process = item.pid.is_some_and(|pid| {
-        item.run_started_at.is_some()
-            && crate::sweep_registry::reaper::pid_identity::tracked_pid_alive(
-                pid,
-                item.run_started_at,
-            )
-    });
+/// The recorded process tree of `item`, as PR 2's teardown takes it: the
+/// recorded pid with its start time, its process group and its scope unit.
+/// Nothing is seeded from the worktree (an operator shell or an attended
+/// session there is not the agent's). The teardown itself checks, before any
+/// signal, that the pid is still the recorded process ([`teardown::leader_state`]):
+/// after a restart the number may belong to a stranger, and a forced H4 finish
+/// records a kill it never verified.
+pub(crate) fn residue_spec(item: &ManifestItem) -> TreeSpec {
+    let observed = item
+        .pid_started_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
     TreeSpec {
-        pid: item.pid.filter(|_| same_process),
-        pgid: item.pgid.filter(|_| same_process),
+        pid: item.pid,
+        pid_started_at: observed,
+        recorded_started_at: item.run_started_at,
+        pgid: item.pgid,
         scope_unit: item.scope_unit.clone(),
-        worktree: item
-            .worktree
-            .as_ref()
-            .filter(|_| !scope_only)
-            .map(|w| PathBuf::from(&w.path)),
     }
 }
 
@@ -283,7 +283,7 @@ pub(crate) mod sweeps {
         );
         let resumed = locked(registry).finish_roll_resume(prepared, token, runtime, death)?;
         // H5 confirms it before the sweep reaper may act on it.
-        roll_pause::hold::hold(&resumed.sweep_id);
+        roll_pause::hold::hold(&resumed.sweep_id, RESUME_HOLD_OWNER);
         Ok(Launched {
             item_id: resumed.sweep_id,
             pid: Some(resumed.pid),
@@ -304,7 +304,7 @@ pub(crate) mod sweeps {
 
     pub(crate) fn abandon(registry: &Arc<Mutex<SweepRegistry>>, launched: &Launched) {
         locked(registry).abandon_roll_resume(&launched.item_id);
-        roll_pause::hold::release(&launched.item_id);
+        roll_pause::hold::release(&launched.item_id, RESUME_HOLD_OWNER);
     }
 
     /// Release a sweep item's claim. With `forge`, the label restore and the
@@ -470,16 +470,12 @@ pub(crate) fn requeue_role(
 }
 
 impl ResumeHost for DaemonResumeHost {
-    fn hold_dispatch(&self) -> bool {
-        self.drain.hold_for_roll_resume(
+    fn hold_dispatch(&self) -> ResumeHold {
+        self.drain.roll_resume_hold(
             "dispatch HELD: this daemon started after a version roll paused its agents; it is \
              verifying its health and resuming them (#10832). The hold ends by itself."
                 .to_string(),
         )
-    }
-
-    fn dispatch_held(&self) -> bool {
-        self.drain.is_roll_resume_held()
     }
 
     fn health_sample(&self) -> Result<(), String> {
@@ -487,12 +483,12 @@ impl ResumeHost for DaemonResumeHost {
         heartbeat_fresh(&self.fallback_root, self.started.elapsed())
     }
 
-    fn safe_point(&self, item: &ManifestItem) -> Option<SafePointRecord> {
-        disk_safe_point(item)
+    fn safe_point(&self, item: &ManifestItem, request: &PauseRequest) -> Option<SafePointRecord> {
+        disk_safe_point(item, request)
     }
 
-    fn reap_residue(&self, item: &ManifestItem, scope_only: bool) -> TeardownReport {
-        reap_residue(item, scope_only)
+    fn reap_residue(&self, item: &ManifestItem) -> TeardownReport {
+        reap_residue(item)
     }
 
     fn refresh_lease(&self, item: &ManifestItem, timeout: Duration) -> Result<(), String> {
@@ -580,7 +576,7 @@ impl ResumeHost for DaemonResumeHost {
     fn settle(&self, manifest_id: &str, item: &ManifestItem, new_item_id: &str) {
         roll_pause::suppress::release_item(manifest_id, &item.id);
         // The sweep reaper takes the resumed run from here.
-        roll_pause::hold::release(new_item_id);
+        roll_pause::hold::release(new_item_id, RESUME_HOLD_OWNER);
     }
 
     fn requeue(
@@ -617,9 +613,13 @@ impl ResumeHost for DaemonResumeHost {
     }
 }
 
-/// The safe-point record on disk for `item`.
-pub(crate) fn disk_safe_point(item: &ManifestItem) -> Option<SafePointRecord> {
-    let sp = roll_pause::read_safe_point(&pause_dir(item))?;
+/// The safe-point record on disk for `item`, when it answers `request`. A
+/// record left by an earlier pause of the same item is not this pause's.
+pub(crate) fn disk_safe_point(
+    item: &ManifestItem,
+    request: &PauseRequest,
+) -> Option<SafePointRecord> {
+    let sp = roll_pause::read_safe_point_for(&pause_dir(item), request)?;
     Some(SafePointRecord {
         reached_at: sp.reached_at,
         parked_tool: Some(sp.parked_tool),
@@ -627,9 +627,9 @@ pub(crate) fn disk_safe_point(item: &ManifestItem) -> Option<SafePointRecord> {
     })
 }
 
-/// Reap whatever is still alive of `item`'s tree.
-pub(crate) fn reap_residue(item: &ManifestItem, scope_only: bool) -> TeardownReport {
-    let spec = residue_spec(item, scope_only);
+/// Reap whatever is still alive of `item`'s recorded process tree.
+pub(crate) fn reap_residue(item: &ManifestItem) -> TeardownReport {
+    let spec = residue_spec(item);
     if spec == TreeSpec::default() {
         return TeardownReport::default();
     }
@@ -653,9 +653,12 @@ pub(crate) fn role_liveness(handle: Option<&mut RoleResumeHandle>) -> Liveness {
 pub(crate) fn abandon_role(launched: &Launched) {
     if let Some(pid) = launched.pid {
         let _ = teardown::teardown_tree(
+            // The role thread's own unreaped child, started no later than
+            // now: the identity the teardown checks before it signals.
             &TreeSpec {
                 pid: Some(pid),
                 pgid: Some(pid),
+                recorded_started_at: Some(chrono::Utc::now()),
                 ..TreeSpec::default()
             },
             Duration::from_millis(500),

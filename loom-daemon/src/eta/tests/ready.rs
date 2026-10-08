@@ -58,6 +58,8 @@ pub(super) fn dispatch() -> DispatchInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: as_of() - Duration::seconds(30),
+        not_here: None,
+        held_until: None,
     }
 }
 
@@ -316,6 +318,8 @@ fn row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
         },
         disposition: crate::types::QueueDisposition::DeferredCapacity,
         facts: crate::eta::tracker::IssueRow::default(),
+        rank: issue as usize,
+        detail: None,
     }
 }
 

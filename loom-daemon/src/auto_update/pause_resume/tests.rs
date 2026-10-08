@@ -2,16 +2,15 @@
 //! and the integration tests drive real sweep registries, real process trees
 //! and the real recovery passes behind a fake `gh`.
 
-use super::host::{self, sweeps, Launched, Liveness, ResumeHost};
+use super::host::{self, Launched, Liveness, ResumeHost};
 use super::*;
 use crate::auto_update::pause_manifest::{ResumeHandle, Roll, WorktreeRecord, WrittenBy};
 use crate::auto_update::pause_roll::teardown::TeardownReport;
-use crate::ipc::DrainState;
-use crate::roll_pause;
+use crate::ipc::{DrainState, ResumeHold};
+use crate::roll_pause::{self, PauseRequest};
 use crate::sweep_registry::test_support;
-use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+use crate::sweep_registry::SweepRegistry;
 use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 
 const SID: &str = "4910f978-64b9-4654-942a-dae6514e859c";
@@ -700,17 +699,14 @@ fn a_health_failure_restarts_probation_and_is_reported() {
             }
             Ok(())
         }
-        fn hold_dispatch(&self) -> bool {
+        fn hold_dispatch(&self) -> ResumeHold {
             self.0.hold_dispatch()
         }
-        fn dispatch_held(&self) -> bool {
-            self.0.dispatch_held()
+        fn safe_point(&self, i: &ManifestItem, r: &PauseRequest) -> Option<SafePointRecord> {
+            self.0.safe_point(i, r)
         }
-        fn safe_point(&self, i: &ManifestItem) -> Option<SafePointRecord> {
-            self.0.safe_point(i)
-        }
-        fn reap_residue(&self, i: &ManifestItem, s: bool) -> TeardownReport {
-            self.0.reap_residue(i, s)
+        fn reap_residue(&self, i: &ManifestItem) -> TeardownReport {
+            self.0.reap_residue(i)
         }
         fn refresh_lease(&self, i: &ManifestItem, t: Duration) -> Result<(), String> {
             self.0.refresh_lease(i, t)
@@ -804,6 +800,143 @@ fn h5_waits_for_a_hold_already_in_force() {
     assert_eq!(*host.hold_blocked.lock().unwrap(), 0, "it waited the hold out");
 }
 
+/// #10979: a host the fleet store says is `paused` finishes its paused
+/// agents (in-flight work, which a fleet pause lets finish) and then must NOT
+/// dispatch: the fleet pause is still in force when H5 ends, whether it was in
+/// force at startup or arrived while H5 was working.
+#[test]
+fn a_fleet_paused_host_does_not_dispatch_after_h5_completes() {
+    // In force at startup (the startup fleet-sync pass re-applied `paused`
+    // before H5 was spawned).
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan(dir.path());
+    write(&plan, &manifest("rp-fleet", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]));
+    let host = Arc::new(FakeHost::default());
+    assert!(host
+        .drain
+        .hold_for_fleet_state("fleet/state.yml says paused".to_string()));
+
+    let status = finished(run_h5(host.clone(), &plan));
+
+    assert_eq!(status.resumed, 1, "its paused agent is finished, not abandoned");
+    assert!(host.drain.is_draining(), "dispatch is still paused after H5");
+    assert!(host.drain.is_fleet_held(), "by the fleet pause, which H5 never released");
+    assert!(!host.drain.is_roll_resume_held());
+    assert_eq!(archived(&plan, "rp-fleet").phase, Phase::Resumed);
+
+    // Arriving while H5 holds dispatch (a sync pass during the resume).
+    let dir = tempfile::tempdir().unwrap();
+    let plan = ResumePlan {
+        manifest_path: dir.path().join("state").join(pause_manifest::MANIFEST_FILE),
+        ..plan
+    };
+    write(&plan, &manifest("rp-fleet-2", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]));
+
+    struct PausedMidway(FakeHost);
+    impl ResumeHost for PausedMidway {
+        fn check(&self, i: &ManifestItem, l: &RollResumeLaunch) -> Result<(), RollResumeRefusal> {
+            // The store flips to `paused` just before the relaunch.
+            assert!(self
+                .0
+                .drain
+                .hold_for_fleet_state("fleet says paused".to_string()));
+            self.0.check(i, l)
+        }
+        fn health_sample(&self) -> Result<(), String> {
+            self.0.health_sample()
+        }
+        fn hold_dispatch(&self) -> ResumeHold {
+            self.0.hold_dispatch()
+        }
+        fn safe_point(&self, i: &ManifestItem, r: &PauseRequest) -> Option<SafePointRecord> {
+            self.0.safe_point(i, r)
+        }
+        fn reap_residue(&self, i: &ManifestItem) -> TeardownReport {
+            self.0.reap_residue(i)
+        }
+        fn refresh_lease(&self, i: &ManifestItem, t: Duration) -> Result<(), String> {
+            self.0.refresh_lease(i, t)
+        }
+        fn already_resumed(&self, i: &ManifestItem) -> Option<String> {
+            self.0.already_resumed(i)
+        }
+        fn launch(
+            &self,
+            i: &ManifestItem,
+            l: &RollResumeLaunch,
+            w: Duration,
+        ) -> Result<Launched, RollResumeRefusal> {
+            self.0.launch(i, l, w)
+        }
+        fn liveness(&self, i: &ManifestItem, l: &Launched) -> Liveness {
+            self.0.liveness(i, l)
+        }
+        fn abandon(&self, i: &ManifestItem, l: &Launched) {
+            self.0.abandon(i, l);
+        }
+        fn settle(&self, m: &str, i: &ManifestItem, n: &str) {
+            self.0.settle(m, i, n);
+        }
+        fn requeue(&self, i: &ManifestItem, n: &RollRequeueNotice, f: bool) -> Result<(), String> {
+            self.0.requeue(i, n, f)
+        }
+        fn recover(&self, m: &str, i: &ManifestItem) {
+            self.0.recover(m, i);
+        }
+        fn finish(&self, m: &str, n: &str) {
+            self.0.finish(m, n);
+        }
+        fn emit(&self, t: &str, p: serde_json::Value) {
+            self.0.emit(t, p);
+        }
+        fn publish(&self, s: &PauseResumeStatus) {
+            self.0.publish(s);
+        }
+    }
+    let host = Arc::new(PausedMidway(FakeHost::default()));
+    let status = finished(run_h5(host.clone(), &plan));
+    assert_eq!(status.resumed, 1);
+    assert!(
+        host.0.drain.is_draining() && host.0.drain.is_fleet_held(),
+        "still paused after H5"
+    );
+}
+
+/// An operator stop is not a fleet pause: H5 resumes nothing under it, and
+/// gives the claims back once the manifest goes stale.
+#[test]
+fn an_operator_stop_holds_the_resume_until_the_manifest_goes_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan(dir.path());
+    let mut m = manifest("rp-stopped", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]);
+    m.roll.max_age_secs = 2;
+    m.roll.pause_started_at = Utc::now() - chrono::Duration::seconds(1);
+    write(&plan, &m);
+    let host = Arc::new(FakeHost::default());
+    // A then-exit operator drain: dispatch is paused, and not by the fleet.
+    let _ = host.drain.begin(Duration::from_secs(600), false, true);
+
+    let status = finished(run_h5(host.clone(), &plan));
+
+    assert_eq!((status.resumed, status.requeued_by_reason[REASON_STALE]), (0, 1));
+    assert!(host.called("launch ").is_empty());
+    assert!(host.drain.is_draining(), "the operator's drain is untouched");
+}
+
+/// A saved session is never resumed beside a survivor of its old tree.
+#[test]
+fn an_item_whose_old_tree_survives_the_reap_is_requeued_not_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan(dir.path());
+    write(&plan, &manifest("rp-surv", Phase::Paused, vec![sweep(dir.path(), "s-1", 1)]));
+    let host = Arc::new(FakeHost::default());
+    host.residue.lock().unwrap().insert("s-1".to_string());
+    host.survivors.lock().unwrap().push(4243);
+    let status = finished(run_h5(host.clone(), &plan));
+    assert_eq!(status.requeued_by_reason["guard-refused:residue-alive"], 1);
+    assert!(host.called("launch ").is_empty());
+}
+
 // ============================================================================
 // Items that are not resumed
 // ============================================================================
@@ -851,8 +984,9 @@ fn exited_requeued_pr_set_and_failed_requeue_items_each_end_their_own_way() {
         "completed work is not crash-recovered"
     );
     assert!(host.called("launch ").is_empty());
-    // An H4-requeued item gave its claim back: only its own scope is residue.
-    assert!(calls.contains(&"residue h4-requeued scope-only".to_string()));
+    // Every item H4 left behind is checked for residue, exited ones included
+    // (H4 runs no teardown for an agent that ended by itself).
+    assert!(calls.contains(&"residue h4-requeued".to_string()));
     assert!(calls.contains(&"residue exited".to_string()));
     assert_eq!((status.completed, status.recovered, status.resumed), (1, 1, 0));
     assert_eq!(status.requeued_by_reason["young-agent-reset"], 1);

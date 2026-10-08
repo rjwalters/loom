@@ -38,7 +38,13 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     FleetWide,
+    /// One record per roster repo every pass (e.g. `eta.fleet_refresh`).
     PerRepo,
+    /// Emitted only for repos with something to report (e.g. `eta.estimate` is
+    /// per tracked item: an idle or all-abstaining repo legitimately emits
+    /// nothing). Judged against [`OutputSource::expected_repos`], not the
+    /// roster.
+    PerActiveRepo,
 }
 
 /// How loudly a missing output should be reported.
@@ -69,9 +75,21 @@ pub struct SingletonOutput {
     /// Record kind / heartbeat the job emits.
     pub record_kind: &'static str,
     pub scope: Scope,
-    /// Expected emission period; the deadline is `2 * cadence`.
+    /// Expected emission period; the deadline is `2 * cadence` unless
+    /// `deadline_override` is set.
     pub cadence: Duration,
     pub severity: Severity,
+    /// Explicit deadline when the producer's own staleness contract is not
+    /// `2 * cadence` (captain gauges: `maxAgeSecs`).
+    pub deadline_override: Option<Duration>,
+}
+
+impl SingletonOutput {
+    /// Age beyond which the output is stale.
+    #[must_use]
+    pub fn deadline(&self) -> Duration {
+        self.deadline_override.unwrap_or(self.cadence * 2)
+    }
 }
 
 const fn mins(m: u64) -> Duration {
@@ -94,6 +112,16 @@ const fn job(
         scope,
         cadence,
         severity: Severity::Critical,
+        deadline_override: None,
+    }
+}
+
+const fn gauge(job_name: &'static str, kind: &'static str) -> SingletonOutput {
+    SingletonOutput {
+        deadline_override: Some(Duration::from_secs(
+            crate::observability::captain_gauges::DEFAULT_MAX_AGE_SECS as u64,
+        )),
+        ..job(job_name, kind, Scope::FleetWide, mins(10))
     }
 }
 
@@ -105,6 +133,7 @@ const fn authority(kind: &'static str, scope: Scope, cadence: Duration) -> Singl
         scope,
         cadence,
         severity: Severity::Critical,
+        deadline_override: None,
     }
 }
 
@@ -132,13 +161,15 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
     },
     // Captain gauges: the per-job `as_of` in the `captain-gauges/v1`
     // heartbeat, published every 600s by default.
-    job(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell", Scope::FleetWide, mins(10)),
-    job(STAR_FACTS_JOB, "captain-gauges/v1:star-facts", Scope::FleetWide, mins(10)),
-    job(QUEUE_BLOCKED_JOB, "captain-gauges/v1:queue-blocked", Scope::FleetWide, mins(10)),
+    // The deadline is the heartbeat's own `maxAgeSecs` (1800s), not 2x cadence
+    // (1200s): one missed publish puts `as_of` near 1500s and must not fire.
+    gauge(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell"),
+    gauge(STAR_FACTS_JOB, "captain-gauges/v1:star-facts"),
+    gauge(QUEUE_BLOCKED_JOB, "captain-gauges/v1:queue-blocked"),
     // The ETA authority: the daily fit check (emitted fitted or skipped) and
     // per-repo estimates (the 10-07 incident).
     authority("eta.fit", Scope::FleetWide, hours(24)),
-    authority("eta.estimate", Scope::PerRepo, mins(30)),
+    authority("eta.estimate", Scope::PerActiveRepo, mins(30)),
 ];
 
 /// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each with
@@ -173,6 +204,14 @@ pub trait OutputSource {
     fn last_seen(&self, record_kind: &str) -> Option<DateTime<Utc>>;
     /// Newest observation per repo for a per-repo `record_kind`.
     fn last_seen_per_repo(&self, record_kind: &str) -> BTreeMap<String, DateTime<Utc>>;
+    /// Repos expected to emit a [`Scope::PerActiveRepo`] `record_kind` (e.g.
+    /// those with at least one estimable tracked item). `None` = unknown,
+    /// which is judged against the whole roster (fail loud). `Some(empty)`
+    /// = nothing expected, so silence is healthy. Slice 2 must derive this
+    /// independently of the silent output (never from `eta.estimate` itself).
+    fn expected_repos(&self, _record_kind: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// One output currently missing or stale.
@@ -220,12 +259,16 @@ fn judge(
     roster: &[String],
     now: DateTime<Utc>,
 ) -> Option<String> {
-    let deadline = o.cadence * 2;
-    // A timestamp in the future (clock skew) counts as fresh.
-    let fresh = |t: DateTime<Utc>| {
-        now.signed_duration_since(t)
+    let deadline = o.deadline();
+    // A timestamp in the future counts as fresh (small clock skew), but only
+    // up to one deadline ahead: a producer clock a day fast must not mask an
+    // outage.
+    let fresh = |t: DateTime<Utc>| match now.signed_duration_since(t).to_std() {
+        Ok(age) => age <= deadline,
+        Err(_) => t
+            .signed_duration_since(now)
             .to_std()
-            .map_or(true, |age| age <= deadline)
+            .is_ok_and(|ahead| ahead <= deadline),
     };
     let kind = o.record_kind;
     let secs = deadline.as_secs();
@@ -235,8 +278,21 @@ fn judge(
             Some(t) if !fresh(t) => Some(format!("{kind} stale since {t} (deadline {secs}s)")),
             Some(_) => None,
         },
-        Scope::PerRepo => {
+        Scope::PerRepo | Scope::PerActiveRepo => {
             let seen = observed.last_seen_per_repo(kind);
+            let expected;
+            let roster = if o.scope == Scope::PerActiveRepo {
+                match observed.expected_repos(kind) {
+                    Some(e) if e.is_empty() => return None,
+                    Some(e) => {
+                        expected = e;
+                        &expected[..]
+                    }
+                    None => roster,
+                }
+            } else {
+                roster
+            };
             if roster.is_empty() {
                 return (!seen.values().any(|t| fresh(*t))).then(|| {
                     format!("{kind} fresh for no repo (roster unknown, deadline {secs}s)")

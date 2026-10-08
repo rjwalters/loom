@@ -403,9 +403,18 @@ struct Run<'a> {
     work: Vec<Work>,
     status: PauseResumeStatus,
     stale: bool,
+    /// Whether dispatch is held for this run (by H5, or by a fleet pause).
+    held: bool,
 }
 
 impl Run<'_> {
+    /// Re-check the dispatch hold. `false` when an operator stop or a real
+    /// drain holds dispatch instead: H5 resumes nothing under one.
+    fn hold(&mut self) -> bool {
+        self.held = self.host.hold_dispatch() != crate::ipc::ResumeHold::Blocked;
+        self.held
+    }
+
     fn event(&mut self, item: Option<&str>, event: &str, detail: Option<String>) {
         self.manifest.events.push(ManifestEvent {
             at: rfc3339(Utc::now()),
@@ -428,7 +437,7 @@ impl Run<'_> {
     fn step(&mut self, step: &str) {
         self.status.step = step.to_string();
         self.status.phase = Some(self.manifest.phase.as_str().to_string());
-        self.status.holding = self.host.dispatch_held();
+        self.status.holding = self.held;
         self.host.publish(&self.status);
     }
 
@@ -698,6 +707,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         work: Vec::new(),
         status,
         stale,
+        held: false,
     };
     let manifest_id = run.manifest.manifest_id.clone();
 
@@ -759,9 +769,16 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         }
     }
 
+    // The pause request H4 raised for this manifest: a safe-point record
+    // counts only if it answers this one.
+    let request = crate::roll_pause::PauseRequest {
+        requested_at: rfc3339(run.manifest.roll.pause_started_at),
+        manifest_id: Some(manifest_id.clone()),
+        ..crate::roll_pause::PauseRequest::default()
+    };
     for idx in 0..run.manifest.items.len() {
         let on_disk = (run.manifest.items[idx].status != ItemStatus::Paused)
-            .then(|| run.host.safe_point(&run.manifest.items[idx]))
+            .then(|| run.host.safe_point(&run.manifest.items[idx], &request))
             .flatten();
         let fate = plan_item(&mut run.manifest.items[idx], stale, on_disk);
         run.work.push(Work {
@@ -786,25 +803,23 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
 
     // ---- Step 2: hold dispatch ------------------------------------------------
     run.step("hold");
-    while !run.host.hold_dispatch() {
-        // Another hold is in force (an operator stop, a fleet pause, a drain):
-        // dispatch is paused either way. Do not resume work on a stopped host;
-        // once the manifest goes stale its claims are given back instead.
+    while !run.hold() {
+        // An operator stop or a drain holds dispatch. Do not resume work on a
+        // stopped host; once the manifest goes stale its claims are given
+        // back instead. (A fleet `paused` state is not this case: H5 proceeds
+        // under it, and it stays in force afterwards.)
         if run.is_stale_now() {
             run.go_stale();
             break;
         }
         std::thread::sleep(tuning.poll);
     }
-    let holding = run.host.dispatch_held();
+    let holding = run.held;
 
     // ---- Step 3: verify the teardown ------------------------------------------
     run.step("residue");
     for idx in run.indices(|f| !matches!(f, Fate::Done)) {
-        // An item H4 already requeued gave its claim back: by now someone
-        // else may be working in its worktree, so only its own scope counts.
-        let scope_only = run.work[idx].fate == (Fate::Requeue { forge: false });
-        let report = run.host.reap_residue(&run.manifest.items[idx], scope_only);
+        let report = run.host.reap_residue(&run.manifest.items[idx]);
         if report.pids.is_empty() && !report.scope_stopped {
             continue;
         }
@@ -826,6 +841,17 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         );
         log::warn!("pause_resume: {id}: reaped residue of the paused agent: {detail}");
         run.event(Some(&id), "residue_reaped", Some(detail));
+        // A saved session is never resumed beside a survivor of its old tree.
+        if !report.survivors.is_empty() && run.work[idx].fate == Fate::Resume {
+            run.requeue_as(
+                idx,
+                "guard-refused:residue-alive",
+                Some(format!(
+                    "{} process(es) of the paused agent survived",
+                    report.survivors.len()
+                )),
+            );
+        }
         run.host.emit(
             "daemon.roll.item.residue_reaped",
             serde_json::json!({
@@ -871,7 +897,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     let mut waiting_logged = false;
     let mut interrupted = false;
     while holding && !run.stale {
-        if !run.host.dispatch_held() {
+        if !run.hold() {
             interrupted = true;
             break;
         }
@@ -931,7 +957,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     let resume_started = Instant::now();
     let deadline = resume_started + tuning.resume_budget;
     for idx in run.indices(|f| f == Fate::Resume) {
-        if !run.host.dispatch_held() {
+        if !run.hold() {
             return interrupt(run, "a drain replaced the dispatch hold during the resume");
         }
         if Instant::now() >= deadline {
@@ -1116,6 +1142,8 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     );
     run.status.note = Some(note);
     run.status.finished_at = Some(Utc::now());
+    // H5's own hold is released; a fleet pause, if any, is the store's.
+    run.held = false;
     run.step("done");
     H5Outcome::Finished(run.status)
 }
@@ -1134,6 +1162,10 @@ fn interrupt(mut run: Run<'_>, why: &str) -> H5Outcome {
     run.step("interrupted");
     H5Outcome::Interrupted(run.status)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -104,13 +104,24 @@ impl RollTrigger for IpcRollTrigger {
         )
     }
 
+    /// A roll or a supervised drain: something that ends in a restart.
+    ///
+    /// Not the shared "dispatch is held" flag (#10979). A fleet-state `paused`
+    /// hold sets that flag too, with no supervisor behind it and no restart
+    /// coming, so keying on the flag made a paused host skip every update tick
+    /// forever while reporting a roll as armed. Such a hold is not a roll: the
+    /// tick decides normally, and the roll it starts replaces the hold with a
+    /// supervised drain ([`DrainState::begin_as`]), which restarts at once when
+    /// nothing is in flight. The restarted daemon reads the store and holds
+    /// again.
     fn roll_in_progress(&self) -> bool {
-        self.drain.is_draining()
+        let snap = self.drain.snapshot();
+        snap.active && !snap.fleet_hold
     }
 
     fn armed_roll(&self) -> Option<ArmedRoll> {
         let snap = self.drain.snapshot();
-        if !snap.active {
+        if !snap.active || snap.fleet_hold {
             return None;
         }
         Some(ArmedRoll {
@@ -138,5 +149,67 @@ impl RollTrigger for IpcRollTrigger {
             );
         }
         superseded
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::ipc::{DrainBegin, PauseOwnership, PauseRollStatus};
+    use std::time::Duration;
+
+    fn trigger(drain: &Arc<DrainState>) -> IpcRollTrigger {
+        let bus = Arc::new(EventBus::new());
+        IpcRollTrigger::new(
+            drain.clone(),
+            Arc::new(WorkspacePool::new(bus.clone(), tokio::runtime::Handle::current())),
+            PathBuf::from("/nonexistent/roll-trigger-test"),
+            bus,
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    /// #10979: a fleet-state `paused` hold holds dispatch but is not a roll.
+    /// With nothing in flight the host must still update: the tick is not
+    /// skipped as "already armed", and the roll it starts replaces the hold
+    /// with a supervised drain that restarts as soon as in-flight is zero.
+    #[tokio::test]
+    async fn a_fleet_state_pause_is_not_a_roll_in_progress() {
+        let drain = Arc::new(DrainState::new());
+        assert!(drain.hold_for_fleet_state("fleet state: paused".to_string()));
+        assert!(drain.is_draining(), "the hold does pause dispatch");
+        let t = trigger(&drain);
+        assert!(!t.roll_in_progress(), "a hold with no restart coming is not a roll");
+        assert_eq!(t.armed_roll(), None, "and no roll is armed to report or supersede");
+
+        // What `trigger_pause_roll` does next on this state.
+        let begun = drain.begin_pause_roll(Duration::from_secs(120), PauseRollStatus::default());
+        let DrainBegin::Started { generation, .. } = begun else {
+            panic!("the roll must start on a held host, got {begun:?}");
+        };
+        let snap = drain.snapshot();
+        assert!(snap.active && !snap.fleet_hold && !snap.startup_hold, "{snap:?}");
+        assert!(drain.is_draining(), "dispatch stays paused throughout");
+        // It is an operator-origin drain (a failed roll must never release the
+        // hold), so H4 stands down to the drain supervisor: nothing in flight
+        // means an immediate restart.
+        assert_eq!(drain.pause_ownership(generation), PauseOwnership::Promoted);
+        assert!(t.roll_in_progress(), "now a restart really is coming");
+    }
+
+    /// The counterpart: a supervised drain and a pause roll still are.
+    #[tokio::test]
+    async fn a_supervised_drain_and_a_pause_roll_are_rolls_in_progress() {
+        let drain = Arc::new(DrainState::new());
+        let t = trigger(&drain);
+        assert!(!t.roll_in_progress());
+        let _ = drain.begin_pause_roll(Duration::from_secs(120), PauseRollStatus::default());
+        assert!(t.roll_in_progress());
+        assert!(t.armed_roll().is_some_and(|roll| !roll.committed));
+        assert!(drain.abort_pause_roll());
+        let _ = drain.begin(Duration::from_secs(60), false, false);
+        assert!(t.roll_in_progress());
+        assert!(t.armed_roll().is_some_and(|roll| roll.committed));
     }
 }

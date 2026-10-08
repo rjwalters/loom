@@ -37,8 +37,12 @@ pub struct Candidate {
     pub scope_unit: Option<String>,
     /// First start of the session (the 5-minute rule's clock).
     pub agent_started_at: Option<DateTime<Utc>>,
-    /// Start of this process.
+    /// Start of this process, as the registry recorded it.
     pub run_started_at: Option<DateTime<Utc>>,
+    /// Start of this process, as the snapshot observed it in the process
+    /// table. With `pid` it is the process's identity: the teardown signals
+    /// the pid only while its start time is still this one (#10974).
+    pub proc_started_at: Option<DateTime<Utc>>,
     pub resume_handle: Option<ResumeHandle>,
     pub worktree: Option<WorktreeRecord>,
     pub checkpoint_phase: Option<String>,
@@ -74,23 +78,46 @@ impl Candidate {
     pub fn tree_spec(&self) -> TreeSpec {
         TreeSpec {
             pid: self.pid,
+            pid_started_at: self.proc_started_at,
+            recorded_started_at: self.run_started_at,
             pgid: self.pgid,
             scope_unit: self.scope_unit.clone(),
-            worktree: self.worktree.as_ref().map(|w| PathBuf::from(&w.path)),
         }
+    }
+}
+
+/// Stamp each candidate with its process's observed start time, from one
+/// read of the process table. A candidate whose pid is not in the table (it
+/// already exited), or every candidate when the table cannot be read, keeps
+/// `None`; the teardown then falls back to the registry's start time.
+pub fn stamp_proc_starts(cands: &mut [Candidate]) {
+    let pids: Vec<u32> = cands.iter().filter_map(|c| c.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let starts = teardown::observe_starts(&pids);
+    for c in cands {
+        c.proc_started_at = c.pid.and_then(|pid| starts.get(&pid).copied());
     }
 }
 
 /// The host side of an H4 pause. `Send + Sync` because forge writes run on
 /// worker threads the orchestrator can stop waiting for.
 pub trait PauseHost: Send + Sync {
-    /// Dispatches still `Pending` (spawn in progress) across every root.
+    /// Close dispatch for pause run `run`, or take `run`'s hold off it. While
+    /// any run holds it closed, no sweep and no role run starts, whatever asks
+    /// for it. Closing returns once no role launch is between its spawn and
+    /// its registration.
+    fn close_dispatch(&self, closed: bool, run: &str);
+    /// Dispatches that are mid-spawn across every root: the child exists and
+    /// its registry entry does not yet (`sweep_registry::roll_gate`).
     fn pending_dispatches(&self) -> usize;
     /// Every in-flight agent: sweeps across all managed roots, plus role runs.
     fn snapshot(&self) -> Vec<Candidate>;
-    /// Take `c` over from the sweep reaper (or hand it back), so a tree this
-    /// pause stops keeps its lock, journal entry and checkpoint.
-    fn hold(&self, c: &Candidate, held: bool);
+    /// Take `c` over from the sweep reaper for pause run `run` (or hand it
+    /// back, if `run` still holds it), so a tree this pause stops keeps its
+    /// lock, journal entry and checkpoint.
+    fn hold(&self, c: &Candidate, held: bool, run: &str);
     /// Whether `c`'s agent process is still running.
     fn is_alive(&self, c: &Candidate) -> bool;
     /// Stop `c`'s whole process tree.
@@ -115,6 +142,9 @@ pub struct DaemonPauseHost {
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     bus: Arc<EventBus>,
+    /// The pause run holding dispatch closed through this host, if any. A
+    /// root registered after the close is closed when it is next visited.
+    closed_by: std::sync::Mutex<Option<String>>,
 }
 
 impl DaemonPauseHost {
@@ -124,6 +154,27 @@ impl DaemonPauseHost {
             pool,
             fallback_root,
             bus,
+            closed_by: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Run `f` on every managed root's registry, under its lock. While this
+    /// pause holds dispatch closed, each registry visited is (re)closed first.
+    fn each_registry(&self, mut f: impl FnMut(&mut crate::sweep_registry::SweepRegistry, &Path)) {
+        let closed_by = self
+            .closed_by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for root in self.roots() {
+            let registry = self.pool.get_or_provision(&root);
+            let mut sr = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(run) = &closed_by {
+                sr.close_for_roll(run, true);
+            }
+            f(&mut sr, &root);
         }
     }
 
@@ -225,6 +276,7 @@ fn role_candidate(run: &roll_pause::live_runs::LiveRun, holders: &[String]) -> C
         scope_unit: run.scope_unit.clone(),
         agent_started_at: Some(run.started_at),
         run_started_at: Some(run.started_at),
+        proc_started_at: None,
         resume_handle: Some(handle),
         worktree: None,
         checkpoint_phase: None,
@@ -278,6 +330,7 @@ pub(crate) fn sweep_candidates(
                     .and_then(|a| parse_time(a.agent_started_at.as_deref()))
                     .or(Some(info.started_at)),
                 run_started_at: Some(info.started_at),
+                proc_started_at: None,
                 resume_handle: agent
                     .and_then(|a| a.resume_handle.as_ref())
                     .map(manifest_handle),
@@ -298,27 +351,26 @@ pub(crate) fn sweep_candidates(
 }
 
 impl PauseHost for DaemonPauseHost {
+    fn close_dispatch(&self, closed: bool, run: &str) {
+        *self
+            .closed_by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = closed.then(|| run.to_string());
+        self.each_registry(|sr, _| sr.close_for_roll(run, closed));
+        // Every root, by one key: a role launch must not slip through on a
+        // differently spelled workspace path.
+        roll_pause::live_runs::close_launches(&[roll_pause::live_runs::all_roots()], run, closed);
+    }
+
     fn pending_dispatches(&self) -> usize {
         let mut pending = 0;
-        for root in self.roots() {
-            let registry = self.pool.get_or_provision(&root);
-            let sr = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending += sr.list(Some(&crate::types::SweepState::Pending)).len();
-        }
+        self.each_registry(|sr, _| pending += sr.mid_spawn_dispatches());
         pending
     }
 
     fn snapshot(&self) -> Vec<Candidate> {
         let mut out = Vec::new();
-        for root in self.roots() {
-            let registry = self.pool.get_or_provision(&root);
-            let sr = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            out.extend(sweep_candidates(&sr, &root));
-        }
+        self.each_registry(|sr, root| out.extend(sweep_candidates(sr, root)));
         let holders: Vec<String> = crate::issue_creation_mutex::holder_snapshot()
             .iter()
             .map(|t| t.role.to_string())
@@ -328,15 +380,16 @@ impl PauseHost for DaemonPauseHost {
                 .iter()
                 .map(|run| role_candidate(run, &holders)),
         );
+        stamp_proc_starts(&mut out);
         out
     }
 
-    fn hold(&self, c: &Candidate, held: bool) {
+    fn hold(&self, c: &Candidate, held: bool, run: &str) {
         if c.kind == ItemKind::Sweep {
             if held {
-                roll_pause::hold::hold(&c.id);
+                roll_pause::hold::hold(&c.id, run);
             } else {
-                roll_pause::hold::release(&c.id);
+                roll_pause::hold::release(&c.id, run);
             }
         }
     }
@@ -391,17 +444,35 @@ impl PauseHost for DaemonPauseHost {
             }
             return Ok(());
         };
-        let registry = self.pool.get_or_provision(&c.repo);
-        let sr = registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sr.requeue_for_roll(issue, notice)
-            .map_err(|e| format!("{e:#}"))
+        requeue_off_the_registry_lock(&self.pool.get_or_provision(&c.repo), issue, notice)
     }
 
     fn emit(&self, topic: &str, payload: serde_json::Value) {
         let _ = self.bus.publish_generic(topic, payload);
     }
+}
+
+/// Do `issue`'s requeue forge writes without holding `registry`'s mutex across
+/// them (Judge finding on #10974). The label restore and the comment are `gh`
+/// calls, each bounded by `reap_gh_timeout`; holding the registry across them
+/// serialized every requeue in a repo and blocked that repo's lease refreshes,
+/// status reads and reaper behind the forge. They need only the registry's
+/// configuration, so they run on a detached copy of it.
+///
+/// # Errors
+/// When a write failed; the item stays `planned` for the next start.
+pub(crate) fn requeue_off_the_registry_lock(
+    registry: &std::sync::Mutex<crate::sweep_registry::SweepRegistry>,
+    issue: u32,
+    notice: &RollRequeueNotice,
+) -> Result<(), String> {
+    let forge = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .detached_for_forge_writes();
+    forge
+        .requeue_for_roll(issue, notice)
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// The repo a candidate belongs to, as the manifest spells it.
