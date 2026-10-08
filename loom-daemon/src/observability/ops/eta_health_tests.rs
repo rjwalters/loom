@@ -195,6 +195,31 @@ fn a_host_whose_refresh_never_ticked_emits_the_gate_but_no_age() {
     assert!(find(&c.metrics, MetricName::EtaHealthRefreshRepos, None).is_empty());
 }
 
+/// #10918: before the first tick, a workspace naming this host the explicit
+/// ETA authority reads `authority` (a state of its own, not `captain`), even
+/// with this host's own `fleetRefresh.enabled` off; another host reads
+/// `disabled` with it off.
+#[test]
+fn the_explicit_authority_has_its_own_gate_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"fleet": {"captain": "cap", "etaAuthority": "w1"},
+            "autonomous": {"eta": {"fleetRefresh": {"enabled": false}}}}"#,
+    )
+    .unwrap();
+    for (host, state) in [("w1", "authority"), ("cap", "disabled")] {
+        let mut health = EtaHealth::default();
+        let (_, c) = capture(|| export(dir.path(), host, now(), &mut health));
+        let gate = find(&c.metrics, MetricName::EtaHealthRefreshGate, None);
+        let on: Vec<_> = gate.iter().filter(|p| value(p) == 1).collect();
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].labels.get("state").map(String::as_str), Some(state), "{host}");
+    }
+}
+
 #[test]
 fn no_coefficient_file_means_fit_not_loaded_and_no_fit_age() {
     let mut health = EtaHealth::default();

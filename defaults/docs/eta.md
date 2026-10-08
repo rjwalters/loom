@@ -2866,6 +2866,29 @@ not one per host.
   (`config.authority`). A non-authority host that reaches the ETA sink anyway
   drops the records and counts
   `loom.daemon.task_faults{task=eta_pass,reason=eta_non_authority_emit}`.
+- **An explicit authority also refreshes and folds (#10918).** The authority
+  fits on its own snapshots and never takes a published fit, so the jobs that
+  feed it must run on the authority too. When `fleet.etaAuthority` /
+  `LOOM_ETA_AUTHORITY` names a host **explicitly**, the ETA-only singleton
+  jobs follow it instead of `fleet.captain`: the
+  [fleet refresh](#fleet-refresh-task-autonomousetafleetrefresh-10263) (snapshots,
+  backfill, raw events: singleton `eta-fleet-refresh`) and the
+  [nightly folds](#nightly-backtest-folds-autonomousetanightlyfolds-10492)
+  (`eta-nightly-folds`, and the retirement filing that reads them). The named
+  host arms them (`host.health.armed_singleton_jobs`). Every other host, the
+  captain included, stands down: no forge call, no record. That leaves one
+  refresher fleet-wide, under the same budgets. With no explicit key nothing
+  changes: the captain gate decides, and the authority is the captain anyway
+  (rule 2). **Why this and not "the authority takes the captain's published
+  fit":** it matches the single-authority decision (#10498: the authority fits
+  locally and serves), it needs no fit-store repo (#10672: 2AMLogic's
+  `fleet.repo` cannot hold machine output), and it keeps every ETA input on the
+  host that has the OTLP exporter. The authority refreshes even when its own
+  `autonomous.eta.fleetRefresh.enabled` is `false` in any config tier, such as
+  a fleet-gitops worker override, since otherwise its fit inputs go stale.
+  Only the env hard stop `LOOM_ETA_FLEET_REFRESH_ENABLED=0` (read at start)
+  keeps it from refreshing. Both gates re-read the key every tick, so moving
+  the authority needs no restart.
 
 ### Fleet refresh task (`autonomous.eta.fleetRefresh`, #10263)
 
@@ -2874,9 +2897,21 @@ daemon keeps them fresh itself. The task is spawned beside the ETA tracker,
 only with an observability exporter configured and `autonomous.eta.enabled`.
 It is **on by default** (operator decision): it generates no work, it only
 reads, and it is budgeted with a reserve floor. Without it the fit would have
-no training data on a fleet host. Settings are read once at spawn; change
-them with a daemon restart.
+no training data on a fleet host. The budgets and the interval are read once
+at spawn; change them with a daemon restart. Who refreshes is decided per
+tick (#10918). The loop is spawned whenever `autonomous.eta.enabled` is on,
+and each tick re-reads `fleet.etaAuthority`, `fleet.captain` and this host's
+`fleetRefresh.enabled`. A host whose `fleetRefresh.enabled` is `false` ticks
+as `disabled`: no forge call, the fit check only. Only the env hard stop
+`LOOM_ETA_FLEET_REFRESH_ENABLED=0` keeps the loop from spawning.
 
+- **One refresher: the explicit ETA authority, else the captain** (#10918).
+  With `fleet.etaAuthority` set, the named host refreshes, whatever its own
+  `fleetRefresh.enabled` (config) and `fleet.captain` say. Every other host,
+  the captain included, stands down as described below, and takes a published
+  fit from the authority instead of the captain. See
+  [one ETA authority](#one-eta-authority-per-fleet-fleetetaauthority-10498).
+  Without it:
 - **One refresher: declare `fleet.captain`** (#10329). On a multi-host fleet,
   declare `fleet.captain` in the tracked `.loom/config.json`. Only the captain
   refreshes; it is the singleton job `eta-fleet-refresh`
@@ -2917,8 +2952,9 @@ them with a daemon restart.
   - **Verification** (any failure keeps the previous fit and is recorded):
     envelope schema and a bare `<16 hex>.json` file name; sha256 of the exact
     fetched bytes; `eta-fit/v1` parse; file `id`/`as_of`/window equal the
-    envelope's; `captain_host` equals the declared `fleet.captain` (a former
-    captain's file is refused); same feature set; `as_of` not in the future,
+    envelope's; `captain_host` equals the refresher (the explicit
+    `fleet.etaAuthority`, else the declared `fleet.captain`, #10918; a former
+    one's file is refused); same feature set; `as_of` not in the future,
     not older than `fleet.etaFitMaxAgeDays` (default 3), and not older than the
     newest local fit.
   - **Captain change.** A publication is the fit *and* its captain and
@@ -2941,8 +2977,9 @@ them with a daemon restart.
   `fleet-<owner>-<repo>.json` stops refreshing only a snapshot-only repo; for
   a provisioned root or the daemon's own repo it triggers a full backfill on
   the next cycle (no published snapshot means a backfill). To opt out, set
-  `autonomous.eta.fleetRefresh.enabled = false` (the whole task) or remove the
-  root from the workspace pool.
+  `autonomous.eta.fleetRefresh.enabled = false` (the whole task, except on
+  the explicit ETA authority, #10918) or remove the root from the workspace
+  pool.
 - **Reader Apps only.** Every read runs under the repo's reader App
   (`forge_identity`, #9537) with `GH_TOKEN` / `GITHUB_TOKEN` (and the
   enterprise variants) removed from the child. There is no writer fallback and
@@ -3020,13 +3057,18 @@ them with a daemon restart.
 
 The promotion gate's backtest half (#10233: at least 7 walk-forward daily
 folds) used to run only when someone invoked `eta backtest` / `eta promote`.
-A daemon task now computes it every day, on the **fleet captain**, after 00:30
-UTC (`observability::eta_nightly_folds`; checked hourly, folds once per UTC
+A daemon task now computes it every day, on the **explicit ETA authority**
+(#10918) or else the **fleet captain**, after 00:30 UTC (`observability::eta_nightly_folds`; checked hourly, folds once per UTC
 day, catches up at most 7 missed days oldest first).
 
-- **Gate.** Each check passes `fleet.captain` first; the captain arms the
-  `eta-nightly-folds` singleton job and folds, every other host stands down and
-  emits nothing. With no captain declared **no host folds** (fail-closed, like
+- **Gate.** With `fleet.etaAuthority` / `LOOM_ETA_AUTHORITY` set explicitly,
+  the named host arms the `eta-nightly-folds` singleton job and folds, and every
+  other host stands down, the captain included (#10918). Its journals are the
+  ones the authority's ETAs were emitted from, and it has the OTLP exporter.
+  Retirement filing (`retirementFiling`, `eta retire --file`) follows the
+  same owner. Otherwise each check passes `fleet.captain` first: the captain
+  arms the job and folds, and every other host stands down and emits nothing.
+  Re-read every check, no restart. With neither declared **no host folds** (fail-closed, like
   ci-telemetry; logged at `warn` and listed in
   `host.health.captainless_singleton_jobs`), so set `fleet.captain` for the
   scoreboard to exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.

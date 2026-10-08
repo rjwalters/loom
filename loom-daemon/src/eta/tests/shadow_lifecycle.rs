@@ -383,8 +383,8 @@ fn scheduled_root(captain: Option<&str>) -> tempfile::TempDir {
     root
 }
 
-fn gate(root: &std::path::Path, host: &str) -> crate::fleet_captain::CaptainGate {
-    crate::fleet_captain::resolve_gate_for_root(root, host)
+fn gate(root: &std::path::Path, host: &str) -> crate::eta::job_owner::Owner {
+    crate::eta::job_owner::resolve_with(root, host, |_| None)
 }
 
 #[test]

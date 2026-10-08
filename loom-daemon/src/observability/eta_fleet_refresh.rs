@@ -9,8 +9,10 @@
 //! `eta fleet backfill|refresh`, so a fleet host's fit had nothing to train on.
 //!
 //! The task is spawned beside `eta::spawn_task` and inherits its gate (an
-//! observability exporter configured, `autonomous.eta.enabled`), plus its own
-//! `autonomous.eta.fleetRefresh.enabled` (default on). It never runs on the
+//! observability exporter configured, `autonomous.eta.enabled`). Since #10918
+//! it is spawned whatever `autonomous.eta.fleetRefresh.enabled` says (default
+//! on); that key is re-read every tick by the gate below. Only an env
+//! `LOOM_ETA_FLEET_REFRESH_ENABLED=0` keeps it from spawning. It never runs on the
 //! ETA pass or the work-finder tick and never takes the ETA state lock: one
 //! `tokio::time::interval` (`intervalSecs`, first cycle [`FIRST_CYCLE_DELAY`]
 //! after spawn, missed ticks skipped), each cycle one `spawn_blocking` call
@@ -22,13 +24,26 @@
 //! `task_alive{task=eta_fleet_refresh}` liveness gauge, so a wedged cycle shows
 //! as a `0`.
 //!
-//! # One refresher: the fleet captain (#10329)
+//! # One refresher: the ETA authority, else the fleet captain (#10329, #10918)
 //!
 //! The snapshots and raw caches are byte-deterministic and host-independent,
 //! and every host resolves the same reader installations, so N refreshers buy
 //! nothing and spend N times the shared reader budgets. Each tick therefore
-//! passes the `fleet.captain` gate (#8848) first ([`gate_tick`], re-read every
-//! tick, so an edit needs no restart):
+//! passes one gate first ([`gate_tick`], re-read every tick, so an edit needs
+//! no restart). Its owner is [`crate::eta::job_owner`]:
+//!
+//! - **`fleet.etaAuthority` names this host** (#10918): `eta-fleet-refresh`
+//!   is armed and the cycle runs, whoever `fleet.captain` names. This
+//!   overrides a host's own `fleetRefresh.enabled = false` from config: the
+//!   authority fits on its own snapshots (#10498), so it must refresh them.
+//! - **It names another host**: this host stands down as below, the captain
+//!   included, and fetches a published fit from the authority, not the
+//!   captain.
+//! - **This host's `fleetRefresh.enabled` is off** and it is not the explicit
+//!   authority: [`RefreshGate::Disabled`], no forge call, no record.
+//!
+//! With no explicit `fleet.etaAuthority`, the `fleet.captain` gate (#8848)
+//! decides, unchanged:
 //!
 //! - **This host is the captain**: `eta-fleet-refresh` is armed
 //!   ([`SINGLETON_JOB_NAME`], `host.health.armed_singleton_jobs`) and the
@@ -40,8 +55,9 @@
 //!   older ones, or none (logged when the gate changes). With `fleet.repo` set
 //!   the host instead fetches, verifies and installs the captain's published fit
 //!   first ([`distribute_fetch`], #10395), and fits itself only when there is
-//!   no usable publication. The captain publishes its newest fit after the
-//!   fit check ([`distribute_publish`]); a publish failure never fails a cycle.
+//!   no usable publication. The refresher (the captain, or the explicit
+//!   authority) publishes its newest fit after the fit check
+//!   ([`distribute_publish`]); a publish failure never fails a cycle.
 //! - **No captain declared**: the cycle runs, unarmed — deliberately
 //!   **fail-open**, unlike the gate's fail-closed contract for alerting jobs.
 //!   A duplicate refresh costs budget, never correctness (deterministic
@@ -49,8 +65,8 @@
 //!   single-host install must not lose its fit for want of a captain. Logged
 //!   once, with the hint to declare one.
 //!
-//! `should_spawn` / `owns_fit` stay config-only, so the fit's owner never
-//! flips with the gate.
+//! `should_spawn` / `owns_fit` stay config-only (spawn-time), so the fit's
+//! owner never flips with the gate.
 //!
 //! # One cycle
 //!
@@ -118,10 +134,15 @@ use crate::workspace_pool::WorkspacePool;
 /// burst of forge reads.
 pub const FIRST_CYCLE_DELAY: Duration = Duration::from_secs(120);
 
-/// Whether the task runs at all for this configuration.
+/// Whether the task runs at all for this configuration: with
+/// `autonomous.eta.enabled`, unless the env hard stop
+/// `LOOM_ETA_FLEET_REFRESH_ENABLED=0` is set. A config
+/// `fleetRefresh.enabled = false` is not a reason to skip the spawn (#10918):
+/// the per-tick gate reads it ([`RefreshGate::Disabled`]), so a host that
+/// later becomes the explicit ETA authority refreshes without a restart.
 #[must_use]
 pub fn should_spawn(config: &EtaConfig) -> bool {
-    config.enabled && config.fleet_refresh.enabled
+    config.enabled && config.fleet_refresh.env_enabled != Some(false)
 }
 
 /// Whether this task owns the daily fit check (#10245): with fleet refresh on,
@@ -148,47 +169,117 @@ pub struct TaskState {
 /// The singleton job name this task arms under `fleet.captain` (#10329).
 pub const SINGLETON_JOB_NAME: &str = "eta-fleet-refresh";
 
-/// One tick's fleet-captain decision (#10329; see the module doc).
+/// One tick's refresh decision (#10329, #10918; see the module doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshGate {
     /// This host is the declared captain: armed, and it refreshes.
     Captain,
+    /// This host is the explicit ETA authority (#10918): armed, and it
+    /// refreshes, whatever `fleet.captain` and its own `fleetRefresh.enabled`
+    /// (config) say.
+    Authority,
     /// No `fleet.captain` declared: it refreshes, unarmed (fail-open).
     NoCaptain,
-    /// Another host is the captain: no forge call, no record; the fit runs.
-    StandDown { captain: String },
+    /// Another host refreshes (`owner`: the explicit ETA authority, else the
+    /// captain): no forge call, no record; the fit runs.
+    StandDown { owner: String },
+    /// This host's `fleetRefresh.enabled` is off and it is not the explicit
+    /// ETA authority: no forge call, no record; the fit runs (#10918).
+    Disabled,
 }
 
 impl RefreshGate {
     /// Whether this tick makes the cycle's forge calls.
     #[must_use]
     pub fn refreshes(&self) -> bool {
-        !matches!(self, Self::StandDown { .. })
+        matches!(self, Self::Captain | Self::Authority | Self::NoCaptain)
+    }
+
+    /// The `refresh-cycle.json` / `loom.eta.health.refresh_gate` state name.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Captain => "captain",
+            Self::Authority => "authority",
+            Self::NoCaptain => "no_captain",
+            Self::StandDown { .. } => "stand_down",
+            Self::Disabled => "disabled",
+        }
     }
 }
 
-/// Resolve this tick's [`RefreshGate`] from `root`'s `fleet.captain`, keep the
+/// Pure: the gate for `owner` on a host whose own `fleetRefresh.enabled` is
+/// `refresh_enabled`. Arms nothing (see [`gate_tick`]).
+#[must_use]
+pub fn decide(owner: &crate::eta::job_owner::Owner, refresh_enabled: bool) -> RefreshGate {
+    use crate::eta::job_owner::Owner;
+    use crate::fleet_captain::CaptainGate;
+    match owner {
+        Owner::Authority => RefreshGate::Authority,
+        _ if !refresh_enabled => RefreshGate::Disabled,
+        Owner::AuthorityElsewhere { authority } => RefreshGate::StandDown {
+            owner: authority.clone(),
+        },
+        Owner::Captain(CaptainGate::Armed { .. }) => RefreshGate::Captain,
+        Owner::Captain(CaptainGate::Refused { captain, .. }) => RefreshGate::StandDown {
+            owner: captain.clone(),
+        },
+        Owner::Captain(CaptainGate::NoCaptainDeclared) => RefreshGate::NoCaptain,
+    }
+}
+
+/// The gate [`gate_tick`] would resolve now, read-only (never arms): for the
+/// doctor and the health gauge before the first tick.
+#[must_use]
+pub fn preview_gate(root: &Path, host_id: &str) -> RefreshGate {
+    let eta = crate::eta::config::read(root);
+    if !should_spawn(&eta) {
+        return RefreshGate::Disabled;
+    }
+    let owner = crate::eta::job_owner::resolve_for_root(root, host_id);
+    decide(&owner, eta.fleet_refresh.enabled)
+}
+
+/// Resolve this tick's [`RefreshGate`] (the explicit ETA authority, else
+/// `fleet.captain`; this host's `fleetRefresh.enabled`), keep the
 /// armed-singleton registry in step, and log the gate when it changes.
 pub fn gate_tick(root: &Path, host_id: &str, task: &mut TaskState) -> RefreshGate {
-    use crate::fleet_captain::{self as captain, CaptainGate};
-    let gate = match captain::resolve_gate_for_root(root, host_id) {
-        CaptainGate::Armed { captain: name } => {
+    gate_tick_with(root, host_id, task, |k| std::env::var(k).ok())
+}
+
+/// [`gate_tick`] over an injected environment.
+pub fn gate_tick_with(
+    root: &Path,
+    host_id: &str,
+    task: &mut TaskState,
+    env: impl Fn(&str) -> Option<String>,
+) -> RefreshGate {
+    use crate::fleet_captain as captain;
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let refresh_enabled = crate::eta::config::resolve(&effective, &env)
+        .fleet_refresh
+        .enabled;
+    let owner = crate::eta::job_owner::resolve_with(root, host_id, &env);
+    let gate = match decide(&owner, refresh_enabled) {
+        RefreshGate::Captain => {
             match captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
                 Ok(()) => RefreshGate::Captain,
                 // `fleet.captain` changed between the two reads: sit this tick
                 // out; the next one re-reads it.
-                Err(_) => RefreshGate::StandDown { captain: name },
+                Err(_) => RefreshGate::StandDown {
+                    owner: host_id.to_string(),
+                },
             }
         }
-        CaptainGate::Refused { captain: name, .. } => {
-            captain::disarm_singleton_job(SINGLETON_JOB_NAME);
-            RefreshGate::StandDown { captain: name }
+        RefreshGate::Authority => {
+            captain::record_owned_singleton_job(SINGLETON_JOB_NAME, true);
+            RefreshGate::Authority
         }
         // Not `arm_singleton_job`: that would list the job as captainless
         // (stopped for want of a captain), and this one fails open instead.
-        CaptainGate::NoCaptainDeclared => {
+        other => {
             captain::disarm_singleton_job(SINGLETON_JOB_NAME);
-            RefreshGate::NoCaptain
+            other
         }
     };
     if task.gate.as_ref() != Some(&gate) {
@@ -204,21 +295,31 @@ fn log_gate(root: &Path, host_id: &str, gate: &RefreshGate) {
             "eta fleet refresh: this host ({host_id}) is the fleet captain — it refreshes the \
              fleet snapshots for every host (#10329)"
         ),
+        RefreshGate::Authority => log::info!(
+            "eta fleet refresh: this host ({host_id}) is the ETA authority (fleet.etaAuthority) — \
+             it refreshes the fleet snapshots for every host, whoever fleet.captain names and \
+             whatever its own fleetRefresh.enabled says (#10918)"
+        ),
+        RefreshGate::Disabled => log::info!(
+            "eta fleet refresh: autonomous.eta.fleetRefresh.enabled is off on this host \
+             ({host_id}) and it is not the ETA authority: no forge calls here (#10918)"
+        ),
         RefreshGate::NoCaptain => log::info!(
             "eta fleet refresh: no fleet.captain declared; every host with a reader refreshes. \
              Declare one on a multi-host fleet (`fleet.captain` in .loom/config.json) so only \
              one host spends the shared reader budgets (#10329)"
         ),
-        RefreshGate::StandDown { captain } => {
+        RefreshGate::StandDown { owner } => {
             let dir = fleet::snapshot_dir(root);
             let present = fleet::load_all(root).len();
             log::info!(
-                "eta fleet refresh: standing down — the fleet captain is {captain}, this host is \
-                 {host_id}: no forge calls and no eta.fleet_refresh records here (#10329). The \
-                 daily fit still runs on the {present} snapshot(s) under {}{}",
+                "eta fleet refresh: standing down — {owner} refreshes (the ETA authority, else the \
+                 fleet captain), this host is {host_id}: no forge calls and no eta.fleet_refresh \
+                 records here (#10329, #10918). The daily fit still runs on the {present} \
+                 snapshot(s) under {}{}",
                 dir.display(),
                 if present == 0 {
-                    ": none, so nothing to fit until the captain's snapshots are shared here \
+                    ": none, so nothing to fit until the refresher's snapshots are shared here \
                      (LOOM_ETA_FLEET_SNAPSHOT_DIR)"
                 } else {
                     ""
@@ -294,9 +395,10 @@ pub fn spawn_task(
     let eta = crate::eta::config::read(&workspace_root);
     if !should_spawn(&eta) {
         log::info!(
-            "eta fleet refresh: disabled (autonomous.eta.enabled={}, fleetRefresh.enabled={})",
+            "eta fleet refresh: disabled (autonomous.eta.enabled={}, \
+             LOOM_ETA_FLEET_REFRESH_ENABLED={:?})",
             eta.enabled,
-            eta.fleet_refresh.enabled
+            eta.fleet_refresh.env_enabled
         );
         return None;
     }
@@ -457,8 +559,9 @@ fn run_production_cycle(
     // #9758: the SigNoz in-sweep half, same cadence, its own backend. Before
     // the fit only by position; the fit reads forge snapshots alone. Not
     // captain-gated (#10329): it spends no reader budget, and it is a
-    // per-host opt-in with its own credential.
-    if config.signoz.enabled {
+    // per-host opt-in with its own credential. Off with this host's fleet
+    // refresh, as before the loop spawned regardless (#10918).
+    if config.signoz.enabled && ticked.gate != RefreshGate::Disabled {
         let repos: Vec<String> = targets.iter().map(|t| t.repo.clone()).collect();
         signoz_cycle(root, &repos, &config.signoz, Utc::now());
     }
@@ -475,12 +578,15 @@ fn run_production_cycle(
     let fits_here = fit_authority(root, &gate_host);
     // #10586: the authority fits and serves the v2 priority inputs, which
     // read the fleet roster's history; refresh its cache before the fit.
-    if fits_here {
+    // Not on a `disabled` tick (#10918): that host made no forge call before
+    // the loop spawned regardless, and makes none now.
+    if fits_here && ticked.gate != RefreshGate::Disabled {
         crate::eta::roster_history::sync_for(root, Utc::now());
     }
+    // #10918: from the refresher, i.e. the explicit ETA authority if any.
     let serving_published = match &ticked.gate {
-        RefreshGate::StandDown { captain } if !fits_here => {
-            distribute_fetch(root, captain, Utc::now()).is_some_and(|k| k.serving_published())
+        RefreshGate::StandDown { owner } if !fits_here => {
+            distribute_fetch(root, owner, Utc::now()).is_some_and(|k| k.serving_published())
         }
         _ => false,
     };
@@ -506,12 +612,18 @@ fn run_production_cycle(
             &check,
         );
     }
-    if matches!(ticked.gate, RefreshGate::Captain)
+    // #10918: the refresher publishes: the captain, or the explicit ETA
+    // authority under its own name (what the stand-down hosts fetch above).
+    if matches!(ticked.gate, RefreshGate::Captain | RefreshGate::Authority)
         && fit_enabled
         && !matches!(check, FitCheck::Failed(_))
     {
-        let captain = crate::config_resolver::fleet_captain(root).unwrap_or(gate_host);
-        distribute_publish(root, &captain, Utc::now());
+        let publisher = if ticked.gate == RefreshGate::Authority {
+            gate_host
+        } else {
+            crate::config_resolver::fleet_captain(root).unwrap_or(gate_host)
+        };
+        distribute_publish(root, &publisher, Utc::now());
     }
 }
 
@@ -1019,9 +1131,8 @@ pub fn cycle_state(
 ) -> crate::eta::health::RefreshCycleState {
     use crate::eta::health::{RefreshCycleState, RefreshRepo};
     let (gate, captain) = match &ticked.gate {
-        RefreshGate::Captain => ("captain", None),
-        RefreshGate::NoCaptain => ("no_captain", None),
-        RefreshGate::StandDown { captain } => ("stand_down", Some(captain.clone())),
+        RefreshGate::StandDown { owner } => ("stand_down", Some(owner.clone())),
+        other => (other.as_str(), None),
     };
     let mut stop_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut repos = Vec::new();

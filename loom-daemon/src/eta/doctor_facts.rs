@@ -64,10 +64,19 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     };
 
     // The read-only gate resolver: it must never arm the singleton job.
-    let gate = match crate::fleet_captain::resolve_gate_for_root(root, host_id) {
-        crate::fleet_captain::CaptainGate::Armed { .. } => Gate::Captain,
-        crate::fleet_captain::CaptainGate::Refused { captain, .. } => Gate::StandDown { captain },
-        crate::fleet_captain::CaptainGate::NoCaptainDeclared => Gate::NoCaptain,
+    // #10918: the explicit ETA authority, else the fleet captain.
+    let gate = match crate::eta::job_owner::resolve_for_root(root, host_id) {
+        crate::eta::job_owner::Owner::Authority => Gate::Authority,
+        crate::eta::job_owner::Owner::AuthorityElsewhere { authority } => {
+            Gate::AuthorityElsewhere { authority }
+        }
+        crate::eta::job_owner::Owner::Captain(g) => match g {
+            crate::fleet_captain::CaptainGate::Armed { .. } => Gate::Captain,
+            crate::fleet_captain::CaptainGate::Refused { captain, .. } => {
+                Gate::StandDown { captain }
+            }
+            crate::fleet_captain::CaptainGate::NoCaptainDeclared => Gate::NoCaptain,
+        },
     };
     let targets = crate::observability::eta_fleet_refresh::repo_targets(
         root,
