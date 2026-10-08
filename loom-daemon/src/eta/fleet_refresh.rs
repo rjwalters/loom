@@ -553,7 +553,9 @@ pub fn run_cycle_with(
         let state = p.state.unwrap_or_else(|| RefreshState::new(repo));
         let load = signoz.as_mut().map(|(reader, limits)| {
             let window = pass_window(&state, p.kind, budgets.backfill_days, now);
-            signoz_history::load(repo, &mut **reader, *limits, window, budgets.backfill_days)
+            let have =
+                super::capacity_log::backfilled_instants(&super::capacity_log::load(root), repo);
+            signoz_history::load(repo, &mut **reader, *limits, window, budgets.backfill_days, &have)
         });
         let plan = walk.apply(load, budgets.gap_fill);
         let stop = walk.run(state, p.published, p.kind, budgets.backfill_days, now, plan);

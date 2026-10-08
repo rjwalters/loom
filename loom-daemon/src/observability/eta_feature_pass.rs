@@ -50,11 +50,41 @@ pub(super) async fn run(
     else {
         return count;
     };
+    log_capacity(workspace_root, &readable, &stall);
     if let Some(state) = lock().as_mut() {
         state.tracker.on_feature_reads(&answers);
         state.tracker.on_stall_snapshot(stall);
     }
     count
+}
+
+/// Append this pass's live capacity rows (#10959): the authority's own pool,
+/// breaker and quota readings per repo. Only the ETA authority writes the
+/// series; a failed write is a lost observation, not a pass failure.
+fn log_capacity(
+    workspace_root: &Path,
+    slugs: &[String],
+    stall: &crate::eta::stall_features::StallSnapshot,
+) {
+    use crate::eta::capacity_features::{with_stall, CapacityFeatures};
+    use crate::eta::capacity_log::{self, CapacityRow, Source};
+    if !super::authority::active() {
+        return;
+    }
+    let now = Utc::now();
+    let rows: Vec<CapacityRow> = slugs
+        .iter()
+        .map(|slug| CapacityRow {
+            known_at: now,
+            repo: slug.clone(),
+            source: Source::Live,
+            features: with_stall(CapacityFeatures::default(), stall, slug, now),
+        })
+        .collect();
+    if let Err(e) = capacity_log::append(workspace_root, &rows) {
+        log::warn!("eta capacity log: could not append: {e}");
+    }
+    let _ = capacity_log::compact(workspace_root, now);
 }
 
 /// When this process last read each PR's file list ([`ReadClock`]).

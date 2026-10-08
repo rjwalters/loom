@@ -602,6 +602,7 @@ fn ci_and_queue_cover_a_fit_window_only_once_it_lies_wholly_after_the_first_row(
         body: RowBody::Queue {
             tick_at: first,
             entries: Vec::new(),
+            capacity: Default::default(),
         },
     }];
     let covered_from = first + Duration::days(WINDOW_DAYS);

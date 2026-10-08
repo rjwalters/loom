@@ -57,8 +57,8 @@
 //! ([`super::WINDOW_DAYS`], 60 days on main) before it skips a forge read.
 
 use super::fleet_signoz_timeline_rows::{
-    CiDurationRow, CiJobRow, CiRunRow, ItemKey, Lifecycle, QueueEntry, Row, RowBody, Source,
-    Transition,
+    CiDurationRow, CiJobRow, CiRunRow, ItemKey, Lifecycle, QueueCapacity, QueueEntry, Row, RowBody,
+    Source, Transition,
 };
 use super::point_in_time::knowable_at;
 use chrono::{DateTime, Duration, Utc};
@@ -207,6 +207,12 @@ pub struct CiRunState {
 pub struct CiState {
     /// By workflow name.
     pub latest: BTreeMap<String, CiRunState>,
+    /// The latest `completed_at` of any successful run of the ref, whether or
+    /// not a later run superseded it (#10959: time since main was green).
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// `(completed_at, duration_ms)` of every run of the ref that reported a
+    /// duration, ascending (#10959: the CI duration percentile).
+    pub run_durations: Vec<(DateTime<Utc>, i64)>,
 }
 
 impl CiState {
@@ -228,6 +234,16 @@ pub struct QueueState {
     pub observed_at: DateTime<Utc>,
     /// The repo's rows, by issue.
     pub entries: BTreeMap<u32, QueueEntry>,
+    /// The snapshot's host-level capacity (#10959).
+    pub capacity: QueueCapacity,
+}
+
+/// One host's latest knowable `queue.snapshot` capacity (#10959).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostQueue {
+    pub tick_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub capacity: QueueCapacity,
 }
 
 /// A family of timeline rows, for [`Coverage`].
@@ -293,6 +309,9 @@ pub struct Timeline {
     /// By `(repo, ref)`; a run with no ref is under `""`.
     pub ci: BTreeMap<(String, String), CiState>,
     pub queue: Option<QueueState>,
+    /// Each host's latest knowable snapshot capacity, by `host_id` (#10959).
+    /// A snapshot naming no host is not attributable and is absent here.
+    pub hosts: BTreeMap<String, HostQueue>,
     pub coverage: Coverage,
     pub stats: TimelineStats,
 }
@@ -427,6 +446,7 @@ impl Timeline {
         let mut jobs: BTreeMap<(&str, u64), &CiJobRow> = BTreeMap::new();
         let mut durations: BTreeMap<DurationKey<'_>, &CiDurationRow> = BTreeMap::new();
         let mut queue: Option<QueueState> = None;
+        let mut hosts: BTreeMap<String, HostQueue> = BTreeMap::new();
         for (observed_at, row) in &knowable {
             let observed_at = *observed_at;
             let family = match &row.body {
@@ -502,7 +522,26 @@ impl Timeline {
                         stats.duplicate_events += 1;
                     }
                 }
-                RowBody::Queue { tick_at, entries } => {
+                RowBody::Queue {
+                    tick_at,
+                    entries,
+                    capacity,
+                } => {
+                    if let Some(host) = &capacity.host_id {
+                        let newer = hosts
+                            .get(host)
+                            .is_none_or(|h| (*tick_at, observed_at) > (h.tick_at, h.observed_at));
+                        if newer {
+                            hosts.insert(
+                                host.clone(),
+                                HostQueue {
+                                    tick_at: *tick_at,
+                                    observed_at,
+                                    capacity: capacity.clone(),
+                                },
+                            );
+                        }
+                    }
                     let newer = queue
                         .as_ref()
                         .is_none_or(|q| (*tick_at, observed_at) > (q.tick_at, q.observed_at));
@@ -511,6 +550,7 @@ impl Timeline {
                             tick_at: *tick_at,
                             observed_at,
                             entries: entries.iter().map(|e| (e.issue, e.clone())).collect(),
+                            capacity: capacity.clone(),
                         });
                     }
                 }
@@ -595,7 +635,14 @@ impl Timeline {
                     .map(|(_, d)| (*d).clone())
                     .collect(),
             };
-            let latest = &mut ci.entry(key).or_default().latest;
+            let state_ci = ci.entry(key).or_default();
+            if run.conclusion.as_deref() == Some("success") {
+                state_ci.last_success_at = state_ci.last_success_at.max(Some(run.completed_at));
+            }
+            if let Some(ms) = run.duration_ms {
+                state_ci.run_durations.push((run.completed_at, ms));
+            }
+            let latest = &mut state_ci.latest;
             let newer = latest.get(&run.workflow).is_none_or(|held| {
                 (run.completed_at, run.run_id, run.run_attempt)
                     > (held.run.completed_at, held.run.run_id, held.run.run_attempt)
@@ -605,11 +652,16 @@ impl Timeline {
             }
         }
 
+        for state in ci.values_mut() {
+            state.run_durations.sort_unstable();
+        }
+
         Timeline {
             cutoff,
             items,
             ci,
             queue,
+            hosts,
             coverage,
             stats,
         }

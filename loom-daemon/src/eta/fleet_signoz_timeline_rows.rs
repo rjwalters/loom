@@ -149,6 +149,7 @@ SELECT
     multiIf(attributes_string['loom.kind'] != '', attributes_string['loom.kind'],
             service = 'loom-ui-d1-export', JSONExtractString(body, 'kind'),
             body) AS kind,
+    resources_string['host.id'] AS host_id,
     multiIf(kind = 'queue.snapshot', {repo:String},
             attributes_string['loom.repo'] != '', attributes_string['loom.repo'],
             service = 'loom-ui-d1-export', JSONExtractString(body, 'repo'),
@@ -277,6 +278,19 @@ pub struct QueueEntry {
     pub reason: Option<String>,
 }
 
+/// The host-level capacity a `queue.snapshot` carries beside its rows
+/// (#10959): which host ticked, the dispatch concurrency cap in force and the
+/// host's counts. Every field is `None` when the record did not say, never a
+/// guessed zero (a stated `max_concurrent` of 0 is `Some(0)`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueCapacity {
+    pub host_id: Option<String>,
+    pub max_concurrent: Option<u32>,
+    pub running: Option<u32>,
+    pub ready: Option<u32>,
+    pub blocked: Option<u32>,
+}
+
 /// What a row says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowBody {
@@ -305,6 +319,8 @@ pub enum RowBody {
     Queue {
         tick_at: DateTime<Utc>,
         entries: Vec<QueueEntry>,
+        /// The host-level capacity of the snapshot (#10959).
+        capacity: QueueCapacity,
     },
 }
 
@@ -778,7 +794,32 @@ fn queue_body(fields: &Fields<'_>, repo: &str, event_at: Option<DateTime<Utc>>) 
             })
         })
         .collect();
-    Ok(Some(RowBody::Queue { tick_at, entries }))
+    let counts = match fields.get(&["counts"]) {
+        Some(v @ Value::Object(_)) => Some(v.clone()),
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text).ok(),
+        _ => None,
+    };
+    let count = |name: &str| {
+        counts
+            .as_ref()
+            .and_then(|c| c.get(name))
+            .and_then(int)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let capacity = QueueCapacity {
+        host_id: fields
+            .text(&["loom.record.host_id", "loom.host_id", "host_id"])
+            .or_else(|| fields.column("host_id").map(str::to_string)),
+        max_concurrent: fields.uint::<u32>(&["max_concurrent"]),
+        running: count("running"),
+        ready: count("ready"),
+        blocked: count("blocked"),
+    };
+    Ok(Some(RowBody::Queue {
+        tick_at,
+        entries,
+        capacity,
+    }))
 }
 
 /// [`TIMELINE_SQL`] over ClickHouse's HTTP interface: the same transport,

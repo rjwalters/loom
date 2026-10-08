@@ -352,6 +352,9 @@ pub struct Plan {
     pub listed_at: Option<DateTime<Utc>>,
     /// The star changes the timeline dates on issues (see [`issue_stars`]).
     pub issue_stars: Vec<(IssueStarChange, String)>,
+    /// Capacity backfill rows (#10959) for hourly instants the capacity log
+    /// lacks, derived from the same walked rows; empty from [`plan`].
+    pub capacity: Vec<super::capacity_log::CapacityRow>,
 }
 
 impl Plan {
@@ -383,6 +386,7 @@ pub fn load(
     limits: Limits,
     (listed_at, since): (DateTime<Utc>, DateTime<Utc>),
     history_days: i64,
+    capacity_have: &std::collections::BTreeSet<DateTime<Utc>>,
 ) -> Load {
     let start = listed_at - Duration::days(history_days + COVERAGE_PROBE_DAYS);
     let rows = match walk(repo, reader, start, listed_at, limits) {
@@ -407,7 +411,14 @@ pub fn load(
             ));
         }
     }
-    Load::Covered(plan(&timeline, listed_at, since))
+    let mut covered = plan(&timeline, listed_at, since);
+    let instants = super::capacity_log::missing_instants(
+        listed_at - Duration::days(history_days),
+        listed_at,
+        capacity_have,
+    );
+    covered.capacity = super::capacity_log::backfill(&rows, repo, &instants);
+    Load::Covered(covered)
 }
 
 /// Every PR of `timeline` touched since `since`, ascending.
@@ -427,6 +438,7 @@ pub fn plan(timeline: &Timeline, cutoff: DateTime<Utc>, since: DateTime<Utc>) ->
         candidates,
         listed_at: Some(cutoff),
         issue_stars: issue_stars(timeline),
+        capacity: Vec::new(),
     }
 }
 
@@ -695,6 +707,9 @@ impl Walk<'_> {
                 self.report.history = Some(HistorySource::Signoz);
                 freeze_raw_cache(self.root, &repo);
                 record_signoz_stars(self.root, &repo, &plan);
+                if let Err(e) = super::capacity_log::append(self.root, &plan.capacity) {
+                    log::warn!("eta fleet refresh: {repo}: could not log capacity backfill: {e}");
+                }
                 self.gap_left = Some(gap_budget);
                 if plan.gap_fills() > 0 {
                     log::info!(

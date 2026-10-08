@@ -3256,6 +3256,42 @@ the primary history source, with forge reads only filling gaps.
   the whole fit window (60 days) lies after it. For `ci.*` and `queue.snapshot`
   that is about 2026-11-27.
 
+### Fleet capacity series (`capacity.jsonl`, #10959)
+
+ETAs assume the fleet has its usual capacity. Slice 1 of the capacity features
+logs that capacity point-in-time, with no model change: no fit column, no
+shadow, no `eta.estimate` field yet.
+
+- **One builder.** `eta/capacity_features.rs::build` reads a SigNoz `Timeline`
+  whose cutoff *is* `as_of` (it takes no second instant, so a row observed
+  later cannot reach a value). `queue.snapshot` rows now keep per-host
+  `host_id`, `max_concurrent` and `counts` (`Timeline.hosts`, latest per host;
+  `QueueState.capacity`), and main-branch `CiState` keeps `last_success_at`
+  and run durations.
+- **Features** (`None` is "not known", never zero): `hosts_live`,
+  `slots_fleet` (sum of `max_concurrent` over hosts whose latest snapshot is
+  at most 2 ticks / 20 min old; a stated 0 counts 0; hosts seen but none live
+  is 0; never seen is `None`), `running_fleet`, `slot_util_fleet`, `main_red`,
+  `since_main_green_sec` (capped at 7 d), `ci_dur_p50_24h_ms`, and the
+  authority-only `pool_usable`, `pool_exhausted`, `breaker_open`,
+  `reader_quota_min` (the `stall_features` reads).
+- **The log.** `capacity.jsonl` beside the fleet snapshots
+  (`eta/capacity_log.rs`, mirroring `pr-files.jsonl`). One row per
+  `{known_at, repo, source}`; `source: live` rows are the ETA authority's own
+  pool/breaker/quota readings, appended each feature pass; `source: backfill`
+  rows are derived hourly from SigNoz `queue.snapshot` and `ci.*` rows keyed by
+  `observed_timestamp`, by the fleet refresh task (96 instants per pass,
+  oldest first, skipping instants already logged). Readers take
+  `latest_before(as_of)`: strictly earlier than `as_of`, live beating backfill
+  at one instant.
+- **Coverage.** `capacity_log::uncovered` reports the families short of a
+  window via `Coverage::covers(Family::Queue | Family::Ci, cutoff, days)`.
+- **Not in slice 1.** Fleet-wide pool/breaker for non-authority hosts (needs a
+  SigNoz *metrics* reader), CI queue-wait p50 (needs `queued_ms` on the job
+  rows), backfilling authority stall fields from past `eta.estimate` rows, the
+  additive `eta.estimate` `Features` fields, and the `eta-fit/v4` columns,
+  shadow and walk-forward (slice 2, with the article of #10949).
+
 ## Queries
 
 [`eta-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/eta-queries.sql)

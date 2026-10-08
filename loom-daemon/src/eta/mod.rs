@@ -97,6 +97,8 @@
 pub mod authority;
 pub mod backtest;
 pub mod calibration_log;
+pub mod capacity_features;
+pub mod capacity_log;
 pub mod config;
 pub mod conformal;
 pub mod conformal_ipcw;
