@@ -1,13 +1,27 @@
 //! The host side of the workspace resync (#10718): the H0 gate, and the glue
 //! that runs a pass from the fleet-sync timer with the daemon's real inputs.
+//!
+//! # A pass never delays fleet-sync
+//!
+//! The timer does not wait for a pass. [`spawn_pass`] starts one on its own
+//! task and returns; the fleet-store sync, the floor and `paused`/`stopped`
+//! enforcement keep their cadence whatever git is doing. Passes are
+//! single-flight: while one is running the next tick starts none (it is
+//! skipped, not queued), so there are never two. A finished pass records its
+//! result in the current status snapshot.
+//!
+//! The other half of "bounded" is inside the pass: a time budget for
+//! classification and a short timeout on every git child (see the parent
+//! module).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use chrono::Utc;
 
-use super::{Env, LazyPayload, Memory, WorkspacePass, ALERT_TOPIC};
+use super::{Env, LazyPayload, Memory, WorkspacePass, ALERT_TOPIC, PASS_BUDGET};
 use crate::event_bus::EventBus;
 use crate::fleet_state::Enforcer;
 use crate::fleet_store::gh::GhTransport;
@@ -34,10 +48,15 @@ pub enum NotCurrent {
     Stalled,
     /// The startup pass has not completed (H5).
     Unverified,
-    /// Not a state at all but a fact about the binary: it was not built from
-    /// a clean checkout, so its payload is no release. Such a host never
-    /// resyncs, and says so once, not per repo.
+    /// Not a state at all but a fact about the binary: it is not an official
+    /// release build (the release workflow did not build it, or the release
+    /// tag names another commit), so its payload is no release. Such a host
+    /// never resyncs, and says so once, not per repo.
     NotAReleaseBuild,
+    /// The binary carries a release stamp, but the forge has not yet
+    /// confirmed that the release tag names its commit. Nothing is pushed
+    /// until it has; the lookup is retried with backoff.
+    ReleaseUnverified,
 }
 
 impl NotCurrent {
@@ -51,8 +70,15 @@ impl NotCurrent {
             Self::FloorBelow => "running version is below the fleet floor",
             Self::Stalled => "self-update is stalled",
             Self::Unverified => "startup pass not complete",
-            Self::NotAReleaseBuild => "this daemon is not a release build",
+            Self::NotAReleaseBuild => "this daemon is not an official release build",
+            Self::ReleaseUnverified => "this daemon's release tag is not verified yet",
         }
+    }
+
+    /// A fact about the binary, not a state the host is passing through.
+    #[must_use]
+    pub fn is_about_the_build(self) -> bool {
+        matches!(self, Self::NotAReleaseBuild | Self::ReleaseUnverified)
     }
 
     /// The host line of a pass: `host not H0: <reason>`.
@@ -75,8 +101,12 @@ impl std::fmt::Display for NotCurrent {
 /// by other parts of the daemon; [`HostGateInputs::live`] collects them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostGateInputs {
-    /// The embedded payload is a release's tracked tree, unmodified.
+    /// The binary has not been shown NOT to be an official release build: it
+    /// carries the release workflow's stamp for its own version, and the
+    /// release tag has not been found to name another commit.
     pub release_build: bool,
+    /// The forge confirmed the release tag names this binary's commit.
+    pub release_verified: bool,
     /// A fleet-sync pass has completed in this process.
     pub verified: bool,
     /// The drain flag is set, or the fleet state holds this host.
@@ -103,6 +133,7 @@ pub struct HostGateInputs {
 pub fn host_gate(i: &HostGateInputs) -> Result<(), NotCurrent> {
     let checks = [
         (!i.release_build, NotCurrent::NotAReleaseBuild),
+        (!i.release_verified, NotCurrent::ReleaseUnverified),
         (!i.verified, NotCurrent::Unverified),
         (i.draining, NotCurrent::Draining),
         (i.staged, NotCurrent::Staged),
@@ -169,8 +200,11 @@ impl HostGateInputs {
         let floor = crate::fleet_sync::loom_min_version()
             .as_deref()
             .and_then(Version::parse);
+        // Read without asking the forge: `run_live` does the asking, once.
+        let provenance = crate::release_provenance::current();
         Self {
-            release_build: Stamp::this_binary().is_some_and(|s| s.release_build),
+            release_build: !provenance.refuted(),
+            release_verified: Stamp::this_binary().is_some_and(|s| s.release_build),
             verified: VERIFIED.load(Ordering::Relaxed),
             draining,
             roll_pending,
@@ -225,6 +259,29 @@ fn run_live(
     else {
         return WorkspacePass::default();
     };
+    let started = Instant::now();
+    let mut guard = match memory().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Release provenance, part (b): ask the forge what the release tag names.
+    // Once per process (the answer is cached; a lookup with no answer is
+    // retried with backoff), and only from a host that could write: one with
+    // `fleet.autoApply` off or dispatch paused asks nobody.
+    if mode == Mode::Write && !enforcer.drain_facts().0 {
+        let found = crate::release_provenance::ensure(Utc::now(), inputs.interval, &|repo, tag| {
+            // The release-resolve machinery: `gh api`, peeling an
+            // annotated tag to the commit it names.
+            crate::release_fetch::source::resolve_tag_commit(
+                &|path| crate::release_fetch::source::gh_api(&inputs.workspace, path),
+                repo,
+                tag,
+            )
+        });
+        if guard.noted.insert(format!("provenance:{found}")) {
+            log::info!("workspace_resync: release provenance: {found}");
+        }
+    }
     let payload = LazyPayload::new(Payload::embedded);
     let env = Env {
         host: &inputs.host,
@@ -244,10 +301,7 @@ fn run_live(
         },
         gate: &|| super::host_gate(&HostGateInputs::live(enforcer)),
         clock: &Utc::now,
-    };
-    let mut guard = match memory().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        spent: &|| started.elapsed() >= PASS_BUDGET,
     };
     let pass = super::run(&env, &registered_roots(), mode, &mut guard);
     drop(guard);
@@ -260,31 +314,84 @@ fn run_live(
     pass
 }
 
-/// Run the workspace half and record it in `status`, the snapshot the pass
-/// before it published. Called by the timer task: once at startup (after the
-/// startup pass, with the drain state wired) and after every timer pass, once
-/// run-state enforcement has been applied. `None` means the startup pass did
-/// not finish; the first timer pass covers it.
-pub(in crate::fleet_sync) async fn pass(
+// ============================================================================
+// Single flight
+// ============================================================================
+
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// The one running pass. Dropping it lets the next one start, on every way
+/// out of the task, a panic included.
+pub(super) struct Flight<'a>(&'a AtomicBool);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Take the single-flight slot; `None` while another pass holds it.
+pub(super) fn begin(slot: &AtomicBool) -> Option<Flight<'_>> {
+    // Lazily: a `Flight` built for a refused caller would free the slot when
+    // it was dropped.
+    (!slot.swap(true, Ordering::AcqRel)).then(|| Flight(slot))
+}
+
+fn latest_cell() -> &'static Mutex<WorkspacePass> {
+    static LATEST: OnceLock<Mutex<WorkspacePass>> = OnceLock::new();
+    LATEST.get_or_init(|| Mutex::new(WorkspacePass::default()))
+}
+
+/// What the last finished workspace pass found. The timer puts it on each
+/// status snapshot it publishes, so a fleet-sync pass does not blank it.
+pub(in crate::fleet_sync) fn latest() -> WorkspacePass {
+    latest_cell()
+        .lock()
+        .map(|found| found.clone())
+        .unwrap_or_default()
+}
+
+/// Start a workspace pass on its own task and return at once. Called by the
+/// timer task: once at startup (after the startup pass, with the drain state
+/// wired) and after every timer pass, once run-state enforcement has been
+/// applied. Returns `false`, and starts nothing, while the previous pass is
+/// still running.
+///
+/// `then` runs on a blocking thread once the pass has finished, still inside
+/// the single flight: the checkout fast-forward (#10869), which must follow
+/// any push this pass made and must never overlap the next pass.
+pub(in crate::fleet_sync) fn spawn_pass(
     inputs: &PassInputs,
     mode: Mode,
-    status: Option<crate::fleet_sync::FleetSyncStatus>,
     enforcer: &Option<Arc<dyn Enforcer>>,
     bus: &Option<Arc<EventBus>>,
-) {
-    let Some(mut status) = status else {
-        return;
+    then: impl FnOnce() + Send + 'static,
+) -> bool {
+    let Some(flight) = begin(&IN_FLIGHT) else {
+        log::info!(
+            "fleet_sync: the previous workspace pass is still running; none is started this tick"
+        );
+        return false;
     };
     let (owned, enforcer, bus) = (inputs.clone(), enforcer.clone(), bus.clone());
-    let found = tokio::task::spawn_blocking(move || {
-        run_live(&owned, mode, enforcer.as_deref(), bus.as_deref())
-    })
-    .await;
-    match found {
-        Ok(found) => {
-            status.workspaces = found;
-            crate::fleet_sync::publish(&status);
+    tokio::spawn(async move {
+        let _flight = flight;
+        let found = tokio::task::spawn_blocking(move || {
+            run_live(&owned, mode, enforcer.as_deref(), bus.as_deref())
+        })
+        .await;
+        match found {
+            Ok(found) => {
+                if let Ok(mut latest) = latest_cell().lock() {
+                    latest.clone_from(&found);
+                }
+                crate::fleet_sync::publish_workspaces(&found);
+            }
+            Err(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
         }
-        Err(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
-    }
+        if let Err(e) = tokio::task::spawn_blocking(then).await {
+            log::warn!("fleet_sync: the step after a workspace pass panicked: {e}");
+        }
+    });
+    true
 }

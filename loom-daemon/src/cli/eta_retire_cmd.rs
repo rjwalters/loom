@@ -5,7 +5,7 @@
 //!
 //! The rule and its evidence are [`loom_daemon::eta::shadow_lifecycle`]; this
 //! file parses arguments and prints; reading the folds and filing (the same
-//! path the captain's nightly task uses) is
+//! path the nightly fold task uses) is
 //! [`loom_daemon::eta::retire_filing`].
 
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ pub(crate) struct EtaRetireArgs {
     pub repo_root: Option<PathBuf>,
 
     /// File each proposal not already filed (on this host or on the forge)
-    /// as an issue. Only the fleet captain files (`fleet.captain`); any other
-    /// host refuses. Without it this only prints.
+    /// as an issue. Only the host that folds files (the explicit
+    /// `fleet.etaAuthority`, else `fleet.captain`); any other host refuses. Without it this only prints.
     #[arg(long)]
     pub file: bool,
 
@@ -66,7 +66,7 @@ impl EtaRetireArgs {
         if !self.file || proposals.is_empty() {
             return Ok(());
         }
-        // Only the fleet captain files (#8848); the gate is checked first.
+        // Only the folds' owner files (#8848, #10918); the gate is checked first.
         let report = retire_filing::file_for_root(
             &root,
             &loom_daemon::sweep_registry::host_identity(),

@@ -71,6 +71,17 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
+    /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
+    /// every tool call unparked.
+    #[command(subcommand)]
+    RollPause(super::roll_pause_cli::RollPauseCommand),
+
+    /// Session handles for a roll resume (#10830): Claude `--session-id` /
+    /// `--resume` args, the Codex resume check, live Codex id capture.
+    #[command(subcommand)]
+    AgentResume(super::roll_pause_cli::AgentResumeCommand),
+
     /// The installed-Loom / daemon compatibility contract (#10716): `show`
     /// this daemon's claims (and a repo's), `check` them across adjacent
     /// releases in CI. Here, not in a script, per the shell-language policy.
@@ -568,6 +579,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::RollPause(cmd) => cmd.run(),
+            ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
@@ -843,6 +856,13 @@ pub(crate) enum MergePrCommand {
     /// — see `cli::merge_pr_version_policy`.
     VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
 
+    /// The pre-merge `workflow` token-scope guard (#10539): refuse a PR that
+    /// touches `.github/workflows/` when the `gh` token's `X-OAuth-Scopes` is
+    /// present and lacks `workflow`. Exit 1 = block (message on stdout), 0 =
+    /// proceed; fails open on any lookup error — see
+    /// `cli::merge_pr_workflow_scope`.
+    WorkflowScope(super::merge_pr_workflow_scope::WorkflowScopeArgs),
+
     /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
     /// discover open CHILD PRs still targeting this parent branch and
     /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
@@ -983,6 +1003,12 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
 
+    /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
+    /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
+    /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
+    /// deadline compare itself on any fault — see `cli::merge_pr_poll_wait`.
+    PollWait(super::merge_pr_poll_wait::PollWaitArgs),
+
     /// The post-`--auto`-wait re-read decision (#8410/#8896, #8191 slice):
     /// stdin is the uncached PR payload; prints MERGED / NO-HEAD / MOVED <sha>
     /// / CLEAR + labels. The shell refuses on any other output — see
@@ -1019,6 +1045,7 @@ impl MergePrCommand {
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::WorkflowScope(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
@@ -1037,6 +1064,7 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }

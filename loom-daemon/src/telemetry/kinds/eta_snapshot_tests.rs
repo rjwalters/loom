@@ -31,6 +31,7 @@ fn record() -> EtaSnapshotRecord {
         as_of: row.as_of,
         rows: vec![row],
         rows_truncated: 0,
+        alternates_truncated: 0,
         rows_truncated_by_kind: Default::default(),
     }
 }
@@ -133,7 +134,8 @@ fn a_refusals_quantiles_are_absent_and_its_reason_is_present() {
     assert_eq!(back, refusal);
 }
 
-/// An older reader's record (no `rows_truncated`) still decodes, and an
+/// An older daemon's record (no `rows_truncated`, no `alternates_truncated`)
+/// still decodes, and an
 /// untagged row is private — the default every per-repo record shares.
 #[test]
 fn missing_optional_fields_decode_to_the_safe_default() {
@@ -150,6 +152,7 @@ fn missing_optional_fields_decode_to_the_safe_default() {
     }))
     .unwrap();
     assert_eq!(decoded.rows_truncated, 0);
+    assert_eq!(decoded.alternates_truncated, 0, "absent from older daemons (#10928)");
     assert_eq!(decoded.rows[0].visibility, RepoVisibility::Private);
     assert_eq!(decoded.rows[0].kind, Kind::Start);
     assert_eq!(decoded.rows[0].stage, None);

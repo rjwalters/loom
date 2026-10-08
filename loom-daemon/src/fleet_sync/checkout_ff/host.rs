@@ -1,18 +1,18 @@
 //! The host side of the checkout fast-forward (#10869): the hold that keeps
 //! it apart from the daemon's self-update, the record of what the workspace
-//! half already fetched, and the glue that runs a pass from the startup pass
-//! and from the fleet-sync timer with the daemon's real inputs.
+//! half already asked the remote, and the glue that runs a pass from the
+//! startup pass and after each workspace pass with the daemon's real inputs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
-use super::{CheckoutPass, Env, Memory, Transition, STARTUP_BUDGET, TOPIC};
+use super::{CheckoutPass, Env, Memory, Transition, PASS_BUDGET, STARTUP_BUDGET, TOPIC};
 use crate::event_bus::EventBus;
-use crate::fleet_state::Enforcement;
+use crate::fleet_state::{Enforcement, Enforcer};
 use crate::fleet_sync::{FleetSyncStatus, PassInputs};
 
 /// "Is a main-health gate run building in this root right now?" In production,
@@ -115,29 +115,31 @@ pub fn hold_for_move(root: &Path) -> Option<MoveHold> {
 }
 
 // ============================================================================
-// What the workspace half already fetched
+// What the workspace half already asked the remote
 // ============================================================================
 
-fn fetch_log() -> &'static Mutex<HashMap<PathBuf, (String, Instant)>> {
-    static LOG: OnceLock<Mutex<HashMap<PathBuf, (String, Instant)>>> = OnceLock::new();
-    LOG.get_or_init(|| Mutex::new(HashMap::new()))
+type Heard = (String, String, DateTime<Utc>);
+
+fn remote_heads() -> &'static Mutex<HashMap<PathBuf, Heard>> {
+    static HEADS: OnceLock<Mutex<HashMap<PathBuf, Heard>>> = OnceLock::new();
+    HEADS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record that `origin/<branch>` of `root` was just fetched. Called by the
-/// workspace half ([`crate::fleet_sync::workspace_resync`]), so the checkout
-/// half of the same pass does not fetch the same branch again.
-pub(in crate::fleet_sync) fn note_fetched(root: &Path, branch: &str) {
-    if let Ok(mut log) = fetch_log().lock() {
-        log.insert(root.to_path_buf(), (branch.to_string(), Instant::now()));
+/// Record that the remote just named `head` as `branch`'s head in `root`.
+/// Called by the workspace half ([`crate::fleet_sync::workspace_resync`])
+/// after each `git ls-remote`, so the checkout half does not ask the same
+/// remote the same question.
+pub(in crate::fleet_sync) fn note_remote_head(root: &Path, branch: &str, head: &str) {
+    if let Ok(mut heads) = remote_heads().lock() {
+        heads.insert(root.to_path_buf(), (branch.to_string(), head.to_string(), Utc::now()));
     }
 }
 
-/// Was `origin/<branch>` of `root` fetched at or after `since`?
-fn fetched_since(root: &Path, branch: &str, since: Instant) -> bool {
-    fetch_log().lock().is_ok_and(|log| {
-        log.get(root)
-            .is_some_and(|(b, at)| b == branch && *at >= since)
-    })
+/// The head the workspace half last heard for `root`'s `branch`, and when.
+fn heard(root: &Path, branch: &str) -> Option<super::Confirmed> {
+    let heads = remote_heads().lock().ok()?;
+    let (b, head, at) = heads.get(root)?;
+    (b == branch).then(|| (head.clone(), *at))
 }
 
 // ============================================================================
@@ -150,21 +152,22 @@ fn memory() -> &'static Mutex<Memory> {
 }
 
 /// One checkout pass over the registered workspaces. Blocking (git children),
-/// so it runs on a blocking thread. `since` is when this fleet-sync pass
-/// began: a fetch the workspace half made after it is reused.
+/// so it runs on a blocking thread.
 fn run_live(
-    write: bool,
-    budget: Option<Duration>,
-    since: Instant,
+    inputs: &PassInputs,
+    network: bool,
+    budget: Duration,
     gate: Option<&GateProbe>,
 ) -> CheckoutPass {
     let started = Instant::now();
     let env = Env {
-        write,
+        write: inputs.auto_apply,
         gate_in_flight: &|root| gate.is_some_and(|probe| probe(root)),
         hold: &hold_for_move,
-        fetched: &|root, branch| fetched_since(root, branch, since),
-        budget,
+        network,
+        recheck: crate::fleet_sync::workspace_resync::recheck_after(inputs.interval),
+        confirmed: &heard,
+        budget: Some(budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
     };
@@ -180,7 +183,8 @@ fn run_live(
 /// be in flight yet: the gate task is spawned later in boot.
 ///
 /// A host whose desired state is `stopped` is about to exit, and is left
-/// alone.
+/// alone. A `paused` host, like one with `fleet.autoApply` off, asks no
+/// remote: it compares with `origin/<default>` as the clone has it.
 pub(in crate::fleet_sync) fn startup(
     inputs: &PassInputs,
     status: &mut FleetSyncStatus,
@@ -188,7 +192,8 @@ pub(in crate::fleet_sync) fn startup(
     if status.enforced == Enforcement::Stop {
         return Vec::new();
     }
-    let pass = run_live(inputs.auto_apply, Some(STARTUP_BUDGET), Instant::now(), None);
+    let network = inputs.auto_apply && status.enforced == Enforcement::Proceed;
+    let pass = run_live(inputs, network, STARTUP_BUDGET, None);
     status.checkouts = pass.checkouts;
     pass.transitions
 }
@@ -204,30 +209,32 @@ pub(in crate::fleet_sync) fn announce(transitions: &[Transition], bus: Option<&E
     }
 }
 
-/// Run the checkout half from the timer task and record it in the published
-/// snapshot. Called last: once at startup after the workspace half (for the
-/// workspaces the startup budget did not reach, and for a resync that half
-/// just pushed) and after the workspace half of every timer pass, so the host
-/// that pushed a resync fast-forwards to it in the same pass.
-pub(in crate::fleet_sync) async fn pass(
+/// The checkout half on the timer, as the step that follows a workspace pass
+/// (`workspace_resync::spawn_pass`'s `then`). It runs on that pass's own task
+/// and inside its single flight, so:
+///
+/// - the fleet-sync timer never waits for it;
+/// - it follows any resync the pass pushed, and that push already moved
+///   `origin/<default>` in this clone, so the host that pushed fast-forwards
+///   to it in the same pass with nothing to fetch;
+/// - it never overlaps the next workspace pass.
+///
+/// It asks no remote when `fleet.autoApply` is off or dispatch is paused (a
+/// drain, a roll's pause or a fleet hold), and none without an enforcer to
+/// read that from.
+pub(in crate::fleet_sync) fn after_resync(
     inputs: &PassInputs,
-    since: Instant,
+    enforcer: &Option<Arc<dyn Enforcer>>,
     gate: &Option<GateProbe>,
     bus: &Option<Arc<EventBus>>,
-) {
-    let (write, gate) = (inputs.auto_apply, gate.clone());
-    let found =
-        tokio::task::spawn_blocking(move || run_live(write, None, since, gate.as_ref())).await;
-    match found {
-        Ok(found) => {
-            announce(&found.transitions, bus.as_deref());
-            // Read the snapshot only now: the pass above took a while, and
-            // the fast-forward must not depend on a snapshot existing.
-            if let Some(mut status) = crate::fleet_sync::cached_status() {
-                status.checkouts = found.checkouts;
-                crate::fleet_sync::publish(&status);
-            }
-        }
-        Err(e) => log::warn!("fleet_sync: a checkout pass panicked: {e}"),
+) -> impl FnOnce() + Send + 'static {
+    let (inputs, enforcer, gate, bus) =
+        (inputs.clone(), enforcer.clone(), gate.clone(), bus.clone());
+    move || {
+        let paused = enforcer.as_deref().is_none_or(|e| e.drain_facts().0);
+        let network = inputs.auto_apply && !paused;
+        let found = run_live(&inputs, network, PASS_BUDGET, gate.as_ref());
+        announce(&found.transitions, bus.as_deref());
+        crate::fleet_sync::publish_checkouts(&found.checkouts);
     }
 }

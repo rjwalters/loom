@@ -398,6 +398,19 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.publish != 'skip'
     runs-on: ${{ matrix.os }}
+    env:
+      # The release stamp (#10718). `loom-daemon/build_stamp.rs` bakes this
+      # into the binary, and a daemon pushes Loom updates into fleet repos only
+      # if it carries the stamp for its own version AND the forge confirms the
+      # tag names the commit it was built from (`release_provenance.rs`). This
+      # is the ONLY place the variable is set: a developer's build, a feature
+      # branch's and every CI job leave it empty, so none of them can push.
+      # Empty on a dry run (`publish == 'false'`), which publishes nothing.
+      #
+      # Job-level on purpose: the collector step below re-runs cargo for this
+      # package, and a step-level value would have it rebuild the binary
+      # without the stamp just before it is packaged.
+      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom' && needs.resolve.outputs.tag) || '' }}
     strategy:
       # Never mask a platform's failure with another's success, and never let
       # one platform's failure cancel an in-flight build for another.
@@ -535,6 +548,22 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/loom-daemon" "dist/loom-daemon-${{ matrix.target }}"
+
+      # The packaged binary must carry exactly the stamp this run set (#10718):
+      # the release tag on a publishing run, nothing on a dry run. Read with
+      # `grep -a` so the cross-compiled artifact, which cannot run here, is
+      # checked too. A release whose binaries lost the stamp would leave every
+      # fleet host unable to resync, so that fails here instead.
+      - name: Verify the release stamp
+        run: |
+          set -euo pipefail
+          bin="dist/loom-daemon-${{ matrix.target }}"
+          marker="loom-release-build-tag=${LOOM_RELEASE_BUILD_TAG};"
+          if ! grep -a -q -F -- "$marker" "$bin"; then
+            echo "::error::$bin does not carry the release stamp '$marker' (LOOM_RELEASE_BUILD_TAG='${LOOM_RELEASE_BUILD_TAG}')." >&2
+            exit 1
+          fi
+          echo "Confirmed: $bin carries '$marker'."
 
       # Detect which signing secrets are present and record the decision as step
       # outputs. GitHub Actions cannot reference `secrets.*` directly in an

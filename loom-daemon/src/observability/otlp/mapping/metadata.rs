@@ -136,6 +136,19 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     if let Some(value) = record.failure_class.as_ref().filter(|v| text(v)) {
         attrs.push(kv_string("loom.failure_class", value.clone()));
     }
+    // Issue #10642: why a `no-phase-signal` sweep ended. Closed vocabularies
+    // (and a decimal exit code), so groupable like `loom.failure_class`.
+    if let Some(cause) = &record.no_phase_cause {
+        for (key, value) in [
+            ("loom.no_phase.exit", &cause.exit),
+            ("loom.no_phase.last_step", &cause.last_step),
+            ("loom.no_phase.reason", &cause.reason),
+        ] {
+            if text(value) {
+                attrs.push(kv_string(key, value.clone()));
+            }
+        }
+    }
     if let Some(value) = record.doctor_cycles {
         attrs.push(kv_int("loom.doctor_cycles", i64::from(value)));
     }

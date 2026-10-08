@@ -71,6 +71,7 @@ use transport::{post, Signal};
 use std::time::Duration;
 
 use super::exporter::{BatchOutcome, ExportError, Exporter};
+use super::request_headers::RequestHeaders;
 use crate::telemetry::TelemetryEnvelope;
 
 /// Per-request timeout — same rationale and value as
@@ -82,12 +83,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// the standard OTLP/HTTP path suffixes — each with `Authorization: Bearer
 /// <ingest_key>`, the same auth convention [`super::exporter::HttpsExporter`]
 /// uses, so `observability.ingestKeyFile` is shared across both sinks.
+///
+/// An entry with `headers_file` (Issue #10961) additionally sends that file's
+/// headers on all three signals; a file-supplied `Authorization` replaces the
+/// Bearer header. See [`super::request_headers`].
+///
+/// Deliberately not `Debug`: it holds the ingest key.
 pub struct OtlpExporter {
     client: reqwest::Client,
     logs_endpoint: String,
     metrics_endpoint: String,
     traces_endpoint: String,
     ingest_key: String,
+    /// Empty unless built by [`OtlpExporter::with_headers_file`].
+    extra_headers: RequestHeaders,
 }
 
 impl OtlpExporter {
@@ -113,7 +122,43 @@ impl OtlpExporter {
             metrics_endpoint: format!("{base}/v1/metrics"),
             traces_endpoint: format!("{base}/v1/traces"),
             ingest_key,
+            extra_headers: RequestHeaders::default(),
         })
+    }
+
+    /// [`Self::new`], plus the extra request headers in `headers_file` when
+    /// the exporter entry names one (Issue #10961). `None` is exactly
+    /// [`Self::new`].
+    ///
+    /// The file is read on every call, so rebuilding the exporter picks up a
+    /// rotated credential. The endpoint is validated first: a headers file is
+    /// never opened for a destination the exporter would refuse.
+    ///
+    /// # Errors
+    ///
+    /// [`Self::new`]'s, or the refused file as an [`ExportError::Transport`]
+    /// naming the path and line — never a header value.
+    pub fn with_headers_file(
+        base_endpoint: String,
+        ingest_key: String,
+        headers_file: Option<&str>,
+    ) -> Result<Self, ExportError> {
+        let mut exporter = Self::new(base_endpoint, ingest_key)?;
+        if let Some(path) = headers_file {
+            let headers = RequestHeaders::load(std::path::Path::new(path))
+                .map_err(|error| ExportError::Transport(error.to_string()))?;
+            log::info!(
+                "observability: OTLP exporter sends {} extra request header(s) from {path}{}",
+                headers.len(),
+                if headers.sets_authorization() {
+                    " (its Authorization replaces the Bearer ingest key)"
+                } else {
+                    ""
+                }
+            );
+            exporter.extra_headers = headers;
+        }
+        Ok(exporter)
     }
 }
 
@@ -153,6 +198,7 @@ impl Exporter for OtlpExporter {
                         &self.client,
                         &self.logs_endpoint,
                         &self.ingest_key,
+                        &self.extra_headers,
                         signal,
                         items,
                         &request,
@@ -187,6 +233,7 @@ impl Exporter for OtlpExporter {
                         &self.client,
                         &self.metrics_endpoint,
                         &self.ingest_key,
+                        &self.extra_headers,
                         signal,
                         items,
                         &request,
@@ -218,6 +265,7 @@ impl Exporter for OtlpExporter {
                         &self.client,
                         &self.traces_endpoint,
                         &self.ingest_key,
+                        &self.extra_headers,
                         signal,
                         items as u64,
                         &request,

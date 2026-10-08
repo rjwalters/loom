@@ -2,10 +2,16 @@
 //! in a registered workspace's main checkout.
 //!
 //! One command here writes to the checkout: [`fast_forward`], a
-//! `merge --ff-only` with hooks off. Everything else is a read, or a `fetch`
-//! that moves only the remote-tracking ref. Nothing here runs `reset`,
+//! `merge --ff-only` with hooks off. Everything else is a read, a
+//! `git ls-remote` that writes nothing, or a `fetch` that moves only the
+//! remote-tracking ref (not even `FETCH_HEAD`). Nothing here runs `reset`,
 //! `rebase`, `stash`, `checkout` or `clean`, makes a merge commit, or removes
 //! a lock file.
+//!
+//! Two commands use the network: [`remote_head`] and [`fetch`]. Every ref
+//! operand that comes from the remote sits behind a standalone `--` (#9106,
+//! #9479), and the default branch's name is checked with
+//! [`crate::refname::check_refname`] before it is used at all.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -13,7 +19,9 @@ use std::time::Duration;
 
 use crate::cmd_out::{run_command, CmdOutcome};
 
-/// Starting bound for the fetch of one branch.
+/// Bound for `git ls-remote` of one ref: a connection and a ref advertisement.
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound for the fetch of one branch.
 pub(super) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Starting bound for each local read.
 pub(super) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -86,6 +94,44 @@ fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     }
 }
 
+/// The default branch's name, from the clone's own `origin/HEAD`. Local: no
+/// remote is asked, and `main` is never guessed. `None` when `origin/HEAD` is
+/// unset, or names a branch git could read as an option (#9106).
+pub(super) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
+    let args = [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ];
+    let name = ok(root, &args, timeout).ok()?;
+    name.strip_prefix("origin/")
+        .filter(|b| crate::refname::check_refname(b).is_ok())
+        .map(str::to_string)
+}
+
+/// The commit `refs/heads/<branch>` is at on the remote, by `git ls-remote`:
+/// one connection, no objects, nothing written in the clone.
+pub(super) fn remote_head(root: &Path, branch: &str, timeout: Duration) -> Result<String, String> {
+    let name = format!("refs/heads/{branch}");
+    let listed = ok(root, &["ls-remote", "--quiet", "origin", "--", &name], timeout)?;
+    listed
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(sha, at)| *at == name && sha.len() >= 40)
+        .map(|(sha, _)| sha.to_string())
+        .ok_or_else(|| format!("origin has no {name}"))
+}
+
+/// The commit the clone's `origin/<branch>` is at; `None` when it has never
+/// been fetched. Local.
+pub(super) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
+    let spec = format!("{}^{{commit}}", tracking(branch));
+    ok(root, &["rev-parse", "--verify", "--quiet", &spec], timeout)
+        .ok()
+        .filter(|sha| !sha.is_empty())
+}
+
 /// The short commit HEAD is at; `None` when it cannot be read.
 pub(super) fn head(root: &Path, timeout: Duration) -> Option<String> {
     ok(root, &["rev-parse", "--short=12", "HEAD"], timeout).ok()
@@ -106,7 +152,8 @@ pub(super) fn current_branch(root: &Path, timeout: Duration) -> Result<Option<St
 pub(super) fn fetch(root: &Path, branch: &str, timeout: Duration) -> Result<(), String> {
     // An explicit refspec, so the remote-tracking ref moves even in a clone
     // whose configured fetch refspec does not cover this branch. `--` ends
-    // option parsing before the ref operand (#9106).
+    // option parsing before the ref operand (#9106). `--no-write-fetch-head`:
+    // this is the operator's checkout, and its `FETCH_HEAD` is theirs.
     let refspec = format!("+refs/heads/{branch}:{}", tracking(branch));
     ok(
         root,
@@ -114,6 +161,7 @@ pub(super) fn fetch(root: &Path, branch: &str, timeout: Duration) -> Result<(), 
             "fetch",
             "--quiet",
             "--no-tags",
+            "--no-write-fetch-head",
             "--no-recurse-submodules",
             "origin",
             "--",

@@ -1,6 +1,6 @@
 //! Delivery: what the ETA hook offers to the OTLP queues.
 
-use super::authority::{drop_pending, gate_delivery};
+use super::authority::{drop_pending, gate_delivery, report_coverage, scope_for};
 use super::*;
 use crate::eta::tests::{as_of, history_a, provenance};
 use crate::eta::tracker::{EstimateContext, IssueState};
@@ -431,4 +431,73 @@ fn demotion_drops_the_pending_store_once() {
     // Idempotent: a second drop finds nothing and does not fail.
     assert_eq!(drop_pending(&mut tracker, &path), 0);
     assert!(read_pending(&path).is_empty(), "nothing is restored after a restart either");
+}
+
+// ===== Authority coverage of the fleet roster (#10897) =====
+
+fn roster_of(n: usize) -> Vec<crate::eta::repo_priority::FleetMember> {
+    (1..=n)
+        .map(|i| crate::eta::repo_priority::FleetMember {
+            repo: Some(format!("acme/repo{i}")),
+            priority: 50,
+        })
+        .collect()
+}
+
+fn faults(captured: &crate::observability::ops::capture::Captured) -> usize {
+    use crate::telemetry::ops::MetricName;
+    captured
+        .metrics
+        .iter()
+        .filter(|p| {
+            p.name == MetricName::DaemonTaskFaults
+                && p.labels.get("reason").map(String::as_str) == Some("eta_authority_coverage")
+        })
+        .count()
+}
+
+#[test]
+fn an_authority_managing_two_of_five_raises_the_critical_signal_and_others_keep_emitting() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let c = coverage(&roster, &["acme/repo1", "acme/repo2"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "loom-fleet-captain");
+    });
+    assert_eq!(faults(&captured), 1, "eta.authority.coverage fires");
+    assert_eq!(c.missing, vec!["acme/repo3", "acme/repo4", "acme/repo5"]);
+    // A non-authority host is not suppressed: undeclared, it emits every
+    // roster repo; declared with the authority's two, it emits the other three.
+    let all = scope_for(false, Some(&roster), &Declared::Undeclared).unwrap();
+    assert_eq!(all.len(), 5);
+    let declared = Declared::Repos(["acme/repo1".to_string(), "acme/repo2".to_string()].into());
+    let rest = scope_for(false, Some(&roster), &declared).unwrap();
+    assert_eq!(rest.len(), 3);
+    assert!(!rest.contains("acme/repo1"));
+}
+
+#[test]
+fn a_healthy_authority_raises_no_signal_and_others_stay_silent() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let slugs: Vec<String> = (1..=5).map(|i| format!("acme/repo{i}")).collect();
+    let c = coverage(&roster, &slugs);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, Some(&roster), &Declared::All), None);
+}
+
+#[test]
+fn an_unknown_roster_raises_nothing_and_changes_no_gating() {
+    use crate::eta::coverage::{coverage, Declared};
+    let c = coverage::<&str>(&[], &["acme/repo1"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, None, &Declared::Undeclared), None);
+    // The authority itself never takes a fallback scope.
+    assert_eq!(scope_for(true, Some(&roster_of(3)), &Declared::Undeclared), None);
 }

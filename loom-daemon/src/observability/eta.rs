@@ -921,6 +921,11 @@ pub(super) async fn record(
         if !seen.insert(slug.to_ascii_lowercase()) {
             continue;
         }
+        // #10897: a non-authority host emits only what the authority is not
+        // declared to cover.
+        if !authority::in_scope(&slug) {
+            continue;
+        }
         let mut listings = Vec::new();
         for label in REVIEW_LABELS {
             match super::queue_blocked::list_open(root.clone(), label, "eta").await {
@@ -943,6 +948,13 @@ pub(super) async fn record(
             repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
     }
+    // #10897: compare what this pass manages with the fleet roster.
+    let managed: Vec<String> = seen.iter().cloned().collect();
+    let me = lock()
+        .as_ref()
+        .map(|state| state.host_id.clone())
+        .unwrap_or_default();
+    authority::check_coverage(workspace_root, &me, &managed);
     // Before `now`: the fleet view is known strictly before the estimates.
     let listed_at = Utc::now();
     let feature_reads = feature_pass::run(&repos, workspace_root).await;
@@ -1156,8 +1168,10 @@ async fn ready_rows(
         rows.push(ReadyRow {
             repo: slug,
             issue: row.issue,
+            rank: row.rank,
             plan: row.plan,
             disposition: row.disposition,
+            detail: row.detail,
             facts: IssueRow {
                 workspace_priority: row.workspace_priority,
                 created_at: row.created_at,

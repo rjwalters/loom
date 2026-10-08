@@ -30,6 +30,13 @@ fn healthy() -> Facts {
                 is_local: true,
                 others: Vec::new(),
                 detail: "robb-studio (fleet_refresh); this host is the authority".into(),
+                coverage: crate::eta::coverage::Coverage {
+                    state: crate::eta::coverage::State::Full,
+                    roster: 2,
+                    covered: 2,
+                    missing: Vec::new(),
+                },
+                coverage_host: Some("robb-studio".into()),
             },
         },
         data: DataFacts {
@@ -434,10 +441,35 @@ fn the_authority_is_printed_and_a_missing_one_warns() {
         is_local: false,
         others: Vec::new(),
         detail: "none (no_candidate)".into(),
+        coverage: crate::eta::coverage::Coverage::default(),
+        coverage_host: None,
     };
     let warn = authority(&none);
     assert_eq!(warn.status, Status::Warn);
     assert!(warn.remedy.unwrap().contains("fleet.etaAuthority"));
+}
+
+#[test]
+fn authority_coverage_reports_full_short_and_unknown() {
+    use crate::eta::coverage::{Coverage, State};
+    let mut a = healthy().config.authority;
+    let full = authority_coverage(&a);
+    assert_eq!(full.status, Status::Ok);
+    assert!(full.detail.contains("2 of 2 roster repos"), "{}", full.detail);
+    assert!(full.detail.contains("robb-studio"), "{}", full.detail);
+    a.coverage = Coverage {
+        state: State::Short,
+        roster: 5,
+        covered: 2,
+        missing: vec!["a/x".into(), "a/y".into(), "a/z".into()],
+    };
+    let short = authority_coverage(&a);
+    assert_eq!(short.status, Status::Warn);
+    assert!(short.detail.contains("2 of 5") && short.detail.contains("a/x, a/y, a/z"));
+    assert!(short.remedy.unwrap().contains("fleet.etaAuthority"));
+    a.coverage = Coverage::default();
+    let unknown = authority_coverage(&a);
+    assert_eq!(unknown.status, Status::Skip);
 }
 
 #[test]
@@ -609,4 +641,46 @@ fn the_repo_check_reports_the_gap_fill_request_count() {
         "{}",
         c.detail
     );
+}
+
+/// #10918: on the explicit ETA authority the refresh gate reads "authority",
+/// even with its own `fleetRefresh.enabled` off; any other host stands down
+/// for the authority, and the backtest skip names it.
+#[test]
+fn the_explicit_authority_refreshes_and_the_others_stand_down_for_it() {
+    let mut f = healthy();
+    f.config.fleet_refresh_enabled = false;
+    f.data.gate = Gate::Authority;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("ETA authority"), "{}", gate.render());
+    let refresh = find(&checks, "data", "refresh_loop");
+    assert_eq!(refresh.status, Status::Ok, "not skipped as 'fleet refresh is off'");
+    let switch = find(&checks, "config", "fleet_refresh");
+    assert_eq!(switch.status, Status::Ok, "no remedy to turn on what is overridden");
+
+    f.config.fleet_refresh_enabled = true;
+    f.data.gate = Gate::AuthorityElsewhere {
+        authority: "loom-worker-1".into(),
+    };
+    f.data.repos[0].has_reader = false;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("loom-worker-1"), "{}", gate.render());
+    assert_eq!(
+        find(&checks, "data", "repo acme/alpha").status,
+        Status::Ok,
+        "a stand-down host does not demand a reader"
+    );
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("ETA authority (loom-worker-1"), "{}", c.render());
 }

@@ -8,14 +8,20 @@
 //! it never writes directly — every edit lands as a branch + PR, reviewed
 //! and merged by the operator like any other change to the store (merge
 //! commits only, per the store's own branch policy; this module has no
-//! auto-merge path, and it never touches `repos.yml`'s `fleet`/`firewall`
-//! flags).
+//! auto-merge path, and it never touches a repo's `fleet`/`firewall` flags).
 //!
-//! - [`state_edit`] / [`priority_edit`] — format-preserving text edits of
-//!   `fleet/state.yml` / `repos.yml` ([`block`]): touch only the lines a
-//!   sub-verb's change requires, so a reviewer's diff is exactly that change.
-//! - [`adopt`] — turns `render --check` drift into the store-side patch that
-//!   would make it the new rendered value.
+//! Every sub-verb edits `fleet.yml`, the store's one hand-edited source, and
+//! never a file rendered from it (#10905): the store's `validate` check
+//! rejects a hand-edited render. [`source`] then runs the store's own
+//! renderer on the edit, so the PR also carries every render it changes.
+//!
+//! - [`state_edit`] / [`priority_edit`] — format-preserving edits of
+//!   `fleet.yml`'s `state:` / `repos:` ([`yaml_edit`]): touch only the lines
+//!   a sub-verb's change requires, so a reviewer's diff is exactly that
+//!   change and the file's comments survive.
+//! - [`adopt`] — turns `render --check` drift into the `fleet.yml` patch
+//!   that would make it the new rendered value.
+//! - [`source`] — `fleet.yml` at the base commit, and its renders.
 //! - [`diff`] — the `--dry-run` / PR-body rendering of a [`FileChange`].
 //! - [`WriteTransport`] — the write half of the network seam
 //!   ([`super::fetch::Transport`] is the read half): POST/PUT under the
@@ -28,10 +34,11 @@
 //!   turns that into the operator-facing message.
 
 pub mod adopt;
-mod block;
 pub mod diff;
 mod priority_edit;
+pub mod source;
 mod state_edit;
+mod yaml_edit;
 
 use std::path::Path;
 
@@ -40,7 +47,6 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-pub use adopt::AdoptedFile;
 pub use priority_edit::edit as edit_priority;
 pub use state_edit::edit as edit_state;
 

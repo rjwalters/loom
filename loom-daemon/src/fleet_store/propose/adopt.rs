@@ -1,92 +1,86 @@
-//! Turn this host's `render --check` drift into the store-side edit that
+//! Turn this host's `render --check` drift into the `fleet.yml` edit that
 //! would make it the new rendered value, for `propose adopt`.
 //!
 //! Reuses [`render::render`] for the same machine-tier merge and host-local
 //! read `render` itself uses, so `adopt` can never disagree with `render
-//! --check` about what counts as drift.
+//! --check` about what counts as drift. The store must have the compiled
+//! `fleet.json`: the edit lands in its source, `fleet.yml` (#10905).
 //!
-//! - **Host-local tier** (`fleet/hosts/<H>/local.json`) is written verbatim
-//!   from the workspace's on-disk file — the store's value for this tier
-//!   *is* the file, with no merge, so "adopt" is just "copy it up". This is
-//!   the one case `render()` cannot see on its own: a store with no
-//!   `local.json` for this host yet gets no [`render::Tier::Local`] target
-//!   at all, so `adopt` also checks the on-disk file directly, to cover
-//!   *adding* a host-local override the store has never had, not just
-//!   updating one that drifted from an existing one.
-//! - **Machine tier** (`fleet/hosts/<H>/defaults.json`) is a patch: only the
-//!   leaves where the on-disk file differs from `deep_merge(base, overlay)`
-//!   are written into the host's overlay object, preserving every other key
-//!   already there (and everything `defaults.json`'s base tier already
-//!   supplies) — a full re-render would blow away the host's other
-//!   overrides along with the drift.
+//! Both tiers are patched leaf by leaf, as format-preserving edits
+//! ([`super::yaml_edit`]) of `config.hosts.<H>`:
+//!
+//! - **Machine tier** (`config.hosts.<H>.defaults`): only the leaves where
+//!   the on-disk file differs from `deep_merge(defaults, overlay)` are
+//!   written into the host's overlay, preserving every other key already
+//!   there (and everything `config.defaults` already supplies): a full
+//!   re-render would blow away the host's other overrides along with the
+//!   drift.
+//! - **Host-local tier** (`config.hosts.<H>.local`): the store's value *is*
+//!   the file, with no merge, so the patch makes it equal to the on-disk
+//!   file. A store with no local tier for this host gets no
+//!   [`render::Tier::Local`] target at all, so `adopt` also checks the
+//!   on-disk file directly, to cover *adding* a host-local override the
+//!   store has never had, not just updating one that drifted.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use serde_json::{Map, Value};
+use anyhow::{anyhow, Context, Result};
+use serde_json::Value;
 
+use super::yaml_edit::{Doc, Seg};
 use crate::fleet_store::fetch::Snapshot;
 use crate::fleet_store::render::{self, Tier};
-use crate::fleet_store::{host_defaults_path, host_local_path};
+use crate::fleet_store::{compiled, FLEET_JSON_PATH};
 
-/// One file [`plan`] proposes to change in the store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdoptedFile {
-    /// Store-relative path.
-    pub path: String,
-    /// The store's current text, `None` when it does not have the file yet.
-    pub before: Option<String>,
-    /// The new text.
-    pub after: String,
-}
-
-/// The store-file changes that would adopt `host`'s on-disk drift
-/// (machine tier at `machine_path`, host-local tier at `local_path`) into
-/// the store. Empty when there is no drift to adopt.
+/// `source` (the store's `fleet.yml`) edited to adopt `host`'s on-disk
+/// drift (machine tier at `machine_path`, host-local tier at `local_path`);
+/// `None` when there is no drift to adopt.
 pub fn plan(
     snapshot: &Snapshot,
+    source: &str,
     host: &str,
     machine_path: &Path,
     local_path: &Path,
-) -> Result<Vec<AdoptedFile>> {
+) -> Result<Option<String>> {
+    let doc_json = compiled::from_snapshot(snapshot)?.ok_or_else(|| {
+        anyhow!("the store has no {FLEET_JSON_PATH}; `propose adopt` edits fleet.yml, its source")
+    })?;
     let targets = render::render(snapshot, host, machine_path, local_path)?;
-    let local_store_path = host_local_path(host);
-    let mut out = Vec::new();
+    let mut doc = Doc::new(source);
     let mut saw_local_target = false;
 
     for t in &targets {
+        let tier = match t.tier {
+            Tier::Local => {
+                saw_local_target = true;
+                "local"
+            }
+            Tier::Machine => "defaults",
+        };
         let Some(current) = on_disk(&t.path)? else {
             continue;
         };
         if current == t.value {
             continue;
         }
-        match t.tier {
-            Tier::Local => {
-                saw_local_target = true;
-                out.push(AdoptedFile {
-                    before: snapshot.text(&local_store_path)?,
-                    path: local_store_path.clone(),
-                    after: pretty(&current)?,
-                });
-            }
-            Tier::Machine => {
-                let overlay_path = host_defaults_path(host);
-                let before = snapshot.text(&overlay_path)?;
-                let mut overlay: Value = match &before {
-                    Some(t) => serde_json::from_str(t)
-                        .with_context(|| format!("parsing store file {overlay_path}"))?,
-                    None => Value::Object(Map::new()),
-                };
-                let mut ops = Vec::new();
-                collect(&mut Vec::new(), &current, &t.value, &mut ops);
-                if !ops.is_empty() {
-                    apply(&mut overlay, &ops);
-                    out.push(AdoptedFile {
-                        path: overlay_path,
-                        before,
-                        after: pretty(&overlay)?,
-                    });
+        let mut ops = Vec::new();
+        collect(&mut Vec::new(), &current, &t.value, &mut ops);
+        for op in &ops {
+            let (leaf, value) = match op {
+                Op::Set(p, v) => (p, Some(v)),
+                Op::Remove(p) => (p, None),
+            };
+            let mut path = vec![
+                Seg::Key("config"),
+                Seg::Key("hosts"),
+                Seg::Key(host),
+                Seg::Key(tier),
+            ];
+            path.extend(leaf.iter().map(|k| Seg::Key(k)));
+            match value {
+                Some(v) => doc.set(&path, v)?,
+                None => {
+                    doc.remove(&path)?;
                 }
             }
         }
@@ -94,17 +88,20 @@ pub fn plan(
 
     // A host-local override the store has never had: `render()` emits no
     // `Local` target to compare against, so check the on-disk file directly.
-    if !saw_local_target && snapshot.text(&local_store_path)?.is_none() {
+    if !saw_local_target && doc_json.host_local(host).is_none() {
         if let Some(current) = on_disk(local_path)? {
-            out.push(AdoptedFile {
-                path: local_store_path,
-                before: None,
-                after: pretty(&current)?,
-            });
+            let path = [
+                Seg::Key("config"),
+                Seg::Key("hosts"),
+                Seg::Key(host),
+                Seg::Key("local"),
+            ];
+            doc.set(&path, &current)?;
         }
     }
 
-    Ok(out)
+    let after = doc.finish();
+    Ok((after != source).then_some(after))
 }
 
 fn on_disk(path: &Path) -> Result<Option<Value>> {
@@ -115,12 +112,6 @@ fn on_disk(path: &Path) -> Result<Option<Value>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
-}
-
-fn pretty(v: &Value) -> Result<String> {
-    let mut s = serde_json::to_string_pretty(v)?;
-    s.push('\n');
-    Ok(s)
 }
 
 /// One leaf (or whole differing subtree) to adopt from `current` (on disk).
@@ -155,52 +146,6 @@ fn collect(path: &mut Vec<String>, current: &Value, wanted: &Value, out: &mut Ve
         }
         (c, w) if c == w => {}
         (c, _) => out.push(Op::Set(path.clone(), c.clone())),
-    }
-}
-
-fn apply(root: &mut Value, ops: &[Op]) {
-    for op in ops {
-        match op {
-            Op::Set(path, v) => set_path(root, path, v.clone()),
-            Op::Remove(path) => remove_path(root, path),
-        }
-    }
-}
-
-fn set_path(root: &mut Value, path: &[String], value: Value) {
-    if path.is_empty() {
-        *root = value;
-        return;
-    }
-    if !root.is_object() {
-        *root = Value::Object(Map::new());
-    }
-    let Value::Object(obj) = root else {
-        unreachable!("just normalized to an object")
-    };
-    if path.len() == 1 {
-        obj.insert(path[0].clone(), value);
-    } else {
-        let entry = obj
-            .entry(path[0].clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        set_path(entry, &path[1..], value);
-    }
-}
-
-fn remove_path(root: &mut Value, path: &[String]) {
-    if path.is_empty() {
-        return;
-    }
-    let Some(obj) = root.as_object_mut() else {
-        return;
-    };
-    if path.len() == 1 {
-        obj.remove(&path[0]);
-        return;
-    }
-    if let Some(next) = obj.get_mut(&path[0]) {
-        remove_path(next, &path[1..]);
     }
 }
 

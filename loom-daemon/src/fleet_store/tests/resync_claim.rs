@@ -88,6 +88,39 @@ fn two_hosts_racing_a_fresh_claim_exactly_one_wins() {
 }
 
 #[test]
+fn meeting_a_held_claim_costs_two_reads_and_creates_nothing() {
+    let forge = FakeRefForge::new();
+    seeded_claim(&forge, &claim_message("host-a", "0.19.880", t0()));
+    let commits = forge.commits.borrow().len();
+    let b = claimant(&forge, "host-b").acquire(TREE, t0()).unwrap();
+    assert!(matches!(b, Acquire::HeldBy { .. }), "{b:?}");
+    // The ref is read before anything is created: no dangling claim commit.
+    assert_eq!(forge.calls.borrow().len(), 2, "{:?}", forge.calls.borrow());
+    assert!(forge.writes().is_empty(), "{:?}", forge.writes());
+    assert_eq!(forge.commits.borrow().len(), commits);
+}
+
+#[test]
+fn a_claim_created_between_the_read_and_the_create_is_held_not_an_error() {
+    let forge = FakeRefForge::new();
+    let theirs = forge.add_commit(&claim_message("host-a", "0.19.880", t0()), &[]);
+    forge.before(move |forge, method, path| {
+        // host-a's create lands just before host-b's.
+        if method == "POST" && path.ends_with("/git/refs") {
+            forge.set_ref(CLAIM_REF, &theirs);
+        }
+    });
+    let b = claimant(&forge, "host-b").acquire(TREE, t0()).unwrap();
+    assert_eq!(
+        b,
+        Acquire::HeldBy {
+            host: "host-a".into(),
+            since: t0(),
+        }
+    );
+}
+
+#[test]
 fn a_fresh_claim_is_not_taken_over_and_a_stale_one_is() {
     let forge = FakeRefForge::new();
     let old = seeded_claim(&forge, &claim_message("host-a", "0.19.880", t0()));
@@ -150,6 +183,8 @@ fn two_takers_of_one_stale_claim_exactly_one_wins() {
         "the loser never reaches the PATCH: {:?}",
         forge.writes()
     );
+    // It read the ticket first, so it created no commit for it either.
+    assert!(forge.writes().is_empty(), "{:?}", forge.writes());
 }
 
 #[test]
@@ -213,6 +248,42 @@ fn a_lost_create_reply_is_resolved_by_reading_the_ref() {
 }
 
 #[test]
+fn a_lost_takeover_reply_is_resolved_by_reading_the_ref() {
+    let later = t0() + ChronoDuration::hours(1);
+    // The PATCH landed and its reply was lost: the claim is ours, and saying
+    // otherwise would leave it held by nobody for the stale window.
+    let forge = FakeRefForge::new();
+    let old = seeded_claim(&forge, &claim_message("host-a", "0.19.880", t0()));
+    forge.fault("PATCH repos/acme/app/git/refs/loom/resync-claim", Fault::LostReply);
+    let held = won(claimant(&forge, "host-b").acquire(TREE, later).unwrap());
+    assert!(held.took_over);
+    assert_eq!(forge.ref_sha(CLAIM_REF), Some(held.sha));
+    assert_eq!(forge.ref_sha(&format!("{TAKEOVER_PREFIX}{old}")), None);
+
+    // The PATCH never landed: an error, and never an assumed claim.
+    let forge = FakeRefForge::new();
+    let old = seeded_claim(&forge, &claim_message("host-a", "0.19.880", t0()));
+    forge.fault("PATCH repos/acme/app/git/refs/loom/resync-claim", Fault::Unreachable);
+    assert!(claimant(&forge, "host-b").acquire(TREE, later).is_err());
+    assert_eq!(forge.ref_sha(CLAIM_REF), Some(old));
+}
+
+#[test]
+fn an_unreachable_forge_is_told_apart_from_an_answer_it_cannot_use() {
+    // No HTTP answer at all: an outage, reported once for the host.
+    let forge = FakeRefForge::new();
+    forge.fault("GET repos/acme/app/git/ref/loom/resync-claim", Fault::Unreachable);
+    let err = claimant(&forge, "host-a").acquire(TREE, t0()).unwrap_err();
+    assert!(err.downcast_ref::<ForgeUnreachable>().is_some(), "{err:#}");
+
+    // An answer (here: no write scope on this repo) is this repo's failure.
+    let forge = FakeRefForge::new();
+    forge.fault("POST repos/acme/app/git/commits", Fault::Status(403));
+    let err = claimant(&forge, "host-a").acquire(TREE, t0()).unwrap_err();
+    assert!(err.downcast_ref::<ForgeUnreachable>().is_none(), "{err:#}");
+}
+
+#[test]
 fn a_forge_error_is_an_error_not_a_claim() {
     for (needle, status) in [
         ("POST repos/acme/app/git/commits", 403),
@@ -256,15 +327,62 @@ fn release_deletes_only_our_own_claim() {
     let forge = FakeRefForge::new();
     let a = claimant(&forge, "host-a");
     let held = won(a.acquire(TREE, t0()).unwrap());
-    assert!(a.release(&held).unwrap());
+    assert!(a.release(&held, t0()).unwrap());
     assert_eq!(forge.ref_sha(CLAIM_REF), None);
     // Releasing again: nothing there, nothing deleted, no error.
-    assert!(!a.release(&held).unwrap());
+    assert!(!a.release(&held, t0()).unwrap());
 
     // A claim that was taken over is the taker's to release.
     let held = won(a.acquire(TREE, t0()).unwrap());
     let theirs = forge.add_commit(&claim_message("host-b", "0.19.880", t0()), &[&held.sha]);
     forge.set_ref(CLAIM_REF, &theirs);
-    assert!(!a.release(&held).unwrap());
+    assert!(!a.release(&held, t0()).unwrap());
     assert_eq!(forge.ref_sha(CLAIM_REF), Some(theirs));
+}
+
+#[test]
+fn release_sends_no_delete_for_a_ticket_that_does_not_exist() {
+    let forge = FakeRefForge::new();
+    let a = claimant(&forge, "host-a");
+    let held = won(a.acquire(TREE, t0()).unwrap());
+    let before = forge.calls.borrow().len();
+    assert!(a.release(&held, t0()).unwrap());
+    let calls: Vec<String> = forge.calls.borrow()[before..].to_vec();
+    assert_eq!(
+        calls,
+        vec![
+            "GET repos/acme/app/git/ref/loom/resync-claim",
+            "DELETE repos/acme/app/git/refs/loom/resync-claim",
+            "GET repos/acme/app/git/matching-refs/loom/resync-takeover/",
+        ],
+        "one DELETE, for the claim; the ticket listing is empty"
+    );
+}
+
+#[test]
+fn release_collects_tickets_orphaned_by_a_dead_taker_and_leaves_a_live_one() {
+    let forge = FakeRefForge::new();
+    let a = claimant(&forge, "host-a");
+    // A taker died after its PATCH: its ticket is named after a claim that is
+    // long gone, so no later takeover will ever meet it.
+    let gone = "f".repeat(40);
+    let dead = forge.add_commit(&claim_message("host-x", "0.19.870", t0()), &[&gone]);
+    let orphan = format!("{TAKEOVER_PREFIX}{gone}");
+    forge.set_ref(&orphan, &dead);
+    // One that is not a claim commit at all.
+    let junk = forge.add_commit("not a claim", &[]);
+    let odd = format!("{TAKEOVER_PREFIX}{}", "e".repeat(40));
+    forge.set_ref(&odd, &junk);
+
+    let later = t0() + ChronoDuration::hours(2);
+    let held = won(a.acquire(TREE, later).unwrap());
+    // Another host is, right now, starting to take OUR claim over.
+    let live = format!("{TAKEOVER_PREFIX}{}", held.sha);
+    let theirs = forge.add_commit(&claim_message("host-b", "0.19.880", later), &[&held.sha]);
+    forge.set_ref(&live, &theirs);
+
+    assert!(a.release(&held, later).unwrap());
+    assert_eq!(forge.ref_sha(&orphan), None, "the orphan is collected");
+    assert_eq!(forge.ref_sha(&odd), None, "so is one nobody can be shown to hold");
+    assert_eq!(forge.ref_sha(&live), Some(theirs), "a fresh ticket is its taker's");
 }

@@ -107,6 +107,11 @@ pub(super) fn log_parts(
             if let Some(reason) = e.no_estimate_reason {
                 attributes.push(kv_string("loom.eta.no_estimate_reason", reason.as_str()));
             }
+            // #10903: a ready row this host's planner cannot dispatch, and why.
+            let not_here = e.path.as_ref().and_then(|p| p.dispatch.as_ref());
+            if let Some(not_here) = not_here.and_then(|d| d.input.not_here.as_deref()) {
+                attributes.push(kv_string("loom.eta.not_here", not_here));
+            }
             let body = serde_json::to_string(e).unwrap_or_default();
             Some(("eta.estimate", SeverityNumber::Info, nanos(e.as_of), attributes, body))
         }
@@ -440,6 +445,46 @@ mod tests {
             Some(Value::StringValue("9d8e226ce0123456789abcdef0123456789abcde".to_string()))
         );
         assert_eq!(log.time_unix_nano, super::nanos(record.explanation.as_of));
+        assert!(attr(&log, "loom.eta.not_here").is_none(), "only a placed ready row has one");
+    }
+
+    /// #10903: a ready row this host's planner did not position carries why.
+    #[test]
+    fn a_placed_ready_row_carries_not_here() {
+        use crate::eta::explanation::{DispatchRecord, PathRecord};
+        let mut record = record();
+        let as_of = record.explanation.as_of;
+        record.explanation.path = Some(PathRecord {
+            start: Stage::ReadyWait,
+            include_merge: true,
+            terminal: Stage::MergeWait,
+            merge_share: None,
+            merge_share_n: None,
+            dispatch: Some(DispatchRecord {
+                input: crate::eta::DispatchInput {
+                    position: 3,
+                    plan_state: "queued".to_string(),
+                    gate: None,
+                    ahead: 2,
+                    free_slots: 0,
+                    max_admissions_per_tick: None,
+                    tick_interval_secs: 60,
+                    saturation_held: false,
+                    plan_at: as_of,
+                    not_here: Some("peer_claim".to_string()),
+                    held_until: None,
+                },
+                turnovers: 3,
+                admission_delay_sec: 30,
+            }),
+        });
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::EtaEstimate(record));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(
+            attr(&log, "loom.eta.not_here"),
+            Some(Value::StringValue("peer_claim".to_string()))
+        );
+        assert!(crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS.contains(&"loom.eta.not_here"));
     }
 
     #[test]
@@ -511,7 +556,8 @@ mod tests {
                             "loom.repo",
                             "loom.issue",
                             "loom.pr_number",
-                            "loom.record_id"
+                            "loom.record_id",
+                            "loom.kind"
                         ]
                         .contains(&kv.key.as_str()),
                     "{} is not allowlisted",
@@ -602,7 +648,7 @@ mod tests {
         for kv in &log.attributes {
             assert!(
                 ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                    || ["loom.repo", "loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
                 "{} is not allowlisted",
                 kv.key
             );
@@ -679,7 +725,7 @@ mod tests {
         for kv in &log.attributes {
             assert!(
                 ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                    || ["loom.repo", "loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
                 "{} is not allowlisted",
                 kv.key
             );
@@ -726,6 +772,7 @@ mod tests {
                     || [
                         "loom.repo",
                         "loom.record_id",
+                        "loom.kind",
                         "loom.pr_number",
                         "loom.issue"
                     ]

@@ -68,7 +68,8 @@ fn absent_config_resolves_to_documented_defaults() {
         resolve_exporters(&config),
         vec![ExporterEntry {
             kind: ExporterKind::Https,
-            endpoint: None
+            endpoint: None,
+            headers_file: None
         }],
         "https is the default exporter"
     );
@@ -135,7 +136,8 @@ fn resolve_exporter_unknown_value_falls_back_to_https() {
         resolve_exporters(&config),
         vec![ExporterEntry {
             kind: ExporterKind::Https,
-            endpoint: None
+            endpoint: None,
+            headers_file: None
         }],
         "a sole unknown singular value still degrades to the https default"
     );
@@ -156,6 +158,7 @@ fn raw(kind: &str, endpoint: Option<&str>) -> RawExporterEntry {
     RawExporterEntry {
         kind: kind.to_string(),
         endpoint: endpoint.map(str::to_string),
+        headers_file: None,
     }
 }
 
@@ -163,6 +166,7 @@ fn entry(kind: ExporterKind, endpoint: Option<&str>) -> ExporterEntry {
     ExporterEntry {
         kind,
         endpoint: endpoint.map(str::to_string),
+        headers_file: None,
     }
 }
 
@@ -925,3 +929,5 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
         handle.abort();
     }
 }
+
+mod headers_file;

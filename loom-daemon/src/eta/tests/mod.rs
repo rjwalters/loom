@@ -2,6 +2,7 @@
 
 mod backtest;
 mod backtest_adaptation;
+mod backtest_censored;
 mod backtest_pr;
 mod backtest_priority;
 mod backtest_subsets;
@@ -57,6 +58,7 @@ mod priority_features;
 mod priority_inputs;
 mod queue_features;
 mod ready;
+mod ready_order;
 mod recalibrate;
 mod recency;
 mod regime;

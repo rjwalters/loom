@@ -128,6 +128,7 @@ pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
 pub mod repo_ref;
+pub mod request_headers;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
@@ -208,6 +209,11 @@ pub struct RawExporterEntry {
     /// Per-exporter endpoint; `None` ⇒ this entry uses the shared
     /// `observability.endpoint`.
     pub endpoint: Option<String>,
+    /// `headers_file` (Issue #10961): a path to extra request headers, see
+    /// [`request_headers`]. `Some("")` records a key that was present but not
+    /// a usable string, so the policy pass refuses it instead of exporting
+    /// without the headers the operator asked for.
+    pub headers_file: Option<String>,
 }
 
 /// One resolved entry of the exporter list (Issue #8756): kind classified,
@@ -218,6 +224,10 @@ pub struct ExporterEntry {
     /// Per-exporter endpoint override; `None` ⇒ use the shared
     /// `observability.endpoint`.
     pub endpoint: Option<String>,
+    /// Path to this entry's extra request headers (Issue #10961,
+    /// [`request_headers`]). Only ever the *path*: the file is read when the
+    /// exporter is built, and its contents never reach this struct.
+    pub headers_file: Option<String>,
 }
 
 /// Which [`exporter::Exporter`] implementation [`spawn_task`] selects.
@@ -307,7 +317,8 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
 
 /// Parse the `observability.exporters` array (Issue #8756). Each element is
 /// either a bare kind string (`"https"`) or an object `{"kind": "otlp",
-/// "endpoint": "…"}`; anything else (or an object without a string `kind`) is
+/// "endpoint": "…", "headers_file": "…"}` (`headersFile` is accepted as an
+/// alias, #10961); anything else (or an object without a string `kind`) is
 /// dropped here — malformed *shapes* cannot be named in a warn line, while a
 /// well-formed-but-unknown kind string survives to [`resolve_exporters`],
 /// which logs it.
@@ -319,6 +330,7 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
             serde_json::Value::String(kind) => Some(RawExporterEntry {
                 kind: kind.clone(),
                 endpoint: None,
+                headers_file: None,
             }),
             serde_json::Value::Object(fields) => {
                 let kind = fields.get("kind")?.as_str()?.to_string();
@@ -327,7 +339,17 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
                     .and_then(serde_json::Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
-                Some(RawExporterEntry { kind, endpoint })
+                // Present-but-unusable (not a string) becomes `Some("")`,
+                // which `request_headers::entry_policy` refuses.
+                let headers_file = ["headers_file", "headersFile"]
+                    .iter()
+                    .find_map(|key| fields.get(*key))
+                    .map(|value| value.as_str().unwrap_or_default().to_string());
+                Some(RawExporterEntry {
+                    kind,
+                    endpoint,
+                    headers_file,
+                })
             }
             _ => None,
         })
@@ -679,6 +701,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         vec![RawExporterEntry {
             kind: env,
             endpoint: None,
+            headers_file: None,
         }]
     } else if let Some(list) = config.exporters.as_ref().filter(|list| !list.is_empty()) {
         list.clone()
@@ -690,6 +713,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         vec![RawExporterEntry {
             kind: singular,
             endpoint: None,
+            headers_file: None,
         }]
     };
     let mut resolved: Vec<ExporterEntry> = Vec::with_capacity(raw.len());
@@ -706,6 +730,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
                     resolved.push(ExporterEntry {
                         kind,
                         endpoint: entry.endpoint,
+                        headers_file: entry.headers_file,
                     });
                 }
             }
@@ -721,6 +746,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         resolved.push(ExporterEntry {
             kind: ExporterKind::Https,
             endpoint: None,
+            headers_file: None,
         });
     }
     resolved
@@ -862,6 +888,15 @@ fn entry_endpoint(
                 .to_string(),
         ));
     }
+    // `headers_file` (Issue #10961): refused here, before the ingest key or
+    // the headers file itself is read. A no-op for an entry without one.
+    if let Err(detail) = request_headers::entry_policy(
+        entry.kind == ExporterKind::Otlp,
+        &endpoint,
+        entry.headers_file.as_deref(),
+    ) {
+        return Err((Some(endpoint), detail));
+    }
     Ok(endpoint)
 }
 
@@ -871,6 +906,18 @@ fn entry_endpoint(
 /// nothing (#10116: the attended live-output tailer's gate).
 #[must_use]
 pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
+    planned_otlp_exporters(config)
+        .into_iter()
+        .map(|(endpoint, _)| endpoint)
+        .collect()
+}
+
+/// [`planned_otlp_endpoints`], each paired with its entry's `headers_file`
+/// path (Issue #10961) — so a second process that builds its own exporter
+/// for the same destination sends the same headers. Paths only; nothing is
+/// read.
+#[must_use]
+pub fn planned_otlp_exporters(config: &ObservabilityConfig) -> Vec<(String, Option<String>)> {
     if !resolve_enabled(config) {
         return Vec::new();
     }
@@ -878,7 +925,10 @@ pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
     resolve_exporters(config)
         .iter()
         .filter(|entry| entry.kind == ExporterKind::Otlp)
-        .filter_map(|entry| entry_endpoint(entry, shared_endpoint.as_ref()).ok())
+        .filter_map(|entry| {
+            let endpoint = entry_endpoint(entry, shared_endpoint.as_ref()).ok()?;
+            Some((endpoint, entry.headers_file.clone()))
+        })
         .collect()
 }
 
@@ -1108,7 +1158,14 @@ pub fn spawn_task(
                 // check against.
                 #[cfg(feature = "otlp")]
                 {
-                    match otlp::OtlpExporter::new(endpoint.clone(), ingest_key.clone()) {
+                    // `headers_file` (#10961) is read here, at construction —
+                    // a refused file lands in the `Err` arm below as this
+                    // sink's own `misconfigured` detail (path and line only).
+                    match otlp::OtlpExporter::with_headers_file(
+                        endpoint.clone(),
+                        ingest_key.clone(),
+                        entry.headers_file.as_deref(),
+                    ) {
                         Ok(exporter) => sender::spawn_task(
                             queue.clone(),
                             exporter,

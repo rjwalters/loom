@@ -272,45 +272,26 @@ pub fn sync(
         return Ok((snap, false));
     }
 
-    let tree_path = format!("repos/{}/git/trees/{commit}?recursive=1", location.repo);
-    let tree = transport.get(&tree_path, None, None)?;
-    if tree.status != 200 {
-        bail!(
-            "forge answered HTTP {} listing commit {commit}{}",
-            tree.status,
-            error_detail(&tree.body)
-        );
-    }
-    let tree: TreeReply = serde_json::from_str(&tree.body).context("malformed tree response")?;
-    if tree.truncated {
-        bail!("the store's tree listing was truncated — the store is too large to read");
-    }
+    let tree = list_tree(transport, &location.repo, &commit)?;
 
     let blob_dir = cache_dir.join(BLOBS);
     std::fs::create_dir_all(&blob_dir)
         .with_context(|| format!("could not create {}", blob_dir.display()))?;
     let mut files = BTreeMap::new();
     let mut bodies = BTreeMap::new();
-    for entry in tree
-        .tree
-        .iter()
-        .filter(|e| e.kind == "blob" && super::is_contract_path(&e.path))
-    {
-        if !entry.sha.bytes().all(|b| b.is_ascii_hexdigit()) || entry.sha.is_empty() {
-            bail!("malformed blob SHA for {}", entry.path);
-        }
-        let blob_path = blob_dir.join(&entry.sha);
+    for (path, sha) in tree.iter().filter(|(p, _)| super::is_contract_path(p)) {
+        let blob_path = blob_dir.join(sha);
         let body = match std::fs::read(&blob_path) {
             Ok(b) => b,
             Err(_) => {
-                let b = fetch_blob(transport, &location.repo, &entry.sha)
-                    .with_context(|| format!("fetching {}", entry.path))?;
+                let b = fetch_blob(transport, &location.repo, sha)
+                    .with_context(|| format!("fetching {path}"))?;
                 write_atomic(&blob_path, &b)?;
                 b
             }
         };
-        files.insert(entry.path.clone(), entry.sha.clone());
-        bodies.insert(entry.path.clone(), body);
+        files.insert(path.clone(), sha.clone());
+        bodies.insert(path.clone(), body);
     }
     let manifest = Manifest {
         version: MANIFEST_VERSION,
@@ -330,6 +311,35 @@ pub fn sync(
         },
         true,
     ))
+}
+
+/// Every file (blob) in `repo`'s tree at `commit`: path → blob SHA.
+pub fn list_tree(
+    transport: &dyn Transport,
+    repo: &str,
+    commit: &str,
+) -> Result<BTreeMap<String, String>> {
+    let tree_path = format!("repos/{repo}/git/trees/{commit}?recursive=1");
+    let tree = transport.get(&tree_path, None, None)?;
+    if tree.status != 200 {
+        bail!(
+            "forge answered HTTP {} listing commit {commit}{}",
+            tree.status,
+            error_detail(&tree.body)
+        );
+    }
+    let tree: TreeReply = serde_json::from_str(&tree.body).context("malformed tree response")?;
+    if tree.truncated {
+        bail!("the store's tree listing was truncated — the store is too large to read");
+    }
+    let mut out = BTreeMap::new();
+    for entry in tree.tree.into_iter().filter(|e| e.kind == "blob") {
+        if !entry.sha.bytes().all(|b| b.is_ascii_hexdigit()) || entry.sha.is_empty() {
+            bail!("malformed blob SHA for {}", entry.path);
+        }
+        out.insert(entry.path, entry.sha);
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -353,7 +363,8 @@ struct BlobReply {
     encoding: String,
 }
 
-fn fetch_blob(transport: &dyn Transport, repo: &str, sha: &str) -> Result<Vec<u8>> {
+/// One blob's bytes.
+pub fn fetch_blob(transport: &dyn Transport, repo: &str, sha: &str) -> Result<Vec<u8>> {
     let reply = transport.get(&format!("repos/{repo}/git/blobs/{sha}"), None, None)?;
     if reply.status != 200 {
         bail!(

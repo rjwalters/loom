@@ -16,13 +16,17 @@
 //!
 //! # Operations
 //!
-//! * **Acquire.** `POST git/refs`. `201` wins. `422 Reference already exists`
-//!   means held: read it, and if it is fresh report the holder.
+//! * **Acquire.** Read the ref first. If it exists and is fresh, report the
+//!   holder: two reads, and nothing is created. If it does not exist, create
+//!   the claim commit and `POST git/refs`: `201` wins, `422 Reference already
+//!   exists` means another host got there in between.
 //! * **Takeover**, only of a claim older than [`stale_after`] (or one whose
 //!   message does not parse). See below.
 //! * **Fence**, before the push: the ref must still be our commit, and less
 //!   than half of [`stale_after`] may have passed since we acquired it.
 //! * **Release.** Re-read, and `DELETE` only while the ref is still ours.
+//!   Then list the takeover tickets (one read, normally empty) and delete any
+//!   that were abandoned.
 //!
 //! # Why takeover is not a fast-forward `PATCH`
 //!
@@ -38,7 +42,8 @@
 //! same name is `422`. Takeover therefore goes through a ticket whose NAME
 //! carries the stale sha, [`TAKEOVER_PREFIX`]`<stale sha>`:
 //!
-//! 1. create the ticket (`201` for exactly one host; the others pass);
+//! 1. create the ticket (`201` for exactly one host; the others pass), after
+//!    a read that lets a host that is already too late create nothing;
 //! 2. re-read the claim: it must still be the stale sha the ticket names;
 //! 3. `PATCH` the claim to a commit whose parent is the stale sha;
 //! 4. re-read the claim: it must now be that commit;
@@ -46,9 +51,11 @@
 //!
 //! A host that dies between 1 and 5 leaves its ticket behind. A ticket older
 //! than [`stale_after`] is deleted by the next host that meets it, which then
-//! passes, so the tick after that races for it again. The window left open is
-//! one request wide (between steps 2 and 3); what closes it is the fence and
-//! the non-forced push.
+//! passes, so the tick after that races for it again. One that nobody will
+//! meet again (the taker died after step 3, so the stale sha it is named
+//! after is gone for good) is collected by the next release, which lists the
+//! tickets. The window left open is one request wide (between steps 2 and
+//! 3); what closes it is the fence and the non-forced push.
 //!
 //! # Transport
 //!
@@ -164,6 +171,20 @@ pub enum Acquire {
     Lost(String),
 }
 
+/// The forge could not be reached at all: the request got no HTTP answer.
+/// Kept apart from an answer the claim cannot use (a `403`, say), so the
+/// caller can report an outage once for the host instead of once per repo.
+#[derive(Debug)]
+pub struct ForgeUnreachable(pub String);
+
+impl std::fmt::Display for ForgeUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ForgeUnreachable {}
+
 /// Why [`Claimant::fence`] says not to push. Neither is a forge failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FenceFailure {
@@ -243,10 +264,16 @@ impl Claimant<'_> {
     /// Try to take the claim. `tree` is the default branch head's tree, which
     /// the forge is known to have.
     ///
+    /// The ref is read before anything is created, so meeting a held claim
+    /// costs two reads and leaves no commit behind.
+    ///
     /// # Errors
-    /// A forge request failed or answered something unexpected. The caller
-    /// counts it as a failure and never assumes it holds the claim.
+    /// A forge request failed ([`ForgeUnreachable`]) or answered something
+    /// unexpected. The caller never assumes it holds the claim.
     pub fn acquire(&self, tree: &str, now: DateTime<Utc>) -> Result<Acquire> {
+        if let Some(current) = self.read_ref(CLAIM_REF)? {
+            return self.contend(&current, tree, now);
+        }
         let sha = self.commit(tree, &[], now)?;
         let won = || {
             Acquire::Won(Held {
@@ -256,26 +283,30 @@ impl Claimant<'_> {
             })
         };
         match self.create_ref(CLAIM_REF, &sha) {
-            Ok(Created::Yes) => return Ok(won()),
-            Ok(Created::Exists) => {}
+            Ok(Created::Yes) => Ok(won()),
+            // Another host created it between our read and our create.
+            Ok(Created::Exists) => match self.read_ref(CLAIM_REF)? {
+                Some(current) => self.contend(&current, tree, now),
+                None => Ok(Acquire::Lost("the claim was released while it was being read".into())),
+            },
             // The reply was lost (a timeout). The ref decides: if it points at
             // this pass's commit, the create landed and the claim is ours.
-            Err(e) => {
-                return match self.read_ref(CLAIM_REF) {
-                    Ok(Some(current)) if current == sha => Ok(won()),
-                    _ => Err(e),
-                };
-            }
+            Err(e) => match self.read_ref(CLAIM_REF) {
+                Ok(Some(current)) if current == sha => Ok(won()),
+                _ => Err(e),
+            },
         }
-        let Some(current) = self.read_ref(CLAIM_REF)? else {
-            return Ok(Acquire::Lost("the claim was released while it was being read".into()));
-        };
-        match self.read_record(&current)? {
+    }
+
+    /// The claim exists at `current`: report a fresh holder, take a stale one
+    /// over.
+    fn contend(&self, current: &str, tree: &str, now: DateTime<Utc>) -> Result<Acquire> {
+        match self.read_record(current)? {
             Some(record) if !self.is_stale(&record, now) => Ok(Acquire::HeldBy {
                 host: record.host,
                 since: record.at,
             }),
-            _ => self.take_over(&current, tree, now),
+            _ => self.take_over(current, tree, now),
         }
     }
 
@@ -304,15 +335,67 @@ impl Claimant<'_> {
     /// # Errors
     /// The ref could not be read or deleted. The claim then expires on its
     /// own after [`stale_after`].
-    pub fn release(&self, held: &Held) -> Result<bool> {
+    pub fn release(&self, held: &Held, now: DateTime<Utc>) -> Result<bool> {
         if self.read_ref(CLAIM_REF)?.as_deref() != Some(held.sha.as_str()) {
             return Ok(false);
         }
         self.delete_ref(CLAIM_REF)?;
-        // A ticket named after our commit can only exist if a host started to
-        // take this claim over and stopped. Nobody will ask for it again.
-        let _ = self.delete_ref(&format!("{TAKEOVER_PREFIX}{}", held.sha));
+        self.collect_tickets(now);
         Ok(true)
+    }
+
+    /// Delete every takeover ticket that was abandoned: one whose commit is
+    /// older than [`stale_after`] or is not a claim commit. One listing read,
+    /// which is normally empty, so normally no `DELETE` is sent. Best effort:
+    /// a ticket that survives is met again at the next release.
+    fn collect_tickets(&self, now: DateTime<Utc>) {
+        let Ok(tickets) = self.list_tickets() else {
+            return;
+        };
+        for (name, sha) in tickets {
+            let abandoned = self
+                .read_record(&sha)
+                .is_ok_and(|record| record.is_none_or(|r| self.is_stale(&r, now)));
+            if abandoned {
+                let _ = self.delete_ref(&name);
+            }
+        }
+    }
+
+    /// Every takeover ticket in the repo, as `(ref name, sha)`.
+    fn list_tickets(&self) -> Result<Vec<(String, String)>> {
+        let prefix = TAKEOVER_PREFIX
+            .strip_prefix("refs/")
+            .unwrap_or(TAKEOVER_PREFIX);
+        let reply = self.get(&format!("repos/{}/git/matching-refs/{prefix}", self.repo))?;
+        if reply.status != 200 {
+            bail!(describe(&reply, "listing takeover tickets", self.repo));
+        }
+        let value: Value = serde_json::from_str(&reply.body)
+            .map_err(|e| anyhow!("malformed ticket listing on {}: {e}", self.repo))?;
+        Ok(value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.get("ref")?.as_str()?;
+                let sha = entry.get("object")?.get("sha")?.as_str()?;
+                name.starts_with(TAKEOVER_PREFIX)
+                    .then(|| (name.to_string(), sha.to_string()))
+            })
+            .collect())
+    }
+
+    fn get(&self, path: &str) -> Result<Reply> {
+        self.read
+            .get(path, None, None)
+            .map_err(|e| ForgeUnreachable(format!("{e:#}")).into())
+    }
+
+    fn send(&self, method: &str, path: &str, body: &Value) -> Result<Reply> {
+        self.write
+            .write(method, path, body)
+            .map_err(|e| ForgeUnreachable(format!("{e:#}")).into())
     }
 
     fn is_stale(&self, record: &ClaimRecord, now: DateTime<Utc>) -> bool {
@@ -323,25 +406,35 @@ impl Claimant<'_> {
     }
 
     fn take_over(&self, stale: &str, tree: &str, now: DateTime<Utc>) -> Result<Acquire> {
-        let sha = self.commit(tree, &[stale], now)?;
         let ticket = format!("{TAKEOVER_PREFIX}{stale}");
+        // Read first, as `acquire` does: a ticket that is already taken costs
+        // reads only, and no commit is created for it.
+        if let Some(theirs) = self.read_ref(&ticket)? {
+            return self.yield_to(&ticket, &theirs, now);
+        }
+        let sha = self.commit(tree, &[stale], now)?;
         if matches!(self.create_ref(&ticket, &sha)?, Created::Exists) {
-            // Another host is taking this claim over. If its ticket is itself
-            // stale it died part-way: clear the ticket and pass, so the next
-            // tick can race for it again.
-            if let Some(theirs) = self.read_ref(&ticket)? {
-                let abandoned = self
-                    .read_record(&theirs)?
-                    .is_none_or(|r| self.is_stale(&r, now));
-                if abandoned {
-                    let _ = self.delete_ref(&ticket);
-                }
-            }
-            return Ok(Acquire::Lost("another host is taking over the stale claim".into()));
+            return match self.read_ref(&ticket)? {
+                Some(theirs) => self.yield_to(&ticket, &theirs, now),
+                None => Ok(Acquire::Lost("another host took over the stale claim".into())),
+            };
         }
         let outcome = self.swap_claim(stale, &sha, now);
         let _ = self.delete_ref(&ticket);
         outcome
+    }
+
+    /// Another host holds the takeover ticket. If the ticket is itself stale
+    /// that host died part-way: clear it and pass, so the next tick can race
+    /// for it again.
+    fn yield_to(&self, ticket: &str, theirs: &str, now: DateTime<Utc>) -> Result<Acquire> {
+        let abandoned = self
+            .read_record(theirs)?
+            .is_none_or(|r| self.is_stale(&r, now));
+        if abandoned {
+            let _ = self.delete_ref(ticket);
+        }
+        Ok(Acquire::Lost("another host is taking over the stale claim".into()))
     }
 
     /// Steps 2-4 of the takeover, with the ticket for `stale` held.
@@ -350,11 +443,30 @@ impl Claimant<'_> {
         if self.read_ref(CLAIM_REF)?.as_deref() != Some(stale) {
             return lost("the stale claim changed before it could be taken over");
         }
-        let reply = self.write.write(
+        let won = || {
+            Acquire::Won(Held {
+                sha: sha.to_string(),
+                acquired_at: now,
+                took_over: true,
+            })
+        };
+        let patched = self.send(
             "PATCH",
             &format!("repos/{}/git/{CLAIM_REF}", self.repo),
             &json!({"sha": sha, "force": false}),
-        )?;
+        );
+        let reply = match patched {
+            Ok(reply) => reply,
+            // The reply was lost. The ref decides, as it does for a create:
+            // if it points at our commit the update landed and the claim is
+            // ours, and saying otherwise would strand it for the stale window.
+            Err(e) => {
+                return match self.read_ref(CLAIM_REF) {
+                    Ok(Some(current)) if current == sha => Ok(won()),
+                    _ => Err(e),
+                };
+            }
+        };
         match reply.status {
             200 => {}
             404 | 422 => return lost("the stale claim was released during the takeover"),
@@ -363,15 +475,11 @@ impl Claimant<'_> {
         if self.read_ref(CLAIM_REF)?.as_deref() != Some(sha) {
             return lost("another host replaced the claim during the takeover");
         }
-        Ok(Acquire::Won(Held {
-            sha: sha.to_string(),
-            acquired_at: now,
-            took_over: true,
-        }))
+        Ok(won())
     }
 
     fn commit(&self, tree: &str, parents: &[&str], now: DateTime<Utc>) -> Result<String> {
-        let reply = self.write.write(
+        let reply = self.send(
             "POST",
             &format!("repos/{}/git/commits", self.repo),
             &json!({
@@ -387,7 +495,7 @@ impl Claimant<'_> {
     }
 
     fn create_ref(&self, name: &str, sha: &str) -> Result<Created> {
-        let reply = self.write.write(
+        let reply = self.send(
             "POST",
             &format!("repos/{}/git/refs", self.repo),
             &json!({"ref": name, "sha": sha}),
@@ -403,9 +511,7 @@ impl Claimant<'_> {
     fn read_ref(&self, name: &str) -> Result<Option<String>> {
         // `GET git/ref/<name without "refs/">` (singular) matches exactly.
         let short = name.strip_prefix("refs/").unwrap_or(name);
-        let reply = self
-            .read
-            .get(&format!("repos/{}/git/ref/{short}", self.repo), None, None)?;
+        let reply = self.get(&format!("repos/{}/git/ref/{short}", self.repo))?;
         match reply.status {
             200 => sha_field(&reply.body, &["object", "sha"]).map(Some),
             404 => Ok(None),
@@ -414,9 +520,7 @@ impl Claimant<'_> {
     }
 
     fn read_record(&self, sha: &str) -> Result<Option<ClaimRecord>> {
-        let reply = self
-            .read
-            .get(&format!("repos/{}/git/commits/{sha}", self.repo), None, None)?;
+        let reply = self.get(&format!("repos/{}/git/commits/{sha}", self.repo))?;
         if reply.status != 200 {
             bail!(describe(&reply, &format!("reading claim commit {sha}"), self.repo));
         }
@@ -432,8 +536,7 @@ impl Claimant<'_> {
     /// Reference does not exist`) is success.
     fn delete_ref(&self, name: &str) -> Result<()> {
         let reply =
-            self.write
-                .write("DELETE", &format!("repos/{}/git/{name}", self.repo), &Value::Null)?;
+            self.send("DELETE", &format!("repos/{}/git/{name}", self.repo), &Value::Null)?;
         match reply.status {
             200 | 204 | 404 | 422 => Ok(()),
             _ => bail!(describe(&reply, &format!("deleting {name}"), self.repo)),

@@ -20,7 +20,7 @@ use super::git::{classify_rejection, Push, WORKTREE_PREFIX};
 use super::*;
 use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared};
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
-use crate::init::payload::Stamp;
+use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
 
 const RUNNING: &str = "0.19.880";
@@ -83,10 +83,14 @@ fn defaults(root: &Path, new: bool) -> PathBuf {
 }
 
 fn payload_from(defaults: &Path) -> Payload {
+    payload_at(defaults, RUNNING)
+}
+
+fn payload_at(defaults: &Path, version: &str) -> Payload {
     Payload::from_defaults(
         defaults.to_path_buf(),
         Stamp {
-            version: v(RUNNING),
+            version: v(version),
             commit: Some("a".repeat(40)),
             requires_daemon: "0.19.772".to_string(),
             release_build: true,
@@ -237,9 +241,14 @@ struct Host<'f> {
     name: &'static str,
     root: PathBuf,
     memory: RefCell<Memory>,
+    /// The version this host runs.
+    version: &'static str,
     payload: LazyPayload,
     unpacked: Rc<Cell<u32>>,
     now: Cell<DateTime<Utc>>,
+    /// How many workspaces a pass may classify before its time budget counts
+    /// as spent.
+    budget: Cell<u32>,
     /// Runs once, after this host has classified and just before it asks for
     /// the claim: the moment another writer can slip in.
     before_claim: RefCell<Option<Box<dyn FnOnce() + 'f>>>,
@@ -247,21 +256,39 @@ struct Host<'f> {
 
 impl<'f> Host<'f> {
     fn new(fx: &'f Fixture, name: &'static str) -> Self {
+        Self::running(fx, name, RUNNING, fx.new_defaults.clone())
+    }
+
+    /// A host running `version`, whose binary embeds `defaults`.
+    fn running(
+        fx: &'f Fixture,
+        name: &'static str,
+        version: &'static str,
+        defaults: PathBuf,
+    ) -> Self {
         let unpacked = Rc::new(Cell::new(0));
-        let (count, defaults) = (unpacked.clone(), fx.new_defaults.clone());
+        let count = unpacked.clone();
         Self {
             fx,
             name,
             root: fx.clone_as(name),
             memory: RefCell::new(Memory::default()),
+            version,
             payload: LazyPayload::new(move || {
                 count.set(count.get() + 1);
-                Ok(payload_from(&defaults))
+                Ok(payload_at(&defaults, version))
             }),
             unpacked,
             now: Cell::new(t0()),
+            budget: Cell::new(u32::MAX),
             before_claim: RefCell::new(None),
         }
+    }
+
+    /// Move this host's clock forward.
+    fn advance(&self, by: Duration) {
+        self.now
+            .set(self.now.get() + ChronoDuration::from_std(by).unwrap());
     }
 
     /// A pass in `Mode::Write` on a host in H0.
@@ -286,9 +313,10 @@ impl<'f> Host<'f> {
         floor: Option<&str>,
     ) -> WorkspacePass {
         let forge = self.fx.forge.clone();
+        let classified = Cell::new(0);
         let env = Env {
             host: self.name,
-            running: v(RUNNING),
+            running: v(self.version),
             floor: floor.map(v),
             interval: INTERVAL,
             payload: &self.payload,
@@ -309,6 +337,10 @@ impl<'f> Host<'f> {
             },
             gate,
             clock: &|| self.now.get(),
+            spent: &|| {
+                classified.set(classified.get() + 1);
+                classified.get() > self.budget.get()
+            },
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
     }
@@ -326,6 +358,11 @@ impl<'f> Host<'f> {
     }
 }
 
+/// The gate is read at the start of a pass, immediately before the claim and
+/// immediately before each push: which call of a pass's gate each one is.
+const AT_CLAIM: u32 = 2;
+const AT_PUSH: u32 = 3;
+
 fn only(pass: &WorkspacePass) -> &WorkspaceReport {
     assert_eq!(pass.workspaces.len(), 1, "{pass:?}");
     &pass.workspaces[0]
@@ -342,6 +379,7 @@ fn reason(report: &WorkspaceReport) -> &str {
 fn h0() -> HostGateInputs {
     HostGateInputs {
         release_build: true,
+        release_verified: true,
         verified: true,
         ..HostGateInputs::default()
     }
@@ -351,7 +389,7 @@ fn h0() -> HostGateInputs {
 fn the_host_gate_names_each_reason() {
     assert_eq!(host_gate(&h0()), Ok(()));
     type Set = fn(&mut HostGateInputs);
-    let table: [(Set, NotCurrent); 7] = [
+    let table: [(Set, NotCurrent); 8] = [
         (|i| i.draining = true, NotCurrent::Draining),
         (|i| i.staged = true, NotCurrent::Staged),
         (|i| i.roll_pending = true, NotCurrent::RollPending),
@@ -359,6 +397,7 @@ fn the_host_gate_names_each_reason() {
         (|i| i.below_floor = true, NotCurrent::FloorBelow),
         (|i| i.verified = false, NotCurrent::Unverified),
         (|i| i.release_build = false, NotCurrent::NotAReleaseBuild),
+        (|i| i.release_verified = false, NotCurrent::ReleaseUnverified),
     ];
     for (set, expected) in table {
         let mut inputs = h0();
@@ -366,11 +405,16 @@ fn the_host_gate_names_each_reason() {
         assert_eq!(host_gate(&inputs), Err(expected));
     }
     // A build that is no release outranks everything: it is not a state the
-    // host will leave.
+    // host will leave. One whose tag is not confirmed yet comes next.
     let mut inputs = h0();
     inputs.release_build = false;
+    inputs.release_verified = false;
     inputs.draining = true;
     assert_eq!(host_gate(&inputs), Err(NotCurrent::NotAReleaseBuild));
+    inputs.release_build = true;
+    assert_eq!(host_gate(&inputs), Err(NotCurrent::ReleaseUnverified));
+    assert!(NotCurrent::ReleaseUnverified.is_about_the_build());
+    assert!(!NotCurrent::Draining.is_about_the_build());
 }
 
 #[test]
@@ -385,11 +429,13 @@ fn a_host_that_is_not_h0_reports_and_never_claims() {
         NotCurrent::Stalled,
         NotCurrent::FloorBelow,
         NotCurrent::Unverified,
+        NotCurrent::ReleaseUnverified,
     ] {
         let pass = host.pass_with(Mode::Write, &|| Err(why), None);
         assert_eq!(pass.host, Some(format!("host not H0: {why}")));
         assert_eq!(only(&pass).state, WState::W1, "still classified: {why}");
         assert!(pass.alerts.is_empty());
+        assert_eq!((pass.probes, pass.fetches), (0, 0), "and asks no remote: {why}");
     }
     assert!(fx.forge.calls.borrow().is_empty(), "no claim call for any reason");
     assert_eq!(fx.origin_head(), before);
@@ -402,7 +448,7 @@ fn a_build_that_is_not_a_release_says_so_once_for_the_host() {
     let pass = host.pass_with(Mode::Write, &|| Err(NotCurrent::NotAReleaseBuild), None);
     assert_eq!(
         pass.host.as_deref(),
-        Some("host never resyncs: this daemon is not a release build")
+        Some("host never resyncs: this daemon is not an official release build")
     );
     // Not a per-repo failure: no reason, no backoff, no alert, no diff made
     // from a payload that is no release.
@@ -471,7 +517,7 @@ fn two_hosts_racing_resync_exactly_once_and_the_loser_is_not_an_error() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
+            if calls.get() == AT_PUSH {
                 *b_pass.borrow_mut() = Some(b.pass());
             }
             Ok(())
@@ -527,7 +573,7 @@ fn a_moved_branch_is_re_read_and_retried_once() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
+            if calls.get() == AT_PUSH {
                 fx.push_from_seed("unrelated work", |seed| write(&seed.join("src.txt"), "x\n"));
             }
             Ok(())
@@ -535,7 +581,7 @@ fn a_moved_branch_is_re_read_and_retried_once() {
         None,
     );
     assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
-    assert_eq!(calls.get(), 3, "the gate is asked again before the second push");
+    assert_eq!(calls.get(), AT_PUSH + 1, "the gate is asked again before the second push");
     assert_eq!(fx.origin_commits(), commits + 2, "their commit, then ours on top");
     assert_eq!(fx.origin_file("src.txt"), "x");
     assert_eq!(fx.origin_file(".loom/docs/new.md"), "new in this release");
@@ -552,7 +598,7 @@ fn a_branch_that_moved_because_it_was_resynced_ends_current_with_no_commit() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
+            if calls.get() == AT_PUSH {
                 fx.resync_from_seed();
             }
             Ok(())
@@ -578,7 +624,7 @@ fn a_branch_that_keeps_moving_goes_back_to_w1_without_a_failure() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() >= 2 {
+            if calls.get() >= AT_PUSH {
                 let n = calls.get();
                 fx.push_from_seed("more work", |seed| {
                     write(&seed.join("src.txt"), &format!("{n}\n"))
@@ -607,7 +653,7 @@ fn the_gate_failing_between_the_claim_and_the_push_abandons_the_resync() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() >= 2 {
+            if calls.get() >= AT_PUSH {
                 Err(NotCurrent::Draining)
             } else {
                 Ok(())
@@ -635,7 +681,7 @@ fn a_claim_taken_over_before_the_push_is_fenced_off() {
         Mode::Write,
         &|| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
+            if calls.get() == AT_PUSH {
                 let theirs = fx
                     .forge
                     .add_commit(&claim_message("host-b", RUNNING, t0()), &[]);
@@ -873,9 +919,18 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     assert!(waiting.alerts.is_empty());
     assert_eq!(fx.forge.calls.borrow().len(), calls);
 
+    // After the backoff the rule still refuses. That is logged, and the repo
+    // backs off again, but a person is told once per repo, not every 6h.
+    host.now.set(until + ChronoDuration::seconds(1));
+    let again = host.pass();
+    assert!(reason(only(&again)).contains("GH006"), "{again:?}");
+    assert!(again.alerts.is_empty(), "no second alert for the same repo");
+    assert_eq!(host.memory.borrow().backoff[&host.root].failures, 2);
+
     // The rule is lifted: after the backoff the resync lands and clears it.
     fs::remove_file(&hook).unwrap();
-    host.now.set(until + ChronoDuration::seconds(1));
+    host.now
+        .set(until + ChronoDuration::hours(6) + ChronoDuration::seconds(2));
     assert_eq!(only(&host.pass()).state, WState::W0);
     assert!(host.memory.borrow().backoff.is_empty(), "cleared on success");
 }
@@ -1019,6 +1074,12 @@ fn the_operators_checkout_is_never_touched_and_a_stale_worktree_is_cleaned() {
         .join(format!("{WORKTREE_PREFIX}999999"));
     write(&stale.join("leftover"), "x\n");
 
+    // The operator's last fetch, which a fetch of ours must not overwrite.
+    // The branch moves first, so this pass does have to fetch.
+    fx.push_from_seed("unrelated work", |seed| write(&seed.join("src.txt"), "x\n"));
+    let fetch_head = host.root.join(".git/FETCH_HEAD");
+    fs::write(&fetch_head, "the operator's own\n").unwrap();
+
     let head = git(&host.root, &["rev-parse", "HEAD"]);
     let branch = git(&host.root, &["rev-parse", "refs/heads/main"]);
     let status = git(&host.root, &["status", "--porcelain"]);
@@ -1030,6 +1091,7 @@ fn the_operators_checkout_is_never_touched_and_a_stale_worktree_is_cleaned() {
     assert_eq!(git(&host.root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(&host.root, &["rev-parse", "refs/heads/main"]), branch, "not fast-forwarded");
     assert_eq!(git(&host.root, &["status", "--porcelain"]), status);
+    assert_eq!(fs::read(&fetch_head).unwrap(), b"the operator's own\n", "FETCH_HEAD is theirs");
     assert!(!stale.exists(), "the leftover worktree is removed");
     assert!(host.resync_worktrees().is_empty());
     assert_eq!(
@@ -1066,7 +1128,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 reason: None,
             },
         ],
-        alerts: Vec::new(),
+        ..WorkspacePass::default()
     };
     assert_eq!(
         pass.lines(),
@@ -1109,3 +1171,6 @@ fn a_failed_push_is_read_as_moved_protected_or_neither() {
         None
     );
 }
+
+#[path = "workspace_resync_bounds.rs"]
+mod bounds;

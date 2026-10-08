@@ -85,7 +85,7 @@ Precedence is **env > config > default**, the same rule every other
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
-| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3) |
+| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
@@ -221,6 +221,90 @@ Back-compat and upgrade rules:
   `misconfigured` status while the other exporters run; only when *no*
   exporter survives — or the shared ingest key is unusable — is export off
   entirely.
+
+### Extra request headers from an owner-only file (`headers_file`, #10961)
+
+An OTLP receiver behind an identity-aware proxy needs request headers the
+exporter's one `Authorization: Bearer <ingest key>` cannot express — a client
+id and client secret pair, for example. An `otlp` entry can name a file of
+such headers, so the daemon reaches that receiver directly instead of through
+a local collector whose only job is to add them:
+
+```json
+{
+  "observability": {
+    "enabled": true,
+    "exporters": [
+      { "kind": "otlp", "endpoint": "https://otlp.example.com",
+        "headers_file": "/path/to/otlp-headers" }
+    ]
+  }
+}
+```
+
+(`otlp.example.com` is a placeholder — the daemon refuses reserved
+documentation domains, so substitute your receiver.) `headersFile` is accepted
+as an alias. The headers are sent on all three signals (`/v1/traces`,
+`/v1/logs`, `/v1/metrics`).
+
+The file holds one `Name: value` per line:
+
+```text
+# identity-aware proxy credentials
+X-Client-Id: <client id>
+X-Client-Secret: <client secret>
+```
+
+- Blank lines, and lines whose first non-blank character is `#`, are ignored.
+  There are **no inline comments**: `#` is legal in a header value, so
+  everything after the first `:` is the value (surrounding spaces and tabs
+  trimmed).
+- The name is everything before the first `:` and must match the HTTP token
+  grammar — letters, digits and ``!#$%&'*+-.^_`|~``, with no space before the
+  colon. The value must be non-empty visible ASCII; interior spaces and tabs
+  are allowed.
+- A name may appear once (case-insensitively). `Host`, `Content-Type`,
+  `Content-Length`, `Transfer-Encoding` and `Connection` belong to the
+  exporter and are refused. A file with no headers at all is refused, and so
+  is one over 64 KiB.
+- **`Authorization` in the file replaces the default Bearer header** — the
+  ingest key is then not sent to this sink at all. Without it, the Bearer
+  header is sent exactly as before, alongside the file's headers.
+  `observability.ingestKeyFile` must still resolve to a readable key either
+  way: it is shared by every exporter and checked before any sink starts.
+
+What gets the entry refused — it degrades to its own `misconfigured` status,
+like any other per-entry policy failure, and other exporters keep running:
+
+- **The file is group- or world-accessible.** It must be a regular file with
+  no group or other permission bits: `chmod 600` it. Checked on Unix, on the
+  opened file, before a byte is parsed.
+- **A malformed line**, or a header name outside the token grammar. The
+  detail names the file and the 1-based line number and a fixed reason —
+  never any text from the file.
+- **A cleartext endpoint.** An entry with `headers_file` must use `https`,
+  unless the endpoint is loopback. This is stricter than the rule for entries
+  without it (which may use plain `http` to a collector on a private
+  network, as in the fan-out example above) and applies only when
+  `headers_file` is set.
+- **`headers_file` on a non-`otlp` entry**, or a value that is not a
+  non-empty string. The native HTTPS exporter does not take extra headers.
+
+Header **values never leave the request**: they are not written to any log
+line, error, `loom-daemon status` field or exported record, and the type that
+holds them has a redacting `Debug`. The path, the header count and whether the
+file sets `Authorization` are logged once when the exporter starts.
+
+The file is read each time the exporter is built — at daemon start, and when
+the attended live-output tailer builds its own — so **rotating a credential is
+a file write plus a daemon restart**, with no config change and no rebuild.
+It is not watched: a running exporter keeps the headers it started with.
+
+`headers_file` belongs to an `observability.exporters` entry, so it has no
+env override, and `$LOOM_OBSERVABILITY_EXPORTER` — which replaces the whole
+list with a single bare kind — drops it along with any per-entry `endpoint`.
+`loom-daemon telemetry-export` (the one-shot fixture replay) does not read
+it.
 
 
 See [OTLP transport and artifact verification](otlp-transport.md) for response
@@ -723,6 +807,16 @@ visible without the watchdog. A request slower than 5 s is also logged at WARN
 log their own phase breakdown, and `CancelSweep` / `DispatchSweep` (slow by
 design: the SIGTERM grace and the token-capture poll). See
 [`telemetry-schema.md`](telemetry-schema.md) for the labels.
+
+**Status builds (#10861).** Concurrent `DaemonStatus` requests for the same
+section set share one build, so the latency series above are per request: a
+request that joined a running build reports only the time it waited.
+`loom.daemon.ipc.status_builds{outcome}` counts the builds (`ok`, `panic`,
+`join_error`). `requests{kind=DaemonStatus}` divided by `status_builds` is the
+coalescing ratio; a ratio well above 1 means callers are retrying or polling
+faster than the build completes. A non-zero `panic` count means status
+callers received error frames; the cause is one ERROR line per build in
+`daemon.log`.
 
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or

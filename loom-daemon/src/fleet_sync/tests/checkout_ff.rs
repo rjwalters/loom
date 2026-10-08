@@ -21,6 +21,9 @@ use super::host::{hold_for_move, hold_for_self_update};
 use super::*;
 use crate::fleet_sync::FleetSyncStatus;
 
+/// The recheck window the tests run with: 15 intervals of one minute.
+const RECHECK: Duration = Duration::from_secs(15 * 60);
+
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
 }
@@ -190,7 +193,9 @@ struct Knobs {
     write: bool,
     gate: Box<dyn Fn(&Path) -> bool>,
     updating: bool,
-    fetched: bool,
+    network: bool,
+    confirmed: Option<(String, DateTime<Utc>)>,
+    now: Rc<Cell<DateTime<Utc>>>,
     budget: Option<Duration>,
     elapsed: Box<dyn Fn() -> Duration>,
 }
@@ -201,7 +206,9 @@ impl Default for Knobs {
             write: true,
             gate: Box::new(|_| false),
             updating: false,
-            fetched: false,
+            network: true,
+            confirmed: None,
+            now: Rc::new(Cell::new(t0())),
             budget: None,
             elapsed: Box::new(|| Duration::ZERO),
         }
@@ -213,10 +220,12 @@ fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutP
         write: knobs.write,
         gate_in_flight: &*knobs.gate,
         hold: &|_| (!knobs.updating).then(MoveHold::free),
-        fetched: &|_, _| knobs.fetched,
+        network: knobs.network,
+        recheck: RECHECK,
+        confirmed: &|_, _| knobs.confirmed.clone(),
         budget: knobs.budget,
         elapsed: &*knobs.elapsed,
-        clock: &t0,
+        clock: &|| knobs.now.get(),
     };
     run(&env, roots, memory)
 }
@@ -261,6 +270,8 @@ fn a_clean_checkout_that_is_behind_is_fast_forwarded() {
     assert_eq!(report.behind, Some(0));
     assert_eq!(report.head.as_deref(), Some(&tip[..12]));
     assert_eq!(git(&fx.host, &["status", "--porcelain"]), "", "and the tree is clean");
+    assert_eq!((found.probes, found.fetches), (1, 1), "one ls-remote, then one fetch");
+    assert!(!fx.host.join(".git/FETCH_HEAD").exists(), "FETCH_HEAD is the operator's");
     // One INFO line, naming the old and the new commit.
     assert_eq!(found.transitions.len(), 1);
     let t = &found.transitions[0];
@@ -593,40 +604,173 @@ fn an_unreachable_origin_is_reported_only_on_the_third_pass_in_a_row() {
     assert_eq!(snapshot(&fx.host), before);
 }
 
+/// Unplug the host checkout from its origin: any network call now fails.
+fn unplug(fx: &Fixture) {
+    let gone = fx.base().join("nowhere.git");
+    git(&fx.host, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
+}
+
 #[test]
-fn a_fetch_the_workspace_half_made_in_this_pass_is_reused() {
-    // The workspace half's stand-in: it advances origin (a resync pushed from
-    // a throwaway worktree of this very clone), which also moves this clone's
-    // remote-tracking ref, and the pass is told the branch was fetched.
+fn a_resync_pushed_from_this_clone_is_reached_in_the_same_pass() {
+    // The workspace half's stand-in: a resync pushed from a throwaway worktree
+    // of this very clone. The push moves this clone's remote-tracking ref.
     let fx = Fixture::new();
     let worktree = fx.base().join("resync-worktree");
-    git(
-        &fx.host,
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "--detach",
-            worktree.to_str().unwrap(),
-        ],
-    );
+    let shown = worktree.to_str().unwrap();
+    git(&fx.host, &["worktree", "add", "--quiet", "--detach", shown]);
     write(&worktree.join(".loom/scripts/spawn.sh"), "#!/bin/sh\necho new\n");
     git(&worktree, &["commit", "--quiet", "-am", "chore(loom): resync"]);
     git(&worktree, &["push", "--quiet", "origin", "HEAD:refs/heads/main"]);
     let pushed = fx.origin_tip();
     assert_ne!(fx.head(), pushed, "the push never touched the main checkout");
 
-    // Origin is unreachable from here on: only a reused fetch can succeed.
-    let gone = fx.base().join("nowhere.git");
-    git(&fx.host, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
-    let reuse = Knobs {
-        fetched: true,
-        ..Knobs::default()
-    };
-    let found = pass(&fx, &reuse);
+    let found = pass(&fx, &Knobs::default());
 
     assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{:?}", only(&found));
     assert_eq!(fx.head(), pushed, "the same pass reaches the commit the resync pushed");
+    assert_eq!((found.probes, found.fetches), (1, 0), "nothing to fetch: the push brought it");
+}
+
+#[test]
+fn a_settled_checkout_is_asked_about_again_only_after_the_recheck_window() {
+    let fx = Fixture::new();
+    let roots = [fx.host.clone()];
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+
+    // First sight: one ls-remote, and nothing to fetch.
+    let found = pass_over(&roots, &knobs, &mut memory);
+    assert_eq!((found.probes, found.fetches), (1, 0));
+
+    // Every tick inside the window: no network at all, even though a commit
+    // has landed. (The first confirmation is back-dated by a per-root offset,
+    // so "inside the window" is asserted from a second, undated one.)
+    knobs
+        .now
+        .set(t0() + chrono::Duration::from_std(RECHECK).unwrap());
+    let found = pass_over(&roots, &knobs, &mut memory);
+    assert_eq!((found.probes, found.fetches), (1, 0), "due by now at the latest");
+    let confirmed_at = knobs.now.get();
+    let tip = fx.push("src/a.rs", "fn a() {}\n");
+    for minutes in [1, 7, 14] {
+        knobs
+            .now
+            .set(confirmed_at + chrono::Duration::minutes(minutes));
+        let found = pass_over(&roots, &knobs, &mut memory);
+        assert_eq!((found.probes, found.fetches), (0, 0), "{minutes} min in");
+        assert_eq!(only(&found).state, CheckoutState::Current);
+    }
+
+    // Once the window has passed: one ls-remote, the head moved, one fetch.
+    knobs.now.set(confirmed_at + chrono::Duration::minutes(15));
+    let found = pass_over(&roots, &knobs, &mut memory);
+    assert_eq!((found.probes, found.fetches), (1, 1));
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded);
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn a_head_the_workspace_half_just_confirmed_is_not_asked_about_again() {
+    let fx = Fixture::new();
+    let tip = fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
+    // The workspace half probed, saw the head move and fetched it.
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    unplug(&fx);
+    let hinted = Knobs {
+        confirmed: Some((tip.clone(), t0())),
+        ..Knobs::default()
+    };
+
+    let found = pass(&fx, &hinted);
+
+    assert_eq!((found.probes, found.fetches), (0, 0));
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded);
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn a_confirmation_that_is_old_or_names_another_commit_does_not_count() {
+    for (head, at) in [
+        // Fresh, but not the commit `origin/main` is at in this clone.
+        ("0".repeat(40), t0()),
+        // The right commit, confirmed a whole window ago.
+        (String::new(), t0() - chrono::Duration::from_std(RECHECK).unwrap()),
+    ] {
+        let fx = Fixture::new();
+        let head = if head.is_empty() { fx.head() } else { head };
+        let hinted = Knobs {
+            confirmed: Some((head, at)),
+            ..Knobs::default()
+        };
+        assert_eq!(pass(&fx, &hinted).probes, 1);
+    }
+}
+
+#[test]
+fn a_host_that_may_not_use_the_network_asks_no_remote_at_all() {
+    // `fleet.autoApply` off: report only, from the clone's own ref.
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    fx.push("src/b.rs", "fn b() {}\n");
+    unplug(&fx);
+    let report_only = Knobs {
+        write: false,
+        network: false,
+        ..Knobs::default()
+    };
+    let before = snapshot(&fx.host);
+    let found = pass(&fx, &report_only);
+    assert_eq!((found.probes, found.fetches), (0, 0));
+    assert_eq!(only(&found).state, CheckoutState::Behind);
+    assert_eq!(only(&found).behind, Some(1), "as far as this clone knows");
+    assert_eq!(snapshot(&fx.host), before);
+
+    // Paused, with `fleet.autoApply` on: still no network, and a commit the
+    // clone already has is fast-forwarded to.
+    let paused = Knobs {
+        network: false,
+        ..Knobs::default()
+    };
+    let found = pass(&fx, &paused);
+    assert_eq!((found.probes, found.fetches), (0, 0));
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded);
+}
+
+#[test]
+fn three_remotes_in_a_row_that_do_not_answer_end_the_pass_s_network_use() {
+    let fx = Fixture::new();
+    let mut roots = vec![fx.host.clone()];
+    for name in ["second", "third", "fourth", "fifth"] {
+        roots.push(fx.clone_as(name));
+    }
+    let gone = fx.base().join("nowhere.git");
+    for root in &roots {
+        git(root, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
+    }
+
+    let found = pass_over(&roots, &Knobs::default(), &mut Memory::default());
+
+    assert_eq!(found.probes, UNREACHABLE_STOP);
+    let states: Vec<_> = found.checkouts.iter().map(|c| c.state).collect();
+    let (failed, local) = states.split_at(3);
+    assert!(failed.iter().all(|s| *s == CheckoutState::FetchFailed), "{states:?}");
+    assert!(local.iter().all(|s| *s == CheckoutState::Current), "{states:?}");
+}
+
+#[test]
+fn a_default_branch_name_git_would_read_as_an_option_is_not_used() {
+    let fx = Fixture::new();
+    fx.push("src/a.rs", "fn a() {}\n");
+    let evil = "refs/remotes/origin/--upload-pack=evil";
+    git(&fx.host, &["symbolic-ref", "refs/remotes/origin/HEAD", evil]);
+
+    let found = assert_skipped(&fx, &Knobs::default(), CheckoutState::NoDefaultBranch);
+
+    assert!(found.detail.as_deref().unwrap().contains("set-head"), "{found:?}");
+    // And with no `origin/HEAD` at all, `main` is not guessed.
+    git(&fx.host, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::NoDefaultBranch);
 }
 
 #[test]
@@ -723,6 +867,10 @@ fn a_standing_skip_is_reported_again_once_it_holds_back_installed_files() {
     assert_eq!(pass_over(&roots, &knobs, &mut memory).transitions[0].level, Level::Warn);
 
     fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
+    // Seen at the next recheck of the remote, not before.
+    knobs
+        .now
+        .set(t0() + chrono::Duration::from_std(RECHECK).unwrap());
     let louder = pass_over(&roots, &knobs, &mut memory).transitions;
     assert_eq!(louder.len(), 1, "{louder:?}");
     assert_eq!(louder[0].level, Level::Error);
@@ -736,8 +884,10 @@ fn with_auto_apply_off_nothing_is_written_and_the_count_is_still_reported() {
     let fx = Fixture::new();
     fx.push("src/a.rs", "fn a() {}\n");
     fx.push("src/b.rs", "fn b() {}\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
     let read_only = Knobs {
         write: false,
+        network: false,
         ..Knobs::default()
     };
     // A tracked file whose timestamp moved but whose content did not: a plain

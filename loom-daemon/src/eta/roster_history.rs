@@ -1,28 +1,44 @@
-//! The fleet store's `repos.yml` history (#10508, #10586): the reader that
-//! turns the store's commit log into the [`RosterRevision`]s the `eta-fit/v2`
-//! inputs `repo_rank` and `ahead_dispatch_fleet` read
+//! The fleet store's roster history (#10508, #10586, #10905): the reader
+//! that turns the store's commit log into the [`RosterRevision`]s the
+//! `eta-fit/v2` inputs `repo_rank` and `ahead_dispatch_fleet` read
 //! ([`super::repo_priority`], [`super::priority_inputs`]).
+//!
+//! The roster is `fleet.json`'s top-level `root` and `repos` (the compiled
+//! fleet document, [`crate::fleet_store::compiled`]). Revisions from before
+//! the store had `fleet.json` come from `repos.yml`, the legacy roster file,
+//! at that commit (#10905).
 //!
 //! Two halves, so training and serving read one value:
 //!
 //! - [`sync`] (network): on the ETA authority's fleet refresh cycle, list the
-//!   commits that touched `repos.yml` on the store's ref and cache each
-//!   revision's content under `<root>/.loom/state/eta/roster-history/`.
+//!   commits that touched the roster on the store's ref and cache each
+//!   revision's roster under `<root>/.loom/state/eta/roster-history/`.
 //! - [`load`] (disk only): read that cache back as revisions. The daily fit
 //!   (`fit::run`) and the tracker's ETA pass both call it, and pass the
 //!   result to the one shared input builder.
 //!
 //! # Wire shape (GitHub REST, through [`Transport`])
 //!
-//! - `GET repos/{store}/commits?path=repos.yml&sha={ref}&since={S}&per_page=100&page={p}`,
+//! For `F` = `fleet.json`:
+//!
+//! - `GET repos/{store}/commits?path=F&sha={ref}&since={S}&per_page=100&page={p}`,
 //!   paginated, with `S` = [`window_opens`]: now − [`WINDOW_DAYS`] (the
 //!   14-day fit window plus margin), aligned down to UTC midnight. More than
 //!   [`MAX_PAGES`] pages is an error, not a silent cut.
-//! - `GET repos/{store}/commits?path=repos.yml&sha={ref}&until={S}&per_page=1`:
+//! - `GET repos/{store}/commits?path=F&sha={ref}&until={S}&per_page=1`:
 //!   the **anchor**, the revision in force when the window opens.
-//! - `GET repos/{store}/contents/repos.yml?ref={commit}` for each commit not
-//!   already cached. Contents are stored content-addressed by blob SHA, and
-//!   a commit is immutable, so no revision is fetched twice.
+//! - `GET repos/{store}/contents/F?ref={commit}` for each commit not
+//!   already cached. Only the roster section is kept, stored under the
+//!   file's blob SHA; a commit is immutable, so no revision is fetched twice.
+//!
+//! When `fleet.json` has no anchor (it is younger than the window, or the
+//! store has none), the same three requests run for `repos.yml`, with
+//! `sha=` the oldest `fleet.json` commit listed instead of the ref. Those
+//! are the revisions from before `fleet.json`, by history order, not commit
+//! date: a predecessor sharing the introduction's second, or a backdated
+//! introduction, loses none. A `repos.yml` commit that is not an ancestor of
+//! that commit is not listed: from then on `repos.yml` is a render of the
+//! same data.
 //!
 //! Requests go through the store's [`Transport`]: in production
 //! `fleet_store::gh::GhTransport`, the reader App first (then the writer App,
@@ -36,8 +52,8 @@
 //! listed ([`CachedListing`]). The next poll sends `If-None-Match`, and a
 //! `304` reuses the cached commits; a `304` with nothing cached is an error.
 //! On GitHub an authorized `304` does not count against the primary rate
-//! limit. So with `repos.yml` unchanged, a poll costs two conditional
-//! requests (the first page and the anchor) and no contents. A poll that
+//! limit. So with the roster unchanged, a poll costs two conditional
+//! requests per file listed (the first page and the anchor) and no contents. A poll that
 //! answers `304` is still a successful poll, and moves `last_poll_at`. Each
 //! new UTC day opens with one unconditional listing.
 //!
@@ -83,7 +99,7 @@
 //! never bridged by its neighbour), or when the last successful poll is more
 //! than [`MAX_STALE_HOURS`] before the instant asked about (a poll failing
 //! for a day leaves the history unable to vouch for the present). It never
-//! falls back to today's `repos.yml`.
+//! falls back to today's roster.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -94,7 +110,7 @@ use serde::{Deserialize, Serialize};
 
 use super::repo_priority::{KnowBasis, RosterRevision};
 use crate::fleet_store::fetch::{write_atomic, Transport};
-use crate::fleet_store::{roster, StoreLocation, ROSTER_PATH};
+use crate::fleet_store::{compiled, roster, StoreLocation, FLEET_JSON_PATH, ROSTER_PATH};
 
 /// Days of history kept: the 14-day fit window plus a week of margin.
 pub const WINDOW_DAYS: i64 = 21;
@@ -112,6 +128,11 @@ pub const MAX_STALE_HOURS: i64 = 24;
 const INDEX: &str = "index.json";
 const BLOBS: &str = "blobs";
 const INDEX_VERSION: u32 = 1;
+
+/// The file an entry written before #10905 read: `repos.yml`.
+fn legacy_file() -> String {
+    ROSTER_PATH.to_string()
+}
 
 /// The append-only observation archive, inside the cache directory.
 pub const ARCHIVE: &str = "observations.jsonl";
@@ -139,8 +160,13 @@ pub struct CommitEntry {
     /// The poll that first listed it, when an earlier poll had succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
-    /// The blob SHA of its `repos.yml`.
+    /// The blob SHA of the file read: `fleet.json` (only its roster section
+    /// is cached) or, before the store had it, `repos.yml`.
     pub blob: String,
+    /// The file read, `fleet.json` or `repos.yml`. Absent from an index
+    /// written before #10905, whose every entry is `repos.yml`.
+    #[serde(default = "legacy_file")]
+    pub file: String,
 }
 
 /// The cache's index.
@@ -194,8 +220,12 @@ pub struct Observation {
     pub sha: String,
     /// Its committer date.
     pub committed_at: DateTime<Utc>,
-    /// The blob SHA of its `repos.yml`.
+    /// The blob SHA of the file read ([`CommitEntry::blob`]).
     pub blob: String,
+    /// The file read; absent from a line written before #10905
+    /// (`repos.yml`).
+    #[serde(default = "legacy_file")]
+    pub file: String,
     /// The poll that first listed it.
     pub first_listed_at: DateTime<Utc>,
     /// Its observation (see the module docs). `None` when the poll that
@@ -294,26 +324,91 @@ fn list(
     Ok((commits, cache))
 }
 
+/// `file` at `commit`: its blob SHA, and what to cache. For `fleet.json`
+/// that is only the roster section (see [`roster_section`]); for
+/// `repos.yml`, the file.
 fn fetch_contents(
     transport: &dyn Transport,
     location: &StoreLocation,
+    file: &str,
     commit: &str,
 ) -> Result<(String, Vec<u8>)> {
-    let path = format!("repos/{}/contents/{ROSTER_PATH}?ref={commit}", location.repo);
+    let path = format!("repos/{}/contents/{file}?ref={commit}", location.repo);
     let reply = transport.get(&path, None, None)?;
     if reply.status != 200 {
-        bail!("forge answered HTTP {} for {ROSTER_PATH} at {commit}", reply.status);
+        bail!("forge answered HTTP {} for {file} at {commit}", reply.status);
     }
     let c: Contents = serde_json::from_str(&reply.body).context("malformed contents reply")?;
     if c.encoding != "base64" || !is_sha(&c.sha) {
-        bail!("unexpected contents reply for {ROSTER_PATH} at {commit}");
+        bail!("unexpected contents reply for {file} at {commit}");
     }
     use base64::{engine::general_purpose, Engine as _};
     let compact: String = c.content.chars().filter(|ch| !ch.is_whitespace()).collect();
     let body = general_purpose::STANDARD
         .decode(compact)
         .context("contents are not valid base64")?;
+    if file == FLEET_JSON_PATH {
+        return Ok((c.sha, roster_section(&body)));
+    }
     Ok((c.sha, body))
+}
+
+/// The part of a `fleet.json` the roster reads, `{"root", "repos"}`, as
+/// JSON. A document the compiled reader refuses is cached as the reason
+/// instead, which [`load`] cannot read as a roster: like an invalid
+/// `repos.yml`, it makes the history unreadable, never bridged.
+fn roster_section(body: &[u8]) -> Vec<u8> {
+    let doc = std::str::from_utf8(body)
+        .map_err(anyhow::Error::from)
+        .and_then(compiled::parse);
+    let mut out = match doc {
+        Ok(doc) => {
+            let top = doc.roster();
+            serde_json::json!({"root": top.get("root"), "repos": top.get("repos")}).to_string()
+        }
+        Err(e) => format!("unreadable {FLEET_JSON_PATH}: {e:#}"),
+    };
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// One file's commit listing for the window opening at `since` (newest
+/// first, the anchor last), over the history reachable from `reference` (a
+/// ref or a commit), and whether the anchor exists: whether the file was in
+/// force when the window opens.
+fn walk(
+    transport: &dyn Transport,
+    location: &StoreLocation,
+    file: &str,
+    reference: &str,
+    since: &str,
+    cached: &Cached<'_>,
+    listings: &mut Vec<CachedListing>,
+) -> Result<(Vec<ListedEntry>, bool)> {
+    let base = format!("repos/{}/commits?path={file}&sha={reference}", location.repo);
+    let mut listed = Vec::new();
+    for page in 1..=MAX_PAGES + 1 {
+        if page > MAX_PAGES {
+            bail!("{file} has more than {} commits in {WINDOW_DAYS} days", MAX_PAGES * PER_PAGE);
+        }
+        let path = format!("{base}&since={since}&per_page={PER_PAGE}&page={page}");
+        let (batch, cache) = list(transport, &path, cached)?;
+        listings.extend(cache);
+        let n = batch.len();
+        listed.extend(batch);
+        if n < PER_PAGE {
+            break;
+        }
+    }
+    let (anchor, cache) = list(transport, &format!("{base}&until={since}&per_page=1"), cached)?;
+    listings.extend(cache);
+    let anchored = !anchor.is_empty();
+    for a in anchor {
+        if !listed.iter().any(|l| l.sha == a.sha) {
+            listed.push(a);
+        }
+    }
+    Ok((listed, anchored))
 }
 
 fn read_index(dir: &Path) -> Option<Index> {
@@ -357,51 +452,64 @@ pub fn sync(
         .map(|i| i.listings.iter().map(|l| (l.path.as_str(), l)).collect())
         .unwrap_or_default();
     let since = window_opens(now).to_rfc3339_opts(SecondsFormat::Secs, true);
-    let base =
-        format!("repos/{}/commits?path={ROSTER_PATH}&sha={}", location.repo, location.reference);
-    // Newest first, as the forge lists them.
-    let mut listed = Vec::new();
     let mut listings = Vec::new();
-    for page in 1..=MAX_PAGES + 1 {
-        if page > MAX_PAGES {
-            bail!(
-                "{ROSTER_PATH} has more than {} commits in {WINDOW_DAYS} days",
-                MAX_PAGES * PER_PAGE
-            );
-        }
-        let path = format!("{base}&since={since}&per_page={PER_PAGE}&page={page}");
-        let (batch, cache) = list(transport, &path, &cached)?;
-        listings.extend(cache);
-        let n = batch.len();
-        listed.extend(batch);
-        if n < PER_PAGE {
-            break;
-        }
-    }
-    let (anchor, cache) = list(transport, &format!("{base}&until={since}&per_page=1"), &cached)?;
-    listings.extend(cache);
-    for a in anchor {
-        if !listed.iter().any(|l| l.sha == a.sha) {
-            listed.push(a);
+    // Newest first, as the forge lists them, each with the file it read.
+    let (fleet_json, anchored) = walk(
+        transport,
+        location,
+        FLEET_JSON_PATH,
+        &location.reference,
+        &since,
+        &cached,
+        &mut listings,
+    )?;
+    let first_compiled = fleet_json.last().map(|e| e.sha.clone());
+    let mut listed: Vec<(ListedEntry, &str)> = fleet_json
+        .into_iter()
+        .map(|e| (e, FLEET_JSON_PATH))
+        .collect();
+    if !anchored {
+        // `fleet.json` is younger than the window (or absent): the revisions
+        // before its first commit come from `repos.yml`. "Before" is history
+        // order, not commit date: the listing reads the history reachable
+        // from that commit, so a predecessor sharing its second, or a
+        // backdated introduction, still counts.
+        let from = first_compiled
+            .as_deref()
+            .unwrap_or(location.reference.as_str());
+        let (legacy, _) =
+            walk(transport, location, ROSTER_PATH, from, &since, &cached, &mut listings)?;
+        for e in legacy {
+            // The introducing commit is reachable from itself: where it also
+            // touched `repos.yml`, that is a render of `fleet.json`.
+            if !listed.iter().any(|(l, _)| l.sha == e.sha) {
+                listed.push((e, ROSTER_PATH));
+            }
         }
     }
     listed.reverse();
 
-    let known: BTreeMap<&str, &CommitEntry> = previous
+    // An entry is reused only for the file it read.
+    let known: BTreeMap<(&str, &str), &CommitEntry> = previous
         .as_ref()
-        .map(|i| i.commits.iter().map(|c| (c.sha.as_str(), c)).collect())
+        .map(|i| {
+            i.commits
+                .iter()
+                .map(|c| ((c.sha.as_str(), c.file.as_str()), c))
+                .collect()
+        })
         .unwrap_or_default();
     let blob_dir = dir.join(BLOBS);
     let mut report = SyncReport::default();
     let mut commits = Vec::with_capacity(listed.len());
     let mut sightings = Vec::new();
-    for ListedEntry { sha, committed_at } in listed {
-        let old = known.get(sha.as_str()).copied();
+    for (ListedEntry { sha, committed_at }, file) in listed {
+        let old = known.get(&(sha.as_str(), file)).copied();
         let kept = archived.get(&sha);
         let entry = match old.filter(|o| blob_dir.join(&o.blob).is_file()) {
             Some(o) => o.clone(),
             None => {
-                let (blob, body) = fetch_contents(transport, location, &sha)?;
+                let (blob, body) = fetch_contents(transport, location, file, &sha)?;
                 write_atomic(&blob_dir.join(&blob), &body)?;
                 report.fetched += 1;
                 let observed_at = match (old, kept) {
@@ -417,6 +525,7 @@ pub fn sync(
                     committed_at,
                     observed_at,
                     blob,
+                    file: file.to_string(),
                 }
             }
         };
@@ -433,6 +542,7 @@ pub fn sync(
                 sha: entry.sha.clone(),
                 committed_at: entry.committed_at,
                 blob: entry.blob.clone(),
+                file: entry.file.clone(),
                 first_listed_at,
                 observed_at: entry.observed_at,
             });
@@ -567,19 +677,20 @@ pub fn load(dir: &Path, at: DateTime<Utc>) -> (Option<Vec<RosterRevision>>, Hist
     if at - index.last_poll_at > Duration::hours(MAX_STALE_HOURS) {
         return none(HistoryStatus::Stale);
     }
-    // `root` in `repos.yml` is irrelevant to priority; any absolute home works.
+    // `root` is irrelevant to priority; any absolute home works.
     let home = Path::new("/");
     let mut revisions = Vec::with_capacity(index.commits.len());
     for c in &index.commits {
         let parsed = std::fs::read(dir.join(BLOBS).join(&c.blob))
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|text| roster::parse(&text, home).ok());
+            .and_then(|text| parse_cached(&c.file, &text, home));
         let Some(parsed) = parsed else {
             log::warn!(
-                "eta roster history: revision {} of {ROSTER_PATH} is unreadable; \
+                "eta roster history: revision {} of {} is unreadable; \
                  repo rank is unknown until it is re-fetched",
-                c.sha
+                c.sha,
+                c.file
             );
             return none(HistoryStatus::Unreadable);
         };
@@ -596,6 +707,16 @@ pub fn load(dir: &Path, at: DateTime<Utc>) -> (Option<Vec<RosterRevision>>, Hist
         commit_date_only: revisions.len() - observed,
     };
     (Some(revisions), coverage)
+}
+
+/// A cached revision as a roster: `fleet.json`'s cached roster section, or
+/// a `repos.yml`.
+fn parse_cached(file: &str, text: &str, home: &Path) -> Option<roster::Roster> {
+    if file == FLEET_JSON_PATH {
+        let top = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()?;
+        return roster::from_compiled(&top, home).ok();
+    }
+    roster::parse(text, home).ok()
 }
 
 /// [`load`] from the workspace's cache.
@@ -624,7 +745,7 @@ pub fn sync_for(workspace_root: &Path, now: DateTime<Utc>) {
     let transport = crate::fleet_store::gh::GhTransport::new(workspace_root, &location.repo);
     match sync(&transport, &dir(workspace_root), &location, now) {
         Ok(r) => log::info!(
-            "eta roster history: {} revisions of {}:{ROSTER_PATH} ({} new, {} fetched)",
+            "eta roster history: {} roster revisions of {} ({} new, {} fetched)",
             r.revisions,
             location.repo,
             r.new,

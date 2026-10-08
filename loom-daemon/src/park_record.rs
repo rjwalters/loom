@@ -101,8 +101,8 @@ pub const UNSTATED: &str = "(unstated)";
 /// repository it lives in (#10443).
 ///
 /// `repo: None` means the repo the record was written in. A *qualified*
-/// reference is never resolved against the local repo: `2AMLogic/2am#1088` and
-/// local `#1088` are different artifacts. Accepted shapes: `N`, `#N`,
+/// reference is never resolved against the local repo: `example-org/tool-repo#202` and
+/// local `#202` are different artifacts. Accepted shapes: `N`, `#N`,
 /// `OWNER/REPO#N`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockerRef {

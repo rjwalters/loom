@@ -25,13 +25,15 @@
 //! - **The workspace resync** ([`workspace_resync`], #10718): after each timer
 //!   pass, and once at startup, every registered repo's installed Loom is
 //!   compared with this daemon's own payload and, on a host in H0 with
-//!   `fleet.autoApply` on, resynced under a per-repo claim.
+//!   `fleet.autoApply` on, resynced under a per-repo claim. It runs on its
+//!   own task, one pass at a time, and the timer never waits for it.
 //! - **The checkout fast-forward** ([`checkout_ff`], #10869): each registered
 //!   workspace's main checkout is fast-forwarded to its default branch when it
 //!   is clean and strictly behind, so a resync that landed on the forge is the
 //!   one this host dispatches from. It runs inside the startup pass (before
-//!   any dispatch producer exists) and last in every timer pass, after the
-//!   workspace resync. It writes only with `fleet.autoApply` on.
+//!   any dispatch producer exists), and then on the workspace resync's own
+//!   task, right after each resync pass, so the timer never waits for it
+//!   either. It writes only with `fleet.autoApply` on.
 //!
 //! # Invariants this module keeps
 //!
@@ -715,6 +717,39 @@ pub fn publish(status: &FleetSyncStatus) {
     }
 }
 
+/// Put a finished workspace pass (#10718) on the current snapshot. Before the
+/// first snapshot exists there is nothing to update; the timer's next publish
+/// carries it.
+fn publish_workspaces(found: &workspace_resync::WorkspacePass) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        status.workspaces.clone_from(found);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// Put a finished checkout pass (#10869) on the current snapshot, as
+/// [`publish_workspaces`] does for the workspace pass.
+fn publish_checkouts(found: &[checkout_ff::CheckoutReport]) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        status.checkouts = found.to_vec();
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
 fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
@@ -1321,15 +1356,16 @@ fn spawn_timer(
             Mode::Check
         };
         // #10718: the workspace resync also runs once at startup, now that the
-        // startup pass is done and the drain state exists.
-        let began = std::time::Instant::now();
-        workspace_resync::pass(&inputs, mode, cached_status(), &enforcer, &bus).await;
-        // #10869: the checkout half is always last, so a resync the workspace
-        // half just pushed is fast-forwarded to in the same pass.
-        checkout_ff::pass(&inputs, began, &gate, &bus).await;
+        // startup pass is done and the drain state exists. It runs on its own
+        // task (one at a time), so nothing here ever waits for git.
+        //
+        // #10869: the checkout half runs on that same task, right after the
+        // resync pass, so a resync this host just pushed is fast-forwarded to
+        // in the same pass and the two never run at once.
+        let then = || checkout_ff::after_resync(&inputs, &enforcer, &gate, &bus);
+        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, then());
         loop {
             tokio::time::sleep(inputs.interval).await;
-            let began = std::time::Instant::now();
             let owned = inputs.clone();
             match tokio::task::spawn_blocking(move || run_pass(&owned, "timer", mode, Utc::now()))
                 .await
@@ -1342,13 +1378,14 @@ fn spawn_timer(
                     if let Some(e) = enforcer.as_deref() {
                         enforce(&mut status, e, bus.as_deref());
                     }
+                    status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
                     // #10718: last, so the floor is current and a hold this
-                    // pass just placed is already in the drain flag.
+                    // pass just placed is already in the drain flag. Not
+                    // awaited: see `workspace_resync::host`.
                     workspace_resync::mark_verified();
-                    workspace_resync::pass(&inputs, mode, Some(status), &enforcer, &bus).await;
-                    checkout_ff::pass(&inputs, began, &gate, &bus).await;
+                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, then());
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }
