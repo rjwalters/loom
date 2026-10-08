@@ -102,6 +102,7 @@ mod merge_pr_partial_comment;
 mod merge_pr_partial_conflict;
 mod merge_pr_partial_reset;
 mod merge_pr_poll_wait;
+mod merge_pr_pr_state;
 mod merge_pr_reconcile;
 mod merge_pr_redate;
 mod merge_pr_redate_report;

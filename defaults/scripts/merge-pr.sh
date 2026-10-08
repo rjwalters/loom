@@ -508,15 +508,12 @@ PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name // empty' 2>/dev/null || tr
 # is greppable in the run log.
 check_branch_name "$PR_BRANCH" "head branch of PR #$PR_NUMBER" || error "Merge blocked: PR #$PR_NUMBER's head branch is not a safe git ref operand (see the check_branch_name refusal above, #9106). Refusing before any git command runs on '$PR_BRANCH'. Rename the branch on the PR and re-run."
 
-# Check if already merged
-if [[ "$PR_MERGED" == "true" ]]; then
-  warning "PR #$PR_NUMBER is already merged"
-  exit 0
-fi
-
-# Check if closed (not merged). One line: the code-line offset for the
-# chain-head merge lock guard below (verbatim, behavior-preserving join).
-[[ "$PR_STATE" != "closed" ]] || error "PR #$PR_NUMBER is closed (not merged)"
+# Terminal-state gate: `loom-daemon merge-pr pr-state` (#8191 slice) — merged wins over
+# closed. Acts only on a positive MERGED/CLOSED; no verdict proceeds (the gates below and the forge refuse such a PR).
+case "$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr pr-state --state "$PR_STATE" --merged "$PR_MERGED" 2>/dev/null)" in
+  "LOOM-PR-STATE MERGED") warning "PR #$PR_NUMBER is already merged"; exit 0 ;;
+  "LOOM-PR-STATE CLOSED") error "PR #$PR_NUMBER is closed (not merged)" ;;
+esac
 
 # Chain-head merge lock (#10167): while ANOTHER PR on this base is a re-dating
 # chain head whose required checks have not reported, defer with exit 6 BEFORE

@@ -251,6 +251,12 @@
 //! retargeted onto the parent's base first, and the branch is kept whenever
 //! that cannot be confirmed.
 
+//! [`pr_state`] is the gate that opens the whole flow once the PR is fetched
+//! (#8191 slice): already merged (exit 0) versus closed unmerged (refuse)
+//! versus carry on. Merged wins over closed, since a merged PR also reads
+//! `state: closed`. The shell acts only on a positively received verdict; a
+//! lost one proceeds, because the later gates and the forge refuse such a PR.
+
 pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
@@ -271,6 +277,7 @@ pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
 pub mod poll_wait;
+pub mod pr_state;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
