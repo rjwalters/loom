@@ -705,6 +705,9 @@ pub fn finish_execution(
     result: &str,
     metadata: TraceAttributes,
 ) -> Option<TraceContext> {
+    // #10964: the execution is over, so its relay token stops working —
+    // before the tracing gate, which the relay does not depend on.
+    super::agent_relay::end_execution(execution);
     if !super::tracing::enabled(root) {
         return None;
     }
@@ -785,6 +788,7 @@ pub fn execution_adopted(root: &Path, execution: &str) {
 }
 
 pub fn child_exited(root: &Path, execution: &str, result: &str) {
+    super::agent_relay::end_execution(execution);
     let store = TraceStore::new(root);
     if let Ok(saved) = TraceStore::load(&store.path(root, execution)) {
         finish_owned_runtime(

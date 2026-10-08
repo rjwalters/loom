@@ -240,9 +240,14 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
 | `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
 | `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
-| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`; a standing refusal is published once, then at most every 5 minutes) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`; a standing refusal is published once, then at most every 5 minutes) |
 | `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
 | `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
+| `daemon.roll.item` (`stage: "resume"`) | Pause-and-roll resume (#10832) | `{stage, manifest_id, item_id, new_item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, running_version, resumed_on, verify_probation_secs, resume_budget_secs, forge}` (one per agent H5 resumed, requeued, completed or handed to restart recovery) |
+| `daemon.roll.item.residue_reaped` | Pause-and-roll resume (#10832) | `{manifest_id, item_id, pids, survivors, scope_stopped}` (processes of a paused agent still alive at H5) |
+| `daemon.roll.manifest.unreadable` | Pause-and-roll resume (#10832) | `{path, outcome, detail, running_version}` (`outcome`: `corrupt`, `unknown-version`; nothing is resumed, restart recovery takes every item) |
+| `daemon.roll.health_failed` | Pause-and-roll resume (#10832) | `{manifest_id, reason, running_version, to_version, failures}` (health did not hold during probation; nothing is resumed until it does) |
+| `daemon.roll.paused.resumed` | Pause-and-roll resume (#10832) | `{manifest_id, phase, from_version, to_version, running_version, resumed_on, items, resumed, completed, requeued_by_reason, recovered, residue_reaped, health_failures, verify_probation_secs, resume_budget_secs, probation_secs, resume_secs, pause_to_resume_secs, max_age_secs}` (`resumed_on`: `target` or `rollback`) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 | `operator_priority.escalation` | Star-liveness pass (#9321)   | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
@@ -6047,8 +6052,8 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 | ~~`autonomous.autoUpdate.rollStallDeadlines`~~, ~~`autonomous.autoUpdate.rollStallCooldownSecs`~~ | ~~`LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES`~~, ~~`LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`~~ | — | **Removed by #10831.** They tuned the unsatisfiable-drain detector (#8998/#9010) of the wait-for-zero roll, which no longer exists: every automatic roll is now a pause-and-roll bounded by `pauseRoll.pauseBudgetSecs`. Both keys and both env vars are ignored if still set. |
 | `autonomous.autoUpdate.pauseRoll.pauseBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_PAUSE_BUDGET_SECS` | `120` | Pause-and-roll H4 (#10831, design §7): how long a roll waits for its agents to reach a safe point. An agent that has not parked by then (a tool call longer than the budget, a runtime whose image has no pause hook) is stopped and requeued with `pause-budget-missed`. Read per roll, **no restart**. Validated together with the two keys below: the three must sum to less than two thirds of the lease TTL (`LOOM_LEASE_TTL_MINUTES`, default 15 min → under 600s), or the combination is **rejected** (ERROR + `daemon.roll.config_rejected`) and the defaults are used. |
-| `autonomous.autoUpdate.pauseRoll.verifyProbationSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_VERIFY_PROBATION_SECS` | `90` | Pause-and-roll H5 health probation, consumed by the resume side (#10832). Validated and reported here so the lease bound holds for the whole pause→resume window. |
-| `autonomous.autoUpdate.pauseRoll.resumeBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_RESUME_BUDGET_SECS` | `120` | Pause-and-roll H5 resume budget, consumed by the resume side (#10832). Validated and reported here. |
+| `autonomous.autoUpdate.pauseRoll.verifyProbationSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_VERIFY_PROBATION_SECS` | `90` | Pause-and-roll H5 health probation (#10832, design §7): after a roll's restart, how long the daemon's IPC must keep answering and its heartbeat stay fresh before any paused agent is relaunched. A failed sample restarts the window. Dispatch is held throughout. Read at startup. Validated with the two keys beside it so the pause→resume window stays under the lease TTL. |
+| `autonomous.autoUpdate.pauseRoll.resumeBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_RESUME_BUDGET_SECS` | `120` | Pause-and-roll H5 resume budget (#10832): how long the relaunch of the paused agents may take once probation has passed. An agent not reached by then is requeued with `resume-timeout`. Read at startup. |
 | `autonomous.autoUpdate.pauseRoll.minResumableAgeSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_MIN_RESUMABLE_AGE_SECS` | `300` (5 min) | Pause-and-roll (#10830, design `docs/design/daemon-roll-pause-resume.md` §2): an agent whose session first started less than this long ago is reset (killed and requeued with reason `young-agent-reset`) at a roll instead of being paused and resumed. The age is measured from the session's first start, carried across earlier roll resumes. `0` disables the rule. Resolved now but **not yet consumed**: no roll pauses agents until #10831/#10832 land |
 | `autonomous.autoUpdate.rollWindowSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS` | *(off)* | Period of the scheduled roll window (#9132). **Unset/zero/invalid → no window**: rolls arm on every new build exactly as before (opt-in; this default preserves existing behaviour). When set, a new build arms **nothing** outside an open window, the settle gate is bypassed (the window is the batching mechanism, so a busy `main` cannot starve the host), and at most one roll arms per window — see [Scheduled roll windows](#scheduled-roll-windows-9132). **Restart required** |
 | `autonomous.autoUpdate.rollWindowOffsetSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS` | derived from host id | Where window 0 opens within the period. Zero/invalid → the **derived** offset: `fnv1a(host_id) mod period`, stable across restarts and spread across hosts. An explicit value is reduced modulo the period, so the offset is always `< rollWindowSecs`. Only meaningful with `rollWindowSecs`. **Restart required** |
@@ -12235,8 +12240,8 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   autoUpdate roll (`autoupdate`) — goes through one trigger
   (`trigger_pause_roll`) and one path. **No automatic roll waits for in-flight
   work to reach zero.** The design is `docs/design/daemon-roll-pause-resume.md`
-  (in the Loom repository); this is the old-binary side (H3 → H4), and the resume
-  side (H5) is #10832.
+  (in the Loom repository). H3 → H4 below is the old binary's side; the next
+  start's side (H5, #10832) follows it.
   - **What it does (H4).** It sets the same dispatch-pause flag, with origin
     `pause-roll`, then: closes dispatch in every registry and in the role
     runner (a dispatch that had already passed the flag is refused too) and
@@ -12280,8 +12285,9 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     containerized (session-exec) agent's invocation is cancelled through the
     spawn script's `.cancel` marker; the session container keeps running.
   - **What can stop it.** No supervisor (nothing would relaunch the daemon), no
-    state directory for the manifest, or a manifest from the previous roll that
-    is still live: the roll is **refused** (`daemon.roll.refused`, ERROR) and
+    state directory for the manifest, a manifest from the previous roll that
+    is still live (H5 has not finished with it), or a target whose last roll
+    did not take and is still backing off: the roll is **refused** (`daemon.roll.refused`, ERROR) and
     nothing is paused. A manifest that cannot be written aborts the pause before
     anything is signalled and dispatch resumes (`daemon.roll.pause_failed`).
     There is no drain fallback in any of these cases. While the previous
@@ -12305,6 +12311,93 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     `--abort-drain` is **refused** with a message naming the step, and the roll
     completes. `--then-exit` always wins: the daemon finishes the pause, writes
     `phase = paused` and stays down; the next start resumes from the manifest.
+  - **What the next start does (H5, #10832).** A daemon that starts and finds
+    the pause manifest (`phase` `paused`, or `pausing`/`resuming` after a
+    crash) holds dispatch and, in order: keeps restart recovery off the paused
+    agents (`reconstruct`, dead-pid claim reclaim, the sweep reaper and the
+    orphan-process and worktree reapers all skip the manifest's items, from
+    their first pass); reaps anything of a paused agent's recorded process tree
+    that is still alive (`daemon.roll.item.residue_reaped`: the recorded pid
+    and its group, only while the pid is still the recorded process, and the
+    scope unit; never by worktree, so a pause H4 had to finish by force is
+    re-checked rather than trusted, and a session whose old tree survives the
+    reap is requeued, not resumed); **refreshes the lease of
+    every agent it will resume, first**; then waits out **health probation**
+    (`pauseRoll.verifyProbationSecs`: IPC answering and the heartbeat fresh,
+    sustained). Only then does it relaunch each paused agent **from its saved
+    session** (`claude -p --resume <id>`, or `codex exec resume <id>` in the
+    same account and, for a session-managed account, the same container, under
+    the sandbox mode the session was started with), in the same workspace, with
+    its claim kept: the claim lock is rebound to the new run and records
+    `resume_of`, the same lease record gets a new renewal loop, and the
+    session's first start is carried so the 5-minute rule does not restart. A
+    role run is resumed the same way with the time it had left, its
+    in-progress guard and (if it held it) the issue-creation mutex seeded
+    first. Dispatch resumes when every item is resumed or requeued; the
+    manifest is archived as `roll-pause-manifest.<id>.done.json` (newest 10
+    kept).
+  - **What is requeued at H5, and why.** Before each relaunch H5 re-checks the
+    live state and requeues on a positive answer, with the same label restore
+    and single comment as H4: `manifest-stale` (the daemon came back after the
+    lease TTL; the manifest is archived `abandoned`), `lease-lost`,
+    `issue-closed` (recorded, never written to the forge), `issue-parked`,
+    `worktree-changed`, `session-store-unavailable`, `session-down` (the
+    session container is not up, or does not mount the workspace),
+    `role-disabled`, `guard-refused:<step>`, `session-resume-failed` (the
+    relaunch exited before its session was running, including a session
+    container image too old to resume in), `resume-attempts-exhausted` (a
+    session already resumed across three rolls) and `resume-timeout`. A
+    requeue releases the agent's claim lock and journal entry and keeps its
+    checkpoint. A requeued role run gives back the claim label it took
+    (`loom:reviewing`, `loom:treating`, `loom:curating`), recorded by the pause
+    hook when the agent ran its `gh pr edit … --add-label`; without that record
+    the role's own staleness rule releases it, as before. An agent whose work
+    ended by itself during the pause is released as completed, with no forge
+    write. A requeue whose forge write fails is handed to ordinary restart
+    recovery.
+  - **An unhealthy binary resumes nothing.** A failed health sample restarts
+    probation (`daemon.roll.health_failed`, ERROR) and dispatch stays held.
+    Once the manifest is older than the lease TTL the paused agents are
+    requeued instead, so no claim is held forever. Rolling back and
+    quarantining a bad binary is #9735's and is not done here.
+  - **Rollback.** A binary at or after #10715 that starts on a manifest written
+    for another version resumes it all the same and reports `resumed_on =
+    rollback`. If it is *older* than the roll's target, the roll did not take:
+    the target is recorded (`roll-failed-target.json` in the auto-update state
+    dir) and no roll to that same target starts for 15 minutes, doubling per
+    repeat up to 6 hours (`daemon.roll.refused`, state `roll-attempt-backoff`);
+    a different target is not held back. This guard stops the pause, not the
+    download: the full arm-time record is #10880. A manifest from a newer
+    schema is reported (`daemon.roll.manifest.unreadable`) and left alone. A
+    binary older than #10715 never reads the manifest: H4 left each agent's
+    lock, journal entry and checkpoint in place, so its ordinary restart
+    recovery drops the stale locks and claim reconciliation reclaims each
+    `loom:building` claim on the dead journal pid once the lease H4 refreshed
+    has aged out.
+  - **Operator commands during H5.** `restart --abort-drain` is **refused**
+    while H5 holds dispatch (the hold ends by itself, within the probation and
+    resume budgets). A real `restart --drain` replaces the hold; H5 then stops
+    relaunching and waits. A `--then-exit` drain exits and the next start
+    finishes the manifest; an aborted drain lets H5 re-hold dispatch and carry
+    on; a drain that outlasts the manifest's max age (the lease TTL) gets
+    every item not yet relaunched requeued, and the manifest archived, so no
+    paused claim waits for a restart. An operator stop already in force at
+    startup is respected the same way: H5 waits for it, resumes nothing
+    meanwhile, and gives the claims back once the manifest is stale. Staleness
+    is also re-checked before each relaunch, and every way out of H5 (a
+    manifest missing or unreadable when H5 loads it, a panic) still lifts the
+    dispatch hold and the recovery suppression.
+  - **A fleet-paused host (#10979).** A fleet `paused` state lets in-flight
+    work finish, and the paused agents are in-flight work: H5 resumes them
+    under the fleet hold and releases nothing, so the host does not dispatch
+    after H5. The startup fleet-sync pass re-applies `paused` before H5 is
+    spawned; a `paused` that arrives while H5 holds dispatch takes the hold
+    over in place.
+  - **Where to look.** `status --json` → `drain.resume`: the manifest id and
+    phase, the H5 step, `resumed_on`, counts of resumed / completed / recovered
+    agents, requeues by reason, and the observed `probation_secs`,
+    `resume_secs` and `pause_to_resume_secs` (pause start to resume end, the
+    window the lease TTL bounds). It stays readable after H5 has finished.
   - **A newer release supersedes an armed roll (#8514)** only until the pause
     has stopped an agent; after that it is too late and the roll completes.
   - **Floor rolls (#10712)** take this same path. They still skip the settle

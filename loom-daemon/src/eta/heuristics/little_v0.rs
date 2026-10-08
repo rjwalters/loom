@@ -134,6 +134,7 @@ impl Heuristic for LittleV0 {
             regime_adjustment: None,
             planner_version: None,
             held_heron: None,
+            stage_predictions: std::collections::BTreeMap::new(),
         };
         let current = match &input.current {
             CurrentState::Refused(reason) => return refuse(explanation, *reason),

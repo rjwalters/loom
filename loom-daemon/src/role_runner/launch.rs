@@ -24,7 +24,16 @@ mod observability_tests;
 /// Claude Code's `-p` sessions read) exactly as the sweep path's
 /// `observability::tracing::prepare_child` does, and removed when the tick has
 /// none, so an ambient daemon value can never parent this session.
-pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path, role: &str) {
+///
+/// Last — opt-in, default-off (#10964) — the session's own OTLP export is
+/// pointed at this daemon's loopback relay. The returned lease is that
+/// session's relay access: the caller holds it until the child has exited.
+pub(super) fn apply_role_observability(
+    cmd: &mut Command,
+    workspace_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
     let execution = crate::observability::lifecycle::role_command(cmd);
     let context = cmd
@@ -41,6 +50,13 @@ pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path,
         role,
         execution.as_deref(),
     );
+    crate::observability::agent_relay::prepare_role_child(
+        cmd,
+        workspace_root,
+        runtime,
+        role,
+        execution.as_deref(),
+    )
 }
 
 // #10640: why a launched tick failed, for its `loom.role_attempt` span.
@@ -69,7 +85,15 @@ pub(super) fn run_role_with_timeout(
     load_per_core_override: Option<f64>,
     backstop: Option<crate::runtime_preference::Reservation>,
     contained: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
+    resume: Option<&roll_resume::RoleRollResume>,
 ) -> RoleTickOutcome {
+    // #10832: a saved session only resumes on the runtime that owns it. A role
+    // whose binding moved to another runtime since the pause is refused here,
+    // before anything is spawned, and H5 requeues the run.
+    if let Some(refused) = resume.and_then(|r| r.refuse(admission)) {
+        note_pre_spawn_skip(&logs_dir, role, &refused);
+        return RoleTickOutcome::Failure(refused);
+    }
     // #9548: every scheduled role (Champion, Curator, Judge, Doctor, ...)
     // writes labels and control markers on this workspace's repo, through
     // `gh` calls that resolve it the way `gh` does, an `upstream` remote
@@ -172,7 +196,17 @@ pub(super) fn run_role_with_timeout(
 
     let mut cmd = Command::new(script);
     cmd.env(crate::provenance::origin::ENV, "autonomous");
-    cmd.arg("-p").arg(prompt);
+    // #10832: a roll resume passes no prompt of its own (see
+    // `sweep_registry::spawn_process`'s identical branch).
+    match resume.map(|r| r.launch.runtime.as_str()) {
+        None => {
+            cmd.arg("-p").arg(prompt);
+        }
+        Some("codex") => {}
+        Some(_) => {
+            cmd.arg("-p");
+        }
+    }
     // Model pin (issue #4501): appended immediately after the prompt, exactly as
     // `sweep_registry::spawn_child` does, so a role child never inherits the
     // account's interactive CLI default (`fable` on the affected host — the most
@@ -246,7 +280,14 @@ pub(super) fn run_role_with_timeout(
         cmd.process_group(0);
     }
 
-    apply_role_observability(&mut cmd, workspace_root, role);
+    // Held to the end of this (blocking) launch: dropping it ends the
+    // session's relay access (#10964).
+    let _relay_lease = apply_role_observability(
+        &mut cmd,
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
     // #10830: a role run is paused and resumed like a sweep (design Q7), so it
     // gets the same pause-and-roll identity. Role runs have no claim lock; the
     // item id is synthetic (`role-<role>-<time>-<rand>`).
@@ -256,8 +297,15 @@ pub(super) fn run_role_with_timeout(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let runtime = admission.map(|a| a.runtime.as_str());
-    let session =
-        sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime);
+    let session = match resume {
+        None => sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime),
+        Some(r) => r.session(&item, workspace_root),
+    };
+    if resume.is_some() && session.is_none() {
+        let reason = "roll resume refused: the saved session id is not usable (#10832)";
+        note_pre_spawn_skip(&logs_dir, role, reason);
+        return RoleTickOutcome::Failure(reason.to_string());
+    }
     if let Some(session) = &session {
         session.apply_env(&mut cmd);
     }
@@ -304,14 +352,20 @@ pub(super) fn run_role_with_timeout(
             role: role.to_string(),
             root: workspace_root.to_path_buf(),
             pid,
-            started_at: chrono::Utc::now(),
+            // The session's FIRST start: carried across a roll resume.
+            started_at: chrono::DateTime::parse_from_rfc3339(&s.agent_started_at)
+                .map_or_else(|_| chrono::Utc::now(), |t| t.with_timezone(&chrono::Utc)),
             runtime: s.runtime.clone(),
-            claude_session_id: s.claude_session_id.clone(),
+            claude_session_id: s
+                .claude_session_id
+                .clone()
+                .or_else(|| s.resume.as_ref().map(|l| l.session_id.clone())),
             scope_unit: s.scope_unit.clone(),
             pause_root: s.pause_root.clone(),
             model: (!model.is_empty()).then(|| model.to_string()),
             timeout,
             started_mono: Instant::now(),
+            resume: s.resume.clone(),
         });
     // Registering consumes the permit. With no pause identity there is nothing
     // to register, and the permit must still be released here: it holds the
@@ -490,6 +544,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         match outcome {
             RoleTickOutcome::Failure(reason) => {
@@ -522,6 +577,7 @@ mod tests {
             "default",
             "",
             "default",
+            None,
             None,
             None,
             None,
