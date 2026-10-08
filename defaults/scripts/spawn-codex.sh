@@ -1193,7 +1193,7 @@ trap "rm -f '$_stderr_file' '$_stderr_file.cancel'" EXIT
 # still running, not after it exits. `loom-daemon agent-resume capture-codex`
 # watches the capture below and writes LOOM_RESUME_HANDLE_FILE as soon as the
 # `session id:` line lands; it ends with this script ($$).
-[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 &
+[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 198>&- & unset LOOM_RESUME_HANDLE_FILE
 set +e
 echo "# LOOM_CLI_START runtime=codex" >&2
 if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then

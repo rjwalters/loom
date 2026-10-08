@@ -1276,7 +1276,7 @@ fi
 # claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
 # a nested agent shares the item's pause state. The proxied host half keeps
 # them: its in-container copy receives them by name and drops them itself.
-[[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT
+[[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT LOOM_RESUME_HANDLE_FILE
 
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command

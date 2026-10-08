@@ -305,8 +305,3 @@ scripts/test-changelog.sh
 # #9987: spawn-claude.sh managed-gh container admission. Hermetic: a fake daemon
 # and docker stub under mktemp -d; no network, forge or real daemon binary.
 test-spawn-claude-managed-gh.sh
-
-# #10830: the dispatch session identity (session id, scope unit, resume vars) is
-# dropped before the agent starts. Hermetic: stub claude/codex under mktemp -d
-# and the built loom-daemon; no network, forge or systemd.
-test-spawn-session-env.sh

@@ -1753,6 +1753,8 @@ jobs:
         run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
       - name: spawn-codex sealed-registration trust waiver (#10102)
         run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
+      - name: spawn-* session identity is not inherited by the agent (#10830)
+        run: bash defaults/scripts/tests/test-spawn-session-env.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
