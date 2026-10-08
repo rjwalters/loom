@@ -4635,7 +4635,9 @@ Wiring it into admission is #10815.
   demand-ledger totals (the same per-repo read as the build back-off). Ready
   and building counts come from the rows the work finder already listed this
   tick (ready = dispatched or deferred; building = `in_flight`); a halted repo
-  reads ready as a known zero (it admits nothing) and building as unobserved. Untriaged issues are not observed yet.
+  reads ready as a known zero (it admits nothing) and building as unobserved; a
+  repo whose ready-queue listing failed this tick reads both as unobserved — a
+  failed listing is not an empty backlog. Untriaged issues are not observed yet.
 - **Fail open.** An unobserved input gives that role a one-slot `floor`, never
   zero for lack of data.
 - **Champion first.** Every repo with merge debt gets its champion slot before
@@ -4647,9 +4649,10 @@ Wiring it into admission is #10815.
   doctor demand is changes debt × `reviewWeight`, builder demand is ready
   issues − `ceil(reviewWeight × (review + changes))`. So a repo deep in changes
   debt gets doctors and no builders, a review-deep one gets judges, and a
-  debt-free repo with ready work gets builders. Judge and doctor are capped per
-  repo at `clamp(ceil(debt / demandWidth.perRun), 1, demandWidth.max)`;
-  champion at 1. Ties break by repo path, then role (champion, judge, doctor,
+  debt-free repo with ready work gets builders. Judge is capped per repo at
+  `clamp(ceil(debt / demandWidth.perRun), 1, demandWidth.max)`, doctor at
+  `clamp(ceil(debt / demandWidth.perRun), 1, demandWidth.doctorMaxPerRepo)`
+  (the live per-repo doctor lane bound), champion at 1. Ties break by repo path, then role (champion, judge, doctor,
   builder), so the output is deterministic.
 - **Budget.** This tick's work-finder cap plus the role-runner ceiling
   (`autonomous.roleRunner.maxConcurrent`). The total never exceeds it.

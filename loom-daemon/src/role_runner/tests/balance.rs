@@ -51,13 +51,26 @@ fn cfg_w(w: f64) -> AllocatorConfig {
 fn changes_heavy_repo_gets_doctors_and_no_builders() {
     let repos = vec![(root("a"), pipe(0, 12, 0, 10))];
     let allocs = allocate(&repos, 8, &AllocatorConfig::default());
-    // ceil(12 / perRun 3) = 4, clamped at max 4.
-    assert_eq!(slots(&allocs, "a", "doctor"), 4);
+    // ceil(12 / perRun 3) = 4, clamped at doctorMaxPerRepo 3 (#10632).
+    assert_eq!(slots(&allocs, "a", "doctor"), 3);
     assert_eq!(slots(&allocs, "a", "builder"), 0);
     let b = find(&allocs, "a", "builder");
     assert_eq!(b.trigger, Trigger::Debt(DebtAxis::Changes));
     assert!(b.reason.contains("builds paused"), "{}", b.reason);
     assert_eq!(find(&allocs, "a", "doctor").trigger, Trigger::Debt(DebtAxis::Changes));
+}
+
+#[test]
+fn doctor_cap_is_doctor_max_per_repo_not_demand_width_max() {
+    let cfg = AllocatorConfig {
+        max_per_repo: 4,
+        doctor_max_per_repo: 2,
+        ..AllocatorConfig::default()
+    };
+    let repos = vec![(root("a"), pipe(12, 12, 0, 0))];
+    let allocs = allocate(&repos, 20, &cfg);
+    assert_eq!(slots(&allocs, "a", "judge"), 4, "judge bounded by demandWidth.max");
+    assert_eq!(slots(&allocs, "a", "doctor"), 2, "doctor bounded by doctorMaxPerRepo");
 }
 
 #[test]

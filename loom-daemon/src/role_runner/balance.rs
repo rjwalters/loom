@@ -34,9 +34,10 @@
 //!   × `reviewWeight`, doctor demand is changes debt × `reviewWeight`, and
 //!   builder demand is ready issues minus `ceil(reviewWeight × (review +
 //!   changes))` — a repo deep in debt pauses its own builds, a debt-free repo
-//!   with ready work gets builders. Judge / doctor are capped per repo at
+//!   with ready work gets builders. Judge is capped per repo at
 //!   `clamp(ceil(debt / perRun), 1, max)` (the demand width formula, applied
-//!   to the repo's own debt). Ties break by repo path, then role (champion,
+//!   to the repo's own debt); doctor at the same formula bounded by
+//!   `doctorMaxPerRepo`, as the live per-repo doctor lanes are (#10632). Ties break by repo path, then role (champion,
 //!   judge, doctor, builder), so the result is deterministic.
 //! - **Bias** (`reviewWeight`, default `1.0`). Above 1 tilts the host toward
 //!   review (judge / doctor demand up, builds pause sooner); below 1 toward
@@ -50,6 +51,7 @@ use serde_json::Value;
 use super::demand::{self, DebtAxis, DemandConfig, DemandLedger, HostDebt};
 use crate::types::QueueDisposition;
 use crate::work_finder::ready_queue::TickQueueRow;
+use crate::work_finder::TickReport;
 
 /// Env override for `autonomous.balance.enabled` (env > config > default).
 pub const ENABLED_ENV: &str = "LOOM_BALANCE_ENABLED";
@@ -140,8 +142,11 @@ pub struct AllocatorConfig {
     pub review_weight: f64,
     /// `demandWidth.perRun` — debt items per judge / doctor slot.
     pub per_run: usize,
-    /// `demandWidth.max` — most judge / doctor slots one repo may get.
+    /// `demandWidth.max` — most judge slots one repo may get.
     pub max_per_repo: usize,
+    /// `demandWidth.doctorMaxPerRepo` — most doctor slots one repo may get,
+    /// the same bound the live per-repo doctor lanes use (#10632).
+    pub doctor_max_per_repo: usize,
     /// `demandWidth.nonPrFloor` — slots the champion-first pass leaves free.
     pub non_pr_floor: usize,
     /// `demandWidth.reserve` — `false` skips the champion-first pass
@@ -158,6 +163,7 @@ impl AllocatorConfig {
             review_weight: valid_weight(balance.review_weight).unwrap_or(DEFAULT_REVIEW_WEIGHT),
             per_run: demand.per_run.max(1),
             max_per_repo: demand.max.max(1),
+            doctor_max_per_repo: demand.doctor_max_per_repo.max(1),
             non_pr_floor: demand.non_pr_floor,
             reserve: demand.reserve,
         }
@@ -282,10 +288,15 @@ fn pr_want(role: &str, axis: DebtAxis, p: &RepoPipeline, cfg: &AllocatorConfig) 
             why: format!("no {} debt", axis.label()),
         },
         Some(d) => {
+            let upper = if role == "doctor" {
+                cfg.doctor_max_per_repo
+            } else {
+                cfg.max_per_repo
+            };
             let cap = if role == "champion" {
                 1
             } else {
-                d.div_ceil(cfg.per_run).clamp(1, cfg.max_per_repo)
+                d.div_ceil(cfg.per_run).clamp(1, upper)
             };
             Want {
                 demand: d as f64 * weighted,
@@ -545,14 +556,14 @@ pub fn log_line(allocs: &[Allocation], host_budget: usize, review_weight: f64) -
 
 /// The work finder's per-tick hook: when `autonomous.balance.enabled` (read
 /// from `primary`), compute the allocation over `roots` and log it once.
-/// `host_budget` is this tick's sweep cap plus the role-agent ceiling.
-/// Disabled is a config read and nothing else.
+/// Ready / building come from `report`'s queue rows, with its
+/// `listing_failed` roots left unobserved. `host_budget` is this tick's sweep
+/// cap plus the role-agent ceiling. Disabled is a config read and nothing else.
 pub fn shadow_tick(
     primary: &Path,
     roots: &[PathBuf],
-    queue: &[TickQueueRow],
+    report: &TickReport,
     halted: &[bool],
-    listing_failed: &[usize],
     sweep_cap: usize,
 ) {
     let balance = BalanceConfig::read(primary);
@@ -567,9 +578,9 @@ pub fn shadow_tick(
         &demand_cfg,
         ledger,
         roots,
-        queue,
+        &report.queue,
         halted,
-        listing_failed,
+        &report.listing_failed,
         budget,
     ) {
         log::info!("{}", log_line(&allocs, budget, balance.review_weight));
