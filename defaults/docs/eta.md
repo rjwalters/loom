@@ -2848,6 +2848,22 @@ not one per host.
   `fleet.etaAuthority` each think they are the authority. On a multi-host
   fleet declare one of the two keys. A fleet where no host has fleetRefresh on
   and no key is set has no ETA emitter at all.
+- **Coverage exception (#10897, Slice 1).** The pass lists PRs through local
+  workspaces, so an authority that manages 2 of 30 roster repos emits ETAs for
+  2. The roster is the cached fleet-store `repos.yml` (no live read); an
+  unknown roster (no `fleet.repo`, cold cache) changes nothing. Every
+  authority pass compares the repos it covered with the roster and, when short,
+  logs once per change and counts
+  `loom.daemon.task_faults{task=eta_pass,reason=eta_authority_coverage}` (the
+  critical `eta.authority.coverage` signal). A non-authority host cannot read
+  the authority's repos, so the committed `fleet.etaAuthorityCovers` declares
+  them: `"all"` keeps the other hosts silent (the healthy case); a list of
+  `owner/repo` slugs silences just those; **undeclared is unverifiable, so
+  other hosts keep emitting every roster repo they manage** (duplicates, each
+  stamped with its emitter in `loom.eta.authority`, beat 28 of 30 repos
+  missing). Re-evaluated every pass. `eta doctor` (`config.authority_coverage`)
+  reports the last recorded authority pass against the roster.
+  Workspace-less authority coverage is Slice 2.
 - **The authority** runs the tracker passes that emit `eta.estimate`,
   `eta.outcome` and `eta.snapshot`, and is the only host that fits
   (`eta-fit/v1`), **locally, even when `fleet.captain` names another host**: it

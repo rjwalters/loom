@@ -101,6 +101,7 @@ pub mod config;
 pub mod conformal;
 pub mod conformal_ipcw;
 pub mod conformal_wrap;
+pub mod coverage;
 pub mod dependency;
 pub mod doctor;
 pub mod doctor_facts;

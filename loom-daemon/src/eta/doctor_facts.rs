@@ -34,6 +34,21 @@ use crate::eta::doctor::Facts;
 use crate::eta::score::EstimateSummary;
 use crate::observability::{self, ExporterKind};
 
+/// The last recorded authority pass against the cached roster as of `now`
+/// (#10897); unknown with no recorded pass or no roster.
+fn last_pass_coverage(root: &Path, now: DateTime<Utc>) -> crate::eta::coverage::Coverage {
+    let Some(pass) = crate::eta::coverage::read_last_pass(root) else {
+        return crate::eta::coverage::Coverage::default();
+    };
+    let Some(history) = crate::eta::roster_history::load_for(root, now).0 else {
+        return crate::eta::coverage::Coverage::default();
+    };
+    crate::eta::repo_priority::revision_at(&history, now)
+        .map_or_else(crate::eta::coverage::Coverage::default, |r| {
+            crate::eta::coverage::coverage(&r.members, &pass.covered)
+        })
+}
+
 /// Gather every fact for the checks, as of `now`, for the host `host_id`.
 #[must_use]
 pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
@@ -59,6 +74,8 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
                 is_local: r.is_authority(),
                 others: r.authority.others.clone(),
                 detail: r.describe(),
+                coverage: last_pass_coverage(root, now),
+                coverage_host: crate::eta::coverage::read_last_pass(root).map(|p| p.host),
             }
         },
     };

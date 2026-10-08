@@ -30,6 +30,13 @@ fn healthy() -> Facts {
                 is_local: true,
                 others: Vec::new(),
                 detail: "robb-studio (fleet_refresh); this host is the authority".into(),
+                coverage: crate::eta::coverage::Coverage {
+                    state: crate::eta::coverage::State::Full,
+                    roster: 2,
+                    covered: 2,
+                    missing: Vec::new(),
+                },
+                coverage_host: Some("robb-studio".into()),
             },
         },
         data: DataFacts {
@@ -434,10 +441,35 @@ fn the_authority_is_printed_and_a_missing_one_warns() {
         is_local: false,
         others: Vec::new(),
         detail: "none (no_candidate)".into(),
+        coverage: crate::eta::coverage::Coverage::default(),
+        coverage_host: None,
     };
     let warn = authority(&none);
     assert_eq!(warn.status, Status::Warn);
     assert!(warn.remedy.unwrap().contains("fleet.etaAuthority"));
+}
+
+#[test]
+fn authority_coverage_reports_full_short_and_unknown() {
+    use crate::eta::coverage::{Coverage, State};
+    let mut a = healthy().config.authority;
+    let full = authority_coverage(&a);
+    assert_eq!(full.status, Status::Ok);
+    assert!(full.detail.contains("2 of 2 roster repos"), "{}", full.detail);
+    assert!(full.detail.contains("robb-studio"), "{}", full.detail);
+    a.coverage = Coverage {
+        state: State::Short,
+        roster: 5,
+        covered: 2,
+        missing: vec!["a/x".into(), "a/y".into(), "a/z".into()],
+    };
+    let short = authority_coverage(&a);
+    assert_eq!(short.status, Status::Warn);
+    assert!(short.detail.contains("2 of 5") && short.detail.contains("a/x, a/y, a/z"));
+    assert!(short.remedy.unwrap().contains("fleet.etaAuthority"));
+    a.coverage = Coverage::default();
+    let unknown = authority_coverage(&a);
+    assert_eq!(unknown.status, Status::Skip);
 }
 
 #[test]
