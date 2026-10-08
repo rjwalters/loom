@@ -13,7 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use super::branch_holders::{branch_holders, held_by_worktree, kept_line, skip_if_held};
+use super::branch_holders::{
+    branch_holders, held_by_worktree, kept_line, skip_if_held, skip_if_held_in,
+};
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -186,7 +188,12 @@ pub struct CleanupStats {
     pub skipped_uncommitted: usize,
     pub skipped_editable: usize,
     pub cleaned_branches: usize,
+    /// Local branches kept by a policy decision (OPEN issue, `--safe` retain
+    /// prefix, unreachable commits under `--safe`): real leftovers.
     pub kept_branches: usize,
+    /// Local branches skipped because a worktree holds them (checked out,
+    /// mid-rebase, mid-bisect); not leftovers (#10851).
+    pub held_branches: usize,
     pub errored_branches: usize,
     pub killed_tmux: usize,
     /// Tmux sessions preserved because they have an attached client (a live
@@ -2047,7 +2054,7 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
 }
 
 /// Tally a failed `git branch -D`: a worktree-held branch is a skip
-/// (`kept_branches`, no error); anything else is a real error.
+/// (`held_branches`, no error); anything else is a real error.
 pub(super) fn record_branch_delete_failure(
     stats: &mut CleanupStats,
     branch: &str,
@@ -2056,7 +2063,7 @@ pub(super) fn record_branch_delete_failure(
 ) {
     if let Some(path) = held_by_worktree(cause) {
         println!("  {}", kept_line(&path, branch));
-        stats.kept_branches += 1;
+        stats.held_branches += 1;
     } else {
         stats.record_error(target, "git branch -D", cause);
     }
@@ -2096,10 +2103,19 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
 /// Force-delete one local branch. `Err` carries git's own message (e.g.
 /// `error: branch 'x' not found.`) so a failure can be reported against the
 /// branch that failed instead of vanishing into the error tally (#4877).
-fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+pub(super) fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+    run_checked(force_delete_cmd(repo_root, branch))
+}
+
+/// The `git branch -D` behind [`force_delete_branch`]. `LC_ALL=C` because
+/// [`record_branch_delete_failure`] parses git's English refusal text; gettext
+/// also ignores `LANGUAGE` under the C locale (#10851).
+pub(super) fn force_delete_cmd(repo_root: &Path, branch: &str) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(["branch", "-D", branch]).current_dir(repo_root);
-    run_checked(cmd)
+    cmd.args(["branch", "-D", branch])
+        .current_dir(repo_root)
+        .env("LC_ALL", "C");
+    cmd
 }
 
 /// Name prefixes that signal "do not garbage-collect this" (issue #5737): a
@@ -2340,9 +2356,8 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
         if protected.contains(branch) {
             continue;
         }
-        if let Some(path) = holders.get(branch) {
-            println!("  {}", kept_line(path, branch));
-            stats.kept_branches += 1;
+        if skip_if_held_in(&holders, branch) {
+            stats.held_branches += 1;
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
@@ -3332,13 +3347,20 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
         println!("  Skipped (grace period): {}", stats.skipped_grace);
         println!("  Skipped (uncommitted): {}", stats.skipped_uncommitted);
     }
-    if stats.cleaned_branches > 0 || stats.kept_branches > 0 || stats.errored_branches > 0 {
+    if stats.cleaned_branches > 0
+        || stats.kept_branches > 0
+        || stats.held_branches > 0
+        || stats.errored_branches > 0
+    {
         if dry_run {
             println!("  Would delete: {} branch(es)", stats.cleaned_branches);
         } else {
             println!("  Deleted: {} branch(es)", stats.cleaned_branches);
         }
         println!("  Kept: {} branch(es)", stats.kept_branches);
+        if stats.held_branches > 0 {
+            println!("  In use (held by a worktree): {} branch(es)", stats.held_branches);
+        }
         if stats.errored_branches > 0 {
             println!("  Errored (gh probe failed): {} branch(es)", stats.errored_branches);
         }
