@@ -28,7 +28,7 @@
 //! Three guarantees, matching the issue's acceptance criteria:
 //!
 //! 1. **Typed schema + one structured surface** — [`Hyperparameters`] groups
-//!    the knobs (`dispatch`, `lifecycle`, `rework`) with documented ranges.
+//!    the knobs (`dispatch`, `lifecycle`, `rework`, `champion`) with documented ranges.
 //! 2. **Fail-fast startup validation** — [`startup_init`] resolves the layer,
 //!    rejects unknown keys, wrong types, out-of-range values and the
 //!    contradictory `low >= high` backoff pair *by name*, and aborts daemon
@@ -44,7 +44,9 @@
 //! Tranche 1 fields (each a real consumed tunable — see the field docs):
 //! `dispatch.{tickIntervalSecs,maxConcurrent,maxAdmissionsPerTick}`,
 //! `lifecycle.{leaseTtlMinutes,idleExitMinutes}`, and
-//! `rework.{buildBackoffHigh,buildBackoffLow}`. Later tranches migrate the
+//! `rework.{buildBackoffHigh,buildBackoffLow}`. The `champion` group (#10753)
+//! carries Champion's promotion-throughput knobs
+//! (`prSlice,promotionSlice,tier2Cap,tier3Cap,tier3BacklogCap`). Later tranches migrate the
 //! remaining knobs (host breaker, admission brake, merge-train bounds, role
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
@@ -152,6 +154,29 @@ pub struct ReworkParams {
     pub build_backoff_low: usize,
 }
 
+/// Champion promotion-throughput tunables (issue #10753). Each has a
+/// single-knob env var the Champion shell snippets read
+/// (`LOOM_CHAMPION_*`, shown per field); there is no legacy config tier.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ChampionParams {
+    /// PR rows processed before the promotion pass runs. Env:
+    /// `LOOM_CHAMPION_PR_SLICE`. Default 10. Range `[1, 1000]`.
+    pub pr_slice: usize,
+    /// Fresh promotion verdicts per pause while PR rows remain. Env:
+    /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
+    pub promotion_slice: usize,
+    /// Tier 2 promotions per repository per pass. Env:
+    /// `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range `[1, 100]`.
+    pub tier2_cap: usize,
+    /// Tier 3 promotions per repository per pass. Env:
+    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[1, 100]`.
+    pub tier3_cap: usize,
+    /// Open unheld `tier:maintenance` `loom:issue`/`loom:building` issues
+    /// above which Tier 3 promotion is gated. Env:
+    /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[1, 1000]`.
+    pub tier3_backlog_cap: usize,
+}
+
 /// The unified hyperparameter vector: every consolidated operational tunable,
 /// grouped by concern. Field order is the digest's canonical serialization
 /// order — append-only from here on (reordering or renaming changes every
@@ -161,6 +186,7 @@ pub struct Hyperparameters {
     pub dispatch: DispatchParams,
     pub lifecycle: LifecycleParams,
     pub rework: ReworkParams,
+    pub champion: ChampionParams,
 }
 
 impl Default for Hyperparameters {
@@ -178,6 +204,13 @@ impl Default for Hyperparameters {
             rework: ReworkParams {
                 build_backoff_high: DEFAULT_HIGH,
                 build_backoff_low: DEFAULT_LOW,
+            },
+            champion: ChampionParams {
+                pr_slice: 10,
+                promotion_slice: 3,
+                tier2_cap: 2,
+                tier3_cap: 1,
+                tier3_backlog_cap: 5,
             },
         }
     }
@@ -313,6 +346,13 @@ const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
 const BUILD_BACKOFF_LOW_RANGE: (u64, u64) = (0, 100_000);
+const CHAMPION_KEYS: [(&str, (u64, u64)); 5] = [
+    ("prSlice", (1, 1000)),
+    ("promotionSlice", (1, 100)),
+    ("tier2Cap", (1, 100)),
+    ("tier3Cap", (1, 100)),
+    ("tier3BacklogCap", (1, 1000)),
+];
 
 /// Validate the hyperparameters layer (config block + env vector): every key
 /// must be known, correctly typed, and in range, and the backoff pair must
@@ -329,7 +369,7 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
         if !layer.is_null() {
             violations.push(Violation::new(
                 "hyperparameters",
-                "must be an object with `dispatch` / `lifecycle` / `rework` groups",
+                "must be an object with `dispatch` / `lifecycle` / `rework` / `champion` groups",
             ));
         }
         return violations;
@@ -339,9 +379,10 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
             "dispatch" => validate_dispatch(keys, &mut violations),
             "lifecycle" => validate_lifecycle(keys, &mut violations),
             "rework" => validate_rework(keys, &mut violations),
+            "champion" => validate_champion(keys, &mut violations),
             unknown => violations.push(Violation::new(
                 format!("hyperparameters.{unknown}"),
-                "unknown group (expected dispatch | lifecycle | rework)",
+                "unknown group (expected dispatch | lifecycle | rework | champion)",
             )),
         }
     }
@@ -439,6 +480,21 @@ fn validate_rework(group: &Value, violations: &mut Vec<Violation>) {
                 format!("backoff pair crossed: low ({low}) must be < high ({high})"),
             ));
         }
+    }
+}
+
+fn validate_champion(group: &Value, violations: &mut Vec<Violation>) {
+    if !group.is_null() && !group.is_object() {
+        violations.push(Violation::new("champion", "must be an object"));
+        return;
+    }
+    for (key, _) in group.as_object().into_iter().flatten() {
+        if !CHAMPION_KEYS.iter().any(|(k, _)| k == key) {
+            violations.push(Violation::new(format!("champion.{key}"), "unknown key"));
+        }
+    }
+    for (key, range) in CHAMPION_KEYS {
+        check_u64(group, "champion", key, range, violations);
     }
 }
 
@@ -666,6 +722,27 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut sources,
             ) as usize,
         },
+        champion: {
+            let d = Hyperparameters::default().champion;
+            let mut pick = |key: &str, default: usize| {
+                pick_u64(
+                    vector.as_ref(),
+                    &block,
+                    "champion",
+                    key,
+                    None,
+                    default as u64,
+                    &mut sources,
+                ) as usize
+            };
+            ChampionParams {
+                pr_slice: pick("prSlice", d.pr_slice),
+                promotion_slice: pick("promotionSlice", d.promotion_slice),
+                tier2_cap: pick("tier2Cap", d.tier2_cap),
+                tier3_cap: pick("tier3Cap", d.tier3_cap),
+                tier3_backlog_cap: pick("tier3BacklogCap", d.tier3_backlog_cap),
+            }
+        },
     };
     Resolved { params, sources }
 }
@@ -878,6 +955,19 @@ impl HyperparamsArgs {
             resolved.params.rework.build_backoff_low,
             resolved.sources["rework.buildBackoffLow"].as_str()
         );
+        let c = &resolved.params.champion;
+        for (key, value) in [
+            ("prSlice", c.pr_slice),
+            ("promotionSlice", c.promotion_slice),
+            ("tier2Cap", c.tier2_cap),
+            ("tier3Cap", c.tier3_cap),
+            ("tier3BacklogCap", c.tier3_backlog_cap),
+        ] {
+            println!(
+                "champion.{key:<23}= {value:>6}  [{}]",
+                resolved.sources[&format!("champion.{key}")].as_str()
+            );
+        }
         Ok(())
     }
 }

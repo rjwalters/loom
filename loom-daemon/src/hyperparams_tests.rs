@@ -303,3 +303,57 @@ fn build_backoff_reader_falls_back_on_a_crossed_final_pair() {
     assert_eq!(parsed.config.low, DEFAULT_LOW);
     assert_eq!(parsed.rejected_pair, Some((60, 100)));
 }
+
+// ---------------------------------------------------------------------------
+// champion group (#10753)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn champion_defaults_match_the_documented_slice_values() {
+    let c = Hyperparameters::default().champion;
+    assert_eq!(
+        (c.pr_slice, c.promotion_slice, c.tier2_cap, c.tier3_cap, c.tier3_backlog_cap),
+        (10, 3, 2, 1, 5)
+    );
+}
+
+#[test]
+#[serial]
+fn champion_block_and_env_vector_resolve_with_provenance() {
+    let tmp = empty_workspace();
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"champion": {"prSlice": 20, "tier3BacklogCap": 8}}}"#,
+    );
+    std::env::set_var(HYPERPARAMS_ENV, r#"{"champion.prSlice": 15, "champion.tier2Cap": 4}"#);
+    let resolved = resolve_effective(tmp.path());
+    std::env::remove_var(HYPERPARAMS_ENV);
+    let c = resolved.params.champion;
+    assert_eq!(c.pr_slice, 15);
+    assert_eq!(c.tier2_cap, 4);
+    assert_eq!(c.tier3_backlog_cap, 8);
+    assert_eq!(c.promotion_slice, 3);
+    assert_eq!(resolved.sources["champion.prSlice"], Source::EnvVector);
+    assert_eq!(resolved.sources["champion.tier2Cap"], Source::EnvVector);
+    assert_eq!(resolved.sources["champion.tier3BacklogCap"], Source::Config);
+    assert_eq!(resolved.sources["champion.tier3Cap"], Source::Default);
+}
+
+#[test]
+fn champion_validation_names_unknown_keys_and_bad_ranges() {
+    let layer = serde_json::json!({"champion": {"prSlice": 0, "tier3Cap": "x", "bogus": 1}});
+    let paths: Vec<String> = validate_layer(&layer).into_iter().map(|v| v.path).collect();
+    assert!(paths.contains(&"champion.prSlice".to_string()));
+    assert!(paths.contains(&"champion.tier3Cap".to_string()));
+    assert!(paths.contains(&"champion.bogus".to_string()));
+    assert!(validate_layer(&serde_json::json!({"champion": {"prSlice": 10}})).is_empty());
+    assert!(validate_layer(&serde_json::json!({"champion": null})).is_empty());
+}
+
+#[test]
+fn champion_values_enter_the_digest() {
+    let base = Hyperparameters::default();
+    let mut tweaked = base;
+    tweaked.champion.tier3_cap = 2;
+    assert_ne!(digest_of(&base), digest_of(&tweaked));
+}
