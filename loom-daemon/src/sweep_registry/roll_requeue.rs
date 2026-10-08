@@ -68,7 +68,41 @@ impl RollRequeueNotice {
                  before the pause budget ran out"
             }
             "session-not-resumable" => "no resumable session was recorded for the agent",
+            // The reasons below are the resuming side's (H5, #10832): the
+            // agent was paused, and could not be resumed after the restart.
+            "manifest-stale" => {
+                "the daemon came back too long after the pause to resume safely: the claim's \
+                 lease could have aged out, so the paused agent was not resumed"
+            }
+            "lease-lost" => "the claim's lease was no longer this host's after the restart",
+            "issue-parked" => "the issue was parked while its agent was paused",
+            "worktree-changed" => {
+                "the agent's worktree was missing, on another branch or at another commit after \
+                 the restart"
+            }
+            "session-store-unavailable" => {
+                "the agent's saved session could not be found after the restart"
+            }
+            "session-resume-failed" => "the agent's saved session did not start again",
+            "resume-attempts-exhausted" => {
+                "the session had already been resumed across three rolls"
+            }
+            "session-down" => "the agent's session container refused the resumed session",
+            "role-disabled" => "the role is no longer enabled for this repository",
+            "resume-timeout" => "the resume budget ran out before this agent was reached",
+            r if r.starts_with("guard-refused:") => {
+                "a dispatch guard refused to resume the agent after the restart"
+            }
             _ => "the agent could not be paused for the roll",
+        };
+        // H4 requeues instead of pausing; H5 requeues what it could not resume.
+        let did = if matches!(
+            self.reason.as_str(),
+            "young-agent-reset" | "pause-budget-missed" | "session-not-resumable"
+        ) {
+            "requeued this item instead of pausing it"
+        } else {
+            "paused this item, could not resume it afterwards, and requeued it"
         };
         let worktree = match (&self.worktree, self.worktree_dirty) {
             (Some(path), Some(true)) => format!(
@@ -83,7 +117,7 @@ impl RollRequeueNotice {
         };
         format!(
             "{ROLL_REQUEUE_COMMENT_MARKER}\nThe Loom daemon on this host restarted for a version \
-             roll (`{from}` → `{to}`) and requeued this item instead of pausing it.\n\n\
+             roll (`{from}` → `{to}`) and {did}.\n\n\
              - **Reason:** `{reason}` — {meaning}.\n\
              - **Phase reached:** {phase}\n\
              - **Agent age:** {age}\n\
@@ -109,7 +143,7 @@ pub(crate) struct RollItemFacts {
     pub(crate) head: Option<String>,
 }
 
-fn git_line(worktree: &Path, args: &[&str]) -> Option<String> {
+pub(super) fn git_line(worktree: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(worktree).args(args);
     let out = reaper::output_with_timeout(cmd, reaper::reap_gh_timeout()).ok()??;

@@ -109,6 +109,22 @@ pub fn start_pause_roll(
         }
         _ => {}
     }
+    // #10832: the last roll to this same target did not take (the host came
+    // back on the old binary). Do not pause every agent for it again at once.
+    // Refused on every tick until the retry time, so rate-limited per target.
+    let held_back = manifest_path.parent().and_then(|dir| {
+        crate::auto_update::pause_resume::attempt::gate(
+            dir,
+            target.to_version.as_deref(),
+            target.to_artifact_sha256.as_deref(),
+            staged_at,
+        )
+    });
+    if let Some(why) = held_back {
+        let key =
+            format!("roll-attempt-backoff:{}", target.to_version.as_deref().unwrap_or_default());
+        return refuse_as("roll-attempt-backoff", &key, why);
+    }
     let (tuning, rejected) = PauseRollTuning::resolve(fallback_root);
     if let Some(why) = rejected {
         log::error!("pause_roll: {why}");
