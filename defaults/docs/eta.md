@@ -367,22 +367,35 @@ refuses PR stages `no_model`; #10923 makes the authority publish its fits.
 The switch is an operator action on the authority host, made only when both
 hold:
 
-1. **Non-refusal.** Over the trailing 24 h, twin-otter-b answers at least
-   95% of the live items `land-v1` answers (refusals by stage:
-   `eta-queries.sql` section 0 and Q7, or the
-   `current_answer_rate` / `candidate_answer_rate` of
-   `loom-daemon eta promote --candidate land-2026-10-04-twin-otter-b --since <24 h ago> --json`,
-   which writes nothing without `--apply`).
+1. **Non-refusal (shipped, #10949).** Of the tracker passes in the
+   trailing 24 h where `land-v1` answered, twin-otter-b answered at least
+   95%, over at least 50 such passes. The shadow ledger keeps these counts
+   per UTC hour (`answer_hours` in `shadow.json`, the newest 72 hours;
+   `eta::shadow_non_refusal`), and `loom-daemon eta promote --candidate
+   land-2026-10-04-twin-otter-b` reports the figure as `non-refusal:` (and
+   `non_refusal` in `--json`; nothing is written without `--apply`). For
+   which stages refuse, see `eta-queries.sql` section 0 and Q7.
 2. **Per-stage parity.** twin-otter-b's live per-stage figures agree with
    its replay (`eta backtest --heuristic land-2026-10-04-twin-otter-b
-   --fit-dir DIR`): no PR stage refuses live where the replay answers.
+   --fit-dir DIR`): no PR stage refuses live where the replay answers. This
+   one is an operator check; no command decides it.
+
+The non-refusal check is part of `eta promote` for **every** candidate, not
+only this one: a failed check refuses the flip like a failed gate, and a
+ledger with fewer than 50 answered passes in the window fails closed.
 
 The switch sets `autonomous.eta.current.land` to
-`land-2026-10-04-twin-otter-b`, through `eta promote --apply` where the
-two-gate rule passes, or as a config change. Either way it must leave an
-`eta.*` record of the switch, naming the heuristic, the time and this
-evidence (#10949). `eta promote` writes an `eta-promotion-decision/v1`
-record; a config change is recorded on #10949.
+`land-2026-10-04-twin-otter-b` and must leave an `eta.*` record naming the
+heuristic, the time and this evidence (#10949). Run `loom-daemon eta promote
+--candidate land-2026-10-04-twin-otter-b --evidence
+https://github.com/rjwalters/loom/issues/10524#issuecomment-6062722711` on the
+authority host first: it appends an `eta-promotion-decision/v1` record to
+`.loom/logs/eta-promotions.jsonl` with `at`, `candidate`, `non_refusal` and
+`evidence`, whether or not it flips. Note that the live gate's coverage band
+(p25–p75 inside 40–60%) refuses twin-otter-b as measured here (.363), so
+`--apply` will not flip it. In that case the switch is a config change made
+by the operator after that record shows `non_refusal` `passed`, with the
+change linked on #10949.
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -2665,13 +2678,15 @@ accepts `--repo-root PATH` (default: the current directory).
   last (stably by issue number) and their reason shown. One bounded `gh issue
   list` plus, per issue, the same open-PR/checkpoint reads `view` makes — no
   extra reads beyond that.
-- **`loom-daemon eta promote --candidate ID [--repo OWNER/NAME] [--since RFC3339] [--apply] [--json]`**
+- **`loom-daemon eta promote --candidate ID [--repo OWNER/NAME] [--since RFC3339] [--evidence URL] [--apply] [--json]`**
   — evaluates the two-gate promotion rule
   ([above](#adding-a-v2-and-comparing-it)) for a registered shadow candidate
-  and, with `--apply` and only when both gates pass, flips
-  `autonomous.eta.current.<kind>` in the host-local config tier (#9328).
+  and, with `--apply` and only when both gates **and** the live non-refusal
+  check pass ([#10949](#the-2026-10-08-walk-forward-and-the-twin-otter-b-promotion-gate-10949)),
+  flips `autonomous.eta.current.<kind>` in the host-local config tier (#9328).
   Without `--apply` it changes nothing. Either way it appends the decision
-  record that explains the outcome. Only a short-listed candidate reaches the
+  record that explains the outcome, with `--evidence` recorded as
+  `evidence`. Only a short-listed candidate reaches the
   gates ([Shadow fleet management](#shadow-fleet-management), #10525).
 - **`loom-daemon eta retire [--file] [--json]`** (#10525) — the retirement
   proposals the saved nightly folds support, with their evidence

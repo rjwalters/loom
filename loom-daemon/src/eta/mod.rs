@@ -160,6 +160,7 @@ pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
 pub mod shadow_lifecycle;
+pub mod shadow_non_refusal;
 pub mod shadow_stats;
 pub mod simulate;
 pub mod stage_queue;

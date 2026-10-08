@@ -172,7 +172,7 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     }
 
     // One over: only the last registration is the excess.
-    let one = registry.check_budget(13).unwrap_err();
+    let one = registry.check_budget(land.len() - 1).unwrap_err();
     assert_eq!(one.excess, ["land-2026-10-06-tandem-wren"]);
 }
 
