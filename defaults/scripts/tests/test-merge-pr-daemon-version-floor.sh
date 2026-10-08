@@ -311,6 +311,7 @@ worktree-contains open -
 worktree-preserve open -
 discovered-worktree open -
 retries-used open -
+poll-wait open -
 revalidate-head open -
 cleanup-paths open -"
 
