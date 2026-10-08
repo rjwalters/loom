@@ -142,6 +142,13 @@ fn committed_github_shadow_queries_charge_each_quota_window_once() {
     assert_eq!(families.get("loom.forge.calls"), Some(&"Delta"));
     assert!(families.contains_key("github.ratelimit.used"));
     assert!(families.contains_key("github.ratelimit.reset"));
+    // #10571: the installation witness label is read (absent / `-` excluded).
+    let installations: BTreeMap<&str, f64> = s[0]
+        .iter()
+        .map(|r| (text(r, "metric_name"), num(r, "installations")))
+        .collect();
+    assert_eq!(installations.get("github.ratelimit.used"), Some(&2.0), "{installations:?}");
+    assert_eq!(installations.get("loom.forge.calls"), Some(&1.0), "{installations:?}");
 
     // 1. Bucket A: stale readings ignored, genuine reset charged, jitter is
     //    one window -> 190 in hour H, 40 in hour H+1 (the pre-fix recipe

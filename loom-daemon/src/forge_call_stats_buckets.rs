@@ -4,8 +4,9 @@
 //! (`core`, `graphql`, `search`). A row's `caller` says *what* spent budget;
 //! this module answers *whose* budget it was: the rows the `gh` facade
 //! attributed ([`super::CallAttribution`]) grouped by billed bucket — the
-//! credential's account, the owner its installation covers, the resource and
-//! the window (`rst`) — or by caller, identity role or repository.
+//! credential's account, the owner its installation covers, the installation
+//! itself (`ci`, #10571; `-` before it), the resource and the window (`rst`)
+//! — or by caller, identity role or repository.
 //!
 //! **Charged** is what a row cost GitHub: `ok` rows × `max(pages, 1)`. A
 //! `304` is free, a rate-limited call spent nothing, a known-free request
@@ -58,7 +59,8 @@ pub fn cwd_route_disagreements() -> u64 {
 /// What [`aggregate_since`] groups rows by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBy {
-    /// `(account, cred_owner, resource, rst)` — one billed bucket window.
+    /// `(account, cred_owner, installation, resource, rst)` — one billed
+    /// bucket window.
     Bucket,
     /// The facade operation name (`caller`).
     Caller,
@@ -89,7 +91,7 @@ impl GroupBy {
     #[must_use]
     pub fn columns(self) -> &'static [&'static str] {
         match self {
-            Self::Bucket => &["ACCOUNT", "CRED_OWNER", "RESOURCE", "RESET"],
+            Self::Bucket => &["ACCOUNT", "CRED_OWNER", "INSTALLATION", "RESOURCE", "RESET"],
             Self::Caller => &["CALLER"],
             Self::Role => &["ROLE"],
             Self::Repo => &["REPO"],
@@ -160,6 +162,7 @@ fn key_of(line: &SinkLine, by: GroupBy) -> Vec<String> {
         GroupBy::Bucket => vec![
             or_unknown(&line.at.ca),
             line.at.co.clone().unwrap_or_else(|| "-".to_string()),
+            line.at.ci.clone().unwrap_or_else(|| "-".to_string()),
             line.at
                 .rr
                 .clone()
@@ -223,7 +226,8 @@ pub fn aggregate_since(dir: &Path, since: i64, now: i64, by: GroupBy) -> CallsAg
 }
 
 /// The `status` per-bucket block: the window's rows grouped by
-/// `(account, cred_owner, resource)` (windows merged), each beside the
+/// `(account, cred_owner, resource)` (windows merged; the installation is
+/// the witness it was read under, #10571), each beside the
 /// bucket book's believed reading — this process's, else the snapshot the
 /// daemon left in `dir`. A believed reading with no rows still shows.
 #[must_use]
@@ -233,7 +237,8 @@ pub fn status_rows(dir: &Path, now: i64) -> Vec<crate::types::ForgeBucketStatus>
     let mut rows: BTreeMap<(String, String, String), crate::types::ForgeBucketStatus> =
         BTreeMap::new();
     for g in agg.groups {
-        let [account, owner, resource, _] = <[String; 4]>::try_from(g.key).unwrap_or_default();
+        let [account, owner, installation, resource, _] =
+            <[String; 5]>::try_from(g.key).unwrap_or_default();
         let row = rows
             .entry((account.clone(), owner.clone(), resource.clone()))
             .or_insert_with(|| crate::types::ForgeBucketStatus {
@@ -242,6 +247,9 @@ pub fn status_rows(dir: &Path, now: i64) -> Vec<crate::types::ForgeBucketStatus>
                 resource,
                 ..Default::default()
             });
+        if installation != "-" {
+            row.installation = Some(installation);
+        }
         row.charged += g.charged;
         row.not_modified += g.not_modified;
         row.rate_limited += g.rate_limited;
@@ -259,6 +267,9 @@ pub fn status_rows(dir: &Path, now: i64) -> Vec<crate::types::ForgeBucketStatus>
                 resource: key.resource.as_str().to_string(),
                 ..Default::default()
             });
+        if key.installation != crate::forge_bucket_book::NO_INSTALLATION {
+            row.installation = Some(key.installation.clone());
+        }
         row.used = reading.used;
         row.limit = reading.limit;
         row.reset_at =

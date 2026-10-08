@@ -34,7 +34,7 @@ fn workspace(r: &Roster, owners: &[&str]) -> tempfile::TempDir {
     for id in &r.readers {
         for owner in owners {
             let dir = super::super::reader_dir(tmp.path(), owner, id);
-            super::super::publish(&dir, "ghs_test", id, "1", &expires).unwrap();
+            super::super::publish(&dir, "ghs_test", id, owner, "1", &expires).unwrap();
         }
     }
     tmp
