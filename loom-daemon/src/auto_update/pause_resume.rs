@@ -19,6 +19,10 @@
 //!    paused until step 7. An operator stop or a fleet `paused` state already
 //!    in force is respected: H5 waits for it to lift, and requeues everything
 //!    once the manifest goes stale rather than resume work on a stopped host.
+//!    The same holds at every later checkpoint: a real drain that replaces
+//!    H5's hold mid-run is waited out (an aborted drain lets H5 carry on), and
+//!    once the manifest goes stale under it, every item not yet relaunched is
+//!    requeued. No paused claim is left for the next restart to find.
 //! 3. **Verify the teardown.** Nothing from a paused agent's tree may be alive
 //!    when it is resumed; whatever is found is reaped and recorded
 //!    (`roll.item.residue_reaped`).
@@ -35,10 +39,15 @@
 //!    with its claim kept. Then **requeue** what cannot be resumed, and finish
 //!    the requeue forge writes H4 left `planned`. Bounded by
 //!    `resumeBudgetSecs`; an item not reached by then is `resume-timeout`.
+//!    Staleness is re-checked before each relaunch: once the manifest passes
+//!    its `max_age_secs` (the lease TTL), the items not yet relaunched are
+//!    requeued (`manifest-stale`).
 //! 7. **Finish**: `phase = resumed` (`abandoned` for a stale manifest), archive
 //!    the manifest as `roll-pause-manifest.<id>.done.json` (newest 10 kept),
 //!    lift the recovery suppression ([`crate::roll_pause::suppress`]) and the
-//!    dispatch hold. The host is back at H0.
+//!    dispatch hold. The host is back at H0. Every other way out of H5 (no
+//!    manifest after all, an unreadable one, a panic) lifts them too
+//!    ([`finish::FinishGuard`]).
 //!
 //! # What ends an item
 //!
@@ -93,6 +102,7 @@ use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 use crate::sweep_registry::roll_resume::RollResumeRefusal;
 
 pub mod attempt;
+mod finish;
 pub(crate) mod host;
 mod startup;
 
@@ -160,6 +170,10 @@ pub struct ResumePlan {
     /// The version this process is running.
     pub running_version: String,
     pub tuning: ResumeTuning,
+    /// The manifest id startup armed the recovery suppression (and the
+    /// dispatch hold) for, if any. H5 finishes it on every way out, even
+    /// when its own load no longer finds that manifest.
+    pub armed: Option<String>,
 }
 
 /// The pause/resume state `status --json` reports (`drain.resume`).
@@ -177,7 +191,8 @@ pub struct PauseResumeStatus {
     #[serde(default)]
     pub load: String,
     /// The H5 step in progress: `hold`, `residue`, `lease`, `probation`,
-    /// `resume`, `requeue`, `done`, `interrupted`, `unreadable`.
+    /// `resume`, `requeue`, `done`, `unreadable`; `waiting` while an operator
+    /// stop or a real drain holds dispatch instead of H5.
     #[serde(default)]
     pub step: String,
     /// `true` while dispatch is held for this manifest.
@@ -253,9 +268,6 @@ pub enum H5Outcome {
     Unreadable(PauseResumeStatus),
     /// Every item is resumed, requeued or released, and the manifest archived.
     Finished(PauseResumeStatus),
-    /// A drain replaced the dispatch hold before H5 finished. The manifest is
-    /// left `resuming` (or untouched) for the next start.
-    Interrupted(PauseResumeStatus),
 }
 
 /// What H5 does with one item.
@@ -446,18 +458,57 @@ impl Run<'_> {
         self.manifest.age_secs(Utc::now()) > max_age
     }
 
-    /// The manifest went stale while H5 was waiting: nothing is resumed.
+    /// The manifest went stale before H5 resumed everything: nothing more is
+    /// relaunched. An item already relaunched is running, and is confirmed as
+    /// usual; every other resume item is requeued.
     fn go_stale(&mut self) {
         if self.stale {
             return;
         }
         self.stale = true;
         self.status.load = "stale".to_string();
-        self.event(None, "went_stale", Some("while waiting to resume".to_string()));
+        self.event(None, "went_stale", Some("before every item was resumed".to_string()));
         for idx in 0..self.work.len() {
-            if self.work[idx].fate == Fate::Resume {
+            if self.work[idx].fate == Fate::Resume && self.work[idx].launched.is_none() {
                 self.requeue_as(idx, REASON_STALE, None);
             }
+        }
+    }
+
+    /// Wait while an operator stop or a real drain holds dispatch instead of
+    /// H5 (`during` says where H5 was). Returns `true` once H5 holds dispatch
+    /// again (a drain that replaced the hold was aborted), `false` when the
+    /// manifest went stale first. Then every resume item not yet relaunched
+    /// is requeued, so no paused claim waits on a hold that never ends.
+    fn wait_for_hold(&mut self, during: &str) -> bool {
+        let (mut waited, step) = (false, self.status.step.clone());
+        loop {
+            if self.hold() {
+                if waited {
+                    self.event(None, "hold_regained", Some(during.to_string()));
+                    self.save();
+                    self.step(&step);
+                }
+                return true;
+            }
+            if self.is_stale_now() {
+                self.go_stale();
+                self.save();
+                return false;
+            }
+            if !waited {
+                waited = true;
+                log::warn!(
+                    "pause_resume: an operator stop or a drain holds dispatch {during}; nothing is \
+                     resumed until it lifts, and the paused claims are requeued once the manifest \
+                     is {}s old",
+                    self.manifest.roll.max_age_secs
+                );
+                self.event(None, "hold_blocked", Some(during.to_string()));
+                self.save();
+                self.step("waiting");
+            }
+            std::thread::sleep(self.plan.tuning.poll);
         }
     }
 
@@ -641,6 +692,8 @@ fn archive(manifest_path: &Path, manifest_id: &str) -> Option<PathBuf> {
 /// Run H5 (design §7). Blocking; call it off the async runtime.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome {
+    // Declared first, so it is dropped last: every way out finishes.
+    let mut guard = finish::FinishGuard::new(Arc::clone(&host), plan.armed.as_deref());
     let started = Instant::now();
     let tuning = plan.tuning;
     let mut status = PauseResumeStatus {
@@ -691,6 +744,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
             return H5Outcome::Unreadable(status);
         }
     };
+    guard.track(&manifest.manifest_id);
     status.manifest_id = Some(manifest.manifest_id.clone());
     status.load = if stale { "stale" } else { "loaded" }.to_string();
     status.from_version.clone_from(&manifest.roll.from_version);
@@ -715,8 +769,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     // before it could archive it.
     if matches!(run.manifest.phase, Phase::Resumed | Phase::Abandoned) {
         archive(&plan.manifest_path, &manifest_id);
-        run.host
-            .finish(&manifest_id, "the pause manifest was already finished");
+        guard.finish("the pause manifest was already finished");
         run.status.finished_at = Some(Utc::now());
         run.step("done");
         return H5Outcome::Finished(run.status);
@@ -803,18 +856,11 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
 
     // ---- Step 2: hold dispatch ------------------------------------------------
     run.step("hold");
-    while !run.hold() {
-        // An operator stop or a drain holds dispatch. Do not resume work on a
-        // stopped host; once the manifest goes stale its claims are given
-        // back instead. (A fleet `paused` state is not this case: H5 proceeds
-        // under it, and it stays in force afterwards.)
-        if run.is_stale_now() {
-            run.go_stale();
-            break;
-        }
-        std::thread::sleep(tuning.poll);
-    }
-    let holding = run.held;
+    // An operator stop or a drain holds dispatch. Do not resume work on a
+    // stopped host; once the manifest goes stale its claims are given back
+    // instead. (A fleet `paused` state is not this case: H5 proceeds under
+    // it, and it stays in force afterwards.)
+    let holding = run.wait_for_hold("before the resume");
 
     // ---- Step 3: verify the teardown ------------------------------------------
     run.step("residue");
@@ -895,11 +941,16 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     run.step("probation");
     let mut window_started: Option<Instant> = None;
     let mut waiting_logged = false;
-    let mut interrupted = false;
     while holding && !run.stale {
         if !run.hold() {
-            interrupted = true;
-            break;
+            // A real drain replaced the hold. Wait it out (or until the
+            // manifest goes stale); health must then hold for a whole new
+            // window.
+            window_started = None;
+            if !run.wait_for_hold("during health probation") {
+                break;
+            }
+            continue;
         }
         if run.is_stale_now() {
             run.go_stale();
@@ -945,9 +996,6 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         std::thread::sleep(tuning.probe_interval);
     }
     run.status.probation_secs = Some(secs_since(started));
-    if interrupted {
-        return interrupt(run, "a drain replaced the dispatch hold during health probation");
-    }
 
     // ---- Step 6: resume, then requeue -----------------------------------------
     run.manifest.phase = Phase::Resuming;
@@ -957,8 +1005,19 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     let resume_started = Instant::now();
     let deadline = resume_started + tuning.resume_budget;
     for idx in run.indices(|f| f == Fate::Resume) {
-        if !run.hold() {
-            return interrupt(run, "a drain replaced the dispatch hold during the resume");
+        // Requeued meanwhile: the manifest went stale while H5 waited.
+        if run.work[idx].fate != Fate::Resume {
+            continue;
+        }
+        if !run.hold() && !run.wait_for_hold("during the resume") {
+            continue;
+        }
+        // The lease TTL bounds the whole pause: past it, nothing more is
+        // relaunched on a claim another host may already have taken.
+        if run.is_stale_now() {
+            run.go_stale();
+            run.save();
+            continue;
         }
         if Instant::now() >= deadline {
             run.requeue_as(idx, REASON_TIMEOUT, None);
@@ -1115,7 +1174,7 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         run.status.recovered
     );
     log::warn!("pause_resume: {note}");
-    run.host.finish(&manifest_id, &note);
+    guard.finish(&note);
     run.host.emit(
         "daemon.roll.paused.resumed",
         serde_json::json!({
@@ -1146,21 +1205,6 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     run.held = false;
     run.step("done");
     H5Outcome::Finished(run.status)
-}
-
-/// H5 lost the dispatch hold to a real drain: stop, and leave the manifest
-/// (and the recovery suppression) for the next start to finish.
-fn interrupt(mut run: Run<'_>, why: &str) -> H5Outcome {
-    log::warn!(
-        "pause_resume: {why}; stopping. The pause manifest {} stays in place and the next start \
-         finishes it.",
-        run.manifest.manifest_id
-    );
-    run.event(None, "resume_interrupted", Some(why.to_string()));
-    run.save();
-    run.status.note = Some(why.to_string());
-    run.step("interrupted");
-    H5Outcome::Interrupted(run.status)
 }
 
 #[cfg(test)]

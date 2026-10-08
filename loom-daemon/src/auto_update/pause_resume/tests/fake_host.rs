@@ -32,9 +32,14 @@ pub(super) struct FakeHost {
     pub(super) unhealthy: Mutex<u32>,
     /// `hold_dispatch` calls refused before the hold is placed.
     pub(super) hold_blocked: Mutex<u32>,
-    /// Lose the hold once this many items have been launched.
+    /// Lose the hold (once) when this many items have been launched.
     pub(super) lose_hold_after: Mutex<Option<usize>>,
+    /// The operator aborts a drain that replaced the hold after H5 has found
+    /// it in force this many times.
+    pub(super) abort_drain_after: Mutex<Option<u32>>,
     pub(super) launch_delay: Duration,
+    /// `health_sample` panics (a bug in H5's host).
+    pub(super) panic_in_health: bool,
     pub(super) drain: DrainState,
 }
 
@@ -69,9 +74,25 @@ impl ResumeHost for FakeHost {
             *blocked -= 1;
             return ResumeHold::Blocked;
         }
-        self.drain.roll_resume_hold("resuming".to_string())
+        drop(blocked);
+        let hold = self.drain.roll_resume_hold("resuming".to_string());
+        let mut abort = self.abort_drain_after.lock().unwrap();
+        match (hold, abort.as_mut()) {
+            (ResumeHold::Blocked, Some(0)) => {
+                *abort = None;
+                self.log("abort-drain".to_string());
+                let _ = self.drain.abort_checked();
+                self.drain.roll_resume_hold("resuming".to_string())
+            }
+            (ResumeHold::Blocked, Some(n)) => {
+                *n -= 1;
+                hold
+            }
+            _ => hold,
+        }
     }
     fn health_sample(&self) -> Result<(), String> {
+        assert!(!self.panic_in_health, "a host bug during health probation");
         self.log("health".to_string());
         let mut left = self.unhealthy.lock().unwrap();
         if *left > 0 {
@@ -135,15 +156,13 @@ impl ResumeHost for FakeHost {
             item.id, launch.session_id, launch.resume_count
         ));
         let launched = self.called("launch ").len();
-        if self
-            .lose_hold_after
-            .lock()
-            .unwrap()
-            .is_some_and(|n| launched >= n)
-        {
-            // An operator drain replaces the hold.
+        let mut lose = self.lose_hold_after.lock().unwrap();
+        if lose.is_some_and(|n| launched >= n) {
+            // An operator drain replaces the hold (once).
+            *lose = None;
             let _ = self.drain.begin(Duration::from_secs(60), false, false);
         }
+        drop(lose);
         Ok(Launched {
             item_id: format!("{}-r{}", item.id, launch.resume_count),
             pid: Some(1),

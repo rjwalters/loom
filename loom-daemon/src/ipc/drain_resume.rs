@@ -9,8 +9,10 @@
 //!
 //! - It is **not** a drain: nothing waits for in-flight work and nothing exits.
 //! - A real drain request **replaces** it (as it replaces a startup hold). H5
-//!   then sees the hold gone ([`DrainState::is_roll_resume_held`]) and stops
-//!   relaunching; the manifest stays for the next start.
+//!   then sees the hold gone and stops relaunching. It waits: an aborted
+//!   drain lets it re-hold and carry on, a `--then-exit` drain leaves the
+//!   manifest for the next start, and once the manifest goes stale under the
+//!   drain H5 requeues what it had not relaunched and finishes.
 //! - `--abort-drain` is **refused** while it is held: releasing dispatch in the
 //!   middle of H5 would let the work finder run beside a half-resumed host,
 //!   and the hold ends by itself within the probation and resume budgets.

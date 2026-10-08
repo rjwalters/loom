@@ -62,6 +62,14 @@ static SEEDED: std::sync::Mutex<Vec<(std::path::PathBuf, CreatesIssuesTransition
     std::sync::Mutex::new(Vec::new());
 static SEEDED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// A workspace root as the seeded holds compare it: canonical, so a root
+/// spelled through a symlink (or with `..`) is the same workspace. A root
+/// that no longer resolves compares by its spelling (as
+/// `roll_pause::suppress` does).
+fn canon_root(root: &std::path::Path) -> std::path::PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
 fn seeds() -> std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, CreatesIssuesTransition)>> {
     SEEDED
         .lock()
@@ -123,13 +131,11 @@ pub fn seed_hold(root: &std::path::Path, role: &str) -> Option<SeededHold> {
         .iter()
         .find(|t| t.role.eq_ignore_ascii_case(role))?;
     holders().push(transition);
+    let root = canon_root(root);
     let mut seeded = seeds();
-    seeded.push((root.to_path_buf(), transition));
+    seeded.push((root.clone(), transition));
     SEEDED_COUNT.store(seeded.len(), std::sync::atomic::Ordering::SeqCst);
-    Some(SeededHold {
-        root: root.to_path_buf(),
-        transition,
-    })
+    Some(SeededHold { root, transition })
 }
 
 /// An issue-creating (`creates_issues=True`) transition shape.
@@ -252,7 +258,7 @@ impl IssueCreationMutex {
     #[must_use]
     pub fn for_root(root: &std::path::Path) -> Self {
         Self {
-            root: Some(root.to_path_buf()),
+            root: Some(canon_root(root)),
             ..Self::new()
         }
     }
@@ -470,6 +476,23 @@ mod tests {
         drop(hold);
         assert_eq!(waiter.await.unwrap(), AUDITOR_PROPOSAL);
         assert!(!mine.is_held());
+    }
+
+    /// #10832: the seeded hold and the mutex compare roots canonically, as
+    /// the recovery suppression does: one workspace spelled two ways is one
+    /// workspace.
+    #[test]
+    fn test_a_seeded_hold_matches_its_workspace_however_the_root_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("repo");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hold = seed_hold(&link, "champion").expect("champion decomposes epics");
+        assert!(IssueCreationMutex::for_root(&real).is_held());
+        assert!(IssueCreationMutex::for_root(&real.join("..").join("repo")).is_held());
+        drop(hold);
+        assert!(!IssueCreationMutex::for_root(&real).is_held());
     }
 
     #[tokio::test]

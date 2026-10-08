@@ -294,6 +294,70 @@ pub(crate) fn release_claim(
     run("roll.role_requeue_comment", vec![kind, "comment", &number, "--body", comment])
 }
 
+/// How far the forge's clock may run ahead of this host's before a `labeled`
+/// event counts as later than the paused run's stop.
+const RECLAIM_SLACK_SECS: i64 = 30;
+
+/// Whether `claim` is still the paused role run's to give back: the sweep
+/// path's "still ours" re-check (`SweepRegistry::roll_claim_still_ours`) for a
+/// role claim.
+///
+/// A role's claim label is the claim itself. While the run was paused, the
+/// role's staleness rule may have released the label, and another run (on
+/// this host or another) may have claimed the same PR or issue with the same
+/// label. Removing it then would strip the new owner's claim. So the requeue
+/// releases the label only when its latest `labeled` event on the forge is no
+/// later than the run's stop (`stopped_at`, else the time the breadcrumb was
+/// recorded).
+///
+/// # Errors
+/// Who-owns-it-now, when the label was applied again after the stop. Like the
+/// sweep check's lease probe, it fails open: an unreadable timeline, or no
+/// stop time to compare with, leaves the claim this run's.
+pub(crate) fn claim_still_ours(
+    root: &Path,
+    gh: &Path,
+    claim: &ClaimBreadcrumb,
+    stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> std::result::Result<(), String> {
+    let cutoff = stopped_at.or_else(|| {
+        claim
+            .at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc))
+    });
+    let Some(cutoff) = cutoff else {
+        return Ok(());
+    };
+    let labeled = crate::claim_reconciliation::forge::fetch_claim_labeled_at(
+        gh,
+        root,
+        claim.number,
+        &claim.label,
+    );
+    relabeled_since(claim, labeled, cutoff)
+}
+
+/// [`claim_still_ours`]'s decision.
+fn relabeled_since(
+    claim: &ClaimBreadcrumb,
+    labeled: Option<chrono::DateTime<chrono::Utc>>,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<(), String> {
+    match labeled {
+        Some(at) if at > cutoff + chrono::Duration::seconds(RECLAIM_SLACK_SECS) => Err(format!(
+            "{} was applied to {} #{} again at {} after the paused run stopped at {}",
+            claim.label,
+            claim.on,
+            claim.number,
+            at.to_rfc3339(),
+            cutoff.to_rfc3339()
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "roll_resume_tests.rs"]

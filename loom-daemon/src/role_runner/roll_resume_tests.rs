@@ -264,3 +264,26 @@ fn releasing_a_role_claim_removes_its_label_and_says_why() {
     let refused = release_claim(read_only.path(), &ro.gh, &claim, "x").unwrap_err();
     assert!(refused.contains("write scope refused"), "{refused}");
 }
+
+/// A role claim is given back only while it is still the paused run's: a
+/// `labeled` event later than the run's stop is someone else's claim. Clock
+/// slack and an unreadable timeline leave it the run's (fail open, like the
+/// sweep path's lease probe).
+#[test]
+fn a_role_claim_relabeled_after_the_stop_is_not_the_paused_runs() {
+    let claim = ClaimBreadcrumb {
+        label: "loom:reviewing".to_string(),
+        on: "pr".to_string(),
+        number: 77,
+        at: None,
+    };
+    let stop = chrono::Utc::now();
+    let secs = chrono::Duration::seconds;
+    let why = relabeled_since(&claim, Some(stop + secs(600)), stop).unwrap_err();
+    assert!(why.contains("loom:reviewing") && why.contains("#77"), "{why}");
+    relabeled_since(&claim, Some(stop - secs(600)), stop).unwrap();
+    relabeled_since(&claim, Some(stop + secs(RECLAIM_SLACK_SECS)), stop).unwrap();
+    relabeled_since(&claim, None, stop).unwrap();
+    // No stop time and no breadcrumb time: nothing to compare with.
+    claim_still_ours(Path::new("/nonexistent"), Path::new("/bin/false"), &claim, None).unwrap();
+}

@@ -28,6 +28,7 @@ fn resume_plan(plan: &PausePlan) -> ResumePlan {
             poll: Duration::from_millis(10),
             forge_window: Duration::from_secs(20),
         },
+        armed: None,
     }
 }
 

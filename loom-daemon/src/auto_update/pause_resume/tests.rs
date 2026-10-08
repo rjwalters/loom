@@ -32,6 +32,7 @@ fn plan(dir: &Path) -> ResumePlan {
         manifest_path: dir.join("state").join(pause_manifest::MANIFEST_FILE),
         running_version: RUNNING.to_string(),
         tuning: tuning(),
+        armed: None,
     }
 }
 
@@ -644,37 +645,7 @@ fn a_crash_during_h5_never_launches_an_item_twice() {
             .is_some_and(|d| d.contains("found already running"))));
 }
 
-/// A real drain that replaces the hold stops H5 where it is. The manifest
-/// stays `resuming`, un-archived, for the next start.
-#[test]
-fn a_drain_that_replaces_the_hold_interrupts_h5_and_leaves_the_manifest() {
-    let dir = tempfile::tempdir().unwrap();
-    let plan = plan(dir.path());
-    write(
-        &plan,
-        &manifest(
-            "rp-int",
-            Phase::Paused,
-            vec![sweep(dir.path(), "a", 1), sweep(dir.path(), "b", 2)],
-        ),
-    );
-    let host = Arc::new(FakeHost {
-        lose_hold_after: Mutex::new(Some(1)),
-        ..FakeHost::default()
-    });
-    let H5Outcome::Interrupted(status) = run_h5(host.clone(), &plan) else {
-        panic!("expected Interrupted");
-    };
-    assert_eq!(status.step, "interrupted");
-    assert_eq!(host.called("launch ").len(), 1, "nothing more is launched");
-    assert!(host.called("finish ").is_empty(), "the suppression stays for the next start");
-    assert!(host.drain.is_draining(), "the operator drain still pauses dispatch");
-    let LoadOutcome::Loaded(left) = pause_manifest::load(&plan.manifest_path, Utc::now()) else {
-        panic!("the manifest must stay loadable");
-    };
-    assert_eq!(left.phase, Phase::Resuming);
-    assert!(left.events.iter().any(|e| e.event == "resume_interrupted"));
-}
+// The drain-replaces-the-hold cases are in `tests/exits.rs`.
 
 // ============================================================================
 // Health and holds
@@ -1095,6 +1066,8 @@ fn a_rolled_back_binary_resumes_and_holds_the_failed_target_back() {
     assert_eq!(attempt::load(state), None);
 }
 
+#[path = "tests/exits.rs"]
+mod exits;
 #[path = "tests/fake_host.rs"]
 mod fake_host;
 #[path = "tests/integration.rs"]

@@ -449,7 +449,9 @@ fn heartbeat_fresh(root: &Path, uptime: Duration) -> Result<(), String> {
 }
 
 /// The role half of a requeue: give back the claim the run's breadcrumb
-/// names, on the forge, and forget the breadcrumb.
+/// names, on the forge, and forget the breadcrumb. Only while the claim is
+/// still this run's to give back ([`role_resume::claim_still_ours`]), as the
+/// sweep half does.
 pub(crate) fn requeue_role(
     item: &ManifestItem,
     notice: &RollRequeueNotice,
@@ -463,7 +465,18 @@ pub(crate) fn requeue_role(
             .and_then(claim_breadcrumb::ClaimBreadcrumb::from_manifest)
     });
     if let (true, Some(claim)) = (forge, claim) {
-        role_resume::release_claim(Path::new(&item.repo), gh, &claim, &notice.comment_body())?;
+        let root = Path::new(&item.repo);
+        match role_resume::claim_still_ours(root, gh, &claim, item.stopped_at) {
+            Ok(()) => role_resume::release_claim(root, gh, &claim, &notice.comment_body())?,
+            Err(why) => log::warn!(
+                "pause_resume: {}: {} on {} #{} is no longer this run's claim ({why}); nothing \
+                 is written to the forge for it",
+                item.id,
+                claim.label,
+                claim.on,
+                claim.number
+            ),
+        }
         claim_breadcrumb::clear(&dir);
     }
     Ok(())
@@ -636,14 +649,20 @@ pub(crate) fn reap_residue(item: &ManifestItem) -> TeardownReport {
     teardown::teardown_tree(&spec, teardown::TERM_GRACE)
 }
 
-/// A resumed role run's liveness.
+/// A resumed role run's liveness. A run H5 no longer has a handle for is not
+/// known to have started its session, so it is not counted as resumed (the
+/// sweep half's `ResumeChild::Untracked`).
 pub(crate) fn role_liveness(handle: Option<&mut RoleResumeHandle>) -> Liveness {
     match handle.map(RoleResumeHandle::state) {
         Some(RoleResumeState::Running) => Liveness::Running,
-        Some(RoleResumeState::Succeeded) | None => Liveness::Finished,
+        Some(RoleResumeState::Succeeded) => Liveness::Finished,
         Some(RoleResumeState::Failed(how)) => Liveness::Died {
             reason: REASON_RESUME_FAILED.to_string(),
             detail: how,
+        },
+        None => Liveness::Died {
+            reason: REASON_RESUME_FAILED.to_string(),
+            detail: "the resumed role run is no longer tracked".to_string(),
         },
     }
 }

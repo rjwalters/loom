@@ -65,23 +65,31 @@ fn held_items(manifest: &pause_manifest::PauseManifest) -> Vec<HeldItem> {
 }
 
 /// What [`arm_at_startup`] found: whether a manifest file exists (whatever
-/// its state), i.e. whether [`Startup::spawn`] has work to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// its state), i.e. whether [`Startup::spawn`] has work to do, and the
+/// manifest id the recovery suppression was armed for, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "call `.spawn(..)` once the drain state exists, or H5 never runs"]
-pub struct Startup(bool);
+pub struct Startup {
+    found: bool,
+    armed: Option<String>,
+}
 
 /// Arm the recovery suppression for a live pause manifest. Call before any
 /// sweep registry is reconstructed.
 pub fn arm_at_startup() -> Startup {
-    Startup(manifest_found())
+    manifest_found()
 }
 
-fn manifest_found() -> bool {
+fn manifest_found() -> Startup {
+    let none = Startup {
+        found: false,
+        armed: None,
+    };
     let Some(path) = pause_manifest::manifest_path() else {
-        return false;
+        return none;
     };
     match pause_manifest::load(&path, Utc::now()) {
-        LoadOutcome::Missing => false,
+        LoadOutcome::Missing => none,
         LoadOutcome::Loaded(m) | LoadOutcome::Stale(m) => {
             if !matches!(m.phase, Phase::Resumed | Phase::Abandoned) {
                 let items = held_items(&m);
@@ -96,12 +104,22 @@ fn manifest_found() -> bool {
                     items.len()
                 );
                 suppress::arm(&m.manifest_id, items);
+                return Startup {
+                    found: true,
+                    armed: Some(m.manifest_id),
+                };
             }
-            true
+            Startup {
+                found: true,
+                armed: None,
+            }
         }
         // Reported once by H5; nothing can be held from a manifest that
         // cannot be read.
-        LoadOutcome::Corrupt(_) | LoadOutcome::UnknownVersion(_) => true,
+        LoadOutcome::Corrupt(_) | LoadOutcome::UnknownVersion(_) => Startup {
+            found: true,
+            armed: None,
+        },
     }
 }
 
@@ -117,9 +135,10 @@ impl Startup {
         bus: &Arc<EventBus>,
         in_progress: &InProgressGuard,
     ) {
-        if let (true, Some(manifest_path)) = (self.0, pause_manifest::manifest_path()) {
+        if let (true, Some(manifest_path)) = (self.found, pause_manifest::manifest_path()) {
             spawn_h5(
                 manifest_path,
+                self.armed,
                 drain,
                 pool,
                 fallback_root.to_path_buf(),
@@ -132,6 +151,7 @@ impl Startup {
 
 fn spawn_h5(
     manifest_path: PathBuf,
+    armed: Option<String>,
     drain: &Arc<DrainState>,
     pool: &Arc<WorkspacePool>,
     fallback_root: PathBuf,
@@ -151,14 +171,15 @@ fn spawn_h5(
     ));
     // Synchronously, so no producer spawned after this call ever ticks with
     // dispatch open. H5 itself re-checks and waits when another hold is in
-    // force.
-    if suppress::is_armed() {
+    // force, and lifts this hold on every way out (`finish::FinishGuard`).
+    if armed.is_some() {
         host.hold_dispatch();
     }
     let plan = ResumePlan {
         manifest_path,
         running_version: env!("CARGO_PKG_VERSION").to_string(),
         tuning: ResumeTuning::from_pause(&tuning),
+        armed,
     };
     tokio::task::spawn_blocking(move || {
         let outcome = super::run_h5(host, &plan);

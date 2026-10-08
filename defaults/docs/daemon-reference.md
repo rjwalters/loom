@@ -12053,9 +12053,16 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   - **Operator commands during H5.** `restart --abort-drain` is **refused**
     while H5 holds dispatch (the hold ends by itself, within the probation and
     resume budgets). A real `restart --drain` replaces the hold; H5 then stops
-    relaunching and the next start finishes the manifest. An operator stop
-    already in force at startup is respected: H5 waits for it, resumes nothing
-    meanwhile, and gives the claims back once the manifest is stale.
+    relaunching and waits. A `--then-exit` drain exits and the next start
+    finishes the manifest; an aborted drain lets H5 re-hold dispatch and carry
+    on; a drain that outlasts the manifest's max age (the lease TTL) gets
+    every item not yet relaunched requeued, and the manifest archived, so no
+    paused claim waits for a restart. An operator stop already in force at
+    startup is respected the same way: H5 waits for it, resumes nothing
+    meanwhile, and gives the claims back once the manifest is stale. Staleness
+    is also re-checked before each relaunch, and every way out of H5 (a
+    manifest missing or unreadable when H5 loads it, a panic) still lifts the
+    dispatch hold and the recovery suppression.
   - **A fleet-paused host (#10979).** A fleet `paused` state lets in-flight
     work finish, and the paused agents are in-flight work: H5 resumes them
     under the fleet hold and releases nothing, so the host does not dispatch
