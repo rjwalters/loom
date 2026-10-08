@@ -66,7 +66,7 @@ fn flags(repo: &str, pr: u32, at: DateTime<Utc>, flags: u8) -> RepoFlagChange {
 /// A repo history with enough of everything: 10 free merges (2 h each),
 /// 8 holds released after 1..8 h (each then merging after 1 h), 2 holds
 /// merged directly, and 6 sequenced spells of 3 h inside a `merge_wait`.
-fn hold_history(repo: &str) -> StageSamples {
+pub(super) fn hold_history(repo: &str) -> StageSamples {
     let mut history = StageSamples::default();
     for n in 0..10_u32 {
         let entered = h(200 - 12 * i64::from(n));
@@ -135,7 +135,7 @@ fn approved(stage: Stage, labels: &[&str], age_h: i64) -> EstimateInput {
     input
 }
 
-fn held() -> EstimateInput {
+pub(super) fn held() -> EstimateInput {
     approved(Stage::MergeHold, &["loom:pr", "loom:operator"], 3)
 }
 
@@ -143,7 +143,7 @@ fn sequenced() -> EstimateInput {
     approved(Stage::MergeWait, &["loom:pr", "loom:sequenced"], 3)
 }
 
-fn heron() -> LandHeldHeron {
+pub(super) fn heron() -> LandHeldHeron {
     LandHeldHeron::new(Some(Arc::new(fixture_fit(fit_as_of()))))
 }
 

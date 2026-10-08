@@ -602,22 +602,25 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
-    // A dependency composition (#10510) recomputes from its node records.
-    if let Some(record) = explanation
+    // A dependency composition (#10510) recomputes from its node records,
+    // a held-heron answer (#10523) from its simulator record. Either may
+    // then carry a calibration shift (an IPCW-wrapped base, #10524), applied
+    // below like any other base's.
+    let simulated = if let Some(record) = explanation
         .dependencies
         .as_ref()
         .filter(|d| !d.nodes.is_empty())
     {
-        return super::dependency::recompute(record);
-    }
-    if let Some(record) = &explanation.held_heron {
-        return super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles);
-    }
-    let simulated = match &explanation.twin_otter {
-        Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
-        None => {
-            let spec = spec_from_explanation(explanation)?;
-            run(&spec).ok().map(|s| s.quantiles)?
+        super::dependency::recompute(record)?
+    } else if let Some(record) = &explanation.held_heron {
+        super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles)?
+    } else {
+        match &explanation.twin_otter {
+            Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
+            None => {
+                let spec = spec_from_explanation(explanation)?;
+                run(&spec).ok().map(|s| s.quantiles)?
+            }
         }
     };
     let served = match (&explanation.recalibration, &explanation.calibration) {
