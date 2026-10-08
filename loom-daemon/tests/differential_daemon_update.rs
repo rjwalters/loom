@@ -818,10 +818,11 @@ fn port_bin() -> PathBuf {
 // Divergence classes — recognised by MECHANISM
 // ---------------------------------------------------------------------------
 
-/// The 12-line `Environment:` block #10470 added to `--help` for the opt-in
-/// required-signature mode. It is spelled out here, independently of
-/// `help.txt`, so the class below verifies the EXACT intended text rather than
-/// "whatever the port prints".
+/// The `Environment:` block #10470 (the first two entries, 12 lines) and
+/// #10473 (`LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR`, 14 lines, directly
+/// after them) added to `--help` for the opt-in required-signature mode. It is
+/// spelled out here, independently of `help.txt`, so the class below verifies
+/// the EXACT intended text rather than "whatever the port prints".
 const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
     "  LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE  1/true/yes/on switches signature
                          handling from the default \"present-only\" mode
@@ -835,6 +836,20 @@ const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
                          derived keyless identity to this workflow file
                          (e.g. release.yml) instead of `[^@]+`. Default:
                          unset.
+  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR  Required-mode companion
+                         (#10473): a full 40-hex commit SHA. The release tag
+                         must resolve to it or a descendant (gh api compare:
+                         identical/ahead), else REFUSED before the candidate
+                         runs. Distinct refusals: configuration error (short
+                         or non-hex anchor), source assurance unavailable
+                         (gh/API failure -- not tampering), not a descendant
+                         of approved source, tag movement, asset replacement.
+                         The last two compare against a local adoption record
+                         (~/.loom/daemon-update/release-adoption.json) written
+                         on each required-mode success; it lives on this
+                         host, so it catches drift, not a host compromise.
+                         Default: unset (evidence reports
+                         source_check=not_configured).
 ";
 
 /// The line the added block sits directly in front of in the help text.
@@ -871,8 +886,9 @@ const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum Divergence {
-    /// MECHANISM: #10470 added documentation for the opt-in required-signature
-    /// mode to `--help`, which the frozen pre-port shell cannot contain. The
+    /// MECHANISM: #10470 (and its #10473 source-anchor companion) added
+    /// documentation for the opt-in required-signature mode to `--help`,
+    /// which the frozen pre-port shell cannot contain. The
     /// port's stdout must equal the shell's stdout with exactly
     /// [`REQUIRE_SIGNATURE_HELP_BLOCK`] inserted immediately before the single
     /// `LOOM_PID_FILE` entry. Exit code and stderr must be identical. Risk
@@ -994,6 +1010,19 @@ fn the_help_divergence_class_is_narrow() {
     // A tampered block.
     let tampered = with_block(good.stdout.replace("Default: off.", "Default: on."));
     assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered #10473 entry, and the block missing it (the #10470-only
+    // text): the class pins the whole addition, not just its first part.
+    let tampered_anchor = with_block(good.stdout.replace("identical/ahead", "behind"));
+    assert_eq!(classify(&base, &tampered_anchor), Err(()));
+    let without_anchor = REQUIRE_SIGNATURE_HELP_BLOCK
+        .split("  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR")
+        .next()
+        .unwrap();
+    let partial = with_block(base.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{without_anchor}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &partial), Err(()));
     // Right stdout, but rc or stderr drifted.
     assert_eq!(
         classify(

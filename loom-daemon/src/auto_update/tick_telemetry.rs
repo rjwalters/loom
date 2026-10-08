@@ -39,6 +39,10 @@ pub struct TickSummary {
     /// #10712: the unsatisfiable-floor stall standing after this tick, as its
     /// alert text. Raises the record to ERROR.
     pub floor_stall: Option<String>,
+    /// #10866: this tick logged the unsatisfiable-floor ERROR line (the stall
+    /// started, changed, or its reminder came due). Not on the tick record:
+    /// `floor_stall` there is the standing condition.
+    pub floor_alerted: bool,
 }
 
 impl TickSummary {
@@ -60,6 +64,7 @@ impl TickSummary {
                 target: roll.target.clone(),
             }),
             floor_stall: None,
+            floor_alerted: false,
         }
     }
 

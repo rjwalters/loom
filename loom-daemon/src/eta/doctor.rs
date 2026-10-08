@@ -127,6 +127,13 @@ pub enum Gate {
         /// The captain's host id.
         captain: String,
     },
+    /// `fleet.etaAuthority` names this host: it refreshes and folds (#10918).
+    Authority,
+    /// `fleet.etaAuthority` names another host, which refreshes and folds.
+    AuthorityElsewhere {
+        /// The authority's host id.
+        authority: String,
+    },
 }
 
 /// `config` link inputs.
@@ -162,6 +169,12 @@ pub struct AuthorityFacts {
     pub others: Vec<String>,
     /// The resolver's one-line explanation.
     pub detail: String,
+    /// The last authority pass against the cached fleet roster (#10897);
+    /// [`State::Unknown`](crate::eta::coverage::State::Unknown) when no pass
+    /// was recorded here or the roster is unknown.
+    pub coverage: crate::eta::coverage::Coverage,
+    /// The host whose pass `coverage` describes (this host's view).
+    pub coverage_host: Option<String>,
 }
 
 /// One repo in the `data` link.
@@ -378,14 +391,19 @@ fn config(f: &Facts) -> Vec<Check> {
         "LOOM_ETA_FIT_ENABLED",
         c.eta_enabled,
     ));
-    out.push(switch(
-        "fleet_refresh",
-        c.fleet_refresh_enabled,
-        "autonomous.eta.fleetRefresh.enabled",
-        "LOOM_ETA_FLEET_REFRESH_ENABLED",
-        false,
-    ));
+    out.push(if !c.fleet_refresh_enabled && f.data.gate == Gate::Authority {
+        Check::ok("config", "fleet_refresh", "autonomous.eta.fleetRefresh.enabled is off here, but this host is the explicit ETA authority, so it refreshes anyway (#10918)")
+    } else {
+        switch(
+            "fleet_refresh",
+            c.fleet_refresh_enabled,
+            "autonomous.eta.fleetRefresh.enabled",
+            "LOOM_ETA_FLEET_REFRESH_ENABLED",
+            false,
+        )
+    });
     out.push(authority(&c.authority));
+    out.push(authority_coverage(&c.authority));
     out.push(if c.otlp_exporter {
         Check::ok("config", "otlp_exporter", "an OTLP exporter is configured")
     } else {
@@ -426,6 +444,37 @@ fn authority(a: &AuthorityFacts) -> Check {
     Check::ok("config", "authority", format!("ETA authority: {}", a.detail))
 }
 
+/// #10897: the authority's last pass against the fleet roster. Prints the
+/// host the view belongs to, since a non-authority host only has its own.
+fn authority_coverage(a: &AuthorityFacts) -> Check {
+    use crate::eta::coverage::State;
+    let whose = a.coverage_host.as_deref().unwrap_or("this host");
+    match a.coverage.state {
+        State::Unknown => Check::skip(
+            "config",
+            "authority_coverage",
+            format!(
+                "authority coverage unknown: no authority pass recorded on this host or no \
+                 fleet roster cached (fleet.repo); reporting {whose}'s view"
+            ),
+        ),
+        State::Full => Check::ok(
+            "config",
+            "authority_coverage",
+            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
+        ),
+        State::Short => Check::bad(
+            "config",
+            "authority_coverage",
+            Status::Warn,
+            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
+            "move fleet.etaAuthority to a host that manages every roster repo (other hosts \
+             keep emitting the uncovered repos meanwhile; declare fleet.etaAuthorityCovers once \
+             it is fixed), or wait for the workspace-less authority (#10897 Slice 2)",
+        ),
+    }
+}
+
 fn data(f: &Facts) -> Vec<Check> {
     let (c, d) = (&f.config, &f.data);
     let mut out = Vec::new();
@@ -434,9 +483,10 @@ fn data(f: &Facts) -> Vec<Check> {
         .iter()
         .filter(|r| r.snapshot_as_of.is_some())
         .count();
-    let standing_down = matches!(d.gate, Gate::StandDown { .. });
-    let refreshes = c.fleet_refresh_enabled && !standing_down;
+    let standing_down = matches!(d.gate, Gate::StandDown { .. } | Gate::AuthorityElsewhere { .. });
+    let refreshes = (c.fleet_refresh_enabled || d.gate == Gate::Authority) && !standing_down;
     out.push(match &d.gate {
+        Gate::Authority => Check::ok("data", "captain_gate", "this host is the ETA authority (fleet.etaAuthority): it refreshes for every host, whoever fleet.captain names and whatever its own fleetRefresh.enabled says (#10918)"),
         _ if !c.fleet_refresh_enabled => Check::skip(
             "data",
             "captain_gate",
@@ -461,6 +511,11 @@ fn data(f: &Facts) -> Vec<Check> {
             "data",
             "captain_gate",
             format!("standing down for captain {captain}; fitting on {with_snapshots} snapshot(s)"),
+        ),
+        Gate::AuthorityElsewhere { authority } => Check::ok(
+            "data",
+            "captain_gate",
+            format!("standing down: the ETA authority {authority} (fleet.etaAuthority) refreshes for every host (#10918)"),
         ),
     });
     for r in &d.repos {
@@ -544,7 +599,7 @@ fn data(f: &Facts) -> Vec<Check> {
 
 fn refresh_loop(f: &Facts) -> Check {
     let (c, d) = (&f.config, &f.data);
-    if !c.fleet_refresh_enabled || !c.eta_enabled {
+    if (!c.fleet_refresh_enabled && d.gate != Gate::Authority) || !c.eta_enabled {
         return Check::skip("data", "refresh_loop", "fleet refresh is off");
     }
     let Some(cycle) = &d.refresh_cycle else {
@@ -581,7 +636,7 @@ fn refresh_loop(f: &Facts) -> Check {
             cycle
                 .captain
                 .as_ref()
-                .map(|c| format!(" (captain {c})"))
+                .map(|c| format!(" (refresher {c})"))
                 .unwrap_or_default(),
             if reasons.is_empty() {
                 String::new()
@@ -1020,6 +1075,9 @@ fn backtest(f: &Facts) -> Vec<Check> {
     let Some(state) = &b.state else {
         let who = match &f.data.gate {
             Gate::StandDown { captain } => format!("the fleet captain ({captain}) runs it"),
+            Gate::AuthorityElsewhere { authority } => {
+                format!("the ETA authority ({authority}, fleet.etaAuthority) runs it")
+            }
             Gate::NoCaptain => {
                 "no fleet.captain is declared, so no host runs it: set `fleet.captain`".to_string()
             }

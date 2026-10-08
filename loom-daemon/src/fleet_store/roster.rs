@@ -120,6 +120,12 @@ pub fn from_snapshot(snapshot: &Snapshot, home: &Path) -> Result<Option<Roster>>
     parse(&text, home).map(Some)
 }
 
+/// The roster from a compiled `fleet.json`'s top-level `root` and `repos`,
+/// already parsed (the ETA roster history caches just that section, #10905).
+pub fn from_compiled(top: &serde_json::Map<String, Value>, home: &Path) -> Result<Roster> {
+    from_map(top, home, super::FLEET_JSON_PATH)
+}
+
 /// The message for a snapshot with no roster at all ([`from_snapshot`]
 /// returned `Ok(None)`).
 #[must_use]

@@ -204,7 +204,7 @@ pub struct Evaluator<'a> {
     prs_by_issue: BTreeMap<u32, RestIssue>,
     propagate: bool,
     /// Whether the pass plans label writes for the inherited star
-    /// (`autonomous.operatorPriority.materializeLabels`, default off).
+    /// (`autonomous.operatorPriority.materializeLabels`, default on).
     materialize: bool,
     /// Single-issue forge reads (cache misses) made so far.
     reads: usize,
@@ -248,8 +248,8 @@ impl<'a> Evaluator<'a> {
 
     /// Whether the pass plans the inherited star as label writes, and reads
     /// star owners to do so (`autonomous.operatorPriority.materializeLabels`,
-    /// #10012 §2–§3). Off by default: the walk then treats every starred
-    /// issue as a root and the plan stays empty, as before materialization.
+    /// #10012 §2–§3; the pass passes the setting, on by default). Off — the
+    /// bare `new` — the walk treats every starred issue as a root, plan empty.
     #[must_use]
     pub fn with_materialize(mut self, materialize: bool) -> Self {
         self.materialize = materialize;

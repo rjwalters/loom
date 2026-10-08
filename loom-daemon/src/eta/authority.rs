@@ -196,6 +196,17 @@ impl Resolution {
     }
 }
 
+/// The explicitly named authority (rule 1), env > config; `None` when
+/// neither names one. The ETA singleton jobs follow it (#10918,
+/// [`super::job_owner`]).
+#[must_use]
+pub fn explicit_with(root: &Path, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env(ENV)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::config_resolver::fleet_eta_authority(root))
+}
+
 /// Resolve this host's authority from `root`'s effective config and `env`.
 #[must_use]
 pub fn resolve_with(
@@ -203,10 +214,7 @@ pub fn resolve_with(
     host_id: &str,
     env: impl Fn(&str) -> Option<String>,
 ) -> Resolution {
-    let explicit = env(ENV)
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| crate::config_resolver::fleet_eta_authority(root));
+    let explicit = explicit_with(root, env);
     let captain = crate::config_resolver::fleet_captain(root);
     let local_refresh_enabled = super::config::read(root).fleet_refresh.enabled;
     let candidates = local_candidates(captain.as_deref(), host_id, local_refresh_enabled);
