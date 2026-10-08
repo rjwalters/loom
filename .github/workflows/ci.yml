@@ -1943,6 +1943,12 @@ jobs:
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      # #10413: ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must not
+      # shadow the pool token spawn-claude.sh selects — drives a real
+      # `loom-daemon tokens select`, so it needs the binary this job
+      # downloads. Split from test-spawn-claude.sh (file-size frozen).
+      - name: spawn-claude ambient credential scrub (#10413)
+        run: bash defaults/scripts/tests/test-spawn-claude-ambient-scrub.sh
       # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
       # after `loom-daemon session-exec posture` has verified the container's
       # label AND HostConfig, so this suite needs the binary this job downloads.
