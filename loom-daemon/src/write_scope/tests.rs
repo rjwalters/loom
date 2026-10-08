@@ -375,7 +375,8 @@ enum Scope {
     /// `GhTransport::write_raw`), never a `gh` child of its own; the file
     /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
     /// named caller reaches the named call only under its captain `gate`
-    /// (e.g. `RefreshGate::Captain`), so only the declared captain writes.
+    /// (e.g. `RefreshGate::Captain`), so only the declared captain (or the
+    /// single refresher it stands for) writes.
     FleetStore {
         caller: &'static str,
         call: &'static str,
@@ -526,9 +527,9 @@ fn daemon_write_paths_are_scoped() {
             "eta/fit/publish.rs",
             FleetStore {
                 caller: "observability/eta_fleet_refresh.rs",
-                call: "distribute_publish(root, &captain",
-                gate: "RefreshGate::Captain)",
-                why: "the captain publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
+                call: "distribute_publish(root, &publisher",
+                gate: "RefreshGate::Captain | RefreshGate::Authority)",
+                why: "the refresher (the captain, or the explicit ETA authority, #10918) publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
             },
         ),
         (

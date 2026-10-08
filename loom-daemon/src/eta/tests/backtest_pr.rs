@@ -272,11 +272,11 @@ fn sweep_record(issue: u32, phases: &[(&str, i64)]) -> SweepOutcomeRecord {
     super::backtest::record(issue, REPO, phases, SweepResult::Success)
 }
 
-#[test]
-fn a_case_both_sources_answer_is_counted_once() {
-    // An in-sweep merge: the sweep record and the forge timeline describe
-    // the same review → rejection → review → approval path.
-    let record = sweep_record(
+/// The in-sweep merge both sources answer: issue 11's sweep record, whose PR
+/// is 9011 (`9000 + issue`, the `record` helper's), through review →
+/// rejection → review → approval.
+fn in_sweep_land_cases(pr_number: Option<u32>) -> Vec<ReplayCase> {
+    let mut record = sweep_record(
         11,
         &[
             ("builder", 600),
@@ -286,16 +286,40 @@ fn a_case_both_sources_answer_is_counted_once() {
             ("merge", 4000),
         ],
     );
-    let sweep_cases: Vec<ReplayCase> = cases_from_record(&record, t(5000))
+    assert_eq!(record.pr_number, Some(9011));
+    record.pr_number = pr_number;
+    cases_from_record(&record, t(5000))
         .into_iter()
         .filter(|c| c.kind == Kind::Land)
-        .collect();
-    let forge = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+        .collect()
+}
+
+#[test]
+fn a_case_both_sources_answer_is_counted_once() {
+    // An in-sweep merge: the sweep record and the forge timeline describe
+    // the same review → rejection → review → approval path of PR 9011.
+    // (Until #10781 the forge side was PR 111 while the sweep record named
+    // PR 9011, and the two were treated as one case only because identity
+    // ignored the PR. They are two PRs on one issue, so the forge side now
+    // names the sweep record's own PR.)
+    let sweep_cases = in_sweep_land_cases(Some(9011));
+    let forge = cases_from_pr_history(REPO, &two_lap_pr(9011, Vec::new()), Some(&[11])).unwrap();
     assert_eq!(forge.len(), 4);
 
     let (merged_set, dropped) = merge_case_sets(sweep_cases.clone(), forge.clone());
     assert_eq!(dropped, 4, "every forge case was already answered by the sweep");
     assert_eq!(merged_set, sweep_cases);
+
+    // A sweep record that does not know its PR (before #9441, or a
+    // checkpoint that missed it) still dedups against the forge, by the
+    // issue-level lap, exactly as before #10781.
+    let unknown_pr = in_sweep_land_cases(None);
+    for pr in [9011, 111] {
+        let forge = cases_from_pr_history(REPO, &two_lap_pr(pr, Vec::new()), Some(&[11])).unwrap();
+        let (merged_set, dropped) = merge_case_sets(unknown_pr.clone(), forge);
+        assert_eq!(dropped, 4, "PR {pr}: the issue-level fallback");
+        assert_eq!(merged_set, unknown_pr);
+    }
 
     // Reading the same PR twice (offline file + forge) is one set, not two;
     // its two genuine review laps stay distinct.
@@ -311,10 +335,66 @@ fn a_case_both_sources_answer_is_counted_once() {
         2
     );
 
-    // A different issue is not collapsed into it.
+    // A different issue is not collapsed into it…
     let other = cases_from_pr_history(REPO, &two_lap_pr(112, Vec::new()), Some(&[12])).unwrap();
     let (kept, dropped) = merge_case_sets(sweep_cases.clone(), other);
     assert_eq!((kept.len(), dropped), (sweep_cases.len() + 4, 0));
+    // …nor is a different, known PR on the same issue.
+    let sibling = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+    let (kept, dropped) = merge_case_sets(sweep_cases.clone(), sibling);
+    assert_eq!((kept.len(), dropped), (sweep_cases.len() + 4, 0));
+}
+
+/// #10781: issue 11 has two PRs. B (9011) merged inside a sweep, so both
+/// sources answer it; A (111) was merged by Champion, so only the forge
+/// does, and each of A's stage entries is earlier than B's. Ranked by issue
+/// alone, A's forge case took lap 0, matched B's sweep case and was dropped,
+/// while B's own forge case took lap 1 and was kept: B scored twice, A
+/// never. Each is kept once.
+#[test]
+fn a_same_issue_pr_merged_outside_the_sweep_is_kept_and_the_swept_one_not_doubled() {
+    let sweep_cases = in_sweep_land_cases(Some(9011));
+    let b = cases_from_pr_history(REPO, &two_lap_pr(9011, Vec::new()), Some(&[11])).unwrap();
+    let a = cases_from_pr_history(
+        REPO,
+        &merged(
+            111,
+            3000,
+            vec![
+                labeled(REVIEW_REQUESTED, 50),
+                unlabeled(REVIEW_REQUESTED, 90),
+                labeled(APPROVED, 90),
+            ],
+        ),
+        Some(&[11]),
+    )
+    .unwrap();
+    assert_eq!(a.len(), 2);
+    for case in &a {
+        let rivals: Vec<&ReplayCase> = sweep_cases
+            .iter()
+            .chain(&b)
+            .filter(|c| c.stage == case.stage)
+            .collect();
+        assert!(!rivals.is_empty(), "{:?} has a B case to be confused with", case.stage);
+        assert!(rivals.iter().all(|c| case.as_of < c.as_of), "A enters {:?} first", case.stage);
+    }
+
+    let mut forge = a.clone();
+    forge.extend(b.clone());
+    let (merged_set, dropped) = merge_case_sets(sweep_cases.clone(), forge);
+    assert_eq!(dropped, b.len(), "B's forge cases, and only those, are dropped");
+    let mut want = sweep_cases.clone();
+    want.extend(a);
+    assert_eq!(merged_set, want);
+
+    // Without its PR the sweep record falls back to the issue-level lap, as
+    // before #10781: one sweep case still answers at most one forge case.
+    let unknown_pr = in_sweep_land_cases(None);
+    let mut forge = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+    forge.extend(b);
+    let (merged_set, dropped) = merge_case_sets(unknown_pr.clone(), forge);
+    assert_eq!((merged_set.len(), dropped), (unknown_pr.len() + 4, 4));
 }
 
 /// `land-v1` with every quantile replaced by an absurdly early triple.

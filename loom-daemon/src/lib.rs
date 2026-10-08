@@ -176,6 +176,7 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_outputs;
 pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
@@ -305,9 +306,13 @@ pub mod role_shard;
 pub mod role_tick_telemetry;
 pub mod role_tool_policy;
 pub mod role_validation;
+/// Safe-point pause hook, pause state and resume handles for a daemon roll (#10830).
+pub mod roll_pause;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;
+#[cfg(test)]
+pub(crate) mod runtime_selection_test_support;
 pub mod safehouse;
 /// Inbound safehouse ChatOps steering (#7893, Phase 3a of #4196). A sibling
 /// module rather than a `safehouse::` submodule: `safehouse.rs` is an

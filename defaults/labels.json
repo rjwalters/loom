@@ -583,6 +583,38 @@
       "yaml_preamble": []
     },
     {
+      "name": "loom:needs-revision",
+      "description": "Champion asked for a revision: Curator revises the body, then removes this. Applied by: Champion.",
+      "color": "6EE7B7",
+      "kind": "workflow",
+      "applied_by": "Champion",
+      "removed_by": "Curator",
+      "park": false,
+      "skip": false,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "propagate": null,
+      "color_note": "emerald-300 - one step back from loom:curated",
+      "yaml_preamble": [
+        "# loom:needs-revision (#10753): Champion's NEEDS REVISION verdict routes the",
+        "# issue to Curator instead of waiting for someone to edit it. Champion's",
+        "# discovery skips the label; Curator revises the body (a dated `## Revision`",
+        "# section) and removes it, and the changed body hash brings Champion back.",
+        "# Bounded: see .loom/docs/promotion-throughput.md."
+      ]
+    },
+    {
       "name": "loom:blocked",
       "description": "Implementation blocked, needs help or clarification",
       "color": "EF4444",

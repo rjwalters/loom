@@ -70,7 +70,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # OPENCODE_VERSION tracks the latest 1.x release instead
 # (.github/workflows/harness-pins.yml); its gate is docker/native/test-image.sh
 # in CI, and the live canary was last run on 1.18.31.
-ARG OPENCODE_VERSION=1.18.34
+ARG OPENCODE_VERSION=1.18.35
 ARG PI_VERSION=0.85.1
 ARG KIMI_CODE_VERSION=2.0.2
 

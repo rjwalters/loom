@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod loom_kind;
 mod record_id;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
@@ -139,6 +140,7 @@ fn sweep_outcome_envelope() -> TelemetryEnvelope {
             complexity: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,

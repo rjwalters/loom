@@ -226,8 +226,8 @@ impl LivenessState {
             let plan = std::mem::take(&mut evaluator.plan);
             drop(evaluator);
             // #10012 §2–§3: write the inherited star, and take back the ones
-            // whose root lost its star. Off unless `materializeLabels` is on
-            // (default off; no plan otherwise), and off with `escalate` (no
+            // whose root lost its star. Off when `materializeLabels` is off
+            // (default on; no plan otherwise), and off with `escalate` (no
             // forge writes) or `propagate` (no plan).
             if settings.materialize_labels
                 && settings.escalate

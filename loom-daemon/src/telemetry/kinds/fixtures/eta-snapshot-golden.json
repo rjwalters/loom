@@ -3,16 +3,6 @@
   "as_of": "2026-10-01T12:00:00Z",
   "rows": [
     {
-      "repo": "acme/secret-app",
-      "visibility": "private",
-      "issue": 42,
-      "kind": "land",
-      "heuristic": "land-v1",
-      "estimate_id": "c4d5e6f708192a3b",
-      "as_of": "2026-10-01T11:55:00Z",
-      "no_estimate_reason": "blocked"
-    },
-    {
       "repo": "rjwalters/loom",
       "visibility": "public",
       "issue": 10391,
@@ -45,6 +35,16 @@
       ]
     },
     {
+      "repo": "acme/secret-app",
+      "visibility": "private",
+      "issue": 42,
+      "kind": "land",
+      "heuristic": "land-v1",
+      "estimate_id": "c4d5e6f708192a3b",
+      "as_of": "2026-10-01T11:55:00Z",
+      "no_estimate_reason": "blocked"
+    },
+    {
       "repo": "rjwalters/loom",
       "visibility": "public",
       "issue": 10477,
@@ -59,6 +59,7 @@
     }
   ],
   "rows_truncated": 1,
+  "alternates_truncated": 1,
   "rows_truncated_by_kind": {
     "finish": 1
   }

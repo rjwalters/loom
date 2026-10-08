@@ -34,6 +34,10 @@ pub(crate) mod rework;
 /// `test_lines`.
 pub(crate) mod landing_size;
 
+/// The cause attached to an `unclassified:no-phase-signal` record (Issue
+/// #10642): exit status, last step reached, bounded reason.
+pub(crate) mod no_phase;
+
 /// One observed lifecycle-phase transition for a live sweep (Issue #4704):
 /// the checkpoint phase marker and the instant [`SweepRegistry::reap_once`]
 /// first observed it.
@@ -254,7 +258,7 @@ impl SweepRegistry {
         // `sweep_outcomes` module doc for why), carrying model/config/result
         // detail the #4644 journal was never meant to hold. Independent
         // best-effort side effect: never allowed to block reaping.
-        self.append_outcome_telemetry_journal(
+        self.append_outcome_telemetry_journal_observed(
             issue,
             sweep_id,
             duration_sec,
@@ -262,6 +266,7 @@ impl SweepRegistry {
             failure_class,
             credential,
             tap_region,
+            exit_code,
         );
     }
 
@@ -414,6 +419,12 @@ impl SweepRegistry {
     /// to and is the only one this record's flat `config` map spells out (Issue
     /// #8659); a region one row cannot represent is *flagged* here and broken
     /// out in full on the sibling `sweep-outcomes.jsonl` line.
+    ///
+    /// Called only from tests since #10642: the reaper's production path goes
+    /// through [`Self::append_outcome_telemetry_journal_observed`] with the
+    /// exit status it observed; this keeps the many fixture call sites
+    /// unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_outcome_telemetry_journal(
         &self,
@@ -424,6 +435,34 @@ impl SweepRegistry {
         failure_class: Option<String>,
         credential: Option<crate::launch_record::CredentialAttribution>,
         tap_region: crate::tap_usage::RegionAccounting,
+    ) {
+        self.append_outcome_telemetry_journal_observed(
+            issue,
+            sweep_id,
+            duration_sec,
+            result,
+            failure_class,
+            credential,
+            tap_region,
+            None,
+        );
+    }
+
+    /// [`Self::append_outcome_telemetry_journal`] plus the exit status the
+    /// reaper observed (Issue #10642), which the `no_phase_cause` of an
+    /// `unclassified:no-phase-signal` record reports. `None` means no exit
+    /// status was observed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_outcome_telemetry_journal_observed(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        duration_sec: i64,
+        result: telemetry::SweepResult,
+        failure_class: Option<String>,
+        credential: Option<crate::launch_record::CredentialAttribution>,
+        tap_region: crate::tap_usage::RegionAccounting,
+        exit_code: Option<i32>,
     ) {
         let info = self.entries.get(sweep_id);
         let model = info.and_then(|i| i.model.clone());
@@ -885,6 +924,17 @@ impl SweepRegistry {
                 doctor_cycles,
                 issue_end_state,
             });
+        // Issue #10642: a synthesized `no-phase-signal` class says nothing on
+        // its own, so attach what is known about how the run ended.
+        let no_phase_cause = (failure_class.as_deref() == Some(telemetry::NO_PHASE_SIGNAL_CLASS))
+            .then(|| {
+                self.no_phase_cause_for(
+                    sweep_id,
+                    issue,
+                    exit_code,
+                    phase_durations.last().map(|p| p.phase.as_str()),
+                )
+            });
 
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
@@ -929,6 +979,7 @@ impl SweepRegistry {
             generated_lines: landing_size.as_ref().map(|size| size.generated_lines),
             test_lines: landing_size.as_ref().map(|size| size.test_lines),
             tokens_status_reason,
+            no_phase_cause,
         };
         // Issue #9441: both disposition invariants hold on every record this
         // daemon writes. A debug assertion rather than a runtime guard — the
@@ -1009,6 +1060,9 @@ impl SweepRegistry {
         }
         if let Some(cycles) = outcome_record.doctor_cycles {
             metadata.insert("loom.doctor_cycles".into(), cycles.to_string());
+        }
+        if let Some(cause) = &outcome_record.no_phase_cause {
+            no_phase::insert_span_attributes(&mut metadata, cause);
         }
         // #9443: the same per-phase numbers `phase_durations` carries, on the
         // execution's own `loom.role_attempt` spans, so the D1/JSONL path and

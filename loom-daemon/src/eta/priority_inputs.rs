@@ -16,7 +16,7 @@
 //! - **`repo_rank`**: [`repo_rank`] in the fleet roster revision knowable
 //!   before `as_of − LAG` ([`revision_at`], LAG = [`KNOWABLE_LAG_SEC`]).
 //!   `None` when no revision is (no history, or it starts after the
-//!   cutoff) or the repo is not a member then. Never today's `repos.yml`.
+//!   cutoff) or the repo is not a member then. Never today's roster.
 //! - **`ahead_dispatch_fleet`**: the other open PRs in the subject's stage,
 //!   across every repo in `scope`, that cross-repo dispatch order puts first:
 //!   [`keyed_cmp`] over [`ETA_FLEET_POSITION_KEYS`] (the real comparator

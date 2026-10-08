@@ -29,6 +29,10 @@ fn reconstruct_admits_live_lock_owners() {
         owner_pid: std::process::id(),
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-77-reconstruct".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -87,6 +91,10 @@ fn unregistered_locked_issues_surfaces_live_lock_with_no_entry() {
         owner_pid: std::process::id(), // guaranteed alive
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-4201-1785221507".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -119,6 +127,10 @@ fn unregistered_locked_issues_excludes_registered_live_entry() {
         owner_pid: std::process::id(),
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-4202-registered".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -155,6 +167,10 @@ fn unregistered_locked_issues_excludes_stale_dead_pid_lock() {
         owner_pid: 2_147_483_640, // dead
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-4203-stale".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -184,6 +200,10 @@ fn reconstruct_drops_stale_locks() {
         owner_pid: 2_147_483_640, // dead
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-78-stale".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -237,6 +257,10 @@ fn reconstruct_recovers_daemon_owned_checkpoint() {
         owner_pid: 2_147_483_640, // dead
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-91-daemon".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -405,6 +429,10 @@ fn reconstruct_recovers_token_name_from_log() {
         owner_pid: std::process::id(), // alive → admitted as Running
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: sweep_id.to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -595,6 +623,10 @@ fn reconstruct_token_recovery_degrades_to_unknown() {
         owner_pid: std::process::id(),
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-402-noline".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock_a.join("owner.json"), serde_json::to_string_pretty(&owner_a).unwrap())
         .unwrap();
@@ -615,6 +647,10 @@ fn reconstruct_token_recovery_degrades_to_unknown() {
         owner_pid: std::process::id(),
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-403-nolog".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock_b.join("owner.json"), serde_json::to_string_pretty(&owner_b).unwrap())
         .unwrap();
@@ -694,6 +730,10 @@ fn adopt_live_journal_sweeps_never_double_counts_a_reconstructed_sweep() {
         owner_pid: std::process::id(),
         acquired_at: Utc::now().to_rfc3339(),
         sweep_id: "sweep-issue-6262-locked".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 
@@ -790,6 +830,10 @@ fn lock_adoption_evidence_names_the_original_sweep_id_and_start() {
         owner_pid: std::process::id(),
         acquired_at: acquired_at.to_rfc3339(),
         sweep_id: "sweep-issue-8720-original".to_string(),
+        item_id: None,
+        scope_unit: None,
+        agent_started_at: None,
+        resume_handle: None,
     };
     std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap()).unwrap();
 

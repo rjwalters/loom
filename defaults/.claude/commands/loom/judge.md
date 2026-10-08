@@ -1916,6 +1916,10 @@ EOF
 
 ## Evaluation Focus Areas
 
+### Rollout check (host-move PRs)
+
+If the PR moves work between hosts or changes who emits a fleet signal (authority, captain, singleton jobs, gating, capability routing), request changes when `## Rollout check` is missing or names no concrete queryable signal and expected value. Other PRs: never flag. Detail: `judge-reference.md` § "Rollout check".
+
 ### PR Description and Issue Linking (CRITICAL)
 
 **Before evaluating code, verify the PR will close its issue:**
