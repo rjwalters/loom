@@ -4,12 +4,14 @@
 #
 # The daemon hands a dispatch its session identity in the environment:
 # LOOM_CLAUDE_SESSION_ID and LOOM_AGENT_SCOPE_UNIT for a fresh launch,
-# LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT for a resume. spawn-claude.sh,
-# claude-wrapper.sh and spawn-codex.sh consume them. If they stayed exported,
-# a nested spawn-claude.sh run from one of the agent's own Bash tool calls
-# would reuse the parent's session id (Claude refuses it, or the wrapper
-# resumes the parent's live conversation) and, on Linux, the name of the
-# parent's still-running systemd scope.
+# LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT for a resume, and
+# LOOM_RESUME_HANDLE_FILE (where the live-captured Codex handle goes) on both.
+# spawn-claude.sh, claude-wrapper.sh and spawn-codex.sh consume them. If they
+# stayed exported, a nested spawn-claude.sh run from one of the agent's own
+# Bash tool calls would reuse the parent's session id (Claude refuses it, or
+# the wrapper resumes the parent's live conversation) and, on Linux, the name
+# of the parent's still-running systemd scope; and a nested spawn-codex.sh
+# would start a capture watcher that overwrites the parent's handle file.
 #
 # Each stub runtime below starts a CHILD process, standing in for a Bash tool
 # call, and reports what that child inherited. LOOM_DAEMON_ITEM_ID stays
@@ -21,24 +23,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
-DAEMON_BIN=""
-for _candidate in \
-    "${CARGO_TARGET_DIR:+$CARGO_TARGET_DIR/release/loom-daemon}" \
-    "${CARGO_TARGET_DIR:+$CARGO_TARGET_DIR/debug/loom-daemon}" \
-    "$REPO_ROOT/target/release/loom-daemon" \
-    "$REPO_ROOT/target/debug/loom-daemon"; do
-    if [[ -n "$_candidate" && -x "$_candidate" ]]; then
-        DAEMON_BIN="$_candidate"
-        break
-    fi
-done
-if [[ -z "$DAEMON_BIN" ]]; then
-    echo "FATAL: no loom-daemon binary found under \$CARGO_TARGET_DIR or $REPO_ROOT/target" >&2
-    echo "  Build one first: cargo build -p loom-daemon" >&2
-    exit 1
-fi
+# Needs a built loom-daemon (`agent-resume claude-args` / `codex-prompt` /
+# `capture-codex` are what the spawn scripts call). FAILS, never skips, without
+# one built from this checkout.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "agent-resume"
+DAEMON_BIN="$LOOM_DAEMON_SELF_BIN"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +60,8 @@ source "$SCRIPT_DIR/lib/session-lock-sandbox.sh" "$TMPROOT"
 
 SESSION="11111111-2222-4333-8444-555555555555"
 SCOPE="loom-agent-sweep-test.scope"
+# Every dispatch carries the handle path, whichever runtime it launches.
+HANDLE="$TMPROOT/item/handle.json"
 
 # A workspace with one token, and the wrapper where spawn-claude.sh looks for it.
 WS="$TMPROOT/ws"
@@ -80,7 +74,7 @@ ln -s "$SCRIPTS_DIR" "$WS/.loom/scripts"
 # What a child of the runtime inherits. `-` (not `:-`) so an exported-but-empty
 # variable would still show up as leaked.
 # shellcheck disable=SC2016  # expanded by the child, on purpose
-CHILD_REPORT='echo "child sid=${LOOM_CLAUDE_SESSION_ID-unset} scope=${LOOM_AGENT_SCOPE_UNIT-unset} resume=${LOOM_RESUME_SESSION_ID-unset} prompt=${LOOM_RESUME_PROMPT-unset} item=${LOOM_DAEMON_ITEM_ID-unset}"'
+CHILD_REPORT='echo "child sid=${LOOM_CLAUDE_SESSION_ID-unset} scope=${LOOM_AGENT_SCOPE_UNIT-unset} resume=${LOOM_RESUME_SESSION_ID-unset} prompt=${LOOM_RESUME_PROMPT-unset} handle=${LOOM_RESUME_HANDLE_FILE-unset} item=${LOOM_DAEMON_ITEM_ID-unset}"'
 
 STUB_DIR="$TMPROOT/stub"
 mkdir -p "$STUB_DIR"
@@ -98,8 +92,30 @@ cat > "$STUB_DIR/codex" <<STUB
 #!/usr/bin/env bash
 echo "stub-codex args=\$*"
 bash -c '$CHILD_REPORT'
+"$STUB_DIR/watcher-report" "$HANDLE"
 STUB
-chmod +x "$STUB_DIR/claude" "$STUB_DIR/codex"
+# Reports whose child the `capture-codex` watcher for handle file $1 is. It must
+# be a direct child of spawn-codex.sh, which is the pid it was told to watch. A
+# subshell in between would keep every descriptor the script inherited (a
+# private account's lease among them) open for as long as the watcher lives.
+cat > "$STUB_DIR/watcher-report" <<'STUB'
+#!/usr/bin/env bash
+watcher=""
+for _ in $(seq 1 300); do
+    watcher="$(pgrep -f "capture-codex .*--handle-file $1 " | head -1)"
+    [[ -z "$watcher" ]] || break
+    sleep 0.1
+done
+[[ -n "$watcher" ]] || { echo "watcher=missing"; exit 0; }
+parent="$(ps -o ppid= -p "$watcher" | tr -d ' ')"
+watched="$(ps -o command= -p "$watcher" | sed -n 's/.*--watch-pid \([0-9][0-9]*\).*/\1/p')"
+if [[ -n "$parent" && "$parent" == "$watched" ]]; then
+    echo "watcher=direct-child-of-the-spawn-script"
+else
+    echo "watcher=child-of-$parent-but-watches-$watched"
+fi
+STUB
+chmod +x "$STUB_DIR/claude" "$STUB_DIR/codex" "$STUB_DIR/watcher-report"
 
 CLAUDE_CONFIG="$TMPROOT/claude-config"
 mkdir -p "$CLAUDE_CONFIG/projects/proj"
@@ -113,6 +129,7 @@ run_claude() {
     shift || true
     env -u LOOM_CLAUDE_SESSION_ID -u LOOM_AGENT_SCOPE_UNIT \
         -u LOOM_RESUME_SESSION_ID -u LOOM_RESUME_PROMPT \
+        LOOM_RESUME_HANDLE_FILE="$HANDLE" \
         LOOM_WORKSPACE="$WS" LOOM_DAEMON_BIN="$DAEMON_BIN" LOOM_DAEMON_SELF_BIN="$DAEMON_BIN" \
         LOOM_SWEEP_NICE=0 LOOM_SWEEP_CPU_QUOTA=0 LOOM_DAEMON_ITEM_ID=4242 \
         LOOM_MAX_RETRIES=1 LOOM_INITIAL_WAIT=0 LOOM_STARTUP_MONITOR_WINDOW=1 \
@@ -122,14 +139,14 @@ run_claude() {
         "$SCRIPTS_DIR/spawn-claude.sh" "$@" 2>&1 || true
 }
 
-CLEAN="child sid=unset scope=unset resume=unset prompt=unset item=4242"
+CLEAN="child sid=unset scope=unset resume=unset prompt=unset handle=unset item=4242"
 
 echo "Testing spawn-claude.sh: a pinned launch (direct exec)..."
 out="$(run_claude LOOM_CLAUDE_SESSION_ID="$SESSION" LOOM_AGENT_SCOPE_UNIT="$SCOPE" -- -p ping)"
 assert_contains "stub-claude args=-p ping --session-id $SESSION" "$out" \
     "the session id is pinned on the command line"
 assert_contains "$CLEAN" "$out" \
-    "a child of the agent inherits neither the session id nor the scope unit, and keeps the item id"
+    "a child of the agent inherits neither the session id, the scope unit nor the handle path, and keeps the item id"
 
 echo "Testing spawn-claude.sh: a resume launch (direct exec)..."
 out="$(run_claude LOOM_RESUME_SESSION_ID="$SESSION" LOOM_RESUME_PROMPT="carry on" LOOM_AGENT_SCOPE_UNIT="$SCOPE" --)"
@@ -160,12 +177,15 @@ out="$(env -u CODEX_HOME -u LOOM_CODEX_PROFILE -u LOOM_CLAUDE_SESSION_ID -u LOOM
     LOOM_SWEEP_NICE=0 LOOM_SPAWN_NO_EXPORT=1 LOOM_DAEMON_SELF_BIN="$DAEMON_BIN" \
     LOOM_DAEMON_ITEM_ID=4242 LOOM_CODEX_HOME="$TMPROOT/codex-home" \
     LOOM_RESUME_SESSION_ID="$SESSION" LOOM_RESUME_PROMPT="carry on" \
+    LOOM_RESUME_HANDLE_FILE="$HANDLE" \
     PATH="$STUB_DIR:$PATH" \
     bash "$SCRIPTS_DIR/spawn-codex.sh" 2>&1 || true)"
 assert_contains "exec resume" "$out" "codex is launched in resume mode"
 assert_contains "$SESSION carry on" "$out" "the resume id and prompt are on the command line"
 assert_contains "$CLEAN" "$out" \
-    "a child of the resumed codex agent inherits neither the resume id nor the resume prompt"
+    "a child of the resumed codex agent inherits neither the resume id, the resume prompt nor the handle path"
+assert_contains "watcher=direct-child-of-the-spawn-script" "$out" \
+    "the capture watcher replaces its backgrounded subshell, so nothing is left holding the script's descriptors"
 
 echo ""
 echo "==================================="

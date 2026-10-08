@@ -230,6 +230,9 @@ impl AgentResumeCommand {
                         ..resume::CapturedHandle::default()
                     },
                 };
+                // Before the first poll: this watcher must not hold a private
+                // account's lease past the end of the run (see the callee).
+                resume::release_inherited_lease(env_var(resume::PRIVATE_LEASE_FD_ENV).as_deref());
                 let _ = resume::capture_codex(&spec);
                 Ok(())
             }

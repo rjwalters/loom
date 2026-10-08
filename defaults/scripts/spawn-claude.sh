@@ -1274,7 +1274,9 @@ fi
 # collide on its scope unit (the scope was named at the systemd-run probe above).
 # LOOM_CLAUDE_SESSION_ID is dropped below, on the direct path only, because
 # claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
-# a nested agent shares the item's pause state. The proxied host half keeps
+# a nested agent shares the item's pause state. LOOM_RESUME_HANDLE_FILE is not
+# read here, but a nested spawn-codex.sh would write the parent's handle through
+# it. The proxied host half keeps
 # them: its in-container copy receives them by name and drops them itself.
 [[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT LOOM_RESUME_HANDLE_FILE
 

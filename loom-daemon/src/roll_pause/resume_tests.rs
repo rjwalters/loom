@@ -94,3 +94,35 @@ fn capture_stops_when_the_watched_process_is_gone_or_time_runs_out() {
     spec.timeout = Duration::from_millis(50);
     assert_eq!(capture_codex(&spec), CaptureOutcome::TimedOut);
 }
+
+/// Whether a fresh open of `path` can take the account lock right now.
+fn lock_is_free(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let probe = std::fs::File::open(path).unwrap();
+    // SAFETY: `probe` is an open file for the whole call.
+    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[test]
+fn the_capture_watcher_gives_up_an_inherited_account_lease() {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = tmp.path().join("account.lock");
+    let owner = std::fs::File::create(&lock).unwrap();
+    // SAFETY: `owner` is an open file for the whole call.
+    assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    // The watcher's copy: a second descriptor on the same open file
+    // description, which is what a child inherits.
+    let inherited = owner.try_clone().unwrap().into_raw_fd();
+    // The spawn script has exited; only the watcher's copy keeps the lock.
+    drop(owner);
+    assert!(!lock_is_free(&lock), "the inherited copy alone holds the lease");
+
+    assert!(!release_inherited_lease(None));
+    assert!(!release_inherited_lease(Some("not-a-descriptor")));
+    assert!(!release_inherited_lease(Some("2")), "never closes stdio");
+    assert!(!lock_is_free(&lock));
+
+    assert!(release_inherited_lease(Some(&inherited.to_string())));
+    assert!(lock_is_free(&lock), "the lease is free once the watcher closed its copy");
+}

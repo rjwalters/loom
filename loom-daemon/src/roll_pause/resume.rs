@@ -32,6 +32,11 @@ pub const RESUME_PROMPT_ENV: &str = "LOOM_RESUME_PROMPT";
 pub const HANDLE_FILE_ENV: &str = "LOOM_RESUME_HANDLE_FILE";
 /// The systemd scope unit name the daemon assigns to an agent.
 pub const SCOPE_UNIT_ENV: &str = "LOOM_AGENT_SCOPE_UNIT";
+/// Names the descriptor holding a private Codex account's lease. A private
+/// dispatch passes it to `spawn-codex.sh` without close-on-exec
+/// (`tokens_pool::private_workspace::dispatch`), so every child of the script
+/// inherits it.
+pub const PRIVATE_LEASE_FD_ENV: &str = "LOOM_PRIVATE_LEASE_FD";
 
 /// Whether `id` looks like a runtime session id (a uuid: hex and dashes).
 #[must_use]
@@ -208,6 +213,30 @@ fn pid_alive(pid: u32) -> bool {
     };
     // SAFETY: signal 0 only checks for existence and permission.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Close the account lease descriptor a capture watcher inherited; `value` is
+/// what [`PRIVATE_LEASE_FD_ENV`] holds. Returns whether a descriptor was closed.
+///
+/// The watcher is backgrounded and can outlive its spawn script by one poll.
+/// The lease is a `flock` on an open file description that every inheritor
+/// shares, so a watcher that kept its copy would keep the account busy after
+/// the run had ended, and the next dispatch on that account would be refused.
+/// The watcher never needs the lease: it only reads the stderr capture.
+///
+/// This covers the watcher process only. `spawn-codex.sh` must `exec` it, so
+/// that no backgrounded subshell is left holding a second copy.
+pub fn release_inherited_lease(value: Option<&str>) -> bool {
+    let Some(fd) = value.and_then(|v| v.trim().parse::<i32>().ok()) else {
+        return false;
+    };
+    // Never stdin, stdout or stderr, whatever the variable says.
+    if fd <= 2 {
+        return false;
+    }
+    // SAFETY: closing a descriptor this process inherited and never wrapped
+    // in an owning type; on a descriptor that is not open this is EBADF.
+    unsafe { libc::close(fd) == 0 }
 }
 
 /// Watch a Codex stderr capture until the session id appears, then write the

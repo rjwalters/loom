@@ -1192,8 +1192,18 @@ trap "rm -f '$_stderr_file' '$_stderr_file.cancel'" EXIT
 # Live session-id capture (#10830): a roll needs the id while the session is
 # still running, not after it exits. `loom-daemon agent-resume capture-codex`
 # watches the capture below and writes LOOM_RESUME_HANDLE_FILE as soon as the
-# `session id:` line lands; it ends with this script ($$).
-[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 198>&- & unset LOOM_RESUME_HANDLE_FILE
+# `session id:` line lands; it ends with this script ($$). It can outlive this
+# script by one poll, so nothing it leaves running may hold a private account's
+# lease (LOOM_PRIVATE_LEASE_FD), or the next dispatch on that account is refused:
+#   * `exec`, so the backgrounded subshell BECOMES the watcher. Without it bash
+#     keeps that subshell waiting on the watcher, and the subshell holds the
+#     lease whatever the watcher's own redirections say.
+#   * The watcher closes the descriptor LOOM_PRIVATE_LEASE_FD names as its first
+#     act. Do not add `N>&-` here instead: on an `exec`, bash 3.2 keeps a saved
+#     copy of the descriptor open in the new process.
+# The handle path is consumed once the watcher is forked, so it is unset on the
+# same line: a nested spawn's watcher would overwrite this session's handle.
+[[ -z "${LOOM_RESUME_HANDLE_FILE:-}" ]] || exec "$(loom_resolve_self_daemon_bin)" agent-resume capture-codex --stderr-file "$_stderr_file" --handle-file "$LOOM_RESUME_HANDLE_FILE" --watch-pid $$ --codex-home "${CODEX_HOME:-}" --account "${CODEX_PROFILE_NAME:-}" --container "${CODEX_SESSION_CONTAINER:-}" </dev/null >/dev/null 2>&1 & unset LOOM_RESUME_HANDLE_FILE
 set +e
 echo "# LOOM_CLI_START runtime=codex" >&2
 if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
