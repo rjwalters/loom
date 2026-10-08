@@ -170,6 +170,36 @@ fn unreachable_remotes_are_one_alert_for_the_host_not_one_per_repo() {
     assert_eq!(network(&host.pass()), (0, 0, 0), "inside the hold");
 }
 
+#[test]
+fn a_fetch_skipped_below_the_disk_floor_is_no_network_alert_and_no_backoff() {
+    use crate::fetch_headroom::test_override::with_free_gb;
+    let fx = Fixture::new(current());
+    let host = Host::new(&fx, "host-a");
+    // Origin moves, so every pass's head query names a head the clone lacks
+    // and must fetch it: the fetch the disk floor skips (#10995).
+    fx.push_from_seed("old script back", |seed| {
+        write(&seed.join(".loom/scripts/a.sh"), "#!/bin/sh\necho old\n");
+    });
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        let pass = with_free_gb(1, || host.pass());
+        let report = only(&pass);
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(reason(report).contains("skipped git fetch"), "{report:?}");
+        assert_eq!(network(&pass), (1, 0, 1), "the forge answered; one fetch tried");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no network (or any) alert: {alerts:?}");
+
+    // The disk recovers: the very next pass fetches and resyncs.
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_file(".loom/scripts/a.sh"), "#!/bin/sh\necho new");
+}
+
 // ----------------------------------------------------------------------------
 // The loop bound
 // ----------------------------------------------------------------------------
