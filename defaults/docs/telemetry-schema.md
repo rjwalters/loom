@@ -1651,6 +1651,19 @@ subscriptions are not counted.
 | `loom.daemon.ipc.latency_max` | `s` | `kind` | the slowest request of that kind answered in the interval |
 | `loom.daemon.ipc.latency` | `s` | `kind` | a delta counter: summed latency of the requests answered |
 | `loom.daemon.ipc.requests` | `{request}` | `kind` | a delta counter: requests answered (with `latency`, gives the mean) |
+| `loom.daemon.ipc.status_builds` | `{build}` | `outcome` | a delta counter: `DaemonStatus` builds finished (#10861) |
+
+Concurrent `DaemonStatus` requests for the same section set share one build
+(Issue #10861), so the three `kind` series are **per request**, not per
+build. A request that joined a build already in flight is counted in
+`requests`, and its latency is only the time it waited, so under concurrency
+the mean (`latency / requests`) and `latency_max` can sit below the build
+time. `status_builds` counts the builds themselves, once each however many
+requests shared them: `requests{kind=DaemonStatus} / status_builds` is the
+coalescing ratio. `outcome` is `ok`, `panic` (every waiting request got an
+error frame) or `join_error` (the build task did not complete); an outcome
+not seen in the interval emits no point. The section set is deliberately not
+a label.
 
 ETA pipeline health (Issue #10391, `observability/ops/eta_health.rs`). All
 gauges, sampled once per collector pass, so they stay alive when no

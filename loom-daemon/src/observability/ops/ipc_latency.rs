@@ -13,6 +13,18 @@
 //! - `loom.daemon.ipc.requests` (delta counter): requests answered. With the
 //!   sum above this gives the mean.
 //!
+//! Concurrent `DaemonStatus` requests for the same section set share one
+//! build (Issue #10861, `ipc::status_off_runtime`). The three series above
+//! stay **per request**: a request that joined a build already in flight is
+//! counted, and its latency is only the time it waited. A fourth series
+//! counts the builds themselves ([`record_status_build_outcome`]):
+//!
+//! - `loom.daemon.ipc.status_builds` (delta counter): status builds finished,
+//!   labelled `outcome` (`ok`, `panic`, `join_error` — [`StatusBuildOutcome`],
+//!   a closed, code-defined set). `requests{kind=DaemonStatus}` over
+//!   `status_builds` is the coalescing ratio. No section label: a section set
+//!   is unbounded cardinality.
+//!
 //! A kind with no requests in an interval emits no point. The `kind` label is
 //! the request's wire `type` tag, read only after the frame parsed as a
 //! [`crate::types::Request`], so it is one of that enum's variant names (a
@@ -73,11 +85,45 @@ struct Agg {
     max: Duration,
 }
 
-type Series = BTreeMap<String, Agg>;
+/// How one shared `DaemonStatus` build ended (Issue #10861): the `outcome`
+/// label of `loom.daemon.ipc.status_builds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StatusBuildOutcome {
+    /// The build produced a report.
+    Ok,
+    /// The build panicked; every waiting request got an error frame.
+    Panic,
+    /// The blocking task did not complete (the runtime shutting down).
+    JoinError,
+}
+
+impl StatusBuildOutcome {
+    /// The `outcome` label value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Panic => "panic",
+            Self::JoinError => "join_error",
+        }
+    }
+}
+
+/// Everything accumulated since the previous drain.
+#[derive(Debug, Default)]
+struct Series {
+    /// Requests answered, by kind.
+    kinds: BTreeMap<String, Agg>,
+    /// Status builds finished, by outcome.
+    status_builds: BTreeMap<StatusBuildOutcome, u64>,
+}
 
 #[cfg(not(test))]
 fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
-    static STORE: std::sync::Mutex<Series> = std::sync::Mutex::new(BTreeMap::new());
+    static STORE: std::sync::Mutex<Series> = std::sync::Mutex::new(Series {
+        kinds: BTreeMap::new(),
+        status_builds: BTreeMap::new(),
+    });
     STORE.lock().ok().map(|mut s| f(&mut s))
 }
 
@@ -86,7 +132,7 @@ fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
 #[cfg(test)]
 fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
     thread_local! {
-        static STORE: std::cell::RefCell<Series> = const { std::cell::RefCell::new(BTreeMap::new()) };
+        static STORE: std::cell::RefCell<Series> = std::cell::RefCell::new(Series::default());
     }
     Some(STORE.with(|s| f(&mut s.borrow_mut())))
 }
@@ -106,10 +152,23 @@ pub fn record(kind: &str, elapsed: Duration) {
         return;
     }
     with_store(|s| {
-        let agg = s.entry(kind.to_string()).or_default();
+        let agg = s.kinds.entry(kind.to_string()).or_default();
         agg.count = agg.count.saturating_add(1);
         agg.sum = agg.sum.saturating_add(elapsed);
         agg.max = agg.max.max(elapsed);
+    });
+}
+
+/// Count one finished `DaemonStatus` build (Issue #10861) — once per build,
+/// however many requests shared it. Accumulates only when ops signals are
+/// exported, like [`record`].
+pub fn record_status_build_outcome(outcome: StatusBuildOutcome) {
+    if !super::spans_exported() {
+        return;
+    }
+    with_store(|s| {
+        let count = s.status_builds.entry(outcome).or_default();
+        *count = count.saturating_add(1);
     });
 }
 
@@ -122,13 +181,14 @@ fn seconds(name: MetricName, d: Duration, kind: &str) -> MetricPoint {
     .label("kind", kind)
 }
 
-/// Drain every kind into its three points (delta semantics: a second drain
-/// with no requests in between is empty).
+/// Drain every kind into its three points, then one `status_builds` point
+/// per outcome seen (delta semantics: a second drain with nothing recorded in
+/// between is empty).
 #[must_use]
 pub fn drain_points() -> Vec<MetricPoint> {
     let drained = with_store(std::mem::take).unwrap_or_default();
-    let mut points = Vec::with_capacity(drained.len() * 3);
-    for (kind, agg) in drained {
+    let mut points = Vec::with_capacity(drained.kinds.len() * 3 + drained.status_builds.len());
+    for (kind, agg) in drained.kinds {
         points.push(seconds(MetricName::DaemonIpcLatencyMax, agg.max, &kind));
         points.push(seconds(MetricName::DaemonIpcLatency, agg.sum, &kind));
         points.push(
@@ -137,6 +197,15 @@ pub fn drain_points() -> Vec<MetricPoint> {
                 i64::try_from(agg.count).unwrap_or(i64::MAX),
             )
             .label("kind", kind),
+        );
+    }
+    for (outcome, count) in drained.status_builds {
+        points.push(
+            MetricPoint::int(
+                MetricName::DaemonIpcStatusBuilds,
+                i64::try_from(count).unwrap_or(i64::MAX),
+            )
+            .label("outcome", outcome.as_str()),
         );
     }
     points
