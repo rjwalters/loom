@@ -212,6 +212,33 @@ fn a_noop_clear_survives_a_daemon_restart() {
     assert_eq!(reg.prless_release_count(10_642), 1);
 }
 
+/// A dispatch that self-reports a no-op and is then reaped as a phaseless
+/// death is exempt from the live tally (#8912); its journaled record must be
+/// exempt from the durable floor too, across a restart.
+#[test]
+#[serial]
+fn a_self_reported_noop_dispatch_is_not_counted_after_a_restart() {
+    clear_repo_env();
+    let dir = tempdir().unwrap();
+    {
+        let (mut reg, _) = fixture_registry(dir.path());
+        let started = Utc::now() - chrono::Duration::seconds(90);
+        let sweep_id = insert_dead_running_at(&mut reg, 10_642, 0, started);
+        reg.record_noop_release(10_642, Some("nothing to do".into()));
+        assert!(reg.noop_release_covers_dispatch(10_642, &sweep_id));
+        reg.reap_once();
+        assert_eq!(reg.prless_release_count(10_642), 0);
+    }
+    let (mut reg, _) = fixture_registry(dir.path());
+    phaseless_death(&mut reg, 10_642, 1);
+    assert_eq!(
+        reg.prless_release_count(10_642),
+        1,
+        "the exempted no-op dispatch must not feed the durable floor"
+    );
+    assert!(!reg.prless_retry_held(10_642));
+}
+
 /// A landed record in the journal ends the durable streak too, so a restart
 /// after a landing does not count the deaths that preceded it.
 #[test]

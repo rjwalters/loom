@@ -490,6 +490,11 @@ impl SweepRegistry {
                 "sweep_registry: issue #{issue} self-reported a no-op release for sweep \
                  {sweep_id} — not counting that outcome as a PR-less release (#8912)"
             );
+            // #10642: the reaper journaled this outcome before classifying
+            // it, after the clear `record_noop_release` made at IPC time.
+            // Move the clear boundary past it so the durable floor never
+            // counts the record this branch just exempted (nor after a restart).
+            self.note_prless_cleared(issue, Utc::now());
             return;
         }
         // Strongest productive signal first, and free: an observed merge phase
