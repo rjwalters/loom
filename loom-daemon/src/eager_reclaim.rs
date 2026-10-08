@@ -24,7 +24,9 @@
 //! ([`crate::worktree_reaper::reap_worktrees_only`],
 //! [`crate::deep_clean::run_for`], [`crate::docker_image_clean::run_for`]),
 //! plus the one genuinely-new pass this issue introduces
-//! ([`crate::scratch_reclaim::run_for`]). Every sub-pass still honors its own
+//! ([`crate::scratch_reclaim::run_for`]), and the aborted-fetch `.git/objects`
+//! temp-file pass ([`crate::git_tmp_reclaim::run_for`], #10995, 10m cooldown,
+//! also called by the reaper). Every sub-pass still honors its own
 //! existing cooldown ([`crate::deep_clean`]'s 6h,
 //! [`crate::docker_image_clean`]'s 30m, [`crate::scratch_reclaim`]'s 30m) —
 //! calling them eagerly only makes an *already-due* pass run promptly instead
@@ -87,6 +89,7 @@ use chrono::{DateTime, Utc};
 
 use crate::deep_clean::DeepCleanReport;
 use crate::docker_image_clean::DockerRetentionReport;
+use crate::git_tmp_reclaim::GitTmpReclaimReport;
 use crate::scratch_reclaim::ScratchReclaimReport;
 
 // ============================================================================
@@ -254,6 +257,8 @@ pub struct EagerReclaimReport {
     pub scratch: Option<ScratchReclaimReport>,
     /// When this pass ran.
     pub at: DateTime<Utc>,
+    /// The aborted-fetch `.git/objects` temp-file sub-pass's report (#10995).
+    pub git_tmp: Option<GitTmpReclaimReport>,
 }
 
 fn gb_or_unknown(free_gb: Option<u64>) -> String {
@@ -288,11 +293,15 @@ impl EagerReclaimReport {
             .scratch
             .as_ref()
             .map_or_else(|| "n/a".to_string(), ScratchReclaimReport::removed_human);
+        let git_tmp = self
+            .git_tmp
+            .as_ref()
+            .map_or_else(|| "n/a".to_string(), GitTmpReclaimReport::removed_human);
         format!(
             "eager_reclaim: {} disk axis binds the dispatch cap down ({} free) — ran an \
              out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's own \
              scheduled pass: worktrees {} removed, deep-clean {deep}, docker {docker}, scratch \
-             {scratch} — now {} free vs. floor {}G (#7512)",
+             {scratch}, git-tmp {git_tmp} — now {} free vs. floor {}G (#7512)",
             self.repo_root.display(),
             gb_or_unknown(self.free_gb_before),
             self.worktrees_removed,
@@ -337,6 +346,8 @@ pub struct SubPasses<'a> {
     pub scratch: &'a dyn Fn(&Path) -> ScratchReclaimReport,
     /// Free GB on the worktree-root volume, sampled before and after.
     pub free_gb: &'a dyn Fn(&Path) -> Option<u64>,
+    /// [`crate::git_tmp_reclaim::run_for`] (#10995).
+    pub git_tmp: &'a dyn Fn(&Path) -> GitTmpReclaimReport,
 }
 
 /// Everything one [`run_pass`] needs besides its injected seams.
@@ -357,7 +368,8 @@ pub struct EagerReclaimInputs {
 
 /// Run one eager pass over `repo_root`, in the exact order
 /// [`crate::worktree_reaper::reap_repo`] already uses for its scheduled pass:
-/// merged-PR worktree reap → deep clean → docker retention → scratch reclaim.
+/// merged-PR worktree reap → git temp-file reclaim (#10995) → deep clean →
+/// docker retention → scratch reclaim.
 ///
 /// The ordering is load-bearing and inherited, not invented here: the cheap
 /// worktree sweeps run first so that the expensive, pressure-gated deep pass
@@ -385,6 +397,7 @@ pub fn run_pass(
         docker: None,
         scratch: None,
         at: inputs.now,
+        git_tmp: None,
     };
 
     if !inputs.enabled {
@@ -408,6 +421,9 @@ pub fn run_pass(
 
     let free_gb_before = (passes.free_gb)(repo_root);
     let worktrees_removed = (passes.reap_worktrees)(repo_root);
+    // #10995: cheap and precise, so before the pressure-gated deep pass, which
+    // then re-probes free space after it — as in `reap_repo`.
+    let git_tmp = (passes.git_tmp)(repo_root);
     let deep_clean = (passes.deep_clean)(repo_root);
     let docker = (passes.docker)(repo_root);
     let scratch = (passes.scratch)(repo_root);
@@ -424,6 +440,7 @@ pub fn run_pass(
         docker: Some(docker),
         scratch: Some(scratch),
         at: inputs.now,
+        git_tmp: Some(git_tmp),
     }
 }
 
@@ -496,12 +513,14 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let docker = crate::docker_image_clean::run_for;
     let scratch = crate::scratch_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
+    let git_tmp = crate::git_tmp_reclaim::run_for;
     let passes = SubPasses {
         reap_worktrees: &reap_worktrees,
         deep_clean: &deep_clean,
         docker: &docker,
         scratch: &scratch,
         free_gb: &free_gb,
+        git_tmp: &git_tmp,
     };
 
     let report = run_pass(repo_root, &inputs, &passes);
@@ -662,6 +681,17 @@ mod tests {
         }
     }
 
+    fn stub_git_tmp_report(root: &Path, now: DateTime<Utc>) -> GitTmpReclaimReport {
+        GitTmpReclaimReport {
+            repo_root: root.to_path_buf(),
+            enabled: true,
+            dry_run: false,
+            totals: crate::git_tmp_reclaim::SweepTotals::default(),
+            skipped: None,
+            at: now,
+        }
+    }
+
     fn run_with_counters(inputs: &EagerReclaimInputs, counters: &Counters) -> EagerReclaimReport {
         let now = inputs.now;
         let reap = |_: &Path| {
@@ -681,12 +711,17 @@ mod tests {
             stub_scratch_report(root, now)
         };
         let free_gb = |_: &Path| Some(3u64);
+        let git_tmp = |root: &Path| {
+            counters.order.borrow_mut().push("git_tmp");
+            stub_git_tmp_report(root, now)
+        };
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
             free_gb: &free_gb,
+            git_tmp: &git_tmp,
         };
         run_pass(Path::new("/repo"), inputs, &passes)
     }
@@ -709,9 +744,10 @@ mod tests {
         assert_eq!(report.worktrees_removed, 2);
         assert_eq!(
             *counters.order.borrow(),
-            vec!["worktrees", "deep", "docker", "scratch"],
+            vec!["worktrees", "git_tmp", "deep", "docker", "scratch"],
             "must mirror worktree_reaper::reap_repo's own sequencing"
         );
+        assert!(report.git_tmp.is_some());
         assert!(report.deep_clean.is_some());
         assert!(report.docker.is_some());
         assert!(report.scratch.is_some());
@@ -737,7 +773,7 @@ mod tests {
         inputs.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.is_none());
-        assert_eq!(counters.total(), 4);
+        assert_eq!(counters.total(), 5);
     }
 
     #[test]
@@ -786,12 +822,14 @@ mod tests {
         let docker = |_: &Path| stub_docker_report(now);
         let scratch = |root: &Path| stub_scratch_report(root, now);
         let free_gb = |_: &Path| Some(1u64);
+        let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
             free_gb: &free_gb,
+            git_tmp: &git_tmp,
         };
         let report = run_pass(Path::new("/repo"), &base_inputs(now), &passes);
 
@@ -912,7 +950,14 @@ mod tests {
             line.starts_with("eager_reclaim:"),
             "must not be confusable with worktree_reaper:'s scheduled-pass line"
         );
-        for needle in ["worktrees", "deep-clean", "docker", "scratch", "floor 20G"] {
+        for needle in [
+            "worktrees",
+            "deep-clean",
+            "docker",
+            "scratch",
+            "git-tmp",
+            "floor 20G",
+        ] {
             assert!(line.contains(needle), "log line missing {needle}: {line}");
         }
     }
