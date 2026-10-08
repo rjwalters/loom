@@ -201,16 +201,16 @@ gh issue list --label "$L" --state open --json number,title,labels \
 done
 ```
 
-Curate each at once (no workflow label = treat as `loom:triage`), then add
+Curate each now (no workflow label = `loom:triage`), then add
 `loom:curated` and `loom:issue` in ONE label POST. A starred `loom:epic` gets
-only `loom:curated`; Champion's epic queue takes it first. Guards: skip the query's labels and hard exclusions. Never add or remove a priority label (the star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
+only `loom:curated`; Champion's epic queue takes it first. Skip the query's labels and hard exclusions. Never add or remove a priority label (star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate, never
-promote: the daemon admits them on a red `main`. Then Champion's revision requests, starred first, then oldest
-("Revising `loom:needs-revision`" below, #10753):
+promote (the daemon admits them on a red `main`). Then revision requests ("Revising `loom:needs-revision`" below, #10753):
+level 2, star, rest, each oldest first:
 
 ```bash
-gh issue list --label loom:needs-revision --state open --json number,title,labels,createdAt \
-  --jq 'sort_by(.createdAt) | sort_by([.labels[].name] | any(test("^loom:(operator-(high-)?priority|high-priority-inherited)$")) | not) | .[] | select([.labels[].name] | index("loom:curating") | not) | "#\(.number) \(.title)"'
+gh issue list --label loom:needs-revision --state open --limit 500 --json number,title,labels,createdAt \
+  --jq 'sort_by([(.labels|map(.name)|if any(.==("loom:operator-high-priority","loom:high-priority-inherited")) then 0 elif index("loom:operator-priority") then 1 else 2 end), .createdAt]) | .[] | select([.labels[].name] | index("loom:curating") | not) | "#\(.number) \(.title)"'
 ```
 
 ### Priority 1: Approved Issues Needing Curation
@@ -1775,14 +1775,13 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
 
 ## Revising `loom:needs-revision` (#10753)
 
-Champion adds `loom:needs-revision` with a NEEDS REVISION verdict an agent can
-close. Claim it (`loom:curating`), read the latest trusted `Champion Review:
+Champion adds `loom:needs-revision` with an agent-closable NEEDS REVISION verdict. Claim it (`loom:curating`), read the latest trusted `Champion Review:
 NEEDS REVISION` comment (first bullet list = findings), then:
 
-- **Revise** (the normal case). Edit the body, never only comment: an unchanged body hash
-  gets the same re-rejection. Fix each finding
-  (verify facts against `origin/main`) or refute it with evidence, then append a
-  dated `## Revision` section answering each by name. Then remove `loom:needs-revision` and `loom:curating` in one edit
+- **Revise** (the normal case). Edit the body, never only comment (an unchanged body hash
+  gets the same re-rejection). Fix each finding
+  (verify against `origin/main`) or refute it with evidence, then append a
+  dated `## Revision` section answering each by name. Then remove both labels in one edit
   (`loom:curated` stays; a starred non-epic issue also gets `loom:issue`).
 - **Split** an oversized issue per "Decomposing Oversized Issues", then park
   the parent on its children:

@@ -137,16 +137,17 @@ EOF
 # apply the caller's OWN --jq expression.
 cat >"$FIXTURE_DIR/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-label=""; expr="."
+label=""; expr="."; limit=30
 while [ $# -gt 0 ]; do
   case "$1" in
     --label=*) label="${1#--label=}"; shift ;;
     --label) label="$2"; shift 2 ;;
     --jq) expr="$2"; shift 2 ;;
+    --limit) limit="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-jq --arg l "$label" '[.[] | select([.labels[].name] | index($l))]' "$LOOM_TEST_ISSUES" | jq -r "$expr"
+jq --arg l "$label" --argjson n "$limit" '[.[] | select([.labels[].name] | index($l))] | . as $a | ($a | sort_by(.createdAt) | reverse | .[:$n] | map(.number)) as $keep | $a | map(select(.number as $x | $keep | index($x)))' "$LOOM_TEST_ISSUES" | jq -r "$expr"
 STUB
 chmod +x "$FIXTURE_DIR/bin/gh"
 
@@ -223,8 +224,29 @@ else
     sed 's/,"loom:needs-revision"//' "$FIXTURE_DIR/curator-star.sh" >"$FIXTURE_DIR/curator-star-old.sh"
     assert_eq "#21 #22 #20 #23" "$(run_stars curator-star-old.sh | numbers_of)" \
         "negative control: without the exclusion, starred rejected proposals reach promotion"
-    assert_eq "#20 #21 #22 #24" "$(run_stars curator-q.sh | numbers_of)" \
-        "the revision queue lists starred issues first (all three labels), then the rest, skipping the claimed #25"
+    assert_eq "#21 #22 #20 #24" "$(run_stars curator-q.sh | numbers_of)" \
+        "the revision queue lists level 2 (direct, inherited), then the star, then the rest, skipping the claimed #25"
+fi
+# Backlog > 30 (gh default page) and priority levels: the queue must see every row, level 2 first.
+python3 -I - "$FIXTURE_DIR/backlog.json" <<'PY'
+import json, sys
+rows = [{"number": 100 + i, "title": "rev %d" % i, "createdAt": "2026-09-%02dT00:00:00Z" % (i + 1),
+         "labels": [{"name": "loom:curated"}, {"name": "loom:needs-revision"}]} for i in range(31)]
+rows[0]["labels"].append({"name": "loom:operator-priority"})            # oldest, ordinary star, outside newest 30
+rows.append({"number": 200, "title": "newer direct level 2", "createdAt": "2026-10-05T00:00:00Z",
+             "labels": [{"name": "loom:operator-high-priority"}, {"name": "loom:needs-revision"}]})
+rows.append({"number": 201, "title": "newest inherited level 2", "createdAt": "2026-10-06T00:00:00Z",
+             "labels": [{"name": "loom:high-priority-inherited"}, {"name": "loom:needs-revision"}]})
+json.dump(rows, open(sys.argv[1], "w"))
+PY
+if [[ -s "$FIXTURE_DIR/curator-q.sh" ]]; then
+    BACKLOG="$( cd "$FIXTURE_DIR" && PATH="$FIXTURE_DIR/bin:$PATH" LOOM_TEST_ISSUES="$FIXTURE_DIR/backlog.json" bash curator-q.sh 2>&1 | numbers_of )"
+    assert_eq "#200 #201 #100 #101" "$(printf '%s\n' "$BACKLOG" | cut -d' ' -f1-4)" \
+        "level 2 (direct and inherited) precedes an older ordinary star, which precedes the rest oldest-first"
+    assert_contains " $BACKLOG " " #100 " "an old starred request outside the newest 30 is still listed (explicit --limit)"
+    sed 's/ --limit 500//' "$FIXTURE_DIR/curator-q.sh" >"$FIXTURE_DIR/curator-q-nolimit.sh"
+    NOLIMIT="$( cd "$FIXTURE_DIR" && PATH="$FIXTURE_DIR/bin:$PATH" LOOM_TEST_ISSUES="$FIXTURE_DIR/backlog.json" bash curator-q-nolimit.sh 2>&1 | numbers_of )"
+    assert_not_contains " $NOLIMIT " " #100 " "negative control: without --limit the oldest request falls off the default 30-row page"
 fi
 assert_contains "$(section_body "Revising" <"$CURATOR_MD")" "a starred non-epic issue also gets \`loom:issue\`" \
     "revision completion defines the post-revision star behaviour in the same edit that clears loom:needs-revision"
