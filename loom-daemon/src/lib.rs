@@ -290,6 +290,7 @@ pub mod reconcile_stack;
 /// `defaults/scripts/lib/default-branch.sh`.
 pub mod refname;
 pub mod release_fetch;
+pub mod release_provenance;
 pub mod release_resolve;
 pub mod repo_root;
 pub mod restart_verify;

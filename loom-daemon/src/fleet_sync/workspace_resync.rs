@@ -4,8 +4,8 @@
 //!
 //! # What a pass does
 //!
-//! For every registered workspace it fetches the default branch, reads the
-//! install metadata from that branch (never the working tree) and classifies:
+//! For every registered workspace it reads the install metadata from the
+//! default branch (never the working tree) and classifies:
 //!
 //! | State | Meaning | This pass |
 //! |---|---|---|
@@ -23,26 +23,65 @@
 //! W2 is the resync itself, under the per-repo claim
 //! ([`crate::fleet_store::resync_claim`]): a throwaway detached worktree off
 //! `origin/<default>`, the payload applied there, one commit, a push that is
-//! never forced. At most one W2 per pass, so a tick's wall time is bounded.
+//! never forced. At most one W2 per pass.
 //!
-//! # Only from H0
+//! # What a pass costs
 //!
-//! [`host_gate`] decides whether this host may claim or write at all. A host
-//! that fails it still classifies and reports. The gate is asked twice: at
-//! the start of the pass and again immediately before the push.
+//! The verdict for a workspace is cached per (default-branch commit, running
+//! version), in [`Memory`].
+//!
+//! * A host that may not write (`fleet.autoApply` off, or not in H0, which
+//!   includes `paused`) makes **no network call at all**. It classifies from
+//!   the clone's own `origin/<default>` ref and reports that.
+//! * A settled workspace (W0, W4, repo-ahead, not installed) costs nothing
+//!   until [`recheck_after`] has passed, then one `git ls-remote` of the
+//!   default branch. If the head is the cached commit, that is all.
+//! * A stale workspace (W1, W3) is probed with `git ls-remote` every tick,
+//!   because another host may be resyncing it.
+//! * `git fetch` runs only when the probed head is not already the clone's
+//!   `origin/<default>`.
+//!
+//! The running version only changes with a restart, which empties the cache,
+//! so startup and a version change both check every workspace.
+//!
+//! # A pass is bounded
+//!
+//! * It runs on its own task, one at a time ([`host`]), so it can never
+//!   delay the fleet-store sync, the floor or `paused`/`stopped` enforcement.
+//! * Classification stops asking the network once [`PASS_BUDGET`] is spent.
+//!   The workspaces it did not reach keep their last verdict, and the next
+//!   pass starts with them.
+//! * Every git child has a timeout of at most a minute ([`git`]).
+//! * Three remotes in a row that do not answer end the pass's network use.
+//!
+//! # Only from H0, only an official release build
+//!
+//! [`host_gate`] decides whether this host may claim or write at all. It is
+//! read at the start of the pass, again immediately before the claim, and
+//! again immediately before the push. A binary that is not a verified
+//! official release build never passes it ([`crate::release_provenance`]).
+//!
+//! # A repo cannot be resynced in a loop
+//!
+//! Whatever the cause, a repo gets at most one daemon resync commit per
+//! running version, and at most one per [`cooldown`]. The record is the
+//! default branch itself: resync commits carry `Loom-Resync-Version`. A
+//! workspace that is stale again at a version it was already resynced to is
+//! refused and alerted once as `resync-loop` (see `w2::bound`).
 //!
 //! # When it runs
 //!
 //! On the fleet-sync timer and once at startup (as soon as the startup pass
-//! has finished and the drain state exists), from the daemon's own loop. It
-//! writes only when `fleet.autoApply` is on, like every other timer write.
-//! Nothing here schedules anything, and nothing waits for a roll window.
+//! has finished and the drain state exists). It writes only when
+//! `fleet.autoApply` is on, like every other timer write. Nothing here
+//! schedules anything, and nothing waits for a roll window.
 
 mod git;
 mod host;
+mod memory;
+mod w2;
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,14 +90,15 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::Mode;
-use crate::fleet_store::resync_claim::{stale_after, Acquire, ClaimForge, Claimant, Held};
-use crate::init::payload::{
-    gate_metadata, materialize_with, resync_workspace_with, Payload, ResyncOutcome, ResyncRefusal,
-};
+use crate::fleet_store::resync_claim::{stale_after, ClaimForge};
+use crate::init::payload::{gate_metadata, materialize_with, Payload, ResyncRefusal};
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS_INSTALLED};
 
 pub use host::{host_gate, HostGateInputs, NotCurrent};
-pub(super) use host::{mark_boot, mark_verified, pass};
+pub(super) use host::{latest, mark_boot, mark_verified, spawn_pass};
+use memory::FailureKind;
+pub use memory::{recheck_after, Memory, OUTAGE_HOLD_CAP, RECHECK_TICKS};
+use w2::attempt;
 
 /// Event-bus topic a resync failure that needs a person is published on.
 pub const ALERT_TOPIC: &str = "fleet_sync.workspace_resync";
@@ -68,6 +108,21 @@ pub const BACKOFF_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Consecutive failures (other than a protection rule) before an alert.
 pub const ALERT_AFTER: u32 = 3;
+
+/// How long one pass may spend asking remotes for their heads. Workspaces
+/// it did not reach are first in the next pass.
+pub const PASS_BUDGET: Duration = Duration::from_secs(45);
+
+/// Remotes in a row that do not answer before a pass stops asking.
+pub const UNREACHABLE_IN_A_ROW: u32 = 3;
+
+/// The least time between two daemon resync commits on one repo, whoever
+/// made them and whatever version they installed: the claim's stale window,
+/// `max(10 x syncIntervalSecs, 15 min)`.
+#[must_use]
+pub fn cooldown(interval: Duration) -> Duration {
+    stale_after(interval)
+}
 
 // ============================================================================
 // What a pass reports
@@ -147,7 +202,8 @@ pub struct Alert {
     pub root: PathBuf,
     /// `OWNER/REPO`, when known.
     pub repo: Option<String>,
-    /// `branch-protection` or `failure`.
+    /// `branch-protection`, `failure`, `resync-loop`, or `network` (one for
+    /// the host, with an empty `root`, however many remotes are down).
     pub kind: &'static str,
     /// Consecutive failures so far.
     pub failures: u32,
@@ -163,14 +219,21 @@ pub struct Alert {
 pub struct WorkspacePass {
     /// The version this daemon runs and would install.
     pub running: String,
-    /// Why this host only reported, when it did: it is not in H0, or its
-    /// payload is not a release. A host-level fact, said once.
+    /// Why this host only reported, when it did: it is not in H0, or it is
+    /// not a verified official release build. A host-level fact, said once.
     pub host: Option<String>,
     /// Every registered workspace.
     pub workspaces: Vec<WorkspaceReport>,
     /// Failures to publish. Not part of the snapshot.
     #[serde(skip)]
     pub alerts: Vec<Alert>,
+    /// `git ls-remote` calls this pass made. Not part of the snapshot.
+    #[serde(skip)]
+    pub probes: u32,
+    /// `git fetch` calls this pass made while classifying. Not part of the
+    /// snapshot.
+    #[serde(skip)]
+    pub fetches: u32,
 }
 
 impl WorkspacePass {
@@ -204,97 +267,6 @@ impl WorkspacePass {
             lines.push(format!("  workspace {name}: {}{reason}{installed}", w.state.as_str()));
         }
         lines
-    }
-}
-
-// ============================================================================
-// What a host remembers between passes
-// ============================================================================
-
-#[derive(Debug, Clone)]
-struct Backoff {
-    failures: u32,
-    next_attempt: DateTime<Utc>,
-    state: WState,
-    last_error: String,
-}
-
-#[derive(Debug, Clone)]
-struct Verdict {
-    commit: String,
-    version: String,
-    stale: bool,
-}
-
-/// Per-repo state kept in process memory. It resets on restart: a restarted
-/// host re-evaluates every workspace from scratch on its first H0 tick.
-#[derive(Debug, Default)]
-pub struct Memory {
-    backoff: HashMap<PathBuf, Backoff>,
-    /// The diff verdict for a default-branch commit and a payload version, so
-    /// an unchanged repo costs a fetch and no diff.
-    verdicts: HashMap<PathBuf, Verdict>,
-    /// Things said once per process.
-    noted: HashSet<String>,
-}
-
-/// How a failure counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureKind {
-    /// A rule on the remote refused the push. Retrying sooner cannot help.
-    Protected,
-    /// Anything else.
-    Other,
-}
-
-impl Memory {
-    /// The backoff delay after `failures` consecutive failures: one sync
-    /// interval, doubling, capped at [`BACKOFF_CAP`].
-    #[must_use]
-    pub fn delay(interval: Duration, failures: u32) -> Duration {
-        let doublings = failures.saturating_sub(1).min(20);
-        interval.saturating_mul(1u32 << doublings).min(BACKOFF_CAP)
-    }
-
-    fn fail(
-        &mut self,
-        report: &WorkspaceReport,
-        kind: FailureKind,
-        detail: &str,
-        interval: Duration,
-        now: DateTime<Utc>,
-    ) -> (DateTime<Utc>, Option<Alert>) {
-        let failures = self
-            .backoff
-            .get(&report.root)
-            .map_or(0, |b| b.failures)
-            .saturating_add(1);
-        let delay = match kind {
-            FailureKind::Protected => BACKOFF_CAP,
-            FailureKind::Other => Self::delay(interval, failures),
-        };
-        let next_attempt = now + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
-        self.backoff.insert(
-            report.root.clone(),
-            Backoff {
-                failures,
-                next_attempt,
-                state: report.state,
-                last_error: detail.to_string(),
-            },
-        );
-        let alert = (kind == FailureKind::Protected || failures >= ALERT_AFTER).then(|| Alert {
-            root: report.root.clone(),
-            repo: report.repo.clone(),
-            kind: match kind {
-                FailureKind::Protected => "branch-protection",
-                FailureKind::Other => "failure",
-            },
-            failures,
-            detail: detail.to_string(),
-            next_attempt,
-        });
-        (next_attempt, alert)
     }
 }
 
@@ -336,7 +308,8 @@ pub struct Env<'a> {
     pub running: Version,
     /// The fleet floor in force, if any.
     pub floor: Option<Version>,
-    /// The fleet-sync cadence: the unit of the backoff and the stale window.
+    /// The fleet-sync cadence: the unit of the backoff, the recheck window
+    /// and the stale window.
     pub interval: Duration,
     /// The running release's payload.
     pub payload: &'a LazyPayload,
@@ -351,6 +324,8 @@ pub struct Env<'a> {
     pub gate: &'a dyn Fn() -> std::result::Result<(), NotCurrent>,
     /// The clock.
     pub clock: &'a dyn Fn() -> DateTime<Utc>,
+    /// Has this pass used its [`PASS_BUDGET`]? Read before each workspace.
+    pub spent: &'a dyn Fn() -> bool,
 }
 
 /// A stale workspace this pass may resync.
@@ -361,51 +336,143 @@ struct Candidate {
     commit: String,
 }
 
+/// What one pass has done on the network so far, and what it will publish.
+#[derive(Default)]
+struct Scan {
+    /// May this pass ask remotes and the forge at all?
+    online: bool,
+    probes: u32,
+    fetches: u32,
+    reached: u32,
+    unreachable: u32,
+    in_a_row: u32,
+    first_error: Option<String>,
+    alerts: Vec<Alert>,
+}
+
+impl Scan {
+    fn answered(&mut self, root: &Path, memory: &mut Memory) {
+        self.reached += 1;
+        self.in_a_row = 0;
+        memory.down.remove(root);
+    }
+
+    fn no_answer(&mut self, root: &Path, name: &str, detail: &str, memory: &mut Memory) {
+        self.unreachable += 1;
+        self.in_a_row += 1;
+        self.first_error
+            .get_or_insert_with(|| format!("{name}: {detail}"));
+        memory.down.insert(root.to_path_buf());
+        if self.in_a_row >= UNREACHABLE_IN_A_ROW && self.online {
+            log::warn!(
+                "workspace_resync: {UNREACHABLE_IN_A_ROW} remotes in a row did not answer; not \
+                 asking any more this pass"
+            );
+            self.online = false;
+        }
+    }
+}
+
 /// Run one workspace pass over `roots`. Never fails: every failure lands in a
 /// report, the backoff and (at the thresholds) an alert.
 pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) -> WorkspacePass {
     let gate = (env.gate)();
+    let started = (env.clock)();
     let mut pass = WorkspacePass {
         running: env.running.to_string(),
         host: gate.err().map(|why| why.host_note()),
         ..WorkspacePass::default()
     };
-    if gate == Err(NotCurrent::NotAReleaseBuild) && memory.noted.insert("release".into()) {
-        log::warn!(
-            "workspace_resync: this daemon is not a release build, so it will never resync a \
-             workspace (reported once)"
-        );
+    if let Err(why) = gate {
+        if why.is_about_the_build() && memory.noted.insert(format!("release:{why}")) {
+            log::warn!(
+                "workspace_resync: {why}, so this host does not resync any workspace (reported \
+                 once)"
+            );
+        }
     }
+    // The network is for a host that may write. One that may not (autoApply
+    // off, paused, rolling, not a release build) reports from what its clones
+    // already hold and asks nobody.
+    let mut scan = Scan {
+        online: mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none(),
+        ..Scan::default()
+    };
+    let count = roots.len();
+    let first = if count == 0 { 0 } else { memory.cursor % count };
+    let mut reports: Vec<Option<WorkspaceReport>> = vec![None; count];
     let mut candidates = Vec::new();
-    for root in roots {
-        let (report, found) = classify(env, root, gate, memory, &mut pass.alerts);
+    let mut resume = None;
+    for step in 0..count {
+        let index = (first + step) % count;
+        let Some(root) = roots.get(index) else {
+            continue;
+        };
+        if resume.is_none() && (env.spent)() {
+            resume = Some(index);
+        }
+        let (report, found) = if resume.is_some() {
+            (carried(env, root, memory), None)
+        } else {
+            classify(env, root, gate, memory, &mut scan)
+        };
         if let Some((nwo, branch, commit)) = found {
             candidates.push(Candidate {
-                index: pass.workspaces.len(),
+                index,
                 nwo,
                 branch,
                 commit,
             });
         }
-        pass.workspaces.push(report);
-    }
-    if mode != Mode::Write || gate.is_err() {
-        return pass;
-    }
-    // W3 first: dispatch into it is (or will be) held until it is resynced.
-    candidates.sort_by_key(|c| {
-        pass.workspaces
-            .get(c.index)
-            .is_none_or(|w| w.state != WState::W3)
-    });
-    for candidate in &candidates {
-        let Some(report) = pass.workspaces.get_mut(candidate.index) else {
-            continue;
-        };
-        if attempt(env, candidate, report, memory, &mut pass.alerts) {
-            break;
+        if let Some(slot) = reports.get_mut(index) {
+            *slot = Some(report);
         }
     }
+    if let Some(index) = resume {
+        memory.cursor = index;
+        log::info!(
+            "workspace_resync: the pass's {}s budget was spent; {} workspace(s) keep their last \
+             verdict and are first next pass",
+            PASS_BUDGET.as_secs(),
+            (first + count - index) % count
+        );
+    }
+    pass.workspaces = reports.into_iter().flatten().collect();
+    if mode == Mode::Write && gate.is_ok() {
+        // W3 first: dispatch into it is (or will be) held until it is resynced.
+        candidates.sort_by_key(|c| {
+            pass.workspaces
+                .get(c.index)
+                .is_none_or(|w| w.state != WState::W3)
+        });
+        for candidate in &candidates {
+            let Some(report) = pass.workspaces.get_mut(candidate.index) else {
+                continue;
+            };
+            if !scan.online || attempt(env, candidate, report, memory, &mut scan) {
+                break;
+            }
+        }
+    }
+    let outage = memory.note_network(
+        scan.reached,
+        scan.unreachable,
+        scan.first_error.as_deref(),
+        env.interval,
+        (env.clock)(),
+    );
+    if let Some(alert) = outage {
+        log::error!("workspace_resync: {}", alert.detail);
+        scan.alerts.push(alert);
+    }
+    log::debug!(
+        "workspace_resync: pass over {count} workspace(s): {} ls-remote, {} fetch",
+        scan.probes,
+        scan.fetches
+    );
+    pass.probes = scan.probes;
+    pass.fetches = scan.fetches;
+    pass.alerts = scan.alerts;
     pass
 }
 
@@ -422,6 +489,20 @@ fn report_for(root: &Path) -> WorkspaceReport {
 
 fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// The report for a workspace this pass did not get to: its last verdict.
+/// No git, no network.
+fn carried(env: &Env<'_>, root: &Path, memory: &Memory) -> WorkspaceReport {
+    let mut report = report_for(root);
+    report.repo = (env.nwo)(root);
+    match memory.verdicts.get(root) {
+        Some(verdict) => verdict.fill(&mut report),
+        None => {
+            report.reason = Some("not checked yet: the pass ran out of time".to_string());
+        }
+    }
+    report
 }
 
 /// Record a failure against `report`'s repo and say so in the report.
@@ -456,7 +537,7 @@ fn classify(
     root: &Path,
     gate: std::result::Result<(), NotCurrent>,
     memory: &mut Memory,
-    alerts: &mut Vec<Alert>,
+    scan: &mut Scan,
 ) -> (WorkspaceReport, Option<(String, String, String)>) {
     let mut report = report_for(root);
     let skip = |mut report: WorkspaceReport, why: &str| {
@@ -478,6 +559,9 @@ fn classify(
         return skip(report, "forge-unsupported: origin is not a GitHub remote");
     };
     report.repo = Some(nwo.clone());
+    // A resync that was killed leaves its worktree behind. One pass runs at a
+    // time and one daemon per host, so none is in use now.
+    git::clean_stale_worktrees(root);
     if let Some(b) = memory.backoff.get(root) {
         if b.next_attempt > (env.clock)() {
             report.state = b.state;
@@ -486,31 +570,130 @@ fn classify(
             return (report, None);
         }
     }
-    match classify_fetched(env, root, gate, memory, &mut report) {
+    let online = scan.online;
+    match classify_head(env, root, gate, memory, scan, online, &mut report) {
         Ok(found) => (report, found.map(|(branch, commit)| (nwo, branch, commit))),
         Err(e) => {
-            record_failure(env, &mut report, FailureKind::Other, &format!("{e:#}"), memory, alerts);
+            if let Some(down) = e.downcast_ref::<git::Unreachable>() {
+                // The remote did not answer. Not this repo's failure to be
+                // alerted on: the pass reports it once, for the host. The
+                // workspace is still reported, from what the clone holds.
+                scan.no_answer(root, &nwo, &down.0, memory);
+                let mut offline = report_for(root);
+                offline.repo = Some(nwo.clone());
+                if classify_head(env, root, gate, memory, scan, false, &mut offline).is_ok() {
+                    report = offline;
+                }
+                let detail = format!("remote did not answer: {}", down.0);
+                record_failure(
+                    env,
+                    &mut report,
+                    FailureKind::Unreachable,
+                    &detail,
+                    memory,
+                    &mut scan.alerts,
+                );
+            } else {
+                let detail = format!("{e:#}");
+                record_failure(
+                    env,
+                    &mut report,
+                    FailureKind::Other,
+                    &detail,
+                    memory,
+                    &mut scan.alerts,
+                );
+            }
             (report, None)
         }
     }
 }
 
-/// The part of [`classify`] that can fail: fetch, read the default branch,
-/// gate, diff. Returns the branch and commit of a stale workspace.
-fn classify_fetched(
+/// The part of [`classify`] that can fail: find the default branch's head
+/// (asking the remote only when `online` and the cached verdict is due),
+/// and evaluate it unless it is the commit already evaluated. Returns the
+/// branch and commit of a stale workspace.
+fn classify_head(
     env: &Env<'_>,
     root: &Path,
     gate: std::result::Result<(), NotCurrent>,
     memory: &mut Memory,
+    scan: &mut Scan,
+    online: bool,
     report: &mut WorkspaceReport,
 ) -> Result<Option<(String, String)>> {
     let branch = git::default_branch(root)
-        .ok_or_else(|| anyhow!("no default branch ref (origin/HEAD or origin/main)"))?;
-    let commit = git::fetch(root, &branch)?;
-    let Some(raw) = git::metadata_at(root, &commit)? else {
+        .ok_or_else(|| anyhow!("no usable default branch ref (origin/HEAD or origin/main)"))?;
+    let version = env.running.to_string();
+    let now = (env.clock)();
+    let cached = memory
+        .verdicts
+        .get(root)
+        .filter(|v| v.version == version && v.branch == branch)
+        .cloned();
+    let known = |commit: &str| cached.as_ref().filter(|v| v.commit == commit);
+    let reuse = |verdict: &memory::Verdict, report: &mut WorkspaceReport| {
+        verdict.fill(report);
+        verdict
+            .stale()
+            .then(|| (branch.clone(), verdict.commit.clone()))
+    };
+    let mut probed = false;
+    let commit = if online {
+        if let Some(verdict) = cached.as_ref().filter(|v| !v.probe_due(now, env.interval)) {
+            return Ok(reuse(verdict, report));
+        }
+        scan.probes += 1;
+        let head = git::remote_head(root, &branch)?;
+        scan.answered(root, memory);
+        probed = true;
+        if let Some(verdict) = known(&head) {
+            memory.confirm(root, now);
+            return Ok(reuse(verdict, report));
+        }
+        if git::tracking_head(root, &branch).as_deref() == Some(head.as_str()) {
+            // The clone already has this commit: nothing to fetch.
+            head
+        } else {
+            scan.fetches += 1;
+            git::fetch(root, &branch)?
+        }
+    } else {
+        let Some(head) = git::tracking_head(root, &branch) else {
+            // Nothing to read, and this pass asks no remote. Not a failure.
+            report.reason = Some(format!("origin/{branch} has not been fetched in this clone"));
+            return Ok(None);
+        };
+        if let Some(verdict) = known(&head) {
+            return Ok(reuse(verdict, report));
+        }
+        head
+    };
+    if evaluate(env, root, &branch, &commit, gate, report)? {
+        memory.settle(root, &branch, &commit, &version, report, probed, now, env.interval);
+    }
+    if report.state == WState::W0 {
+        // A repo that reached W0 has nothing left to back off from.
+        memory.backoff.remove(root);
+    }
+    let stale = matches!(report.state, WState::W1 | WState::W3);
+    Ok(stale.then_some((branch, commit)))
+}
+
+/// Read `commit`'s install metadata, gate it and diff the payload against it,
+/// into `report`. Returns whether the result is worth remembering.
+fn evaluate(
+    env: &Env<'_>,
+    root: &Path,
+    branch: &str,
+    commit: &str,
+    gate: std::result::Result<(), NotCurrent>,
+    report: &mut WorkspaceReport,
+) -> Result<bool> {
+    let Some(raw) = git::metadata_at(root, commit)? else {
         report.state = WState::Skipped;
         report.reason = Some("Loom is not installed on the default branch".to_string());
-        return Ok(None);
+        return Ok(true);
     };
     if let Ok(meta) = InstallMeta::parse(&raw) {
         report.installed = meta.loom_version;
@@ -523,31 +706,29 @@ fn classify_fetched(
         }
         Err(refusal) => {
             (report.state, report.reason) = refused(&refusal);
-            return Ok(None);
+            return Ok(true);
         }
     };
     if gate == Err(NotCurrent::NotAReleaseBuild) {
         // Without a release payload there is nothing to diff against. The
         // reason is the host's, already said once on the pass.
-        return Ok(None);
+        return Ok(false);
     }
-    if !diff_is_stale(env, root, &commit, memory)? {
+    if diff_is_stale(env, root, commit)? {
+        report.state = if compat == Compat::InstalledTooOld {
+            WState::W3
+        } else {
+            WState::W1
+        };
+    } else {
         report.state = WState::W0;
         if compat != Compat::Compatible {
             // The stamp is old or incomplete, the files are not. No resync
             // will ever rewrite it, so this is current, not owed.
             report.reason = Some("files match the payload; the stamp is left as is".to_string());
         }
-        // A repo that reached W0 has nothing left to back off from.
-        memory.backoff.remove(root);
-        return Ok(None);
     }
-    report.state = if compat == Compat::InstalledTooOld {
-        WState::W3
-    } else {
-        WState::W1
-    };
-    Ok(Some((branch, commit)))
+    Ok(true)
 }
 
 fn daemon(env: &Env<'_>) -> DaemonCompat {
@@ -575,21 +756,15 @@ fn refused(refusal: &ResyncRefusal) -> (WState, Option<String>) {
 }
 
 /// Does this daemon's payload differ from `commit`'s installed files in a way
-/// a resync could close? Cached per default-branch commit and payload version.
-fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str, memory: &mut Memory) -> Result<bool> {
-    let version = env.running.to_string();
-    if let Some(v) = memory.verdicts.get(root) {
-        if v.commit == commit && v.version == version {
-            return Ok(v.stale);
-        }
-    }
+/// a resync could close? The caller caches the answer per commit.
+fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str) -> Result<bool> {
     let payload = env.payload.get()?;
     let tree = tempfile::Builder::new()
         .prefix("loom-resync-tree-")
         .tempdir()?;
     git::export_surfaces(root, commit, tree.path())?;
     let diff = materialize_with(payload, tree.path())?;
-    let stale = diff.stamp_pending() || {
+    Ok(diff.stamp_pending() || {
         let paths: Vec<String> = diff
             .added
             .iter()
@@ -599,216 +774,6 @@ fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str, memory: &mut Memory) 
             .collect();
         let ignored = git::ignored(root, root, &paths);
         paths.iter().any(|p| !ignored.contains(p))
-    };
-    remember(memory, root, commit, &version, stale);
-    Ok(stale)
-}
-
-fn remember(memory: &mut Memory, root: &Path, commit: &str, version: &str, stale: bool) {
-    memory.verdicts.insert(
-        root.to_path_buf(),
-        Verdict {
-            commit: commit.to_string(),
-            version: version.to_string(),
-            stale,
-        },
-    );
-}
-
-/// How a resync under the claim ended.
-enum Done {
-    /// One commit is on the default branch.
-    Pushed(String),
-    /// Nothing left to do at this commit: another host or a person did it.
-    AlreadyCurrent(String),
-    /// The re-read found a state this host never writes to.
-    NoWrite(WState, Option<String>),
-    /// Stopped before the push, on purpose. Not a failure.
-    Aborted(String),
-    /// The branch moved on both tries. Next tick.
-    Moved,
-    /// A rule on the remote refused the push.
-    Protected(String),
-}
-
-/// Try the claim for `candidate` and, if won, resync. Returns whether this
-/// pass has used its one W2 (so the remaining candidates wait a tick).
-fn attempt(
-    env: &Env<'_>,
-    candidate: &Candidate,
-    report: &mut WorkspaceReport,
-    memory: &mut Memory,
-    alerts: &mut Vec<Alert>,
-) -> bool {
-    let root = report.root.clone();
-    // Loom writes only to repositories it manages and can write (#9548). A
-    // refusal is this host's standing, not a failure: another host may hold
-    // a credential that can, so there is no backoff and no alert.
-    if let Err(why) = (env.may_write)(&root, &candidate.nwo) {
-        if memory
-            .noted
-            .insert(format!("scope:{}:{why}", root.display()))
-        {
-            log::warn!(
-                "workspace_resync: {}: not resynced from this host: {why} (reported once)",
-                candidate.nwo
-            );
-        }
-        report.reason = Some(format!("not written from this host: {why}"));
-        return false;
-    }
-    let forge = (env.forge)(&root, &candidate.nwo);
-    let version = env.running.to_string();
-    let claimant = Claimant {
-        read: forge.as_read(),
-        write: forge.as_write(),
-        repo: &candidate.nwo,
-        host: env.host,
-        version: &version,
-        stale_after: stale_after(env.interval),
-    };
-    let acquired = git::tree_of(&root, &candidate.commit)
-        .and_then(|tree| claimant.acquire(&tree, (env.clock)()));
-    let held = match acquired {
-        Ok(Acquire::Won(held)) => held,
-        Ok(Acquire::HeldBy { host, since }) => {
-            log::debug!("workspace_resync: {}: claim held by {host}", candidate.nwo);
-            report.reason = Some(format!("claim held by {host} since {}", stamp(since)));
-            return false;
-        }
-        Ok(Acquire::Lost(why)) => {
-            log::debug!("workspace_resync: {}: {why}", candidate.nwo);
-            report.reason = Some(format!("claim not taken this tick: {why}"));
-            return false;
-        }
-        Err(e) => {
-            let detail = format!("claim: {e:#}");
-            record_failure(env, report, FailureKind::Other, &detail, memory, alerts);
-            return true;
-        }
-    };
-    let outcome = resync_under_claim(env, candidate, &root, &claimant, &held);
-    match claimant.release(&held) {
-        Ok(_) => {}
-        Err(e) => log::warn!(
-            "workspace_resync: {}: could not release the claim ({e:#}); it expires on its own",
-            candidate.nwo
-        ),
-    }
-    match outcome {
-        Ok(Done::Pushed(commit)) => {
-            memory.backoff.remove(&root);
-            log::info!(
-                "workspace_resync: {}: resynced installed Loom to v{version} ({commit})",
-                candidate.nwo
-            );
-            report.state = WState::W0;
-            report.installed = Some(version.clone());
-            report.reason = Some(format!("resynced to v{version} in {}", short(&commit)));
-        }
-        Ok(Done::AlreadyCurrent(commit)) => {
-            memory.backoff.remove(&root);
-            remember(memory, &root, &commit, &version, false);
-            report.state = WState::W0;
-            report.reason = Some("already current once the claim was held; no commit".to_string());
-        }
-        Ok(Done::NoWrite(state, reason)) => (report.state, report.reason) = (state, reason),
-        Ok(Done::Aborted(why)) => {
-            log::info!("workspace_resync: {}: resync abandoned: {why}", candidate.nwo);
-            report.reason = Some(why);
-        }
-        Ok(Done::Moved) => {
-            report.reason = Some("the default branch moved twice; retrying next tick".to_string());
-        }
-        Ok(Done::Protected(rule)) => {
-            let detail = format!("push refused by a branch rule: {rule}");
-            record_failure(env, report, FailureKind::Protected, &detail, memory, alerts);
-        }
-        Err(e) => {
-            record_failure(env, report, FailureKind::Other, &format!("{e:#}"), memory, alerts);
-        }
-    }
-    true
-}
-
-fn short(commit: &str) -> &str {
-    &commit[..commit.len().min(12)]
-}
-
-/// W2, with the claim held: re-read, apply in a throwaway worktree, commit,
-/// push. A moved branch is retried once.
-fn resync_under_claim(
-    env: &Env<'_>,
-    candidate: &Candidate,
-    root: &Path,
-    claimant: &Claimant<'_>,
-    held: &Held,
-) -> Result<Done> {
-    for _ in 0..2 {
-        // Everything is read again now that the claim is ours: another host
-        // or a person may have resynced it, or a newer host moved it ahead.
-        let commit = git::fetch(root, &candidate.branch)?;
-        let raw = git::metadata_at(root, &commit)?.ok_or_else(|| {
-            anyhow!("the install metadata is gone from origin/{}", candidate.branch)
-        })?;
-        if let Err(refusal) = gate_metadata(&raw, &daemon(env)) {
-            let (state, reason) = refused(&refusal);
-            return Ok(Done::NoWrite(state, reason));
-        }
-        let payload = env.payload.get()?;
-        git::clean_stale_worktrees(root);
-        let worktree = git::add_worktree(root, &commit)?;
-        let done = in_worktree(env, candidate, root, &worktree, &commit, payload, claimant, held);
-        git::remove_worktree(root, &worktree);
-        match done? {
-            Done::Moved => {}
-            other => return Ok(other),
-        }
-    }
-    Ok(Done::Moved)
-}
-
-#[allow(clippy::too_many_arguments)] // one step of W2; each argument is a distinct input
-fn in_worktree(
-    env: &Env<'_>,
-    candidate: &Candidate,
-    root: &Path,
-    worktree: &Path,
-    commit: &str,
-    payload: &Payload,
-    claimant: &Claimant<'_>,
-    held: &Held,
-) -> Result<Done> {
-    let written = match resync_workspace_with(payload, worktree)? {
-        ResyncOutcome::Refused(refusal) => {
-            let (state, reason) = refused(&refusal);
-            return Ok(Done::NoWrite(state, reason));
-        }
-        ResyncOutcome::Unchanged => return Ok(Done::AlreadyCurrent(commit.to_string())),
-        ResyncOutcome::Applied { written } => written,
-    };
-    let version = env.running;
-    let message = format!(
-        "chore(loom): resync installed Loom to v{version}\n\nLoom-Resync-Host: {}\n\
-         Loom-Resync-Version: {version}\n",
-        env.host
-    );
-    let Some(new) = git::commit(worktree, root, &written, &message)? else {
-        return Ok(Done::AlreadyCurrent(commit.to_string()));
-    };
-    // The second gate check and the fence, immediately before the push. A
-    // roll that started since the claim sets the drain flag; a claim that was
-    // taken over is no longer ours.
-    if let Err(why) = (env.gate)() {
-        return Ok(Done::Aborted(format!("{} before the push", why.host_note())));
-    }
-    if let Err(why) = claimant.fence(held, (env.clock)())? {
-        return Ok(Done::Aborted(format!("{why}; not pushing")));
-    }
-    Ok(match git::push(worktree, root, &candidate.branch)? {
-        git::Push::Accepted => Done::Pushed(new),
-        git::Push::NonFastForward => Done::Moved,
-        git::Push::Protected(rule) => Done::Protected(rule),
     })
 }
 

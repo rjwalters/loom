@@ -1,9 +1,15 @@
 //! The git half of the workspace resync (#10718): everything it runs in a
 //! registered workspace's clone. Reads go through the clone's object store
-//! and remote-tracking refs; the only writes are a `fetch`, a throwaway
-//! detached worktree under `.loom/worktrees/`, and a push that is never
-//! forced. The operator's checkout (its index and working tree) is not
-//! touched by anything here.
+//! and remote-tracking refs; the only writes are a `fetch` of the default
+//! branch (when its head moved), a throwaway detached worktree under
+//! `.loom/worktrees/`, and a push that is never forced. The operator's
+//! checkout (its index, working tree and `FETCH_HEAD`) is not touched by
+//! anything here.
+//!
+//! Every child runs under a short timeout (see the constants below), and a
+//! timed-out child's process group is killed. Every ref operand derived from
+//! the remote sits behind a standalone `--` (#9106, #9479), and the default
+//! branch's name is checked with [`crate::refname::check_refname`] first.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -11,14 +17,42 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
 
 use crate::install_compat::INSTALL_METADATA_PATH;
 use crate::proc_exec::{run_bounded, Completion};
 
 /// Local plumbing: no network, small output.
-const QUICK: Duration = Duration::from_secs(60);
-/// A fetch of one branch, or a checkout of the whole tree.
-const SLOW: Duration = Duration::from_secs(300);
+const QUICK: Duration = Duration::from_secs(20);
+/// `git ls-remote` of one ref: a connection and a ref advertisement.
+const PROBE: Duration = Duration::from_secs(15);
+/// A fetch of one branch.
+const FETCH: Duration = Duration::from_secs(30);
+/// A checkout of the whole tree, an archive of it, a commit or a push (the
+/// last two run the repo's hooks).
+const HEAVY: Duration = Duration::from_secs(60);
+
+/// How many commits of the default branch [`past_resyncs`] reads.
+const HISTORY_DEPTH: &str = "--max-count=300";
+
+/// Trailer naming the host that made a resync commit.
+pub(super) const TRAILER_HOST: &str = "Loom-Resync-Host";
+/// Trailer naming the version a resync commit installed.
+pub(super) const TRAILER_VERSION: &str = "Loom-Resync-Version";
+
+/// The remote could not be reached (or did not answer in time). Kept apart
+/// from every other failure so an outage is one host-level alert, not one
+/// per repo.
+#[derive(Debug)]
+pub(super) struct Unreachable(pub(super) String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
 
 /// Prefix of the throwaway worktree's directory name; the pid follows.
 pub(super) const WORKTREE_PREFIX: &str = ".resync-";
@@ -83,7 +117,12 @@ pub(super) fn default_branch(root: &Path) -> Option<String> {
     .ok()?;
     if head.status.success() {
         let name = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        if let Some(branch) = name.strip_prefix("origin/").filter(|b| !b.is_empty()) {
+        // The name is the remote's to choose. One git would read as an
+        // option or a revision expression is not used (#9106).
+        if let Some(branch) = name
+            .strip_prefix("origin/")
+            .filter(|b| crate::refname::check_refname(b).is_ok())
+        {
             return Some(branch.to_string());
         }
     }
@@ -102,23 +141,127 @@ pub(super) fn default_branch(root: &Path) -> Option<String> {
     main.status.success().then(|| "main".to_string())
 }
 
+/// The first line of a child's stderr: enough to say why the remote did not
+/// answer, without git's advice paragraphs.
+fn first_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_string()
+}
+
+/// The commit `refs/heads/<branch>` is at on the remote, by `git ls-remote`:
+/// one connection, no objects, nothing written in the clone.
+///
+/// # Errors
+/// [`Unreachable`] when the remote did not answer; a plain error when it
+/// answered without that branch.
+pub(super) fn remote_head(root: &Path, branch: &str) -> Result<String> {
+    let name = format!("refs/heads/{branch}");
+    let out = run(root, root, &["ls-remote", "--quiet", "origin", "--", &name], PROBE)
+        .map_err(|e| Unreachable(format!("{e:#}")))?;
+    if !out.status.success() {
+        let why = first_line(&out.stderr);
+        return Err(Unreachable(format!("git ls-remote origin failed: {why}")).into());
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(sha, listed)| *listed == name && sha.len() >= 40)
+        .map(|(sha, _)| sha.to_string())
+        .ok_or_else(|| anyhow!("origin has no {name}"))
+}
+
+/// The commit the clone's `origin/<branch>` is at; `None` when it has never
+/// been fetched. Local.
+pub(super) fn tracking_head(root: &Path, branch: &str) -> Option<String> {
+    let spec = format!("refs/remotes/origin/{branch}^{{commit}}");
+    let out = run(root, root, &["rev-parse", "--verify", "--quiet", &spec], QUICK).ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !sha.is_empty()).then_some(sha)
+}
+
 /// Fetch the default branch and return the commit `origin/<branch>` is at.
+///
+/// # Errors
+/// [`Unreachable`] when the fetch itself failed.
 pub(super) fn fetch(root: &Path, branch: &str) -> Result<String> {
     // An explicit refspec, so the remote-tracking ref moves even in a clone
-    // whose configured fetch refspec does not cover this branch.
+    // whose configured fetch refspec does not cover this branch. Behind `--`
+    // because the branch name is the remote's. `--no-write-fetch-head`: this
+    // is the operator's checkout, and its `FETCH_HEAD` is theirs.
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    ok(root, root, &["fetch", "--quiet", "--no-tags", "origin", &refspec], SLOW)
-        .with_context(|| format!("fetching origin/{branch}"))?;
-    ok(
-        root,
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("refs/remotes/origin/{branch}^{{commit}}"),
-        ],
-        QUICK,
+    let args = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "origin",
+        "--",
+        &refspec,
+    ];
+    let out = run(root, root, &args, FETCH).map_err(|e| Unreachable(format!("{e:#}")))?;
+    if !out.status.success() {
+        let why = first_line(&out.stderr);
+        return Err(Unreachable(format!("fetching origin/{branch} failed: {why}")).into());
+    }
+    tracking_head(root, branch)
+        .ok_or_else(|| anyhow!("origin/{branch} is missing after a successful fetch"))
+}
+
+/// A daemon resync commit found on the default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PastResync {
+    /// The commit.
+    pub(super) commit: String,
+    /// Its `Loom-Resync-Host`.
+    pub(super) host: String,
+    /// Its `Loom-Resync-Version`.
+    pub(super) version: String,
+    /// Its committer time.
+    pub(super) at: DateTime<Utc>,
+}
+
+/// The message of a resync commit.
+pub(super) fn resync_message(host: &str, version: &str) -> String {
+    format!(
+        "chore(loom): resync installed Loom to v{version}\n\n{TRAILER_HOST}: {host}\n\
+         {TRAILER_VERSION}: {version}\n"
     )
+}
+
+/// The daemon resync commits among the last [`HISTORY_DEPTH`] commits reachable
+/// from `commit`, newest first. Local: the history is already in the clone.
+pub(super) fn past_resyncs(root: &Path, commit: &str) -> Result<Vec<PastResync>> {
+    let args = [
+        "log",
+        HISTORY_DEPTH,
+        "--format=%x1e%H%x1f%ct%x1f%B",
+        commit,
+        "--",
+    ];
+    let out = ok(root, root, &args, QUICK).context("reading the default branch's history")?;
+    Ok(out.split('\u{1e}').filter_map(parse_past_resync).collect())
+}
+
+fn parse_past_resync(record: &str) -> Option<PastResync> {
+    let mut fields = record.splitn(3, '\u{1f}');
+    let (commit, time, body) = (fields.next()?, fields.next()?, fields.next()?);
+    let trailer = |key: &str| {
+        body.lines()
+            .filter_map(|line| line.split_once(": "))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Some(PastResync {
+        commit: commit.trim().to_string(),
+        version: trailer(TRAILER_VERSION)?,
+        host: trailer(TRAILER_HOST).unwrap_or_else(|| "an unnamed host".to_string()),
+        at: Utc.timestamp_opt(time.trim().parse().ok()?, 0).single()?,
+    })
 }
 
 /// The tree of `commit`.
@@ -155,7 +298,7 @@ pub(super) fn export_surfaces(root: &Path, commit: &str, dest: &Path) -> Result<
             args.push(surface);
         }
     }
-    let out = run(root, root, &args, SLOW)?;
+    let out = run(root, root, &args, HEAVY)?;
     if !out.status.success() {
         bail!("git archive {commit} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -208,13 +351,39 @@ pub(super) fn clean_stale_worktrees(root: &Path) {
     }
 }
 
+/// The throwaway worktree. Removed when dropped, so a panic or an early
+/// return inside the resync leaves nothing behind.
+pub(super) struct Worktree {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Worktree {
+    /// Where it is.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        remove_worktree(&self.root, &self.path);
+    }
+}
+
 /// Add the throwaway worktree, detached at `commit`.
-pub(super) fn add_worktree(root: &Path, commit: &str) -> Result<PathBuf> {
+pub(super) fn add_worktree(root: &Path, commit: &str) -> Result<Worktree> {
     let path = worktrees_dir(root).join(format!("{WORKTREE_PREFIX}{}", std::process::id()));
     let shown = path.to_string_lossy().into_owned();
-    ok(root, root, &["worktree", "add", "--detach", &shown, commit], SLOW)
+    // The guard exists before the checkout starts: one that fails or times
+    // out part-way is removed too.
+    let worktree = Worktree {
+        root: root.to_path_buf(),
+        path,
+    };
+    ok(root, root, &["worktree", "add", "--detach", &shown, commit], HEAVY)
         .context("creating the resync worktree")?;
-    Ok(path)
+    Ok(worktree)
 }
 
 /// Remove a throwaway worktree and its registration. Never fails: whatever is
@@ -268,7 +437,7 @@ pub(super) fn commit(
         ]);
     }
     args.extend(["commit", "--quiet", "-m", message]);
-    ok(worktree, root, &args, SLOW).context("committing the resync")?;
+    ok(worktree, root, &args, HEAVY).context("committing the resync")?;
     ok(worktree, root, &["rev-parse", "HEAD"], QUICK).map(Some)
 }
 
@@ -279,7 +448,7 @@ pub(super) fn commit(
 /// branch nor a protection rule (network, auth).
 pub(super) fn push(worktree: &Path, root: &Path, branch: &str) -> Result<Push> {
     let refspec = format!("HEAD:refs/heads/{branch}");
-    let out = run(worktree, root, &["push", "origin", &refspec], SLOW)?;
+    let out = run(worktree, root, &["push", "origin", "--", &refspec], HEAVY)?;
     if out.status.success() {
         return Ok(Push::Accepted);
     }

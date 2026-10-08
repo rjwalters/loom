@@ -174,6 +174,17 @@ impl FakeRefForge {
                     None => reply(404, json!({"message": "Not Found"})),
                 }
             }
+            ("GET", name) if name.starts_with("matching-refs/") => {
+                let prefix = format!("refs/{}", &name["matching-refs/".len()..]);
+                let found: Vec<Value> = self
+                    .refs
+                    .borrow()
+                    .iter()
+                    .filter(|(full, _)| full.starts_with(&prefix))
+                    .map(|(full, sha)| json!({"ref": full, "object": {"sha": sha}}))
+                    .collect();
+                reply(200, Value::Array(found))
+            }
             ("GET", name) if name.starts_with("commits/") => {
                 match self.commits.borrow().get(&name["commits/".len()..]) {
                     Some((message, _)) => reply(200, json!({"message": message})),

@@ -459,8 +459,8 @@ fn loom_source_repo_is_refused_and_nothing_is_written() {
     assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
 }
 
-/// A payload packed from a dirty checkout is not a release (#10878 review):
-/// `LOOM_DAEMON_GIT_DIRTY` other than `clean` clears `Stamp::release_build`.
+/// A payload that is not an official release's is never applied (#10878
+/// review, #10718): `Stamp::release_build` is false for it.
 #[test]
 fn dirty_build_payload_is_refused_and_nothing_is_written() {
     let tmp = TempDir::new().unwrap();
@@ -482,11 +482,14 @@ fn dirty_build_payload_is_refused_and_nothing_is_written() {
     assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
 }
 
-/// This binary's own stamp follows the build's tree state, and nothing else.
+/// This binary's own stamp follows the release-provenance check, and nothing
+/// else. A clean tree is not enough: the build under test is clean in CI and
+/// is still no release.
 #[test]
-fn this_binary_is_a_release_build_only_when_built_clean() {
+fn this_binary_is_a_release_build_only_when_release_provenance_is_verified() {
     let stamp = Stamp::this_binary().unwrap();
-    assert_eq!(stamp.release_build, crate::self_update::BUILT_TREE_STATE == "clean");
+    assert_eq!(stamp.release_build, crate::release_provenance::is_verified());
+    assert!(!stamp.release_build, "a test build is never an official release build");
 }
 
 /// A recorded version that cannot be ordered might be newer than the daemon

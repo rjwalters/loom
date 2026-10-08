@@ -1730,13 +1730,16 @@ published on the event bus as `fleet.sync.state`.
 ### Workspace resync (#10718)
 
 The same timer also keeps each registered repo's installed Loom at the version
-the daemon is **running**. It runs once at startup (after the startup pass,
-once the drain state exists) and then every `fleet.syncIntervalSecs`. Nothing
-else schedules it, and it does not wait for a roll window.
+the daemon is **running**. A pass starts once at startup (after the startup
+pass, once the drain state exists) and then every `fleet.syncIntervalSecs`.
+Nothing else schedules it, and it does not wait for a roll window.
 
-Each pass fetches every registered workspace's default branch, reads
-`.loom/install-metadata.json` from that branch (never the working tree) and
-classifies it:
+A pass runs on its own task and the timer never waits for it, so it cannot
+delay the fleet-store sync, the floor, or `paused`/`stopped` enforcement. Only
+one pass runs at a time: while one is still running, the next tick starts none.
+
+Each pass reads `.loom/install-metadata.json` from every registered
+workspace's default branch (never the working tree) and classifies it:
 
 | State | Meaning | What the pass does |
 |---|---|---|
@@ -1754,46 +1757,108 @@ classifies it:
 - **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
   They are left to the host roll (#10719).
 - **Only from H0.** A host claims and writes only when all of these hold: it is
-  a release build, a fleet-sync pass has completed, dispatch is not paused (a
-  drain, a roll's pause or a fleet hold), no roll is retained, the binary on
-  disk is still the one running, self-update is not in backoff or terminal, and
-  the running version is not below `loom_min_version`. The gate is checked
-  again immediately before the push. A host that fails it still classifies and
-  reports. A newer release merely existing is not a reason to wait.
+  a verified official release build (below), a fleet-sync pass has completed,
+  dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
+  `paused` reaches it), no roll is retained, the binary on disk is still the one
+  running, self-update is not in backoff or terminal, and the running version
+  is not below `loom_min_version`. The gate is read at the start of the pass,
+  again immediately before the claim, and again immediately before the push.
+  A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
+
+**Only an official release build pushes.** A daemon resyncs from the payload it
+embeds, so the binary must be a release's. Both of these must hold:
+
+1. It carries the release stamp for its own version. `release.yml` sets
+   `LOOM_RELEASE_BUILD_TAG` on a publishing run and `build_stamp.rs` bakes it
+   in. A developer's build, a feature branch's, a CI build and
+   `scripts/daemon-build.sh` carry no stamp.
+2. Once per process, the daemon asks the forge which commit tag `v<version>`
+   of `rjwalters/loom` names, and it is the commit the binary was built from.
+
+A binary that fails either is reported once for the host
+(`host never resyncs: this daemon is not an official release build`) and never
+claims or writes. If the tag lookup gets no answer, the host reports
+`this daemon's release tag is not verified yet`, pushes nothing, and retries on
+a later tick (one sync interval apart at first, doubling, capped at one hour).
+
+**What a pass costs.** The verdict is cached per default-branch commit and
+running version, in process memory.
+
+| Workspace | Per tick |
+|---|---|
+| any, on a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
+| settled (`W0`, `W4`, `repo-ahead`, not installed) | nothing for 15 sync intervals, then one `git ls-remote` of the default branch |
+| stale (`W1`, `W3`) | one `git ls-remote` |
+| head moved since the cached verdict | one `git fetch` of the default branch, only if the clone does not already have the commit |
+
+A restart empties the cache, and the running version only changes with a
+restart, so startup and a version change both check every workspace. At
+60 repos and 5 hosts with a 60s interval, the steady state is about 1,200
+`git ls-remote` an hour fleet-wide and no `git fetch`.
+
+**A pass is bounded.** Classification stops asking the network after 45s; the
+workspaces it did not reach keep their last verdict and are first in the next
+pass. Every git child has a timeout: 15s for `ls-remote`, 30s for a fetch, 60s
+for the worktree checkout, the commit and the push, 20s for local plumbing.
+Three remotes in a row that do not answer end the pass's network use.
 
 A stale workspace is resynced under a per-repo claim, the ref
 `refs/loom/resync-claim`:
 
-- The first host to create the ref wins. The others pass until their next tick,
-  with no error and no alert.
+- A host reads the ref first. If it is held and fresh, the host passes until
+  its next tick, with no error, no alert and nothing created. Otherwise the
+  first host to create the ref wins.
 - The claim commit records the host, the version and the time. A claim older
   than `max(10 x syncIntervalSecs, 15 min)` may be taken over. Takeover goes
   through a ticket ref, `refs/loom/resync-takeover/<stale sha>`, which only one
   host can create: GitHub does not enforce fast-forward on refs outside
   `refs/heads/`, so an update of the claim ref cannot pick a winner.
 - The holder releases the claim when it is done, and only while the ref is
-  still its own commit.
+  still its own commit. It then deletes any abandoned takeover ticket.
 
 The resync itself runs in a throwaway detached worktree
 (`.loom/worktrees/.resync-<pid>`) off `origin/<default>`, never the checkout
 agents work in. It makes one commit (`chore(loom): resync installed Loom to
 v<version>`, with `Loom-Resync-Host` and `Loom-Resync-Version` trailers) and
-pushes it without `--force`. At most one repo is resynced per pass.
+pushes it without `--force`. At most one repo is resynced per pass. The
+worktree is removed and the claim released on every way out, a panic included;
+a worktree left by a killed process is removed by the next pass. The fetch does
+not rewrite the checkout's `FETCH_HEAD`.
+
+The commit is made under the repo's own configured git identity
+(`loom-daemon <loom-daemon@users.noreply.github.com>` only when git has none),
+and the push uses the checkout's own git credential, not the fleet writer App.
+The claim ref is the only part that goes through the writer App. A host whose
+checkout credential cannot push to the default branch fails the push; one whose
+credential is a repo admin can bypass branch protection.
+
+**A repo cannot be resynced in a loop.** Whatever makes a repo stale again (a
+host on the same version with other files, a person or a tool undoing the
+resync), it gets at most one daemon resync commit per version, from any host,
+and at most one per `max(10 x syncIntervalSecs, 15 min)`. The record is the
+default branch itself: the last 300 commits are searched for
+`Loom-Resync-Version`. A workspace that is stale again at a version it was
+already resynced to is left alone, reported as `resync-loop`, and alerted once.
+The next release resyncs it.
 
 | Outcome | Result |
 |---|---|
 | push accepted | `W0` |
 | nothing left to write once the claim is held | `W0`, no commit |
 | branch moved | re-read and retried once, then next tick |
-| host left H0, or the claim was taken over, before the push | abandoned, no push; not a failure |
-| branch protection or a ruleset refused the push | backoff of 6h, alert at once |
+| host left H0, or the claim was taken over, before the claim or the push | abandoned, no push; not a failure |
+| already resynced to this version | `resync-loop`: no push, one alert per repo and version |
+| another resync landed within the cooldown | waits; not a failure |
+| branch protection or a ruleset refused the push | backoff of 6h; one alert per repo, then logged only |
+| a remote or the forge did not answer | backoff for that repo, no alert for it; one `network` alert for the host per outage, from the third failing pass |
 | any other failure | backoff from one sync interval, doubling, capped at 6h; alert from the third in a row |
 
 Alerts are logged at `error` and published on the event bus as
-`fleet_sync.workspace_resync`. The backoff is in memory and resets on restart.
-Each workspace's state and reason appear on the `Fleet store:` status block and
-under `workspaces` in `fleet-sync-status.json`.
+`fleet_sync.workspace_resync`. The cache, the backoff and the alert-once marks
+are in memory and reset on restart. Each workspace's state and reason appear on
+the `Fleet store:` status block and under `workspaces` in
+`fleet-sync-status.json`.
 
 The resync covers the payload surfaces only: `.loom/{roles,scripts,hooks,docs,runtimes}/`,
 `.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc` and

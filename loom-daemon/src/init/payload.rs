@@ -92,11 +92,13 @@
 //! above this daemon, so an older host never completes (and so rolls back) a
 //! newer host's partial apply.
 //!
-//! # Only a release build resyncs
+//! # Only an official release build resyncs
 //!
-//! `build.rs` packs the working tree, so a daemon built from a checkout with
-//! uncommitted changes embeds files that are no release. [`Stamp::this_binary`]
-//! carries the build's tree state and the gate refuses unless it is `clean`.
+//! `build.rs` packs whatever tree it is run in, so a developer's build or a
+//! feature branch's embeds files that are no release, even from a clean
+//! checkout. [`Stamp::this_binary`] sets `release_build` only for a binary the
+//! release workflow built and whose release tag the forge confirmed
+//! ([`crate::release_provenance`]); the gate refuses every other payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -141,10 +143,12 @@ pub struct Stamp {
     pub commit: Option<String>,
     /// The oldest daemon these files work with.
     pub requires_daemon: String,
-    /// The payload is the tracked `defaults/` tree of `commit`, unmodified.
-    /// False for a build from a dirty checkout, or one that could not tell
-    /// (`LOOM_DAEMON_GIT_DIRTY` is `dirty` or `unknown`); such a payload is
-    /// never applied.
+    /// The payload is an official release's: the binary was built by the
+    /// release workflow for `v<version>`, and the forge confirmed that tag
+    /// names `commit` ([`crate::release_provenance`]). False for every other
+    /// build (a developer's, a feature branch's, CI's), and for a release
+    /// build whose tag has not been confirmed yet; such a payload is never
+    /// applied.
     pub release_build: bool,
 }
 
@@ -160,7 +164,7 @@ impl Stamp {
             version: Version::parse(env!("CARGO_PKG_VERSION"))?,
             commit,
             requires_daemon: REQUIRES_DAEMON.to_string(),
-            release_build: crate::self_update::BUILT_TREE_STATE == "clean",
+            release_build: crate::release_provenance::is_verified(),
         })
     }
 }
@@ -279,8 +283,9 @@ pub enum ResyncRefusal {
     /// The Loom source checkout installs from its own `defaults/` (dogfood
     /// symlinks); a resync never writes there.
     LoomSourceRepo,
-    /// This daemon was not built from a clean checkout, so its embedded
-    /// payload is not the files of any release.
+    /// This daemon is not a verified official release build
+    /// ([`crate::release_provenance`]), so its embedded payload is not known
+    /// to be the files of any release.
     NotAReleaseBuild,
     /// A contract field holds a value that is not `MAJOR.MINOR.PATCH` (for
     /// example `0.20.0-rc1`). It cannot be ordered against this daemon, so it
@@ -344,7 +349,8 @@ impl std::fmt::Display for ResyncRefusal {
             Self::LoomSourceRepo => write!(f, "the Loom source checkout is never resynced"),
             Self::NotAReleaseBuild => write!(
                 f,
-                "this daemon was not built from a clean checkout; its payload is not a release"
+                "this daemon is not a verified official release build; its payload is never \
+                 applied"
             ),
             Self::UnrecognizedVersion { field, value } => write!(
                 f,
