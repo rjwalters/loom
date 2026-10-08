@@ -410,6 +410,11 @@ fn probe_platform(roots: &[PathBuf]) -> GitLiveness {
 // Sweep
 // ============================================================================
 
+/// True only when `path` itself is a real directory (a symlink to one is not).
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
 fn age_secs(meta: &std::fs::Metadata, now: DateTime<Utc>) -> Option<i64> {
     let modified: DateTime<Utc> = meta.modified().ok()?.into();
     Some((now - modified).num_seconds())
@@ -420,6 +425,11 @@ fn age_secs(meta: &std::fs::Metadata, now: DateTime<Utc>) -> Option<i64> {
 fn candidates(objects_dir: &Path) -> Vec<(PathBuf, std::fs::Metadata)> {
     let mut out = Vec::new();
     let mut scan = |dir: PathBuf| {
+        // A symlinked `pack/` (or fan-out dir) would lead outside this
+        // checkout's object store; never traverse it.
+        if !is_real_dir(&dir) {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
@@ -485,6 +495,11 @@ pub fn sweep(common_dir: &Path, grace_secs: i64, now: DateTime<Utc>, dry_run: bo
         if dry_run {
             totals.files += 1;
             totals.bytes += meta.len();
+            continue;
+        }
+        // Re-check at deletion time that the parent is still a real directory
+        // (guards a swap between the scan and the removal).
+        if !path.parent().is_some_and(is_real_dir) {
             continue;
         }
         match std::fs::remove_file(&path) {

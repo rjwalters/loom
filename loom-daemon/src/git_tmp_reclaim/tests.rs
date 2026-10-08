@@ -215,6 +215,27 @@ fn decoys_are_never_touched_even_when_ancient() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinked_pack_dir_is_never_traversed() {
+    let repo = fixture_repo();
+    let root = repo.path();
+    let o = objects(root);
+    // Replace `objects/pack` with a symlink to an external store holding old debris.
+    let outside = tempfile::tempdir().unwrap();
+    let external_pack = outside.path().join("pack");
+    std::fs::create_dir_all(&external_pack).unwrap();
+    let victim = external_pack.join("tmp_pack_old");
+    write_aged(&victim, 10, 30 * 24 * 3600);
+    std::fs::remove_dir_all(o.join("pack")).unwrap();
+    std::os::unix::fs::symlink(&external_pack, o.join("pack")).unwrap();
+
+    let common = resolve_common_dir(root).unwrap();
+    let totals = sweep(&common, HOUR, Utc::now() + chrono::Duration::days(1), false);
+    assert_eq!(totals.files, 0, "nothing behind a symlinked pack dir is a candidate");
+    assert!(victim.exists(), "external file must survive");
+}
+
 #[test]
 fn fsck_connectivity_passes_after_reclaim() {
     let repo = fixture_repo();
