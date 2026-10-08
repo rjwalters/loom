@@ -222,6 +222,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Loom-owned per-run cargo target dirs (#8370): `worker_spawn` exports one
+    // as CARGO_TARGET_DIR for every role run, and `role_runner` / the orphan
+    // sweep remove them. Gigabytes of build output, never committable.
+    ".loom/targets/",
     // `.loom/state/` is daemon-written, per-host runtime state, ignored
     // WHOLESALE (#9592). It used to be ignored one subsystem at a time
     // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
@@ -1192,6 +1196,8 @@ mod tests {
             ".loom/manifest.json",
             ".loom/stuck-config.json",
             ".loom/metrics/",
+            // #8370: Loom-owned per-run cargo target dirs.
+            ".loom/targets/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
             ".loom/native-tools/",

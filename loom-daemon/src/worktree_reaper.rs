@@ -888,6 +888,10 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // `crate::native_state_reclaim`'s module docs.
     let _ = crate::native_state_reclaim::run_for(repo_root);
 
+    // #8370: orphaned cargo target dirs under `.loom/targets/` and the known
+    // improvised prefixes. Own per-repo cooldown, shared with the eager tier.
+    let _ = crate::target_orphan_reclaim::run_for(repo_root);
+
     report
 }
 

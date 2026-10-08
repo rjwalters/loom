@@ -1449,11 +1449,6 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
-    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
-    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
-    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
-    #[serde(default)]
-    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
