@@ -17,6 +17,7 @@
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
+- [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -851,6 +852,139 @@ running / ready / blocked counts with a freshness badge (`idle` = recent tick,
 empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
 never sent one), and a fleet-wide work queue listing every issue
 with its host, phase, waiting time, blocking reason and issue / PR links.
+
+## 3d. Agent telemetry relay (Issue #10964)
+
+An agent CLI the daemon launches can export its own OTLP telemetry — model
+requests, tool calls, token and cost counters. Getting that to your store with
+a consistent identity and with secrets scrubbed used to need a separate
+collector on every machine. With the relay on, the daemon is that collector
+for the sessions **it** launches:
+
+```
+launched session ──OTLP/HTTP──▶ 127.0.0.1:<ephemeral port>   (in the daemon)
+   (token in its env)                │ token → the session the daemon launched
+                                     ▼
+                           bind identity · scrub secrets
+                                     ▼
+                           bounded queue (drop-oldest, counted)
+                                     ▼
+                           your configured `otlp` exporter ──▶ your endpoint
+```
+
+**Scope rule.** Only sessions launched by the daemon are wired. An interactive
+session you start yourself — in the same repository, on the same machine — is
+not touched and exports nothing through the daemon: the receiver's address and
+a token are written only into the environment of a child the daemon spawns,
+never into the daemon's own environment, a file, or a config another process
+could read. A machine with no daemon running has no receiver at all.
+
+**Off by default.** The receiver starts only when both hold:
+
+1. an `otlp` exporter is configured and actually started (§3) — the relay
+   never adds or starts an exporter, and has nothing to forward to without
+   one; and
+2. the relay's own switch is on:
+
+   ```json
+   { "observability": { "agentRelay": { "enabled": true } } }
+   ```
+
+   (`LOOM_OBSERVABILITY_AGENT_RELAY` overrides it; **env > config > default
+   `false`**.) Turning the switch off disables the relay and nothing else.
+
+The same switch is read again at each launch against the launched session's
+own workspace, so one repository of a multi-workspace daemon can opt out.
+Requires a daemon built with the `otlp` Cargo feature (release builds are).
+
+**What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
+`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`,
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:<port>` and
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <session token>`. The
+per-signal endpoint, protocol and header variables, OTLP compression and
+client-certificate variables, and the content gates (`OTEL_LOG_USER_PROMPTS`,
+`OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_CONTENT`,
+`OTEL_LOG_RAW_API_BODIES`, `OTEL_LOG_MANAGED_SETTINGS`) are removed from that
+child, so nothing inherited from the daemon's environment can redirect a
+signal or widen what is captured. `OTEL_LOG_TOOL_DETAILS` stays under
+`observability.claudeCodeTelemetry.logToolDetails`
+([`tracing.md`](tracing.md)). When both that block and the relay are on, the
+relay's endpoint wins: the session exports through the daemon, not directly.
+
+**Which launches are wired.**
+
+| Launch | Wired | Why |
+|---|---|---|
+| Sweep child admitted for `claude` | yes | Claude Code is configured entirely by its documented `OTEL_*` environment. |
+| Role-runner tick admitted for `claude` | yes | Same. |
+| Any launch admitted for `codex` | no | Codex configures OTLP export in its `config.toml` `[otel]` table, not `OTEL_EXPORTER_OTLP_*`; wiring it means writing that table per launch. |
+| Any launch admitted for `opencode` | no | No documented OTLP exporter setting to point at the relay. |
+| A launch with no runtime admission | no | The spawn script picks the runtime, so the daemon does not know which CLI will run and will not guess a `service.name`. |
+| Epic-supervisor role dispatch | no | No runtime admission on that path (above). |
+| Containerized dispatch (`runtimes.containment.enabled` / `LOOM_SWEEP_CONTAINERIZED`) | no | The receiver is loopback-only on the host; a container's loopback is its own. |
+
+**Port.** `127.0.0.1` on an ephemeral port the kernel picks when the daemon
+starts. Nothing to configure, no collision between two daemons or two users on
+one host, and no well-known port for other local processes to aim at. The
+address is never anything but loopback.
+
+**Attribution.** Each launch gets its own random token, delivered only in that
+child's environment. The receiver identifies the sender by the token alone —
+nothing in the request body takes part — and answers `401` to a request
+without a live session's token before reading its body. A token stops working
+when its session ends (the sweep's execution closes, or the role tick's child
+exits), and in any case 24 hours after it was minted. The daemon keeps only a
+hash of it, and it is never logged or forwarded.
+
+**Identity.** Every forwarded `Resource` is built by the daemon:
+
+| Attribute | Value |
+|---|---|
+| `service.name` | the harness — `claude-code` |
+| `service.instance.id`, `host.id` (and any other host attribute the daemon's own telemetry carries) | this daemon's host identity |
+| `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
+| `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
+| `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
+| `loom.daemon.version`, `loom.relay.redaction` | the relaying build, and the redaction policy applied |
+
+Whatever the sender put under `service.name`, `service.namespace`,
+`service.instance.id`, `host.*` or `loom.*` is discarded — on the resource and
+on every scope, record, data point, span, span event and link, so a
+record-level attribute cannot shadow the bound one. Other resource attributes
+the CLI reports about itself (`service.version`, `os.type`, …) are kept. Trace
+and span ids are the sender's and are preserved; that is what parents a
+session's spans under the `TRACEPARENT` its launch exported.
+
+**Redaction.** Every string the sender controls passes through the same
+scrubber as live session output ([`session-output.md`](session-output.md),
+policy `producer/v1`): log bodies, attribute values at any depth, span and
+event names, status messages, metric descriptions. An attribute value is
+scrubbed together with its key, so `password = …` is caught even though the
+value alone has no shape to match. A `bytes` value is replaced by its length.
+This scrubs secret *shapes*; it is not a content filter — which is why the
+content gates above stay off.
+
+**Back-pressure.** The receiver acknowledges a request as soon as it is
+scrubbed and queued; it never waits on your endpoint. Each `otlp` sink has its
+own in-memory queue (256 requests / 32 MiB), separate from the daemon's own
+durable queue, drained through that sink's exporter configuration (endpoint,
+ingest key, `headers_file`) on its own task and connection pool — so relayed
+volume cannot evict or delay the daemon's own telemetry, and a slow or
+unreachable endpoint cannot slow a session. When the queue is full the oldest
+request is dropped and counted; when the endpoint next accepts anything, one
+`loom.agent_relay.gap` log record per affected session is delivered first,
+under that session's own identity, with `loom.relay.gap_reason`
+(`relay_queue_overflow` or `upstream_rejected`) and
+`loom.relay.dropped_{requests,log_records,metric_data_points,spans}`. Relayed
+records still queued when the daemon stops are lost.
+
+**Limits.** OTLP/HTTP only (`application/x-protobuf` or `application/json`;
+no gRPC, no compressed bodies); 4 MiB per request; 32 concurrent connections
+(`503` past that); 30 seconds to send a request. A malformed request gets a
+`4xx` and is never forwarded. A session that outlives the daemon that launched
+it (a sweep adopted after a restart) keeps a stale address and exports nothing
+until it is relaunched.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 
