@@ -7,7 +7,7 @@
 //! `LOOM_GH_BIN` are process-global, so the end-to-end tests are `#[serial]`.
 
 use super::*;
-use crate::release_fetch::fetch::{fetch_and_verify_with_policy, FetchInputs, FetchOutcome};
+use crate::release_fetch::fetch::{FetchInputs, FetchOutcome};
 use crate::release_fetch::SignaturePolicy;
 use serial_test::serial;
 use std::cell::RefCell;
