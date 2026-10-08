@@ -25,6 +25,7 @@ fn row(number: u32, is_pull_request: bool) -> RestIssue {
         state: "open".to_string(),
         body: None,
         author: None,
+        author_association: None,
         is_pull_request,
     }
 }

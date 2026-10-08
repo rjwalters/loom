@@ -80,6 +80,9 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `loom-daemon/src/work_finder/forge.rs` reads
     // `.loom/config.json` directly each time, never cached.
     ("autonomous.workFinder.extraSkipLabels", Reloadability::Live),
+    // Read from config each time a red-main fix is waiting (#10118) —
+    // `main_red_fix::escalate_after`, never cached.
+    ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
     // Everything else under `autonomous.workFinder` — `enabled` (gates
     // whether the loop is spawned at all), `intervalSecs` (the ticker's
     // fixed period), `maxAdmissionsPerTick`, `hostClass` /
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(classify("autonomous.workFinder.maxConcurrent"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.maxConcurrentPerRepo"), Reloadability::Live);
         assert_eq!(classify("autonomous.workFinder.extraSkipLabels"), Reloadability::Live);
+        assert_eq!(classify("autonomous.workFinder.redFixEscalateAfterSecs"), Reloadability::Live);
     }
 
     #[test]

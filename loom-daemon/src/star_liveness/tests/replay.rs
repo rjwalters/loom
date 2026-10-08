@@ -56,6 +56,7 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
                     state: it["state"].as_str().unwrap_or("open").into(),
                     body: it["body"].as_str().map(str::to_string),
                     author: it["author"].as_str().map(str::to_string),
+                    author_association: None,
                     is_pull_request: it["pr"].as_bool().unwrap_or(false),
                 },
             );

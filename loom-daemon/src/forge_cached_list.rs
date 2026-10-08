@@ -490,6 +490,7 @@ mod tests {
             state: s("open"),
             body: Some(s("body")),
             author: Some(s("octocat")),
+            author_association: None,
             is_pull_request: is_pr,
         }
     }

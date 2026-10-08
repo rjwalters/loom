@@ -126,7 +126,9 @@ says so, and no role applies it).
 - **Red-main fixes** are a body marker, not a label: an issue that fixes a red
   `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
   pre-existing failure confirmed on `origin/main`). Curator takes these next,
-  after starred work, with no promotion bypass.
+  after starred work, and never promotes them: while that repo's `main` is
+  verified red the work finder admits them from `loom:triage`/`loom:curated`
+  itself (only when a trusted identity filed them, #9548), and alerts the operator if one stays unclaimed (#10118).
 
 ## Entry points
 
