@@ -2726,6 +2726,17 @@ pub fn plan_idle_runs(
         log::debug!("role_runner: idle edge for {} suppressed — archived (#10562)", root.display());
         return Vec::new();
     }
+    // #10719: a held workspace starts no role. The hold stops new sweeps, the
+    // in-flight set drains, and that very drain is what raises this idle edge —
+    // so without this the hold would itself launch every `onIdle` role. The
+    // edge was already observed above, so the bookkeeping stays right.
+    if crate::workspace_hold::hold_for(root).is_some() {
+        log::debug!(
+            "role_runner: idle edge for {} suppressed — workspace held (#10719)",
+            root.display()
+        );
+        return Vec::new();
+    }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
     // config. Resolved ONCE for the whole edge rather than per-spec so a single
     // idle edge cannot admit a burst that each individually passed a

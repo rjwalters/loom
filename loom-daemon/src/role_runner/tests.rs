@@ -2820,6 +2820,38 @@ fn test_plan_idle_runs_fires_on_edge_when_enabled() {
 
 #[test]
 #[serial]
+fn test_plan_idle_runs_held_workspace_suppresses() {
+    use crate::workspace_hold::{set_for_test, HeldCopy, HoldKind, WorkspaceHold};
+    std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    let mut t = IdleTrigger::new();
+    let set = new_in_progress_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cfg = on_idle_config(Some(true), vec!["champion"]);
+    let now = Instant::now();
+    set_for_test(
+        root,
+        Some(WorkspaceHold {
+            kind: HoldKind::DaemonTooOld,
+            copy: HeldCopy::Checkout,
+            since: chrono::Utc::now(),
+            detail: "test".to_string(),
+        }),
+    );
+    // Busy, then the drain's idle edge: the hold must not launch the role.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // The edge was consumed, so lifting the hold does not replay it ...
+    set_for_test(root, None);
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    // ... but the next real busy -> idle edge fires again.
+    assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+    let plan = plan_idle_runs(&mut t, &set, root, &cfg, true, false, now);
+    assert_eq!(plan.iter().map(|(s, _)| s.name).collect::<Vec<_>>(), vec!["champion"]);
+}
+
+#[test]
+#[serial]
 fn test_plan_idle_runs_drain_suppresses() {
     std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     let mut t = IdleTrigger::new();

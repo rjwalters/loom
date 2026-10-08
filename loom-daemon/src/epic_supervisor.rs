@@ -478,6 +478,9 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// scheduled drain pauses new epic-child dispatch just like a red `main`.
     /// Absent (the default / test path) means the supervisor is never drained.
     drain_flag: Option<Arc<AtomicBool>>,
+    /// The workspace this supervisor serves, so a W3/W4 hold on it (#10719)
+    /// can stop its tick. `None` for a supervisor with no workspace identity.
+    hold_root: Option<PathBuf>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -495,6 +498,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             bus: None,
             health_state: None,
             drain_flag: None,
+            hold_root: None,
         }
     }
 
@@ -511,6 +515,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_health_gate(mut self, health_state: Arc<MainHealthState>) -> Self {
         self.health_state = Some(health_state);
+        self
+    }
+
+    /// Name the workspace this supervisor serves (#10719): while it is held
+    /// (W3/W4) the tick dispatches nothing. Builder-style; returns `self`.
+    #[must_use]
+    pub fn with_hold_root(mut self, root: PathBuf) -> Self {
+        self.hold_root = Some(root);
         self
     }
 
@@ -551,6 +563,22 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             .drain_flag
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed));
+        // #10719: a held workspace dispatches nothing — `dispatch_role` runs the
+        // held checkout's spawn script directly, outside the registry guard.
+        if let Some(hold) = self
+            .hold_root
+            .as_deref()
+            .and_then(crate::workspace_hold::hold_for)
+        {
+            log::warn!(
+                "epic_supervisor: workspace held ({}) — skipping tick (no epic dispatch) (#10719)",
+                hold.detail
+            );
+            return Ok(TickReport {
+                halted: true,
+                ..TickReport::default()
+            });
+        }
         if health_halted || drained {
             log::warn!(
                 "epic_supervisor: {} — skipping tick (no epic dispatch)",
@@ -1126,7 +1154,8 @@ pub fn spawn_multi_supervisor_thread(
                             )
                             .with_event_bus(event_bus.clone())
                             .with_health_gate(health_states.get_or_create(root))
-                            .with_drain_flag(drain_flag.clone());
+                            .with_drain_flag(drain_flag.clone())
+                            .with_hold_root(root.clone());
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());
@@ -1735,6 +1764,35 @@ mod tests {
 
         // Clear the drain ⇒ the next tick dispatches normally.
         drain.store(false, Ordering::Relaxed);
+        let r2 = sup.tick().await.unwrap();
+        assert!(!r2.halted);
+        assert_eq!(r2.roles_dispatched, 1);
+    }
+
+    /// A W3/W4 hold (#10719) halts epic dispatch for that workspace only; the
+    /// role dispatch path bypasses the registry guard, so the tick must check.
+    #[tokio::test]
+    async fn test_tick_skips_dispatch_while_workspace_held() {
+        use crate::workspace_hold::{set_for_test, HeldCopy, HoldKind, WorkspaceHold};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            .with_hold_root(dir.path().to_path_buf());
+        set_for_test(
+            dir.path(),
+            Some(WorkspaceHold {
+                kind: HoldKind::DaemonTooOld,
+                copy: HeldCopy::Checkout,
+                since: chrono::Utc::now(),
+                detail: "test".to_string(),
+            }),
+        );
+
+        let report = sup.tick().await.unwrap();
+        assert!(report.halted, "a hold halts the tick");
+        assert_eq!(report.roles_dispatched, 0);
+        assert!(sup.dispatcher.roles.is_empty(), "no epic dispatch while held");
+
+        set_for_test(dir.path(), None);
         let r2 = sup.tick().await.unwrap();
         assert!(!r2.halted);
         assert_eq!(r2.roles_dispatched, 1);

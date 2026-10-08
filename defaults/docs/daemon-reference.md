@@ -1815,11 +1815,13 @@ cannot work with this daemon. The checkout copy is
   bypass a hold.
 - **Where it is enforced.** The sweep registry refuses issue and PR-set
   dispatch with a typed `WorkspaceHeldDispatchError` before any lock, label
-  flip or forge call, so every producer is covered. The work finder skips the
+  flip or forge call, so every sweep producer is covered. The work finder skips the
   held workspace's batch once per tick with `workspace_halted` rows whose
   cause is `install_incompatible` or `daemon_too_old`, and grants no recovery
   probe or red-main fix dispatch into it. The role runner starts no role tick
-  there and logs the hold once.
+  there (interval or `onIdle` edge) and logs the hold once; the epic supervisor
+  skips the held workspace's tick, because its role dispatch runs the checkout's
+  spawn script outside the registry guard.
 - **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
   first pass after a resync has landed on the default branch and this host's
   checkout is current. `W4` clears once this host runs a daemon at or above
