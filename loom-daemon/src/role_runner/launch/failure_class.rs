@@ -17,6 +17,7 @@
 //! | `toolless-launch` | exit 0, but the native launch never offered the `loom_*` tools (#8448) |
 //! | `sandbox-unavailable` | exit 0, but the runtime sandbox refused every tool call (#10003) |
 //! | `preflight-auth-failed` | the wrapper's auth pre-flight refused the session |
+//! | `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364): the account's session container was down, or did not mount the workdir |
 //! | `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the sweep's pre-flight classifier: the adapter died before its CLI started |
 //! | `account-pool-exhausted` | the wrapper's rotation ran out of accounts mid-run |
 //! | `credential-expired`, `account-exhausted:<category>`, `session-limit`, `runtime-timeout`, `runtime-fatal`, `cwd-deleted`, `model-refusal` | the runtime adapter's own terminal verdict (`# LOOM_TERMINAL_RESULT`) |
@@ -121,12 +122,17 @@ pub(super) fn exited(
 /// The class of a non-zero exit with `code`, most specific first:
 ///
 /// 1. the wrapper's auth pre-flight sentinel;
-/// 2. the sweep pre-flight classifier (an explicit pre-flight marker, or no
+/// 2. a `session-exec` refusal the adapter's terminal record carries
+///    (`SESSION_DOWN` / `SESSION_MOUNT_STALE`): it refuses before the CLI
+///    runs, so without this rung step 3's "no `# LOOM_CLI_START`" inference
+///    would hide the named cause. It matches the span's
+///    `loom.admission.reason`;
+/// 3. the sweep pre-flight classifier (an explicit pre-flight marker, or no
 ///    `# LOOM_CLI_START` at all — the adapter died before its CLI ran);
-/// 3. the wrapper's mid-run account-rotation exhaustion sentinel;
-/// 4. the runtime adapter's own terminal category, unless it is the
+/// 4. the wrapper's mid-run account-rotation exhaustion sentinel;
+/// 5. the runtime adapter's own terminal category, unless it is the
 ///    `RECOVERABLE` catch-all (which says only "unrecognized");
-/// 5. the sweep crash classifier, whose last resort is `exit-<code>`.
+/// 6. the sweep crash classifier, whose last resort is `exit-<code>`.
 #[must_use]
 pub(super) fn classify_exit(
     region: &str,
@@ -135,6 +141,9 @@ pub(super) fn classify_exit(
 ) -> String {
     if region.contains(AUTH_PREFLIGHT_SENTINEL) {
         return "preflight-auth-failed".to_string();
+    }
+    if let Some(class) = adapter.and_then(session_refusal_class) {
+        return class.to_string();
     }
     if let PreflightOutcome::Preflight(label) =
         sweep_registry::classify_preflight_outcome(Some(region))
@@ -148,6 +157,16 @@ pub(super) fn classify_exit(
         return class.to_string();
     }
     sweep_registry::classify_crash(region, Some(code)).unwrap_or_else(|| format!("exit-{code}"))
+}
+
+/// The class of a `session-exec` refusal category (#10455, #10364) — the same
+/// literals as `loom.admission.reason` — or `None` for any other category.
+fn session_refusal_class(category: TerminalClassification) -> Option<&'static str> {
+    match category {
+        TerminalClassification::SessionDown => Some("session-down"),
+        TerminalClassification::SessionMountStale => Some("session-mount-stale"),
+        _ => None,
+    }
 }
 
 /// The class a runtime adapter's terminal category names, or `None` when it
@@ -164,6 +183,7 @@ fn adapter_class(category: TerminalClassification) -> Option<&'static str> {
         C::CwdDeleted => Some("cwd-deleted"),
         C::ModelRefusal => Some("model-refusal"),
         C::SandboxUnavailable => Some("sandbox-unavailable"),
+        C::SessionDown | C::SessionMountStale => session_refusal_class(category),
         C::Recoverable | C::Success => None,
     }
 }
@@ -183,6 +203,8 @@ fn adapter_wire_name(category: TerminalClassification) -> &'static str {
         C::ModelRefusal => "MODEL_REFUSAL",
         C::SessionLimit => "SESSION_LIMIT",
         C::SandboxUnavailable => "SANDBOX_UNAVAILABLE",
+        C::SessionDown => "SESSION_DOWN",
+        C::SessionMountStale => "SESSION_MOUNT_STALE",
     }
 }
 

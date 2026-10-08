@@ -310,6 +310,7 @@ instead, from what the launch site observed:
 | `timeout-ceiling` | the role timeout fired and the child was terminated (a load-saturated ceiling is `skipped_load` instead) |
 | `killed-by-signal` | the child was ended by a signal; the message names it |
 | `toolless-launch`, `sandbox-unavailable` | exit 0, but the launch offered no `loom_*` tools (#8448) or the sandbox refused every tool call (#10003) |
+| `session-down`, `session-mount-stale` | a `session-exec` refusal (#10455, #10364) named in the adapter's terminal record; it outranks `preflight-no-cli-start` and matches `loom.admission.reason` |
 | `preflight-auth-failed`, `preflight-mcp-failed`, `preflight-token-selection-failed`, `preflight-no-cli-start` | the adapter died before its CLI started (`# LOOM_CLI_START` never written) |
 | `account-pool-exhausted` | the wrapper's account rotation ran out mid-run |
 | `credential-expired`, `account-exhausted:<category>`, `session-limit`, `runtime-timeout`, `runtime-fatal`, `cwd-deleted`, `model-refusal` | the runtime adapter's own `# LOOM_TERMINAL_RESULT` category |

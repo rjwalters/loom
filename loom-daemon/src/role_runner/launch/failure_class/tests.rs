@@ -183,8 +183,49 @@ fn adapter_wire_names_round_trip() {
         C::ModelRefusal,
         C::SessionLimit,
         C::SandboxUnavailable,
+        C::SessionDown,
+        C::SessionMountStale,
     ] {
         let parsed: TerminalClassification = adapter_wire_name(category).parse().unwrap();
         assert_eq!(parsed, category);
     }
+}
+
+/// #10455 / #10364: a `session-exec` refusal happens before the CLI starts,
+/// so its region has no `# LOOM_CLI_START`. Its named cause must still win
+/// over the "no CLI start" pre-flight inference, and agree with the span's
+/// `loom.admission.reason`.
+#[test]
+fn a_session_refusal_outranks_the_no_cli_start_inference() {
+    let region = "# LOOM_ACCOUNT name=alice";
+    assert_eq!(
+        classify_exit(region, Some(TerminalClassification::SessionDown), 78),
+        "session-down"
+    );
+    assert_eq!(
+        classify_exit(region, Some(TerminalClassification::SessionMountStale), 78),
+        "session-mount-stale"
+    );
+    // Without the refusal the same region is still a pre-flight death.
+    assert_eq!(classify_exit(region, None, 78), "preflight-no-cli-start");
+}
+
+/// The mount-stale refusal is announced by `session-exec`, and the adapter
+/// packages only a generic `RECOVERABLE`; the record parser applies the
+/// announcement, so the span still names the refusal and quotes it.
+#[cfg(unix)]
+#[test]
+fn an_announced_mount_stale_refusal_classifies_from_the_log() {
+    let log = tick(&format!(
+        "# LOOM_ACCOUNT name=alice\n# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE\n{}",
+        terminal("RECOVERABLE", 78)
+    ));
+    let failure = exited(exit_with(78), &log, ANCHOR);
+    let attrs = failure.attributes();
+    assert_eq!(attrs["loom.failure_class"], "session-mount-stale");
+    assert_eq!(attrs["loom.exit_code"], "78");
+    assert_eq!(
+        attrs[crate::telemetry::trace::STATUS_MESSAGE],
+        "role child exited with code 78; runtime adapter reported SESSION_MOUNT_STALE"
+    );
 }
