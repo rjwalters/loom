@@ -333,7 +333,7 @@ registry would be a second mechanism for dominated heuristics).
 
 ### The 2026-10-08 walk-forward and the twin-otter-b promotion gate (#10949)
 
-The 2026-10-08 walk-forward (2AMLogic/loom-experiments#21) ran 52
+The 2026-10-08 walk-forward (loom-experiments#21) ran 52
 point-in-time daily folds, 2026-08-15 to 2026-10-05, covering 7,875 PR-days.
 Confidence intervals are clustered by fold day. Full results: #10524,
 comment 6062722711.
