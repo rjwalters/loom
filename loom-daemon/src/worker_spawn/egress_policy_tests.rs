@@ -214,6 +214,153 @@ fn script_refuses_to_install_when_the_blocked_hosts_do_not_resolve() {
     assert!(!cap.path().join("restored").exists(), "no empty chain is installed");
 }
 
+/// Runs the sidecar script over stub binaries for `passes` refreshes. The stub
+/// `sleep` advances `$CAP/pass`, so `getent_body` can answer differently per
+/// refresh; every `getent` call is logged to `$CAP/getent.log` and each
+/// `iptables-restore` input is appended to `$CAP/<family>-restore`. Returns
+/// `(exit code, v4 restores, v6 restores, getent log)`.
+fn run_refreshing(
+    getent_body: &str,
+    passes: u32,
+    fail_string: bool,
+) -> (Option<i32>, String, String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let write = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write("sleep", r#"echo x >> "$CAP/sleeps""#);
+    write(
+        "getent",
+        &format!(
+            r#"echo "$1 $2" >> "$CAP/getent.log"
+pass=0
+[ -f "$CAP/sleeps" ] && pass=$(wc -l < "$CAP/sleeps")
+calls=$(grep -cx "$1 $2" "$CAP/getent.log")
+{getent_body}"#
+        ),
+    );
+    for fam in ["iptables", "ip6tables"] {
+        write(
+            &format!("{fam}-restore"),
+            &format!(
+                r#"input=$(cat)
+if [ -n "${{FAIL_STRING:-}}" ] && printf '%s' "$input" | grep -q -- '-m string'; then exit 2; fi
+printf '%s\n' "$input" >> "$CAP/{fam}-restore""#
+            ),
+        );
+        write(fam, "exit 0");
+    }
+    let cap = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(sidecar_script())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("CAP", cap.path())
+        .env("LOOM_EGRESS_REFRESH", "0")
+        .env("LOOM_EGRESS_BLOCKED", "api.github.com uploads.github.com")
+        .env("LOOM_EGRESS_ALLOWED", "github.com");
+    // `passes == 0`: exit after the first install.
+    if passes == 0 {
+        cmd.env("LOOM_EGRESS_ONCE", "1");
+    } else {
+        cmd.env("LOOM_EGRESS_PASSES", passes.to_string());
+    }
+    if fail_string {
+        cmd.env("FAIL_STRING", "1");
+    }
+    let _ = std::fs::remove_file(READY_FILE);
+    let out = cmd.output().unwrap();
+    let get = |f: &str| std::fs::read_to_string(cap.path().join(f)).unwrap_or_default();
+    (
+        out.status.code(),
+        get("iptables-restore"),
+        get("ip6tables-restore"),
+        get("getent.log"),
+    )
+}
+
+/// Every host answers on the first pass; on later passes `down` answers nothing.
+fn getent_failing_after_install(down: &str) -> String {
+    format!(
+        r#"[ "$pass" -ge 1 ] && [ "$2" = {down} ] && exit 0
+case "$1 $2" in
+"ahostsv4 api.github.com") echo "192.0.2.10  STREAM a";;
+"ahostsv4 uploads.github.com") echo "192.0.2.11  STREAM u";;
+"ahostsv4 github.com") echo "192.0.2.12  STREAM g";;
+"ahostsv6 api.github.com") echo "2001:db8::10  STREAM a";;
+"ahostsv6 uploads.github.com") echo "2001:db8::11  STREAM u";;
+esac"#
+    )
+}
+
+#[test]
+fn refresh_keeps_the_previous_rules_when_either_blocked_host_stops_resolving() {
+    for down in ["api.github.com", "uploads.github.com"] {
+        for fail_string in [false, true] {
+            let (code, v4, v6, _) =
+                run_refreshing(&getent_failing_after_install(down), 1, fail_string);
+            assert_eq!(code, Some(0), "{down}");
+            // One install at startup; the degraded refresh installs nothing, over
+            // IPv4 (host unresolvable) and IPv6 (host that answered goes silent).
+            assert_eq!(v4.matches("COMMIT").count(), 1, "{down} fail_string={fail_string}: {v4}");
+            assert_eq!(v6.matches("COMMIT").count(), 1, "{down} fail_string={fail_string}: {v6}");
+            for ip in ["192.0.2.10/32", "192.0.2.11/32"] {
+                assert!(v4.contains(ip), "{down}: the full set was installed once: {v4}");
+            }
+            for ip in ["2001:db8::10/128", "2001:db8::11/128"] {
+                assert!(v6.contains(ip), "{down}: {v6}");
+            }
+        }
+    }
+}
+
+#[test]
+fn refresh_reinstalls_once_every_host_resolves_again() {
+    // The failure is transient: a later pass with every host answering installs.
+    let body = r#"[ "$pass" -eq 1 ] && [ "$2" = uploads.github.com ] && exit 0
+case "$1 $2" in
+"ahostsv4 api.github.com") echo "192.0.2.10  STREAM a";;
+"ahostsv4 uploads.github.com") echo "192.0.2.11  STREAM u";;
+"ahostsv4 github.com") echo "192.0.2.12  STREAM g";;
+esac"#;
+    let (code, v4, _, _) = run_refreshing(body, 2, false);
+    assert_eq!(code, Some(0));
+    assert_eq!(v4.matches("COMMIT").count(), 2, "{v4}");
+}
+
+#[test]
+fn rules_are_rendered_from_one_lookup_per_host_even_when_dns_changes() {
+    // Each (family, host) answers once; any further lookup returns a different
+    // address (or nothing). The rules, and the no-`xt_string` fallback render,
+    // must come from the first answers only.
+    let body = r#"case "$1 $2" in
+"ahostsv4 api.github.com") [ "$calls" = 1 ] && echo "192.0.2.10  STREAM a" || echo "198.51.100.1  STREAM a";;
+"ahostsv4 uploads.github.com") [ "$calls" = 1 ] && echo "192.0.2.11  STREAM u";;
+"ahostsv4 github.com") [ "$calls" = 1 ] && echo "192.0.2.12  STREAM g" || echo "198.51.100.3  STREAM g";;
+esac"#;
+    for fail_string in [false, true] {
+        let (code, v4, _, log) = run_refreshing(body, 0, fail_string);
+        assert_eq!(code, Some(0), "fail_string={fail_string}");
+        assert_eq!(v4.matches("COMMIT").count(), 1, "{v4}");
+        for ip in ["192.0.2.10/32", "192.0.2.11/32", "192.0.2.12/32"] {
+            assert!(v4.contains(ip), "fail_string={fail_string}: {v4}");
+        }
+        assert!(!v4.contains("198.51.100"), "a second lookup leaked into the rules: {v4}");
+        for q in [
+            "ahostsv4 api.github.com",
+            "ahostsv4 uploads.github.com",
+            "ahostsv4 github.com",
+        ] {
+            assert_eq!(log.lines().filter(|l| *l == q).count(), 1, "{q} resolved more than once");
+        }
+    }
+}
+
 #[test]
 fn canary_exit_status_classification() {
     assert_eq!(classify_canary(Some((0, String::new()))), CanaryOutcome::Open);

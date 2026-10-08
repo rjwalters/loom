@@ -228,7 +228,8 @@ pub fn render_restore(
 
 /// The sidecar's `sh -c` program. Configuration arrives in the environment
 /// (`LOOM_EGRESS_BLOCKED`, `LOOM_EGRESS_ALLOWED`, `LOOM_EGRESS_REFRESH`;
-/// `LOOM_EGRESS_ONCE=1` exits after the first install — the test hook).
+/// `LOOM_EGRESS_ONCE=1` exits after the first install and
+/// `LOOM_EGRESS_PASSES=N` after N refreshes — the test hooks).
 /// Exit 70: rules could not be installed (the spawn is aborted).
 #[must_use]
 pub fn sidecar_script() -> String {
@@ -237,7 +238,27 @@ pub fn sidecar_script() -> String {
 CHAIN={CHAIN}
 READY={READY_FILE}
 resolve() {{ getent "ahosts$1" "$2" 2>/dev/null | awk '{{print $1}}' | sort -u; }}
-collect() {{ for h in $2; do resolve "$1" "$h"; done | sort -u; }}
+# snapshot FAM PREV: resolve every host exactly once into SNAP ("role host ip"
+# lines, role B = blocked, A = allowed). Every rule set is rendered from this
+# one snapshot, never from a second lookup. Fails, leaving the installed rules
+# alone, when a host cannot be vouched for: over IPv4 each host must resolve;
+# over IPv6 a host may have no AAAA record, unless it answered in PREV (the
+# last accepted snapshot), in which case silence is a failed lookup.
+snapshot() {{
+  fam=$1 prev=$2 SNAP=
+  for role in B A; do
+    if [ "$role" = B ]; then hosts=$LOOM_EGRESS_BLOCKED; else hosts=$LOOM_EGRESS_ALLOWED; fi
+    for h in $hosts; do
+      ips=$(resolve "$fam" "$h")
+      if [ -z "$ips" ]; then
+        if [ "$fam" = v4 ] || printf '%s\n' "$prev" | grep -qF "$role $h "; then return 1; fi
+        continue
+      fi
+      for ip in $ips; do SNAP="$SNAP$role $h $ip
+"; done
+    done
+  done
+}}
 render() {{
   fam=$1 sni=$2 w=/32
   [ "$fam" = v6 ] && w=/128
@@ -247,41 +268,45 @@ render() {{
       printf -- '-A %s -p tcp --dport 443 -m string --string %s --algo bm -j REJECT --reject-with tcp-reset\n' "$CHAIN" "$h"
     done
   fi
-  collect "$fam" "$LOOM_EGRESS_ALLOWED" | while read -r ip; do
+  printf '%s' "$SNAP" | awk '$1 == "A" {{print $3}}' | sort -u | while read -r ip; do
     [ -n "$ip" ] && printf -- '-A %s -d %s%s -j ACCEPT\n' "$CHAIN" "$ip" "$w"
   done
-  collect "$fam" "$LOOM_EGRESS_BLOCKED" | while read -r ip; do
+  printf '%s' "$SNAP" | awk '$1 == "B" {{print $3}}' | sort -u | while read -r ip; do
     [ -n "$ip" ] && printf -- '-A %s -d %s%s -p tcp -j REJECT --reject-with tcp-reset\n' "$CHAIN" "$ip" "$w"
   done
   printf 'COMMIT\n'
 }}
 apply() {{
-  fam=$1 ipt=iptables
-  [ "$fam" = v6 ] && ipt=ip6tables
-  # A resolution that found no blocked address (a DNS blip) must not replace
-  # the chain with an empty one, and the allowed side must resolve in IPv4.
-  # Keep the previous rules and fail; IPv6 with no AAAA at all and no chain
-  # yet has nothing to block.
-  if [ -z "$(collect "$fam" "$LOOM_EGRESS_BLOCKED")" ]; then
-    if [ "$fam" = v6 ] && ! "$ipt" -n -L "$CHAIN" >/dev/null 2>&1; then return 0; fi
+  fam=$1 ipt=iptables prev=$PREV4
+  if [ "$fam" = v6 ]; then ipt=ip6tables prev=$PREV6; fi
+  # A refresh that cannot vouch for every host (a DNS blip on one of them)
+  # must not replace the chain with a partial one. Keep the previous rules and
+  # fail; IPv6 with no AAAA at all and no chain yet has nothing to block.
+  snapshot "$fam" "$prev" || return 1
+  if ! printf '%s' "$SNAP" | grep -q '^B '; then
+    [ "$fam" = v6 ] && return 0
     return 1
   fi
-  if [ "$fam" = v4 ] && [ -z "$(collect "$fam" "$LOOM_EGRESS_ALLOWED")" ]; then return 1; fi
   v4v6=$(render "$fam" 1)
   if ! printf '%s\n' "$v4v6" | "$ipt-restore" --noflush 2>/dev/null; then
     printf '%s\n' "$(render "$fam" 0)" | "$ipt-restore" --noflush || return 1
   fi
   "$ipt" -C OUTPUT -j "$CHAIN" 2>/dev/null || "$ipt" -I OUTPUT 1 -j "$CHAIN" || return 1
+  if [ "$fam" = v6 ]; then PREV6=$SNAP; else PREV4=$SNAP; fi
 }}
 has_global_v6() {{ [ -r /proc/net/if_inet6 ] && awk '$6 != "lo"' /proc/net/if_inet6 | grep -q .; }}
+PREV4='' PREV6=''
 apply v4 || {{ echo "loom-egress: cannot install IPv4 rules" >&2; exit 70; }}
 if ! apply v6 && has_global_v6; then echo "loom-egress: cannot install IPv6 rules" >&2; exit 70; fi
 : > "$READY"
 [ "${{LOOM_EGRESS_ONCE:-}}" = 1 ] && exit 0
+passes=0
 while :; do
   sleep "${{LOOM_EGRESS_REFRESH:-{REFRESH_SECS}}}"
   apply v4 || true
   apply v6 || true
+  passes=$((passes + 1))
+  [ "$passes" = "${{LOOM_EGRESS_PASSES:-}}" ] && exit 0
 done
 "#
     )
