@@ -77,11 +77,14 @@ fn no_events() -> impl FnMut(&RepoTarget, &Reader, ForgeEndpoint, u64, SyncMode)
 // -- gating ---------------------------------------------------------------
 
 #[test]
-fn the_task_runs_only_when_eta_and_fleet_refresh_are_both_on() {
+fn the_task_runs_with_eta_on_unless_the_env_hard_stop_is_set() {
     let resolve = |v: serde_json::Value| crate::eta::config::resolve(&v, |_| None);
     assert!(should_spawn(&resolve(json!({}))), "default on");
     assert!(!should_spawn(&resolve(json!({"autonomous": {"eta": {"enabled": false}}}))));
-    assert!(!should_spawn(&resolve(
+    // #10918: a config `false` still spawns the loop; its per-tick gate reads
+    // `disabled` there unless this host becomes the explicit ETA authority,
+    // which then refreshes with no restart.
+    assert!(should_spawn(&resolve(
         json!({"autonomous": {"eta": {"fleetRefresh": {"enabled": false}}}})
     )));
     let env_off = crate::eta::config::resolve(&json!({}), |k| {

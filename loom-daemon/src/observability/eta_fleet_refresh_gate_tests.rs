@@ -104,7 +104,7 @@ fn a_non_captain_makes_no_forge_call_and_no_record_but_still_fits() {
     assert_eq!(
         tick.gate,
         RefreshGate::StandDown {
-            captain: "host-b".to_string()
+            owner: "host-b".to_string()
         }
     );
     assert_eq!((calls, synced), (0, 0), "no snapshot, backfill or raw-event call");
@@ -188,6 +188,145 @@ fn a_standing_down_host_honours_a_backfill_hold_beside_its_snapshots() {
     let (tick, calls, _) = run_tick(root, "host-a", &mut TaskState::default());
     assert_eq!(calls, 0);
     assert!(tick.fit_held, "the fit waits for the captain's backfill, as on the captain");
+}
+
+// -- the explicit ETA authority (#10918) ----------------------------------------
+
+/// `.loom/config.json` under `root`, (re)written as `config`.
+fn configure(root: &Path, config: &serde_json::Value) {
+    let path = root.join(crate::config_resolver::LEGACY_CONFIG_REL);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, config.to_string()).unwrap();
+}
+
+#[test]
+fn the_explicit_authority_refreshes_and_the_captain_stands_down() {
+    let _serial = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    configure(root, &serde_json::json!({"fleet": {"captain": "cap", "etaAuthority": "w1"}}));
+
+    let (captain, calls, synced) = run_tick(root, "cap", &mut TaskState::default());
+    assert_eq!(
+        captain.gate,
+        RefreshGate::StandDown {
+            owner: "w1".to_string()
+        }
+    );
+    assert_eq!((calls, synced), (0, 0), "the captain makes no forge call");
+    assert!(captain.outcome.is_none(), "and no eta.fleet_refresh record");
+    assert!(!armed(), "not listed on the captain");
+    assert_eq!(cycle_state(&captain, now(), 3600).captain.as_deref(), Some("w1"));
+
+    let (authority, calls, synced) = run_tick(root, "w1", &mut TaskState::default());
+    assert_eq!(authority.gate, RefreshGate::Authority);
+    assert!(calls > 0 && synced > 0, "the authority makes the cycle's forge calls");
+    assert!(authority.outcome.is_some());
+    assert!(armed(), "host.health.armed_singleton_jobs lists it on the authority");
+    assert!(!captainless_singleton_job_names().contains(&SINGLETON_JOB_NAME.to_string()));
+    assert_eq!(cycle_state(&authority, now(), 3600).gate, "authority");
+
+    // Every other host stands down too: one refresher fleet-wide.
+    let (other, calls, _) = run_tick(root, "w2", &mut TaskState::default());
+    assert!(!other.gate.refreshes() && calls == 0);
+    assert!(!armed(), "a stand-down tick disarms");
+    crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+}
+
+#[test]
+fn the_authority_overrides_its_own_fleet_refresh_off_and_keeps_its_fit_inputs_current() {
+    let _serial = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // fleet-gitops' worker shape: refresh off in this host's config.
+    configure(
+        root,
+        &serde_json::json!({
+            "fleet": {"captain": "cap", "etaAuthority": "w1"},
+            "autonomous": {"eta": {"fleetRefresh": {"enabled": false}}}
+        }),
+    );
+    // A stale snapshot, three days old: what the authority had been fitting on.
+    let stale = now() - chrono::Duration::days(3);
+    let mut snapshot = fleet::FleetSnapshot::empty("acme/alpha");
+    snapshot.merge(&[], stale);
+    fleet::write(&fleet::snapshot_path(root, "acme/alpha"), &snapshot).unwrap();
+
+    let (tick, calls, _) = run_tick(root, "w1", &mut TaskState::default());
+    assert_eq!(tick.gate, RefreshGate::Authority);
+    assert!(calls > 0);
+    let as_of = fleet::read(&fleet::snapshot_path(root, "acme/alpha"))
+        .unwrap()
+        .as_of;
+    assert!(as_of > stale, "one cycle advances the snapshot: {as_of}");
+    let fitter = run::current_fitter();
+    assert!(
+        matches!(after_cycle(root, now(), tick.fit_held, true, &fitter), FitCheck::Wrote(_)),
+        "the fit reads `written`, not no_snapshots or stale"
+    );
+    crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+
+    // A host that is not the authority keeps its config `false`.
+    let (worker, calls, _) = run_tick(root, "w2", &mut TaskState::default());
+    assert_eq!(worker.gate, RefreshGate::Disabled);
+    assert_eq!(calls, 0);
+    assert_eq!(cycle_state(&worker, now(), 3600).gate, "disabled");
+}
+
+#[test]
+fn the_gate_is_pure_over_the_owner_and_the_hosts_switch() {
+    use crate::eta::job_owner::resolve;
+    let gate = |explicit, captain, host, on| decide(&resolve(explicit, captain, host), on);
+    // No explicit authority: exactly the captain gate, as before.
+    assert_eq!(gate(None, Some("cap"), "cap", true), RefreshGate::Captain);
+    assert_eq!(
+        gate(None, Some("cap"), "w1", true),
+        RefreshGate::StandDown {
+            owner: "cap".into()
+        }
+    );
+    assert_eq!(gate(None, None, "w1", true), RefreshGate::NoCaptain);
+    assert_eq!(gate(None, Some("cap"), "cap", false), RefreshGate::Disabled);
+    // The authority is the captain: unchanged in effect, it refreshes.
+    assert_eq!(gate(Some("cap"), Some("cap"), "cap", true), RefreshGate::Authority);
+    // The authority refreshes even with its own switch off; nobody else does.
+    assert_eq!(gate(Some("w1"), Some("cap"), "w1", false), RefreshGate::Authority);
+    assert_eq!(gate(Some("w1"), Some("cap"), "cap", false), RefreshGate::Disabled);
+    let names: Vec<&str> = [
+        RefreshGate::Captain,
+        RefreshGate::Authority,
+        RefreshGate::NoCaptain,
+        RefreshGate::StandDown { owner: "x".into() },
+        RefreshGate::Disabled,
+    ]
+    .iter()
+    .map(RefreshGate::as_str)
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "captain",
+            "authority",
+            "no_captain",
+            "stand_down",
+            "disabled"
+        ]
+    );
+}
+
+#[test]
+fn moving_the_authority_takes_effect_on_the_next_tick() {
+    let _serial = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut task = TaskState::default();
+    configure(root, &serde_json::json!({"fleet": {"captain": "cap"}}));
+    let (first, _, _) = run_tick(root, "cap", &mut task);
+    assert_eq!(first.gate, RefreshGate::Captain);
+    configure(root, &serde_json::json!({"fleet": {"captain": "cap", "etaAuthority": "w1"}}));
+    let (second, calls, _) = run_tick(root, "cap", &mut task);
+    assert!(!second.gate.refreshes() && calls == 0);
+    assert!(!armed(), "the captain disarms within one tick, with no restart");
 }
 
 // -- the reserve, per installation (raw events) ---------------------------------

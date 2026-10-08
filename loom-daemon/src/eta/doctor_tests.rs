@@ -642,3 +642,45 @@ fn the_repo_check_reports_the_gap_fill_request_count() {
         c.detail
     );
 }
+
+/// #10918: on the explicit ETA authority the refresh gate reads "authority",
+/// even with its own `fleetRefresh.enabled` off; any other host stands down
+/// for the authority, and the backtest skip names it.
+#[test]
+fn the_explicit_authority_refreshes_and_the_others_stand_down_for_it() {
+    let mut f = healthy();
+    f.config.fleet_refresh_enabled = false;
+    f.data.gate = Gate::Authority;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("ETA authority"), "{}", gate.render());
+    let refresh = find(&checks, "data", "refresh_loop");
+    assert_eq!(refresh.status, Status::Ok, "not skipped as 'fleet refresh is off'");
+    let switch = find(&checks, "config", "fleet_refresh");
+    assert_eq!(switch.status, Status::Ok, "no remedy to turn on what is overridden");
+
+    f.config.fleet_refresh_enabled = true;
+    f.data.gate = Gate::AuthorityElsewhere {
+        authority: "loom-worker-1".into(),
+    };
+    f.data.repos[0].has_reader = false;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("loom-worker-1"), "{}", gate.render());
+    assert_eq!(
+        find(&checks, "data", "repo acme/alpha").status,
+        Status::Ok,
+        "a stand-down host does not demand a reader"
+    );
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("ETA authority (loom-worker-1"), "{}", c.render());
+}
