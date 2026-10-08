@@ -30,7 +30,7 @@
 //!
 //! | Envelope field | OTLP destination |
 //! |---|---|
-//! | `host_id` | `Resource` attribute `service.instance.id` (and `host.id`) — one `ResourceLogs`/`ResourceMetrics` entry per distinct `host_id` in a batch |
+//! | `host_id` | `Resource` attributes `service.instance.id`, `host.id` and `host.name` (all the same string) — one `ResourceLogs`/`ResourceMetrics` entry per distinct `host_id` in a batch |
 //! | `emitted_at` | `LogRecord.time_unix_nano` / `.observed_time_unix_nano`, or `NumberDataPoint.time_unix_nano` |
 //! | a record's repo-visibility tag (when present) | **not** a `Resource` attribute — a `Resource` describes the emitting *host*, and one host's batch can reference many repos, so visibility is a per-`LogRecord` attribute `loom.repo.visibility` (alongside `loom.repo`) instead |
 //!

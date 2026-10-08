@@ -177,6 +177,25 @@ still omit the optional feature. Export remains disabled until explicitly enable
 See [execution traces](tracing.md) for persisted trace identity, correlated logs,
 completed-span export, and bounded shutdown.
 
+Every OTLP request, on all three signals (traces, logs, metrics), carries one
+resource per emitting host with exactly these attributes:
+
+| Resource attribute | Value |
+|---|---|
+| `service.name` | the literal `loom-daemon` |
+| `service.instance.id` | the envelope's `host_id` |
+| `host.id` | the envelope's `host_id` |
+| `host.name` | the envelope's `host_id` (#10977) |
+| `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
+
+`host.name` has one source, the same string as `host.id`: the daemon's host
+identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
+otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
+`$LOOM_HOST_ID` at provisioning time on any host whose OS hostname is not a name
+you chose (a cloud instance's is derived from its address). The daemon sets
+`host.name` itself, so a receiver reached without a collector gets it too; the
+bundled collector's resource allowlist forwards it unchanged.
+
 ### Multi-exporter fan-out (#8756)
 
 `observability.exporters` accepts a **list**, delivering the same envelopes to
