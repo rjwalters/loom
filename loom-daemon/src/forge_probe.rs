@@ -586,7 +586,7 @@ fn actor_of(http: &dyn ProbeHttp, token: &str, secrets: &[&str]) -> Option<Strin
     serde_json::from_str::<serde_json::Value>(body.trim())
         .ok()
         .and_then(|v| v.get("login").and_then(|l| l.as_str()).map(String::from))
-        .filter(|l| is_clean(l, secrets))
+        .filter(|l| !l.trim().is_empty() && is_clean(l, secrets))
 }
 
 /// True when redaction would leave `s` unchanged, i.e. it embeds no credential.
@@ -1127,21 +1127,44 @@ mod tests {
             assert!(err.to_string().contains("without a usable version"), "{err}");
         }
 
-        // A 200 login carrying a token yields no actor: the PASS fails closed.
-        for l in [FAKE_WRITER, FAKE_RO, "https://u:pw@h"] {
+        // issue-create with a valid read-back: only the login varies.
+        let issue_create_row = |login: &str| {
             let mut http = FakeHttp::new();
             http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-            http.push("issues", vec![Ok((201, r#"{"number":7}"#.into()))]);
-            http.push("user", vec![Ok((200, format!(r#"{{"login":"{l}"}}"#)))]);
-            let results = run(&leaky_cfg(), &http).unwrap();
+            http.push(
+                "issues",
+                vec![
+                    Ok((201, r#"{"number":7}"#.into())),
+                    Ok((200, issue_json(7, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+                ],
+            );
+            http.push("user", vec![Ok((200, serde_json::json!({ "login": login }).to_string()))]);
+            let mut c = leaky_cfg();
+            c.only = vec!["issue-create".into()];
+            let results = run(&c, &http).unwrap();
             let receipt = serde_json::to_string(&results).unwrap();
             assert_clean(&receipt);
             assert!(!receipt.contains("u:pw"), "{receipt}");
-            assert!(results.iter().all(|r| r.actor.is_none()), "{receipt}");
-            assert!(
-                results.iter().all(|r| r.outcome != OUTCOME_PASS),
-                "no PASS without actor evidence: {receipt}"
-            );
+            let row = results
+                .into_iter()
+                .find(|r| r.test_id.contains("issue-create"))
+                .unwrap();
+            (row, receipt)
+        };
+
+        // Control: a clean login on a valid read-back is a PASS with an actor.
+        let (row, receipt) = issue_create_row("probe-writer");
+        assert_eq!(row.outcome, OUTCOME_PASS, "{receipt}");
+        assert_eq!(row.actor.as_deref(), Some("probe-writer"));
+
+        // A credential-bearing, empty or whitespace-only login is unusable
+        // evidence: the otherwise-passing case fails closed with no actor.
+        for l in [FAKE_WRITER, FAKE_RO, "https://u:pw@h", "", "   "] {
+            let (row, receipt) = issue_create_row(l);
+            assert_eq!(row.outcome, OUTCOME_FAIL, "login {l:?}: {receipt}");
+            assert!(row.actor.is_none(), "login {l:?}: {receipt}");
+            assert!(row.observed.contains("actor evidence unavailable"), "login {l:?}: {receipt}");
+            assert!(row.observed.contains("issue #7 created"), "{receipt}");
         }
     }
 
