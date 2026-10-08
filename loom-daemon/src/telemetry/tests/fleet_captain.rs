@@ -41,6 +41,7 @@ pub(super) fn host_health_with_captain(
         is_captain,
         armed_singleton_jobs,
         captainless_singleton_jobs: Vec::new(),
+        authority_owned_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
         memory: None,
@@ -129,4 +130,32 @@ fn host_health_carries_captainless_singleton_jobs_only_when_present_9014() {
     assert_eq!(value["captainless_singleton_jobs"], serde_json::json!(["ci-telemetry-poll"]));
     let back: HostHealthRecord = serde_json::from_value(value).unwrap();
     assert_eq!(back.captainless_singleton_jobs, vec!["ci-telemetry-poll".to_string()]);
+}
+
+#[test]
+fn host_health_carries_authority_owned_singleton_jobs_only_when_present_10925() {
+    let TelemetryRecord::HostHealth(mut health) = host_health_with_captain(None, Vec::new()) else {
+        unreachable!()
+    };
+    assert!(serde_json::to_value(&health)
+        .unwrap()
+        .get("authority_owned_singleton_jobs")
+        .is_none());
+
+    health.authority_owned_singleton_jobs = vec!["eta-fleet-refresh".to_string()];
+    let value = serde_json::to_value(&health).unwrap();
+    assert_eq!(
+        value["authority_owned_singleton_jobs"],
+        serde_json::json!(["eta-fleet-refresh"])
+    );
+    let back: HostHealthRecord = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(back.authority_owned_singleton_jobs, vec!["eta-fleet-refresh".to_string()]);
+
+    // A pre-#10925 record (field absent) still decodes, as empty.
+    let mut old = value;
+    old.as_object_mut()
+        .unwrap()
+        .remove("authority_owned_singleton_jobs");
+    let back: HostHealthRecord = serde_json::from_value(old).unwrap();
+    assert!(back.authority_owned_singleton_jobs.is_empty());
 }

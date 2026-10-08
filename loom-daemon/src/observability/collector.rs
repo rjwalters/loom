@@ -1214,6 +1214,7 @@ async fn sample_host_health(
             workspace_root,
         ),
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
+        authority_owned_singleton_jobs: crate::fleet_captain::authority_owned_singleton_job_names(),
         exported_kinds,
         exporters,
         // Memory/pressure slice ("deferred vs killed vs timed out"): the

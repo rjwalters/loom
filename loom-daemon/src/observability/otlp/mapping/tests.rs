@@ -219,6 +219,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            authority_owned_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
             memory: Some(MemoryPressureSummary {
@@ -635,6 +636,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        authority_owned_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
         memory: None,

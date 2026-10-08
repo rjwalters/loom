@@ -195,6 +195,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            authority_owned_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
             memory: None,

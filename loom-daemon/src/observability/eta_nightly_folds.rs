@@ -433,11 +433,16 @@ mod tests {
             "the captain does not fold"
         );
         assert!(!armed_singleton_job_names().contains(&job));
+        assert!(!crate::fleet_captain::authority_owned_singleton_job_names().contains(&job));
         assert!(!captainless_singleton_job_names().contains(&job), "it has an owner");
         let authority = gate_tick_with(root.path(), "loom-worker-1", &mut last, no_env);
         assert_eq!(authority, FoldGate::Authority);
         assert!(authority.folds());
         assert!(armed_singleton_job_names().contains(&job), "host.health lists it");
+        assert!(
+            crate::fleet_captain::authority_owned_singleton_job_names().contains(&job),
+            "and marks it authority-owned (#10925)"
+        );
 
         // The key removed: the captain gate again, with no restart.
         std::fs::write(&config, r#"{"fleet": {"captain": "cap"}}"#).unwrap();
@@ -448,7 +453,13 @@ mod tests {
             }
         );
         assert!(!armed_singleton_job_names().contains(&job), "disarmed within one check");
+        assert!(!crate::fleet_captain::authority_owned_singleton_job_names().contains(&job));
         assert_eq!(gate_tick_with(root.path(), "cap", &mut last, no_env), FoldGate::Captain);
+        assert!(armed_singleton_job_names().contains(&job));
+        assert!(
+            !crate::fleet_captain::authority_owned_singleton_job_names().contains(&job),
+            "a captain-gated job is never owner-listed"
+        );
         crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
     }
 

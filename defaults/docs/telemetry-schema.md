@@ -2933,6 +2933,13 @@ in `daemon-reference.md` for the full design:
   not-this-host refusal is not listed. Omitted when empty. It is not yet on
   the public redaction allowlist, so the public view drops it.
 
+- `authority_owned_singleton_jobs` (#10925) — the subset of
+  `armed_singleton_jobs` armed under an explicit `fleet.etaAuthority` rather
+  than `fleet.captain` (`eta-fleet-refresh`, `eta-nightly-folds`). Omitted when
+  empty, cleared on the next tick when the authority moves away; a pre-#10925
+  record decodes as empty. A "singleton armed on a non-captain" check must
+  exclude these. Not yet on the public redaction allowlist.
+
 `is_captain` and `armed_singleton_jobs` are additive (no `schema_version` bump) and pass through public
 redaction unchanged (`loom-ui:src/redaction.ts`): `is_captain` describes
 this host's own role in an operator-assigned fleet-wide designation, and a

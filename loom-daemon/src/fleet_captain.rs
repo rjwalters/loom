@@ -284,6 +284,10 @@ pub fn disarm_singleton_job(job_name: &str) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(job_name);
+    owned_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(job_name);
 }
 
 /// Process-lifetime set of singleton jobs whose most recent
@@ -294,6 +298,27 @@ pub fn disarm_singleton_job(job_name: &str) {
 fn captainless_registry() -> &'static Mutex<BTreeSet<String>> {
     static REGISTRY: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Process-lifetime set of singleton jobs currently armed here under a
+/// non-captain owner (`fleet.etaAuthority`, #10925) via
+/// [`record_owned_singleton_job`]. Always a subset of the armed registry.
+fn owned_registry() -> &'static Mutex<BTreeSet<String>> {
+    static REGISTRY: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Armed singleton job names whose owner is an explicit authority rather than
+/// `fleet.captain` (#10925), sorted. Sampled into
+/// [`crate::telemetry::HostHealthRecord::authority_owned_singleton_jobs`].
+#[must_use]
+pub fn authority_owned_singleton_job_names() -> Vec<String> {
+    owned_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Singleton job names currently refused on this host for want of a declared
@@ -362,6 +387,10 @@ pub fn record_owned_singleton_job(job_name: &str, armed_here: bool) {
         .remove(job_name);
     if armed_here {
         armed_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_name.to_string());
+        owned_registry()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(job_name.to_string());

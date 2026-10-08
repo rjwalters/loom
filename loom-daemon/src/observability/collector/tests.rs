@@ -1166,6 +1166,7 @@ fn all_repos_failing_roles_is_not_green_anywhere_while_every_other_axis_is_healt
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        authority_owned_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
         memory: None,

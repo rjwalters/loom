@@ -3036,7 +3036,7 @@ not one per host.
   backfill, raw events: singleton `eta-fleet-refresh`) and the
   [nightly folds](#nightly-backtest-folds-autonomousetanightlyfolds-10492)
   (`eta-nightly-folds`, and the retirement filing that reads them). The named
-  host arms them (`host.health.armed_singleton_jobs`). Every other host, the
+  host arms them (`host.health.armed_singleton_jobs`, and also `host.health.authority_owned_singleton_jobs` so a reader can tell an authority-owned job from a captain job leaked onto a non-captain; `is_captain` is `false` or absent on that host and the not-captain anomaly flag must exclude the owner-listed jobs, #10925). Every other host, the
   captain included, stands down: no forge call, no record. That leaves one
   refresher fleet-wide, under the same budgets. With no explicit key nothing
   changes: the captain gate decides, and the authority is the captain anyway

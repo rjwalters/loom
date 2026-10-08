@@ -1640,6 +1640,15 @@ pub struct HostHealthRecord {
     /// empty; a pre-#9014 record decodes as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
+    /// Armed singleton jobs whose owner is an explicit authority rather than
+    /// `fleet.captain` (Issue #10925), from
+    /// [`crate::fleet_captain::authority_owned_singleton_job_names`] -- today
+    /// `eta-fleet-refresh` and `eta-nightly-folds` on the `fleet.etaAuthority`
+    /// host. Always a subset of `armed_singleton_jobs`; a reader flagging
+    /// "armed on a non-captain" must exclude these. Omitted when empty; a
+    /// pre-#10925 record decodes as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_owned_singleton_jobs: Vec<String>,
     /// Record kinds this host's started exporters carry (Issue #10196),
     /// sorted wire `kind` tags -- the export-coverage half of the replay
     /// contract (`telemetry-replay.md`). Derived from the kind registry via

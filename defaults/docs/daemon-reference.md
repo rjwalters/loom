@@ -7862,7 +7862,7 @@ every other optional field on that struct already follows. The dashboard
 (`2AMLogic/loom-ui:src/redaction.ts`'s `host.health` allowlist,
 `loom-ui:web/src/fleet.ts`'s `singletonsArmedOnNonCaptain`/
 `noCaptainReporting`, rendered in `loom-ui:web/src/views/fleetOverview.ts`)
-flags (a) a singleton reported armed on a non-captain host, and (b) a fleet
+flags (a) a singleton reported armed on a non-captain host (excluding any job also listed in `authority_owned_singleton_jobs`, #10925: the `fleet.etaAuthority` host legitimately arms `eta-fleet-refresh` / `eta-nightly-folds` while `is_captain` is `false` or absent, so the exclusion applies in both the `Some(false)` and the no-captain `None` cases), and (b) a fleet
 that has opted in (some host reports `is_captain` at all) but none of them is
 currently `true` — a typo'd or decommissioned captain id, or one that has
 simply never reported `host.health`, surfaces the same way rather than
