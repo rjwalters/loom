@@ -36,6 +36,7 @@
 //!   instead of adding a second forge call path.
 
 pub mod aggressive;
+pub mod branch_holders;
 pub mod cargo_target;
 pub mod claim_file;
 pub mod clean;

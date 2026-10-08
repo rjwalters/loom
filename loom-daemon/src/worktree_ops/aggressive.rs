@@ -487,7 +487,10 @@ fn remove_aggressive_worktree(
         wt.branch_short().as_deref(),
         reason.as_str(),
     );
-    if let Some(b) = wt.branch_short() {
+    if let Some(b) = wt
+        .branch_short()
+        .filter(|b| !super::branch_holders::skip_if_held(repo_root, b))
+    {
         let _ = Command::new("git")
             .args(["branch", "-D", &b])
             .current_dir(repo_root)
