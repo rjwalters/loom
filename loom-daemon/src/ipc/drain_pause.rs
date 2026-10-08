@@ -129,6 +129,21 @@ impl DrainState {
         true
     }
 
+    /// Whether a pause roll is armed, committed or in progress: an active
+    /// [`DrainOrigin::PauseRoll`] drain, whether or not the H4 pause has
+    /// stopped an agent yet. The restart it ends in is coming.
+    ///
+    /// `false` for an operator drain, a fleet-state `paused` hold (always
+    /// [`DrainOrigin::Operator`]) and a pause roll an operator request
+    /// promoted: those pause dispatch, but no roll is coming. This is what
+    /// replaced #6007's retained-roll flag (`roll_pending`) for the workspace
+    /// resync's host gate (#10718, merged with #10831 in #10974).
+    #[must_use]
+    pub fn pause_roll_in_progress(&self) -> bool {
+        let inner = self.inner.lock().expect("Drain mutex poisoned");
+        inner.active && inner.origin == DrainOrigin::PauseRoll
+    }
+
     /// The active drain's terminal action: `true` ⇒ exit and stay down.
     #[must_use]
     pub fn then_exit(&self) -> bool {

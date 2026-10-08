@@ -30,8 +30,9 @@
 //!
 //! The payload diff is narrower than the shell resync it will replace. After
 //! a payload resync the stamp says "release X" while every surface below can
-//! still be at an older release. Each needs an owner before
-//! `fleet-resync.sh` is retired (#10718 / #10719):
+//! still be at an older release. The daemon's workspace resync (#10718)
+//! installs this diff as it is; each surface below needs an owner before
+//! `fleet-resync.sh` is retired (#10895):
 //!
 //! * `.agents/skills/` (the Codex role prompts; marker-gated in the script)
 //! * `.claude/README.md` and `.github/CONFIGURATION.md`
@@ -85,11 +86,19 @@
 //! cannot be ordered against this daemon, so it could be newer. Only an
 //! absent, empty or `"unknown"` value counts as "not recorded".
 //!
-//! # Only a release build resyncs
+//! An interrupted resync is covered too. `loom_version` is stamped last, so a
+//! tree a NEWER daemon was part-way through still shows the old version;
+//! [`gate_metadata`] reads the `resync_pending` target and refuses when it is
+//! above this daemon, so an older host never completes (and so rolls back) a
+//! newer host's partial apply.
 //!
-//! `build.rs` packs the working tree, so a daemon built from a checkout with
-//! uncommitted changes embeds files that are no release. [`Stamp::this_binary`]
-//! carries the build's tree state and the gate refuses unless it is `clean`.
+//! # Only an official release build resyncs
+//!
+//! `build.rs` packs whatever tree it is run in, so a developer's build or a
+//! feature branch's embeds files that are no release, even from a clean
+//! checkout. [`Stamp::this_binary`] sets `release_build` only for a binary the
+//! release workflow built and whose release tag the forge confirmed
+//! ([`crate::release_provenance`]); the gate refuses every other payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -134,10 +143,12 @@ pub struct Stamp {
     pub commit: Option<String>,
     /// The oldest daemon these files work with.
     pub requires_daemon: String,
-    /// The payload is the tracked `defaults/` tree of `commit`, unmodified.
-    /// False for a build from a dirty checkout, or one that could not tell
-    /// (`LOOM_DAEMON_GIT_DIRTY` is `dirty` or `unknown`); such a payload is
-    /// never applied.
+    /// The payload is an official release's: the binary was built by the
+    /// release workflow for `v<version>`, and the forge confirmed that tag
+    /// names `commit` ([`crate::release_provenance`]). False for every other
+    /// build (a developer's, a feature branch's, CI's), and for a release
+    /// build whose tag has not been confirmed yet; such a payload is never
+    /// applied.
     pub release_build: bool,
 }
 
@@ -153,7 +164,7 @@ impl Stamp {
             version: Version::parse(env!("CARGO_PKG_VERSION"))?,
             commit,
             requires_daemon: REQUIRES_DAEMON.to_string(),
-            release_build: crate::self_update::BUILT_TREE_STATE == "clean",
+            release_build: crate::release_provenance::is_verified(),
         })
     }
 }
@@ -272,8 +283,9 @@ pub enum ResyncRefusal {
     /// The Loom source checkout installs from its own `defaults/` (dogfood
     /// symlinks); a resync never writes there.
     LoomSourceRepo,
-    /// This daemon was not built from a clean checkout, so its embedded
-    /// payload is not the files of any release.
+    /// This daemon is not a verified official release build
+    /// ([`crate::release_provenance`]), so its embedded payload is not known
+    /// to be the files of any release.
     NotAReleaseBuild,
     /// A contract field holds a value that is not `MAJOR.MINOR.PATCH` (for
     /// example `0.20.0-rc1`). It cannot be ordered against this daemon, so it
@@ -302,14 +314,30 @@ pub enum ResyncRefusal {
         /// This daemon's running version.
         running: Version,
     },
+    /// A NEWER daemon started a resync here and did not finish it: the
+    /// metadata's `resync_pending` names a version above this daemon's. Some
+    /// of that release's files may already be in place while `loom_version`
+    /// still shows the old one, so completing the run from this payload would
+    /// roll them back (#10718).
+    PendingAheadOfDaemon {
+        /// The version the interrupted resync was installing.
+        pending: Version,
+        /// This daemon's running version.
+        running: Version,
+    },
 }
 
 impl ResyncRefusal {
-    /// True for the two "repo ahead of daemon" refusals: the inputs to the
+    /// True for the "repo ahead of daemon" refusals: the inputs to the
     /// host's `repo_ahead_target` and the `daemon-too-old` dispatch hold.
     #[must_use]
     pub fn repo_ahead_of_daemon(&self) -> bool {
-        matches!(self, Self::NeedsNewerDaemon { .. } | Self::RepoAheadOfDaemon { .. })
+        matches!(
+            self,
+            Self::NeedsNewerDaemon { .. }
+                | Self::RepoAheadOfDaemon { .. }
+                | Self::PendingAheadOfDaemon { .. }
+        )
     }
 }
 
@@ -321,7 +349,8 @@ impl std::fmt::Display for ResyncRefusal {
             Self::LoomSourceRepo => write!(f, "the Loom source checkout is never resynced"),
             Self::NotAReleaseBuild => write!(
                 f,
-                "this daemon was not built from a clean checkout; its payload is not a release"
+                "this daemon is not a verified official release build; its payload is never \
+                 applied"
             ),
             Self::UnrecognizedVersion { field, value } => write!(
                 f,
@@ -336,6 +365,11 @@ impl std::fmt::Display for ResyncRefusal {
                 f,
                 "repo ahead of daemon: installed loom_version {installed} is newer than running \
                  {running}; resyncing would downgrade it"
+            ),
+            Self::PendingAheadOfDaemon { pending, running } => write!(
+                f,
+                "repo ahead of daemon: a resync to {pending} was interrupted here and this \
+                 daemon runs {running}; completing it from this payload would downgrade it"
             ),
         }
     }
@@ -406,6 +440,42 @@ pub fn resync_gate(
         }
     }
     Ok(compat)
+}
+
+/// [`resync_gate`] over the raw text of an `install-metadata.json`, plus the
+/// one check that needs a key [`InstallMeta`] does not carry: an interrupted
+/// resync (`resync_pending`) that a NEWER daemon started is refused, because
+/// `loom_version` is stamped last and so still shows the old release while
+/// some of the newer files are already in place. Pure.
+///
+/// # Errors
+/// The refusal: unparseable metadata, anything [`resync_gate`] refuses, or a
+/// pending resync this daemon cannot be ordered at or above.
+pub fn gate_metadata(raw: &str, daemon: &DaemonCompat) -> Result<Compat, ResyncRefusal> {
+    let installed =
+        InstallMeta::parse(raw).map_err(|e| ResyncRefusal::UnreadableMetadata(e.to_string()))?;
+    let compat = resync_gate(&installed, daemon)?;
+    let pending = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get(PENDING_KEY).cloned());
+    match pending {
+        None | Some(Value::Null) => Ok(compat),
+        Some(Value::String(s)) => match Version::parse(&s) {
+            Some(v) if v > daemon.running => Err(ResyncRefusal::PendingAheadOfDaemon {
+                pending: v,
+                running: daemon.running,
+            }),
+            Some(_) => Ok(compat),
+            None => Err(ResyncRefusal::UnrecognizedVersion {
+                field: PENDING_KEY,
+                value: s,
+            }),
+        },
+        Some(other) => Err(ResyncRefusal::UnrecognizedVersion {
+            field: PENDING_KEY,
+            value: other.to_string(),
+        }),
+    }
 }
 
 /// Stage this binary's embedded payload against `dest` and report the diff.
@@ -590,15 +660,13 @@ fn gate_workspace(dest: &Path, stamp: &Stamp) -> Result<Compat, ResyncRefusal> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ResyncRefusal::NotInstalled),
         Err(e) => return Err(ResyncRefusal::UnreadableMetadata(e.to_string())),
     };
-    let installed =
-        InstallMeta::parse(&raw).map_err(|e| ResyncRefusal::UnreadableMetadata(e.to_string()))?;
     let daemon = DaemonCompat {
         running: *running,
         supports_installed: Version::parse(crate::install_compat::SUPPORTS_INSTALLED)
             .unwrap_or(*running),
         floor: None,
     };
-    resync_gate(&installed, &daemon)
+    gate_metadata(&raw, &daemon)
 }
 
 /// Every repo-relative path the payload step can write, in a stable order.
@@ -751,7 +819,8 @@ fn prune_empty_parents(dest: &Path, rel: &str) {
     }
 }
 
-/// Metadata key that marks a resync as started and not yet stamped.
+/// Metadata key that marks a resync as started and not yet stamped. Its value
+/// is the version that resync was installing; [`gate_metadata`] reads it.
 const PENDING_KEY: &str = "resync_pending";
 
 /// The workspace's metadata records a resync that never reached its stamp.

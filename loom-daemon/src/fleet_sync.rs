@@ -22,6 +22,11 @@
 //!   not into the config tiers, so a change takes effect on the next tick with
 //!   no restart. A malformed value keeps the last good floor and alerts. The
 //!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712).
+//! - **The workspace resync** ([`workspace_resync`], #10718): after each timer
+//!   pass, and once at startup, every registered repo's installed Loom is
+//!   compared with this daemon's own payload and, on a host in H0 with
+//!   `fleet.autoApply` on, resynced under a per-repo claim. It runs on its
+//!   own task, one pass at a time, and the timer never waits for it.
 //!
 //! # Invariants this module keeps
 //!
@@ -72,6 +77,8 @@ use crate::fleet_store::floor::{self, FloorRead};
 use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
+
+pub mod workspace_resync;
 
 /// Config key for the timer cadence.
 pub const SYNC_INTERVAL_KEY: &str = "fleet.syncIntervalSecs";
@@ -630,6 +637,14 @@ pub struct FleetSyncStatus {
     /// host with no floor writes the same snapshot it did before.
     #[serde(default, skip_serializing_if = "FloorPass::is_unset")]
     pub floor: FloorPass,
+    /// Each registered workspace's installed-Loom state (#10718). Filled by
+    /// the timer after each pass ([`run_pass`] carries the previous findings
+    /// forward); omitted until a workspace pass has run.
+    #[serde(
+        default,
+        skip_serializing_if = "workspace_resync::WorkspacePass::is_unset"
+    )]
+    pub workspaces: workspace_resync::WorkspacePass,
 }
 
 fn default_enforced() -> Enforcement {
@@ -685,6 +700,23 @@ pub fn publish(status: &FleetSyncStatus) {
         return;
     };
     if let Err(e) = write_status(&path, status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// Put a finished workspace pass (#10718) on the current snapshot. Before the
+/// first snapshot exists there is nothing to update; the timer's next publish
+/// carries it.
+fn publish_workspaces(found: &workspace_resync::WorkspacePass) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        status.workspaces.clone_from(found);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
         log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
     }
 }
@@ -777,6 +809,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     let mut lines = vec![head];
     lines.extend(state_lines(s));
     lines.extend(floor_lines(&s.floor));
+    lines.extend(s.workspaces.lines());
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -958,6 +991,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         state,
         enforced,
         floor,
+        // The last workspace pass's findings, until this tick's replace them.
+        workspaces: cached_status().map(|s| s.workspaces).unwrap_or_default(),
     }
 }
 
@@ -1190,6 +1225,7 @@ pub async fn start(
         inputs.host,
         inputs.interval.as_secs()
     );
+    workspace_resync::mark_boot();
     let state = startup_pass(&inputs, bus.as_deref()).await;
     // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
@@ -1222,6 +1258,7 @@ async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventB
     };
     match capped {
         Ok(Ok(status)) => {
+            workspace_resync::mark_verified();
             publish(&status);
             report(&status, bus);
             status.state
@@ -1263,6 +1300,10 @@ fn spawn_timer(
         } else {
             Mode::Check
         };
+        // #10718: the workspace resync also runs once at startup, now that the
+        // startup pass is done and the drain state exists. It runs on its own
+        // task (one at a time), so nothing here ever waits for git.
+        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus);
         loop {
             tokio::time::sleep(inputs.interval).await;
             let owned = inputs.clone();
@@ -1277,8 +1318,14 @@ fn spawn_timer(
                     if let Some(e) = enforcer.as_deref() {
                         enforce(&mut status, e, bus.as_deref());
                     }
+                    status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
+                    // #10718: last, so the floor is current and a hold this
+                    // pass just placed is already in the drain flag. Not
+                    // awaited: see `workspace_resync::host`.
+                    workspace_resync::mark_verified();
+                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus);
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

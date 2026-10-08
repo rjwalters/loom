@@ -80,6 +80,9 @@ pub const REPO_LIST_FOR_OWNER: ForgeOp = ForgeOp::inventoried("repo.list-for-own
 pub const REPO_LIST_FOR_INSTALLATION: ForgeOp = ForgeOp::inventoried("repo.list-for-installation");
 /// Git-database / contents reads of the fleet store.
 pub const GIT_READ_OBJECTS: ForgeOp = ForgeOp::inventoried("git.read-objects");
+/// The default-branch head of a batch of repositories, in one GraphQL query
+/// (the workspace resync's per-tick head check, #10987).
+pub const GIT_DEFAULT_BRANCH_HEADS: ForgeOp = ForgeOp::inventoried("git.default-branch-heads");
 /// Git-database / contents / ref writes of the fleet store.
 pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
     ForgeOp::inventoried("git.write-refs-and-contents");
@@ -125,6 +128,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     REPO_LIST_FOR_OWNER,
     REPO_LIST_FOR_INSTALLATION,
     GIT_READ_OBJECTS,
+    GIT_DEFAULT_BRANCH_HEADS,
     GIT_WRITE_REFS_AND_CONTENTS,
     TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,

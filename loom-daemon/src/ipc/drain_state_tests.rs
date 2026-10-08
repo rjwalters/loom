@@ -123,6 +123,44 @@ fn an_operator_request_promotes_a_pause_roll() {
     assert!(drain.is_draining());
 }
 
+/// The workspace resync's host gate keys "a roll is coming" on this (#10718,
+/// #10974): an armed pause roll, a committed one, and nothing else.
+#[test]
+fn pause_roll_in_progress_is_armed_or_committed_pause_rolls_only() {
+    // Armed (nothing stopped yet), then committed (an agent stopped).
+    let drain = DrainState::new();
+    assert!(!drain.pause_roll_in_progress(), "idle");
+    let generation =
+        match drain.begin_pause_roll(Duration::from_secs(600), PauseRollStatus::default()) {
+            DrainBegin::Started { generation, .. } => generation,
+            other => panic!("expected Started, got {other:?}"),
+        };
+    assert!(drain.pause_roll_in_progress(), "armed");
+    assert!(drain.pause_commit_stop(generation));
+    assert!(drain.pause_roll_in_progress(), "committed");
+
+    // Ended: an uncommitted pause roll aborted.
+    let drain = DrainState::new();
+    let _ = drain.begin_as(Duration::from_secs(600), false, false, DrainOrigin::PauseRoll);
+    assert!(drain.abort_pause_roll());
+    assert!(!drain.pause_roll_in_progress(), "aborted");
+
+    // Promoted by an operator request: an operator drain now, no roll coming.
+    let drain = DrainState::new();
+    let _ = drain.begin_as(Duration::from_secs(600), false, false, DrainOrigin::PauseRoll);
+    let _ = drain.begin(Duration::from_secs(600), false, false);
+    assert!(drain.is_draining() && !drain.pause_roll_in_progress(), "promoted");
+
+    // An operator drain and a fleet-state `paused` hold pause dispatch but
+    // are not rolls.
+    let drain = DrainState::new();
+    let _ = drain.begin(Duration::from_secs(600), false, false);
+    assert!(drain.is_draining() && !drain.pause_roll_in_progress(), "operator drain");
+    let drain = DrainState::new();
+    assert!(drain.hold_for_fleet_state("paused".to_string()));
+    assert!(drain.is_draining() && !drain.pause_roll_in_progress(), "fleet hold");
+}
+
 #[test]
 fn the_auto_updater_can_still_end_its_own_roll() {
     let drain = DrainState::new();

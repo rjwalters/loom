@@ -430,6 +430,30 @@ pub trait Enforcer: Send + Sync {
 
     /// Drain and exit (`stopped`). `true` when the drain was accepted.
     fn stop(&self, reason: String) -> bool;
+
+    /// What the workspace resync's host gate reads about dispatch and rolls
+    /// (#10718). The default knows only about this mechanism's own hold.
+    fn drain_facts(&self) -> DrainFacts {
+        DrainFacts {
+            draining: self.is_held(),
+            ..DrainFacts::default()
+        }
+    }
+}
+
+/// The drain-state facts the workspace resync's host gate reads (#10718).
+///
+/// Named fields rather than a tuple so a later signal (PR 3's
+/// `resume_pending`, #10832) is one more field, not a reshuffled tuple.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainFacts {
+    /// Dispatch is paused for any reason: a drain, a pause roll, a fleet-state
+    /// `paused` hold or an operator-stop hold.
+    pub draining: bool,
+    /// A pause roll is armed, committed or in progress (#10831): see
+    /// [`crate::ipc::DrainState::pause_roll_in_progress`]. Never set by a fleet-state hold
+    /// or an operator drain.
+    pub roll_in_progress: bool,
 }
 
 /// The production [`Enforcer`]: #4090's drain primitives, nothing new.
@@ -480,6 +504,13 @@ impl Enforcer for IpcEnforcer {
 
     fn is_held(&self) -> bool {
         self.drain.is_fleet_held()
+    }
+
+    fn drain_facts(&self) -> DrainFacts {
+        DrainFacts {
+            draining: self.drain.is_draining(),
+            roll_in_progress: self.drain.pause_roll_in_progress(),
+        }
     }
 
     fn stop(&self, reason: String) -> bool {

@@ -19,7 +19,10 @@
 //! - **reset jitter** of a second is still one window;
 //! - **two interleaved windows** under one label set are each counted once;
 //! - an **owner-less** pre-#10343 point is ignored;
-//! - query 3's **band** and query 4's span counts come out as documented.
+//! - query 3's **band** and query 4's span counts come out as documented;
+//! - the **agent slice** (#10607): agent rows count as attributed, so the
+//!   band shrinks by `agent_share`, and query 5 splits them by role and
+//!   served/passthrough.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
@@ -132,7 +135,7 @@ fn committed_github_shadow_queries_charge_each_quota_window_once() {
     clickhouse(&format!("{FIXTURE}\n{SHADOW}"), "TSV");
 
     let s = sections();
-    assert_eq!(s.len(), 5, "queries 0-4");
+    assert_eq!(s.len(), 6, "queries 0-5");
 
     // 0. preflight names all three families; loom.forge.calls is Delta.
     let families: BTreeMap<&str, &str> = s[0]
@@ -168,23 +171,30 @@ fn committed_github_shadow_queries_charge_each_quota_window_once() {
         "the legacy owner-less 9999 reading leaked in: {q1:?}"
     );
 
-    // 2. attributed: ok 150, ok+error 170, 304s 50; the free probe excluded.
+    // 2. attributed: daemon ok 150 + agent ok 20, ok+error 190, 304s 50 + 25;
+    //    the free probe excluded; the agent slice is its own column.
     let q2 = &s[2];
     assert_eq!(q2.len(), 1, "{q2:?}");
     assert_eq!(text(&q2[0], "resource"), "core");
-    assert_eq!(num(&q2[0], "attributed_min"), 150.0);
-    assert_eq!(num(&q2[0], "attributed_max"), 170.0);
-    assert_eq!(num(&q2[0], "free_304"), 50.0);
+    assert_eq!(num(&q2[0], "attributed_min"), 170.0);
+    assert_eq!(num(&q2[0], "attributed_max"), 190.0);
+    assert_eq!(num(&q2[0], "free_304"), 75.0);
+    assert_eq!(num(&q2[0], "agent_attributed"), 20.0);
+    assert_eq!(num(&q2[0], "agent_free_304"), 25.0);
 
     // 3. the band for bucket A, hour H; NULL-safe for the hour with no calls.
+    //    Without the agent rows it was 0.105 .. 0.211: the agent slice
+    //    shrinks it by agent_share.
     let q3: Vec<&Row> = s[3]
         .iter()
         .filter(|r| text(r, "account") == "app-1")
         .collect();
     assert_eq!(num(q3[0], "github_used"), 190.0, "{q3:?}");
-    assert!((num(q3[0], "shadow_low") - 0.105).abs() < 1e-9, "{q3:?}");
-    assert!((num(q3[0], "shadow_high") - 0.211).abs() < 1e-9, "{q3:?}");
+    assert!(num(q3[0], "shadow_low").abs() < 1e-9, "{q3:?}");
+    assert!((num(q3[0], "shadow_high") - 0.105).abs() < 1e-9, "{q3:?}");
+    assert!((num(q3[0], "agent_share") - 0.105).abs() < 1e-9, "{q3:?}");
     assert_eq!(num(q3[1], "attributed_min"), 0.0, "{q3:?}");
+    assert_eq!(num(q3[1], "agent_attributed"), 0.0, "{q3:?}");
 
     // 4. span cross-check: two `ok` spans, 3 known requests, 1 unknown.
     let q4 = &s[4];
@@ -193,4 +203,19 @@ fn committed_github_shadow_queries_charge_each_quota_window_once() {
     assert_eq!(num(&q4[0], "known_requests"), 3.0);
     assert_eq!(num(&q4[0], "unknown_request_spans"), 1.0);
     assert_eq!(num(&q4[0], "unknown_status_spans"), 1.0);
+
+    // 5. the agent slice by role: daemon rows (`-` or no label) excluded.
+    let q5: Vec<(&str, &str, f64, f64)> = s[5]
+        .iter()
+        .map(|r| (text(r, "agent"), text(r, "via"), num(r, "charged"), num(r, "free_304")))
+        .collect();
+    assert_eq!(
+        q5,
+        [
+            ("builder", "passthrough", 15.0, 0.0),
+            ("judge", "served", 5.0, 25.0)
+        ],
+        "{:?}",
+        s[5]
+    );
 }
