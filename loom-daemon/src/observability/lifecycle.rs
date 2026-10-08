@@ -500,6 +500,21 @@ pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
     root.to_owned()
 }
 
+/// The execution's own scope (#10637): `loom.repo` and `loom.sweep_id` as its
+/// root span carries them. `prepare_execution` stamps both on every sweep
+/// root, so a checkpoint span that names only an issue also names the
+/// repository and sweep it belongs to, with values that join that root's
+/// exactly. A key the root lacks, or a root no longer open, stays absent.
+fn execution_scope(active: &[ActiveSpan], root: &TraceContext) -> TraceAttributes {
+    let Some(span) = active.iter().find(|span| span.record.context == *root) else {
+        return TraceAttributes::new();
+    };
+    ["loom.repo", "loom.sweep_id"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_observation(
     journal: &Journal,
@@ -561,9 +576,13 @@ fn checkpoint_observation(
         metadata.insert("loom.pr_number".into(), pr.to_string());
     }
     let at = Utc::now();
+    let active = journal.active();
+    if let Ok(active) = &active {
+        metadata.extend(execution_scope(active, root));
+    }
     // An explicitly launched role already has an authoritative start. Its
     // checkpoint completes that same attempt; never fabricate a second one.
-    if let Ok(active) = journal.active() {
+    if let Ok(active) = active {
         if let Some(attempt_span) = active
             .iter()
             .filter(|a| {
@@ -665,7 +684,7 @@ pub fn prepare_execution(
             crate::telemetry::trace::STORY_KEY_VERSION.into(),
         );
     } else {
-        metadata.insert("loom.repo".into(), TraceStore::fallback_repo(root));
+        metadata.insert("loom.repo".into(), TraceStore::repo_attribute(root));
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
@@ -962,7 +981,8 @@ fn open_role_attempt(
     execution: &str,
     started_at: chrono::DateTime<Utc>,
 ) -> Option<Span> {
-    let repo = TraceStore::fallback_repo(root);
+    // #10637: GitHub's spelling; the trace ID keys on its lowercase.
+    let repo = TraceStore::repo_attribute(root);
     // Host memory state at the launch — the other end of this span's host
     // snapshot pair (the end lands in `finish_execution`), so a
     // deferred/killed/timed-out attempt carries the host state at both

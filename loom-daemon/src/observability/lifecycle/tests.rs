@@ -417,6 +417,75 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
     assert!(attempt.ended_at - attempt.started_at >= chrono::Duration::seconds(1450));
 }
 
+/// #10637: a checkpoint observation names an issue; it must also name the
+/// repository and sweep, copied from its execution's root so they join that
+/// root exactly. Covers both synthetic sources (phase and attempt), the
+/// owned-start completion, and a root that lacks the keys (left absent).
+#[test]
+fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = attributes(&[
+        ("loom.repo", "TwoAM-Fixture/Loom-UI"),
+        ("loom.sweep_id", "sweep-issue-18-1790000000"),
+    ]);
+    let observed = |name: &str, root_attrs: TraceAttributes, owned: bool, source: &str| {
+        let journal = Journal::for_context(&dir.path().join(format!("{name}.json")));
+        let root = TraceContext::root(true);
+        journal
+            .start(root.clone(), None, SpanName::Sweep, Utc::now(), root_attrs)
+            .unwrap();
+        if owned {
+            let attrs = attributes(&[("loom.role", "builder")]);
+            let phase = journal
+                .start(root.child(), Some(&root), SpanName::Phase, Utc::now(), attrs.clone())
+                .unwrap();
+            journal
+                .start(
+                    phase.record.context.child(),
+                    Some(&phase.record.context),
+                    SpanName::RoleAttempt,
+                    Utc::now(),
+                    attrs,
+                )
+                .unwrap();
+        }
+        checkpoint_observation(&journal, &root, None, 18, "builder-done", None, None, None, source);
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(spans.len(), 2, "{name}: the phase and its attempt, root still open");
+        spans
+    };
+    let cases = [
+        ("write", SYNTHETIC_TIMING_SOURCES[0], false),
+        ("poll", SYNTHETIC_TIMING_SOURCES[1], false),
+        ("owned", "checkpoint_write_observed", true),
+    ];
+    for (name, source, owned) in cases {
+        for span in observed(name, scope.clone(), owned, source) {
+            assert!(matches!(span.name, SpanName::Phase | SpanName::RoleAttempt));
+            for (key, value) in &scope {
+                assert_eq!(
+                    span.attributes.get(key),
+                    Some(value),
+                    "{name}: {key} on {:?}",
+                    span.name
+                );
+            }
+            assert_eq!(span.attributes["loom.issue"], "18");
+        }
+    }
+    for span in observed("bare-root", TraceAttributes::new(), false, SYNTHETIC_TIMING_SOURCES[0]) {
+        for key in scope.keys() {
+            assert!(!span.attributes.contains_key(key), "{key} must stay absent, never guessed");
+        }
+    }
+}
+
 /// `finish_attempt` writes the flag onto both the attempt and its phase, and
 /// `None` leaves the key **absent** — the "unknown != zero" half of the
 /// contract. A caller that cannot tell must not publish a guess.
@@ -478,7 +547,12 @@ mod role_tick_spans {
     use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
 
     fn traced_root() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // Mixed case on purpose: with no origin and no `LOOM_REPO`, the
+        // basename is the tick root's repo name (#10637).
+        let dir = tempfile::Builder::new()
+            .prefix("Loom-UI-")
+            .tempdir()
+            .unwrap();
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),
@@ -592,6 +666,7 @@ mod role_tick_spans {
     #[test]
     #[serial_test::serial] // `loom.repo` resolution reads the process-global `LOOM_REPO`
     fn a_tick_that_launches_keeps_its_role_attempt_span() {
+        std::env::remove_var("LOOM_REPO");
         let cases = vec![
             (RoleTickOutcome::Success, "success", "success", SpanStatus::Ok),
             (
@@ -633,6 +708,16 @@ mod role_tick_spans {
             assert_eq!(root.attributes["loom.sweep_id"], trace.execution);
             assert_eq!(root.attributes["loom.timing_source"], "owned_boundary");
             assert_eq!(root.attributes[ATTEMPT_WORKED], "true");
+            // #10637: `loom.repo` keeps the repo's own spelling, and the trace
+            // ID still derives from its lowercase, so the span carries its
+            // own derivation input.
+            let repo = dir.path().file_name().unwrap().to_str().unwrap();
+            assert!(repo.starts_with("Loom-UI-"), "{repo}");
+            assert_eq!(root.attributes["loom.repo"], repo);
+            assert_eq!(
+                trace.context,
+                TraceContext::derived("execution", &[&repo.to_ascii_lowercase(), &trace.execution]),
+            );
             assert!(
                 !files_under(dir.path(), crate::observability::runtime_usage::join::JOIN_DIR)
                     .is_empty(),
