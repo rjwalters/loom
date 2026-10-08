@@ -33,6 +33,12 @@
 //! only, no secrets). A later fetch of the same tag that resolves to a
 //! different commit, or serves a different asset digest, is refused.
 //!
+//! The record is shared by every update on the host, so persisting a pin is
+//! one serialized transaction: an exclusive interprocess lock on a sidecar
+//! `<record>.lock`, a re-read, a re-check of this tag's pin (a conflicting
+//! pin persisted by a concurrent update after [`gate`] ran is refused, never
+//! overwritten), then an atomic write that keeps every other entry.
+//!
 //! **Honest limit**: the record lives on the recipient host. It detects drift
 //! and ordinary/accidental replacement of a release asset or tag; it does not
 //! defend against an attacker with write access to the recipient (who can
@@ -283,25 +289,113 @@ pub fn read_record(path: &Path) -> Result<AdoptionRecord, String> {
     }
 }
 
-/// Upsert one entry, atomically (temp file + rename). A commit already on
-/// record is kept when this fetch did not resolve one.
-pub fn write_entry(path: &Path, mut entry: AdoptionEntry) -> Result<(), String> {
-    let mut record = read_record(path)?;
+/// How long [`write_entry`] waits for a concurrent update to release the
+/// record lock before refusing. The critical section is one small read and
+/// one small write, so a holder past this bound is wedged, not busy.
+const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why an adoption pin could not be persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistError {
+    /// A different commit was pinned for this tag after [`gate`] read the
+    /// record (a concurrent update adopted it first).
+    TagMoved { was: String, now: String },
+    /// A different asset digest was pinned for this tag after [`gate`] read
+    /// the record.
+    AssetReplaced { was: String },
+    /// Lock, read, or write failure -- never evidence of tampering.
+    Storage(String),
+}
+
+/// The sidecar lock file serializing every read-modify-write of `path`
+/// (`<record>.lock`). It is never deleted: removing a lock file while
+/// another process holds or is opening it would split the lock.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Take the exclusive interprocess lock on `path`'s record (`flock` via
+/// [`std::fs::File::try_lock`]), waiting up to `wait`. Released when the
+/// returned file is dropped.
+fn lock_record(path: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+    let lock = lock_path(path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .map_err(|e| format!("could not open lock {}: {e}", lock.display()))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "timed out after {}ms waiting for another update to release {}",
+                    wait.as_millis(),
+                    lock.display()
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("could not lock {}: {e}", lock.display()));
+            }
+        }
+    }
+}
+
+/// Upsert one entry as a single serialized transaction: under the record
+/// lock, re-read the record, refuse a conflicting pin that appeared since
+/// [`gate`] checked it, then write atomically (temp file + rename) keeping
+/// every other entry. A commit already on record is kept when this fetch did
+/// not resolve one.
+pub fn write_entry(path: &Path, entry: AdoptionEntry) -> Result<(), PersistError> {
+    write_entry_waiting(path, entry, RECORD_LOCK_WAIT)
+}
+
+fn write_entry_waiting(
+    path: &Path,
+    mut entry: AdoptionEntry,
+    wait: std::time::Duration,
+) -> Result<(), PersistError> {
+    let storage = |e: std::io::Error| PersistError::Storage(e.to_string());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(storage)?;
+    }
+    let _lock = lock_record(path, wait).map_err(PersistError::Storage)?;
+    let mut record = read_record(path).map_err(PersistError::Storage)?;
     record.schema = 1;
     let key = record_key(&entry.slug, &entry.tag, &entry.target);
-    if entry.commit.is_none() {
-        entry.commit = record.entries.get(&key).and_then(|e| e.commit.clone());
+    if let Some(prev) = record.entries.get(&key) {
+        if let (Some(was), Some(now)) = (prev.commit.as_deref(), entry.commit.as_deref()) {
+            if was != now {
+                return Err(PersistError::TagMoved {
+                    was: was.to_string(),
+                    now: now.to_string(),
+                });
+            }
+        }
+        if prev.asset_sha256 != entry.asset_sha256 {
+            return Err(PersistError::AssetReplaced {
+                was: prev.asset_sha256.clone(),
+            });
+        }
+        if entry.commit.is_none() {
+            entry.commit.clone_from(&prev.commit);
+        }
     }
     record.entries.insert(key, entry);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    let text =
+        serde_json::to_string_pretty(&record).map_err(|e| PersistError::Storage(e.to_string()))?;
+    std::fs::write(&tmp, text).map_err(storage)?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        e.to_string()
+        PersistError::Storage(e.to_string())
     })
 }
 
@@ -395,6 +489,54 @@ fn mismatch(class: RefusalClass, head: String, partial: SourceReport) -> Refusal
     }
 }
 
+/// `when` is empty for a pin seen by [`gate`], or explains that the pin
+/// appeared concurrently (found by [`record_adoption`] under the lock).
+fn tag_moved(
+    i: &GateInputs<'_>,
+    path: &Path,
+    was: &str,
+    now: &str,
+    when: &str,
+    mut partial: SourceReport,
+) -> Refusal {
+    partial.adoption = Some("tag_moved");
+    mismatch(
+        RefusalClass::TagMoved,
+        format!(
+            "Tag movement detected: release {} now resolves to commit {now}, but this host \
+             adopted it at commit {was} (adoption record {}){when}.",
+            i.tag,
+            path.display()
+        ),
+        partial,
+    )
+}
+
+fn asset_replaced(
+    i: &GateInputs<'_>,
+    path: &Path,
+    was: &str,
+    when: &str,
+    mut partial: SourceReport,
+) -> Refusal {
+    partial.adoption = Some("asset_replaced");
+    mismatch(
+        RefusalClass::AssetReplaced,
+        format!(
+            "Asset replacement detected: loom-daemon-{} for release {} now has sha256 {}, but \
+             this host adopted sha256 {was} (adoption record {}){when}.",
+            i.target,
+            i.tag,
+            i.asset_sha256,
+            path.display()
+        ),
+        partial,
+    )
+}
+
+/// Suffix for a conflicting pin found only at persistence time.
+const PINNED_CONCURRENTLY: &str = "; pinned by a concurrent update after this fetch's check";
+
 /// Run the source gate. Nothing here executes the candidate.
 pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal> {
     // Filled in as each check completes, so a refusal carries the facts
@@ -440,34 +582,11 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
             Some(prev) => {
                 if let (Some(was), Some(now)) = (prev.commit.as_deref(), commit.as_deref()) {
                     if was != now {
-                        partial.adoption = Some("tag_moved");
-                        return Err(mismatch(
-                            RefusalClass::TagMoved,
-                            format!(
-                                "Tag movement detected: release {} now resolves to commit {now}, \
-                                 but this host adopted it at commit {was} (adoption record {}).",
-                                i.tag,
-                                path.display()
-                            ),
-                            partial,
-                        ));
+                        return Err(tag_moved(i, path, was, now, "", partial));
                     }
                 }
                 if prev.asset_sha256 != i.asset_sha256 {
-                    partial.adoption = Some("asset_replaced");
-                    return Err(mismatch(
-                        RefusalClass::AssetReplaced,
-                        format!(
-                            "Asset replacement detected: loom-daemon-{} for release {} now has \
-                             sha256 {}, but this host adopted sha256 {} (adoption record {}).",
-                            i.target,
-                            i.tag,
-                            i.asset_sha256,
-                            prev.asset_sha256,
-                            path.display()
-                        ),
-                        partial,
-                    ));
+                    return Err(asset_replaced(i, path, &prev.asset_sha256, "", partial));
                 }
                 partial.adoption = Some("matched");
             }
@@ -506,7 +625,10 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
 
 /// Persist the adoption pin after every check passed, BEFORE the candidate is
 /// executed. A write failure is a refusal: adopting without a pin would make a
-/// later replaced tag/asset look `first_seen` and be accepted.
+/// later replaced tag/asset look `first_seen` and be accepted. The pin is
+/// re-validated under the record lock, so a conflicting pin persisted by a
+/// concurrent update after [`gate`] ran is refused as tag movement / asset
+/// replacement rather than overwritten.
 pub fn record_adoption(report: &SourceReport, i: &GateInputs<'_>) -> Result<(), Refusal> {
     let Some(path) = i.record_path else {
         return Ok(());
@@ -518,21 +640,29 @@ pub fn record_adoption(report: &SourceReport, i: &GateInputs<'_>) -> Result<(), 
         commit: report.source_commit.clone(),
         asset_sha256: i.asset_sha256.to_string(),
     };
-    write_entry(path, entry).map_err(|e| Refusal {
-        class: RefusalClass::RecordWriteFailed,
-        partial: SourceReport {
-            adoption: Some("write_failed"),
-            ..report.clone()
+    write_entry(path, entry).map_err(|e| match e {
+        PersistError::TagMoved { was, now } => {
+            tag_moved(i, path, &was, &now, PINNED_CONCURRENTLY, report.clone())
+        }
+        PersistError::AssetReplaced { was } => {
+            asset_replaced(i, path, &was, PINNED_CONCURRENTLY, report.clone())
+        }
+        PersistError::Storage(e) => Refusal {
+            class: RefusalClass::RecordWriteFailed,
+            partial: SourceReport {
+                adoption: Some("write_failed"),
+                ..report.clone()
+            },
+            lines: vec![
+                format!(
+                    "Required source assurance is on: could not write the release adoption \
+                     record {} ({e}); without it a later tag or asset replacement could not be \
+                     detected. This is NOT evidence of tampering.",
+                    path.display()
+                ),
+                "Refusing the artifact before it is executed or provisioned.".to_string(),
+            ],
         },
-        lines: vec![
-            format!(
-                "Required source assurance is on: could not write the release adoption record \
-                 {} ({e}); without it a later tag or asset replacement could not be detected. \
-                 This is NOT evidence of tampering.",
-                path.display()
-            ),
-            "Refusing the artifact before it is executed or provisioned.".to_string(),
-        ],
     })
 }
 

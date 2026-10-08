@@ -206,6 +206,128 @@ fn source_adoption_record_detects_movement_and_replacement() {
     assert_eq!(entry.commit.as_deref(), Some(B));
 }
 
+/// #10659 review: two updates both pass `gate()` on the same ABSENT tag with
+/// different commits (or digests). Persistence re-validates under the record
+/// lock, so the second is refused as tag movement / asset replacement and the
+/// first pin survives -- it is never overwritten.
+#[test]
+fn source_adoption_second_conflicting_pin_after_gate_is_refused() {
+    let dir = tempdir();
+    let rec = dir.join("adoption.json");
+    let anchor = AnchorSetting::Anchor(A.to_string());
+    let with = |commit: &str| {
+        let mut m = tag_map("v1.0.0", commit);
+        m.insert(format!("repos/{SLUG}/compare/{A}...{commit}"), compare_body("ahead"));
+        fake_api(m)
+    };
+    // Different commit, same tag: both gates see the tag as first_seen.
+    let ra = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
+    let rb = gate(&with(C), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
+    assert_eq!((ra.adoption, rb.adoption), (Some("first_seen"), Some("first_seen")));
+    record_adoption(&ra, &inputs(&anchor, Some(&rec), "sha1")).unwrap();
+    let e = record_adoption(&rb, &inputs(&anchor, Some(&rec), "sha1")).unwrap_err();
+    assert_eq!(e.class, RefusalClass::TagMoved);
+    assert_eq!(e.partial.adoption, Some("tag_moved"));
+    assert_eq!(e.partial.source_commit.as_deref(), Some(C));
+    assert_eq!(e.partial.source_check, Some("ahead"));
+    assert!(e.lines[0].contains("Tag movement detected"), "{:?}", e.lines);
+    assert!(e.lines[0].contains("concurrent update"), "{:?}", e.lines);
+    let entry = read_record(&rec)
+        .unwrap()
+        .entries
+        .into_values()
+        .next()
+        .unwrap();
+    assert_eq!((entry.commit.as_deref(), entry.asset_sha256.as_str()), (Some(B), "sha1"));
+
+    // Different digest, same tag (unanchored: only the digest is pinned).
+    let rec2 = dir.join("adoption2.json");
+    let none = AnchorSetting::NotConfigured;
+    let api = fake_api(HashMap::new());
+    let r1 = gate(&api, &inputs(&none, Some(&rec2), "sha1")).unwrap();
+    let r2 = gate(&api, &inputs(&none, Some(&rec2), "sha2")).unwrap();
+    record_adoption(&r1, &inputs(&none, Some(&rec2), "sha1")).unwrap();
+    let e = record_adoption(&r2, &inputs(&none, Some(&rec2), "sha2")).unwrap_err();
+    assert_eq!(e.class, RefusalClass::AssetReplaced);
+    assert_eq!(e.partial.adoption, Some("asset_replaced"));
+    assert!(e.lines[0].contains("Asset replacement detected"), "{:?}", e.lines);
+    let entries = read_record(&rec2).unwrap().entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.values().next().unwrap().asset_sha256, "sha1");
+    // Re-persisting the SAME pin is still accepted (the `matched` path).
+    record_adoption(&r1, &inputs(&none, Some(&rec2), "sha1")).unwrap();
+}
+
+/// #10659 review: concurrent adoptions of DIFFERENT tags on one record must
+/// not drop each other's entries (lost read-modify-write update).
+#[test]
+fn source_adoption_concurrent_different_tags_lose_no_entry() {
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 6;
+    let dir = tempdir();
+    let rec = dir.join("adoption.json");
+    let barrier = std::sync::Barrier::new(THREADS);
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let (rec, barrier) = (&rec, &barrier);
+            s.spawn(move || {
+                barrier.wait();
+                for n in 0..PER_THREAD {
+                    let entry = AdoptionEntry {
+                        slug: SLUG.to_string(),
+                        tag: format!("v{t}.{n}.0"),
+                        target: TARGET.to_string(),
+                        commit: None,
+                        asset_sha256: format!("sha-{t}-{n}"),
+                    };
+                    write_entry(rec, entry).unwrap();
+                }
+            });
+        }
+    });
+    let entries = read_record(&rec).unwrap().entries;
+    assert_eq!(entries.len(), THREADS * PER_THREAD, "lost entries: {entries:?}");
+    for t in 0..THREADS {
+        for n in 0..PER_THREAD {
+            let e = &entries[&record_key(SLUG, &format!("v{t}.{n}.0"), TARGET)];
+            assert_eq!(e.asset_sha256, format!("sha-{t}-{n}"));
+        }
+    }
+}
+
+/// The write is serialized on the record lock: while another holder has it,
+/// a writer neither reads nor writes the record; a holder past the bound is a
+/// storage failure (`write_failed`), never a silent unlocked write.
+#[test]
+fn source_adoption_write_waits_for_the_record_lock() {
+    let dir = tempdir();
+    let rec = dir.join("adoption.json");
+    let entry = |tag: &str| AdoptionEntry {
+        slug: SLUG.to_string(),
+        tag: tag.to_string(),
+        target: TARGET.to_string(),
+        commit: None,
+        asset_sha256: "sha1".to_string(),
+    };
+    let held = lock_record(&rec, std::time::Duration::ZERO).unwrap();
+    // Bounded wait while held: a storage failure, and nothing was written.
+    match write_entry_waiting(&rec, entry("v0"), std::time::Duration::from_millis(60)) {
+        Err(PersistError::Storage(why)) => assert!(why.contains("timed out"), "{why}"),
+        other => panic!("expected a lock-timeout storage failure, got {other:?}"),
+    }
+    assert!(!rec.exists());
+    // A default-wait writer blocks until the holder releases, then succeeds.
+    std::thread::scope(|s| {
+        let h = s.spawn(|| write_entry(&rec, entry("v1")));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!h.is_finished(), "writer must wait for the lock");
+        assert!(!rec.exists(), "nothing may be written while the lock is held");
+        drop(held);
+        h.join().unwrap().unwrap();
+    });
+    assert_eq!(read_record(&rec).unwrap().entries.len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // End to end: real fetch, fake `gh` + `cosign`
 // ---------------------------------------------------------------------------
