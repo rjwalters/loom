@@ -573,6 +573,107 @@ pub(crate) enum ForgeAction {
         source: String,
     },
 
+    /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
+    /// this verdict be posted? Reads the PR's trusted comments and labels.
+    /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
+    /// (same verdict at the same head just landed: post nothing, still apply
+    /// labels) or 3. An approval is refused over `loom:ci-failure`, over a
+    /// same-head changes-requested marker without `--overrules-prior`, and
+    /// whenever either read fails. See `loom_daemon::verdict_gate`.
+    #[command(name = "verdict-gate")]
+    VerdictGate {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name` (the caller has already vetted it with `may-write`).
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+        /// The head SHA the verdict is rendered against.
+        #[arg(long)]
+        sha: String,
+        /// Why each point of a same-head changes-requested verdict no longer
+        /// blocks (approvals only; at least 40 chars).
+        #[arg(long, default_value = "")]
+        overrules_prior: String,
+        /// How recent a same-verdict marker must be to dedupe against.
+        #[arg(long, default_value_t = loom_daemon::verdict_gate::DEFAULT_WINDOW_SECS)]
+        window_secs: i64,
+    },
+
+    /// `forge verdict-labels <pr> --repo R --verdict V` (#10581) — apply the
+    /// verdict's label transition (add first, then remove, then re-read and
+    /// verify): approve leaves `loom:pr` and none of `loom:changes-requested`,
+    /// `loom:ci-failure`, `loom:reviewing`, `loom:review-requested`;
+    /// changes-requested leaves `loom:changes-requested` and not `loom:pr`.
+    /// Exits 1 with a one-line repair command when the result does not hold.
+    #[command(name = "verdict-labels")]
+    VerdictLabels {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name` (the caller has already vetted it with `may-write`).
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+    },
+
+    /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
+    /// --seen-opposite N` (#10581) — read-only post-write arbitration. The host
+    /// lock cannot order two hosts, so after posting and labelling each caller
+    /// re-reads: if more opposite-verdict same-head markers exist than its gate
+    /// saw (`seen-opposite=N` on the gate line), a rival landed concurrently.
+    /// Changes-requested wins. Prints `LOOM-VERDICT-RECONCILE
+    /// STABLE|PREVAILS|SUPERSEDED|DUPLICATE|UNREAD`; exits 0, 0, 11 (an approval
+    /// that lost: post a superseding marker, flip the labels), 12 (an identical
+    /// concurrent verdict with a lower comment id exists: this caller's own
+    /// comment was withdrawn, apply no labels) or 1.
+    #[command(name = "verdict-reconcile")]
+    VerdictReconcile {
+        /// The PR number.
+        pr: u64,
+        /// `owner/name`.
+        #[arg(long)]
+        repo: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long)]
+        verdict: String,
+        /// The head SHA the verdict was rendered against.
+        #[arg(long)]
+        sha: String,
+        /// Opposite-verdict same-head markers the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_opposite: usize,
+        /// Newest same-verdict same-head marker comment id the gate read saw.
+        #[arg(long, default_value_t = 0)]
+        seen_same_max_id: u64,
+        /// The token this caller put in its own comment (empty: it posted
+        /// nothing). Lets an identical concurrent verdict be arbitrated: the
+        /// lowest comment id stands, the other withdraws (exit 12).
+        #[arg(long, default_value = "")]
+        nonce: String,
+    },
+
+    /// `forge verdict-lock acquire|release <pr> --repo R` (#10581) — the
+    /// per-PR host lock `post-verdict.sh` holds across its gate read, comment
+    /// post and label transition, so a rival verdict cannot land in between
+    /// and two identical callers cannot both pass the dedupe read. `acquire`
+    /// waits up to `LOOM_VERDICT_LOCK_WAIT_SECS` (90) and exits 9 on timeout
+    /// (fail closed); a lock older than 5 minutes is reaped. Host-local only:
+    /// independent hosts share no lock; `verdict-reconcile` arbitrates cross-host.
+    #[command(name = "verdict-lock")]
+    VerdictLock {
+        /// `acquire` or `release`.
+        action: String,
+        /// The PR number.
+        pr: u64,
+        /// `owner/name`.
+        #[arg(long)]
+        repo: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -783,6 +884,48 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictGate {
+            pr,
+            repo,
+            verdict,
+            sha,
+            overrules_prior,
+            window_secs,
+        } => {
+            return super::forge_verdict_cmd::verdict_gate(
+                pr,
+                &repo,
+                &verdict,
+                &sha,
+                &overrules_prior,
+                window_secs,
+            );
+        }
+        ForgeAction::VerdictLock { action, pr, repo } => {
+            return super::forge_verdict_cmd::verdict_lock(&action, pr, &repo);
+        }
+        ForgeAction::VerdictReconcile {
+            pr,
+            repo,
+            verdict,
+            sha,
+            seen_opposite,
+            seen_same_max_id,
+            nonce,
+        } => {
+            return super::forge_verdict_cmd::verdict_reconcile(
+                pr,
+                &repo,
+                &verdict,
+                &sha,
+                seen_opposite,
+                seen_same_max_id,
+                &nonce,
+            );
+        }
+        ForgeAction::VerdictLabels { pr, repo, verdict } => {
+            return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        }
         ForgeAction::VerdictStaleNotice {
             label,
             marker_sha,
@@ -949,6 +1092,13 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         ForgeAction::Parent {
             action: super::forge_parent_cmd::ParentAction::Link { repo, .. },
         } => Some(repo.clone()),
+        // #10581: `verdict-labels` POSTs and DELETEs labels on the supplied
+        // `--repo`, so a direct call (the repair command the script prints)
+        // is vetted like every other write verb. `verdict-gate` only reads.
+        ForgeAction::VerdictLabels { repo, .. } => Some(Some(repo.clone())),
+        // #10581: `verdict-reconcile` DELETEs the caller's duplicate verdict
+        // comment on the supplied `--repo`, so a direct call is vetted too.
+        ForgeAction::VerdictReconcile { repo, .. } => Some(Some(repo.clone())),
         _ => None,
     }
 }
@@ -1031,7 +1181,7 @@ mod write_target_tests {
     #[test]
     fn merge_queue_verbs_parse_through_the_deferred_slot() {
         use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
-        use clap::{CommandFactory, Parser};
+        use clap::CommandFactory;
         let sha = "a".repeat(40);
         let argv = [
             "loom-daemon",
@@ -1042,7 +1192,10 @@ mod write_target_tests {
             "--approved-sha",
             &sha,
         ];
-        let cli = crate::Cli::try_parse_from(argv).expect("parse");
+        // #10616: whole-`Cli` parses run on the binary's 8 MiB main-thread
+        // stack, never libtest's 2 MiB worker (the #10581 verdict verbs pushed
+        // the debug-build `ForgeAction` frames past it).
+        let cli = super::super::whole_cli_parse::try_parse_cli(&argv).expect("parse");
         let Some(crate::Commands::Forge {
             action: ForgeAction::MergeQueue { action },
         }) = cli.command
@@ -1059,14 +1212,60 @@ mod write_target_tests {
             }
             _ => panic!("expected `step`"),
         }
-        let mut cmd = crate::Cli::command();
-        cmd.build();
-        let mq = cmd
-            .find_subcommand("forge")
-            .and_then(|f| f.find_subcommand("merge-queue"))
-            .expect("forge merge-queue is registered");
-        for verb in ["mode", "reconcile", "handoff", "step", "revoke"] {
-            assert!(mq.find_subcommand(verb).is_some(), "{verb}");
-        }
+        let missing = super::super::whole_cli_parse::on_stack(
+            "merge-queue-verbs-8MiB",
+            super::super::whole_cli_parse::MAIN_THREAD_STACK,
+            || {
+                let mut cmd = crate::Cli::command();
+                cmd.build();
+                let mq = cmd
+                    .find_subcommand("forge")
+                    .and_then(|f| f.find_subcommand("merge-queue"))
+                    .expect("forge merge-queue is registered");
+                ["mode", "reconcile", "handoff", "step", "revoke"]
+                    .into_iter()
+                    .filter(|verb| mq.find_subcommand(verb).is_none())
+                    .collect::<Vec<_>>()
+            },
+        );
+        assert!(missing.is_empty(), "unregistered merge-queue verbs: {missing:?}");
+    }
+
+    /// #10581: a direct `verdict-labels --repo unmanaged/repo` is vetted
+    /// (`may_write_from` runs before the handler's first gh call); the gate
+    /// verb only reads.
+    #[test]
+    fn verdict_labels_is_vetted_against_its_repo_and_the_gate_is_not() {
+        let labels = ForgeAction::VerdictLabels {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+        };
+        assert_eq!(write_target(&labels), Some(Some("unmanaged/repo".into())));
+        let gate = ForgeAction::VerdictGate {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+            sha: "a".repeat(40),
+            overrules_prior: String::new(),
+            window_secs: 600,
+        };
+        assert_eq!(write_target(&gate), None);
+    }
+
+    /// #10581: `verdict-reconcile` can DELETE a comment, so a direct call
+    /// against an unmanaged repository is vetted before the handler runs.
+    #[test]
+    fn verdict_reconcile_is_vetted_against_its_repo() {
+        let reconcile = ForgeAction::VerdictReconcile {
+            pr: 7,
+            repo: "unmanaged/repo".into(),
+            verdict: "approved".into(),
+            sha: "a".repeat(40),
+            seen_opposite: 0,
+            seen_same_max_id: 0,
+            nonce: String::new(),
+        };
+        assert_eq!(write_target(&reconcile), Some(Some("unmanaged/repo".into())));
     }
 }
