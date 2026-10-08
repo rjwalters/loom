@@ -16,9 +16,13 @@
 //!   `.gitignore` block. A run's dir is `<root>/.loom/targets/<role>-<run-id>`.
 //! * [`crate::role_runner`] plans the path before it spawns a tick and passes it
 //!   to the child as [`RUN_TARGET_DIR_ENV`]. It holds a [`RunDirGuard`] for the
-//!   life of the tick and removes the dir when the child is gone, on every
-//!   outcome. That is the run-end half: `worker_spawn` ends in `exec()`, so
-//!   nothing inside the spawn chain survives to clean up after the agent.
+//!   life of the tick and removes the dir when the child AND everything left
+//!   in the child's process group are gone, on every outcome. A tick whose
+//!   group still has a live member (a detached `cargo test` the agent
+//!   backgrounded) keeps its dir for the orphan sweep. That is the run-end
+//!   half, and it exists for role-runner ticks only: `worker_spawn` ends in
+//!   `exec()`, so nothing inside the spawn chain survives to clean up after
+//!   the agent.
 //! * [`crate::worker_spawn`] (the seam every dispatch surface converges on)
 //!   decides with [`decide`], creates the dir with [`provision`] (which also
 //!   records the harness pid in [`OWNER_FILE`], since `exec()` keeps the pid),
@@ -237,12 +241,38 @@ pub fn remove_run_dir(
     }
 }
 
+/// How long [`RunDirGuard`]'s drop waits for a tick's process group to empty
+/// before it gives the dir to the orphan sweep. Covers the gap between the
+/// leader's exit (or the timeout's SIGTERM/SIGKILL) and its children's.
+pub const GROUP_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether any process is left in process group `pgid` (`kill(-pgid, 0)`).
+/// `EPERM` counts as alive: something is there, we just may not signal it.
+/// A `pgid` of 0 or 1, or one that does not fit a `pid_t`, is reported alive:
+/// `kill(0, ..)` and `kill(-1, ..)` address this process's own group and
+/// every process, never the tick's, so the honest answer is "unknown", and an
+/// unknown keeps the dir.
+#[must_use]
+pub fn process_group_alive(pgid: u32) -> bool {
+    let Some(pgid) = i32::try_from(pgid).ok().filter(|&p| p > 1) else {
+        return true;
+    };
+    // SAFETY: signal 0 performs the existence and permission check only; no
+    // signal is delivered. `pgid > 1`, so `-pgid` names exactly one group.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 /// Holds one run's planned dir for the life of a role tick and removes it on
 /// drop, whatever the outcome. Removal is best-effort: a failure is logged and
 /// never changes the tick's result.
 #[derive(Debug)]
 pub struct RunDirGuard {
     dir: PathBuf,
+    /// The tick's process group, once the child is spawned.
+    pgid: Option<u32>,
 }
 
 impl RunDirGuard {
@@ -251,7 +281,15 @@ impl RunDirGuard {
     pub fn plan(repo_root: &Path, role: &str, run_id: &str) -> Self {
         Self {
             dir: planned_for(repo_root, role, run_id),
+            pgid: None,
         }
+    }
+
+    /// Record the process group the tick's child leads (`process_group(0)`
+    /// makes it the child's own pid). The dir is then kept at run end for as
+    /// long as anything in that group is alive.
+    pub fn watch_process_group(&mut self, pgid: u32) {
+        self.pgid = Some(pgid);
     }
 
     /// The planned path.
@@ -265,13 +303,20 @@ impl RunDirGuard {
         cmd.env(RUN_TARGET_DIR_ENV, &self.dir);
     }
 
-    /// Remove now, with the liveness probe and remover injected (tests).
+    /// Remove now, with the liveness probes and remover injected (tests).
+    /// `group_alive` is asked about the watched process group, if any, before
+    /// anything else: the owner pid names only the harness, and a descendant
+    /// it left behind can still be writing here.
     pub fn finish_with(
         &self,
         owner_alive: &dyn Fn(u32) -> bool,
+        group_alive: &dyn Fn(u32) -> bool,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> Removal {
-        let outcome = remove_run_dir(&self.dir, owner_alive, remove);
+        let outcome = match self.pgid.filter(|&pgid| group_alive(pgid)) {
+            Some(pgid) => Removal::Kept(format!("process group {pgid} still has a live member")),
+            None => remove_run_dir(&self.dir, owner_alive, remove),
+        };
         match &outcome {
             Removal::Removed => log::info!(
                 "run_target_dir: removed run target dir {} at run end",
@@ -293,8 +338,27 @@ impl RunDirGuard {
 
 impl Drop for RunDirGuard {
     fn drop(&mut self) {
-        let _ = self
-            .finish_with(&crate::live_claim::pid_is_live_process, &|p| std::fs::remove_dir_all(p));
+        // Nothing was created (not a Cargo repo, an operator CARGO_TARGET_DIR):
+        // do not spend the grace on it.
+        if std::fs::symlink_metadata(&self.dir).is_err() {
+            return;
+        }
+        // Give a group that is on its way out a moment to finish dying, so a
+        // timed-out tick (SIGTERM to the group, then this) still frees its
+        // dir now instead of in three hours.
+        let deadline = std::time::Instant::now() + GROUP_EXIT_GRACE;
+        let group_alive = |pgid: u32| loop {
+            if !process_group_alive(pgid) {
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let _ = self.finish_with(&crate::live_claim::pid_is_live_process, &group_alive, &|p| {
+            std::fs::remove_dir_all(p)
+        });
     }
 }
 

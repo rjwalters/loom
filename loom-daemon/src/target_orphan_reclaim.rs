@@ -10,10 +10,13 @@
 //!   end; a daemon sweep or a manual spawn has no process left to do that
 //!   (`worker_spawn` ends in `exec()`), so this is where those go.
 //! * The locations agents improvised before Loom gave them one:
-//!   `<repo>/.loom/target-*`, `/tmp/loom-target-*`, `/tmp/cargo-target-*`,
-//!   `$TMPDIR/cargo-target-*`, `~/.cache/cargo-target-*`. One fleet host held
-//!   85 GB of `.loom/target-{builder,doctor,judge}-<N>`; another 45 GB of
-//!   `/private/tmp/cargo-target-{issue,review}-*`.
+//!   `<repo>/.loom/target-*`, and agent-shaped names ([`is_agent_shaped`])
+//!   under `/tmp`, `$TMPDIR` and `~/.cache`: `cargo-target-issue-<N>`,
+//!   `loom-target-<N>-doctor`. One fleet host held 85 GB of
+//!   `.loom/target-{builder,doctor,judge}-<N>`; another 45 GB of
+//!   `/private/tmp/cargo-target-{issue,review}-*`. A bare prefix is not
+//!   enough outside the repo: a human's `~/.cache/cargo-target-shared` is
+//!   theirs.
 //!
 //! Out of scope: Claude Code session scratchpads and `$TMPDIR/opencode/*`
 //! clones. Neither has a stable prefix this module could match without also
@@ -23,10 +26,23 @@
 //!
 //! A candidate is removed only when ALL of these hold:
 //!
+//! 0. Its scan root is trusted ([`vet_root`]). A root inside the repo
+//!    (`.loom`, `.loom/targets`) is scanned only when every path component
+//!    below the repo root is a real directory, not a symlink, and its
+//!    canonical path is inside the canonical repo root. A `.loom/targets`
+//!    symlinked onto a bigger volume (or at `$HOME`) is refused whole:
+//!    its children are somebody else's directories.
 //! 1. It is a direct child of one of the scan roots and its name matches that
-//!    root's prefix. Nothing is found by walking deeper.
+//!    root's matcher. Nothing is found by walking deeper.
 //! 2. It is a real directory, not a symlink (`symlink_metadata`), so a link
 //!    named `cargo-target-x` pointing at `$HOME` is never followed.
+//! 2a. Under `.loom/targets` it carries the owner marker
+//!    ([`crate::run_target_dir::OWNER_FILE`]) that `provision` writes. A
+//!    directory Loom did not create there is not Loom's to remove.
+//! 2b. Under a shared root (`/tmp`, `$TMPDIR`, `~/.cache`) it is owned by
+//!    this process's effective uid. Liveness cannot be established for
+//!    another user's directory (`/proc/<pid>/fd` and `lsof` do not show
+//!    another user's processes to a non-root caller), so it is kept.
 //! 3. It does not overlap a configured target dir
 //!    ([`host_configured_target_dirs`]): an
 //!    operator's shared `CARGO_TARGET_DIR=/tmp/cargo-target-shared` is not an
@@ -71,12 +87,15 @@ pub const DEFAULT_MAX_AGE_HOURS: u64 = 3;
 /// Default cooldown between passes for one repo: 30 minutes.
 pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
 
-/// Name prefixes for the improvised locations.
+/// Name prefix for the improvised location inside the repo's `.loom/`.
 pub const LEGACY_REPO_PREFIX: &str = "target-";
-/// Prefixes matched directly under `/tmp`.
+/// Prefixes matched directly under `/tmp` (with an agent-shaped suffix).
 pub const TMP_PREFIXES: &[&str] = &["loom-target-", "cargo-target-"];
-/// Prefix matched directly under `$TMPDIR` and `~/.cache`.
+/// Prefix matched directly under `$TMPDIR` and `~/.cache` (same rule).
 pub const CARGO_TARGET_PREFIX: &str = "cargo-target-";
+/// The words an agent put in an improvised name: its role, or what it was
+/// working on.
+pub const AGENT_NAME_WORDS: &[&str] = &["issue", "review", "pr", "builder", "doctor", "judge"];
 
 // ============================================================================
 // Config (.loom/config.json → autonomous.worktreeReaper.targetOrphanReclaim)
@@ -151,33 +170,153 @@ pub fn resolve_min_interval_secs(config: &TargetOrphanConfig) -> u64 {
 pub struct ScanRoot {
     pub dir: PathBuf,
     pub matcher: NameMatcher,
+    pub scope: RootScope,
+}
+
+/// Where a [`ScanRoot`] lives, which decides how the root itself is vetted
+/// and which ownership gate its children pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootScope {
+    /// Inside the repo (`.loom`, `.loom/targets`). The root must be a real
+    /// directory chain under the repo root ([`vet_root`]).
+    Repo,
+    /// A directory other users and other tools also write to (`/tmp`,
+    /// `$TMPDIR`, `~/.cache`). A child must be owned by this process's euid.
+    Shared,
 }
 
 /// Which child names under a [`ScanRoot`] are candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameMatcher {
-    /// `<repo>/.loom/targets/`: any run-dir-shaped name.
+    /// `<repo>/.loom/targets/`: a `<role>-<run-id>` name. The name alone is
+    /// never enough there; [`evaluate`] also requires the owner marker.
     RunDir,
-    /// Any of these prefixes, followed by at least one more character.
+    /// Any of these prefixes, followed by at least one more character. Only
+    /// for a root inside the repo.
     Prefixes(Vec<&'static str>),
+    /// Any of these prefixes followed by an agent-shaped suffix
+    /// ([`is_agent_shaped`]). For the shared roots.
+    AgentShaped(Vec<&'static str>),
+}
+
+/// Whether `suffix` (what follows a `cargo-target-` / `loom-target-` prefix)
+/// is a name an agent improvised: `-`-separated tokens, each one of
+/// [`AGENT_NAME_WORDS`] or a run of digits, with at least one of each.
+/// `issue-10078`, `review-9745`, `10570-doctor` are; `shared`, `x`, `1`,
+/// `issue`, `my-issue-3` are not, so a human's
+/// `~/.cache/cargo-target-shared` never matches.
+#[must_use]
+pub fn is_agent_shaped(suffix: &str) -> bool {
+    let (mut words, mut numbers) = (0usize, 0usize);
+    for token in suffix.split('-') {
+        if AGENT_NAME_WORDS.contains(&token) {
+            words += 1;
+        } else if !token.is_empty()
+            && token.len() <= 10
+            && token.bytes().all(|b| b.is_ascii_digit())
+        {
+            numbers += 1;
+        } else {
+            return false;
+        }
+    }
+    words >= 1 && numbers >= 1
+}
+
+/// Whether `name` has the `<role>-<run-id>` shape `planned_for` produces:
+/// `[A-Za-z0-9_-]+`, starting with an alphanumeric, with a `-` separating a
+/// non-empty role from a non-empty run id.
+fn is_run_dir_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .split_once('-')
+            .is_some_and(|(role, id)| !role.is_empty() && !id.trim_matches('-').is_empty())
 }
 
 impl NameMatcher {
     #[must_use]
     pub fn matches(&self, name: &str) -> bool {
         match self {
-            Self::RunDir => {
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            }
+            Self::RunDir => is_run_dir_name(name),
             Self::Prefixes(prefixes) => prefixes
                 .iter()
                 .any(|p| name.len() > p.len() && name.starts_with(p)),
+            Self::AgentShaped(prefixes) => prefixes
+                .iter()
+                .any(|p| name.strip_prefix(p).is_some_and(is_agent_shaped)),
         }
     }
 }
+
+impl ScanRoot {
+    /// The per-candidate gates that depend on which root a candidate is in.
+    #[must_use]
+    pub fn gates(&self) -> RootGates {
+        RootGates {
+            require_owner_marker: self.matcher == NameMatcher::RunDir,
+            require_own_uid: self.scope == RootScope::Shared,
+        }
+    }
+}
+
+/// The root-dependent gates [`evaluate`] applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootGates {
+    /// Keep a dir with no [`crate::run_target_dir::OWNER_FILE`] marker.
+    pub require_owner_marker: bool,
+    /// Keep a dir whose owner uid is not this process's euid.
+    pub require_own_uid: bool,
+}
+
+/// Whether `root` may be scanned at all. A shared root always may (its
+/// children pass the ownership gate instead). A root inside the repo may only
+/// when every path component from the repo root down to it is a real
+/// directory (`symlink_metadata`, so a symlink at ANY level refuses it, not
+/// just the last) and its canonical path is inside the canonical repo root.
+/// `Err` carries why; a root that does not exist is `Err` too, and silent.
+pub fn vet_root(repo_root: &Path, root: &ScanRoot) -> Result<(), String> {
+    if root.scope == RootScope::Shared {
+        return Ok(());
+    }
+    let Ok(relative) = root.dir.strip_prefix(repo_root) else {
+        return Err(format!("not under the repo root {}", repo_root.display()));
+    };
+    let mut walked = repo_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!("non-normal path component in {}", relative.display()));
+        };
+        walked.push(part);
+        match std::fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("{} is a symlink", walked.display()));
+            }
+            Ok(_) => return Err(format!("{} is not a directory", walked.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(MISSING_ROOT.to_string());
+            }
+            Err(e) => return Err(format!("{}: {e}", walked.display())),
+        }
+    }
+    let (Ok(real_root), Ok(real_repo)) = (root.dir.canonicalize(), repo_root.canonicalize()) else {
+        return Err("could not canonicalize the root or the repo root".to_string());
+    };
+    if real_root == real_repo || !real_root.starts_with(&real_repo) {
+        return Err(format!(
+            "resolves to {}, outside the repo root {}",
+            real_root.display(),
+            real_repo.display()
+        ));
+    }
+    Ok(())
+}
+
+/// [`vet_root`]'s reason for a root that simply is not there (the common
+/// case: no run has created `.loom/targets` yet). Not worth a log line.
+const MISSING_ROOT: &str = "does not exist";
 
 /// The fixed scan roots for `repo_root`, with `home` and `tmpdir` injected.
 /// A root that resolves to the same real directory as an earlier one (macOS
@@ -188,33 +327,41 @@ pub fn scan_roots(repo_root: &Path, home: Option<&Path>, tmpdir: Option<&Path>) 
         ScanRoot {
             dir: crate::run_target_dir::targets_root(repo_root),
             matcher: NameMatcher::RunDir,
+            scope: RootScope::Repo,
         },
         ScanRoot {
             dir: repo_root.join(".loom"),
             matcher: NameMatcher::Prefixes(vec![LEGACY_REPO_PREFIX]),
+            scope: RootScope::Repo,
         },
         ScanRoot {
             dir: PathBuf::from("/tmp"),
-            matcher: NameMatcher::Prefixes(TMP_PREFIXES.to_vec()),
+            matcher: NameMatcher::AgentShaped(TMP_PREFIXES.to_vec()),
+            scope: RootScope::Shared,
         },
     ];
     if let Some(tmpdir) = tmpdir.filter(|p| p.is_absolute()) {
         roots.push(ScanRoot {
             dir: tmpdir.to_path_buf(),
-            matcher: NameMatcher::Prefixes(vec![CARGO_TARGET_PREFIX]),
+            matcher: NameMatcher::AgentShaped(vec![CARGO_TARGET_PREFIX]),
+            scope: RootScope::Shared,
         });
     }
     if let Some(home) = home.filter(|p| p.is_absolute()) {
         roots.push(ScanRoot {
             dir: home.join(".cache"),
-            matcher: NameMatcher::Prefixes(vec![CARGO_TARGET_PREFIX]),
+            matcher: NameMatcher::AgentShaped(vec![CARGO_TARGET_PREFIX]),
+            scope: RootScope::Shared,
         });
     }
     let mut merged: Vec<(PathBuf, ScanRoot)> = Vec::new();
     for root in roots {
         let real = crate::worktree_ops::cargo_target::realish(&root.dir);
         if let Some((_, existing)) = merged.iter_mut().find(|(r, _)| *r == real) {
-            if let (NameMatcher::Prefixes(have), NameMatcher::Prefixes(add)) =
+            // Only two shared roots ever merge (a `$TMPDIR` that is `/tmp`).
+            // A shared root that resolves to a repo root is dropped: the
+            // stricter repo vetting already covers that directory.
+            if let (NameMatcher::AgentShaped(have), NameMatcher::AgentShaped(add)) =
                 (&mut existing.matcher, &root.matcher)
             {
                 for p in add {
@@ -239,6 +386,11 @@ pub fn scan_roots(repo_root: &Path, home: Option<&Path>, tmpdir: Option<&Path>) 
 pub enum KeepReason {
     /// A symlink or a non-directory wearing a matching name.
     NotADirectory,
+    /// Under `.loom/targets` without the owner marker `provision` writes:
+    /// Loom did not create it.
+    NoOwnerMarker,
+    /// Under a shared root and owned by another user.
+    ForeignOwner { uid: u32 },
     /// Overlaps a configured target dir.
     ConfiguredTargetDir(PathBuf),
     /// Written within the max age.
@@ -272,6 +424,32 @@ pub struct Probes<'a> {
     pub live_issues: &'a HashSet<u32>,
     /// Configured target dirs (already resolved through symlinks).
     pub protected: &'a [PathBuf],
+    /// This process's effective uid, for the shared-root ownership gate.
+    pub euid: u32,
+}
+
+/// This process's effective uid.
+#[must_use]
+pub fn current_euid() -> u32 {
+    // SAFETY: geteuid only reads the caller's effective user id.
+    unsafe { libc::geteuid() }
+}
+
+/// Whether a directory owned by `owner_uid` may be removed from a shared
+/// root by a process running as `euid`: only its own. Root gets no pass: a
+/// root daemon is exactly the case where another user's dir would otherwise
+/// be deletable.
+#[must_use]
+pub fn owned_by_us(owner_uid: u32, euid: u32) -> bool {
+    owner_uid == euid
+}
+
+/// Whether `dir` carries a real (non-symlink) owner marker file with a pid in
+/// it, as [`crate::run_target_dir::provision`] writes.
+fn has_owner_marker(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(crate::run_target_dir::OWNER_FILE))
+        .is_ok_and(|m| m.is_file())
+        && crate::run_target_dir::owner_pid(dir).is_some()
 }
 
 /// Every run of ASCII digits in `name`, parsed. `cargo-target-review-9745`
@@ -309,13 +487,22 @@ fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
 /// otherwise eligible.
 pub fn evaluate(
     path: &Path,
+    gates: RootGates,
     now: DateTime<Utc>,
     max_age_secs: i64,
     probes: &Probes<'_>,
 ) -> Result<Candidate, KeepReason> {
+    use std::os::unix::fs::MetadataExt;
+
     let meta = std::fs::symlink_metadata(path).map_err(|_| KeepReason::Unreadable)?;
     if !meta.is_dir() {
         return Err(KeepReason::NotADirectory);
+    }
+    if gates.require_own_uid && !owned_by_us(meta.uid(), probes.euid) {
+        return Err(KeepReason::ForeignOwner { uid: meta.uid() });
+    }
+    if gates.require_owner_marker && !has_owner_marker(path) {
+        return Err(KeepReason::NoOwnerMarker);
     }
     let real = crate::worktree_ops::cargo_target::realish(path);
     if let Some(p) = probes
@@ -372,6 +559,9 @@ pub struct TargetOrphanReport {
     pub kept: Vec<(PathBuf, KeepReason)>,
     /// Eligible but `remove_dir_all` failed.
     pub failed: Vec<(PathBuf, String)>,
+    /// Scan roots that were not scanned at all, with why ([`vet_root`]): a
+    /// symlinked `.loom/targets`, a root that resolves outside the repo.
+    pub refused_roots: Vec<(PathBuf, String)>,
 }
 
 impl TargetOrphanReport {
@@ -440,6 +630,13 @@ pub fn log_report(report: &TargetOrphanReport) {
             path.display()
         );
     }
+    for (root, why) in &report.refused_roots {
+        log::warn!(
+            "target_orphan_reclaim: category={CATEGORY} not scanning {}: {why}; nothing under \
+             it will be reclaimed",
+            root.display()
+        );
+    }
     if report.removed.is_empty() && report.eligible.is_empty() && report.failed.is_empty() {
         log::debug!("{}", report.log_line());
     } else {
@@ -466,6 +663,13 @@ pub fn run_with(
         ..TargetOrphanReport::default()
     };
     for root in roots {
+        if let Err(why) = vet_root(repo_root, root) {
+            if why != MISSING_ROOT {
+                report.refused_roots.push((root.dir.clone(), why));
+            }
+            continue;
+        }
+        let gates = root.gates();
         let Ok(entries) = std::fs::read_dir(&root.dir) else {
             continue;
         };
@@ -476,7 +680,7 @@ pub fn run_with(
                 continue;
             }
             let path = entry.path();
-            match evaluate(&path, now, max_age_secs, probes) {
+            match evaluate(&path, gates, now, max_age_secs, probes) {
                 Ok(candidate) => report.eligible.push(candidate),
                 Err(why) => report.kept.push((path, why)),
             }
@@ -538,7 +742,7 @@ pub fn run_now(repo_root: &Path, max_age_hours: u64, dry_run: bool) -> TargetOrp
     // A unit test that reaches this through a reaper or eager pass must never
     // act on the developer's real `/tmp`, `$TMPDIR` or `~/.cache`.
     if cfg!(test) {
-        roots.retain(|r| r.dir.starts_with(repo_root));
+        roots.retain(|r| r.scope == RootScope::Repo);
     }
     let protected = host_configured_target_dirs(repo_root);
     let live_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
@@ -547,6 +751,7 @@ pub fn run_now(repo_root: &Path, max_age_hours: u64, dry_run: bool) -> TargetOrp
         owner_alive: &crate::live_claim::pid_is_live_process,
         live_issues: &live_issues,
         protected: &protected,
+        euid: current_euid(),
     };
     let max_age_secs = i64::try_from(max_age_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
     run_with(repo_root, &roots, Utc::now(), max_age_secs, dry_run, &probes)

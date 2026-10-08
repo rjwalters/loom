@@ -9059,8 +9059,9 @@ See `loom-daemon/src/tmpfs_visibility.rs`,
 
 **The leak.** Agents that were not handed a `CARGO_TARGET_DIR` improvised one:
 `<repo>/.loom/target-{builder,doctor,judge}-<N>` (85 GB on one fleet host),
-`/tmp/loom-target-*`, `/tmp/cargo-target-*`, `$TMPDIR/cargo-target-*`,
-`~/.cache/cargo-target-*`. Nothing owned them, so nothing removed them.
+`/tmp/loom-target-*`, `/tmp/cargo-target-{issue,review}-<N>`,
+`$TMPDIR/cargo-target-*`, `~/.cache/cargo-target-*`. Nothing owned them, so
+nothing removed them.
 
 **Prevention.** `worker_spawn` now exports a Loom-owned
 `CARGO_TARGET_DIR=<repo>/.loom/targets/<role>-<run-id>` (logged as
@@ -9068,7 +9069,13 @@ See `loom-daemon/src/tmpfs_visibility.rs`,
 `CARGO_TARGET_DIR` is already set, the spawn is a containerized re-entry, or
 the repo has no root `Cargo.toml`. A role-runner tick plans the path (passed
 as `LOOM_RUN_TARGET_DIR`) and removes the dir when the child exits, on every
-outcome; a removal failure is logged and never fails the tick.
+outcome; a removal failure is logged and never fails the tick. It first checks
+the child's process group (`kill(-pgid, 0)`, with a 2 s grace): while a
+descendant is alive (a detached `cargo test`) the dir is kept for the sweep.
+Run-end removal exists for role-runner ticks only. A daemon sweep spawn or a
+manual `spawn-worker.sh` derives a fresh dir per spawn (so each build is cold;
+sccache softens it) and has no process left to remove it, so those dirs are
+collected only by the sweep below, three hours or more after the owner exits.
 
 **The sweep** (`target_orphan_reclaim`) collects what run-end removal cannot
 (daemon sweeps, manual spawns, the legacy prefixes above). It runs from the
@@ -9079,7 +9086,27 @@ a symlink), does not overlap a configured `CARGO_TARGET_DIR` /
 `build.target-dir`, has a newest recursive mtime older than the max age, no
 live claim names its issue, its recorded owner pid (`.loom-run-owner`) is not
 running, and no process holds it open. If the open-handle probe cannot run (no
-`/proc`, no `lsof`) the dir is kept. Each pass logs
+`/proc`, no `lsof`) the dir is kept.
+
+Three more gates bound where it can reach:
+
+- **The scan root.** `<repo>/.loom` and `<repo>/.loom/targets` are scanned
+  only when every component below the repo root is a real directory and the
+  canonical path is inside the canonical repo root. A symlinked root is
+  refused whole (`not scanning … is a symlink`), because its children belong
+  to wherever the link points.
+- **The name.** Under `.loom/targets` a dir needs the `<role>-<run-id>` shape
+  **and** the `.loom-run-owner` marker `provision` writes. Under `/tmp`,
+  `$TMPDIR` and `~/.cache` the prefix must be followed by an agent-shaped
+  suffix: `-`-separated tokens, each one of `issue`, `review`, `pr`,
+  `builder`, `doctor`, `judge` or a number, with at least one word and one
+  number (`cargo-target-issue-10078`, `loom-target-10570-doctor`). A human's
+  `~/.cache/cargo-target-shared` never matches.
+- **The owner.** Under those three shared roots a dir owned by any uid other
+  than the daemon's effective uid is kept (`ForeignOwner`), root daemon
+  included: liveness cannot be established for another user's processes.
+
+Each pass logs
 `target_orphan_reclaim: category=cargo_target_orphan … removed=N bytes_freed=B`.
 
 | Knob | Default |

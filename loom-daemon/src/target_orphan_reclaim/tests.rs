@@ -27,11 +27,20 @@ fn make_dir(path: &Path, hours: u64) {
     backdate(path, hours);
 }
 
+/// A run dir as `provision` leaves it (owner marker included), backdated.
+fn make_run_dir(path: &Path, hours: u64) {
+    make_dir(path, hours);
+    std::fs::write(path.join(crate::run_target_dir::OWNER_FILE), "999999\n").unwrap();
+    backdate(path, hours);
+}
+
 struct Fixture {
     free: fn(&Path) -> Option<bool>,
     alive: fn(u32) -> bool,
     live: HashSet<u32>,
     protected: Vec<PathBuf>,
+    gates: RootGates,
+    euid: u32,
 }
 
 impl Fixture {
@@ -41,6 +50,8 @@ impl Fixture {
             alive: |_| false,
             live: HashSet::new(),
             protected: Vec::new(),
+            gates: RootGates::default(),
+            euid: current_euid(),
         }
     }
 
@@ -50,10 +61,20 @@ impl Fixture {
             owner_alive: &self.alive,
             live_issues: &self.live,
             protected: &self.protected,
+            euid: self.euid,
         };
-        evaluate(path, Utc::now(), 3 * HOUR, &probes)
+        evaluate(path, self.gates, Utc::now(), 3 * HOUR, &probes)
     }
 }
+
+const SHARED: RootGates = RootGates {
+    require_owner_marker: false,
+    require_own_uid: true,
+};
+const RUN_DIRS: RootGates = RootGates {
+    require_owner_marker: true,
+    require_own_uid: false,
+};
 
 #[test]
 fn prefix_matcher_needs_a_suffix_and_the_exact_prefix() {
@@ -66,11 +87,78 @@ fn prefix_matcher_needs_a_suffix_and_the_exact_prefix() {
 }
 
 #[test]
-fn run_dir_matcher_refuses_odd_names() {
-    assert!(NameMatcher::RunDir.matches("doctor-role-doctor-20261008T000000Z-ab12"));
-    assert!(!NameMatcher::RunDir.matches(""));
-    assert!(!NameMatcher::RunDir.matches(".hidden"));
-    assert!(!NameMatcher::RunDir.matches("a b"));
+fn run_dir_matcher_needs_the_role_dash_run_id_shape() {
+    let m = NameMatcher::RunDir;
+    assert!(m.matches("doctor-role-doctor-20261008T000000Z-ab12"));
+    assert!(m.matches("worker-83920-1791490000"));
+    assert!(m.matches("doctor-1"));
+    for odd in [
+        "",
+        ".hidden",
+        "a b",
+        "Documents",
+        "Desktop",
+        "src",
+        "-x",
+        "x-",
+        "_a-b",
+        "a--",
+    ] {
+        assert!(!m.matches(odd), "{odd:?}");
+    }
+    // What the runner and the spawn actually produce always matches.
+    for (role, id) in [
+        ("doctor", "role-doctor-20261008T000000Z-ab12cdef"),
+        ("my role", "1-2"),
+    ] {
+        let dir = crate::run_target_dir::planned_for(Path::new("/r"), role, id);
+        assert!(m.matches(dir.file_name().unwrap().to_str().unwrap()), "{}", dir.display());
+    }
+}
+
+/// Judge finding 3 (#11013): on a shared root a bare prefix is not enough. A
+/// human's own `CARGO_TARGET_DIR=~/.cache/cargo-target-shared` is invisible
+/// to a launchd/systemd daemon and must never be a candidate.
+#[test]
+fn the_shared_root_matcher_takes_agent_shaped_names_only() {
+    let m = NameMatcher::AgentShaped(TMP_PREFIXES.to_vec());
+    for agent in [
+        "cargo-target-issue-10078",
+        "cargo-target-review-9745",
+        "cargo-target-pr-11013",
+        "cargo-target-builder-10744",
+        "cargo-target-doctor-8370",
+        "cargo-target-judge-1",
+        "loom-target-10570-doctor",
+        "loom-target-doctor-10570",
+        "loom-target-issue-8370-judge",
+    ] {
+        assert!(m.matches(agent), "{agent}");
+    }
+    for human in [
+        "cargo-target-x",
+        "cargo-target-shared",
+        "cargo-target-",
+        "cargo-target-1",
+        "cargo-target-issue",
+        "cargo-target-issue-",
+        "cargo-target-issue-x",
+        "cargo-target-issue-10078-mine",
+        "cargo-target-my-issue-3",
+        "cargo-target-release",
+        "cargo-target-doctor-99999999999",
+        "loom-target-x",
+        "loom-target-2026",
+        "my-cargo-target-issue-1",
+        "cargo-targets",
+    ] {
+        assert!(!m.matches(human), "{human}");
+    }
+    // `$TMPDIR` and `~/.cache` know only the `cargo-target-` prefix.
+    let cache = NameMatcher::AgentShaped(vec![CARGO_TARGET_PREFIX]);
+    assert!(cache.matches("cargo-target-issue-1"));
+    assert!(!cache.matches("loom-target-issue-1"));
+    assert!(!cache.matches("cargo-target-x"));
 }
 
 #[test]
@@ -79,16 +167,35 @@ fn scan_roots_cover_exactly_the_known_prefixes() {
     let home = tempfile::tempdir().unwrap();
     let tmpdir = tempfile::tempdir().unwrap();
     let roots = scan_roots(repo.path(), Some(home.path()), Some(tmpdir.path()));
-    let find = |dir: PathBuf| roots.iter().find(|r| r.dir == dir).unwrap().matcher.clone();
-    assert_eq!(find(repo.path().join(".loom/targets")), NameMatcher::RunDir);
-    assert_eq!(find(repo.path().join(".loom")), NameMatcher::Prefixes(vec!["target-"]));
+    let find = |dir: PathBuf| {
+        let root = roots.iter().find(|r| r.dir == dir).unwrap();
+        (root.matcher.clone(), root.scope)
+    };
+    let agent = |prefixes: &[&'static str]| NameMatcher::AgentShaped(prefixes.to_vec());
+    assert_eq!(find(repo.path().join(".loom/targets")), (NameMatcher::RunDir, RootScope::Repo));
+    assert_eq!(
+        find(repo.path().join(".loom")),
+        (NameMatcher::Prefixes(vec!["target-"]), RootScope::Repo)
+    );
     assert_eq!(
         find(PathBuf::from("/tmp")),
-        NameMatcher::Prefixes(vec!["loom-target-", "cargo-target-"])
+        (agent(&["loom-target-", "cargo-target-"]), RootScope::Shared)
     );
-    assert_eq!(find(tmpdir.path().to_path_buf()), NameMatcher::Prefixes(vec!["cargo-target-"]));
-    assert_eq!(find(home.path().join(".cache")), NameMatcher::Prefixes(vec!["cargo-target-"]));
+    assert_eq!(
+        find(tmpdir.path().to_path_buf()),
+        (agent(&["cargo-target-"]), RootScope::Shared)
+    );
+    assert_eq!(find(home.path().join(".cache")), (agent(&["cargo-target-"]), RootScope::Shared));
     assert_eq!(roots.len(), 5);
+    // Every root outside the repo is shared, so it gets the ownership gate
+    // and never the bare-prefix matcher.
+    for root in &roots {
+        let inside = root.dir.starts_with(repo.path());
+        assert_eq!(root.scope == RootScope::Repo, inside, "{root:?}");
+        assert_eq!(root.gates().require_own_uid, !inside, "{root:?}");
+        assert_eq!(matches!(root.matcher, NameMatcher::AgentShaped(_)), !inside, "{root:?}");
+    }
+    assert!(roots[0].gates().require_owner_marker);
 }
 
 #[test]
@@ -227,6 +334,28 @@ fn a_file_wearing_the_name_is_kept() {
     assert_eq!(Fixture::new().eval(&file), Err(KeepReason::NotADirectory));
 }
 
+/// The three production root shapes, rebased onto a temp repo and a temp
+/// stand-in for `/tmp`. Never the real `/tmp`, `$TMPDIR` or `~/.cache`.
+fn roots_for(repo: &Path, fake_tmp: &Path) -> Vec<ScanRoot> {
+    vec![
+        ScanRoot {
+            dir: repo.join(".loom/targets"),
+            matcher: NameMatcher::RunDir,
+            scope: RootScope::Repo,
+        },
+        ScanRoot {
+            dir: repo.join(".loom"),
+            matcher: NameMatcher::Prefixes(vec![LEGACY_REPO_PREFIX]),
+            scope: RootScope::Repo,
+        },
+        ScanRoot {
+            dir: fake_tmp.to_path_buf(),
+            matcher: NameMatcher::AgentShaped(TMP_PREFIXES.to_vec()),
+            scope: RootScope::Shared,
+        },
+    ]
+}
+
 /// Integration: backdated candidates and decoys under temp scan roots.
 fn populated() -> (tempfile::TempDir, Vec<ScanRoot>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
@@ -234,35 +363,26 @@ fn populated() -> (tempfile::TempDir, Vec<ScanRoot>, tempfile::TempDir) {
     make_dir(outside.path(), 10);
     let repo = tmp.path().join("repo");
     let fake_tmp = tmp.path().join("tmp");
-    make_dir(&repo.join(".loom/targets/doctor-1"), 10); // eligible
+    make_run_dir(&repo.join(".loom/targets/doctor-1"), 10); // eligible
+    make_dir(&repo.join(".loom/targets/doctor-2"), 10); // no owner marker
     make_dir(&repo.join(".loom/target-builder-10744"), 10); // eligible
     make_dir(&repo.join(".loom/worktrees"), 10); // wrong name
     make_dir(&fake_tmp.join("loom-target-10570-doctor"), 10); // eligible
-    make_dir(&fake_tmp.join("cargo-target-fresh"), 0); // young
+    make_dir(&fake_tmp.join("cargo-target-issue-7"), 0); // young
+    make_dir(&fake_tmp.join("cargo-target-shared"), 10); // a human's name
     make_dir(&fake_tmp.join("unrelated-target-1"), 10); // wrong name
     #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.path(), fake_tmp.join("cargo-target-link")).unwrap();
-    let roots = vec![
-        ScanRoot {
-            dir: repo.join(".loom/targets"),
-            matcher: NameMatcher::RunDir,
-        },
-        ScanRoot {
-            dir: repo.join(".loom"),
-            matcher: NameMatcher::Prefixes(vec![LEGACY_REPO_PREFIX]),
-        },
-        ScanRoot {
-            dir: fake_tmp,
-            matcher: NameMatcher::Prefixes(TMP_PREFIXES.to_vec()),
-        },
-    ];
+    std::os::unix::fs::symlink(outside.path(), fake_tmp.join("cargo-target-issue-8")).unwrap();
+    let roots = roots_for(&repo, &fake_tmp);
     (tmp, roots, outside)
 }
 
-fn run_fixture(
+fn run_fixture_as(
+    repo: &Path,
     roots: &[ScanRoot],
     dry_run: bool,
     free: fn(&Path) -> Option<bool>,
+    euid: u32,
 ) -> TargetOrphanReport {
     let live = HashSet::new();
     let probes = Probes {
@@ -270,8 +390,19 @@ fn run_fixture(
         owner_alive: &|_| false,
         live_issues: &live,
         protected: &[],
+        euid,
     };
-    run_with(Path::new("/repo"), roots, Utc::now(), 3 * HOUR, dry_run, &probes)
+    run_with(repo, roots, Utc::now(), 3 * HOUR, dry_run, &probes)
+}
+
+/// [`populated`]'s roots: the repo is the parent of the first root's `.loom`.
+fn run_fixture(
+    roots: &[ScanRoot],
+    dry_run: bool,
+    free: fn(&Path) -> Option<bool>,
+) -> TargetOrphanReport {
+    let repo = roots[1].dir.parent().unwrap().to_path_buf();
+    run_fixture_as(&repo, roots, dry_run, free, current_euid())
 }
 
 #[test]
@@ -301,12 +432,18 @@ fn a_real_run_removes_only_eligible_dirs() {
         assert!(!root.join(gone).exists(), "{gone}");
     }
     for kept in [
+        "repo/.loom/targets/doctor-2",
         "repo/.loom/worktrees",
-        "tmp/cargo-target-fresh",
+        "tmp/cargo-target-issue-7",
+        "tmp/cargo-target-shared",
         "tmp/unrelated-target-1",
     ] {
         assert!(root.join(kept).exists(), "{kept}");
     }
+    assert!(report.refused_roots.is_empty(), "{report:?}");
+    assert!(report
+        .kept
+        .contains(&(root.join("repo/.loom/targets/doctor-2"), KeepReason::NoOwnerMarker)));
     assert!(outside.path().join("lib.rlib").exists(), "symlink target untouched");
     let line = report.log_line();
     assert!(line.contains("removed=3"), "{line}");
@@ -395,4 +532,209 @@ fn config_and_env_resolution() {
     std::env::set_var(MAX_AGE_HOURS_ENV, "6");
     assert_eq!(resolve_max_age_hours(&cfg), 6);
     std::env::remove_var(MAX_AGE_HOURS_ENV);
+}
+
+// ============================================================================
+// Judge finding 1 (#11013): a symlinked scan root must not reach outside the
+// repo, and `.loom/targets` must not accept an arbitrary name.
+// ============================================================================
+
+/// A stand-in for `$HOME`: innocent, old, unopened dirs with plain names, one
+/// of which is even run-dir shaped and carries an owner marker.
+fn innocent_home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    for name in ["Documents", "Desktop", "my-project", "target-archive"] {
+        make_dir(&home.path().join(name), 100);
+    }
+    make_run_dir(&home.path().join("doctor-1"), 100);
+    home
+}
+
+fn assert_untouched(home: &Path) {
+    for name in [
+        "Documents",
+        "Desktop",
+        "my-project",
+        "target-archive",
+        "doctor-1",
+    ] {
+        assert!(home.join(name).join("lib.rlib").is_file(), "{name} must survive");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_targets_root_is_refused_and_nothing_behind_it_is_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = innocent_home();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".loom")).unwrap();
+    std::os::unix::fs::symlink(home.path(), repo.join(".loom/targets")).unwrap();
+    let roots = roots_for(&repo, &tmp.path().join("tmp"));
+    let report = run_fixture_as(&repo, &roots, false, |_| Some(false), current_euid());
+    assert!(report.eligible.is_empty() && report.removed.is_empty(), "{report:?}");
+    assert!(report.kept.is_empty(), "a refused root is not even listed: {report:?}");
+    assert_eq!(report.refused_roots.len(), 1, "{report:?}");
+    assert_eq!(report.refused_roots[0].0, repo.join(".loom/targets"));
+    assert!(report.refused_roots[0].1.contains("is a symlink"), "{report:?}");
+    assert_untouched(home.path());
+    assert!(repo.join(".loom/targets").is_symlink(), "the link itself stays");
+}
+
+/// The symlink is one level up: `.loom/targets` is a real dir, but only on
+/// the far side of a symlinked `.loom`. Both repo roots are refused.
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_any_component_below_the_repo_root_refuses_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    make_run_dir(&elsewhere.path().join("targets/doctor-1"), 100);
+    make_dir(&elsewhere.path().join("target-builder-1"), 100);
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), repo.join(".loom")).unwrap();
+    let roots = roots_for(&repo, &tmp.path().join("tmp"));
+    for root in &roots[..2] {
+        let why = vet_root(&repo, root).unwrap_err();
+        assert!(why.contains(".loom is a symlink"), "{}: {why}", root.dir.display());
+    }
+    let report = run_fixture_as(&repo, &roots, false, |_| Some(false), current_euid());
+    assert!(report.removed.is_empty() && report.eligible.is_empty(), "{report:?}");
+    assert_eq!(report.refused_roots.len(), 2, "{report:?}");
+    assert!(elsewhere.path().join("targets/doctor-1/lib.rlib").is_file());
+    assert!(elsewhere.path().join("target-builder-1/lib.rlib").is_file());
+}
+
+#[test]
+fn vet_root_accepts_real_dirs_and_refuses_everything_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".loom/targets")).unwrap();
+    let roots = roots_for(&repo, tmp.path());
+    assert_eq!(vet_root(&repo, &roots[0]), Ok(()));
+    assert_eq!(vet_root(&repo, &roots[1]), Ok(()));
+    assert_eq!(vet_root(&repo, &roots[2]), Ok(()), "a shared root is vetted per child");
+    // A repo-scoped root that is not under the repo root at all.
+    let stray = ScanRoot {
+        dir: tmp.path().to_path_buf(),
+        matcher: NameMatcher::RunDir,
+        scope: RootScope::Repo,
+    };
+    assert!(vet_root(&repo, &stray)
+        .unwrap_err()
+        .contains("not under the repo root"));
+    // `..` cannot be used to climb back out.
+    let climbing = ScanRoot {
+        dir: repo.join(".loom/../.."),
+        ..stray.clone()
+    };
+    assert!(vet_root(&repo, &climbing).is_err());
+    // The repo root itself is never a scan root.
+    let whole_repo = ScanRoot {
+        dir: repo.clone(),
+        ..stray
+    };
+    assert!(vet_root(&repo, &whole_repo).is_err());
+    // A missing root is refused quietly (no `refused_roots` entry).
+    let empty = tmp.path().join("empty-repo");
+    std::fs::create_dir_all(&empty).unwrap();
+    let roots = roots_for(&empty, tmp.path());
+    let report = run_fixture_as(&empty, &roots[..2], false, |_| Some(false), current_euid());
+    assert!(report.refused_roots.is_empty(), "{report:?}");
+}
+
+/// Even with a sound root, `.loom/targets` holds only what `provision` made.
+#[test]
+fn a_dir_without_the_owner_marker_is_never_a_run_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("doctor-1");
+    make_dir(&plain, 100);
+    let fx = Fixture {
+        gates: RUN_DIRS,
+        ..Fixture::new()
+    };
+    assert_eq!(fx.eval(&plain), Err(KeepReason::NoOwnerMarker));
+    // A marker that is not a pid, or is a symlink, is not a marker.
+    let marker = plain.join(crate::run_target_dir::OWNER_FILE);
+    std::fs::write(&marker, "not-a-pid").unwrap();
+    backdate(&plain, 100);
+    assert_eq!(fx.eval(&plain), Err(KeepReason::NoOwnerMarker));
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&marker).unwrap();
+        let real = tmp.path().join("pidfile");
+        std::fs::write(&real, "4242").unwrap();
+        std::os::unix::fs::symlink(&real, &marker).unwrap();
+        assert_eq!(fx.eval(&plain), Err(KeepReason::NoOwnerMarker));
+        std::fs::remove_file(&marker).unwrap();
+    }
+    std::fs::write(&marker, "4242\n").unwrap();
+    backdate(&plain, 100);
+    assert!(fx.eval(&plain).is_ok(), "the real marker makes it a run dir");
+}
+
+// ============================================================================
+// Judge finding 2 (#11013): shared roots need an ownership gate.
+// ============================================================================
+
+#[test]
+fn only_our_own_uid_owns_a_shared_root_candidate() {
+    assert!(owned_by_us(501, 501));
+    assert!(!owned_by_us(502, 501));
+    assert!(!owned_by_us(0, 501), "root's dir is not ours");
+    assert!(!owned_by_us(501, 0), "and running as root makes nobody's dir ours");
+}
+
+/// A real foreign-uid dir needs root to create, so the gate is driven from
+/// the other side: the same dir, evaluated as if the daemon were another
+/// user. Every other gate would pass (old, free, no claim).
+#[cfg(unix)]
+#[test]
+fn another_users_dir_under_a_shared_root_is_kept() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("cargo-target-issue-10078");
+    make_dir(&dir, 100);
+    let owner = std::fs::metadata(&dir).unwrap().uid();
+    for daemon_euid in [owner.wrapping_add(1), 0]
+        .into_iter()
+        .filter(|&u| u != owner)
+    {
+        let fx = Fixture {
+            gates: SHARED,
+            euid: daemon_euid,
+            ..Fixture::new()
+        };
+        assert_eq!(fx.eval(&dir), Err(KeepReason::ForeignOwner { uid: owner }));
+    }
+    let ours = Fixture {
+        gates: SHARED,
+        euid: owner,
+        ..Fixture::new()
+    };
+    assert!(ours.eval(&dir).is_ok(), "our own dir still goes");
+    // Inside the repo the gate does not apply: a root daemon still collects
+    // the repo owner's dirs there.
+    let in_repo = Fixture {
+        euid: owner.wrapping_add(1),
+        ..Fixture::new()
+    };
+    assert!(in_repo.eval(&dir).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pass_running_as_another_user_removes_nothing_from_a_shared_root() {
+    let (tmp, roots, _outside) = populated();
+    let repo = tmp.path().join("repo");
+    let report =
+        run_fixture_as(&repo, &roots, false, |_| Some(false), current_euid().wrapping_add(1));
+    let shared = tmp.path().join("tmp/loom-target-10570-doctor");
+    assert!(shared.join("lib.rlib").is_file(), "{report:?}");
+    assert!(report
+        .kept
+        .iter()
+        .any(|(p, why)| *p == shared && matches!(why, KeepReason::ForeignOwner { .. })));
+    assert_eq!(report.removed.len(), 2, "only the two repo-internal dirs: {report:?}");
+    assert!(report.removed.iter().all(|c| c.path.starts_with(&repo)), "{report:?}");
 }

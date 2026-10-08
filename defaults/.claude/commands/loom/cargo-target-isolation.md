@@ -31,7 +31,7 @@ Decide once, before your first verdict-bearing build:
 1. **`$CARGO_TARGET_DIR` is set to a Loom-owned dir**: a path under
    `<repo>/.loom/targets/`, or the per-worktree dir named in your worktree's
    `.loom-cargo-target-dir`. Use it as given. Loom created it for this run
-   and removes it when the run ends. Do not export another or delete it.
+   and reclaims it (see Cleanup). Do not export another or delete it.
 2. **Otherwise** (unset, a shared cache, an operator value, or you are one of
    several agents building concurrently in one session, which all inherit the
    same value): build into your worktree's own `target/`.
@@ -53,8 +53,14 @@ rebuild. Only a result from one of the two dirs above is verdict-bearing.
 
 ## Cleanup
 
-There is none for you to do: Loom removes a case-1 dir at run end, and a
-case-2 dir goes with the worktree. If you find a leftover dir that an earlier
+There is none for you to do. A case-1 dir is removed at run end only on a
+role-runner tick (the daemon's periodic `/loom:<role>` dispatch), once the
+harness and its process group have exited. For a daemon sweep spawn or a
+manual `spawn-worker.sh` nothing waits on the run, so the daemon's orphan
+sweep collects the dir 3 h or more after its owner exits. A case-2 dir goes
+with the worktree. Do not background a build and end your run: it keeps the
+dir until the sweep. If
+you find a leftover dir that an earlier
 run created under `/tmp` (from before this recipe), remove it by its literal
 printed path (`rm -rf /tmp/cargo-target-123`). The `rmScope` guard
 (`defaults/docs/guard-hooks.md`) allows `/tmp` and `$TMPDIR` literals and

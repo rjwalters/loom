@@ -772,7 +772,14 @@ mod tests {
         assert_eq!(report.worktrees_removed, 2);
         assert_eq!(
             *counters.order.borrow(),
-            vec!["worktrees", "git_tmp", "deep", "docker", "scratch", "target_orphans"],
+            vec![
+                "worktrees",
+                "git_tmp",
+                "deep",
+                "docker",
+                "scratch",
+                "target_orphans"
+            ],
             "must mirror worktree_reaper::reap_repo's own sequencing"
         );
         assert!(report.git_tmp.is_some());

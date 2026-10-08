@@ -591,8 +591,22 @@ configured `CARGO_TARGET_DIR` / `build.target-dir`. The daemon runs the same
 sweep every 15 minutes and whenever free disk drops below the floor
 (`category=cargo_target_orphan` in its log). Then re-run the test.
 
+**What the sweep will not touch.** Under `/tmp`, `$TMPDIR` and `~/.cache` it
+matches agent-shaped names only (`cargo-target-issue-<N>`,
+`cargo-target-review-<N>`, `loom-target-<N>-doctor`: role or `issue` /
+`review` / `pr` words plus a number) and only dirs owned by the daemon's own
+user. Your own `~/.cache/cargo-target-shared` is never a candidate, whether or
+not the daemon can see your `CARGO_TARGET_DIR`. Under `<repo>/.loom/targets/`
+it removes only dirs carrying Loom's `.loom-run-owner` marker. If `.loom` or
+`.loom/targets` is a symlink (say, to a bigger volume) the sweep refuses that
+root and logs `not scanning … is a symlink`; set `CARGO_TARGET_DIR` or
+`build.target-dir` to relocate builds instead. To turn the sweep off entirely:
+`LOOM_TARGET_ORPHAN_RECLAIM=0`.
+
 **Prevention**: every role run now gets a Loom-owned `CARGO_TARGET_DIR` under
-`<repo>/.loom/targets/`, removed when the run ends. Agents must use it (or
+`<repo>/.loom/targets/`. A role-runner tick's dir is removed when the run
+ends; a daemon sweep's or manual spawn's is collected by the orphan sweep
+after its owner exits. Agents must use it (or
 their worktree's `target/`) and never create one under `/tmp`, `~`, `~/.cache`
 or `.loom/target-*`; see `cargo-target-isolation.md`. The disk-headroom
 estimate per worktree (`LOOM_PER_WORKTREE_GB`) defaults to 8 GB, measured
