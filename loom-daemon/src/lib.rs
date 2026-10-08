@@ -164,6 +164,7 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod docker_image_clean;
 pub mod eager_reclaim;
