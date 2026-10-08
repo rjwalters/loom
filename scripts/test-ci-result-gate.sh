@@ -20,6 +20,11 @@ run "skipped-because-upstream-cancelled fails" 1 pull_request "{\"changes\":$C,\
 run "Detect Changes skipped on PR fails" 1 pull_request "{\"changes\":$K,\"a\":$S}"
 run "needed job cancelled fails" 1 pull_request "{\"changes\":$S,\"a\":$C}" "a: cancelled"
 run "needed job failed fails" 1 push "{\"changes\":$K,\"a\":$F}" "a: failure"
+# #10825: the push-only image filter (`changes-push`).
+run "push: image jobs skipped by changes-push passes" 0 push "{\"changes\":$K,\"changes-push\":$S,\"worker-base-image\":$K,\"worker-image-smoke\":$K,\"a\":$S}"
+run "push: changes-push failed fails" 1 push "{\"changes\":$K,\"changes-push\":$F,\"worker-base-image\":$S,\"worker-image-smoke\":$S}" "changes-push: failure"
+run "push: changes-push cancelled fails" 1 push "{\"changes\":$K,\"changes-push\":$C,\"worker-image-smoke\":$S}" "changes-push: cancelled"
+run "PR: image jobs skipped with Detect Changes failed fails" 1 pull_request "{\"changes\":$F,\"changes-push\":$K,\"worker-image-smoke\":$K}" "worker-image-smoke: skipped because Detect Changes was failure"
 run "empty needs fails closed" 2 pull_request "{}"
 run "missing needs fails closed" 2 pull_request ""
 

@@ -552,10 +552,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
-      # No rust-cache and no `changes.docker` gate. ci.yml only builds these
-      # images when the PR touched docker/**, so a change to the daemon's own
+      # No rust-cache and no image-input gate. ci.yml builds these images only
+      # when a PR, or a push to main since the last green push run (#10825),
+      # touched an image input (scripts/ci-image-inputs.sh), and the daemon
+      # source is deliberately not one. So a change to the daemon's own
       # startup path -- which every one of these smokes exercises inside the
-      # image -- is never validated against the image until a release.
+      # image -- is validated against the image HERE, daily, and nowhere else
+      # before a release. Keep this job unconditional (ci-principles rule 3's
+      # exception depends on it).
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package the binary where the Dockerfiles expect it

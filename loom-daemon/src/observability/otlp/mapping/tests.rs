@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod host_name;
 mod loom_kind;
 mod record_id;
 use crate::telemetry::{
