@@ -1,5 +1,5 @@
-//! The nightly ETA backtest folds (#10492): a daily task on the declared fleet
-//! captain that folds yesterday's walk-forward backtest for every registered
+//! The nightly ETA backtest folds (#10492): a daily task on the explicit ETA
+//! authority (#10918), else the declared fleet captain, that folds yesterday's walk-forward backtest for every registered
 //! `land` heuristic and emits `eta.backtest.fold` / `eta.backtest.summary`.
 //!
 //! - **Cadence.** First check [`FIRST_CHECK_DELAY`] after start, then every
@@ -7,10 +7,15 @@
 //!   day is due ([`crate::eta::nightly_folds::due_days`]: after 00:30 UTC, not
 //!   already folded), so it folds once per UTC day; a restart does not repeat a
 //!   day, and a few missed days are caught up, oldest first.
-//! - **Captain-gated.** Each check passes the `fleet.captain` gate first
-//!   ([`gate_tick`], re-read every tick). The captain arms the
-//!   [`SINGLETON_JOB_NAME`] singleton job and folds; any other host stands down
-//!   and emits nothing. With no captain declared **no host folds** (fail-closed,
+//! - **Authority-, else captain-gated.** Each check passes one gate first
+//!   ([`gate_tick`], re-read every tick, so an edit needs no restart). When
+//!   `fleet.etaAuthority` / `LOOM_ETA_AUTHORITY` names a host explicitly, that
+//!   host arms the [`SINGLETON_JOB_NAME`] singleton job and folds, and every
+//!   other host, the captain included, stands down (#10918,
+//!   [`crate::eta::job_owner`]): the folds read the journals of the one host
+//!   that emits ETAs, and it has the OTLP exporter. Otherwise the
+//!   `fleet.captain` gate decides: the captain arms and folds; any other host
+//!   stands down and emits nothing. With no captain declared **no host folds** (fail-closed,
 //!   exactly like ci-telemetry's singleton gate): `fleet.captain` must name a
 //!   host for the scoreboard to exist. The refusal is logged at `warn` and
 //!   listed in `host.health.captainless_singleton_jobs` (#9014).
@@ -28,10 +33,10 @@
 //!   snapshots and, when present, an offline merged-PR cache. See
 //!   [`crate::eta::nightly_folds`].
 //! - **Retirement filing (#10525).** With `autonomous.eta.nightlyFolds.
-//!   retirementFiling` (default **off**), each captain tick that has the folds
+//!   retirementFiling` (default **off**), each folding tick that has the folds
 //!   saved then runs [`file_retirements`]: the same path as `loom-daemon eta
 //!   retire --file` ([`crate::eta::retire_filing`]), which re-checks the
-//!   captain gate, dedups against its ledger and the forge, and fails closed
+//!   same gate (the explicit ETA authority, else the captain), dedups against its ledger and the forge, and fails closed
 //!   if the forge cannot be searched. It files issues only; it never
 //!   unregisters a heuristic. An error is logged at `warn`, never fatal to the
 //!   fold job, and retried next tick.
@@ -62,36 +67,61 @@ pub fn should_run(config: &EtaConfig) -> bool {
     config.enabled && config.nightly_folds_enabled
 }
 
-/// One check's fleet-captain decision.
+/// One check's fold decision (the explicit ETA authority, else
+/// `fleet.captain`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldGate {
-    /// This host is the declared captain: armed, and it folds.
+    /// This host is the declared captain (no explicit ETA authority): armed,
+    /// and it folds.
     Captain,
-    /// No `fleet.captain` declared: no fold (fail-closed, like ci-telemetry).
+    /// This host is the explicit ETA authority (#10918): armed, and it folds.
+    Authority,
+    /// No `fleet.captain` and no explicit ETA authority declared: no fold
+    /// (fail-closed, like ci-telemetry).
     NoCaptain,
-    /// Another host is the captain: no fold, no record.
-    StandDown { captain: String },
+    /// Another host folds (`owner`: the explicit ETA authority, else the
+    /// captain): no fold, no record.
+    StandDown { owner: String },
 }
 
 impl FoldGate {
     /// Whether this check folds.
     #[must_use]
     pub fn folds(&self) -> bool {
-        matches!(self, Self::Captain)
+        matches!(self, Self::Captain | Self::Authority)
     }
 }
 
 /// Resolve this check's [`FoldGate`] and keep the armed-singleton registry in
 /// step. Logs when the gate changes from `last`.
 pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> FoldGate {
+    gate_tick_with(root, host_id, last, |k| std::env::var(k).ok())
+}
+
+/// [`gate_tick`] over an injected environment.
+pub fn gate_tick_with(
+    root: &Path,
+    host_id: &str,
+    last: &mut Option<FoldGate>,
+    env: impl Fn(&str) -> Option<String>,
+) -> FoldGate {
+    use crate::eta::job_owner::{self, Owner};
     use crate::fleet_captain::{self as captain, CaptainGate};
-    let gate = match captain::resolve_gate_for_root(root, host_id) {
-        CaptainGate::Armed { captain: name } => {
+    let gate = match job_owner::resolve_with(root, host_id, env) {
+        Owner::Authority => {
+            captain::record_owned_singleton_job(SINGLETON_JOB_NAME, true);
+            FoldGate::Authority
+        }
+        Owner::AuthorityElsewhere { authority } => {
+            captain::record_owned_singleton_job(SINGLETON_JOB_NAME, false);
+            FoldGate::StandDown { owner: authority }
+        }
+        Owner::Captain(CaptainGate::Armed { captain: name }) => {
             match captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
                 Ok(()) => FoldGate::Captain,
                 // `fleet.captain` changed between the two reads: sit this
                 // check out; the next one re-reads it.
-                Err(_) => FoldGate::StandDown { captain: name },
+                Err(_) => FoldGate::StandDown { owner: name },
             }
         }
         // Both refusals still go through `arm_singleton_job`, as ci-telemetry's
@@ -100,12 +130,12 @@ pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> Fol
         // (#9014) — this job fails closed, so it belongs there — and clears
         // that entry once a captain is declared. The trailing disarm covers a
         // `fleet.captain` edit between the two reads: this check never folds.
-        CaptainGate::Refused { captain: name, .. } => {
+        Owner::Captain(CaptainGate::Refused { captain: name, .. }) => {
             let _ = captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id);
             captain::disarm_singleton_job(SINGLETON_JOB_NAME);
-            FoldGate::StandDown { captain: name }
+            FoldGate::StandDown { owner: name }
         }
-        CaptainGate::NoCaptainDeclared => {
+        Owner::Captain(CaptainGate::NoCaptainDeclared) => {
             let _ = captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id);
             captain::disarm_singleton_job(SINGLETON_JOB_NAME);
             FoldGate::NoCaptain
@@ -117,14 +147,20 @@ pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> Fol
                 "eta nightly folds: this host ({host_id}) is the fleet captain — it folds the \
                  nightly backtest (#10492)"
             ),
+            FoldGate::Authority => log::info!(
+                "eta nightly folds: this host ({host_id}) is the ETA authority \
+                 (fleet.etaAuthority) — it folds the nightly backtest, whoever fleet.captain \
+                 names (#10492, #10918)"
+            ),
             FoldGate::NoCaptain => log::warn!(
                 "eta nightly folds: no fleet.captain declared — no host folds the nightly \
                  backtest. Set `fleet.captain` in .loom/config.json to the host that should \
                  emit eta.backtest.* (#10492)"
             ),
-            FoldGate::StandDown { captain } => log::info!(
-                "eta nightly folds: standing down — the fleet captain is {captain}, this host is \
-                 {host_id}: no folds and no eta.backtest.* records here (#10492)"
+            FoldGate::StandDown { owner } => log::info!(
+                "eta nightly folds: standing down — {owner} folds (the ETA authority, else the \
+                 fleet captain), this host is {host_id}: no folds and no eta.backtest.* records \
+                 here (#10492, #10918)"
             ),
         }
         *last = Some(gate.clone());
@@ -324,8 +360,9 @@ mod tests {
     fn only_the_captain_folds() {
         assert!(FoldGate::Captain.folds());
         assert!(!FoldGate::NoCaptain.folds(), "fail-closed, like ci-telemetry");
+        assert!(FoldGate::Authority.folds());
         assert!(!FoldGate::StandDown {
-            captain: "other".into()
+            owner: "other".into()
         }
         .folds());
     }
@@ -333,9 +370,16 @@ mod tests {
     /// #10532 review: a no-captain refusal reaches the #9014 captainless
     /// registry `host.health.captainless_singleton_jobs` samples, and leaves
     /// it once a captain (even another host) is declared.
+    /// The armed and captainless registries are process-global, and both
+    /// gate tests arm or disarm the same job: run them one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_no_captain_tick_lists_the_job_as_captainless() {
         use crate::fleet_captain::{armed_singleton_job_names, captainless_singleton_job_names};
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let job = SINGLETON_JOB_NAME.to_string();
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
@@ -351,7 +395,7 @@ mod tests {
         assert_eq!(
             gate_tick(root.path(), "loom-worker-1", &mut last),
             FoldGate::StandDown {
-                captain: "loom-worker-2".into()
+                owner: "loom-worker-2".into()
             }
         );
         assert!(!captainless_singleton_job_names().contains(&job));
@@ -360,6 +404,51 @@ mod tests {
         assert_eq!(gate_tick(root.path(), "loom-worker-2", &mut last), FoldGate::Captain);
         assert!(armed_singleton_job_names().contains(&job));
         assert!(!captainless_singleton_job_names().contains(&job));
+        crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+    }
+
+    /// #10918: with `fleet.etaAuthority` naming a host other than the
+    /// captain, the authority folds and the captain stands down; without it,
+    /// the captain gate is unchanged.
+    #[test]
+    fn an_explicit_authority_folds_and_the_captain_stands_down() {
+        use crate::fleet_captain::{armed_singleton_job_names, captainless_singleton_job_names};
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = SINGLETON_JOB_NAME.to_string();
+        let no_env = |_: &str| None;
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let mut last = None;
+
+        let both = r#"{"fleet": {"captain": "cap", "etaAuthority": "loom-worker-1"}}"#;
+        std::fs::write(&config, both).unwrap();
+        assert_eq!(
+            gate_tick_with(root.path(), "cap", &mut last, no_env),
+            FoldGate::StandDown {
+                owner: "loom-worker-1".into()
+            },
+            "the captain does not fold"
+        );
+        assert!(!armed_singleton_job_names().contains(&job));
+        assert!(!captainless_singleton_job_names().contains(&job), "it has an owner");
+        let authority = gate_tick_with(root.path(), "loom-worker-1", &mut last, no_env);
+        assert_eq!(authority, FoldGate::Authority);
+        assert!(authority.folds());
+        assert!(armed_singleton_job_names().contains(&job), "host.health lists it");
+
+        // The key removed: the captain gate again, with no restart.
+        std::fs::write(&config, r#"{"fleet": {"captain": "cap"}}"#).unwrap();
+        assert_eq!(
+            gate_tick_with(root.path(), "loom-worker-1", &mut last, no_env),
+            FoldGate::StandDown {
+                owner: "cap".into()
+            }
+        );
+        assert!(!armed_singleton_job_names().contains(&job), "disarmed within one check");
+        assert_eq!(gate_tick_with(root.path(), "cap", &mut last, no_env), FoldGate::Captain);
         crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
     }
 

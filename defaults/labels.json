@@ -1,7 +1,7 @@
 {
   "$comment": [
     "Single source of truth for Loom label semantics (#10013). Embedded in loom-daemon; the Loom block of .github/labels.yml and defaults/.github/labels.yml is GENERATED from this file by `loom-daemon labels generate`. Edit here, then run `loom-daemon labels generate --write`.",
-    "stale_after_minutes, lifecycle and propagate are INERT in this slice: no consumer reads them yet (the daemon's own constants remain authoritative). contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict)."
+    "stale_after_minutes and lifecycle are INERT: no consumer reads them yet (the daemon's own constants remain authoritative). propagate is #10012's propagation rule (null = never propagates; star_liveness::propagation_rules derives its table from it): direction, rank (rule order; a family counts once), family (shared prefix rule, e.g. tier:), add (always | default-if-family-absent), removal (with-parent | never), to_prs. contradicts_approval is the 1-based report order of labels that contradict loom:pr (null = does not contradict)."
   ],
   "yaml_header": [
     "# ============================================================================",
@@ -583,6 +583,38 @@
       "yaml_preamble": []
     },
     {
+      "name": "loom:needs-revision",
+      "description": "Champion asked for a revision: Curator revises the body, then removes this. Applied by: Champion.",
+      "color": "6EE7B7",
+      "kind": "workflow",
+      "applied_by": "Champion",
+      "removed_by": "Curator",
+      "park": false,
+      "skip": false,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "propagate": null,
+      "color_note": "emerald-300 - one step back from loom:curated",
+      "yaml_preamble": [
+        "# loom:needs-revision (#10753): Champion's NEEDS REVISION verdict routes the",
+        "# issue to Curator instead of waiting for someone to edit it. Champion's",
+        "# discovery skips the label; Curator revises the body (a dated `## Revision`",
+        "# section) and removes it, and the changed body hash brings Champion back.",
+        "# Bounded: see .loom/docs/promotion-throughput.md."
+      ]
+    },
+    {
       "name": "loom:blocked",
       "description": "Implementation blocked, needs help or clarification",
       "color": "EF4444",
@@ -956,7 +988,14 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
+      "propagate": {
+        "direction": "parent-to-child",
+        "rank": 1,
+        "family": null,
+        "add": "always",
+        "removal": "with-parent",
+        "to_prs": true
+      },
       "color_note": "yellow-600 - matches loom-ui's star",
       "yaml_preamble": [
         "# loom:operator-priority (#9244) is the operator's \"star\": land this ASAP,",
@@ -1123,7 +1162,14 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
+      "propagate": {
+        "direction": "parent-to-child",
+        "rank": 3,
+        "family": "tier:",
+        "add": "default-if-family-absent",
+        "removal": "never",
+        "to_prs": false
+      },
       "color_note": "green - highest priority",
       "yaml_preamble": [
         "# Tier Labels (Goal Alignment)"
@@ -1151,7 +1197,14 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
+      "propagate": {
+        "direction": "parent-to-child",
+        "rank": 3,
+        "family": "tier:",
+        "add": "default-if-family-absent",
+        "removal": "never",
+        "to_prs": false
+      },
       "color_note": "yellow - medium priority",
       "yaml_preamble": []
     },
@@ -1177,7 +1230,14 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
+      "propagate": {
+        "direction": "parent-to-child",
+        "rank": 3,
+        "family": "tier:",
+        "add": "default-if-family-absent",
+        "removal": "never",
+        "to_prs": false
+      },
       "color_note": "purple - lower priority",
       "yaml_preamble": []
     },
@@ -1394,7 +1454,14 @@
       "requires_base": null,
       "remove_with": [],
       "lifecycle": "active",
-      "propagate": null,
+      "propagate": {
+        "direction": "parent-to-child",
+        "rank": 2,
+        "family": null,
+        "add": "always",
+        "removal": "with-parent",
+        "to_prs": false
+      },
       "color_note": "gray-200 - external/hold marker",
       "yaml_preamble": [
         "# External Contribution Gate",

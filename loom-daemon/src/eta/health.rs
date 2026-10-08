@@ -52,9 +52,11 @@ pub struct RefreshRepo {
 pub struct RefreshCycleState {
     /// When the tick started.
     pub started_at: DateTime<Utc>,
-    /// `captain`, `no_captain` or `stand_down`.
+    /// `captain`, `authority`, `no_captain`, `stand_down` or `disabled`
+    /// ([`crate::observability::eta_fleet_refresh::RefreshGate::as_str`]).
     pub gate: String,
-    /// The declared captain, on `stand_down`.
+    /// The refreshing host, on `stand_down`: the explicit ETA authority, else
+    /// the declared captain (#10918; the key keeps its name for old files).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captain: Option<String>,
     /// The configured `intervalSecs`.

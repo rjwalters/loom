@@ -240,6 +240,9 @@ path = "defaults/.claude/commands/loom/judge.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
 
 [[operation]]
 id = "pr.commits-and-compare"

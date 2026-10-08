@@ -303,12 +303,17 @@ fn qreq(refs: &[&str]) -> ApplyRequest {
 #[test]
 fn mixed_blocked_by_shapes_parse_and_apply() {
     let mut f = Fake::new("body", &["loom:building"])
-        .remote("2AMLogic/2am", 1088, "open")
+        .remote("example-org/tool-repo", 202, "open")
         .blocker(5, "open")
         .blocker(7, "open");
-    let r = qreq(&["2AMLogic/2am#1088", "#5", "7"]);
+    let r = qreq(&["example-org/tool-repo#202", "#5", "7"]);
     assert_eq!(run(&mut f, &r).0, exit::OK);
-    assert!(f.calls.contains(&"state 2AMLogic/2am#1088".to_string()), "{:?}", f.calls);
+    assert!(
+        f.calls
+            .contains(&"state example-org/tool-repo#202".to_string()),
+        "{:?}",
+        f.calls
+    );
     assert_eq!(park_record_blockers(&f.state.body).len(), 3);
 }
 

@@ -1,12 +1,12 @@
 //! Which labels travel from a parent to its children (#10012 §6).
 //!
 //! One small table ([`RULES`]): label, add mode, removal mode, and whether a
-//! linked PR gets it too. Every other label **never propagates**; the
-//! registry audit test keeps that list honest, so a label added to
-//! `defaults/labels.json` later must be classified here (as a rule, or by its
-//! kind in [`NEVER_KINDS`] / by name in [`NEVER_LABELS`]) before it builds.
-//! The label registry (#10013) is meant to absorb this table into its
-//! reserved `propagate` field; until then this is the one place it lives.
+//! linked PR gets it too. It is **derived from the label registry** (#10013
+//! AC 6): each `defaults/labels.json` entry's `propagate` field is its rule,
+//! and `propagate: null` means the label never propagates. Change a rule in
+//! the registry, not here. The tests pin the derived table to the literal it
+//! replaced and require every registry label of a [`NEVER_KINDS`] kind to be
+//! `null`, so a new label is classified where it is defined.
 //!
 //! [`plan`] is the pure decision for one child; it writes nothing. The pass
 //! that applies it to the forge is the §2 materialization slice (built on
@@ -18,7 +18,10 @@
 //! `create-issue.sh --parent` ([`super::parent_link::child_body`]). It is not
 //! a label, so nothing here (or in any later pass) edits bodies.
 
-use crate::work_finder::OPERATOR_PRIORITY_LABEL;
+use std::sync::LazyLock;
+
+use crate::label_registry::Registry;
+pub use crate::label_registry::{AddMode, Removal};
 
 /// The outside-submission gate label.
 pub const EXTERNAL_LABEL: &str = "external";
@@ -44,26 +47,6 @@ impl Match {
     }
 }
 
-/// When a child gets the label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddMode {
-    /// Whenever an ancestor carries it and the child does not.
-    Always,
-    /// Only as a default: the child carries no member of the family yet.
-    /// Never overwrites a child's own choice.
-    DefaultIfFamilyAbsent,
-}
-
-/// When propagation takes the label back off a child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Removal {
-    /// Once no ancestor carries it any more, and only a copy whose provenance
-    /// is propagation (never one a human applied to the child).
-    WithParent,
-    /// Never: once copied, the child owns it.
-    Never,
-}
-
 /// One propagation rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rule {
@@ -74,37 +57,42 @@ pub struct Rule {
     pub to_prs: bool,
 }
 
-/// The whole table (§6). Direction is always parent → child.
-pub const RULES: &[Rule] = &[
-    // The star: down to issues and PRs, removed with the parent's star.
-    Rule {
-        label: Match::Exact(OPERATOR_PRIORITY_LABEL),
-        add: AddMode::Always,
-        removal: Removal::WithParent,
-        to_prs: true,
-    },
-    // A child of an unapproved outside submission must not bypass the
-    // maintainer gate; approving the parent (removing the label) frees it.
-    Rule {
-        label: Match::Exact(EXTERNAL_LABEL),
-        add: AddMode::Always,
-        removal: Removal::WithParent,
-        to_prs: false,
-    },
-    // A default only. Guide still owns re-tiering.
-    Rule {
-        label: Match::Family(TIER_PREFIX),
-        add: AddMode::DefaultIfFamilyAbsent,
-        removal: Removal::Never,
-        to_prs: false,
-    },
-];
+/// The whole table (§6), in registry `propagate.rank` order. Direction is
+/// always parent → child (the only registry `direction`).
+pub static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| rules_from(Registry::embedded()));
+
+/// One [`Rule`] per registry `propagate` entry (a family once), by rank.
+fn rules_from(reg: &'static Registry) -> Vec<Rule> {
+    let mut ranked: Vec<(u32, Rule)> = Vec::new();
+    for l in &reg.labels {
+        let Some(p) = &l.propagate else { continue };
+        let label = match &p.family {
+            Some(f) => Match::Family(f.as_str()),
+            None => Match::Exact(l.name.as_str()),
+        };
+        if ranked.iter().any(|(_, r)| r.label == label) {
+            continue;
+        }
+        let rule = Rule {
+            label,
+            add: p.add,
+            removal: p.removal,
+            to_prs: p.to_prs,
+        };
+        ranked.push((p.rank, rule));
+    }
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, r)| r).collect()
+}
 
 /// Registry kinds that never propagate, whatever the label: per-item state
 /// (holds, claims, lifecycle, PR lanes), proposal kinds, structure, size and
 /// resource weight. Decomposition exists to separate the automatable part
 /// from the rest, so a hold or claim on the parent says nothing about a child;
-/// `loom:heavy` would false-positive on the light children.
+/// `loom:heavy` would false-positive on the light children. A registry label
+/// of one of these kinds must carry `propagate: null` (tested). Within a
+/// propagating kind, `null` also covers the retired `loom:urgent` and the
+/// #10307 priority levels, which reach *blockers* by their own pass.
 pub const NEVER_KINDS: &[&str] = &[
     "workflow",
     "claim",
@@ -116,23 +104,9 @@ pub const NEVER_KINDS: &[&str] = &[
     "resource",
 ];
 
-/// Labels of an otherwise-propagating kind that never propagate by this
-/// table.
-pub const NEVER_LABELS: &[&str] = &[
-    // Retired; no role applies it.
-    "loom:urgent",
-    // Priority levels (#10307) travel to *blockers* by their own pass, with
-    // body provenance; containment never carries a level.
-    "loom:operator-high-priority",
-    "loom:high-priority-inherited",
-];
-
 /// The rule covering `label`, or `None` when it never propagates.
 #[must_use]
 pub fn rule_for(label: &str) -> Option<&'static Rule> {
-    if NEVER_LABELS.contains(&label) {
-        return None;
-    }
     RULES.iter().find(|r| r.label.covers(label))
 }
 
@@ -174,7 +148,7 @@ fn has(labels: &[String], l: &str) -> bool {
 pub fn plan(ancestors: &[Vec<String>], child: Child<'_>, complete: bool) -> Vec<Action> {
     let mut adds = Vec::new();
     let mut removes = Vec::new();
-    for rule in RULES {
+    for rule in RULES.iter() {
         if child.is_pr && !rule.to_prs {
             continue;
         }
@@ -225,7 +199,7 @@ pub fn plan(ancestors: &[Vec<String>], child: Child<'_>, complete: bool) -> Vec<
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::label_registry::Registry;
+    use crate::work_finder::OPERATOR_PRIORITY_LABEL;
 
     const STAR: &str = OPERATOR_PRIORITY_LABEL;
 
@@ -249,37 +223,66 @@ mod tests {
         Action::Remove(l.into())
     }
 
-    // ---- the audit: every registry label is classified -------------------
+    // ---- the registry is the table (#10013 AC 6) ---------------------------
 
+    /// The derived table, pinned to the hand-listed literal it replaced (no
+    /// behavior change). Changing a rule is a semantic change: edit
+    /// `defaults/labels.json` and this pin in the same PR.
     #[test]
-    fn every_registry_label_is_a_rule_or_never_propagates() {
-        let reg = Registry::embedded();
-        let mut unclassified = Vec::new();
-        for l in &reg.labels {
-            let ruled = rule_for(&l.name).is_some();
-            let never =
-                NEVER_KINDS.contains(&l.kind.as_str()) || NEVER_LABELS.contains(&l.name.as_str());
-            if ruled == never {
-                unclassified
-                    .push(format!("{} (kind {}, rule {ruled}, never {never})", l.name, l.kind));
+    fn derived_rules_equal_the_previous_literal_in_order() {
+        let previous = [
+            Rule {
+                label: Match::Exact(OPERATOR_PRIORITY_LABEL),
+                add: AddMode::Always,
+                removal: Removal::WithParent,
+                to_prs: true,
+            },
+            Rule {
+                label: Match::Exact(EXTERNAL_LABEL),
+                add: AddMode::Always,
+                removal: Removal::WithParent,
+                to_prs: false,
+            },
+            Rule {
+                label: Match::Family(TIER_PREFIX),
+                add: AddMode::DefaultIfFamilyAbsent,
+                removal: Removal::Never,
+                to_prs: false,
+            },
+        ];
+        assert_eq!(RULES.as_slice(), previous.as_slice());
+    }
+
+    /// Each label's `propagate` is exactly its rule: `null` iff no rule
+    /// covers it, and a non-null entry is the rule that covers it.
+    #[test]
+    fn every_registry_label_is_its_propagate_rule() {
+        for l in &Registry::embedded().labels {
+            let rule = rule_for(&l.name);
+            match &l.propagate {
+                None => assert!(rule.is_none(), "{} has propagate null but a rule", l.name),
+                Some(p) => {
+                    let r = rule.unwrap_or_else(|| panic!("{} has no rule", l.name));
+                    assert_eq!((r.add, r.removal, r.to_prs), (p.add, p.removal, p.to_prs));
+                }
             }
         }
-        assert!(
-            unclassified.is_empty(),
-            "classify each label in star_liveness::propagation_rules (exactly one of a rule or the never list): {unclassified:?}"
-        );
     }
 
     #[test]
-    fn the_never_lists_name_real_registry_entries() {
+    fn never_kinds_are_real_and_carry_no_propagate() {
         let reg = Registry::embedded();
         for k in NEVER_KINDS {
             assert!(!reg.with_kind(k).is_empty(), "NEVER_KINDS has stale kind {k}");
         }
-        for l in NEVER_LABELS {
-            assert!(reg.get(l).is_some(), "NEVER_LABELS has stale label {l}");
+        for l in reg
+            .labels
+            .iter()
+            .filter(|l| NEVER_KINDS.contains(&l.kind.as_str()))
+        {
+            assert!(l.propagate.is_none(), "{} (kind {}) must have propagate null", l.name, l.kind);
         }
-        for r in RULES {
+        for r in RULES.iter() {
             let hit = reg.labels.iter().any(|l| r.label.covers(&l.name));
             assert!(hit, "rule {:?} covers no registry label", r.label);
         }

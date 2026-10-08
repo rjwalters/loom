@@ -540,6 +540,69 @@ fn same_issue_cases_landing_out_of_prediction_order_are_each_folded_once() {
     }
 }
 
+/// #10781 (the #10782 Judge's note): a merge-ending `sweep.outcome` record
+/// can lack `pr_number`, which is sampled from the checkpoint. The PR cache
+/// sees the merge just before midnight and the sweep record is emitted just
+/// after it. Keyed by PR, the case was folded on `d` with its PR and again on
+/// `d + 1` without it. It is folded once, on `d`, and counted once in the
+/// merged set, as `eta backtest` counts it.
+#[test]
+fn a_case_whose_sweep_record_lacks_its_pr_is_folded_once_across_midnight() {
+    let d = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+    let midnight = day_start(d) + Duration::days(1);
+    let mut envelope = history_a_envelopes().remove(0);
+    envelope.emitted_at = midnight + Duration::minutes(2);
+    let TelemetryRecord::SweepOutcome(r) = &mut envelope.record else {
+        panic!("the fixture's first line is a sweep.outcome");
+    };
+    r.issue = 7_000_000;
+    r.pr_number = None;
+    r.sweep_id = "sweep-without-pr".to_string();
+    let swept: Vec<ReplayCase> = backtest::cases_from_envelopes([&envelope])
+        .into_iter()
+        .filter(|c| c.kind == Kind::Land)
+        .collect();
+    assert!(swept.len() > 1, "a merge-ending record yields land cases");
+    let cached: Vec<ReplayCase> = swept
+        .iter()
+        .map(|c| {
+            let mut c = c.clone();
+            c.subject.pr_number = Some(7_777);
+            c.subject.sweep_id = None;
+            c.actual_at = midnight - Duration::minutes(2);
+            c
+        })
+        .collect();
+    assert!(cached.iter().all(|c| c.as_of < c.actual_at));
+    let inputs = Inputs {
+        envelopes: vec![envelope],
+        pr_cases: cached,
+        ..Inputs::default()
+    };
+
+    let key = |c: &ReplayCase| (c.subject.issue, c.stage, c.as_of);
+    let mut want: Vec<_> = swept.iter().map(key).collect();
+    want.sort();
+    let mut both: Vec<_> = known_cases(&inputs, midnight + Duration::days(1))
+        .iter()
+        .map(key)
+        .collect();
+    both.sort();
+    assert_eq!(both, want, "both sources answer it; it is held once");
+
+    let mut folded = Vec::new();
+    for offset in -1..=2 {
+        let day = d + Duration::days(offset);
+        let known = known_cases(&inputs, day_start(day) + Duration::days(1));
+        folded.extend(cohort(&inputs, day, &known).iter().map(|c| (day, key(c))));
+    }
+    folded.sort();
+    let on_d: Vec<_> = want.iter().map(|k| (d, *k)).collect();
+    assert_eq!(folded, on_d, "once, on the day the PR cache first knew it");
+    assert_eq!(current_n_cases(&fold(&inputs, d)), u64::try_from(want.len()).unwrap());
+    assert_eq!(current_n_cases(&fold(&inputs, d + Duration::days(1))), 0);
+}
+
 /// Finding 1's other half: the cross-midnight case is folded at the end of
 /// the day it resolves, but its prediction still reads nothing at or after
 /// its own `as_of` — not its own landing, not anything else that day.

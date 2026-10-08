@@ -562,6 +562,7 @@ pub(super) fn required() -> SignaturePolicy {
     SignaturePolicy {
         require_signature: true,
         approved_workflow: None,
+        ..SignaturePolicy::default()
     }
 }
 
@@ -724,6 +725,7 @@ fn required_mode_keyless_derived_pinned_regexp_evidence() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let v = verified_evidence(run_with(&fakebin, &linux_inputs(&dir), &policy));
     assert_eq!(v["tag"], "v0.16.0");
@@ -773,6 +775,7 @@ fn required_mode_keyless_exact_identity_override_evidence() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
     assert_eq!(v["verification_method"], "cosign-keyless-identity");
@@ -799,6 +802,7 @@ fn required_mode_linux_key_mode_evidence_has_no_workflow_identity() {
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
     assert_eq!(v["verification_method"], "cosign-key");
@@ -834,6 +838,7 @@ exit 0
     let policy = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
     assert_eq!(v["verification_method"], "codesign");
@@ -868,6 +873,7 @@ exit 1
     let pinned = SignaturePolicy {
         require_signature: true,
         approved_workflow: Some("release.yml".to_string()),
+        ..SignaturePolicy::default()
     };
     let lines = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &pinned));
     assert!(

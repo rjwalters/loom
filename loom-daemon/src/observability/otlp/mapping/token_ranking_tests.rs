@@ -77,7 +77,8 @@ fn a_full_round_emits_every_key_and_only_allowlisted_ones() {
     for kv in &log.attributes {
         assert!(
             TOKEN_RANKING_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                || kv.key == "loom.record_id",
+                || kv.key == "loom.record_id"
+                || kv.key == "loom.kind",
             "{} is not allowlisted",
             kv.key
         );
