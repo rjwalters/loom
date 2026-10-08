@@ -270,6 +270,7 @@ pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
+pub mod poll_wait;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
