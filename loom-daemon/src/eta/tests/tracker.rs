@@ -536,8 +536,12 @@ fn expire_drops_old_pending() {
         .on_listing(REPO, &[pr(111, 11, &["loom:pr"], -60)], t(0), 300);
     h.estimate(t(0));
     assert_eq!(h.tracker.expire(t(3600)).dropped, 0);
-    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)).dropped, 11);
+    let expired = h.tracker.expire(t(0) + Duration::days(31));
+    assert_eq!(expired.dropped, 11);
     assert!(h.tracker.pending().is_empty());
+    // #10933: every expiry is either censored (decided) or counted lost.
+    assert_eq!(expired.undecided + expired.censored.len(), 11);
+    assert_eq!(expired.cap_censored, 0, "nothing was over the cap");
 }
 
 #[test]

@@ -47,6 +47,7 @@ pub mod codex_session;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
+pub mod eta_coverage;
 pub mod eta_health;
 pub mod forge_calls;
 pub mod host;

@@ -155,9 +155,19 @@ pub(super) fn report_coverage(c: &coverage::Coverage, host_id: &str) {
 }
 
 /// Forget every pending estimate and delete the persisted store. Idempotent.
-/// Returns how many in-memory estimates were dropped.
+/// Returns how many estimates were dropped: the in-memory ones, or, when
+/// there are none (a restart as a non-authority host), the persisted store's
+/// entries, which are deleted unread. Counted as
+/// `pending_lost{reason=dropped_authority}` (#10933).
 pub(super) fn drop_pending(tracker: &mut Tracker, path: &Path) -> usize {
-    let dropped = tracker.pending().len();
+    let dropped = match tracker.pending().len() {
+        0 => persisted_entries(path),
+        n => n,
+    };
+    crate::observability::ops::eta_coverage::note_lost(
+        crate::observability::ops::eta_coverage::LossReason::DroppedAuthority,
+        dropped,
+    );
     // An empty store: the registry filters nothing, so the built-in one does.
     tracker.restore_pending(Vec::new(), &Registry::builtin());
     if let Err(error) = std::fs::remove_file(path) {
@@ -166,6 +176,14 @@ pub(super) fn drop_pending(tracker: &mut Tracker, path: &Path) -> usize {
         }
     }
     dropped
+}
+
+/// Non-empty lines of the persisted pending store at `path` (one estimate
+/// each); 0 when it is absent or unreadable. Counts without parsing.
+fn persisted_entries(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// Startup: the authority restores its pending store, any other host drops it

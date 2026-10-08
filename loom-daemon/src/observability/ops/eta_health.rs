@@ -48,6 +48,8 @@ pub struct EtaHealth {
     /// rather than left at its last nonzero value on the backend.
     emitted_items: BTreeSet<ItemKey>,
     emitted_reasons: BTreeSet<String>,
+    /// Outcome-coverage counters and export memory (#10933).
+    coverage: super::eta_coverage::Memory,
 }
 
 /// The last built `eta.snapshot`, as the `loom.eta.health.snapshot_*` gauges
@@ -127,6 +129,11 @@ pub fn note_over_cap(n: usize, series: usize) {
     }
 }
 
+/// Update the outcome-coverage counters in the global state (#10933).
+pub fn note_coverage(f: impl FnOnce(&mut super::eta_coverage::Memory)) {
+    with(|h| f(&mut h.coverage));
+}
+
 /// Record a refresh tick in the global state ([`EtaHealth::tick`]).
 pub fn note_tick(state: &crate::eta::health::RefreshCycleState) {
     with(|h| h.tick(state));
@@ -170,6 +177,8 @@ pub struct Facts {
     pub now: DateTime<Utc>,
     /// `None` when ETA is disabled (no tracker).
     pub items: Option<BTreeMap<(String, String, String), u64>>,
+    /// The outcome-coverage gauges' inputs (#10933).
+    pub coverage: super::eta_coverage::Facts,
     /// The loaded coefficient file's cutoff, when one is loaded.
     pub fit_cutoff: Option<DateTime<Utc>>,
     pub fit_check: Option<(DateTime<Utc>, String)>,
@@ -213,6 +222,7 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
             );
         }
     }
+    out.extend(super::eta_coverage::points(&facts.coverage));
     out.push(MetricPoint::int(
         MetricName::EtaHealthFitLoaded,
         i64::from(facts.fit_cutoff.is_some()),
@@ -337,6 +347,10 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
         now,
         items: super::super::eta::health_items(),
         fit_cutoff: crate::eta::fit::coeffs::load_latest(root, now).map(|f| f.as_of),
+        coverage: super::eta_coverage::gather(
+            &health.coverage,
+            super::super::eta::health_pending(now),
+        ),
         fit_check,
         snapshots,
         gate: Some(gate),
@@ -354,6 +368,7 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
 fn export(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) {
     let facts = gather(root, host_id, now, health);
     let out = points(&facts);
+    health.coverage.remember(&facts.coverage);
     // Remember what this pass exported; an unknown reading keeps the memory
     // so the series is still zeroed once it is measurable again.
     if let Some(items) = facts.items {
@@ -377,6 +392,7 @@ fn export_global(root: &Path, host_id: &str, now: DateTime<Utc>) {
         h.ages = health.ages;
         h.emitted_items = health.emitted_items;
         h.emitted_reasons = health.emitted_reasons;
+        h.coverage.keep_emitted(health.coverage);
     });
 }
 

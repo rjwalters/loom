@@ -431,7 +431,7 @@ processors:
           # #10571 adds installation (the App installation id a bucket was
           # minted under — one per account/owner, so no new series).
           # loom.forge.calls (#10607) adds agent (an agent role, `-` for the daemon).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "heuristic", "kind", "container", "installation", "agent"])
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "heuristic", "kind", "container", "installation", "agent", "age_bucket"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

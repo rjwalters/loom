@@ -576,6 +576,8 @@ fn the_cap_thins_redundant_refreshes_and_keeps_every_series_scoreable() {
     let dropped = tracker.drain_dropped();
     assert_eq!(dropped.over_cap, total - MAX_PENDING);
     assert_eq!(dropped.series_over_cap, 0);
+    assert_eq!(expired.cap_censored, 0, "thinned refreshes are lost, not censored");
+    assert_eq!(expired.undecided, 0, "nothing aged out");
 
     let mut series: BTreeMap<(u32, String), Vec<i64>> = BTreeMap::new();
     for p in tracker.pending() {
@@ -666,6 +668,10 @@ fn only_more_distinct_series_than_the_cap_lose_a_whole_series() {
     let dropped = tracker.drain_dropped();
     assert_eq!(dropped.over_cap, 1);
     assert_eq!(dropped.series_over_cap, 1, "the oldest series was lost and is reported");
+    assert_eq!(
+        expired.cap_censored, 1,
+        "its decided late surprise is scored, so it is not counted lost (#10933)"
+    );
     assert_eq!(expired.censored.len(), 1, "its decided late surprise is still scored");
     assert_eq!(expired.censored[0].estimate.issue, 1);
 }

@@ -59,6 +59,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #10607: `loom.forge.calls` ingested from agent `gh` fronts — the agent
     // role (closed vocabulary), `-` on the daemon's own rows.
     "agent",
+    // #10933: `loom.eta.health.pending` (closed vocabulary of five series-age
+    // buckets).
+    "age_bucket",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -398,6 +401,21 @@ pub enum MetricName {
     /// Pending estimates evicted by the MAX_PENDING cap since process start.
     #[serde(rename = "loom.eta.health.pending_over_cap")]
     EtaHealthPendingOverCap,
+    // ---- ETA outcome coverage (Issue #10933) -------------------------------
+    /// Pending ETA series by kind, heuristic and the age bucket of the
+    /// series' earliest pending estimate.
+    #[serde(rename = "loom.eta.health.pending")]
+    EtaHealthPending,
+    /// Age of the oldest pending ETA series, by kind and heuristic.
+    #[serde(rename = "loom.eta.health.pending_oldest_age_seconds")]
+    EtaHealthPendingOldestAgeSeconds,
+    /// Pending ETA estimates dropped without an outcome since process start,
+    /// by reason.
+    #[serde(rename = "loom.eta.health.pending_lost")]
+    EtaHealthPendingLost,
+    /// ETA outcomes emitted since process start, by kind, heuristic and outcome.
+    #[serde(rename = "loom.eta.health.outcomes")]
+    EtaHealthOutcomes,
     // ---- Codex session containers (Issue #10455) ---------------------------
     /// Per session-managed Codex account, one point per `state` ∈ `running`,
     /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
@@ -500,6 +518,10 @@ impl MetricName {
             }
             Self::EtaHealthSnapshotBytes => "loom.eta.health.snapshot_bytes",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
+            Self::EtaHealthPending => "loom.eta.health.pending",
+            Self::EtaHealthPendingOldestAgeSeconds => "loom.eta.health.pending_oldest_age_seconds",
+            Self::EtaHealthPendingLost => "loom.eta.health.pending_lost",
+            Self::EtaHealthOutcomes => "loom.eta.health.outcomes",
             Self::CodexSessionState => "loom.codex_session.state",
             Self::CodexSessionRecord => "loom.codex_session.record",
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
@@ -594,6 +616,10 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesTruncated => "{row}",
             Self::EtaHealthSnapshotBytes => "By",
             Self::EtaHealthPendingOverCap => "{estimate}",
+            Self::EtaHealthPending => "{series}",
+            Self::EtaHealthPendingOldestAgeSeconds => "s",
+            Self::EtaHealthPendingLost => "{estimate}",
+            Self::EtaHealthOutcomes => "{outcome}",
             Self::CodexSessionState => "1",
             Self::CodexSessionRecord => "1",
             Self::CodexSessionMountDrift => "{path}",
@@ -699,6 +725,22 @@ impl MetricName {
             Self::EtaHealthPendingOverCap => {
                 "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
                  whole series only when distinct series exceed the cap."
+            }
+            Self::EtaHealthPending => {
+                "Pending ETA series by kind, heuristic and the age bucket of the series' \
+                 earliest pending estimate."
+            }
+            Self::EtaHealthPendingOldestAgeSeconds => {
+                "Age of the oldest pending ETA series, by kind and heuristic."
+            }
+            Self::EtaHealthPendingLost => {
+                "Pending ETA estimates dropped without an outcome since process start, by \
+                 reason (evicted_cap, dropped_authority, expired_undecided, \
+                 orphaned_post_outcome, retired_heuristic)."
+            }
+            Self::EtaHealthOutcomes => {
+                "ETA outcomes emitted since process start, by kind, heuristic and outcome \
+                 (started, landed, finished, abandoned, censored, refused)."
             }
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \

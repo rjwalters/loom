@@ -2685,6 +2685,31 @@ retried rather than dropped. An item with an outstanding check gets **no**
 the following passes instead of emitting phantom live ETAs for PRs that have
 already merged.
 
+### Outcome coverage (#10933)
+
+An estimate is scored only once it gets an `eta.outcome`. The ones that
+never do are mostly the slow items, so every accuracy figure reads early
+unless it is read beside how much is missing. "No outcome" covers six
+different things, and the authority's `loom.eta.health.*` gauges (see
+[`telemetry-schema.md`](telemetry-schema.md)) keep them apart:
+
+| what | where it shows |
+|---|---|
+| still open | `pending{kind,heuristic,age_bucket}` and `pending_oldest_age_seconds{kind,heuristic}`: pending **series**, aged by their earliest estimate (`lt_4h`, `4h_24h`, `1d_3d`, `3d_7d`, `gt_7d`) |
+| evicted by the `MAX_PENDING` cap, not censored | `pending_lost{reason=evicted_cap}` |
+| dropped because this host is not, or stopped being, the authority (#10498) | `pending_lost{reason=dropped_authority}`, counted on the host that dropped them; a restart as a non-authority counts the persisted store it deletes unread |
+| expired at 30 days undecided | `pending_lost{reason=expired_undecided}` |
+| emitted after its own outcome instant | `pending_lost{reason=orphaned_post_outcome}` |
+| restored for a retired heuristic | `pending_lost{reason=retired_heuristic}` |
+
+`outcomes{kind,heuristic,outcome}` counts what was emitted: `started`,
+`landed`, `finished`, `abandoned`, `censored`, or `refused` for an outcome of
+a refusal (no p50, never scored, whatever the item did). The loss and outcome
+counters are cumulative since process start, like `pending_over_cap`.
+A superseded estimate and a PR closed unmerged are not outcomes and not
+losses: they stay pending for the replacement PR. On the SigNoz side,
+`eta-queries.sql` Q8 reads the same split from the records.
+
 ## Provenance
 
 Every `eta.estimate` and `eta.outcome` carries the heuristic id and the
@@ -3513,8 +3538,16 @@ answers, against `signoz_logs.distributed_logs_v2`:
   the series' next emission or outcome, so a refusal that is never refreshed
   weighs as long as it stood rather than once. A series' still-open last state
   is left out until something follows it.
+- **Q8**: **outcome coverage** (#10933) per kind and heuristic: estimates and
+  series, outcomes of answered estimates by `loom.eta.outcome`, `refused`
+  (outcomes of refusals, never scored), `scored`, and `resolution_rate` =
+  series with a scored or censored outcome ÷ series. `unresolved_*` buckets
+  the series none of whose estimates has an outcome by the age, now, of the
+  series' earliest estimate. Read Q1–Q7 beside it: the series that never
+  resolve are mostly the slow ones, so a low rate means the figures read early.
+  See [Outcome coverage](#outcome-coverage-10933) for what the daemon counts.
 
-Every section groups by `(heuristic, revision)` as well as by heuristic, so a
+Sections 0–Q7 group by `(heuristic, revision)` as well as by heuristic, so a
 daemon roll shows as two rows, and the accuracy sections exclude rows with
 incomplete provenance. Every `loom.eta.*` attribute they read is pinned to the emitted
 schema by `loom-daemon/tests/eta_artifacts.rs`, so a renamed or dropped
@@ -3523,4 +3556,5 @@ SigNoz. `loom-daemon/tests/signoz_eta_queries.rs` goes further: it executes the
 whole file verbatim against the pinned ClickHouse the SigNoz trial deploys and
 checks the answers, with the mutation of the committed SQL that breaks each one
 run as a counterfactual; `loom-daemon/tests/signoz_eta_accuracy_views.rs` does
-the same for Q4–Q7 over its own fixture.
+the same for Q4–Q7 over its own fixture, and for Q8 over a fixture relative to
+now.

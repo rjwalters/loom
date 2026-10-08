@@ -15,7 +15,8 @@
 //!
 //! An expiring estimate with no p90 (a refusal, or one persisted before
 //! #10211), or whose p90 is not yet behind `now`, is undecided and is dropped
-//! as before.
+//! as before, counted in [`Expired::undecided`] so the coverage gauge
+//! `loom.eta.health.pending_lost{reason=expired_undecided}` sees it (#10933).
 
 use super::Kind;
 use super::{Resolved, Tracker, MAX_PENDING, PENDING_MAX_AGE_DAYS};
@@ -33,6 +34,12 @@ pub struct Expired {
     pub dropped: usize,
     /// The decided late surprises among them, scored before they went.
     pub censored: Vec<Resolved>,
+    /// Expired at [`PENDING_MAX_AGE_DAYS`] undecided, so dropped unscored
+    /// (#10933).
+    pub undecided: usize,
+    /// Of the cap's whole-series evictions, those scored as `censored` on
+    /// the way out (#10933): not lost, unlike the rest of the cap's count.
+    pub cap_censored: usize,
 }
 
 /// The censored score of `estimate` at `now`, when its late surprise is
@@ -138,6 +145,8 @@ impl Tracker {
             .partition(|p| p.as_of < cutoff);
         self.pending = keep;
         let mut censored: Vec<Resolved> = expiring.iter().filter_map(|p| censor(p, now)).collect();
+        let undecided = expiring.len() - censored.len();
+        let mut cap_censored = 0;
         if self.pending.len() > MAX_PENDING {
             // Evict redundant refreshes per series first (#10496): the oldest
             // estimate of a series is its longest-lead one, which scoring
@@ -158,13 +167,17 @@ impl Tracker {
             // scored on the way out.
             let excess = self.pending.len() - MAX_PENDING;
             let over: Vec<EstimateSummary> = self.pending.drain(..excess).collect();
+            let scored = censored.len();
             censored.extend(over.iter().filter_map(|p| censor(p, now)));
+            cap_censored = censored.len() - scored;
             self.cap_dropped += excess;
             self.cap_series_dropped += excess;
         }
         Expired {
             dropped: before - self.pending.len(),
             censored,
+            undecided,
+            cap_censored,
         }
     }
 }

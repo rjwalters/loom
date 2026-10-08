@@ -18,6 +18,10 @@
 //!   bound; admitted, it invents a `gt_24h` convergence row.
 //! - **Q7, time weighting.** A refusal is emitted once and never refreshed;
 //!   counting rows inflates the answer rate from 0.5 to 0.75.
+//! - **Q8, outcome coverage (#10933).** Outcomes are de-duplicated per
+//!   estimate and a refusal's outcome is `refused`, never `landed`; either
+//!   mistake inflates the landed count. Unresolved series are bucketed by
+//!   the age of their earliest estimate (its own fixture, relative to now).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
@@ -29,6 +33,7 @@ const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf
 
 const QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
 const FIXTURE: &str = include_str!("fixtures/signoz_eta/accuracy_views.sql");
+const COVERAGE_FIXTURE: &str = include_str!("fixtures/signoz_eta/coverage.sql");
 const SINCE: &str = "2026-09-01 00:00:00";
 
 type Row = BTreeMap<String, serde_json::Value>;
@@ -82,7 +87,7 @@ fn statements() -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect();
-    assert_eq!(all.len(), 8, "eta-queries.sql is documented as section 0 plus Q1-Q7");
+    assert_eq!(all.len(), 9, "eta-queries.sql is documented as section 0 plus Q1-Q8");
     all
 }
 
@@ -93,7 +98,12 @@ fn q(n: usize) -> String {
 
 /// Runs `queries` after the fixture, one result set per query.
 fn run(queries: &[String]) -> Vec<Vec<Row>> {
-    let mut script = String::from(FIXTURE);
+    run_on(FIXTURE, queries)
+}
+
+/// Runs `queries` after `fixture`, one result set per query.
+fn run_on(fixture: &str, queries: &[String]) -> Vec<Vec<Row>> {
+    let mut script = String::from(fixture);
     for (index, statement) in queries.iter().enumerate() {
         script.push_str(&format!("\nSELECT {index} AS loom_section_marker;\n{statement};\n"));
     }
@@ -277,5 +287,47 @@ fn the_answer_rate_is_time_weighted_not_row_counted() {
         0.75,
         "counted by rows, the two refreshes of the answer outvote the refusal \
          that was never re-emitted"
+    );
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn outcome_coverage_counts_series_resolution_and_unresolved_age() {
+    let committed = q(8);
+    let duplicated = mutate(&committed, "    LIMIT 1 BY outcome_id\n", "");
+    let refusal_as_landed = mutate(
+        &committed,
+        "countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'landed')",
+        "countIf(outcome_id != '' AND o_outcome = 'landed')",
+    );
+    let out = run_on(COVERAGE_FIXTURE, &[committed, duplicated, refusal_as_landed]);
+
+    let v1 = row(&out[0], "cov-v1");
+    assert_eq!(num(v1, "estimates"), 8.0);
+    assert_eq!(num(v1, "series"), 7.0, "issue 900's refresh is one series");
+    assert_eq!(num(v1, "landed"), 2.0);
+    assert_eq!(num(v1, "censored"), 1.0);
+    assert_eq!(num(v1, "abandoned"), 1.0);
+    assert_eq!(num(v1, "refused"), 1.0, "the refusal's outcome is counted apart");
+    assert_eq!(num(v1, "scored"), 2.0);
+    assert_eq!(num(v1, "resolved_series"), 2.0, "scored or censored only");
+    assert_eq!(num(v1, "resolution_rate"), 0.286);
+    assert_eq!(num(v1, "unresolved_lt_4h"), 1.0);
+    assert_eq!(num(v1, "unresolved_4h_24h"), 0.0);
+    assert_eq!(num(v1, "unresolved_1d_3d"), 1.0);
+    assert_eq!(num(v1, "unresolved_3d_7d"), 0.0);
+    assert_eq!(num(v1, "unresolved_gt_7d"), 1.0);
+    let v2 = row(&out[0], "cov-v2");
+    assert_eq!(num(v2, "resolution_rate"), 1.0, "heuristics are reported apart");
+
+    assert_eq!(
+        num(row(&out[1], "cov-v1"), "landed"),
+        3.0,
+        "without de-duplication the redelivered outcome counts twice"
+    );
+    assert_eq!(
+        num(row(&out[2], "cov-v1"), "landed"),
+        3.0,
+        "without the answered filter the refusal's outcome reads as a landing"
     );
 }

@@ -428,6 +428,26 @@ fn demotion_drops_the_pending_store_once() {
     assert!(read_pending(&path).is_empty(), "nothing is restored after a restart either");
 }
 
+#[test]
+fn a_restart_as_non_authority_counts_the_store_it_deletes_unread() {
+    // #10933: the in-memory tracker is empty after a restart, so the loss is
+    // the persisted store's entries, which are deleted without being read.
+    let (emissions, _) = lifecycle(provenance());
+    let dir = tempfile::tempdir().unwrap();
+    let path = pending_path(dir.path());
+    let pending: Vec<EstimateSummary> = emissions
+        .iter()
+        .take(3)
+        .map(|e| EstimateSummary::of(&e.explanation))
+        .collect();
+    assert_eq!(pending.len(), 3);
+    write_pending(&path, &pending);
+    let mut fresh = Tracker::new(provenance());
+    assert_eq!(drop_pending(&mut fresh, &path), 3);
+    assert!(!path.exists());
+    assert_eq!(drop_pending(&mut fresh, &path), 0, "idempotent");
+}
+
 // ===== Authority coverage of the fleet roster (#10897) =====
 
 fn roster_of(n: usize) -> Vec<crate::eta::repo_priority::FleetMember> {

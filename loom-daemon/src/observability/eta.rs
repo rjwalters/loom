@@ -366,6 +366,14 @@ pub(super) fn health_items() -> Option<std::collections::BTreeMap<(String, Strin
     Some(super::ops::eta_health::buckets(guard.as_ref()?.tracker.pending()))
 }
 
+/// The pending store bucketed by series age for the coverage gauges
+/// (#10933), computed under the tracker lock without cloning it. `None`
+/// when ETA is disabled; empty on a non-authority host (it holds no store).
+pub(super) fn health_pending(now: DateTime<Utc>) -> Option<super::ops::eta_coverage::PendingAges> {
+    let guard = lock();
+    Some(super::ops::eta_coverage::pending_ages(guard.as_ref()?.tracker.pending(), now))
+}
+
 /// Fold `outcomes` into the shadow ledger and persist it (#9328).
 ///
 /// Every heuristic of a kind estimated the same subject at the same `as_of`,
@@ -382,6 +390,7 @@ fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
     if outcomes.is_empty() {
         return;
     }
+    super::ops::eta_coverage::note_outcomes(outcomes);
     let landed: Vec<CalibrationObservation> = outcomes
         .iter()
         .filter(|r| {
@@ -484,6 +493,12 @@ pub fn spawn_task(
     // Only the ETA authority restores (#10498); a pending estimate of a retired
     // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
     let unregistered = authority::restore(&mut tracker, &workspace_root, &registry);
+    if unregistered > 0 {
+        super::ops::eta_coverage::note_lost(
+            super::ops::eta_coverage::LossReason::RetiredHeuristic,
+            unregistered,
+        );
+    }
     log::info!(
         "eta: enabled (dry_run={}, refresh={}s, {} pending restored, \
          {} dropped for an unregistered heuristic)",
@@ -1114,12 +1129,11 @@ pub(super) async fn record(
             });
         }
         // A decided late surprise is scored before it expires (#10233).
-        let expired = state.tracker.expire(now);
+        let mut expired = state.tracker.expire(now);
         effects.push(crate::eta::tracker::Effects {
-            outcomes: expired.censored,
+            outcomes: std::mem::take(&mut expired.censored),
             ..Default::default()
         });
-        let expired = expired.dropped;
         let all = crate::eta::tracker::merged(effects);
         note_outcomes(state, &all.outcomes, now);
         (
@@ -1143,6 +1157,7 @@ pub(super) async fn record(
     let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
+    super::ops::eta_coverage::note_pass(&expired, &dropped);
     log::info!(
         "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
          invalid={} reads={} deferred_reads={} feature_reads={} orphaned={} over_cap={}",
@@ -1151,7 +1166,7 @@ pub(super) async fn record(
         delivered.outcomes,
         rows.len(),
         pending.len(),
-        expired,
+        expired.dropped,
         delivered.invalid,
         reads_answered(&rows),
         deferred,

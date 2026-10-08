@@ -28,6 +28,8 @@
 -- Q4-Q7 (#10233) are the views the promotion gate's live rules mirror: late
 -- surprise on the common decidable subset, stability of the predicted landing
 -- instant, convergence of the interval, and a time-weighted answer rate.
+-- Q8 (#10933) is outcome coverage: how many estimated series were ever
+-- resolved, so the figures above can be read against their survivorship.
 --
 -- Duplicates: delivery is at least once, so every section de-duplicates
 -- outcomes on `loom.eta.estimate_id` (`LIMIT 1 BY`).
@@ -406,3 +408,93 @@ FROM (
 WHERE is_estimate = 1 AND seq < n
 GROUP BY heuristic, revision, kind
 ORDER BY heuristic, revision, kind;
+
+-- Q8. Outcome coverage (#10933): how much of what was estimated was ever
+--     scored. Every figure above is computed over estimates that got an
+--     outcome, and the ones that never do are mostly the slow items, so a
+--     low resolution rate means Q1-Q7 read early (survivorship). A series is
+--     `(repo, issue, kind, heuristic)`; the population is every estimate in
+--     the window, each joined to its own outcome on `loom.eta.estimate_id`.
+--     Per kind and heuristic:
+--       estimates, series   estimate rows and distinct series;
+--       started ... censored outcomes of ANSWERED estimates, by
+--                           `loom.eta.outcome`;
+--       refused             outcomes of refusals (no `loom.eta.p50_sec`),
+--                           whatever the item did: never scored, and not a
+--                           survivorship effect;
+--       scored              outcomes carrying `loom.eta.error_sec`;
+--       resolution_rate     series with a scored or censored outcome / series;
+--       unresolved_*        series none of whose estimates has an outcome, by
+--                           the age NOW of the series' earliest estimate
+--                           (lt_4h, 4h_24h, 1d_3d, 3d_7d, gt_7d, as the
+--                           `loom.eta.health.pending` gauge buckets them).
+--     An unresolved series is either still open or was dropped by the
+--     tracker; the daemon's `loom.eta.health.pending_lost{reason}` counts the
+--     drops (cap eviction, authority demotion, undecided expiry, post-outcome
+--     orphan, retired heuristic). A superseded estimate or a PR closed
+--     unmerged is not an outcome: it stays pending for the replacement PR.
+WITH est AS (
+    SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+           attributes_string['loom.repo'] AS repo,
+           attributes_number['loom.issue'] AS issue,
+           attributes_string['loom.eta.kind'] AS kind,
+           attributes_string['loom.eta.heuristic'] AS heuristic,
+           toInt64(intDiv(timestamp, 1000000000)) AS t
+    FROM signoz_logs.distributed_logs_v2
+    WHERE mapContains(attributes_string, 'loom.eta.trigger')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY estimate_id
+),
+outc AS (
+    SELECT attributes_string['loom.eta.estimate_id'] AS outcome_id,
+           attributes_string['loom.eta.outcome'] AS o_outcome,
+           toUInt8(mapContains(attributes_number, 'loom.eta.p50_sec')) AS o_answered,
+           toUInt8(mapContains(attributes_number, 'loom.eta.error_sec')) AS o_scored
+    FROM signoz_logs.distributed_logs_v2
+    WHERE mapContains(attributes_string, 'loom.eta.outcome')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY outcome_id
+),
+series AS (
+    SELECT kind, heuristic, repo, issue,
+           count() AS estimates,
+           min(t) AS first_t,
+           countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'started') AS started,
+           countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'landed') AS landed,
+           countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'finished') AS finished,
+           countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'abandoned') AS abandoned,
+           countIf(outcome_id != '' AND o_answered = 1 AND o_outcome = 'censored') AS censored,
+           countIf(outcome_id != '' AND o_answered = 0) AS refused,
+           countIf(outcome_id != '' AND o_scored = 1) AS scored,
+           max(toUInt8(outcome_id != '')) AS has_outcome,
+           max(toUInt8(outcome_id != '' AND (o_scored = 1 OR o_outcome = 'censored'))) AS resolved
+    FROM est
+    LEFT JOIN outc ON est.estimate_id = outc.outcome_id
+    GROUP BY kind, heuristic, repo, issue
+)
+SELECT kind, heuristic,
+       sum(estimates) AS estimates,
+       count() AS series,
+       sum(started) AS started,
+       sum(landed) AS landed,
+       sum(finished) AS finished,
+       sum(abandoned) AS abandoned,
+       sum(censored) AS censored,
+       sum(refused) AS refused,
+       sum(scored) AS scored,
+       sum(resolved) AS resolved_series,
+       round(sum(resolved) / count(), 3) AS resolution_rate,
+       countIf(has_outcome = 0 AND toUnixTimestamp(now()) - first_t < 4 * 3600) AS unresolved_lt_4h,
+       countIf(has_outcome = 0 AND toUnixTimestamp(now()) - first_t >= 4 * 3600
+               AND toUnixTimestamp(now()) - first_t < 86400) AS unresolved_4h_24h,
+       countIf(has_outcome = 0 AND toUnixTimestamp(now()) - first_t >= 86400
+               AND toUnixTimestamp(now()) - first_t < 3 * 86400) AS unresolved_1d_3d,
+       countIf(has_outcome = 0 AND toUnixTimestamp(now()) - first_t >= 3 * 86400
+               AND toUnixTimestamp(now()) - first_t < 7 * 86400) AS unresolved_3d_7d,
+       countIf(has_outcome = 0 AND toUnixTimestamp(now()) - first_t >= 7 * 86400)
+           AS unresolved_gt_7d
+FROM series
+GROUP BY kind, heuristic
+ORDER BY kind, heuristic;

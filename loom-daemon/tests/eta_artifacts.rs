@@ -181,7 +181,7 @@ fn the_query_file_and_the_doc_describe_the_same_question_set() {
     let sections = sections(QUERIES);
     assert_eq!(
         sections,
-        vec!["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"],
+        vec!["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8"],
         "eta-queries.sql's sections changed; update the Queries section of eta.md with them"
     );
     for id in [
@@ -193,6 +193,7 @@ fn the_query_file_and_the_doc_describe_the_same_question_set() {
         "**Q5**",
         "**Q6**",
         "**Q7**",
+        "**Q8**",
     ] {
         assert!(ETA_DOC.contains(id), "eta.md's Queries section does not describe {id}");
     }
