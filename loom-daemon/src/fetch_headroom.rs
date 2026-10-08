@@ -103,6 +103,12 @@ pub(crate) mod test_override {
         FREE_GB.with(Cell::get)
     }
 
+    /// Pin (or unpin) the probe from inside a running test, for a disk that
+    /// fills partway through the code under test.
+    pub(crate) fn set(free_gb: Option<u64>) {
+        FREE_GB.with(|c| c.set(free_gb));
+    }
+
     /// Run `f` with the probe pinned to `free_gb`.
     pub(crate) fn with_free_gb<T>(free_gb: u64, f: impl FnOnce() -> T) -> T {
         FREE_GB.with(|c| c.set(Some(free_gb)));

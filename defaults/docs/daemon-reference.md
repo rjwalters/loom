@@ -9209,8 +9209,10 @@ workspace resync, `loom-daemon update`) are skipped and logged when the
 checkout's volume is below `diskWarnFreeGb`. The main-health gate reports the
 skip as the `low-disk` unevaluated class, never as a git failure or a red
 `main`; the workspace resync reports it as a `low-disk:` reason on the
-workspace, never as an unreachable remote, so it raises no `network` alert and
-grows no backoff; an unmeasurable volume never skips a fetch.
+workspace, never as an unreachable remote or a failure of the repo, so it
+raises no `network` or per-repo `failure` alert and grows no backoff, and it
+takes no resync claim for a resync whose fetch would be skipped; an
+unmeasurable volume never skips a fetch.
 
 ```json
 {

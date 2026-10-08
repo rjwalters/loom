@@ -200,6 +200,70 @@ fn a_fetch_skipped_below_the_disk_floor_is_no_network_alert_and_no_backoff() {
     assert_eq!(fx.origin_file(".loom/scripts/a.sh"), "#!/bin/sh\necho new");
 }
 
+#[test]
+fn a_resync_below_the_disk_floor_takes_no_claim_and_counts_no_failure() {
+    use crate::fetch_headroom::test_override::with_free_gb;
+    // The clone already holds the remote head, so classification fetches
+    // nothing and hands W2 a stale candidate: the fetch the floor skips is
+    // the one under the claim (#10995).
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let commits = fx.origin_commits();
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        let pass = with_free_gb(1, || host.pass());
+        let report = only(&pass);
+        assert_eq!(report.state, WState::W1, "still reported stale: {report:?}");
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(reason(report).contains("skipped git fetch"), "{report:?}");
+        assert_eq!(pass.fetches, 0, "classification had nothing to fetch");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no per-repo failure (or any) alert: {alerts:?}");
+    assert!(fx.forge.calls.borrow().is_empty(), "no claim asked for: nothing to release");
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None);
+    assert_eq!(fx.origin_commits(), commits, "nothing pushed");
+
+    // The disk recovers: the very next pass claims, resyncs and releases.
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_commits(), commits + 1);
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "claim released");
+}
+
+#[test]
+fn a_disk_that_fills_once_the_claim_is_held_releases_it_and_counts_no_failure() {
+    use crate::fetch_headroom::test_override;
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let commits = fx.origin_commits();
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        // Room at the check before the claim, none by the fetch under it.
+        *host.before_claim.borrow_mut() = Some(Box::new(|| test_override::set(Some(1))));
+        let pass = host.pass();
+        test_override::set(None);
+        let report = only(&pass);
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(!fx.forge.calls.borrow().is_empty(), "the claim was taken");
+        assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "and released, not leaked");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no per-repo failure (or any) alert: {alerts:?}");
+    assert_eq!(fx.origin_commits(), commits, "nothing pushed");
+    assert!(host.resync_worktrees().is_empty());
+
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_commits(), commits + 1);
+}
+
 // ----------------------------------------------------------------------------
 // The loop bound
 // ----------------------------------------------------------------------------
