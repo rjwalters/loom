@@ -14,7 +14,8 @@
 //! Replay: free GB on one host falls linearly from 120 GB at 14:00Z to 0 at
 //! 15:20Z (total 386 GB) and stays 0. The warning fires once every point in its
 //! 10 minute window is under 30 GB or 10%; the critical rule once every point is
-//! under 5 GB or 3%.
+//! under 5 GB or 3%. A second replay puts a healthy and a 0 GB reading in the same
+//! minute: each minute takes the min of the breach predicate, so that host never pages.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
@@ -101,6 +102,10 @@ fn disk_alerts_key_on_d1_export_host_health_and_keep_unknown_out() {
         assert!(q.contains("JSONHas(body, 'worktree_root_free_gb')"));
         assert!(q.contains(&format!("< {free}\n")), "absolute GB threshold {free}");
         assert!(q.contains(&format!("< {pct})")), "fraction threshold {pct}");
+        // "every record breaches": a minute bucket is 1 only if all of its records
+        // breach. max() would let one breaching record hide a healthy one.
+        assert!(q.contains("min(toUInt8("), "per-minute breach must be min(), not max()");
+        assert!(!q.contains("max(toUInt8("), "max() discards healthy readings");
         assert_eq!(rule["labels"]["severity"], sev);
         assert_eq!(rule["condition"]["op"], "1");
         assert_eq!(rule["condition"]["target"], 0);
@@ -263,6 +268,28 @@ fn replayed_free_gb_falling_to_zero_trips_warning_then_critical() {
     assert_eq!(firing(DISK_LOW, &f, at(15, 30)), ["loom-worker-1", "loom-worker-3"]);
     // The incident's own window (the 14:00-16:00 replay) fires within one interval:
     // free hits 0 at 15:20Z, the 10 minute window is all-zero by 15:30Z.
+}
+
+/// Two readings per host per minute. `loom-worker-6` alternates 0 GB and a
+/// recovered 100 GB inside every minute, so only half its records breach: neither
+/// rule may page (a per-minute max() of the breach predicate would). `loom-worker-7`
+/// reports 0 GB twice a minute, so every record breaches and both rules page.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_mixed_readings_within_a_minute_do_not_page() {
+    let mut f = String::from(SCHEMA);
+    for min in 0..120 {
+        let ts = T0 + min * 60;
+        f += &host_health(ts, "loom-worker-6", Some(0.0), Some(TOTAL_GB));
+        f += &host_health(ts + 30, "loom-worker-6", Some(100.0), Some(TOTAL_GB));
+        f += &host_health(ts, "loom-worker-7", Some(0.0), Some(TOTAL_GB));
+        f += &host_health(ts + 30, "loom-worker-7", Some(0.0), Some(TOTAL_GB));
+    }
+    let at = |hh: i64, mm: i64| T0 + (hh - 14) * 3600 + mm * 60;
+    for end in [at(14, 10), at(15, 0), at(15, 30)] {
+        assert_eq!(firing(DISK_LOW, &f, end), ["loom-worker-7"]);
+        assert_eq!(firing(DISK_CRITICAL, &f, end), ["loom-worker-7"]);
+    }
 }
 
 fn eta_row(ts_sec: i64, host: &str, stage: &str, reason: Option<&str>) -> String {
