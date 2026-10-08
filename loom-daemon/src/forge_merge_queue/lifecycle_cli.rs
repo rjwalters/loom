@@ -21,8 +21,10 @@
 
 use super::authz::{CheckConclusion, HandoffError};
 use super::events::FileEventSink;
+use super::forge::read_facts;
 use super::gh_lifecycle::GhLifecycleForge;
 use super::github::GhQueueApi;
+use super::grants::CommentGrantStore;
 use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{
     authorize_check, handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled,
@@ -337,6 +339,9 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
                 ),
             }
         }
+        MergeQueueCmd::GroupCheck { commit, repo } => {
+            group_check_report(env, commit, repo.as_ref())
+        }
         MergeQueueCmd::AuthorizeCheck { pr, pr_head, repo } => {
             let (l, _) = match live(env, repo.as_ref()) {
                 Ok(x) => x,
@@ -363,4 +368,52 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
         }
         _ => return None,
     })
+}
+
+/// `group-check`: mode-independent like `authorize-check` (if a ruleset
+/// requires the context, it is enforced). Exit 0 = `success` posted, 1 =
+/// `failure` posted, 6 = `pending` posted, 3 = nothing (or no confirmed
+/// post) — in every non-zero case the merge stays blocked.
+fn group_check_report(env: &Env, commit: &str, repo: Option<&String>) -> Report {
+    use super::group_authz::GroupConclusion;
+    use super::group_run::{run_group_check, GhContextStates, RunOutcome};
+    let (l, nwo) = match live(env, repo) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if let crate::write_scope::Verdict::Deny(why) =
+        crate::write_scope::may_write_from(&env.root, repo.map(String::as_str))
+    {
+        return undetermined(&format!("refusing the status write (#9548): {why}"));
+    }
+    let required = match super::preflight::github_preflight(&env.gh, &nwo, None) {
+        Ok(c) => c.required_checks,
+        Err(e) => return undetermined(&format!("required contexts unreadable: {e}")),
+    };
+    let store = CommentGrantStore::new(&l.forge, "group-check", chrono::Utc::now());
+    let states = GhContextStates {
+        forge: &l.forge,
+        required,
+    };
+    let out = run_group_check(&store, &l.forge, &states, &|pr| read_facts(&l.forge, pr), commit);
+    match out {
+        RunOutcome::Unreadable(e) => undetermined(&format!("merge groups unreadable: {e}")),
+        RunOutcome::PostFailed(c, e) => {
+            undetermined(&format!("concluded {c:?} but the status was not confirmed posted: {e}"))
+        }
+        RunOutcome::Posted(c) => {
+            let (code, word) = match &c {
+                GroupConclusion::Success => (0, "success"),
+                GroupConclusion::Pending(_) => (6, "pending"),
+                GroupConclusion::Failure(_) => (1, "failure"),
+            };
+            lines(
+                code,
+                vec![
+                    format!("LOOM-MERGE-GROUP-CHECK {word} commit={commit}"),
+                    super::group_authz::status_for(&c).1,
+                ],
+            )
+        }
+    }
 }

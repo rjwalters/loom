@@ -28,7 +28,7 @@
 --     leg, shard imbalance (`loom.ci.shard.{index,total,kind}`). Both are
 --     `None` on a job GitHub reported no `created_at` for, or a job whose
 --     display name carries no `(k/N)` shard suffix (`ci.yml`'s two sharded
---     job families: `Rust Unit Tests` / `Rust OTLP Feature Tests` via
+--     job families: `Rust Unit Tests` via
 --     `cargo nextest run --partition`, and `Shell Test Suites` via
 --     `LOOM_CI_SHARD`).
 --   * Sections 11-13 (#9089) and 16-17 (#9456) are the ONLY sections that read
@@ -969,10 +969,11 @@ LIMIT {top:UInt32};
 --     spans the leg emitted -- at `nextest::MAX_TEST_SPANS_PER_JOB` the cap is
 --     binding and `leg_tail_s` is a floor, not a total.
 --
---     `job` is in the GROUP BY precisely because `ci.yml` has TWO
---     nextest-partition families both sharding 1..3: comparing a `Rust Unit
---     Tests` leg against a `Rust OTLP Feature Tests` leg of the same `(k/N)`
---     compares two unrelated partitions.
+--     `job` is in the GROUP BY precisely so a second
+--     nextest-partition family sharding 1..3 (the `Rust OTLP Feature Tests`
+--     family existed until #10823) would not be merged with `Rust Unit Tests`:
+--     legs of different families with the same `(k/N)` are unrelated
+--     partitions.
 --
 --     TRACES, 7 days.
 WITH tests AS (

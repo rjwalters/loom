@@ -3,34 +3,44 @@
 //!
 //! # Contract
 //!
-//! A top-level key holding a quoted `"X.Y.Z"` string:
+//! A top-level key holding an `"X.Y.Z"` string:
 //!
 //! ```yaml
 //! loom_min_version: "0.19.830"
 //! ```
 //!
-//! Read from the store's compiled `fleet.json` ([`super::FLEET_JSON_PATH`])
-//! when that file carries the key, and otherwise from the top level of
-//! `repos.yml` ([`super::ROSTER_PATH`]). The fallback lives entirely in
-//! [`from_repos_yml`] so #10705, which makes `fleet.json` the only source, can
-//! delete it in one place; [`super::roster::parse`] is deliberately not widened
-//! to know about the key.
+//! In `fleet.json` it is always a JSON string. In `repos.yml` quote it; an
+//! unquoted `X.Y.Z` is also read (YAML parses it as a string), while an
+//! unquoted `X.Y` is a number and is refused.
+//!
+//! Read from the top level of the store's compiled `fleet.json`
+//! ([`super::FLEET_JSON_PATH`], via [`super::compiled`]) when that file is
+//! present, and otherwise from the top level of `repos.yml`
+//! ([`super::ROSTER_PATH`]). A `fleet.json` that is present is the only
+//! source: without the key the result is **Absent**, and `repos.yml` is not
+//! consulted. One that is present but not a valid compiled document is
+//! **Malformed**, again with no fallback. The `repos.yml` fallback lives
+//! entirely in [`from_repos_yml`] so the legacy-fallback removal (#10705
+//! follow-up) can delete it in one place; [`super::roster::parse`] is
+//! deliberately not widened to know about the key.
 //!
 //! # Outcomes
 //!
-//! - **Absent** from both sources: no floor.
-//! - **Valid** `X.Y.Z` (three dot-separated decimal integers): that floor.
-//! - **Malformed** (not a string, not `X.Y.Z`, or a source file that cannot
-//!   be parsed at all): never read as "no floor". The caller keeps its last
-//!   good floor and alerts (see [`crate::fleet_sync`]).
+//! - **Absent**: no floor.
+//! - **Valid** canonical `X.Y.Z`: three dot-separated decimal integers, no
+//!   whitespace, no sign, no leading zeros (a component is `0` or starts with
+//!   `1`-`9`). That floor.
+//! - **Malformed** (not a string, not canonical `X.Y.Z`, or a source file that
+//!   cannot be read as above): never read as "no floor". The caller keeps its
+//!   last good floor and alerts (see [`crate::fleet_sync`]). `"01.2.3"` and
+//!   `" 0.19.830 "` are Malformed rather than silently reinterpreted: the
+//!   floor drives rolls and alerts, so a typo should be seen.
 //!
-//! This module is pure: it reads a [`Snapshot`] and decides. Nothing consumes
-//! the floor yet; the comparison against the running version is a later
-//! #10698 step.
+//! This module is pure: it reads a [`Snapshot`] and decides.
 
 use serde_json::Value;
 
-use super::fetch::Snapshot;
+use super::{compiled, fetch::Snapshot};
 
 /// The key, in both sources.
 pub const KEY: &str = "loom_min_version";
@@ -42,7 +52,7 @@ pub enum FloorRead {
     Absent,
     /// A well-formed floor.
     Valid {
-        /// The floor, normalised to `X.Y.Z`.
+        /// The floor, canonical `X.Y.Z`.
         version: String,
         /// The store path it was read from.
         source: &'static str,
@@ -56,23 +66,26 @@ pub enum FloorRead {
     },
 }
 
-/// Read the floor from `snapshot`: `fleet.json` first, then the top level of
-/// `repos.yml`.
+/// Read the floor from `snapshot`: the compiled `fleet.json` when present,
+/// else the top level of `repos.yml`.
 #[must_use]
 pub fn read(snapshot: &Snapshot) -> FloorRead {
-    match source_text(snapshot, super::FLEET_JSON_PATH) {
-        Err(read) => return read,
-        Ok(Some(text)) => match from_fleet_json(&text) {
-            Ok(Some(value)) => return classify(&value, super::FLEET_JSON_PATH),
-            Ok(None) => {}
-            Err(detail) => {
-                return FloorRead::Malformed {
-                    source: super::FLEET_JSON_PATH,
-                    detail,
-                }
-            }
-        },
+    match compiled::from_snapshot(snapshot) {
+        // `roster()` is the whole top-level document, so this is the top-level
+        // `loom_min_version` key of `fleet.json`.
+        Ok(Some(c)) => {
+            return c
+                .roster()
+                .get(KEY)
+                .map_or(FloorRead::Absent, |value| classify(value, super::FLEET_JSON_PATH))
+        }
         Ok(None) => {}
+        Err(e) => {
+            return FloorRead::Malformed {
+                source: super::FLEET_JSON_PATH,
+                detail: format!("{e:#}"),
+            }
+        }
     }
     match source_text(snapshot, super::ROSTER_PATH) {
         Err(read) => read,
@@ -95,21 +108,12 @@ fn source_text(snapshot: &Snapshot, path: &'static str) -> Result<Option<String>
     })
 }
 
-/// The raw `loom_min_version` value at the top level of `fleet.json`, `None`
-/// when the key is absent. `Err` when the file is not a JSON object.
-fn from_fleet_json(text: &str) -> Result<Option<Value>, String> {
-    let doc: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON ({e})"))?;
-    let top = doc
-        .as_object()
-        .ok_or_else(|| "top level must be an object".to_string())?;
-    Ok(top.get(KEY).cloned())
-}
-
 /// The raw `loom_min_version` value at the top level of `repos.yml`, `None`
 /// when the key is absent. `Err` when the file is not a YAML mapping.
 ///
-/// The interim source until #10705 compiles `fleet.json`; that issue deletes
-/// this function together with its call in [`read`].
+/// The legacy source, used only when the store has no `fleet.json`; the
+/// legacy-fallback removal (#10705 follow-up) deletes this function together
+/// with its call in [`read`].
 fn from_repos_yml(text: &str) -> Result<Option<Value>, String> {
     let doc = super::yaml::parse(text).map_err(|e| format!("not valid YAML ({e:#})"))?;
     let top = doc
@@ -125,32 +129,38 @@ fn classify(value: &Value, source: &'static str) -> FloorRead {
     }
 }
 
-/// Validate a raw `loom_min_version` value as an `X.Y.Z` string.
+/// Validate a raw `loom_min_version` value as a canonical `X.Y.Z` string
+/// (no whitespace, no leading zeros).
 pub fn validate(value: &Value) -> Result<String, String> {
     let Some(raw) = value.as_str() else {
         return Err(format!(
-            "`{KEY}` must be a quoted \"X.Y.Z\" string, got {}",
+            "`{KEY}` must be an \"X.Y.Z\" string, got {}",
             truncate(&value.to_string(), 60)
         ));
     };
-    let trimmed = raw.trim();
-    match parse_triple(trimmed) {
+    match parse_triple(raw) {
         Some((major, minor, patch)) => Ok(format!("{major}.{minor}.{patch}")),
         None => Err(format!(
-            "`{KEY}` must be \"X.Y.Z\" (three decimal integers), got \"{}\"",
-            truncate(trimmed, 60)
+            "`{KEY}` must be canonical \"X.Y.Z\" (three decimal integers, no whitespace, no \
+             leading zeros), got \"{}\"",
+            truncate(raw, 60)
         )),
     }
 }
 
-/// Parse `X.Y.Z` into its three components. `None` for anything else
-/// (pre-release or build suffixes, a leading `v`, missing or extra parts).
+/// Parse canonical `X.Y.Z` into its three components. `None` for anything else
+/// (whitespace, pre-release or build suffixes, a leading `v` or `+`, leading
+/// zeros such as `01`, missing or extra parts). A component is `0` or starts
+/// with `1`-`9`.
 #[must_use]
 pub fn parse_triple(s: &str) -> Option<(u64, u64, u64)> {
     let mut parts = s.split('.');
     let mut next = || -> Option<u64> {
         let p = parts.next()?;
         if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if p.len() > 1 && p.starts_with('0') {
             return None;
         }
         p.parse().ok()
