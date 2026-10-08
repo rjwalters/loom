@@ -97,11 +97,13 @@ impl ForgeProbeArgs {
         let run_ns = match self.run_ns {
             Some(ns) => ns,
             None => std::env::var("GITEA_QUAL_RUN_NS").unwrap_or_else(|_| {
-                let secs = std::time::SystemTime::now()
+                // Nanosecond clock + pid: second resolution collides for
+                // concurrent or back-to-back runs.
+                let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
+                    .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                format!("loomp-{secs}")
+                format!("loomp-{nanos}-{}", std::process::id())
             }),
         };
         let cfg = RunnerConfig {

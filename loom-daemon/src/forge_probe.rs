@@ -219,6 +219,36 @@ impl ProbeHttp for LiveHttp {
     }
 }
 
+/// One path-safe name component: nonempty, `[A-Za-z0-9._-]` only, and not a
+/// dot segment. The allowlist excludes `/`, `\`, `%`, `?`, `#`, `@`, `:`
+/// and whitespace, so a validated value can neither traverse (curl
+/// normalizes `..`) nor smuggle URL delimiters or encoded traversal.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Validate the repo and run namespace at the public runner boundary, before
+/// any request — a malformed value must never reach an authenticated write
+/// URL (it could redirect the write to a different repository).
+fn validate_config(cfg: &RunnerConfig) -> Result<()> {
+    let mut parts = cfg.repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None)
+            if is_safe_component(owner) && is_safe_component(name) => {}
+        _ => anyhow::bail!(
+            "repo must be exactly <owner>/<repo> (letters, digits, '.', '_', '-'; no traversal or URL delimiters)"
+        ),
+    }
+    if !is_safe_component(&cfg.run_ns) {
+        anyhow::bail!("run namespace must be nonempty (letters, digits, '.', '_', '-')");
+    }
+    Ok(())
+}
+
 /// Build the receipt: every required-profile row from the probe manifest,
 /// in the manifest's risk-first order, executed where a handler exists and
 /// `unknown` where it does not.
@@ -228,6 +258,7 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
     if cfg.timeout.is_zero() {
         anyhow::bail!("timeout must be positive (0 would disable the per-call bound)");
     }
+    validate_config(cfg)?;
     let inv = crate::forge_inventory::load_embedded()?;
     let manifest = crate::forge_inventory::probe::build(&inv, &[]);
     let mut results = Vec::new();

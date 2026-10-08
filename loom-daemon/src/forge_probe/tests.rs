@@ -512,3 +512,46 @@ fn zero_timeout_is_rejected_before_any_request() {
     assert_eq!(fake.calls.get(), 0, "no request may precede validation");
     assert!(err.to_string().contains("timeout must be positive"), "{err:#}");
 }
+
+#[test]
+fn malformed_repo_or_namespace_is_rejected_before_any_request() {
+    let bad_repos = [
+        "qualification/loomp-test/../../production/live",
+        "../production",
+        "owner/..",
+        "owner/%2e%2e",
+        "owner/repo/extra",
+        "owner",
+        "",
+        "/repo",
+        "owner/",
+        "owner/re?po",
+        "owner/re#po",
+        "ow ner/repo",
+        "owner\\repo",
+    ];
+    for repo in bad_repos {
+        let mut c = cfg(true);
+        c.repo = repo.into();
+        let fake = FakeHttp::new();
+        let err = run(&c, &fake).unwrap_err();
+        assert_eq!(fake.calls.get(), 0, "repo {repo:?}: no transport call may precede validation");
+        assert!(err.to_string().contains("repo must be exactly"), "{repo:?}: {err:#}");
+    }
+    for ns in ["", ".", "..", "a/b", "a b"] {
+        let mut c = cfg(true);
+        c.run_ns = ns.into();
+        let fake = FakeHttp::new();
+        let err = run(&c, &fake).unwrap_err();
+        assert_eq!(fake.calls.get(), 0, "ns {ns:?}: no transport call may precede validation");
+        assert!(err.to_string().contains("run namespace"), "{ns:?}: {err:#}");
+    }
+}
+
+#[test]
+fn a_normal_owner_repo_control_passes_validation() {
+    let mut c = cfg(true);
+    c.repo = "qual-org.1/loomp_test-2".into();
+    assert!(validate_config(&c).is_ok());
+    assert!(validate_config(&cfg(false)).is_ok());
+}
