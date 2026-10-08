@@ -300,7 +300,9 @@ pub fn evaluate(root: &Path, repo: &str, number: u64) -> Outcome {
     };
     let listing = super::records::fetch_comment_listing(repo, &n, root, false);
     let comments = listing.as_deref().and_then(super::parse_listing);
-    let events = fetch_events(repo, &n, root);
+    let events = super::records::fetch_issue_events(repo, &n, root)
+        .as_deref()
+        .and_then(super::parse_listing);
     let role_of = |login: &str| fetch_role(repo, login, root);
     let policy = TrustPolicy::for_root(root);
     let effective = crate::config_resolver::resolve_effective_config(root);
@@ -327,14 +329,6 @@ pub fn evaluate(root: &Path, repo: &str, number: u64) -> Outcome {
         gate,
         detail,
     }
-}
-
-/// The REST issue events listing (`labeled`/`unlabeled` with their actor),
-/// oldest first. `None` on any failure.
-fn fetch_events(repo: &str, number: &str, root: &Path) -> Option<Vec<Value>> {
-    let path = format!("repos/{repo}/issues/{number}/events");
-    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
-    super::parse_listing(&out.ok_output()?.stdout)
 }
 
 /// A user's repository `role_name`. `None` on any failure (a non-collaborator

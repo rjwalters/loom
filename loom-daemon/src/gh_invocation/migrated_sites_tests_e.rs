@@ -61,8 +61,9 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
     (
         "comment_trust/records.rs",
         1,
-        "trusted-comment CLI read through the raw `script_helpers::run_gh` spawn (optionally \
-         `gh-cached`): not a facade row; the choke-point ratchet owns its migration",
+        "trusted-comment and issue-events (#10827) CLI reads through one raw \
+         `script_helpers::run_gh` spawn (optionally `gh-cached`): not a facade row; the \
+         choke-point ratchet owns its migration",
     ),
     (
         "observability/pick_journal.rs",
