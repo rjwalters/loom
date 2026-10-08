@@ -9,9 +9,10 @@ on:
   # tree. Dormant until a repository enables a merge queue -- GitHub only
   # emits this event for a queue-enabled branch, and this repository is
   # user-owned, so today it never fires here. Every job a merge group needs
-  # treats `merge_group` exactly like `push`: no path filter (the `changes`
-  # job is PR-only), the full suite. `loom-daemon merge-group-ci audit`
-  # proves that statically; see defaults/docs/merge-queue-ci.md.
+  # runs on `merge_group` with no path filter (the `changes` job is PR-only):
+  # the full suite, a superset of `push`, which path-filters only the image
+  # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
+  # see defaults/docs/merge-queue-ci.md.
   merge_group:
     types: [checks_requested]
 
@@ -98,7 +99,7 @@ jobs:
   # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
   # hiccup from failing the path filter every filtered job `needs`.
   changes:
-    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; push and merge_group run every filtered job unconditionally
+    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; merge_group runs every filtered job unconditionally, and push does too except the image jobs (changes-push, #10825)
     name: Detect Changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -106,12 +107,16 @@ jobs:
     permissions:
       pull-requests: read
       actions: write
+      # The image-input checkout below (#10825).
+      contents: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      docker: ${{ steps.filter.outputs.docker }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      # Not a paths-filter group: scripts/ci-image-inputs.sh is the one
+      # definition of an image input, shared with `changes-push` (#10825).
+      docker: ${{ steps.images.outputs.docker }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -193,18 +198,6 @@ jobs:
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
-            docker:
-              - 'docker/**'
-              - '.dockerignore'
-              # The run-job seam (#7853) is the one thing outside docker/ that
-              # this filter's jobs prove: docker/worker/test-run-job.sh drives
-              # these two scripts inside a real worker container to show the
-              # container needs no docker socket. A seam-only PR must re-run
-              # that leg, or the only test that can catch a regression in the
-              # containment story is skipped on exactly the PRs that cause one.
-              - 'defaults/scripts/run-job.sh'
-              - 'defaults/scripts/lib/run-job-exec.sh'
-              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'defaults/**'
@@ -251,6 +244,64 @@ jobs:
           set -euo pipefail
           echo "daemon needed=true"
           echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      # Do the image jobs run? (#10825) The same script `changes-push` runs on
+      # main, so PR and push agree on what an image input is: docker/**, the
+      # .dockerignore-allowlisted private-control files under defaults/ (which
+      # the former `docker` paths group missed), the run-job seam (#7853) and
+      # ci.yml. A failed listing fails CLOSED (docker=true).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+      - name: Decide whether the image jobs run
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-image-inputs.sh pr --repo "$REPO" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  # Detect Image Inputs (push): the ONE path filter on a push to main, and the
+  # operator-approved exception to ci-principles rule 3 (#10825). It decides
+  # only whether `worker-base-image` and the three image smokes run; every
+  # other job still runs unconditionally on push. The base is the head of the
+  # last GREEN `CI` push run on main, never `github.event.before`: main's
+  # concurrency (one running + newest pending) cancels pending runs in a
+  # burst, so `before` can be an unverified commit, and a red smoke run must
+  # not be forgotten by the next clean diff. Fails CLOSED to docker=true, and
+  # if this job itself fails or is cancelled the image jobs run anyway (their
+  # `if:` reads `result != 'success'`) and `CI Result` goes red. Daemon-source
+  # changes are deliberately not image inputs; ci-daily.yml's `docker-smokes`
+  # runs every smoke unfiltered each day (rule 10). Push-only, so it is not a
+  # job the merge-group audit relies on: `merge_group` never path-filters.
+  changes-push:
+    name: Detect Image Inputs (push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push'
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+      - name: Decide whether the image jobs run (diff since the last green push run)
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: scripts/ci-image-inputs.sh push --repo "$REPO" --sha "$SHA" --branch "$BRANCH" --workflow ci.yml >> "$GITHUB_OUTPUT"
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -302,17 +353,26 @@ jobs:
     # each built --release, which caught release-profile-only breakage
     # (cfg(debug_assertions) code, optimisation-only link failures) before
     # merge. They now use the shared debug build, so without this job such a
-    # break would first surface in the post-merge release workflow. Nothing
-    # waits on it, so it stays off the critical path.
+    # break would first surface in the post-merge release workflow.
     #
     # It is ALSO the one release build per CI run (#10824): the binary is
     # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
     # stages it into the Docker build context, so the image smokes no longer
     # build their own. That makes the shipped `--features otlp` binary the one
     # the smokes exercise (they previously ran a non-shipped default-feature
-    # build). The `if:` is the UNION of `backend` and `docker` so a docker-only
-    # PR still produces the artifact; keep it a superset of `worker-base-image`'s
-    # gate (#10825 narrows that one).
+    # build). Since then `worker-base-image` waits on it, so on a run that
+    # builds images this job IS on the image smokes' critical path; on any
+    # other run nothing waits on it.
+    #
+    # Its `if:` MUST stay at least as wide as `worker-base-image`'s (and so the
+    # smokes'): if the base image runs while this job skipped, the artifact
+    # download fails and the smokes go red for no reason. Today it is: this job
+    # runs unconditionally on push and merge_group, where #10825 path-filters
+    # the image jobs on push only via `changes-push`, and on a PR it is the
+    # UNION of `backend` and `docker`, so a docker-only PR still produces the
+    # artifact. Narrowing this gate below the image gate is not allowed; if you
+    # change either, keep this note true (scripts/test-ci-image-inputs.sh pins
+    # it).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -758,6 +818,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the image-input detection and the image gate wiring (#10825)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-image-inputs.sh
       - name: Test the release decision and release.yml wiring (#10826)
         if: ${{ !cancelled() }}
         run: bash scripts/test-release-decision.sh
@@ -2648,7 +2711,10 @@ jobs:
     # tarball it uploads, under the exact tags they used before
     # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
     # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
-    # they do (#10825 owns changing that condition).
+    # they do: always on merge_group; on push only when `changes-push` found an
+    # image input since the last green push run, or did not succeed (fails
+    # closed); on a PR when `changes.docker` is true (#10825). `release-build`'s
+    # gate must stay a superset of this one (see its comment).
     #
     # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
     # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB
@@ -2664,8 +2730,11 @@ jobs:
     # export from failing the build. The published `:latest` is not used as
     # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
     # never match.
-    needs: [changes, release-build]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-push, release-build]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -2731,9 +2800,16 @@ jobs:
     name: loom-worker Image Smoke Test
     # Consumes the image `worker-base-image` built (#10822). `always()` keeps
     # this job RUNNING when that producer failed, so the first step turns it
-    # red instead of skipped (ci-principles rule 7).
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    # red instead of skipped (ci-principles rule 7). The image gate (#10825,
+    # shared by all four image jobs): `merge_group` FIRST, so the merge-group
+    # audit proves it runs there unconditionally; on push, `changes-push`'s
+    # diff since the last green push run, run anyway unless that job
+    # succeeded with docker=false; on a PR, `changes.docker`.
+    needs: [changes, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2770,15 +2846,18 @@ jobs:
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test
-    # Mirrors worker-image-smoke exactly (same `changes.docker` gate — this
+    # Mirrors worker-image-smoke exactly (same image gate — this
     # image is FROM loom-worker, so any docker/** change, including a
     # loom-worker-only one, is worth re-validating this layer against): #6899,
     # Epic #6896 Phase 1. Its FROM target is the base image this run's
     # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
     # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
     # published image, which a PR's Dockerfile changes are not in.
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2813,7 +2892,7 @@ jobs:
   native-image-smoke:
     name: loom-worker-native Image Smoke Test
     # Mirrors session-image-smoke exactly (#8403, Epic #6896 Phase 3): same
-    # `changes.docker` gate, same FROM target (the base image this run's
+    # image gate, same FROM target (the base image this run's
     # `worker-base-image` built, #10822), same timeout. A sibling job rather
     # than a matrix over the two overlay images on purpose — a matrix would
     # couple two independent deliverables' failure modes, and CI here is
@@ -2823,8 +2902,11 @@ jobs:
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2862,7 +2944,10 @@ jobs:
   # This job runs `if: always()`, needs EVERY other job, and fails when
   # `Detect Changes` is not `success` on a PR, when any job failed/cancelled,
   # or when a job was skipped only because its upstream did not succeed. A
-  # skip the path filter actually decided stays a pass. Rule + tests:
+  # skip the path filter actually decided stays a pass. On push the only
+  # filter is `changes-push` (#10825): the image jobs skip only when it
+  # SUCCEEDED with docker=false; if it fails or is cancelled they run anyway
+  # and its own result fails this gate, so it fails closed. Rule + tests:
   # scripts/ci-result-gate.sh, scripts/test-ci-result-gate.sh. Making it a
   # REQUIRED context is a ruleset change applied by an operator AFTER this job
   # has reported on `main` (setup-branch-protection.sh); a required context
@@ -2875,6 +2960,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - changes-push
       - build-daemon
       - release-build
       - node-packages
