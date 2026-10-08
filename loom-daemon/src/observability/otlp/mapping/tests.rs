@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod loom_kind;
 mod record_id;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
