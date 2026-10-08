@@ -374,8 +374,16 @@ impl SignatureEvidence {
                 .as_ref()
                 .and_then(|r| r.source_anchor.clone())
                 .filter(|a| is_commit_sha(a)),
-            source_check: facts.source.as_ref().map(|r| r.source_check.to_string()),
-            adoption_record: facts.source.as_ref().map(|r| r.adoption.to_string()),
+            source_check: facts
+                .source
+                .as_ref()
+                .and_then(|r| r.source_check)
+                .map(str::to_string),
+            adoption_record: facts
+                .source
+                .as_ref()
+                .and_then(|r| r.adoption)
+                .map(str::to_string),
             policy_revision: None,
             policy_revision_status: FieldStatus::NotAvailable,
             approval_provenance: None,

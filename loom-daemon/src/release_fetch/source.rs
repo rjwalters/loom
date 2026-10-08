@@ -328,6 +328,9 @@ pub struct Refusal {
     pub class: RefusalClass,
     /// `err()`-worded lines, WITHOUT the shared abort line.
     pub lines: Vec<String>,
+    /// The checks that had completed when the gate refused, for the evidence
+    /// record. A check that did not run stays `None` (null in the record).
+    pub partial: SourceReport,
 }
 
 /// What the source gate established, for the evidence line. Only checks that
@@ -336,10 +339,13 @@ pub struct Refusal {
 pub struct SourceReport {
     pub source_commit: Option<String>,
     pub source_anchor: Option<String>,
-    /// `not_configured` | `identical` | `ahead`.
-    pub source_check: &'static str,
-    /// `not_recorded` (no record path) | `first_seen` | `matched`.
-    pub adoption: &'static str,
+    /// `not_configured` | `identical` | `ahead` | `behind` | `diverged` |
+    /// `unavailable`; `None` when the check did not run.
+    pub source_check: Option<&'static str>,
+    /// `not_recorded` (no record path) | `first_seen` | `matched` |
+    /// `unavailable` | `tag_moved` | `asset_replaced` | `write_failed`;
+    /// `None` when the check did not run.
+    pub adoption: Option<&'static str>,
 }
 
 impl SourceReport {
@@ -347,8 +353,8 @@ impl SourceReport {
     pub fn extend_evidence(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
         obj.insert("source_commit".into(), self.source_commit.clone().into());
         obj.insert("source_anchor".into(), self.source_anchor.clone().into());
-        obj.insert("source_check".into(), self.source_check.into());
-        obj.insert("adoption_record".into(), self.adoption.into());
+        obj.insert("source_check".into(), self.source_check.map(str::to_string).into());
+        obj.insert("adoption_record".into(), self.adoption.map(str::to_string).into());
     }
 }
 
@@ -361,8 +367,9 @@ pub struct GateInputs<'a> {
     pub record_path: Option<&'a Path>,
 }
 
-fn unavailable(why: &str) -> Refusal {
+fn unavailable(why: &str, partial: SourceReport) -> Refusal {
     Refusal {
+        partial,
         class: RefusalClass::Unavailable,
         lines: vec![
             format!(
@@ -374,9 +381,10 @@ fn unavailable(why: &str) -> Refusal {
     }
 }
 
-fn mismatch(class: RefusalClass, head: String) -> Refusal {
+fn mismatch(class: RefusalClass, head: String, partial: SourceReport) -> Refusal {
     Refusal {
         class,
+        partial,
         lines: vec![
             head,
             "Refusing the artifact before it is executed or provisioned. If this change is \
@@ -389,6 +397,14 @@ fn mismatch(class: RefusalClass, head: String) -> Refusal {
 
 /// Run the source gate. Nothing here executes the candidate.
 pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal> {
+    // Filled in as each check completes, so a refusal carries the facts
+    // already established; a check that never ran stays `None`.
+    let mut partial = SourceReport {
+        source_commit: None,
+        source_anchor: None,
+        source_check: None,
+        adoption: None,
+    };
     let anchor = match i.anchor {
         AnchorSetting::Invalid(why) => {
             return Err(Refusal {
@@ -398,25 +414,33 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
                     "Refusing rather than skipping the source check; fix or unset the variable."
                         .to_string(),
                 ],
+                partial,
             })
         }
         AnchorSetting::Anchor(a) => Some(a.as_str()),
         AnchorSetting::NotConfigured => None,
     };
+    partial.source_anchor = anchor.map(str::to_string);
 
     let commit = match anchor {
-        Some(_) => Some(resolve_tag_commit(api, i.slug, i.tag).map_err(|e| unavailable(&e))?),
+        Some(_) => Some(
+            resolve_tag_commit(api, i.slug, i.tag).map_err(|e| unavailable(&e, partial.clone()))?,
+        ),
         None => None,
     };
+    partial.source_commit = commit.clone();
 
-    let mut adoption = "not_recorded";
     if let Some(path) = i.record_path {
-        let record = read_record(path).map_err(|e| unavailable(&e))?;
+        let record = read_record(path).map_err(|e| {
+            partial.adoption = Some("unavailable");
+            unavailable(&e, partial.clone())
+        })?;
         match record.entries.get(&record_key(i.slug, i.tag, i.target)) {
-            None => adoption = "first_seen",
+            None => partial.adoption = Some("first_seen"),
             Some(prev) => {
                 if let (Some(was), Some(now)) = (prev.commit.as_deref(), commit.as_deref()) {
                     if was != now {
+                        partial.adoption = Some("tag_moved");
                         return Err(mismatch(
                             RefusalClass::TagMoved,
                             format!(
@@ -425,10 +449,12 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
                                 i.tag,
                                 path.display()
                             ),
+                            partial,
                         ));
                     }
                 }
                 if prev.asset_sha256 != i.asset_sha256 {
+                    partial.adoption = Some("asset_replaced");
                     return Err(mismatch(
                         RefusalClass::AssetReplaced,
                         format!(
@@ -440,18 +466,22 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
                             prev.asset_sha256,
                             path.display()
                         ),
+                        partial,
                     ));
                 }
-                adoption = "matched";
+                partial.adoption = Some("matched");
             }
         }
+    } else {
+        partial.adoption = Some("not_recorded");
     }
 
-    let source_check = match (anchor, commit.as_deref()) {
+    partial.source_check = Some(match (anchor, commit.as_deref()) {
         (Some(a), Some(c)) => match compare(api, i.slug, a, c) {
             Ancestry::Identical => "identical",
             Ancestry::Ahead => "ahead",
             st @ (Ancestry::Behind | Ancestry::Diverged) => {
+                partial.source_check = Some(st.as_str());
                 return Err(mismatch(
                     RefusalClass::NotDescendant,
                     format!(
@@ -460,19 +490,18 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
                         i.tag,
                         st.as_str()
                     ),
-                ))
+                    partial,
+                ));
             }
-            Ancestry::Unavailable(e) => return Err(unavailable(&e)),
+            Ancestry::Unavailable(e) => {
+                partial.source_check = Some("unavailable");
+                return Err(unavailable(&e, partial));
+            }
         },
         _ => "not_configured",
-    };
+    });
 
-    Ok(SourceReport {
-        source_commit: commit,
-        source_anchor: anchor.map(str::to_string),
-        source_check,
-        adoption,
-    })
+    Ok(partial)
 }
 
 /// Persist the adoption pin after every check passed, BEFORE the candidate is
@@ -491,6 +520,10 @@ pub fn record_adoption(report: &SourceReport, i: &GateInputs<'_>) -> Result<(), 
     };
     write_entry(path, entry).map_err(|e| Refusal {
         class: RefusalClass::RecordWriteFailed,
+        partial: SourceReport {
+            adoption: Some("write_failed"),
+            ..report.clone()
+        },
         lines: vec![
             format!(
                 "Required source assurance is on: could not write the release adoption record \

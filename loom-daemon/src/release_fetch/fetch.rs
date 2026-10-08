@@ -596,6 +596,7 @@ pub(super) fn verify_core(
             Ok(r) => source_report = Some(r),
             Err(refusal) => {
                 facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+                facts.source = Some(refusal.partial);
                 let mut lines = refusal.lines;
                 lines.push(ABORT_LINE.to_string());
                 return FetchOutcome::VerificationFailed { lines };
@@ -625,6 +626,7 @@ pub(super) fn verify_core(
     if let Some(report) = source_report.as_ref() {
         if let Err(refusal) = source::record_adoption(report, &gate_inputs) {
             facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+            facts.source = Some(refusal.partial);
             let mut lines = refusal.lines;
             lines.push(ABORT_LINE.to_string());
             return FetchOutcome::VerificationFailed { lines };

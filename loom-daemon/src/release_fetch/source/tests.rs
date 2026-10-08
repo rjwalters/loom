@@ -103,10 +103,10 @@ fn source_identical_and_ahead_accepted() {
         let mut map = tag_map("v1.0.0", commit);
         map.insert(format!("repos/{SLUG}/compare/{A}...{commit}"), compare_body(status));
         let r = gate(&fake_api(map), &inputs(&anchor, None, "x")).unwrap();
-        assert_eq!(r.source_check, status);
+        assert_eq!(r.source_check, Some(status));
         assert_eq!(r.source_commit.as_deref(), Some(commit));
         assert_eq!(r.source_anchor.as_deref(), Some(A));
-        assert_eq!(r.adoption, "not_recorded");
+        assert_eq!(r.adoption, Some("not_recorded"));
     }
 }
 
@@ -187,10 +187,10 @@ fn source_adoption_record_detects_movement_and_replacement() {
         fake_api(m)
     };
     let r = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
-    assert_eq!(r.adoption, "first_seen");
+    assert_eq!(r.adoption, Some("first_seen"));
     assert!(record_adoption(&r, &inputs(&anchor, Some(&rec), "sha1")).is_ok());
     let r = gate(&with(B), &inputs(&anchor, Some(&rec), "sha1")).unwrap();
-    assert_eq!(r.adoption, "matched");
+    assert_eq!(r.adoption, Some("matched"));
     let e = gate(&with(C), &inputs(&anchor, Some(&rec), "sha1")).unwrap_err();
     assert_eq!(e.class, RefusalClass::TagMoved);
     let e = gate(&with(B), &inputs(&anchor, Some(&rec), "sha2")).unwrap_err();
@@ -199,7 +199,7 @@ fn source_adoption_record_detects_movement_and_replacement() {
     // and a later unanchored write keeps the commit already on record.
     let none = AnchorSetting::NotConfigured;
     let r = gate(&with(C), &inputs(&none, Some(&rec), "sha1")).unwrap();
-    assert_eq!(r.source_check, "not_configured");
+    assert_eq!(r.source_check, Some("not_configured"));
     assert!(record_adoption(&r, &inputs(&none, Some(&rec), "sha1")).is_ok());
     let rec_json = read_record(&rec).unwrap();
     let entry = rec_json.entries.values().next().unwrap();
@@ -334,6 +334,14 @@ exit 1
     }
 
     fn fetch(&self, tag: &str, policy: &SignaturePolicy) -> FetchOutcome {
+        self.fetch_with_evidence(tag, policy).0
+    }
+
+    fn fetch_with_evidence(
+        &self,
+        tag: &str,
+        policy: &SignaturePolicy,
+    ) -> (FetchOutcome, serde_json::Value) {
         let inputs = FetchInputs {
             repo_root: &self.root,
             target: TARGET,
@@ -347,10 +355,20 @@ exit 1
         std::env::set_var("PATH", format!("{}:{old}", self.fakebin.display()));
         let gh =
             crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&self.fakebin.join("gh"));
-        let out = fetch_and_verify_with_policy(&inputs, policy);
+        let (out, record) = crate::release_fetch::fetch_and_verify_with_evidence(&inputs, policy);
         drop(gh);
         std::env::set_var("PATH", old);
-        out
+        (out, serde_json::to_value(&record).unwrap())
+    }
+
+    /// Must refuse; returns the durable evidence record (not the refusal text).
+    fn refused_record(&self, tag: &str, policy: &SignaturePolicy) -> serde_json::Value {
+        let _ = std::fs::remove_file(&self.marker);
+        let (out, ev) = self.fetch_with_evidence(tag, policy);
+        assert!(matches!(out, FetchOutcome::VerificationFailed { .. }), "expected a refusal");
+        assert!(!self.marker.exists(), "candidate was executed before the refusal");
+        assert_eq!(ev["outcome"], "source_assurance_refused", "{ev}");
+        ev
     }
 
     /// Must verify; returns the parsed evidence record. Resets the marker so a
@@ -529,4 +547,61 @@ fn default_mode_ignores_source_policy_entirely() {
     let ev = fx.verified("v1.0.0", &policy);
     assert!(ev.is_null(), "present-only mode prints no evidence: {ev}");
     assert!(!fx.record.exists(), "present-only mode writes no adoption record");
+}
+
+#[test]
+#[serial]
+fn refusal_evidence_keeps_the_source_facts_established_before_it() {
+    let fx = Fx::new();
+    let policy = fx.policy(Some(A));
+
+    // Ancestry refusal: tag resolved and adoption checked, ancestry said no.
+    fx.set_tag("v0.9.0", C, "behind");
+    let ev = fx.refused_record("v0.9.0", &policy);
+    assert_eq!(ev["source_revision"], C, "{ev}");
+    assert_eq!(ev["source_anchor"], A, "{ev}");
+    assert_eq!(ev["source_check"], "behind", "{ev}");
+    assert_eq!(ev["adoption_record"], "first_seen", "{ev}");
+    fx.set_tag("v0.8.0", C, "diverged");
+    let ev = fx.refused_record("v0.8.0", &policy);
+    assert_eq!(ev["source_check"], "diverged", "{ev}");
+
+    // API failure: nothing resolved, so every check that did not run is null.
+    std::fs::write(fx.api.join("FAIL"), "").unwrap();
+    let ev = fx.refused_record("v1.0.0", &policy);
+    assert_eq!(ev["source_anchor"], A, "{ev}");
+    assert!(ev["source_revision"].is_null(), "{ev}");
+    assert!(ev["source_check"].is_null(), "{ev}");
+    assert!(ev["adoption_record"].is_null(), "{ev}");
+    std::fs::remove_file(fx.api.join("FAIL")).unwrap();
+
+    // Moved tag / replaced asset against an adopted release.
+    fx.set_tag("v1.0.0", B, "ahead");
+    let _ = fx.verified("v1.0.0", &policy);
+    fx.set_tag("v1.0.0", C, "ahead");
+    let ev = fx.refused_record("v1.0.0", &policy);
+    assert_eq!(ev["adoption_record"], "tag_moved", "{ev}");
+    assert_eq!(ev["source_revision"], C, "{ev}");
+    assert!(ev["source_check"].is_null(), "ancestry never ran: {ev}");
+    fx.set_tag("v1.0.0", B, "ahead");
+    fx.set_asset("replaced");
+    let ev = fx.refused_record("v1.0.0", &policy);
+    assert_eq!(ev["adoption_record"], "asset_replaced", "{ev}");
+    assert_eq!(ev["source_revision"], B, "{ev}");
+}
+
+#[test]
+#[serial]
+fn refusal_evidence_reports_adoption_write_failure() {
+    let fx = Fx::new();
+    let tmp = fx
+        .record
+        .with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    fx.set_tag("v1.0.0", B, "ahead");
+    let ev = fx.refused_record("v1.0.0", &fx.policy(Some(A)));
+    assert_eq!(ev["adoption_record"], "write_failed", "{ev}");
+    assert_eq!(ev["source_check"], "ahead", "{ev}");
+    assert_eq!(ev["source_revision"], B, "{ev}");
+    assert_eq!(ev["source_anchor"], A, "{ev}");
 }
