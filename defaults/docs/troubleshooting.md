@@ -8,6 +8,7 @@
 - [Stuck Agent Detection](#stuck-agent-detection)
 - [Sweep Dispatch Troubleshooting](#sweep-dispatch-troubleshooting)
 - [Overnight / long-running orchestration](#overnight--long-running-orchestration)
+- [Worker disk full: dispatch halted `disk_full` (#10973)](#worker-disk-full-dispatch-halted-disk_full-10973)
 <!-- toc:end -->
 
 ## Common Issues
