@@ -12,8 +12,10 @@
 //! - `LOOM-REVALIDATE CLEAR` + labels
 //!
 //! Always exits 0. A caller that gets no `LOOM-REVALIDATE` line (missing or
-//! older binary) must REFUSE: it cannot tell "head unchanged" from "never
-//! looked", and this guards an irreversible merge.
+//! older binary) must not read that as "head unchanged": `merge-pr.sh` falls
+//! back to the retired jq predicate (the pre-verb decision, which still reads
+//! the payload and refuses on NO-HEAD), so a host whose daemon predates this
+//! verb degrades to the old behaviour instead of refusing every `--auto` merge.
 
 use std::io::Read;
 
