@@ -39,17 +39,22 @@ name: Build and Release
 # Artifacts include checksums and platform signatures; Linux keyless signatures
 # carry a .pem certificate. Update verification is owned by loom-daemon-update.sh.
 #
-# Release on every VERSION bump (#7609): a `push` to `main` that
-# changes `VERSION` runs the `resolve` job first, which creates the tag
-# `v<VERSION>` at that commit and a GitHub Release for it (skipping cleanly
-# when the Release already exists), and every later job keys off
-# `needs.resolve.outputs.{tag,publish}` instead of the raw trigger event. A
-# Release created with the workflow's own GITHUB_TOKEN does NOT fire a second
-# `release` event, so a bump produces exactly one run. This is what keeps the
-# signed artifacts current with `main` — before it, Releases were cut by hand
-# at minor versions only, the fleet's self-update could never resolve a
-# current artifact (#6010), and every host rebuilt from source (and on macOS
-# re-signed locally, #7605). A hand-created Release or a `workflow_dispatch`
+# Release only a green `main` commit (#10826, replacing #7609's "release on
+# every VERSION bump"). The automated path is a `workflow_run` trigger on the
+# `CI` workflow completing: a run whose CI concluded `success` for a `push` to
+# this repo's `main` runs the `resolve` job, which reads `VERSION` from THAT
+# run's `head_sha` (the commit CI actually tested — never `github.sha`, which in
+# a `workflow_run` run is the default branch's current tip) and, when
+# scripts/release-decision.sh says so, creates the tag `v<VERSION>` at
+# `head_sha` and a GitHub Release for it. Every later job keys off
+# `needs.resolve.outputs.{tag,publish}` and checks out that tag, so what is
+# built, signed and published is exactly the tested tree. A `main` commit whose
+# CI failed, was cancelled (superseded) or never ran is never released; its
+# version may simply never get a tag — versions are assigned at merge by
+# version-bump-on-merge.yml and tags may skip them (see
+# defaults/docs/release-cadence.md). A Release created with the workflow's own
+# GITHUB_TOKEN does NOT fire a second `release` event, so a green commit
+# produces exactly one run. A hand-created Release or a `workflow_dispatch`
 # dry run behaves exactly as before.
 #
 # Each target builds in its own matrix job with `fail-fast: false`: one
@@ -96,9 +101,15 @@ name: Build and Release
 on:
   release:
     types: [created]
-  push:
+  # #10826: the ONLY automated release trigger. Matches the workflow named
+  # exactly `CI` (ci.yml), not `CI Daily`. `branches` filters on the CI run's
+  # head branch; the conclusion/event/repository guards live in `resolve`'s
+  # `if:` (and again in scripts/release-decision.sh), because a `workflow_run`
+  # fires for every completion, red or green.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
-    paths: [VERSION]
   workflow_dispatch:
     inputs:
       tag:
@@ -114,11 +125,25 @@ on:
         required: false
         type: string
 
-# One run per tag: a second push of the same VERSION (or a manual re-run) waits
-# rather than racing the first run's asset uploads. Never cancels — a half-
-# uploaded Release is worse than a late one.
+# Three concurrency regimes, never cancel-in-progress (a half-uploaded Release is
+# worse than a late one):
+#   - Hand-cut `release` / `workflow_dispatch` (dry run, hosted gate): one
+#     group per tag / gate SHA, exactly as before, so a human release or dry run
+#     never queues behind, or is displaced as "pending" by, an automated one.
+#   - Eligible `workflow_run` (green CI on a push to this repo's main): ONE
+#     constant group, `release-main` (#10826). GitHub keeps one run in progress
+#     and only the NEWEST pending (a newer arrival cancels the older pending
+#     run), so a burst of green main runs yields at most two release builds:
+#     the oldest running, the newest pending. A cancelled pending run is
+#     intended — its version is skipped, and the newer commit carries the
+#     newer VERSION. CI completions on main are themselves serialized.
+#   - Ineligible `workflow_run` (red/cancelled CI, PR or fork run): a unique
+#     per-run group. Its jobs are all skipped by `resolve`'s `if:`, and it must
+#     not enter `release-main`, where it would displace a green pending run.
+# The eligibility test here and in `resolve`'s `if:` must stay identical;
+# scripts/test-release-decision.sh checks that they do.
 concurrency:
-  group: release-${{ github.event.inputs.gate_sha || github.event.release.tag_name || github.event.inputs.tag || github.sha }}
+  group: release-${{ github.event.inputs.gate_sha || github.event.release.tag_name || github.event.inputs.tag || (github.event_name == 'workflow_run' && (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && 'main' || format('ineligible-{0}', github.run_id))) || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -149,29 +174,58 @@ jobs:
   #   release           → the created Release's tag; publish=true
   #   workflow_dispatch → inputs.tag (may be empty = build github.ref);
   #                       publish=false (Actions artifacts only, as before)
-  #   push (VERSION)    → v<VERSION>; creates tag + Release if absent →
-  #                       publish=true; publish=skip if it already exists
+  #   workflow_run      → green `CI` on a push to main (#10826): v<VERSION
+  #                       at head_sha>; scripts/release-decision.sh decides;
+  #                       creates tag + Release at head_sha → publish=true;
+  #                       publish=skip when already released, a newer release
+  #                       exists, or head_sha is no longer on main
+  #
+  # The `workflow_run` guard below is the eligibility test (green, push, main,
+  # this repository). A red/cancelled/PR/fork CI completion skips this job and
+  # therefore every job after it: nothing is built, nothing is released. It
+  # must match the `concurrency` group's test at the top of this file.
   resolve:
     name: Resolve release tag
-    if: github.event_name != 'workflow_dispatch' || inputs.gate_sha == ''
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.gate_sha == '') &&
+      (github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       publish: ${{ steps.resolve.outputs.publish }}
-      # `true` only on the path that CREATES the Release here (a VERSION bump
-      # on main). That Release is created with `--latest=false` (#8515), so
+      # `true` only on the path that CREATES the Release here (a green main
+      # commit with an unreleased VERSION). That Release is created with `--latest=false` (#8515), so
       # something has to promote it once every asset has landed — see the
       # `promote-release` job. Every other path (a hand-created Release, a
       # workflow_dispatch dry run, a Release that already existed) leaves the
       # repository's "Latest" pointer exactly where it found it.
       promote: ${{ steps.resolve.outputs.promote }}
     steps:
+      # On `workflow_run`, `github.sha`/`github.ref` are the default branch's
+      # CURRENT tip, not the commit CI tested; checking either out here would
+      # release an untested newer commit (#10826). The tested commit is
+      # `workflow_run.head_sha`, and VERSION is read from its tree.
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.event.inputs.tag || github.ref }}
 
-      - name: Resolve tag (and create the Release on a VERSION bump)
+      # The decision script comes from the same commit as the workflow
+      # definition that is running (a `workflow_run` run executes the default
+      # branch's release.yml), not from head_sha: a CI run for a commit that
+      # predates the script must still get a decision, not a missing file.
+      - name: Checkout release decision script
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          sparse-checkout: scripts/release-decision.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve tag (and create the Release for a green main commit)
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -179,7 +233,12 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
@@ -201,12 +260,36 @@ jobs:
                 echo "promote=false"
               } >> "$GITHUB_OUTPUT"
               ;;
-            push)
+            workflow_run)
+              # Facts for scripts/release-decision.sh. VERSION comes from the
+              # head_sha checkout above; tags and ancestry from the forge. Any
+              # failure to read them fails this step (nothing is released on a
+              # guess) — the next green main run retries.
+              if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+                echo "::error::checkout is $(git rev-parse HEAD), expected the tested commit $SHA"; exit 1
+              fi
               version="$(./scripts/version.sh)"
-              tag="v${version}"
-              if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
-                echo "::notice::Release $tag already exists — this push publishes nothing."
-                echo "- SKIPPED: Release \`$tag\` already exists." >> "$GITHUB_STEP_SUMMARY"
+              existing_tags="$(git ls-remote --tags --refs origin 'refs/tags/v*' | awk '{ sub("^refs/tags/", "", $2); print $2 }')"
+              release_exists=false
+              if gh release view "v${version}" --repo "$REPO" >/dev/null 2>&1; then release_exists=true; fi
+              # base...head = SHA...main: `ahead`/`identical` means main contains SHA.
+              ancestry="$(gh api "repos/${REPO}/compare/${SHA}...main" --jq '.status' 2>/dev/null || true)"
+              decision_rc=0
+              decision="$(VERSION_AT_HEAD="$version" EXISTING_TAGS="$existing_tags" \
+                RELEASE_EXISTS="$release_exists" ANCESTRY="$ancestry" HEAD_SHA="$SHA" \
+                bash .release-tooling/scripts/release-decision.sh)" || decision_rc=$?
+              echo "$decision"
+              verdict="$(sed -n 's/^decision=//p' <<<"$decision")"
+              reason="$(sed -n 's/^reason=//p' <<<"$decision")"
+              tag="$(sed -n 's/^tag=//p' <<<"$decision")"
+              if [ "$decision_rc" -ne 0 ] || [ "$verdict" = "refuse" ]; then
+                echo "::error::release decision refused (exit $decision_rc): $reason"
+                echo "- REFUSED: $reason (CI run: $WR_RUN_URL)" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              if [ "$verdict" = "skip" ]; then
+                echo "::notice::Nothing to release: $reason"
+                echo "- SKIPPED: $reason (CI run: $WR_RUN_URL)" >> "$GITHUB_STEP_SUMMARY"
                 # promote=false: nothing was built or uploaded by this run, so
                 # it has no standing to move the "Latest" pointer (#8515).
                 {
@@ -214,80 +297,96 @@ jobs:
                   echo "publish=skip"
                   echo "promote=false"
                 } >> "$GITHUB_OUTPUT"
-              else
-                # --target creates the tag at this exact commit when it does not
-                # exist yet; --generate-notes diffs against the previous tag.
-                #
-                # --latest=false is load-bearing (#8515): this Release is
-                # created BEFORE `build-daemon` has uploaded a single asset, so
-                # without it `releases/latest` would name an asset-less Release
-                # for the whole duration of the build matrix — minutes during
-                # which every updater on every platform correctly concludes
-                # "this release has no artifact for my target" and either
-                # rebuilds from source (soft path) or hard-fails (`--fetch`).
-                # The Release, its tag and its notes are all still published
-                # immediately and fetchable BY TAG; only the repository's
-                # "Latest" pointer waits, and it is moved by the
-                # `promote-release` job once every matrix leg has uploaded.
-                # A matrix failure therefore leaves "Latest" on the previous,
-                # complete Release rather than advancing it onto a broken one.
-                #
-                # Bounded retry (#8290): a one-off HTTP 403/5xx from the
-                # releases API (observed once, "Resource not accessible by
-                # integration", immediately followed by a clean run of the
-                # identical call one bump later) previously failed this step
-                # outright and left that version's tag/Release uncreated for
-                # good. Retry a transient-looking failure up to 2 times
-                # (3 attempts total) with a short backoff, logging every
-                # attempt, before giving up for real.
-                max_attempts=3
-                attempt=1
-                while :; do
-                  # `|| create_status=$?` serves two purposes here under
-                  # `set -e`: (1) it stops a failing `gh` call from
-                  # aborting the whole step immediately (a command
-                  # followed by `||` is exempt from errexit); (2) it lets
-                  # us capture the real exit status right here — `if
-                  # create_output="$(...)"; then …; fi` with no `else`
-                  # would instead report the *if statement's own* status
-                  # (0) on the false branch, not the failed command's.
-                  create_status=0
-                  create_output="$(gh release create "$tag" --repo "$REPO" --target "$SHA" \
-                    --title "$tag" --generate-notes --latest=false 2>&1)" || create_status=$?
-                  if [ "$create_status" -eq 0 ]; then
-                    echo "$create_output"
-                    break
-                  fi
-                  echo "::warning::gh release create for $tag failed on attempt $attempt/$max_attempts: $create_output"
-                  # A concurrent run (or a retry racing our own prior attempt
-                  # that actually succeeded server-side before timing out)
-                  # can make gh report the release already exists — that is
-                  # success, not a transient failure, so don't retry-loop on it.
-                  if printf '%s' "$create_output" | grep -qiE 'already exists'; then
-                    echo "::notice::Release $tag already exists (created by a concurrent/prior attempt) — treating as success."
-                    break
-                  fi
-                  if [ "$attempt" -ge "$max_attempts" ]; then
-                    echo "::error::gh release create for $tag failed after $max_attempts attempts — giving up. Last output: $create_output"
-                    exit "$create_status"
-                  fi
-                  if printf '%s' "$create_output" | grep -qE 'HTTP (403|5[0-9]{2})'; then
-                    backoff=$((attempt * 5))
-                    echo "Transient-looking failure (403/5xx) — retrying in ${backoff}s (attempt $((attempt + 1))/$max_attempts)..."
-                    sleep "$backoff"
-                    attempt=$((attempt + 1))
-                  else
-                    echo "::error::gh release create for $tag failed with a non-retryable error: $create_output"
-                    exit "$create_status"
-                  fi
-                done
-                echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (VERSION bump on main), NOT yet marked Latest (#8515)." >> "$GITHUB_STEP_SUMMARY"
-                {
-                  echo "tag=$tag"
-                  echo "publish=true"
-                  echo "promote=true"
-                } >> "$GITHUB_OUTPUT"
+                exit 0
               fi
+              if [ "$verdict" != "publish" ] || [ "$tag" != "v${version}" ]; then
+                echo "::error::unexpected release decision '$verdict' for tag '$tag'"; exit 1
+              fi
+              # --target creates the tag at the TESTED commit (head_sha); the
+              # decision above established the tag does not exist yet.
+              # --generate-notes diffs against the previous tag, so a skipped
+              # version's changes land in the next release's notes.
+              #
+              # --latest=false is load-bearing (#8515): this Release is
+              # created BEFORE `build-daemon` has uploaded a single asset, so
+              # without it `releases/latest` would name an asset-less Release
+              # for the whole duration of the build matrix — minutes during
+              # which every updater on every platform correctly concludes
+              # "this release has no artifact for my target" and either
+              # rebuilds from source (soft path) or hard-fails (`--fetch`).
+              # The Release, its tag and its notes are all still published
+              # immediately and fetchable BY TAG; only the repository's
+              # "Latest" pointer waits, and it is moved by the
+              # `promote-release` job once every matrix leg has uploaded.
+              # A matrix failure therefore leaves "Latest" on the previous,
+              # complete Release rather than advancing it onto a broken one.
+              #
+              # Bounded retry (#8290): a one-off HTTP 403/5xx from the
+              # releases API (observed once, "Resource not accessible by
+              # integration", immediately followed by a clean run of the
+              # identical call one bump later) previously failed this step
+              # outright and left that version's tag/Release uncreated for
+              # good. Retry a transient-looking failure up to 2 times
+              # (3 attempts total) with a short backoff, logging every
+              # attempt, before giving up for real.
+              max_attempts=3
+              attempt=1
+              while :; do
+                # `|| create_status=$?` serves two purposes here under
+                # `set -e`: (1) it stops a failing `gh` call from
+                # aborting the whole step immediately (a command
+                # followed by `||` is exempt from errexit); (2) it lets
+                # us capture the real exit status right here — `if
+                # create_output="$(...)"; then …; fi` with no `else`
+                # would instead report the *if statement's own* status
+                # (0) on the false branch, not the failed command's.
+                create_status=0
+                create_output="$(gh release create "$tag" --repo "$REPO" --target "$SHA" \
+                  --title "$tag" --generate-notes --latest=false 2>&1)" || create_status=$?
+                if [ "$create_status" -eq 0 ]; then
+                  echo "$create_output"
+                  break
+                fi
+                echo "::warning::gh release create for $tag failed on attempt $attempt/$max_attempts: $create_output"
+                # A concurrent run (or a retry racing our own prior attempt
+                # that actually succeeded server-side before timing out)
+                # can make gh report the release already exists — that is
+                # success, not a transient failure, so don't retry-loop on it.
+                if printf '%s' "$create_output" | grep -qiE 'already exists'; then
+                  echo "::notice::Release $tag already exists (created by a concurrent/prior attempt) — treating as success."
+                  break
+                fi
+                if [ "$attempt" -ge "$max_attempts" ]; then
+                  echo "::error::gh release create for $tag failed after $max_attempts attempts — giving up. Last output: $create_output"
+                  exit "$create_status"
+                fi
+                if printf '%s' "$create_output" | grep -qE 'HTTP (403|5[0-9]{2})'; then
+                  backoff=$((attempt * 5))
+                  echo "Transient-looking failure (403/5xx) — retrying in ${backoff}s (attempt $((attempt + 1))/$max_attempts)..."
+                  sleep "$backoff"
+                  attempt=$((attempt + 1))
+                else
+                  echo "::error::gh release create for $tag failed with a non-retryable error: $create_output"
+                  exit "$create_status"
+                fi
+              done
+              # The tag must name the tested commit, whoever created it: an
+              # "already exists" above (a hand-cut Release racing this run)
+              # could otherwise publish a build of some other tree under it.
+              # Peeled (`^{}`) line wins for an annotated tag; else the tag line.
+              tag_commit="$(git ls-remote --tags origin | awk -v t="refs/tags/${tag}" '
+                $2 == t "^{}" { peeled = $1 } $2 == t { plain = $1 }
+                END { print (peeled != "" ? peeled : plain) }')"
+              if [ "$tag_commit" != "$SHA" ]; then
+                echo "::error::tag $tag points at '${tag_commit:-<missing>}', not the tested commit $SHA — refusing to build or publish under it."
+                exit 1
+              fi
+              echo "- Created Release \`$tag\` at \`${SHA:0:12}\` (green main CI: $WR_RUN_URL), NOT yet marked Latest (#8515)." >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo "tag=$tag"
+                echo "publish=true"
+                echo "promote=true"
+              } >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "::error::unsupported event $EVENT_NAME"; exit 1
@@ -592,9 +691,15 @@ jobs:
           cert="dist/loom-daemon-${{ matrix.target }}.pem"
           if [ "$SIGN_MODE" = "keyless" ]; then
             # Keyless (#5054): cosign exchanges this workflow's OIDC token for a
-            # short-lived Fulcio certificate whose SAN is
-            #   https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>
-            # and records the signature in Rekor. Publishing the certificate
+            # short-lived Fulcio certificate whose SAN is the running workflow
+            # ref: `.../.github/workflows/release.yml@refs/tags/<tag>` for a
+            # hand-cut `release` run, but `...@refs/heads/main` for the automated
+            # path (a `workflow_run` run, like the `push` run before #10826, runs
+            # on the default branch). In the automated case the certificate's
+            # workflow-SHA claim is main's tip when CI completed, which can be a
+            # descendant of the tagged head_sha rather than equal to it. The
+            # default verifier pins `@refs/tags/<tag>`; see #10611. The
+            # signature is recorded in Rekor. Publishing the certificate
             # next to the signature is what lets a consumer verify with NO
             # distributed key:
             #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
@@ -851,10 +956,12 @@ jobs:
           # `gh release edit --latest` sends `make_latest=true`, which pins THIS
           # release as Latest regardless of its creation date — unlike the
           # `legacy`, date-ordered default it replaces. That is safe only if
-          # promotions can never complete out of order, and here they can: this
-          # workflow's `concurrency` group is keyed per tag/SHA with
-          # `cancel-in-progress: false`, so runs for DIFFERENT releases are
-          # explicitly allowed to overlap. They demonstrably do — v0.19.295 ran
+          # promotions can never complete out of order, and here they still can.
+          # Automated runs share the one `release-main` group since #10826 and
+          # no longer overlap each other, but a hand-cut `release` run keeps its
+          # own per-tag group and may overlap an automated one; before #10826
+          # every run had its own group and they overlapped routinely —
+          # v0.19.295 ran
           # 18:37:25Z→18:52:30Z while v0.19.296 started at 18:42:40Z; start gaps
           # run 5-20 min against 15-18 min durations. A run whose matrix is
           # slower than its successor's would otherwise land its promotion LAST

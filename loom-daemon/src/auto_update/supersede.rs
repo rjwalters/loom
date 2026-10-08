@@ -170,6 +170,7 @@ mod tests {
             target: None,
             installed_version: Some(installed.to_string()),
             installed_sha256: Some("aaaa".to_string()),
+            on_disk_version: None,
         }
     }
 

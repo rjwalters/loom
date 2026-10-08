@@ -111,12 +111,16 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
     use crate::gh_invocation::ParentContext;
     use crate::gh_invocation::{AccessIntent, GhBinSource, GhInvocation, GhTarget, Operation};
     let parent = TraceContext::derived("sweep", &["acme/widgets", "sweep-issue-9-1"]);
+    // #10752: `github.caller` is only stamped inside a caller scope and
+    // `github.number` only on a write whose argv names an issue/PR.
+    let _scope = crate::gh_invocation::caller_scope::enter("stale_blocked_release");
     let inv = GhInvocation::new(
         Operation::new("api.graphql"),
         AccessIntent::Write,
         GhTarget::repo("acme/widgets").unwrap(),
         std::time::Duration::from_secs(5),
     )
+    .args(["api", "repos/acme/widgets/issues/9/labels"])
     .parent(ParentContext::Parent(parent.clone()));
     let at = Utc::now();
     let open = InvocationSpan::open_at(&inv, at, "42.0".into());
@@ -129,7 +133,8 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
         "graphql",
         &cred,
         "writer",
-    );
+    )
+    .with_repo(Some("acme/widgets"));
     let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at, &billing);
     let again = InvocationSpan::open_at(&inv, at, "42.0".into());
     assert_eq!(open.context, again.context, "IDs recompute from the span's facts");

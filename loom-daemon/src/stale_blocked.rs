@@ -69,6 +69,10 @@ pub mod release_gh;
 pub mod release_outcome;
 pub mod release_task;
 
+// The release pass's per-artifact verdicts and their SigNoz export (#10752).
+pub mod release_items;
+pub mod release_telemetry;
+
 /// Which kind of artifact a finding is about.
 ///
 /// Carried rather than inferred: the two populations come from different

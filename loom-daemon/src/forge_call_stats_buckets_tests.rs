@@ -49,6 +49,7 @@ fn w1_line(t: i64, caller: &str, o: Outcome, at: CallAttribution) -> String {
         ir: Some("reader".into()),
         ib: None,
         at,
+        ag: crate::forge_call_stats::agent::AgentStamp::default(),
     })
     .unwrap()
 }

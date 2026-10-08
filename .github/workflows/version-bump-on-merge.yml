@@ -32,6 +32,12 @@ name: Version Bump on Merge
 # user-owned repository (#7829). Provision the two named App secrets before
 # activation; missing credentials must fail rather than fall back to a
 # different identity. This workflow does not change repository rules.
+#
+# Releasing is not this workflow's job (#10826): a version in a bump commit is
+# released only if that commit, or a later `main` commit carrying the same
+# unreleased `VERSION`, finishes green in `CI` — release.yml runs on
+# `workflow_run` of `CI`, not on this push. A version whose commits never go
+# green is skipped (no tag); see defaults/docs/release-cadence.md.
 
 on:
   push:

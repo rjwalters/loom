@@ -49,6 +49,7 @@ pub mod github;
 pub mod grants;
 pub mod group_authz;
 pub mod group_github;
+pub mod group_run;
 pub mod lifecycle;
 pub mod lifecycle_cli;
 pub mod mode;
@@ -112,6 +113,12 @@ pub enum MergeQueueCmd {
     Revoke {
         pr: u32,
         reason: String,
+        repo: Option<String>,
+    },
+    /// #10256: evaluate and post `loom/merge-authorization` for the merge
+    /// group built at `commit` (every member, concluded last).
+    GroupCheck {
+        commit: String,
         repo: Option<String>,
     },
     /// #10256: body of the required `loom/merge-authorization` check.
@@ -325,6 +332,7 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env) -> Report {
         | MergeQueueCmd::Handoff { .. }
         | MergeQueueCmd::Step { .. }
         | MergeQueueCmd::Revoke { .. }
+        | MergeQueueCmd::GroupCheck { .. }
         | MergeQueueCmd::AuthorizeCheck { .. } => {
             Report::err("INTERNAL", "lifecycle verb was not dispatched", 1)
         }

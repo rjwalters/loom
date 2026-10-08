@@ -10,8 +10,10 @@
 //! Now the daemon owns the only one, so the question is answered in-process and
 //! a host with no usable script is no longer limited by whether one exists.
 
+use super::artifact_verdict::compare_versions;
 use super::{ArtifactInfo, ArtifactResolution};
 use crate::release_resolve::{build_time_repo, resolve, resolve_repo, Inputs, Resolution};
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 /// The environment-derived [`Inputs`] for this host, built once so the
@@ -71,16 +73,71 @@ pub(super) fn native_resolution(root: &Path) -> ArtifactResolution {
     let inputs = env_inputs(root);
     match resolve(&inputs) {
         Resolution::Unresolved(reason) => ArtifactResolution::Unresolved(reason),
-        Resolution::Resolved(r) => ArtifactResolution::Resolved(ArtifactInfo {
-            repo: r.repo,
-            tag: r.tag,
-            version: r.version,
-            published_at: r.published_at,
-            asset_sha256: r.asset_sha256,
-            target: Some(r.target),
-            installed_version: r.installed_version,
-            installed_sha256: r.installed_sha256,
-        }),
+        Resolution::Resolved(r) => ArtifactResolution::Resolved(with_running_basis(
+            ArtifactInfo {
+                repo: r.repo,
+                tag: r.tag,
+                version: r.version,
+                published_at: r.published_at,
+                asset_sha256: r.asset_sha256,
+                target: Some(r.target),
+                installed_version: r.installed_version,
+                installed_sha256: r.installed_sha256,
+                on_disk_version: None,
+            },
+            env!("CARGO_PKG_VERSION"),
+        )),
+    }
+}
+
+/// Re-base a resolution's "installed" identity on the RUNNING process (#10710).
+///
+/// `info` arrives carrying the on-disk probe — `--version` and sha256 of the
+/// file at [`running_binary`]. That is the wrong question for "is this host
+/// current": once a roll has swapped the file but the restart has not landed
+/// (an abandoned drain, a deferred restart), macOS reads the NEW file and the
+/// verdict says up to date while the old process keeps running — forever, as
+/// nothing re-arms it. Linux gets ` (deleted)` and no answer at all.
+///
+/// So the verdict compares `running` (the caller passes
+/// `env!("CARGO_PKG_VERSION")`), which cannot be swapped out from under the
+/// process. The probe is kept as [`ArtifactInfo::on_disk_version`], a
+/// diagnostic (staged-but-not-running). Consequences, each deliberate:
+///
+/// - running == on disk (the common case): only `on_disk_version` changes —
+///   the verdict is byte-for-byte what it was.
+/// - on disk newer than running, release == on disk: `Newer`, so the roll
+///   re-arms; the refetch installs the same bytes and the restart lands it.
+/// - running newer than the release (a dev build): `StaleRepo`, never a
+///   downgrade roll — the same arm an on-disk-newer binary always took.
+/// - a different version on disk: its sha describes some other build, not
+///   this process, so it is dropped. With running == release that resolves to
+///   `UpToDate` ("no checksum to compare"), never a `ShaDiffers` refetch that
+///   would overwrite the staged binary. Same-version sha mismatches still reach
+///   `ShaDiffers`, so `already_converged`'s macOS re-sign guard is untouched.
+#[must_use]
+pub(super) fn with_running_basis(mut info: ArtifactInfo, running: &str) -> ArtifactInfo {
+    let on_disk = info.installed_version.take();
+    let same_build = on_disk
+        .as_deref()
+        .is_some_and(|v| compare_versions(v.trim(), running) == Ordering::Equal);
+    if !same_build {
+        info.installed_sha256 = None;
+    }
+    info.installed_version = Some(running.to_string());
+    info.on_disk_version = on_disk;
+    info
+}
+
+/// The verdict-reason suffix naming a staged-but-not-running binary, or `""`
+/// when the file on disk is the running version (or unknown) (#10710).
+#[must_use]
+pub(super) fn staged_note(info: &ArtifactInfo) -> String {
+    match (info.on_disk_version.as_deref(), info.installed_version.as_deref()) {
+        (Some(disk), Some(running)) if compare_versions(disk, running) != Ordering::Equal => {
+            format!(" (on disk: {disk}, staged but not running)")
+        }
+        _ => String::new(),
     }
 }
 
@@ -98,9 +155,10 @@ pub(super) fn native_resolution(root: &Path) -> ArtifactResolution {
 /// running.
 ///
 /// So: the real `current_exe()`, and `None` the moment the kernel says its
-/// inode is gone. `None` is the fail-safe direction — `classify_artifact`
-/// turns an undetermined installed version into `Newer`, and #7609's
-/// `already_converged` guard is what stops that becoming a fetch loop.
+/// inode is gone. Since #10710 the verdict no longer depends on this answer —
+/// [`with_running_basis`] compares the running version and keeps this probe's
+/// version only as the staged-but-not-running diagnostic — but `None` still
+/// matters for the sha: no file, no checksum, so no `ShaDiffers` refetch.
 pub(crate) fn running_binary() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // The kernel appends this to /proc/self/exe once the inode is unlinked.

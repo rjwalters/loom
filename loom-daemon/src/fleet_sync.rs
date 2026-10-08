@@ -723,7 +723,21 @@ pub fn probe_status() -> Option<FleetSyncStatus> {
 /// Remove a snapshot left behind by an earlier, configured run. Called when
 /// `fleet.repo` is no longer set, so `loom-daemon status` never reports a store
 /// this host has stopped reading.
+///
+/// Also forgets the process-wide floor (#10792): with no store there is no
+/// floor, so [`loom_min_version`] returns `None` and [`last_good_floor`] finds
+/// neither a cell value nor a file. The cell goes back to "no pass has run",
+/// not `Some(None)`. A config *error* (`Err` from `resolve_config`) does not
+/// come through here: keeping the last good floor is the safe failure.
 pub fn clear_status() {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = None;
+    }
+    // The in-memory snapshot also carries the floor ([`last_good_floor`] reads
+    // it), so it goes too; otherwise the "forgotten" floor would come back.
+    if let Ok(mut guard) = cell().lock() {
+        *guard = None;
+    }
     let Some(path) = status_path() else {
         return;
     };

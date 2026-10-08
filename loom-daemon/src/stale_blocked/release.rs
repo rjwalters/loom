@@ -53,6 +53,7 @@ use serde_json::Value;
 
 use super::batch::{gather_filtered, Options, RefState, StaleBlockedForge};
 use super::budget::{Floor, ForgeCost, Guard};
+use super::release_items::{Item, ItemContext, ItemVerdict};
 use super::{classify, Artifact, Verdict};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_identity::FleetLogins;
@@ -219,18 +220,22 @@ pub struct Report {
     pub unevaluated: Vec<Unread>,
     pub failed: Vec<Unread>,
     pub cost: ForgeCost,
+    /// One verdict per listed artifact, in decision order (#10752).
+    pub items: Vec<Item>,
+    #[serde(skip)]
+    pub(super) context: ItemContext,
 }
 
 impl Report {
-    fn skip(&mut self, why: Skip) {
+    fn skip(&mut self, number: u64, why: Skip) {
         *self.skipped.entry(why.key()).or_default() += 1;
+        self.decide(number, ItemVerdict::Skipped, Some(why.key()), None);
     }
 
     fn unread(&mut self, number: u64, why: impl Into<String>) {
-        self.unevaluated.push(Unread {
-            number,
-            why: why.into(),
-        });
+        let why = why.into();
+        self.decide(number, ItemVerdict::Unevaluated, None, Some(&why));
+        self.unevaluated.push(Unread { number, why });
     }
 
     /// One log line with every count.
@@ -452,7 +457,7 @@ pub fn run(
     let mut writes = 0;
     for plan in plans {
         if writes >= cfg.max_writes {
-            report.skip(Skip::WriteCap);
+            report.skip(u64::from(plan.row.number), Skip::WriteCap);
             continue;
         }
         if execute(park, extra, policy, &plan, cfg.dry_run, &mut report) {
@@ -472,12 +477,14 @@ fn plan_from_listing(
 ) -> Vec<Plan> {
     let mut eligible = Vec::new();
     for row in rows {
+        report.listed(&row);
+        let number = u64::from(row.number);
         let body = row.body.clone().unwrap_or_default();
         match body_skip(&body, &row.labels) {
-            Some(why) => report.skip(why),
+            Some(why) => report.skip(number, why),
             None => match local_blockers(&body) {
                 Some(declared) => eligible.push((declared, row)),
-                None => report.skip(Skip::CrossRepo),
+                None => report.skip(number, Skip::CrossRepo),
             },
         }
     }
@@ -517,6 +524,7 @@ fn plan_from_listing(
                     }
                 })
                 .clone();
+            report.blocker_read(b, &state);
             match state {
                 Err(why) => {
                     report.unread(number, format!("declared blocker #{b}: {why}"));
@@ -524,7 +532,7 @@ fn plan_from_listing(
                 }
                 Ok(s) => match resolution(&s) {
                     None => {
-                        report.skip(Skip::ClosedUnmergedPr);
+                        report.skip(number, Skip::ClosedUnmergedPr);
                         continue 'rows;
                     }
                     Some(true) => resolved.push(b),
@@ -533,7 +541,7 @@ fn plan_from_listing(
             }
         }
         if resolved.is_empty() {
-            report.still_blocked += 1;
+            report.hold(number);
             continue;
         }
         let kind = if row.is_pull_request {
@@ -623,7 +631,7 @@ fn veto_from_evidence(
         match bodies.get(&i64::from(plan.row.number)) {
             Some(b) if same_body(b, planned_body(&plan)) => {}
             Some(_) => {
-                report.skip(Skip::ConcurrentEdit);
+                report.skip(n, Skip::ConcurrentEdit);
                 continue;
             }
             None => {
@@ -656,7 +664,7 @@ fn veto_from_evidence(
             }
         };
         match veto {
-            Some(why) => report.skip(why),
+            Some(why) => report.skip(n, why),
             None => kept.push(plan),
         }
     }
@@ -689,7 +697,7 @@ fn execute(
         && local_blockers(&fresh.body).as_ref() == Some(&plan.declared)
         && body_skip(&fresh.body, &fresh.labels).is_none();
     if !unchanged {
-        report.skip(Skip::ConcurrentEdit);
+        report.skip(n, Skip::ConcurrentEdit);
         return false;
     }
     let comments = match extra.comments(n) {
@@ -709,7 +717,7 @@ fn execute(
         .iter()
         .any(|c| body_of(c).contains(PERMANENT_BLOCK_MARKER))
     {
-        report.skip(Skip::Permanent);
+        report.skip(n, Skip::Permanent);
         return false;
     }
     let trusted: Vec<String> = comments
@@ -721,7 +729,7 @@ fn execute(
         .iter()
         .any(|b| b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER))
     {
-        report.skip(Skip::DaemonHold);
+        report.skip(n, Skip::DaemonHold);
         return false;
     }
     let mark = marker(plan.releases(), &plan.resolved);
@@ -754,16 +762,12 @@ fn execute(
                 acted.applied = true;
             }
             Err(e) => {
-                report.failed.push(Unread { number: n, why: e });
+                report.fail(n, e);
                 return true;
             }
         }
     }
-    if plan.releases() {
-        report.released.push(acted);
-    } else {
-        report.reparked.push(acted);
-    }
+    report.acted(plan.releases(), acted);
     true
 }
 

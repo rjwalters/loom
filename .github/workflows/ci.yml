@@ -264,7 +264,7 @@ jobs:
   release-build:
     name: Release Build Check
     needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.docker == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
@@ -272,6 +272,15 @@ jobs:
     # merge. They now use the shared debug build, so without this job such a
     # break would first surface in the post-merge release workflow. Nothing
     # waits on it, so it stays off the critical path.
+    #
+    # It is ALSO the one release build per CI run (#10824): the binary is
+    # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
+    # stages it into the Docker build context, so the image smokes no longer
+    # build their own. That makes the shipped `--features otlp` binary the one
+    # the smokes exercise (they previously ran a non-shipped default-feature
+    # build). The `if:` is the UNION of `backend` and `docker` so a docker-only
+    # PR still produces the artifact; keep it a superset of `worker-base-image`'s
+    # gate (#10825 narrows that one).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -283,6 +292,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --package loom-daemon --features otlp
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: target/release/loom-daemon
+          if-no-files-found: error
+          retention-days: 1
 
   node-packages:
     name: Node Packages (MCP server, dashboard)
@@ -680,6 +695,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the release decision and release.yml wiring (#10826)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-release-decision.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -2553,7 +2571,7 @@ jobs:
     # export from failing the build. The published `:latest` is not used as
     # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
     # never match.
-    needs: changes
+    needs: [changes, release-build]
     if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -2566,26 +2584,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # --- Binary staging seam (#10824) -------------------------------------
-      # Everything from here to "Stage dist/loom-daemon-linux-amd64" exists only
-      # to put the Linux release binary where the Dockerfile COPYs it from.
-      # #10824 replaces these three steps with a download of the shared
-      # `Release Build Check` artifact; nothing after them reads target/.
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # The Linux release binary the Dockerfile COPYs comes from the single
+      # `Release Build Check` build (`--features otlp`, the shipped config),
+      # not a build of our own. download-artifact fails on a missing artifact,
+      # so a failed producer turns this job red rather than skipped.
+      # upload-artifact drops the executable bit, hence the chmod.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Native build (the runner IS x86_64-unknown-linux-gnu) -- the release
-      # workflow's own `build-daemon` matrix covers every published target;
-      # this only needs the one Linux artifact the Dockerfile consumes.
+          name: loom-daemon-release-linux-amd64
+          path: dist
       - name: Stage dist/loom-daemon-linux-amd64
         run: |
           set -euo pipefail
-          cargo build --release --package loom-daemon
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
       # --- end binary staging seam ------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

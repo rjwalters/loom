@@ -678,6 +678,11 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             // (#10444); the test drives the gate script, so both are inputs.
             "scripts/test-ci-result-gate.sh",
             "scripts/ci-result-gate.sh",
+            // The release-decision tests also ride in this step group
+            // (#10826); they drive the decision script and parse release.yml.
+            "scripts/test-release-decision.sh",
+            "scripts/release-decision.sh",
+            ".github/workflows/release.yml",
             CI_WORKFLOW,
         ],
         scanned: SHELL,
