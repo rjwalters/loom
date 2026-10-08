@@ -653,7 +653,10 @@ window), never as a monotone series.
 labelled by caller, inventoried operation, identity role, credential bucket
 (`account`, `cred_owner`, `installation`, `resource`), `target_owner` and `outcome`; the free
 `rate_limit` probe appears under `resource="other"` and is never charged to a
-bucket. On a host
+bucket. Agent sessions' own `gh` calls join it (#10607): the daemon ingests
+the agent `gh` front's sink rows each tick, labelled `agent` = the role
+(`-` on the daemon's rows), served (`caller="agent_gh_front"`) or
+passthrough (`caller="agent.gh.<command>"`). On a host
 without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
@@ -677,9 +680,11 @@ are surely charged (the band's high end), and `ok`+`error` bounds the
 attributed figure from above (an `error` may be a charged 4xx or a local
 failure that sent nothing); 304s and the free probe are excluded. The
 recipe is `defaults/observability/signoz/github-shadow.sql`
-(queries 1–3, with query 4 cross-checking against the spans); a large
-shadow on a bucket means spend from outside this fleet's daemons (agent `gh`
-calls, another host, an operator) or an uninstrumented caller. A negative
+(queries 1–3, with query 4 cross-checking against the spans, and query 5
+plus query 3's `agent_share` splitting out the agent slice, #10607); a large
+shadow on a bucket means spend from outside this fleet's daemons (an agent
+`gh` that bypassed the front, another host, an operator) or an
+uninstrumented caller. A negative
 shadow means the bucket's readings undercount it (sparse readings, or a
 pre-#10571 daemon's readings of another bucket), not that Loom over-spent.
 

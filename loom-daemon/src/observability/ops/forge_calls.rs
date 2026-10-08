@@ -15,6 +15,14 @@
 //! Every label is a short, bounded token the accounting already sanitized —
 //! an operation name, an `app-<id>`-style account, a lowercased owner — never
 //! a path, a token or a repository-specific number.
+//!
+//! `agent` (#10607) is the agent role of a row the daemon ingested from an
+//! agent `gh` front's sink rows ([`record_agent`],
+//! [`crate::forge_call_stats::ingest`]); the daemon's own rows carry
+//! [`NO_AGENT`]. Served vs passthrough rides `caller`: `agent_gh_front` is a
+//! served read, `agent.gh.<command>` a passthrough. Agent series live in a
+//! store of their own with a smaller cap, so ingested (untrusted) rows can
+//! never push the daemon's own series into the overflow fold.
 
 use std::collections::BTreeMap;
 
@@ -26,8 +34,21 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 /// whatever the labels vary in, and the folded counts keep the total.
 const MAX_SERIES: usize = 2048;
 
+/// Distinct agent label sets held between drains ([`record_agent`]). Past
+/// it a new set folds into one series per `(agent, served|passthrough,
+/// outcome)`, so the agent store adds at most `AGENT_MAX_SERIES + 140`
+/// points.
+const AGENT_MAX_SERIES: usize = 512;
+
 /// The value of every string label of a folded (over-cap) series.
 const OVERFLOW: &str = "overflow";
+
+/// The `agent` label of the daemon's own rows.
+pub const NO_AGENT: &str = "-";
+
+/// The `caller` a folded passthrough agent series keeps (a served one keeps
+/// `agent_gh_front`), so served vs passthrough survives the fold.
+const AGENT_OVERFLOW_CALLER: &str = "agent.gh.overflow";
 
 /// How a call ended, as the `outcome` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +98,39 @@ pub struct CallLabels {
     pub outcome: CallOutcome,
 }
 
-type SeriesKey = (String, String, String, String, String, String, String, String, &'static str);
-type Series = BTreeMap<SeriesKey, u64>;
+/// `(caller, op, role, account, cred_owner, installation, target_owner,
+/// resource, agent, outcome)`.
+type Key = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    &'static str,
+    &'static str,
+);
+type Series = BTreeMap<Key, u64>;
 
-fn add(store: &mut Series, labels: CallLabels, value: u64) {
+/// The daemon's own series and the ingested agent series, capped apart.
+#[derive(Default)]
+struct Stores {
+    daemon: Series,
+    agent: Series,
+}
+
+impl Stores {
+    const fn new() -> Self {
+        Self {
+            daemon: BTreeMap::new(),
+            agent: BTreeMap::new(),
+        }
+    }
+}
+
+fn add(store: &mut Series, cap: usize, labels: CallLabels, agent: &'static str, value: u64) {
     let key = (
         labels.caller,
         labels.op,
@@ -90,12 +140,19 @@ fn add(store: &mut Series, labels: CallLabels, value: u64) {
         labels.installation,
         labels.target_owner,
         labels.resource,
+        agent,
         labels.outcome.as_str(),
     );
-    let key = if store.len() >= MAX_SERIES && !store.contains_key(&key) {
+    let key = if store.len() >= cap && !store.contains_key(&key) {
         let o = || OVERFLOW.to_string();
-        (o(), o(), o(), o(), o(), o(), o(), o(), key.8)
-    } else {
+        let caller = if agent == NO_AGENT {
+            o()
+        } else if key.0 == crate::agent_gh::STATS_CALLER {
+            key.0.clone()
+        } else {
+            AGENT_OVERFLOW_CALLER.to_string()
+        };
+        (caller, o(), o(), o(), o(), o(), o(), o(), agent, key.9)    } else {
         key
     };
     let slot = store.entry(key).or_default();
@@ -103,17 +160,17 @@ fn add(store: &mut Series, labels: CallLabels, value: u64) {
 }
 
 #[cfg(not(test))]
-fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
-    static STORE: std::sync::Mutex<Series> = std::sync::Mutex::new(BTreeMap::new());
+fn with_store<R>(f: impl FnOnce(&mut Stores) -> R) -> Option<R> {
+    static STORE: std::sync::Mutex<Stores> = std::sync::Mutex::new(Stores::new());
     STORE.lock().ok().map(|mut s| f(&mut s))
 }
 
 /// Test builds keep the series per thread, so parallel tests that make
 /// facade calls never see each other's points.
 #[cfg(test)]
-fn with_store<R>(f: impl FnOnce(&mut Series) -> R) -> Option<R> {
+fn with_store<R>(f: impl FnOnce(&mut Stores) -> R) -> Option<R> {
     thread_local! {
-        static STORE: std::cell::RefCell<Series> = const { std::cell::RefCell::new(BTreeMap::new()) };
+        static STORE: std::cell::RefCell<Stores> = const { std::cell::RefCell::new(Stores::new()) };
     }
     Some(STORE.with(|s| f(&mut s.borrow_mut())))
 }
@@ -124,7 +181,17 @@ pub fn record(labels: CallLabels, value: u64) {
     if !super::spans_exported() || value == 0 {
         return;
     }
-    with_store(|s| add(s, labels, value));
+    with_store(|s| add(&mut s.daemon, MAX_SERIES, labels, NO_AGENT, value));
+}
+
+/// [`record`] for a row an agent `gh` front wrote, ingested by the daemon
+/// (#10607): `agent` is its closed-vocabulary role. Kept in the agent store,
+/// whose own cap leaves the daemon's series untouched.
+pub fn record_agent(labels: CallLabels, agent: &'static str, value: u64) {
+    if !super::spans_exported() || value == 0 {
+        return;
+    }
+    with_store(|s| add(&mut s.agent, AGENT_MAX_SERIES, labels, agent, value));
 }
 
 /// Drain every series into `loom.forge.calls` points (delta semantics: a
@@ -133,7 +200,9 @@ pub fn record(labels: CallLabels, value: u64) {
 pub fn drain_points() -> Vec<MetricPoint> {
     let drained = with_store(std::mem::take).unwrap_or_default();
     drained
+        .daemon
         .into_iter()
+        .chain(drained.agent)
         .map(
             |(
                 (
@@ -145,6 +214,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     installation,
                     target_owner,
                     resource,
+                    agent,
                     outcome,
                 ),
                 n,
@@ -158,6 +228,7 @@ pub fn drain_points() -> Vec<MetricPoint> {
                     .label("installation", installation)
                     .label("target_owner", target_owner)
                     .label("resource", resource)
+                    .label("agent", agent)
                     .label("outcome", outcome)
             },
         )
@@ -184,6 +255,7 @@ pub fn drain_event_points() -> Vec<MetricPoint> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::telemetry::ops::MetricValue;
 
     #[test]
     fn the_disagree_counter_is_exported_by_name() {
@@ -230,7 +302,7 @@ mod tests {
         let mut store = Series::new();
         let n = MAX_SERIES * 3;
         for i in 0..n {
-            add(&mut store, labels(i, outcomes[i % outcomes.len()]), 2);
+            add(&mut store, MAX_SERIES, labels(i, outcomes[i % outcomes.len()]), NO_AGENT, 2);
         }
         assert!(store.len() <= MAX_SERIES + outcomes.len(), "{} series", store.len());
         assert_eq!(store.values().sum::<u64>(), 2 * n as u64, "no count is lost");
@@ -241,12 +313,13 @@ mod tests {
             for v in [&k.0, &k.1, &k.2, &k.3, &k.4, &k.5, &k.6, &k.7] {
                 assert_eq!(v, OVERFLOW, "{k:?}");
             }
+            assert_eq!(k.8, NO_AGENT, "{k:?}");
         }
 
         // A series admitted before the cap keeps accumulating under its own key.
         let first = labels(0, CallOutcome::Ok);
         let before = store.len();
-        add(&mut store, first.clone(), 5);
+        add(&mut store, MAX_SERIES, first.clone(), NO_AGENT, 5);
         assert_eq!(store.len(), before);
         let key = (
             first.caller,
@@ -257,8 +330,81 @@ mod tests {
             first.installation,
             first.target_owner,
             first.resource,
+            NO_AGENT,
             first.outcome.as_str(),
         );
         assert_eq!(store.get(&key).copied(), Some(2 + 5));
+    }
+
+    fn agent_labels(caller: &str, i: usize) -> CallLabels {
+        CallLabels {
+            caller: caller.to_string(),
+            op: "unknown".to_string(),
+            role: "agent-builder".to_string(),
+            account: format!("app-{i}"),
+            cred_owner: format!("owner-{i}"),
+            installation: "-".to_string(),
+            target_owner: "acme".to_string(),
+            resource: "graphql".to_string(),
+            outcome: CallOutcome::Ok,
+        }
+    }
+
+    /// #10607: ingested agent rows drain once, labelled `agent`, beside the
+    /// daemon's own rows (labelled `-`).
+    #[test]
+    fn agent_rows_drain_once_with_the_agent_label() {
+        use crate::observability::ops::capture::capture;
+        let (points, _) = capture(|| {
+            let _ = drain_points();
+            record(labels(1, CallOutcome::Ok), 1);
+            record_agent(agent_labels("agent.gh.pr", 1), "builder", 2);
+            record_agent(agent_labels("agent.gh.pr", 1), "builder", 1);
+            record_agent(agent_labels("agent_gh_front", 1), "judge", 1);
+            drain_points()
+        });
+        let agent = |p: &MetricPoint| p.labels["agent"].clone();
+        assert_eq!(points.len(), 3, "{points:?}");
+        let pr = points
+            .iter()
+            .find(|p| p.labels["caller"] == "agent.gh.pr")
+            .unwrap();
+        assert_eq!((agent(pr), pr.value), ("builder".into(), MetricValue::Int(3)));
+        let served = points
+            .iter()
+            .find(|p| p.labels["caller"] == "agent_gh_front")
+            .unwrap();
+        assert_eq!(agent(served), "judge");
+        let own = points
+            .iter()
+            .find(|p| p.labels["caller"] == "issue.view")
+            .unwrap();
+        assert_eq!(agent(own), NO_AGENT);
+        assert!(points.iter().all(|p| p.labels.len() == 10), "{points:?}");
+        let (again, _) = capture(drain_points);
+        assert!(again.is_empty(), "delta semantics: {again:?}");
+    }
+
+    /// A flood of distinct agent label sets folds inside the agent store:
+    /// the daemon's own store keeps its full cap, and served vs passthrough
+    /// and the role survive the fold.
+    #[test]
+    fn agent_series_fold_apart_from_the_daemons() {
+        let mut stores = Stores::new();
+        for i in 0..AGENT_MAX_SERIES * 2 {
+            let caller = if i % 2 == 0 {
+                "agent.gh.api"
+            } else {
+                "agent_gh_front"
+            };
+            add(&mut stores.agent, AGENT_MAX_SERIES, agent_labels(caller, i), "hermit", 1);
+        }
+        assert!(stores.agent.len() <= AGENT_MAX_SERIES + 2, "{}", stores.agent.len());
+        assert_eq!(stores.agent.values().sum::<u64>(), (AGENT_MAX_SERIES * 2) as u64);
+        let folded: Vec<_> = stores.agent.keys().filter(|k| k.1 == OVERFLOW).collect();
+        let callers: Vec<&str> = folded.iter().map(|k| k.0.as_str()).collect();
+        assert_eq!(callers, [AGENT_OVERFLOW_CALLER, "agent_gh_front"], "{folded:?}");
+        assert!(folded.iter().all(|k| k.8 == "hermit"));
+        assert!(stores.daemon.is_empty());
     }
 }
