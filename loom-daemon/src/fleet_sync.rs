@@ -658,6 +658,10 @@ pub struct FleetSyncStatus {
     /// back, and omitted until a checkout pass has run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkouts: Vec<checkout_ff::CheckoutReport>,
+    /// Why the last checkout step checked nothing, when it did not
+    /// ([`checkout_ff::BUSY_NOTE`]); `checkouts` are then from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkouts_note: Option<String>,
 }
 
 fn default_enforced() -> Enforcement {
@@ -734,12 +738,16 @@ fn publish_workspaces(found: &workspace_resync::WorkspacePass) {
     }
 }
 
-/// Put a finished checkout pass (#10869) on the current snapshot, as
-/// [`publish_workspaces`] does for the workspace pass.
-fn publish_checkouts(found: &[checkout_ff::CheckoutReport]) {
+/// Put a finished checkout step (#10869) on the current snapshot, as
+/// [`publish_workspaces`] does for the workspace pass: its reports, or (with
+/// `found` `None`) only the note saying why it checked nothing.
+fn publish_checkouts(found: Option<&[checkout_ff::CheckoutReport]>, note: Option<&str>) {
     let updated = cell().lock().ok().and_then(|mut guard| {
         let status = guard.as_mut()?;
-        status.checkouts = found.to_vec();
+        if let Some(found) = found {
+            status.checkouts = found.to_vec();
+        }
+        status.checkouts_note = note.map(str::to_string);
         Some(status.clone())
     });
     let (Some(status), Some(path)) = (updated, status_path()) else {
@@ -840,6 +848,11 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     lines.extend(floor_lines(&s.floor));
     lines.extend(s.workspaces.lines());
     lines.extend(checkout_ff::lines(&s.checkouts));
+    lines.extend(
+        s.checkouts_note
+            .iter()
+            .map(|note| format!("  checkouts: {note}")),
+    );
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -1025,6 +1038,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         workspaces: cached_status().map(|s| s.workspaces).unwrap_or_default(),
         // Likewise the last checkout pass's (#10869).
         checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
+        checkouts_note: cached_status().and_then(|s| s.checkouts_note),
     }
 }
 
@@ -1362,8 +1376,9 @@ fn spawn_timer(
         // #10869: the checkout half runs on that same task, right after the
         // resync pass, so a resync this host just pushed is fast-forwarded to
         // in the same pass and the two never run at once.
-        let then = || checkout_ff::after_resync(&inputs, &enforcer, &gate, &bus);
-        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, then());
+        let then = || checkout_ff::after_resync(&inputs, &gate, &bus);
+        let (step, after) = then();
+        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
         loop {
             tokio::time::sleep(inputs.interval).await;
             let owned = inputs.clone();
@@ -1385,7 +1400,8 @@ fn spawn_timer(
                     // pass just placed is already in the drain flag. Not
                     // awaited: see `workspace_resync::host`.
                     workspace_resync::mark_verified();
-                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, then());
+                    let (step, after) = then();
+                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

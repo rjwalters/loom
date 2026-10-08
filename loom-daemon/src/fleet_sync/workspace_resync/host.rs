@@ -212,17 +212,31 @@ impl HostGateInputs {
     #[must_use]
     pub fn live(enforcer: &dyn Enforcer) -> Self {
         let (draining, roll_pending) = enforcer.drain_facts();
+        let floor = crate::fleet_sync::loom_min_version();
+        Self::read(draining, roll_pending, floor.as_deref(), VERIFIED.load(Ordering::Relaxed))
+    }
+
+    /// The signals as the startup pass can know them (#10869), before the
+    /// drain state exists: `paused` is what that pass enforces, no roll can
+    /// be retained by a process that has just started, and `floor` is the
+    /// floor that pass just read. `verified` is set: this pass is the one
+    /// that verifies, so [`NotCurrent::Unverified`] is the one reason a
+    /// fresh daemon is exempt from.
+    #[must_use]
+    pub fn at_boot(paused: bool, floor: Option<&str>) -> Self {
+        Self::read(paused, false, floor, true)
+    }
+
+    fn read(draining: bool, roll_pending: bool, floor: Option<&str>, verified: bool) -> Self {
         let update = crate::auto_update::global_status_snapshot();
         let running = Version::parse(env!("CARGO_PKG_VERSION"));
-        let floor = crate::fleet_sync::loom_min_version()
-            .as_deref()
-            .and_then(Version::parse);
+        let floor = floor.and_then(Version::parse);
         // Read without asking the forge: `run_live` does the asking, once.
         let provenance = crate::release_provenance::current();
         Self {
             release_build: !provenance.refuted(),
             release_verified: Stamp::this_binary().is_some_and(|s| s.release_build),
-            verified: VERIFIED.load(Ordering::Relaxed),
+            verified,
             draining,
             roll_pending,
             // An unreadable identity at boot proves nothing either way.
@@ -424,7 +438,7 @@ fn publish_stuck(bus: Option<&EventBus>, ticks: u32, detail: String) {
 
 /// How a supervised pass ended.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Ended<T> {
+pub(in crate::fleet_sync) enum Ended<T> {
     /// It returned.
     Done(T),
     /// It panicked.
@@ -456,65 +470,87 @@ pub(super) async fn supervise<T: Send + 'static>(
 /// applied. Returns `false`, and starts nothing, while the previous pass is
 /// still running.
 ///
-/// `then` runs on the pass's own blocking thread once the pass has finished,
-/// inside [`supervise`]: the checkout fast-forward (#10869), which must follow
-/// any push this pass made, must never overlap the next pass, and is covered
-/// by the same single flight, stuck-pass watchdog and abandonment as the pass.
-/// It is handed the instant the pass began, so it can keep to
-/// [`PASS_DEADLINE`]. A panic in it is logged and does not lose the pass.
-pub(in crate::fleet_sync) fn spawn_pass(
+/// `then` is the checkout fast-forward (#10869). See [`spawn_with`] for how
+/// it runs. `publish` gets what it returned, after the pass's own result has
+/// been stored and published, so no snapshot shows the new checkout step
+/// beside the previous workspace pass.
+pub(in crate::fleet_sync) fn spawn_pass<T: Send + 'static>(
     inputs: &PassInputs,
     mode: Mode,
     enforcer: &Option<Arc<dyn Enforcer>>,
     bus: &Option<Arc<EventBus>>,
-    then: impl FnOnce(Instant) + Send + 'static,
+    then: impl FnOnce(Instant, &WorkspacePass) -> T + Send + 'static,
+    publish: impl FnOnce(T) + Send + 'static,
 ) -> bool {
-    let Some(flight) = begin(&IN_FLIGHT) else {
-        let (ticks, alert) = note_refused(&REFUSED);
-        if alert {
+    let (owned, enforcer, pass_bus, stuck_bus) =
+        (inputs.clone(), enforcer.clone(), bus.clone(), bus.clone());
+    let pass = move || run_live(&owned, mode, enforcer.as_deref(), pass_bus.as_deref());
+    let finish = move |ended: Ended<(WorkspacePass, Option<T>)>| match ended {
+        Ended::Done((found, after)) => {
+            if let Ok(mut latest) = latest_cell().lock() {
+                latest.clone_from(&found);
+            }
+            crate::fleet_sync::publish_workspaces(&found);
+            if let Some(after) = after {
+                publish(after);
+            }
+        }
+        Ended::Panicked(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
+        Ended::Abandoned => {
             let detail = format!(
-                "a workspace pass is still running {ticks} ticks after it started; no pass has \
-                 started since, and the workspace states shown are from before it"
+                "a workspace pass did not end within {}s and is no longer waited for; passes \
+                 resume when it ends",
+                ABANDON_AFTER.as_secs()
             );
-            publish_stuck(bus.as_deref(), ticks, detail);
-        } else {
-            log::info!(
-                "fleet_sync: the previous workspace pass is still running; none is started this \
-                 tick ({ticks} in a row)"
-            );
+            publish_stuck(stuck_bus.as_deref(), STUCK_AFTER_TICKS, detail);
         }
-        return false;
     };
-    REFUSED.store(0, Ordering::Release);
-    let (owned, enforcer, bus) = (inputs.clone(), enforcer.clone(), bus.clone());
-    tokio::spawn(async move {
-        let stuck_bus = bus.clone();
-        let work = move || {
-            let began = Instant::now();
-            let found = run_live(&owned, mode, enforcer.as_deref(), bus.as_deref());
-            let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| then(began)));
-            if after.is_err() {
-                log::warn!("fleet_sync: the step after a workspace pass panicked");
-            }
-            found
-        };
-        match supervise(flight, ABANDON_AFTER, work).await {
-            Ended::Done(found) => {
-                if let Ok(mut latest) = latest_cell().lock() {
-                    latest.clone_from(&found);
-                }
-                crate::fleet_sync::publish_workspaces(&found);
-            }
-            Ended::Panicked(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
-            Ended::Abandoned => {
-                let detail = format!(
-                    "a workspace pass did not end within {}s and is no longer waited for; passes \
-                     resume when it ends",
-                    ABANDON_AFTER.as_secs()
-                );
-                publish_stuck(stuck_bus.as_deref(), STUCK_AFTER_TICKS, detail);
-            }
+    if spawn_with(&IN_FLIGHT, ABANDON_AFTER, pass, then, finish).is_some() {
+        REFUSED.store(0, Ordering::Release);
+        return true;
+    }
+    let (ticks, alert) = note_refused(&REFUSED);
+    if alert {
+        let detail = format!(
+            "a workspace pass is still running {ticks} ticks after it started; no pass has \
+             started since, and the workspace states shown are from before it"
+        );
+        publish_stuck(bus.as_deref(), ticks, detail);
+    } else {
+        log::info!(
+            "fleet_sync: the previous workspace pass is still running; none is started this \
+             tick ({ticks} in a row)"
+        );
+    }
+    false
+}
+
+/// The body of [`spawn_pass`], with the slot, the pass and its ending
+/// injected. `None`, and nothing is run, while `slot` is taken: `then` is
+/// dropped with the refused tick, so it never overlaps a running pass.
+///
+/// Otherwise `pass` and then `then` run on one blocking thread, inside
+/// [`supervise`], so the single flight, the stuck-pass watchdog and
+/// abandonment cover both. `then` is handed the instant the pass began (so it
+/// can keep to [`PASS_DEADLINE`]) and what the pass found (so it takes the
+/// pass's own network decision). A panic in `then` is logged and costs only
+/// its own result: `finish` still gets the pass's.
+pub(in crate::fleet_sync) fn spawn_with<T: Send + 'static>(
+    slot: &'static AtomicBool,
+    deadline: Duration,
+    pass: impl FnOnce() -> WorkspacePass + Send + 'static,
+    then: impl FnOnce(Instant, &WorkspacePass) -> T + Send + 'static,
+    finish: impl FnOnce(Ended<(WorkspacePass, Option<T>)>) + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let flight = begin(slot)?;
+    let work = move || {
+        let began = Instant::now();
+        let found = pass();
+        let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| then(began, &found)));
+        if after.is_err() {
+            log::warn!("fleet_sync: the step after a workspace pass panicked");
         }
-    });
-    true
+        (found, after.ok())
+    };
+    Some(tokio::spawn(async move { finish(supervise(flight, deadline, work).await) }))
 }

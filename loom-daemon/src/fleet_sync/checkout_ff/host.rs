@@ -5,14 +5,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
 use super::{CheckoutPass, Env, Memory, Transition, PASS_BUDGET, STARTUP_BUDGET, TOPIC};
 use crate::event_bus::EventBus;
-use crate::fleet_state::{Enforcement, Enforcer};
+use crate::fleet_state::Enforcement;
+use crate::fleet_sync::workspace_resync::{host_gate, HostGateInputs, WorkspacePass};
 use crate::fleet_sync::{FleetSyncStatus, PassInputs};
 
 /// "Is a main-health gate run building in this root right now?" In production,
@@ -155,33 +156,51 @@ fn memory() -> &'static Mutex<Memory> {
     MEMORY.get_or_init(|| Mutex::new(Memory::default()))
 }
 
-/// One checkout pass over the registered workspaces. Blocking (git children),
-/// so it runs on a blocking thread.
-/// `since` is when the workspace pass this follows began: a head it heard
-/// after that is trusted. `None` at startup, before any workspace pass.
-fn run_live(
-    inputs: &PassInputs,
+/// What a live pass may do, and for how long.
+struct Live<'a> {
+    /// `fleet.autoApply`.
+    write: bool,
+    /// May it use the network at all?
     network: bool,
+    /// Roots the workspace resync is backing off: not asked.
+    backing_off: &'a [PathBuf],
     budget: Duration,
-    gate: Option<&GateProbe>,
+    gate: Option<&'a GateProbe>,
+    /// When the workspace pass this follows began: a head it heard after
+    /// that is trusted. `None` at startup, before any workspace pass.
     since: Option<DateTime<Utc>>,
-) -> CheckoutPass {
+}
+
+/// One checkout pass over `roots` with the daemon's real git, hold, breaker
+/// and clock. Blocking (git children), so it runs on a blocking thread.
+fn run_live(live: &Live<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPass {
     let started = Instant::now();
     let env = Env {
-        write: inputs.auto_apply,
-        gate_in_flight: &|root| gate.is_some_and(|probe| probe(root)),
+        write: live.write,
+        gate_in_flight: &|root| live.gate.is_some_and(|probe| probe(root)),
         hold: &hold_for_move,
-        network,
-        confirmed: &|root, branch| since.and_then(|since| heard(root, branch, since)),
+        network: live.network,
+        backing_off: &|root| live.backing_off.iter().any(|r| r == root),
+        confirmed: &|root, branch| live.since.and_then(|since| heard(root, branch, since)),
         breaker_open: &|| crate::rate_limit_breaker::global_skip_pass(CALLER),
-        budget: Some(budget),
+        budget: Some(live.budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
     };
-    // One pass at a time: a startup pass that outlived its cap may still be
-    // running when the timer's first pass begins.
-    let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
-    super::run(&env, &crate::fleet_sync::workspace_resync::registered_roots(), &mut guard)
+    super::run(&env, roots, memory)
+}
+
+/// May the startup pass's checkout half use the network? Only on a host the
+/// workspace resync would itself let use it (#10869): `fleet.autoApply` on
+/// and [`host_gate`] passing on what is knowable at boot
+/// ([`HostGateInputs::at_boot`]: a fresh daemon is exempt from
+/// [`NotCurrent::Unverified`] alone, since this is the pass that verifies).
+/// No outage hold exists yet in a process that has just started.
+///
+/// [`NotCurrent::Unverified`]: crate::fleet_sync::workspace_resync::NotCurrent::Unverified
+#[must_use]
+pub(in crate::fleet_sync) fn online_at_boot(auto_apply: bool, gate: &HostGateInputs) -> bool {
+    auto_apply && host_gate(gate).is_ok()
 }
 
 /// The checkout half of the **startup pass**: runs on the startup pass's own
@@ -190,8 +209,11 @@ fn run_live(
 /// be in flight yet: the gate task is spawned later in boot.
 ///
 /// A host whose desired state is `stopped` is about to exit, and is left
-/// alone. A `paused` host, like one with `fleet.autoApply` off, asks no
-/// remote: it compares with `origin/<default>` as the clone has it.
+/// alone. One that may not use the network ([`online_at_boot`]) compares with
+/// `origin/<default>` as the clone has it.
+///
+/// It waits for the pass memory: nothing can hold it this early but an
+/// earlier startup pass, and that is bounded by its own budget.
 pub(in crate::fleet_sync) fn startup(
     inputs: &PassInputs,
     status: &mut FleetSyncStatus,
@@ -199,8 +221,19 @@ pub(in crate::fleet_sync) fn startup(
     if status.enforced == Enforcement::Stop {
         return Vec::new();
     }
-    let network = inputs.auto_apply && status.enforced == Enforcement::Proceed;
-    let pass = run_live(inputs, network, STARTUP_BUDGET, None, None);
+    let paused = status.enforced != Enforcement::Proceed;
+    let gate = HostGateInputs::at_boot(paused, status.floor.floor.as_deref());
+    let live = Live {
+        write: inputs.auto_apply,
+        network: online_at_boot(inputs.auto_apply, &gate),
+        backing_off: &[],
+        budget: STARTUP_BUDGET,
+        gate: None,
+        since: None,
+    };
+    let roots = crate::fleet_sync::workspace_resync::registered_roots();
+    let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
+    let pass = run_live(&live, &roots, &mut guard);
     status.checkouts = pass.checkouts;
     pass.transitions
 }
@@ -216,38 +249,99 @@ pub(in crate::fleet_sync) fn announce(transitions: &[Transition], bus: Option<&E
     }
 }
 
-/// The checkout half on the timer, as the step that follows a workspace pass
-/// (`workspace_resync::spawn_pass`'s `then`). It runs on that pass's own
-/// blocking thread, inside the same supervised closure, so:
+/// What the timer's checkout step found, for [`publish`] once the workspace
+/// pass it followed has been stored.
+#[derive(Debug)]
+pub(in crate::fleet_sync) enum Stepped {
+    /// The step ran.
+    Ran(CheckoutPass),
+    /// An earlier step that never ended still holds the pass memory: nothing
+    /// was checked this tick.
+    Busy,
+}
+
+/// The status line for a tick whose step found the memory taken.
+pub const BUSY_NOTE: &str = "an earlier checkout step has not ended; nothing was checked this tick";
+
+/// The checkout step on the timer, after the workspace pass `resync` that
+/// began at `began`, over the registered `roots`.
+///
+/// - **Its network decision is that pass's own** ([`WorkspacePass::online`]),
+///   never re-derived here, so the two halves cannot disagree: a host the
+///   resync keeps off the network (not in H0, an outage hold, autoApply off,
+///   paused) costs no `ls-remote` and no fetch here either. Roots the pass is
+///   backing off ([`WorkspacePass::backing_off`]) are not asked.
+/// - **It never waits for the pass memory.** A step abandoned inside a git
+///   child still holds it; waiting would park this thread too, so the
+///   workspace pass it follows would never end and its result would be lost.
+///   The step is skipped for the tick instead ([`Stepped::Busy`]), as the
+///   resync half does.
+/// - It keeps to what is left of the pass's
+///   [`crate::fleet_sync::workspace_resync::PASS_DEADLINE`] and to
+///   [`PASS_BUDGET`], and trusts the heads the pass learned.
+pub(in crate::fleet_sync) fn timer_step(
+    memory: &Mutex<Memory>,
+    roots: &dyn Fn() -> Vec<PathBuf>,
+    write: bool,
+    resync: &WorkspacePass,
+    began: Instant,
+    gate: Option<&GateProbe>,
+) -> Stepped {
+    let mut guard = match memory.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            log::warn!("checkout_ff: {BUSY_NOTE}");
+            return Stepped::Busy;
+        }
+    };
+    let spent = began.elapsed();
+    let left = crate::fleet_sync::workspace_resync::PASS_DEADLINE.saturating_sub(spent);
+    let live = Live {
+        write,
+        network: resync.online,
+        backing_off: &resync.backing_off,
+        budget: PASS_BUDGET.min(left),
+        gate,
+        since: Some(Utc::now() - chrono::Duration::from_std(spent).unwrap_or_default()),
+    };
+    Stepped::Ran(run_live(&live, &roots(), &mut guard))
+}
+
+/// The two halves of the checkout step on the timer, for
+/// `workspace_resync::spawn_pass`: the step itself ([`timer_step`]), run on
+/// the workspace pass's own blocking thread inside the same supervised
+/// closure, and what publishes its result once the workspace pass's own has
+/// been stored. So:
 ///
 /// - the fleet-sync timer never waits for it;
 /// - the single flight, the stuck-pass watchdog and abandonment cover it;
-/// - it keeps to what is left of the pass's
-///   [`crate::fleet_sync::workspace_resync::PASS_DEADLINE`], and to
-///   [`PASS_BUDGET`];
-/// - it follows any resync the pass pushed, and trusts the heads the pass
-///   learned, so a repo the pass covered costs no network here;
+/// - it follows any resync the pass pushed;
 /// - it never overlaps the next workspace pass.
-///
-/// It asks no remote when `fleet.autoApply` is off or dispatch is paused (a
-/// drain, a roll's pause or a fleet hold), and none without an enforcer to
-/// read that from.
 pub(in crate::fleet_sync) fn after_resync(
     inputs: &PassInputs,
-    enforcer: &Option<Arc<dyn Enforcer>>,
     gate: &Option<GateProbe>,
     bus: &Option<Arc<EventBus>>,
-) -> impl FnOnce(Instant) + Send + 'static {
-    let (inputs, enforcer, gate, bus) =
-        (inputs.clone(), enforcer.clone(), gate.clone(), bus.clone());
-    move |began: Instant| {
-        let paused = enforcer.as_deref().is_none_or(|e| e.drain_facts().0);
-        let network = inputs.auto_apply && !paused;
-        let spent = began.elapsed();
-        let left = crate::fleet_sync::workspace_resync::PASS_DEADLINE.saturating_sub(spent);
-        let since = Utc::now() - chrono::Duration::from_std(spent).unwrap_or_default();
-        let found = run_live(&inputs, network, PASS_BUDGET.min(left), gate.as_ref(), Some(since));
-        announce(&found.transitions, bus.as_deref());
-        crate::fleet_sync::publish_checkouts(&found.checkouts);
+) -> (
+    impl FnOnce(Instant, &WorkspacePass) -> Stepped + Send + 'static,
+    impl FnOnce(Stepped) + Send + 'static,
+) {
+    let (write, gate, bus) = (inputs.auto_apply, gate.clone(), bus.clone());
+    let step = move |began: Instant, resync: &WorkspacePass| {
+        let roots = crate::fleet_sync::workspace_resync::registered_roots;
+        timer_step(memory(), &roots, write, resync, began, gate.as_ref())
+    };
+    (step, move |stepped| publish(stepped, bus.as_deref()))
+}
+
+/// Put a step's result on the snapshot and the event bus. A busy tick keeps
+/// the last pass's reports and says why they are not new.
+fn publish(stepped: Stepped, bus: Option<&EventBus>) {
+    match stepped {
+        Stepped::Ran(found) => {
+            crate::fleet_sync::publish_checkouts(Some(&found.checkouts), None);
+            announce(&found.transitions, bus);
+        }
+        Stepped::Busy => crate::fleet_sync::publish_checkouts(None, Some(BUSY_NOTE)),
     }
 }

@@ -1906,9 +1906,12 @@ each registered workspace's main checkout to its default branch.
   past it.
 - **Writes need `fleet.autoApply`.** With it off, nothing is modified and a
   clean checkout that is behind is reported as `behind`, with the count.
-- **Any build may fast-forward.** Unlike the resync, which pushes to the repo
-  and so requires an official release build, this is a write to the host's own
-  clean checkout and is not tied to the binary's provenance.
+- **The local merge is not tied to provenance; the network is.** The merge is
+  a write to the host's own clean checkout, so any build with
+  `fleet.autoApply` on may fast-forward to the `origin/<default>` its clone
+  already has. Asking a remote or fetching is another matter: this step does
+  that only on a host the workspace resync would itself use the network on
+  (see below), so a build that is not an official release asks nothing.
 - **One git write.** `git merge --ff-only origin/<default>`, with hooks
   disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
   `submodule.recurse` and the silent overwrite of ignored files turned off.
@@ -1917,24 +1920,47 @@ each registered workspace's main checkout to its default branch.
 
 What a pass costs on the network:
 
-- **None at all** with `fleet.autoApply` off or with dispatch paused (a drain,
-  a roll's pause or a fleet hold). The checkout is compared with the clone's
-  own `origin/<default>` as it stands, so the reported count is as of the last
-  fetch anything made in that clone.
+- **None at all on a host the workspace resync keeps off the network**: no
+  `ls-remote` and no fetch. The checkout is compared with the clone's own
+  `origin/<default>` as it stands, so the reported count is as of the last
+  fetch anything made in that clone. That is a host:
+  - with `fleet.autoApply` off;
+  - with dispatch paused (a drain, a roll's pause or a fleet hold);
+  - running a build that is not an official release, or whose release tag is
+    not verified yet;
+  - with a roll pending, or a different binary staged on disk;
+  - running a version below the fleet floor (`loom_min_version`);
+  - whose self-update is backing off or has given up;
+  - in an outage hold (no remote answered in a recent pass).
+
+  On the timer the step does not work this out for itself: it takes the
+  workspace pass's own decision, so the two halves cannot disagree. At startup
+  it applies the same host gate to what is knowable at boot; a fresh daemon is
+  exempt only from "startup pass not complete", since that pass is the one
+  that verifies.
+- **None for a repo the resync is backing off** because its remote did not
+  answer or refused, until that backoff ends.
 - **None for a repo the workspace resync asked about in the same pass.** That
   pass already learned the head (one batched query per owner) and fetched it
   if it moved; this step trusts it, and fetches only if the clone's
   `origin/<default>` is somehow not that head.
 - **One `git ls-remote` per pass for any other root**: the Loom source repo
   and a non-GitHub origin (which the resync skips), a repo the resync did not
-  reach or is backing off, and every root at startup. Then a `git fetch` only
+  reach, and every root at startup. Then a `git fetch` only
   when the head moved, with `--no-write-fetch-head`. The rate-limit breaker is
   read immediately before each `ls-remote`; while it is open nothing more is
   asked and the checkout is compared with the clone as it stands.
 - Three remotes in a row that do not answer end the pass's network use.
 
-So any commit on the default branch reaches every clean checkout on the next
-tick, and the host that pushed a resync fast-forwards to it in the same pass.
+So on a host that may use the network, any commit on the default branch
+reaches every clean checkout on the next tick, and the host that pushed a
+resync fast-forwards to it in the same pass.
+
+The step never waits for its own state: if an earlier step that never ended
+(for example one stuck in a git child) still holds it, the tick's step is
+skipped, the workspace pass it follows still records its result, and the
+`Fleet store:` block says `checkouts: an earlier checkout step has not ended;
+nothing was checked this tick`.
 
 For each workspace the first rule that matches ends the attempt:
 
@@ -1964,7 +1990,10 @@ For each workspace the first rule that matches ends the attempt:
   `.loom/install-metadata.json`). That sync is unchanged, and it runs only for
   a repo with a build gate when a gate run is due. This step discards nothing,
   so any tracked change is `dirty`. The two compose: after a fast-forward the
-  gate's reset is a no-op. A checkout left dirty by the retired shell resync
+  gate's reset is a no-op. They are not mutually excluded: this step checks
+  for a gate run before an attempt and again right before the merge, which
+  narrows the race but does not close it. Both writers are the daemon's own and
+  both only bring the checkout to `origin/<default>`, so a race converges. A checkout left dirty by the retired shell resync
   shows up once and needs a one-time clean-up.
 - **Not the fleet-refresh task.** `eta-fleet-refresh` (#10263) refreshes ETA
   snapshots through the forge API on the fleet captain. It runs no git command
@@ -1995,8 +2024,13 @@ against now advances on its own:
   as terminal, so the daemon holds the checkout for the whole run of the
   script: this step skips it (`self-update-in-flight`), and an update that
   starts during an attempt waits for that one attempt. A `loom-daemon-update.sh`
-  run by hand is outside the daemon and is not covered: if a fast-forward lands
-  during its build, its verification fails loudly and it is run again.
+  run by hand is outside the daemon and is not covered. A fast-forward that
+  lands before its build stamps the commit fails its verification (exit 4),
+  and it is run again. There is a narrow window after the stamp, while the
+  compiler is still reading sources, in which a fast-forward gives a binary
+  stamped with the old commit but built partly from new sources, and the
+  verification passes. It needs a new commit on the default branch to land in
+  that window, after the script's own fast-forward.
 
 Reporting:
 

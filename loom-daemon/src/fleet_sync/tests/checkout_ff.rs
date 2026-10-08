@@ -191,6 +191,7 @@ struct Knobs {
     gate: Box<dyn Fn(&Path) -> bool>,
     updating: bool,
     network: bool,
+    backing_off: Vec<PathBuf>,
     confirmed: Option<String>,
     breaker: Rc<Cell<bool>>,
     budget: Option<Duration>,
@@ -204,6 +205,7 @@ impl Default for Knobs {
             gate: Box::new(|_| false),
             updating: false,
             network: true,
+            backing_off: Vec::new(),
             confirmed: None,
             breaker: Rc::new(Cell::new(false)),
             budget: None,
@@ -218,6 +220,7 @@ fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutP
         gate_in_flight: &*knobs.gate,
         hold: &|_| (!knobs.updating).then(MoveHold::free),
         network: knobs.network,
+        backing_off: &|root| knobs.backing_off.iter().any(|r| r == root),
         confirmed: &|_, _| knobs.confirmed.clone(),
         breaker_open: &|| knobs.breaker.get(),
         budget: knobs.budget,
@@ -1085,3 +1088,6 @@ fn a_refused_merge_is_read_as_a_file_in_the_way_or_as_a_failure() {
     let other = "fatal: Not possible to fast-forward, aborting.";
     assert!(matches!(classify_refusal(other), Refusal::Other(e) if e.contains("fast-forward")));
 }
+
+#[path = "checkout_ff_offline.rs"]
+mod offline;

@@ -117,6 +117,9 @@ use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS
 use heads::{Asked, HeadAsk, Heads};
 pub use host::{host_gate, HostGateInputs, NotCurrent, ABANDON_AFTER, STUCK_AFTER_TICKS};
 pub(super) use host::{latest, mark_boot, mark_verified, registered_roots, spawn_pass};
+/// The hand-off to the checkout step, for its tests (#10869).
+#[cfg(test)]
+pub(super) use host::{spawn_with, Ended};
 use memory::FailureKind;
 pub use memory::{Memory, OUTAGE_HOLD_CAP};
 use w2::attempt;
@@ -258,6 +261,17 @@ pub struct WorkspacePass {
     /// snapshot.
     #[serde(skip)]
     pub fetches: u32,
+    /// This pass's own decision to use the network: `fleet.autoApply` on, the
+    /// host in H0 ([`host_gate`], so also not paused) and no outage hold. The
+    /// checkout step that follows it (#10869) takes this as its own, so the
+    /// two halves never disagree. Not part of the snapshot.
+    #[serde(skip)]
+    pub online: bool,
+    /// Roots whose remote did not answer, or refused, and that this host is
+    /// backing off: nothing on this host asks them again before the backoff
+    /// ends. Not part of the snapshot.
+    #[serde(skip)]
+    pub backing_off: Vec<PathBuf>,
 }
 
 impl WorkspacePass {
@@ -430,8 +444,10 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     // The network is for a host that may write. One that may not (autoApply
     // off, paused, rolling, not a release build) reports from what its clones
     // already hold and asks nobody.
+    let online = mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none();
+    pass.online = online;
     let mut scan = Scan {
-        online: mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none(),
+        online,
         ..Scan::default()
     };
     let count = roots.len();
@@ -559,6 +575,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     pass.probes = scan.probes;
     pass.fetches = scan.fetches;
     pass.alerts = scan.alerts;
+    pass.backing_off = memory.remotes_backed_off(roots, (env.clock)());
     pass
 }
 

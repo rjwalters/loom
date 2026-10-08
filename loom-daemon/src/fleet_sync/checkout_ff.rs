@@ -38,18 +38,36 @@
 //! Every pass, on every tick, makes sure `origin/<default>` is the remote's
 //! head before it compares, and it asks the network as little as it can:
 //!
-//! * A host with `fleet.autoApply` off, or with dispatch paused, makes **no
-//!   network call at all**. It compares the checkout with the clone's own
-//!   `origin/<default>` ref as it stands.
+//! * A host the workspace resync keeps off the network makes **no network
+//!   call at all** here either: no `ls-remote`, no fetch. It compares the
+//!   checkout with the clone's own `origin/<default>` ref as it stands, and
+//!   may still fast-forward to it with `fleet.autoApply` on. That is a host
+//!   with `fleet.autoApply` off; one that is paused (a drain, a roll's pause
+//!   or a fleet hold); one not in H0 for any other reason (not an official
+//!   release build or not yet verified as one, a roll pending, a different
+//!   binary staged, below the fleet floor, its self-update stalled); and one
+//!   in an outage hold.
+//!
+//!   On the timer the step does not decide this itself. It takes the
+//!   workspace pass's own decision
+//!   ([`WorkspacePass::online`](super::workspace_resync::WorkspacePass::online)),
+//!   so the two halves cannot disagree. At startup it applies the same
+//!   [`host_gate`](super::workspace_resync::host_gate) to what is knowable at
+//!   boot; a fresh daemon is exempt only from `Unverified`, since the startup
+//!   pass is the one that verifies.
+//! * A repo the resync is backing off because its remote did not answer or
+//!   refused
+//!   ([`WorkspacePass::backing_off`](super::workspace_resync::WorkspacePass::backing_off))
+//!   is not asked here either.
 //! * A repo the workspace resync asked about in this same pass costs
 //!   **nothing**: that pass already learned the head (one batched query per
 //!   owner) and fetched it if it moved, and recorded it
 //!   ([`note_remote_head`]). This step trusts it. Only if the clone's
 //!   `origin/<default>` is somehow not that head does it fetch.
 //! * Any other root (the Loom source repo and a non-GitHub origin, which the
-//!   resync skips; one the resync did not reach or is backing off; every
-//!   root at startup, before any resync pass) gets one `git ls-remote` per
-//!   pass, and a `git fetch` only when the head moved. The rate-limit breaker
+//!   resync skips; one the resync did not reach; every root at startup,
+//!   before any resync pass) gets one `git ls-remote` per pass, and a `git
+//!   fetch` only when the head moved. The rate-limit breaker
 //!   is read immediately before each such `ls-remote`, never once up front,
 //!   and while it is open nothing more is asked (#11003).
 //! * A pass stops starting workspaces at its budget ([`STARTUP_BUDGET`],
@@ -58,8 +76,10 @@
 //!   remotes in a row that do not answer end the pass's network use. Every
 //!   git child has a timeout.
 //!
-//! So any commit on the default branch reaches a clean checkout on the next
-//! tick, and a resync this host pushed in the same pass.
+//! So on a host that may use the network, any commit on the default branch
+//! reaches a clean checkout on the next tick, and a resync this host pushed in
+//! the same pass. On one that may not, a checkout reaches what its clone
+//! already has.
 //!
 //! # What it never does
 //!
@@ -112,8 +132,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use host::hold_for_self_update;
+pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 pub use host::{hold_for_move, GateProbe, MoveHold};
+#[cfg(test)]
+pub(in crate::fleet_sync) use host::{online_at_boot, timer_step, Stepped};
 
 /// Event-bus topic a checkout state transition is published on.
 pub const TOPIC: &str = "fleet_sync.checkout";
@@ -453,9 +476,14 @@ pub struct Env<'a> {
     /// Take the hold that keeps a self-update from starting in this root
     /// while it is moved. `None`: one is already running there.
     pub hold: &'a dyn Fn(&Path) -> Option<MoveHold>,
-    /// May this pass use the network at all? Not with `fleet.autoApply` off,
-    /// and not on a paused host.
+    /// May this pass use the network at all? Only on a host the workspace
+    /// resync would itself use it on: `fleet.autoApply` on, in H0 (so not
+    /// paused, a release build, not rolling, not below the floor, its
+    /// self-update not stalled) and in no outage hold.
     pub network: bool,
+    /// Is the workspace resync backing this root off because its remote did
+    /// not answer or refused? Then it is not asked here either.
+    pub backing_off: &'a dyn Fn(&Path) -> bool,
     /// The head the workspace resync learned for this root and branch in this
     /// same pass, if it asked.
     pub confirmed: &'a dyn Fn(&Path, &str) -> Option<String>,
@@ -590,7 +618,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
 /// workspace resync learned in this pass is trusted; otherwise the remote is
 /// asked once. Fetches only when the head moved.
 fn refresh(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) -> Result<(), String> {
-    if !env.network {
+    if !env.network || (env.backing_off)(root) {
         return Ok(());
     }
     let head = match (env.confirmed)(root, branch) {
