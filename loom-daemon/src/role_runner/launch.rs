@@ -24,7 +24,16 @@ mod observability_tests;
 /// Claude Code's `-p` sessions read) exactly as the sweep path's
 /// `observability::tracing::prepare_child` does, and removed when the tick has
 /// none, so an ambient daemon value can never parent this session.
-pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path, role: &str) {
+///
+/// Last — opt-in, default-off (#10964) — the session's own OTLP export is
+/// pointed at this daemon's loopback relay. The returned lease is that
+/// session's relay access: the caller holds it until the child has exited.
+pub(super) fn apply_role_observability(
+    cmd: &mut Command,
+    workspace_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
     let execution = crate::observability::lifecycle::role_command(cmd);
     let context = cmd
@@ -41,6 +50,13 @@ pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path,
         role,
         execution.as_deref(),
     );
+    crate::observability::agent_relay::prepare_role_child(
+        cmd,
+        workspace_root,
+        runtime,
+        role,
+        execution.as_deref(),
+    )
 }
 
 // #10640: why a launched tick failed, for its `loom.role_attempt` span.
@@ -246,7 +262,14 @@ pub(super) fn run_role_with_timeout(
         cmd.process_group(0);
     }
 
-    apply_role_observability(&mut cmd, workspace_root, role);
+    // Held to the end of this (blocking) launch: dropping it ends the
+    // session's relay access (#10964).
+    let _relay_lease = apply_role_observability(
+        &mut cmd,
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
     // #10830: a role run is paused and resumed like a sweep (design Q7), so it
     // gets the same pause-and-roll identity. Role runs have no claim lock; the
     // item id is synthetic (`role-<role>-<time>-<rand>`).

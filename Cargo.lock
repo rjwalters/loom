@@ -1288,6 +1288,7 @@ dependencies = [
  "libc",
  "log",
  "opentelemetry-proto",
+ "prost",
  "regex",
  "reqwest",
  "rusqlite",

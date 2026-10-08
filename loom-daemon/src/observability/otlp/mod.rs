@@ -63,6 +63,7 @@
 //! and every attribute above).
 
 mod mapping;
+pub mod relay;
 mod traces;
 mod transport;
 
