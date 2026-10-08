@@ -129,6 +129,22 @@ token count does, and SF7 already reconciles the whole row. A new *rollup* — a
 second pipeline keyed differently — would have needed its own CT8 analogue; an
 extra column on this one does not.
 
+**But an added column has to reach the installed table (#9507).** The rollup's
+`CREATE TABLE IF NOT EXISTS` is a no-op on a database that ran an earlier
+version of it, and `sweep_facts` is durable — it holds facts whose `records`
+rows D1 has already evicted — so it is upgraded in place, never dropped and
+rebuilt. SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+[`sweep-facts-migrate.sql`](sweep-facts-migrate.sql) is one read-only `SELECT`
+that prints exactly the `ALTER TABLE sweep_facts ADD COLUMN …` statements still
+missing (none on an up-to-date or not-yet-created table). That makes the upgrade
+re-runnable, even from a half-applied state. Run it before the rollup on any
+existing database (the exact `wrangler` + `jq` recipe is in the file's header),
+apply what it prints, then run `sweep-facts-rollup.sql` and `issue-effort.sql`.
+Historical rows keep every stored value and read `NULL` in the new columns (not
+measured, never `0`). `issue-effort.sql` drops and recreates its view, so a
+re-install always replaces an older definition. Adding a rollup column means
+adding its row to the migration's list too; a CI test fails if the two disagree.
+
 ## Verification status
 
 | Artifact | Status |
@@ -136,6 +152,6 @@ extra column on this one does not.
 | `sweep-facts-rollup.sql`, `issue-effort.sql`, `landed-size.sql`, `sweep-facts-queries.sql` | **Contract-checked** in CI (`loom-daemon/tests/sweep_facts_artifacts.rs`): column lists, question set, window binding and the reconciliation seam are asserted statically. `landed-size.sql` is additionally **fixture-executed** in CI (`loom-daemon/tests/landed_size_sqlite.rs`, #9934): the view runs verbatim on bundled SQLite (with D1's `ln`/`exp` registered by the harness) against a known `sweep_facts` fixture. D1 execution itself is operator-side — the one-time backfill run before more history is evicted is tracked in the operator-side D1 backfill (see #9446's backfill note); the landed-size fit has since shipped (`v1-2026-10-02`, #9934), so the first live rollup run pastes the fitted constants in by re-running this file as committed. |
 | `landed-size.sql` parameters | **Fitted: `v1-2026-10-02` (#9934).** The component means/SDs and per-model token factors were fit by `fit-landed-size.mjs` (beside the SQL) on the baseline window [2026-09-29, 2026-10-02) — the #9466 component emitters' first four days: 379 landings, 111 with hw_* components, 374 with a clean token reading. The window is young and the mixture uneven (111 three-component landings against ~263 token-only ones), so the refit is part of the artifact: rerun the script over a longer window once hw_* coverage matures, paste its `params` block, bump `params_version`. The tokens component scores only clean verdicts (`measured`, or the absent verdict of legacy rows — #9440/#9454). The measured point values are the experiment's bucket ratios (#9466), marked provisional until #9434's calibration collapses them into one point value per class. |
 | `sweep_facts.story_points` + SF8 | **Contract-checked** in CI alongside SF1–SF7, and **exercised locally** against SQLite over synthetic `records` (#9433): the rollup ingests the column, SF8 excludes non-landed sweeps, reports the `NULL` population as `points_missing`, sums only measured point values, and a triple rollup re-run leaves 7 fact rows with SF7 `unexplained_drops = 0` while a corrected payload updates the column in place. `story_points` is `NULL` in bulk on records written before #9432's emitter landed — that is the absent-vs-zero contract holding, not a gap in the rollup. Not yet executed against live D1. |
-| `issue-effort.sql` seconds partition (#9507) | **Fixture-executed** in CI (`loom-daemon/tests/issue_effort_sqlite.rs`): the committed `sweep-facts-rollup.sql` and `issue-effort.sql` run verbatim on bundled SQLite over synthetic `records`, asserting the partition identity, the clamp + `overaccounted_sec`, open events, the unattributed triggers, absent-vs-`[]`, and SF1's coverage row (including an empty window). The ClickHouse extractions' new `rework_*_sec`/`rework_*_open` columns are only **parity-checked by name** — no in-repo test executes ClickHouse SQL. |
+| `issue-effort.sql` seconds partition (#9507) | **Fixture-executed** in CI (`loom-daemon/tests/issue_effort_sqlite.rs`): the committed `sweep-facts-rollup.sql` and `issue-effort.sql` run verbatim on bundled SQLite over synthetic `records`, asserting the partition identity, the clamp + `overaccounted_sec`, open events, the unattributed triggers, absent-vs-`[]`, and SF1's coverage row (including an empty window). The **upgrade** from the previous installed table and view is fixture-executed too (`loom-daemon/tests/sweep_facts_upgrade_sqlite.rs`). It starts from the merge-base definitions with retained rows, including a fact whose raw records were evicted, and runs `sweep-facts-migrate.sql`, the rollup and the view. It asserts that no stored value changes, that the new columns are `NULL` on unrecoverable history, that the replaced view answers as a fresh install does, and that a re-run (or resuming a half-applied upgrade) is a no-op. The `wrangler --json` / `jq` recipe and D1's `pragma_table_info` support have not yet been exercised against live D1. The ClickHouse extractions' new `rework_*_sec`/`rework_*_open` columns are only **parity-checked by name** — no in-repo test executes ClickHouse SQL. |
 | `sweep-facts-extract-clickstack.sql` | Mirrors the live-verified `clickstack/cycle-time-extract.sql` conventions (`default.otel_logs`, `Body` filter, attribute-map reads) but is **not yet executed live** against a sweep-facts window. |
 | `sweep-facts-extract-signoz.sql` | **Not executed live.** Contract-checked like its cycle-time counterpart; reads both `attributes_string` and `attributes_number` so it does not depend on an unverified assumption about which map the pinned ingester files a numeric attribute in (#8529 follow-up). |

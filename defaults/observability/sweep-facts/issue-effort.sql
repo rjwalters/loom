@@ -74,8 +74,18 @@
 -- `records`; this reads `sweep_facts`). Do not edit one without the other:
 -- `loom-daemon/tests/sweep_facts_artifacts.rs`
 -- (`the_bundle_buckets_triggers_exactly_as_ie1_does`) fails if they disagree.
+--
+-- Re-installing (#9507). A view holds no data, so this file REPLACES any
+-- installed `issue_effort` rather than `CREATE VIEW IF NOT EXISTS` — which
+-- would silently keep an older definition (one without `clean_sec`, say) and
+-- break every query reading the new columns. Re-running the file is a no-op
+-- on an up-to-date database. The view reads the #9507 `rework_*_sec` /
+-- `rework_*_open` columns, so an older installed `sweep_facts` must be
+-- upgraded first (`sweep-facts-migrate.sql`).
 
-CREATE VIEW IF NOT EXISTS issue_effort AS
+DROP VIEW IF EXISTS issue_effort;
+
+CREATE VIEW issue_effort AS
 WITH
     -- The landing sweeps. One row per landing.
     landings AS (
