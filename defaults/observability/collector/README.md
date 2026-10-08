@@ -356,7 +356,8 @@ metrics); `repo`, `workflow`, `job`, `runner`, `conclusion` (the
 `provider`, `account`, `model`, `state`). A contract test in
 `loom-daemon/src/observability/ops/tests.rs` fails if `OPS_METRIC_LABEL_KEYS`
 gains a key this list lacks. `metric.points` values are additionally bounded
-at the source: at most 8 labels per point, values ≤128 bytes with no control
+at the source: at most 10 labels per point (`MAX_LABELS_PER_POINT` — the ten
+`loom.forge.calls` labels, #10607), values ≤128 bytes with no control
 characters, finite numbers only — enforced when the daemon enqueues the point
 and again when it exports it (#8857). The #8857 quota metrics
 (`loom.llm.tokens.*`, `loom.llm.requests`, `loom.pool.*`) carry only
