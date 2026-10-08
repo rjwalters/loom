@@ -598,6 +598,7 @@
       "champion_path": false,
       "human_gated": false,
       "merge_hold": false,
+      "operator_hold": false,
       "contradicts_approval": null,
       "stale_after_minutes": null,
       "requires_base": null,
