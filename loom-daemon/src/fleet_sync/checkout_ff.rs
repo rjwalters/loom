@@ -31,7 +31,37 @@
 //! | | | `fast-forwarded` |
 //!
 //! With `fleet.autoApply` off, row 10 is not attempted and a clean checkout
-//! that is behind reports `behind`.
+//! that is behind reports `behind`. The same holds, with `fleet.autoApply`
+//! on, while the host is paused (see "When nothing is written").
+//!
+//! Row 5 has one more outcome that is not a failure: a fetch that is due on a
+//! volume below the free-space floor is not run, and a checkout with nothing
+//! else to report is `low-disk` (see "What a pass costs").
+//!
+//! # When nothing is written
+//!
+//! "Paused" means everything on the host is left as it is, in a state a
+//! resume can pick up. So the fast-forward, though it is only a local write,
+//! follows the pause just as the network does. With `fleet.autoApply` on, row
+//! 10 is still not attempted while any of these holds
+//! ([`HostGateInputs::write_hold`](super::workspace_resync::HostGateInputs::write_hold)):
+//!
+//! * dispatch is paused: a drain, a roll's pause or a fleet hold (`draining`);
+//! * a pause roll is armed, committed or in progress (`roll pending`);
+//! * a pause manifest found at startup is not yet finished by H5
+//!   (`resume-pending`, #11016). This covers the startup pass, which runs
+//!   before H5 is even spawned, and every timer pass until H5 ends.
+//!
+//! The question is asked again immediately before the merge, so a pause that
+//! begins during a pass stops the checkouts the pass has not reached. A clean
+//! checkout that is behind reports `behind` and names the reason. Nothing is
+//! lost: the first pass after the pause ends does the fast-forward.
+//!
+//! Nothing else about the host stops the write. A host that is merely
+//! offline (an outage hold, a remote that does not answer) or not in H0 for
+//! another reason (not an official release build, a different binary staged,
+//! below the fleet floor, its self-update stalled) asks no remote, and may
+//! still fast-forward to what its clone already holds.
 //!
 //! # What a pass costs
 //!
@@ -40,13 +70,14 @@
 //!
 //! * A host the workspace resync keeps off the network makes **no network
 //!   call at all** here either: no `ls-remote`, no fetch. It compares the
-//!   checkout with the clone's own `origin/<default>` ref as it stands, and
-//!   may still fast-forward to it with `fleet.autoApply` on. That is a host
-//!   with `fleet.autoApply` off; one that is paused (a drain, a roll's pause
-//!   or a fleet hold); one not in H0 for any other reason (not an official
-//!   release build or not yet verified as one, a roll pending, a different
-//!   binary staged, below the fleet floor, its self-update stalled); and one
-//!   in an outage hold.
+//!   checkout with the clone's own `origin/<default>` ref as it stands.
+//!   Whether it may then fast-forward to that ref is a separate question
+//!   (see "When nothing is written"). That is a host with `fleet.autoApply`
+//!   off; one that is paused (a drain, a roll's pause or a fleet hold); one
+//!   with a resume pending; one not in H0 for any other reason (not an
+//!   official release build or not yet verified as one, a roll pending, a
+//!   different binary staged, below the fleet floor, its self-update
+//!   stalled); and one in an outage hold.
 //!
 //!   On the timer the step does not decide this itself. It takes the
 //!   workspace pass's own decision
@@ -55,6 +86,17 @@
 //!   [`host_gate`](super::workspace_resync::host_gate) to what is knowable at
 //!   boot; a fresh daemon is exempt only from `Unverified`, since the startup
 //!   pass is the one that verifies.
+//! * **No fetch below the free-space floor** (#10995). A fetch on a full
+//!   disk leaves a partial `tmp_pack_*` behind, and this step would retry it
+//!   every tick. So every fetch asks
+//!   [`fetch_headroom::skip_reason`](crate::fetch_headroom::skip_reason)
+//!   first, on the timer and at startup, for a root the resync covers and for
+//!   one it does not. Below the floor the fetch is not run and not counted,
+//!   and the checkout is compared with the clone's ref as it stands. That is
+//!   not a failure: it is never `fetch-failed` or `git-failure`, it sets no
+//!   backoff, and it does not count toward the three-in-a-row stop. A
+//!   checkout with nothing else to report is `low-disk`, as the resync
+//!   reports the same skip.
 //! * A repo the resync is backing off because its remote did not answer or
 //!   refused
 //!   ([`WorkspacePass::backing_off`](super::workspace_resync::WorkspacePass::backing_off))
@@ -134,9 +176,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) use host::hold_for_self_update;
 pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
-pub use host::{hold_for_move, GateProbe, MoveHold};
 #[cfg(test)]
-pub(in crate::fleet_sync) use host::{online_at_boot, timer_step, Stepped};
+pub(in crate::fleet_sync) use host::{boot_step, online_at_boot, timer_step, Stepped};
+pub use host::{hold_for_move, GateProbe, MoveHold};
 
 /// Event-bus topic a checkout state transition is published on.
 pub const TOPIC: &str = "fleet_sync.checkout";
@@ -167,7 +209,8 @@ pub enum CheckoutState {
     Current,
     /// This pass fast-forwarded it.
     FastForwarded,
-    /// Clean and behind, on a host with `fleet.autoApply` off.
+    /// Clean and behind, and not written to: `fleet.autoApply` is off, or the
+    /// host is paused, rolling or has a resume pending.
     Behind,
     /// The default branch does not resolve.
     NoDefaultBranch,
@@ -181,6 +224,10 @@ pub enum CheckoutState {
     SelfUpdateInFlight,
     /// The fetch failed.
     FetchFailed,
+    /// The remote's head is not in the clone, and the fetch for it was not
+    /// run because the checkout's volume is below the free-space floor
+    /// (#10995). Not a failure.
+    LowDisk,
     /// Unpushed local commits, and nothing to fast-forward to.
     Ahead,
     /// Local commits and missing commits.
@@ -207,6 +254,7 @@ impl CheckoutState {
             Self::GateInFlight => "gate-in-flight",
             Self::SelfUpdateInFlight => "self-update-in-flight",
             Self::FetchFailed => "fetch-failed",
+            Self::LowDisk => "low-disk",
             Self::Ahead => "ahead",
             Self::Diverged => "diverged",
             Self::Dirty => "dirty",
@@ -295,6 +343,9 @@ pub struct CheckoutPass {
     pub probes: u32,
     /// `git fetch` calls this pass made.
     pub fetches: u32,
+    /// Fetches this pass did not run because the volume is below the
+    /// free-space floor (#10995). Never counted in `fetches`.
+    pub low_disk: u32,
 }
 
 fn stamp(at: DateTime<Utc>) -> String {
@@ -471,6 +522,10 @@ impl Memory {
 pub struct Env<'a> {
     /// May this pass fast-forward (`fleet.autoApply`)? Off: report only.
     pub write: bool,
+    /// Why this host may not write to a checkout right now, whatever
+    /// `fleet.autoApply` says: it is paused, rolling or has a resume pending.
+    /// Read immediately before each merge.
+    pub held: &'a dyn Fn() -> Option<&'static str>,
     /// Is a main-health gate run building in this root right now?
     pub gate_in_flight: &'a dyn Fn(&Path) -> bool,
     /// Take the hold that keeps a self-update from starting in this root
@@ -565,6 +620,8 @@ impl Found {
 struct Net {
     probes: u32,
     fetches: u32,
+    /// Fetches not run below the free-space floor.
+    low_disk: u32,
     /// Remotes in a row that did not answer.
     misses: u32,
     /// The rate-limit breaker was found open: nothing more is asked.
@@ -597,7 +654,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
         );
         start + reached
     };
-    (pass.probes, pass.fetches) = (net.probes, net.fetches);
+    (pass.probes, pass.fetches, pass.low_disk) = (net.probes, net.fetches, net.low_disk);
     // In registry order, whatever order they were visited in. A root no pass
     // has reached yet has nothing to show.
     pass.checkouts = roots
@@ -617,15 +674,24 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
 /// Rule 5: make sure `origin/<branch>` is the remote's head. A head the
 /// workspace resync learned in this pass is trusted; otherwise the remote is
 /// asked once. Fetches only when the head moved.
-fn refresh(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) -> Result<(), String> {
+///
+/// `Ok(Some(reason))`: the head moved, and the fetch for it was not run
+/// because the checkout's volume is below the free-space floor (#10995). That
+/// is not a failure, and `origin/<branch>` is left as the clone has it.
+fn refresh(
+    env: &Env<'_>,
+    root: &Path,
+    branch: &str,
+    net: &mut Net,
+) -> Result<Option<String>, String> {
     if !env.network || (env.backing_off)(root) {
-        return Ok(());
+        return Ok(None);
     }
     let head = match (env.confirmed)(root, branch) {
         Some(head) => head,
         None => {
             if net.misses >= UNREACHABLE_STOP || net.breaker_open {
-                return Ok(());
+                return Ok(None);
             }
             // Read now, not once per pass: a refusal a moment ago may have
             // opened it (#11003).
@@ -635,7 +701,7 @@ fn refresh(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) -> Result<()
                     "checkout_ff: the forge rate-limit breaker is open; no more remotes are asked \
                      this pass"
                 );
-                return Ok(());
+                return Ok(None);
             }
             net.probes += 1;
             let head = git::remote_head(root, branch, env.bound(git::PROBE_TIMEOUT))
@@ -646,10 +712,19 @@ fn refresh(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) -> Result<()
     };
     let tracking = git::tracking_head(root, branch, env.bound(git::LOCAL_TIMEOUT));
     if tracking.as_deref() != Some(head.as_str()) {
+        // The one gate every daemon fetch into a managed checkout asks first.
+        // Asked here, where the fetch is decided, so it covers the timer and
+        // the startup pass, a head the resync learned and one this step asked
+        // for itself. Before the count, and with no error: a fetch that is
+        // not run is neither a fetch nor a remote that did not answer.
+        if let Some(low) = crate::fetch_headroom::skip_reason(root) {
+            net.low_disk += 1;
+            return Ok(Some(low));
+        }
         net.fetches += 1;
         git::fetch(root, branch, env.bound(git::FETCH_TIMEOUT))?;
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The rules, in order, for one checkout.
@@ -702,10 +777,13 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     };
 
     // 5. Ask the remote, when that is due and allowed.
-    if let Err(e) = refresh(env, root, &branch, net) {
-        let _ = found.measure(env, root, &branch);
-        return found.end(S::FetchFailed, e);
-    }
+    let low_disk = match refresh(env, root, &branch, net) {
+        Ok(low_disk) => low_disk,
+        Err(e) => {
+            let _ = found.measure(env, root, &branch);
+            return found.end(S::FetchFailed, e);
+        }
+    };
 
     // 6-8. Compare.
     if let Err(e) = found.measure(env, root, &branch) {
@@ -713,6 +791,9 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     }
     let (ahead, behind) = (found.ahead.unwrap_or(0), found.behind.unwrap_or(0));
     match (ahead, behind) {
+        // The clone's own ref is all this pass could compare with: the
+        // remote's head is newer, and there was no room to fetch it.
+        (0, 0) if low_disk.is_some() => return found.end(S::LowDisk, low_disk),
         (0, 0) => return found.end(S::Current, None),
         (_, 0) => {
             let why = format!("{ahead} unpushed commit(s) on `{branch}`");
@@ -737,6 +818,10 @@ fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     // The gate may have started since rule 4. Ask again, right before the write.
     if (env.gate_in_flight)(root) {
         return gated(found);
+    }
+    // And so may a pause. A paused host writes nothing, not even locally.
+    if let Some(why) = (env.held)() {
+        return found.end(S::Behind, format!("the host is held ({why}); nothing written"));
     }
 
     // 10. The one write.

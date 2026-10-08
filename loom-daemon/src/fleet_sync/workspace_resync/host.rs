@@ -66,6 +66,10 @@ pub enum NotCurrent {
     Stalled,
     /// The startup pass has not completed (H5).
     Unverified,
+    /// A pause manifest found at startup is not yet finished by H5: this
+    /// process has not passed health probation and resumed or requeued what
+    /// the roll paused (#11016).
+    ResumePending,
     /// Not a state at all but a fact about the binary: it is not an official
     /// release build (the release workflow did not build it, or the release
     /// tag names another commit), so its payload is no release. Such a host
@@ -88,6 +92,7 @@ impl NotCurrent {
             Self::FloorBelow => "running version is below the fleet floor",
             Self::Stalled => "self-update is stalled",
             Self::Unverified => "startup pass not complete",
+            Self::ResumePending => "resume-pending",
             Self::NotAReleaseBuild => "this daemon is not an official release build",
             Self::ReleaseUnverified => "this daemon's release tag is not verified yet",
         }
@@ -133,6 +138,9 @@ pub struct HostGateInputs {
     /// (#10831, [`crate::fleet_state::DrainFacts::roll_in_progress`]). Not a
     /// fleet-state `paused` hold or an operator drain; those are `draining`.
     pub roll_pending: bool,
+    /// A pause manifest found at startup is not yet finished by H5
+    /// ([`crate::roll_pause::suppress::host_verified`] is false, #11016).
+    pub resume_pending: bool,
     /// The running binary's file was replaced or removed since boot.
     pub staged: bool,
     /// The running version is below `loom_min_version`.
@@ -156,6 +164,7 @@ pub fn host_gate(i: &HostGateInputs) -> Result<(), NotCurrent> {
         (!i.release_verified, NotCurrent::ReleaseUnverified),
         (!i.verified, NotCurrent::Unverified),
         (i.draining, NotCurrent::Draining),
+        (i.resume_pending, NotCurrent::ResumePending),
         (i.staged, NotCurrent::Staged),
         (i.roll_pending, NotCurrent::RollPending),
         (i.stalled, NotCurrent::Stalled),
@@ -211,6 +220,28 @@ pub(in crate::fleet_sync) fn mark_boot() {
 }
 
 impl HostGateInputs {
+    /// Why this host may not write to a checkout at all, not even locally
+    /// (#10869): dispatch is paused, H5 has not finished with a pause
+    /// manifest, or a pause roll is under way. "Paused" means everything is
+    /// left as it is, in a state a resume can pick up, so the checkout fast
+    /// forward does not move a working tree in any of the three.
+    ///
+    /// Narrower than [`host_gate`] on purpose. The other reasons a host is
+    /// not in H0 (not a release build, a staged binary, below the floor, a
+    /// stalled self-update) keep it off the network and stop it pushing, but
+    /// a fast-forward of its own clean checkout to a commit its clone already
+    /// holds is still allowed there. Read from the facts themselves, not from
+    /// `host_gate`'s first reason, which may name one of those instead.
+    #[must_use]
+    pub fn write_hold(&self) -> Option<NotCurrent> {
+        let holds = [
+            (self.draining, NotCurrent::Draining),
+            (self.roll_pending, NotCurrent::RollPending),
+            (self.resume_pending, NotCurrent::ResumePending),
+        ];
+        holds.iter().find(|(held, _)| *held).map(|(_, why)| *why)
+    }
+
     /// The signals as they are right now.
     #[must_use]
     pub fn live(enforcer: &dyn Enforcer) -> Self {
@@ -229,7 +260,9 @@ impl HostGateInputs {
     /// can be armed yet in a process that has just started, and `floor` is the
     /// floor that pass just read. `verified` is set: this pass is the one
     /// that verifies, so [`NotCurrent::Unverified`] is the one reason a
-    /// fresh daemon is exempt from.
+    /// fresh daemon is exempt from. A pause manifest H5 has not finished
+    /// with is known this early (`arm_at_startup` runs before
+    /// `fleet_sync::start`), and is read like every other fact.
     #[must_use]
     pub fn at_boot(paused: bool, floor: Option<&str>) -> Self {
         Self::read(paused, false, floor, true)
@@ -247,6 +280,9 @@ impl HostGateInputs {
             verified,
             draining,
             roll_pending,
+            // False from the moment startup finds a live pause manifest until
+            // H5 has finished with it (#11016).
+            resume_pending: !crate::roll_pause::suppress::host_verified(),
             // An unreadable identity at boot proves nothing either way.
             staged: boot_exe()
                 .get()

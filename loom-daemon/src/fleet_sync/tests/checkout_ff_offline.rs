@@ -4,6 +4,11 @@
 //! memory, and `spawn_pass`'s hand-off runs it after the pass on the same
 //! supervised thread.
 //!
+//! Being offline does not by itself stop the local fast-forward: a host that
+//! is otherwise in H0 still moves a clean checkout to what its clone holds.
+//! What does stop the write (a pause, a roll, a pending resume) is in
+//! `checkout_ff_holds.rs`. Every step here runs with no write hold.
+//!
 //! Real git in temp dirs only, as in the parent module. Every step is handed
 //! its roots: none of these tests reads the workspace registry.
 
@@ -26,11 +31,19 @@ fn resync(online: bool, backing_off: Vec<PathBuf>) -> WorkspacePass {
     }
 }
 
-/// A timer step over `roots`, with its own fresh memory.
+/// No write hold: the host is not paused, not rolling, and has no resume
+/// pending.
+fn unheld() -> Option<&'static str> {
+    None
+}
+
+/// A timer step over `roots`, with its own fresh memory, on a host with no
+/// write hold.
 fn step(roots: &[PathBuf], resync: &WorkspacePass) -> CheckoutPass {
     let memory = Mutex::new(Memory::default());
     let roots = roots.to_vec();
-    match timer_step(&memory, &move || roots.clone(), true, resync, Instant::now(), None) {
+    let began = Instant::now();
+    match timer_step(&memory, &move || roots.clone(), true, &unheld, resync, began, None) {
         Stepped::Ran(found) => found,
         Stepped::Busy => panic!("nothing holds this memory"),
     }
@@ -57,7 +70,10 @@ fn a_step_after_an_offline_workspace_pass_asks_no_remote() {
     let (fx, known) = behind_and_unplugged();
     let found = step(std::slice::from_ref(&fx.host), &resync(false, Vec::new()));
     assert_eq!((found.probes, found.fetches), (0, 0));
-    // The local merge against the clone's own ref still happens.
+    // This host is offline and nothing more: the network is down, and it is
+    // not paused, not rolling and has no resume pending (`step` passes no
+    // write hold). So the local merge against the clone's own ref still
+    // happens. A paused host would not write: see `checkout_ff_holds.rs`.
     assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
     assert_eq!(fx.head(), known, "as far as this clone knows, and no further");
 
@@ -96,7 +112,7 @@ fn a_step_whose_memory_is_held_skips_the_tick_instead_of_waiting() {
     std::thread::spawn(move || {
         let never = || -> Vec<PathBuf> { panic!("a busy step reads no roots") };
         let pass = resync(true, Vec::new());
-        let stepped = timer_step(&shared, &never, true, &pass, Instant::now(), None);
+        let stepped = timer_step(&shared, &never, true, &unheld, &pass, Instant::now(), None);
         let _ = tx.send(stepped);
     });
     let stepped = rx
@@ -106,7 +122,8 @@ fn a_step_whose_memory_is_held_skips_the_tick_instead_of_waiting() {
     drop(held);
     // Once the old step lets go, the next tick runs.
     let pass = resync(false, Vec::new());
-    let free = timer_step(&memory, &Vec::<PathBuf>::new, true, &pass, Instant::now(), None);
+    let none = Vec::<PathBuf>::new;
+    let free = timer_step(&memory, &none, true, &unheld, &pass, Instant::now(), None);
     assert!(matches!(free, Stepped::Ran(_)), "{free:?}");
 }
 
@@ -124,10 +141,11 @@ fn h0_at_boot() -> HostGateInputs {
 fn the_startup_step_is_offline_wherever_the_host_gate_would_be() {
     assert!(online_at_boot(true, &h0_at_boot()));
     type Set = fn(&mut HostGateInputs);
-    let offline: [(&str, Set); 8] = [
+    let offline: [(&str, Set); 9] = [
         ("non-release build", |i| i.release_build = false),
         ("release not verified", |i| i.release_verified = false),
         ("roll pending", |i| i.roll_pending = true),
+        ("resume pending", |i| i.resume_pending = true),
         ("staged binary", |i| i.staged = true),
         ("below the floor", |i| i.below_floor = true),
         ("stalled self-update", |i| i.stalled = true),
@@ -190,7 +208,7 @@ async fn the_step_runs_after_the_pass_on_its_thread_and_takes_its_network_decisi
         by_then.lock().unwrap().then =
             Some((std::thread::current().id(), began, at, resync.online));
         let memory = Mutex::new(Memory::default());
-        timer_step(&memory, &move || roots.clone(), true, resync, began, None)
+        timer_step(&memory, &move || roots.clone(), true, &unheld, resync, began, None)
     };
     let (tx, rx) = mpsc::channel();
     let task = spawn_with(&SLOT, Duration::from_secs(120), pass, then, move |ended| {

@@ -14,7 +14,8 @@ use crate::fleet_sync::checkout_ff::{self, Stepped};
 fn checkout_after(pass: &WorkspacePass, root: &Path) -> checkout_ff::CheckoutPass {
     let memory = Mutex::new(checkout_ff::Memory::default());
     let roots = || vec![root.to_path_buf()];
-    match checkout_ff::timer_step(&memory, &roots, true, pass, Instant::now(), None) {
+    let began = Instant::now();
+    match checkout_ff::timer_step(&memory, &roots, true, &|| None, pass, began, None) {
         Stepped::Ran(found) => found,
         Stepped::Busy => panic!("nothing holds this memory"),
     }
@@ -114,4 +115,55 @@ fn only_an_unreachable_or_refused_backoff_is_listed_for_the_checkout_step() {
     // Every backoff has ended by then: nothing is listed.
     let later = now + ChronoDuration::hours(48);
     assert!(memory.remotes_backed_off(&roots, later).is_empty());
+}
+
+/// #10995 through both halves: the resync skips its fetch below the disk
+/// floor, sets no backoff and stays online, and has already told the checkout
+/// step the head it heard. The step that follows must not run that fetch.
+#[test]
+fn a_low_disk_resync_pass_is_followed_by_a_step_that_fetches_nothing() {
+    use crate::fetch_headroom::test_override::with_free_gb;
+    use crate::fleet_sync::checkout_ff::CheckoutState;
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    // The default branch moves after the clone, so the head the pass hears is
+    // one the clone lacks.
+    fx.push_from_seed("a later commit", |seed| write(&seed.join("later.txt"), "x\n"));
+    let before = git(&host.root, &["rev-parse", "refs/remotes/origin/main"]);
+    let memory = Mutex::new(checkout_ff::Memory::default());
+    let roots = || vec![host.root.clone()];
+    let step_after = |began: Instant, pass: &WorkspacePass| match checkout_ff::timer_step(
+        &memory,
+        &roots,
+        true,
+        &|| None,
+        pass,
+        began,
+        None,
+    ) {
+        Stepped::Ran(found) => found,
+        Stepped::Busy => panic!("nothing holds this memory"),
+    };
+
+    for tick in 0..4 {
+        let (pass, step) = with_free_gb(1, || {
+            // As `spawn_with` does: the step is handed the instant the pass
+            // began, so it trusts the head that pass heard.
+            let began = Instant::now();
+            let pass = host.pass();
+            let step = step_after(began, &pass);
+            (pass, step)
+        });
+        let report = only(&pass);
+        assert!(reason(report).starts_with("low-disk: "), "tick {tick}: {report:?}");
+        assert!(pass.online, "a low-disk skip does not take the pass offline");
+        assert!(pass.backing_off.is_empty(), "nor back the root off");
+        assert_eq!(step.probes, 0, "tick {tick}: the resync's head is trusted: {step:?}");
+        assert_eq!(step.fetches, 0, "tick {tick}: the step runs no fetch either");
+        assert_eq!(step.low_disk, 1, "tick {tick}: it skipped the one that was due");
+        assert_eq!(step.checkouts[0].state, CheckoutState::LowDisk, "tick {tick}: {step:?}");
+        let after = git(&host.root, &["rev-parse", "refs/remotes/origin/main"]);
+        assert_eq!(after, before, "tick {tick}: nothing was fetched by either half");
+        host.advance(INTERVAL);
+    }
 }

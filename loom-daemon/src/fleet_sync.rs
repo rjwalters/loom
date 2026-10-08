@@ -1376,7 +1376,7 @@ fn spawn_timer(
         // #10869: the checkout half runs on that same task, right after the
         // resync pass, so a resync this host just pushed is fast-forwarded to
         // in the same pass and the two never run at once.
-        let then = || checkout_ff::after_resync(&inputs, &gate, &bus);
+        let then = || checkout_ff::after_resync(&inputs, &enforcer, &gate, &bus);
         let (step, after) = then();
         workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
         loop {

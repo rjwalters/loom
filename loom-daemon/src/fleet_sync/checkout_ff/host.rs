@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 
 use super::{CheckoutPass, Env, Memory, Transition, PASS_BUDGET, STARTUP_BUDGET, TOPIC};
 use crate::event_bus::EventBus;
-use crate::fleet_state::Enforcement;
-use crate::fleet_sync::workspace_resync::{host_gate, HostGateInputs, WorkspacePass};
+use crate::fleet_state::{Enforcement, Enforcer};
+use crate::fleet_sync::workspace_resync::{host_gate, HostGateInputs, NotCurrent, WorkspacePass};
 use crate::fleet_sync::{FleetSyncStatus, PassInputs};
 
 /// "Is a main-health gate run building in this root right now?" In production,
@@ -160,6 +160,9 @@ fn memory() -> &'static Mutex<Memory> {
 struct Live<'a> {
     /// `fleet.autoApply`.
     write: bool,
+    /// Why the host may not write to a checkout right now (paused, rolling,
+    /// resume pending), read immediately before each merge.
+    held: &'a dyn Fn() -> Option<&'static str>,
     /// May it use the network at all?
     network: bool,
     /// Roots the workspace resync is backing off: not asked.
@@ -177,6 +180,7 @@ fn run_live(live: &Live<'_>, roots: &[PathBuf], memory: &mut Memory) -> Checkout
     let started = Instant::now();
     let env = Env {
         write: live.write,
+        held: live.held,
         gate_in_flight: &|root| live.gate.is_some_and(|probe| probe(root)),
         hold: &hold_for_move,
         network: live.network,
@@ -212,6 +216,14 @@ pub(in crate::fleet_sync) fn online_at_boot(auto_apply: bool, gate: &HostGateInp
 /// alone. One that may not use the network ([`online_at_boot`]) compares with
 /// `origin/<default>` as the clone has it.
 ///
+/// **It runs before H5 is spawned**, so it must not act on a daemon that a
+/// pause roll just restarted and H5 has not verified yet. It does not:
+/// `arm_at_startup` runs before `fleet_sync::start` (the order is pinned by
+/// the source-order test in `auto_update::pause_resume::startup`), so
+/// [`HostGateInputs::at_boot`] already sees the pending resume. With one
+/// pending the pass asks no remote, fetches nothing and writes nothing
+/// ([`boot_step`]); the first timer pass after H5 ends does the fast-forward.
+///
 /// It waits for the pass memory: nothing can hold it this early but an
 /// earlier startup pass, and that is bounded by its own budget.
 pub(in crate::fleet_sync) fn startup(
@@ -222,20 +234,39 @@ pub(in crate::fleet_sync) fn startup(
         return Vec::new();
     }
     let paused = status.enforced != Enforcement::Proceed;
-    let gate = HostGateInputs::at_boot(paused, status.floor.floor.as_deref());
+    let floor = status.floor.floor.clone();
+    let gate = || HostGateInputs::at_boot(paused, floor.as_deref());
+    let roots = crate::fleet_sync::workspace_resync::registered_roots();
+    let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
+    let pass = boot_step(&mut guard, &roots, inputs.auto_apply, &gate);
+    status.checkouts = pass.checkouts;
+    pass.transitions
+}
+
+/// The startup pass's checkout half over `roots`, with the host's facts
+/// injected (`gate`: [`HostGateInputs::at_boot`] in production).
+///
+/// - The network follows [`online_at_boot`].
+/// - A write needs `fleet.autoApply` and no
+///   [`write_hold`](HostGateInputs::write_hold): a host that boots paused, or
+///   with a pause manifest H5 has not finished with, moves no checkout. The
+///   facts are read again before each merge.
+pub(in crate::fleet_sync) fn boot_step(
+    memory: &mut Memory,
+    roots: &[PathBuf],
+    auto_apply: bool,
+    gate: &dyn Fn() -> HostGateInputs,
+) -> CheckoutPass {
     let live = Live {
-        write: inputs.auto_apply,
-        network: online_at_boot(inputs.auto_apply, &gate),
+        write: auto_apply,
+        held: &|| gate().write_hold().map(NotCurrent::as_str),
+        network: online_at_boot(auto_apply, &gate()),
         backing_off: &[],
         budget: STARTUP_BUDGET,
         gate: None,
         since: None,
     };
-    let roots = crate::fleet_sync::workspace_resync::registered_roots();
-    let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
-    let pass = run_live(&live, &roots, &mut guard);
-    status.checkouts = pass.checkouts;
-    pass.transitions
+    run_live(&live, roots, memory)
 }
 
 /// Publish each transition on [`TOPIC`]. The log line was written by the pass.
@@ -271,6 +302,12 @@ pub const BUSY_NOTE: &str = "an earlier checkout step has not ended; nothing was
 ///   resync keeps off the network (not in H0, an outage hold, autoApply off,
 ///   paused) costs no `ls-remote` and no fetch here either. Roots the pass is
 ///   backing off ([`WorkspacePass::backing_off`]) are not asked.
+/// - **Its write decision is not the network's.** `write` is
+///   `fleet.autoApply`. `held` says why the host may not write to a checkout
+///   right now even so (paused, rolling, resume pending:
+///   [`HostGateInputs::write_hold`]), and is read immediately before each
+///   merge, not once when the workspace pass began. A host that is offline
+///   for any other reason may still fast-forward to what its clone holds.
 /// - **It never waits for the pass memory.** A step abandoned inside a git
 ///   child still holds it; waiting would park this thread too, so the
 ///   workspace pass it follows would never end and its result would be lost.
@@ -283,6 +320,7 @@ pub(in crate::fleet_sync) fn timer_step(
     memory: &Mutex<Memory>,
     roots: &dyn Fn() -> Vec<PathBuf>,
     write: bool,
+    held: &dyn Fn() -> Option<&'static str>,
     resync: &WorkspacePass,
     began: Instant,
     gate: Option<&GateProbe>,
@@ -299,6 +337,7 @@ pub(in crate::fleet_sync) fn timer_step(
     let left = crate::fleet_sync::workspace_resync::PASS_DEADLINE.saturating_sub(spent);
     let live = Live {
         write,
+        held,
         network: resync.online,
         backing_off: &resync.backing_off,
         budget: PASS_BUDGET.min(left),
@@ -306,6 +345,17 @@ pub(in crate::fleet_sync) fn timer_step(
         since: Some(Utc::now() - chrono::Duration::from_std(spent).unwrap_or_default()),
     };
     Stepped::Ran(run_live(&live, &roots(), &mut guard))
+}
+
+/// Why the host may not write to a checkout right now, from the live drain
+/// state. No drain state to read is itself a reason: fail closed.
+pub(super) fn write_hold_now(enforcer: Option<&dyn Enforcer>) -> Option<&'static str> {
+    match enforcer {
+        Some(enforcer) => HostGateInputs::live(enforcer)
+            .write_hold()
+            .map(NotCurrent::as_str),
+        None => Some("no drain state to read"),
+    }
 }
 
 /// The two halves of the checkout step on the timer, for
@@ -318,8 +368,13 @@ pub(in crate::fleet_sync) fn timer_step(
 /// - the single flight, the stuck-pass watchdog and abandonment cover it;
 /// - it follows any resync the pass pushed;
 /// - it never overlaps the next workspace pass.
+///
+/// `enforcer` is the drain state the step reads its write hold from, live,
+/// before each merge. With none there is no way to know the host is not
+/// paused, so nothing is written (the resync half makes no pass at all then).
 pub(in crate::fleet_sync) fn after_resync(
     inputs: &PassInputs,
+    enforcer: &Option<Arc<dyn Enforcer>>,
     gate: &Option<GateProbe>,
     bus: &Option<Arc<EventBus>>,
 ) -> (
@@ -327,9 +382,11 @@ pub(in crate::fleet_sync) fn after_resync(
     impl FnOnce(Stepped) + Send + 'static,
 ) {
     let (write, gate, bus) = (inputs.auto_apply, gate.clone(), bus.clone());
+    let enforcer = enforcer.clone();
     let step = move |began: Instant, resync: &WorkspacePass| {
         let roots = crate::fleet_sync::workspace_resync::registered_roots;
-        timer_step(memory(), &roots, write, resync, began, gate.as_ref())
+        let held = || write_hold_now(enforcer.as_deref());
+        timer_step(memory(), &roots, write, &held, resync, began, gate.as_ref())
     };
     (step, move |stepped| publish(stepped, bus.as_deref()))
 }

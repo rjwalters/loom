@@ -188,6 +188,8 @@ fn snapshot(repo: &Path) -> Snapshot {
 /// `fleet.autoApply` on, nothing else going on".
 struct Knobs {
     write: bool,
+    /// Why the host may not write right now (paused, rolling, resume pending).
+    held: Option<&'static str>,
     gate: Box<dyn Fn(&Path) -> bool>,
     updating: bool,
     network: bool,
@@ -202,6 +204,7 @@ impl Default for Knobs {
     fn default() -> Self {
         Self {
             write: true,
+            held: None,
             gate: Box::new(|_| false),
             updating: false,
             network: true,
@@ -217,6 +220,7 @@ impl Default for Knobs {
 fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutPass {
     let env = Env {
         write: knobs.write,
+        held: &|| knobs.held,
         gate_in_flight: &*knobs.gate,
         hold: &|_| (!knobs.updating).then(MoveHold::free),
         network: knobs.network,
@@ -1091,3 +1095,6 @@ fn a_refused_merge_is_read_as_a_file_in_the_way_or_as_a_failure() {
 
 #[path = "checkout_ff_offline.rs"]
 mod offline;
+
+#[path = "checkout_ff_holds.rs"]
+mod holds;

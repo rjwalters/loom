@@ -1776,8 +1776,12 @@ workspace's default branch (never the working tree) and classifies it:
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
   `paused` reaches it), no pause roll is armed, committed or in progress
   (#10831; reported as `roll pending`, and never set by a fleet hold or an
-  operator drain), the binary on disk is still the one running, self-update is not in backoff or terminal, and the running version
-  is not below `loom_min_version`. The gate is read at the start of the pass,
+  operator drain), no pause manifest found at startup is still waiting for H5
+  to finish with it (#11016; reported as `resume-pending`, so a daemon a pause
+  roll just restarted claims and pushes nothing, in its startup pass or on the
+  timer, until health probation has passed), the binary on disk is still the
+  one running, self-update is not in backoff or terminal, and the running
+  version is not below `loom_min_version`. The gate is read at the start of the pass,
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
@@ -1918,6 +1922,18 @@ each registered workspace's main checkout to its default branch.
   past it.
 - **Writes need `fleet.autoApply`.** With it off, nothing is modified and a
   clean checkout that is behind is reported as `behind`, with the count.
+- **A paused host writes nothing.** "Paused" means everything on the host is
+  left as it is, in a state a resume can pick up, so the fast-forward follows
+  the pause just as the network does, though it is only a local write. With
+  `fleet.autoApply` on, no checkout is moved while dispatch is paused (a
+  drain, a roll's pause or a fleet hold), while a pause roll is armed,
+  committed or in progress, or while a pause manifest found at startup is not
+  yet finished by H5 (`resume-pending`). The last covers the startup pass,
+  which runs before H5 is spawned, and every timer pass until H5 ends. The
+  question is asked again right before each merge. A clean checkout that is
+  behind is reported as `behind` with the reason, and the first pass after
+  the pause ends fast-forwards it. A host that is merely offline, or not in
+  H0 for another reason, is not held this way.
 - **The local merge is not tied to provenance; the network is.** The merge is
   a write to the host's own clean checkout, so any build with
   `fleet.autoApply` on may fast-forward to the `origin/<default>` its clone
@@ -1938,6 +1954,8 @@ What a pass costs on the network:
   fetch anything made in that clone. That is a host:
   - with `fleet.autoApply` off;
   - with dispatch paused (a drain, a roll's pause or a fleet hold);
+  - with a resume pending: a pause manifest found at startup that H5 has not
+    finished with;
   - running a build that is not an official release, or whose release tag is
     not verified yet;
   - with a roll pending, or a different binary staged on disk;
@@ -1963,6 +1981,10 @@ What a pass costs on the network:
   read immediately before each `ls-remote`; while it is open nothing more is
   asked and the checkout is compared with the clone as it stands.
 - Three remotes in a row that do not answer end the pass's network use.
+- **No fetch below the free-space floor** (`diskWarnFreeGb`, #10995). A fetch
+  that is due there is not run, at startup or on the timer, and the checkout
+  reports `low-disk`, never `fetch-failed`: it is not a failure, sets no
+  backoff and does not count toward the three-in-a-row stop.
 
 So on a host that may use the network, any commit on the default branch
 reaches every clean checkout on the next tick, and the host that pushed a
@@ -1983,7 +2005,7 @@ For each workspace the first rule that matches ends the attempt:
 | 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
 | 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
 | 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
-| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed` |
+| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed`; `low-disk` when the fetch was not run below the free-space floor and nothing else is to report |
 | 6 | nothing behind and nothing ahead | `current` |
 | 7 | ahead only: unpushed local commits | `ahead` |
 | 8 | ahead and behind | `diverged` |
