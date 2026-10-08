@@ -13,6 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use super::branch_holders::{
+    branch_holders, held_by_worktree, kept_line, skip_if_held, skip_if_held_in,
+};
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -185,7 +188,12 @@ pub struct CleanupStats {
     pub skipped_uncommitted: usize,
     pub skipped_editable: usize,
     pub cleaned_branches: usize,
+    /// Local branches kept by a policy decision (OPEN issue, `--safe` retain
+    /// prefix, unreachable commits under `--safe`): real leftovers.
     pub kept_branches: usize,
+    /// Local branches skipped because a worktree holds them (checked out,
+    /// mid-rebase, mid-bisect); not leftovers (#10851).
+    pub held_branches: usize,
     pub errored_branches: usize,
     pub killed_tmux: usize,
     /// Tmux sessions preserved because they have an attached client (a live
@@ -1387,11 +1395,12 @@ pub fn cleanup_worktree(
         "classify_worktree=Remove",
     );
 
-    let deleted = Command::new("git")
-        .args(["branch", "-d", &branch_name])
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
+    let deleted = skip_if_held(repo_root, &branch_name)
+        || Command::new("git")
+            .args(["branch", "-d", &branch_name])
+            .current_dir(repo_root)
+            .status()
+            .is_ok_and(|s| s.success());
     if !deleted {
         let _ = Command::new("git")
             .args(["branch", "-D", &branch_name])
@@ -1751,6 +1760,7 @@ pub fn cleanup_pr_worktree(
                      pr-{pr_num}'s worktree"
                 );
             }
+            _ if skip_if_held(repo_root, &branch_name) => {}
             BranchDeleteMode::ForceSafe => {
                 // Every commit on the branch is part of what the forge merged
                 // (tip == head SHA), so `-D` cannot lose anything — and it is
@@ -2043,25 +2053,20 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
     }
 }
 
-fn checked_out_branches(repo_root: &Path) -> std::collections::HashSet<String> {
-    let mut out_set = std::collections::HashSet::new();
-    let Ok(out) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-    else {
-        return out_set;
-    };
-    if !out.status.success() {
-        return out_set;
+/// Tally a failed `git branch -D`: a worktree-held branch is a skip
+/// (`held_branches`, no error); anything else is a real error.
+pub(super) fn record_branch_delete_failure(
+    stats: &mut CleanupStats,
+    branch: &str,
+    target: &str,
+    cause: &str,
+) {
+    if let Some(path) = held_by_worktree(cause) {
+        println!("  {}", kept_line(&path, branch));
+        stats.held_branches += 1;
+    } else {
+        stats.record_error(target, "git branch -D", cause);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        if let Some(name) = line.strip_prefix("branch refs/heads/") {
-            out_set.insert(name.trim().to_string());
-        }
-    }
-    out_set
 }
 
 /// The repo's default branch, resolved from `origin/HEAD` — `None` if that
@@ -2098,10 +2103,19 @@ fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
 /// Force-delete one local branch. `Err` carries git's own message (e.g.
 /// `error: branch 'x' not found.`) so a failure can be reported against the
 /// branch that failed instead of vanishing into the error tally (#4877).
-fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+pub(super) fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
+    run_checked(force_delete_cmd(repo_root, branch))
+}
+
+/// The `git branch -D` behind [`force_delete_branch`]. `LC_ALL=C` because
+/// [`record_branch_delete_failure`] parses git's English refusal text; gettext
+/// also ignores `LANGUAGE` under the C locale (#10851).
+pub(super) fn force_delete_cmd(repo_root: &Path, branch: &str) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(["branch", "-D", branch]).current_dir(repo_root);
-    run_checked(cmd)
+    cmd.args(["branch", "-D", branch])
+        .current_dir(repo_root)
+        .env("LC_ALL", "C");
+    cmd
 }
 
 /// Name prefixes that signal "do not garbage-collect this" (issue #5737): a
@@ -2247,7 +2261,9 @@ fn delete_stale_branch(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
     }
     match force_delete_branch(repo_root, branch) {
         Ok(()) => stats.cleaned_branches += 1,
-        Err(cause) => stats.record_error(&format!("branch {branch}"), "git branch -D", &cause),
+        Err(cause) => {
+            record_branch_delete_failure(stats, branch, &format!("branch {branch}"), &cause);
+        }
     }
 }
 
@@ -2333,11 +2349,15 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
     if let Some(c) = current_branch(repo_root) {
         protected.insert(c);
     }
-    protected.extend(checked_out_branches(repo_root));
+    let holders = branch_holders(repo_root);
 
     let mut issue_pass_candidates: Vec<String> = Vec::new();
     for branch in &branches {
         if protected.contains(branch) {
+            continue;
+        }
+        if skip_if_held_in(&holders, branch) {
+            stats.held_branches += 1;
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
@@ -2364,9 +2384,10 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
                 if !opts.dry_run {
                     match force_delete_branch(repo_root, branch) {
                         Ok(()) => stats.cleaned_branches += 1,
-                        Err(cause) => stats.record_error(
+                        Err(cause) => record_branch_delete_failure(
+                            stats,
+                            branch,
                             &format!("branch {branch} (issue #{issue_num} CLOSED)"),
-                            "git branch -D",
                             &cause,
                         ),
                     }
@@ -3326,13 +3347,20 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
         println!("  Skipped (grace period): {}", stats.skipped_grace);
         println!("  Skipped (uncommitted): {}", stats.skipped_uncommitted);
     }
-    if stats.cleaned_branches > 0 || stats.kept_branches > 0 || stats.errored_branches > 0 {
+    if stats.cleaned_branches > 0
+        || stats.kept_branches > 0
+        || stats.held_branches > 0
+        || stats.errored_branches > 0
+    {
         if dry_run {
             println!("  Would delete: {} branch(es)", stats.cleaned_branches);
         } else {
             println!("  Deleted: {} branch(es)", stats.cleaned_branches);
         }
         println!("  Kept: {} branch(es)", stats.kept_branches);
+        if stats.held_branches > 0 {
+            println!("  In use (held by a worktree): {} branch(es)", stats.held_branches);
+        }
         if stats.errored_branches > 0 {
             println!("  Errored (gh probe failed): {} branch(es)", stats.errored_branches);
         }

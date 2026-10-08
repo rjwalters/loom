@@ -24,7 +24,7 @@ pub(crate) enum LabelsCommand {
     List {
         /// A boolean property: park, skip, hold, operator_gate,
         /// blocked_colabel, hard_exclusion, champion_path, human_gated,
-        /// contradicts_approval (report order).
+        /// merge_hold, operator_hold, contradicts_approval (report order).
         #[arg(long, conflicts_with = "kind")]
         property: Option<String>,
         /// A label kind (workflow, claim, pr-lane, proposal, hold, ...).
@@ -182,7 +182,8 @@ fn label_json(l: &loom_daemon::label_registry::Label) -> serde_json::Value {
         "park": l.park, "skip": l.skip, "hold": l.hold,
         "operator_gate": l.operator_gate, "blocked_colabel": l.blocked_colabel,
         "hard_exclusion": l.hard_exclusion, "champion_path": l.champion_path,
-        "human_gated": l.human_gated, "contradicts_approval": l.contradicts_approval,
+        "human_gated": l.human_gated,
+        "merge_hold": l.merge_hold, "operator_hold": l.operator_hold, "contradicts_approval": l.contradicts_approval,
         "stale_after_minutes": l.stale_after_minutes, "requires_base": l.requires_base,
         "remove_with": l.remove_with, "lifecycle": l.lifecycle,
     });

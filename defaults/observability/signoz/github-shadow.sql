@@ -26,13 +26,15 @@
 --
 -- Since #10343 every `github.ratelimit.*` point carries `owner` and `role`,
 -- and the legacy owner-less 60 s probe series is gone (it is booked into the
--- bucket book instead). A label set is still NOT guaranteed to be one bucket:
--- live data shows `(account, owner, resource)` series carrying two
--- interleaved hourly reset chains (rjwalters/loom#10571), and several hosts
--- export the same bucket with readings of different ages. So `used` is never
--- read as monotone across samples -- queries 1 and 3 key every reading by its
--- quota WINDOW (the paired `github.ratelimit.reset`) and charge each window's
--- high-water mark once. An operator's ambient-login host reports
+-- bucket book instead). Since rjwalters/loom#10571 `account`/`owner` are the
+-- identity actually minted into each credential directory (its sidecar), and
+-- `installation` names the App installation, so two installations no longer
+-- share one label set; older daemons' data can still carry two interleaved
+-- hourly reset chains under one set, and several hosts export the same
+-- bucket with readings of different ages. So `used` is never read as
+-- monotone across samples -- queries 1 and 3 key every reading by its quota
+-- WINDOW (the paired `github.ratelimit.reset`) and charge each window's
+-- high-water mark once (defence in depth). An operator's ambient-login host reports
 -- `owner = '-'`, `role = 'ambient'`; it has no attributed counterpart in
 -- query 2 and shows as all-shadow by construction.
 --
@@ -44,7 +46,12 @@
 --    `loom.forge.calls` is exported as a delta Sum: query 2 sums its samples,
 --    which is only right while `temporality` reads Delta. If it reads
 --    Cumulative, rewrite query 2 with query 1's lag-delta pattern.
-SELECT metric_name, type, temporality, uniqExact(fingerprint) AS series
+--    `installations` counts the App installations (#10571) the family's
+--    series name; `-` (no sidecar) and an older daemon's absent label are
+--    not counted.
+SELECT metric_name, type, temporality, uniqExact(fingerprint) AS series,
+       uniqExactIf(JSONExtractString(labels, 'installation'),
+                   JSONExtractString(labels, 'installation') NOT IN ('', '-')) AS installations
 FROM signoz_metrics.time_series_v4
 WHERE metric_name IN ('github.ratelimit.used', 'github.ratelimit.reset', 'loom.forge.calls')
 GROUP BY metric_name, type, temporality

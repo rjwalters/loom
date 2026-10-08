@@ -291,6 +291,15 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             (TickDecisionKind::Fetch, Some(outcome_str(&outcome)), note)
         }
     };
+    // #10712: a host below the fleet floor says so on whatever the tick
+    // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
+    // alert is never a gate: nothing above was held back for it and dispatch
+    // is untouched.
+    let note = format!("{note}{}", state.floor.note_suffix());
+    if let Some(stall) = state.floor.stall() {
+        log::error!("auto_update: {}", stall.note());
+        summary.floor_stall = Some(stall.note());
+    }
 
     status.publish(state.snapshot(true, last_check, note.clone(), &artifact));
     summary.finish(kind, note, &artifact, outcome)
@@ -338,6 +347,12 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 ) -> TickSummary {
     let started_at = Utc::now();
     let started = Instant::now();
+    // #10712: the fleet floor in force (updated by fleet-sync without a
+    // restart) against the version this process is running. Read here, not in
+    // `run_tick`, so tick tests set the basis themselves.
+    state
+        .floor
+        .set_basis(crate::fleet_sync::loom_min_version(), env!("CARGO_PKG_VERSION"));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline)
     }));

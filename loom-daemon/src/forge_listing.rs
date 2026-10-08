@@ -65,6 +65,9 @@ pub struct RestIssue {
     pub body: Option<String>,
     /// Author login (`user.login` from REST), for `gh … --json author` parity.
     pub author: Option<String>,
+    /// The author's `author_association` (`OWNER`, `MEMBER`, `NONE`, …), so a
+    /// body marker can be believed only from a trusted author (#9548, #10118).
+    pub author_association: Option<String>,
     /// Present when the row is actually a pull request (REST issue listings
     /// include PRs). Call sites filter on this to keep pre-#4428 semantics.
     pub is_pull_request: bool,
@@ -592,6 +595,8 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         #[serde(default)]
         user: Option<RawUser>,
         #[serde(default)]
+        author_association: Option<String>,
+        #[serde(default)]
         pull_request: Option<serde_json::Value>,
         #[serde(default)]
         comments: u32,
@@ -610,6 +615,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             state: r.state,
             body: r.body,
             author: r.user.and_then(|u| u.login),
+            author_association: r.author_association,
             is_pull_request: r.pull_request.is_some(),
         })
         .collect())

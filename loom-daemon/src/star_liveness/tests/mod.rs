@@ -16,6 +16,7 @@ mod intents_tests;
 mod landing_tests;
 mod level_inherit_tests;
 mod level_tests;
+mod materialize_tests;
 mod named_blocker_tests;
 mod notice_tests;
 mod parent_link_tests;

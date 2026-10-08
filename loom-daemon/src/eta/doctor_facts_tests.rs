@@ -37,6 +37,7 @@ fn gather_resolves_a_fresh_reader_under_the_doctors_own_root() {
         slug: Some("r1".into()),
         installation_id: "9".into(),
         expires_at: (Utc::now() + chrono::Duration::minutes(50)).to_rfc3339(),
+        ..Default::default()
     };
     std::fs::write(dir.join("identity.json"), serde_json::to_vec(&side).unwrap()).unwrap();
 

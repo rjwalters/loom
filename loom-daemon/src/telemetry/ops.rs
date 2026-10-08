@@ -47,6 +47,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "role",
     "cred_owner",
     "target_owner",
+    // #10571: the App installation a bucket was minted under (one per
+    // `(account, owner)`, so it adds no series).
+    "installation",
     "outcome",
     "heuristic",
     "kind",
@@ -331,6 +334,18 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- IPC request latency (Issue #10765) -------------------------------
+    /// Slowest IPC request answered in the interval, seconds from the request
+    /// line being read to the response written, labelled `kind` (the
+    /// request's wire `type` tag, or `invalid`).
+    #[serde(rename = "loom.daemon.ipc.latency_max")]
+    DaemonIpcLatencyMax,
+    /// Summed IPC request latency since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.latency")]
+    DaemonIpcLatency,
+    /// IPC requests answered since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.requests")]
+    DaemonIpcRequests,
     // ---- ETA pipeline health (Issue #10391) ------------------------------
     /// Live ETA items on this host, by kind, heuristic and answered/refusal reason.
     #[serde(rename = "loom.eta.health.items")]
@@ -445,6 +460,9 @@ impl MetricName {
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
+            Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
+            Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
             Self::EtaHealthItems => "loom.eta.health.items",
             Self::EtaHealthFitLoaded => "loom.eta.health.fit_loaded",
             Self::EtaHealthFitAgeSeconds => "loom.eta.health.fit_age_seconds",
@@ -490,7 +508,9 @@ impl MetricName {
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
             | Self::ForgeFacadeEvents
-            | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
+            | Self::DaemonTaskFaults
+            | Self::DaemonIpcLatency
+            | Self::DaemonIpcRequests => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -532,6 +552,8 @@ impl MetricName {
             Self::MergeTimeToLandMax => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
+            Self::DaemonIpcRequests => "{request}",
             Self::EtaHealthItems => "{item}",
             Self::EtaHealthFitLoaded => "1",
             Self::EtaHealthFitAgeSeconds => "s",
@@ -617,6 +639,9 @@ impl MetricName {
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
+            Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
+            Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
             Self::EtaHealthItems => {
                 "Live ETA items on this host, by kind, heuristic and answered/refusal reason."
             }

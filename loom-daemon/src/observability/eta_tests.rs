@@ -206,6 +206,7 @@ fn pr_views_key_each_pr_to_the_issue_it_closes() {
         state: "open".to_string(),
         body: Some(body.to_string()),
         author: None,
+        author_association: None,
         is_pull_request: pr,
     };
     let listings = vec![

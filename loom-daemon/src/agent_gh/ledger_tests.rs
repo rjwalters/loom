@@ -12,6 +12,7 @@ fn writer() -> CredAttr {
         account: "app-42".to_string(),
         owner: Some("acme".to_string()),
         kind: "writer",
+        installation: Some("151241341".to_string()),
     }
 }
 
@@ -88,6 +89,7 @@ fn a_row_carries_role_credential_and_repo_and_nothing_from_the_argv() {
         (at.ca.as_deref(), at.co.as_deref(), at.tk.as_deref(), at.ro.as_deref()),
         (Some("app-42"), Some("acme"), Some("writer"), Some("target"))
     );
+    assert_eq!(at.ci.as_deref(), Some("151241341"), "the sidecar's installation (#10571)");
     let all = format!("{row:?}");
     for leaked in ["private body", secret, "comment", "--body"] {
         assert!(!all.contains(leaked), "{leaked:?} leaked into {all}");
@@ -236,8 +238,11 @@ fn a_booked_row_rolls_up_by_bucket_and_by_role() {
     assert_eq!(charged(&roles, &["agent-builder"]), Some(2), "{roles:?}");
     assert_eq!(charged(&roles, &["agent-judge"]), Some(1), "{roles:?}");
     let buckets = by(GroupBy::Bucket);
-    assert_eq!(charged(&buckets, &["app-42", "acme", "graphql", "-"]), Some(2), "{buckets:?}");
-    assert_eq!(charged(&buckets, &["app-42", "acme", "core", "-"]), Some(1), "{buckets:?}");
+    // The bucket key carries the sidecar's installation (#10571).
+    let graphql = ["app-42", "acme", "151241341", "graphql", "-"];
+    assert_eq!(charged(&buckets, &graphql), Some(2), "{buckets:?}");
+    let core = ["app-42", "acme", "151241341", "core", "-"];
+    assert_eq!(charged(&buckets, &core), Some(1), "{buckets:?}");
     assert_eq!((buckets.no_repo, buckets.no_account), (0, 0));
     let callers = by(GroupBy::Caller);
     assert_eq!(charged(&callers, &["agent.gh.pr"]), Some(1), "{callers:?}");

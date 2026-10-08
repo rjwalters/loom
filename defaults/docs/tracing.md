@@ -176,6 +176,12 @@ Doctor completions, and subsequent Judge approvals even between daemon polls.
 The terminal checkpoint helper journals after its atomic write succeeds. It does
 not infer an earlier start or a missing verdict. A caller that bypasses that
 helper can provide only the phases that the daemon actually observes.
+Every checkpoint-observed phase and role span, and an owned attempt its
+checkpoint completes, also carries its execution root's `loom.repo` and
+`loom.sweep_id` (#10637), so it names the repository and sweep, not only the
+issue. `loom.repo` is GitHub's own `owner/name` spelling on every Loom span,
+the value `loom.dispatch.*` carries; where a repo keys a trace ID, the key is
+its ASCII lowercase ([trace identity](trace-identity.md)).
 
 `loom.attempt.worked` (#9420) is the companion a **duration** query needs:
 `"true"` when the span's interval measures an attempt that ran its stage's

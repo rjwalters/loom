@@ -67,6 +67,9 @@ pub struct CallLabels {
     pub account: String,
     /// The owner the credential's installation covers, or `unknown`.
     pub cred_owner: String,
+    /// The App installation the credential was minted under (#10571), or
+    /// `-`; one per `(account, cred_owner)`, so it adds no series.
+    pub installation: String,
     /// The owner of the repository the call was for, or `unknown`.
     pub target_owner: String,
     /// The billed resource.
@@ -74,7 +77,8 @@ pub struct CallLabels {
     pub outcome: CallOutcome,
 }
 
-type Series = BTreeMap<(String, String, String, String, String, String, String, &'static str), u64>;
+type SeriesKey = (String, String, String, String, String, String, String, String, &'static str);
+type Series = BTreeMap<SeriesKey, u64>;
 
 fn add(store: &mut Series, labels: CallLabels, value: u64) {
     let key = (
@@ -83,13 +87,14 @@ fn add(store: &mut Series, labels: CallLabels, value: u64) {
         labels.role,
         labels.account,
         labels.cred_owner,
+        labels.installation,
         labels.target_owner,
         labels.resource,
         labels.outcome.as_str(),
     );
     let key = if store.len() >= MAX_SERIES && !store.contains_key(&key) {
         let o = || OVERFLOW.to_string();
-        (o(), o(), o(), o(), o(), o(), o(), key.7)
+        (o(), o(), o(), o(), o(), o(), o(), o(), key.8)
     } else {
         key
     };
@@ -130,13 +135,27 @@ pub fn drain_points() -> Vec<MetricPoint> {
     drained
         .into_iter()
         .map(
-            |((caller, op, role, account, cred_owner, target_owner, resource, outcome), n)| {
+            |(
+                (
+                    caller,
+                    op,
+                    role,
+                    account,
+                    cred_owner,
+                    installation,
+                    target_owner,
+                    resource,
+                    outcome,
+                ),
+                n,
+            )| {
                 MetricPoint::int(MetricName::ForgeCalls, i64::try_from(n).unwrap_or(i64::MAX))
                     .label("caller", caller)
                     .label("op", op)
                     .label("role", role)
                     .label("account", account)
                     .label("cred_owner", cred_owner)
+                    .label("installation", installation)
                     .label("target_owner", target_owner)
                     .label("resource", resource)
                     .label("outcome", outcome)
@@ -192,6 +211,7 @@ mod tests {
             role: format!("role-{}", i % 3),
             account: format!("app-{i}"),
             cred_owner: format!("owner-{i}"),
+            installation: format!("{i}"),
             target_owner: format!("target-{i}"),
             resource: format!("res-{}", i % 5),
             outcome,
@@ -218,7 +238,7 @@ mod tests {
         let folded: Vec<_> = store.iter().filter(|(k, _)| k.0 == OVERFLOW).collect();
         assert_eq!(folded.len(), outcomes.len(), "one overflow series per outcome");
         for (k, _) in &folded {
-            for v in [&k.0, &k.1, &k.2, &k.3, &k.4, &k.5, &k.6] {
+            for v in [&k.0, &k.1, &k.2, &k.3, &k.4, &k.5, &k.6, &k.7] {
                 assert_eq!(v, OVERFLOW, "{k:?}");
             }
         }
@@ -234,6 +254,7 @@ mod tests {
             first.role,
             first.account,
             first.cred_owner,
+            first.installation,
             first.target_owner,
             first.resource,
             first.outcome.as_str(),

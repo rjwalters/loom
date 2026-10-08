@@ -1230,6 +1230,8 @@ pub fn spawn_task(
         // Long-running task liveness gauges (#10414), on their own ticker so
         // a stuck collector pass cannot hide another loop's death.
         ops_handles.push(ops::liveness::spawn_task());
+        // IPC request latency by kind (#10765), on its own ticker too.
+        ops_handles.push(ops::ipc_latency::spawn_task());
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.

@@ -226,6 +226,11 @@ pub fn plan(
         ro: Some(origin.to_string()),
         ca: forge_call_stats::sanitize(&cred.account),
         co: cred.owner.as_deref().and_then(forge_call_stats::sanitize),
+        // The installation the credential directory's sidecar names (#10571).
+        ci: cred
+            .installation
+            .as_deref()
+            .and_then(forge_call_stats::sanitize),
         tk: Some(cred.kind.to_string()),
         rr: Some(pool.as_str().to_string()),
         pg,

@@ -21,6 +21,7 @@ fn item(number: u32, labels: &[&str]) -> RestIssue {
         state: "open".into(),
         body: Some("Blocked on the vendor contract; see comment".into()),
         author: Some("someone".into()),
+        author_association: None,
         is_pull_request: false,
     }
 }

@@ -43,7 +43,7 @@ fn merge_hold_is_the_last_stage_in_every_but_not_in_all() {
 
 #[test]
 fn every_operator_hold_on_an_approved_pr_is_merge_hold() {
-    for hold in MERGE_HOLD_LABELS {
+    for hold in MERGE_HOLD_LABELS.iter().copied() {
         assert_eq!(
             stage_from_pr_labels(&labels(&["loom:pr", hold])),
             Ok(Stage::MergeHold),
@@ -82,7 +82,7 @@ fn other_holds_and_holds_off_an_approved_pr_are_still_refused() {
         );
     }
     for stage_label in ["loom:review-requested", "loom:changes-requested"] {
-        for hold in MERGE_HOLD_LABELS {
+        for hold in MERGE_HOLD_LABELS.iter().copied() {
             assert_eq!(
                 stage_from_pr_labels(&labels(&[stage_label, hold])),
                 Err(NoEstimateReason::Blocked),
@@ -114,7 +114,10 @@ fn the_operator_star_alone_is_not_a_hold() {
 fn every_merge_hold_label_is_a_registry_hold_label() {
     // A label-registry rename must fail here, not silently un-hold a PR.
     let holds = hold_labels();
-    for label in MERGE_HOLD_LABELS.iter().chain(MERGE_HOLD_COMPANION_LABELS) {
+    for label in MERGE_HOLD_LABELS
+        .iter()
+        .chain(MERGE_HOLD_COMPANION_LABELS.iter())
+    {
         assert!(holds.contains(label), "{label} is not a hold label");
     }
 }

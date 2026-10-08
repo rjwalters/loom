@@ -261,6 +261,44 @@ impl RollStallReport {
     }
 }
 
+/// The other stall this loop can declare (Issue #10712): the fleet floor
+/// (`loom_min_version`) is above the running version and above every published
+/// release, so no roll can satisfy it.
+///
+/// Unlike a [`RollStallReport`] there is nothing to abandon: no roll was armed
+/// for the floor, and none is. The host keeps dispatching on its current
+/// version and ordinary autoUpdate rolls still apply. The report exists so the
+/// stall is typed, alerted at ERROR, and visible in `status`, instead of a
+/// floor that silently does nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorStallReport {
+    /// The floor in force, `X.Y.Z`.
+    pub floor: String,
+    /// The running version, below the floor.
+    pub running: String,
+    /// The newest published release's version, also below the floor.
+    pub newest: String,
+}
+
+impl FloorStallReport {
+    /// The ERROR line and `status` note.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let Self {
+            floor,
+            running,
+            newest,
+        } = self;
+        format!(
+            "FLEET FLOOR UNSATISFIABLE: loom_min_version {floor} is above every published release \
+             (newest {newest}), so this host (running {running}) cannot roll to it. Most likely a \
+             typo in the fleet store's loom_min_version. DISPATCH CONTINUES on {running}: the \
+             floor never refuses work, and ordinary autoUpdate rolls still apply. Fix the floor, \
+             or publish a release at or above {floor}."
+        )
+    }
+}
+
 /// One episode of drain-deadline accounting that survives roll re-arms
 /// (Issue #8998). Pure — no I/O, no clock of its own — so the whole
 /// widen/re-arm/abandon sequence is a unit test rather than a 21-hour

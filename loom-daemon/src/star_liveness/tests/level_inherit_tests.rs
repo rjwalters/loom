@@ -20,13 +20,15 @@ fn has(world: &World, slug: &str, n: u32, label: &str) -> bool {
 }
 
 /// The provenance markers in `slug#n`'s body. The daemon never posts a
-/// provenance comment (#10307: loom-ui reads the body).
+/// level provenance comment (#10307: loom-ui reads the body). A materialized
+/// star's audit marker (#10012, `inherited_from=#P`) is a comment by design
+/// and is not level provenance.
 fn provenance(world: &World, slug: &str, n: u32) -> Vec<String> {
     assert!(
         !world
             .posted(slug)
             .iter()
-            .any(|(num, body)| *num == n && body.contains("inherited_from=")),
+            .any(|(num, body)| *num == n && body.contains(levels::PROVENANCE_TOKEN)),
         "no provenance comment"
     );
     let body = world.repo(slug).items[&n].body.clone().unwrap_or_default();

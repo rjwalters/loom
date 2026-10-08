@@ -22,12 +22,16 @@
 --   (any drop = reset, whole lower value charged) billed 240 in hour H.
 --
 -- Bucket B `{app-2, beta, graphql}` -- two buckets interleaved under one
--- label set (rjwalters/loom#10571): window X (reset H+30m) 4000 @1m,
+-- label set, as a pre-#10571 daemon could export (rjwalters/loom#10571): window X (reset H+30m) 4000 @1m,
 -- 4100 @3m, 4150 @5m; window Y (reset H+50m) 30 @2m, 45 @4m. Expected hour
 -- H = 4150 + 45 = 4195; the pre-fix recipe re-charged X on every switch and
 -- billed 8250.
 --
 -- A pre-#10343 owner-less point `{app-1, core}` reading 9999 must be ignored.
+--
+-- Installations (#10571): bucket A and its `loom.forge.calls` are
+-- installation 11, bucket B 22; the legacy point has none. Query 0 counts 2
+-- for `github.ratelimit.used`, 1 for `loom.forge.calls`.
 --
 -- `loom.forge.calls` for bucket A in hour H: ok 150, error 20,
 -- not_modified 50, plus a free `rate_limit` probe (`resource=other`) of 7.
@@ -94,18 +98,18 @@ CREATE TABLE loom_fixture.series_seed
 ) ENGINE = Memory;
 
 INSERT INTO loom_fixture.series_seed VALUES
-    ('github.ratelimit.used',  11, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","host.id":"h1"}'),
-    ('github.ratelimit.reset', 12, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","host.id":"h1"}'),
-    ('github.ratelimit.used',  21, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","host.id":"h2"}'),
-    ('github.ratelimit.reset', 22, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","host.id":"h2"}'),
-    ('github.ratelimit.used',  31, 'Gauge', 'Unspecified', '{"account":"app-2","owner":"beta","resource":"graphql","role":"reader","host.id":"h1"}'),
-    ('github.ratelimit.reset', 32, 'Gauge', 'Unspecified', '{"account":"app-2","owner":"beta","resource":"graphql","role":"reader","host.id":"h1"}'),
+    ('github.ratelimit.used',  11, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","installation":"11","host.id":"h1"}'),
+    ('github.ratelimit.reset', 12, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","installation":"11","host.id":"h1"}'),
+    ('github.ratelimit.used',  21, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","installation":"11","host.id":"h2"}'),
+    ('github.ratelimit.reset', 22, 'Gauge', 'Unspecified', '{"account":"app-1","owner":"acme","resource":"core","role":"writer","installation":"11","host.id":"h2"}'),
+    ('github.ratelimit.used',  31, 'Gauge', 'Unspecified', '{"account":"app-2","owner":"beta","resource":"graphql","role":"reader","installation":"22","host.id":"h1"}'),
+    ('github.ratelimit.reset', 32, 'Gauge', 'Unspecified', '{"account":"app-2","owner":"beta","resource":"graphql","role":"reader","installation":"22","host.id":"h1"}'),
     ('github.ratelimit.used',  41, 'Gauge', 'Unspecified', '{"account":"app-1","resource":"core","host.id":"h3"}'),
     ('github.ratelimit.reset', 42, 'Gauge', 'Unspecified', '{"account":"app-1","resource":"core","host.id":"h3"}'),
-    ('loom.forge.calls', 51, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","resource":"core","outcome":"ok","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
-    ('loom.forge.calls', 52, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","resource":"core","outcome":"error","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
-    ('loom.forge.calls', 53, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","resource":"core","outcome":"not_modified","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
-    ('loom.forge.calls', 54, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","resource":"other","outcome":"ok","op":"quota.rate-limit-reading","caller":"api.rate_limit","role":"writer","target_owner":"acme","host.id":"h1"}');
+    ('loom.forge.calls', 51, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"ok","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
+    ('loom.forge.calls', 52, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"error","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
+    ('loom.forge.calls', 53, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"core","outcome":"not_modified","op":"issue.list","caller":"x","role":"writer","target_owner":"acme","host.id":"h1"}'),
+    ('loom.forge.calls', 54, 'Sum', 'Delta', '{"account":"app-1","cred_owner":"acme","installation":"11","resource":"other","outcome":"ok","op":"quota.rate-limit-reading","caller":"api.rate_limit","role":"writer","target_owner":"acme","host.id":"h1"}');
 
 -- Two hour-rows per series (the SigNoz trap the sub-select exists for).
 INSERT INTO signoz_metrics.time_series_v4

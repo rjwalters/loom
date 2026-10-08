@@ -151,10 +151,11 @@ fn the_walk_caps_forge_reads_counting_closed_children_and_blocker_reads() {
         let repo = world.repo(slug);
         (repo.issue_reads, repo.comment_reads)
     };
-    // Each stale-blocked child's comments are read twice: once by the walk
-    // (counted against the cap) and once by the unblock's marker dedupe after
-    // the walk (outside it).
-    assert_eq!(comment_reads, 6);
+    // Each stale-blocked child's comments are read three times: once by the
+    // walk (counted against the cap), then, outside it, once by the
+    // unblock's marker dedupe and once by the star materialization's
+    // operator-removed check (#10012 §2).
+    assert_eq!(comment_reads, 9);
     let walk_comment_reads = 3;
     assert_eq!(
         issue_reads + walk_comment_reads,

@@ -21,6 +21,7 @@ fn refused(slug: &str, error: &str, incident_body: &str, author: &str, associati
         slug,
         RestIssue {
             author: Some(author.into()),
+            author_association: None,
             ..issue_with_body(30, &["loom:triage"], incident_body)
         },
     );
@@ -139,6 +140,7 @@ fn the_newest_trusted_matching_issue_is_the_incident() {
     let quote = "Merges fail: merge commits are not allowed on this repository.";
     let dated = |number: u32, created: &str| RestIssue {
         author: Some("turian".into()),
+        author_association: None,
         created_at: Some(created.into()),
         ..issue_with_body(number, &["loom:triage"], quote)
     };
