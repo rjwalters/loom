@@ -1568,36 +1568,48 @@ on a live host is the daemon's own sync, below
 
 Every other sub-verb above only reads the store. `propose` is the one place
 `fleet-config` writes to it — and it never writes directly: each sub-verb
-edits a fresh fetch of the relevant store file in memory, then opens a
-**branch + PR** (never a direct push) carrying that one change and the hidden
-`<!-- loom:provenance v1 … -->` marker every Loom-authored PR body carries
-(`loom-daemon/src/provenance`), with `base=` the store commit it branched
-from. Merges stay the operator's, per the store's own branch policy — this command
-has no auto-merge path, and it never touches `repos.yml`'s `fleet`/`firewall`
-flags. `--dry-run` prints the diff and stops before opening anything.
+edits `fleet.yml`, the store's one hand-edited source, in memory (#10905),
+then opens a **branch + PR** (never a direct push) carrying that change and
+the hidden `<!-- loom:provenance v1 … -->` marker every Loom-authored PR body
+carries (`loom-daemon/src/provenance`), with `base=` the store commit it
+branched from. Merges stay the operator's, per the store's own branch
+policy — this command has no auto-merge path, and it never touches a repo's
+`fleet`/`firewall` flags. `--dry-run` prints the diff and stops before
+opening anything. A store without `fleet.yml` takes no proposal.
 
 Every edit is **format-preserving**: it patches only the lines the change
 requires (a small line-oriented editor, not a YAML re-serialize), so a
-reviewer's diff is exactly that change — comments, ordering and unrelated
-records in `repos.yml` / `fleet/state.yml` are untouched.
+reviewer's diff is exactly that change — comments (including an inline
+comment on a replaced value), ordering and unrelated records are untouched.
+
+**Renders.** The store's `validate` check rejects a render that differs from
+`fleet.yml` (`fleet-stale`), so the edited `fleet.yml` is rendered with the
+store's own `scripts/render.py`, run from a scratch copy of the base commit's
+`scripts/` and `schema/`, and the PR carries `fleet.yml` plus every render it
+changes (`fleet.json`, `repos.yml`, `fleet/state.yml`, the host tiers). A
+render that refuses the edit is an error and opens nothing. Without `python3`
+and PyYAML on the host (or without `scripts/render.py` in the store) the PR
+carries `fleet.yml` alone, and both a warning and the PR body say to run
+`python3 scripts/render.py` on the branch.
 
 - **`propose state <running|paused|stopped> [--host H] --reason … [--by WHO]
-  [--dry-run]`** — sets `fleet/state.yml`'s `hosts.<H>.state` (or, with no
-  `--host`, the top-level `fleet.state` default), always (re)writing
-  `since`/`by`; `reason` is required. Creates `hosts:` and/or the host's own
-  entry when either is missing; editing the fleet default requires that
-  block to already exist. `--by` defaults to this host's identity.
+  [--dry-run]`** — sets `state.hosts.<H>.state` (or, with no `--host`, the
+  `state.fleet` default), always (re)writing `since`/`by`; `reason` is
+  required. Creates `hosts:` and/or the host's own entry when either is
+  missing; editing the fleet default requires that block to already exist.
+  `--by` defaults to this host's identity.
 - **`propose priority <repo> <priority> [--dry-run]`** — sets the named
-  `repos[]` record's `fleet_priority` in `repos.yml`, inserting the key if
-  the record does not have one yet. Every other key on that record, and
-  every other record, is untouched.
+  `repos[]` record's `fleet_priority`, inserting the key if the record does
+  not have one yet. Every other key on that record, and every other record,
+  is untouched.
 - **`propose adopt [--host H] [--dry-run]`** — turns this host's `render
-  --check` drift into the store-side edit that would make it the new
-  rendered value: the host-local tier (`fleet/hosts/<H>/local.json`) is
-  adopted verbatim (including creating it when the store has never had one
-  for this host); the machine tier (`fleet/hosts/<H>/defaults.json`) is
-  patched leaf-by-leaf, so the host's other overrides survive untouched.
-  Exits with nothing to propose (and no PR) when the host has no drift.
+  --check` drift into the `fleet.yml` edit that would make it the new
+  rendered value, leaf by leaf: the host-local tier
+  (`config.hosts.<H>.local`) is made equal to the on-disk file (added when
+  the store has none for this host); the machine tier
+  (`config.hosts.<H>.defaults`) gets only the differing leaves, so the
+  host's other overrides survive untouched. Exits with nothing to propose
+  (and no PR) when the host has no drift.
 
 Any sub-verb whose edit came out a no-op — the store already says what it
 was asked to say — prints `nothing to propose` and exits 0 without opening
