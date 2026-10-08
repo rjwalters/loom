@@ -11,17 +11,34 @@
 //! result in the current status snapshot.
 //!
 //! The other half of "bounded" is inside the pass: a time budget for
-//! classification and a short timeout on every git child (see the parent
-//! module).
+//! classification, a deadline after which no resync starts, and a short
+//! timeout on every git child (see the parent module).
+//!
+//! # A pass that does not end
+//!
+//! Every child a pass runs has a timeout, so a pass ends. If one does not
+//! anyway (a filesystem that stops answering, a defect), two things happen
+//! (#10987):
+//!
+//! * At the [`STUCK_AFTER_TICKS`]-th tick in a row that finds it still
+//!   running, a `pass-stuck` alert is published, once for that pass.
+//! * After [`ABANDON_AFTER`] the task stops waiting for it and gives the
+//!   single-flight slot up, so the slot is never held forever. A thread
+//!   cannot be killed, so the old pass may still exist and still hold the
+//!   pass memory: until it ends, each new pass finds the memory taken, does
+//!   nothing, and says so on the status snapshot. Nothing piles up, and the
+//!   passes resume by themselves when the old one ends.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 
-use super::{Env, LazyPayload, Memory, WorkspacePass, ALERT_TOPIC, PASS_BUDGET};
+use super::{
+    Alert, Env, LazyPayload, Memory, WorkspacePass, ALERT_TOPIC, PASS_BUDGET, PASS_DEADLINE,
+};
 use crate::event_bus::EventBus;
 use crate::fleet_state::Enforcer;
 use crate::fleet_store::gh::GhTransport;
@@ -260,9 +277,25 @@ fn run_live(
         return WorkspacePass::default();
     };
     let started = Instant::now();
-    let mut guard = match memory().lock() {
+    let mut guard = match memory().try_lock() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            // An abandoned pass (see the module docs) still holds it. Waiting
+            // here would park one more thread every tick.
+            log::warn!(
+                "workspace_resync: an earlier pass that never ended still holds the pass \
+                 memory; nothing is checked this tick"
+            );
+            // The last finished pass's findings stay on the snapshot.
+            let last = latest();
+            return WorkspacePass {
+                running: last.running,
+                host: Some("an earlier workspace pass has not ended; nothing was checked".into()),
+                workspaces: last.workspaces,
+                ..WorkspacePass::default()
+            };
+        }
     };
     // Release provenance, part (b): ask the forge what the release tag names.
     // Once per process (the answer is cached; a lookup with no answer is
@@ -302,6 +335,8 @@ fn run_live(
         gate: &|| super::host_gate(&HostGateInputs::live(enforcer)),
         clock: &Utc::now,
         spent: &|| started.elapsed() >= PASS_BUDGET,
+        overdue: &|| started.elapsed() >= PASS_DEADLINE,
+        heads: &super::heads::live,
     };
     let pass = super::run(&env, &registered_roots(), mode, &mut guard);
     drop(guard);
@@ -351,6 +386,70 @@ pub(in crate::fleet_sync) fn latest() -> WorkspacePass {
         .unwrap_or_default()
 }
 
+/// Ticks in a row that find the previous pass still running before that is
+/// an alert.
+pub const STUCK_AFTER_TICKS: u32 = 5;
+
+/// How long the task waits for a pass before it gives the single-flight slot
+/// up. Far beyond what a pass can take with every child at its timeout, and
+/// the claim's stale window: by then the fence refuses any push the old pass
+/// might still try.
+pub const ABANDON_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Ticks in a row that found the previous pass still running.
+static REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// Count one tick that found the previous pass still running. Returns the
+/// count, and whether this is the tick that alerts.
+pub(super) fn note_refused(refused: &AtomicU32) -> (u32, bool) {
+    let ticks = refused.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    (ticks, ticks == STUCK_AFTER_TICKS)
+}
+
+fn publish_stuck(bus: Option<&EventBus>, ticks: u32, detail: String) {
+    log::error!("fleet_sync: {detail}");
+    let alert = Alert {
+        root: PathBuf::new(),
+        repo: None,
+        kind: "pass-stuck",
+        failures: ticks,
+        detail,
+        next_attempt: Utc::now(),
+    };
+    if let Some(bus) = bus {
+        let payload = serde_json::to_value(&alert).unwrap_or(serde_json::Value::Null);
+        let _ = bus.publish_generic(ALERT_TOPIC, payload);
+    }
+}
+
+/// How a supervised pass ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Ended<T> {
+    /// It returned.
+    Done(T),
+    /// It panicked.
+    Panicked(String),
+    /// It was still running at the deadline. It is not waited for any longer;
+    /// its thread runs on until whatever it is stuck in lets go.
+    Abandoned,
+}
+
+/// Run `work` on a blocking thread and wait for it for at most `deadline`,
+/// holding `flight` meanwhile. The single-flight slot is free again when
+/// this returns, however the work ended.
+pub(super) async fn supervise<T: Send + 'static>(
+    flight: Flight<'_>,
+    deadline: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Ended<T> {
+    let _flight = flight;
+    match tokio::time::timeout(deadline, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(found)) => Ended::Done(found),
+        Ok(Err(e)) => Ended::Panicked(e.to_string()),
+        Err(_) => Ended::Abandoned,
+    }
+}
+
 /// Start a workspace pass on its own task and return at once. Called by the
 /// timer task: once at startup (after the startup pass, with the drain state
 /// wired) and after every timer pass, once run-state enforcement has been
@@ -363,26 +462,42 @@ pub(in crate::fleet_sync) fn spawn_pass(
     bus: &Option<Arc<EventBus>>,
 ) -> bool {
     let Some(flight) = begin(&IN_FLIGHT) else {
-        log::info!(
-            "fleet_sync: the previous workspace pass is still running; none is started this tick"
-        );
+        let (ticks, alert) = note_refused(&REFUSED);
+        if alert {
+            let detail = format!(
+                "a workspace pass is still running {ticks} ticks after it started; no pass has \
+                 started since, and the workspace states shown are from before it"
+            );
+            publish_stuck(bus.as_deref(), ticks, detail);
+        } else {
+            log::info!(
+                "fleet_sync: the previous workspace pass is still running; none is started this \
+                 tick ({ticks} in a row)"
+            );
+        }
         return false;
     };
+    REFUSED.store(0, Ordering::Release);
     let (owned, enforcer, bus) = (inputs.clone(), enforcer.clone(), bus.clone());
     tokio::spawn(async move {
-        let _flight = flight;
-        let found = tokio::task::spawn_blocking(move || {
-            run_live(&owned, mode, enforcer.as_deref(), bus.as_deref())
-        })
-        .await;
-        match found {
-            Ok(found) => {
+        let stuck_bus = bus.clone();
+        let work = move || run_live(&owned, mode, enforcer.as_deref(), bus.as_deref());
+        match supervise(flight, ABANDON_AFTER, work).await {
+            Ended::Done(found) => {
                 if let Ok(mut latest) = latest_cell().lock() {
                     latest.clone_from(&found);
                 }
                 crate::fleet_sync::publish_workspaces(&found);
             }
-            Err(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
+            Ended::Panicked(e) => log::warn!("fleet_sync: a workspace pass panicked: {e}"),
+            Ended::Abandoned => {
+                let detail = format!(
+                    "a workspace pass did not end within {}s and is no longer waited for; passes \
+                     resume when it ends",
+                    ABANDON_AFTER.as_secs()
+                );
+                publish_stuck(stuck_bus.as_deref(), STUCK_AFTER_TICKS, detail);
+            }
         }
     });
     true
