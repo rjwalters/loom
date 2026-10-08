@@ -972,6 +972,9 @@ impl SweepRegistry {
         // Retry any previously-failed quarantine label restores (Issue #4110).
         // Cheap early-return when nothing is pending.
         self.retry_pending_quarantine_releases();
+        // Release no-op holds whose inputs changed (Issue #10156). Cheap
+        // early-return when nothing is held.
+        self.reconcile_noop_holds(std::time::Instant::now());
         // SIGKILL-escalate any orphaned process group that survived a
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).

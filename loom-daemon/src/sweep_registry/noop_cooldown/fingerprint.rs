@@ -70,11 +70,18 @@ impl IssueSnapshot {
     /// set (an operator starring or unstarring is a human signal) but its mere
     /// presence never exempts the issue from the hold.
     pub(super) fn fingerprint(&self) -> String {
+        self.fingerprint_ignoring(&[])
+    }
+
+    /// [`Self::fingerprint`] with `ignored` labels (the hold's own park
+    /// labels) left out, so a parked issue can be compared against the
+    /// fingerprint taken before the park landed.
+    pub(super) fn fingerprint_ignoring(&self, ignored: &[&str]) -> String {
         let mut labels: Vec<&str> = self
             .labels
             .iter()
             .map(String::as_str)
-            .filter(|l| !DAEMON_CHURN_LABELS.contains(l))
+            .filter(|l| !DAEMON_CHURN_LABELS.contains(l) && !ignored.contains(l))
             .collect();
         labels.sort_unstable();
         labels.dedup();
@@ -85,11 +92,10 @@ impl IssueSnapshot {
             .collect();
         deps.sort_unstable();
         format!(
-            "labels=[{}];open={};comments={}:{};pr={};deps=[{}]",
+            "labels=[{}];open={};comments=[{}];pr={};deps=[{}]",
             labels.join(","),
             self.open,
-            self.comments.len(),
-            self.comments.last().map_or("", String::as_str),
+            self.comments.join(","),
             self.linked_pr,
             deps.join(","),
         )
@@ -177,6 +183,13 @@ mod tests {
         let mut s = base();
         s.comments[0] = "1:2026-10-03T00:00:00Z".into();
         assert_ne!(a, s.fingerprint(), "an edited comment");
+        // Editing an *earlier* comment must register even when the last one
+        // is untouched.
+        let mut two = base();
+        two.comments.push("2:2026-10-02T00:00:00Z".into());
+        let before = two.fingerprint();
+        two.comments[0] = "1:2026-10-05T00:00:00Z".into();
+        assert_ne!(before, two.fingerprint(), "an edited earlier comment");
         let mut s = base();
         s.linked_pr = "open:#9".into();
         assert_ne!(a, s.fingerprint(), "a linked PR");
@@ -186,6 +199,15 @@ mod tests {
         let mut s = base();
         s.open = false;
         assert_ne!(a, s.fingerprint(), "the issue closing");
+    }
+
+    #[test]
+    fn ignoring_the_park_labels_matches_the_pre_park_fingerprint() {
+        let before = base().fingerprint();
+        let mut parked = base();
+        parked.labels = vec!["loom:operator-priority".into(), "loom:blocked".into()];
+        assert_ne!(before, parked.fingerprint());
+        assert_eq!(before, parked.fingerprint_ignoring(&["loom:blocked"]));
     }
 
     #[test]

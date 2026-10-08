@@ -82,7 +82,15 @@ pub(crate) struct NoopStreak {
     pub(crate) held: bool,
     /// The one-per-streak "could not park" notice has been posted.
     failure_notice_posted: bool,
+    /// When reconciliation last looked at this held streak's inputs.
+    checked_at: Option<std::time::Instant>,
 }
+
+/// Minimum gap between reconciliation reads of one held issue.
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Most held issues reconciled in one reaper tick (each costs several reads).
+const RECONCILE_PER_TICK: usize = 2;
 
 /// The cooldown windows plus the hold streaks.
 ///
@@ -139,9 +147,11 @@ fn trim_stderr(stderr: &[u8]) -> String {
 }
 
 /// `jq` over the comments endpoint: one `id:updated_at` line per comment that
-/// is neither from a bot account nor one of Loom's own marked comments.
+/// is neither from a bot account nor one of this hold's own notices. Only the
+/// hold's marker is excluded: a human comment that happens to carry some other
+/// Loom marker is still new information and must reset the streak.
 const COMMENTS_JQ: &str = ".[] | select((.user.type // \"\") != \"Bot\") \
-                           | select((.body // \"\") | contains(\"<!-- loom:\") | not) \
+                           | select((.body // \"\") | contains(\"<!-- loom:noop-hold\") | not) \
                            | \"\\(.id):\\(.updated_at)\"";
 
 /// `jq` over one issue: the facts the fingerprint and dependency scan read.
@@ -281,6 +291,7 @@ impl SweepRegistry {
                 park,
                 held: false,
                 failure_notice_posted,
+                checked_at: None,
             },
         );
         log::info!(
@@ -293,7 +304,10 @@ impl SweepRegistry {
         let outcome = self.apply_noop_hold(issue, count, park, reason, &snapshot);
         if let Some(s) = self.noop_cooldown.streaks.get_mut(&issue) {
             match outcome {
-                NoopHoldOutcome::Applied => s.held = true,
+                NoopHoldOutcome::Applied => {
+                    s.held = true;
+                    s.checked_at = Some(std::time::Instant::now());
+                }
                 NoopHoldOutcome::LabelWriteFailed => s.failure_notice_posted = true,
                 NoopHoldOutcome::VetoedClosed => {
                     self.noop_cooldown.streaks.remove(&issue);
@@ -301,6 +315,105 @@ impl SweepRegistry {
                 NoopHoldOutcome::VetoedNoForge => {}
             }
         }
+    }
+
+    /// Release daemon-applied holds whose inputs have changed (Issue #10156).
+    ///
+    /// A parked issue is excluded from dispatch, so it can never no-op again
+    /// to notice a change; this pass reads each held issue (at most every
+    /// [`RECONCILE_INTERVAL`], [`RECONCILE_PER_TICK`] per call) and compares
+    /// its fingerprint, ignoring the hold's own labels, against the one the
+    /// park was decided on. A change removes only this hold's labels, returns
+    /// the issue to `loom:issue`, and drops the streak so the next no-op starts
+    /// at 1. Fails open: an unreadable forge leaves the hold in place.
+    pub(crate) fn reconcile_noop_holds(&mut self, now: std::time::Instant) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let mut due: Vec<u32> = self
+            .noop_cooldown
+            .streaks
+            .iter()
+            .filter(|(_, s)| {
+                s.held
+                    && s.checked_at
+                        .is_none_or(|t| now.saturating_duration_since(t) >= RECONCILE_INTERVAL)
+            })
+            .map(|(issue, _)| *issue)
+            .collect();
+        due.sort_unstable();
+        due.truncate(RECONCILE_PER_TICK);
+        for issue in due {
+            if let Some(s) = self.noop_cooldown.streaks.get_mut(&issue) {
+                s.checked_at = Some(now);
+            }
+            self.reconcile_one_hold(issue);
+        }
+    }
+
+    fn reconcile_one_hold(&mut self, issue: u32) {
+        let Some((park, announced)) = self
+            .noop_cooldown
+            .streaks
+            .get(&issue)
+            .map(|s| (s.park, s.fingerprint.clone()))
+        else {
+            return;
+        };
+        let Some(snapshot) = self.fetch_noop_snapshot(issue) else {
+            return;
+        };
+        let ours = park.labels();
+        let still_parked = ours.iter().any(|l| snapshot.labels.iter().any(|x| x == l));
+        if !snapshot.open || !still_parked {
+            // Closed, or someone already lifted the park: nothing to undo.
+            self.noop_cooldown.streaks.remove(&issue);
+            return;
+        }
+        if snapshot.fingerprint_ignoring(ours) == announced {
+            return;
+        }
+        let other_hold = snapshot.labels.iter().any(|l| {
+            !ours.contains(&l.as_str())
+                && (crate::work_finder::PARK_LABELS.contains(&l.as_str())
+                    || l == crate::work_finder::OPERATOR_HOLD_LABEL)
+        });
+        let claimed = snapshot.labels.iter().any(|l| l == "loom:building");
+        let restore = !other_hold && !claimed;
+        if let Err(cause) = self.lift_park_labels(issue, ours, restore) {
+            log::warn!(
+                "sweep_registry: no-op hold for #{issue} saw changed inputs but could not lift                  {ours:?}; retrying next interval (#10156): {cause}"
+            );
+            return;
+        }
+        self.noop_cooldown.streaks.remove(&issue);
+        log::info!("sweep_registry: no-op hold for #{issue} released: inputs changed (#10156)");
+        let body = format!(
+            "{NOOP_HOLD_COMMENT_MARKER}\n<!-- loom:noop-hold-kind=released (#10156) -->\n\
+             **Hold released.** A comment, label, linked PR or dependency changed since this \
+             issue was held, so {} was removed{} and the no-op count restarts (Issue #10156).",
+            ours.join(" + "),
+            if restore {
+                " and `loom:issue` restored"
+            } else {
+                ""
+            },
+        );
+        self.post_noop_hold_comment(issue, &body);
+    }
+
+    /// Remove this hold's `labels` (and add `loom:issue` when `restore`).
+    fn lift_park_labels(&self, issue: u32, labels: &[&str], restore: bool) -> Result<(), String> {
+        let issue_arg = issue.to_string();
+        let mut edit: Vec<&str> = vec!["issue", "edit", &issue_arg];
+        for l in labels {
+            edit.extend(["--remove-label", l]);
+        }
+        if restore {
+            edit.extend(["--add-label", "loom:issue"]);
+        }
+        self.run_gh_edit("noop_hold.lift", &edit)
+            .map_err(|(_, detail)| detail)
     }
 
     /// Park `issue` and say why. Never touches `loom:building` or
@@ -412,9 +525,17 @@ impl SweepRegistry {
         if remove_loom_issue {
             edit.extend(["--remove-label", "loom:issue"]);
         }
+        self.run_gh_edit("noop_hold.label", &edit)
+    }
+
+    /// Run one prepared `gh issue edit`; `Err((timed_out, detail))`.
+    fn run_gh_edit(&self, site: &'static str, edit: &[&str]) -> Result<(), (bool, String)> {
         let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        edit.extend(repo_flag.iter().map(String::as_str));
-        match self.gh_write("noop_hold.label", edit) {
+        let args = edit
+            .iter()
+            .copied()
+            .chain(repo_flag.iter().map(String::as_str));
+        match self.gh_write(site, args) {
             Ok(Some(out)) if out.status.success() => Ok(()),
             Ok(Some(out)) => Err((
                 false,

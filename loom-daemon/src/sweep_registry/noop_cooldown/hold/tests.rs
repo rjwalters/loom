@@ -232,6 +232,120 @@ fn lifting_the_park_starts_a_fresh_streak_not_an_instant_rehold() {
     assert_eq!(forge.calls("issue edit").len(), edits, "no immediate re-park");
 }
 
+/// Reflect the park the daemon just wrote onto the fake forge, the way the
+/// real forge would.
+fn reflect_park(forge: &Forge, labels: &[&str]) {
+    forge.set_issue(ISSUE, "open", "", labels);
+}
+
+#[test]
+#[serial]
+fn a_changed_input_releases_an_applied_park_without_a_manual_label_edit() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
+    reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
+    assert!(reg.noop_hold_applied(ISSUE));
+    let parked = [
+        "loom:operator-priority",
+        "loom:operator-only",
+        "loom:operator-decision",
+    ];
+    reflect_park(&forge, &parked);
+    let t0 = std::time::Instant::now();
+    let edits = forge.calls("issue edit").len();
+
+    // Nothing changed (the hold's own notice is excluded): the park stays.
+    reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL);
+    assert!(reg.noop_hold_applied(ISSUE));
+    assert_eq!(forge.calls("issue edit").len(), edits, "unchanged inputs keep the park");
+
+    // An approval comment arrives while parked.
+    forge.set_comments("9:2026-10-08T00:00:00Z\n");
+    // Throttled: too soon after the last look.
+    reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL);
+    assert!(reg.noop_hold_applied(ISSUE), "reconciliation is rate-limited per issue");
+
+    reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    assert_eq!(reg.noop_streak_count(ISSUE), 0, "the streak is dropped");
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
+    assert!(lift.contains("--remove-label loom:operator-decision"), "{lift}");
+    assert!(lift.contains("--add-label loom:issue"), "{lift}");
+    assert!(!lift.contains("loom:operator-priority"), "the star is never touched: {lift}");
+    assert!(forge
+        .comment_bodies()
+        .iter()
+        .any(|c| c.contains("kind=released")));
+
+    // Once lifted, the next no-op is a fresh streak at 1.
+    forge.set_issue(ISSUE, "open", "", &["loom:issue", "loom:operator-priority"]);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1);
+}
+
+#[test]
+#[serial]
+fn a_closed_dependency_releases_a_blocked_park() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    let body = "## Dependencies\n- [ ] #77 the upstream\n";
+    forge.set_issue(ISSUE, "open", body, &["loom:issue"]);
+    forge.set_issue(77, "open", "", &[]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE));
+    forge.set_issue(ISSUE, "open", body, &["loom:blocked"]);
+    forge.set_issue(77, "closed", "", &[]);
+    reg.reconcile_noop_holds(std::time::Instant::now() + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:blocked"), "{lift}");
+    assert!(lift.contains("--add-label loom:issue"), "{lift}");
+}
+
+#[test]
+#[serial]
+fn an_operator_who_already_lifted_the_park_is_not_edited_again() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    reg.record_noop_release(ISSUE, Some("human gate".into()));
+    reg.record_noop_release(ISSUE, Some("human gate".into()));
+    assert!(reg.noop_hold_applied(ISSUE));
+    let edits = forge.calls("issue edit").len();
+    forge.set_issue(ISSUE, "open", "", &["loom:issue", "x"]);
+    reg.reconcile_noop_holds(std::time::Instant::now() + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE));
+    assert_eq!(forge.calls("issue edit").len(), edits, "nothing left to undo");
+}
+
+/// `COMMENTS_JQ` is evaluated by `gh`, which the fake bypasses, so run the
+/// real filter through `jq`: only a bot or the hold's own notice drops out.
+#[test]
+fn comment_filter_keeps_a_human_comment_that_carries_another_loom_marker() {
+    use std::io::Write;
+    let comments = serde_json::json!([
+        {"id": 1, "updated_at": "t1", "user": {"type": "User"}, "body": "plain"},
+        {"id": 2, "updated_at": "t2", "user": {"type": "User"},
+         "body": "approved <!-- loom:verdict-sha sha=abc -->"},
+        {"id": 3, "updated_at": "t3", "user": {"type": "Bot"}, "body": "bot"},
+        {"id": 4, "updated_at": "t4", "user": {"type": "User"},
+         "body": format!("{NOOP_HOLD_COMMENT_MARKER}\nheld")},
+    ]);
+    let mut child = std::process::Command::new("jq")
+        .args(["-r", COMMENTS_JQ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("jq");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(comments.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1:t1\n2:t2\n");
+}
+
 #[test]
 #[serial]
 fn zero_threshold_disables_the_hold_without_touching_the_cooldown() {
