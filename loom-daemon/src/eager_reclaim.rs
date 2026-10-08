@@ -91,6 +91,7 @@ use crate::deep_clean::DeepCleanReport;
 use crate::docker_image_clean::DockerRetentionReport;
 use crate::git_tmp_reclaim::GitTmpReclaimReport;
 use crate::scratch_reclaim::ScratchReclaimReport;
+use crate::target_orphan_reclaim::TargetOrphanReport;
 
 // ============================================================================
 // Constants
@@ -255,6 +256,8 @@ pub struct EagerReclaimReport {
     pub docker: Option<DockerRetentionReport>,
     /// The new `/tmp`-shaped scratch sub-pass's own report (#7512 item 3).
     pub scratch: Option<ScratchReclaimReport>,
+    /// The orphaned cargo target dir sub-pass's own report (#8370).
+    pub target_orphans: Option<TargetOrphanReport>,
     /// When this pass ran.
     pub at: DateTime<Utc>,
     /// The aborted-fetch `.git/objects` temp-file sub-pass's report (#10995).
@@ -297,11 +300,16 @@ impl EagerReclaimReport {
             .git_tmp
             .as_ref()
             .map_or_else(|| "n/a".to_string(), GitTmpReclaimReport::removed_human);
+        let target_orphans = self
+            .target_orphans
+            .as_ref()
+            .map_or_else(|| "n/a".to_string(), TargetOrphanReport::summary);
         format!(
             "eager_reclaim: {} disk axis binds the dispatch cap down ({} free) — ran an \
              out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's own \
              scheduled pass: worktrees {} removed, deep-clean {deep}, docker {docker}, scratch \
-             {scratch}, git-tmp {git_tmp} — now {} free vs. floor {}G (#7512)",
+             {scratch}, git-tmp {git_tmp}, cargo-target orphans {target_orphans} — now {} free \
+             vs. floor {}G (#7512)",
             self.repo_root.display(),
             gb_or_unknown(self.free_gb_before),
             self.worktrees_removed,
@@ -344,6 +352,8 @@ pub struct SubPasses<'a> {
     pub docker: &'a dyn Fn(&Path) -> DockerRetentionReport,
     /// [`crate::scratch_reclaim::run_for`].
     pub scratch: &'a dyn Fn(&Path) -> ScratchReclaimReport,
+    /// [`crate::target_orphan_reclaim::run_for`] (#8370).
+    pub target_orphans: &'a dyn Fn(&Path) -> TargetOrphanReport,
     /// Free GB on the worktree-root volume, sampled before and after.
     pub free_gb: &'a dyn Fn(&Path) -> Option<u64>,
     /// [`crate::git_tmp_reclaim::run_for`] (#10995).
@@ -396,6 +406,7 @@ pub fn run_pass(
         deep_clean: None,
         docker: None,
         scratch: None,
+        target_orphans: None,
         at: inputs.now,
         git_tmp: None,
     };
@@ -427,6 +438,7 @@ pub fn run_pass(
     let deep_clean = (passes.deep_clean)(repo_root);
     let docker = (passes.docker)(repo_root);
     let scratch = (passes.scratch)(repo_root);
+    let target_orphans = (passes.target_orphans)(repo_root);
     let free_gb_after = (passes.free_gb)(repo_root);
 
     EagerReclaimReport {
@@ -439,6 +451,7 @@ pub fn run_pass(
         deep_clean: Some(deep_clean),
         docker: Some(docker),
         scratch: Some(scratch),
+        target_orphans: Some(target_orphans),
         at: inputs.now,
         git_tmp: Some(git_tmp),
     }
@@ -512,6 +525,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let deep_clean = |root: &Path| crate::deep_clean::run_for(root, floor_gb);
     let docker = crate::docker_image_clean::run_for;
     let scratch = crate::scratch_reclaim::run_for;
+    let target_orphans = crate::target_orphan_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
     let git_tmp = crate::git_tmp_reclaim::run_for;
     let passes = SubPasses {
@@ -519,6 +533,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
         deep_clean: &deep_clean,
         docker: &docker,
         scratch: &scratch,
+        target_orphans: &target_orphans,
         free_gb: &free_gb,
         git_tmp: &git_tmp,
     };
@@ -692,6 +707,14 @@ mod tests {
         }
     }
 
+    fn stub_target_orphan_report(root: &Path) -> TargetOrphanReport {
+        TargetOrphanReport {
+            repo_root: root.to_path_buf(),
+            enabled: true,
+            ..TargetOrphanReport::default()
+        }
+    }
+
     fn run_with_counters(inputs: &EagerReclaimInputs, counters: &Counters) -> EagerReclaimReport {
         let now = inputs.now;
         let reap = |_: &Path| {
@@ -710,6 +733,10 @@ mod tests {
             counters.order.borrow_mut().push("scratch");
             stub_scratch_report(root, now)
         };
+        let target_orphans = |root: &Path| {
+            counters.order.borrow_mut().push("target_orphans");
+            stub_target_orphan_report(root)
+        };
         let free_gb = |_: &Path| Some(3u64);
         let git_tmp = |root: &Path| {
             counters.order.borrow_mut().push("git_tmp");
@@ -720,6 +747,7 @@ mod tests {
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
+            target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
         };
@@ -744,13 +772,21 @@ mod tests {
         assert_eq!(report.worktrees_removed, 2);
         assert_eq!(
             *counters.order.borrow(),
-            vec!["worktrees", "git_tmp", "deep", "docker", "scratch"],
+            vec![
+                "worktrees",
+                "git_tmp",
+                "deep",
+                "docker",
+                "scratch",
+                "target_orphans"
+            ],
             "must mirror worktree_reaper::reap_repo's own sequencing"
         );
         assert!(report.git_tmp.is_some());
         assert!(report.deep_clean.is_some());
         assert!(report.docker.is_some());
         assert!(report.scratch.is_some());
+        assert!(report.target_orphans.is_some());
         assert_eq!(report.free_gb_before, Some(3));
         assert_eq!(report.free_gb_after, Some(3));
     }
@@ -773,7 +809,7 @@ mod tests {
         inputs.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.is_none());
-        assert_eq!(counters.total(), 5);
+        assert_eq!(counters.total(), 6);
     }
 
     #[test]
@@ -821,6 +857,7 @@ mod tests {
         let reap = |_: &Path| 0usize;
         let docker = |_: &Path| stub_docker_report(now);
         let scratch = |root: &Path| stub_scratch_report(root, now);
+        let target_orphans = |root: &Path| stub_target_orphan_report(root);
         let free_gb = |_: &Path| Some(1u64);
         let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
         let passes = SubPasses {
@@ -828,6 +865,7 @@ mod tests {
             deep_clean: &deep,
             docker: &docker,
             scratch: &scratch,
+            target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
         };
@@ -956,6 +994,7 @@ mod tests {
             "docker",
             "scratch",
             "git-tmp",
+            "cargo-target orphans",
             "floor 20G",
         ] {
             assert!(line.contains(needle), "log line missing {needle}: {line}");

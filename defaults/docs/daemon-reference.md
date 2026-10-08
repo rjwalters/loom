@@ -4272,7 +4272,7 @@ touching running work.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
+| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370) on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
 | **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
 | **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
@@ -5480,7 +5480,8 @@ config (`autonomous.workFinder.enabled`, see "Operability" below). Tunables:
 supervisor's 300s so the `loom:issue` backlog drains promptly),
 `LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
 dynamic policy above, not a fixed target), and `LOOM_PER_WORKTREE_GB` (default
-2 — the per-worktree disk estimate the disk-headroom bound divides by). A zero
+8 since #8370, calibrated from measured cargo target dirs — the per-worktree
+disk estimate the disk-headroom bound divides by). A zero
 or unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
@@ -9065,6 +9066,66 @@ independent of the 60s work-finder tick interval.
 See `loom-daemon/src/tmpfs_visibility.rs`,
 `loom-daemon/src/health/tmpfs_visibility_section.rs`, and
 `loom-daemon/src/work_finder/tmpfs_warning.rs`.
+
+#### Orphaned cargo target dir reclaim (#8370)
+
+**The leak.** Agents that were not handed a `CARGO_TARGET_DIR` improvised one:
+`<repo>/.loom/target-{builder,doctor,judge}-<N>` (85 GB on one fleet host),
+`/tmp/loom-target-*`, `/tmp/cargo-target-{issue,review}-<N>`,
+`$TMPDIR/cargo-target-*`, `~/.cache/cargo-target-*`. Nothing owned them, so
+nothing removed them.
+
+**Prevention.** `worker_spawn` now exports a Loom-owned
+`CARGO_TARGET_DIR=<repo>/.loom/targets/<role>-<run-id>` (logged as
+`# LOOM_CARGO_TARGET_DIR … (#8370)`) unless the #8458 per-worktree dir applies,
+`CARGO_TARGET_DIR` is already set, the spawn is a containerized re-entry, or
+the repo has no root `Cargo.toml`. A role-runner tick plans the path (passed
+as `LOOM_RUN_TARGET_DIR`) and removes the dir when the child exits, on every
+outcome; a removal failure is logged and never fails the tick. It first checks
+the child's process group (`kill(-pgid, 0)`, with a 2 s grace): while a
+descendant is alive (a detached `cargo test`) the dir is kept for the sweep.
+Run-end removal exists for role-runner ticks only. A daemon sweep spawn or a
+manual `spawn-worker.sh` derives a fresh dir per spawn (so each build is cold;
+sccache softens it) and has no process left to remove it, so those dirs are
+collected only by the sweep below, three hours or more after the owner exits.
+
+**The sweep** (`target_orphan_reclaim`) collects what run-end removal cannot
+(daemon sweeps, manual spawns, the legacy prefixes above). It runs from the
+scheduled reaper tick, the eager below-floor pass, and `loom-daemon clean`
+(report-only unless `-y`; `--dry-run` reports bytes and deletes nothing). It
+removes a direct child of a known prefix only when it is a real directory (not
+a symlink), does not overlap a configured `CARGO_TARGET_DIR` /
+`build.target-dir`, has a newest recursive mtime older than the max age, no
+live claim names its issue, its recorded owner pid (`.loom-run-owner`) is not
+running, and no process holds it open. If the open-handle probe cannot run (no
+`/proc`, no `lsof`) the dir is kept.
+
+Three more gates bound where it can reach:
+
+- **The scan root.** `<repo>/.loom` and `<repo>/.loom/targets` are scanned
+  only when every component below the repo root is a real directory and the
+  canonical path is inside the canonical repo root. A symlinked root is
+  refused whole (`not scanning … is a symlink`), because its children belong
+  to wherever the link points.
+- **The name.** Under `.loom/targets` a dir needs the `<role>-<run-id>` shape
+  **and** the `.loom-run-owner` marker `provision` writes. Under `/tmp`,
+  `$TMPDIR` and `~/.cache` the prefix must be followed by an agent-shaped
+  suffix: `-`-separated tokens, each one of `issue`, `review`, `pr`,
+  `builder`, `doctor`, `judge` or a number, with at least one word and one
+  number (`cargo-target-issue-10078`, `loom-target-10570-doctor`). A human's
+  `~/.cache/cargo-target-shared` never matches.
+- **The owner.** Under those three shared roots a dir owned by any uid other
+  than the daemon's effective uid is kept (`ForeignOwner`), root daemon
+  included: liveness cannot be established for another user's processes.
+
+Each pass logs
+`target_orphan_reclaim: category=cargo_target_orphan … removed=N bytes_freed=B`.
+
+| Knob | Default |
+|---|---|
+| `LOOM_TARGET_ORPHAN_RECLAIM` / `autonomous.worktreeReaper.targetOrphanReclaim.enabled` | on |
+| `LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS` / `….maxAgeHours` | 3 |
+| `LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS` / `….minIntervalSecs` (per repo) | 1800 |
 
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 
