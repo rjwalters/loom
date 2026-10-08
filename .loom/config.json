@@ -38,7 +38,29 @@
     ],
     "timeoutSeconds": 1200,
     "loadThreshold": 0.9,
-    "maxDeferSeconds": 1800
+    "maxDeferSeconds": 1800,
+    "preflightPathScopes": [
+      {
+        "env": "LOOM_BUILD_GATE_INSTALLER_SUITE",
+        "suite": "scripts/test-installer.sh",
+        "runWhenChanged": [
+          "install.sh",
+          "scripts/install-loom.sh",
+          "scripts/uninstall-loom.sh",
+          "scripts/install/*",
+          "scripts/test-installer.sh",
+          "scripts/version.sh",
+          "scripts/daemon-build.sh",
+          "scripts/cargo-target-dir.sh",
+          "scripts/loom",
+          "defaults/*",
+          ".github/labels.yml",
+          "loom-daemon/src/init/*",
+          "loom-daemon/src/preflight.rs",
+          ".loom/config.json"
+        ]
+      }
+    ]
   },
   "guards": {
     "sqlDdl": false,

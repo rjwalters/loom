@@ -3,8 +3,9 @@
 //!
 //! Exit codes: `0` pass / gate not configured; `1` failed, attempts remain
 //! (output tail printed — fix and re-run); `4` attempts exhausted
-//! (`preflight_unresolved`, claim released, open NO PR); `7` (`--check`) no
-//! passing receipt for the current `HEAD`.
+//! (`preflight_unresolved`, claim released, open NO PR); `5` timed out
+//! (#10860: not a failure, claim kept); `7` (`--check`) no passing receipt
+//! for the current `HEAD`.
 
 use std::path::PathBuf;
 
@@ -55,20 +56,37 @@ impl PreflightArgs {
                 println!(
                     "preflight: reason=preflight_unresolved after {attempts}/{max} attempts — open NO PR.\n{tail}"
                 );
-                if let Some(n) = self.issue {
-                    // Fail closed: hand the issue back so the pipeline can
-                    // retry — through the protected, worktree-scoped release
-                    // path, and say so loudly if the forge call fails.
-                    match u32::try_from(n)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|n| preflight::release_claim(&wt, n))
-                    {
-                        Ok(()) => eprintln!("preflight: claim on #{n} released"),
-                        Err(e) => eprintln!(
-                            "preflight: FAILED to release claim on #{n}: {e:#} — release it manually (`loom-recover-orphans --recover`)"
-                        ),
-                    }
-                }
+            }
+            Verdict::TimedOut {
+                attempt, max, tail, ..
+            } if attempt >= max => {
+                println!(
+                    "preflight: reason=preflight_timeout after {attempt}/{max} timeouts — open NO PR (claim kept).\n{tail}"
+                );
+            }
+            Verdict::TimedOut {
+                attempt, max, tail, ..
+            } => {
+                println!(
+                    "preflight: TIMED OUT (timeout {attempt}/{max}) — not a check failure; claim kept. Re-run when the host is less loaded.\n{tail}"
+                );
+            }
+        }
+        if let Some(n) = self.issue {
+            // Fail closed on a terminal check failure: hand the issue back so
+            // the pipeline can retry — through the protected, worktree-scoped
+            // release path, and say so loudly if the forge call fails. A
+            // timeout keeps the claim (#10860).
+            let settled = match u32::try_from(n) {
+                Ok(n) => preflight::settle_claim(&wt, n, &verdict),
+                Err(e) => verdict.releases_claim().then(|| Err(e.into())),
+            };
+            match settled {
+                None => {}
+                Some(Ok(())) => eprintln!("preflight: claim on #{n} released"),
+                Some(Err(e)) => eprintln!(
+                    "preflight: FAILED to release claim on #{n}: {e:#} — release it manually (`loom-recover-orphans --recover`)"
+                ),
             }
         }
         std::process::exit(verdict.exit_code());
