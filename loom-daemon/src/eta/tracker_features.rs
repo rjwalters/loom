@@ -554,7 +554,7 @@ impl Tracker {
 
     /// Hand the tracker the fleet roster's revisions, oldest first (#10508):
     /// what every later estimate's roster-derived `eta-fit/v2` inputs read
-    /// (`None`: unknown). Never today's `repos.yml` standing in for history.
+    /// (`None`: unknown). Never today's roster standing in for history.
     pub fn set_fleet_history(&mut self, history: Option<Vec<RosterRevision>>) {
         self.context.fleet_history = history;
     }
