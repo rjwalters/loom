@@ -19,6 +19,22 @@
 //! decode (the client must not retry it), `503` when the connection cap is
 //! reached (it may).
 //!
+//! # Time and memory
+//!
+//! A connection gets [`Limits::head_timeout`] (a few seconds) to present a
+//! request head that passes authentication; only an authenticated request
+//! gets the longer [`Limits::read_timeout`] for its body. A peer without a
+//! token therefore holds one of the [`Limits::max_connections`] slots for
+//! seconds, not half a minute. Connections past the cap are answered `503`
+//! by at most as many short-lived tasks again, and simply closed beyond that.
+//!
+//! An authenticated body is then checked twice for size, because wire bytes
+//! are not memory (see [`super::estimate`]): its decoded size is estimated
+//! **before** decoding and refused past [`DecodeBudget::decoded`], and after
+//! binding its encoded size is refused past [`DecodeBudget::bound`]. At most
+//! [`Limits::decode_concurrency`] requests are decoded at once. Both refusals
+//! are `413`.
+//!
 //! Each connection serves one request and is closed, which keeps the framing
 //! trivial; an OTLP exporter batches, so it reconnects a few times a minute.
 //!
@@ -46,8 +62,57 @@ pub(super) struct Limits {
     pub max_body: usize,
     /// Connections served at once.
     pub max_connections: usize,
-    /// Wall-clock budget to receive one whole request.
+    /// Wall-clock budget to receive and authenticate the request head.
+    pub head_timeout: Duration,
+    /// Wall-clock budget to receive an authenticated request's body.
     pub read_timeout: Duration,
+    /// Requests decoded and sanitized at once.
+    pub decode_concurrency: usize,
+    /// Size budgets relative to the wire size.
+    pub budget: DecodeBudget,
+}
+
+/// How large a request may become, relative to the bytes it arrived in.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DecodeBudget {
+    /// Decoded-size estimate allowed per wire byte.
+    pub decoded_factor: usize,
+    /// Added to every request's decoded allowance (headroom for small ones).
+    pub decoded_slack: usize,
+    /// Ceiling on any request's decoded-size estimate.
+    pub decoded_max: usize,
+    /// Encoded size after binding allowed per wire byte.
+    pub bound_factor: usize,
+    /// Added to every request's bound allowance: a small request gains a
+    /// whole daemon-built resource.
+    pub bound_slack: usize,
+}
+
+impl DecodeBudget {
+    /// The decoded-size estimate a `wire`-byte request may reach.
+    pub(super) fn decoded(&self, wire: usize) -> usize {
+        wire.saturating_mul(self.decoded_factor)
+            .saturating_add(self.decoded_slack)
+            .min(self.decoded_max)
+    }
+
+    /// The encoded size after binding a `wire`-byte request may reach.
+    pub(super) fn bound(&self, wire: usize) -> usize {
+        wire.saturating_mul(self.bound_factor)
+            .saturating_add(self.bound_slack)
+    }
+}
+
+impl Default for DecodeBudget {
+    fn default() -> Self {
+        DecodeBudget {
+            decoded_factor: 8,
+            decoded_slack: 1024 * 1024,
+            decoded_max: super::MAX_DECODED_BYTES,
+            bound_factor: 4,
+            bound_slack: 64 * 1024,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -56,7 +121,10 @@ impl Default for Limits {
             max_head: 16 * 1024,
             max_body: super::MAX_BODY_BYTES,
             max_connections: super::MAX_CONNECTIONS,
+            head_timeout: Duration::from_secs(3),
             read_timeout: Duration::from_secs(30),
+            decode_concurrency: super::DECODE_CONCURRENCY,
+            budget: DecodeBudget::default(),
         }
     }
 }
@@ -77,6 +145,9 @@ pub(super) struct Receiver {
     queues: Vec<Arc<RelayQueue>>,
     limits: Limits,
     permits: Arc<tokio::sync::Semaphore>,
+    /// Tasks answering connections past the cap.
+    refusals: Arc<tokio::sync::Semaphore>,
+    decodes: Arc<tokio::sync::Semaphore>,
     pub(super) counters: Counters,
 }
 
@@ -90,6 +161,8 @@ impl Receiver {
             relay,
             queues,
             permits: Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1))),
+            refusals: Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1))),
+            decodes: Arc::new(tokio::sync::Semaphore::new(limits.decode_concurrency.max(1))),
             limits,
             counters: Counters::default(),
         })
@@ -112,25 +185,30 @@ pub(super) async fn serve(listener: TcpListener, receiver: Arc<Receiver>) {
         };
         let Ok(permit) = receiver.permits.clone().try_acquire_owned() else {
             receiver.counters.busy.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let _ = respond(&mut stream, Refusal::Busy.status(), None).await;
-            });
+            // Answering takes a task; those are capped too. Past the cap the
+            // connection is just closed (dropped here).
+            if let Ok(refusal) = receiver.refusals.clone().try_acquire_owned() {
+                tokio::spawn(async move {
+                    let _refusal = refusal;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        respond(&mut stream, Refusal::Busy.status(), None),
+                    )
+                    .await;
+                });
+            }
             continue;
         };
         let receiver = receiver.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let outcome =
-                tokio::time::timeout(receiver.limits.read_timeout, handle(&mut stream, &receiver))
-                    .await;
-            let refusal = match outcome {
-                Ok(Ok(encoding)) => {
+            let refusal = match handle(&mut stream, &receiver).await {
+                Ok(encoding) => {
                     receiver.counters.accepted.fetch_add(1, Ordering::Relaxed);
                     let _ = respond(&mut stream, 200, Some(encoding)).await;
                     return;
                 }
-                Ok(Err(refusal)) => refusal,
-                Err(_) => Refusal::Timeout,
+                Err(refusal) => refusal,
             };
             refusal.count(&receiver.counters);
             log::debug!("agent-relay: refused a request from {peer}: {}", refusal.reason());
@@ -177,7 +255,7 @@ impl Refusal {
             Refusal::MethodNotAllowed => "method not allowed",
             Refusal::Unauthorized => "no live session for the presented credential",
             Refusal::LengthRequired => "no body length",
-            Refusal::TooLarge => "request too large",
+            Refusal::TooLarge => "request too large, or out of proportion to its wire size",
             Refusal::UnsupportedMedia => "unsupported content type or encoding",
             Refusal::Timeout => "request not received in time",
             Refusal::Busy => "connection limit reached",
@@ -195,8 +273,17 @@ impl Refusal {
     }
 }
 
-/// Serve one request: authenticate, read, sanitize, enqueue.
-async fn handle(stream: &mut TcpStream, receiver: &Receiver) -> Result<Encoding, Refusal> {
+/// What an authenticated request head established.
+struct Admitted {
+    head: Head,
+    leftover: Vec<u8>,
+    signal: Signal,
+    encoding: Encoding,
+    bound: crate::observability::agent_relay::BoundIdentity,
+}
+
+/// Read the head and authenticate it. Nothing of the body is read.
+async fn admit(stream: &mut TcpStream, receiver: &Receiver) -> Result<Admitted, Refusal> {
     let (head, leftover) = read_head(stream, receiver.limits.max_head).await?;
     let head = Head::parse(&head).ok_or(Refusal::BadRequest)?;
     let signal = match head.path() {
@@ -223,25 +310,71 @@ async fn handle(stream: &mut TcpStream, receiver: &Receiver) -> Result<Encoding,
         .header("content-type")?
         .and_then(Encoding::from_content_type)
         .ok_or(Refusal::UnsupportedMedia)?;
-    let body = read_body(stream, &head, leftover, receiver.limits.max_body).await?;
-    let bytes = body.len();
-    // Decoding and the regex pass are CPU work proportional to the body, so
-    // they run off the async workers.
+    Ok(Admitted {
+        head,
+        leftover,
+        signal,
+        encoding,
+        bound,
+    })
+}
+
+/// Serve one request: authenticate, read, size-check, sanitize, enqueue.
+async fn handle(stream: &mut TcpStream, receiver: &Receiver) -> Result<Encoding, Refusal> {
+    let admitted = tokio::time::timeout(receiver.limits.head_timeout, admit(stream, receiver))
+        .await
+        .map_err(|_| Refusal::Timeout)??;
+    let Admitted {
+        head,
+        leftover,
+        signal,
+        encoding,
+        bound,
+    } = admitted;
+    let body = tokio::time::timeout(
+        receiver.limits.read_timeout,
+        read_body(stream, &head, leftover, receiver.limits.max_body),
+    )
+    .await
+    .map_err(|_| Refusal::Timeout)??;
+    let budget = receiver.limits.budget;
+    // One decode at a time per permit: the estimate below bounds each
+    // decode, this bounds how many run together.
+    let _decode = receiver
+        .decodes
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Refusal::Busy)?;
+    // Estimating, decoding and the regex pass are CPU work proportional to
+    // the body, so they run off the async workers.
     let batch = tokio::task::spawn_blocking(move || {
-        let mut payload = sanitize::decode(signal, encoding, &body).ok()?;
+        let wire = body.len();
+        let estimate = match encoding {
+            Encoding::Protobuf => {
+                super::estimate::protobuf(signal, &body).map_err(|()| Refusal::BadRequest)?
+            }
+            Encoding::Json => super::estimate::json(&body),
+        };
+        if estimate > budget.decoded(wire) {
+            return Err(Refusal::TooLarge);
+        }
+        let mut payload =
+            sanitize::decode(signal, encoding, &body).map_err(|()| Refusal::BadRequest)?;
+        drop(body);
         let items = sanitize::bind_and_scrub(&mut payload, &bound);
-        Some(Batch {
-            payload,
+        if payload.encoded_len() > budget.bound(wire) {
+            return Err(Refusal::TooLarge);
+        }
+        Ok(Batch::new(
+            &payload,
             items,
-            bytes,
-            session: bound.label(),
-            resource: sanitize::bound_resource(None, &bound),
-        })
+            bound.label(),
+            sanitize::bound_resource(None, &bound),
+        ))
     })
     .await
-    .ok()
-    .flatten()
-    .ok_or(Refusal::BadRequest)?;
+    .map_err(|_| Refusal::BadRequest)??;
     if batch.items > 0 {
         if let Some((last, rest)) = receiver.queues.split_last() {
             for queue in rest {

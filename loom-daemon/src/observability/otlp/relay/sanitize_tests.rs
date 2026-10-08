@@ -296,11 +296,11 @@ fn secret_shapes_are_scrubbed_from_spans_and_metric_points() {
 
     let metrics = json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
         "name": "fixture.counter", "description": format!("contact {EMAIL}"),
-        "sum": {"dataPoints": [{"asInt": "1", "attributes": secret,
-            "exemplars": [{"asDouble": 1.0, "filteredAttributes": secret}]}]}
+        "sum": {"dataPoints": [{"asInt": "1", "attributes": secret}]}
     }]}]}]});
     let mut payload = decode_json(Signal::Metrics, &metrics);
-    bind_and_scrub(&mut payload, &bound());
+    add_exemplar_from_point_attributes(&mut payload);
+    assert_eq!(bind_and_scrub(&mut payload, &bound()), 1, "the metric must not be empty");
     let Payload::Metrics(request) = &payload else {
         panic!()
     };
@@ -410,4 +410,288 @@ fn content_types_map_to_encodings() {
     assert_eq!(Encoding::from_content_type("application/x-protobuf"), Some(Encoding::Protobuf));
     assert_eq!(Encoding::from_content_type("application/grpc"), None);
     assert_eq!(Encoding::from_content_type("text/plain"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Keys, schema URLs, numbers and ids (review round 1)
+// ---------------------------------------------------------------------------
+
+/// Synthetic fixtures for the places a value used to slip past the scrubber.
+const SECRET_KEY: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+const SECRET_SCHEMA: &str = "https://example.invalid/?token=syntheticsecret123";
+const SECRET_NUMBER: &str = "123456789";
+
+/// `value` decoded from JSON, and the same request round-tripped through
+/// protobuf: every check runs against both encodings.
+fn both_encodings(signal: Signal, value: &serde_json::Value) -> Vec<Payload> {
+    let from_json = decode_json(signal, value);
+    let from_protobuf = decode(signal, Encoding::Protobuf, &from_json.encode_to_vec()).unwrap();
+    assert_eq!(from_json, from_protobuf);
+    vec![from_json, from_protobuf]
+}
+
+/// Assert none of `secrets` survives anywhere in the forwarded request, in
+/// either its JSON or its protobuf form.
+fn assert_clean(payload: &Payload, secrets: &[&str]) {
+    let json = match payload {
+        Payload::Logs(r) => serde_json::to_string(r),
+        Payload::Metrics(r) => serde_json::to_string(r),
+        Payload::Traces(r) => serde_json::to_string(r),
+    }
+    .unwrap();
+    let wire = payload.encode_to_vec();
+    for secret in secrets {
+        assert!(!json.contains(secret), "{secret} survived in JSON: {json}");
+        assert!(
+            !wire.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "{secret} survived in protobuf"
+        );
+    }
+}
+
+/// Give every data point an exemplar carrying the point's own attributes.
+///
+/// Exemplars are added to the decoded struct rather than written in the JSON
+/// fixture: `opentelemetry-proto`'s JSON decoder drops a metric's whole
+/// `data` when a data point has any exemplar (protobuf is unaffected), so a
+/// JSON exemplar fixture would test an empty metric.
+fn add_exemplar_from_point_attributes(payload: &mut Payload) {
+    let Payload::Metrics(request) = payload else {
+        panic!("metrics only")
+    };
+    for resource in &mut request.resource_metrics {
+        for scope in &mut resource.scope_metrics {
+            for metric in &mut scope.metrics {
+                if let Some(metric::Data::Sum(sum)) = metric.data.as_mut() {
+                    for point in &mut sum.data_points {
+                        point.exemplars.push(Exemplar {
+                            filtered_attributes: point.attributes.clone(),
+                            trace_id: SECRET_KEY.as_bytes().to_vec(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Attributes carrying each fixture: a secret-shaped key, a credential-named
+/// number, a nested map with both, and a forged daemon key in odd case.
+fn hostile_attributes() -> serde_json::Value {
+    json!([
+        {"key": SECRET_KEY, "value": {"stringValue": "ok"}},
+        {"key": "password", "value": {"intValue": SECRET_NUMBER}},
+        {"key": "api_key", "value": {"doubleValue": 123456789.5}},
+        {"key": "Service.Name", "value": {"stringValue": "forged-service"}},
+        {"key": "LOOM.repo", "value": {"stringValue": "forged-owner/forged-repo"}},
+        {"key": "Host.Name", "value": {"stringValue": "forged-host"}},
+        {"key": "nested", "value": {"kvlistValue": {"values": [
+            {"key": SECRET_KEY, "value": {"stringValue": "ok"}},
+            {"key": "token", "value": {"intValue": SECRET_NUMBER}},
+            {"key": "Loom.Sweep_Id", "value": {"stringValue": "forged-sweep"}}]}}},
+        {"key": "duration_ms", "value": {"intValue": "1500"}},
+        {"key": "cost_usd", "value": {"doubleValue": 0.25}}
+    ])
+}
+
+const HOSTILE: &[&str] = &[
+    SECRET_KEY,
+    SECRET_SCHEMA,
+    SECRET_NUMBER,
+    "123456789.5",
+    "forged",
+];
+
+#[test]
+fn keys_schema_urls_and_numbers_are_scrubbed_on_logs_in_both_encodings() {
+    let attributes = hostile_attributes();
+    let logs = json!({"resourceLogs": [{
+        "resource": {"attributes": attributes},
+        "schemaUrl": SECRET_SCHEMA,
+        "scopeLogs": [{
+            "scope": {"name": "fixture", "attributes": attributes},
+            "schemaUrl": SECRET_SCHEMA,
+            "logRecords": [{"body": {"kvlistValue": {"values": attributes}}, "attributes": attributes}]
+        }]
+    }]});
+    for mut payload in both_encodings(Signal::Logs, &logs) {
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+        assert_clean(&payload, HOSTILE);
+        let Payload::Logs(request) = &payload else {
+            panic!()
+        };
+        let resource = &request.resource_logs[0];
+        assert!(resource.schema_url.is_empty());
+        assert!(resource.scope_logs[0].schema_url.is_empty());
+        let pairs = resource_pairs(resource.resource.as_ref().unwrap());
+        assert_eq!(one(&pairs, "service.name"), "claude-code");
+        assert_eq!(one(&pairs, "host.name"), "host-fixture");
+        // Ordinary numbers keep their type and value; a credential-named one
+        // becomes a marker.
+        let record = &resource.scope_logs[0].log_records[0];
+        let value = |key: &str| {
+            record
+                .attributes
+                .iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| kv.value.clone())
+        };
+        assert_eq!(
+            value("duration_ms").and_then(|v| v.value),
+            Some(any_value::Value::IntValue(1500))
+        );
+        assert_eq!(
+            value("cost_usd").and_then(|v| v.value),
+            Some(any_value::Value::DoubleValue(0.25))
+        );
+        assert_eq!(
+            value("password").and_then(|v| v.value),
+            Some(any_value::Value::StringValue("[REDACTED:credential]".to_string()))
+        );
+    }
+}
+
+#[test]
+fn keys_schema_urls_and_numbers_are_scrubbed_on_spans_and_metrics_in_both_encodings() {
+    let attributes = hostile_attributes();
+    let traces = json!({"resourceSpans": [{
+        "resource": {"attributes": attributes},
+        "schemaUrl": SECRET_SCHEMA,
+        "scopeSpans": [{"schemaUrl": SECRET_SCHEMA, "scope": {"attributes": attributes}, "spans": [{
+            "traceId": "0af7651916cd43dd8448eb211c80319c", "spanId": "b7ad6b7169203331",
+            "name": "fixture", "attributes": attributes,
+            "events": [{"name": "e", "attributes": attributes}],
+            "links": [{"traceId": "0af7651916cd43dd8448eb211c80319c",
+                       "spanId": "b7ad6b7169203331", "attributes": attributes}]
+        }]}]
+    }]});
+    for mut payload in both_encodings(Signal::Traces, &traces) {
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+        assert_clean(&payload, HOSTILE);
+    }
+    let metrics = json!({"resourceMetrics": [{
+        "resource": {"attributes": attributes},
+        "schemaUrl": SECRET_SCHEMA,
+        "scopeMetrics": [{"schemaUrl": SECRET_SCHEMA, "metrics": [{
+            "name": "fixture", "metadata": attributes,
+            "sum": {"dataPoints": [{"asInt": "1", "attributes": attributes}]}
+        }]}]
+    }]});
+    for mut payload in both_encodings(Signal::Metrics, &metrics) {
+        add_exemplar_from_point_attributes(&mut payload);
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+        assert_clean(&payload, HOSTILE);
+    }
+}
+
+#[test]
+fn the_daemon_owned_filter_ignores_case() {
+    for key in [
+        "service.name",
+        "Service.Name",
+        "SERVICE.INSTANCE.ID",
+        "Service.Namespace",
+        "LOOM.repo",
+        "Loom.Sweep_Id",
+        "Host.Name",
+        "HOST.ID",
+        " host.id",
+    ] {
+        assert!(daemon_owned(key), "{key}");
+    }
+    for key in ["service.version", "os.type", "hostname", "loomish", "model"] {
+        assert!(!daemon_owned(key), "{key}");
+    }
+}
+
+#[test]
+fn ids_of_the_wrong_length_are_cleared_and_valid_ones_kept() {
+    let mut payload = Payload::Traces(ExportTraceServiceRequest {
+        resource_spans: vec![opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+            scope_spans: vec![opentelemetry_proto::tonic::trace::v1::ScopeSpans {
+                spans: vec![opentelemetry_proto::tonic::trace::v1::Span {
+                    trace_id: SECRET_KEY.as_bytes().to_vec(),
+                    span_id: vec![7; 8],
+                    parent_span_id: SECRET_NUMBER.as_bytes().to_vec(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    });
+    bind_and_scrub(&mut payload, &bound());
+    assert_clean(&payload, &[SECRET_KEY, SECRET_NUMBER]);
+    let Payload::Traces(request) = &payload else {
+        panic!()
+    };
+    let span = &request.resource_spans[0].scope_spans[0].spans[0];
+    assert!(span.trace_id.is_empty());
+    assert!(span.parent_span_id.is_empty());
+    assert_eq!(span.span_id, vec![7; 8]);
+}
+
+// ---------------------------------------------------------------------------
+// Amplification (review round 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_containers_are_dropped_and_identical_resources_merged_before_binding() {
+    // 10 000 empty resource containers, 10 000 containers holding only an
+    // empty scope, and two record-bearing containers with the same sender
+    // resource: one bound resource out.
+    let mut resource_logs = vec![json!({}); 10_000];
+    resource_logs.extend(vec![json!({"scopeLogs": [{}]}); 10_000]);
+    let sender = json!({"attributes": [{"key": "os.type", "value": {"stringValue": "fixture"}}]});
+    for name in ["first", "second"] {
+        resource_logs.push(
+            json!({"resource": sender, "scopeLogs": [{"logRecords": [{"eventName": name}]}]}),
+        );
+    }
+    let logs = json!({ "resourceLogs": resource_logs });
+    for mut payload in both_encodings(Signal::Logs, &logs) {
+        let wire = payload.encoded_len();
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 2);
+        let Payload::Logs(request) = &payload else {
+            panic!()
+        };
+        assert_eq!(request.resource_logs.len(), 1, "merged into one bound resource");
+        assert_eq!(request.resource_logs[0].scope_logs.len(), 2);
+        assert!(payload.encoded_len() < wire, "{} vs {wire}", payload.encoded_len());
+    }
+    // Different sender resources stay apart: their attributes differ.
+    let distinct = json!({"resourceLogs": [
+        {"resource": {"attributes": [{"key": "os.type", "value": {"stringValue": "a"}}]},
+         "scopeLogs": [{"logRecords": [{}]}]},
+        {"resource": {"attributes": [{"key": "os.type", "value": {"stringValue": "b"}}]},
+         "scopeLogs": [{"logRecords": [{}]}]}]});
+    let mut payload = decode_json(Signal::Logs, &distinct);
+    bind_and_scrub(&mut payload, &bound());
+    let Payload::Logs(request) = &payload else {
+        panic!()
+    };
+    assert_eq!(request.resource_logs.len(), 2);
+}
+
+#[test]
+fn metrics_and_spans_without_items_are_pruned_too() {
+    let metrics = json!({"resourceMetrics": [
+        {"scopeMetrics": [{"metrics": [{"name": "no-data"}, {"name": "empty", "gauge": {}}]}]},
+        {"scopeMetrics": [{"metrics": [{"name": "kept", "gauge": {"dataPoints": [{"asInt": "1"}]}}]}]}]});
+    let mut payload = decode_json(Signal::Metrics, &metrics);
+    assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+    let Payload::Metrics(request) = &payload else {
+        panic!()
+    };
+    assert_eq!(request.resource_metrics.len(), 1);
+    assert_eq!(request.resource_metrics[0].scope_metrics[0].metrics.len(), 1);
+
+    let traces = json!({"resourceSpans": [{}, {"scopeSpans": [{}, {"spans": []}]}]});
+    let mut payload = decode_json(Signal::Traces, &traces);
+    assert_eq!(bind_and_scrub(&mut payload, &bound()), 0);
+    let Payload::Traces(request) = &payload else {
+        panic!()
+    };
+    assert!(request.resource_spans.is_empty());
 }

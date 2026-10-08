@@ -35,6 +35,7 @@
 //! compiles in (declaring it directly adds no package to the lockfile). gRPC
 //! is not served.
 
+mod estimate;
 mod forward;
 mod sanitize;
 mod server;
@@ -56,10 +57,19 @@ pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// queued.
 pub const MAX_CONNECTIONS: usize = 32;
 
+/// Ceiling on a request's estimated decoded size, whatever its wire size.
+/// With [`DECODE_CONCURRENCY`] this bounds the memory decoding can take at
+/// once (up to twice the estimate, for `Vec` growth).
+pub const MAX_DECODED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Requests decoded at once.
+pub const DECODE_CONCURRENCY: usize = 2;
+
 /// Requests the forward queue holds for one sink.
 pub const MAX_QUEUED_REQUESTS: usize = 256;
 
-/// Bytes (of received bodies) the forward queue holds for one sink.
+/// Bytes the forward queue holds for one sink, measured as the encoded,
+/// already-bound requests it actually keeps.
 pub const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 
 /// One `otlp` sink the relay forwards to: the endpoint and `headers_file` of

@@ -28,6 +28,20 @@
 //! accepts anything. A consumer is told the stream is incomplete rather than
 //! left to infer a complete one.
 //!
+//! # What the byte bound measures
+//!
+//! A queued request is held **encoded** (protobuf), after binding and
+//! scrubbing, so [`Limits::max_bytes`] bounds the memory the queue actually
+//! holds — not the size of the bodies the requests arrived in, which can be
+//! far smaller than what binding makes of them. Only the request at the head
+//! is decoded again, by the drain loop, one at a time.
+//!
+//! Gap accounting is bounded too: past [`MAX_GAP_ENTRIES`] distinct
+//! `(session, reason)` entries, further sessions' losses are folded into one
+//! aggregate entry per reason, under a host-only resource, so an outage that
+//! outlives many short sessions cannot grow it without limit. Totals are
+//! never lost; only per-session attribution is, for the sessions past the cap.
+//!
 //! [`DurableQueue`]: crate::observability::queue::DurableQueue
 
 use std::collections::{BTreeMap, VecDeque};
@@ -42,7 +56,16 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use super::super::mapping::{kv_string, nanos};
 use super::super::transport::{post, Signal};
 use super::super::OtlpExporter;
-use super::sanitize::Payload;
+use super::sanitize::{self, Encoding, Payload};
+use prost::Message;
+
+/// Distinct `(session, reason)` gap entries kept before further sessions are
+/// folded into an aggregate.
+pub(super) const MAX_GAP_ENTRIES: usize = 128;
+
+/// The label losses past [`MAX_GAP_ENTRIES`] are folded under. Session labels
+/// are sweep or role ids, which never contain a space.
+pub(super) const OTHER_SESSIONS: &str = "other sessions";
 
 /// `LogRecord.event_name` of a gap marker.
 pub(super) const GAP_EVENT: &str = "loom.agent_relay.gap";
@@ -70,23 +93,59 @@ impl GapReason {
 pub(super) struct Limits {
     /// Requests held at once.
     pub max_requests: usize,
-    /// Sum of the queued requests' received body sizes.
+    /// Sum of the queued requests' held sizes ([`Batch::bytes`]).
     pub max_bytes: usize,
 }
 
 /// One sanitized request awaiting delivery.
 #[derive(Debug, Clone)]
 pub(in crate::observability::otlp) struct Batch {
-    /// Already identity-bound and scrubbed.
-    pub payload: Payload,
+    signal: Signal,
+    /// The identity-bound, scrubbed request, protobuf-encoded.
+    encoded: Vec<u8>,
     /// Records it carries, in the signal's unit.
     pub items: u64,
-    /// The size of the body it was decoded from — the queue's byte measure.
+    /// What holding it costs — the encoded request plus its gap resource and
+    /// label. The queue's byte measure.
     pub bytes: usize,
     /// The sending session's secret-free label, for drop accounting.
     pub session: String,
     /// The sending session's bound resource, for its gap marker.
     pub resource: Resource,
+}
+
+impl Batch {
+    /// Encode `payload` for holding.
+    pub(in crate::observability::otlp) fn new(
+        payload: &Payload,
+        items: u64,
+        session: String,
+        resource: Resource,
+    ) -> Self {
+        let encoded = payload.encode_to_vec();
+        let bytes = encoded
+            .len()
+            .saturating_add(resource.encoded_len())
+            .saturating_add(session.len());
+        Batch {
+            signal: payload.signal(),
+            encoded,
+            items,
+            bytes,
+            session,
+            resource,
+        }
+    }
+
+    pub(in crate::observability::otlp) fn signal(&self) -> Signal {
+        self.signal
+    }
+
+    /// The request, decoded again for sending. `None` only if the bytes this
+    /// process encoded fail to decode, which would be a bug.
+    pub(in crate::observability::otlp) fn payload(&self) -> Option<Payload> {
+        sanitize::decode(self.signal, Encoding::Protobuf, &self.encoded).ok()
+    }
 }
 
 /// Records lost for one session and reason, by signal.
@@ -231,26 +290,75 @@ impl RelayQueue {
     /// Put undelivered gap accounting back, merged with anything newer.
     fn restore_gaps(&self, gaps: Gaps) {
         let mut state = self.lock();
-        for (key, (resource, lost)) in gaps {
-            state
-                .gaps
-                .entry(key)
-                .or_insert_with(|| (resource, Lost::default()))
-                .1
-                .merge(&lost);
+        for ((label, reason), (resource, lost)) in gaps {
+            fold(&mut state.gaps, &label, reason, &resource, &lost);
         }
+    }
+
+    /// Bytes held now, as [`Batch::bytes`] counts them.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.lock().bytes
+    }
+
+    /// Gap entries waiting to be reported.
+    pub(super) fn gap_entries(&self) -> usize {
+        self.lock().gaps.len()
     }
 }
 
 fn note_lost(state: &mut QueueState, batch: &Batch, reason: GapReason) {
     state.dropped_requests += 1;
     state.dropped_records += batch.items;
-    state
-        .gaps
-        .entry((batch.session.clone(), reason))
-        .or_insert_with(|| (batch.resource.clone(), Lost::default()))
+    let mut lost = Lost::default();
+    lost.add(batch.signal, batch.items);
+    fold(&mut state.gaps, &batch.session, reason, &batch.resource, &lost);
+}
+
+/// Add `lost` to `label`'s entry, or — when that would be a new entry past
+/// [`MAX_GAP_ENTRIES`] — to the aggregate entry for `reason`.
+fn fold(gaps: &mut Gaps, label: &str, reason: GapReason, resource: &Resource, lost: &Lost) {
+    let key = (label.to_string(), reason);
+    let key = if gaps.contains_key(&key) || gaps.len() < MAX_GAP_ENTRIES {
+        key
+    } else {
+        (OTHER_SESSIONS.to_string(), reason)
+    };
+    let aggregate = key.0 == OTHER_SESSIONS;
+    gaps.entry(key)
+        .or_insert_with(|| {
+            let resource = if aggregate {
+                host_only(resource)
+            } else {
+                resource.clone()
+            };
+            (resource, Lost::default())
+        })
         .1
-        .add(batch.payload.signal(), batch.items);
+        .merge(lost);
+}
+
+/// `resource` without anything that names one session.
+fn host_only(resource: &Resource) -> Resource {
+    let keep = |key: &str| {
+        matches!(
+            key,
+            "service.name"
+                | "service.instance.id"
+                | "loom.daemon.version"
+                | "loom.runtime"
+                | "loom.relay.redaction"
+                | "loom.session.launch"
+        ) || key.starts_with("host.")
+    };
+    Resource {
+        attributes: resource
+            .attributes
+            .iter()
+            .filter(|attribute| keep(&attribute.key))
+            .cloned()
+            .collect(),
+        ..Default::default()
+    }
 }
 
 /// The gap markers for `gaps` as one logs request: a `WARN` record per
@@ -264,7 +372,7 @@ pub(super) fn gap_request(gaps: &Gaps, now: chrono::DateTime<chrono::Utc>) -> Ba
         ..Default::default()
     };
     let mut resource_logs = Vec::with_capacity(gaps.len());
-    for ((_, reason), (resource, lost)) in gaps {
+    for ((label, reason), (resource, lost)) in gaps {
         let record = LogRecord {
             time_unix_nano: nanos(now),
             observed_time_unix_nano: nanos(now),
@@ -285,6 +393,13 @@ pub(super) fn gap_request(gaps: &Gaps, now: chrono::DateTime<chrono::Utc>) -> Ba
                 int("loom.relay.dropped_log_records", lost.log_records),
                 int("loom.relay.dropped_metric_data_points", lost.metric_data_points),
                 int("loom.relay.dropped_spans", lost.spans),
+                KeyValue {
+                    key: "loom.relay.aggregated".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::BoolValue(label == OTHER_SESSIONS)),
+                    }),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
@@ -297,13 +412,13 @@ pub(super) fn gap_request(gaps: &Gaps, now: chrono::DateTime<chrono::Utc>) -> Ba
             ..Default::default()
         });
     }
-    Batch {
-        items: resource_logs.len() as u64,
-        payload: Payload::Logs(ExportLogsServiceRequest { resource_logs }),
-        bytes: 0,
-        session: String::new(),
-        resource: Resource::default(),
-    }
+    let items = resource_logs.len() as u64;
+    Batch::new(
+        &Payload::Logs(ExportLogsServiceRequest { resource_logs }),
+        items,
+        String::new(),
+        Resource::default(),
+    )
 }
 
 /// What the upstream did with one request.
@@ -330,8 +445,11 @@ impl Upstream for OtlpExporter {
     /// authentication and `headers_file`, under the exporter's own response
     /// policy.
     async fn send(&self, batch: &Batch) -> Delivery {
-        let signal = batch.payload.signal();
-        let outcome = match &batch.payload {
+        let signal = batch.signal();
+        let Some(payload) = batch.payload() else {
+            return Delivery::Refused;
+        };
+        let outcome = match &payload {
             Payload::Logs(request) => {
                 let endpoint = &self.logs_endpoint;
                 post(
@@ -454,10 +572,13 @@ fn report(queue: &RelayQueue, last_reported: &mut u64) {
     let dropped = queue.dropped_records();
     if dropped > *last_reported {
         log::warn!(
-            "agent-relay: dropped {} relayed record(s) so far ({} request(s)); {} request(s) queued",
+            "agent-relay: dropped {} relayed record(s) so far ({} request(s)); {} request(s) \
+             ({} bytes) queued, {} gap entr(ies) awaiting report",
             dropped,
             queue.dropped_requests(),
-            queue.len()
+            queue.len(),
+            queue.held_bytes(),
+            queue.gap_entries()
         );
         *last_reported = dropped;
     }

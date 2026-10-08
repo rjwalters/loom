@@ -656,7 +656,7 @@ async fn connections_past_the_cap_are_turned_away_and_stalled_ones_time_out() {
     let upstream = UpstreamStub::start(Answer::Accept).await;
     let limits = server::Limits {
         max_connections: 2,
-        read_timeout: Duration::from_millis(400),
+        head_timeout: Duration::from_millis(400),
         ..server::Limits::default()
     };
     let queue = forward::Limits {
@@ -850,4 +850,214 @@ async fn the_receiver_starts_only_when_opted_in_and_an_otlp_sink_started() {
     for task in tasks.into_iter().chain(more) {
         task.abort();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1: amplification and slow peers
+// ---------------------------------------------------------------------------
+
+/// `count` empty `ResourceLogs`, then one container holding one record: the
+/// shape that used to decode into `count` full daemon-built resources.
+fn empty_resources_then_one_record(count: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(count * 2 + 16);
+    for _ in 0..count {
+        body.extend_from_slice(&[0x0a, 0x00]);
+    }
+    // ResourceLogs { scope_logs: [ScopeLogs { log_records: [LogRecord {}] }] }
+    body.extend_from_slice(&[0x0a, 0x04, 0x12, 0x02, 0x12, 0x00]);
+    body
+}
+
+#[tokio::test]
+#[serial]
+async fn a_body_of_millions_of_empty_resources_is_refused_before_it_is_decoded() {
+    let upstream = UpstreamStub::start(Answer::Accept).await;
+    let stack = Stack::default(&upstream.url()).await;
+    let (token, _lease) = stack.launch(4242, "sweep-fixture-1");
+
+    // The reported reproduction: just over 4 MB of wire, two million
+    // resources once decoded.
+    let body = empty_resources_then_one_record(2_000_000);
+    assert_eq!(body.len(), 4_000_006);
+    let estimate = super::estimate::protobuf(Signal::Logs, &body).unwrap();
+    assert!(
+        estimate
+            > 2_000_000 * std::mem::size_of::<opentelemetry_proto::tonic::logs::v1::ResourceLogs>()
+    );
+    let budget = server::DecodeBudget::default();
+    assert!(estimate > budget.decoded(body.len()));
+    assert!(budget.decoded(body.len()) <= MAX_DECODED_BYTES);
+
+    let began = Instant::now();
+    let status = stack
+        .post("/v1/logs", Some(&token), "application/x-protobuf", &body)
+        .await;
+    assert_eq!(status, 413);
+    // Refused on the estimate, a byte scan: no multi-gigabyte decode ran.
+    assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+    assert_eq!(stack.queue.len(), 0);
+    assert_eq!(stack.queue.held_bytes(), 0);
+    assert_eq!(stack.receiver.counters.too_large.load(Ordering::Relaxed), 1);
+
+    // The same shape in JSON is refused the same way.
+    let mut json_body = String::from(r#"{"resourceLogs":["#);
+    json_body.push_str(&"{},".repeat(1_300_000));
+    json_body.push_str(r#"{"scopeLogs":[{"logRecords":[{}]}]}]}"#);
+    let status = stack
+        .post("/v1/logs", Some(&token), "application/json", json_body.as_bytes())
+        .await;
+    assert_eq!(status, 413);
+    assert_eq!(stack.queue.len(), 0);
+
+    // A modest number of empty containers is legitimate input: accepted,
+    // pruned to one bound resource, and held at its true encoded size.
+    let body = empty_resources_then_one_record(1_000);
+    assert_eq!(
+        stack
+            .post("/v1/logs", Some(&token), "application/x-protobuf", &body)
+            .await,
+        200
+    );
+    until("the request upstream", || !upstream.seen().is_empty()).await;
+    let forwarded: serde_json::Value = serde_json::from_str(&upstream.seen()[0].body).unwrap();
+    assert_eq!(forwarded["resourceLogs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_request_that_binding_would_inflate_out_of_proportion_is_refused() {
+    let upstream = UpstreamStub::start(Answer::Hang).await;
+    let stack = Stack::default(&upstream.url()).await;
+    let (token, _lease) = stack.launch(4242, "sweep-fixture-1");
+    // Thousands of distinct sender resources, each with one record: small
+    // enough per container to pass the decode estimate, but each would gain
+    // a whole daemon-built resource when bound.
+    let resource_logs: Vec<serde_json::Value> = (0..3_000)
+        .map(|i| {
+            json!({"resource": {"attributes": [
+                {"key": "os.type", "value": {"stringValue": format!("{i:0>60}")}}]},
+                "scopeLogs": [{"logRecords": [{}]}]})
+        })
+        .collect();
+    let request = json!({ "resourceLogs": resource_logs });
+    let Payload::Logs(decoded) =
+        super::sanitize::decode(Signal::Logs, Encoding::Json, request.to_string().as_bytes())
+            .unwrap()
+    else {
+        panic!()
+    };
+    let body = decoded.encode_to_vec();
+    let budget = server::DecodeBudget::default();
+    let estimate = super::estimate::protobuf(Signal::Logs, &body).unwrap();
+    assert!(estimate <= budget.decoded(body.len()), "this case must reach binding");
+    assert_eq!(
+        stack
+            .post("/v1/logs", Some(&token), "application/x-protobuf", &body)
+            .await,
+        413
+    );
+    assert_eq!(stack.queue.len(), 0);
+
+    // An ordinary request is held at exactly its encoded, bound size.
+    let ordinary = as_protobuf(&lying_leaky_logs());
+    assert_eq!(
+        stack
+            .post("/v1/logs", Some(&token), "application/x-protobuf", &ordinary)
+            .await,
+        200
+    );
+    until("the request to be queued or sent", || {
+        stack.queue.len() + upstream.seen().len() > 0
+    })
+    .await;
+    // With the upstream hung, the request is held (in flight at the head).
+    assert!(stack.queue.held_bytes() > 0);
+    assert!(stack.queue.held_bytes() <= server::DecodeBudget::default().bound(ordinary.len()) * 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_peer_without_a_head_is_cut_off_quickly_and_a_slow_authenticated_body_is_not() {
+    let upstream = UpstreamStub::start(Answer::Accept).await;
+    let limits = server::Limits {
+        head_timeout: Duration::from_millis(300),
+        read_timeout: Duration::from_secs(10),
+        ..server::Limits::default()
+    };
+    let queue = forward::Limits {
+        max_requests: 8,
+        max_bytes: 1 << 20,
+    };
+    let stack = Stack::start(&upstream.url(), limits, queue).await;
+    let (token, _lease) = stack.launch(1, "sweep-fixture-1");
+
+    // Silent, and a head trickled in too slowly: both answered 408 at the
+    // head deadline, long before the body budget.
+    let began = Instant::now();
+    let mut silent = TcpStream::connect(stack.relay.addr()).await.unwrap();
+    let mut partial = TcpStream::connect(stack.relay.addr()).await.unwrap();
+    partial
+        .write_all(b"POST /v1/logs HTTP/1.1\r\n")
+        .await
+        .unwrap();
+    assert_eq!(status_of(&mut silent).await, 408);
+    assert_eq!(status_of(&mut partial).await, 408);
+    assert!(began.elapsed() < Duration::from_secs(3), "{:?}", began.elapsed());
+
+    // An authenticated head, then the body after the head deadline: fine.
+    let body = lying_leaky_logs().to_string();
+    let mut stream = TcpStream::connect(stack.relay.addr()).await.unwrap();
+    let head = format!(
+        "POST /v1/logs HTTP/1.1\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    stream.write_all(body.as_bytes()).await.unwrap();
+    assert_eq!(status_of(&mut stream).await, 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_flood_of_connections_past_the_cap_is_bounded_and_the_receiver_recovers() {
+    let upstream = UpstreamStub::start(Answer::Accept).await;
+    let limits = server::Limits {
+        max_connections: 2,
+        head_timeout: Duration::from_millis(300),
+        ..server::Limits::default()
+    };
+    let queue = forward::Limits {
+        max_requests: 8,
+        max_bytes: 1 << 20,
+    };
+    let stack = Stack::start(&upstream.url(), limits, queue).await;
+    let (token, _lease) = stack.launch(1, "sweep-fixture-1");
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(TcpStream::connect(stack.relay.addr()).await.unwrap());
+    }
+    until("both slots taken", || stack.receiver.permits_available() == 0).await;
+    // Many more: each is answered 503 or simply closed — or, if it landed
+    // after a held slot's head deadline freed it, timed out like any silent
+    // peer. Never left waiting.
+    let mut flood = Vec::new();
+    for _ in 0..200 {
+        flood.push(TcpStream::connect(stack.relay.addr()).await.unwrap());
+    }
+    let began = Instant::now();
+    for mut stream in flood {
+        let status = status_of(&mut stream).await;
+        assert!(matches!(status, 503 | 408 | 0), "{status}");
+    }
+    assert!(began.elapsed() < Duration::from_secs(8), "{:?}", began.elapsed());
+    assert!(stack.receiver.counters.busy.load(Ordering::Relaxed) > 0);
+    drop(held);
+    until("the slots to be released", || stack.receiver.permits_available() == 2).await;
+    assert_eq!(
+        stack
+            .post("/v1/logs", Some(&token), "application/json", b"{}")
+            .await,
+        200
+    );
 }

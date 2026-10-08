@@ -21,40 +21,35 @@ fn logs(session: &str, tag: &str, records: usize, bytes: usize) -> Batch {
             ..Default::default()
         })
         .collect();
-    Batch {
-        payload: Payload::Logs(ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: Some(resource(session)),
-                scope_logs: vec![ScopeLogs {
-                    log_records,
-                    ..Default::default()
-                }],
+    let payload = Payload::Logs(ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(resource(session)),
+            scope_logs: vec![ScopeLogs {
+                log_records,
                 ..Default::default()
             }],
-        }),
-        items: records as u64,
-        bytes,
-        session: session.to_string(),
-        resource: resource(session),
-    }
+            ..Default::default()
+        }],
+    });
+    let mut batch = Batch::new(&payload, records as u64, session.to_string(), resource(session));
+    // The tests set the held size directly, to exercise the byte bound.
+    batch.bytes = bytes;
+    batch
 }
 
 fn spans(session: &str, count: usize) -> Batch {
-    Batch {
-        payload: Payload::Traces(ExportTraceServiceRequest {
-            resource_spans: vec![ResourceSpans {
-                scope_spans: vec![ScopeSpans {
-                    spans: vec![Span::default(); count],
-                    ..Default::default()
-                }],
+    let payload = Payload::Traces(ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span::default(); count],
                 ..Default::default()
             }],
-        }),
-        items: count as u64,
-        bytes: 10,
-        session: session.to_string(),
-        resource: resource(session),
-    }
+            ..Default::default()
+        }],
+    });
+    let mut batch = Batch::new(&payload, count as u64, session.to_string(), resource(session));
+    batch.bytes = 10;
+    batch
 }
 
 fn limits(max_requests: usize, max_bytes: usize) -> Limits {
@@ -66,7 +61,7 @@ fn limits(max_requests: usize, max_bytes: usize) -> Limits {
 
 /// The tag of a logs batch (its first record's event name).
 fn tag(batch: &Batch) -> String {
-    match &batch.payload {
+    match &batch.payload().unwrap() {
         Payload::Logs(request) => request
             .resource_logs
             .first()
@@ -233,7 +228,7 @@ async fn an_outage_becomes_a_gap_marker_delivered_before_what_followed() {
     assert_eq!(tag(&delivered[1]), "r4");
     assert_eq!(tag(&delivered[2]), "r5");
 
-    let Payload::Logs(marker) = &delivered[0].payload else {
+    let Some(Payload::Logs(marker)) = delivered[0].payload() else {
         panic!("a gap marker is a log record")
     };
     assert_eq!(marker.resource_logs.len(), 1);
@@ -288,7 +283,7 @@ async fn a_refused_request_is_dropped_counted_and_reported_not_retried_forever()
         .iter()
         .find(|batch| tag(batch) == GAP_EVENT)
         .expect("the refusal is reported");
-    let Payload::Logs(marker) = &marker.payload else {
+    let Some(Payload::Logs(marker)) = marker.payload() else {
         panic!()
     };
     let record = &marker.resource_logs[0].scope_logs[0].log_records[0];
@@ -339,4 +334,83 @@ fn settling_a_request_that_overflow_already_evicted_removes_nothing() {
     queue.settle_front(sequence, None);
     assert_eq!(queue.len(), 1);
     assert_eq!(tag(&queue.front().unwrap().1), "newer");
+}
+
+#[test]
+fn a_held_batch_is_measured_by_what_it_holds_and_round_trips() {
+    let payload = Payload::Logs(ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(resource("sweep-a")),
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    event_name: "fixture".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    });
+    let batch = Batch::new(&payload, 1, "sweep-a".to_string(), resource("sweep-a"));
+    assert_eq!(
+        batch.bytes,
+        payload.encoded_len() + resource("sweep-a").encoded_len() + "sweep-a".len()
+    );
+    assert_eq!(batch.payload(), Some(payload));
+}
+
+#[tokio::test]
+async fn session_churn_through_an_outage_keeps_gap_state_bounded_and_every_loss_counted() {
+    // Thousands of short sessions, each losing requests while the upstream
+    // is down: the per-session map must stop growing at its cap, and the
+    // aggregate must carry everything past it.
+    let queue = RelayQueue::new(limits(4, usize::MAX));
+    let upstream = Fake::new(RETRY);
+    let task = start(&queue, &upstream);
+    let sessions = 5_000;
+    for index in 0..sessions {
+        queue.offer(logs(&format!("sweep-{index}"), "r", 2, 10));
+    }
+    until("the drain to be retrying", || upstream.attempts.load(Ordering::SeqCst) >= 2).await;
+    assert!(queue.gap_entries() <= MAX_GAP_ENTRIES, "{}", queue.gap_entries());
+    let dropped = queue.dropped_records();
+    assert_eq!(dropped, (sessions as u64 - 4) * 2);
+
+    upstream.set(DELIVER);
+    until("the backlog to drain", || queue.len() == 0 && queue.gap_entries() == 0).await;
+    let delivered = upstream.delivered();
+    let Some(Payload::Logs(marker)) = delivered
+        .iter()
+        .find(|batch| tag(batch) == GAP_EVENT)
+        .and_then(Batch::payload)
+    else {
+        panic!("no gap marker delivered")
+    };
+    assert!(marker.resource_logs.len() <= MAX_GAP_ENTRIES);
+    // Every lost record is accounted for, per session or in the aggregate.
+    let mut reported = 0i64;
+    let mut aggregated = 0;
+    for resource_logs in &marker.resource_logs {
+        let record = &resource_logs.scope_logs[0].log_records[0];
+        for attribute in &record.attributes {
+            match (attribute.key.as_str(), attribute.value.as_ref().and_then(|v| v.value.clone())) {
+                ("loom.relay.dropped_log_records", Some(any_value::Value::IntValue(n))) => {
+                    reported += n;
+                }
+                ("loom.relay.aggregated", Some(any_value::Value::BoolValue(true))) => {
+                    aggregated += 1;
+                    // The aggregate names no single session.
+                    let resource = resource_logs.resource.as_ref().unwrap();
+                    assert!(!resource
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key == "loom.sweep_id"));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(reported as u64, dropped);
+    assert_eq!(aggregated, 1);
+    task.abort();
 }
