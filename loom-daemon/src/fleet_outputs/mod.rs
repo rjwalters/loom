@@ -249,6 +249,16 @@ pub const AUTHORITY_SITES: &[(&str, Option<&str>, &str)] = &[
         "restore/refresh: a non-authority host drops pending estimates and emits none",
     ),
     ("eta/doctor_facts.rs", None, "read-only `loom-daemon doctor` diagnostic"),
+    (
+        "fleet_alert/eta_emit.rs",
+        None,
+        "raises the silent-authority alert on the authority host; gates no emit",
+    ),
+    (
+        "observability/ops/eta_health.rs",
+        None,
+        "reads authority to report ETA health gauges; gates no emit",
+    ),
 ];
 
 /// Read access to when outputs were last observed (fleet store / local queue
