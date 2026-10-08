@@ -2610,7 +2610,7 @@ blocker reads count), and a child of
 several starred issues takes the earliest starred-at.
 
 **Materialized star (#10012 §2–§3).** With `materializeLabels` on (default
-**off**, an opt-in) together with `propagate` and `escalate`, the pass also writes the inherited star as the `loom:operator-priority` label on
+**on**; `false` opts out) together with `propagate` and `escalate`, the pass also writes the inherited star as the `loom:operator-priority` label on
 every open child reached by a link the issue text records (park record, task
 list, the dependency phrase of a `loom:blocked` parent), so Curator, Builder's
 starred-first query, the dashboard and `forge starred` see it too. A
@@ -2686,7 +2686,7 @@ default**):
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 | `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
-| `materializeLabels` | `LOOM_OPERATOR_PRIORITY_MATERIALIZE_LABELS` | `false` | write the inherited star as the `loom:operator-priority` label (and on the linked PR) and take it back when the root loses its star ("Materialized star" above); needs `propagate` and `escalate`. Off, the inherited star is an in-memory ordering only, no star owner is read and no star label is written |
+| `materializeLabels` | `LOOM_OPERATOR_PRIORITY_MATERIALIZE_LABELS` | `true` | write the inherited star as the `loom:operator-priority` label (and on the linked PR) and take it back when the root loses its star ("Materialized star" above); needs `propagate` and `escalate`. Opt out with `false` (env `0`): the inherited star is an in-memory ordering only, no star owner is read and no star label is written |
 | `levelCaps` | — | `{"2": 5}` (the level table) | per-level cap on open issues carrying the level's operator label; over the cap is flagged in the digest, never refused |
 
 **Priority levels (#10307).** Every pass also walks each level ≥ 2 issue's

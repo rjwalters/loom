@@ -322,15 +322,26 @@ fn an_unread_owner_does_not_restart_the_depth_cap() {
     assert!((901..=903).all(|n| world.starred(slug, n)));
 }
 
-/// `materializeLabels` is off by default: without it the pass reads no star
-/// owner and writes no star label, and the walk still orders the children in
-/// memory. Config and env turn it on.
+/// `materializeLabels` is on by default (operator ruling on #10012); config
+/// `false` or env `0` opts out, and then the pass reads no star owner and
+/// writes no star label, while the walk still orders the children in memory.
 #[test]
-fn materialize_labels_is_off_by_default() {
-    assert!(!Settings::default().materialize_labels);
-    assert!(!Settings::from_block(None).materialize_labels);
-    let on = Settings::from_block(Some(&serde_json::json!({"materializeLabels": true})));
-    assert!(on.materialize_labels);
+fn materialize_labels_is_on_by_default_and_opts_out() {
+    use crate::star_liveness::MATERIALIZE_LABELS_ENV as ENV;
+    assert!(Settings::default().materialize_labels);
+    let saved = std::env::var_os(ENV);
+    std::env::remove_var(ENV);
+    assert!(Settings::from_block(None).materialize_labels);
+    let off = serde_json::json!({"materializeLabels": false});
+    assert!(!Settings::from_block(Some(&off)).materialize_labels);
+    std::env::set_var(ENV, "0");
+    assert!(!Settings::from_block(None).materialize_labels, "env 0 opts out");
+    std::env::set_var(ENV, "1");
+    assert!(Settings::from_block(Some(&off)).materialize_labels, "env beats config");
+    match saved {
+        Some(v) => std::env::set_var(ENV, v),
+        None => std::env::remove_var(ENV),
+    }
 
     let world = World::default();
     let slug = "m/default-off";
