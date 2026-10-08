@@ -1,4 +1,6 @@
 //! Build script: capture git commit + build timestamp for `--version`.
+//! It also packs the install payload the binary embeds (#10717; see
+//! `pack_install_payload` at the bottom).
 //!
 //! Motivated by issue #3470 (and the broader #3287 Option D recommendation):
 //! when a consumer install fails with a "MISSING: <file>" error from the
@@ -208,4 +210,125 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=LOOM_DAEMON_BUILD_TIME={timestamp}");
+
+    // `../defaults` is already on the watch set above, so an edit to the
+    // payload re-runs this and re-packs it.
+    pack_install_payload();
+}
+
+/// Pack the installable file set into `$OUT_DIR/install-payload.tar.zst`
+/// (#10717). `init/payload.rs` embeds it with `include_bytes!`, which is what
+/// makes a resync install the files of the RUNNING release: the binary
+/// carries them, so `~/GitHub/loom` (which the release-download update path
+/// deliberately leaves at whatever version it was) is never read.
+///
+/// The set is `defaults/` as git tracks it (`git ls-files`), so untracked and
+/// ignored scratch in a developer's tree never ships. A build with no git (a
+/// source tarball) walks the directory instead. Entries are sorted and carry
+/// no owner or mtime, so the archive is a function of the file contents and
+/// their executable bits alone. Symlinks stay symlinks: `defaults/roles/*.md`
+/// point into `defaults/.claude/commands/loom/`, and the installer copies
+/// through them exactly as it does from a source checkout.
+fn pack_install_payload() {
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
+    let out = Path::new(&out_dir).join("install-payload.tar.zst");
+    let root = Path::new("..");
+
+    let mut files = tracked_payload_files(root).unwrap_or_else(|| {
+        let mut walked = Vec::new();
+        walk_payload_dir(root, Path::new("defaults"), &mut walked);
+        walked
+    });
+    files.sort();
+    files.dedup();
+
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.follow_symlinks(false);
+    for rel in &files {
+        let path = root.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue; // tracked but deleted in the working tree
+        };
+        let mut header = tar::Header::new_gnu();
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::read_link(&path) else {
+                continue;
+            };
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, rel, &target)
+                .unwrap_or_else(|e| panic!("pack install payload: {rel}: {e}"));
+        } else if meta.is_file() {
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("pack install payload: read {rel}: {e}"));
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(if is_executable(&meta) { 0o755 } else { 0o644 });
+            header.set_size(bytes.len() as u64);
+            builder
+                .append_data(&mut header, rel, bytes.as_slice())
+                .unwrap_or_else(|e| panic!("pack install payload: {rel}: {e}"));
+        }
+    }
+    let tar_bytes = builder
+        .into_inner()
+        .unwrap_or_else(|e| panic!("pack install payload: finish tar: {e}"));
+    // Level 10: ~4.5 MB for today's ~19 MB tree, in well under a second.
+    // Level 19 saves another ~0.5 MB for twenty times the build time.
+    let compressed = zstd::encode_all(tar_bytes.as_slice(), 10)
+        .unwrap_or_else(|e| panic!("pack install payload: compress: {e}"));
+    std::fs::write(&out, compressed)
+        .unwrap_or_else(|e| panic!("pack install payload: write {}: {e}", out.display()));
+}
+
+/// `defaults/` files as git tracks them, relative to the repo root. `None`
+/// when git cannot answer (no git, or not a checkout).
+fn tracked_payload_files(root: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--", "defaults"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files: Vec<String> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| String::from_utf8(s.to_vec()).ok())
+        .collect();
+    (!files.is_empty()).then_some(files)
+}
+
+/// The no-git fallback: every file and symlink under `defaults/`.
+fn walk_payload_dir(root: &Path, rel: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(root.join(rel)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = rel.join(entry.file_name());
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_payload_dir(root, &child, out);
+        } else if entry.file_name() != ".DS_Store" {
+            out.push(child.to_string_lossy().into_owned());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    false
 }
