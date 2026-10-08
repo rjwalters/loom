@@ -472,3 +472,7 @@ pub fn snapshot() -> Option<PollGatingStatus> {
 #[cfg(test)]
 #[path = "poll_gate/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "poll_gate/wiring_tests.rs"]
+mod wiring_tests;

@@ -67,7 +67,7 @@ fn render_poll_gating(s: &ForgeEventsStatus) -> Vec<String> {
         |rate| format!("{:.1}% ({}/{})", rate * 100.0, g.lossy_repolls, g.hard_cap_repolls),
     );
     let mut lines = vec![format!(
-        "Forge poll gating: {state} — hard cap {}s, {} poll(s) skipped, {} event re-poll(s),          {} hard-cap re-poll(s), lossy-feed rate {lossy}",
+        "Forge poll gating: {state} — hard cap {}s, {} poll(s) skipped, {} event re-poll(s), {} hard-cap re-poll(s), lossy-feed rate {lossy}",
         g.hard_cap_secs, g.polls_skipped, g.event_repolls, g.hard_cap_repolls
     )];
     for w in &g.workspaces {
@@ -327,9 +327,6 @@ mod tests {
         assert_eq!(render_block(None, now()).lines().count(), 1);
     }
 
-    // The event key must never reach an operator-visible surface, even
-    // indirectly: the status type carries only paths and classes, and this
-    // asserts the renderer adds nothing.
     #[test]
     fn poll_gating_renders_nothing_when_off_and_state_plus_lossy_rate_when_on() {
         let mut s = status(State::Healthy);
@@ -350,11 +347,20 @@ mod tests {
             }],
         });
         let out = render_block(Some(&s), now());
-        assert!(out.contains("ACTIVE"), "{out}");
-        assert!(out.contains("lossy-feed rate 25.0% (1/4)"), "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("Forge poll gating:"))
+            .expect("gating line");
+        assert_eq!(
+            line,
+            "Forge poll gating: ACTIVE (feed healthy) — hard cap 600s, 7 poll(s) skipped, 2 event re-poll(s), 4 hard-cap re-poll(s), lossy-feed rate 25.0% (1/4)"
+        );
         assert!(out.contains("/ws/a (o/a): gated"), "{out}");
     }
 
+    // The event key must never reach an operator-visible surface, even
+    // indirectly: the status type carries only paths and classes, and this
+    // asserts the renderer adds nothing.
     #[test]
     fn no_state_renders_anything_but_the_recorded_detail() {
         let mut s = status(State::Failing);
