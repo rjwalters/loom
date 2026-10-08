@@ -53,7 +53,7 @@
 
 use super::history::StageSamples;
 use super::journal::JournalEntry;
-use super::score::{score, EstimateSummary, OutcomeKind, Score};
+use super::score::{score, score_censored, EstimateSummary, OutcomeKind, Score};
 use super::tracker::READY_FIRST_SEEN;
 use super::{
     explanation, AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic,
@@ -442,6 +442,12 @@ pub struct BacktestReport {
     /// diagnostic, never a promotion input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_adaptation: Option<RegimeAdaptation>,
+    /// The late-surprise rate over resolved **and** in-flight (censored)
+    /// cases, with an issue-bootstrap interval and the resolved-only rate
+    /// beside it (#9970 Slice 2, [`censored`]). Present only when some case
+    /// was censored, so every report without one is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_surprise: Option<LateSurprise>,
 }
 
 /// `by_tail` key for an ordinary estimate (or a refusal).
@@ -566,7 +572,11 @@ fn replay(
         .map(|case| {
             let input = case_input(case, loom);
             let summary = EstimateSummary::of(&heuristic.estimate(&input, history));
-            let score = score(&summary, case.outcome, case.actual_at, &[]);
+            let score = if case.outcome == OutcomeKind::Censored {
+                score_censored(&summary, case.actual_at)
+            } else {
+                score(&summary, case.outcome, case.actual_at, &[])
+            };
             Replayed {
                 case: case.clone(),
                 summary,
@@ -593,8 +603,18 @@ pub fn replay_scored(
         .collect()
 }
 
-fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport {
+fn report_of(heuristic: &dyn Heuristic, every: &[Replayed]) -> BacktestReport {
     let kind = heuristic.kind();
+    // In-flight cases are reported apart (`late_surprise`): in the buckets a
+    // decided late miss would read as a refusal, and the loss-based figures
+    // have nothing to say about an actual that is only a lower bound.
+    let late_surprise = censored::late_surprise_of(every);
+    let resolved: Vec<Replayed> = every
+        .iter()
+        .filter(|r| r.case.outcome != OutcomeKind::Censored)
+        .cloned()
+        .collect();
+    let replayed = resolved.as_slice();
     let all: Vec<&Score> = replayed.iter().map(|r| &r.score).collect();
     let overall = bucket_of(&all);
 
@@ -653,6 +673,7 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         by_tail,
         by_subset: subsets::subsets_of(replayed),
         regime_adaptation: None,
+        late_surprise,
     }
 }
 
@@ -824,6 +845,11 @@ pub use paired::{Convergence, Fold, Paired, Stability};
 pub mod subsets;
 
 pub use subsets::{PairedSubset, SubsetBucket};
+
+#[path = "backtest_censored.rs"]
+pub mod censored;
+
+pub use censored::{censor_at, LateSurprise};
 
 #[path = "backtest_adaptation.rs"]
 pub mod adaptation;
