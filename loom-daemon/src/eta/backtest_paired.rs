@@ -193,9 +193,12 @@ pub struct Paired {
     pub a_mean_pinball4_loss_sec: Option<f64>,
     /// `b`'s.
     pub b_mean_pinball4_loss_sec: Option<f64>,
-    /// Cases whose late surprise (`actual > p90`) is decided on both sides.
+    /// Cases both sides answered with a p90, in-flight cases included
+    /// (#9970 Slice 2) — the same population as [`Self::delta_late_rate`].
     pub late_pairs: usize,
-    /// `a`'s late-surprise rate over them.
+    /// `a`'s late-surprise (`actual > p90`) rate over them. An in-flight case
+    /// still inside its p90 counts as not late, so this is a lower bound,
+    /// never an overstatement; with no in-flight cases it is the resolved rate.
     pub a_late_rate: Option<f64>,
     /// `b`'s.
     pub b_late_rate: Option<f64>,
@@ -272,10 +275,11 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
             day.1.current_loss4_sec += la;
             day.1.candidate_loss4_sec += lb;
         }
+        // One lower-bound late flag feeds both the gate's rates and
+        // `delta_late_rate`: keying on raw `above_p90` would admit only the
+        // in-flight cases already past p90 and overstate lateness (#9970).
         if let (Some(la), Some(lb)) = (late_flag(ra), late_flag(rb)) {
             add(&mut delta_late, &issue, f64::from(u8::from(lb)) - f64::from(u8::from(la)));
-        }
-        if let (Some(la), Some(lb)) = (sa.above_p90, sb.above_p90) {
             out.late_pairs += 1;
             a_late += usize::from(la);
             b_late += usize::from(lb);

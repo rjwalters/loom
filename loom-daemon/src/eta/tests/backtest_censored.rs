@@ -162,4 +162,30 @@ fn compare_counts_in_flight_answers_and_gives_an_issue_resampled_late_delta() {
     let delta = c.paired.delta_late_rate.expect("decidable cases");
     let (lo, hi) = (delta.lo.unwrap(), delta.hi.unwrap());
     assert!(lo <= delta.value.unwrap() && delta.value.unwrap() <= hi);
+
+    // The gate's late rates share `delta_late_rate`'s lower-bound population:
+    // every in-flight case enters, undecided ones as not late — 14/93, not
+    // the 14/89 an `above_p90`-keyed count gives by admitting only the late.
+    assert_eq!(c.paired.late_pairs, delta.n);
+    assert_eq!(c.paired.late_pairs, 93);
+    assert_eq!(c.paired.a_late_rate, Some(14.0 / 93.0));
+    assert_eq!(c.paired.b_late_rate, Some(14.0 / 93.0));
+
+    // With no in-flight cases the gate's rate is the resolved rate, unchanged.
+    let resolved_only: Vec<_> = view
+        .iter()
+        .filter(|c| c.outcome != OutcomeKind::Censored)
+        .cloned()
+        .collect();
+    let r = backtest::compare(
+        &LandV1,
+        &LandV2,
+        &history_a(),
+        &resolved_only,
+        Filter::default(),
+        &provenance(),
+    )
+    .unwrap();
+    assert_eq!(r.paired.late_pairs, 86);
+    assert_eq!(r.paired.a_late_rate, Some(11.0 / 86.0));
 }
