@@ -353,6 +353,28 @@ fn a_stale_owned_staging_file_is_swept_by_the_next_install() {
     assert_eq!(entries(dir.path()), vec!["loom-daemon".to_string()]);
 }
 
+/// Age a symlink itself (not its target), so only the file-type check can
+/// keep the sweep away from it.
+#[cfg(unix)]
+fn age_link(p: &Path, secs: u64) {
+    use std::os::unix::ffi::OsStrExt;
+    let then = (std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let tv = libc::timeval {
+        tv_sec: libc::time_t::try_from(then).unwrap(),
+        tv_usec: 0,
+    };
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path and `times` points at two
+    // initialised timevals for the duration of the call.
+    let rc = unsafe { libc::lutimes(c.as_ptr(), [tv, tv].as_ptr()) };
+    assert_eq!(rc, 0, "lutimes failed: {}", std::io::Error::last_os_error());
+    let md = std::fs::symlink_metadata(p).unwrap();
+    assert!(md.modified().unwrap().elapsed().unwrap().as_secs() >= secs - 60);
+}
+
 #[cfg(unix)]
 #[test]
 fn the_sweep_leaves_everything_that_does_not_qualify() {
@@ -361,6 +383,10 @@ fn the_sweep_leaves_everything_that_does_not_qualify() {
     let dest = dir.path().join("loom-daemon");
     let old = 2 * 3600;
 
+    // The one entry that qualifies, so the selection below is non-empty.
+    let stale = dir.path().join(STALE_NAME);
+    write(&stale, b"partial");
+    age(&stale, old);
     // Fresh matching file (a concurrent install's live temp file).
     let recent = dir.path().join(".loom-daemon.loom-install.1.1.1");
     write(&recent, b"live");
@@ -375,15 +401,21 @@ fn the_sweep_leaves_everything_that_does_not_qualify() {
     let suffix2 = dir.path().join(".loom-daemon.loom-install.1.2.3.4");
     write(&suffix2, b"x");
     age(&suffix2, old);
-    // Stale matching-named directory.
+    // Stale matching-named directory: only the file-type check excludes it.
     let adir = dir.path().join(".loom-daemon.loom-install.2.2.2");
     std::fs::create_dir(&adir).unwrap();
     age(&adir, old);
-    // Matching-named symlink (dangling target elsewhere).
+    // Stale matching-named symlink (the link itself is aged, so only the
+    // file-type check excludes it; removing that check unlinks it).
     let target = _s.path().join("target");
     write(&target, b"t");
     let link = dir.path().join(".loom-daemon.loom-install.3.3.3");
     std::os::unix::fs::symlink(&target, &link).unwrap();
+    age_link(&link, old);
+
+    // The selection is exactly the one stale regular file: the aged
+    // directory and aged symlink are rejected on file type alone.
+    assert_eq!(super::stale_staging_entries(dir.path(), &dest), vec![stale.clone()]);
 
     assert!(install_to(&fresh, &dest));
 
@@ -403,22 +435,47 @@ fn the_sweep_leaves_everything_that_does_not_qualify() {
         .into_iter()
         .collect::<Vec<_>>()
     );
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert!(target.exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn a_sweep_failure_does_not_change_the_install_result() {
-    // The sweep's remove_file fails on a matching-named stale entry it
-    // misjudges (here a directory); errors are ignored and the install wins.
+    // A matching-named stale entry the sweep cannot remove does not change
+    // the install's result. A directory is used because it is the one such
+    // entry a test can build portably; it is rejected by the file-type check
+    // before `remove_file` is reached. A real `remove_file` error is ignored
+    // by construction (only `.is_ok()` is counted), and a non-removable
+    // regular file cannot be made here without also making the staging
+    // directory unwritable, which would fail the install itself.
     let dir = tmpdir();
     let (_s, fresh) = fresh_source();
     let dest = dir.path().join("loom-daemon");
-    // A matching-named directory that cannot be removed by remove_file.
     let adir = dir.path().join(STALE_NAME);
     std::fs::create_dir(&adir).unwrap();
     age(&adir, 2 * 3600);
 
     assert!(install_to(&fresh, &dest));
     assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert!(adir.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_names_are_matched_on_raw_bytes() {
+    use super::is_staging_name;
+    assert!(is_staging_name(b".loom-daemon.loom-install.1.22.333", b"loom-daemon"));
+    assert!(!is_staging_name(b"loom-daemon", b"loom-daemon"));
+    assert!(!is_staging_name(b".loom-daemon.loom-install.1.2", b"loom-daemon"));
+    assert!(!is_staging_name(b".loom-daemon.loom-install.1..2", b"loom-daemon"));
+    assert!(!is_staging_name(b".a.b.loom-install.1.2.3", b"a"));
+    // Two non-UTF-8 basenames differing only in invalid bytes: a lossy
+    // conversion maps both to U+FFFD; byte matching keeps them apart.
+    assert!(is_staging_name(b".x\xff.loom-install.1.2.3", b"x\xff"));
+    assert!(!is_staging_name(b".x\xfe.loom-install.1.2.3", b"x\xff"));
+    assert!(!is_staging_name(b".x\xff.loom-install.1.2.3", b"x\xfe"));
 }

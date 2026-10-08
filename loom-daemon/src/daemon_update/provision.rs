@@ -206,44 +206,52 @@ fn staging_dir(dest: &Path) -> &Path {
 }
 
 /// Age after which a leftover staging file is considered orphaned.
+#[cfg(unix)]
 const STALE_STAGING_SECS: u64 = 3600;
 
 /// Does `name` look like `.{base}.loom-install.<digits>.<digits>.<digits>`?
-fn is_staging_name(name: &str, base: &str) -> bool {
-    let prefix = format!(".{base}.loom-install.");
-    let Some(rest) = name.strip_prefix(&prefix) else {
+///
+/// Compared as raw bytes, never through a lossy UTF-8 conversion: two
+/// non-UTF-8 basenames that differ only in invalid bytes would otherwise both
+/// map to the same `U+FFFD` text and one could sweep the other's files.
+#[cfg(unix)]
+fn is_staging_name(name: &[u8], base: &[u8]) -> bool {
+    let Some(rest) = name
+        .strip_prefix(b".")
+        .and_then(|r| r.strip_prefix(base))
+        .and_then(|r| r.strip_prefix(b".loom-install.".as_slice()))
+    else {
         return false;
     };
-    let parts: Vec<&str> = rest.split('.').collect();
+    let parts: Vec<&[u8]> = rest.split(|&b| b == b'.').collect();
     parts.len() == 3
         && parts
             .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .all(|p| !p.is_empty() && p.iter().all(u8::is_ascii_digit))
 }
 
-/// Best-effort removal of orphaned `.{base}.loom-install.*` files beside
-/// `dest` (a kill between write and rename leaves one). Only regular files
-/// (not symlinks or directories) owned by the effective user and older than
-/// [`STALE_STAGING_SECS`] are removed; the age gate also protects a
-/// concurrent install's live temp file. No pid liveness (pids are reused).
-/// Every error is ignored: a sweep failure never fails an install.
+/// The orphaned `.{base}.loom-install.*` entries beside `dest` that the sweep
+/// may remove: regular files only (not symlinks or directories), owned by the
+/// effective user, and older than [`STALE_STAGING_SECS`]. The age gate also
+/// protects a concurrent install's live temp file. No pid liveness (pids are
+/// reused). Any entry that cannot be inspected is skipped.
 #[cfg(unix)]
-fn sweep_stale_staging(dir: &Path, dest: &Path) {
+fn stale_staging_entries(dir: &Path, dest: &Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
-    let Some(base) = dest.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-        return;
+    let Some(base) = dest.file_name() else {
+        return Vec::new();
     };
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     let max_age = std::time::Duration::from_secs(STALE_STAGING_SECS);
-    let mut removed = 0usize;
+    let mut found = Vec::new();
     for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_staging_name(&name, &base) {
+        if !is_staging_name(entry.file_name().as_bytes(), base.as_bytes()) {
             continue;
         }
         let path = entry.path();
@@ -258,10 +266,22 @@ fn sweep_stale_staging(dir: &Path, dest: &Path) {
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > max_age);
-        if stale && std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+        if stale {
+            found.push(path);
         }
     }
+    found
+}
+
+/// Best-effort removal of the [`stale_staging_entries`] beside `dest` (a kill
+/// between write and rename leaves one). Every error is ignored: a sweep
+/// failure never fails an install.
+#[cfg(unix)]
+fn sweep_stale_staging(dir: &Path, dest: &Path) {
+    let removed = stale_staging_entries(dir, dest)
+        .iter()
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count();
     if removed > 0 {
         out::say(&format!(
             "Removed {removed} stale install temp file(s) next to {}",
