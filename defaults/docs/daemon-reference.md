@@ -1834,7 +1834,7 @@ cannot work with this daemon. The checkout copy is
   | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
   | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
   | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
-  | Epic supervisor singleton roles (Architect, Champion; `LOOM_EPIC_SUPERVISOR=1`) | its role dispatch, with the same typed `WorkspaceHeldDispatchError`, before the spawn script runs. It is logged as a failed dispatch on each supervisor tick while the hold stands |
+  | Epic supervisor (`LOOM_EPIC_SUPERVISOR=1`): singleton roles (Architect, Champion) and epic child sweeps | the supervisor skips the held workspace's whole tick, logged each tick. Its role dispatch runs the checkout's spawn script outside the registry, so it also refuses on its own with the same typed `WorkspaceHeldDispatchError` before that script runs |
 
   Three things are not refused, on purpose. The pause-and-roll resume
   relaunches sweeps and role runs that were already in flight when the host

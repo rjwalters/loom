@@ -478,6 +478,9 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// scheduled drain pauses new epic-child dispatch just like a red `main`.
     /// Absent (the default / test path) means the supervisor is never drained.
     drain_flag: Option<Arc<AtomicBool>>,
+    /// The workspace this supervisor serves, so a W3/W4 hold on it (#10719)
+    /// can stop its tick. `None` for a supervisor with no workspace identity.
+    hold_root: Option<PathBuf>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -495,6 +498,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             bus: None,
             health_state: None,
             drain_flag: None,
+            hold_root: None,
         }
     }
 
@@ -511,6 +515,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_health_gate(mut self, health_state: Arc<MainHealthState>) -> Self {
         self.health_state = Some(health_state);
+        self
+    }
+
+    /// Name the workspace this supervisor serves (#10719): while it is held
+    /// (W3/W4) the tick dispatches nothing. Builder-style; returns `self`.
+    #[must_use]
+    pub fn with_hold_root(mut self, root: PathBuf) -> Self {
+        self.hold_root = Some(root);
         self
     }
 
@@ -551,6 +563,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             .drain_flag
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed));
+        // #10719: a held workspace dispatches nothing — `dispatch_role` runs the
+        // held checkout's spawn script directly, outside the registry guard.
+        if role_spawn::tick_held(self.hold_root.as_deref()) {
+            return Ok(TickReport {
+                halted: true,
+                ..TickReport::default()
+            });
+        }
         if health_halted || drained {
             log::warn!(
                 "epic_supervisor: {} — skipping tick (no epic dispatch)",
@@ -1126,7 +1146,8 @@ pub fn spawn_multi_supervisor_thread(
                             )
                             .with_event_bus(event_bus.clone())
                             .with_health_gate(health_states.get_or_create(root))
-                            .with_drain_flag(drain_flag.clone());
+                            .with_drain_flag(drain_flag.clone())
+                            .with_hold_root(root.clone());
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());
@@ -1420,7 +1441,9 @@ pub mod forge {
                 reg.config().workspace_root.clone()
             };
             // #10719: `spawn_bin` is this checkout's own script, and this path
-            // never reaches the registry guard `dispatch_sweep` passes.
+            // never reaches the registry guard `dispatch_sweep` passes. The
+            // tick skips a held workspace first; this is the refusal at the
+            // spawn itself, for a hold set mid-tick or any other caller.
             crate::workspace_hold::guard(&repo_root)?;
             let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
             log::info!(

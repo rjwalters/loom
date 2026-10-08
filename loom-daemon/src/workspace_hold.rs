@@ -14,7 +14,7 @@
 //! | Work-finder selection, the red-main fix lane, the pre-flight recovery probe | the per-root pre-filter (`work_finder::pool_preflight`) |
 //! | Role runner, interval ticks | [`filter_held`] |
 //! | Role runner, idle-edge (`onIdle`) runs | [`refuse_role_start`] |
-//! | Epic supervisor singleton roles (Architect, Champion) | [`guard`], in its `dispatch_role` |
+//! | Epic supervisor: its whole tick, and its singleton roles (Architect, Champion) | the tick skips a held root; [`guard`] again in its `dispatch_role` |
 //!
 //! Not refused, on purpose: the pause-and-roll resume of sweeps and role runs
 //! (work that was already in flight when the host rolled), the resync itself,

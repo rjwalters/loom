@@ -2659,8 +2659,7 @@ impl IdleTrigger {
 /// Steps, in order:
 /// 1. Record the idle edge (always — so the level state stays accurate even on
 ///    a tick that ends up not firing).
-/// 2. Bail on no edge, on an active scheduled drain (#4090), or when the
-///    workspace is held ([`crate::workspace_hold`], #10719).
+/// 2. Bail on no edge, or on an active scheduled drain (#4090).
 /// 3. Bail when the role runner is disabled for this root
 ///    ([`resolve_enabled`], precedence env > config > default) — this is the
 ///    **per-root** gate (#4377): it is resolved from `root`'s own
@@ -2668,7 +2667,9 @@ impl IdleTrigger {
 ///    switch, which only decides whether the loops start at all. When
 ///    `onIdle` roles are configured for `root` but the gate is off, this is
 ///    the silent-no-op the issue exists to fix — see
-///    [`warn_if_idle_configured_but_disabled`].
+///    [`warn_if_idle_configured_but_disabled`]. Then bail on the host shard,
+///    an archived repo, or a held workspace ([`crate::workspace_hold`],
+///    #10719).
 /// 4. Per configured on-idle role ([`resolve_on_idle_roles`]): skip if inside
 ///    the debounce window, or if an interval / idle run already holds the
 ///    in-progress guard; else record the fire and acquire the guard.
@@ -2695,10 +2696,6 @@ pub fn plan_idle_runs(
             "role_runner: idle edge for {} suppressed — drain in progress (#4090)",
             root.display()
         );
-        return Vec::new();
-    }
-    // #10719: a hold drains the workspace, so the hold itself makes this edge.
-    if crate::workspace_hold::refuse_role_start(root, "idle edge") {
         return Vec::new();
     }
     if !resolve_enabled(config) {
@@ -2729,6 +2726,15 @@ pub fn plan_idle_runs(
     }
     if roster::repo_is_archived(root, None) {
         log::debug!("role_runner: idle edge for {} suppressed — archived (#10562)", root.display());
+        return Vec::new();
+    }
+    // #10719: a held workspace starts no role. The hold stops new sweeps, the
+    // in-flight set drains, and that very drain is what raises this idle edge —
+    // so without this the hold would itself launch every `onIdle` role. The
+    // edge was already observed above, so the bookkeeping stays right.
+    // After the gates above, so it is logged (with the hold's reason) only
+    // for an edge that would otherwise have started a role.
+    if crate::workspace_hold::refuse_role_start(root, "idle edge") {
         return Vec::new();
     }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
