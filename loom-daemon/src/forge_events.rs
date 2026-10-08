@@ -79,6 +79,7 @@ use crate::observability::endpoint_policy::{reserved_placeholder_host, valid_otl
 use crate::types::{Event, ForgeEventsState, ForgeEventsStatus};
 
 pub mod keys;
+pub mod poll_gate;
 pub mod wake;
 
 #[cfg(test)]
@@ -163,6 +164,8 @@ pub struct ForgeEventsConfig {
     pub event_key_file: Option<String>,
     pub poll_interval_secs: Option<u64>,
     pub page_size: Option<u32>,
+    /// `forgeEvents.pollGating` (#9255): default off.
+    pub poll_gating: Option<bool>,
 }
 
 /// Read the `forgeEvents` block from `root`'s resolved config.
@@ -186,6 +189,7 @@ pub fn read_config(root: &Path) -> ForgeEventsConfig {
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
             .filter(|v| *v > 0),
+        poll_gating: block.get("pollGating").and_then(serde_json::Value::as_bool),
     }
 }
 
@@ -696,7 +700,17 @@ pub fn global_status() -> ForgeEventsStatus {
         .get()
         .map_or_else(ForgeEventsStatus::disabled, |status| status.snapshot());
     status.wakes = wake::armed_snapshot();
+    status.poll_gating = poll_gate::snapshot();
     status
+}
+
+/// The feed's current state without allocating a full snapshot (the poll gate
+/// reads it on every discovery read). Unregistered ⇒ `Disabled`.
+#[must_use]
+pub fn global_state() -> ForgeEventsState {
+    GLOBAL_STATUS
+        .get()
+        .map_or(ForgeEventsState::Disabled, |status| status.snapshot().state)
 }
 
 // ============================================================================
@@ -1047,6 +1061,11 @@ impl FeedClient {
                 ),
             );
         }
+        // Invalidation keys for opt-in poll gating (#9255). Ingested BEFORE
+        // `record_success` flips the status to `healthy`, so a workspace can
+        // never be gated on a feed state that has not yet seen these events.
+        // A no-op when `forgeEvents.pollGating` is off.
+        poll_gate::ingest_page(&page.events, page.clamped);
         if page.events.is_empty() {
             // A quiet feed is a healthy feed. A forward cursor on an empty
             // page (the feed clamped us past expired events) is still worth
