@@ -29,6 +29,7 @@ fn stamp(version: &str) -> Stamp {
         version: v(version),
         commit: Some("a".repeat(40)),
         requires_daemon: "0.19.772".to_string(),
+        release_build: true,
     }
 }
 
@@ -251,6 +252,38 @@ fn new_file_is_added_and_written() {
     );
     // The installer's own rule: shell scripts are executable.
     assert!(is_exec(&ws.join(".loom/scripts/new/c.sh")));
+    // Both are now recorded as Loom's, after the entry that was there.
+    assert_eq!(
+        meta_json(&ws)["installed_files"],
+        serde_json::json!([
+            ".loom/scripts/lib/b.sh",
+            ".claude/commands/loom/new.md",
+            ".loom/scripts/new/c.sh"
+        ])
+    );
+}
+
+/// A file a resync adds is one a later resync can retire (#10878 review).
+#[test]
+fn file_added_by_a_resync_is_retired_by_a_later_one() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.880");
+    write(&defaults.join("scripts/new/c.sh"), "#!/bin/sh\nnew\n");
+    let payload = Payload::from_defaults(defaults.clone(), stamp("0.19.881"));
+    assert!(matches!(
+        resync_workspace_with(&payload, &ws).unwrap(),
+        ResyncOutcome::Applied { .. }
+    ));
+    assert!(ws.join(".loom/scripts/new/c.sh").is_file());
+
+    fs::remove_file(defaults.join("scripts/new/c.sh")).unwrap();
+    let payload = Payload::from_defaults(defaults, stamp("0.19.882"));
+    let diff = materialize_with(&payload, &ws).unwrap();
+    assert_eq!(diff.removed, vec![".loom/scripts/new/c.sh"], "{diff:?}");
+    apply(&ws, &diff).unwrap();
+    assert!(!ws.join(".loom/scripts/new").exists());
+    assert_eq!(meta_json(&ws)["installed_files"], serde_json::json!([".loom/scripts/lib/b.sh"]));
 }
 
 #[test]
@@ -275,6 +308,7 @@ fn removed_loom_owned_file_is_deleted_and_repo_owned_files_survive() {
     assert!(ws.join(".loom/hooks/post-worktree.sh").is_file());
     assert!(!is_exec(&ws.join(".loom/hooks/post-worktree.sh")), "repo-owned: mode untouched");
     assert!(ws.join(".loom/docs/d.md").is_file(), "no ownership evidence: kept");
+    assert_eq!(meta_json(&ws)["installed_files"], serde_json::json!([]));
 }
 
 #[test]
@@ -380,6 +414,186 @@ fn not_installed_is_refused() {
 }
 
 #[test]
+fn unreadable_metadata_is_refused_and_nothing_is_written() {
+    for bad in ["not json at all", "[]", "{\"loom_version\": 19}"] {
+        let tmp = TempDir::new().unwrap();
+        let defaults = fake_defaults(tmp.path());
+        let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+        write(&ws.join(META), bad);
+        write(&defaults.join("scripts/a.sh"), "#!/bin/sh\nother\n");
+        let payload = Payload::from_defaults(defaults, stamp("0.19.880"));
+
+        let before = freeze(&ws);
+        let outcome = resync_workspace_with(&payload, &ws).unwrap();
+        assert!(
+            matches!(outcome, ResyncOutcome::Refused(ResyncRefusal::UnreadableMetadata(_))),
+            "{bad:?}: {outcome:?}"
+        );
+        // A diff materialized by hand is refused by `apply` the same way.
+        let diff = materialize_with(&payload, &ws).unwrap();
+        assert!(!diff.is_empty());
+        assert!(matches!(
+            apply(&ws, &diff).unwrap(),
+            ResyncOutcome::Refused(ResyncRefusal::UnreadableMetadata(_))
+        ));
+        assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn loom_source_repo_is_refused_and_nothing_is_written() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+    // The explicit marker `is_loom_source_repo` honours.
+    write(&ws.join(".loom-source"), "");
+    write(&defaults.join("scripts/a.sh"), "#!/bin/sh\nother\n");
+    let payload = Payload::from_defaults(defaults, stamp("0.19.880"));
+
+    let before = freeze(&ws);
+    let expected = ResyncOutcome::Refused(ResyncRefusal::LoomSourceRepo);
+    assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), expected);
+    let diff = materialize_with(&payload, &ws).unwrap();
+    assert!(!diff.is_empty());
+    assert_eq!(apply(&ws, &diff).unwrap(), expected);
+    assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
+}
+
+/// A payload packed from a dirty checkout is not a release (#10878 review):
+/// `LOOM_DAEMON_GIT_DIRTY` other than `clean` clears `Stamp::release_build`.
+#[test]
+fn dirty_build_payload_is_refused_and_nothing_is_written() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+    write(&defaults.join("scripts/a.sh"), "#!/bin/sh\nuncommitted\n");
+    let dirty = Stamp {
+        release_build: false,
+        ..stamp("0.19.880")
+    };
+    let payload = Payload::from_defaults(defaults, dirty);
+
+    let before = freeze(&ws);
+    let expected = ResyncOutcome::Refused(ResyncRefusal::NotAReleaseBuild);
+    assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), expected);
+    let diff = materialize_with(&payload, &ws).unwrap();
+    assert!(!diff.is_empty());
+    assert_eq!(apply(&ws, &diff).unwrap(), expected);
+    assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
+}
+
+/// This binary's own stamp follows the build's tree state, and nothing else.
+#[test]
+fn this_binary_is_a_release_build_only_when_built_clean() {
+    let stamp = Stamp::this_binary().unwrap();
+    assert_eq!(stamp.release_build, crate::self_update::BUILT_TREE_STATE == "clean");
+}
+
+/// A recorded version that cannot be ordered might be newer than the daemon
+/// (#10878 review): refuse, for either contract field.
+#[test]
+fn unparseable_recorded_version_is_refused_and_nothing_is_written() {
+    for (field, value) in [
+        ("loom_version", "0.20.0-rc1"),
+        ("loom_version", "0.20"),
+        ("requires_daemon", "0.20.0-rc1"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let defaults = fake_defaults(tmp.path());
+        let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+        let mut meta = meta_json(&ws);
+        meta[field] = value.into();
+        write(&ws.join(META), &serde_json::to_string_pretty(&meta).unwrap());
+        write(&defaults.join("scripts/a.sh"), "#!/bin/sh\nother\n");
+        let payload = Payload::from_defaults(defaults, stamp("0.19.880"));
+
+        let before = freeze(&ws);
+        let expected = ResyncOutcome::Refused(ResyncRefusal::UnrecognizedVersion {
+            field,
+            value: value.to_string(),
+        });
+        assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), expected, "{field}={value}");
+        let diff = materialize_with(&payload, &ws).unwrap();
+        assert_eq!(apply(&ws, &diff).unwrap(), expected);
+        assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
+    }
+}
+
+/// `apply` fails part-way: one file is written, the next cannot be. The stamp
+/// must not move, and the next resync must see work to do and finish it.
+#[test]
+fn partial_failure_leaves_the_stamp_alone_and_the_next_resync_retries() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.880");
+    write(&defaults.join("docs/d.md"), "doc v2\n");
+    write(&defaults.join("scripts/a.sh"), "#!/bin/sh\necho a2\n");
+    set_exec(&defaults.join("scripts/a.sh"));
+    let payload = Payload::from_defaults(defaults, stamp("0.19.881"));
+
+    let diff = materialize_with(&payload, &ws).unwrap();
+    assert_eq!(diff.changed, vec![".loom/docs/d.md", ".loom/scripts/a.sh"]);
+    // Block the second write: a rename cannot replace a non-empty directory.
+    let blocked = ws.join(".loom/scripts/a.sh");
+    fs::remove_file(&blocked).unwrap();
+    write(&blocked.join("in-the-way"), "x\n");
+
+    assert!(apply(&ws, &diff).is_err());
+    assert_eq!(fs::read_to_string(ws.join(".loom/docs/d.md")).unwrap(), "doc v2\n");
+    let meta = meta_json(&ws);
+    assert_eq!(meta["loom_version"], "0.19.880", "the stamp is never ahead of the files");
+    assert_eq!(meta["resync_pending"], "0.19.881");
+
+    // The obstruction is cleared; the next resync writes what is left.
+    fs::remove_dir_all(&blocked).unwrap();
+    let retry = materialize_with(&payload, &ws).unwrap();
+    assert!(!retry.is_empty());
+    assert_eq!(retry.added, vec![".loom/scripts/a.sh"], "{retry:?}");
+    assert_eq!(
+        apply(&ws, &retry).unwrap(),
+        ResyncOutcome::Applied {
+            written: vec![".loom/scripts/a.sh".to_string(), META.to_string()]
+        }
+    );
+    let meta = meta_json(&ws);
+    assert_eq!(meta["loom_version"], "0.19.881");
+    assert!(meta.get("resync_pending").is_none());
+    assert!(materialize_with(&payload, &ws).unwrap().is_empty());
+}
+
+/// The case stamping last used to lose: every file was written and only the
+/// stamp was not. The file diff is empty, but the resync is still owed.
+#[test]
+fn interrupted_before_the_stamp_is_not_an_empty_diff() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.880");
+    let mut meta = meta_json(&ws);
+    meta["resync_pending"] = "0.19.881".into();
+    write(&ws.join(META), &serde_json::to_string_pretty(&meta).unwrap());
+    let payload = Payload::from_defaults(defaults, stamp("0.19.881"));
+
+    let before = freeze(&ws);
+    let diff = materialize_with(&payload, &ws).unwrap();
+    assert!(diff.added.is_empty() && diff.changed.is_empty() && diff.removed.is_empty());
+    assert!(diff.stamp_pending() && !diff.is_empty(), "{diff:?}");
+    drop(diff);
+
+    assert_eq!(
+        resync_workspace_with(&payload, &ws).unwrap(),
+        ResyncOutcome::Applied {
+            written: vec![META.to_string()]
+        }
+    );
+    assert_eq!(touched(&ws, &before, &snapshot(&ws)), vec![META]);
+    let meta = meta_json(&ws);
+    assert_eq!(meta["loom_version"], "0.19.881");
+    assert!(meta.get("resync_pending").is_none());
+    // Converged: the next one is a true no-op.
+    assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), ResyncOutcome::Unchanged);
+}
+
+#[test]
 fn gate_proceeds_at_or_below_running_and_for_unrecorded_versions() {
     let daemon = DaemonCompat {
         running: v("0.19.880"),
@@ -402,7 +616,15 @@ fn gate_proceeds_at_or_below_running_and_for_unrecorded_versions() {
     assert_eq!(resync_gate(&meta(None, None), &daemon), Ok(Compat::ResyncOwed));
     assert_eq!(resync_gate(&meta(Some("unknown"), None), &daemon), Ok(Compat::ResyncOwed));
     assert_eq!(resync_gate(&meta(Some("0.18.0"), None), &daemon), Ok(Compat::InstalledTooOld));
+    assert_eq!(resync_gate(&meta(Some(""), Some("unknown")), &daemon), Ok(Compat::ResyncOwed));
     assert!(resync_gate(&meta(Some("0.19.881"), None), &daemon).is_err());
+    assert_eq!(
+        resync_gate(&meta(Some("0.20.0-rc1"), Some("0.19.772")), &daemon),
+        Err(ResyncRefusal::UnrecognizedVersion {
+            field: "loom_version",
+            value: "0.20.0-rc1".to_string()
+        })
+    );
 }
 
 fn is_exec(path: &Path) -> bool {
@@ -488,8 +710,17 @@ fn payload_source_is_independent_of_the_loom_checkout() {
     let ws = tmp.path().join("ws");
     fs::create_dir_all(ws.join(".git")).unwrap();
     write(&ws.join(META), "{\"loom_version\": \"0.19.0\", \"installed_files\": []}\n");
-    // Install the embedded payload once, through the same apply path.
-    let first = materialize_payload(&ws).unwrap();
+    // Install the embedded payload once, through the same apply path. The
+    // test binary may be built from a dirty checkout, which `apply` refuses,
+    // so this view of the same tree is stamped as a release.
+    let release = Payload::from_defaults(
+        embedded.defaults().to_path_buf(),
+        Stamp {
+            release_build: true,
+            ..embedded.stamp().clone()
+        },
+    );
+    let first = materialize_with(&release, &ws).unwrap();
     assert!(!first.is_empty());
     assert!(matches!(apply(&ws, &first).unwrap(), ResyncOutcome::Applied { .. }));
 
