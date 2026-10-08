@@ -3486,6 +3486,10 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
         println!("Cleaning Stale Logs\n");
         clean_log_files(repo_root, &mut stats, opts.dry_run);
         println!();
+
+        println!("Cleaning Aborted-Fetch Git Temp Files\n");
+        let _ = crate::git_tmp_reclaim::clean_section(repo_root, opts.dry_run);
+        println!();
     }
 
     if opts.deep {

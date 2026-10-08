@@ -691,6 +691,23 @@ fn classify(
     match classify_head(env, root, gate, memory, scan, asked, &mut report) {
         Ok(found) => (report, found.map(|(branch, commit)| (nwo, branch, commit))),
         Err(e) => {
+            if let Some(low) = e.downcast_ref::<git::LowDisk>() {
+                // Below the disk floor the fetch was skipped (#10995). The
+                // remote answered, so this is neither a network outage nor a
+                // repo failure. It returns here, before the failure
+                // accounting below: no `no_answer`, no `record_failure`, no
+                // backoff, no alert. The workspace is reported from what the
+                // clone holds, and the next pass retries as soon as the disk
+                // has room.
+                log::info!("workspace_resync: {}: low-disk: {}", root.display(), low.0);
+                let mut offline = report_for(root);
+                offline.repo = Some(nwo.clone());
+                if classify_head(env, root, gate, memory, scan, Asked::No, &mut offline).is_ok() {
+                    report = offline;
+                }
+                report.reason = Some(format!("low-disk: {}", low.0));
+                return (report, None);
+            }
             // Which kind of failure: the remote did not answer (the host's,
             // reported once for the pass), the remote or the forge refused
             // this repo (the repo's own), or anything else.

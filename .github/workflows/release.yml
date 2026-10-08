@@ -1264,9 +1264,10 @@ jobs:
     # isolation means the image build-worker-image loaded into ITS runner's
     # local docker store does not carry over to this job's fresh runner, so
     # rebuilding locally (identical steps, same inputs) is simpler and more
-    # robust than transferring a `docker save` tarball between jobs, and
-    # keeps this job correct on a workflow_dispatch dry run too, where
-    # nothing was pushed to GHCR for a registry-pull FROM to resolve against.
+    # robust than transferring a `docker save` tarball between jobs. On a
+    # workflow_dispatch dry run, where nothing was pushed to GHCR for a
+    # registry-pull FROM to resolve against, the native build consumes that
+    # local base via the docker-driver builder (#11012, see that step).
     # Multi-arch (#7388): the `needs:` dependency additionally guarantees
     # build-worker-image's own multi-arch PUSH step has already completed
     # before this job's own multi-arch push step runs, so the REGISTRY
@@ -1364,9 +1365,19 @@ jobs:
           tags: |
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
+      # Dry run (#11012): the `docker-container` builder set up above runs
+      # its own BuildKit, which resolves `FROM ${BASE_IMAGE}` against the
+      # REGISTRY and cannot see the base image the step above `load`ed into
+      # the docker daemon's store. A dry run never pushes that base, so on a
+      # version no real release has published yet the FROM is "not found".
+      # `builder: default` (the runner's docker-driver builder) builds inside
+      # the daemon itself, so FROM resolves to the locally loaded base. Only
+      # on `publish == 'false'`: a publishing run keeps the current builder
+      # (empty input), exactly as before.
       - name: Build loom-worker-session image (native amd64, for smoke test)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
+          builder: ${{ needs.resolve.outputs.publish == 'false' && 'default' || '' }}
           context: .
           file: docker/session/Dockerfile
           platforms: linux/amd64
@@ -1506,9 +1517,12 @@ jobs:
           tags: |
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
+      # Dry run (#11012): same `builder: default` routing as
+      # build-session-image's native build, for the same reason.
       - name: Build loom-worker-native image (native amd64, for smoke test)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
+          builder: ${{ needs.resolve.outputs.publish == 'false' && 'default' || '' }}
           context: .
           file: docker/native/Dockerfile
           platforms: linux/amd64

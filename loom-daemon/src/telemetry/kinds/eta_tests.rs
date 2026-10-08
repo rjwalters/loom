@@ -62,6 +62,7 @@ fn outcome() -> EtaOutcomeRecord {
         outcome_source: "pulls_read".to_string(),
         outcome_resolution_sec: Some(120),
         result: None,
+        attribution: None,
     }
 }
 

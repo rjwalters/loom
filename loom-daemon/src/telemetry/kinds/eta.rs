@@ -112,6 +112,17 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.pr.resolved_at",
     "loom.eta.pr.observed_at",
     "loom.eta.pr.resolution_sec",
+    // `eta.outcome` stage attribution (#10929).
+    "loom.eta.attribution.unattributed_sec",
+    "loom.eta.attribution.dominant_stage",
+    // `eta.stage_outcome` (#10929).
+    "loom.eta.stage_outcome.stage",
+    "loom.eta.stage_outcome.exit",
+    "loom.eta.stage_outcome.next_stage",
+    "loom.eta.stage_outcome.entered_at",
+    "loom.eta.stage_outcome.left_at",
+    "loom.eta.stage_outcome.dwell_sec",
+    "loom.eta.stage_outcome.open_estimates",
     // `eta.backtest.fold` (#10492).
     "loom.eta.backtest.fold.fold_id",
     "loom.eta.backtest.fold.heuristic",
@@ -194,6 +205,12 @@ pub struct EtaOutcomeRecord {
     pub outcome_resolution_sec: Option<i64>,
     /// `finish`: the sweep's terminal class (`exited`, `crashed`).
     pub result: Option<String>,
+    /// The error split by stage (#10929): each forecast stage's predicted
+    /// and actual entry and dwell after `as_of`, and its contribution, with
+    /// `Σ contribution_sec + unattributed_sec == score.error_sec`. Absent when
+    /// the estimate forecast no stage or the outcome has no error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<crate::eta::stage_forecast::Attribution>,
 }
 
 impl EtaEstimateRecord {
