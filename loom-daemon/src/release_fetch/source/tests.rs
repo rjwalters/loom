@@ -422,7 +422,7 @@ fn required_mode_refuses_tag_moved_to_different_commit() {
     let policy = fx.policy(Some(A));
     fx.set_tag("v1.0.0", B, "ahead");
     let ev = fx.verified("v1.0.0", &policy);
-    assert_eq!(ev["source_commit"], B);
+    assert_eq!(ev["source_revision"], B);
     assert!(fx.record.is_file(), "adoption record must be written on success");
 
     // The same tag now points at a different (still descending) commit.
@@ -501,13 +501,13 @@ fn required_mode_evidence_reports_source_check_fields() {
     // did not run (the tag was never resolved, so no commit is reported).
     let ev = fx.verified("v1.0.0", &fx.policy(None));
     assert_eq!(ev["source_check"], "not_configured");
-    assert!(ev["source_commit"].is_null(), "{ev}");
+    assert!(ev["source_revision"].is_null(), "{ev}");
     assert!(ev["source_anchor"].is_null(), "{ev}");
     assert_eq!(ev["adoption_record"], "first_seen");
 
     let ev = fx.verified("v1.0.0", &fx.policy(Some(A)));
     assert_eq!(ev["source_check"], "ahead");
-    assert_eq!(ev["source_commit"], B);
+    assert_eq!(ev["source_revision"], B);
     assert_eq!(ev["source_anchor"], A);
     assert_eq!(ev["adoption_record"], "matched");
     assert_eq!(ev["signature_state"], "verified");
