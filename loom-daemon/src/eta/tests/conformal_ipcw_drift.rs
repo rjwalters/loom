@@ -233,14 +233,16 @@ fn swift_tern_leak_perturbing_post_as_of_outcomes_is_bit_identical() {
 }
 
 #[test]
-fn swift_tern_is_shadow_registered_and_recomputes() {
+fn swift_tern_is_retired_but_still_recomputes() {
+    // Retired from the registry (#10921); the module stays, so persisted
+    // explanations and the offline `--wrap ipcw-drift` still work.
     let registry = Registry::builtin();
-    assert!(registry.ids().contains(&LAND_SWIFT_TERN));
-    assert!(registry
+    assert!(!registry.ids().contains(&LAND_SWIFT_TERN));
+    assert!(!registry
         .for_kind(Kind::Land)
         .any(|h| h.id() == LAND_SWIFT_TERN));
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
-    let heuristic = registry.get(LAND_SWIFT_TERN).unwrap();
+    let heuristic = LandSwiftTern::default();
     assert!(heuristic.models_hold(), "as twin-otter-b");
 
     let input = input_at(Stage::SweepBuilder, 0, 0);

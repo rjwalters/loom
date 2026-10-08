@@ -38,6 +38,7 @@ fn queue(stage: Stage, items_ahead: u32, rate: f64, exits: u32) -> StageQueue {
         half_life_sec: HALF_LIFE_SEC,
         window_sec: WINDOW_SEC,
         exits,
+        planner: None,
     }
 }
 

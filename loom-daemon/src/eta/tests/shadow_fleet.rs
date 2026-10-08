@@ -16,6 +16,7 @@ use serde_json::json;
 const AMBER_HERON: &str = "land-2026-10-04-amber-heron";
 const FRESH_TIDE: &str = "land-2026-10-04-fresh-tide";
 const TWIN_OTTER: &str = "land-2026-10-04-twin-otter";
+const SWIFT_TERN: &str = "land-2026-10-06-swift-tern";
 const CALM_PLOVER: &str = "land-2026-10-06-calm-plover";
 
 /// Every built-in id and its declared tier. A new registration fails this
@@ -31,7 +32,7 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("little-v0", Tier::Baseline),
     ("land-2026-10-06-brisk-petrel", Tier::Candidate),
     ("land-2026-10-06-quick-tern", Tier::Candidate),
-    ("land-2026-10-06-swift-tern", Tier::Candidate),
+    ("land-2026-10-08-ranked-rook", Tier::Candidate),
     ("land-2026-10-06-held-heron", Tier::Candidate),
     ("land-2026-10-06-keen-wren", Tier::Candidate),
     ("land-2026-10-06-bold-lark", Tier::Candidate),
@@ -57,7 +58,14 @@ fn retired_ids_are_unregistered_and_answer_retired() {
     let registry = Registry::builtin();
     assert_eq!(
         RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        [LAND_V3, AMBER_HERON, FRESH_TIDE, TWIN_OTTER, CALM_PLOVER]
+        [
+            LAND_V3,
+            AMBER_HERON,
+            FRESH_TIDE,
+            TWIN_OTTER,
+            CALM_PLOVER,
+            SWIFT_TERN
+        ]
     );
     for (id, kind) in RETIRED {
         assert!(!registry.registers(*kind, id), "{id} is retired, so not registered");
@@ -103,6 +111,20 @@ fn twin_otter_is_retired_and_b_stays_a_candidate() {
     assert!(!decision.promote);
     assert_eq!(decision.candidate_tier, Some(Tier::Retired));
     assert_eq!(builtin_tier("land-2026-10-04-twin-otter-b"), Some(Tier::Candidate));
+}
+
+/// #10921: `land-2026-10-06-swift-tern` made room for
+/// `land-2026-10-08-ranked-rook` within the budget. Live, it served
+/// quick-tern's answers byte for byte; it answers `retired`, is not
+/// registered, and cannot be promoted.
+#[test]
+fn swift_tern_is_retired_and_ranked_rook_is_a_candidate() {
+    assert_eq!(builtin_tier(SWIFT_TERN), Some(Tier::Retired));
+    assert!(!Registry::builtin().registers(Kind::Land, SWIFT_TERN));
+    let decision = decide_with_passing_evidence(LAND_V1, SWIFT_TERN);
+    assert!(!decision.promote);
+    assert_eq!(decision.candidate_tier, Some(Tier::Retired));
+    assert_eq!(builtin_tier("land-2026-10-08-ranked-rook"), Some(Tier::Candidate));
 }
 
 /// #10489: `land-2026-10-06-calm-plover` hit its rates but lost `pinball4`

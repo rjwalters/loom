@@ -74,6 +74,7 @@ use crate::eta::labels::{
     hold_labels, pr_flags, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED,
     TREATING,
 };
+use crate::eta::planner_queue::planner_position;
 use crate::eta::priority_features::{PriorityEntry, PriorityState};
 use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
 use crate::eta::queue_features::QueueSubject;
@@ -467,6 +468,40 @@ impl<'a> QueueWorld<'a> {
         )
         .into_iter()
         .collect();
+        // #10921: the Judge's pick order over the same roster, each PR at
+        // its own labels' level known strictly before `as_of`, through the
+        // one function serving calls.
+        let own = |repo: &str, number: u32| {
+            self.stars
+                .iter()
+                .find(|w| w.repo.eq_ignore_ascii_case(repo) && w.pr == number)
+                .and_then(|w| PriorityState::from_flags(&w.flags, as_of))
+                .unwrap_or_default()
+        };
+        let starred: Vec<PriorityEntry> = roster
+            .iter()
+            .map(|e| PriorityEntry {
+                repo: e.repo.clone(),
+                pr: e.pr,
+                stage: e.stage,
+                entered_at: e.entered_at,
+                known_at: e.known_at,
+                star: own(&e.repo, e.pr),
+            })
+            .collect();
+        let star = own(&case.subject.repo, pr);
+        for queue in &mut case.queue {
+            queue.planner = planner_position(
+                &case.subject.repo,
+                pr,
+                case.stage,
+                &star,
+                &starred,
+                &self.log,
+                &self.scope,
+                as_of,
+            );
+        }
     }
 }
 

@@ -115,8 +115,9 @@ pub struct Explanation {
     /// refusal, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twin_otter: Option<TwinOtterRecord>,
-    /// What `little-v0` (#10208) computed its queue estimate from. Absent for
-    /// every other heuristic, so their explanations are byte-identical.
+    /// What `little-v0` (#10208), or a `land-2026-10-08-ranked-rook` queue
+    /// answer (#10921), computed its queue estimate from. Absent for every
+    /// other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueRecord>,
     /// How a dependency composition (#10510) composed, or refused, the
@@ -270,6 +271,21 @@ pub struct QueueRecord {
     pub seed: String,
     /// `splitmix64`.
     pub rng: String,
+    /// The pick order behind `items_ahead` when it is not FIFO:
+    /// `judge_planner` for `land-2026-10-08-ranked-rook` (#10921), whose
+    /// wait is then `round((items_ahead + 1) / drain_rate_per_hr * 3600)`
+    /// (the subject's own review departure included). Absent for
+    /// `little-v0`, so its explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
+    /// The FIFO `items_ahead` of the same stage ([`super::stage_queue`]),
+    /// beside the planner's, for comparison. Absent for `little-v0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fifo_items_ahead: Option<u32>,
+    /// The subject's own operator level as the planner ordered it. Absent
+    /// for `little-v0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_level: Option<u8>,
 }
 
 /// The current stage as the estimate saw it.

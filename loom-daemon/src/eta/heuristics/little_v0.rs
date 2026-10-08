@@ -233,6 +233,9 @@ impl Heuristic for LittleV0 {
             gamma_shape: shape,
             seed: format!("0x{seed:016x}"),
             rng: "splitmix64".to_string(),
+            order: None,
+            fifo_items_ahead: None,
+            operator_level: None,
         });
         explanation.result = Some(EstimateResult {
             p25_sec: p25,

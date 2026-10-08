@@ -77,6 +77,12 @@ pub struct StageQueue {
     pub window_sec: i64,
     /// Exits in the window, unweighted.
     pub exits: u32,
+    /// The Judge's real pick order for a `review_wait` PR (#10921,
+    /// [`super::planner_queue`]), set by the caller after this FIFO view.
+    /// Absent for every other stage and before the planner view existed, so
+    /// a queue without it serializes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<super::planner_queue::PlannerPosition>,
 }
 
 /// The exponentially weighted exit rate, per hour, of exits `ages_sec` old.
@@ -152,5 +158,6 @@ pub fn stage_queue(
         half_life_sec: HALF_LIFE_SEC,
         window_sec: WINDOW_SEC,
         exits: u32::try_from(ages.len()).unwrap_or(u32::MAX),
+        planner: None,
     })
 }

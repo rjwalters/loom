@@ -16,7 +16,8 @@
 //! - [`Tier::Candidate`]: a challenger. Only a candidate can be promoted, and
 //!   only candidates are offered in the loom-ui ETA chooser (the tier rides on
 //!   every `eta.snapshot` alternate).
-//! - [`Tier::Retired`]: no longer registered (#10484, #10549, #10528). It produces no
+//! - [`Tier::Retired`]: no longer registered (#10484, #10549, #10528,
+//!   #10921). It produces no
 //!   estimate, no alternate and no ledger pair. The id stays in [`RETIRED`]
 //!   so it is never reused and a lookup still answers what it was.
 //!
@@ -78,7 +79,8 @@ impl std::fmt::Display for Tier {
     }
 }
 
-/// Retired heuristic ids and their kind (#10484, #10549, #10528, #10489). Never
+/// Retired heuristic ids and their kind (#10484, #10549, #10528, #10489,
+/// #10921). Never
 /// registered, never reused; see `eta.md` "Retired heuristics" for why each
 /// was retired. `land-2026-10-04-twin-otter`'s evaluation lives on inside
 /// `land-2026-10-04-twin-otter-b` (and keen-wren's PR stages); only its own
@@ -89,6 +91,9 @@ pub const RETIRED: &[(&str, Kind)] = &[
     ("land-2026-10-04-fresh-tide", Kind::Land),
     (super::heuristics::LAND_TWIN_OTTER, Kind::Land),
     ("land-2026-10-06-calm-plover", Kind::Land),
+    // #10921: made room for `land-2026-10-08-ranked-rook`; its module and
+    // the drift-aware calibrator stay (offline `eta backtest --wrap`).
+    (super::heuristics::LAND_SWIFT_TERN, Kind::Land),
 ];
 
 /// Whether `id` is a retired heuristic id.

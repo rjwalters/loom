@@ -221,7 +221,7 @@ fn external_review_path_from_listings_to_merge() {
     assert_eq!(
         merged.outcomes.len(),
         28,
-        "two estimates x land-v1 + the land-v2, even-lark, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, loop-kite, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
+        "two estimates x land-v1 + the land-v2, even-lark, brisk-petrel, quick-tern, ranked-rook, held-heron, keen-wren, bold-lark, loop-kite, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
     );
     for outcome in &merged.outcomes {
         assert_eq!(outcome.score.outcome, OutcomeKind::Landed);
@@ -264,7 +264,7 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
     );
     // Fourteen: `land-v1` (primary) and the `land-v2`,
     // `land-2026-10-06-even-lark`, `land-2026-10-06-brisk-petrel` (#10528),
-    // `land-2026-10-06-quick-tern`, `-swift-tern`,
+    // `land-2026-10-06-quick-tern`, `land-2026-10-08-ranked-rook` (#10921),
     // `land-2026-10-06-held-heron`, `land-2026-10-06-keen-wren` (#10508),
     // `land-2026-10-06-bold-lark`, `land-2026-10-06-loop-kite` (#10521),
     // `land-2026-10-04-twin-otter-b`, `land-v4`, `little-v0` and
@@ -272,7 +272,7 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
     // at the same `as_of` — the live pairs (#9328, #10489, #10524, #10523,
     // #10508, #10244, #10210, #10208, #10510, #10528, #10521; `land-v3` and
     // `-amber-heron` retired, #10484; `-fresh-tide`, #10549;
-    // `land-2026-10-04-twin-otter`, #10528).
+    // `land-2026-10-04-twin-otter`, #10528; `-swift-tern`, #10921).
     assert_eq!(not_planned.outcomes.len(), 14);
     assert_eq!(not_planned.outcomes[0].score.outcome, OutcomeKind::Abandoned);
     assert_eq!(not_planned.outcomes[0].score.error_sec, None);

@@ -60,6 +60,7 @@ use crate::eta::fleet::FleetSnapshot;
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
 use crate::eta::loop_features::FileSnapshot;
+use crate::eta::planner_queue::planner_position;
 use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
 use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
@@ -650,7 +651,8 @@ impl Tracker {
         self.context.stall = Some(snapshot);
     }
 
-    /// The per-stage queue context `little-v0` reads (#10208) for `item` at
+    /// The per-stage queue context `little-v0` (#10208) and, with its Judge
+    /// pick order, `land-2026-10-08-ranked-rook` (#10921) read for `item` at
     /// `now`: empty without a fleet view observed before `now`, a PR, or a PR
     /// stage.
     pub(super) fn stage_queue_for(
@@ -671,6 +673,12 @@ impl Tracker {
         if view.observed_at >= now {
             return Vec::new();
         }
+        let star = view
+            .priority_roster
+            .iter()
+            .find(|e| e.pr == pr && e.repo.eq_ignore_ascii_case(&key.repo))
+            .map(|e| e.star.clone())
+            .unwrap_or_default();
         stage_queue(
             &key.repo,
             pr,
@@ -681,6 +689,21 @@ impl Tracker {
             &view.scope,
             now,
         )
+        .map(|mut queue| {
+            // #10921: the Judge's pick order, from the same roster replay
+            // builds its own from (`backtest/pr_cases.rs`).
+            queue.planner = planner_position(
+                &key.repo,
+                pr,
+                stage.stage,
+                &star,
+                &view.priority_roster,
+                &view.events,
+                &view.scope,
+                now,
+            );
+            queue
+        })
         .into_iter()
         .collect()
     }

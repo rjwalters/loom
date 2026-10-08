@@ -272,7 +272,7 @@ only.
 | `land-2026-10-06-even-lark` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled. The score is in **seconds** (`actual − q_τ`), so each quantile moves by `+ c_τ` seconds; the shift changes by at most 2 h a day. Fitted at the estimate's own `as_of` (recorded as `calibration`, `method` `split_conformal_km_seconds`; replaced the retired log-scale `land-2026-10-06-calm-plover`; #10489) | after `merge_wait` |
 | `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
 | `land-2026-10-06-brisk-petrel` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, with p25/p50/p75/p90 scaled by the **latent-regime residual factor** (`eta/regime.rs`): the 3 h half-life weighted mean of `ln(actual / p50)` over twin-otter-b's scored outcomes from the last 24 h, clamped to 0.25-4. It is applied **only while the drift check (6 h CUSUM against the 7-day baseline) has tripped** for the item's stage, so a calm stream is served twin-otter-b's estimate byte for byte. It is identity below the sample floor or when the mean is within 3 standard errors of zero. Recorded as `regime_adjustment{stage, factor, n_recent, half_life}` (#10528). Shadow, tier `candidate` | at the merge |
-| `land-2026-10-06-swift-tern` | `land` | quick-tern made **drift-aware** (#10524 slice 3, #10528): when the stage's CUSUM drift check trips (residuals centred on the shift quick-tern would serve), the half-life ladder starts at 1.5 h instead of 6 h. The interval inflation the check asks for is recorded but not applied. Otherwise quick-tern's answer. Recorded as `calibration` with `ipcw.drift{…}` | at the merge |
+| `land-2026-10-08-ranked-rook` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, except a PR in **`review_wait`**: it is answered from its place in the **Judge's real pick order** (`pr_planning::ordered_queue`: operator level highest first, then newest first; `preferHumanPrs` pinned off), `(items_ahead + 1) / repo review drain rate` plus `little-v0`'s recency-weighted service of the later stages, with `little-v0`'s Gamma interval. No position or no review exit in the repo's 24 h window answers as twin-otter-b. Recorded as `queue` with `order: judge_planner` (#10921, [below](#the-judge-ordered-review-queue-10921)). Shadow, tier `candidate` | at the merge |
 | `land-2026-10-06-bold-lark` | `land` | keen-wren's priority-aware estimate (#10508) wrapped by the same IPCW split-conformal calibrator as quick-tern (#10524 slice 4). Only keen-wren's logged rows are evidence. Recorded as `calibration` with `base = land-2026-10-06-keen-wren` | at the merge |
 | `land-2026-10-06-held-heron` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, except a PR that is **held** (`merge_hold`) or **sequenced** (`merge_wait` with `loom:sequenced`) at `as_of`. That PR is answered by a competing-risks hold and sequencing chain whose hazards are events ÷ exposure over the 14 days before `as_of`, read from the stage episodes and the PR flag timeline; there are no draws. Too little evidence answers as twin-otter-b. Recorded as `held_heron` (#10523) | at the merge |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
@@ -303,6 +303,7 @@ registry would be a second mechanism for dominated heuristics).
 | `land-2026-10-04-amber-heron` | 2026-10-06 | Dominated in live outcomes (same 48 h window): pinball4 8.97 h (the worst of any heuristic that answers broadly), p25-p75 coverage 0.147, late surprise 0.649, barely better than `land-v2`'s 0.71. On the small common subset all seven answered (6 items) it is last on pinball. | #10207, #10484 |
 | `land-2026-10-04-fresh-tide` | 2026-10-06 | Failed the backtest gate: on the 52-fold backtest over verified forge history (the evidence is on #10549) it was +0.49 h [+0.30, +0.69] pinball4 against `land-v2`, winning 17 of 52 days (Wilson lower bound 0.22). Its recency idea is covered by the recent-window calibration of #10541 and the planned regime adjustment of #10528. Its module and the `eta backtest --half-life-days` replay flag (#10325) were removed with it; the engine's recency weighting stays (`recalibrate` uses it). | #10209, #10549 |
 | `land-2026-10-04-twin-otter` | 2026-10-07 | Superseded by its fixed successor `land-2026-10-04-twin-otter-b` (the #10500 train/serve skew fix), the only heuristic that passed the backtest gate (−2.39 h pinball4 against `land-v2`). It answered PR stages only, which `-b` answers identically, so the chooser loses nothing. Retired to keep `land` within the 13-heuristic budget when `land-2026-10-06-brisk-petrel` landed: a 14th alternate would exceed the 3 KB `eta.snapshot` row guard. Only the registration went: `-b`, keen-wren, held-heron and the fit still use its module (`recompute`, `adapt_input`, `visit_*`, `DRAW_ORDER`), and `-b`'s PR-stage explanations still record and replay `twin_otter`. | #10243, #10528 |
+| `land-2026-10-06-swift-tern` | 2026-10-08 | Made room for `land-2026-10-08-ranked-rook` within the 14-heuristic budget (#10921; #10949 proposes retiring every IPCW shadow). On the 52-fold point-in-time walk-forward (loom-experiments#21, 7,875 PR-days) it lost to twin-otter-b by +11.77 h pinball4 [+9.22, +14.59] and won 7/52 days against `land-v1`. No nightly fold reached SigNoz (the fold host has no exporter); live, on the 441 `land` outcomes every heuristic scored from the authority (`loom-worker-1`, 2026-10-05..08) it answered **exactly as quick-tern** (pinball4 20.77 h both; p25-p75 coverage 0.011, late surprise 0 both), so its drift check never changed an answer, and twin-otter-b dominated it (9.79 h, same coverage and late surprise). Only the registration went: the module, `Calibrator::IpcwDrift` and the offline `eta backtest --wrap ipcw-drift` stay. | #10524, #10921 |
 | `land-2026-10-06-calm-plover` | 2026-10-06 | Hit its rates but failed the backtest's deciding loss: on the walk-forward replay of 600 merged-PR timelines (1,144 common `land` cases) it was +4,810 s [+580, +9,230] `pinball4` against `land-v2`, at p25–p75 coverage 49.4% and late surprise 9.8%. Its one multiplicative shift per cell widened every item's range by the same factor. Replaced in the registry by `land-2026-10-06-even-lark`, the same calibration on the seconds scale; the log-scale code stays in `eta::conformal` so persisted calm-plover explanations still recompute. | #10489 |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
@@ -627,6 +628,9 @@ then applies `shift`.
 is unchanged (ids are immutable). Swift-tern ships the same way: registered,
 not current, tier `candidate`, it models the hold, and it is registered just
 after quick-tern. The method is `eta::conformal_ipcw::calibrate_drift_aware`.
+It was [retired](#retired-heuristics) on 2026-10-08 (#10921): live, it
+answered as quick-tern on every scored case. Its module stays, so persisted
+explanations recompute and `--wrap ipcw-drift` still evaluates it offline.
 
 - **The check.** For a stage cell, the residuals `ln(actual / p50)` of
   twin-otter-b's landings known before `as_of` go through the regime CUSUM
@@ -680,7 +684,7 @@ twin-otter-b it reproduces quick-tern (`Calibrator::Ipcw`) and swift-tern
 The wrapper has four rules:
 - It wraps `land` bases only.
 - It never calibrates twice. A base that already calibrates itself
-  (even-lark, quick-tern, swift-tern, bold-lark) comes back unchanged, only
+  (even-lark, quick-tern, bold-lark) comes back unchanged, only
   re-identified, and `eta backtest --wrap` refuses it by name
   (`conformal_wrap::CALIBRATED`).
 - It degrades to the base. With thin evidence, the base's answer comes back
@@ -866,7 +870,7 @@ in wiring. Two rules keep it safe as their number grows (#10525).
 |---|---|---|---|---|
 | `baseline` | `start-v1`, `finish-v1`, `land-v1`, `little-v0` | yes | no | no |
 | `candidate` | every other registered id | yes | yes | yes, through the gates |
-| `retired` | `land-v3`, `land-2026-10-04-amber-heron`, `land-2026-10-04-fresh-tide`, `land-2026-10-04-twin-otter` ([above](#retired-heuristics)) | no (not registered) | no | no |
+| `retired` | `land-v3`, `land-2026-10-04-amber-heron`, `land-2026-10-04-fresh-tide`, `land-2026-10-04-twin-otter`, `land-2026-10-06-swift-tern` ([above](#retired-heuristics)) | no (not registered) | no | no |
 
 A baseline is the reference every candidate is scored beside. `land-v1` is
 also the default `current` for `land`; being a baseline only stops the gate
@@ -2098,6 +2102,66 @@ event's `known_at` differs.
   until the next snapshot refresh moves `H`. The history's start, for the
   168 h rule, is the snapshots' (as training's), else the journal's oldest
   row.
+
+### The Judge-ordered review queue (#10921)
+
+FIFO `ahead` and `little-v0`'s `items_ahead` count the PRs that entered a
+stage earlier. The Judge does not pick that way. It walks
+`loom-daemon pr-queue --role judge`, which is `pr_planning::ordered_queue`:
+effective operator level highest first (#10307), then a trusted human-origin
+PR when `planning.preferHumanPrs`, then the listing order, which is **newest
+first**. So a starred PR is reviewed before older unstarred ones, and an
+unstarred PR waits behind every newer one. `eta::planner_queue` calls that
+one function; it never re-implements the order.
+
+- **The position** (`StageQueue.planner`, `PlannerPosition`): for a PR in
+  `review_wait` whose repo is in the fleet scope, the PRs `ordered_queue`
+  puts before it among its repo's `review_wait` PRs (`items_ahead`), the
+  queue's length, the PR's own level, and its **repo's** review drain rate
+  (the Judge runs one instance per repo; same weighting as `stage_queue`:
+  6 h half life, 24 h window). Every other stage has none.
+- **The rows** are synthetic listing rows: number, `state: open`,
+  `loom:review-requested` and the operator label of the PR's **own** level.
+  A linked issue's star is not a PR label, so the Judge, and this position,
+  do not see it.
+- **`preferHumanPrs` is pinned off.** Origin is a trusted provenance marker
+  in the PR body, checked against its author. Neither the replay's label
+  timeline nor serving's roster carries it point-in-time, so serving and
+  replay both order with it off (`planner_queue::PREFER_HUMAN_PRS`): parity
+  before fidelity. `eta simulate --planner` therefore shows no
+  `review_wait` delta for a `preferHumanPrs` flip yet.
+- **Point in time and parity.** Roster entries with `known_at >= as_of`,
+  level changes at or after `as_of`, and events at or after `as_of` are not
+  read. Serving (`Tracker::stage_queue_for`, from the pass's priority
+  roster) and replay (`backtest/pr_cases.rs`, from the batch's label
+  timelines) both call `planner_position`; a test pins that neither orders
+  on its own.
+
+`land-2026-10-08-ranked-rook` serves it. A PR in `review_wait` with a
+position and at least one review exit in its repo's window is answered as
+
+```text
+wait    = (items_ahead + 1) / repo review drain rate   (its own review exit included)
+service = Σ recency-weighted mean of each later stage  (little-v0's)
+p50     = wait + service
+```
+
+with `little-v0`'s Gamma posterior on the rate for the interval (shape = the
+repo's exits, 400 draws seeded from the estimate id). The PR's age in
+`review_wait` is **not** read: the position is the state, so the time
+already waited is not conditioned on a second time. At any age a later
+position never gets an earlier quantile, and the same position gets the
+same p50 at every age. (On the 52-fold walk-forward, loom-experiments#21,
+every other heuristic's review-queue rank runs the wrong way, Spearman −0.3
+to −0.47 between position and p50, from conditioning on elapsed age.)
+Everything else,
+refusals included, is `land-2026-10-04-twin-otter-b`'s answer under its id.
+The explanation records `queue` with `order: judge_planner`,
+`fifo_items_ahead` and `operator_level`, and `run_explanation` recomputes
+the four quantiles from it. It ignores PRs that arrive later and are picked
+first, so an old unstarred PR's wait is optimistic. Doctor order
+(`PrRole::Doctor`), Champion merge order (`PrRole::Champion`), and the
+issue stages' dispatch position are follow-ups (#10528).
 
 ### Item facts: issue, sweep, verdicts (#10231)
 

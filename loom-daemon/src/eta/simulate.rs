@@ -601,6 +601,8 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 ///
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.
+/// A `land-2026-10-08-ranked-rook` planner-queue answer (#10921) recomputes
+/// from its `queue` record ([`super::heuristics::recompute_ranked_rook`]).
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
     // A dependency composition (#10510) recomputes from its node records,
     // a held-heron answer (#10523) from its simulator record. Either may
@@ -614,6 +616,9 @@ pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)
         super::dependency::recompute(record)?
     } else if let Some(record) = &explanation.held_heron {
         super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles)?
+    } else if let Some(record) = explanation.queue.as_ref().filter(|q| q.order.is_some()) {
+        // A `land-2026-10-08-ranked-rook` planner-queue answer (#10921).
+        super::heuristics::recompute_ranked_rook(record)?
     } else {
         match &explanation.twin_otter {
             Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,

@@ -29,6 +29,10 @@
 //! successor: the same evaluation over an `eta-fit/v3` file, which adds the
 //! review-loop, Judge-rate, file-overlap and own-CI predictors and the
 //! cumulative stage age.
+//! `land-2026-10-08-ranked-rook` (#10921) is twin-otter-b with a PR in
+//! `review_wait` answered from its place in the Judge's real pick order
+//! ([`crate::eta::planner_queue`]). It took the budget slot of
+//! `land-2026-10-06-swift-tern`, retired (its module stays, unregistered).
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
@@ -40,6 +44,7 @@ mod land_held_heron;
 mod land_keen_wren;
 mod land_loop_kite;
 mod land_quick_tern;
+mod land_ranked_rook;
 mod land_swift_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -62,6 +67,10 @@ pub use land_held_heron::{
 pub use land_keen_wren::{LandKeenWren, LAND_KEEN_WREN, PRE_PR_METHOD as KEEN_WREN_PRE_PR_METHOD};
 pub use land_loop_kite::{LandLoopKite, LAND_LOOP_KITE};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
+pub use land_ranked_rook::{
+    recompute as recompute_ranked_rook, LandRankedRook, LAND_RANKED_ROOK,
+    ORDER as RANKED_ROOK_ORDER,
+};
 pub use land_swift_tern::{LandSwiftTern, LAND_SWIFT_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{

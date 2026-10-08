@@ -8,7 +8,7 @@ use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
     LandV1, LandV2, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_EVEN_LARK, LAND_HELD_HERON,
-    LAND_KEEN_WREN, LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN,
+    LAND_KEEN_WREN, LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_RANKED_ROOK, LAND_TANDEM_WREN,
     LAND_TWIN_OTTER_B, LAND_V1, LAND_V2, LAND_V4,
 };
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
@@ -248,7 +248,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             "little-v0",
             LAND_BRISK_PETREL,
             LAND_QUICK_TERN,
-            LAND_SWIFT_TERN,
+            LAND_RANKED_ROOK,
             LAND_HELD_HERON,
             LAND_KEEN_WREN,
             LAND_BOLD_LARK,
@@ -306,7 +306,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             "little-v0",
             LAND_BRISK_PETREL,
             LAND_QUICK_TERN,
-            LAND_SWIFT_TERN,
+            LAND_RANKED_ROOK,
             LAND_HELD_HERON,
             LAND_KEEN_WREN,
             LAND_BOLD_LARK,

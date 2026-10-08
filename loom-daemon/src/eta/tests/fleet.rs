@@ -671,6 +671,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     // #10208: the zero-parameter queue floor and the queue context it reads.
     ("heuristics/little_v0.rs", include_str!("../heuristics/little_v0.rs")),
     ("stage_queue.rs", include_str!("../stage_queue.rs")),
+    // #10921: the Judge-ordered review queue and the heuristic that reads it.
+    ("planner_queue.rs", include_str!("../planner_queue.rs")),
+    (
+        "heuristics/land_ranked_rook.rs",
+        include_str!("../heuristics/land_ranked_rook.rs"),
+    ),
     // #10528: brisk-petrel and the regime adjustment it serves through.
     ("regime.rs", include_str!("../regime.rs")),
     (

@@ -140,6 +140,7 @@ pub mod labels;
 pub mod loop_features;
 pub mod nightly_folds;
 pub mod offline;
+pub mod planner_queue;
 pub mod planner_sim;
 pub mod planner_version;
 pub mod point_in_time;
@@ -649,7 +650,8 @@ pub struct EstimateInput {
     /// Per-stage queue context (#10208): items ahead and the recent drain
     /// rate of the stage the item is in, computed by the tracker from events
     /// observed before `as_of`. Empty when no fleet view was observed yet.
-    /// Only `little-v0` reads it.
+    /// Only `little-v0` and `land-2026-10-08-ranked-rook` (its
+    /// [`stage_queue::StageQueue::planner`], #10921) read it.
     pub queue: Vec<stage_queue::StageQueue>,
     /// The pass's dependency graph (#10510), point-in-time: only a
     /// dependency composition ([`dependency::compose`]) reads it. `None`
@@ -751,8 +753,11 @@ impl Registry {
                 // #10524: wraps twin-otter-b; registered before `-b` so
                 // `-b` stays last but for tandem-wren.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),
-                // #10524 slice 3: quick-tern made drift-aware (#10528).
-                Box::new(heuristics::LandSwiftTern::new(fit.clone())),
+                // #10921: twin-otter-b with review_wait from the Judge's
+                // pick order. It took the slot of the retired
+                // `land-2026-10-06-swift-tern` (live: quick-tern's answers,
+                // byte for byte), also before `-b`.
+                Box::new(heuristics::LandRankedRook::new(fit.clone())),
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),

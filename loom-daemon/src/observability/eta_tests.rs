@@ -77,8 +77,9 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // #10549; land-2026-10-04-twin-otter, which refused this pre-PR stage,
     // retired, #10528); little-v0 (#10208) refuses it; the twin-otter -b
     // composition (#10244) answers it from land-v2's path, and so do its
-    // land-2026-10-06-quick-tern and -swift-tern calibration wrappers
-    // (#10524), the land-2026-10-06-held-heron hybrid (#10523), which routes
+    // land-2026-10-06-quick-tern calibration wrapper (#10524), the
+    // land-2026-10-08-ranked-rook review queue (#10921; it took retired
+    // `-swift-tern`'s slot), the land-2026-10-06-held-heron hybrid (#10523), which routes
     // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
     // (#10508), land-2026-10-06-loop-kite (#10521), whose pre-PR stages
     // take the dispatch plan and land-v2's path, the

@@ -45,7 +45,7 @@
 //! Pure: no clock, no file, no forge.
 
 use super::conformal_ipcw;
-use super::heuristics::{LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_QUICK_TERN, LAND_SWIFT_TERN};
+use super::heuristics::{LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_QUICK_TERN};
 use super::history::StageSamples;
 use super::regime;
 use super::simulate::run_explanation;
@@ -54,12 +54,8 @@ use super::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
 /// The registered `land` heuristics that already calibrate their own
 /// estimate. Wrapping one is the identity (see "Never twice"), so `eta
 /// backtest --wrap` refuses them.
-pub const CALIBRATED: &[&str] = &[
-    LAND_EVEN_LARK,
-    LAND_QUICK_TERN,
-    LAND_SWIFT_TERN,
-    LAND_BOLD_LARK,
-];
+/// (`land-2026-10-06-swift-tern` left the list when it was retired, #10921.)
+pub const CALIBRATED: &[&str] = &[LAND_EVEN_LARK, LAND_QUICK_TERN, LAND_BOLD_LARK];
 
 /// Which IPCW calibrator wraps the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,7 +9,8 @@ use crate::eta::emit::{Trigger, HOURLY_CAP};
 use crate::eta::explanation::Explanation;
 use crate::eta::heuristics::{
     LandTwinOtter, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN,
-    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B, LAND_V4,
+    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_RANKED_ROOK, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
+    LAND_V4,
 };
 use crate::eta::queue_features::{reason, EventLog};
 use crate::eta::simulate::run_explanation;
@@ -27,7 +28,7 @@ const RR: &str = "loom:review-requested";
 const PR: &str = "loom:pr";
 const OP: &str = "loom:operator";
 /// `land-2026-10-06-quick-tern` (#10524) wraps `-b`, so it models the hold
-/// too, `land-2026-10-06-swift-tern` (#10524) wraps `-b` like quick-tern,
+/// too, `land-2026-10-08-ranked-rook` (#10921) answers it as `-b` does,
 /// `land-2026-10-06-held-heron` (#10523) answers it,
 /// `land-2026-10-06-keen-wren` (#10508) is twin-otter's evaluation over v2,
 /// `land-2026-10-06-loop-kite` (#10521) the same over v3,
@@ -37,7 +38,7 @@ const OP: &str = "loom:operator";
 const HOLD_AWARE: [&str; 9] = [
     LAND_BRISK_PETREL,
     LAND_QUICK_TERN,
-    LAND_SWIFT_TERN,
+    LAND_RANKED_ROOK,
     LAND_HELD_HERON,
     LAND_KEEN_WREN,
     LAND_BOLD_LARK,

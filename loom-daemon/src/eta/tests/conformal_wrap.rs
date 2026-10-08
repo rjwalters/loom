@@ -278,15 +278,7 @@ fn refusals_never_twice_and_nothing_registered() {
     assert_eq!(twice.calibration, quick.calibration);
     assert_eq!(twice.quantiles_with_p90(), quick.quantiles_with_p90());
     assert_eq!(twice.heuristic, "quick+ipcw");
-    assert_eq!(
-        CALIBRATED,
-        [
-            LAND_EVEN_LARK,
-            LAND_QUICK_TERN,
-            LAND_SWIFT_TERN,
-            LAND_BOLD_LARK
-        ]
-    );
+    assert_eq!(CALIBRATED, [LAND_EVEN_LARK, LAND_QUICK_TERN, LAND_BOLD_LARK]);
 
     // Names round-trip; a wrapped id is never a registered one.
     for c in Calibrator::ALL {
