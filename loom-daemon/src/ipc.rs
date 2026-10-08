@@ -1527,7 +1527,6 @@ pub fn build_daemon_status_for(
         auto_update_artifact_published_at: au.artifact_published_at,
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
-        auto_update_roll_window: au.roll_window,
         // Long-running task liveness (#10414): every registered loop's
         // last beat and whether it is inside its staleness window.
         task_liveness: crate::task_liveness::snapshot(),

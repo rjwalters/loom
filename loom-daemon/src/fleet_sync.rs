@@ -21,7 +21,9 @@
 //!   it from the snapshot into a process-wide value ([`loom_min_version`]),
 //!   not into the config tiers, so a change takes effect on the next tick with
 //!   no restart. A malformed value keeps the last good floor and alerts. The
-//!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712).
+//!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712),
+//!   reads it as three values ([`floor_knowledge`]) and is woken when a pass
+//!   resolves a different floor ([`floor_wake`], #10885).
 //! - **The workspace resync** ([`workspace_resync`], #10718): after each timer
 //!   pass, and once at startup, every registered repo's installed Loom is
 //!   compared with this daemon's own payload and, on a host in H0 with
@@ -78,7 +80,10 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
+mod floor_knowledge;
 pub mod workspace_resync;
+
+pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 
 /// Config key for the timer cadence.
 pub const SYNC_INTERVAL_KEY: &str = "fleet.syncIntervalSecs";
@@ -555,6 +560,7 @@ fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
 fn set_floor(floor: Option<String>) {
     if let Ok(mut guard) = floor_cell().lock() {
         *guard = Some(floor);
@@ -977,7 +983,9 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
     let floor = floor_half(&inputs.cache, &inputs.location, last_good_floor().as_deref(), now);
-    set_floor(floor.floor.clone());
+    // #10885: a floor that differs from the previous pass's wakes the
+    // self-update loop, so it acts now and not at its next interval.
+    floor_knowledge::record_floor(&floor);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1177,13 +1185,21 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #10885: not a fleet host, so it has no floor by definition.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;
         }
         Err(e) => {
+            // #10885: a store is named but unusable. Still a fleet host: its
+            // floor is unknown, never absent.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
             log::warn!("fleet_sync: disabled — {e:#}");
             return None;
         }
     };
+    // #10885: from here on this is a fleet host, whether or not syncing can
+    // start. Until a pass resolves a floor it is unknown, never absent.
+    floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
     let host = crate::sweep_registry::host_identity();
     if let Err(e) = store::validate_host(&host) {
         log::warn!("fleet_sync: disabled — {e:#}");

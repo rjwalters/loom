@@ -61,7 +61,6 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
 ) -> TickSummary {
     let now = Instant::now();
     let last_check = Utc::now();
-    let settle = state.window.begin_tick(last_check, trigger, settle);
     let armed = trigger.armed_roll();
     let mut summary = TickSummary::new(armed.as_ref());
     // Cooperate with a roll or drain that is already armed rather than racing
@@ -83,7 +82,6 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             }
             supersede::ArmedRollAction::Supersede { from, to } => {
                 let note = supersede::supersede_note(&from, &to);
-                state.window.allow_retarget();
                 log::warn!("auto_update: {note}");
                 if !trigger.supersede_roll(&from, &to) {
                     // The roll completed or was abandoned between the two reads
@@ -136,7 +134,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         in_flight,
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
-    let (kind, outcome, note) = match state.window.gate(last_check, decision) {
+    let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
             // refusal — the generic reason alone gave no way to tell an
@@ -158,7 +156,8 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             // unless read live at exactly the right moment).
             log::info!("auto_update: {reason}");
             // #10414: a skip with a target being tracked is a roll some gate
-            // held back (settle, backoff, terminal, in-flight, roll window).
+            // held back (settle, backoff, terminal, in-flight). A fleet host
+            // holding at its floor tracks nothing, so it reports `skip`.
             let kind = if state.tracked_target.is_some() {
                 TickDecisionKind::Defer
             } else {
@@ -189,10 +188,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             // A source-path roll: the checkout is ahead of the running binary
             // (`repo_ahead`). It has no release-artifact identity, so it is
             // never a supersede candidate (#8514).
-            let window_arm = state.begin_roll_arm(&outcome); // #10713
+            state.persist_before_arm(&outcome);
             let drain_accepted = matches!(outcome, RebuildOutcome::Success)
                 && trigger.trigger_pause_roll(&RollTarget::repo_ahead());
-            state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
@@ -249,10 +247,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                 to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
                 label: Some(supersede::artifact_roll_target(&info)),
             };
-            let window_arm = state.begin_roll_arm(&outcome); // #10713
+            state.persist_before_arm(&outcome);
             let drain_accepted =
                 matches!(outcome, RebuildOutcome::Success) && trigger.trigger_pause_roll(&target);
-            state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
@@ -333,15 +330,16 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     probe: &mut P,
     trigger: &T,
     tuning: &TickTuning,
+    floor: &FloorFeed,
 ) -> TickSummary {
     let started_at = Utc::now();
     let started = Instant::now();
-    // #10712: the fleet floor in force (updated by fleet-sync without a
-    // restart) against the version this process is running. Read here, not in
-    // `run_tick`, so tick tests set the basis themselves.
+    // #10712: what is known about the fleet floor (updated by fleet-sync
+    // without a restart) against the version this process is running. Read
+    // here, not in `run_tick`, so tick tests set the basis themselves.
     state
         .floor
-        .set_basis(crate::fleet_sync::loom_min_version(), env!("CARGO_PKG_VERSION"));
+        .set_basis(floor.knowledge(), env!("CARGO_PKG_VERSION"));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline)
     }));
@@ -389,32 +387,89 @@ where
     log::info!("auto_update: starting loop ({})", tuning.describe());
     task_liveness::register(AUTO_UPDATE, tuning.interval, liveness_window(tuning.interval));
     let mut state = AutoUpdateState::new();
-    state.window = roll_window::WindowGate::new(tuning.roll_window);
-    // #10713: after the window, so its consumption can be checked against it.
     state.attach_persistence(persisted_state::default_path());
-    tokio::spawn(run_loop(state, probe, trigger, status, tuning))
+    tokio::spawn(run_loop(state, probe, trigger, status, tuning, FloorFeed::fleet_sync()))
 }
 
-/// The loop [`spawn_auto_update_task`] runs: tick every `tuning.interval`,
-/// beat liveness after each tick, and stop (visibly) only if a tick's task is
-/// lost outright.
+/// Where the loop reads the fleet floor from, and the wake that says it
+/// changed (#10885). Production reads fleet-sync's process-wide value
+/// ([`Self::fleet_sync`]); tests supply their own so they do not depend on it.
+#[derive(Clone)]
+pub(super) struct FloorFeed {
+    read: Arc<dyn Fn() -> crate::fleet_sync::FloorKnowledge + Send + Sync>,
+    wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
+}
+
+impl FloorFeed {
+    /// The fleet-sync loop's floor and its wake.
+    pub(super) fn fleet_sync() -> Self {
+        Self {
+            read: Arc::new(crate::fleet_sync::floor_knowledge),
+            wake: Arc::new(crate::fleet_sync::floor_wake),
+        }
+    }
+
+    /// A feed over an arbitrary reader and wake.
+    #[cfg(test)]
+    pub(super) fn new(
+        read: impl Fn() -> crate::fleet_sync::FloorKnowledge + Send + Sync + 'static,
+        wake: &'static crate::fleet_sync::FloorWake,
+    ) -> Self {
+        Self {
+            read: Arc::new(read),
+            wake: Arc::new(move || wake),
+        }
+    }
+
+    fn knowledge(&self) -> crate::fleet_sync::FloorKnowledge {
+        (self.read)()
+    }
+
+    fn wake(&self) -> &'static crate::fleet_sync::FloorWake {
+        (self.wake)()
+    }
+}
+
+/// The loop [`spawn_auto_update_task`] runs: tick at once, then every
+/// `tuning.interval` or as soon as the fleet floor changes, whichever comes
+/// first. Beats liveness after each tick, and stops (visibly) only if a tick's
+/// task is lost outright.
+///
+/// #10885: the first tick runs at spawn, so a host that starts below its floor
+/// rolls without waiting an interval. A floor change wakes the loop
+/// ([`crate::fleet_sync::FloorWake`]) and restarts the interval from that
+/// tick. The wake fires on a change of value only, so a floor roll that keeps
+/// failing is paced by its backoff.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
     mut trigger: T,
     status: Arc<AutoUpdateStatus>,
     tuning: TickTuning,
+    floor: FloorFeed,
 ) where
     P: AutoUpdateProbe + Send + 'static,
     T: RollTrigger + Send + Sync + 'static,
 {
     let mut ticker = tokio::time::interval(tuning.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let wake = floor.wake();
+    // The generation the last tick started under. A change that lands while a
+    // tick is running is therefore still pending when it returns.
+    let mut seen = wake.generation();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = wake.changed_since(seen) => {
+                log::info!("auto_update: the fleet floor changed — ticking now, not at the next interval");
+                ticker.reset();
+            }
+        }
+        seen = wake.generation();
+        let floor_task = floor.clone();
         let status_task = status.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            guarded_tick(&mut state, &status_task, &mut probe, &trigger, &tuning);
+            guarded_tick(&mut state, &status_task, &mut probe, &trigger, &tuning, &floor_task);
             (state, probe, trigger)
         });
         match wait_for_tick(handle, tuning.interval, TICK_OVERRUN).await {

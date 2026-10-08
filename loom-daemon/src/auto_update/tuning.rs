@@ -32,9 +32,6 @@ pub struct TickTuning {
     pub settle: Duration,
     /// Gate 4's bound on deferring a rebuild for in-flight sweeps (#4929).
     pub defer_deadline: Duration,
-    /// #9132's schedule: window period, per-host offset, launchd live-reload
-    /// opt-in. `period: None` (the default) leaves rolls arming on every build.
-    pub roll_window: super::roll_window::RollWindowTuning,
 }
 
 impl TickTuning {
@@ -45,10 +42,6 @@ impl TickTuning {
             interval: super::resolve_interval(config),
             settle: super::resolve_settle(config),
             defer_deadline: super::resolve_defer_deadline(config),
-            roll_window: super::roll_window::RollWindowTuning::resolve(
-                &config.roll_window,
-                super::resolve_interval(config),
-            ),
         }
     }
 
@@ -58,11 +51,10 @@ impl TickTuning {
     #[must_use]
     pub fn describe(&self) -> String {
         format!(
-            "interval={}s, settle={}s, deferDeadline={}s, {}",
+            "interval={}s, settle={}s, deferDeadline={}s",
             self.interval.as_secs(),
             self.settle.as_secs(),
-            self.defer_deadline.as_secs(),
-            self.roll_window.describe()
+            self.defer_deadline.as_secs()
         )
     }
 }
@@ -70,7 +62,7 @@ impl TickTuning {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto_update::roll_window::{RollWindowConfig, RollWindowTuning};
+    use crate::auto_update::removed_settings::REMOVED;
     use crate::auto_update::{
         DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS, DEFAULT_AUTO_UPDATE_INTERVAL_SECS,
         DEFAULT_AUTO_UPDATE_SETTLE_SECS,
@@ -79,13 +71,10 @@ mod tests {
 
     /// Every env override the resolvers read, cleared so a tier test measures the
     /// tier it means to.
-    const ENV_VARS: [&str; 6] = [
+    const ENV_VARS: [&str; 3] = [
         crate::auto_update::AUTO_UPDATE_INTERVAL_ENV,
         crate::auto_update::AUTO_UPDATE_SETTLE_ENV,
         crate::auto_update::AUTO_UPDATE_DEFER_DEADLINE_ENV,
-        crate::auto_update::roll_window::ROLL_WINDOW_SECS_ENV,
-        crate::auto_update::roll_window::ROLL_WINDOW_OFFSET_SECS_ENV,
-        crate::auto_update::roll_window::LAUNCHD_LIVE_RELOAD_ENV,
     ];
 
     #[test]
@@ -101,9 +90,6 @@ mod tests {
             tuning.defer_deadline,
             Duration::from_secs(DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS)
         );
-        // Windowing is opt-in: the default leaves the arm-on-build behaviour intact.
-        assert_eq!(tuning.roll_window.period, None);
-        assert!(!tuning.roll_window.launchd_live_reload);
     }
 
     #[test]
@@ -117,11 +103,7 @@ mod tests {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
-            roll_window: RollWindowConfig {
-                period_secs: Some(21_600),
-                offset_secs: Some(900),
-                launchd_live_reload: Some(true),
-            },
+            removed_keys: Vec::new(),
         });
         assert_eq!(
             tuning,
@@ -129,20 +111,42 @@ mod tests {
                 interval: Duration::from_secs(120),
                 settle: Duration::from_secs(30),
                 defer_deadline: Duration::from_secs(7200),
-                roll_window: RollWindowTuning {
-                    period: Some(Duration::from_secs(21_600)),
-                    offset: Duration::from_secs(900),
-                    // max(2 x 120s interval, 600s floor), under the 6h period.
-                    open_for: Duration::from_secs(600),
-                    launchd_live_reload: true,
-                },
             }
         );
         // The description is what both startup log lines render, so pin it.
-        assert_eq!(
-            tuning.describe(),
-            "interval=120s, settle=30s, deferDeadline=7200s, \
-             rollWindow=21600s, rollWindowOffset=900s, launchdLiveReload=true"
-        );
+        assert_eq!(tuning.describe(), "interval=120s, settle=30s, deferDeadline=7200s");
+    }
+
+    /// #10885: the removed roll-window settings change nothing. A config that
+    /// still carries the keys, in a process that still sets the env vars,
+    /// resolves to the tuning it would without them.
+    #[test]
+    #[serial(loom_auto_update_env)]
+    fn the_removed_roll_window_settings_do_not_change_the_tuning() {
+        for var in ENV_VARS {
+            std::env::remove_var(var);
+        }
+        let plain = AutoUpdateConfig {
+            enabled: Some(true),
+            interval_secs: Some(120),
+            settle_secs: Some(30),
+            defer_deadline_secs: Some(7200),
+            removed_keys: Vec::new(),
+        };
+        let expected = TickTuning::resolve(&plain);
+
+        for removed in REMOVED {
+            std::env::set_var(removed.env, "21600");
+        }
+        let old = AutoUpdateConfig {
+            removed_keys: REMOVED.iter().map(|r| r.key).collect(),
+            ..plain
+        };
+        let resolved = TickTuning::resolve(&old);
+        for removed in REMOVED {
+            std::env::remove_var(removed.env);
+        }
+        assert_eq!(resolved, expected);
+        assert!(!resolved.describe().contains("ollWindow"), "{}", resolved.describe());
     }
 }
