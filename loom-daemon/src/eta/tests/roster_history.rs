@@ -1,6 +1,6 @@
-//! The fleet store's `repos.yml` history reader (#10508, #10586): the forge
-//! listing, the content cache, the observation convention, and what an
-//! unavailable history loads as.
+//! The fleet store's roster history reader (#10508, #10586, #10905): the
+//! forge listing, the content cache, the observation convention, what an
+//! unavailable history loads as, and `fleet.json` with `repos.yml` before it.
 
 use super::fit_rows::{h, OTHER, REPO};
 use crate::eta::fit::features_v2::N_FEATURES_V2;
@@ -15,11 +15,29 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use std::cell::{Cell, RefCell};
 
-/// A fake store: `repos.yml`'s commits, oldest first, answering the three
-/// requests the reader makes.
+/// One fake commit: what it wrote to `repos.yml` and `fleet.json`.
+pub(crate) struct FakeCommit {
+    sha: String,
+    at: DateTime<Utc>,
+    repos_yml: Option<String>,
+    fleet_json: Option<String>,
+}
+
+impl FakeCommit {
+    fn file(&self, path: &str) -> Option<&String> {
+        match path {
+            "repos.yml" => self.repos_yml.as_ref(),
+            "fleet.json" => self.fleet_json.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// A fake store: its commits, oldest first, answering the three requests
+/// the reader makes for each file.
 pub(crate) struct FakeStore {
-    /// `(sha, committer date, repos.yml)`, in history order.
-    pub(crate) commits: RefCell<Vec<(String, DateTime<Utc>, String)>>,
+    /// In history order.
+    pub(crate) commits: RefCell<Vec<FakeCommit>>,
     pub(crate) offline: Cell<bool>,
     pub(crate) calls: RefCell<Vec<String>>,
     /// The `If-None-Match` sent with each call, in call order.
@@ -33,6 +51,24 @@ pub(crate) fn location() -> StoreLocation {
         repo: "acme/fleet".to_string(),
         reference: "main".to_string(),
     }
+}
+
+/// A compiled `fleet.json` whose fleet is `REPO` and `OTHER` at these
+/// priorities, with a run state of `state` (which the roster ignores).
+pub(crate) fn roster_json(repo: u32, other: u32, state: &str) -> String {
+    serde_json::json!({
+        "_generated": {"schema_version": 1, "source": "fleet.yml"},
+        "root": "/srv",
+        "repos": [
+            {"name": "loom", "remote": format!("git@github.com:{REPO}.git"), "fleet": true,
+             "fleet_priority": repo, "purpose": "ignored"},
+            {"name": "other", "remote": format!("https://github.com/{OTHER}.git"), "fleet": true,
+             "fleet_priority": other},
+        ],
+        "state": {"fleet": {"state": state}},
+        "config": {"defaults": {}},
+    })
+    .to_string()
 }
 
 /// A `repos.yml` whose fleet is `REPO` and `OTHER` at these priorities.
@@ -55,13 +91,27 @@ impl FakeStore {
         }
     }
 
-    /// Push a commit dated `at` (which may be backdated).
+    /// Push a commit dated `at` (which may be backdated) that changes
+    /// `repos.yml` only: a store from before `fleet.json`.
     pub(crate) fn commit(&self, at: DateTime<Utc>, yaml: &str) -> String {
+        self.commit_files(at, Some(yaml), None)
+    }
+
+    /// Push a commit dated `at` that changes the files given.
+    pub(crate) fn commit_files(
+        &self,
+        at: DateTime<Utc>,
+        repos_yml: Option<&str>,
+        fleet_json: Option<&str>,
+    ) -> String {
         let n = self.commits.borrow().len();
         let sha = format!("{:040x}", n + 1);
-        self.commits
-            .borrow_mut()
-            .push((sha.clone(), at, yaml.to_string()));
+        self.commits.borrow_mut().push(FakeCommit {
+            sha: sha.clone(),
+            at,
+            repos_yml: repos_yml.map(str::to_string),
+            fleet_json: fleet_json.map(str::to_string),
+        });
         sha
     }
 
@@ -113,43 +163,53 @@ impl Transport for FakeStore {
         if self.offline.get() {
             bail!("network is unreachable");
         }
-        // The forge lists newest first: here, reverse history order.
-        let newest_first: Vec<(String, DateTime<Utc>)> = self
-            .commits
-            .borrow()
-            .iter()
-            .rev()
-            .map(|(s, at, _)| (s.clone(), *at))
-            .collect();
         // One linear history, whatever ref is asked for.
-        if api_path.starts_with("repos/acme/fleet/commits?path=repos.yml&sha=") {
-            if let Some(until) = param(api_path, "until") {
-                let until = time(until);
+        if let Some(rest) = api_path.strip_prefix("repos/acme/fleet/commits?path=") {
+            let file = rest.split('&').next().unwrap();
+            // `sha=` a commit lists the history reachable from it; any other
+            // ref is the tip. History is linear here.
+            let commits = self.commits.borrow();
+            let tip = param(api_path, "sha")
+                .and_then(|s| commits.iter().position(|c| c.sha == s))
+                .unwrap_or(commits.len().saturating_sub(1));
+            // The forge lists newest first: here, reverse history order.
+            let newest_first: Vec<(String, DateTime<Utc>)> = commits[..commits.len().min(tip + 1)]
+                .iter()
+                .rev()
+                .filter(|c| c.file(file).is_some())
+                .map(|c| (c.sha.clone(), c.at))
+                .collect();
+            let until = param(api_path, "until").map(time);
+            let Some(since) = param(api_path, "since").map(time) else {
                 return Ok(self.listing(
                     newest_first
                         .into_iter()
-                        .filter(|(_, at)| *at <= until)
+                        .filter(|(_, at)| *at <= until.unwrap())
                         .take(1)
                         .collect(),
                     etag,
                 ));
-            }
-            let since = time(param(api_path, "since").unwrap());
+            };
             let per: usize = param(api_path, "per_page").unwrap().parse().unwrap();
             let page: usize = param(api_path, "page").unwrap().parse().unwrap();
             return Ok(self.listing(
                 newest_first
                     .into_iter()
-                    .filter(|(_, at)| *at >= since)
+                    .filter(|(_, at)| *at >= since && until.is_none_or(|u| *at <= u))
                     .skip((page - 1) * per)
                     .take(per)
                     .collect(),
                 etag,
             ));
         }
-        if let Some(sha) = api_path.strip_prefix("repos/acme/fleet/contents/repos.yml?ref=") {
+        if let Some(rest) = api_path.strip_prefix("repos/acme/fleet/contents/") {
+            let (file, sha) = rest.split_once("?ref=").unwrap();
             let commits = self.commits.borrow();
-            let Some((_, _, yaml)) = commits.iter().find(|(s, ..)| s == sha) else {
+            let Some(yaml) = commits
+                .iter()
+                .find(|c| c.sha == sha)
+                .and_then(|c| c.file(file))
+            else {
                 return Ok(Reply {
                     status: 404,
                     etag: None,
@@ -419,8 +479,10 @@ fn the_window_opens_at_utc_midnight_so_a_days_listings_repeat() {
     );
 }
 
+/// A store without `fleet.json` lists it (empty) and then `repos.yml`: two
+/// listings per file, each answered `304` once nothing changed.
 #[test]
-fn an_unchanged_roster_costs_two_304s_and_still_counts_as_a_poll() {
+fn an_unchanged_roster_costs_a_304_per_listing_and_still_counts_as_a_poll() {
     let tmp = tempfile::tempdir().unwrap();
     let store = FakeStore::new();
     store.commit(h(0.0), &roster_yaml(100, 100));
@@ -428,12 +490,12 @@ fn an_unchanged_roster_costs_two_304s_and_still_counts_as_a_poll() {
     sync(&store, tmp.path(), &location(), h(3.0)).unwrap();
     let history = load(tmp.path(), h(3.0)).0.unwrap();
     let first = store.calls.borrow().len();
-    assert_eq!(first, 2 + 2, "two listings, two contents");
+    assert_eq!(first, 2 + 2 + 2, "two listings per file, two contents");
 
     let report = sync(&store, tmp.path(), &location(), h(9.0)).unwrap();
     assert_eq!((report.revisions, report.new, report.fetched), (2, 0, 0));
-    assert_eq!(store.calls.borrow().len() - first, 2, "the first page and the anchor only");
-    assert_eq!(store.not_modified.get(), 2);
+    assert_eq!(store.calls.borrow().len() - first, 4, "each file's first page and anchor only");
+    assert_eq!(store.not_modified.get(), 4);
     assert!(store.sent_etags.borrow()[first..]
         .iter()
         .all(Option::is_some));
@@ -450,7 +512,7 @@ fn a_new_commit_breaks_the_304_and_is_observed_at_that_poll() {
     store.commit(h(0.0), &roster_yaml(100, 100));
     sync(&store, tmp.path(), &location(), h(3.0)).unwrap();
     sync(&store, tmp.path(), &location(), h(4.0)).unwrap();
-    assert_eq!(store.not_modified.get(), 2);
+    assert_eq!(store.not_modified.get(), 4);
     // Backdated to 1 h, pushed between the 4 h and 5 h polls.
     store.commit(h(1.0), &roster_yaml(0, 100));
     let report = sync(&store, tmp.path(), &location(), h(5.0)).unwrap();
@@ -475,7 +537,7 @@ fn a_new_utc_day_lists_unconditionally() {
         .all(Option::is_none));
     // The next poll of the same day is conditional again.
     sync(&store, tmp.path(), &location(), h(27.0)).unwrap();
-    assert_eq!(store.not_modified.get(), 2);
+    assert_eq!(store.not_modified.get(), 4);
 }
 
 /// A forge that answers every listing `304`, cached or not.
@@ -627,4 +689,185 @@ fn an_observation_restored_from_the_archive_leaks_nothing_into_the_v2_fit() {
     sync(&store, tmp.path(), &location(), seen).unwrap();
     assert_eq!(load(tmp.path(), seen).1.observed, 0);
     assert_ne!(fitted_v2(tmp.path(), seen).0, base.0, "commit dates alone do leak");
+}
+
+// ---- fleet.json, with repos.yml before it (#10905) ----------------------------
+
+/// A store that switched to `fleet.json` at 4 h: `repos.yml` alone before
+/// it, both files (the second a render) from then on.
+fn switched_store() -> FakeStore {
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    store.commit(h(2.0), &roster_yaml(100, 10));
+    // fleet.json introduced, same roster.
+    store.commit_files(h(4.0), None, Some(&roster_json(100, 10, "running")));
+    store.commit_files(h(6.0), Some(&roster_yaml(5, 10)), Some(&roster_json(5, 10, "running")));
+    // A run-state edit: fleet.json only, roster unchanged.
+    store.commit_files(h(8.0), None, Some(&roster_json(5, 10, "paused")));
+    // A render-format change of repos.yml alone, after the switch: dropped.
+    store.commit_files(h(9.0), Some(&format!("# rendered\n{}", roster_yaml(5, 10))), None);
+    store
+}
+
+#[test]
+fn the_roster_comes_from_fleet_json_and_from_repos_yml_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = switched_store();
+    let report = sync(&store, tmp.path(), &location(), h(10.0)).unwrap();
+    assert_eq!(report.revisions, 5, "two repos.yml revisions, three fleet.json ones");
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tmp.path().join("index.json")).unwrap()).unwrap();
+    let files: Vec<&str> = index["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        files,
+        [
+            "repos.yml",
+            "repos.yml",
+            "fleet.json",
+            "fleet.json",
+            "fleet.json"
+        ]
+    );
+    // Only the roster section of a fleet.json is cached.
+    let cached = std::fs::read_to_string(
+        tmp.path()
+            .join("blobs")
+            .join(index["commits"][4]["blob"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert!(!cached.contains("paused") && cached.contains("fleet_priority"), "{cached}");
+
+    let history = load(tmp.path(), h(10.0)).0.unwrap();
+    let rank = |t| revision_at(&history, t).and_then(|r| repo_rank(r, REPO));
+    assert_eq!(rank(h(1.0)), Some(0.5));
+    assert_eq!(rank(h(3.0)), Some(1.0), "repos.yml before fleet.json");
+    assert_eq!(rank(h(5.0)), Some(1.0), "fleet.json's first revision");
+    assert_eq!(rank(h(7.0)), Some(0.0), "and its later ones");
+    assert_eq!(rank(h(9.5)), Some(0.0));
+
+    // Every instant reads the same roster as the legacy file's own history.
+    let legacy = FakeStore::new();
+    for (at, yaml) in [
+        (0.0, (100, 100)),
+        (2.0, (100, 10)),
+        (6.0, (5, 10)),
+        (9.0, (5, 10)),
+    ] {
+        legacy.commit(h(at), &roster_yaml(yaml.0, yaml.1));
+    }
+    let legacy_dir = tempfile::tempdir().unwrap();
+    sync(&legacy, legacy_dir.path(), &location(), h(10.0)).unwrap();
+    let old = load(legacy_dir.path(), h(10.0)).0.unwrap();
+    for tenth in 0..=100 {
+        let t = h(f64::from(tenth) / 10.0);
+        assert_eq!(
+            revision_at(&history, t).map(|r| &r.members),
+            revision_at(&old, t).map(|r| &r.members),
+            "at {t}"
+        );
+    }
+}
+
+/// The (file, sha) of each cached revision, oldest first.
+fn cached_revisions(dir: &std::path::Path) -> Vec<(String, String)> {
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    index["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["file"].as_str().unwrap().to_string(), c["sha"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn a_repos_yml_commit_sharing_the_introductions_second_is_still_a_predecessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    let first = store.commit(h(0.0), &roster_yaml(100, 100));
+    let last_legacy = store.commit(h(4.0), &roster_yaml(100, 10));
+    let intro = store.commit_files(h(4.0), None, Some(&roster_json(100, 10, "running")));
+    store.commit_files(h(6.0), Some(&format!("# rendered\n{}", roster_yaml(100, 10))), None);
+    sync(&store, tmp.path(), &location(), h(10.0)).unwrap();
+    let file = |f: &str, sha: &String| (f.to_string(), sha.clone());
+    assert_eq!(
+        cached_revisions(tmp.path()),
+        [
+            file("repos.yml", &first),
+            file("repos.yml", &last_legacy),
+            file("fleet.json", &intro)
+        ],
+        "the same-second predecessor is kept; the later render is not"
+    );
+}
+
+#[test]
+fn a_backdated_fleet_json_introduction_keeps_every_predecessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    let first = store.commit(h(3.0), &roster_yaml(100, 100));
+    let second = store.commit(h(5.0), &roster_yaml(100, 10));
+    // Landed after both, but dated before them.
+    let intro = store.commit_files(h(1.0), None, Some(&roster_json(100, 10, "running")));
+    sync(&store, tmp.path(), &location(), h(10.0)).unwrap();
+    let file = |f: &str, sha: &String| (f.to_string(), sha.clone());
+    assert_eq!(
+        cached_revisions(tmp.path()),
+        [
+            file("repos.yml", &first),
+            file("repos.yml", &second),
+            file("fleet.json", &intro)
+        ],
+    );
+}
+
+#[test]
+fn once_fleet_json_anchors_the_window_repos_yml_is_not_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = switched_store();
+    let now = h(0.0) + Duration::days(WINDOW_DAYS + 1);
+    store.commit_files(now - Duration::days(1), None, Some(&roster_json(1, 10, "running")));
+    let report = sync(&store, tmp.path(), &location(), now).unwrap();
+    assert_eq!(report.revisions, 2, "the anchor and the window, both fleet.json");
+    assert!(store
+        .calls
+        .borrow()
+        .iter()
+        .all(|c| !c.contains("repos.yml")));
+    let history = load(tmp.path(), now).0.unwrap();
+    assert_eq!(revision_at(&history, now).and_then(|r| repo_rank(r, REPO)), Some(0.0));
+}
+
+#[test]
+fn an_index_from_before_fleet_json_still_loads_and_is_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    sync(&store, tmp.path(), &location(), h(1.0)).unwrap();
+    let index = tmp.path().join("index.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    for c in json["commits"].as_array_mut().unwrap() {
+        c.as_object_mut().unwrap().remove("file");
+    }
+    std::fs::write(&index, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let history = load(tmp.path(), h(1.0)).0.unwrap();
+    assert_eq!(history.len(), 1);
+    let report = sync(&store, tmp.path(), &location(), h(2.0)).unwrap();
+    assert_eq!(report.fetched, 0, "its repos.yml entries are reused");
+}
+
+#[test]
+fn a_fleet_json_the_compiled_reader_refuses_makes_the_history_unreadable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit_files(h(0.0), None, Some(&roster_json(1, 2, "running")));
+    store.commit_files(h(1.0), None, Some(r#"{"root": "/srv", "repos": []}"#));
+    sync(&store, tmp.path(), &location(), h(2.0)).unwrap();
+    assert_eq!(load(tmp.path(), h(2.0)).1.status, HistoryStatus::Unreadable);
 }

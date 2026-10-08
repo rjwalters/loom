@@ -1507,13 +1507,16 @@ for a fit or backtest to report.
   v1 transform exactly as before; all `FEATURES_V2` names use
   `model_features_v2` with `twin_otter.input.priority`. So a v2 explanation
   recomputes from its own record, as v1's does.
-- **Roster history** (`eta::roster_history`, #10586). On the ETA
+- **Roster history** (`eta::roster_history`, #10586, #10905). On the ETA
   authority, each fleet refresh cycle polls the fleet store (`fleet.repo`,
-  `fleet.ref`) before the fit: `GET repos/{store}/commits?path=repos.yml`,
+  `fleet.ref`) before the fit: `GET repos/{store}/commits?path=fleet.json`,
   paginated over the last 21 days (the 14-day window plus margin), plus the
   newest earlier commit as the anchor in force when the window opens. Each
-  revision's `repos.yml` is cached content-addressed under
-  `.loom/state/eta/roster-history/`. The fit (`fit::run`) and the tracker's
+  revision's roster (`fleet.json`'s `root` and `repos`) is cached under
+  `.loom/state/eta/roster-history/`. While `fleet.json` is younger than the
+  window (or absent), the same listing runs for `repos.yml` over the history
+  reachable from `fleet.json`'s first commit (by ancestry, not commit date),
+  for the revisions from before it. The fit (`fit::run`) and the tracker's
   pass (`Tracker::set_fleet_history`) both load that one cache, so the two
   sides read one history value. Requests go through the store's
   `GhTransport` (reader App first, then the writer App), never the operator
@@ -1522,8 +1525,8 @@ for a fit or backtest to report.
     (`window_opens`), so each listing URL repeats all day. The index keeps
     each listing's `ETag` and commits, and the next poll sends
     `If-None-Match`. A `304` reuses the cached commits; a `304` with nothing
-    cached is an error. With `repos.yml` unchanged, a poll is two conditional
-    requests (first page and anchor) and no contents. An authorized `304`
+    cached is an error. With the roster unchanged, a poll is two conditional
+    requests per file listed (first page and anchor) and no contents. An authorized `304`
     does not count against GitHub's primary rate limit. A `304` poll still
     counts as a successful poll. Each UTC day opens with one unconditional
     listing.
@@ -1569,7 +1572,7 @@ for a fit or backtest to report.
   (alternating, first on). Absent means unread: an unstarred-by-label PR is
   then unknown, never unstarred. `history = None` (no cache, stale, or
   unreadable) leaves `repo_rank` and the fleet position unknown, never
-  today's `repos.yml`. `eta backtest --pr-history` / `--forge-pr-cases`
+  today's roster. `eta backtest --pr-history` / `--forge-pr-cases`
   and the nightly folds pass the cached roster history. The plain
   `cases_from_pr_records` is unchanged, and no case's other fields move.
   `backtest::fill_linked_stars` fills an unread `linked_star` from the
