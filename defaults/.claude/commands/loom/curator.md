@@ -23,7 +23,6 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Checking Dependencies](#checking-dependencies)
 - [Repairing `loom:decision-malformed` (#10057)](#repairing-loomdecision-malformed-10057)
 - [Revising `loom:needs-revision` (#10753)](#revising-loomneeds-revision-10753)
-
 - [Draining `loom:blocked-unnamed` (#10558)](#draining-loomblocked-unnamed-10558)
 - [Checking Operator-Only Premises (#6849)](#checking-operator-only-premises-6849)
 - [De-escalating Fact-Based Champion Escalations (#7650)](#de-escalating-fact-based-champion-escalations-7650)
