@@ -31,9 +31,14 @@
 //! `optional` is skipped: the script probes for it and degrades.
 //!
 //! A violated claim is a [`Report::violations`] entry, and the CLI exits 1.
+//!
+//! A sibling of [`crate::install_compat`], not a child of it, on purpose:
+//! `init` uses the constants and the classifier there, and must not reach the
+//! release lookup and download here (the `.gitignore Convergence Check`
+//! input set in `merge_pr/stale_checks/inputs.rs` stops at `install_compat`).
 
-use super::Version;
-use crate::release_fetch::checksum;
+use crate::install_compat::Version;
+use crate::release_fetch::{checksum, fetch};
 use crate::release_resolve::resolve::asset_names;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -388,19 +393,9 @@ fn download_release_binary(
     dest: &Path,
 ) -> Result<PathBuf> {
     let sha = format!("{asset}.sha256");
-    let out = Command::new(crate::gh_invocation::gh_bin())
-        .current_dir(repo_root)
-        .args([
-            "release", "download", tag, "-R", repo, "-p", asset, "-p", &sha, "-D",
-        ])
-        .arg(dest)
-        .stdin(Stdio::null())
-        .output()
-        .context("running gh release download")?;
     anyhow::ensure!(
-        out.status.success(),
-        "gh release download {tag} {asset} failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
+        fetch::download(repo_root, repo, tag, &[asset, &sha], dest),
+        "gh release download {tag} {asset} failed"
     );
     let bin = dest.join(asset);
     anyhow::ensure!(

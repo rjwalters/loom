@@ -13,7 +13,7 @@
 //! [`classify`] turns one pair into a [`Compat`], the input to the workspace
 //! states (W0-W4) the tracker defines. Nothing here acts on the result: the
 //! resync (#10717, #10718) and the dispatch hold (#10719) do. The claims are
-//! proven in CI by [`harness`] across adjacent releases.
+//! proven in CI by [`crate::install_compat_harness`] across adjacent releases.
 //!
 //! Both constants move only when a release breaks compatibility. Where and how
 //! they are bumped is in `defaults/docs/release-cadence.md`
@@ -23,8 +23,6 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
-
-pub mod harness;
 
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.

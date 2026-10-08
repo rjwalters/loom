@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
-use super::harness::{
+use super::*;
+use crate::install_compat_harness::{
     hard_floors, invoked_files_from_source, optional_subs, parse_detector_list,
     subcommand_unrecognized,
 };
-use super::*;
 use std::path::PathBuf;
 
 /// Today's `.loom/install-metadata.json` shape (this repo, 2026-10-07): no

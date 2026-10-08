@@ -733,7 +733,7 @@ path = "loom-daemon/src/release_fetch/fetch.rs"
 # outage during the lookup fails the step on purpose, as a proof step.
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/install_compat/harness.rs"
+path = "loom-daemon/src/install_compat_harness.rs"
 
 [[operation]]
 id = "release.publish"

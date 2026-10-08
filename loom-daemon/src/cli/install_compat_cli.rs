@@ -5,7 +5,7 @@
 //!   the repo's recorded side (read from its default branch) and how they
 //!   classify. Read-only.
 //! * `check` is the CI proof across adjacent releases
-//!   ([`loom_daemon::install_compat::harness`]). Exit `0` when every claim
+//!   ([`loom_daemon::install_compat_harness`]). Exit `0` when every claim
 //!   holds, `1` when one is violated, `2` when the check could not run.
 //!
 //! Rust rather than a script under `scripts/` because new executable logic
@@ -13,9 +13,10 @@
 
 use anyhow::Result;
 use loom_daemon::install_compat::{
-    self, classify, harness, DaemonCompat, Version, DAEMON_INVOKED_INSTALLED_FILES,
-    REQUIRES_DAEMON, SUPPORTS_INSTALLED,
+    self, classify, DaemonCompat, Version, DAEMON_INVOKED_INSTALLED_FILES, REQUIRES_DAEMON,
+    SUPPORTS_INSTALLED,
 };
+use loom_daemon::install_compat_harness as harness;
 use loom_daemon::release_resolve::host;
 use std::path::PathBuf;
 

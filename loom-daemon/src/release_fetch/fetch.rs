@@ -270,7 +270,18 @@ impl Drop for ScratchDir {
     }
 }
 
-fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], dest: &Path) -> bool {
+/// Download the assets of release `tag` matching `patterns` into `dest`
+/// (`gh release download --clobber`, through [`crate::gh_invocation::GhInvocation`]
+/// so the call is counted). `true` on success. Also used by the
+/// install-compat CI proof (`crate::install_compat_harness`).
+#[must_use]
+pub fn download(
+    repo_root: &Path,
+    repo_slug: &str,
+    tag: &str,
+    patterns: &[&str],
+    dest: &Path,
+) -> bool {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade, so the download is counted.
     let op = Operation::new("release.download");
