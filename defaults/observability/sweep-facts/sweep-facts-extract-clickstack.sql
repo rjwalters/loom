@@ -26,8 +26,9 @@
 -- missing key, which is exactly the absent-vs-zero confusion the telemetry
 -- schema forbids. Nested array attributes (`loom.phase_durations`,
 -- `loom.rework_events`) arrive as JSON strings in the String-valued attribute
--- map; the rework classification counts are walked here so the fact shape
--- carries the same two counts the D1 rollup computes with `json_each`.
+-- map; the rework classification counts, measured seconds and open-event
+-- counts (#9507) are walked here so the fact shape carries the same rework
+-- columns the D1 rollup computes with `json_each`.
 --
 -- STATUS: contract-checked in CI; not yet executed live against a
 -- sweep-facts window (the cycle-time extraction is the live-verified
@@ -35,12 +36,17 @@
 
 CREATE DATABASE IF NOT EXISTS loom_analytics;
 
+-- `duration_sec` is `Nullable(Int64)` on purpose (#9507): a rework event
+-- whose clearing forge event was never observed carries NO `duration_sec`, and
+-- a plain `Int64` would let JSONExtract default it to 0 — fabricating a
+-- measured zero. Nullable keeps it NULL, so `rework_*_open` can count it and
+-- `rework_*_sec` sums only measured entries, exactly as the D1 rollup does.
 CREATE OR REPLACE VIEW loom_analytics.raw_sweep_fact AS
 WITH
     JSONExtract(LogAttributes['loom.phase_durations'],
                 'Array(Tuple(phase String, duration_sec Int64))') AS phase_durations,
     JSONExtract(LogAttributes['loom.rework_events'],
-                'Array(Tuple(classification String, kind String, reason String, duration_sec Int64))')
+                'Array(Tuple(classification String, kind String, reason String, duration_sec Nullable(Int64)))')
         AS rework_events
 SELECT
     toDateTime64(Timestamp, 3)                                          AS emitted_at,
@@ -93,6 +99,24 @@ SELECT
     if(mapContains(LogAttributes, 'loom.rework_events'),
        length(arrayFilter(t -> t.classification = 'environmental', rework_events)),
        NULL)                                                            AS rework_environmental,
+    if(mapContains(LogAttributes, 'loom.rework_events'),
+       toInt64(arraySum(t -> ifNull(t.duration_sec, 0),
+           arrayFilter(t -> t.classification = 'substantive', rework_events))),
+       NULL)                                                            AS rework_substantive_sec,
+    if(mapContains(LogAttributes, 'loom.rework_events'),
+       toInt64(arraySum(t -> ifNull(t.duration_sec, 0),
+           arrayFilter(t -> t.classification = 'environmental', rework_events))),
+       NULL)                                                            AS rework_environmental_sec,
+    if(mapContains(LogAttributes, 'loom.rework_events'),
+       toInt64(length(arrayFilter(
+           t -> t.classification = 'substantive' AND isNull(t.duration_sec),
+           rework_events))),
+       NULL)                                                            AS rework_substantive_open,
+    if(mapContains(LogAttributes, 'loom.rework_events'),
+       toInt64(length(arrayFilter(
+           t -> t.classification = 'environmental' AND isNull(t.duration_sec),
+           rework_events))),
+       NULL)                                                            AS rework_environmental_open,
     toUInt32OrNull(LogAttributes['loom.pr_number'])                     AS pr_number,
     if(mapContains(LogAttributes, 'loom.pr_numbers'),
        LogAttributes['loom.pr_numbers'], NULL)                          AS pr_numbers,

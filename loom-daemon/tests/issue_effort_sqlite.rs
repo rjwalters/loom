@@ -337,3 +337,276 @@ fn the_window_is_bound_not_baked_in() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The bundle's seconds partition (#9507): the same split as IE1, carried by
+// `sweep-facts-rollup.sql` → `sweep_facts` → the `issue_effort` view in
+// `sweep-facts/issue-effort.sql`. Both committed files execute verbatim, in
+// production order (rollup, then view), against the same `records` DDL.
+// ---------------------------------------------------------------------------
+
+/// Issue 50 exercises every arm of the bundle's partition: a clean first
+/// attempt with measured environmental rework, an `operator_redispatch` with
+/// measured substantive rework, a triggerless pre-#9444 record with no
+/// `rework_events` key, an `unknown` attempt with only an OPEN event, a
+/// `merge_conflict` attempt whose measured rework OVER-accounts its wall (the
+/// clamp), and a landed substantive retry with one open and one measured
+/// event. Issue 51 is a single clean landing with `rework_events: []`.
+const BUNDLE_FIXTURE: &[Row] = &[
+    Row {
+        emitted_at: "2026-09-21T10:00:00Z",
+        issue: 50,
+        sweep_id: "b-a",
+        payload: r#"{"trigger":"first","total_duration_sec":1000,
+            "rework_events":[{"kind":"merge_conflict","classification":"environmental",
+                              "duration_sec":100}]}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T11:00:00Z",
+        issue: 50,
+        sweep_id: "b-b",
+        payload: r#"{"trigger":"operator_redispatch","total_duration_sec":400,
+            "rework_events":[{"kind":"rejudge","classification":"substantive",
+                              "duration_sec":50}]}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T12:00:00Z",
+        issue: 50,
+        sweep_id: "b-c",
+        payload: r#"{"total_duration_sec":300}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T13:00:00Z",
+        issue: 50,
+        sweep_id: "b-d",
+        payload: r#"{"trigger":"unknown","total_duration_sec":200,
+            "rework_events":[{"kind":"merge_conflict","classification":"environmental"}]}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T14:00:00Z",
+        issue: 50,
+        sweep_id: "b-e",
+        payload: r#"{"trigger":"merge_conflict","total_duration_sec":100,
+            "rework_events":[{"kind":"merge_conflict","classification":"environmental",
+                              "duration_sec":150}]}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T15:00:00Z",
+        issue: 50,
+        sweep_id: "b-f",
+        payload: r#"{"trigger":"retry_after_substantive_failure","total_duration_sec":600,
+            "disposition":"landed","pr_number":7,
+            "rework_events":[{"kind":"rejudge","classification":"substantive"},
+                             {"kind":"rejudge","classification":"substantive",
+                              "duration_sec":100}]}"#,
+    },
+    Row {
+        emitted_at: "2026-09-21T16:00:00Z",
+        issue: 51,
+        sweep_id: "b-g",
+        payload: r#"{"trigger":"first","total_duration_sec":50,"disposition":"landed",
+            "pr_number":8,"rework_events":[]}"#,
+    },
+];
+
+/// Every statement of a committed bundle file, executed in order.
+fn execute_committed(conn: &Connection, relative: &str) {
+    let sql = std::fs::read_to_string(repo_file(relative))
+        .unwrap_or_else(|e| panic!("{relative} must be readable: {e}"));
+    for statement in statements(&sql) {
+        conn.execute_batch(&statement)
+            .unwrap_or_else(|e| panic!("{relative} must execute on SQLite: {e}\n{statement}"));
+    }
+}
+
+/// `records` seeded with [`BUNDLE_FIXTURE`], the committed rollup run over it,
+/// and the committed `issue_effort` view created on top.
+fn bundle_seeded() -> Connection {
+    let conn = d1_sqlite::d1_connection();
+    conn.execute_batch(&records_ddl()).unwrap();
+    for row in BUNDLE_FIXTURE {
+        conn.execute(
+            "INSERT INTO records \
+             (schema_version, emitted_at, host_id, kind, repo, visibility, issue, sweep_id, \
+              payload, ingested_at) \
+             VALUES (2, ?1, 'host-a', 'sweep.outcome', 'o/r', 'public', ?2, ?3, json(?4), ?1)",
+            rusqlite::params![row.emitted_at, row.issue, row.sweep_id, row.payload],
+        )
+        .unwrap_or_else(|e| panic!("fixture row {} is not insertable: {e}", row.sweep_id));
+    }
+    execute_committed(&conn, "defaults/observability/sweep-facts/sweep-facts-rollup.sql");
+    execute_committed(&conn, "defaults/observability/sweep-facts/issue-effort.sql");
+    conn
+}
+
+/// One `issue_effort` row as a column-name → rendered-value map.
+fn effort_row(conn: &Connection, issue: u32) -> std::collections::BTreeMap<String, String> {
+    let statement = "SELECT * FROM issue_effort WHERE issue = :issue";
+    let names: Vec<String> = conn
+        .prepare(statement)
+        .unwrap()
+        .column_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let rows = query_with(conn, statement, &[(":issue", &issue.to_string())]);
+    assert_eq!(rows.len(), 1, "issue {issue} has exactly one landing: {rows:?}");
+    names.into_iter().zip(rows[0].iter().cloned()).collect()
+}
+
+fn int(row: &std::collections::BTreeMap<String, String>, column: &str) -> i64 {
+    row.get(column)
+        .unwrap_or_else(|| panic!("issue_effort has no `{column}` column: {row:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("`{column}` is not an integer ({e}): {row:?}"))
+}
+
+#[test]
+fn the_rollup_carries_rework_seconds_and_open_events_absent_vs_zero() {
+    let conn = bundle_seeded();
+    let fact = |sweep_id: &str| -> Vec<String> {
+        query_with(
+            &conn,
+            "SELECT rework_substantive_sec, rework_environmental_sec, \
+                    rework_substantive_open, rework_environmental_open \
+               FROM sweep_facts WHERE sweep_id = :id",
+            &[(":id", sweep_id)],
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("the rollup wrote no row for {sweep_id}"))
+    };
+    assert_eq!(fact("b-a"), ["0", "100", "0", "0"], "measured environmental event");
+    assert_eq!(
+        fact("b-c"),
+        ["", "", "", ""],
+        "no `rework_events` key → NULL in every rework column (the timeline was not read)"
+    );
+    assert_eq!(
+        fact("b-d"),
+        ["0", "0", "0", "1"],
+        "an event with no duration_sec is OPEN: 0 seconds, counted in `_open`"
+    );
+    assert_eq!(fact("b-f"), ["100", "0", "1", "0"], "one open and one measured event");
+    assert_eq!(fact("b-g"), ["0", "0", "0", "0"], "`[]` → 0: read, and nothing happened");
+}
+
+#[test]
+fn the_bundle_partitions_an_issues_wall_into_four_buckets() {
+    let conn = bundle_seeded();
+    let row = effort_row(&conn, 50);
+    assert_eq!(int(&row, "attempts"), 6, "{row:?}");
+    assert_eq!(int(&row, "lifecycle_wall_sec"), 2600, "{row:?}");
+    // b-a's residual (1000 - 100) is the only clean time.
+    assert_eq!(int(&row, "clean_sec"), 900, "{row:?}");
+    // b-b's measured 50 s (its trigger is unattributable, its measured event
+    // is not) + b-f's measured 100 s + b-f's 500 s residual. b-f's OPEN event
+    // contributes nothing.
+    assert_eq!(int(&row, "substantive_rework_sec"), 650, "{row:?}");
+    // b-a's measured 100 s + b-e's measured 150 s; b-e's residual clamps at 0.
+    assert_eq!(int(&row, "environmental_rework_sec"), 250, "{row:?}");
+    // operator_redispatch (b-b's 350 s residual), triggerless (b-c, 300 s) and
+    // unknown (b-d, 200 s) are unattributed — never a rework bucket.
+    assert_eq!(int(&row, "unattributed_sec"), 850, "{row:?}");
+    // b-e claims 150 s of rework inside a 100 s attempt.
+    assert_eq!(int(&row, "overaccounted_sec"), 50, "{row:?}");
+    assert_eq!(int(&row, "rework_substantive_open"), 1, "{row:?}");
+    assert_eq!(int(&row, "rework_environmental_open"), 1, "{row:?}");
+    // first, merge_conflict, retry_after_substantive_failure.
+    assert_eq!(int(&row, "attributed_attempts"), 3, "{row:?}");
+    // (900 + 650 + 250) / (900 + 650 + 250 + 850).
+    assert_eq!(row["attributed_wall_pct"], "67.9", "{row:?}");
+
+    // The identity, asserted rather than read.
+    let buckets: i64 = [
+        "clean_sec",
+        "substantive_rework_sec",
+        "environmental_rework_sec",
+        "unattributed_sec",
+    ]
+    .iter()
+    .map(|column| int(&row, column))
+    .sum();
+    assert_eq!(
+        buckets,
+        int(&row, "lifecycle_wall_sec") + int(&row, "overaccounted_sec"),
+        "clean + substantive + environmental + unattributed must equal lifecycle + \
+         overaccounted: {row:?}"
+    );
+
+    // A sane timeline over-accounts nothing, so the four buckets ARE the
+    // lifecycle.
+    let clean = effort_row(&conn, 51);
+    assert_eq!(int(&clean, "overaccounted_sec"), 0, "{clean:?}");
+    assert_eq!(int(&clean, "clean_sec"), int(&clean, "lifecycle_wall_sec"), "{clean:?}");
+    assert_eq!(clean["attributed_wall_pct"], "100.0", "{clean:?}");
+}
+
+/// The bundle and IE1 agree on the IE fixture: running both over the same
+/// `records` yields the same four buckets for every issue.
+#[test]
+fn the_bundle_split_matches_ie1_on_the_same_records() {
+    let conn = seeded();
+    execute_committed(&conn, "defaults/observability/sweep-facts/sweep-facts-rollup.sql");
+    execute_committed(&conn, "defaults/observability/sweep-facts/issue-effort.sql");
+    // repo, issue, attempts, max_attempt_index, lifecycle_sec, clean_sec,
+    // substantive_rework_sec, environmental_rework_sec, unattributed_sec, …
+    for ie1 in query(&conn, &committed_statements()[0]) {
+        let bundle = query_with(
+            &conn,
+            "SELECT DISTINCT lifecycle_wall_sec, clean_sec, substantive_rework_sec, \
+                    environmental_rework_sec, unattributed_sec \
+               FROM issue_effort WHERE issue = :issue",
+            &[(":issue", &ie1[1])],
+        );
+        assert_eq!(bundle.len(), 1, "issue {}: {bundle:?}", ie1[1]);
+        assert_eq!(
+            bundle[0],
+            ie1[4..9],
+            "issue {}: the bundle's split and IE1's disagree on identical records",
+            ie1[1]
+        );
+    }
+}
+
+/// SF1's window coverage row, executed from the committed question file: one
+/// row for the window, and an empty window divides by nothing.
+#[test]
+fn sf1_coverage_row_reports_the_attributable_share_without_dividing_by_zero() {
+    let sql = std::fs::read_to_string(repo_file(
+        "defaults/observability/sweep-facts/sweep-facts-queries.sql",
+    ))
+    .unwrap();
+    let coverage = statements(&sql)
+        .into_iter()
+        .find(|s| s.contains("attributed_attempts_pct"))
+        .expect("sweep-facts-queries.sql carries no SF1 coverage row");
+    for (since, until, expected) in [
+        // Both issues landed in-window: 7 attempts, 4 attributable (57.1%);
+        // seconds (950 + 650 + 250) / (950 + 650 + 250 + 850) = 68.5%.
+        (
+            "2026-09-01T00:00:00Z",
+            "2026-10-01T00:00:00Z",
+            vec![
+                "2", "7", "4", "57.1", "2650", "950", "650", "250", "850", "50", "68.5",
+            ],
+        ),
+        // An empty window: zero issues, NULL shares, no error.
+        (
+            "2020-01-01T00:00:00Z",
+            "2020-01-02T00:00:00Z",
+            vec!["0", "", "", "", "", "", "", "", "", "", ""],
+        ),
+    ] {
+        let conn = bundle_seeded();
+        // `sf_window` is `CREATE VIEW IF NOT EXISTS` in the committed file, so
+        // defining it first binds the window without editing the SQL.
+        conn.execute_batch(&format!(
+            "CREATE VIEW sf_window AS SELECT '{since}' AS since, '{until}' AS until"
+        ))
+        .unwrap();
+        let rows = query_with(&conn, &coverage, &[]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0], expected, "window [{since}, {until})");
+    }
+}

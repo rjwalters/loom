@@ -7,12 +7,12 @@
 -- SQLite dialect, `json_extract` / `json_each`. This is deliberately NOT the
 -- ClickHouse `loom_analytics.*` rollup the CT queries read, and deliberately
 -- NOT #9446's `sweep_facts` rollup (`defaults/observability/sweep-facts/`):
--- that rollup flattens `rework_events` into two per-classification COUNTS and
--- discards each event's `kind` and `duration_sec`, so every duration-level
--- question below (IE1, IE2, IE4) is unanswerable from it. The lineage fields
--- these need live on the raw `records` payload, so that is what is read here;
--- the two layers are complementary — `sweep_facts` answers "how many", this
--- file answers "how much, and which failure mode".
+-- that rollup flattens `rework_events` into per-classification counts and
+-- measured seconds (#9507) and discards each event's `kind`, so the per-kind
+-- question (IE4) is unanswerable from it. The lineage fields these need live on
+-- the raw `records` payload, so that is what is read here. IE1's split IS
+-- carried by the bundle since #9507 (`sweep-facts/issue-effort.sql`), using
+-- IE1's arithmetic and trigger → bucket table — see TWIN at IE1.
 --
 -- WHY THIS EXISTS. An issue's cost is not one number. Some of it is the work;
 -- some of it is a reviewer finding the work wanting (so the issue is HARD);
@@ -81,6 +81,11 @@
 -- An attempt with `trigger = 'first'` contributes its residual to `clean_sec`;
 -- that is the only source of clean time, which is why a first attempt riddled
 -- with conflicts still reports most of itself as environmental.
+--
+-- TWIN: `attempt_bucket` below is copied into `sweep-facts/issue-effort.sql`'s
+-- `charged` CTE (the bundle's seconds partition, #9507). Do not edit one
+-- without the other: `loom-daemon/tests/sweep_facts_artifacts.rs`
+-- (`the_bundle_buckets_triggers_exactly_as_ie1_does`) fails if they disagree.
 -- ---------------------------------------------------------------------------
 WITH attempt AS (
     SELECT

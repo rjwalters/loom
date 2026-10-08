@@ -16,7 +16,8 @@
 --
 --   wrangler d1 execute loom-fleet-telemetry --file sweep-facts-queries.sql
 --
--- All eight answers come back in one pass, in SF order.
+-- All eight answers come back in one pass, in SF order (SF1 as two
+-- statements: the per-issue split, then its window coverage row).
 
 -- The window every SF query reads. Edit HERE, once.
 CREATE VIEW IF NOT EXISTS sf_window AS
@@ -28,6 +29,12 @@ SELECT '2026-09-22T00:00:00Z' AS since,
 -- least one attempt's tokens are merely unknown (#9440) — the lifecycle sums
 -- of such a row are lower bounds, and the clean column is the only comparable
 -- one. NULL cells are missing data, never measured zeros.
+--
+-- The seconds partition (#9507): `clean_sec + substantive_rework_sec +
+-- environmental_rework_sec + unattributed_sec = lifecycle_wall_sec +
+-- overaccounted_sec` (see `issue-effort.sql` for the arithmetic and why
+-- `clean_sec` is not `clean_wall_sec`). READ THE COVERAGE ROW BELOW FIRST:
+-- the split describes only the attributable share of the window.
 SELECT
     e.repo                   AS repo,
     e.issue                  AS issue,
@@ -42,10 +49,53 @@ SELECT
     e.clean_tokens_in        AS clean_tokens_in,
     e.clean_tokens_out       AS clean_tokens_out,
     e.rework_substantive     AS rework_substantive,
-    e.rework_environmental   AS rework_environmental
+    e.rework_environmental   AS rework_environmental,
+    e.rework_substantive_open    AS rework_substantive_open,
+    e.rework_environmental_open  AS rework_environmental_open,
+    e.clean_sec                  AS clean_sec,
+    e.substantive_rework_sec     AS substantive_rework_sec,
+    e.environmental_rework_sec   AS environmental_rework_sec,
+    e.unattributed_sec           AS unattributed_sec,
+    e.overaccounted_sec          AS overaccounted_sec,
+    e.attributed_attempts        AS attributed_attempts,
+    e.attributed_wall_pct        AS attributed_wall_pct
 FROM issue_effort e, sf_window w
 WHERE e.landed_at >= w.since AND e.landed_at < w.until
 ORDER BY e.lifecycle_tokens_in DESC, e.repo, e.issue;
+
+-- SF1, coverage row (#9507) — read this BEFORE the split above. One row for
+-- the whole window: how many of the landed issues' attempts and partitioned
+-- seconds the trigger classification can attribute at all. The unattributed
+-- population is `operator_redispatch`, `unknown` and every pre-#9444 record
+-- (no `trigger`); until the trigger/rework writers (#9506/#9514) are on the
+-- fleet it is nearly everything, which is the rollout boundary showing, not a
+-- defect. Lifecycle columns repeat on every landing row of an issue, so the
+-- issues are deduplicated before summing. An empty window yields one row of
+-- zero issues and NULL shares — never a divide by zero.
+SELECT
+    count(*)                                         AS issues,
+    sum(d.attempts)                                  AS attempts,
+    sum(d.attributed_attempts)                       AS attributed_attempts,
+    round(100.0 * sum(d.attributed_attempts)
+          / NULLIF(sum(d.attempts), 0), 1)           AS attributed_attempts_pct,
+    sum(d.lifecycle_wall_sec)                        AS lifecycle_wall_sec,
+    sum(d.clean_sec)                                 AS clean_sec,
+    sum(d.substantive_rework_sec)                    AS substantive_rework_sec,
+    sum(d.environmental_rework_sec)                  AS environmental_rework_sec,
+    sum(d.unattributed_sec)                          AS unattributed_sec,
+    sum(d.overaccounted_sec)                         AS overaccounted_sec,
+    round(100.0 * (sum(d.clean_sec) + sum(d.substantive_rework_sec)
+                   + sum(d.environmental_rework_sec))
+          / NULLIF(sum(d.clean_sec) + sum(d.substantive_rework_sec)
+                   + sum(d.environmental_rework_sec)
+                   + sum(d.unattributed_sec), 0), 1) AS attributed_wall_pct
+FROM (
+    SELECT DISTINCT e.repo, e.issue, e.attempts, e.attributed_attempts,
+           e.lifecycle_wall_sec, e.clean_sec, e.substantive_rework_sec,
+           e.environmental_rework_sec, e.unattributed_sec, e.overaccounted_sec
+    FROM issue_effort e, sf_window w
+    WHERE e.landed_at >= w.since AND e.landed_at < w.until
+) d;
 
 -- SF2. How much work lands per day: Σ LSI over the day's landings — the
 -- size-weighted throughput KPI (#9466), and the headline half of the pair it
