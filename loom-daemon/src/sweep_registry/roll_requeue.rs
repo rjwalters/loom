@@ -172,6 +172,14 @@ impl SweepRegistry {
         }
     }
 
+    /// A registry with this one's configuration and none of its state, for
+    /// forge writes that must not run under the live registry's mutex
+    /// ([`Self::requeue_for_roll`] reads only the configuration). It tracks no
+    /// sweeps, holds no children and has no event bus.
+    pub(crate) fn detached_for_forge_writes(&self) -> SweepRegistry {
+        SweepRegistry::new(self.config.clone())
+    }
+
     /// What a one-shot lease refresh needs, captured under the registry lock so
     /// the refresh itself ([`refresh_lease_once`]) can run without it.
     pub(crate) fn lease_refresh_identity(&self) -> (PathBuf, String) {

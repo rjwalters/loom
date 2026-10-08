@@ -5,21 +5,23 @@
 use super::host::{sweep_candidates, Candidate, PauseHost};
 use super::teardown::{self, TeardownReport};
 use super::*;
-use crate::auto_update::pause_manifest::{ItemKind, ResumeHandle, Runtime};
-use crate::ipc::{AbortOutcome, DrainOrigin};
+use crate::auto_update::pause_manifest::{ItemKind, LoadOutcome, ResumeHandle, Runtime};
+use crate::event_bus::EventBus;
+use crate::ipc::{AbortOutcome, DrainBegin, DrainOrigin, PauseRollStatus};
 use crate::sweep_registry::test_support;
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+use crate::workspace_pool::WorkspacePool;
 use serial_test::serial;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-const SID: &str = "4910f978-64b9-4654-942a-dae6514e859c";
+pub(super) const SID: &str = "4910f978-64b9-4654-942a-dae6514e859c";
 
-fn tuning(budget_ms: u64) -> PauseRollTuning {
+pub(super) fn tuning(budget_ms: u64) -> PauseRollTuning {
     PauseRollTuning {
         pause_budget: Duration::from_millis(budget_ms),
         poll: Duration::from_millis(20),
@@ -29,7 +31,7 @@ fn tuning(budget_ms: u64) -> PauseRollTuning {
     }
 }
 
-fn target() -> RollTarget {
+pub(super) fn target() -> RollTarget {
     RollTarget {
         source: TargetSource::Floor,
         to_version: Some("0.19.900".to_string()),
@@ -39,7 +41,7 @@ fn target() -> RollTarget {
 }
 
 /// Begin a pause roll on `drain` and return the plan for it.
-fn begin(drain: &DrainState, dir: &Path, tuning: PauseRollTuning) -> PausePlan {
+pub(super) fn begin(drain: &DrainState, dir: &Path, tuning: PauseRollTuning) -> PausePlan {
     let progress = PauseRollStatus {
         budget_secs: tuning.pause_budget.as_secs(),
         ..PauseRollStatus::default()
@@ -60,14 +62,14 @@ fn begin(drain: &DrainState, dir: &Path, tuning: PauseRollTuning) -> PausePlan {
     }
 }
 
-fn load(plan: &PausePlan) -> PauseManifest {
+pub(super) fn load(plan: &PausePlan) -> PauseManifest {
     match pause_manifest::load(&plan.manifest_path, Utc::now()) {
         LoadOutcome::Loaded(m) => m,
         other => panic!("expected a loadable manifest, got {other:?}"),
     }
 }
 
-fn item<'a>(m: &'a PauseManifest, id: &str) -> &'a ManifestItem {
+pub(super) fn item<'a>(m: &'a PauseManifest, id: &str) -> &'a ManifestItem {
     m.items
         .iter()
         .find(|i| i.id == id)
@@ -77,7 +79,7 @@ fn item<'a>(m: &'a PauseManifest, id: &str) -> &'a ManifestItem {
 /// Stand in for the agent's pause hook: once a pause is requested for
 /// `pause_dir`'s item, run the real hook for one tool call, which parks and
 /// writes the safe-point record.
-fn spawn_parking_agent(pause_dir: PathBuf) -> std::thread::JoinHandle<()> {
+pub(super) fn spawn_parking_agent(pause_dir: PathBuf) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !roll_pause::is_requested(&pause_dir) {
@@ -110,37 +112,48 @@ fn spawn_parking_agent(pause_dir: PathBuf) -> std::thread::JoinHandle<()> {
 // Scripted host
 // ============================================================================
 
-type Hook = Box<dyn Fn(&str) + Send + Sync>;
+pub(super) type Hook = Box<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Default)]
-struct FakeHost {
-    cands: Vec<Candidate>,
-    pending: AtomicUsize,
-    dead: Mutex<BTreeSet<String>>,
-    torn: Mutex<Vec<String>>,
-    held: Mutex<BTreeSet<String>>,
-    leases: Mutex<Vec<String>>,
-    requeued: Mutex<Vec<(String, String)>>,
-    events: Mutex<Vec<(String, serde_json::Value)>>,
-    requeue_delay: Duration,
-    requeue_fails: bool,
+pub(super) struct FakeHost {
+    pub(super) cands: Vec<Candidate>,
+    pub(super) pending: AtomicUsize,
+    pub(super) dead: Mutex<BTreeSet<String>>,
+    pub(super) torn: Mutex<Vec<String>>,
+    /// Held item -> the pause run holding it.
+    pub(super) held: Mutex<BTreeMap<String, String>>,
+    /// The pause runs holding dispatch closed.
+    pub(super) closed: Mutex<BTreeSet<String>>,
+    pub(super) leases: Mutex<Vec<String>>,
+    pub(super) requeued: Mutex<Vec<(String, String)>>,
+    pub(super) events: Mutex<Vec<(String, serde_json::Value)>>,
+    pub(super) requeue_delay: Duration,
+    pub(super) requeue_fails: bool,
     /// Called with the item id at the start of each teardown.
-    on_teardown: Option<Hook>,
+    pub(super) on_teardown: Option<Hook>,
 }
 
 impl PauseHost for FakeHost {
+    fn close_dispatch(&self, closed: bool, run: &str) {
+        let mut set = self.closed.lock().unwrap();
+        if closed {
+            set.insert(run.to_string());
+        } else {
+            set.remove(run);
+        }
+    }
     fn pending_dispatches(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
     fn snapshot(&self) -> Vec<Candidate> {
         self.cands.clone()
     }
-    fn hold(&self, c: &Candidate, held: bool) {
-        let mut set = self.held.lock().unwrap();
+    fn hold(&self, c: &Candidate, held: bool, run: &str) {
+        let mut map = self.held.lock().unwrap();
         if held {
-            set.insert(c.id.clone());
-        } else {
-            set.remove(&c.id);
+            map.insert(c.id.clone(), run.to_string());
+        } else if map.get(&c.id).is_some_and(|by| by == run) {
+            map.remove(&c.id);
         }
     }
     fn is_alive(&self, c: &Candidate) -> bool {
@@ -178,7 +191,7 @@ impl PauseHost for FakeHost {
 }
 
 impl FakeHost {
-    fn item_events(&self) -> Vec<serde_json::Value> {
+    pub(super) fn item_events(&self) -> Vec<serde_json::Value> {
         self.events
             .lock()
             .unwrap()
@@ -190,7 +203,7 @@ impl FakeHost {
 }
 
 /// A sweep candidate `age_secs` old with a resumable Claude session.
-fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate {
+pub(super) fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate {
     Candidate {
         id: id.to_string(),
         kind: ItemKind::Sweep,
@@ -202,6 +215,7 @@ fn cand(dir: &Path, id: &str, issue: u32, age_secs: i64) -> Candidate {
         scope_unit: None,
         agent_started_at: Some(Utc::now() - chrono::Duration::seconds(age_secs)),
         run_started_at: Some(Utc::now() - chrono::Duration::seconds(age_secs)),
+        proc_started_at: None,
         resume_handle: Some(ResumeHandle {
             runtime: Runtime::Claude,
             session_id: Some(SID.to_string()),
@@ -786,25 +800,30 @@ async fn h3_refuses_while_the_previous_rolls_manifest_is_still_live() {
 // ============================================================================
 
 /// A [`PauseHost`] over one real sweep registry, with real process trees.
-struct RegistryHost {
-    registry: Arc<Mutex<SweepRegistry>>,
-    root: PathBuf,
-    events: Mutex<Vec<(String, serde_json::Value)>>,
-    leases: Mutex<Vec<String>>,
+pub(super) struct RegistryHost {
+    pub(super) registry: Arc<Mutex<SweepRegistry>>,
+    pub(super) root: PathBuf,
+    pub(super) events: Mutex<Vec<(String, serde_json::Value)>>,
+    pub(super) leases: Mutex<Vec<String>>,
 }
 
 impl PauseHost for RegistryHost {
+    fn close_dispatch(&self, closed: bool, run: &str) {
+        self.registry.lock().unwrap().close_for_roll(run, closed);
+    }
     fn pending_dispatches(&self) -> usize {
-        0
+        self.registry.lock().unwrap().mid_spawn_dispatches()
     }
     fn snapshot(&self) -> Vec<Candidate> {
-        sweep_candidates(&self.registry.lock().unwrap(), &self.root)
+        let mut cands = sweep_candidates(&self.registry.lock().unwrap(), &self.root);
+        host::stamp_proc_starts(&mut cands);
+        cands
     }
-    fn hold(&self, c: &Candidate, held: bool) {
+    fn hold(&self, c: &Candidate, held: bool, run: &str) {
         if held {
-            roll_pause::hold::hold(&c.id);
+            roll_pause::hold::hold(&c.id, run);
         } else {
-            roll_pause::hold::release(&c.id);
+            roll_pause::hold::release(&c.id, run);
         }
     }
     fn is_alive(&self, c: &Candidate) -> bool {
@@ -818,11 +837,7 @@ impl PauseHost for RegistryHost {
         Ok(())
     }
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String> {
-        self.registry
-            .lock()
-            .unwrap()
-            .requeue_for_roll(c.issue.unwrap(), notice)
-            .map_err(|e| format!("{e:#}"))
+        host::requeue_off_the_registry_lock(&self.registry, c.issue.unwrap(), notice)
     }
     fn emit(&self, topic: &str, payload: serde_json::Value) {
         self.events
@@ -833,13 +848,13 @@ impl PauseHost for RegistryHost {
 }
 
 /// A fake agent: a process group whose child has left it with `setsid()`.
-struct FakeAgent {
-    child: std::process::Child,
-    setsid_pid: u32,
+pub(super) struct FakeAgent {
+    pub(super) child: std::process::Child,
+    pub(super) setsid_pid: u32,
 }
 
 impl FakeAgent {
-    fn spawn(dir: &Path, name: &str) -> Self {
+    pub(super) fn spawn(dir: &Path, name: &str) -> Self {
         let pidfile = dir.join(format!("{name}.setsid.pid"));
         let script = format!(
             "perl -e 'use POSIX; my $p = fork(); if ($p == 0) {{ POSIX::setsid(); \
@@ -853,10 +868,10 @@ impl FakeAgent {
             .expect("the setsid'd child never started");
         Self { child, setsid_pid }
     }
-    fn pid(&self) -> u32 {
+    pub(super) fn pid(&self) -> u32 {
         self.child.id()
     }
-    fn gone(&mut self) -> bool {
+    pub(super) fn gone(&mut self) -> bool {
         // Reap the direct child so its pid stops reading as alive.
         let _ = self.child.try_wait();
         test_support::wait_until_dead(self.setsid_pid, 10_000)
@@ -877,7 +892,7 @@ impl Drop for FakeAgent {
 /// Register `agent` as issue `issue`'s running sweep: a registry entry, a
 /// claim lock stamped with its pause-and-roll identity (as dispatch does), a
 /// checkpoint, and a session `age_secs` old. Returns `(sweep_id, pause_dir)`.
-fn register(
+pub(super) fn register(
     registry: &mut SweepRegistry,
     root: &Path,
     agent: &FakeAgent,
@@ -1060,13 +1075,18 @@ fn h4_pauses_resets_and_requeues_real_agents_and_keeps_the_paused_items_recovery
     assert_eq!(status.requeued_by_reason["pause-budget-missed"], 1);
     assert!(status.stop_secs.is_some() && status.settle_secs.is_some());
 
-    // Every pause request is withdrawn; the safe-point record stays for H5.
+    // Every pause request is withdrawn. The safe point H5 reads is the
+    // manifest's (asserted above). The record on disk answers this request
+    // only: here the stand-in hook outlives the "stopped" tree, sees the
+    // request go and releases its call, which removes the record.
     for d in [&paused_dir, &young_dir, &missed_dir] {
         assert!(!roll_pause::is_requested(d));
     }
-    assert!(roll_pause::read_safe_point(&paused_dir).is_some());
     hook.join().unwrap();
+    assert!(roll_pause::read_safe_point(&paused_dir).is_none());
+    // The gate this pause closed stays closed: the daemon exits next.
+    assert!(host.registry.lock().unwrap().closed_for_roll());
     for id in [&paused_id, &young_id, &missed_id] {
-        roll_pause::hold::release(id);
+        roll_pause::hold::release(id, &manifest_id);
     }
 }

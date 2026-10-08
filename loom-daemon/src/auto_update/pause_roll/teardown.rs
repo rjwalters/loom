@@ -12,13 +12,40 @@
 //!    `owner.json` names one for every Linux dispatch, including Codex and
 //!    Claude launches that never created a scope. When the stop fails or the
 //!    unit is not loaded, the legs below do the work (Judge finding on #10864).
-//! 2. **Freeze-first tree kill** over every seed attributed to the item: its
-//!    pid, every member of its process group, and every process working in its
-//!    worktree (cwd or argv), each expanded to its descendants through the
-//!    ppid map, which survives `setsid` where the pgid does not. This reuses
-//!    [`crate::orphan_process_reaper::reap_tree`] (`SIGSTOP` parent-first,
-//!    re-snapshot, `SIGTERM` + `SIGCONT`, `SIGKILL` the survivors).
+//! 2. **Freeze-first tree kill** over the item's seeds, each expanded to its
+//!    descendants through the ppid map, which survives `setsid` where the pgid
+//!    does not. This reuses [`crate::orphan_process_reaper::reap_tree`]
+//!    (`SIGSTOP` parent-first, re-snapshot, `SIGTERM` + `SIGCONT`, `SIGKILL`
+//!    the survivors).
 //! 3. **Process-group `SIGKILL`** for anything still in the group.
+//!
+//! # Reach (Judge finding on #10974)
+//!
+//! The teardown signals nothing outside the agent's own tree:
+//!
+//! - **Seeds are the recorded identity only**: the recorded pid, and the
+//!   members of the recorded process group. A process is never a seed because
+//!   its cwd or argv is in the item's worktree, so an operator shell or an
+//!   attended session opened there is not touched. (A descendant that was
+//!   reparented to pid 1 *and* left the group is reached by the scope leg on
+//!   Linux, and otherwise by the orphan reaper's own, agent-shaped pass.)
+//! - **Protected pids are removed before descendants are expanded**: this
+//!   daemon, its ancestors, its other children, and anything on a foreign
+//!   controlling terminal that is not below the agent. A record that names a
+//!   protected pid therefore plans nothing, not "everything under it".
+//! - **A pid is signalled only while it is still the recorded process**: the
+//!   record carries the process's start time ([`TreeSpec::pid_started_at`],
+//!   observed when H4 snapshots), and a live pid whose start time differs is a
+//!   recycled number. It is not a seed, and its group number is not trusted
+//!   either.
+//!
+//! # Bounded (Judge finding on #10974)
+//!
+//! The process table comes from `ps` (so the same code works under launchd and
+//! systemd), run through [`run_bounded`]: a wedged `ps` is killed at
+//! [`PS_TIMEOUT`] and the table is reported unavailable. Without a table there
+//! is no tree to plan, so the teardown falls back to the guarded group
+//! `SIGKILL` ([`force_kill_group`]), which needs no external command.
 //!
 //! **Session-exec (containerized) items.** The host side of a session-exec
 //! invocation is part of the tree above. `spawn-codex.sh` traps `TERM` and
@@ -26,39 +53,54 @@
 //! `SIGTERM` is what revokes the invocation: the in-container worker cancels
 //! the invocation's tree and the session container keeps running. The grace
 //! between `SIGTERM` and `SIGKILL` is what gives that trap time to run.
-//!
-//! The process table comes from `ps`, not `/proc`, so the same code works under
-//! launchd (macOS) and systemd (Linux). The daemon's own pid and its ancestors
-//! are never signalled.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::orphan_process_reaper::{
-    children_map, descendants_of, order_parent_first, parent_map, reap_tree, references_worktree,
+    ancestors_of, children_map, descendants_of, order_parent_first, parent_map, reap_tree,
     OrphanTree, ProcEntry, ReapHooks,
 };
+use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::reaper::{group_has_members, send_group_signal, send_signal};
 
 /// How long a stopped tree gets between `SIGTERM` and `SIGKILL`.
 pub const TERM_GRACE: Duration = Duration::from_secs(3);
 /// Bound on the `systemctl --user stop` call.
 const SCOPE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound on one `ps` call. A healthy `ps` answers in tens of milliseconds.
+pub const PS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How far a pid's observed start time may drift between two `ps` readings
+/// and still be the same process. `etime` has one-second resolution and each
+/// reading is taken against a slightly later clock, later still on a loaded
+/// host. The margin is safe to be generous with: the recorded process was
+/// alive when its start was observed, so a stranger wearing its pid started
+/// after that, and would have to have been handed a just-freed pid number
+/// within this many seconds of the original's own start to pass.
+const IDENTITY_TOLERANCE_SECS: i64 = 30;
 
 /// What identifies one item's tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TreeSpec {
     /// The agent's tracked pid (the spawn script; it leads its group).
     pub pid: Option<u32>,
+    /// When that process started, as the H4 snapshot observed it. With
+    /// [`Self::pid`] it is the process's identity: a live pid with a different
+    /// start time is a recycled number and is never signalled.
+    pub pid_started_at: Option<DateTime<Utc>>,
+    /// When the registry recorded the process as started. The fallback
+    /// identity evidence when the snapshot could not observe a start time
+    /// ([`pid_identity::pid_was_recycled`]'s rule).
+    pub recorded_started_at: Option<DateTime<Utc>>,
     /// Its process group.
     pub pgid: Option<u32>,
     /// The systemd scope unit recorded at dispatch, if any. May not exist.
     pub scope_unit: Option<String>,
-    /// The item's worktree, for worktree-attributed seeds. `None` for a role
-    /// run, which has no worktree of its own.
-    pub worktree: Option<PathBuf>,
 }
 
 /// What a teardown did.
@@ -72,6 +114,9 @@ pub struct TeardownReport {
     pub pids: Vec<u32>,
     /// Pids still alive after the whole escalation.
     pub survivors: Vec<u32>,
+    /// Why nothing, or less than the whole tree, was signalled: the recorded
+    /// pid is now another process, or the process table could not be read.
+    pub reach_note: Option<String>,
     /// Wall time, milliseconds.
     pub elapsed_ms: u64,
 }
@@ -82,15 +127,38 @@ pub struct Proc {
     pub pid: u32,
     pub ppid: u32,
     pub pgid: u32,
+    /// The controlling terminal, `None` when the process has none.
+    pub tty: Option<String>,
+    /// When the process started (the read time minus `etime`).
+    pub started_at: Option<DateTime<Utc>>,
     pub cmdline: String,
-    pub cwd: Option<PathBuf>,
 }
 
-/// Parse `ps -axo pid=,ppid=,pgid=,stat=,command=` output. Zombies (`stat`
-/// starting with `Z`) are dropped: a killed process stays in the table until
-/// its parent reaps it, and it is not running.
+/// Parse a `ps` elapsed time, `[[dd-]hh:]mm:ss`, into seconds.
 #[must_use]
-pub fn parse_ps(out: &str) -> Vec<Proc> {
+pub fn parse_etime(s: &str) -> Option<i64> {
+    let (days, clock) = match s.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, s),
+    };
+    let mut secs = 0i64;
+    let parts: Vec<&str> = clock.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    for part in parts {
+        secs = secs
+            .checked_mul(60)?
+            .checked_add(part.parse::<i64>().ok()?)?;
+    }
+    days.checked_mul(86_400)?.checked_add(secs)
+}
+
+/// Parse `ps -axo pid=,ppid=,pgid=,stat=,tty=,etime=,command=` output read at
+/// `now`. Zombies (`stat` starting with `Z`) are dropped: a killed process
+/// stays in the table until its parent reaps it, and it is not running.
+#[must_use]
+pub fn parse_ps(out: &str, now: DateTime<Utc>) -> Vec<Proc> {
     out.lines()
         .filter_map(|line| {
             let mut it = line.split_whitespace();
@@ -100,71 +168,125 @@ pub fn parse_ps(out: &str) -> Vec<Proc> {
             if it.next()?.starts_with('Z') {
                 return None;
             }
+            let tty = it.next()?;
+            let started_at = parse_etime(it.next()?)
+                .and_then(|secs| now.checked_sub_signed(chrono::Duration::seconds(secs)));
             let cmdline = it.collect::<Vec<_>>().join(" ");
             Some(Proc {
                 pid,
                 ppid,
                 pgid,
+                // macOS prints `??`, Linux `?`, for "no controlling terminal".
+                tty: (!tty.starts_with('?') && tty != "-").then(|| tty.to_string()),
+                started_at,
                 cmdline,
-                cwd: None,
             })
         })
         .collect()
 }
 
-/// The live process table. `with_cwd` also resolves each process's cwd
-/// (`/proc/<pid>/cwd` on Linux, one `lsof` call elsewhere), which is only
-/// needed for worktree attribution. Empty when `ps` cannot be run.
+/// Run `cmd` to completion or kill it at `timeout`. `Some(stdout)` when it
+/// exited (whatever its status), `None` when it could not be spawned or was
+/// killed for running long.
+///
+/// Stdout is drained on its own thread while the child runs. A process table
+/// is larger than a pipe buffer, so a wait that only polls the exit status
+/// would deadlock against a `ps` blocked on a full pipe.
 #[must_use]
-pub fn process_table(with_cwd: bool) -> Vec<Proc> {
-    let Ok(out) = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let mut procs = parse_ps(&String::from_utf8_lossy(&out.stdout));
-    if with_cwd {
-        fill_cwds(&mut procs);
-    }
-    procs
-}
-
-#[cfg(target_os = "linux")]
-fn fill_cwds(procs: &mut [Proc]) {
-    for p in procs {
-        p.cwd = std::fs::read_link(format!("/proc/{}/cwd", p.pid)).ok();
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fill_cwds(procs: &mut [Proc]) {
-    // `-F pn`: one `p<pid>` line per process, then `n<path>` for its cwd.
-    let Ok(out) = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-n", "-P", "-F", "pn"])
-        .output()
-    else {
-        return;
-    };
-    let cwds = parse_lsof_cwds(&String::from_utf8_lossy(&out.stdout));
-    for p in procs {
-        p.cwd = cwds.get(&p.pid).cloned();
-    }
-}
-
-/// Parse `lsof -a -d cwd -F pn` output into `pid -> cwd`.
-#[must_use]
-pub fn parse_lsof_cwds(out: &str) -> HashMap<u32, PathBuf> {
-    let mut map = HashMap::new();
-    let mut pid: Option<u32> = None;
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix('p') {
-            pid = rest.parse().ok();
-        } else if let (Some(rest), Some(p)) = (line.strip_prefix('n'), pid) {
-            map.insert(p, PathBuf::from(rest));
+pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child is gone, so the pipe closes and the reader ends.
+                // The short wait only covers a grandchild holding the pipe.
+                let out = rx.recv_timeout(Duration::from_secs(2)).ok()?;
+                return Some((status.success(), out));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
-    map
+}
+
+/// Where the process table comes from. Production uses `ps` on `PATH` with
+/// [`PS_TIMEOUT`]; tests point it at a script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcSource {
+    pub ps: PathBuf,
+    pub timeout: Duration,
+}
+
+impl ProcSource {
+    /// The system `ps`.
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            ps: PathBuf::from("ps"),
+            timeout: PS_TIMEOUT,
+        }
+    }
+
+    /// The live process table, or `None` when `ps` could not be run or did
+    /// not answer within the timeout.
+    #[must_use]
+    pub fn table(&self) -> Option<Vec<Proc>> {
+        let mut cmd = Command::new(&self.ps);
+        cmd.args(["-axo", "pid=,ppid=,pgid=,stat=,tty=,etime=,command="]);
+        let (_, out) = run_bounded(cmd, self.timeout)?;
+        let procs = parse_ps(&String::from_utf8_lossy(&out), Utc::now());
+        // An empty table is a failed read: this process is always in it.
+        (!procs.is_empty()).then_some(procs)
+    }
+
+    /// Whether `pid` is a running process: alive and not a zombie. A child
+    /// that exited but has not been reaped still answers `kill(pid, 0)`; H4
+    /// holds the sweep reaper off its items, so that is exactly the state an
+    /// agent that ended by itself is left in. A `ps` that cannot answer leaves
+    /// the liveness probe's verdict (alive).
+    #[must_use]
+    pub fn pid_running(&self, pid: u32) -> bool {
+        if !crate::sweep_registry::is_pid_alive(pid) {
+            return false;
+        }
+        let mut cmd = Command::new(&self.ps);
+        cmd.args(["-o", "stat=", "-p", &pid.to_string()]);
+        let Some((ok, out)) = run_bounded(cmd, self.timeout) else {
+            return true; // cannot tell: the liveness probe said alive
+        };
+        let stat = String::from_utf8_lossy(&out);
+        let stat = stat.trim();
+        !(stat.is_empty() && !ok) && !stat.starts_with('Z')
+    }
+}
+
+/// The live process table from the system `ps`.
+#[must_use]
+pub fn process_table() -> Option<Vec<Proc>> {
+    ProcSource::system().table()
+}
+
+/// [`ProcSource::pid_running`] against the system `ps`.
+#[must_use]
+pub fn pid_running(pid: u32) -> bool {
+    ProcSource::system().pid_running(pid)
 }
 
 fn as_entries(procs: &[Proc]) -> Vec<ProcEntry> {
@@ -173,45 +295,119 @@ fn as_entries(procs: &[Proc]) -> Vec<ProcEntry> {
         .map(|p| ProcEntry {
             pid: p.pid,
             ppid: p.ppid,
-            cwd: p.cwd.clone(),
+            cwd: None,
             cmdline: p.cmdline.clone(),
             age_secs: None,
         })
         .collect()
 }
 
-/// The pids of `spec`'s tree in `procs`, parent-first: every seed (the pid, the
-/// group's members, the worktree's processes) plus its descendants, minus
-/// `protected` (this daemon and its ancestors) and pids 0/1.
+/// What the table says about the recorded pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leader {
+    /// The pid is live and is the recorded process.
+    Verified,
+    /// No live process has the pid (it exited, or is a zombie).
+    Gone,
+    /// A live process has the pid, but it is not the recorded process (its
+    /// start time differs), or there is no start time to check it against.
+    Stranger,
+}
+
+/// Whether `spec`'s recorded pid is still the recorded process in `procs`.
+///
+/// The recorded start time ([`TreeSpec::pid_started_at`]) must match the
+/// row's within [`IDENTITY_TOLERANCE_SECS`]. When the snapshot observed none,
+/// the registry's start time decides by [`pid_identity::pid_was_recycled`]'s
+/// rule. With no evidence at all, or a row with no readable start time, the
+/// pid is unverifiable and is treated as a stranger: an unknown pid is never
+/// signalled.
 #[must_use]
-pub fn plan_tree(spec: &TreeSpec, procs: &[Proc], protected: &HashSet<u32>) -> Vec<u32> {
+pub fn leader_state(spec: &TreeSpec, procs: &[Proc]) -> Leader {
+    let Some(row) = spec.pid.and_then(|pid| procs.iter().find(|p| p.pid == pid)) else {
+        return Leader::Gone;
+    };
+    let same = match (row.started_at, spec.pid_started_at, spec.recorded_started_at) {
+        (Some(now), Some(then), _) => (now - then).num_seconds().abs() <= IDENTITY_TOLERANCE_SECS,
+        (Some(now), None, Some(recorded)) => !pid_identity::pid_was_recycled(Some(now), recorded),
+        _ => false,
+    };
+    if same {
+        Leader::Verified
+    } else {
+        Leader::Stranger
+    }
+}
+
+/// The pids the teardown must never signal: this daemon (`me`), its
+/// ancestors, its other children (`leader` is the one child that is this
+/// agent), and pids 0 and 1.
+#[must_use]
+pub fn protected_pids(procs: &[Proc], me: u32, leader: Option<u32>) -> HashSet<u32> {
+    let parents = parent_map(&as_entries(procs));
+    let mut set = ancestors_of(me, &parents);
+    set.insert(me);
+    set.extend([0, 1]);
+    set.extend(
+        procs
+            .iter()
+            .filter(|p| p.ppid == me && Some(p.pid) != leader)
+            .map(|p| p.pid),
+    );
+    set
+}
+
+/// The pids of `spec`'s tree in `procs`, parent-first, and what the table
+/// says about the recorded pid.
+///
+/// Seeds are the recorded pid (only while it is [`Leader::Verified`]) and the
+/// members of the recorded group (unless the recorded pid is now a
+/// [`Leader::Stranger`], which means the group number was recycled with it).
+/// `protected` pids are dropped from the seeds **before** descendants are
+/// expanded, and the expansion does not pass through one. A group member on a
+/// controlling terminal other than `daemon_tty`'s that is not below the
+/// recorded pid is an attended session, not part of the tree, and is dropped
+/// with them.
+#[must_use]
+pub fn plan_tree(
+    spec: &TreeSpec,
+    procs: &[Proc],
+    protected: &HashSet<u32>,
+    daemon_tty: Option<&str>,
+) -> (Vec<u32>, Leader) {
+    let leader = leader_state(spec, procs);
     let entries = as_entries(procs);
-    let mut seeds: Vec<u32> = Vec::new();
-    for (p, e) in procs.iter().zip(&entries) {
-        let by_pid = spec.pid == Some(p.pid);
-        let by_group = spec.pgid.is_some_and(|g| g > 1 && p.pgid == g);
-        let by_worktree = spec
-            .worktree
-            .as_deref()
-            .is_some_and(|w| references_worktree(e, w));
-        if by_pid || by_group || by_worktree {
+    let mut children = children_map(&entries);
+    // Never descend through a protected pid.
+    children.retain(|parent, _| !protected.contains(parent));
+    for kids in children.values_mut() {
+        kids.retain(|pid| !protected.contains(pid));
+    }
+
+    let by_pid: Vec<u32> = match (spec.pid, leader) {
+        (Some(pid), Leader::Verified) if !protected.contains(&pid) => vec![pid],
+        _ => Vec::new(),
+    };
+    let below_leader: HashSet<u32> = descendants_of(&by_pid, &children).into_iter().collect();
+    let group = spec
+        .pgid
+        .filter(|g| *g > 1 && !protected.contains(g) && leader != Leader::Stranger)
+        // A group id other than the recorded pid has no identity to check.
+        .filter(|g| Some(*g) == spec.pid || !procs.iter().any(|p| p.pid == *g));
+    let mut seeds = by_pid.clone();
+    for p in procs {
+        let in_group = group.is_some_and(|g| p.pgid == g);
+        let attended = p.tty.as_deref().is_some_and(|t| Some(t) != daemon_tty)
+            && !below_leader.contains(&p.pid)
+            && !by_pid.contains(&p.pid);
+        if in_group && !protected.contains(&p.pid) && !attended {
             seeds.push(p.pid);
         }
     }
-    let children = children_map(&entries);
     let mut all: HashSet<u32> = seeds.iter().copied().collect();
     all.extend(descendants_of(&seeds, &children));
     all.retain(|pid| *pid > 1 && !protected.contains(pid));
-    order_parent_first(&all, &parent_map(&entries))
-}
-
-/// This process and every ancestor of it: never signalled.
-fn protected_pids(procs: &[Proc]) -> HashSet<u32> {
-    let me = std::process::id();
-    let parents = parent_map(&as_entries(procs));
-    let mut set = crate::orphan_process_reaper::ancestors_of(me, &parents);
-    set.insert(me);
-    set
+    (order_parent_first(&all, &parent_map(&entries)), leader)
 }
 
 /// Whether `unit` is a loaded systemd user unit. `false` on any error.
@@ -248,12 +444,55 @@ fn stop_scope(unit: &str) -> Result<(), String> {
     }
 }
 
+/// This process's own process group.
+fn own_pgid() -> u32 {
+    // SAFETY: `getpgrp` takes no arguments, cannot fail and touches no memory.
+    u32::try_from(unsafe { libc::getpgrp() }).unwrap_or(0)
+}
+
+/// `SIGKILL` `spec`'s process group without reading the process table: the
+/// last resort when `ps` cannot answer, and what the H4 deadline uses to
+/// finish a pause whose teardown is stuck. Runs no external command, so it
+/// cannot hang.
+///
+/// Guarded as far as that allows: never group 0 or 1, never this daemon's own
+/// group, and (where a start time is derivable without `ps`, i.e. Linux) never
+/// a group whose leader pid now belongs to a process started well after the
+/// recorded one. Returns `true` when the signal was sent.
+pub fn force_kill_group(spec: &TreeSpec) -> bool {
+    let Some(pgid) = spec.pgid.or(spec.pid).filter(|g| *g > 1) else {
+        return false;
+    };
+    if pgid == own_pgid() || pgid == std::process::id() {
+        return false;
+    }
+    let recorded = spec.pid_started_at.or(spec.recorded_started_at);
+    if let Some(recorded) = recorded {
+        if crate::live_claim::pid_is_live_process(pgid)
+            && pid_identity::pid_was_recycled(pid_identity::pid_start_wallclock(pgid), recorded)
+        {
+            return false;
+        }
+    }
+    group_has_members(pgid) && send_group_signal(pgid, libc::SIGKILL)
+}
+
 /// Stop `spec`'s whole tree. Never fails: every leg is best-effort and the
 /// report says what is left.
 #[must_use]
 pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
+    teardown_tree_with(spec, grace, &ProcSource::system())
+}
+
+/// [`teardown_tree`] with an explicit process-table source.
+#[must_use]
+pub fn teardown_tree_with(spec: &TreeSpec, grace: Duration, source: &ProcSource) -> TeardownReport {
     let started = Instant::now();
     let mut report = TeardownReport::default();
+    let finish = |mut report: TeardownReport| {
+        report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        report
+    };
 
     if let Some(unit) = spec.scope_unit.as_deref() {
         match stop_scope(unit) {
@@ -262,14 +501,39 @@ pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
         }
     }
 
-    let with_cwd = spec.worktree.is_some();
-    let procs = process_table(with_cwd);
-    let protected = protected_pids(&procs);
-    let pids = plan_tree(spec, &procs, &protected);
+    let Some(procs) = source.table() else {
+        // No table, so no tree and no identity check: the group is all that
+        // can still be reached.
+        let killed = force_kill_group(spec);
+        report.reach_note = Some(format!(
+            "the process table could not be read within {}s; {}",
+            source.timeout.as_secs(),
+            if killed {
+                "sent SIGKILL to the process group only"
+            } else {
+                "nothing was signalled"
+            }
+        ));
+        return finish(report);
+    };
+    let me = std::process::id();
+    let protected = protected_pids(&procs, me, spec.pid);
+    let daemon_tty = procs
+        .iter()
+        .find(|p| p.pid == me)
+        .and_then(|p| p.tty.clone());
+    let (pids, leader) = plan_tree(spec, &procs, &protected, daemon_tty.as_deref());
+    if leader == Leader::Stranger {
+        report.reach_note = Some(format!(
+            "pid {:?} is no longer the recorded process (its start time differs or cannot be \
+             checked): the pid number was recycled, so neither it nor its group was signalled",
+            spec.pid
+        ));
+    }
     if !pids.is_empty() {
         let tree = OrphanTree {
             issue: 0,
-            worktree: spec.worktree.clone().unwrap_or_default(),
+            worktree: PathBuf::new(),
             seeds: pids.clone(),
             pids: pids.clone(),
             details: Vec::new(),
@@ -278,7 +542,7 @@ pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
         // The post-freeze re-snapshot must come from the same table source, so
         // a child forked between the scan and the freeze is caught on macOS
         // too (the orphan reaper's own snapshot is `/proc`-only).
-        let snapshot = || as_entries(&process_table(false));
+        let snapshot = || as_entries(&source.table().unwrap_or_default());
         let signal = |pid: u32, sig: i32| !protected.contains(&pid) && send_signal(pid, sig);
         let hooks = ReapHooks {
             signal: &signal,
@@ -293,7 +557,12 @@ pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
         // this daemon's own unreaped child. Only a pid still in the (zombie-
         // free) table really survived.
         if !outcome.survivors.is_empty() {
-            let live: HashSet<u32> = process_table(false).iter().map(|p| p.pid).collect();
+            let live: HashSet<u32> = source
+                .table()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.pid)
+                .collect();
             report.survivors = outcome
                 .survivors
                 .into_iter()
@@ -302,195 +571,36 @@ pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
         }
     }
 
-    // Leg 3: whatever is still in the group.
-    if let Some(pgid) = spec.pgid.filter(|g| *g > 1 && !protected.contains(g)) {
-        if group_has_members(pgid) {
-            send_group_signal(pgid, libc::SIGKILL);
+    // Leg 3: whatever is still in the group, unless the group number went
+    // with a recycled pid.
+    if leader != Leader::Stranger {
+        if let Some(pgid) = spec
+            .pgid
+            .filter(|g| *g > 1 && !protected.contains(g) && *g != own_pgid())
+        {
+            if group_has_members(pgid) {
+                send_group_signal(pgid, libc::SIGKILL);
+            }
         }
     }
-    report.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    report
+    finish(report)
 }
 
-/// Whether `pid` is a running process: alive and not a zombie. A child that
-/// exited but has not been reaped still answers `kill(pid, 0)`; H4 holds the
-/// sweep reaper off its items, so that is exactly the state an agent that
-/// ended by itself is left in.
+/// The start time of each of `pids` in one table read, for the identity a
+/// [`TreeSpec`] carries. Empty when the table cannot be read.
 #[must_use]
-pub fn pid_running(pid: u32) -> bool {
-    if !crate::sweep_registry::is_pid_alive(pid) {
-        return false;
-    }
-    let Ok(out) = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-    else {
-        return true; // cannot tell: the liveness probe said alive
+pub fn observe_starts(pids: &[u32]) -> HashMap<u32, DateTime<Utc>> {
+    let Some(procs) = process_table() else {
+        return HashMap::new();
     };
-    let stat = String::from_utf8_lossy(&out.stdout);
-    let stat = stat.trim();
-    !(stat.is_empty() && !out.status.success()) && !stat.starts_with('Z')
-}
-
-/// Whether anything of `spec`'s tree is still alive: its pid, its group, or a
-/// process working in its worktree.
-#[cfg(test)]
-#[must_use]
-pub fn tree_alive(spec: &TreeSpec) -> bool {
-    if spec.pid.is_some_and(pid_running) {
-        return true;
-    }
-    let procs = process_table(false);
-    if spec
-        .pgid
-        .is_some_and(|g| g > 1 && procs.iter().any(|p| p.pgid == g))
-    {
-        return true;
-    }
-    spec.worktree.as_deref().is_some_and(worktree_has_processes)
-}
-
-#[cfg(test)]
-fn worktree_has_processes(worktree: &std::path::Path) -> bool {
-    let procs = process_table(true);
-    let protected = protected_pids(&procs);
-    as_entries(&procs)
+    procs
         .iter()
-        .any(|e| !protected.contains(&e.pid) && references_worktree(e, worktree))
+        .filter(|p| pids.contains(&p.pid))
+        .filter_map(|p| Some((p.pid, p.started_at?)))
+        .collect()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    fn p(pid: u32, ppid: u32, pgid: u32, cmd: &str) -> Proc {
-        Proc {
-            pid,
-            ppid,
-            pgid,
-            cmdline: cmd.to_string(),
-            cwd: None,
-        }
-    }
-
-    #[test]
-    fn ps_rows_parse_with_spaces_in_the_command() {
-        let procs = parse_ps(
-            "  10     1    10 Ss /bin/sh -c sleep 5\n bad line\n 11 10 10 S+ sleep 5\n 12 10 10 Z (perl)\n",
-        );
-        assert_eq!(procs.len(), 2, "the zombie row is dropped");
-        assert_eq!(procs[0].cmdline, "/bin/sh -c sleep 5");
-        assert_eq!((procs[1].pid, procs[1].ppid, procs[1].pgid), (11, 10, 10));
-    }
-
-    #[test]
-    fn lsof_cwd_rows_parse() {
-        let map = parse_lsof_cwds("p10\nfcwd\nn/w/issue-1\np11\nn/elsewhere\n");
-        assert_eq!(map[&10], PathBuf::from("/w/issue-1"));
-        assert_eq!(map[&11], PathBuf::from("/elsewhere"));
-    }
-
-    /// A pgid-only kill is not enough (`orphan_process_reaper.rs:16-35`): the
-    /// plan follows the ppid link across a `setsid`, and picks up a reparented
-    /// process by its worktree.
-    #[test]
-    fn the_plan_covers_the_group_a_setsid_child_and_a_worktree_orphan() {
-        let wt = PathBuf::from("/r/.loom/worktrees/issue-7");
-        let mut orphan = p(400, 1, 400, "vite --port 5173");
-        orphan.cwd = Some(wt.join("app"));
-        let procs = vec![
-            p(100, 50, 100, "spawn-claude.sh"),
-            p(101, 100, 100, "claude -p"),
-            p(102, 101, 102, "timeout 60 ngspice"), // new group
-            p(103, 102, 103, "dev-server"),         // setsid'd, still a descendant
-            p(200, 50, 200, "other agent"),
-            orphan,
-            p(500, 1, 500, "/usr/bin/tool --cwd /r/.loom/worktrees/issue-70"),
-        ];
-        let spec = TreeSpec {
-            pid: Some(100),
-            pgid: Some(100),
-            scope_unit: None,
-            worktree: Some(wt),
-        };
-        let plan = plan_tree(&spec, &procs, &HashSet::new());
-        let set: HashSet<u32> = plan.iter().copied().collect();
-        assert_eq!(set, HashSet::from([100, 101, 102, 103, 400]));
-        // Parent-first: the leader is frozen before its children.
-        let pos = |pid| plan.iter().position(|x| *x == pid).unwrap();
-        assert!(pos(100) < pos(101) && pos(101) < pos(102) && pos(102) < pos(103));
-    }
-
-    #[test]
-    fn the_daemon_and_its_ancestors_are_never_planned() {
-        let procs = vec![
-            p(1, 0, 1, "launchd"),
-            p(50, 1, 50, "loom-daemon"),
-            p(100, 50, 100, "a"),
-        ];
-        let spec = TreeSpec {
-            pid: Some(50), // a corrupt record naming the daemon itself
-            pgid: None,
-            scope_unit: None,
-            worktree: None,
-        };
-        let plan = plan_tree(&spec, &procs, &HashSet::from([50, 1]));
-        assert_eq!(plan, vec![100], "descendants only; never the protected pids");
-    }
-
-    /// The real thing: a tree whose child has left the process group with
-    /// `setsid` is entirely gone after the teardown, and a recorded scope unit
-    /// that does not exist falls back to the tree kill.
-    #[test]
-    fn a_real_tree_with_a_setsid_child_is_fully_stopped() {
-        use std::os::unix::process::CommandExt;
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
-        // The child calls setsid() (new session AND group), records its pid
-        // and sleeps; the parent sleeps too.
-        let script = format!(
-            "perl -e 'use POSIX; my $p = fork(); if ($p == 0) {{ POSIX::setsid(); \
-             open(my $f, \">\", \"{}\"); print $f $$; close($f); sleep 300; exit 0 }} sleep 300'",
-            pidfile.display()
-        );
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&script).process_group(0);
-        let mut child = cmd.spawn().unwrap();
-        let pid = child.id();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let setsid_pid: u32 = loop {
-            if let Some(n) = std::fs::read_to_string(&pidfile)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                break n;
-            }
-            assert!(Instant::now() < deadline, "the setsid child never started");
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        assert!(crate::sweep_registry::is_pid_alive(setsid_pid));
-
-        let spec = TreeSpec {
-            pid: Some(pid),
-            pgid: Some(pid),
-            scope_unit: Some("loom-agent-does-not-exist.scope".to_string()),
-            worktree: None,
-        };
-        let report = teardown_tree(&spec, Duration::from_millis(300));
-        let _ = child.wait();
-        assert!(!report.scope_stopped, "the recorded scope never existed");
-        assert!(report.scope_note.is_some());
-        assert!(report.pids.contains(&setsid_pid), "{report:?}");
-        assert!(report.survivors.is_empty(), "{report:?}");
-        let gone = Instant::now() + Duration::from_secs(5);
-        while crate::sweep_registry::is_pid_alive(setsid_pid) && Instant::now() < gone {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            !crate::sweep_registry::is_pid_alive(setsid_pid),
-            "the setsid'd child outlived the teardown"
-        );
-        assert!(!tree_alive(&spec));
-    }
-}
+#[path = "teardown_tests.rs"]
+mod tests;

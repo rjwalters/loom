@@ -237,8 +237,9 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
 | `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
 | `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
-| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items}` (the manifest could not be written; nothing was signalled) |
-| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`) |
+| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
+| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`; a standing refusal is published once, then at most every 5 minutes) |
 | `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
 | `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
@@ -11846,13 +11847,17 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   (in the Loom repository); this is the old-binary side (H3 → H4), and the resume
   side (H5) is #10832.
   - **What it does (H4).** It sets the same dispatch-pause flag, with origin
-    `pause-roll`, then: waits for `Pending` dispatches to settle; snapshots every
-    daemon-dispatched agent (sweeps in every managed root, plus role runs);
+    `pause-roll`, then: closes dispatch in every registry and in the role
+    runner (a dispatch that had already passed the flag is refused too) and
+    waits, for at most 30s, for any dispatch that is mid-spawn to be recorded;
+    snapshots every daemon-dispatched agent (sweeps in every managed root, plus role runs);
     writes the pause manifest (`roll-pause-manifest.json` in the auto-update
     state dir, `phase = pausing`) **before signalling anything**; stops at once
     every agent it will not resume; asks the rest to stop at a **safe point** (a
     moment between tool calls, via the `roll-pause` hook) and stops each one's
-    whole process tree as soon as its safe-point record appears; refreshes each
+    whole process tree as soon as its safe-point record **for this pause**
+    appears (a record left by an earlier pause that stood down is never
+    trusted); refreshes each
     paused agent's lease once; requeues whatever has not parked when
     `pauseRoll.pauseBudgetSecs` runs out; does the requeue forge writes; rewrites
     the manifest with `phase = paused`; and exits for the supervised relaunch.
@@ -11874,8 +11879,12 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     pause has taken it over.
   - **Process trees.** Stopping an agent stops everything it started: the
     recorded systemd scope when it really exists (`systemctl --user stop`), and
-    always a freeze-first kill of its process group, its descendants (followed
-    through `setsid`) and every process working in its worktree. A recorded
+    always a freeze-first kill of its process group and its descendants
+    (followed through `setsid`). Nothing else is signalled: a process is not
+    part of the tree because it runs in the agent's worktree, the daemon, its
+    ancestors and its other children are excluded before descendants are
+    followed, and a pid is signalled only while its start time is still the one
+    recorded at the snapshot (a recycled pid is left alone). A recorded
     scope unit that was never created falls back to that tree kill. A
     containerized (session-exec) agent's invocation is cancelled through the
     spawn script's `.cancel` marker; the session container keeps running.
@@ -11884,7 +11893,19 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     is still live: the roll is **refused** (`daemon.roll.refused`, ERROR) and
     nothing is paused. A manifest that cannot be written aborts the pause before
     anything is signalled and dispatch resumes (`daemon.roll.pause_failed`).
-    There is no drain fallback in any of these cases.
+    There is no drain fallback in any of these cases. While the previous
+    roll's manifest stays live the refusal repeats on every tick; it is logged
+    and published once per manifest, then at most every 5 minutes.
+  - **It always ends.** Every command H4 runs is bounded, and the pause as a
+    whole has a deadline: its settle window, `pauseBudgetSecs`, the 30s forge
+    floor and a 90s margin (270s with the defaults). Past it, a pause that has
+    stopped nothing is ended, its requests, holds and manifest are removed and
+    dispatch resumes (`daemon.roll.pause_failed`); one that has already stopped
+    an agent kills what is left by process group, records those agents
+    `requeue` / `planned` / `pause-budget-missed` in the manifest (left at
+    `phase = pausing`, which the next start finishes) and restarts
+    (`daemon.roll.forced`). Dispatch is never left paused with
+    `--abort-drain` refused.
   - **Operator commands during a pause.** Until the pause has stopped an agent,
     `restart --drain` promotes it to an ordinary operator drain (the pause
     withdraws its requests, deletes its manifest and stops nothing) and

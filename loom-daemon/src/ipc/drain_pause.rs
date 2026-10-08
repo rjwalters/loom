@@ -101,6 +101,34 @@ impl DrainState {
         self.pause_update(generation, |p| p.stopped = true) == PauseOwnership::Ours
     }
 
+    /// End the pause roll of `generation` **if it has not committed**: clear
+    /// the dispatch-pause flag, bump the generation (so its supervisor stands
+    /// down) and record `note`. Returns `false`, changing nothing, when the
+    /// pause has already stopped an agent, was promoted, or is gone. Decided
+    /// under the descriptor lock, like [`Self::pause_commit_stop`], so "end it"
+    /// and "stop an agent" can never both win (#10974: the H4 deadline and a
+    /// failed H4 task use this instead of an unconditional clear).
+    pub fn pause_abort_uncommitted(&self, generation: u64, note: String) -> bool {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if self.generation() != generation
+            || !inner.active
+            || inner.origin != DrainOrigin::PauseRoll
+            || inner.pause.as_ref().is_some_and(|p| p.stopped)
+        {
+            return false;
+        }
+        self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.roll_target = None;
+        inner.pause = None;
+        inner.note = Some(note);
+        self.ledger_after(inner, chrono::Utc::now(), false);
+        true
+    }
+
     /// The active drain's terminal action: `true` ⇒ exit and stay down.
     #[must_use]
     pub fn then_exit(&self) -> bool {
