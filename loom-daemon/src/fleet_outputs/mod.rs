@@ -22,12 +22,14 @@
 //! Slice 1 only: no delivery wiring and no runtime behaviour change. Later
 //! slices feed [`Condition`]s into `fleet_alert` and add a SigNoz rule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::observability::captain_gauges::{QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB, STAR_FACTS_JOB};
+use crate::observability::captain_gauges::{
+    self as gauges, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB, STAR_FACTS_JOB,
+};
 
 #[cfg(test)]
 mod registry_tests;
@@ -66,6 +68,13 @@ pub enum Gate {
 /// The `job` name of every [`Gate::EtaAuthority`] row.
 pub const ETA_AUTHORITY: &str = "eta-authority";
 
+/// Config toggle: every ETA job (`EtaConfig::enabled`).
+pub const ETA_ENABLED_KEY: &str = "autonomous.eta.enabled";
+/// Config toggle: the nightly backtest folds (`EtaConfig::nightly_folds_enabled`).
+pub const ETA_NIGHTLY_FOLDS_KEY: &str = "autonomous.eta.nightlyFolds.enabled";
+/// Config toggle: the CI telemetry poller (`ci_telemetry::Settings::enabled`).
+pub const CI_TELEMETRY_KEY: &str = "autonomous.ciTelemetry.enabled";
+
 /// One output a singleton job is obliged to keep producing.
 #[derive(Debug, Clone, Copy)]
 pub struct SingletonOutput {
@@ -79,6 +88,9 @@ pub struct SingletonOutput {
     /// `deadline_override` is set.
     pub cadence: Duration,
     pub severity: Severity,
+    /// Config toggles that must all be on for the job to run. The row is not
+    /// evaluated while any is in [`OutputSource::disabled`].
+    pub enabled_by: &'static [&'static str],
     /// Explicit deadline when the producer's own staleness contract is not
     /// `2 * cadence` (captain gauges: `maxAgeSecs`).
     pub deadline_override: Option<Duration>,
@@ -104,6 +116,7 @@ const fn job(
     kind: &'static str,
     scope: Scope,
     cadence: Duration,
+    enabled_by: &'static [&'static str],
 ) -> SingletonOutput {
     SingletonOutput {
         job,
@@ -112,16 +125,21 @@ const fn job(
         scope,
         cadence,
         severity: Severity::Critical,
+        enabled_by,
         deadline_override: None,
     }
 }
 
-const fn gauge(job_name: &'static str, kind: &'static str) -> SingletonOutput {
+const fn gauge(
+    job_name: &'static str,
+    kind: &'static str,
+    enabled_by: &'static [&'static str],
+) -> SingletonOutput {
     SingletonOutput {
         deadline_override: Some(Duration::from_secs(
             crate::observability::captain_gauges::DEFAULT_MAX_AGE_SECS as u64,
         )),
-        ..job(job_name, kind, Scope::FleetWide, mins(10))
+        ..job(job_name, kind, Scope::FleetWide, mins(10), enabled_by)
     }
 }
 
@@ -133,6 +151,7 @@ const fn authority(kind: &'static str, scope: Scope, cadence: Duration) -> Singl
         scope,
         cadence,
         severity: Severity::Critical,
+        enabled_by: &[ETA_ENABLED_KEY],
         deadline_override: None,
     }
 }
@@ -146,26 +165,45 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
         "eta.fleet_refresh",
         Scope::PerRepo,
         hours(1),
+        &[ETA_ENABLED_KEY],
     ),
+    // Stamped at the folded day's cutoff (end of UTC day D), not at emission:
+    // a healthy observed age peaks near 24h + the run window, inside 48h
+    // (`fold_stamp_lag_fits_the_deadline`).
     job(
         crate::eta::nightly_folds::SINGLETON_JOB_NAME,
         "eta.backtest.fold",
         Scope::FleetWide,
         hours(24),
+        &[ETA_ENABLED_KEY, ETA_NIGHTLY_FOLDS_KEY],
     ),
     // Runs complete fleet-wide around the clock, but a quiet spell is legal:
     // a long cadence and Warning, not Critical.
     SingletonOutput {
         severity: Severity::Warning,
-        ..job(crate::ci_telemetry::SINGLETON_JOB_NAME, "ci.run", Scope::FleetWide, hours(3))
+        ..job(
+            crate::ci_telemetry::SINGLETON_JOB_NAME,
+            "ci.run",
+            Scope::FleetWide,
+            hours(3),
+            &[CI_TELEMETRY_KEY],
+        )
     },
     // Captain gauges: the per-job `as_of` in the `captain-gauges/v1`
     // heartbeat, published every 600s by default.
     // The deadline is the heartbeat's own `maxAgeSecs` (1800s), not 2x cadence
     // (1200s): one missed publish puts `as_of` near 1500s and must not fire.
-    gauge(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell"),
-    gauge(STAR_FACTS_JOB, "captain-gauges/v1:star-facts"),
-    gauge(QUEUE_BLOCKED_JOB, "captain-gauges/v1:queue-blocked"),
+    gauge(STAGE_DWELL_JOB, "captain-gauges/v1:stage-dwell", &[gauges::ENABLED_KEY]),
+    gauge(
+        STAR_FACTS_JOB,
+        "captain-gauges/v1:star-facts",
+        &[gauges::ENABLED_KEY, gauges::STAR_FACTS_KEY],
+    ),
+    gauge(
+        QUEUE_BLOCKED_JOB,
+        "captain-gauges/v1:queue-blocked",
+        &[gauges::ENABLED_KEY, gauges::QUEUE_BLOCKED_KEY],
+    ),
     // The ETA authority: the daily fit check (emitted fitted or skipped) and
     // per-repo estimates (the 10-07 incident).
     authority("eta.fit", Scope::FleetWide, hours(24)),
@@ -174,11 +212,18 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
 
 /// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each with
 /// a reason.
-pub const EXEMPT: &[(&str, &str)] = &[(
-    crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
-    "emits no record kind yet: its output is forge labels, and a pass that finds nothing to \
-     label is healthy; needs a pass heartbeat before it can be watched (#10916 follow-up)",
-)];
+pub const EXEMPT: &[(&str, &str)] = &[
+    (
+        crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
+        "emits no record kind yet: its output is forge labels, and a pass that finds nothing to \
+         label is healthy; needs a pass heartbeat before it can be watched (#10916 follow-up)",
+    ),
+    (
+        crate::eta::retire_filing::JOB_NAME,
+        "runs inside eta-nightly-folds (whose eta.backtest.fold row watches the host) and its \
+         output is forge issues, filed only when a heuristic should retire: silence is healthy",
+    ),
+];
 
 /// Every source file (relative to `loom-daemon/src`) that calls
 /// `eta::authority::resolve{,_with}`, and the registry `record_kind` that call
@@ -212,6 +257,49 @@ pub trait OutputSource {
     fn expected_repos(&self, _record_kind: &str) -> Option<Vec<String>> {
         None
     }
+    /// Config toggles (see [`SingletonOutput::enabled_by`]) that are **off**.
+    /// Listing what is off, not what is on, keeps a source that never read
+    /// the config loud: the default is empty, so every row is judged.
+    fn disabled(&self) -> BTreeSet<&'static str> {
+        BTreeSet::new()
+    }
+}
+
+/// One open forge item, for [`estimate_owed`].
+#[derive(Debug, Clone)]
+pub struct OpenItem {
+    pub repo: String,
+    pub opened_at: DateTime<Utc>,
+    /// Whether the item's newest observed `eta.estimate` is a refusal; `None`
+    /// when none was observed yet. A refusal is emitted once and never
+    /// refreshed, so the caller needs an unbounded look-back for it (or a
+    /// source that does not age out): once a refusal ages out of the window
+    /// this becomes `None`, and an all-abstaining repo owes again.
+    pub newest_refused: Option<bool>,
+}
+
+/// The repos that owe `eta.estimate`: the pure producer for
+/// [`OutputSource::expected_repos`], from the forge's open items and the
+/// observed records, never from the authority.
+///
+/// An estimable item is refreshed every pass (`eta::emit`); a refusal is
+/// emitted once and not refreshed; a first emission always goes out. So a
+/// repo owes estimates while one of its open items is not refused. An item
+/// with no record yet gets `grace` from when it opened (pass the row's
+/// deadline) before it counts, so a just-opened item does not fire. A repo
+/// with no open item (idle) or whose items all abstain owes nothing.
+#[must_use]
+pub fn estimate_owed(open: &[OpenItem], now: DateTime<Utc>, grace: Duration) -> Vec<String> {
+    let grace = chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX);
+    let owing: BTreeSet<&str> = open
+        .iter()
+        .filter(|i| match i.newest_refused {
+            Some(refused) => !refused,
+            None => now.signed_duration_since(i.opened_at) > grace,
+        })
+        .map(|i| i.repo.as_str())
+        .collect();
+    owing.into_iter().map(str::to_owned).collect()
 }
 
 /// One output currently missing or stale.
@@ -227,6 +315,8 @@ pub struct Condition {
 
 /// Judge `registry` against `observed` at `now`. Absent data is firing.
 ///
+/// A row whose `enabled_by` toggle is in [`OutputSource::disabled`] is skipped.
+///
 /// A per-repo output must be fresh for every `roster` repo. An empty roster
 /// (unknown, not "no repos") cannot excuse silence: the output must then be
 /// fresh for at least one repo.
@@ -237,8 +327,10 @@ pub fn evaluate(
     roster: &[String],
     now: DateTime<Utc>,
 ) -> Vec<Condition> {
+    let disabled = observed.disabled();
     registry
         .iter()
+        .filter(|o| !o.enabled_by.iter().any(|k| disabled.contains(k)))
         .filter_map(|o| {
             let headline = judge(o, observed, roster, now)?;
             Some(Condition {

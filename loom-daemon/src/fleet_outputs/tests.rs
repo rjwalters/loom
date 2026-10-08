@@ -6,6 +6,7 @@ struct Fake {
     fleet: BTreeMap<&'static str, DateTime<Utc>>,
     repos: BTreeMap<&'static str, BTreeMap<String, DateTime<Utc>>>,
     expected: BTreeMap<&'static str, Vec<String>>,
+    disabled: BTreeSet<&'static str>,
 }
 impl OutputSource for Fake {
     fn last_seen(&self, k: &str) -> Option<DateTime<Utc>> {
@@ -16,6 +17,9 @@ impl OutputSource for Fake {
     }
     fn expected_repos(&self, k: &str) -> Option<Vec<String>> {
         self.expected.get(k).cloned()
+    }
+    fn disabled(&self) -> BTreeSet<&'static str> {
+        self.disabled.clone()
     }
 }
 
@@ -28,8 +32,8 @@ fn ago(m: i64) -> DateTime<Utc> {
 fn roster(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("org/repo{i}")).collect()
 }
-const FLEET: SingletonOutput = job("j", "k", Scope::FleetWide, mins(30));
-const PER_REPO: SingletonOutput = job("j", "e", Scope::PerRepo, mins(30));
+const FLEET: SingletonOutput = job("j", "k", Scope::FleetWide, mins(30), &[]);
+const PER_REPO: SingletonOutput = job("j", "e", Scope::PerRepo, mins(30), &[]);
 
 fn row_for(kind: &str) -> SingletonOutput {
     *SINGLETON_OUTPUTS
@@ -283,4 +287,176 @@ fn captain_gauges_tolerate_one_missed_publish() {
             .insert(kind, now() - chrono::Duration::seconds(1801));
         assert_eq!(evaluate(&[row], &f, &[], now()).len(), 1, "{kind}");
     }
+}
+
+fn kinds(c: &[Condition]) -> Vec<&'static str> {
+    c.iter().map(|c| c.record_kind).collect()
+}
+
+fn item(repo: &str, opened: DateTime<Utc>, refused: Option<bool>) -> OpenItem {
+    OpenItem {
+        repo: repo.to_string(),
+        opened_at: opened,
+        newest_refused: refused,
+    }
+}
+
+fn grace() -> Duration {
+    row_for("eta.estimate").deadline()
+}
+
+/// An idle repo (no open item) and an all-abstaining repo (every newest
+/// record a refusal) owe nothing; one estimable item flips it back.
+#[test]
+fn estimate_owed_skips_idle_and_all_abstaining_repos() {
+    let r = roster(3);
+    let mut open = vec![
+        item(&r[0], ago(600), Some(false)),
+        item(&r[1], ago(60 * 48), Some(true)),
+        item(&r[1], ago(60 * 48), Some(true)),
+    ];
+    // r[2] has no open item at all.
+    assert_eq!(estimate_owed(&open, now(), grace()), [r[0].clone()]);
+    open.push(item(&r[1], ago(600), Some(false)));
+    assert_eq!(estimate_owed(&open, now(), grace()), [r[0].clone(), r[1].clone()]);
+    assert!(estimate_owed(&[], now(), grace()).is_empty());
+}
+
+/// A just-opened item has no record yet: it counts only after one deadline.
+#[test]
+fn new_item_gets_a_deadline_of_grace() {
+    let r = roster(1);
+    let open = [item(&r[0], ago(10), None)];
+    assert!(estimate_owed(&open, now(), grace()).is_empty());
+    let late = now() + chrono::Duration::from_std(grace()).unwrap();
+    assert_eq!(estimate_owed(&open, late, grace()), [r[0].clone()]);
+}
+
+/// End to end through `estimate_owed`: the idle and all-abstaining repos are
+/// quiet, and the fleet stays quiet.
+#[test]
+fn idle_and_abstaining_repos_stay_quiet_end_to_end() {
+    let r = roster(30);
+    let mut f = whole_fleet_at(ago(1), &r);
+    // repo0 idle, repo1 all-abstaining: both stale or absent, neither owes.
+    let est = f.repos.get_mut("eta.estimate").unwrap();
+    est.insert(r[0].clone(), ago(60 * 72));
+    est.remove(&r[1]);
+    let mut open: Vec<OpenItem> = r[2..]
+        .iter()
+        .map(|n| item(n, ago(600), Some(false)))
+        .collect();
+    open.push(item(&r[1], ago(60 * 48), Some(true)));
+    f.expected
+        .insert("eta.estimate", estimate_owed(&open, now(), grace()));
+    let c = evaluate(SINGLETON_OUTPUTS, &f, &r, now());
+    assert!(c.is_empty(), "{c:?}");
+}
+
+/// 10-07 through `estimate_owed`: live items in every repo, 28 gone silent.
+#[test]
+fn replay_10_07_fires_through_estimate_owed() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let open: Vec<OpenItem> = r
+        .iter()
+        .map(|n| item(n, ago(60 * 40), Some(false)))
+        .collect();
+    let mut f = Fake::default();
+    f.expected
+        .insert("eta.estimate", estimate_owed(&open, now(), grace()));
+    f.repos.insert(
+        "eta.estimate",
+        r.iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), if i < 2 { ago(5) } else { ago(31 * 60) }))
+            .collect(),
+    );
+    let c = evaluate(&[row], &f, &r, now());
+    assert_eq!(c.len(), 1);
+    assert!(c[0].headline.contains("2 of 30"), "{}", c[0].headline);
+}
+
+/// A caller that never supplied the owing set keeps main's roster fallback:
+/// the 10-07 shape (2 of 30 fresh) fires at 2x cadence + 1 min.
+#[test]
+fn replay_10_07_without_an_owed_set_still_fires() {
+    let row = row_for("eta.estimate");
+    let r = roster(30);
+    let stop = now();
+    let mut f = Fake::default();
+    let deadline = chrono::Duration::from_std(row.deadline()).unwrap();
+    let late = stop + deadline + chrono::Duration::minutes(1);
+    f.repos.insert(
+        "eta.estimate",
+        r.iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), if i < 2 { late } else { stop }))
+            .collect(),
+    );
+    let c = evaluate(&[row], &f, &r, late);
+    assert_eq!(c.len(), 1);
+    assert!(c[0].headline.contains("2 of 30"), "{}", c[0].headline);
+}
+
+/// Every captain-gauges deadline is at least the bound the dispatchers use
+/// for that job.
+#[test]
+fn captain_gauge_deadlines_cover_the_heartbeat_contract() {
+    for (job, bound) in [
+        (STAGE_DWELL_JOB, gauges::DEFAULT_MAX_AGE_SECS),
+        (QUEUE_BLOCKED_JOB, gauges::DEFAULT_MAX_AGE_SECS),
+        (STAR_FACTS_JOB, gauges::DEFAULT_STAR_FACTS_MAX_AGE_SECS),
+    ] {
+        let row = SINGLETON_OUTPUTS.iter().find(|o| o.job == job).unwrap();
+        assert!(row.deadline().as_secs() >= bound.unsigned_abs(), "{job}");
+    }
+}
+
+/// Opt-in jobs: a fleet with them off is not owed their output; the rest of
+/// the registry is still judged, and a source that never read the config
+/// (empty `disabled`) stays loud.
+#[test]
+fn disabled_opt_in_jobs_do_not_fire() {
+    let r = roster(30);
+    let mut f = whole_fleet_at(ago(1), &r);
+    for o in SINGLETON_OUTPUTS {
+        if o.record_kind.starts_with("captain-gauges/v1:") || o.record_kind == "ci.run" {
+            f.fleet.remove(o.record_kind);
+        }
+    }
+    assert_eq!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).len(), 4);
+    f.disabled = BTreeSet::from([gauges::ENABLED_KEY, CI_TELEMETRY_KEY]);
+    assert!(evaluate(SINGLETON_OUTPUTS, &f, &r, now()).is_empty());
+    // Only the sub-switches off: stage-dwell is still owed.
+    f.disabled = BTreeSet::from([
+        gauges::STAR_FACTS_KEY,
+        gauges::QUEUE_BLOCKED_KEY,
+        CI_TELEMETRY_KEY,
+    ]);
+    assert_eq!(
+        kinds(&evaluate(SINGLETON_OUTPUTS, &f, &r, now())),
+        ["captain-gauges/v1:stage-dwell"]
+    );
+    // ETA off: every ETA row is skipped even with no ETA data at all.
+    let off = Fake {
+        disabled: BTreeSet::from([gauges::ENABLED_KEY, CI_TELEMETRY_KEY, ETA_ENABLED_KEY]),
+        ..Fake::default()
+    };
+    assert!(evaluate(SINGLETON_OUTPUTS, &off, &r, now()).is_empty());
+}
+
+/// `eta.backtest.fold` is stamped at the folded day's cutoff (end of UTC day
+/// D) and folded after `RUN_AFTER` on D+1 by an hourly check. The worst
+/// healthy observed age is a day plus that run window, which must leave at
+/// least half a day of slack for one late run.
+#[test]
+fn fold_stamp_lag_fits_the_deadline() {
+    use crate::eta::nightly_folds::RUN_AFTER;
+    use crate::observability::eta_nightly_folds::CHECK_INTERVAL;
+    let row = row_for("eta.backtest.fold");
+    let run_after =
+        Duration::from_secs(u64::from(RUN_AFTER.0) * 3600 + u64::from(RUN_AFTER.1) * 60);
+    let worst_healthy = hours(24) + run_after + CHECK_INTERVAL;
+    assert!(row.deadline() >= worst_healthy + hours(12), "{worst_healthy:?}");
 }
