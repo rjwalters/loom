@@ -1274,8 +1274,9 @@ fi
 # collide on its scope unit (the scope was named at the systemd-run probe above).
 # LOOM_CLAUDE_SESSION_ID is dropped below, on the direct path only, because
 # claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
-# a nested agent shares the item's pause state.
-unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT
+# a nested agent shares the item's pause state. The proxied host half keeps
+# them: its in-container copy receives them by name and drops them itself.
+[[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT
 
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
