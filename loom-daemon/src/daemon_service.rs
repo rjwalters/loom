@@ -1479,9 +1479,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // sole sampler — a daemon with no work-finder never trips it (and its
         // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
         let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
-        host_breaker::register_global(std::sync::Arc::new(host_breaker::SharedHostBreaker::new(
-            host_breaker_config,
-        )));
+        host_breaker::register_global(std::sync::Arc::new(
+            host_breaker::SharedHostBreaker::new(host_breaker_config)
+                .with_disk_guard(&sweep_workspace),
+        ));
         log::info!(
             "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
             host_breaker_config.enabled,
