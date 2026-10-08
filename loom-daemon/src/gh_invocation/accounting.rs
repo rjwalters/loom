@@ -273,7 +273,7 @@ pub(super) fn record(
         // become the host's `other` budget reading (a zero there would read
         // as a host-wide `rate_limit_quota` stall). `parse_probe` books the
         // probe's readings into the bucket book on its own path.
-        (pool, classified, Some(&resp.ratelimit).filter(|_| !probe))
+        (pool, classified, (!probe).then_some(&resp.ratelimit))
     } else {
         let classified = match outcome {
             InvokeOutcome::Ok => Outcome::Ok,
