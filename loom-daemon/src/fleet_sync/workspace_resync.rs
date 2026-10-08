@@ -58,7 +58,7 @@ use crate::init::payload::{
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS_INSTALLED};
 
 pub use host::{host_gate, HostGateInputs, NotCurrent};
-pub(super) use host::{mark_boot, mark_verified, pass};
+pub(super) use host::{mark_boot, mark_verified, pass, registered_roots};
 
 /// Event-bus topic a resync failure that needs a person is published on.
 pub const ALERT_TOPIC: &str = "fleet_sync.workspace_resync";

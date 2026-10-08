@@ -197,7 +197,7 @@ fn memory() -> &'static Mutex<Memory> {
 }
 
 /// The registered workspaces that exist on this host.
-fn registered_roots() -> Vec<PathBuf> {
+pub(in crate::fleet_sync) fn registered_roots() -> Vec<PathBuf> {
     crate::workspace_registry::default_registry_path()
         .and_then(|p| crate::workspace_registry::WorkspaceRegistry::load(&p))
         .map(|r| r.roots())

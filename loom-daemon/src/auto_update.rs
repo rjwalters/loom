@@ -25,7 +25,12 @@
 //!    working checkout, so an unattended `cargo build --release` there would
 //!    compile whatever is uncommitted into the running daemon. The loop refuses
 //!    to build unless [`crate::self_update::source_tree_clean`] is `Some(true)`.
-//!    It never runs `git pull` on the operator's behalf.
+//!    It never runs `git pull` on the operator's behalf. (Fleet-sync may
+//!    fast-forward this checkout, as it does every registered workspace, on a
+//!    host with `fleet.autoApply` on — only when it is clean and strictly
+//!    behind, and never while this loop's update script is running in it:
+//!    [`crate::fleet_sync::checkout_ff`], #10869. That is not this loop
+//!    pulling, and this gate is unchanged by it.)
 //! 3. **Backoff on failure** — a source tree that does not compile must not
 //!    retry every tick forever. Retryable build failures back off exponentially
 //!    with a ceiling; the terminal give-up state is surfaced in `loom-daemon status`.
@@ -1025,6 +1030,9 @@ fn run_update_script_with(
         nice_child(&mut command);
     }
 
+    // #10869: the script verifies its build against this checkout's HEAD, so
+    // fleet-sync's fast-forward must not move it until the script has exited.
+    let _checkout = crate::fleet_sync::checkout_ff::hold_for_self_update(cwd);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {

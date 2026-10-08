@@ -26,6 +26,12 @@
 //!   pass, and once at startup, every registered repo's installed Loom is
 //!   compared with this daemon's own payload and, on a host in H0 with
 //!   `fleet.autoApply` on, resynced under a per-repo claim.
+//! - **The checkout fast-forward** ([`checkout_ff`], #10869): each registered
+//!   workspace's main checkout is fast-forwarded to its default branch when it
+//!   is clean and strictly behind, so a resync that landed on the forge is the
+//!   one this host dispatches from. It runs inside the startup pass (before
+//!   any dispatch producer exists) and last in every timer pass, after the
+//!   workspace resync. It writes only with `fleet.autoApply` on.
 //!
 //! # Invariants this module keeps
 //!
@@ -77,6 +83,7 @@ use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
 
+pub mod checkout_ff;
 pub mod workspace_resync;
 
 /// Config key for the timer cadence.
@@ -644,6 +651,11 @@ pub struct FleetSyncStatus {
         skip_serializing_if = "workspace_resync::WorkspacePass::is_unset"
     )]
     pub workspaces: workspace_resync::WorkspacePass,
+    /// Each registered workspace's main checkout, as the last checkout pass
+    /// found it (#10869). `#[serde(default)]` so an older snapshot still reads
+    /// back, and omitted until a checkout pass has run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkouts: Vec<checkout_ff::CheckoutReport>,
 }
 
 fn default_enforced() -> Enforcement {
@@ -792,6 +804,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     lines.extend(state_lines(s));
     lines.extend(floor_lines(&s.floor));
     lines.extend(s.workspaces.lines());
+    lines.extend(checkout_ff::lines(&s.checkouts));
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -975,6 +988,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         floor,
         // The last workspace pass's findings, until this tick's replace them.
         workspaces: cached_status().map(|s| s.workspaces).unwrap_or_default(),
+        // Likewise the last checkout pass's (#10869).
+        checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
     }
 }
 
@@ -1104,9 +1119,24 @@ pub struct Started {
     pub repo: String,
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
+    gate: Option<checkout_ff::GateProbe>,
 }
 
 impl Started {
+    /// Tell the timer's checkout fast-forward (#10869) how to ask whether a
+    /// main-health gate run is building in a workspace: the gate builds in
+    /// the main checkout, which must not move under it. The gate's states do
+    /// not exist yet when [`start`] runs, so they are handed over here.
+    #[must_use]
+    pub fn gated_by(
+        mut self,
+        health: &std::sync::Arc<crate::main_health_gate::WorkspaceHealthStates>,
+    ) -> Self {
+        let health = health.clone();
+        self.gate = Some(std::sync::Arc::new(move |root: &Path| health.is_gate_in_flight(root)));
+        self
+    }
+
     /// The daemon workspace this host syncs from — the fallback sweep root an
     /// [`crate::fleet_state::IpcEnforcer`]'s drain request needs.
     #[must_use]
@@ -1123,7 +1153,7 @@ impl Started {
         self,
         enforcer: Option<std::sync::Arc<dyn Enforcer>>,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_timer(self.inputs, self.bus, enforcer)
+        spawn_timer(self.inputs, self.bus, enforcer, self.gate)
     }
 }
 
@@ -1218,6 +1248,7 @@ pub async fn start(
         repo: inputs.location.repo.clone(),
         inputs,
         bus,
+        gate: None,
     })
 }
 
@@ -1232,17 +1263,23 @@ pub async fn start(
 /// `fleet.syncIntervalSecs` and enforces then.
 async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventBus>) -> StatePass {
     let owned = inputs.clone();
-    let join =
-        tokio::task::spawn_blocking(move || run_pass(&owned, "startup", Mode::Write, Utc::now()));
+    let join = tokio::task::spawn_blocking(move || {
+        let mut status = run_pass(&owned, "startup", Mode::Write, Utc::now());
+        // #10869: inside the startup pass, so a daemon that just rolled
+        // dispatches from the checkout its new installed files are in.
+        let moved = checkout_ff::startup(&owned, &mut status);
+        (status, moved)
+    });
     let capped = match resolve_startup_timeout(&|k| std::env::var(k).ok()) {
         Some(cap) => tokio::time::timeout(cap, join).await.map_err(|_| cap),
         None => Ok(join.await),
     };
     match capped {
-        Ok(Ok(status)) => {
+        Ok(Ok((status, moved))) => {
             workspace_resync::mark_verified();
             publish(&status);
             report(&status, bus);
+            checkout_ff::announce(&moved, bus);
             status.state
         }
         Ok(Err(e)) => {
@@ -1275,6 +1312,7 @@ fn spawn_timer(
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
     enforcer: Option<std::sync::Arc<dyn Enforcer>>,
+    gate: Option<checkout_ff::GateProbe>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mode = if inputs.auto_apply {
@@ -1284,9 +1322,14 @@ fn spawn_timer(
         };
         // #10718: the workspace resync also runs once at startup, now that the
         // startup pass is done and the drain state exists.
+        let began = std::time::Instant::now();
         workspace_resync::pass(&inputs, mode, cached_status(), &enforcer, &bus).await;
+        // #10869: the checkout half is always last, so a resync the workspace
+        // half just pushed is fast-forwarded to in the same pass.
+        checkout_ff::pass(&inputs, began, &gate, &bus).await;
         loop {
             tokio::time::sleep(inputs.interval).await;
+            let began = std::time::Instant::now();
             let owned = inputs.clone();
             match tokio::task::spawn_blocking(move || run_pass(&owned, "timer", mode, Utc::now()))
                 .await
@@ -1305,6 +1348,7 @@ fn spawn_timer(
                     // pass just placed is already in the drain flag.
                     workspace_resync::mark_verified();
                     workspace_resync::pass(&inputs, mode, Some(status), &enforcer, &bus).await;
+                    checkout_ff::pass(&inputs, began, &gate, &bus).await;
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

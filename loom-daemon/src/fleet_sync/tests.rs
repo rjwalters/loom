@@ -516,6 +516,7 @@ fn sample_status() -> FleetSyncStatus {
         enforced: Enforcement::Proceed,
         floor: FloorPass::default(),
         workspaces: workspace_resync::WorkspacePass::default(),
+        checkouts: Vec::new(),
     }
 }
 

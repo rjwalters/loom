@@ -1346,6 +1346,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // mid-run — it is armed HERE, rather than inside `fleet_sync::start`
     // above, because neither the drain state nor the workspace pool it drains
     // through exists at the point in boot where the startup render must happen.
+    // #10869: the timer's checkout fast-forward asks these states whether a
+    // gate run is building in a checkout before it moves it.
+    let fleet_started = fleet_started.map(|s| s.gated_by(&workspace_health_states));
     let drain_state = loom_daemon::fleet_state::wire(fleet_started, &workspace_pool, &event_bus);
     let drain_flag = drain_state.flag();
 

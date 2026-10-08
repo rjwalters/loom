@@ -109,6 +109,8 @@ pub(super) fn fetch(root: &Path, branch: &str) -> Result<String> {
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
     ok(root, root, &["fetch", "--quiet", "--no-tags", "origin", &refspec], SLOW)
         .with_context(|| format!("fetching origin/{branch}"))?;
+    // The checkout half of this pass (#10869) reuses this fetch.
+    crate::fleet_sync::checkout_ff::note_fetched(root, branch);
     ok(
         root,
         root,
