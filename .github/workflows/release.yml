@@ -554,12 +554,21 @@ jobs:
       # `grep -a` so the cross-compiled artifact, which cannot run here, is
       # checked too. A release whose binaries lost the stamp would leave every
       # fleet host unable to resync, so that fails here instead.
+      #
+      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-14 runner
+      # exports LC_ALL=en_US.UTF-8, and its BSD grep (2.6.0-FreeBSD) in a
+      # UTF-8 locale does not find the marker in the Mach-O binary even though
+      # the bytes are there: release run 37837360573 failed this step on
+      # aarch64-apple-darwin only, and diagnostic run 37841304807 showed the
+      # marker at a known offset, the MARKER symbol in __TEXT,__const, grep
+      # count 0 under en_US.UTF-8 and 1 under LC_ALL=C on the same file. The
+      # Linux legs use GNU grep, which is unaffected.
       - name: Verify the release stamp
         run: |
           set -euo pipefail
           bin="dist/loom-daemon-${{ matrix.target }}"
           marker="loom-release-build-tag=${LOOM_RELEASE_BUILD_TAG};"
-          if ! grep -a -q -F -- "$marker" "$bin"; then
+          if ! LC_ALL=C grep -a -q -F -- "$marker" "$bin"; then
             echo "::error::$bin does not carry the release stamp '$marker' (LOOM_RELEASE_BUILD_TAG='${LOOM_RELEASE_BUILD_TAG}')." >&2
             exit 1
           fi
