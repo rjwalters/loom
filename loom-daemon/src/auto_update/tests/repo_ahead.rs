@@ -2,7 +2,7 @@
 //! `select_target`, `decide` and `run_tick`.
 //!
 //! The demand is a second floor. The table is demand {unset, satisfied,
-//! below, unsatisfiable} x floor {the four floor states} x settle {0, 600}:
+//! below, unsatisfiable} x floor {the five floor states} x settle {0, 600}:
 //! a demand a release satisfies rolls at once to the exact tag as
 //! `repo_ahead` (as `floor` when the floor drives too), an unsatisfiable one
 //! stalls and holds nothing back, and without a demand every decision is
@@ -109,7 +109,11 @@ fn decision_table_demand_x_floor_x_settle() {
                 let summary = run_tick(&mut state, &status, &mut probe, &trigger, settle, DEFER);
 
                 let demanded = ahead == Ahead::Below || floor == Floor::Below;
-                let rolls = settle_secs == 0 || demanded;
+                // #10885: only a host with no fleet store chases the newest
+                // release (behind settle). A fleet host rolls only for a
+                // demand: its floor, or a workspace that needs a newer daemon.
+                let chases = floor == Floor::NoStore && settle_secs == 0;
+                let rolls = chases || demanded;
                 assert_eq!(fetch_calls.load(Ordering::SeqCst), usize::from(rolls), "{case}");
                 // The same roll path, pinned to the exact tag.
                 let pinned = format!("v{NEWEST}@{SHA_B}");
@@ -143,10 +147,19 @@ fn decision_table_demand_x_floor_x_settle() {
     }
 }
 
+/// On a host with no fleet store, and on a fleet host whose floor is met
+/// (#10885's "rolls only for the floor"), a workspace that needs a newer
+/// daemon rolls the host at once, to the exact tag.
 #[test]
 fn a_repo_ahead_roll_installs_the_exact_tag_under_a_one_week_settle() {
+    for floor in [Floor::NoStore, Floor::Satisfied] {
+        exact_tag_roll(floor);
+    }
+}
+
+fn exact_tag_roll(floor: Floor) {
     let tmp = tempfile::tempdir().unwrap();
-    let mut state = floored(tmp.path(), Floor::Unset);
+    let mut state = floored(tmp.path(), floor);
     state.repo_ahead.set_basis(Ahead::Below.demand(), RUNNING);
     let art = newest(RUNNING);
     let check = no_source();
@@ -165,10 +178,11 @@ fn a_repo_ahead_roll_installs_the_exact_tag_under_a_one_week_settle() {
             assert!(why.contains("workspace acme/app needs daemon 0.19.870"), "{why}");
             assert!(why.contains("exact tag v0.19.900"), "{why}");
         }
-        other => panic!("expected a repo-ahead fetch, got {other:?}"),
+        other => panic!("{floor:?}: expected a repo-ahead fetch, got {other:?}"),
     }
-    // Without the demand the same tick waits for settle.
-    let mut plain = floored(tmp.path(), Floor::Unset);
+    // Without the demand the same tick waits for settle (no store), or does
+    // not roll at all (a fleet host whose floor is met).
+    let mut plain = floored(tmp.path(), floor);
     assert!(!matches!(
         plain.decide(Instant::now(), &inputs, week, DEFER),
         TickDecision::FetchArtifact { .. }

@@ -23,6 +23,8 @@
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
+use crate::fleet_sync::FloorKnowledge;
+
 use super::{floor_verdict, FloorStallReport, FloorVerdict, Release, Target, TargetSource};
 
 /// The demand in force: the version, and the workspace that asks for it.
@@ -64,7 +66,7 @@ impl RepoAheadState {
         if self.demand != demand || self.running != running {
             self.demand = demand;
             self.running = running.to_string();
-            self.verdict = FloorVerdict::Unset;
+            self.verdict = FloorVerdict::NoStore;
         }
     }
 
@@ -72,8 +74,13 @@ impl RepoAheadState {
     /// when a release satisfies the demand. A tick that cannot tell keeps a
     /// standing stall, as the floor does (#10866).
     pub fn observe(&mut self, newest: Option<&Release>) -> Option<Release> {
-        let version = self.demand.as_ref().map(|d| d.version.as_str());
-        let seen = floor_verdict(version, &self.running, newest);
+        // A demand is classified exactly as a floor set at its version; no
+        // demand is no floor at all.
+        let knowledge = self
+            .demand
+            .as_ref()
+            .map_or(FloorKnowledge::NoStore, |d| FloorKnowledge::Set(d.version.clone()));
+        let seen = floor_verdict(&knowledge, &self.running, newest);
         let keep_stall = matches!(seen, FloorVerdict::Unresolved { .. })
             && matches!(self.verdict, FloorVerdict::Unsatisfiable(_));
         if !keep_stall {
