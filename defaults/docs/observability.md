@@ -968,21 +968,28 @@ hash of it, and it is never logged or forwarded.
 | `loom.daemon.version`, `loom.relay.redaction` | the relaying build, and the redaction policy applied |
 
 Whatever the sender put under `service.name`, `service.namespace`,
-`service.instance.id`, `host.*` or `loom.*` is discarded — on the resource and
-on every scope, record, data point, span, span event and link, so a
-record-level attribute cannot shadow the bound one. Other resource attributes
-the CLI reports about itself (`service.version`, `os.type`, …) are kept. Trace
-and span ids are the sender's and are preserved; that is what parents a
-session's spans under the `TRACEPARENT` its launch exported.
+`service.instance.id`, `host.*` or `loom.*` — in any letter case — is
+discarded, on the resource and on every scope, record, data point, span, span
+event, link and nested map, so a record-level attribute cannot shadow the
+bound one. Other resource attributes the CLI reports about itself
+(`service.version`, `os.type`, …) are kept. Trace and span ids are the
+sender's and are preserved; that is what parents a session's spans under the
+`TRACEPARENT` its launch exported. An id of the wrong length is cleared.
+
+Empty containers are removed before binding, and containers with identical
+sender resources are merged, so a request normally carries one bound
+`Resource`.
 
 **Redaction.** Every string the sender controls passes through the same
 scrubber as live session output ([`session-output.md`](session-output.md),
 policy `producer/v1`): log bodies, attribute values at any depth, span and
 event names, status messages, metric descriptions. An attribute value is
 scrubbed together with its key, so `password = …` is caught even though the
-value alone has no shape to match. A `bytes` value is replaced by its length.
-This scrubs secret *shapes*; it is not a content filter — which is why the
-content gates above stay off.
+value alone has no shape to match — numbers included (`password = 123456789`
+becomes the marker). An attribute whose *key* is secret-shaped is dropped
+whole. A `schema_url` the scrubber would change is cleared. A `bytes` value is
+replaced by its length. This scrubs secret *shapes*; it is not a content
+filter — which is why the content gates above stay off.
 
 **Back-pressure.** The receiver acknowledges a request as soon as it is
 scrubbed and queued; it never waits on your endpoint. Each `otlp` sink has its
@@ -998,12 +1005,58 @@ under that session's own identity, with `loom.relay.gap_reason`
 `loom.relay.dropped_{requests,log_records,metric_data_points,spans}`. Relayed
 records still queued when the daemon stops are lost.
 
+The queue holds each request **after** binding and scrubbing, protobuf-encoded,
+and its 32 MiB counts those bytes — what it actually keeps, not the size the
+requests arrived in. Loss accounting is bounded too: past 128 distinct
+`(session, reason)` entries awaiting report, further sessions' losses are
+folded into one aggregate record per reason (`loom.relay.aggregated = true`,
+host attributes only). Totals are kept; per-session attribution past the cap
+is not. During a long outage with many short sessions, that map grows to the
+cap and stops.
+
 **Limits.** OTLP/HTTP only (`application/x-protobuf` or `application/json`;
 no gRPC, no compressed bodies); 4 MiB per request; 32 concurrent connections
-(`503` past that); 30 seconds to send a request. A malformed request gets a
-`4xx` and is never forwarded. A session that outlives the daemon that launched
-it (a sweep adopted after a restart) keeps a stale address and exports nothing
-until it is relaunched.
+(`503` past that, and past twice that the connection is simply closed);
+3 seconds to present an authenticated request head, then 30 seconds for the
+body. A malformed request gets a `4xx` and is never forwarded.
+
+Wire bytes are not memory — an empty OTLP element is two bytes on the wire
+and up to a few hundred decoded — so size is checked twice more, each refusal
+a `413`. Before decoding, the receiver estimates the decoded size from the
+wire bytes (a schema-aware scan for protobuf, a bounded scan for JSON) and
+refuses anything over 8× the body plus 1 MiB, capped at 32 MiB. After binding,
+it refuses a request whose encoded size exceeds 4× the body plus 64 KiB. At
+most two requests are decoded at once, so decoding holds at most about
+2 × 2 × 32 MiB at a time (the factor of two is `Vec` growth).
+
+The OTLP JSON decoder used here (`opentelemetry-proto`) drops a metric's
+data when a data point carries an exemplar; such a metric arrives with no
+points and is not forwarded. Protobuf — what wired sessions are told to use —
+is unaffected.
+
+**What the relay does not stop.** Stated so an operator can decide with them
+in view:
+
+- **Descendants share the session's identity.** Every process the session
+  starts inherits its environment: the token, the endpoint and
+  `OTEL_*_EXPORTER=otlp`. An OpenTelemetry-instrumented tool it runs, or a
+  nested `claude`, exports through the relay under that session's identity.
+  It is bounded by the same queue and limits, and it cannot post as any other
+  session, but it is not the session itself.
+- **A stale port after a daemon restart.** A session adopted across a restart
+  keeps the old address. That port is free once the old daemon exits, and
+  another local process could bind it and receive that session's raw,
+  unscrubbed telemetry, token included. Relaunching the session ends this.
+- **The content gates cover inherited environment only.** The launch removes
+  `OTEL_LOG_USER_PROMPTS` and the other capture switches from the child's
+  environment, but Claude Code also reads an `env` block from its settings
+  files (`settings.json`, `settings.local.json`), and one there can re-enable
+  capture. Not verified against a live session. The relay still scrubs secret
+  shapes in whatever arrives.
+
+A session that outlives the daemon that launched it (a sweep adopted after a
+restart) keeps a stale address and exports nothing until it is relaunched —
+unless something else now holds that address, as above.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 
