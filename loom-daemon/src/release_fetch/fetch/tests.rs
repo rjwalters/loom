@@ -9,7 +9,7 @@ use super::*;
 use serial_test::serial;
 use std::io::Write as _;
 
-fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+pub(super) fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let p = dir.join(name);
     let mut f = std::fs::File::create(&p).unwrap();
     writeln!(f, "#!/usr/bin/env bash\n{body}").unwrap();
@@ -24,7 +24,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     p
 }
 
-fn tempdir() -> PathBuf {
+pub(super) fn tempdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "loom-daemon-fetch-test-{}-{}",
         std::process::id(),
@@ -37,7 +37,7 @@ fn tempdir() -> PathBuf {
     dir
 }
 
-fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {
+pub(super) fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {
     let old = std::env::var("PATH").unwrap_or_default();
     std::env::set_var("PATH", format!("{}:{old}", bindir.display()));
     // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
@@ -146,11 +146,11 @@ exit 1
 }
 
 /// The ordinary fixture: the release lists exactly what it can serve.
-fn write_fake_gh(dir: &Path, assets_dir: &Path) -> PathBuf {
+pub(super) fn write_fake_gh(dir: &Path, assets_dir: &Path) -> PathBuf {
     write_fake_gh_full(dir, assets_dir, &[], false)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
@@ -333,7 +333,7 @@ fn missing_release_asset_is_a_download_failure_not_a_verification_failure() {
 // ---------------------------------------------------------------------------
 
 /// The binary + its `.sha256`, checksum-consistent, under `dir/assets`.
-fn write_checksummed_assets(dir: &Path, bin_name: &str) -> PathBuf {
+pub(super) fn write_checksummed_assets(dir: &Path, bin_name: &str) -> PathBuf {
     let assets = dir.join("assets");
     std::fs::create_dir_all(&assets).unwrap();
     let bin_bytes = b"fake artifact bytes";
@@ -346,7 +346,7 @@ fn write_checksummed_assets(dir: &Path, bin_name: &str) -> PathBuf {
     assets
 }
 
-fn linux_inputs<'a>(dir: &'a Path) -> FetchInputs<'a> {
+pub(super) fn linux_inputs<'a>(dir: &'a Path) -> FetchInputs<'a> {
     FetchInputs {
         repo_root: dir,
         target: "x86_64-unknown-linux-gnu",
@@ -558,7 +558,7 @@ fn fetched_and_verified_signature_reports_the_verified_state() {
 // #10470: required-assurance policy
 // ---------------------------------------------------------------------------
 
-fn required() -> SignaturePolicy {
+pub(super) fn required() -> SignaturePolicy {
     SignaturePolicy {
         require_signature: true,
         approved_workflow: None,
@@ -573,7 +573,7 @@ fn run_with(fakebin: &Path, inputs: &FetchInputs<'_>, policy: &SignaturePolicy) 
     outcome.unwrap()
 }
 
-fn expect_refusal(outcome: FetchOutcome) -> Vec<String> {
+pub(super) fn expect_refusal(outcome: FetchOutcome) -> Vec<String> {
     match outcome {
         FetchOutcome::VerificationFailed { lines } => lines,
         FetchOutcome::Verified { artifact, .. } => {
@@ -584,7 +584,7 @@ fn expect_refusal(outcome: FetchOutcome) -> Vec<String> {
     }
 }
 
-fn signed_assets(dir: &Path, bin_name: &str, pem: bool) -> PathBuf {
+pub(super) fn signed_assets(dir: &Path, bin_name: &str, pem: bool) -> PathBuf {
     let assets = write_checksummed_assets(dir, bin_name);
     std::fs::write(assets.join(format!("{bin_name}.sig")), b"sig").unwrap();
     if pem {
@@ -593,7 +593,7 @@ fn signed_assets(dir: &Path, bin_name: &str, pem: bool) -> PathBuf {
     assets
 }
 
-const BIN: &str = "loom-daemon-x86_64-unknown-linux-gnu";
+pub(super) const BIN: &str = "loom-daemon-x86_64-unknown-linux-gnu";
 
 #[test]
 fn policy_from_values_parses_flag_and_workflow() {

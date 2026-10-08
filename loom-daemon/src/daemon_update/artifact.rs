@@ -296,7 +296,7 @@ pub fn fetch_and_verify_artifact(
     tag: &str,
 ) -> Result<FetchedArtifact, FetchFailure> {
     use crate::release_fetch::{
-        fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,
+        evidence, fetch_and_verify_with_evidence, FetchInputs, FetchOutcome, SignaturePolicy,
     };
 
     let bin_name = format!("loom-daemon-{target}");
@@ -313,7 +313,11 @@ pub fn fetch_and_verify_artifact(
         cosign_oidc_issuer_env: std::env::var("LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER").ok(),
     };
 
-    match fetch_and_verify_with_policy(&inputs, &SignaturePolicy::from_env()) {
+    // #10474: every verdict, in both policy modes, lands in the durable
+    // signature-evidence journal (best-effort; never changes the verdict).
+    let (outcome, record) = fetch_and_verify_with_evidence(&inputs, &SignaturePolicy::from_env());
+    let _ = evidence::record(repo_root, &record);
+    match outcome {
         FetchOutcome::Verified {
             artifact,
             checksum_line,
