@@ -70,6 +70,7 @@ mod shadow_fleet;
 mod shadow_gate;
 mod shadow_lifecycle;
 mod shadow_stats;
+mod stage_forecast;
 mod stall;
 mod star_parity;
 mod tracker;

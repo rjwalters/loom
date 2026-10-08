@@ -1904,6 +1904,22 @@ path completion time, so its `p50_at` is exactly `eta_p50_at`; a stage no
 path visits carries `null` times, never a fabricated one. A timeline can be
 drawn from `stage_marks` alone.
 
+`stage_predictions` (#10929) is the per-stage forecast, keyed by stage, for
+each stage still ahead. It holds:
+
+- `entry_p50` / `entry_p90`: the first entry, which for the terminal stage
+  too is the *entry*, not the completion;
+- `dwell_p50` / `dwell_p90`: the total time in the stage across visits;
+- `reach_pct`: the percentage of paths that visit the stage.
+
+Values are whole seconds from `as_of`, and entry and dwell are taken over
+the paths that visit the stage. `alloc` is the stage's share of the p50
+total, from the paths ranked p40–p60, and the stages' `alloc` values sum to
+the simulated p50. Like the marks, all of this is read off the draws already
+made, so no quantile moves. `run_predictions` recomputes it from the
+explanation's own fields. Only the path engine fills it; other heuristics
+omit it. It is dropped with `stage_marks` under the size cap.
+
 `held_heron` (#10523) is how a `land-2026-10-06-held-heron` simulator
 answer recomputes. It is the competing-risks chain for a held or sequenced
 PR: the rates, the evidence and the solution's settings (see
@@ -2401,6 +2417,17 @@ before p90 existed. The outcome row also exports `loom.eta.p25_sec`,
 `loom.eta.p75_sec` and `loom.eta.p90_sec`, so an interval can be read without
 joining the estimate. The promotion gate decides on `pinball4_loss_sec` and
 gates on `above_p90` (#10233; see "Adding a v2, and comparing it").
+
+**Which stage caused the miss (#10929).** `eta.outcome.attribution` splits
+`error_sec` by stage. Each forecast or observed stage contributes
+`actual_dwell − alloc`, where the actual is the time observed in the stage
+after `as_of`. `unattributed_sec` holds what no stage explains: inexactly
+observed time, an applied stall, and a calibration or regime shift. The parts
+always sum to `error_sec`. `dominant_stage` names the largest contribution.
+Each stage boundary is also its own record, `eta.stage_outcome` (entry, exit,
+dwell and exit kind, plus the newest open estimate per series), so a
+predicted-vs-actual stage timeline can be drawn per item. The nightly
+per-heuristic, per-stage bias rollup is a follow-up.
 
 **Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
 before any PR are *not* abandonments — a replacement PR or a later sweep

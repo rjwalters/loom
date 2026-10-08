@@ -22,6 +22,7 @@ fn row() -> EtaSnapshotRow {
         stage: Some(Stage::ReviewWait),
         no_estimate_reason: None,
         alternates: Vec::new(),
+        stages: BTreeMap::new(),
     }
 }
 

@@ -80,6 +80,7 @@ fn summary(
         stage_quartiles: Vec::new(),
         tail_extrapolated: false,
         stall_cause: None,
+        stage_predictions: Default::default(),
     }
 }
 
