@@ -794,6 +794,8 @@ fn at_stage(stage: Stage) -> EstimateInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: input.as_of,
+        not_here: None,
+        held_until: None,
     });
     input
 }

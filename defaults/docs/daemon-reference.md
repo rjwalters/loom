@@ -28,6 +28,7 @@
 - [Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)](#gate-verdicts-verified_red-vs-unevaluated-3974)
 - [Per-workspace priority tiers (#3946)](#per-workspace-priority-tiers-3946)
 - [Forge-side pipeline snapshot (`status --pipeline`, #3977)](#forge-side-pipeline-snapshot-status---pipeline-3977)
+- [Section-scoped status (`status --json --section`, #10787)](#section-scoped-status-status---json---section-10787)
 - [One-shot fleet vitals (`loom-daemon health`, #4761)](#one-shot-fleet-vitals-loom-daemon-health-4761)
 - [ETA tracker (`autonomous.eta`, #9289)](#eta-tracker-autonomouseta-9289)
 - [Reaper task](#reaper-task)
@@ -2840,6 +2841,72 @@ managed repo, fetched *after* the IPC round-trip completes:
   its 24h default. A masked-off metric is left `None`; a caller that masks a
   metric off simply must not read it.
 
+## Section-scoped status (`status --json --section`, #10787)
+
+A full `loom-daemon status --json` builds the whole report — `O(registered
+repos)`, 10–21 s across ~58 repos on a busy dispatcher — and then runs the
+CLI's own collectors (the per-account token probe, the git staleness check,
+the worktree disk walk). A caller that reads two or three fields can ask for
+only those:
+
+```bash
+loom-daemon status --json --section daemon_build,auto_update
+loom-daemon status --json --section drain --section in_flight
+```
+
+- **Names** — `--section` takes the payload's top-level keys, comma-separated
+  and repeatable, and requires `--json`. A section that groups several keys is
+  named for its base key: `in_flight` is `in_flight` + `in_flight_count`, and
+  `preflight_advisory`, `observability` and `role_runner` group their
+  `*_`-prefixed keys. `loom-daemon status --help` lists every valid name; an
+  unknown one is a usage error (exit 2) naming them all.
+- **Output** — the same JSON object with only the selected keys. Without
+  `--section` the output is unchanged.
+- **What it skips** — the daemon builds only the phases a selected section
+  reads (`loom_daemon::status_section::SectionSet`), and the CLI skips its
+  collectors for unselected sections. `daemon_build`, `auto_update` and the
+  other process-level sections walk no registered repo at all.
+- **What still walks every repo** — anything derived from the live sweep list:
+  `in_flight`, `unregistered_locked`, `stale_sweeps`, `capacity_bound`,
+  `role_agents` and `drain` (the last three for the in-flight count), plus
+  `per_repo`, `worktrees` and `pipeline`, which also run the per-repo detail
+  phases. Do not pick `drain` or `role_agents` as a "cheap" poll.
+- **Interactions** — `pipeline` still needs `--pipeline` (else `null`). The
+  autonomy-mismatch exit code applies only when `protection` is selected.
+- **Wire** — a selection is sent as `Request::DaemonStatusSections { sections
+  }`; a selection naming every section is sent as the plain `DaemonStatus`
+  frame. The reply is the same `Response::DaemonStatus`. The daemon refuses a
+  frame with an empty `sections` list with an error reply.
+- **Version skew** — an unreachable daemon gets the usual unreachable payload
+  (`--section` ignored). A daemon older than the CLI rejects the frame, which
+  the CLI reports as `daemon too old for --section` (exit 1).
+
+### Concurrent status requests share one build (#10861)
+
+A status build cannot be cancelled once it has started, so a client that
+times out and retries used to leave its first build running and start a
+second. The daemon now runs **at most one build per section set at a time**
+(`ipc/status_off_runtime.rs`): a request that arrives while a build for the
+same set is in flight waits for that build's report.
+
+- **Keyed by section set.** Order and duplicates do not matter, and an
+  all-sections request shares the full build. Different sets never wait on
+  each other, so `--section daemon_build,auto_update` still answers quickly
+  while a full build is running.
+- **In flight only.** A finished report is never reused: a request arriving
+  after a build has completed starts a new one, so `status` straight after
+  `drain` / `halt` / `release` reflects the action. A request that *joins* a
+  build can receive a snapshot whose build began up to one build-duration
+  earlier.
+- **Drain is always live.** The `drain` block is overlaid per request, after
+  the shared build, so it is current even on a joined build.
+- **Failures.** If the shared build panics or its task does not complete,
+  every waiting request gets an error reply (never a dropped connection), and
+  the next request builds afresh.
+- **Telemetry.** `loom.daemon.ipc.requests{kind=DaemonStatus}` still counts
+  every request; `loom.daemon.ipc.status_builds{outcome}` counts the builds
+  ([`telemetry-schema.md`](telemetry-schema.md)).
+
 ## One-shot fleet vitals (`loom-daemon health`, #4761)
 
 ```
@@ -5650,6 +5717,7 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 | `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
 | `autonomous.autoUpdate.rollStallCooldownSecs` | `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS` | `21600` (6h) | Bounds the `rollStallDeadlines` suppression above in TIME as well as by the `in_flight == 0` sample (#9010): once a standing unsatisfiability declaration has stood for this long, it is dropped and the next tick arms a roll for **one** more bounded attempt — if the host still cannot drain, the detector re-declares after `rollStallDeadlines` more deadlines rather than cycling, so the cost is one paused-dispatch budget per cooldown period instead of unbounded staleness on a host whose `in_flight == 0` sample never lands. Zero/invalid → default, exactly like `rollStallDeadlines`: a `0` would clear a declaration on the tick it was made, re-entering #8998's livelock through the knob. Set it very large to make the retry effectively unreachable |
+| `autonomous.autoUpdate.pauseRoll.minResumableAgeSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_MIN_RESUMABLE_AGE_SECS` | `300` (5 min) | Pause-and-roll (#10830, design `docs/design/daemon-roll-pause-resume.md` §2): an agent whose session first started less than this long ago is reset (killed and requeued with reason `young-agent-reset`) at a roll instead of being paused and resumed. The age is measured from the session's first start, carried across earlier roll resumes. `0` disables the rule. Resolved now but **not yet consumed**: no roll pauses agents until #10831/#10832 land |
 | `autonomous.autoUpdate.rollWindowSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS` | *(off)* | Period of the scheduled roll window (#9132). **Unset/zero/invalid → no window**: rolls arm on every new build exactly as before (opt-in; this default preserves existing behaviour). When set, a new build arms **nothing** outside an open window, the settle gate is bypassed (the window is the batching mechanism, so a busy `main` cannot starve the host), and at most one roll arms per window — see [Scheduled roll windows](#scheduled-roll-windows-9132). **Restart required** |
 | `autonomous.autoUpdate.rollWindowOffsetSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS` | derived from host id | Where window 0 opens within the period. Zero/invalid → the **derived** offset: `fnv1a(host_id) mod period`, stable across restarts and spread across hosts. An explicit value is reduced modulo the period, so the offset is always `< rollWindowSecs`. Only meaningful with `rollWindowSecs`. **Restart required** |
 | `autonomous.autoUpdate.launchdLiveReload` | `LOOM_AUTO_UPDATE_LAUNCHD_LIVE_RELOAD` | `false` | Opt-in for the launchd skip-the-drain path (`restart --reload-supervisor`, #6682). Selected **only** on launchd **and** only when `true`; systemd always uses the bounded drain. Depends on #9452 (the stale-sweep watchdog killing journal-adopted survivors) — do not enable on a real host before that is resolved. **Not yet wired to execute**: the selection is reported in `status` and logged, and rolls still use the bounded drain until live-host verification lands |

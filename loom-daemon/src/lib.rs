@@ -306,6 +306,8 @@ pub mod role_shard;
 pub mod role_tick_telemetry;
 pub mod role_tool_policy;
 pub mod role_validation;
+/// Safe-point pause hook, pause state and resume handles for a daemon roll (#10830).
+pub mod roll_pause;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;

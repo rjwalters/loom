@@ -203,6 +203,21 @@ pub(crate) struct LockOwner {
     /// is the honest value for both.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) overflow: bool,
+    /// Pause-and-roll identity (Issue #10830), stamped at spawn by
+    /// [`resume_handle::DispatchSession::stamp`](super::resume_handle::DispatchSession::stamp):
+    /// the item id that arms the pause hook, the systemd scope unit (the H4
+    /// teardown unit, Linux only), the session's FIRST start (the 5-minute
+    /// rule's clock, carried across roll resumes), and the resume handle.
+    /// Same `Option` + `#[serde(default)]` contract as `pgid`/`model`: an
+    /// `owner.json` from an older binary has none of them and still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scope_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_handle: Option<super::resume_handle::ResumeHandle>,
 }
 
 impl LockOwner {
@@ -227,6 +242,10 @@ impl LockOwner {
             model: None,
             effort: None,
             overflow: false,
+            item_id: None,
+            scope_unit: None,
+            agent_started_at: None,
+            resume_handle: None,
         }
     }
 }

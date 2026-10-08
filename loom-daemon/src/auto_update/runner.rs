@@ -300,8 +300,22 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     // alert is never a gate: nothing above was held back for it and dispatch
     // is untouched.
     let note = format!("{note}{}", state.floor.note_suffix());
+    // #10866: the note and the record's `floor_stall` are state and are set on
+    // every tick the stall stands. Only the ERROR line is rate-limited.
+    summary.floor_alerted = state
+        .floor
+        .alert_due(last_check, floor_roll::alert::REMINDER);
     if let Some(stall) = state.floor.stall() {
-        log::error!("auto_update: {}", stall.note());
+        if summary.floor_alerted {
+            let since = state.floor.stall_declared_at().unwrap_or(last_check);
+            log::error!(
+                "auto_update: {} [standing since {}; logged again when it changes, else once per \
+                 {}s]",
+                stall.note(),
+                since.format("%Y-%m-%dT%H:%M:%SZ"),
+                floor_roll::alert::REMINDER.as_secs()
+            );
+        }
         summary.floor_stall = Some(stall.note());
     }
 

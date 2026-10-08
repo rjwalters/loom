@@ -328,6 +328,16 @@ impl SweepRegistry {
         if let Some(selection) = selection {
             selection.apply(&mut cmd);
         }
+        // #10830: name this agent for pause-and-roll (item id, pause dir,
+        // pinned Claude session id, scope unit). Inert until a roll asks.
+        let session = super::resume_handle::DispatchSession::new(
+            sweep_id,
+            &self.config.workspace_root,
+            runtime_admission.map(|a| a.runtime.as_str()),
+        );
+        if let Some(session) = &session {
+            session.apply_env(&mut cmd);
+        }
         let child = crate::observability::lifecycle::spawn_child(
             &mut cmd,
             &self.config.workspace_root,
@@ -349,6 +359,9 @@ impl SweepRegistry {
         // per-issue log is never mistaken for the current selection.
         if let Some(selection) = selection {
             selection.spawned();
+        }
+        if let (Some(session), SweepKind::Issue(issue)) = (&session, kind) {
+            self.stamp_resume_handle_in_lock(*issue, session, model, effort);
         }
         let header_anchor = format!("sweep_id={sweep_id}");
         Ok((child, header_anchor))

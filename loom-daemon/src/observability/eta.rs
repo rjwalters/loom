@@ -1178,8 +1178,10 @@ async fn ready_rows(
         rows.push(ReadyRow {
             repo: slug,
             issue: row.issue,
+            rank: row.rank,
             plan: row.plan,
             disposition: row.disposition,
+            detail: row.detail,
             facts: IssueRow {
                 workspace_priority: row.workspace_priority,
                 created_at: row.created_at,

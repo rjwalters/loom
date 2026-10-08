@@ -71,6 +71,17 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
+    /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
+    /// every tool call unparked.
+    #[command(subcommand)]
+    RollPause(super::roll_pause_cli::RollPauseCommand),
+
+    /// Session handles for a roll resume (#10830): Claude `--session-id` /
+    /// `--resume` args, the Codex resume check, live Codex id capture.
+    #[command(subcommand)]
+    AgentResume(super::roll_pause_cli::AgentResumeCommand),
+
     /// The installed-Loom / daemon compatibility contract (#10716): `show`
     /// this daemon's claims (and a repo's), `check` them across adjacent
     /// releases in CI. Here, not in a script, per the shell-language policy.
@@ -568,6 +579,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::RollPause(cmd) => cmd.run(),
+            ScriptPortCommand::AgentResume(cmd) => cmd.run(),
             ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),

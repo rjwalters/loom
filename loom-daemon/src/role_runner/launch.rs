@@ -247,6 +247,20 @@ pub(super) fn run_role_with_timeout(
     }
 
     apply_role_observability(&mut cmd, workspace_root, role);
+    // #10830: a role run is paused and resumed like a sweep (design Q7), so it
+    // gets the same pause-and-roll identity. Role runs have no claim lock; the
+    // item id is synthetic (`role-<role>-<time>-<rand>`).
+    let item = format!(
+        "role-{role}-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let runtime = admission.map(|a| a.runtime.as_str());
+    if let Some(session) =
+        sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime)
+    {
+        session.apply_env(&mut cmd);
+    }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
     if let Some(selection) = &selection {
