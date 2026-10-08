@@ -444,6 +444,14 @@ fn disabled_opt_in_jobs_do_not_fire() {
         ..Fake::default()
     };
     assert!(evaluate(SINGLETON_OUTPUTS, &off, &r, now()).is_empty());
+    // Global ETA on, fit off: `eta.fit` is skipped, `eta.estimate` is still judged.
+    let fit_off = Fake {
+        disabled: BTreeSet::from([gauges::ENABLED_KEY, CI_TELEMETRY_KEY, ETA_FIT_KEY]),
+        ..Fake::default()
+    };
+    let kinds_fit_off = kinds(&evaluate(SINGLETON_OUTPUTS, &fit_off, &r, now()));
+    assert!(!kinds_fit_off.contains(&"eta.fit"), "{kinds_fit_off:?}");
+    assert!(kinds_fit_off.contains(&"eta.estimate"), "{kinds_fit_off:?}");
 }
 
 /// `eta.backtest.fold` is stamped at the folded day's cutoff (end of UTC day

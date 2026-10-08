@@ -72,6 +72,9 @@ pub const ETA_AUTHORITY: &str = "eta-authority";
 pub const ETA_ENABLED_KEY: &str = "autonomous.eta.enabled";
 /// Config toggle: the nightly backtest folds (`EtaConfig::nightly_folds_enabled`).
 pub const ETA_NIGHTLY_FOLDS_KEY: &str = "autonomous.eta.nightlyFolds.enabled";
+/// Config toggle: the daily ETA fit check (`EtaConfig::fit_enabled`; also
+/// `LOOM_ETA_FIT_ENABLED`). Only `eta.fit` honours it; `eta.estimate` does not.
+pub const ETA_FIT_KEY: &str = "autonomous.eta.fit.enabled";
 /// Config toggle: the CI telemetry poller (`ci_telemetry::Settings::enabled`).
 pub const CI_TELEMETRY_KEY: &str = "autonomous.ciTelemetry.enabled";
 
@@ -143,7 +146,12 @@ const fn gauge(
     }
 }
 
-const fn authority(kind: &'static str, scope: Scope, cadence: Duration) -> SingletonOutput {
+const fn authority(
+    kind: &'static str,
+    scope: Scope,
+    cadence: Duration,
+    enabled_by: &'static [&'static str],
+) -> SingletonOutput {
     SingletonOutput {
         job: ETA_AUTHORITY,
         gate: Gate::EtaAuthority,
@@ -151,7 +159,7 @@ const fn authority(kind: &'static str, scope: Scope, cadence: Duration) -> Singl
         scope,
         cadence,
         severity: Severity::Critical,
-        enabled_by: &[ETA_ENABLED_KEY],
+        enabled_by,
         deadline_override: None,
     }
 }
@@ -206,8 +214,9 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
     ),
     // The ETA authority: the daily fit check (emitted fitted or skipped) and
     // per-repo estimates (the 10-07 incident).
-    authority("eta.fit", Scope::FleetWide, hours(24)),
-    authority("eta.estimate", Scope::PerActiveRepo, mins(30)),
+    // The fit check also needs its own toggle (`eta_fit::should_run`).
+    authority("eta.fit", Scope::FleetWide, hours(24), &[ETA_ENABLED_KEY, ETA_FIT_KEY]),
+    authority("eta.estimate", Scope::PerActiveRepo, mins(30), &[ETA_ENABLED_KEY]),
 ];
 
 /// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each with
