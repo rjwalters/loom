@@ -1373,6 +1373,13 @@ pub struct DaemonStatusReport {
     /// in-progress pause. Empty from a pre-#8652 daemon (`#[serde(default)]`).
     #[serde(default)]
     pub drain_paused_by_day: std::collections::BTreeMap<chrono::NaiveDate, u64>,
+    /// The pause-and-roll resume state (#10832): the pause manifest this
+    /// process found at startup, the H5 step it is on (or how it ended), and
+    /// what became of each paused agent, with per-reason requeue counters and
+    /// observed durations. `None` when the process started without a manifest
+    /// (and from a pre-#10832 daemon). Rendered as `drain.resume`.
+    #[serde(default)]
+    pub pause_resume: Option<crate::auto_update::pause_resume::PauseResumeStatus>,
     /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
     /// daemon process. `false` in the common opt-out case (the loop is
     /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older

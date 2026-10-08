@@ -47,7 +47,8 @@ pub struct LiveRun {
     pub started_at: DateTime<Utc>,
     /// The runtime (`claude` / `codex`).
     pub runtime: String,
-    /// The pinned Claude session id, when the runtime is Claude.
+    /// The session id known at launch: the pinned Claude session id, or the
+    /// saved session of a run a roll resumed (#10832, either runtime).
     pub claude_session_id: Option<String>,
     /// The systemd scope unit the spawn script was asked to use, when one was
     /// named (Linux). Not proof the scope exists.
@@ -60,6 +61,9 @@ pub struct LiveRun {
     /// time it has left (`timeout_remaining_secs`).
     pub timeout: Duration,
     pub started_mono: Instant,
+    /// Set when this run resumes a session a roll paused (#10832): the saved
+    /// session and its lineage, so a second roll records them again.
+    pub(crate) resume: Option<crate::sweep_registry::resume_handle::RollResumeLaunch>,
 }
 
 impl LiveRun {
@@ -196,6 +200,7 @@ mod tests {
             model: None,
             timeout: Duration::from_secs(600),
             started_mono: Instant::now(),
+            resume: None,
         }
     }
 
