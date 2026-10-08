@@ -1514,8 +1514,9 @@ for a fit or backtest to report.
   newest earlier commit as the anchor in force when the window opens. Each
   revision's roster (`fleet.json`'s `root` and `repos`) is cached under
   `.loom/state/eta/roster-history/`. While `fleet.json` is younger than the
-  window (or absent), the same listing runs for `repos.yml`, capped at
-  `fleet.json`'s first commit, for the revisions from before it. The fit (`fit::run`) and the tracker's
+  window (or absent), the same listing runs for `repos.yml` over the history
+  reachable from `fleet.json`'s first commit (by ancestry, not commit date),
+  for the revisions from before it. The fit (`fit::run`) and the tracker's
   pass (`Tracker::set_fleet_history`) both load that one cache, so the two
   sides read one history value. Requests go through the store's
   `GhTransport` (reader App first, then the writer App), never the operator

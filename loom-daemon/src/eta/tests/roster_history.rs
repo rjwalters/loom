@@ -166,10 +166,14 @@ impl Transport for FakeStore {
         // One linear history, whatever ref is asked for.
         if let Some(rest) = api_path.strip_prefix("repos/acme/fleet/commits?path=") {
             let file = rest.split('&').next().unwrap();
+            // `sha=` a commit lists the history reachable from it; any other
+            // ref is the tip. History is linear here.
+            let commits = self.commits.borrow();
+            let tip = param(api_path, "sha")
+                .and_then(|s| commits.iter().position(|c| c.sha == s))
+                .unwrap_or(commits.len().saturating_sub(1));
             // The forge lists newest first: here, reverse history order.
-            let newest_first: Vec<(String, DateTime<Utc>)> = self
-                .commits
-                .borrow()
+            let newest_first: Vec<(String, DateTime<Utc>)> = commits[..commits.len().min(tip + 1)]
                 .iter()
                 .rev()
                 .filter(|c| c.file(file).is_some())
@@ -767,6 +771,59 @@ fn the_roster_comes_from_fleet_json_and_from_repos_yml_before_it() {
             "at {t}"
         );
     }
+}
+
+/// The (file, sha) of each cached revision, oldest first.
+fn cached_revisions(dir: &std::path::Path) -> Vec<(String, String)> {
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    index["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["file"].as_str().unwrap().to_string(), c["sha"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn a_repos_yml_commit_sharing_the_introductions_second_is_still_a_predecessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    let first = store.commit(h(0.0), &roster_yaml(100, 100));
+    let last_legacy = store.commit(h(4.0), &roster_yaml(100, 10));
+    let intro = store.commit_files(h(4.0), None, Some(&roster_json(100, 10, "running")));
+    store.commit_files(h(6.0), Some(&format!("# rendered\n{}", roster_yaml(100, 10))), None);
+    sync(&store, tmp.path(), &location(), h(10.0)).unwrap();
+    let file = |f: &str, sha: &String| (f.to_string(), sha.clone());
+    assert_eq!(
+        cached_revisions(tmp.path()),
+        [
+            file("repos.yml", &first),
+            file("repos.yml", &last_legacy),
+            file("fleet.json", &intro)
+        ],
+        "the same-second predecessor is kept; the later render is not"
+    );
+}
+
+#[test]
+fn a_backdated_fleet_json_introduction_keeps_every_predecessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    let first = store.commit(h(3.0), &roster_yaml(100, 100));
+    let second = store.commit(h(5.0), &roster_yaml(100, 10));
+    // Landed after both, but dated before them.
+    let intro = store.commit_files(h(1.0), None, Some(&roster_json(100, 10, "running")));
+    sync(&store, tmp.path(), &location(), h(10.0)).unwrap();
+    let file = |f: &str, sha: &String| (f.to_string(), sha.clone());
+    assert_eq!(
+        cached_revisions(tmp.path()),
+        [
+            file("repos.yml", &first),
+            file("repos.yml", &second),
+            file("fleet.json", &intro)
+        ],
+    );
 }
 
 #[test]

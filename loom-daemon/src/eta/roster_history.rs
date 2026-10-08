@@ -32,11 +32,13 @@
 //!   file's blob SHA; a commit is immutable, so no revision is fetched twice.
 //!
 //! When `fleet.json` has no anchor (it is younger than the window, or the
-//! store has none), the same three requests run for `repos.yml`, the
-//! listing capped with `&until=` the oldest `fleet.json` commit listed.
-//! Those are the revisions from before `fleet.json`. A `repos.yml` commit
-//! dated at or after that one is dropped: from then on `repos.yml` is a
-//! render of the same data.
+//! store has none), the same three requests run for `repos.yml`, with
+//! `sha=` the oldest `fleet.json` commit listed instead of the ref. Those
+//! are the revisions from before `fleet.json`, by history order, not commit
+//! date: a predecessor sharing the introduction's second, or a backdated
+//! introduction, loses none. A `repos.yml` commit that is not an ancestor of
+//! that commit is not listed: from then on `repos.yml` is a render of the
+//! same data.
 //!
 //! Requests go through the store's [`Transport`]: in production
 //! `fleet_store::gh::GhTransport`, the reader App first (then the writer App,
@@ -371,25 +373,25 @@ fn roster_section(body: &[u8]) -> Vec<u8> {
 }
 
 /// One file's commit listing for the window opening at `since` (newest
-/// first, the anchor last), capped at `until` when given, and whether the
-/// anchor exists: whether the file was in force when the window opens.
+/// first, the anchor last), over the history reachable from `reference` (a
+/// ref or a commit), and whether the anchor exists: whether the file was in
+/// force when the window opens.
 fn walk(
     transport: &dyn Transport,
     location: &StoreLocation,
     file: &str,
+    reference: &str,
     since: &str,
-    until: Option<&str>,
     cached: &Cached<'_>,
     listings: &mut Vec<CachedListing>,
 ) -> Result<(Vec<ListedEntry>, bool)> {
-    let base = format!("repos/{}/commits?path={file}&sha={}", location.repo, location.reference);
-    let cap = until.map(|u| format!("&until={u}")).unwrap_or_default();
+    let base = format!("repos/{}/commits?path={file}&sha={reference}", location.repo);
     let mut listed = Vec::new();
     for page in 1..=MAX_PAGES + 1 {
         if page > MAX_PAGES {
             bail!("{file} has more than {} commits in {WINDOW_DAYS} days", MAX_PAGES * PER_PAGE);
         }
-        let path = format!("{base}&since={since}{cap}&per_page={PER_PAGE}&page={page}");
+        let path = format!("{base}&since={since}&per_page={PER_PAGE}&page={page}");
         let (batch, cache) = list(transport, &path, cached)?;
         listings.extend(cache);
         let n = batch.len();
@@ -452,29 +454,35 @@ pub fn sync(
     let since = window_opens(now).to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut listings = Vec::new();
     // Newest first, as the forge lists them, each with the file it read.
-    let (fleet_json, anchored) =
-        walk(transport, location, FLEET_JSON_PATH, &since, None, &cached, &mut listings)?;
-    let first_compiled = fleet_json.last().map(|e| e.committed_at);
+    let (fleet_json, anchored) = walk(
+        transport,
+        location,
+        FLEET_JSON_PATH,
+        &location.reference,
+        &since,
+        &cached,
+        &mut listings,
+    )?;
+    let first_compiled = fleet_json.last().map(|e| e.sha.clone());
     let mut listed: Vec<(ListedEntry, &str)> = fleet_json
         .into_iter()
         .map(|e| (e, FLEET_JSON_PATH))
         .collect();
     if !anchored {
         // `fleet.json` is younger than the window (or absent): the revisions
-        // before its first commit come from `repos.yml`.
-        let until = first_compiled.map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true));
-        let (legacy, _) = walk(
-            transport,
-            location,
-            ROSTER_PATH,
-            &since,
-            until.as_deref(),
-            &cached,
-            &mut listings,
-        )?;
+        // before its first commit come from `repos.yml`. "Before" is history
+        // order, not commit date: the listing reads the history reachable
+        // from that commit, so a predecessor sharing its second, or a
+        // backdated introduction, still counts.
+        let from = first_compiled
+            .as_deref()
+            .unwrap_or(location.reference.as_str());
+        let (legacy, _) =
+            walk(transport, location, ROSTER_PATH, from, &since, &cached, &mut listings)?;
         for e in legacy {
-            let before = first_compiled.is_none_or(|t| e.committed_at < t);
-            if before && !listed.iter().any(|(l, _)| l.sha == e.sha) {
+            // The introducing commit is reachable from itself: where it also
+            // touched `repos.yml`, that is a render of `fleet.json`.
+            if !listed.iter().any(|(l, _)| l.sha == e.sha) {
                 listed.push((e, ROSTER_PATH));
             }
         }
