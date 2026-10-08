@@ -138,6 +138,21 @@ pub struct Page {
     pub files: Option<Vec<String>>,
     /// The head commit the entries name, when they name exactly one.
     pub head_sha: Option<String>,
+    /// Lines added, summed over the entries; `None` unless `files` is a whole
+    /// list and every entry carried the stat.
+    pub additions: Option<u32>,
+    /// Lines deleted; same rule as `additions`.
+    pub deletions: Option<u32>,
+    /// The number of entries on the page, whole list or not.
+    pub listed: u32,
+}
+
+/// Sum one numeric field over every entry, `None` if any entry lacks it.
+fn sum_field(rows: &[Value], field: &str) -> Option<u32> {
+    rows.iter().try_fold(0u32, |acc, r| {
+        let n = u32::try_from(r.get(field).and_then(Value::as_u64)?).ok()?;
+        acc.checked_add(n)
+    })
 }
 
 /// The head commit one file entry names: its `contents_url`'s `ref`, else
@@ -182,6 +197,17 @@ pub fn parse_page(body: &Value) -> Option<Page> {
     Some(Page {
         files: whole.then(|| names.into_iter().collect()),
         head_sha,
+        additions: if whole {
+            sum_field(rows, "additions")
+        } else {
+            None
+        },
+        deletions: if whole {
+            sum_field(rows, "deletions")
+        } else {
+            None
+        },
+        listed: u32::try_from(rows.len()).unwrap_or(u32::MAX),
     })
 }
 
@@ -293,7 +319,12 @@ pub fn refresh(
             .filter(|s| s.pr == c.pr && s.repo.eq_ignore_ascii_case(&c.repo))
             .max_by_key(|s| s.known_at);
         if latest.is_some_and(|s| {
-            s.complete == complete && s.files == files && s.head_sha == page.head_sha
+            s.complete == complete
+                && s.files == files
+                && s.head_sha == page.head_sha
+                && s.additions == page.additions
+                && s.deletions == page.deletions
+                && s.listed == Some(page.listed)
         }) {
             continue;
         }
@@ -304,6 +335,9 @@ pub fn refresh(
             files,
             head_sha: page.head_sha,
             complete,
+            additions: page.additions,
+            deletions: page.deletions,
+            listed: Some(page.listed),
         });
     }
     out
