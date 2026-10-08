@@ -30,6 +30,7 @@ const MARKERS: &[&str] = &[
     "loom:stale-check-redate",
     "loom:premise-check",
     "closedByPullRequestsReferences",
+    "DECISION_MARKER_PREFIX",
 ];
 
 /// Every production file whose code names a covered marker.
@@ -45,6 +46,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
     (
         "cli/lease_co_occupancy.rs",
         "lease + lease-yield reader in read_rows (FETCH_SITES, #9631)",
+    ),
+    (
+        "comment_trust/decision.rs",
+        "#10827 signed-record verifier: trust is the Ed25519 signature, never the author",
     ),
     ("comment_trust/records.rs", "the H14 filter itself"),
     ("dep_classify/cli.rs", "reads IssueView from dep_classify/forge.rs (trusted)"),

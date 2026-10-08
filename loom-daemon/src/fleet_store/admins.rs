@@ -116,18 +116,32 @@ fn warn_once(cause: &str) {
     }
 }
 
+/// Why a loaded snapshot is too old to trust: a cached (unconfirmed) snapshot
+/// last confirmed more than [`MAX_AGE`] ago. Shared with the decision-signer
+/// reader ([`super::decision_signers`], #10827) so both fail closed alike.
+#[must_use]
+pub fn over_age(loaded: &fetch::Loaded, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let m = &loaded.snapshot.manifest;
+    if !matches!(loaded.freshness, Freshness::Cached { .. }) {
+        return None;
+    }
+    // A confirmation time in the future (clock skew) is not "fresh": only a
+    // non-negative age inside the window counts.
+    match (now - m.confirmed_at).to_std() {
+        Ok(age) if age <= MAX_AGE => None,
+        _ => Some(format!(
+            "cached snapshot of {} is older than 24h and the forge was not reachable",
+            m.repo
+        )),
+    }
+}
+
 /// Turn a loaded snapshot into a roster (fail closed).
 #[must_use]
 pub fn from_loaded(loaded: &fetch::Loaded, now: chrono::DateTime<chrono::Utc>) -> Admins {
     let m = &loaded.snapshot.manifest;
-    if matches!(loaded.freshness, Freshness::Cached { .. }) {
-        let age = (now - m.confirmed_at).to_std().unwrap_or_default();
-        if age > MAX_AGE {
-            return Admins::unavailable(format!(
-                "cached snapshot of {} is older than 24h and the forge was not reachable",
-                m.repo
-            ));
-        }
+    if let Some(why) = over_age(loaded, now) {
+        return Admins::unavailable(why);
     }
     let text = match loaded.snapshot.text(ADMINS_PATH) {
         Ok(Some(t)) => t,
@@ -177,16 +191,25 @@ pub fn resolve(root: &std::path::Path) -> Admins {
 }
 
 fn load_live(root: &std::path::Path, location: &super::StoreLocation) -> Admins {
-    let cache_dir = match super::default_cache_dir(location) {
-        Ok(d) => d,
-        Err(e) => return Admins::unavailable(format!("{e:#}")),
-    };
-    let transport = super::gh::GhTransport::new(root, &location.repo);
     let now = chrono::Utc::now();
-    match fetch::load(&transport, &cache_dir, location, Policy::AllowStale, now) {
+    match load_store(root, location, now) {
         Ok(loaded) => from_loaded(&loaded, now),
-        Err(e) => Admins::unavailable(format!("{e:#}")),
+        Err(e) => Admins::unavailable(e),
     }
+}
+
+/// Load the configured store's snapshot through the daemon's own forge path
+/// (stale cache allowed, judged by [`over_age`]). Shared with
+/// [`super::decision_signers`]; never reads the judged repository.
+pub fn load_store(
+    root: &std::path::Path,
+    location: &super::StoreLocation,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<fetch::Loaded, String> {
+    let cache_dir = super::default_cache_dir(location).map_err(|e| format!("{e:#}"))?;
+    let transport = super::gh::GhTransport::new(root, &location.repo);
+    fetch::load(&transport, &cache_dir, location, Policy::AllowStale, now)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]

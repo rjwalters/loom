@@ -549,6 +549,24 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge promotion-gate --issue N [--repo OWNER/REPO]` (#10827) — may
+    /// issue N be promoted to `loom:issue` automatically? Yes when its body
+    /// author is trusted, it carries a direct operator star, or its newest
+    /// verified signed operator decision is `approve`. Prints
+    /// `GATE=ELIGIBLE|HOLD|UNAVAILABLE`, `REASON=`, `DETAIL=` (local only),
+    /// `NOTICE=needed|posted|none` and, when needed, `NOTICE_BODY=`. Branch
+    /// on the `GATE=` line, never the exit code: anything but `ELIGIBLE`
+    /// (an older binary prints nothing) means do not promote.
+    #[command(name = "promotion-gate")]
+    PromotionGate {
+        /// The issue number.
+        #[arg(long)]
+        issue: u64,
+        /// `owner/name` (default: the cwd's repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
     /// [--source S]` (#9709) — print the stale-verdict audit comment for a
     /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
@@ -782,6 +800,9 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
+        }
+        ForgeAction::PromotionGate { issue, repo } => {
+            return super::forge_identity_cmd::promotion_gate(issue, repo.as_deref());
         }
         ForgeAction::VerdictStaleNotice {
             label,

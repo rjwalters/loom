@@ -45,6 +45,14 @@
 //! `star_liveness::trust` delegates its decision to [`trusted_by`], and the
 //! shell reaches the same predicate through `loom-daemon forge
 //! trusted-comments`.
+//!
+//! # Record-scoped exception: signed operator decisions (#10827)
+//!
+//! [`decision`] lets one verified, Ed25519-signed `loom:operator-decision`
+//! line count as a fleet admin's decision whoever posted it. It is a separate
+//! API on purpose: nothing in this module consults it, so it can never make
+//! [`TrustPolicy::trusts`] true for the poster, the rest of the comment or any
+//! other marker. [`promotion_gate`] is its one consumer.
 
 use std::path::Path;
 
@@ -348,6 +356,8 @@ pub fn parse_listing(bytes: &[u8]) -> Option<Vec<Value>> {
     Some(out)
 }
 
+pub mod decision;
+pub mod promotion_gate;
 pub mod records;
 
 #[cfg(test)]

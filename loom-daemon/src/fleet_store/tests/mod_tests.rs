@@ -58,6 +58,8 @@ fn contract_paths() {
         "fleet.json",
         "fleet/state.yml",
         "fleet/defaults.json",
+        "fleet/admins.json",
+        "fleet/decision-signers.json",
         "fleet/hosts/h1/defaults.json",
         "fleet/hosts/h1/local.json",
     ] {

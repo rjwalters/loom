@@ -51,7 +51,7 @@
 #      redundant label edit. DECISION=ALREADY_ESCALATED instead (#6942).
 #
 # Output (stdout — one KEY=VALUE per line, machine-parseable):
-#   DECISION=OK|NOT_OPEN|MISMATCH|COMPLETED|ESCALATED|ALREADY_ESCALATED
+#   DECISION=OK|NOT_OPEN|MISMATCH|GATED|COMPLETED|ESCALATED|ALREADY_ESCALATED
 #   REASON=<short human-readable reason>
 #   TIER=<tier:goal-advancing|tier:goal-supporting|tier:maintenance|"">
 #
@@ -79,6 +79,9 @@
 #        unrecoverable from the verdict text, the completing edit failed, or
 #        its own read-back still shows loom:issue missing — routed to
 #        loom:operator-only,loom:operator-mechanical instead of guessing)
+#   14 = GATED (--apply: `loom-daemon forge promotion-gate` did not say
+#        ELIGIBLE, #10827 -- untrusted body author with no trusted signal, or
+#        the gate could not run; nothing written, nothing posted)
 #
 # CALLERS MUST NOT SWALLOW THE EXIT CODE. OK (0), NOT_OPEN (10), and
 # ALREADY_ESCALATED (0) all mean "nothing to do here";
@@ -253,6 +256,16 @@ fi
 # (forge-helpers.sh in a subshell: it sets -e) and name it on every write; a
 # refusal leaves this a report-only MISMATCH.
 WRITE_REPO="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}" 2>"$GH_STDERR")" || { emit "MISMATCH" "$REASON; --apply refused: loom-daemon forge may-write: $(tr '\n' ' ' <"$GH_STDERR")"; exit 11; }
+
+# #10827: the promotion author gate. An untrusted body author is promoted only
+# with an operator star or a verified signed decision; HOLD/UNAVAILABLE (or a
+# binary predating the verb) writes nothing and posts nothing: exit 14.
+# requires-daemon: forge optional   Without the `promotion-gate` verb (pre-#10827 binary) no GATE=ELIGIBLE line prints, so nothing is promoted (fails closed).
+GATE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge promotion-gate --issue "$ISSUE" --repo "$WRITE_REPO" 2>/dev/null)"
+if ! grep -qx 'GATE=ELIGIBLE' <<<"$GATE_OUT"; then
+  emit "GATED" "$REASON; not promoted: author gate $(grep -m1 '^GATE=' <<<"$GATE_OUT" || echo 'GATE=UNAVAILABLE') $(grep -m1 '^REASON=' <<<"$GATE_OUT")"
+  exit 14
+fi
 
 # Recover the tier from the "**Goal Alignment**: [Tier N] ..." line Step 3b's
 # template writes into the verdict comment. Heuristic on purpose — this is

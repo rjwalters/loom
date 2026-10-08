@@ -1427,6 +1427,7 @@ and the legacy files are not consulted.
 | `repos.yml` | `roster` | YAML, below |
 | `fleet/state.yml` | `state` | YAML, below |
 | `fleet/admins.json` | comment trust | JSON `{"admins": ["login", ...]}`: fleet admins trusted as comment authors in every fleet repo; unreadable means empty (fails closed). See [comment-trust](comment-trust.md) (#10303) |
+| `fleet/decision-signers.json` | comment trust | JSON `{"version": 1, "keys": [{"id", "alg": "ed25519", "public_key", "state": "active"\|"revoked"}]}`: public keys whose signed `loom:operator-decision` markers count as a fleet admin's decision. Public keys only; unreadable means no signed decision counts (fails closed). See [comment-trust](comment-trust.md) (#10827) |
 
 Other files in the store (a README, a host inventory) are never fetched.
 

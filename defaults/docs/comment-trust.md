@@ -27,6 +27,12 @@ A comment or review is trusted when its author is:
 | A login in `forge.trustedCommenters` | An explicit allowlist, same account-kind rule (list `helper[bot]` to allow an App). |
 | A login on the **fleet admin roster**, `fleet/admins.json` in the fleet store | `{"admins": ["turian", "rjwalters"]}`, read through the fleet store reader (`fleet.repo`, `fleet.ref`), never from the repo being judged. User accounts only (App-spelled entries are ignored). Applies in every fleet repo (#10303). |
 
+One row is **record-scoped**, not author-scoped:
+
+| Record | Why |
+|---|---|
+| A verified signed `loom:operator-decision` marker line, whoever posted it | A fleet admin's decision relayed by a tool (e.g. a dashboard App) that must stay an untrusted author. Only the parsed record counts: the rest of that comment, its author, the author's other comments and markers, and the issue body all stay untrusted. See [Signed operator decisions](#signed-operator-decisions-10827) (#10827). |
+
 **Another Loom installation's markers are not ours.** A foreign fleet emits
 perfectly well-formed Loom markers; its Apps are not in this roster, so they
 count for nothing here.
@@ -131,6 +137,163 @@ association, Apps and self rules are unchanged.
   behaviour). Each cause is logged once at warn, and
   `TrustPolicy::sources_consulted()` reports `fleet admin roster ...
   (unavailable: <reason>)` for the ignored-marker notice.
+
+## Signed operator decisions (#10827)
+
+**Threat model.** A fleet may record an operator's decision through a narrow
+GitHub App that also files bot issues, so the App must stay an untrusted
+author: listing it in `forge.trustedCommenters` would make every marker it
+writes, including forged decision text from automated paths, count as
+control. Instead, one line of its comment counts when it carries an Ed25519
+signature by a key the fleet published. Anyone can copy a signed line; they
+cannot alter one or move it to another repo or issue, and it expires.
+
+**What verification grants.** Exactly one record: fleet admin `by` decided
+`decision` on issue `issue` of `repo` at `at`. Not the comment's other text,
+not its author, not the author's other comments or markers, not the issue
+body. `TrustPolicy::trusts` is unchanged (`loom-daemon/src/comment_trust/
+decision.rs` is a separate API, and its only consumer is the promotion gate
+below). A decision comment's human-readable line is content; only the
+verified marker is state.
+
+### Wire format
+
+One whole line of the comment (a trailing `\r` is allowed), fields in this
+order, single spaces, nothing after `-->`:
+
+```text
+<!-- loom:operator-decision v1 repo=<owner/name> issue=<n> decision=<approve|defer|reject> by=<login> at=<YYYY-MM-DDTHH:MM:SSZ> key=<key-id> sig=ed25519:<base64> -->
+```
+
+- `repo`, `by`: lower case (the one normalisation rule; GitHub names are
+  case-insensitive). `by` is a user login, never `x[bot]`.
+- `issue`: a positive decimal integer, no leading zero.
+- `decision`: `approve`, `defer` or `reject`. Any other word is prose even
+  with a valid signature.
+- `at`: UTC, whole seconds, `Z` suffix; no fraction, no offset.
+- `key`: `[a-z0-9][a-z0-9._-]{0,63}`, an id from `fleet/decision-signers.json`.
+- `sig`: padded standard base64 of the 64-byte signature.
+
+Anything else is rejected, never normalised: a duplicate, unknown or
+reordered field, extra whitespace, trailing data, upper case, a non-canonical
+timestamp, number or base64, an unknown version. A comment with two marker
+lines counts for nothing.
+
+**Signed bytes**: UTF-8 (ASCII), seven `\n`-terminated lines, terminal
+newline included:
+
+```text
+loom:operator-decision v1
+repo=<repo>
+issue=<issue>
+decision=<decision>
+by=<by>
+at=<at>
+key=<key>
+```
+
+### Verification (fails closed)
+
+A line is a decision only when all hold; otherwise it is prose:
+
+1. it parses strictly (above);
+2. `repo`/`issue` are where the comment sits (the comment's own `issue_url`,
+   which must also match the issue it was listed under);
+3. `key` names an **active** key in `fleet/decision-signers.json`, read
+   through the fleet store reader (`fleet.repo`/`fleet.ref`), never from the
+   judged repository; lookup is by id only, never by trying every key;
+4. the signature verifies under that key;
+5. `by` is on the fleet admin roster `fleet/admins.json`, checked separately
+   (holding a key adds no admin);
+6. `at` is no older than `forge.operatorDecisionMaxAgeSecs` (default 7 days,
+   capped at 30) and no more than 5 minutes in the future.
+
+Missing or malformed signer data, a cached store snapshot older than 24h, an
+unknown/revoked key, a bad signature, the wrong place, a non-admin `by`, or an
+out-of-window `at` all leave the line prose.
+
+**Replay.** Among the issue's verified, in-window records the greatest `at`
+wins; on equal `at` the more conservative decision (`reject` > `defer` >
+`approve`), then the greater `(key, sig)`. Invalid records take no part, so a
+newer forged marker cannot shadow an older valid one, and when every record
+has aged out the issue has no signed decision again.
+
+Diagnostics name reason categories (`bad-signature:1,expired:1`) and key ids,
+never a marker payload or signature.
+
+### Signer keys: `fleet/decision-signers.json`
+
+```json
+{"version": 1, "keys": [
+  {"id": "dash-2026-10", "alg": "ed25519", "public_key": "<base64 of 32 bytes>", "state": "active"},
+  {"id": "dash-2026-04", "alg": "ed25519", "public_key": "<base64 of 32 bytes>", "state": "revoked"}
+]}
+```
+
+Strict: unknown fields, a version other than 1, more than 16 keys, a duplicate
+id or public key, a non-`ed25519` alg, a state other than `active`/`revoked`,
+or non-canonical base64 rejects the **whole file**. Cached like the admin
+roster (`forge.decisionSignersTtlSecs`, default 300; a stale snapshot only
+while younger than 24h).
+
+**Rotation**: add the new key as `active` beside the old one (two active keys
+verify side by side, each only its own markers), move the signer over, then
+mark the old key `revoked` or delete it. A revoked or removed key verifies
+nothing, including markers it already signed.
+
+**Private keys never live in this repository or the fleet store.** Loom
+stores and reads public keys only and never signs. The signing tool keeps its
+private key under the credential policy
+([credential-storage](credential-storage.md)). With OpenSSL:
+
+```bash
+printf 'loom:operator-decision v1\nrepo=%s\nissue=%s\ndecision=%s\nby=%s\nat=%s\nkey=%s\n' \
+  "$REPO" "$N" "$DECISION" "$BY" "$AT" "$KEY" > msg.bin
+openssl pkeyutl -sign -inkey "$PRIVATE_KEY_PEM" -rawin -in msg.bin | base64   # sig=ed25519:<this>
+```
+
+### Published test vector
+
+Test-only key: seed `05c3574eb3a78c83d2719f2755c0f1cac6fdec94fe8694b70a26dface35cbc08`
+(`sha256("loom-10827-test-vector-key-a")`), public key
+`4hMOQPTWOkE461Va0/ykByEMayRT+DM/4or9N+OA86Q=`. Signed with OpenSSL 4.0.3 and
+pinned in `comment_trust::decision::tests`:
+
+```text
+<!-- loom:operator-decision v1 repo=acme/widgets issue=42 decision=approve by=octo-admin at=2026-10-08T12:00:00Z key=test-a sig=ed25519:rRAbMpmWIg/OA7RxZswtB15XMruYCHRmGxR4MbdiuJTrh1+AkHRUvpuvi/cR4TPAxCnFJiFG94rgLYB69sZ1CA== -->
+```
+
+## Promotion author gate (#10827)
+
+The rules above cover markers, not who wrote the issue being promoted. Every
+automatic `loom:curated` → `loom:issue` write first asks
+`loom-daemon forge promotion-gate --issue N [--repo OWNER/REPO]`:
+
+| Answer | When |
+|---|---|
+| `GATE=ELIGIBLE` | The body author is trusted (the table above); or the issue carries a direct operator star (`loom:operator-priority` / `loom:operator-high-priority`) whose newest `labeled` event's actor is trusted (the table above) or a user with repository role `triage` or better (an App's role is never asked, so the issues-write App cannot star its own issue; the daemon's `*-inherited` stars do not count); or its newest verified signed decision is `approve` |
+| `GATE=HOLD` | An untrusted body author with none of those, or a newest signed decision of `defer`/`reject` |
+| `GATE=UNAVAILABLE` | The issue or its comments could not be read, or a star's applier could not be resolved and nothing else decided |
+
+Callers branch on the `GATE=` line, never the exit code; anything but
+`ELIGIBLE` (including no output from an older binary) means do not promote.
+Passing is not approval: every other promotion criterion still applies, and a
+signed `approve` is evidence of who decided, interpreted by the normal
+workflow. A held issue is left exactly as it was. `NOTICE=needed` plus
+`NOTICE_BODY=` offers one explanatory comment (`<!-- loom:promotion-author-gate -->`),
+needed only until a trusted author has posted it, so retries never repeat it.
+`REASON=` is safe to post; `DETAIL=` (ignored-marker counts, signer and roster
+state) may name the fleet store and stays local.
+
+Callers: Champion Step 3b and Pass 0c (`check-promotion-landed.sh --apply`
+exits 14, `DECISION=GATED`, writing and posting nothing), and Curator's
+starred promotion (Priority 0 adds `loom:issue` only on `GATE=ELIGIBLE`, so a
+star the untrusted App applied itself promotes nothing). `/loom:sweep`'s
+approval gate executes an approval
+already given (an operator dispatch, a star, or the red-fix lane's own
+trusted-author check). Restoring `loom:issue` after a claim or park
+(`loom:building`/`loom:blocked` → `loom:issue`) re-grants an approval the
+issue already had and is not a promotion.
 
 ## Configuration
 
