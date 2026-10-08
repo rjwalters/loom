@@ -582,7 +582,7 @@ pub mod pause_classify;
 pub mod pause_manifest;
 pub mod pause_resume;
 pub mod pause_roll;
-/// #10713: `auto_update_state.json` (settle clocks, window).
+/// #10713: `auto_update_state.json` (settle clocks, floor alert).
 pub mod persisted_state;
 pub use pause_roll::RollTarget;
 /// #10712: floor-driven roll targets (target selection, settle skip, stall).

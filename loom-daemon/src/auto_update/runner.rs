@@ -121,9 +121,13 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // but a day-long incident needs a signal that reaches the daemon's own
     // log without anyone asking. Logged every tick the threshold is crossed
     // (bounded by `interval`, default 900s — not spammy).
-    if let Some(warning) =
-        crate::self_update::staleness_warning_default(check.commits_behind, check.hours_behind)
-    {
+    //
+    // #10885: not on a fleet host. It does not follow its source checkout (it
+    // moves when the floor moves), so being behind it is by design and a
+    // WARN every tick would be noise.
+    let staleness =
+        crate::self_update::staleness_warning_default(check.commits_behind, check.hours_behind);
+    if let Some(warning) = staleness.filter(|_| !state.floor.fleet_host()) {
         log::warn!("auto_update: {warning}");
     }
 

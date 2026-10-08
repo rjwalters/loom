@@ -537,6 +537,53 @@ fn losing_the_fleet_store_starts_the_settle_clock_from_that_tick() {
     assert!(matches!(settled, TickDecision::FetchArtifact { .. }), "{settled:?}");
 }
 
+/// A trigger that refuses every roll, as H3 does while the failed-target
+/// guard (#10832, `pause_resume::attempt::gate`) holds a target back.
+#[derive(Default)]
+struct Refusing {
+    asked: Mutex<Vec<(pause_manifest::TargetSource, Option<String>)>>,
+}
+
+impl RollTrigger for Refusing {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((target.source.clone(), target.to_version.clone()));
+        false
+    }
+    fn roll_in_progress(&self) -> bool {
+        false
+    }
+    fn armed_roll(&self) -> Option<ArmedRoll> {
+        None
+    }
+}
+
+/// #10832's failed-target guard lives in H3, behind `trigger_pause_roll`. A
+/// floor roll skips settle but not that: every floor-driven tick offers its
+/// target (version and checksum, which the guard keys on) to the trigger, a
+/// refusal arms nothing, and the next tick offers it again.
+#[test]
+fn a_floor_roll_goes_through_the_trigger_every_tick_so_h3_can_hold_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Below);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let trigger = Refusing::default();
+    let status = AutoUpdateStatus::new(true);
+    for n in 1..=2 {
+        let mut probe = probe(newest(RUNNING), &fetches);
+        let settle = Duration::from_secs(600);
+        let summary = run_tick(&mut state, &status, &mut probe, &trigger, settle, DEFER);
+        assert!(!summary.roll_armed, "tick {n}");
+        assert_eq!(trigger.asked.lock().unwrap().len(), n, "tick {n}");
+        let note = status.snapshot().note.unwrap_or_default();
+        assert!(note.contains("could not start"), "tick {n}: {note}");
+    }
+    let asked = trigger.asked.lock().unwrap();
+    assert_eq!(asked[0], (pause_manifest::TargetSource::Floor, Some(NEWEST.to_string())));
+}
+
 /// #10880 relies on it: the tick that arms a roll writes the state file
 /// itself, because the roll's restart can end the process before the
 /// end-of-tick save (which `guarded_tick`, not `run_tick`, performs).

@@ -122,7 +122,7 @@ mod tests {
     /// resolves to the tuning it would without them.
     #[test]
     #[serial(loom_auto_update_env)]
-    fn the_removed_roll_window_settings_do_not_change_the_tuning() {
+    fn the_removed_window_settings_do_not_change_the_tuning() {
         for var in ENV_VARS {
             std::env::remove_var(var);
         }

@@ -275,6 +275,59 @@ mod tests {
         ));
     }
 
+    fn pass(floor: Option<&str>) -> FloorPass {
+        FloorPass {
+            floor: floor.map(str::to_string),
+            ..FloorPass::default()
+        }
+    }
+
+    /// The process-wide cells are shared, so this is serialized with the
+    /// other tests that use them (`fleet_sync/tests.rs`).
+    #[test]
+    #[serial_test::serial(loom_socket_path_env)]
+    fn a_pass_wakes_the_loop_when_the_floor_changes_and_not_when_it_does_not() {
+        let reset = || {
+            *floor_cell().lock().unwrap() = None;
+            *meta().lock().unwrap() = Meta::default();
+        };
+        reset();
+        set_store_mode(StoreMode::Configured);
+        let wake = floor_wake();
+
+        // The first pass to resolve anything is a change (unknown -> set).
+        let before = wake.generation();
+        record_floor(&pass(Some("0.19.888")));
+        assert_ne!(wake.generation(), before);
+        assert_eq!(floor_knowledge(), FloorKnowledge::Set("0.19.888".to_string()));
+        assert_eq!(super::super::loom_min_version().as_deref(), Some("0.19.888"));
+
+        // The steady state: every later pass resolves the same floor.
+        let steady = wake.generation();
+        for _ in 0..3 {
+            record_floor(&pass(Some("0.19.888")));
+        }
+        assert_eq!(wake.generation(), steady, "an unchanged floor never wakes the loop");
+
+        // The operator raises the floor.
+        record_floor(&pass(Some("0.19.940")));
+        assert_ne!(wake.generation(), steady);
+        assert_eq!(floor_knowledge(), FloorKnowledge::Set("0.19.940".to_string()));
+
+        // A store that stops carrying the field: unknown, with the pass's reason.
+        let mut bad = pass(None);
+        bad.error = Some("fleet.json: malformed `loom_min_version`".to_string());
+        record_floor(&bad);
+        assert_eq!(
+            floor_knowledge(),
+            FloorKnowledge::Unknown("fleet.json: malformed `loom_min_version`".to_string())
+        );
+        // No store at all: not a fleet host.
+        set_store_mode(StoreMode::Absent);
+        assert_eq!(floor_knowledge(), FloorKnowledge::NoStore);
+        reset();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_wake_resolves_on_a_bump_and_not_before() {
         let wake = FloorWake::new();

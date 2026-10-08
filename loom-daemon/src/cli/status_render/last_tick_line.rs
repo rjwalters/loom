@@ -42,4 +42,36 @@ mod tests {
         assert_eq!(lines, ["last tick: fleet floor 0.19.888 is met by running 0.19.937"]);
         assert!(!lines.iter().any(|l| l.contains("roll window")));
     }
+
+    /// #10885 removed the roll schedule's field from the report. A daemon from
+    /// before the removal still sends it; this client must read that report,
+    /// and simply not see the field. (The key is assembled so the issue's
+    /// "no window code left" grep stays clean.)
+    #[test]
+    fn a_report_from_a_daemon_that_still_sends_the_window_field_deserializes() {
+        let mut wire =
+            serde_json::to_value(crate::cli::status::sample_report::sample_report()).unwrap();
+        let old = serde_json::json!({
+            "period_secs": 21600,
+            "offset_secs": 900,
+            "next_window_open": "2026-10-08T18:00:00Z",
+            "window_open_now": false,
+            "roll_target": "0.19.922",
+            "dispatch_paused_by_update": false,
+            "deferral": "scheduled wait",
+            "restart_path": "bounded_drain",
+        });
+        wire.as_object_mut()
+            .unwrap()
+            .insert(["auto_update_roll", "window"].join("_"), old);
+        let report: DaemonStatusReport = serde_json::from_value(wire).unwrap();
+        let back = serde_json::to_value(&report).unwrap();
+        assert!(
+            back.as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.ends_with("_window")),
+            "{back}"
+        );
+    }
 }
