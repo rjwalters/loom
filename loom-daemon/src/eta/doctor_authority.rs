@@ -150,6 +150,7 @@ mod tests {
                 last_emit_at: last_emit_mins_ago.map(|m| now() - Duration::minutes(m)),
                 repos_covered: 2,
                 open_prs: 3,
+                complete: true,
             }),
         }
     }

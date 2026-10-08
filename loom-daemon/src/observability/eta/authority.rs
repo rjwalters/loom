@@ -251,6 +251,17 @@ pub(super) fn gate_delivery(
     Delivered::default()
 }
 
+/// What a full pass observed of the review queue (#10898).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Coverage {
+    /// Repos whose review listings succeeded.
+    pub repos: usize,
+    /// Open review PRs across those repos.
+    pub prs: usize,
+    /// No in-scope repo's listing failed; otherwise `prs` is a lower bound.
+    pub complete: bool,
+}
+
 /// What one authority pass amounts to for liveness (#10898).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PassOutcome {
@@ -278,20 +289,21 @@ pub(super) fn pass_outcome(
 }
 
 /// [`gate_delivery`] with this process's authority flag, then the liveness
-/// beat and emit heartbeat. `coverage` is a full pass's `(repos covered, open
-/// review PRs)`; `None` for a between-passes bus delivery, which refreshes
+/// beat and emit heartbeat. `coverage` is what a full pass observed; `None` for a between-passes bus delivery, which refreshes
 /// the last emit but neither beats nor changes the recorded coverage.
 pub(super) fn deliver_checked(
     emissions: Vec<Emission>,
     outcomes: Vec<Resolved>,
     host_id: &str,
     dry_run: bool,
-    coverage: Option<(usize, usize)>,
+    coverage: Option<Coverage>,
 ) -> Delivered {
     let loom = Provenance::current();
     let delivered = gate_delivery(active(), emissions, outcomes, &loom, host_id, dry_run, sink());
     let pass = pass_outcome(active(), sink().is_some(), dry_run, &delivered);
-    if pass.beat && coverage.is_some() {
+    // An incomplete pass (failed listings) saw unavailable inputs, not a
+    // healthy queue, so it does not beat.
+    if pass.beat && coverage.is_some_and(|c| c.complete) {
         crate::task_liveness::beat_if_registered(crate::task_liveness::ETA_PASS);
     }
     if active() {
@@ -300,8 +312,9 @@ pub(super) fn deliver_checked(
             let prev = crate::eta::emit_heartbeat::read(&root);
             let fallback = prev
                 .as_ref()
-                .map_or((0, 0), |p| (p.repos_covered, p.open_prs));
-            let (repos, prs) = coverage.map_or(fallback, |(r, p)| (r as u64, p as u64));
+                .map_or((0, 0, false), |p| (p.repos_covered, p.open_prs, p.complete));
+            let (repos, prs, complete) =
+                coverage.map_or(fallback, |c| (c.repos as u64, c.prs as u64, c.complete));
             let now = chrono::Utc::now();
             let next = crate::eta::emit_heartbeat::next(
                 prev.as_ref(),
@@ -310,6 +323,7 @@ pub(super) fn deliver_checked(
                 pass.emitted,
                 repos,
                 prs,
+                complete,
             );
             crate::eta::emit_heartbeat::write(&root, &next);
         }
@@ -387,5 +401,24 @@ mod tests {
                 emitted: false
             }
         );
+    }
+
+    #[test]
+    fn failed_listings_with_no_exporter_raise_the_silent_alert_after_the_threshold() {
+        // The #10906 review path: an exporter-less authority whose listings
+        // keep failing writes "0 PRs, incomplete" heartbeats. That is not a
+        // quiet fleet, so once the silence passes the threshold it alerts.
+        use chrono::{Duration, TimeZone, Utc};
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 8, 0, 0, 0).unwrap();
+        let started = t0 - Duration::hours(40);
+        let out = pass_outcome(true, false, false, &Delivered::default());
+        assert!(!out.beat && !out.emitted);
+        let now = t0 + Duration::hours(3);
+        let failed = crate::eta::emit_heartbeat::next(None, "h", now, out.emitted, 0, 0, false);
+        let cond = crate::fleet_alert::eta_emit::condition(Some(&failed), now, started);
+        assert!(cond.is_some());
+        // A genuinely empty, fully listed fleet stays exempt.
+        let empty = crate::eta::emit_heartbeat::next(None, "h", now, out.emitted, 2, 0, true);
+        assert!(crate::fleet_alert::eta_emit::condition(Some(&empty), now, started).is_none());
     }
 }

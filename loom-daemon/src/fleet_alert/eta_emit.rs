@@ -23,8 +23,9 @@ pub const KEY_ETA_SILENT: &str = "eta-authority-silent";
 
 /// The condition for an authority at `now`, from its heartbeat. `started` is
 /// the process start (the grace origin). Silence only matters while there is
-/// something to estimate: a heartbeat whose last pass saw no open PRs is a
-/// quiet fleet, but one whose last *pass* is itself older than the threshold
+/// something to estimate: a heartbeat whose last pass listed every repo and
+/// saw no open PRs is a quiet fleet (a pass with a failed listing observed
+/// nothing, so it never counts as quiet), but one whose last *pass* is itself older than the threshold
 /// says nothing about open PRs and so does not excuse the silence. Pure.
 #[must_use]
 pub fn condition(
@@ -37,7 +38,7 @@ pub fn condition(
         return None;
     }
     let pass_current = hb.is_some_and(|h| now - h.pass_at <= emit_heartbeat::SILENT_AFTER);
-    if pass_current && hb.is_some_and(|h| h.open_prs == 0) {
+    if pass_current && hb.is_some_and(|h| h.complete && h.open_prs == 0) {
         return None;
     }
     let age = silence.age_secs.unwrap_or(0);
@@ -94,6 +95,7 @@ mod tests {
             last_emit_at: last_emit,
             repos_covered: 2,
             open_prs,
+            complete: true,
         }
     }
 
@@ -114,6 +116,17 @@ mod tests {
         assert!(condition(Some(&hb(Some(t0()), now, 4)), now, started).is_none());
         let later = t0() + Duration::hours(5);
         assert!(condition(Some(&hb(Some(t0()), later, 0)), later, started).is_none());
+    }
+
+    #[test]
+    fn a_pass_with_failed_listings_is_not_a_quiet_fleet() {
+        // Listings failed, so "0 open PRs" is unknown: the silence stands.
+        let started = t0() - Duration::hours(40);
+        let now = t0() + Duration::hours(5);
+        let mut unknown = hb(Some(t0()), now, 0);
+        unknown.complete = false;
+        assert!(condition(Some(&unknown), now, started).is_some());
+        assert!(condition(Some(&hb(Some(t0()), now, 0)), now, started).is_none());
     }
 
     #[test]

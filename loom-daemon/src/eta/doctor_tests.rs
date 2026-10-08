@@ -43,6 +43,7 @@ fn healthy() -> Facts {
                     last_emit_at: Some(now() - Duration::minutes(10)),
                     repos_covered: 2,
                     open_prs: 3,
+                    complete: true,
                 }),
             },
         },

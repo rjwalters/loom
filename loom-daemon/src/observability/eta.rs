@@ -920,6 +920,9 @@ pub(super) async fn record(
     // issues (`None` when any star listing failed: unknown, not unstarred).
     let mut stars: Vec<RepoStars> = Vec::new();
     let mut seen = BTreeSet::new();
+    // #10898: false once any in-scope repo's listing fails, so the pass's
+    // PR count is a lower bound rather than an observed (possibly empty) queue.
+    let mut listings_complete = true;
     for root in &roots {
         let Some(slug) =
             super::collector::resolve_repo_slug_cached(slug_cache, &root.to_string_lossy()).await
@@ -954,6 +957,8 @@ pub(super) async fn record(
             };
             stars.push((slug.clone(), links, starred));
             repos.push((root.clone(), slug, pr_views(&listings), listed));
+        } else {
+            listings_complete = false;
         }
     }
     // #10897: compare what this pass manages with the fleet roster.
@@ -1140,7 +1145,11 @@ pub(super) async fn record(
     pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
     let stages = stage_outcome::build(&rows, &pending, &outcomes, now);
     stage_outcome::emit(stages, &host_id, dry_run);
-    let coverage = (repos.len(), repos.iter().map(|r| r.3.len()).sum());
+    let coverage = authority::Coverage {
+        repos: repos.len(),
+        prs: repos.iter().map(|r| r.3.len()).sum(),
+        complete: listings_complete,
+    };
     let delivered =
         authority::deliver_checked(emissions, outcomes, &host_id, dry_run, Some(coverage));
     write_pending(&pending_path(workspace_root), &pending);

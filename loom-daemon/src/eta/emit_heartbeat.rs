@@ -36,6 +36,11 @@ pub struct Heartbeat {
     pub repos_covered: u64,
     /// Review-stage PRs open across those repos at that pass.
     pub open_prs: u64,
+    /// Every in-scope repo's review listing succeeded, so `open_prs` is an
+    /// observation. `false` = some listing failed: the count is unknown, not
+    /// zero. Absent (an older file) reads as `false`, the conservative side.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 /// `<root>/.loom/state/eta/health/last-emit.json`.
@@ -45,7 +50,8 @@ pub fn path(root: &Path) -> PathBuf {
 }
 
 /// Fold one pass into the heartbeat: `emitted` records offered at `now`
-/// refresh `last_emit_at`, otherwise the previous one is kept.
+/// refresh `last_emit_at`, otherwise the previous one is kept. `complete` is
+/// whether the pass's listings all succeeded (see [`Heartbeat::complete`]).
 #[must_use]
 pub fn next(
     prev: Option<&Heartbeat>,
@@ -54,6 +60,7 @@ pub fn next(
     emitted: bool,
     repos_covered: u64,
     open_prs: u64,
+    complete: bool,
 ) -> Heartbeat {
     let kept = prev.and_then(|p| p.last_emit_at);
     Heartbeat {
@@ -62,6 +69,7 @@ pub fn next(
         last_emit_at: if emitted { Some(now) } else { kept },
         repos_covered,
         open_prs,
+        complete,
     }
 }
 
