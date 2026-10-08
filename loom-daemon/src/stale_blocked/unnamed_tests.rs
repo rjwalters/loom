@@ -510,3 +510,56 @@ fn a_queued_issue_that_gains_a_hold_loses_the_marker_and_a_claim_defers_it() {
     assert!(r.queued.is_empty());
     assert_eq!(w.park.writes.len(), 2);
 }
+
+#[test]
+fn a_queued_issue_that_gains_a_legacy_daemon_hold_loses_the_marker() {
+    let mut w = World::new();
+    w.add(5, "No blocker recorded.", &[]);
+    assert_eq!(w.run().queued, vec![5]);
+    // The forge now lists the queue label, then the daemon holds the issue.
+    let labels = w.park.items[&5].labels.clone();
+    let l: Vec<&str> = labels.iter().map(String::as_str).collect();
+    w.gather.rows.clear();
+    w.gather.unnamed.clear();
+    w.park.writes.clear();
+    w.add(5, "No blocker recorded.", &l[1..]);
+    w.extra.comments.insert(
+        5,
+        vec![json!({
+            "body": format!("{QUARANTINE_COMMENT_MARKER}\nheld"),
+            "user": {"login": "someone"},
+            "author_association": "MEMBER",
+            "created_at": "2026-10-02T00:00:00Z",
+        })],
+    );
+    w.extra
+        .blocked_at
+        .insert(5, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert_eq!(r.cleared, vec![5]);
+    assert_eq!(r.already_queued, 0);
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert_eq!(w.park.writes, vec![format!("remove #5 {UNNAMED_LABEL}")]);
+    assert!(w.park.items[&5]
+        .labels
+        .contains(&"loom:blocked".to_string()));
+
+    // A hold released before the current block does not veto the marker.
+    let mut w = World::new();
+    w.add(6, "No blocker recorded.", &[UNNAMED_LABEL]);
+    w.extra.comments.insert(
+        6,
+        vec![json!({
+            "body": format!("{QUARANTINE_COMMENT_MARKER}\nheld"),
+            "user": {"login": "someone"},
+            "author_association": "MEMBER",
+            "created_at": "2026-01-01T00:00:00Z",
+        })],
+    );
+    w.extra
+        .blocked_at
+        .insert(6, "2026-10-01T00:00:00Z".to_string());
+    let r = w.run();
+    assert!(r.cleared.is_empty());
+    assert_eq!(r.already_queued, 1);
+}

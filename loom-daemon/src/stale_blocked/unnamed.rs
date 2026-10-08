@@ -319,7 +319,24 @@ pub fn run(
             }
         };
         match (queued, doc) {
-            (true, Doc::Undocumented) => report.already_queued += 1,
+            (true, Doc::Undocumented) => {
+                // The queue marker must not outlive a legacy daemon hold that
+                // arrived after it was applied: the comment veto otherwise
+                // lives only in `queue()`.
+                let body = row.body.as_deref().unwrap_or_default();
+                let held = extra
+                    .comments(n)
+                    .map_err(|e| format!("comment read failed: {e}"))
+                    .and_then(|c| legacy_hold_veto(extra, policy, n, body, &c));
+                match held {
+                    Ok(true) => {
+                        clear(park, n, cfg.dry_run, &mut cap, &mut report);
+                        report.skip(Skip::DaemonHold);
+                    }
+                    Ok(false) => report.already_queued += 1,
+                    Err(why) => report.unread(n, why),
+                }
+            }
             (true, _) => clear(park, n, cfg.dry_run, &mut cap, &mut report),
             (false, Doc::Documented) => {}
             (false, Doc::DaemonHold) => report.skip(Skip::DaemonHold),
@@ -376,6 +393,51 @@ fn documentation(extra: &mut dyn ReleaseForge, n: u64, ev: &Evidence) -> Result<
         }
         _ => Ok(Doc::Documented),
     }
+}
+
+fn comment_body(c: &Value) -> String {
+    c.get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Whether a trusted legacy PR-less-retry / quarantine hold comment vetoes the
+/// issue. Only for a pre-#10161 hold, i.e. no daemon record in the body. A hold
+/// comment older than the latest `loom:blocked` belongs to a released hold and
+/// must not veto a later bare re-block; an undated comment or unreadable label
+/// time still vetoes (fail safe). Shared by the queue write and the
+/// already-queued reconciliation, so a marker never outlives this veto.
+fn legacy_hold_veto(
+    extra: &mut dyn ReleaseForge,
+    policy: &TrustPolicy,
+    n: u64,
+    body: &str,
+    comments: &[Value],
+) -> Result<bool, String> {
+    if parse(body).iter().any(is_daemon_hold) {
+        return Ok(false);
+    }
+    let holds: Vec<&Value> = comments
+        .iter()
+        .filter(|c| policy.trusts_json(c))
+        .filter(|c| {
+            let b = comment_body(c);
+            b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
+        })
+        .collect();
+    if holds.is_empty() {
+        return Ok(false);
+    }
+    let labeled_at = extra
+        .last_labeled_at(n, BLOCKED_LABEL)
+        .map_err(|e| format!("label-event read failed: {e}"))?;
+    Ok(holds.iter().any(|c| {
+        super::hold::reviews_current_block(
+            c.get("created_at").and_then(Value::as_str),
+            labeled_at.as_deref(),
+        )
+    }))
 }
 
 /// The per-pass write budget: queueing and clearing each get `max`.
@@ -454,12 +516,7 @@ fn queue(
             return;
         }
     };
-    let body_of = |c: &Value| {
-        c.get("body")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
+    let body_of = comment_body;
     if comments
         .iter()
         .any(|c| body_of(c).contains(PERMANENT_BLOCK_MARKER))
@@ -467,38 +524,14 @@ fn queue(
         report.skip(Skip::Permanent);
         return;
     }
-    // Legacy comment marker: only for a pre-#10161 hold, i.e. no body record.
-    // A hold comment older than the latest `loom:blocked` belongs to a
-    // released hold and must not veto a later bare re-block; an undated
-    // comment or unreadable label time still vetoes (fail safe).
-    let body_record = parse(&fresh.body).iter().any(is_daemon_hold);
-    let hold_comments: Vec<&Value> = if body_record {
-        Vec::new()
-    } else {
-        comments
-            .iter()
-            .filter(|c| policy.trusts_json(c))
-            .filter(|c| {
-                let b = body_of(c);
-                b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
-            })
-            .collect()
-    };
-    if !hold_comments.is_empty() {
-        let labeled_at = match extra.last_labeled_at(n, BLOCKED_LABEL) {
-            Ok(t) => t,
-            Err(e) => {
-                report.unread(n, format!("label-event read failed: {e}"));
-                return;
-            }
-        };
-        if hold_comments.iter().any(|c| {
-            super::hold::reviews_current_block(
-                c.get("created_at").and_then(Value::as_str),
-                labeled_at.as_deref(),
-            )
-        }) {
+    match legacy_hold_veto(extra, policy, n, &fresh.body, &comments) {
+        Ok(true) => {
             report.skip(Skip::DaemonHold);
+            return;
+        }
+        Ok(false) => {}
+        Err(why) => {
+            report.unread(n, why);
             return;
         }
     }

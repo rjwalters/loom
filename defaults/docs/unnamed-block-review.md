@@ -44,6 +44,13 @@ comment). **Skip the issue and write nothing** if it carries:
 - `loom:building`, or a `loom:curating` claim that is not yours. Run Curator's
   "Stale `loom:curating` Claim Check" (`claim-staleness.sh`) and stand down on
   `fresh`/`unknown`; reclaim only on `stale`, as for any Curator work.
+- a **current** daemon hold with no body record: a trusted comment carrying a
+  legacy PR-less-retry or quarantine marker (`<!-- loom:prless-retry-kind=hold`
+  or `Auto-quarantined by loom-daemon`) whose `created_at` is not older than
+  the latest `loom:blocked` application. An older one belongs to a released
+  hold and does not veto a later bare re-block; an undated comment still does.
+  Releasing would act on a daemon-owned hold: do not remove `loom:blocked`;
+  the daemon strips the queue label on its next tick.
 - no longer `loom:blocked`, or a body naming a blocker or reason **for the
   current hold** (a record whose `at=` is not older than the latest
   `loom:blocked` application, allowing for write slack): only remove
@@ -75,6 +82,9 @@ the per-outcome count source for the dashboard.
 - Queued, then an operator adds `loom:operator-only` or a Builder adds
   `loom:building` before you run: **skip**, no write, even though the body and
   documentation verdict are unchanged.
+- Queued, then the daemon adds a current legacy quarantine / PR-less-retry hold
+  comment (no body record) before you run: **skip**, no write. The tick also
+  strips the queue label; `loom:blocked` stays intact.
 - A January reason record, then a bare re-block in October, queued by the tick:
   the record is stale, so evaluate and finish with **named**, **kept** or
   **released**. Never just drop the label (tick, drain and tick must converge).
