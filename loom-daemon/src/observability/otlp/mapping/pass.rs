@@ -2,8 +2,8 @@
 //! per pass and one per artifact verdict, each stamped when it was decided.
 //!
 //! The body is the record's JSON (the per-verdict and per-reason maps, the
-//! blockers, the provenance). Like `pick.decision`, each record stamps its own
-//! `loom.kind`, which is what the queries filter on. The scalars ride as
+//! blockers, the provenance). `log_record_for` stamps `loom.kind` (what the
+//! queries filter on) on every log kind centrally (#10899). The scalars ride as
 //! `loom.pass.*` attributes plus the shared `loom.repo` / `loom.role`, so
 //! "passes per repo", "released
 //! per pass" and "why is #n still held" need no `JSONExtract`; the two count
@@ -53,7 +53,6 @@ fn summary_severity(r: &PassSummaryRecord) -> SeverityNumber {
 
 fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
     let attributes = vec![
-        kv_string("loom.kind", "pass.summary"),
         kv_string("loom.repo", r.repo.clone()),
         kv_string("loom.pass.id", r.pass_id.clone()),
         kv_string("loom.pass.mechanism", r.mechanism.clone()),
@@ -79,7 +78,6 @@ fn summary(r: &PassSummaryRecord) -> (&'static str, SeverityNumber, u64, Vec<Key
 
 fn verdict(r: &PassVerdictRecord) -> (&'static str, SeverityNumber, u64, Vec<KeyValue>, String) {
     let mut attributes = vec![
-        kv_string("loom.kind", "pass.verdict"),
         kv_string("loom.repo", r.repo.clone()),
         kv_string("loom.pass.id", r.pass_id.clone()),
         kv_string("loom.pass.mechanism", r.mechanism.clone()),

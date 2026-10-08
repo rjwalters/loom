@@ -59,7 +59,8 @@ fn a_full_tick_emits_every_key_and_only_allowlisted_ones() {
     assert_eq!(log.severity_number, SeverityNumber::Info as i32);
     for kv in &log.attributes {
         assert!(
-            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str()) || kv.key == "loom.record_id",
+            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                || ["loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
             "{} is not allowlisted",
             kv.key
         );

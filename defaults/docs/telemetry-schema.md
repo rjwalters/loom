@@ -60,6 +60,25 @@ decision. Every log record also carries `loom.record_id`, a content-derived
 dedupe id (`derived_hex(["loom.record", kind, host_id, emitted_at, record JSON],
 16)`). Full contract: [`telemetry-replay.md`](telemetry-replay.md).
 
+### `loom.kind` on every log record (Issues #9881, #10899)
+
+Every OTLP **log** record carries its record kind as the ordinary string
+attribute `loom.kind`, equal to the envelope's `kind` tag (`sweep.outcome`,
+`eta.estimate`, `ci.job`, `pr.resolved`, …). That holds for every kind whose
+registry row says `otlp: Logs`. Filter logs by kind on this key, never on the
+log `name` column (SigNoz lowers `name` to a JSON function this ClickHouse build
+rejects, loom-ui#747) and never on `body`: the JSON-body kinds (`eta.*`,
+`pr.resolved`, `pass.*`, `pick.decision`, `auto_update.tick`,
+`token_ranking.refresh`, `ci.job.log`, `session.output`) have a body that is
+not the event name. The mapping stamps it once, after the per-kind mapping, at
+index 1 right after `loom.record_id`, so the 64-attribute bound never drops
+it. The collector's log `keep_keys` admits it. Records exported before #10899
+lack it for every kind except the `sweep.*` lifecycle kinds (other than
+`sweep.phase`), `role_tick.outcome`, `session.summary`, `session.analysis`,
+`pick.decision` and `pass.*`. The `loom.eta.*` attribute filters the ETA
+queries use are unchanged and still valid. Contract:
+`observability/otlp/mapping/tests/loom_kind.rs`, which walks the kind registry.
+
 ### `schema_version` semantics
 
 `schema_version` is a **plain integer**, not a semver string, deliberately: a
