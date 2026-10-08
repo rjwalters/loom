@@ -673,6 +673,9 @@ jobs:
       # zero rows survive the SQL so SigNoz can see a series recover.
       - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      # #10973: replay of the host-disk and ETA Ready-coverage alert rules
+      - name: Verify the SigNoz disk and ETA Ready-coverage alert rules against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
       # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
       # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
       # heuristic is promoted on. eta_artifacts.rs already pins every attribute
