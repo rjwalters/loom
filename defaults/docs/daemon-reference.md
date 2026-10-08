@@ -1761,8 +1761,8 @@ workspace's default branch (never the working tree) and classifies it:
 | `W0` | the installed files equal this daemon's payload | nothing |
 | `W1` | compatible, but the files differ | tries the claim |
 | `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first |
-| `W4` | the installed files need a newer daemon | reports only |
-| `repo-ahead` | installed by a newer daemon, or at a version that cannot be ordered | reports only |
+| `W4` | the installed files need a newer daemon, or record a version that cannot be ordered | reports only |
+| `repo-ahead` | installed by a newer daemon, and still compatible with this one | reports only |
 | `skipped` | the Loom source repo, a non-GitHub origin, or no Loom on the default branch | nothing |
 
 - **An empty payload diff is `W0`, whatever the stamp says.** A resync that
@@ -1770,7 +1770,8 @@ workspace's default branch (never the working tree) and classifies it:
   claim and no commit, and a stamp that is old or lacks `requires_daemon` over
   matching files is left alone.
 - **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
-  They are left to the host roll (#10719).
+  `W4` holds dispatch and asks for a host roll; `repo-ahead` does neither
+  (see "Dispatch holds" below).
 - **Only from H0.** A host claims and writes only when all of these hold: it is
   a verified official release build (below), a fleet-sync pass has completed,
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
@@ -1781,6 +1782,64 @@ workspace's default branch (never the working tree) and classifies it:
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
+
+#### Dispatch holds (#10719)
+
+Dispatch runs each repo's own installed files: agent worktrees start from the
+default branch, and the spawn script and role runs come from the host's
+checkout. After every workspace pass the daemon judges **both copies** of each
+registered workspace and holds new dispatch into a workspace when either one
+cannot work with this daemon. The checkout copy is
+`<root>/.loom/install-metadata.json` in the working tree.
+
+| Verdict for a copy | Hold | Typed outcome | Asks for a roll |
+|---|---|---|---|
+| its `requires_daemon` is above the running daemon (`W4`) | held | `daemon-too-old` | yes |
+| a contract field that cannot be ordered, such as `0.20.0-rc1` | held | `daemon-too-old` | yes |
+| too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
+| too old by its stamp, files equal to the payload (`W0`) | not held | | no |
+| installed by a newer daemon, `requires_daemon` at or below this one (`repo-ahead`) | not held | | no |
+| compatible, or a resync owed (no `requires_daemon`) | not held | | no |
+| could not be read this pass | the previous verdict stands | | as before |
+
+- **The ratchet guard.** A repo that is only *ahead* of this daemon is
+  neither held nor a reason to roll. Hosts roll at different moments, so a
+  host that has just rolled resyncs repos to a release the others do not run
+  yet. If that alone made them roll, one straggler would pull the whole fleet
+  forward one release at a time. While the newer files' `requires_daemon` is
+  at or below this daemon, this host keeps working the repo, never resyncs it
+  downward, and reports `repo-ahead`.
+- **A hold is per workspace and stops new dispatch only.** The host is never
+  paused, in-flight sweeps and role runs are not touched, no other workspace
+  is affected, and the workspace is still resynced. IPC `force` does not
+  bypass a hold.
+- **Where it is enforced.** The sweep registry refuses issue and PR-set
+  dispatch with a typed `WorkspaceHeldDispatchError` before any lock, label
+  flip or forge call, so every producer is covered. The work finder skips the
+  held workspace's batch once per tick with `workspace_halted` rows whose
+  cause is `install_incompatible` or `daemon_too_old`, and grants no recovery
+  probe or red-main fix dispatch into it. The role runner starts no role tick
+  there and logs the hold once.
+- **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
+  first pass after a resync has landed on the default branch and this host's
+  checkout is current. `W4` clears once this host runs a daemon at or above
+  `requires_daemon`. A workspace that leaves the registry is dropped.
+- **A hold that stands for 30 minutes alerts**, once, at ERROR. Every set,
+  clear and standing alert is published on the event-bus topic
+  `fleet_sync.workspace_hold`. The `Fleet store:` block of `loom-daemon status`
+  shows each held workspace with its kind, which copy holds it and since when.
+- **The roll.** The highest version a `daemon-too-old` copy asks for is the
+  host's repo-ahead demand. The self-update loop treats it like the fleet
+  floor: the target is the newest release at or above it, pinned to the exact
+  tag, with no settle wait, through the same pause-and-roll, recorded as
+  `target_source = repo_ahead` (`floor` when the floor drives too). A demand
+  no release satisfies is reported at ERROR and arms nothing; that one
+  workspace stays held and every other workspace keeps dispatching.
+- **The Loom source repo** installs from its own tree and is never resynced,
+  so it is judged for `W4` only. Its `loom_version` moves with every release
+  and never asks for a roll.
+- **After a restart** there are no holds until the first workspace pass has
+  finished.
 
 **Only an official release build pushes.** A daemon resyncs from the payload it
 embeds, so the binary must be a release's. Both of these must hold:

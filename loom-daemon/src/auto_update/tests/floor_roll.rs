@@ -423,3 +423,6 @@ fn an_unparseable_latest_version_is_unresolved_not_a_stall() {
         assert!(!note.contains("FLEET FLOOR UNSATISFIABLE"), "{floor:?}: {note}");
     }
 }
+
+#[path = "repo_ahead.rs"]
+mod repo_ahead;

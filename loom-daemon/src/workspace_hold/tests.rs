@@ -8,7 +8,7 @@ use serial_test::serial;
 
 use super::*;
 use crate::install_compat::{classify, DaemonCompat, InstallMeta};
-use crate::sweep_registry::SweepKind;
+use crate::types::SweepKind;
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
@@ -348,7 +348,7 @@ fn the_registry_refuses_a_held_workspace_and_not_its_sibling() {
         assert!(err.to_string().contains("`force` does not override"), "{err}");
     }
     assert!(!held_log.exists(), "nothing was spawned");
-    assert!(held.list().is_empty(), "no registry entry");
+    assert!(held.list(None).is_empty(), "no registry entry");
 
     let out = free.dispatch(&SweepKind::Issue(10720), None, None, None, None);
     assert!(out.is_ok(), "the sibling dispatches: {out:?}");
@@ -384,4 +384,33 @@ fn the_work_finder_cause_tokens_round_trip() {
     }
     assert_eq!(HoldKind::InstallIncompatible.halt_cause().as_str(), "install_incompatible");
     assert_eq!(HoldKind::DaemonTooOld.halt_cause().as_str(), "daemon_too_old");
+}
+
+/// The work finder's per-root pre-filter: the held workspace is held with the
+/// hold's cause and gets no recovery probe; its sibling is not held by it.
+#[tokio::test]
+async fn the_work_finder_holds_only_the_held_root_and_names_the_cause() {
+    use crate::work_finder::pool_preflight::preflight_held_causes_per_root;
+    let held_dir = tempfile::tempdir().unwrap();
+    let free_dir = tempfile::tempdir().unwrap();
+    let roots = vec![held_dir.path().to_path_buf(), free_dir.path().to_path_buf()];
+    let pool = crate::workspace_pool::WorkspacePool::new(
+        std::sync::Arc::new(crate::event_bus::EventBus::new()),
+        tokio::runtime::Handle::current(),
+    );
+    set_for_test(held_dir.path(), Some(hold(HoldKind::DaemonTooOld)));
+    let (held, causes, probes) = preflight_held_causes_per_root(&pool, &roots, t0());
+    assert!(held[0]);
+    assert_eq!(causes[0], Some(HaltCause::DaemonTooOld));
+    assert!(!probes.contains(&roots[0]), "no recovery probe into a held workspace");
+    let hold_causes = [HaltCause::DaemonTooOld, HaltCause::InstallIncompatible];
+    assert!(causes[1].is_none_or(|c| !hold_causes.contains(&c)), "{:?}", causes[1]);
+
+    set_for_test(held_dir.path(), Some(hold(HoldKind::InstallIncompatible)));
+    let (_, causes, _) = preflight_held_causes_per_root(&pool, &roots, t0());
+    assert_eq!(causes[0], Some(HaltCause::InstallIncompatible));
+
+    set_for_test(held_dir.path(), None);
+    let (_, causes, _) = preflight_held_causes_per_root(&pool, &roots, t0());
+    assert!(causes[0].is_none_or(|c| !hold_causes.contains(&c)), "{:?}", causes[0]);
 }

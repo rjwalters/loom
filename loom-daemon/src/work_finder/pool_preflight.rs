@@ -652,10 +652,10 @@ pub fn preflight_held_causes_per_root(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let pool_held = fold_peer_pool_hold(state, &registry, &observation);
             let gate = registry.preflight_dispatch_gate(now);
-            let (held, cause) = if !crate::write_scope::gate_root(root, "dispatch") {
-                (true, Some(HaltCause::WriteScope))
-            } else if let Some(hold) = crate::workspace_hold::hold_for(root) {
+            let (held, cause) = if let Some(hold) = crate::workspace_hold::hold_for(root) {
                 (true, Some(hold.kind.halt_cause()))
+            } else if !crate::write_scope::gate_root(root, "dispatch") {
+                (true, Some(HaltCause::WriteScope))
             } else {
                 preflight_cause(pool_held, gate)
             };
