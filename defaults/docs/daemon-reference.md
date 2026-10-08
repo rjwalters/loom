@@ -1907,9 +1907,9 @@ a second resync at the same release writes nothing.
 | files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
 
 A path pinned in `.loom/resync-ignore` is never written or removed, in either
-form the shell resync accepts (`.agents/skills/loom-x/SKILL.md` or
-`agents-skills/loom-x/SKILL.md`, `.claude/commands/loom/x.md` or
-`commands/loom/x.md`). A symlink, or a surface reached through a symlinked
+form the shell resync accepts (`.agents/skills/loom-<name>/SKILL.md` or
+`agents-skills/loom-<name>/SKILL.md`, `.claude/commands/loom/<name>.md` or
+`commands/loom/<name>.md`). A symlink, or a surface reached through a symlinked
 directory, is left alone. A file the repo's ignore rules exclude is never
 committed.
 
