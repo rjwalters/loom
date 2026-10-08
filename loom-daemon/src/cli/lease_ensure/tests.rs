@@ -60,6 +60,10 @@ disown "$loop_pid" 2>/dev/null || true
 echo "$loop_pid"
 "#;
 
+/// Above Linux's maximum `pid_max` (2^22), so never a live process: the
+/// fixture's session identity is unreadable and publish keeps its own id.
+const NO_SUCH_PID: u32 = 4_999_999;
+
 fn write_script(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -80,10 +84,12 @@ fn checkout(publish: &str, renew: &str) -> TempDir {
 fn args(dir: &TempDir) -> LeaseEnsureArgs {
     LeaseEnsureArgs {
         issue: 8193,
-        watch_pid: 3_606_631,
+        watch_pid: NO_SUCH_PID,
         max_age: DEFAULT_MAX_AGE_SECS,
         force: false,
         workspace: dir.path().to_string_lossy().into_owned(),
+        deferred: false,
+        retry_interval: 60,
     }
 }
 
@@ -91,6 +97,7 @@ fn in_session() -> SessionEnv {
     SessionEnv {
         dispatched_issue: None,
         session_present: true,
+        ..Default::default()
     }
 }
 
@@ -125,7 +132,7 @@ fn publishes_and_threads_the_identity_into_a_bounded_renewal_loop() {
     let renew = argv(&dir, "renew-argv").unwrap();
     assert_eq!(
         renew.trim(),
-        "start 8193 --watch-pid 3606631 --max-age 14400 --host host-abc12345 --sweep-id \
+        "start 8193 --watch-pid 4999999 --max-age 14400 --host host-abc12345 --sweep-id \
          sweep-insession-20260918-1234"
     );
 }
@@ -141,6 +148,7 @@ fn a_daemon_dispatched_issue_is_a_no_op() {
     let env = SessionEnv {
         dispatched_issue: Some("8193".to_string()),
         session_present: true,
+        ..Default::default()
     };
 
     assert_eq!(args(&dir).ensure(&env), Outcome::AlreadyDispatched);
@@ -156,6 +164,7 @@ fn a_marker_naming_a_different_issue_does_not_suppress_this_one() {
     let env = SessionEnv {
         dispatched_issue: Some("8116".to_string()),
         session_present: true,
+        ..Default::default()
     };
 
     assert!(matches!(args(&dir).ensure(&env), Outcome::Renewing { .. }));
@@ -376,4 +385,408 @@ fn worktree_sh_call_site_matches_documented_pid_chain() {
         "pid chain drifted: {line}"
     );
     assert!(!line.contains("2>&1"), "stderr outcome must stay visible: {line}");
+}
+
+// ------------------------------------------------------------------
+// #10570: a declined publish is retried by a bounded deferred publisher
+// ------------------------------------------------------------------
+
+/// Declines (exit 4, a peer's lease is still inside its TTL) on its first two
+/// calls, then publishes — the #10161 timeline: a released sweep's leftover
+/// lease blocks the attended claim until it ages out.
+const PUBLISH_DECLINES_TWICE: &str = r#"#!/usr/bin/env bash
+n=$(cat publish-attempts 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > publish-attempts
+printf '%s\n' "$*" > publish-argv
+if [ "$n" -le 2 ]; then echo "SKIP: fresh peer lease" >&2; exit 4; fi
+echo "host-abc12345 sweep-insession-attended"
+"#;
+
+/// Publish exit 2: the `gh` write failed (transient forge trouble).
+const PUBLISH_GH_FAILS: &str = r#"#!/usr/bin/env bash
+n=$(cat publish-attempts 2>/dev/null || echo 0); echo "$((n + 1))" > publish-attempts
+exit 2
+"#;
+
+fn attempts(dir: &TempDir) -> u32 {
+    argv(dir, "publish-attempts").map_or(0, |s| s.trim().parse().unwrap())
+}
+
+/// A fake clock driven by the loop's own sleeps.
+struct FakeTime {
+    now: std::cell::Cell<u64>,
+    sleeps: std::cell::RefCell<Vec<u64>>,
+}
+
+impl FakeTime {
+    fn new() -> Self {
+        Self {
+            now: std::cell::Cell::new(0),
+            sleeps: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+    fn elapsed(&self) -> u64 {
+        self.now.get()
+    }
+    fn sleep(&self, secs: u64) {
+        self.now.set(self.now.get() + secs);
+        self.sleeps.borrow_mut().push(secs);
+    }
+}
+
+fn run_loop(a: &LeaseEnsureArgs, alive: impl FnMut() -> bool) -> (deferred::DeferredEnd, FakeTime) {
+    let t = FakeTime::new();
+    let end = deferred::retry_loop(a, &in_session(), || t.elapsed(), |s| t.sleep(s), alive, |_| {});
+    (end, t)
+}
+
+#[test]
+fn only_a_peer_or_gh_failure_decline_is_retryable() {
+    assert!(Outcome::PublishDeclined(Some(4)).is_retryable());
+    assert!(Outcome::PublishDeclined(Some(2)).is_retryable());
+    for settled in [
+        Outcome::PublishDeclined(None),
+        Outcome::PublishDeclined(Some(1)),
+        Outcome::NoAgentSession,
+        Outcome::AlreadyDispatched,
+        Outcome::RenewalFailed(Some(1)),
+        Outcome::PublishUnparseable(String::new()),
+    ] {
+        assert!(!settled.is_retryable(), "{settled:?} must not be retried");
+    }
+}
+
+/// The #10161 shape end to end: declined while the leftover lease is fresh,
+/// published once it ages out, and the renewer gets only what remains of the
+/// original cap.
+#[test]
+fn a_deferred_publisher_publishes_once_the_peer_lease_ages_out() {
+    let dir = checkout(PUBLISH_DECLINES_TWICE, RENEW_OK);
+    let a = args(&dir);
+    let (end, t) = run_loop(&a, || true);
+
+    assert_eq!(
+        end,
+        deferred::DeferredEnd::Settled(Outcome::Renewing {
+            host: "host-abc12345".to_string(),
+            sweep_id: "sweep-insession-attended".to_string(),
+            loop_pid: Some("424242".to_string()),
+        })
+    );
+    assert_eq!(attempts(&dir), 3);
+    assert_eq!(*t.sleeps.borrow(), vec![60, 60, 60]);
+    let renew = argv(&dir, "renew-argv").unwrap();
+    assert!(
+        renew.contains(&format!("--max-age {}", DEFAULT_MAX_AGE_SECS - 180)),
+        "renewal must inherit the remaining cap, not a fresh one: {renew}"
+    );
+}
+
+/// A dead session stops the publisher before another attempt: it must never
+/// publish a lease for a claim nobody is working.
+#[test]
+fn a_deferred_publisher_stops_when_the_session_dies() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let mut calls = 0;
+    let (end, _) = run_loop(&args(&dir), || {
+        calls += 1;
+        calls < 2
+    });
+
+    assert_eq!(end, deferred::DeferredEnd::SessionEnded);
+    assert!(argv(&dir, "publish-argv").is_some(), "one attempt while alive");
+    assert!(argv(&dir, "renew-argv").is_none());
+}
+
+/// A live peer that keeps its lease fresh is never superseded, and the
+/// publisher gives up at the cap rather than polling forever.
+#[test]
+fn a_deferred_publisher_is_bounded_by_the_age_cap() {
+    let dir = checkout(PUBLISH_GH_FAILS, RENEW_OK);
+    let mut a = args(&dir);
+    a.max_age = 150;
+    let (end, t) = run_loop(&a, || true);
+
+    assert_eq!(end, deferred::DeferredEnd::CapReached);
+    assert_eq!(attempts(&dir), 2, "attempts at 60s and 120s, none at 180s");
+    assert_eq!(t.elapsed(), 180);
+    assert!(argv(&dir, "renew-argv").is_none());
+}
+
+/// `--max-age 0` means unbounded for a renewer, never for this publisher.
+#[test]
+fn a_deferred_publisher_is_bounded_even_when_max_age_is_zero() {
+    let dir = checkout(PUBLISH_GH_FAILS, RENEW_OK);
+    let mut a = args(&dir);
+    a.max_age = 0;
+    a.retry_interval = 3_600;
+    let (end, t) = run_loop(&a, || true);
+
+    assert_eq!(end, deferred::DeferredEnd::CapReached);
+    assert!(t.elapsed() >= DEFAULT_MAX_AGE_SECS);
+}
+
+/// Past the lease TTL a still-fresh peer is being renewed, i.e. live: slow
+/// down to the renewer's own cadence instead of polling every minute.
+#[test]
+fn a_deferred_publisher_backs_off_once_the_peer_is_provably_live() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let ttl = (loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0) as u64;
+    let t = FakeTime::new();
+    let end = deferred::retry_loop(
+        &args(&dir),
+        &in_session(),
+        || t.elapsed(),
+        |s| t.sleep(s),
+        || t.elapsed() < ttl + 1_000,
+        |_| {},
+    );
+
+    assert_eq!(end, deferred::DeferredEnd::SessionEnded);
+    let sleeps = t.sleeps.borrow();
+    assert_eq!(sleeps.first(), Some(&60));
+    assert_eq!(sleeps.last(), Some(&300));
+}
+
+/// Renewer failure after a deferred publish settles with an observable
+/// outcome instead of retrying a publish that already succeeded.
+#[test]
+fn a_renewer_failure_after_a_deferred_publish_is_reported() {
+    let dir = checkout(PUBLISH_OK, RENEW_REFUSES);
+    let (end, _) = run_loop(&args(&dir), || true);
+    assert_eq!(end, deferred::DeferredEnd::Settled(Outcome::RenewalFailed(Some(1))));
+    assert!(end.describe(8193).contains("8193"));
+}
+
+#[test]
+fn every_deferred_end_explains_itself() {
+    for end in [
+        deferred::DeferredEnd::SessionEnded,
+        deferred::DeferredEnd::CapReached,
+        deferred::DeferredEnd::Settled(Outcome::PublishDeclined(Some(4))),
+    ] {
+        assert!(end.describe(8193).contains("8193"), "{end:?}");
+    }
+}
+
+/// One deferred publisher per issue per checkout.
+#[test]
+fn the_deferred_lock_admits_a_single_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("logs/issue-1.deferred.lock");
+    let held = deferred::try_lock(&lock).expect("first owner takes it");
+    assert!(deferred::try_lock(&lock).is_none(), "second owner refused");
+    drop(held);
+    assert!(deferred::try_lock(&lock).is_some(), "released on drop");
+}
+
+/// Exit 4 (a peer's lease is fresh) until the test drops `peer-expired`, then
+/// publish under whatever `--sweep-id` the caller passed. Every call's argv is
+/// appended, so the test can tell which session ever published.
+const PUBLISH_UNTIL_PEER_EXPIRES: &str = r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> publish-calls
+[ -e peer-expired ] || { echo "SKIP: fresh peer lease" >&2; exit 4; }
+echo "host-abc12345 ${4:-sweep-insession-fallback}"
+"#;
+
+/// A real process to stand in for a watched agent session.
+fn session_process() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap()
+}
+
+/// Wait up to `secs` for `done`, polling.
+fn eventually(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + std::time::Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    done()
+}
+
+/// #10570 review: session A's deferred publisher holds the issue lock and is
+/// asleep; A dies; session B is declined and calls `spawn` BEFORE A wakes and
+/// releases. B must still get a publisher of its own, and it must publish
+/// once the peer lease expires, with no further `lease ensure` call. Before
+/// the fix, B's `spawn` saw A's lock, reported "already waiting" and launched
+/// nothing; A then woke, saw its dead session and exited, leaving B leaseless
+/// (the #10161 failure again). Drives the real `spawn_with` / `run_with`
+/// lock wiring, with real processes as the two watched sessions; only the
+/// launch is a thread rather than an exec of the daemon binary.
+#[test]
+fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
+    let dir = checkout(PUBLISH_UNTIL_PEER_EXPIRES, RENEW_OK);
+    let poll = std::time::Duration::from_millis(50);
+    let mut session_a = session_process();
+    let mut session_b = session_process();
+    let session = |child: &std::process::Child, retry_interval| LeaseEnsureArgs {
+        watch_pid: child.id(),
+        force: true,
+        retry_interval,
+        ..args(&dir)
+    };
+    // A sleeps a full backed-off interval between attempts: it is "asleep"
+    // for the whole test unless its sliced sleep notices its session died.
+    let a = session(&session_a, 300);
+    let b = session(&session_b, 1);
+    let launch = |args: &LeaseEnsureArgs| {
+        let args = LeaseEnsureArgs {
+            workspace: args.workspace.clone(),
+            ..*args
+        };
+        let handle = std::thread::spawn(move || deferred::run_with(&args, &in_session(), poll));
+        Ok::<_, std::io::Error>(handle)
+    };
+
+    let mut a_thread = None;
+    let line = deferred::spawn_with(&a, |args| {
+        a_thread = Some(launch(args)?);
+        Ok(1)
+    });
+    assert!(line.contains("will retry"), "{line}");
+    let a_id = session_sweep_id(a.watch_pid).expect("A's session identity");
+    let b_id = session_sweep_id(b.watch_pid).expect("B's session identity");
+    let log = || {
+        let root = loom_daemon::repo_root::resolve_repo_root(&a.workspace).unwrap();
+        fs::read_to_string(deferred::log_path(&root, 8193)).unwrap_or_default()
+    };
+    assert!(
+        eventually(10, || log().contains("owns issue")),
+        "A never took the lock: {}",
+        log()
+    );
+    // A owns the lock and is asleep: its first attempt is 300 s out.
+
+    // B is declined and arrives while A still holds the lock.
+    let mut b_thread = None;
+    let line = deferred::spawn_with(&b, |args| {
+        b_thread = Some(launch(args)?);
+        Ok(2)
+    });
+    assert!(
+        line.contains("deferred publisher 2 will retry") && line.contains("another session"),
+        "B must get its own publisher, not 'already waiting': {line}"
+    );
+    // Once B's publisher is waiting, a second call from the SAME session is
+    // still deduplicated.
+    assert!(eventually(10, || log().contains("waiting for another session")), "{}", log());
+    let again = deferred::spawn_with(&b, |_| panic!("same session must not launch twice"));
+    assert!(again.contains("already waiting"), "{again}");
+
+    // A dies while asleep.
+    session_a.kill().unwrap();
+    session_a.wait().unwrap();
+    assert_eq!(
+        a_thread.unwrap().join().unwrap(),
+        Some(deferred::DeferredEnd::SessionEnded),
+        "A must release within a poll of its session ending, not after 300 s"
+    );
+
+    // The peer lease expires; B publishes with no further `lease ensure`.
+    fs::write(dir.path().join("peer-expired"), "").unwrap();
+    let b_end = b_thread.unwrap().join().unwrap();
+    session_b.kill().unwrap();
+    session_b.wait().unwrap();
+
+    assert_eq!(
+        b_end,
+        Some(deferred::DeferredEnd::Settled(Outcome::Renewing {
+            host: "host-abc12345".to_string(),
+            sweep_id: b_id.clone(),
+            loop_pid: Some("424242".to_string()),
+        }))
+    );
+    let calls = fs::read_to_string(dir.path().join("publish-calls")).unwrap();
+    assert!(!calls.contains(&a_id), "A's dead session must never publish: {calls}");
+    assert!(argv(&dir, "renew-argv").unwrap().contains(&b_id));
+}
+
+/// While the owner's session is alive it keeps the issue lock: a waiting
+/// publisher for another session gives up when its own session ends, never
+/// running a second retry loop beside the owner.
+#[test]
+fn a_waiting_publisher_ends_with_its_own_session_while_the_owner_lives() {
+    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
+    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let owner = deferred::try_lock(&deferred::lock_path(&root, 8193))
+        .expect("stand-in owner takes the issue lock");
+    let mut session = session_process();
+    let a = LeaseEnsureArgs {
+        watch_pid: session.id(),
+        force: true,
+        ..args(&dir)
+    };
+    let waiter = std::thread::spawn(move || {
+        deferred::run_with(&a, &in_session(), std::time::Duration::from_millis(50))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    session.kill().unwrap();
+    session.wait().unwrap();
+
+    assert_eq!(waiter.join().unwrap(), Some(deferred::DeferredEnd::SessionEnded));
+    assert!(argv(&dir, "publish-argv").is_none(), "no attempt without the issue lock");
+    drop(owner);
+}
+
+/// Outcomes land in a per-issue log, since `worktree.sh` callers rarely read
+/// stderr and the detached publisher has none.
+#[test]
+fn outcomes_are_recorded_in_the_per_issue_log() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    deferred::record(&dir.path().to_string_lossy(), 8193, "first line");
+    deferred::record(&dir.path().to_string_lossy(), 8193, "second line");
+    let root = loom_daemon::repo_root::resolve_repo_root(&dir.path().to_string_lossy()).unwrap();
+    let log = fs::read_to_string(deferred::log_path(&root, 8193)).unwrap();
+    assert!(log.contains(" first line\n") && log.contains(" second line\n"), "{log}");
+}
+
+// ------------------------------------------------------------------
+// #10570: a session-stable attended lease identity
+// ------------------------------------------------------------------
+
+#[test]
+fn the_session_identity_is_stable_for_a_live_process_and_absent_otherwise() {
+    let me = std::process::id();
+    let id = session_sweep_id(me).expect("this test process has a start identity");
+    assert!(id.starts_with(&format!("sweep-insession-s{me}-")), "{id}");
+    assert!(!id.contains(char::is_whitespace) && !id.contains("-->"), "{id}");
+    assert_eq!(session_sweep_id(me), Some(id));
+    assert_eq!(session_sweep_id(NO_SUCH_PID), None);
+}
+
+/// A session's second `lease ensure` (a `worktree.sh N` reuse) must publish
+/// under the same identity, so the script sees its OWN fresh lease rather
+/// than a peer's and re-attaches instead of declining.
+#[test]
+fn a_live_session_publishes_under_the_same_identity_every_time() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let mut a = args(&dir);
+    a.watch_pid = std::process::id();
+
+    a.ensure(&in_session());
+    let first = argv(&dir, "publish-argv").unwrap();
+    a.ensure(&in_session());
+    let second = argv(&dir, "publish-argv").unwrap();
+
+    assert!(first.contains("--sweep-id sweep-insession-s"), "{first}");
+    assert_eq!(first, second);
+}
+
+/// An in-session `/loom:sweep` run's `LOOM_SWEEP_RUN_ID` keeps precedence.
+#[test]
+fn a_sweep_run_id_keeps_publish_on_its_own_identity() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let mut a = args(&dir);
+    a.watch_pid = std::process::id();
+    let env = SessionEnv {
+        run_id_set: true,
+        ..in_session()
+    };
+
+    a.ensure(&env);
+    assert_eq!(argv(&dir, "publish-argv").unwrap().trim(), "publish 8193");
 }

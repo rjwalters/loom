@@ -202,6 +202,25 @@ the lease aged out) and sent stderr to `/dev/null`, hiding the one-line
 (`Renewing` = published and renewed; anything else = no fresh lease, so another
 host's orphan recovery may reclaim the claim after its grace period).
 
+**A declined publish is retried, not final (#10570).** The #10161 incident
+(2026-10-06) was not the pid chain: the attended claim at 12:24:24Z landed while
+a *released* fleet sweep's lease (last renewed 12:14:54Z, claim dropped
+12:19:28Z) was still inside the 15-minute TTL. Publish exited 4 ("a peer holds
+a fresh lease"), `lease ensure` stopped there, and no attended lease ever
+appeared; when the leftover aged out, another host's recovery correctly found
+only a stale lease and reclaimed at 12:35:51Z. Now an exit 4 or 2 spawns one
+detached **deferred publisher** per issue per checkout. It re-runs the same
+publish (same trusted format, same peer rules, so a live peer is never
+superseded) every 60 s, slowing to 300 s once the peer has outlived the TTL. It
+stops when a publish settles (then starts the normal renewer with the time left
+of the original cap), when the watched session dies, or at the cap. Every
+outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`. An attended
+lease's sweep id is stable per watched session
+(`sweep-insession-s<pid>-<start-time>`), so a second `lease ensure` from the
+same session re-attaches to its own lease. Without that, the session's first
+lease would read as a live peer and block the second call. An in-session
+sweep's `LOOM_SWEEP_RUN_ID` still wins.
+
 **Why the second writer exists.** `/loom:sweep`'s in-session path dispatches
 its Builder through the Task tool, one level deep, deliberately (the skill's
 own "CRITICAL: One level deep" rule). Those Builders are subagents of the
