@@ -29,6 +29,12 @@ pub(super) struct Backoff {
     pub(super) next_attempt: DateTime<Utc>,
     pub(super) state: WState,
     pub(super) last_error: String,
+    /// The rest of what the workspace was found to be when it failed. A
+    /// workspace in backoff is reported from these, so a W4 hold keeps the
+    /// `requires_daemon` its roll demand is made of (#10719).
+    pub(super) installed: Option<String>,
+    pub(super) requires_daemon: Option<String>,
+    pub(super) refusal: Option<crate::init::payload::ResyncRefusal>,
 }
 
 /// What a workspace was found to be at one default-branch commit, for one
@@ -42,6 +48,7 @@ pub(super) struct Verdict {
     pub(super) installed: Option<String>,
     pub(super) requires_daemon: Option<String>,
     pub(super) reason: Option<String>,
+    pub(super) refusal: Option<crate::init::payload::ResyncRefusal>,
 }
 
 impl Verdict {
@@ -56,6 +63,7 @@ impl Verdict {
         report.installed.clone_from(&self.installed);
         report.requires_daemon.clone_from(&self.requires_daemon);
         report.reason.clone_from(&self.reason);
+        report.refusal.clone_from(&self.refusal);
     }
 }
 
@@ -154,6 +162,9 @@ impl Memory {
                 next_attempt,
                 state: report.state,
                 last_error: detail.to_string(),
+                installed: report.installed.clone(),
+                requires_daemon: report.requires_daemon.clone(),
+                refusal: report.refusal.clone(),
             },
         );
         let alerts = match kind {
@@ -197,6 +208,7 @@ impl Memory {
                 installed: report.installed.clone(),
                 requires_daemon: report.requires_daemon.clone(),
                 reason: report.reason.clone(),
+                refusal: report.refusal.clone(),
             },
         );
     }

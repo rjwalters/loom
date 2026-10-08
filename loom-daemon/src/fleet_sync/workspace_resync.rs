@@ -23,7 +23,9 @@
 //! W3 and W4 hold new dispatch into the workspace, and W4 makes this host a
 //! roll candidate ([`crate::workspace_hold`], #10719). A repo that is only
 //! repo-ahead is neither held nor a reason to roll: this host keeps working
-//! it and never resyncs it downward.
+//! it and never resyncs it downward. The one repo-ahead case that is held (and
+//! still no reason to roll) is a resync to a newer release that was
+//! interrupted on the default branch: its files are a mix of two releases.
 //!
 //! W2 is the resync itself, under the per-repo claim
 //! ([`crate::fleet_store::resync_claim`]): a throwaway detached worktree off
@@ -219,6 +221,12 @@ pub struct WorkspaceReport {
     /// The dispatch hold standing on it, if any (#10719).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<crate::workspace_hold::WorkspaceHold>,
+    /// What the gate refused on the default branch, for the dispatch hold.
+    /// Kept apart from `reason`, which a failure replaces with its backoff,
+    /// and carried through a backoff with `requires_daemon`. Not part of the
+    /// snapshot.
+    #[serde(skip)]
+    pub refusal: Option<ResyncRefusal>,
 }
 
 /// A failure that needs a person: published on [`ALERT_TOPIC`].
@@ -281,6 +289,18 @@ impl WorkspacePass {
     /// The workspace lines of the `Fleet store:` block.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
+        self.lines_at(None)
+    }
+
+    /// [`Self::lines`], read at `now` on a host whose passes run every
+    /// `interval`. A hold whose verdict is older than a few intervals says
+    /// so: passes have stopped, or the held copy has been unreadable since.
+    #[must_use]
+    pub fn lines_at(&self, read: Option<(DateTime<Utc>, Duration)>) -> Vec<String> {
+        let stale = |h: &crate::workspace_hold::WorkspaceHold| {
+            read.and_then(|(now, interval)| h.stale_note(now, interval.saturating_mul(3)))
+                .map_or_else(String::new, |note| format!("; {note}"))
+        };
         let mut lines = Vec::new();
         if let Some(why) = &self.host {
             lines.push(format!("  workspaces: {why}; reporting only"));
@@ -301,7 +321,7 @@ impl WorkspacePass {
             let hold = w
                 .hold
                 .as_ref()
-                .map_or_else(String::new, |h| format!("; {}: {}", h.note(), h.detail));
+                .map_or_else(String::new, |h| format!("; {}: {}{}", h.note(), h.detail, stale(h)));
             lines
                 .push(format!("  workspace {name}: {}{reason}{installed}{hold}", w.state.as_str()));
         }
@@ -586,6 +606,7 @@ fn report_for(root: &Path) -> WorkspaceReport {
         requires_daemon: None,
         reason: None,
         hold: None,
+        refusal: None,
     }
 }
 
@@ -679,7 +700,12 @@ fn classify(
     git::clean_stale_worktrees(root);
     if let Some(b) = memory.backoff.get(root) {
         if b.next_attempt > (env.clock)() {
+            // The whole finding the failure interrupted, not only its state:
+            // the hold's demand and detail come from these (#10719).
             report.state = b.state;
+            report.installed.clone_from(&b.installed);
+            report.requires_daemon.clone_from(&b.requires_daemon);
+            report.refusal.clone_from(&b.refusal);
             report.reason =
                 Some(format!("backoff until {}: {}", stamp(b.next_attempt), b.last_error));
             return (report, None);
@@ -852,6 +878,7 @@ fn evaluate(
         }
         Err(refusal) => {
             (report.state, report.reason) = refused(&refusal);
+            report.refusal = Some(refusal);
             return Ok(true);
         }
     };

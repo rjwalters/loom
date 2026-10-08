@@ -97,7 +97,8 @@ fn the_other_refusals() {
                 pending: v("0.19.950"),
                 running: v("0.19.900"),
             },
-            Verdict::Clear,
+            // Held, and (see the test further down) with no roll demand.
+            Verdict::Hold(HoldKind::InstallIncompatible),
         ),
     ] {
         assert_eq!(decide_hold(&Err(refusal.clone()), Some(true)), want, "{refusal:?}");
@@ -154,14 +155,52 @@ fn an_older_compatible_host_neither_rolls_nor_holds_for_a_repo_the_newer_host_st
     assert!(events.is_empty(), "{events:?}");
     assert!(holds.holds().is_empty(), "no dispatch hold");
     assert_eq!(holds.demand(), None, "no roll demand");
-    // And with no demand the self-update target is the ordinary one.
-    let auto = crate::auto_update::floor_roll::Release {
+    // The roll's only input from here is `Holds::demand()`. Run it through
+    // the self-update loop's own steps (`RepoAheadState`, then
+    // `select_target`) with the newer release already out: the target stays
+    // the ordinary, settle-gated one.
+    use crate::auto_update::floor_roll::repo_ahead::{Demand, RepoAheadState};
+    use crate::auto_update::floor_roll::{select_target, Release, TargetSource};
+    let release = Release {
         tag: "v0.19.937".into(),
         version: "0.19.937".into(),
     };
-    let target =
-        crate::auto_update::floor_roll::select_target("0.19.930", None, None, Some(&auto)).unwrap();
-    assert_eq!(target.source, crate::auto_update::floor_roll::TargetSource::AutoUpdate);
+    let roll = |holds: &Holds| {
+        let demand = holds.demand().map(|d| Demand {
+            version: d.version,
+            workspace: d.repo.unwrap_or_default(),
+        });
+        let mut state = RepoAheadState::default();
+        state.set_basis(demand, "0.19.930");
+        let ahead = state.observe(Some(&release));
+        let target = select_target("0.19.930", None, ahead.as_ref(), Some(&release)).unwrap();
+        (state.driving(), target.source)
+    };
+    assert_eq!(
+        roll(&holds),
+        (false, TargetSource::AutoUpdate),
+        "a compatible repo rolls nobody"
+    );
+
+    // The control: the same repo, once its files NEED the newer daemon. The
+    // same wiring now yields a hold, a demand, and a repo-ahead target. So
+    // the assertions above pass because of the guard, not because nothing
+    // on this path can ever produce a demand.
+    let needy = meta(Some("0.19.937"), Some("0.19.937"));
+    let g = gate(&needy, &older);
+    assert_eq!(decide_hold(&g, Some(true)), Verdict::Hold(HoldKind::DaemonTooOld));
+    let finding =
+        Finding::daemon_too_old(String::new(), needy.requires_daemon.as_deref(), older.running);
+    let seen = Observation {
+        root,
+        repo: Some("acme/app".into()),
+        default_branch: finding.clone(),
+        checkout: finding,
+    };
+    let events = holds.step(&[seen], older.running, t0() + mins(1), ALERT_AFTER);
+    assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["set"]);
+    assert_eq!(holds.demand().map(|d| d.version), Some("0.19.937".to_string()));
+    assert_eq!(roll(&holds), (true, TargetSource::RepoAhead));
 }
 
 // ----------------------------------------------------------------------------
@@ -257,19 +296,122 @@ fn the_checkout_copy_holds_on_its_own_and_w4_wins_over_w3() {
     );
 }
 
+/// A hold nothing clears alerts at 30 minutes and again every 30 minutes:
+/// never once and then silence, and never once per pass.
 #[test]
-fn a_standing_hold_alerts_once() {
+fn a_standing_hold_alerts_every_thirty_minutes_while_it_stands() {
     let mut holds = Holds::default();
     let a = "/nonexistent/a";
     let pass = |holds: &mut Holds, at| {
         holds.step(&[obs(a, w4("0.19.950"), Finding::clear())], v(RUNNING), at, ALERT_AFTER)
     };
     assert_eq!(pass(&mut holds, t0()).len(), 1);
-    assert!(pass(&mut holds, t0() + mins(29)).is_empty());
-    let events = pass(&mut holds, t0() + mins(30));
-    assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["standing"]);
-    assert!(pass(&mut holds, t0() + mins(31)).is_empty());
-    assert!(pass(&mut holds, t0() + mins(120)).is_empty(), "once per hold");
+    let mut alerted = Vec::new();
+    for minute in 1..=125 {
+        let events = pass(&mut holds, t0() + mins(minute));
+        assert!(events.iter().all(|e| e.event == "standing"), "{events:?}");
+        if !events.is_empty() {
+            assert_eq!(events[0].hold.since, t0(), "the hold's own clock is untouched");
+            alerted.push(minute);
+        }
+    }
+    assert_eq!(alerted, [30, 60, 90, 120], "bounded: one per 30 minutes over 125 passes");
+
+    // A hold that changes kind is a new hold, with a new clock.
+    let events =
+        holds.step(&[obs(a, w3(), Finding::clear())], v(RUNNING), t0() + mins(126), ALERT_AFTER);
+    assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["set"]);
+    let later = |holds: &mut Holds, m| {
+        holds.step(&[obs(a, w3(), Finding::clear())], v(RUNNING), t0() + mins(m), ALERT_AFTER)
+    };
+    assert!(later(&mut holds, 150).is_empty(), "not 30 minutes into the new hold yet");
+    assert_eq!(later(&mut holds, 156).len(), 1);
+}
+
+/// A copy that cannot be read keeps its hold, and keeps alerting: the hold
+/// says how old the verdict it stands on is, in the alert and on `status`.
+#[test]
+fn an_unreadable_copy_keeps_alerting_and_says_how_old_its_verdict_is() {
+    let mut holds = Holds::default();
+    let a = "/nonexistent/a";
+    holds.step(&[obs(a, w4("0.19.950"), Finding::clear())], v(RUNNING), t0(), ALERT_AFTER);
+    let unreadable = |holds: &mut Holds, m| {
+        let seen = [obs(a, Finding::unknown(), Finding::unknown())];
+        holds.step(&seen, v(RUNNING), t0() + mins(m), ALERT_AFTER)
+    };
+    let mut alerted = Vec::new();
+    for minute in (5..=95).step_by(5) {
+        if !unreadable(&mut holds, minute).is_empty() {
+            alerted.push(minute);
+        }
+    }
+    assert_eq!(alerted, [30, 60, 90], "the previous verdict still alerts on the cadence");
+    let hold = holds.holds().into_values().next().unwrap();
+    assert_eq!(hold.verdict_at, t0(), "no pass has judged it since the first");
+    let now = t0() + mins(95);
+    let interval = Duration::from_secs(300);
+    assert_eq!(
+        hold.stale_note(now, interval * 3).as_deref(),
+        Some("hold verdict is 95 minutes old")
+    );
+    assert!(unread_note(&hold, now).contains("could not read the default-branch copy"));
+    assert!(unread_note(&hold, now).contains("95 minutes ago"));
+
+    // Read again: the verdict is the latest pass's, and nothing is said.
+    holds.step(&[obs(a, w4("0.19.950"), Finding::clear())], v(RUNNING), now, ALERT_AFTER);
+    let hold = holds.holds().into_values().next().unwrap();
+    assert_eq!((hold.since, hold.verdict_at), (t0(), now));
+    assert_eq!(hold.stale_note(now + mins(10), interval * 3), None);
+    assert_eq!(unread_note(&hold, now), "");
+    // Passes stop altogether: `status` reads the last snapshot later and says so.
+    assert_eq!(
+        hold.stale_note(now + mins(40), interval * 3).as_deref(),
+        Some("hold verdict is 40 minutes old")
+    );
+}
+
+/// An interrupted resync to a newer release holds dispatch and asks for no
+/// roll, on either copy, beside a W4 copy whose demand is untouched by it.
+#[test]
+fn an_interrupted_newer_resync_is_held_without_a_roll_demand() {
+    let d = daemon("0.19.900", None);
+    let raw =
+        r#"{"loom_version":"0.19.900","requires_daemon":"0.19.772","resync_pending":"0.19.950"}"#;
+    let gate = crate::init::payload::gate_metadata(raw, &d);
+    assert!(matches!(gate, Err(ResyncRefusal::PendingAheadOfDaemon { .. })), "{gate:?}");
+    let verdict = decide_hold(&gate, None);
+    assert_eq!(verdict, Verdict::Hold(HoldKind::InstallIncompatible));
+    // A pending run at or below this daemon is this daemon's to finish.
+    let own = raw.replace("0.19.950", "0.19.900");
+    assert_eq!(
+        decide_hold(&crate::init::payload::gate_metadata(&own, &d), None),
+        Verdict::Clear
+    );
+
+    let pending = || Finding::install_incompatible("a resync to 0.19.950 was interrupted".into());
+    assert_eq!(pending().demand, None);
+    let mut holds = Holds::default();
+    let seen = [
+        obs("/nonexistent/a", pending(), Finding::clear()),
+        obs("/nonexistent/b", Finding::clear(), pending()),
+    ];
+    let events = holds.step(&seen, d.running, t0(), ALERT_AFTER);
+    assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["set", "set"]);
+    assert!(events.iter().all(|e| e.demand.is_none()), "{events:?}");
+    assert_eq!(holds.holds().len(), 2, "both held");
+    assert_eq!(holds.demand(), None, "and no roll demand from either");
+
+    // Beside a real W4, the demand is the W4's and only the W4's.
+    let seen = [
+        obs("/nonexistent/a", pending(), Finding::clear()),
+        obs("/nonexistent/c", w4("0.19.920"), Finding::clear()),
+    ];
+    holds.step(&seen, d.running, t0() + mins(1), ALERT_AFTER);
+    let demand = holds.demand().unwrap();
+    assert_eq!(
+        (demand.version.as_str(), demand.root),
+        ("0.19.920", PathBuf::from("/nonexistent/c"))
+    );
 }
 
 #[test]
@@ -321,6 +463,7 @@ fn hold(kind: HoldKind) -> WorkspaceHold {
         copy: HeldCopy::DefaultBranch,
         since: t0(),
         detail: "requires daemon 0.19.950 > running 0.19.900".into(),
+        verdict_at: t0(),
     }
 }
 

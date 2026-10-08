@@ -111,6 +111,23 @@ impl HaltCause {
     }
 }
 
+/// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in
+/// [`HaltCause::ALL`] order, for the work finder's pre-dispatch hold line.
+/// That slice folds four holds (pre-flight advisory, token pool, write scope
+/// and the #10719 workspace hold), so the line names the ones in force
+/// instead of guessing.
+#[must_use]
+pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
+    let parts: Vec<String> = HaltCause::ALL
+        .iter()
+        .filter_map(|cause| {
+            let n = causes.iter().filter(|c| **c == Some(*cause)).count();
+            (n > 0).then(|| format!("{n} {}", cause.as_str()))
+        })
+        .collect();
+    parts.join(", ")
+}
+
 /// The per-root cause fold — the named-cause counterpart of
 /// [`super::dispatch_held_per_root_with_preflight`] plus the daemon-global
 /// `draining` / breaker terms the production loop OR's on top (#9017).

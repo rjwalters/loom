@@ -813,7 +813,8 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     let mut lines = vec![head];
     lines.extend(state_lines(s));
     lines.extend(floor_lines(&s.floor));
-    lines.extend(s.workspaces.lines());
+    let interval = std::time::Duration::from_secs(s.interval_secs);
+    lines.extend(s.workspaces.lines_at(Some((now, interval))));
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {

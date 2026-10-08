@@ -2659,7 +2659,8 @@ impl IdleTrigger {
 /// Steps, in order:
 /// 1. Record the idle edge (always — so the level state stays accurate even on
 ///    a tick that ends up not firing).
-/// 2. Bail on no edge, or on an active scheduled drain (#4090).
+/// 2. Bail on no edge, on an active scheduled drain (#4090), or when the
+///    workspace is held ([`crate::workspace_hold`], #10719).
 /// 3. Bail when the role runner is disabled for this root
 ///    ([`resolve_enabled`], precedence env > config > default) — this is the
 ///    **per-root** gate (#4377): it is resolved from `root`'s own
@@ -2694,6 +2695,10 @@ pub fn plan_idle_runs(
             "role_runner: idle edge for {} suppressed — drain in progress (#4090)",
             root.display()
         );
+        return Vec::new();
+    }
+    // #10719: a hold drains the workspace, so the hold itself makes this edge.
+    if crate::workspace_hold::refuse_role_start(root, "idle edge") {
         return Vec::new();
     }
     if !resolve_enabled(config) {

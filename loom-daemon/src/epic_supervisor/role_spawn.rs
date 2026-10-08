@@ -154,6 +154,57 @@ mod tests {
         assert_eq!(env(&cmd, RESOURCE_ATTRIBUTES_ENV), None, "no attribute stamp when off");
     }
 
+    /// #10719: the singleton role dispatch runs this checkout's own spawn
+    /// script and never reaches the registry, so it refuses a held workspace
+    /// itself, with the same typed error, and spawns nothing. A sibling
+    /// workspace on the same host is not affected.
+    #[test]
+    #[serial_test::serial]
+    fn a_held_workspace_refuses_the_epic_role_dispatch_and_its_sibling_does_not() {
+        use super::super::{forge::SpawnDispatcher, EpicDispatcher};
+        use crate::workspace_hold::{
+            set_for_test, HeldCopy, HoldKind, WorkspaceHeldDispatchError, WorkspaceHold,
+        };
+        let _guard = EnvGuard::clear();
+        let dispatcher = |dir: &Path| {
+            let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
+            let bin = dir.join(".loom/scripts/spawn-claude.sh");
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+            (SpawnDispatcher::new(bin, registry), log)
+        };
+        let (held_dir, free_dir) = (root(false), root(false));
+        let (mut held, held_log) = dispatcher(held_dir.path());
+        let (mut free, free_log) = dispatcher(free_dir.path());
+        set_for_test(
+            held_dir.path(),
+            Some(WorkspaceHold {
+                kind: HoldKind::InstallIncompatible,
+                copy: HeldCopy::Checkout,
+                since: chrono::Utc::now(),
+                detail: "installed 0.19.800 is too old for daemon 0.19.900".into(),
+                verdict_at: chrono::Utc::now(),
+            }),
+        );
+
+        let err = held.dispatch_role(42, &shape()).expect_err("held");
+        let typed = err
+            .downcast_ref::<WorkspaceHeldDispatchError>()
+            .expect("the typed refusal the registry guard returns");
+        assert_eq!(typed.kind, HoldKind::InstallIncompatible);
+        assert!(err.to_string().contains("install-incompatible"), "{err}");
+        assert!(!held_log.exists(), "the held checkout's spawn script never ran");
+
+        free.dispatch_role(42, &shape())
+            .expect("the sibling dispatches");
+        assert!(free_log.exists(), "the sibling's spawn script ran");
+
+        // The hold lifts: the same workspace dispatches again.
+        set_for_test(held_dir.path(), None);
+        held.dispatch_role(42, &shape())
+            .expect("dispatches once the hold clears");
+        assert!(held_log.exists());
+    }
+
     /// #9473: the gateway contract survives only into `spawn-worker.sh`.
     #[test]
     fn epic_role_command_withholds_the_llm_gateway_contract_from_a_non_seam_bin() {

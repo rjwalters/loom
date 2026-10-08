@@ -103,3 +103,122 @@ fn a_too_old_checkout_is_held_only_while_its_files_differ() {
     hold_pass(&host, floor, &mut holds);
     assert!(holds.holds().is_empty());
 }
+
+/// Install metadata a resync to `pending` was interrupted over: the stamp is
+/// still the old release's, because it is written last.
+fn interrupted(version: &str, requires: Option<&str>, pending: &str) -> String {
+    metadata(version, requires).replacen(
+        "{\n",
+        &format!("{{\n  \"resync_pending\": \"{pending}\",\n"),
+        1,
+    )
+}
+
+/// A newer daemon started a resync on the default branch and did not finish
+/// it. The files are a mix of two releases, so dispatch is held; the hold
+/// asks for no roll, and this host never completes the run from its own
+/// (older) payload.
+#[test]
+fn an_interrupted_newer_resync_is_held_and_demands_no_roll() {
+    let fx = Fixture::new(Seed {
+        version: RUNNING,
+        current: true,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+
+    fx.push_from_seed("a resync to 0.19.950, interrupted", |seed| {
+        write(
+            &seed.join(INSTALL_METADATA_PATH),
+            &interrupted(RUNNING, Some("0.19.772"), "0.19.950"),
+        );
+    });
+    let before = fx.origin_head();
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, None, &mut holds);
+    let held = Verdict::Hold(HoldKind::InstallIncompatible);
+    // This host's checkout is still at the commit before the interruption.
+    assert_eq!(verdicts(&seen), (held, Verdict::Clear));
+    assert_eq!(seen[0].default_branch.demand, None, "an interrupted resync names no need");
+    let hold = holds.holds().into_values().next().expect("held");
+    assert_eq!((hold.kind, hold.copy), (HoldKind::InstallIncompatible, HeldCopy::DefaultBranch));
+    assert!(hold.detail.contains("a resync to 0.19.950 was interrupted"), "{}", hold.detail);
+    assert!(hold.detail.contains("mix of two releases"), "{}", hold.detail);
+    assert_eq!(holds.demand(), None, "held without a roll demand: the ratchet guard stands");
+    assert_eq!(fx.origin_head(), before, "and never completed from this older payload");
+
+    // The same in this host's checkout (an interrupted CLI resync there).
+    let own = fs::read_to_string(host.root.join(INSTALL_METADATA_PATH)).unwrap();
+    write(
+        &host.root.join(INSTALL_METADATA_PATH),
+        &interrupted(RUNNING, Some("0.19.772"), "0.19.950"),
+    );
+    host.advance(INTERVAL);
+    let seen = hold_pass(&host, None, &mut holds);
+    assert_eq!(verdicts(&seen), (held, held));
+    assert_eq!(seen[0].checkout.demand, None);
+    assert_eq!(holds.demand(), None);
+
+    // A host on that release finishes the run, and the checkout is repaired.
+    fx.push_from_seed("the resync, finished", |seed| {
+        write(&seed.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("0.19.772")));
+    });
+    write(&host.root.join(INSTALL_METADATA_PATH), &own);
+    host.advance(INTERVAL);
+    assert_eq!(verdicts(&hold_pass(&host, None, &mut holds)), (Verdict::Clear, Verdict::Clear));
+    assert!(holds.holds().is_empty(), "cleared on the first clean pass");
+}
+
+/// A W4 workspace whose remote starts failing is reported from its backoff.
+/// It must stay the W4 it was found to be: the `requires_daemon` its roll
+/// demand is made of, and the versions in the hold's detail. Losing them
+/// made the demand "the release after this one", which can roll the host to
+/// a release still below the real requirement, with no settle wait.
+#[test]
+fn a_w4_workspace_in_backoff_keeps_its_requirement_demand_and_detail() {
+    let fx = Fixture::new(Seed {
+        version: "0.19.900",
+        requires: Some("0.19.890"),
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    // Only the default branch is W4, so the demand is its alone to carry.
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata(RUNNING, Some("0.19.772")));
+    let w4 = Verdict::Hold(HoldKind::DaemonTooOld);
+    let healthy = hold_pass(&host, None, &mut Holds::default());
+    assert_eq!(verdicts(&healthy), (w4, Verdict::Clear));
+    let want = healthy[0].default_branch.clone();
+    assert_eq!(want.demand, Some(v("0.19.890")));
+
+    // The repo's remote starts refusing: a failure, and a backoff.
+    let fault = super::super::heads::Fault::NotFound("no such repository".into());
+    host.heads
+        .faults
+        .borrow_mut()
+        .insert(host.root.clone(), fault);
+    git(&host.root, &["remote", "set-url", "origin", "/nonexistent/origin.git"]);
+    host.advance(INTERVAL);
+    let failing = hold_pass(&host, None, &mut Holds::default());
+    assert_eq!(host.memory.borrow().backoff[&host.root].failures, 1);
+    assert_eq!(failing[0].default_branch, want, "the failing pass itself");
+
+    // Inside the backoff nothing is read: the report is the remembered one.
+    host.advance(Duration::from_secs(1));
+    let waiting = host.pass();
+    let report = only(&waiting);
+    assert!(reason(report).starts_with("backoff until "), "{report:?}");
+    assert_eq!(report.state, WState::W4);
+    assert_eq!(report.installed.as_deref(), Some("0.19.900"));
+    assert_eq!(report.requires_daemon.as_deref(), Some("0.19.890"));
+
+    // A fresh `Holds`, so nothing is owed to what an earlier pass left.
+    let mut holds = Holds::default();
+    let seen = hold_pass(&host, None, &mut holds);
+    assert_eq!(seen[0].default_branch, want, "same verdict, demand and detail as when healthy");
+    assert_eq!(holds.demand().expect("still a roll demand").version, "0.19.890");
+    let hold = holds.holds().into_values().next().unwrap();
+    assert!(hold.detail.contains("0.19.890"), "{}", hold.detail);
+    assert!(!hold.detail.contains("backoff"), "{}", hold.detail);
+}

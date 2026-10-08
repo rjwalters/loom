@@ -3205,23 +3205,23 @@ pub fn spawn_multi_work_finder_task(
             // Distinguish a pre-flight-advisory hold from the main-health /
             // gate-in-flight holds (#5030 AC4) so an operator can tell "held
             // because pre-flight is broken" apart from "held because CI is red."
-            // #7708 folded a second cause into this same slice, so this edge
-            // line names both and defers the specifics to whichever hold
-            // logged its own edge line (`pool_preflight` logs the pool one).
+            // The slice folds four holds (#5030, #7708, write scope, #10719),
+            // so this edge line counts the causes in force and defers the
+            // specifics to whichever hold logged its own edge line.
             if preflight_held_count != was_preflight_held_count {
                 if preflight_held_count > 0 {
                     log::warn!(
-                        "work_finder: {preflight_held_count} of {} repo(s) held — \
-                         claude-wrapper pre-flight advisory tripped (broken .mcp.json, #5030) or \
-                         the resolved token pool has zero spawnable accounts (#7708); dispatch is \
-                         suppressed (an advisory hold still allows one probe per cooldown, a pool \
-                         hold allows none)",
-                        roots.len()
+                        "work_finder: {preflight_held_count} of {} repo(s) held before dispatch \
+                         ({}); see each hold's own edge line. A preflight_advisory hold (#5030) \
+                         still allows one probe per cooldown; token_pool (#7708), write_scope and \
+                         the workspace holds (#10719) allow none",
+                        roots.len(),
+                        halt_cause::held_summary(&preflight_causes)
                     );
                 } else {
                     log::info!(
-                        "work_finder: pre-flight + token-pool holds cleared for all repos — \
-                         dispatch resuming (#5030/#7708)"
+                        "work_finder: pre-dispatch holds cleared for all repos — dispatch \
+                         resuming (#5030/#7708/#10719)"
                     );
                 }
                 was_preflight_held_count = preflight_held_count;

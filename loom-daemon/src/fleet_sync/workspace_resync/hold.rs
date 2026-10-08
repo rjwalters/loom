@@ -5,7 +5,9 @@
 //! * **The default branch** is what the pass already classified. Its W state
 //!   is the verdict: W4 holds as `daemon-too-old`, W3 as
 //!   `install-incompatible`. W3 already means "too old AND the payload
-//!   differs" (an empty diff is W0), so the hold keys on the diff.
+//!   differs" (an empty diff is W0), so the hold keys on the diff. A
+//!   repo-ahead workspace is clear unless what the gate refused is an
+//!   interrupted newer resync, which holds and asks for no roll.
 //! * **The checkout** is `<root>/.loom/install-metadata.json` in the working
 //!   tree, gated exactly like the default branch's. The payload is diffed
 //!   against the working tree only when the stamp is too old, and the answer
@@ -14,8 +16,13 @@
 //! A copy that could not be read this pass is [`Verdict::Unknown`], which
 //! keeps whatever the last pass found.
 //!
+//! The versions a hold names come from the gate's own refusal and the
+//! recorded `requires_daemon`, never from the report's `reason`: a failed pass
+//! replaces that with its backoff, and a workspace in backoff is still held.
+//!
 //! The Loom source repo installs from its own tree and is never resynced, so
-//! no W3 hold could ever clear there; it is judged for W4 only.
+//! no `install-incompatible` hold could ever clear there; it is judged for
+//! W4 only.
 //!
 //! [`Verdict::Unknown`]: crate::workspace_hold::Verdict::Unknown
 
@@ -42,11 +49,20 @@ pub(super) fn observe(
             } else {
                 from_report(env, report)
             };
+            let checkout = checkout(env, &report.root, source, gate, memory);
+            let [default_branch, checkout] = [default_branch, checkout].map(|found| {
+                let w3 = found.verdict == Verdict::Hold(HoldKind::InstallIncompatible);
+                if source && w3 {
+                    Finding::clear()
+                } else {
+                    found
+                }
+            });
             Observation {
                 root: report.root.clone(),
                 repo: report.repo.clone(),
                 default_branch,
-                checkout: checkout(env, &report.root, source, gate, memory),
+                checkout,
             }
         })
         .collect()
@@ -64,20 +80,39 @@ fn too_old(env: &Env<'_>, installed: Option<&str>) -> String {
     )
 }
 
+/// What a refusal says to a person, with what an interrupted resync means
+/// for dispatch spelled out.
+fn refusal_detail(refusal: &ResyncRefusal) -> String {
+    match refusal {
+        ResyncRefusal::PendingAheadOfDaemon { .. } => format!(
+            "{refusal}. Its files are a mix of two releases, so nothing is dispatched into it \
+             until a host on that release finishes the resync; this host does not roll for it"
+        ),
+        other => other.to_string(),
+    }
+}
+
 /// The default-branch copy, from the state the pass gave the workspace.
 fn from_report(env: &Env<'_>, report: &WorkspaceReport) -> Finding {
     match report.state {
         WState::W4 => Finding::daemon_too_old(
-            report
-                .reason
-                .clone()
-                .unwrap_or_else(|| "the installed files need a newer daemon".to_string()),
+            report.refusal.as_ref().map_or_else(
+                || "the installed files need a newer daemon".to_string(),
+                refusal_detail,
+            ),
             report.requires_daemon.as_deref(),
             env.running,
         ),
         WState::W3 => Finding::install_incompatible(too_old(env, report.installed.as_deref())),
-        // `RepoAhead` is the ratchet guard's case: ahead, yet compatible.
-        WState::W0 | WState::W1 | WState::RepoAhead | WState::Skipped => Finding::clear(),
+        // `RepoAhead` is the ratchet guard's case: ahead, yet compatible. The
+        // one exception is an interrupted newer resync: held, and no demand.
+        WState::RepoAhead => match &report.refusal {
+            Some(refusal @ ResyncRefusal::PendingAheadOfDaemon { .. }) => {
+                Finding::install_incompatible(refusal_detail(refusal))
+            }
+            _ => Finding::clear(),
+        },
+        WState::W0 | WState::W1 | WState::Skipped => Finding::clear(),
         WState::W2 | WState::Unknown => Finding::unknown(),
     }
 }
@@ -92,13 +127,14 @@ fn from_gate(
     match decide_hold(gate, diff_stale) {
         Verdict::Unknown => Finding::unknown(),
         Verdict::Clear => Finding::clear(),
-        Verdict::Hold(HoldKind::InstallIncompatible) => {
-            Finding::install_incompatible(too_old(env, meta.loom_version.as_deref()))
-        }
-        Verdict::Hold(HoldKind::DaemonTooOld) => Finding::daemon_too_old(
+        // `Ok` is W3; a refusal here is an interrupted newer resync.
+        Verdict::Hold(HoldKind::InstallIncompatible) => Finding::install_incompatible(
             gate.as_ref()
                 .err()
-                .map_or_else(String::new, ToString::to_string),
+                .map_or_else(|| too_old(env, meta.loom_version.as_deref()), refusal_detail),
+        ),
+        Verdict::Hold(HoldKind::DaemonTooOld) => Finding::daemon_too_old(
+            gate.as_ref().err().map_or_else(String::new, refusal_detail),
             meta.requires_daemon.as_deref(),
             env.running,
         ),

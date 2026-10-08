@@ -1770,8 +1770,9 @@ workspace's default branch (never the working tree) and classifies it:
   claim and no commit, and a stamp that is old or lacks `requires_daemon` over
   matching files is left alone.
 - **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
-  `W4` holds dispatch and asks for a host roll; `repo-ahead` does neither
-  (see "Dispatch holds" below).
+  `W4` holds dispatch and asks for a host roll; `repo-ahead` does neither,
+  except that an interrupted resync to a newer release is held (and asks for
+  no roll). See "Dispatch holds" below.
 - **Only from H0.** A host claims and writes only when all of these hold: it is
   a verified official release build (below), a fleet-sync pass has completed,
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
@@ -1797,6 +1798,7 @@ cannot work with this daemon. The checkout copy is
 | its `requires_daemon` is above the running daemon (`W4`) | held | `daemon-too-old` | yes |
 | a contract field that cannot be ordered, such as `0.20.0-rc1` | held | `daemon-too-old` | yes |
 | too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
+| a resync to a release above this daemon was interrupted there (`resync_pending`) | held | `install-incompatible` | no |
 | too old by its stamp, files equal to the payload (`W0`) | not held | | no |
 | installed by a newer daemon, `requires_daemon` at or below this one (`repo-ahead`) | not held | | no |
 | compatible, or a resync owed (no `requires_daemon`) | not held | | no |
@@ -1809,25 +1811,57 @@ cannot work with this daemon. The checkout copy is
   forward one release at a time. While the newer files' `requires_daemon` is
   at or below this daemon, this host keeps working the repo, never resyncs it
   downward, and reports `repo-ahead`.
+- **An interrupted newer resync is held, and asks for no roll.** When
+  `resync_pending` names a release above this daemon, some of that release's
+  files are in place while the stamp, written last, is still the old
+  release's. The files are a mix of two releases and their `requires_daemon`
+  is not on record, so nothing is dispatched into the workspace. It names a
+  release, not a need, so it raises no roll demand: the ratchet guard holds
+  here too. It clears when a host on that release finishes the resync, or
+  when a person reruns the interrupted resync in the checkout. The daemon's
+  own resync commits only after the stamp, so in practice this is an
+  interrupted CLI resync in a checkout.
 - **A hold is per workspace and stops new dispatch only.** The host is never
   paused, in-flight sweeps and role runs are not touched, no other workspace
   is affected, and the workspace is still resynced. IPC `force` does not
   bypass a hold.
-- **Where it is enforced.** The sweep registry refuses issue and PR-set
-  dispatch with a typed `WorkspaceHeldDispatchError` before any lock, label
-  flip or forge call, so every producer is covered. The work finder skips the
-  held workspace's batch once per tick with `workspace_halted` rows whose
-  cause is `install_incompatible` or `daemon_too_old`, and grants no recovery
-  probe or red-main fix dispatch into it. The role runner starts no role tick
-  there and logs the hold once.
+- **Where it is enforced.** Every path on which the daemon starts new work
+  in a workspace refuses a held one:
+
+  | Path | Refused by |
+  |---|---|
+  | Sweeps: the work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | the sweep registry, for issue and PR-set dispatch, with a typed `WorkspaceHeldDispatchError` before any lock, label flip or forge call |
+  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
+  | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
+  | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
+  | Epic supervisor singleton roles (Architect, Champion; `LOOM_EPIC_SUPERVISOR=1`) | its role dispatch, with the same typed `WorkspaceHeldDispatchError`, before the spawn script runs. It is logged as a failed dispatch on each supervisor tick while the hold stands |
+
+  Three things are not refused, on purpose. The pause-and-roll resume
+  relaunches sweeps and role runs that were already in flight when the host
+  rolled; a hold is about new work. The workspace resync still runs, because
+  it is what clears a `W3` hold. A terminal a person opens over IPC is not
+  dispatch. Until the first workspace pass after a restart has finished there
+  are no holds at all (see "After a restart" below).
 - **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
   first pass after a resync has landed on the default branch and this host's
   checkout is current. `W4` clears once this host runs a daemon at or above
   `requires_daemon`. A workspace that leaves the registry is dropped.
-- **A hold that stands for 30 minutes alerts**, once, at ERROR. Every set,
-  clear and standing alert is published on the event-bus topic
-  `fleet_sync.workspace_hold`. The `Fleet store:` block of `loom-daemon status`
-  shows each held workspace with its kind, which copy holds it and since when.
+- **A hold that stands for 30 minutes alerts** at ERROR, and again every 30
+  minutes for as long as it stands. Every set, clear and standing alert is
+  published on the event-bus topic `fleet_sync.workspace_hold`. The
+  `Fleet store:` block of `loom-daemon status` shows each held workspace with
+  its kind, which copy holds it and since when.
+- **A hold can outlive its evidence, and says so.** A copy that cannot be
+  read keeps its previous verdict, so its hold stands until a pass can read
+  it again. Each hold records when a pass last judged its copy (`verdictAt`).
+  The repeated ERROR names that time when the latest pass could not read the
+  copy. `loom-daemon status` appends `hold verdict is N minutes old` once the
+  verdict is older than three sync intervals, which is also what a host whose
+  workspace passes have stopped shows.
+- **A workspace in backoff stays what it was found to be.** A `W4` workspace
+  whose remote starts failing is reported from its backoff with the same
+  `requires_daemon`, so its roll demand and the versions in its hold do not
+  change while the remote is down.
 - **The roll.** The highest version a `daemon-too-old` copy asks for is the
   host's repo-ahead demand. The self-update loop treats it like the fleet
   floor: the target is the newest release at or above it, pinned to the exact

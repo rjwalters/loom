@@ -6,6 +6,20 @@
 //! When either copy cannot work with this daemon, new dispatch into that one
 //! workspace is held until the pair is compatible again.
 //!
+//! # Every way the daemon starts work in a workspace
+//!
+//! | Path | Where it is refused |
+//! |---|---|
+//! | Sweeps: work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | [`guard`], in the registry (issue and PR-set dispatch) |
+//! | Work-finder selection, the red-main fix lane, the pre-flight recovery probe | the per-root pre-filter (`work_finder::pool_preflight`) |
+//! | Role runner, interval ticks | [`filter_held`] |
+//! | Role runner, idle-edge (`onIdle`) runs | [`refuse_role_start`] |
+//! | Epic supervisor singleton roles (Architect, Champion) | [`guard`], in its `dispatch_role` |
+//!
+//! Not refused, on purpose: the pause-and-roll resume of sweeps and role runs
+//! (work that was already in flight when the host rolled), the resync itself,
+//! and terminals a person opens over IPC.
+//!
 //! # What is held
 //!
 //! | Verdict for a copy | Hold | Roll demand |
@@ -13,6 +27,7 @@
 //! | its `requires_daemon` is above this daemon (W4) | `daemon-too-old` | yes |
 //! | a contract field that cannot be ordered (`0.20.0-rc1`) | `daemon-too-old` | yes |
 //! | too old for this daemon or the floor, files differ (W3) | `install-incompatible` | no |
+//! | a resync to a release above this daemon was interrupted there | `install-incompatible` | no |
 //! | too old by its stamp, files equal the payload | none (W0) | no |
 //! | installed by a newer daemon, `requires_daemon` at or below this one | none | no |
 //! | compatible, or a resync owed | none | no |
@@ -31,6 +46,13 @@
 //! Only a copy that *needs* a newer daemon (or whose version cannot be
 //! ordered, so it may) holds dispatch and raises [`repo_ahead_min`].
 //!
+//! An interrupted resync to a newer release is held too, and asks for no
+//! roll. `requires_daemon` is stamped last, so the half-applied files are a
+//! mix of two releases whose compatibility nobody recorded. The hold clears
+//! when a host on that release (or this one, once it has rolled for another
+//! reason) finishes the resync. Raising a roll demand from it would be the
+//! ratchet again: it names a release, not a need.
+//!
 //! # Scope of a hold
 //!
 //! A hold stops **new** dispatch into **one** workspace. It never pauses the
@@ -39,9 +61,15 @@
 //! gates, and this is a structural refusal like the workspace-commands guard.
 //!
 //! The holds are rebuilt on every workspace pass (the fleet-sync timer), so
-//! one clears on the first pass whose verdict for both copies is clean. A
-//! hold that has stood for [`ALERT_AFTER`] is logged once at ERROR and
-//! published on [`TOPIC`], as is every set and clear.
+//! one clears on the first pass whose verdict for both copies is clean.
+//! Every set and clear is logged and published on [`TOPIC`]. A hold that has
+//! stood for [`ALERT_AFTER`] is logged at ERROR and published as `standing`,
+//! and again every [`ALERT_AFTER`] for as long as it stands.
+//!
+//! A copy that cannot be read keeps its last verdict, so a hold can outlive
+//! the evidence for it. Each hold carries when a pass last judged its copy
+//! ([`WorkspaceHold::verdict_at`]); the repeated ERROR and the status row say
+//! so when that is no longer the latest pass.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,7 +87,8 @@ use crate::work_finder::halt_cause::HaltCause;
 /// published on. Transitions only, never once per pass.
 pub const TOPIC: &str = "fleet_sync.workspace_hold";
 
-/// How long a hold stands before it alerts. A starting value.
+/// How long a hold stands before it alerts, and how often the alert repeats
+/// while it still stands. A starting value.
 pub const ALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// Why a workspace's dispatch is held.
@@ -67,7 +96,9 @@ pub const ALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 #[serde(rename_all = "kebab-case")]
 pub enum HoldKind {
     /// W3: the installed files are too old for this daemon or the fleet
-    /// floor, and differ from this daemon's payload.
+    /// floor, and differ from this daemon's payload. Also a resync to a newer
+    /// release that was interrupted, leaving files from two releases. Either
+    /// way a resync clears it, and it asks for no roll.
     InstallIncompatible,
     /// W4: the installed files need a newer daemon than this one, or record a
     /// version that cannot be ordered against it.
@@ -128,9 +159,21 @@ pub struct WorkspaceHold {
     pub since: DateTime<Utc>,
     /// The versions involved, for a person.
     pub detail: String,
+    /// When a pass last judged the deciding copy held. Equal to the latest
+    /// pass unless the copy has been unreadable since, or passes stopped.
+    pub verdict_at: DateTime<Utc>,
 }
 
 impl WorkspaceHold {
+    /// `hold verdict is N minutes old`, once no pass has judged the copy for
+    /// longer than `fresh` (a few pass intervals). `None` while it is fresh.
+    #[must_use]
+    pub fn stale_note(&self, now: DateTime<Utc>, fresh: Duration) -> Option<String> {
+        let age = now.signed_duration_since(self.verdict_at);
+        let fresh = chrono::Duration::from_std(fresh).ok()?;
+        (age > fresh).then(|| format!("hold verdict is {} minutes old", age.num_minutes()))
+    }
+
     /// `held: <kind> (<copy>) since <time>`, for a status line.
     #[must_use]
     pub fn note(&self) -> String {
@@ -175,9 +218,13 @@ pub fn decide_hold(gate: &Result<Compat, ResyncRefusal>, diff_stale: Option<bool
         }
         // The ratchet guard: ahead, and its `requires_daemon` is at or below
         // this daemon (or it would be `NeedsNewerDaemon`). Compatible.
-        Err(
-            ResyncRefusal::RepoAheadOfDaemon { .. } | ResyncRefusal::PendingAheadOfDaemon { .. },
-        ) => Verdict::Clear,
+        Err(ResyncRefusal::RepoAheadOfDaemon { .. }) => Verdict::Clear,
+        // A newer release is half applied: files from two releases, and the
+        // `requires_daemon` on record is the old one. Held, with no demand
+        // ([`Finding::install_incompatible`] never carries one).
+        Err(ResyncRefusal::PendingAheadOfDaemon { .. }) => {
+            Verdict::Hold(HoldKind::InstallIncompatible)
+        }
         Err(ResyncRefusal::UnreadableMetadata(_)) => Verdict::Unknown,
         Err(
             ResyncRefusal::NotInstalled
@@ -238,7 +285,7 @@ impl Finding {
         }
     }
 
-    /// A W3 hold.
+    /// A W3 hold, or an interrupted newer resync. Never a roll demand.
     #[must_use]
     pub fn install_incompatible(detail: String) -> Self {
         Self {
@@ -286,7 +333,7 @@ pub struct RepoAheadDemand {
     pub copy: HeldCopy,
 }
 
-/// A hold was set, cleared, or has stood for [`ALERT_AFTER`].
+/// A hold was set, cleared, or has stood for another [`ALERT_AFTER`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transition {
@@ -310,6 +357,8 @@ struct Standing {
     kind: HoldKind,
     detail: String,
     demand: Option<Version>,
+    /// The pass that last judged the copy held.
+    seen: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +367,8 @@ struct Entry {
     /// The last known verdict per copy: default branch, then checkout.
     copies: [Option<Standing>; 2],
     since: DateTime<Utc>,
-    alerted: bool,
+    /// When the standing alert last fired for this hold.
+    alerted: Option<DateTime<Utc>>,
 }
 
 impl Entry {
@@ -343,6 +393,7 @@ impl Entry {
             copy,
             since: self.since,
             detail: standing.detail.clone(),
+            verdict_at: standing.seen,
         })
     }
 
@@ -402,6 +453,7 @@ impl Holds {
                     kind,
                     detail: finding.detail.clone(),
                     demand: finding.demand,
+                    seen: now,
                 }),
             };
             let mut entry = Entry {
@@ -411,7 +463,7 @@ impl Holds {
                     keep(&seen.checkout, old_checkout),
                 ],
                 since: now,
-                alerted: false,
+                alerted: None,
             };
             let Some((copy, standing)) = entry.deciding().map(|(c, s)| (c, s.clone())) else {
                 if let Some(was) = was {
@@ -423,21 +475,24 @@ impl Holds {
             // same reason; a W3 hold that becomes W4 starts a new one.
             if let Some(was) = was.as_ref().filter(|was| was.kind == standing.kind) {
                 entry.since = was.since;
-                entry.alerted = before.as_ref().is_some_and(|b| b.alerted);
+                entry.alerted = before.as_ref().and_then(|b| b.alerted);
             }
             let demand = entry.demand().map(|(v, _)| v);
             if let Some(hold) = entry.hold() {
                 let changed = was
                     .as_ref()
                     .is_none_or(|was| (was.kind, was.copy) != (standing.kind, copy));
-                let since = now.signed_duration_since(hold.since);
-                let due = !entry.alerted
-                    && chrono::Duration::from_std(alert_after).is_ok_and(|after| since >= after);
+                // Due once it has stood for `alert_after`, and then again
+                // every `alert_after` since the last alert: a hold nothing
+                // clears must not go quiet.
+                let last = entry.alerted.unwrap_or(hold.since);
+                let due = chrono::Duration::from_std(alert_after)
+                    .is_ok_and(|after| now.signed_duration_since(last) >= after);
                 if changed {
                     transitions.push(event("set", &root, &seen.repo, hold.clone(), demand));
                 }
                 if due {
-                    entry.alerted = true;
+                    entry.alerted = Some(now);
                     transitions.push(event("standing", &root, &seen.repo, hold, demand));
                 }
             }
@@ -571,11 +626,14 @@ pub fn apply(
                 "workspace_hold: {name}: hold cleared ({kind}, {copy} copy); dispatch resumes"
             ),
             _ => log::error!(
-                "workspace_hold: {name}: dispatch has been held for {}s ({kind}, {copy} copy): \
-                 {detail}. Nothing has cleared it: check for a protected branch that blocks the \
-                 resync, a checkout that cannot fast-forward, or a requires_daemon no release \
-                 satisfies",
-                ALERT_AFTER.as_secs()
+                "workspace_hold: {name}: dispatch has been held for {} minutes ({kind}, {copy} \
+                 copy): {detail}.{} Nothing has cleared it: check for a protected branch that \
+                 blocks the resync, a checkout that cannot fast-forward, an interrupted resync a \
+                 newer host has to finish, or a requires_daemon no release satisfies. This \
+                 repeats every {} minutes while the hold stands",
+                now.signed_duration_since(t.hold.since).num_minutes(),
+                unread_note(&t.hold, now),
+                ALERT_AFTER.as_secs() / 60
             ),
         }
         if let Some(bus) = bus {
@@ -587,6 +645,21 @@ pub fn apply(
         .iter()
         .filter_map(|seen| Some((seen.root.clone(), standing.get(&normalize(&seen.root))?.clone())))
         .collect()
+}
+
+/// For the standing alert: says when this pass could not read the copy, so
+/// the hold stands on an older verdict. Empty when this pass judged it.
+fn unread_note(hold: &WorkspaceHold, now: DateTime<Utc>) -> String {
+    if hold.verdict_at >= now {
+        return String::new();
+    }
+    format!(
+        " This pass could not read the {} copy: the hold stands on the verdict of {} ({} minutes \
+         ago).",
+        hold.copy.as_str(),
+        hold.verdict_at.format("%Y-%m-%dT%H:%M:%SZ"),
+        now.signed_duration_since(hold.verdict_at).num_minutes()
+    )
 }
 
 // ============================================================================
@@ -680,6 +753,29 @@ pub fn filter_held(
     }
     *logged = held;
     free
+}
+
+/// Whether a role run that is about to start in `root` must not, because the
+/// workspace is held. For the starts [`filter_held`] does not see: the
+/// idle-edge (`onIdle`) runs, which the work finder fires per root. A hold
+/// stops new sweeps, so the workspace drains and goes idle; without this the
+/// hold itself would start every `onIdle` role in the held checkout.
+///
+/// Logged each time it refuses. Idle edges are rare, and the edge is spent:
+/// the role fires on the next idle edge after the hold clears.
+#[must_use]
+pub fn refuse_role_start(root: &Path, what: &str) -> bool {
+    let Some(hold) = hold_for(root) else {
+        return false;
+    };
+    log::info!(
+        "role_runner: {what} for {} suppressed: the workspace is held ({}, {} copy): {} (#10719)",
+        root.display(),
+        hold.kind.as_str(),
+        hold.copy.as_str(),
+        hold.detail
+    );
+    true
 }
 
 /// Put a hold on `root` (or lift it) directly, for tests of the dispatch

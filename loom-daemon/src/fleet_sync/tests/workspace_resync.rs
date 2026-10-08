@@ -1133,6 +1133,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 requires_daemon: None,
                 reason: Some("claim held by host-b since 2026-10-08T12:00:00Z".to_string()),
                 hold: None,
+                refusal: None,
             },
             WorkspaceReport {
                 root: PathBuf::from("/src/lib"),
@@ -1142,6 +1143,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 requires_daemon: None,
                 reason: None,
                 hold: None,
+                refusal: None,
             },
         ],
         ..WorkspacePass::default()

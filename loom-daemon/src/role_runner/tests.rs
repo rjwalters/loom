@@ -4253,3 +4253,4 @@ mod roster_fence;
 mod shard_dispatch;
 mod tick_ring;
 mod triggers;
+mod workspace_hold;

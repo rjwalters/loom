@@ -1419,6 +1419,9 @@ pub mod forge {
                     .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
                 reg.config().workspace_root.clone()
             };
+            // #10719: `spawn_bin` is this checkout's own script, and this path
+            // never reaches the registry guard `dispatch_sweep` passes.
+            crate::workspace_hold::guard(&repo_root)?;
             let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
             log::info!(
                 "epic_supervisor: dispatching {} for epic #{epic} with model={model} (source={})",
