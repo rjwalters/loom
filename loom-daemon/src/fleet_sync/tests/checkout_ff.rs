@@ -21,9 +21,6 @@ use super::host::{hold_for_move, hold_for_self_update};
 use super::*;
 use crate::fleet_sync::FleetSyncStatus;
 
-/// The recheck window the tests run with: 15 intervals of one minute.
-const RECHECK: Duration = Duration::from_secs(15 * 60);
-
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
 }
@@ -194,8 +191,8 @@ struct Knobs {
     gate: Box<dyn Fn(&Path) -> bool>,
     updating: bool,
     network: bool,
-    confirmed: Option<(String, DateTime<Utc>)>,
-    now: Rc<Cell<DateTime<Utc>>>,
+    confirmed: Option<String>,
+    breaker: Rc<Cell<bool>>,
     budget: Option<Duration>,
     elapsed: Box<dyn Fn() -> Duration>,
 }
@@ -208,7 +205,7 @@ impl Default for Knobs {
             updating: false,
             network: true,
             confirmed: None,
-            now: Rc::new(Cell::new(t0())),
+            breaker: Rc::new(Cell::new(false)),
             budget: None,
             elapsed: Box::new(|| Duration::ZERO),
         }
@@ -221,11 +218,11 @@ fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutP
         gate_in_flight: &*knobs.gate,
         hold: &|_| (!knobs.updating).then(MoveHold::free),
         network: knobs.network,
-        recheck: RECHECK,
         confirmed: &|_, _| knobs.confirmed.clone(),
+        breaker_open: &|| knobs.breaker.get(),
         budget: knobs.budget,
         elapsed: &*knobs.elapsed,
-        clock: &|| knobs.now.get(),
+        clock: &t0,
     };
     run(&env, roots, memory)
 }
@@ -632,37 +629,21 @@ fn a_resync_pushed_from_this_clone_is_reached_in_the_same_pass() {
 }
 
 #[test]
-fn a_settled_checkout_is_asked_about_again_only_after_the_recheck_window() {
+fn a_root_the_resync_did_not_ask_about_is_asked_every_tick_and_fetched_only_when_moved() {
     let fx = Fixture::new();
     let roots = [fx.host.clone()];
     let mut memory = Memory::default();
     let knobs = Knobs::default();
 
-    // First sight: one ls-remote, and nothing to fetch.
-    let found = pass_over(&roots, &knobs, &mut memory);
-    assert_eq!((found.probes, found.fetches), (1, 0));
-
-    // Every tick inside the window: no network at all, even though a commit
-    // has landed. (The first confirmation is back-dated by a per-root offset,
-    // so "inside the window" is asserted from a second, undated one.)
-    knobs
-        .now
-        .set(t0() + chrono::Duration::from_std(RECHECK).unwrap());
-    let found = pass_over(&roots, &knobs, &mut memory);
-    assert_eq!((found.probes, found.fetches), (1, 0), "due by now at the latest");
-    let confirmed_at = knobs.now.get();
-    let tip = fx.push("src/a.rs", "fn a() {}\n");
-    for minutes in [1, 7, 14] {
-        knobs
-            .now
-            .set(confirmed_at + chrono::Duration::minutes(minutes));
+    // Nothing moved: one ls-remote per tick, never a fetch.
+    for tick in 0..3 {
         let found = pass_over(&roots, &knobs, &mut memory);
-        assert_eq!((found.probes, found.fetches), (0, 0), "{minutes} min in");
+        assert_eq!((found.probes, found.fetches), (1, 0), "tick {tick}");
         assert_eq!(only(&found).state, CheckoutState::Current);
     }
 
-    // Once the window has passed: one ls-remote, the head moved, one fetch.
-    knobs.now.set(confirmed_at + chrono::Duration::minutes(15));
+    // A commit lands: the very next tick sees it, fetches once and moves.
+    let tip = fx.push("src/a.rs", "fn a() {}\n");
     let found = pass_over(&roots, &knobs, &mut memory);
     assert_eq!((found.probes, found.fetches), (1, 1));
     assert_eq!(only(&found).state, CheckoutState::FastForwarded);
@@ -670,40 +651,82 @@ fn a_settled_checkout_is_asked_about_again_only_after_the_recheck_window() {
 }
 
 #[test]
-fn a_head_the_workspace_half_just_confirmed_is_not_asked_about_again() {
+fn a_head_the_resync_learned_in_this_pass_costs_no_network() {
+    // Already fetched by the resync pass: nothing at all.
     let fx = Fixture::new();
     let tip = fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
-    // The workspace half probed, saw the head move and fetched it.
     git(&fx.host, &["fetch", "--quiet", "origin"]);
     unplug(&fx);
-    let hinted = Knobs {
-        confirmed: Some((tip.clone(), t0())),
+    let covered = Knobs {
+        confirmed: Some(tip.clone()),
         ..Knobs::default()
     };
-
-    let found = pass(&fx, &hinted);
-
+    let found = pass(&fx, &covered);
     assert_eq!((found.probes, found.fetches), (0, 0));
     assert_eq!(only(&found).state, CheckoutState::FastForwarded);
+    assert_eq!(fx.head(), tip);
+
+    // The resync pass named a head this clone does not have (its verdict was
+    // cached): no ls-remote, one fetch.
+    let fx = Fixture::new();
+    let tip = fx.push("src/a.rs", "fn a() {}\n");
+    let covered = Knobs {
+        confirmed: Some(tip.clone()),
+        ..Knobs::default()
+    };
+    let found = pass(&fx, &covered);
+    assert_eq!((found.probes, found.fetches), (0, 1));
     assert_eq!(fx.head(), tip);
 }
 
 #[test]
-fn a_confirmation_that_is_old_or_names_another_commit_does_not_count() {
-    for (head, at) in [
-        // Fresh, but not the commit `origin/main` is at in this clone.
-        ("0".repeat(40), t0()),
-        // The right commit, confirmed a whole window ago.
-        (String::new(), t0() - chrono::Duration::from_std(RECHECK).unwrap()),
-    ] {
-        let fx = Fixture::new();
-        let head = if head.is_empty() { fx.head() } else { head };
-        let hinted = Knobs {
-            confirmed: Some((head, at)),
-            ..Knobs::default()
-        };
-        assert_eq!(pass(&fx, &hinted).probes, 1);
-    }
+fn only_a_head_heard_in_the_pass_this_step_follows_is_trusted() {
+    let root = PathBuf::from("/repos/heard-test");
+    let before = Utc::now() - chrono::Duration::seconds(5);
+    super::host::note_remote_head(&root, "main", "abc");
+    let after = Utc::now() + chrono::Duration::seconds(5);
+    assert_eq!(super::host::heard(&root, "main", before).as_deref(), Some("abc"));
+    assert_eq!(super::host::heard(&root, "main", after), None, "from an earlier pass");
+    assert_eq!(super::host::heard(&root, "master", before), None, "another branch");
+}
+
+#[test]
+fn an_open_breaker_stops_this_step_s_own_ls_remote_and_is_read_each_time() {
+    let fx = Fixture::new();
+    let second = fx.clone_as("second");
+    let third = fx.clone_as("third");
+    let tip = fx.push("src/a.rs", "fn a() {}\n");
+    let roots = [fx.host.clone(), second.clone(), third.clone()];
+
+    // Open before the pass: nothing is asked, and nothing fails.
+    let knobs = Knobs::default();
+    knobs.breaker.set(true);
+    let found = pass_over(&roots, &knobs, &mut Memory::default());
+    assert_eq!((found.probes, found.fetches), (0, 0));
+    assert!(found
+        .checkouts
+        .iter()
+        .all(|c| c.state == CheckoutState::Current));
+
+    // Opened during the first root's attempt, after its ls-remote: the gate
+    // probe's second call (right before the merge) stands in for "a moment
+    // later". The second root asks nothing more.
+    let knobs = Knobs::default();
+    let (breaker, calls) = (knobs.breaker.clone(), Rc::new(Cell::new(0u32)));
+    let knobs = Knobs {
+        gate: Box::new(move |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                breaker.set(true);
+            }
+            false
+        }),
+        ..knobs
+    };
+    let found = pass_over(&roots, &knobs, &mut Memory::default());
+    assert_eq!(found.probes, 1, "read again before each ls-remote");
+    assert_eq!(fx.head(), tip, "the root it did ask about still moved");
+    assert_ne!(git(&second, &["rev-parse", "HEAD"]), tip);
 }
 
 #[test]
@@ -867,10 +890,6 @@ fn a_standing_skip_is_reported_again_once_it_holds_back_installed_files() {
     assert_eq!(pass_over(&roots, &knobs, &mut memory).transitions[0].level, Level::Warn);
 
     fx.push(".loom/scripts/spawn.sh", "#!/bin/sh\necho new\n");
-    // Seen at the next recheck of the remote, not before.
-    knobs
-        .now
-        .set(t0() + chrono::Duration::from_std(RECHECK).unwrap());
     let louder = pass_over(&roots, &knobs, &mut memory).transitions;
     assert_eq!(louder.len(), 1, "{louder:?}");
     assert_eq!(louder[0].level, Level::Error);

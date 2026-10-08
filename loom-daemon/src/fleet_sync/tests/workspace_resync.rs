@@ -3,8 +3,9 @@
 //! Real git, in temp dirs only: a bare `origin`, a `seed` clone that stands
 //! for everyone else pushing to it, and one clone per "host". The forge (the
 //! claim ref) is the in-memory `FakeRefForge` behind the fleet store's
-//! transport seams. The payload is a small synthetic `defaults/` tree. No
-//! network, no `gh`, no registered workspace.
+//! transport seams, and its batched head query is the in-memory `ForgeHeads`
+//! (see `workspace_resync_heads.rs`). The payload is a small synthetic
+//! `defaults/` tree. No network, no `gh`, no registered workspace.
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::git::{classify_rejection, Push, WORKTREE_PREFIX};
+use super::git::WORKTREE_PREFIX;
 use super::*;
 use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared};
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
@@ -252,6 +253,10 @@ struct Host<'f> {
     /// Runs once, after this host has classified and just before it asks for
     /// the claim: the moment another writer can slip in.
     before_claim: RefCell<Option<Box<dyn FnOnce() + 'f>>>,
+    /// The forge's batched head query, and whether the pass is past its
+    /// deadline.
+    heads: head_check::ForgeHeads,
+    overdue: Cell<bool>,
 }
 
 impl<'f> Host<'f> {
@@ -282,6 +287,8 @@ impl<'f> Host<'f> {
             now: Cell::new(t0()),
             budget: Cell::new(u32::MAX),
             before_claim: RefCell::new(None),
+            heads: head_check::ForgeHeads::default(),
+            overdue: Cell::new(false),
         }
     }
 
@@ -341,6 +348,8 @@ impl<'f> Host<'f> {
                 classified.set(classified.get() + 1);
                 classified.get() > self.budget.get()
             },
+            overdue: &|| self.overdue.get(),
+            heads: &|asks| self.heads.answer(asks),
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
     }
@@ -370,6 +379,11 @@ fn only(pass: &WorkspacePass) -> &WorkspaceReport {
 
 fn reason(report: &WorkspaceReport) -> &str {
     report.reason.as_deref().unwrap_or("")
+}
+
+/// What a pass asked the network: `(head queries, ls-remotes, fetches)`.
+fn network(pass: &WorkspacePass) -> (u32, u32, u32) {
+    (pass.head_queries, pass.probes, pass.fetches)
 }
 
 // ----------------------------------------------------------------------------
@@ -435,7 +449,7 @@ fn a_host_that_is_not_h0_reports_and_never_claims() {
         assert_eq!(pass.host, Some(format!("host not H0: {why}")));
         assert_eq!(only(&pass).state, WState::W1, "still classified: {why}");
         assert!(pass.alerts.is_empty());
-        assert_eq!((pass.probes, pass.fetches), (0, 0), "and asks no remote: {why}");
+        assert_eq!(network(&pass), (0, 0, 0), "and asks no remote: {why}");
     }
     assert!(fx.forge.calls.borrow().is_empty(), "no claim call for any reason");
     assert_eq!(fx.origin_head(), before);
@@ -1148,29 +1162,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
     assert!(WorkspacePass::default().lines().is_empty());
 }
 
-#[test]
-fn a_failed_push_is_read_as_moved_protected_or_neither() {
-    let moved = " ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs";
-    assert_eq!(classify_rejection(moved), Some(Push::NonFastForward));
-    let stale = " ! [rejected]        HEAD -> main (non-fast-forward)";
-    assert_eq!(classify_rejection(stale), Some(Push::NonFastForward));
-    let raced = " ! [remote rejected] HEAD -> main (cannot lock ref 'refs/heads/main')";
-    assert_eq!(classify_rejection(raced), Some(Push::NonFastForward));
-    let ruleset = "remote: error: GH013: Repository rule violations found for refs/heads/main.\n \
-                   ! [remote rejected] HEAD -> main (push declined due to repository rule violations)";
-    assert_eq!(
-        classify_rejection(ruleset),
-        Some(Push::Protected(
-            "error: GH013: Repository rule violations found for refs/heads/main.".to_string()
-        ))
-    );
-    let hook = " ! [remote rejected] HEAD -> main (pre-receive hook declined)";
-    assert_eq!(classify_rejection(hook), Some(Push::Protected(hook.trim().to_string())));
-    assert_eq!(
-        classify_rejection("fatal: unable to access 'https://…': Could not resolve host"),
-        None
-    );
-}
-
 #[path = "workspace_resync_bounds.rs"]
 mod bounds;
+#[path = "workspace_resync_heads.rs"]
+mod head_check;

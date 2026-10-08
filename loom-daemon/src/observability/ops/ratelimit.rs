@@ -593,7 +593,8 @@ pub fn fresh_fallback(
     budget.filter(|b| b.core_reset.min(b.graphql_reset) > now)
 }
 
-/// One rate-limit tick: flush the skip counter, probe the budget (booking it
+/// One rate-limit tick: flush the skip counter, ingest agent `gh` front rows
+/// (#10607), probe the budget (booking it
 /// on an App host, else falling back to the breaker's trip-time reading)
 /// and export the gauges — the bucket book's once, after the probe. Returns
 /// before any probe when no OTLP exporter is running.
@@ -607,6 +608,9 @@ pub async fn record(workspace_root: &Path) {
         .unwrap_or_else(PoisonError::into_inner)
         .replace(now);
     sink.emit_metrics_since(drain_skip_points(), since);
+    // #10607: the agent `gh` fronts' new sink rows join this drain.
+    let now_s = now.timestamp();
+    let _ = tokio::task::spawn_blocking(move || crate::forge_call_stats::ingest::tick(now_s)).await;
     emit_chunked(sink, super::forge_calls::drain_points(), since);
     sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     let root = workspace_root.to_path_buf();

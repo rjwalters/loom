@@ -22,7 +22,7 @@
 //! | 3 | no rebase, merge, cherry-pick, bisect or revert in progress | `mid-operation` |
 //! | 4 | no main-health gate run is building in this checkout | `gate-in-flight` |
 //! | 4 | the daemon's self-update is not running in this checkout | `self-update-in-flight` |
-//! | 5 | the remote answers (asked only when due, see below) | `fetch-failed` |
+//! | 5 | `origin/<default>` is the remote's head (see below) | `fetch-failed` |
 //! | 6 | nothing behind, nothing ahead | `current` (done) |
 //! | 7 | ahead only: unpushed local commits | `ahead` |
 //! | 8 | ahead and behind | `diverged` |
@@ -35,26 +35,31 @@
 //!
 //! # What a pass costs
 //!
+//! Every pass, on every tick, makes sure `origin/<default>` is the remote's
+//! head before it compares, and it asks the network as little as it can:
+//!
 //! * A host with `fleet.autoApply` off, or with dispatch paused, makes **no
 //!   network call at all**. It compares the checkout with the clone's own
 //!   `origin/<default>` ref as it stands.
-//! * Otherwise the remote is asked for its head with one `git ls-remote`, and
-//!   only when nothing has confirmed `origin/<default>` within
-//!   [`super::workspace_resync::recheck_after`] (15 sync intervals). The
-//!   workspace half's own probes count ([`note_remote_head`]), so a repo both
-//!   halves cover is asked once, not twice.
-//! * `git fetch` runs only when the head the remote named is not already the
-//!   clone's `origin/<default>`.
-//! * A resync this host pushed moved `origin/<default>` in this clone, so the
-//!   fast-forward to it costs one `git ls-remote` and no fetch. On another
-//!   host the workspace half probes a stale repo every tick and fetches when
-//!   its head moves; this step follows that ref and asks nothing itself.
-//! * A pass stops at its budget ([`STARTUP_BUDGET`], [`PASS_BUDGET`]); the
-//!   next one starts where it stopped. Three remotes in a row that do not
-//!   answer end the pass's network use. Every git child has a timeout.
+//! * A repo the workspace resync asked about in this same pass costs
+//!   **nothing**: that pass already learned the head (one batched query per
+//!   owner) and fetched it if it moved, and recorded it
+//!   ([`note_remote_head`]). This step trusts it. Only if the clone's
+//!   `origin/<default>` is somehow not that head does it fetch.
+//! * Any other root (the Loom source repo and a non-GitHub origin, which the
+//!   resync skips; one the resync did not reach or is backing off; every
+//!   root at startup, before any resync pass) gets one `git ls-remote` per
+//!   pass, and a `git fetch` only when the head moved. The rate-limit breaker
+//!   is read immediately before each such `ls-remote`, never once up front,
+//!   and while it is open nothing more is asked (#11003).
+//! * A pass stops starting workspaces at its budget ([`STARTUP_BUDGET`],
+//!   [`PASS_BUDGET`], and on the timer whatever is left of the workspace
+//!   pass's own deadline); the next pass starts where it stopped. Three
+//!   remotes in a row that do not answer end the pass's network use. Every
+//!   git child has a timeout.
 //!
-//! So a commit that is not a resync reaches a clean checkout within 15 sync
-//! intervals, not one. A resync reaches it within one.
+//! So any commit on the default branch reaches a clean checkout on the next
+//! tick, and a resync this host pushed in the same pass.
 //!
 //! # What it never does
 //!
@@ -330,23 +335,12 @@ struct Seen {
     report: CheckoutReport,
 }
 
-/// When the remote last named `head` as `branch`'s head.
-#[derive(Debug, Clone)]
-struct Probed {
-    branch: String,
-    head: String,
-    at: DateTime<Utc>,
-}
-
 /// Per-checkout state kept in process memory, so a state is reported when it
 /// changes and not once per pass. It resets on restart: a restarted daemon
 /// reports each standing skip state once more.
 #[derive(Debug, Default)]
 pub struct Memory {
     seen: HashMap<PathBuf, Seen>,
-    /// This step's own probes, so a settled checkout is not asked about again
-    /// until the recheck window has passed.
-    probed: HashMap<PathBuf, Probed>,
     /// Where the next pass starts, so a pass that ran out of time does not
     /// starve the workspaces at the end of the list.
     cursor: usize,
@@ -449,9 +443,6 @@ impl Memory {
 // The pass
 // ============================================================================
 
-/// A commit the remote named as a branch's head, and when it did.
-pub type Confirmed = (String, DateTime<Utc>);
-
 /// Everything a pass reads from outside itself. Production builds it in
 /// [`host`]; tests inject each piece.
 pub struct Env<'a> {
@@ -465,12 +456,11 @@ pub struct Env<'a> {
     /// May this pass use the network at all? Not with `fleet.autoApply` off,
     /// and not on a paused host.
     pub network: bool,
-    /// How long a confirmed remote head is trusted before the remote is asked
-    /// again.
-    pub recheck: Duration,
-    /// The head the workspace half last heard the remote name for this root
-    /// and branch, and when.
-    pub confirmed: &'a dyn Fn(&Path, &str) -> Option<Confirmed>,
+    /// The head the workspace resync learned for this root and branch in this
+    /// same pass, if it asked.
+    pub confirmed: &'a dyn Fn(&Path, &str) -> Option<String>,
+    /// Is the forge rate-limit breaker open? Read before each `ls-remote`.
+    pub breaker_open: &'a dyn Fn() -> bool,
     /// How long the pass may run before it stops starting workspaces.
     pub budget: Option<Duration>,
     /// Time since the pass started.
@@ -549,23 +539,14 @@ struct Net {
     fetches: u32,
     /// Remotes in a row that did not answer.
     misses: u32,
-}
-
-/// A stable per-root offset in `[0, window)`, so sixty checkouts first asked
-/// about in one pass are not all asked again in the same later pass.
-fn spread(root: &Path, window: Duration) -> chrono::Duration {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    let secs = hasher.finish() % window.as_secs().max(1);
-    chrono::Duration::seconds(i64::try_from(secs).unwrap_or(0))
+    /// The rate-limit breaker was found open: nothing more is asked.
+    breaker_open: bool,
 }
 
 /// Run one checkout pass over `roots`. Never fails: every failure is a state.
 pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPass {
     let mut pass = CheckoutPass::default();
     memory.seen.retain(|root, _| roots.contains(root));
-    memory.probed.retain(|root, _| roots.contains(root));
     let mut net = Net::default();
     let start = memory.cursor % roots.len().max(1);
     let mut reached = 0;
@@ -573,7 +554,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
         if env.out_of_budget() {
             break;
         }
-        let found = attempt(env, root, memory, &mut net);
+        let found = attempt(env, root, &mut net);
         memory.record(root, found, (env.clock)(), &mut pass.transitions);
         reached += 1;
     }
@@ -605,58 +586,46 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], memory: &mut Memory) -> CheckoutPas
     pass
 }
 
-/// Rule 5: make sure `origin/<branch>` is the remote's head, asking the
-/// remote only when nothing has confirmed it within the recheck window.
-fn refresh(
-    env: &Env<'_>,
-    root: &Path,
-    branch: &str,
-    memory: &mut Memory,
-    net: &mut Net,
-) -> Result<(), String> {
-    if !env.network || net.misses >= UNREACHABLE_STOP {
+/// Rule 5: make sure `origin/<branch>` is the remote's head. A head the
+/// workspace resync learned in this pass is trusted; otherwise the remote is
+/// asked once. Fetches only when the head moved.
+fn refresh(env: &Env<'_>, root: &Path, branch: &str, net: &mut Net) -> Result<(), String> {
+    if !env.network {
         return Ok(());
     }
-    let now = (env.clock)();
-    let window = chrono::Duration::from_std(env.recheck).unwrap_or(chrono::Duration::MAX);
+    let head = match (env.confirmed)(root, branch) {
+        Some(head) => head,
+        None => {
+            if net.misses >= UNREACHABLE_STOP || net.breaker_open {
+                return Ok(());
+            }
+            // Read now, not once per pass: a refusal a moment ago may have
+            // opened it (#11003).
+            if (env.breaker_open)() {
+                net.breaker_open = true;
+                log::info!(
+                    "checkout_ff: the forge rate-limit breaker is open; no more remotes are asked \
+                     this pass"
+                );
+                return Ok(());
+            }
+            net.probes += 1;
+            let head = git::remote_head(root, branch, env.bound(git::PROBE_TIMEOUT))
+                .inspect_err(|_| net.misses += 1)?;
+            net.misses = 0;
+            head
+        }
+    };
     let tracking = git::tracking_head(root, branch, env.bound(git::LOCAL_TIMEOUT));
-    let own = memory
-        .probed
-        .get(root)
-        .filter(|p| p.branch == branch)
-        .map(|p| (p.head.clone(), p.at));
-    // Confirmed: the remote named this very commit as the head, recently.
-    let confirmed = [own, (env.confirmed)(root, branch)]
-        .into_iter()
-        .flatten()
-        .any(|(head, at)| Some(&head) == tracking.as_ref() && now >= at && now - at < window);
-    if confirmed {
-        return Ok(());
-    }
-    net.probes += 1;
-    let head = git::remote_head(root, branch, env.bound(git::PROBE_TIMEOUT)).inspect_err(|_| {
-        net.misses += 1;
-    })?;
-    net.misses = 0;
     if tracking.as_deref() != Some(head.as_str()) {
         net.fetches += 1;
         git::fetch(root, branch, env.bound(git::FETCH_TIMEOUT))?;
     }
-    // The first confirmation is back-dated by a per-root offset.
-    let at = if memory.probed.contains_key(root) {
-        now
-    } else {
-        now - spread(root, env.recheck)
-    };
-    let branch = branch.to_string();
-    memory
-        .probed
-        .insert(root.to_path_buf(), Probed { branch, head, at });
     Ok(())
 }
 
 /// The rules, in order, for one checkout.
-fn attempt(env: &Env<'_>, root: &Path, memory: &mut Memory, net: &mut Net) -> Decided {
+fn attempt(env: &Env<'_>, root: &Path, net: &mut Net) -> Decided {
     use CheckoutState as S;
     let mut found = Found::default();
     let local = || env.bound(git::LOCAL_TIMEOUT);
@@ -705,7 +674,7 @@ fn attempt(env: &Env<'_>, root: &Path, memory: &mut Memory, net: &mut Net) -> De
     };
 
     // 5. Ask the remote, when that is due and allowed.
-    if let Err(e) = refresh(env, root, &branch, memory, net) {
+    if let Err(e) = refresh(env, root, &branch, net) {
         let _ = found.measure(env, root, &branch);
         return found.end(S::FetchFailed, e);
     }

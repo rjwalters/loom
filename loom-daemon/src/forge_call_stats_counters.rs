@@ -23,6 +23,16 @@ pub fn bump(name: &'static str) -> u64 {
     })
 }
 
+/// Add `n` to the counter `name` (a no-op for `0`).
+pub fn add(name: &'static str, n: u64) {
+    if n > 0 {
+        with(|m| {
+            let v = m.entry(name).or_default();
+            v.0 = v.0.saturating_add(n);
+        });
+    }
+}
+
 /// The current value of counter `name` (`0` when never bumped).
 #[must_use]
 pub fn get(name: &str) -> u64 {

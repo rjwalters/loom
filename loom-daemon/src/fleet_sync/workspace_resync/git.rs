@@ -17,7 +17,6 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
 
 use crate::install_compat::INSTALL_METADATA_PATH;
 use crate::proc_exec::{run_bounded, Completion};
@@ -53,6 +52,53 @@ impl std::fmt::Display for Unreachable {
 }
 
 impl std::error::Error for Unreachable {}
+
+/// The remote (or the forge) answered and refused this repo: it was deleted
+/// or renamed, or the credential may not read it. Kept apart from
+/// [`Unreachable`] so one dead repo is that repo's failure and never counts
+/// toward the host's network outage (#10987).
+#[derive(Debug)]
+pub(super) struct Refused(pub(super) String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Does a failed `ls-remote` or `fetch` say the remote answered and refused,
+/// as opposed to not answering? Read from git's own stderr: GitHub's "not
+/// found" (which is also its answer to a credential that may not see the
+/// repo) and the HTTP and credential-helper authentication failures.
+pub(super) fn is_refusal(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    [
+        "repository not found",
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "invalid username or",
+        "bad credentials",
+        "permission to ",
+        "returned error: 401",
+        "returned error: 403",
+        "returned error: 404",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// The error for a network child (`ls-remote`, `fetch`) that exited non-zero.
+fn network_failure(what: &str, stderr: &[u8]) -> anyhow::Error {
+    let detail = format!("{what} failed: {}", first_line(stderr));
+    if is_refusal(&String::from_utf8_lossy(stderr)) {
+        Refused(detail).into()
+    } else {
+        Unreachable(detail).into()
+    }
+}
 
 /// Prefix of the throwaway worktree's directory name; the pid follows.
 pub(super) const WORKTREE_PREFIX: &str = ".resync-";
@@ -156,15 +202,15 @@ fn first_line(stderr: &[u8]) -> String {
 /// one connection, no objects, nothing written in the clone.
 ///
 /// # Errors
-/// [`Unreachable`] when the remote did not answer; a plain error when it
-/// answered without that branch.
+/// [`Unreachable`] when the remote did not answer; [`Refused`] when it
+/// answered and refused the repo; a plain error when it answered without
+/// that branch.
 pub(super) fn remote_head(root: &Path, branch: &str) -> Result<String> {
     let name = format!("refs/heads/{branch}");
     let out = run(root, root, &["ls-remote", "--quiet", "origin", "--", &name], PROBE)
         .map_err(|e| Unreachable(format!("{e:#}")))?;
     if !out.status.success() {
-        let why = first_line(&out.stderr);
-        return Err(Unreachable(format!("git ls-remote origin failed: {why}")).into());
+        return Err(network_failure("git ls-remote origin", &out.stderr));
     }
     let head = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -189,7 +235,8 @@ pub(super) fn tracking_head(root: &Path, branch: &str) -> Option<String> {
 /// Fetch the default branch and return the commit `origin/<branch>` is at.
 ///
 /// # Errors
-/// [`Unreachable`] when the fetch itself failed.
+/// [`Unreachable`] when the fetch got no answer; [`Refused`] when the remote
+/// refused the repo.
 pub(super) fn fetch(root: &Path, branch: &str) -> Result<String> {
     // An explicit refspec, so the remote-tracking ref moves even in a clone
     // whose configured fetch refspec does not cover this branch. Behind `--`
@@ -207,8 +254,7 @@ pub(super) fn fetch(root: &Path, branch: &str) -> Result<String> {
     ];
     let out = run(root, root, &args, FETCH).map_err(|e| Unreachable(format!("{e:#}")))?;
     if !out.status.success() {
-        let why = first_line(&out.stderr);
-        return Err(Unreachable(format!("fetching origin/{branch} failed: {why}")).into());
+        return Err(network_failure(&format!("fetching origin/{branch}"), &out.stderr));
     }
     tracking_head(root, branch)
         .ok_or_else(|| anyhow!("origin/{branch} is missing after a successful fetch"))
@@ -223,8 +269,6 @@ pub(super) struct PastResync {
     pub(super) host: String,
     /// Its `Loom-Resync-Version`.
     pub(super) version: String,
-    /// Its committer time.
-    pub(super) at: DateTime<Utc>,
 }
 
 /// The message of a resync commit.
@@ -238,20 +282,13 @@ pub(super) fn resync_message(host: &str, version: &str) -> String {
 /// The daemon resync commits among the last [`HISTORY_DEPTH`] commits reachable
 /// from `commit`, newest first. Local: the history is already in the clone.
 pub(super) fn past_resyncs(root: &Path, commit: &str) -> Result<Vec<PastResync>> {
-    let args = [
-        "log",
-        HISTORY_DEPTH,
-        "--format=%x1e%H%x1f%ct%x1f%B",
-        commit,
-        "--",
-    ];
+    let args = ["log", HISTORY_DEPTH, "--format=%x1e%H%x1f%B", commit, "--"];
     let out = ok(root, root, &args, QUICK).context("reading the default branch's history")?;
     Ok(out.split('\u{1e}').filter_map(parse_past_resync).collect())
 }
 
 fn parse_past_resync(record: &str) -> Option<PastResync> {
-    let mut fields = record.splitn(3, '\u{1f}');
-    let (commit, time, body) = (fields.next()?, fields.next()?, fields.next()?);
+    let (commit, body) = record.split_once('\u{1f}')?;
     let trailer = |key: &str| {
         body.lines()
             .filter_map(|line| line.split_once(": "))
@@ -263,7 +300,6 @@ fn parse_past_resync(record: &str) -> Option<PastResync> {
         commit: commit.trim().to_string(),
         version: trailer(TRAILER_VERSION)?,
         host: trailer(TRAILER_HOST).unwrap_or_else(|| "an unnamed host".to_string()),
-        at: Utc.timestamp_opt(time.trim().parse().ok()?, 0).single()?,
     })
 }
 

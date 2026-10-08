@@ -135,12 +135,16 @@ pub(in crate::fleet_sync) fn note_remote_head(root: &Path, branch: &str, head: &
     }
 }
 
-/// The head the workspace half last heard for `root`'s `branch`, and when.
-fn heard(root: &Path, branch: &str) -> Option<super::Confirmed> {
+/// The head the workspace half heard for `root`'s `branch` at or after
+/// `since`: in the pass this step follows. `None` for anything older.
+pub(super) fn heard(root: &Path, branch: &str, since: DateTime<Utc>) -> Option<String> {
     let heads = remote_heads().lock().ok()?;
     let (b, head, at) = heads.get(root)?;
-    (b == branch).then(|| (head.clone(), *at))
+    (b == branch && *at >= since).then(|| head.clone())
 }
+
+/// The rate-limit breaker's name for this step.
+const CALLER: &str = "checkout_ff";
 
 // ============================================================================
 // Running a pass
@@ -153,11 +157,14 @@ fn memory() -> &'static Mutex<Memory> {
 
 /// One checkout pass over the registered workspaces. Blocking (git children),
 /// so it runs on a blocking thread.
+/// `since` is when the workspace pass this follows began: a head it heard
+/// after that is trusted. `None` at startup, before any workspace pass.
 fn run_live(
     inputs: &PassInputs,
     network: bool,
     budget: Duration,
     gate: Option<&GateProbe>,
+    since: Option<DateTime<Utc>>,
 ) -> CheckoutPass {
     let started = Instant::now();
     let env = Env {
@@ -165,8 +172,8 @@ fn run_live(
         gate_in_flight: &|root| gate.is_some_and(|probe| probe(root)),
         hold: &hold_for_move,
         network,
-        recheck: crate::fleet_sync::workspace_resync::recheck_after(inputs.interval),
-        confirmed: &heard,
+        confirmed: &|root, branch| since.and_then(|since| heard(root, branch, since)),
+        breaker_open: &|| crate::rate_limit_breaker::global_skip_pass(CALLER),
         budget: Some(budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
@@ -193,7 +200,7 @@ pub(in crate::fleet_sync) fn startup(
         return Vec::new();
     }
     let network = inputs.auto_apply && status.enforced == Enforcement::Proceed;
-    let pass = run_live(inputs, network, STARTUP_BUDGET, None);
+    let pass = run_live(inputs, network, STARTUP_BUDGET, None, None);
     status.checkouts = pass.checkouts;
     pass.transitions
 }
@@ -210,13 +217,16 @@ pub(in crate::fleet_sync) fn announce(transitions: &[Transition], bus: Option<&E
 }
 
 /// The checkout half on the timer, as the step that follows a workspace pass
-/// (`workspace_resync::spawn_pass`'s `then`). It runs on that pass's own task
-/// and inside its single flight, so:
+/// (`workspace_resync::spawn_pass`'s `then`). It runs on that pass's own
+/// blocking thread, inside the same supervised closure, so:
 ///
 /// - the fleet-sync timer never waits for it;
-/// - it follows any resync the pass pushed, and that push already moved
-///   `origin/<default>` in this clone, so the host that pushed fast-forwards
-///   to it in the same pass with nothing to fetch;
+/// - the single flight, the stuck-pass watchdog and abandonment cover it;
+/// - it keeps to what is left of the pass's
+///   [`crate::fleet_sync::workspace_resync::PASS_DEADLINE`], and to
+///   [`PASS_BUDGET`];
+/// - it follows any resync the pass pushed, and trusts the heads the pass
+///   learned, so a repo the pass covered costs no network here;
 /// - it never overlaps the next workspace pass.
 ///
 /// It asks no remote when `fleet.autoApply` is off or dispatch is paused (a
@@ -227,13 +237,16 @@ pub(in crate::fleet_sync) fn after_resync(
     enforcer: &Option<Arc<dyn Enforcer>>,
     gate: &Option<GateProbe>,
     bus: &Option<Arc<EventBus>>,
-) -> impl FnOnce() + Send + 'static {
+) -> impl FnOnce(Instant) + Send + 'static {
     let (inputs, enforcer, gate, bus) =
         (inputs.clone(), enforcer.clone(), gate.clone(), bus.clone());
-    move || {
+    move |began: Instant| {
         let paused = enforcer.as_deref().is_none_or(|e| e.drain_facts().0);
         let network = inputs.auto_apply && !paused;
-        let found = run_live(&inputs, network, PASS_BUDGET, gate.as_ref());
+        let spent = began.elapsed();
+        let left = crate::fleet_sync::workspace_resync::PASS_DEADLINE.saturating_sub(spent);
+        let since = Utc::now() - chrono::Duration::from_std(spent).unwrap_or_default();
+        let found = run_live(&inputs, network, PASS_BUDGET.min(left), gate.as_ref(), Some(since));
         announce(&found.transitions, bus.as_deref());
         crate::fleet_sync::publish_checkouts(&found.checkouts);
     }

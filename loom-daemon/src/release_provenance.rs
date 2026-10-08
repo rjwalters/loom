@@ -9,9 +9,10 @@
 //!
 //! # (a) The build stamp
 //!
-//! `build_stamp.rs` bakes `LOOM_RELEASE_BUILD_TAG` into the binary as
-//! [`BUILT_RELEASE_TAG`]. Only `.github/workflows/release.yml` sets that
-//! variable, and only on a run that publishes. A developer's build, a feature
+//! `build_stamp.rs` bakes `LOOM_RELEASE_BUILD_TAG` into the binary as a
+//! marker read through [`built_release_tag`]. Only
+//! `.github/workflows/release.yml` sets that variable, and only on a run that
+//! publishes. A developer's build, a feature
 //! branch's, CI's test and release-check jobs and `scripts/daemon-build.sh`
 //! leave it unset, so they bake in the empty string. The stamp must equal
 //! `v<crate version>`, the source commit must be known, and the tree clean.
@@ -52,9 +53,37 @@ pub type TagLookup<'a> = dyn Fn(&str, &str) -> Result<String, String> + 'a;
 /// The repository whose tags are releases.
 pub const RELEASE_REPO: &str = "rjwalters/loom";
 
-/// The marker the stamp is embedded in, so `release.yml` can check a built
-/// artifact (including a cross-compiled one it cannot run) with `grep -a`.
-const MARKER: &str = concat!("loom-release-build-tag=", env!("LOOM_DAEMON_RELEASE_TAG"), ";");
+/// The marker text the stamp is embedded in, so `release.yml` can check a
+/// built artifact (including a cross-compiled one it cannot run) with
+/// `grep -a`. Never read directly: see [`MARKER`].
+const MARKER_TEXT: &str = concat!("loom-release-build-tag=", env!("LOOM_DAEMON_RELEASE_TAG"), ";");
+
+/// The prefix of [`MARKER_TEXT`] before the tag.
+const MARKER_PREFIX: &str = "loom-release-build-tag=";
+
+/// [`MARKER_TEXT`] as bytes in a static the binary must keep (#10992).
+///
+/// A plain `const` read only through `strip_prefix` is folded at compile
+/// time, so the full marker never reached a release binary and the
+/// workflow's "Verify the release stamp" step failed on every target.
+/// `#[used]` keeps the compiler from dropping the static, and
+/// [`built_release_tag`] reads it through [`std::hint::black_box`], so it is
+/// referenced at runtime and survives the linker's `--gc-sections` too. The
+/// tag the daemon uses is derived from these same bytes, so what the
+/// workflow checks is what the daemon reads.
+#[used]
+static MARKER: [u8; MARKER_TEXT.len()] = marker_bytes();
+
+const fn marker_bytes() -> [u8; MARKER_TEXT.len()] {
+    let text = MARKER_TEXT.as_bytes();
+    let mut out = [0u8; MARKER_TEXT.len()];
+    let mut i = 0;
+    while i < text.len() {
+        out[i] = text[i];
+        i += 1;
+    }
+    out
+}
 
 /// Longest wait between two tag lookups that got no answer.
 pub const RETRY_CAP: Duration = Duration::from_secs(60 * 60);
@@ -63,8 +92,17 @@ pub const RETRY_CAP: Duration = Duration::from_secs(60 * 60);
 /// every build `release.yml` did not make.
 #[must_use]
 pub fn built_release_tag() -> &'static str {
-    MARKER
-        .strip_prefix("loom-release-build-tag=")
+    // The runtime read that keeps the marker in the binary (#10992). Do not
+    // replace it with a read of `MARKER_TEXT`: that is folded away again.
+    let marker: &'static [u8] = std::hint::black_box(&MARKER);
+    tag_from_marker(marker)
+}
+
+/// The tag inside a marker's bytes; empty when they are not a marker.
+fn tag_from_marker(marker: &[u8]) -> &str {
+    std::str::from_utf8(marker)
+        .ok()
+        .and_then(|text| text.strip_prefix(MARKER_PREFIX))
         .and_then(|rest| rest.strip_suffix(';'))
         .unwrap_or("")
 }

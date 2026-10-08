@@ -1738,6 +1738,9 @@ Nothing else schedules it, and it does not wait for a roll window.
 A pass runs on its own task and the timer never waits for it, so it cannot
 delay the fleet-store sync, the floor, or `paused`/`stopped` enforcement. Only
 one pass runs at a time: while one is still running, the next tick starts none.
+A pass still running at the fifth tick in a row is one `pass-stuck` alert. After
+15 minutes the task stops waiting for it and frees the slot; until the old pass
+ends, each new one does nothing and says so on the status block.
 
 Each pass reads `.loom/install-metadata.json` from every registered
 workspace's default branch (never the working tree) and classifies it:
@@ -1783,26 +1786,36 @@ claims or writes. If the tag lookup gets no answer, the host reports
 `this daemon's release tag is not verified yet`, pushes nothing, and retries on
 a later tick (one sync interval apart at first, doubling, capped at one hour).
 
-**What a pass costs.** The verdict is cached per default-branch commit and
-running version, in process memory.
+**What a pass costs.** Every pass checks every workspace's default-branch
+head (#10987), so a change made by anyone is classified on the next tick. The
+verdict is cached per default-branch commit and running version, in process
+memory.
 
-| Workspace | Per tick |
+| Case | Per tick |
 |---|---|
-| any, on a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
-| settled (`W0`, `W4`, `repo-ahead`, not installed) | nothing for 15 sync intervals, then one `git ls-remote` of the default branch |
-| stale (`W1`, `W3`) | one `git ls-remote` |
+| a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
+| a host that may write | one GraphQL query per repo owner, naming every repo's default branch and head (100 repos per query) |
+| head is the cached commit | nothing more: no git child, no fetch |
 | head moved since the cached verdict | one `git fetch` of the default branch, only if the clone does not already have the commit |
+| the query failed, or does not cover a repo | one `git ls-remote` for each such repo, 8 at a time |
+| the rate-limit breaker is open | nothing is asked; the pass reports from the cache and says so |
 
-A restart empties the cache, and the running version only changes with a
-restart, so startup and a version change both check every workspace. At
-60 repos and 5 hosts with a 60s interval, the steady state is about 1,200
-`git ls-remote` an hour fleet-wide and no `git fetch`.
+The query runs under the writer App through `gh api graphql` and costs one
+point on that installation's GraphQL bucket (not the REST core bucket); a
+`POST` has no ETag, so an unchanged fleet still pays it. An installation token
+sees one owner's repos, hence one query per owner. At 60 repos and 5 hosts
+with a 60s interval that is 300 queries an hour per owner fleet-wide (600 for
+two owners), no `git ls-remote` and no `git fetch`. A query that fails in
+three passes in a row while the remotes still answer is one `head-query`
+alert. A restart empties the cache, so startup and a version change both
+evaluate every workspace.
 
-**A pass is bounded.** Classification stops asking the network after 45s; the
-workspaces it did not reach keep their last verdict and are first in the next
-pass. Every git child has a timeout: 15s for `ls-remote`, 30s for a fetch, 60s
-for the worktree checkout, the commit and the push, 20s for local plumbing.
-Three remotes in a row that do not answer end the pass's network use.
+**A pass is bounded.** Classification stops after 45s; the workspaces it did
+not reach keep their last verdict and are first in the next pass. No resync
+starts more than 120s into a pass. Every child has a timeout: 15s for the head
+query and for `ls-remote`, 30s for a fetch, 60s for the worktree checkout, the
+commit and the push, 20s for local plumbing. Three remotes in a row that do
+not answer end the pass's network use.
 
 A stale workspace is resynced under a per-repo claim, the ref
 `refs/loom/resync-claim`:
@@ -1836,12 +1849,12 @@ credential is a repo admin can bypass branch protection.
 
 **A repo cannot be resynced in a loop.** Whatever makes a repo stale again (a
 host on the same version with other files, a person or a tool undoing the
-resync), it gets at most one daemon resync commit per version, from any host,
-and at most one per `max(10 x syncIntervalSecs, 15 min)`. The record is the
-default branch itself: the last 300 commits are searched for
+resync), it gets at most one daemon resync commit per version, from any host.
+The record is the default branch itself: the last 300 commits are searched for
 `Loom-Resync-Version`. A workspace that is stale again at a version it was
 already resynced to is left alone, reported as `resync-loop`, and alerted once.
-The next release resyncs it.
+The next release resyncs it. There is no wait between resyncs to different
+versions: a host never installs a version older than the repo's.
 
 | Outcome | Result |
 |---|---|
@@ -1850,9 +1863,9 @@ The next release resyncs it.
 | branch moved | re-read and retried once, then next tick |
 | host left H0, or the claim was taken over, before the claim or the push | abandoned, no push; not a failure |
 | already resynced to this version | `resync-loop`: no push, one alert per repo and version |
-| another resync landed within the cooldown | waits; not a failure |
 | branch protection or a ruleset refused the push | backoff of 6h; one alert per repo, then logged only |
 | a remote or the forge did not answer | backoff for that repo, no alert for it; one `network` alert for the host per outage, from the third failing pass |
+| the forge or the remote refuses one repo (deleted, renamed, or the credential may not read it) | backoff for that repo and a `repo-access` alert from the third in a row; never counted as an outage |
 | any other failure | backoff from one sync interval, doubling, capped at 6h; alert from the third in a row |
 
 Alerts are logged at `error` and published on the event bus as
@@ -1878,13 +1891,15 @@ each registered workspace's main checkout to its default branch.
 
 - **When.** Inside the startup pass, before any dispatch producer exists, so a
   daemon that just rolled dispatches (and later resumes paused agents) from the
-  installed files that match it. Then on the workspace resync's own task,
-  right after each resync pass and inside its single flight: the fleet-sync
-  timer never waits for it, it follows any resync that pass pushed, and it
-  never overlaps the next pass. Nothing else schedules it, and it does not
-  wait for a roll window.
-- **Bounded.** It stops starting workspaces after 30 s at startup and 45 s on
-  the timer; the next pass starts with the ones it did not reach, and they keep
+  installed files that match it. Then on every tick, as the last step of the
+  workspace resync's pass: on that pass's own thread, inside the same
+  supervised closure, so the fleet-sync timer never waits for it, the single
+  flight and the stuck-pass watchdog cover it, it follows any resync that pass
+  pushed, and it never overlaps the next pass. Nothing else schedules it, and
+  it does not wait for a roll window.
+- **Bounded.** It stops starting workspaces after 30 s at startup, and on the
+  timer after 45 s or at the workspace pass's 120 s deadline, whichever comes
+  first; the next pass starts with the ones it did not reach, and they keep
   their last report. Every git child has a timeout (15 s for a read and for
   `ls-remote`, 30 s for a fetch). At startup it runs inside the startup pass's
   own cap (`LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS`), so it never delays boot
@@ -1894,6 +1909,11 @@ each registered workspace's main checkout to its default branch.
 - **Any build may fast-forward.** Unlike the resync, which pushes to the repo
   and so requires an official release build, this is a write to the host's own
   clean checkout and is not tied to the binary's provenance.
+- **One git write.** `git merge --ff-only origin/<default>`, with hooks
+  disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
+  `submodule.recurse` and the silent overwrite of ignored files turned off.
+  Never `reset`, `rebase`, `stash`, `checkout`, `clean`, a merge commit, or a
+  removed lock file. Submodules are not updated.
 
 What a pass costs on the network:
 
@@ -1901,24 +1921,20 @@ What a pass costs on the network:
   a roll's pause or a fleet hold). The checkout is compared with the clone's
   own `origin/<default>` as it stands, so the reported count is as of the last
   fetch anything made in that clone.
-- Otherwise **one `git ls-remote` per workspace per 15 sync intervals**, and
-  only when nothing has confirmed `origin/<default>` in that time. The
-  workspace resync's own probes count, so a repo both cover is asked once.
-  The first probes are spread, so they do not all come due in one pass.
-- **`git fetch` only when the head moved**, with `--no-write-fetch-head`.
+- **None for a repo the workspace resync asked about in the same pass.** That
+  pass already learned the head (one batched query per owner) and fetched it
+  if it moved; this step trusts it, and fetches only if the clone's
+  `origin/<default>` is somehow not that head.
+- **One `git ls-remote` per pass for any other root**: the Loom source repo
+  and a non-GitHub origin (which the resync skips), a repo the resync did not
+  reach or is backing off, and every root at startup. Then a `git fetch` only
+  when the head moved, with `--no-write-fetch-head`. The rate-limit breaker is
+  read immediately before each `ls-remote`; while it is open nothing more is
+  asked and the checkout is compared with the clone as it stands.
 - Three remotes in a row that do not answer end the pass's network use.
 
-So a resync reaches every clean checkout within one sync interval: the host
-that pushed it fast-forwards in the same pass (one `ls-remote`, nothing to
-fetch), and on every other host the workspace resync probes a stale repo every
-tick, fetches when its head moves, and this step follows. Any other commit
-reaches a clean checkout within 15 sync intervals, or at the next daemon
-start.
-- **One git write.** `git merge --ff-only origin/<default>`, with hooks
-  disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
-  `submodule.recurse` and the silent overwrite of ignored files turned off.
-  Never `reset`, `rebase`, `stash`, `checkout`, `clean`, a merge commit, or a
-  removed lock file. Submodules are not updated.
+So any commit on the default branch reaches every clean checkout on the next
+tick, and the host that pushed a resync fast-forwards to it in the same pass.
 
 For each workspace the first rule that matches ends the attempt:
 
@@ -1929,7 +1945,7 @@ For each workspace the first rule that matches ends the attempt:
 | 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
 | 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
 | 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
-| 5 | the remote answers, when it is asked | `fetch-failed` |
+| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed` |
 | 6 | nothing behind and nothing ahead | `current` |
 | 7 | ahead only: unpushed local commits | `ahead` |
 | 8 | ahead and behind | `diverged` |
