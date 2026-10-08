@@ -1671,6 +1671,9 @@ Never an issue number, sha or path.
 | `loom.eta.health.refresh_repos` | `{repository}` | `reason` (a fleet-refresh stop reason) | repos per stop reason in the last tick that refreshed; a reason that drops out is exported once as `0` |
 | `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
 | `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
+| `loom.eta.health.snapshot_rows_truncated` | `{row}` | none | rows the last `eta.snapshot` dropped at its 2000-row cap or 1 MiB budget (#10928). Above `0`, the dashboard has no fresh ETA for those items: alert on it |
+| `loom.eta.health.snapshot_alternates_truncated` | `{row}` | none | rows the last `eta.snapshot` sent without their `alternates` because they did not fit the 1 MiB budget (#10928) |
+| `loom.eta.health.snapshot_bytes` | `By` | none | compact JSON size of the last `eta.snapshot`, at most 1 MiB (#10928): headroom against the dashboard's 2 MiB state value |
 | `loom.eta.health.pending_over_cap` | `{estimate}` | none | cumulative pending estimates evicted by the `MAX_PENDING` cap since process start (#10496). Omitted before the first ETA pass; a rising value means refreshes are being thinned (redundant middles, then pairs to their earliest). Whole series are evicted only when distinct series alone exceed the cap; the daemon log's `whole series lost` count reports those |
 | `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: the container's workspace mounts differ from what its workspace label would mount today: a registered root under the label is not mounted, a mount is no longer registered, or a mount is one `session start` now refuses although still registered (home, `firewall: true`) (#10364; the reconciler's own definition since #10600). No drift verdict, so never `stale_mounts`, while the workspace registry cannot be read. Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
 | `loom.codex_session.record` | `1` | `account`, `kind` ∈ `hold`, `drift_removal`, `container` | per session-managed Codex account, `1` while that on-disk record stands, else `0` (#10600): `hold` is an operator `accounts session stop` (`.session-hold.json`); `drift_removal` is the reconciler's fail-closed removal for a denied mount (`.session-drift-removed.json`), which keeps the seat down. Emitted with `loom.codex_session.state`, and omitted the same way |
@@ -2364,8 +2367,9 @@ fact from "this host is not estimating".
 | Field | Type | Notes |
 |---|---|---|
 | `as_of` | RFC 3339 | the newest row's `as_of` — the freshness stamp |
-| `rows[]` | array | one row per `(repo, issue, kind)`, in that order, at most 200. Past the cap rows are kept by priority (`land` with `p50`, then `land` refusals, then `start`/`finish`), then re-sorted |
-| `rows_truncated` | integer | rows dropped by the 200-row cap |
+| `rows[]` | array | one row per `(repo, issue, kind)`, at most 2000 and 1 MiB of compact JSON for the whole record (#10928; 200 before). Sent in cut-priority order (`land` with `p50`, then `land` refusals, then `start`/`finish`), `(repo, issue, kind)` within a rank, so a reader that keeps a prefix keeps the rows that matter most; past either bound the lowest-priority rows are dropped |
+| `rows_truncated` | integer | rows dropped by the row cap or the byte budget |
+| `alternates_truncated` | integer | rows sent without the `alternates[]` they have, because those did not fit the 1 MiB budget (#10928). Rows keep alternates in row order, so these are the last rows that have any. `0` (or absent, from older daemons) when none were cut |
 | `rows_truncated_by_kind` | object, optional | `rows_truncated` per kind (`start`/`finish`/`land` -> count). Omitted when nothing was dropped and on older daemons |
 
 Each row:
@@ -2388,11 +2392,12 @@ Each row:
 **`alternates[]` (#10390)** is additive: `schema_version` stays 12 and older
 readers ignore it. One entry per registered non-current heuristic of the row's
 kind that has a pending estimate for the item — the newest per heuristic
-(matched by item, never by equal `as_of`), sorted by `heuristic`, at most 12
-(#10549, was 8; a loom-ui that still slices at 8 reads the first 8, so
-either deploy order is safe). Built only from estimates the tracker already holds; an
-alternate never creates a row, and a row cut by the 200-row cap takes its
-alternates with it. A change to a shadow estimate alone triggers a new
+(matched by item, never by equal `as_of`), sorted by `heuristic`, at most 13
+(#10521; 12 since #10549, was 8; a loom-ui that still slices lower reads the
+first ones by id, so either deploy order is safe). Built only from estimates the tracker already holds; an
+alternate never creates a row, a row cut by the row cap takes its alternates
+with it, and alternates are the first thing the 1 MiB budget gives up
+(`alternates_truncated`, #10928). A change to a shadow estimate alone triggers a new
 snapshot. Each alternate:
 
 | Field | Type | Notes |

@@ -105,10 +105,14 @@ fn canonical() -> EtaSnapshotRecord {
         no_estimate_reason: None,
         alternates: Vec::new(),
     };
+    // Cut-priority order (#10928): the estimating `land` row, then the
+    // `land` refusal, then `start`. One row's alternates did not fit the
+    // byte budget, so `alternates_truncated` is on the wire too.
     EtaSnapshotRecord {
         as_of: at(12, 0),
-        rows: vec![refusal, land, start],
+        rows: vec![land, refusal, start],
         rows_truncated: 1,
+        alternates_truncated: 1,
         rows_truncated_by_kind: BTreeMap::from([(Kind::Finish, 1)]),
     }
 }
