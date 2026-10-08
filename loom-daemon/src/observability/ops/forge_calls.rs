@@ -383,6 +383,18 @@ mod tests {
             .unwrap();
         assert_eq!(agent(own), NO_AGENT);
         assert!(points.iter().all(|p| p.labels.len() == 10), "{points:?}");
+        // The export boundary applies `bounded_points()` (sink and OTLP
+        // mapping); all ten labels must survive it, not just the raw drain.
+        let bounded = crate::telemetry::ops::MetricPointsRecord {
+            captured_at: chrono::Utc::now(),
+            interval_start: None,
+            points: points.clone(),
+        }
+        .bounded_points();
+        assert_eq!(bounded, points, "bounding must not drop any forge-call label");
+        for key in ["target_owner", "installation", "agent"] {
+            assert!(bounded.iter().all(|p| p.labels.contains_key(key)), "{key}: {bounded:?}");
+        }
         let (again, _) = capture(drain_points);
         assert!(again.is_empty(), "delta semantics: {again:?}");
     }

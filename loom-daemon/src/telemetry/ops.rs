@@ -154,8 +154,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point (`loom.forge.calls` carries nine, #10607).
-pub const MAX_LABELS_PER_POINT: usize = 9;
+/// Most labels kept on one point (`loom.forge.calls` carries ten, #10607).
+pub const MAX_LABELS_PER_POINT: usize = 10;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
