@@ -320,6 +320,7 @@ fn champion_defaults_match_the_documented_slice_values() {
 #[test]
 #[serial]
 fn champion_block_and_env_vector_resolve_with_provenance() {
+    clear_champion_envs();
     let tmp = empty_workspace();
     write_config(
         tmp.path(),
@@ -348,6 +349,82 @@ fn champion_validation_names_unknown_keys_and_bad_ranges() {
     assert!(paths.contains(&"champion.bogus".to_string()));
     assert!(validate_layer(&serde_json::json!({"champion": {"prSlice": 10}})).is_empty());
     assert!(validate_layer(&serde_json::json!({"champion": null})).is_empty());
+}
+
+const CHAMPION_ENVS: [&str; 5] = [
+    "LOOM_CHAMPION_PR_SLICE",
+    "LOOM_CHAMPION_PROMOTION_SLICE",
+    "LOOM_CHAMPION_TIER2_CAP",
+    "LOOM_CHAMPION_TIER3_CAP",
+    "LOOM_CHAMPION_TIER3_BACKLOG_CAP",
+];
+
+fn clear_champion_envs() {
+    for var in CHAMPION_ENVS {
+        std::env::remove_var(var);
+    }
+}
+
+#[test]
+#[serial]
+fn champion_single_knob_env_beats_vector_and_config_with_provenance() {
+    clear_champion_envs();
+    let tmp = empty_workspace();
+    write_config(
+        tmp.path(),
+        r#"{"hyperparameters": {"champion": {"prSlice": 20, "tier3Cap": 2, "tier3BacklogCap": 8}}}"#,
+    );
+    std::env::set_var(HYPERPARAMS_ENV, r#"{"champion.prSlice": 15, "champion.tier2Cap": 4}"#);
+    std::env::set_var("LOOM_CHAMPION_PR_SLICE", "7");
+    std::env::set_var("LOOM_CHAMPION_TIER2_CAP", "9");
+    std::env::set_var("LOOM_CHAMPION_TIER3_CAP", "0");
+    // Mirrors the shell `_cap`: non-integer / empty values fall through.
+    std::env::set_var("LOOM_CHAMPION_TIER3_BACKLOG_CAP", "2.5");
+    std::env::set_var("LOOM_CHAMPION_PROMOTION_SLICE", "");
+    let resolved = resolve_effective(tmp.path());
+    std::env::remove_var(HYPERPARAMS_ENV);
+    clear_champion_envs();
+    let c = resolved.params.champion;
+    assert_eq!(c.pr_slice, 7, "env beats vector (15) and config (20)");
+    assert_eq!(c.tier2_cap, 9, "env beats vector (4)");
+    assert_eq!(c.tier3_cap, 0, "env 0 is honoured over config (2)");
+    assert_eq!(c.tier3_backlog_cap, 8, "non-integer env falls through to config");
+    assert_eq!(c.promotion_slice, 3, "empty env falls through to default");
+    assert_eq!(resolved.sources["champion.prSlice"], Source::Env);
+    assert_eq!(resolved.sources["champion.tier2Cap"], Source::Env);
+    assert_eq!(resolved.sources["champion.tier3Cap"], Source::Env);
+    assert_eq!(resolved.sources["champion.tier3BacklogCap"], Source::Config);
+    assert_eq!(resolved.sources["champion.promotionSlice"], Source::Default);
+    assert_eq!(Source::Env.as_str(), "env");
+}
+
+#[test]
+fn champion_env_value_mirrors_the_shell_cap_parser() {
+    assert_eq!(champion_env_value("0"), Some(0));
+    assert_eq!(champion_env_value("12"), Some(12));
+    for bad in ["", "abc", "-1", "2.5", " 3"] {
+        assert_eq!(champion_env_value(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+#[serial]
+fn champion_caps_accept_zero_but_slices_do_not() {
+    clear_champion_envs();
+    let zero_caps =
+        serde_json::json!({"champion": {"tier2Cap": 0, "tier3Cap": 0, "tier3BacklogCap": 0}});
+    assert!(validate_layer(&zero_caps).is_empty());
+    let zero_slices = serde_json::json!({"champion": {"prSlice": 0, "promotionSlice": 0}});
+    let paths: Vec<String> = validate_layer(&zero_slices)
+        .into_iter()
+        .map(|v| v.path)
+        .collect();
+    assert_eq!(paths, vec!["champion.prSlice", "champion.promotionSlice"]);
+    let tmp = empty_workspace();
+    write_config(tmp.path(), r#"{"hyperparameters": {"champion": {"tier3Cap": 0}}}"#);
+    let resolved = resolve_effective(tmp.path());
+    assert_eq!(resolved.params.champion.tier3_cap, 0);
+    assert_eq!(resolved.sources["champion.tier3Cap"], Source::Config);
 }
 
 #[test]

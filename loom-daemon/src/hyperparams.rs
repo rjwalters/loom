@@ -156,7 +156,8 @@ pub struct ReworkParams {
 
 /// Champion promotion-throughput tunables (issue #10753). Each has a
 /// single-knob env var the Champion shell snippets read
-/// (`LOOM_CHAMPION_*`, shown per field); there is no legacy config tier.
+/// (`LOOM_CHAMPION_*`, shown per field), resolved at the top tier with
+/// `Source::Env` provenance; there is no legacy config tier.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ChampionParams {
     /// PR rows processed before the promotion pass runs. Env:
@@ -166,14 +167,14 @@ pub struct ChampionParams {
     /// `LOOM_CHAMPION_PROMOTION_SLICE`. Default 3. Range `[1, 100]`.
     pub promotion_slice: usize,
     /// Tier 2 promotions per repository per pass. Env:
-    /// `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range `[1, 100]`.
+    /// `LOOM_CHAMPION_TIER2_CAP`. Default 2. Range `[0, 100]` (`0` disables).
     pub tier2_cap: usize,
     /// Tier 3 promotions per repository per pass. Env:
-    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[1, 100]`.
+    /// `LOOM_CHAMPION_TIER3_CAP`. Default 1. Range `[0, 100]` (`0` disables).
     pub tier3_cap: usize,
     /// Open unheld `tier:maintenance` `loom:issue`/`loom:building` issues
     /// above which Tier 3 promotion is gated. Env:
-    /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[1, 1000]`.
+    /// `LOOM_CHAMPION_TIER3_BACKLOG_CAP`. Default 5. Range `[0, 1000]`.
     pub tier3_backlog_cap: usize,
 }
 
@@ -346,13 +347,26 @@ const LEASE_TTL_MINUTES_MAX: f64 = 1440.0;
 const IDLE_EXIT_MINUTES_RANGE: (u64, u64) = (1, 10080);
 const BUILD_BACKOFF_HIGH_RANGE: (u64, u64) = (1, 100_000);
 const BUILD_BACKOFF_LOW_RANGE: (u64, u64) = (0, 100_000);
-const CHAMPION_KEYS: [(&str, (u64, u64)); 5] = [
-    ("prSlice", (1, 1000)),
-    ("promotionSlice", (1, 100)),
-    ("tier2Cap", (1, 100)),
-    ("tier3Cap", (1, 100)),
-    ("tier3BacklogCap", (1, 1000)),
+/// Champion knobs: `(key, single-knob env var, range)`. The three caps admit
+/// `0` because Champion's shell `_cap` honours it (`0` disables that tier /
+/// gates Tier 3 shut — promotion-throughput.md); the slices do not.
+const CHAMPION_KEYS: [(&str, &str, (u64, u64)); 5] = [
+    ("prSlice", "LOOM_CHAMPION_PR_SLICE", (1, 1000)),
+    ("promotionSlice", "LOOM_CHAMPION_PROMOTION_SLICE", (1, 100)),
+    ("tier2Cap", "LOOM_CHAMPION_TIER2_CAP", (0, 100)),
+    ("tier3Cap", "LOOM_CHAMPION_TIER3_CAP", (0, 100)),
+    ("tier3BacklogCap", "LOOM_CHAMPION_TIER3_BACKLOG_CAP", (0, 1000)),
 ];
+
+/// Parse a `LOOM_CHAMPION_*` value exactly as Champion's shell `_cap` does:
+/// a non-empty all-digit string is the value (`0` included, no range clamp —
+/// the shell applies none); anything else is absent (falls through).
+fn champion_env_value(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
 
 /// Validate the hyperparameters layer (config block + env vector): every key
 /// must be known, correctly typed, and in range, and the backoff pair must
@@ -489,11 +503,11 @@ fn validate_champion(group: &Value, violations: &mut Vec<Violation>) {
         return;
     }
     for (key, _) in group.as_object().into_iter().flatten() {
-        if !CHAMPION_KEYS.iter().any(|(k, _)| k == key) {
+        if !CHAMPION_KEYS.iter().any(|(k, _, _)| k == key) {
             violations.push(Violation::new(format!("champion.{key}"), "unknown key"));
         }
     }
-    for (key, range) in CHAMPION_KEYS {
+    for (key, _, range) in CHAMPION_KEYS {
         check_u64(group, "champion", key, range, violations);
     }
 }
@@ -506,6 +520,9 @@ fn validate_champion(group: &Value, violations: &mut Vec<Violation>) {
 /// module: a later tier only fills a field the earlier tiers left absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
+    /// A single-knob env var (today only the `LOOM_CHAMPION_*` knobs report
+    /// this tier — #10753).
+    Env,
     /// `$LOOM_HYPERPARAMS` vector.
     EnvVector,
     /// `.loom/config.json → "hyperparameters"` block.
@@ -521,6 +538,7 @@ impl Source {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Env => "env",
             Self::EnvVector => "env-vector",
             Self::Config => "config",
             Self::Legacy => "legacy",
@@ -723,8 +741,23 @@ pub fn resolve_effective(root: &Path) -> Resolved {
             ) as usize,
         },
         champion: {
+            // The `LOOM_CHAMPION_*` single-knob env tier is what Champion's
+            // shell actually consumes, so it outranks the vector/block here
+            // and reports `Source::Env` — the digest then names the values
+            // the role really ran under (#10753).
             let d = Hyperparameters::default().champion;
             let mut pick = |key: &str, default: usize| {
+                let env_var = CHAMPION_KEYS
+                    .iter()
+                    .find(|(k, _, _)| *k == key)
+                    .map(|e| e.1);
+                if let Some(n) = env_var
+                    .and_then(|var| std::env::var(var).ok())
+                    .and_then(|raw| champion_env_value(&raw))
+                {
+                    sources.insert(format!("champion.{key}"), Source::Env);
+                    return n as usize;
+                }
                 pick_u64(
                     vector.as_ref(),
                     &block,
