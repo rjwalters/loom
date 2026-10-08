@@ -266,6 +266,7 @@ pub mod hold_state;
 pub mod issue_close_gate;
 pub mod labels;
 pub mod loom_pr_guard;
+pub mod merge_route;
 pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;

@@ -994,6 +994,12 @@ pub(crate) enum MergePrCommand {
     /// / CLEAR + labels. The shell refuses on any other output — see
     /// `cli::merge_pr_revalidate_head`.
     RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
+
+    /// The per-attempt route of the synchronous merge-retry loop (#8191
+    /// slice): stdin is the failed merge's response; prints `LOOM-MERGE-ROUTE
+    /// AWAIT|SYNC|FAIL` plus its narration, exit 0. The shell routes on the
+    /// classifier's kind itself on any fault — see `cli::merge_pr_merge_route`.
+    MergeRoute(super::merge_pr_merge_route::MergeRouteArgs),
 }
 
 impl MergePrCommand {
@@ -1045,6 +1051,7 @@ impl MergePrCommand {
             MergePrCommand::RetriesUsed(args) => args.run(),
             MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
+            MergePrCommand::MergeRoute(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

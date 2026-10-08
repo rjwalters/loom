@@ -312,6 +312,7 @@ worktree-preserve open -
 discovered-worktree open -
 retries-used open -
 poll-wait open -
+merge-route open -
 revalidate-head open -
 cleanup-paths open -"
 
