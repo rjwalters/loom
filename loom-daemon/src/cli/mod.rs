@@ -117,6 +117,7 @@ mod merge_pr_stale_checks;
 mod merge_pr_tree_checks;
 mod merge_pr_usage;
 mod merge_pr_version_policy;
+mod merge_pr_workflow_scope;
 mod merge_pr_worktree_preserve;
 mod merge_pr_worktree_teardown;
 mod merge_pr_worktrees;

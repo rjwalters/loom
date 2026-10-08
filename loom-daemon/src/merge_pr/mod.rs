@@ -285,6 +285,7 @@ pub mod stale_checks;
 pub mod tree_checks;
 pub mod usage;
 pub mod version_policy;
+pub mod workflow_scope;
 pub mod worktree_preserve;
 pub mod worktree_teardown;
 pub mod worktrees;
