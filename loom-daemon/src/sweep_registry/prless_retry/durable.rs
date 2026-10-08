@@ -36,6 +36,15 @@
 //!   next to the journal ([`clear_marks_path`]), so records older than it are
 //!   not counted even after a daemon restart.
 //!
+//! - only a record whose sweep the PR-less tally **actually counted** is
+//!   counted. The reaper journals every death, but several never reach the
+//!   tally: a superseded claim, a self-reported no-op dispatch (#8912), a
+//!   pool or pre-flight death, a hard-exclusion decline, and a death whose
+//!   open-PR probe failed (fail-open). [`SweepRegistry::record_prless_release_for`]
+//!   notes each sweep it counts in a second sidecar ([`counted_marks_path`]),
+//!   so those exempt records are skipped rather than inflating the floor — and,
+//!   unlike a clear, skipping them never erases an earlier legitimate failure.
+//!
 //! Other PR-less outcomes in between (a substantive failure, a no-op exit)
 //! are skipped rather than counted or treated as a clear, so the floor never
 //! exceeds what the in-memory tally would have counted on a process that
@@ -108,6 +117,36 @@ fn read_clear_marks(path: &Path) -> HashMap<u32, DateTime<Utc>> {
         .unwrap_or_default()
 }
 
+/// The sidecar that persists the sweeps the tally counted: the journal's file
+/// name plus `.prless-counted.json`, in the same directory.
+fn counted_marks_path(journal: &Path) -> PathBuf {
+    let mut name = journal.file_name().unwrap_or_default().to_os_string();
+    name.push(".prless-counted.json");
+    journal.with_file_name(name)
+}
+
+/// Read the persisted counted-sweep marks; missing or unreadable is empty.
+fn read_counted_marks(path: &Path) -> HashMap<String, DateTime<Utc>> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Atomically replace the sidecar at `path` with `marks`.
+fn write_marks<K: serde::Serialize, V: serde::Serialize>(
+    path: &Path,
+    marks: &HashMap<K, V>,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(marks).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The durable count for one outcome, and the cause its record carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoPhaseStreak {
@@ -128,19 +167,26 @@ impl SweepRegistry {
         let mut marks = read_clear_marks(&path);
         marks.retain(|_, t| *t >= horizon);
         marks.insert(issue, at);
-        let tmp = path.with_extension("json.tmp");
-        let written = serde_json::to_vec(&marks)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::write(&tmp, bytes)?;
-                std::fs::rename(&tmp, &path)
-            });
+        let written = write_marks(&path, &marks);
         if let Err(e) = written {
             log::warn!(
                 "could not persist PR-less clear mark for issue #{issue} to {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    /// Note that the PR-less tally counted `sweep_id`'s outcome, so the
+    /// durable floor counts its journal record (and no exempt one).
+    fn note_prless_counted(&self, sweep_id: &str, at: DateTime<Utc>) {
+        let path = counted_marks_path(&self.config.resolve_outcome_telemetry_path());
+        let horizon = at - chrono::Duration::seconds(NO_PHASE_STREAK_WINDOW_SECS);
+        let mut marks = read_counted_marks(&path);
+        marks.retain(|_, t| *t >= horizon);
+        marks.insert(sweep_id.to_string(), at);
+        if let Err(e) = write_marks(&path, &marks) {
+            log::warn!(
+                "could not persist PR-less counted mark for sweep {sweep_id} to {}: {e}",
                 path.display()
             );
         }
@@ -154,7 +200,9 @@ impl SweepRegistry {
         if !self.prless_retry_config.enabled {
             return;
         }
-        match self.durable_no_phase_streak(issue, sweep_id, Utc::now()) {
+        let now = Utc::now();
+        self.note_prless_counted(sweep_id, now);
+        match self.durable_no_phase_streak(issue, sweep_id, now) {
             Some(streak) => {
                 let reason = match &streak.cause {
                     Some(cause) => format!("{reason}; recorded cause: {}", cause.summary()),
@@ -184,7 +232,8 @@ impl SweepRegistry {
             .flatten()
             .fold(window_start, std::cmp::max);
         let envelopes = crate::sweep_outcomes::read_all_outcome_telemetry(&path);
-        streak_from(&envelopes, issue, sweep_id, since)
+        let counted = read_counted_marks(&counted_marks_path(&path));
+        streak_from(&envelopes, issue, sweep_id, since, &counted)
     }
 }
 
@@ -200,6 +249,7 @@ fn streak_from(
     issue: u32,
     sweep_id: &str,
     since: DateTime<Utc>,
+    counted: &HashMap<String, DateTime<Utc>>,
 ) -> Option<NoPhaseStreak> {
     let outcomes: Vec<(DateTime<Utc>, &SweepOutcomeRecord)> = envelopes
         .iter()
@@ -227,7 +277,7 @@ fn streak_from(
         {
             break;
         }
-        if is_no_phase_failure(record) {
+        if is_no_phase_failure(record) && counted.contains_key(&record.sweep_id) {
             count = count.saturating_add(1);
         }
     }

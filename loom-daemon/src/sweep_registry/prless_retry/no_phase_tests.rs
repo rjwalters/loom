@@ -239,6 +239,47 @@ fn a_self_reported_noop_dispatch_is_not_counted_after_a_restart() {
     assert!(!reg.prless_retry_held(10_642));
 }
 
+/// Append a journaled `no-phase-signal` failure the PR-less tally never
+/// counted — the shape a superseded claim, a pool/pre-flight death or a
+/// fail-open `ProbeFailed` death leaves behind (all are journaled, none reach
+/// `record_prless_release_for`). Cloned from a real reaped record.
+fn append_uncounted_death(ws: &Path, template: &str, sweep_id: &str) {
+    let path = ws.join("test-sweep-outcome-telemetry.jsonl");
+    let mut record = outcome_for(ws, template);
+    record.sweep_id = sweep_id.into();
+    crate::sweep_outcomes::append_outcome_telemetry(
+        &path,
+        &crate::telemetry::TelemetryEnvelope::new(
+            "host",
+            crate::telemetry::TelemetryRecord::SweepOutcome(record),
+        ),
+    )
+    .unwrap();
+}
+
+/// Journaled deaths the tally exempted (superseded claim, fail-open probe)
+/// must not feed the floor, and must not erase the earlier legitimate failure
+/// either: one counted death, two exempt records, a restart, one more counted
+/// death reads 2 — not 4 (exempt records counted) and not 1 (earlier failure
+/// cleared) (#10642 review).
+#[test]
+#[serial]
+fn exempt_journaled_deaths_are_neither_counted_nor_a_clear() {
+    clear_repo_env();
+    let dir = tempdir().unwrap();
+    let template = {
+        let (mut reg, _) = fixture_registry(dir.path());
+        phaseless_death(&mut reg, 10_642, 0)
+    };
+    append_uncounted_death(dir.path(), &template, "sweep-exempt-superseded");
+    append_uncounted_death(dir.path(), &template, "sweep-exempt-probe-failed");
+
+    let (mut reg, _) = fixture_registry(dir.path());
+    phaseless_death(&mut reg, 10_642, 1);
+    assert_eq!(reg.prless_release_count(10_642), 2);
+    assert!(!reg.prless_retry_held(10_642));
+}
+
 /// A landed record in the journal ends the durable streak too, so a restart
 /// after a landing does not count the deaths that preceded it.
 #[test]
