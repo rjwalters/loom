@@ -97,6 +97,9 @@ fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
     assert_eq!(one(&pairs, "service.name"), "claude-code");
     assert_eq!(one(&pairs, "service.instance.id"), "host-fixture");
     assert_eq!(one(&pairs, "host.id"), "host-fixture");
+    // Every host attribute the daemon's own telemetry carries, the relay
+    // carries too — with the daemon's value, not the sender's `host.name`.
+    assert_eq!(one(&pairs, "host.name"), "host-fixture");
     assert_eq!(one(&pairs, "loom.repo"), "example-owner/example-repo");
     assert_eq!(one(&pairs, "loom.issue"), "4242");
     assert_eq!(one(&pairs, "loom.sweep_id"), "sweep-fixture-1");

@@ -961,7 +961,7 @@ hash of it, and it is never logged or forwarded.
 | Attribute | Value |
 |---|---|
 | `service.name` | the harness — `claude-code` |
-| `service.instance.id`, `host.id` (and any other host attribute the daemon's own telemetry carries) | this daemon's host identity |
+| `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
 | `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
 | `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
 | `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
