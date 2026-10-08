@@ -37,6 +37,14 @@ on:
 # cancel-in-progress true. This stanza is the ONLY cancellation mechanism on
 # main (rule 4) -- the `changes` job's cancel step is PR-only.
 #
+# #10670: so a high main `cancelled` rate during a merge burst is this bound
+# working, not runs being killed. Measured over the last 100 main push runs
+# (2026-10-06 10:40-22:53Z, Actions API): 54 cancelled, every one with ZERO
+# jobs (superseded while pending); no started run was cancelled. ci-queries.sql section 18 splits main
+# cancellations into superseded-before-start vs cancelled-after-start (the
+# latter is a rule-2 violation and must stay 0), and loom-daemon's
+# `main_cancel` lint fails if any workflow change could produce one.
+#
 # #10257: a merge-group run is keyed on its own head SHA, so it can never
 # share a group with a PR run, with `main`, or with another merge group: a
 # pending merge-group run that got superseded would never report its
@@ -103,6 +111,7 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
       docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -113,25 +122,42 @@ jobs:
       # every other job reads.
       # PR events only (#7779). The rationale above is entirely about a
       # superseded PR push -- "a force-pushed rebase created a new run". On a
-      # push to main there is nothing to supersede: `github.head_ref` is empty,
-      # so REF fell back to `github.ref_name` = `main`, and this job cancelled
-      # every other queued/in_progress main run. That is the dominant cause of
-      # the 22/30 cancellation rate, not the `concurrency:` stanza alone --
-      # each main commit is distinct work that deserves its own verification.
+      # push to main there is nothing to supersede. HISTORY, fixed by #7779:
+      # before that fix `github.head_ref` was empty on a push, so REF fell back
+      # to `github.ref_name` = `main`, and this step cancelled every other
+      # queued/in_progress main run -- then the dominant cause of the 22/30
+      # cancellation rate. Since #10670 the step itself also refuses to reach
+      # a main run (no `ref_name` fallback, `pull_request` runs only), and
+      # `main_cancel.rs` (`cargo test -p loom-daemon --lib main_cancel`) fails
+      # if any cancel path a push or merge_group run can reach could cancel a
+      # started run. main's remaining `cancelled` runs are pending runs the
+      # concurrency stanza superseded before they started (zero jobs), by
+      # design: one running (oldest) + the newest pending.
       - name: Cancel older queued/in_progress runs for this ref
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
-          REF: ${{ github.head_ref || github.ref_name }}
+          REF: ${{ github.head_ref }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          echo "Checking for superseded '$WORKFLOW' runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
+          # PR runs only, by construction (#10670), not just by the job's
+          # `if:`: REF is the PR head branch with no `ref_name` fallback, so
+          # it can never resolve to `main`, and the jq filter selects only
+          # `pull_request` runs, so even a fork PR whose head branch is named
+          # `main` cannot reach a push run. A started main run is never
+          # cancelled (ci-principles.md rule 2); the concurrency stanza's
+          # pending-run supersession is the only bound on main.
+          if [[ -z "$REF" ]]; then
+            echo "No PR head ref; nothing to supersede."
+            exit 0
+          fi
+          echo "Checking for superseded '$WORKFLOW' PR runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
           gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$REF" \
-            --json databaseId,status --jq \
-            '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' \
+            --json databaseId,status,event --jq \
+            '.[] | select(.event == "pull_request") | select(.status == "queued" or .status == "in_progress") | .databaseId' \
             | while read -r run_id; do
                 if [[ "$run_id" != "$CURRENT_RUN_ID" ]]; then
                   echo "Cancelling superseded run $run_id (workflow=$WORKFLOW ref=$REF)"
@@ -206,6 +232,12 @@ jobs:
               - '.github/dependabot.yml'
               - '**/package.json'
               - '.github/workflows/ci.yml'
+            # Every workflow file, for the Workflow Cancellation Lint job
+            # (#10670). The `backend` group lists only ci.yml, so without this
+            # a security.yml-only (or new-workflow) PR would merge with the
+            # main_cancel lint never having run.
+            workflows:
+              - '.github/workflows/**'
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
@@ -451,6 +483,37 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
+
+  # Workflow Cancellation Lint (#10670). The `main_cancel` lint, the
+  # every-workflow parse check and the merge-group audit are Rust unit tests in
+  # `merge_group_ci`, so `backend-tests` runs them -- but only when the
+  # `backend` group matches, and of the workflow files that group lists only
+  # ci.yml. This repo has no merge queue, so the PR run is the only check before
+  # merge: a PR touching only security.yml, codeql.yml, release.yml or a new
+  # workflow would otherwise land with the lint unrun, and the first run to
+  # catch a cancel regression would be the main push it can already cancel.
+  # This job runs just that test module on any `.github/workflows/**` change
+  # (a lib-test build of one crate, not the three-leg suite), and on every push
+  # and merge_group like every other filtered job. On a PR that also matches
+  # `backend` the module runs twice (here and in a backend-tests leg); the
+  # price is one more runner doing a cache-restored lib-test build of one
+  # crate, in parallel, so it adds no wall-clock time to the run.
+  workflow-cancel-lint:
+    name: Workflow Cancellation Lint
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.workflows == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint every workflow for cancellation of a started main run
+        run: cargo test -p loom-daemon --lib merge_group_ci
 
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
@@ -2811,6 +2874,7 @@ jobs:
       - node-packages
       - backend-lint-and-check
       - backend-tests
+      - workflow-cancel-lint
       - backend-otlp-feature
       - structural-checks
       - daemon-checks
