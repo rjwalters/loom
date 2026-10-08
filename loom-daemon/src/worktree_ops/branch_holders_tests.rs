@@ -191,9 +191,9 @@ fn force_delete_runs_git_under_the_c_locale() {
 #[test]
 fn localized_refusal_is_still_a_skip() {
     // An operator locale of German. The env is set on the child only, so the
-    // test needs no serialization; `force_delete_cmd`'s own `LC_ALL=C`
-    // overrides an inherited `LC_ALL` (pinned by the test above). Passes
-    // trivially when no `de` catalog is installed.
+    // test needs no serialization. `LC_ALL` is deliberately left unset here:
+    // setting it would replace `force_delete_cmd`'s own `LC_ALL=C` (pinned by
+    // the test above). Passes trivially when no `de` catalog is installed.
     let (_tmp, repo, wt) = repo_with_dirty_worktree_on_stale_branch();
     let mut cmd = force_delete_cmd(&repo, "feature/issue-1");
     cmd.env("LANGUAGE", "de")
@@ -233,10 +233,11 @@ fn bisect_in_linked_worktree_holds_its_start_branch() {
 
     assert_eq!(branch_holders(&repo).get("feature/issue-1"), Some(&wt));
 
-    // git's own refusal (`... for bisect`) parses to the same worktree.
+    // git's own refusal parses to the same worktree. Newer git (2.56) appends
+    // ` for bisect`; older git ends at the worktree path. Both must parse.
+    // The suffixed form is pinned by `held_by_worktree_parses_the_bisect_refusal`.
     let cause = run_checked(force_delete_cmd(&repo, "feature/issue-1"))
         .expect_err("git must refuse a branch held for bisect");
-    assert!(cause.ends_with("for bisect"), "{cause}");
     assert_eq!(held_by_worktree(&cause), Some(wt.clone()));
 
     let mut stats = CleanupStats::default();

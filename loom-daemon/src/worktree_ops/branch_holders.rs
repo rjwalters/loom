@@ -12,10 +12,10 @@ use std::process::Command;
 /// in `git worktree list --porcelain`) **or** when it is mid-rebase / mid-bisect:
 /// git reports such a worktree as `detached`, yet `git branch -D` still refuses
 /// the branch ("used by worktree at ..."), because the rebase will move it back
-/// on completion. A `git rebase --update-refs` also holds every other branch of
-/// the stack it will rewrite (`rebase-merge/update-refs`, #10851). That detached-but-held case is what failed
-/// `loom-fleet-clean` on robb-studio (gf180-trng `pr-161`, loom `pr-7904` /
-/// `pr-10252`).
+/// on completion. That detached-but-held case is what failed `loom-fleet-clean`
+/// on robb-studio (gf180-trng `pr-161`, loom `pr-7904` / `pr-10252`). A
+/// `git rebase --update-refs` also holds every other branch of the stack it
+/// will rewrite (`rebase-merge/update-refs`, #10851).
 pub(crate) fn branch_holders(repo_root: &Path) -> HashMap<String, PathBuf> {
     let mut holders = HashMap::new();
     let Ok(out) = Command::new("git")
