@@ -121,6 +121,9 @@ path = "loom-daemon/src/gh_state_probe.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/merge_pr/ci_result.rs"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "ci.stale-check-freshness"
