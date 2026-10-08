@@ -687,5 +687,31 @@
     }
   ],
   "no_estimate_reason": null,
-  "truncated": []
+  "truncated": [],
+  "stage_predictions": {
+    "review_wait": {
+      "entry_p50": 0,
+      "entry_p90": 0,
+      "dwell_p50": 1182,
+      "dwell_p90": 2760,
+      "alloc": 1386,
+      "reach_pct": 100
+    },
+    "doctor": {
+      "entry_p50": 695,
+      "entry_p90": 1822,
+      "dwell_p50": 1371,
+      "dwell_p90": 2940,
+      "alloc": 335,
+      "reach_pct": 46
+    },
+    "merge_wait": {
+      "entry_p50": 1743,
+      "entry_p90": 4573,
+      "dwell_p50": 172,
+      "dwell_p90": 728,
+      "alloc": 283,
+      "reach_pct": 100
+    }
+  }
 }

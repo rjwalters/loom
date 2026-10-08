@@ -37,8 +37,8 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::score::EstimateSummary;
 use crate::eta::Kind;
 use crate::telemetry::kinds::eta_snapshot::{
-    EtaSnapshotAlternate, EtaSnapshotRecord, EtaSnapshotRow, MAX_ALTERNATES, MAX_RECORD_BYTES,
-    MAX_ROWS,
+    EtaSnapshotAlternate, EtaSnapshotRecord, EtaSnapshotRow, EtaSnapshotStage, MAX_ALTERNATES,
+    MAX_RECORD_BYTES, MAX_ROWS,
 };
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 
@@ -254,6 +254,10 @@ pub fn build_record(
 /// alternates while they still fit. The first row whose alternates do not
 /// fit, and every row after it, is sent without them and counted in
 /// `alternates_truncated`: a row's ETA outranks every row's shadow estimates.
+///
+/// A row's own stage forecast (`stages`, #10929) is an extra too: it never
+/// costs a row, and it rides, in priority order, while it fits, before any
+/// alternate.
 #[must_use]
 pub fn build_record_with(
     selected: &[EstimateSummary],
@@ -271,11 +275,12 @@ pub fn build_record_with(
         (cap_rank(estimate), repo, estimate.issue, estimate.kind)
     });
     let mut used = RECORD_OVERHEAD_BYTES;
-    // (row, its size without alternates, its size with them)
-    let mut admitted: Vec<(EtaSnapshotRow, usize, usize)> = Vec::new();
+    // (row, its size without alternates, its size with them, its stages)
+    let mut admitted: Vec<(EtaSnapshotRow, usize, usize, Stages)> = Vec::new();
     for estimate in ranked.iter().take(MAX_ROWS) {
         let mut row = to_row(estimate, alternates, visibility);
         let alts = std::mem::take(&mut row.alternates);
+        let stages = std::mem::take(&mut row.stages);
         // `+ 1`: the comma between rows.
         let bare = super::sender::json_len(&row) + 1;
         if used + bare > MAX_RECORD_BYTES {
@@ -284,7 +289,15 @@ pub fn build_record_with(
         used += bare;
         row.alternates = alts;
         let full = super::sender::json_len(&row) + 1;
-        admitted.push((row, bare, full));
+        admitted.push((row, bare, full, stages));
+    }
+    for (row, _, _, stages) in &mut admitted {
+        // `+ 10`: the `"stages":` key and its comma.
+        let cost = super::sender::json_len(&*stages) + 10;
+        if !stages.is_empty() && used + cost <= MAX_RECORD_BYTES {
+            used += cost;
+            row.stages = std::mem::take(stages);
+        }
     }
     let mut rows_truncated_by_kind: BTreeMap<Kind, usize> = BTreeMap::new();
     for dropped in ranked.iter().skip(admitted.len()) {
@@ -294,7 +307,7 @@ pub fn build_record_with(
     let mut fits = true;
     let rows: Vec<EtaSnapshotRow> = admitted
         .into_iter()
-        .map(|(mut row, bare, full)| {
+        .map(|(mut row, bare, full, _)| {
             if row.alternates.is_empty() {
                 return row;
             }
@@ -316,6 +329,9 @@ pub fn build_record_with(
         rows,
     }
 }
+
+/// A row's per-stage forecast (#10929).
+type Stages = BTreeMap<crate::eta::Stage, EtaSnapshotStage>;
 
 /// One row for `estimate`, with every alternate it has.
 fn to_row(
@@ -340,6 +356,7 @@ fn to_row(
         as_of: estimate.as_of,
         stage: estimate.stage,
         no_estimate_reason: estimate.no_estimate_reason,
+        stages: EtaSnapshotStage::all(&estimate.stage_predictions),
         alternates: alternates
             .get(&(estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind))
             .into_iter()
