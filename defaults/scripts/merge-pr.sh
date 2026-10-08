@@ -1853,8 +1853,8 @@ _recheck_mergeable_before_refusal() {
 # read and validated by `loom-daemon merge-pr zero-checks-settle`, not here.
 _wait_for_checks_then_sync_merge() {
   # The unfetchable/pending arms' deadline-or-wait decision: `loom-daemon merge-pr poll-wait` (#8191 slice).
-  # Returns 5 on timeout. A verb that cannot run keeps the deadline compare here (only the wording degrades). SELF_BIN-first (#8134), like the per-poll check-runs-rollup.
-  _mp_poll_wait() { local now o a l m; now="$(date +%s)"; o="$(printf '%s\n' "${2:-}" | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr poll-wait --kind "$1" --pr "$PR_NUMBER" --now "$now" --deadline "$deadline" --timeout "$LOOM_AUTO_MERGE_TIMEOUT" --interval "$LOOM_AUTO_MERGE_POLL_INTERVAL" --rc "${3:-0}" 2>/dev/null)" || o=""; [[ "$o" == "LOOM-POLL-WAIT "* ]] || o="LOOM-POLL-WAIT $([[ "$now" -ge "$deadline" ]] && echo TIMEOUT || echo WAIT) warning PR #$PR_NUMBER: 'merge-pr poll-wait' unavailable (missing/older loom-daemon), polling on the deadline alone (check-runs ${1}, rc=${3:-0})"; read -r _ a l m <<<"$o"; if [[ "$a" == TIMEOUT ]]; then warning "$m"; return 5; fi; if [[ "$l" == info ]]; then info "$m"; else warning "$m"; fi; sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"; }
+  # Returns 5 on timeout, 0 to wait; callers sleep OUTSIDE the `|| exit 5` (errexit is off in that context, so a failed sleep would exit 5, not 1). A verb that cannot run keeps the deadline compare here (only the wording degrades). SELF_BIN-first (#8134), like the per-poll check-runs-rollup.
+  _mp_poll_wait() { local now o a l m; now="$(date +%s)"; o="$(printf '%s\n' "${2:-}" | "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" merge-pr poll-wait --kind "$1" --pr "$PR_NUMBER" --now "$now" --deadline "$deadline" --timeout "$LOOM_AUTO_MERGE_TIMEOUT" --interval "$LOOM_AUTO_MERGE_POLL_INTERVAL" --rc "${3:-0}" 2>/dev/null)" || o=""; [[ "$o" == "LOOM-POLL-WAIT "* ]] || o="LOOM-POLL-WAIT $([[ "$now" -ge "$deadline" ]] && echo TIMEOUT || echo WAIT) warning PR #$PR_NUMBER: 'merge-pr poll-wait' unavailable (missing/older loom-daemon), polling on the deadline alone (check-runs ${1}, rc=${3:-0})"; read -r _ a l m <<<"$o"; if [[ "$a" == TIMEOUT ]]; then warning "$m"; return 5; fi; if [[ "$l" == info ]]; then info "$m"; else warning "$m"; fi; }
   local head_sha base_ref
   # Poll the SHA this run will actually MERGE, not the one the initial
   # (gh-cached) $PR_JSON fetch reported: $MERGE_PRECONDITION_SHA is the live,
@@ -1961,6 +1961,7 @@ _wait_for_checks_then_sync_merge() {
       [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
       # Wait-or-timeout (exit 5, #8896) is `_mp_poll_wait` (#8191 slice).
       _mp_poll_wait unfetchable "" "$fetch_rc" || exit 5
+      sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
     fi
     not_found_streak=0
@@ -2020,6 +2021,7 @@ _wait_for_checks_then_sync_merge() {
 
     if [[ -n "$pending" ]]; then
       _mp_poll_wait pending "$pending" || exit 5
+      sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
     fi
 
