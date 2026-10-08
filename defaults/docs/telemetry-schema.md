@@ -2200,9 +2200,9 @@ token's prefix inside the probing process.
 
 | Field | Type | Notes |
 |---|---|---|
-| `round_id` | string | derived, never random: `derived_hex(["loom.token_ranking.refresh", host_id, workspace, round start], 32)` |
+| `round_id` | string | derived, never random: `derived_hex(["loom.token_ranking.refresh", host_id, workspace root, round start], 32)`. The hash takes the full workspace path (so two workspaces sharing a final component on one host never collide); the path itself is never exported |
 | `started_at` | RFC3339 | the round's start |
-| `workspace` | string | the workspace root refreshed |
+| `workspace` | string | the **final path component** of the workspace root refreshed (`/home/alice/GitHub/loom` -> `loom`), never the absolute path: an absolute path embeds the operating user's name. Same reduction as `daemon.preflight.advisory`'s `workspace_root` (#8760); also exported as `loom.token_ranking.workspace` |
 | `outcome` | string | `success` (the `tokens check --ranking` child exited 0), `failure`, `disabled` (`autonomous.tokenRankingRefresh.enabled=false` or the env override; nothing ran) |
 | `failure_class` | string? | for a failure: `spawn_error`, `timeout`, `nonzero_exit`, `poll_error`, `panic`, `error`. The child's output is never exported |
 | `source` | string | `monitor` (a fresh claude-monitor `ranking.json` served the round; only overdue rows were re-probed), `probe` (every account was probed), `unknown` (no summary from the child: an early failure, a disabled workspace, or an older binary) |

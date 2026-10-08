@@ -31,7 +31,7 @@ fn record() -> TokenRankingRefreshRecord {
     TokenRankingRefreshRecord {
         round_id: "0123456789abcdef0123456789abcdef".to_string(),
         started_at: Utc.with_ymd_and_hms(2026, 10, 7, 13, 0, 0).unwrap(),
-        workspace: "/home/ubuntu/GitHub/loom".to_string(),
+        workspace: "loom".to_string(),
         outcome: RoundOutcome::Failure,
         failure_class: Some("nonzero_exit".to_string()),
         source: RankingSource::Probe,
@@ -85,6 +85,10 @@ fn a_full_round_emits_every_key_and_only_allowlisted_ones() {
     for key in TOKEN_RANKING_LOG_ATTRIBUTE_KEYS {
         assert!(attr(&log, key).is_some(), "{key} is emitted");
     }
+    assert_eq!(
+        attr(&log, "loom.token_ranking.workspace"),
+        Some(Value::StringValue("loom".into()))
+    );
     let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
         panic!("string body");
     };

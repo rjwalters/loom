@@ -214,7 +214,9 @@ pub struct TokenRankingRefreshRecord {
     pub round_id: String,
     /// When the round started; the record's time.
     pub started_at: DateTime<Utc>,
-    /// The workspace root the round refreshed.
+    /// The final path component of the workspace root the round refreshed
+    /// (`loom`, never `/home/alice/GitHub/loom`): an absolute path embeds the
+    /// host's user name. See `token_ranking_refresh::telemetry::workspace_label`.
     pub workspace: String,
     /// How the round ended.
     pub outcome: RoundOutcome,

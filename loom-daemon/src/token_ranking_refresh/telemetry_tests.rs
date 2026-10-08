@@ -67,7 +67,7 @@ fn a_successful_round_emits_one_record_with_its_accounts() {
         assert_eq!(outcome, RefreshOutcome::Success);
     });
     assert_eq!(record.outcome, RoundOutcome::Success);
-    assert_eq!(record.workspace, "/repo-a");
+    assert_eq!(record.workspace, "repo-a");
     assert_eq!(record.source, RankingSource::Probe);
     assert_eq!(record.accounts, summary().accounts);
     assert_eq!((record.probed_count, record.api_key_probe_count), (2, 1));
@@ -148,6 +148,30 @@ fn the_round_id_is_derived_not_random() {
     };
     assert_eq!(build("/repo-a"), build("/repo-a"));
     assert_ne!(build("/repo-a"), build("/repo-b"));
+    // Two workspaces sharing a final component still get distinct ids: the
+    // hash takes the full path, which is never exported.
+    assert_ne!(build("/home/alice/a/loom"), build("/home/alice/b/loom"));
+}
+
+#[test]
+fn the_exported_workspace_is_the_final_path_component_only() {
+    let round = record(
+        Path::new("/home/alice/GitHub/loom"),
+        RoundEnd::Success,
+        Some(summary()),
+        "host-1",
+        Utc::now(),
+        Duration::ZERO,
+        Provenance::current(),
+    );
+    assert_eq!(round.workspace, "loom");
+    let body = serde_json::to_string(&round).unwrap();
+    assert!(!body.contains("alice"), "the absolute path leaked: {body}");
+    assert!(!body.contains("/home"), "the absolute path leaked: {body}");
+
+    assert_eq!(workspace_label(Path::new("/home/alice/GitHub/loom/")), "loom");
+    assert_eq!(workspace_label(Path::new("loom")), "loom");
+    assert_eq!(workspace_label(Path::new("/")), "/");
 }
 
 fn write_fake_bin(dir: &Path, body: &str) -> PathBuf {

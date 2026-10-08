@@ -57,7 +57,27 @@ pub enum RoundEnd<'a> {
     Disabled,
 }
 
+/// The exported form of a workspace root: its final path component
+/// (`/home/alice/GitHub/loom` -> `loom`), never the absolute path.
+///
+/// An absolute path routinely embeds the operating user's name, which is
+/// host-identifying in a way nothing else on this wire is; the final component
+/// keeps the field's point (*which* workspace's round this was) at the repo
+/// granularity `loom.repo` uses. Same rule as `daemon.preflight.advisory`'s
+/// `workspace_root` (#8760). A path with no final component (`/`) falls back
+/// to its lossy display form.
+#[must_use]
+pub fn workspace_label(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map_or_else(|| workspace.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
 /// Build the record for one round. Pure: host and provenance are inputs.
+///
+/// `round_id` is derived from the full workspace path (so two workspaces that
+/// share a basename on one host never collide); only the hash leaves the
+/// host. The exported `workspace` is [`workspace_label`].
 #[must_use]
 pub fn record(
     workspace: &Path,
@@ -68,7 +88,7 @@ pub fn record(
     duration: Duration,
     loom: Provenance,
 ) -> TokenRankingRefreshRecord {
-    let workspace = workspace.display().to_string();
+    let workspace_path = workspace.display().to_string();
     let at = crate::telemetry::trace::instant(started_at);
     let (outcome, failure_class) = match end {
         RoundEnd::Success => (RoundOutcome::Success, None),
@@ -82,11 +102,11 @@ pub fn record(
     };
     TokenRankingRefreshRecord {
         round_id: crate::telemetry::trace::derived_hex(
-            &["loom.token_ranking.refresh", host_id, &workspace, &at],
+            &["loom.token_ranking.refresh", host_id, &workspace_path, &at],
             32,
         ),
         started_at,
-        workspace,
+        workspace: workspace_label(workspace),
         outcome,
         failure_class: failure_class.map(str::to_string),
         source,
