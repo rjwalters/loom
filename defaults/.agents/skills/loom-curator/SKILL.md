@@ -768,13 +768,11 @@ them into the one you are curating. Never absorb a sibling that has:
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed. No numbered blocker exists; the `COMMENT` above is the recorded reason ("Adding Dependencies").
 > - If this instead names a resolvable dependency on another issue/PR, record it as a park record — see `.loom/docs/park-record.md`.
 
-### Ops work (`loom:ops`)
-
-Affected Files "none" and deliverable is forge state: add `loom:ops` and a `## Verification` section. See `.loom/docs/ops-lane.md`.
+**Ops work:** forge-state deliverable, Affected Files "none" -> add `loom:ops` + `## Verification` (`.loom/docs/ops-lane.md`).
 
 ### Date-stamp volatile facts
 
-> **Date-stamp volatile facts.** Counts, version numbers, file/line references, and "no X is needed" claims are point-in-time observations, not durable truths — a repo with several concurrently active worktrees can invalidate them within days. Write every volatile fact with the commit or date you verified it against, not as a bare assertion, so a later reader knows which claims to re-verify rather than trust:
+> **Date-stamp volatile facts.** Counts, version numbers, file/line references, and "no X is needed" claims are point-in-time observations, not durable truths — a repo with several concurrently active worktrees can invalidate them within days. Write every volatile fact with the commit or date you verified it against, not as a bare assertion, so readers know what to re-verify:
 >
 > ```markdown
 > Before: "The parser exposes 18 verbs (13 net-new)."
