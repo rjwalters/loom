@@ -230,8 +230,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             let outcome = probe.rebuild(low_priority);
             // `None`: a source-path roll has no release-artifact identity, so it
             // is never a supersede candidate (#8514).
+            let window_arm = state.begin_roll_arm(&outcome); // #10713
             let drain_accepted =
                 matches!(outcome, RebuildOutcome::Success) && trigger.trigger_for(None);
+            state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
@@ -276,8 +278,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             // #8514: label the roll with the artifact identity it is rolling to,
             // so a later tick can tell a still-current pending roll from one a
             // newer release has overtaken.
+            let window_arm = state.begin_roll_arm(&outcome); // #10713
             let drain_accepted = matches!(outcome, RebuildOutcome::Success)
                 && trigger.trigger_for(Some(&supersede::artifact_roll_target(&info)));
+            state.end_roll_arm(window_arm, drain_accepted);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
@@ -367,6 +371,8 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    // #10713: persist after every tick (a no-op unless attached at spawn).
+    state.persist_state();
     tick_telemetry::emit(&summary, state.consecutive_failures, started_at, started.elapsed());
     summary
 }
@@ -401,6 +407,8 @@ where
         .with_roll_stall_deadlines(tuning.roll_stall_deadlines)
         .with_roll_stall_cooldown(tuning.roll_stall_cooldown);
     state.window = roll_window::WindowGate::new(tuning.roll_window);
+    // #10713: after the window, so its consumption can be checked against it.
+    state.attach_persistence(persisted_state::default_path());
     tokio::spawn(run_loop(state, probe, trigger, status, tuning))
 }
 

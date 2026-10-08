@@ -590,6 +590,9 @@ impl super::AutoUpdateState {
     }
 }
 
+// #10713: the tracker <-> persisted `StallState` conversion.
+mod persist;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
