@@ -12199,6 +12199,7 @@ seams):
 | `LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER` | Expected keyless certificate issuer (default `https://token.actions.githubusercontent.com`) |
 | `LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE` | `1`/`true`/`yes`/`on` selects **required** signature mode (#10470): an unsigned release (`SIGNATURE=skipped`) or one whose signature cannot be checked here (`SIGNATURE=unavailable`) is refused before provisioning, with distinct messages, and a sanitized `LOOM_SIGNATURE_EVIDENCE {...}` line is emitted on success (the full schema-versioned record, see [Signature evidence record](#signature-evidence-record-loom_signature_evidence-10474)): tag, asset sha256, signature state, and what the verifier that actually succeeded checked (`verification_method` = `codesign` / `cosign-key` / `cosign-keyless-identity` / `cosign-keyless-identity-regexp`; `identity`, `identity_regexp` and `oidc_issuer` are populated only by the keyless verifier that checked them and are `null` for codesign and key mode, which establish no GitHub workflow identity). Default off = the **present-only** compatibility mode (#5054), unchanged |
 | `LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW` | Optional, with required mode: pin the derived keyless identity to this workflow file (regex-escaped) instead of `[^@]+`; a workflow rename then needs an explicit policy update. Recorded in the evidence line as `configured_workflow`, with `configured_workflow_applied` true only when a keyless regexp actually enforced it (false for codesign, key mode and an exact-identity override) |
+| `LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR` | Optional, with required mode (#10473): a full 40-hex commit SHA; the release tag must resolve (via `gh api .../git/ref/tags/<tag>`, annotated tags peeled through `git/tags/<sha>`) to that commit or a descendant (`compare/<anchor>...<commit>` status `identical`/`ahead`). Refusal classes, all before the candidate is executed: **configuration error** (short/non-hex anchor — never a skip), **source assurance unavailable** (`gh`/API failure or unparsable answer — not worded as tampering), **not a descendant of approved source** (`behind`/`diverged`, including a rollback below the anchor), **tag movement** (same tag, different commit than this host adopted) and **asset replacement** (same tag, different asset sha256). Every required-mode success records `{tag -> commit, asset sha256}` in `~/.loom/daemon-update/release-adoption.json` (public facts only; each write holds an exclusive lock on `release-adoption.json.lock` and re-checks the tag's pin, so a conflicting pin a concurrent update persisted first is refused as tag movement / asset replacement, never overwritten) and adds `source_revision` (the resolved commit) / `source_anchor` / `source_check` (`identical` / `ahead` / `not_configured`) / `adoption_record` (`first_seen` / `matched`; an unwritable record refuses the artifact before it is executed) to the evidence line; unrun checks stay `null`. **Limits**: the commit half of the record is only populated when an anchor is set (the asset-digest half always is); the record lives on the recipient host, so it detects drift and ordinary replacement, not an attacker with write access to that host; provenance attestation and an approval boundary outside the recipient are not provided. Lower/replace the anchor (or remove a record entry) explicitly to accept an older release or a re-cut tag |
 | `LOOM_SIGNATURE_EVIDENCE_JOURNAL_PATH` | Override where the durable signature-evidence journal is written (default `<repo>/.loom/logs/signature-evidence.jsonl`, only when the checkout already has a `.loom/`). See [Signature evidence record](#signature-evidence-record-loom_signature_evidence-10474) |
 
 #### Signature evidence record (`LOOM_SIGNATURE_EVIDENCE`, #10474)
@@ -12223,7 +12224,7 @@ belongs to the fleet-inventory repo, not here.
   and additive-only in *what* it carries: it is now the same record, a strict
   superset of the original nine keys with identical meanings.
 
-`LOOM_SIGNATURE_EVIDENCE` not-available fields (explicit `null` + `*_status: "not_available"`, never fabricated): `source_revision` (#10473), `policy_revision` / `approval_provenance` / `root_domain_scope` (#10472).
+`LOOM_SIGNATURE_EVIDENCE` not-available fields (explicit `null` + `*_status: "not_available"`, never fabricated): `policy_revision` / `approval_provenance` / `root_domain_scope` (#10472).
 
 Schema (`schema_version: 1`; adding a field is not a breaking change, so
 consumers must ignore unknown keys):
@@ -12235,7 +12236,7 @@ consumers must ignore unknown keys):
 | `host_id` | The host's telemetry identity (`LOOM_HOST_ID` precedence, same as OTLP records) |
 | `loom` | Deciding build's provenance: `version`, `revision`, `tree_state`, `complete` |
 | `policy_mode` | `required` or `present-only` |
-| `outcome` | `verified` / `refused_unsigned` / `refused_unavailable` / `signature_invalid` / `checksum_mismatch` / `signature_material_unavailable` / `glibc_incompatible` / `download_failed` |
+| `outcome` | `verified` / `refused_unsigned` / `refused_unavailable` / `signature_invalid` / `checksum_mismatch` / `signature_material_unavailable` / `glibc_incompatible` / `source_assurance_refused` / `download_failed` |
 | `tamper_evidence` | `true` only for `signature_invalid` and `checksum_mismatch`; a tooling gap (`refused_unavailable`) is never tampering |
 | `tag` | Release tag fetched |
 | `asset_sha256` | Digest of the checksum-verified binary; `null` when the checksum did not match or no binary was downloaded |
@@ -12244,7 +12245,8 @@ consumers must ignore unknown keys):
 | `identity`, `identity_regexp`, `oidc_issuer` | Populated only by the keyless verifier that checked them; `null` for codesign and key mode |
 | `configured_workflow` | `LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW` as configured (the current policy-revision proxy) |
 | `configured_workflow_applied` | Whether that pin was enforced by this verification |
-| `source_revision` + `source_revision_status` | Always `null` + `"not_available"` — filled by #10473 (adopted source revision / tag ancestry) |
+| `source_revision` + `source_revision_status` | The release commit the tag resolved to (`"available"`) when the required-mode source gate ran with a configured anchor (#10473); otherwise `null` + `"not_available"` |
+| `source_anchor`, `source_check`, `adoption_record` | Source-gate detail (#10473): the configured anchor, `not_configured`/`identical`/`ahead` (refusals: `behind`/`diverged`/`unavailable`), and `not_recorded`/`first_seen`/`matched` (refusals: `unavailable`/`tag_moved`/`asset_replaced`/`write_failed`); `null` when that check did not run |
 | `policy_revision` + `policy_revision_status` | Always `null` + `"not_available"` — filled by #10472 (recorded, monotonic assurance policy) |
 | `approval_provenance` + `approval_provenance_status` | Always `null` + `"not_available"` — filled by #10472 (provider authority map) |
 | `root_domain_scope` + `root_domain_scope_status` | Always `null` + `"not_available"` — filled by #10472 (provider authority map) |
