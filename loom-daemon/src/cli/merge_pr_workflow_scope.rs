@@ -8,6 +8,9 @@
 //! decision lives in [`loom_daemon::merge_pr::workflow_scope`].
 
 use anyhow::Result;
+use loom_daemon::cmd_out::DEFAULT_TIMEOUT;
+use loom_daemon::forge_call_stats::ops::PR_DIFF_AND_FILES;
+use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use loom_daemon::merge_pr::workflow_scope::{assess, touches_workflows, Verdict, SKIP_ENV};
 use loom_daemon::script_helpers::run_gh;
 
@@ -32,7 +35,20 @@ impl WorkflowScopeArgs {
             return Ok(());
         };
         let endpoint = format!("repos/{}/pulls/{}/files", self.repo, self.pr);
-        let files = run_gh(&["api", &endpoint, "--paginate", "--jq", ".[].filename"], &cwd, false);
+        // Through the facade, not the raw `run_gh` spawn, so the paginated read
+        // is a ledger row whose pages the walk counts when `LOOM_GH_PAGE_WALK`
+        // is on (gh_invocation/migrated_sites_tests_e.rs). Same `gh` resolver
+        // and deadline as `run_gh`; same argv as consolidate's component-files read.
+        let files = GhInvocation::new(
+            Operation::new("merge_pr.workflow_scope_files"),
+            AccessIntent::Read,
+            GhTarget::None,
+            DEFAULT_TIMEOUT,
+        )
+        .forge_op(PR_DIFF_AND_FILES)
+        .args(["api", &endpoint, "--paginate", "--jq", ".[].filename"])
+        .current_dir(&cwd)
+        .run();
         let Some(files) = files.ok_stdout_trimmed() else {
             return Ok(());
         };
