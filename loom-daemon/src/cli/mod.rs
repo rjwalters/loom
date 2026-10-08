@@ -72,6 +72,7 @@ mod guards_status;
 pub(crate) mod health;
 pub(crate) mod host;
 pub(crate) mod inflight;
+mod install_binary;
 pub(crate) mod install_compat_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
