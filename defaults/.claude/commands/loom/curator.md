@@ -197,20 +197,20 @@ Level 2 (`loom:operator-high-priority`, or daemon-written `loom:high-priority-in
 # level list: keep in sync with operator_levels.rs LEVELS until #10311
 for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
 gh issue list --label "$L" --state open --json number,title,labels \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator-only","loom:operator-decision")) | not) | "#\(.number) \(.title)"'
+  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator-only","loom:operator-decision","loom:needs-revision")) | not) | "#\(.number) \(.title)"'
 done
 ```
 
 Curate each at once (no workflow label = treat as `loom:triage`), then add
 `loom:curated` and `loom:issue` in ONE label POST. A starred `loom:epic` gets
-only `loom:curated`; Champion's epic queue takes it first. Guards still apply: skip the labels in the query above and hard exclusions. Never add or remove a priority label (the star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
+only `loom:curated`; Champion's epic queue takes it first. Guards: skip the query's labels and hard exclusions. Never add or remove a priority label (the star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate, never
-promote: the daemon admits them on a red `main`. Then Champion's revision requests, oldest
-first ("Revising `loom:needs-revision`" below, #10753):
+promote: the daemon admits them on a red `main`. Then Champion's revision requests, starred first, then oldest
+("Revising `loom:needs-revision`" below, #10753):
 
 ```bash
 gh issue list --label loom:needs-revision --state open --json number,title,labels,createdAt \
-  --jq 'sort_by(.createdAt) | .[] | select([.labels[].name] | index("loom:curating") | not) | "#\(.number) \(.title)"'
+  --jq 'sort_by(.createdAt) | sort_by([.labels[].name] | any(test("^loom:(operator-(high-)?priority|high-priority-inherited)$")) | not) | .[] | select([.labels[].name] | index("loom:curating") | not) | "#\(.number) \(.title)"'
 ```
 
 ### Priority 1: Approved Issues Needing Curation
@@ -1777,28 +1777,27 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
 
 Champion adds `loom:needs-revision` with a NEEDS REVISION verdict an agent can
 close. Claim it (`loom:curating`), read the latest trusted `Champion Review:
-NEEDS REVISION` comment (its first bullet list is the findings), then:
+NEEDS REVISION` comment (first bullet list = findings), then:
 
-- **Revise** (the normal case). Edit the body, never only comment: that leaves the body
-  hash unchanged and Champion re-rejects the same text. Fix each finding
-  (verify facts against `origin/main`) or refute it with evidence, and append a
+- **Revise** (the normal case). Edit the body, never only comment: an unchanged body hash
+  gets the same re-rejection. Fix each finding
+  (verify facts against `origin/main`) or refute it with evidence, then append a
   dated `## Revision` section answering each by name. Then remove `loom:needs-revision` and `loom:curating` in one edit
-  (`loom:curated` stays).
+  (`loom:curated` stays; a starred non-epic issue also gets `loom:issue`).
 - **Split** an oversized issue per "Decomposing Oversized Issues", then park
-  the parent on its children so it never returns to Champion as a tracker:
+  the parent on its children:
   `loom-daemon park-record apply --issue <N> --blocked-by <children> --by
   curator --remove-label loom:needs-revision --remove-label loom:curating`.
-- **Close** an obsolete, duplicate or wrong-approach issue.
-- **A real PO-level call** no revision settles: `loom-daemon operator-decision
+- **Close** an obsolete, duplicate or wrong-approach one.
+- **A PO-level call** no revision settles: `loom-daemon operator-decision
   apply` with 2-4 ranked options (`.loom/docs/operator-decision.md`), then
   remove the label.
 
 A routing comment carrying `<!-- champion:revision-exhausted -->` is the
-**final round**: prefer a split, a close or a decision to a marginal edit. A
-failure on a preference or authority question goes to the operator; a factual
-one gets a `<!-- champion:revision-disposition -->` round, where you must close,
-split or file a decision, never edit again. Loop and bound:
-`.loom/docs/promotion-throughput.md`.
+**final round**: prefer a split, close or decision to a marginal edit. A
+preference or authority failure goes to the operator; a factual one gets a
+`<!-- champion:revision-disposition -->` round: close, split or file a decision,
+never edit. Bounds: `.loom/docs/promotion-throughput.md`.
 
 ## Checking Operator-Only Premises (#6849)
 

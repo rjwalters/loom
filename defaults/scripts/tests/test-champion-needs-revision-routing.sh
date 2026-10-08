@@ -185,7 +185,7 @@ fi
 echo ""
 echo "Test 2: Curator drains loom:needs-revision, oldest first, skipping a claimed one"
 section_body "Finding Work" <"$CURATOR_MD" \
-    | bash_block_with 'loom:needs-revision' >"$FIXTURE_DIR/curator-q.sh"
+    | bash_block_with 'label loom:needs-revision' >"$FIXTURE_DIR/curator-q.sh"
 if [[ ! -s "$FIXTURE_DIR/curator-q.sh" ]]; then
     fail "could not extract curator.md's loom:needs-revision queue from Finding Work"
 else
@@ -195,6 +195,39 @@ fi
 WORKFLOW="$(section_body "Priority 2: Triage queue" <"$CURATOR_MD")"
 assert_contains "$WORKFLOW" "then \`loom:needs-revision\`) first" \
     "Curator's workflow takes the revision queue before Priority 1"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 2b: a starred loom:needs-revision issue takes the revision path, never the star promotion"
+cat >"$FIXTURE_DIR/stars.json" <<'EOF'
+[
+ {"number":20,"title":"starred rejected","createdAt":"2026-10-06T00:00:00Z","labels":[{"name":"loom:operator-priority"},{"name":"loom:curated"},{"name":"loom:needs-revision"}]},
+ {"number":21,"title":"level 2 rejected","createdAt":"2026-10-07T00:00:00Z","labels":[{"name":"loom:operator-high-priority"},{"name":"loom:curated"},{"name":"loom:needs-revision"}]},
+ {"number":22,"title":"inherited rejected","createdAt":"2026-10-08T00:00:00Z","labels":[{"name":"loom:high-priority-inherited"},{"name":"loom:curated"},{"name":"loom:needs-revision"}]},
+ {"number":23,"title":"starred fresh","createdAt":"2026-10-09T00:00:00Z","labels":[{"name":"loom:operator-priority"}]},
+ {"number":24,"title":"unstarred revision","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:needs-revision"}]},
+ {"number":25,"title":"starred disposition round","createdAt":"2026-10-02T00:00:00Z","labels":[{"name":"loom:operator-priority"},{"name":"loom:curated"},{"name":"loom:needs-revision"},{"name":"loom:curating"}]}
+]
+EOF
+section_body "Priority 0: Starred" <"$CURATOR_MD" \
+    | bash_block_with 'operator-high-priority' >"$FIXTURE_DIR/curator-star.sh"
+run_stars() {
+    ( cd "$FIXTURE_DIR" && PATH="$FIXTURE_DIR/bin:$PATH" \
+        LOOM_TEST_ISSUES="$FIXTURE_DIR/stars.json" bash "$1" 2>&1 )
+}
+if [[ ! -s "$FIXTURE_DIR/curator-star.sh" || ! -s "$FIXTURE_DIR/curator-q.sh" ]]; then
+    fail "could not extract curator.md's star query or revision queue"
+else
+    assert_eq "#23" "$(run_stars curator-star.sh | numbers_of)" \
+        "the star query lists only the fresh starred issue, never a starred loom:needs-revision one (all three priority labels)"
+    sed 's/,"loom:needs-revision"//' "$FIXTURE_DIR/curator-star.sh" >"$FIXTURE_DIR/curator-star-old.sh"
+    assert_eq "#21 #22 #20 #23" "$(run_stars curator-star-old.sh | numbers_of)" \
+        "negative control: without the exclusion, starred rejected proposals reach promotion"
+    assert_eq "#20 #21 #22 #24" "$(run_stars curator-q.sh | numbers_of)" \
+        "the revision queue lists starred issues first (all three labels), then the rest, skipping the claimed #25"
+fi
+assert_contains "$(section_body "Revising" <"$CURATOR_MD")" "a starred non-epic issue also gets \`loom:issue\`" \
+    "revision completion defines the post-revision star behaviour in the same edit that clears loom:needs-revision"
 
 # ---------------------------------------------------------------------------
 echo ""
