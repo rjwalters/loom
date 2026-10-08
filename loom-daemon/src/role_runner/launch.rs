@@ -296,6 +296,15 @@ pub(super) fn run_role_with_timeout(
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
+    // #8370: this run's Loom-owned CARGO_TARGET_DIR. `worker_spawn` creates
+    // it (or not: an operator CARGO_TARGET_DIR, no Cargo.toml); the guard
+    // removes it when this function returns, on every outcome. That is after
+    // the child has exited or been killed, but not necessarily after its
+    // descendants have: the guard checks the child's process group first
+    // (`watch_process_group` below) and leaves the dir to the orphan sweep
+    // while anything in it is alive.
+    let mut run_target = crate::run_target_dir::RunDirGuard::plan(workspace_root, role, &item);
+    run_target.apply(&mut cmd);
     let runtime = admission.map(|a| a.runtime.as_str());
     let session = match resume {
         None => sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime),
@@ -337,6 +346,10 @@ pub(super) fn run_role_with_timeout(
         selection.spawned();
     }
     let pid = child.id();
+    // `process_group(0)` above made the child its own group leader, so its
+    // pid is the group id.
+    #[cfg(unix)]
+    run_target.watch_process_group(pid);
     // #8555: hand this tick's metered backstop slot (the one `runtime_preflight`
     // took, carried here by value) to the child that will spend it. No-op when
     // no ceiling is configured or the tick did not fall through to a governed

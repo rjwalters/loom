@@ -317,6 +317,8 @@ pub mod role_tool_policy;
 pub mod role_validation;
 /// Safe-point pause hook, pause state and resume handles for a daemon roll (#10830).
 pub mod roll_pause;
+/// A Loom-owned `CARGO_TARGET_DIR` per role run under `.loom/targets/` (#8370).
+pub mod run_target_dir;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;
@@ -372,6 +374,8 @@ pub mod sweep_registry;
 pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
+/// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
+pub mod target_orphan_reclaim;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
