@@ -180,7 +180,7 @@ fn only_a_whole_listing_is_ready_complete() {
     assert!(anchor.repos.iter().any(|r| r.repo == "acme/partial"));
 
     // #999 left both queues: the whole repo says so, the partial one cannot.
-    let later = now + chrono::Duration::minutes(5);
+    let later = now + chrono::Duration::minutes(1);
     let second = build_view(&input(ready), Some(&view), later);
     let last = Emitted {
         view,

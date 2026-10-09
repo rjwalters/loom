@@ -993,8 +993,9 @@ async fn sample_snapshots(
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
     // This host's view of its held sweeps, review PRs and ready queue over
-    // OTLP (Issue #10196), independent of ETA. Hourly anchor, deltas only on
-    // change; its review listings are ETag-cached (warm after stage_dwell).
+    // OTLP (Issue #10196), independent of ETA. 5-minute anchor, deltas only
+    // on change; its review listings are ETag-cached (warm after stage_dwell)
+    // and reused by the pass after each work-finder tick (#11161).
     super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 

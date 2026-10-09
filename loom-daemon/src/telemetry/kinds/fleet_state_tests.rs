@@ -60,6 +60,7 @@ fn record() -> FleetStateRecord {
         chunk_index: 0,
         chunk_count: 1,
         stamps: stamps(),
+        tick_interval_secs: Some(60),
         census_at: Some(at(12, 4)),
         slots: Some(FleetSlots {
             max_concurrent: 4,
@@ -158,10 +159,12 @@ fn the_header_carries_chunks_and_stamps_and_no_truncation_field() {
             "planner_version",
             "repos",
             "schema",
-            "slots"
+            "slots",
+            "tick_interval_secs"
         ]
     );
     assert_eq!(wire["chunk_count"], 1);
+    assert_eq!(wire["tick_interval_secs"], 60);
     // A host with no fleet store omits the fleet stamp.
     let mut r = record();
     r.stamps.fleet_config_hash = None;
@@ -169,6 +172,17 @@ fn the_header_carries_chunks_and_stamps_and_no_truncation_field() {
         .unwrap()
         .get("fleet_config_hash")
         .is_none());
+}
+
+/// `tick_interval_secs` is additive (#11161): a record from an emitter that
+/// predates it decodes, with no cadence.
+#[test]
+fn a_record_without_tick_interval_secs_still_decodes() {
+    let mut wire = serde_json::to_value(record()).unwrap();
+    wire.as_object_mut().unwrap().remove("tick_interval_secs");
+    let back: FleetStateRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(back.tick_interval_secs, None);
+    assert_eq!(back.repos, record().repos);
 }
 
 /// The per-item facts: stage, entered-at, PR, host and slot. Pinned,

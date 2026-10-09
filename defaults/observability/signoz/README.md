@@ -587,6 +587,11 @@ real-canary comparison still needs.
 > ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
 > `retention.sql` there (#8946 item 2 stays held).
 
+`fleet.state` volume (#11161): a full anchor every 5 minutes is 288 a day, so
+at Loom's own ~300 KB anchor (~3000 rows) that is ~90 MB of log body per host
+per day before ClickHouse compression (~33 GB per host per year), plus the
+60-second deltas, which carry only changed rows.
+
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
 CI duration/outcome trends in `ci-queries.sql` 1–3 are the retro asset, and

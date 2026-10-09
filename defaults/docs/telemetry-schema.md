@@ -2407,8 +2407,13 @@ one log record per envelope, with the record JSON as the log **body** and a few
 `loom.fleet.*` scalars as attributes. `queue.snapshot` stays a
 native-HTTPS dashboard key and is unchanged.
 
-The collector builds it on the `host.health` interval. **Every host emits its
-own view; nothing is elected.** The record does not depend on ETA: it is sent
+The daemon builds and diffs it after **every work-finder tick** (default
+60 s, `autonomous.workFinder.intervalSecs`) and on the collector's 5-minute
+`host.health` pass (#11161). Only the 5-minute pass reads the forge (the
+review listings, repo slugs and visibility); a tick pass reuses what that
+pass read and makes no forge call, so the review rows and census change at
+most once per 5-minute pass while held and `ready_wait` rows follow every
+tick. **Every host emits its own view; nothing is elected.** The record is sent
 whenever an OTLP exporter exists and
 **no record at all** only when there is no OTLP exporter. An anchor with zero
 rows is still sent, because it truthfully says "nothing here". Rows come from
@@ -2435,8 +2440,9 @@ its absence from the tick.
 
 **Anchors and deltas.** The first pass of a daemon process sends a full
 **anchor** (`anchor: true`, every row), and so does any pass at which the last
-anchor is at least 3600 s old or the planner stamps changed (a regime
-boundary). Between anchors a pass sends a **delta** (`anchor: false`) only if
+anchor is at least 300 s old (`ANCHOR_INTERVAL_SECS`) or the planner stamps
+changed (a regime boundary). A lost delta therefore leaves a reader's
+reconstruction wrong for at most about 5 minutes. Between anchors a pass sends a **delta** (`anchor: false`) only if
 rows, a census, a repo's `ready_complete` or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
@@ -2471,6 +2477,7 @@ all `chunk_count` chunks of that `(host, as_of)`.
 | `planner_version` | string | the daemon version whose planner produced the ranks |
 | `planner_config_hash` | string | 12 hex of sha256 over the canonical JSON (sorted keys, no whitespace) of the effective `autonomous.workFinder` and `autonomous.mergeSequencing` blocks; unrelated config never moves it |
 | `fleet_config_hash` | string, optional | the fleet store commit this host's last fleet-sync config pass resolved; absent on a host with no fleet store |
+| `tick_interval_secs` | integer, optional | the seconds between the emitter's passes, its sampling resolution: the work finder's resolved tick interval once it has ticked in this process, else `300` (#11161). Absent from an older emitter, which sampled every 300 s |
 | `census_at` | RFC 3339, optional | when the review listings were read |
 | `slots` | object, optional | `{max_concurrent, occupancy?}` from the last work-finder dispatch plan |
 | `capacity` | object, optional | host capacity beside `slots` (never repeating `max_concurrent` / `occupancy`); additive on `fleet-state/v1`, absent from older emitters. All discrete: `live_workers` (sweeps this host runs), `accounts_usable` (ranking accounts with status `available`) / `accounts_exhausted` (ranking accounts with status `exhausted` only; `blocked`, `rate_limited` and unknown statuses count in neither), both absent when the ranking is unreadable or lists no account, `host_breaker` / `rate_limit_breaker` (`closed` / `open` / `cooldown`, absent when none is enabled), `admission_brake_held` (bool, absent when none is enabled). No utilisation fraction is carried, so a quiet host stays quiet: a change in any field above is a delta, drift is not |

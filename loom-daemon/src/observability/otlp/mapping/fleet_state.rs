@@ -72,6 +72,7 @@ mod tests {
                 planner_config_hash: "0123456789ab".to_string(),
                 fleet_config_hash: None,
             },
+            tick_interval_secs: Some(60),
             census_at: Some(as_of),
             slots: None,
             capacity: None,

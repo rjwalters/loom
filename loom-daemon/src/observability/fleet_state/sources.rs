@@ -1,9 +1,15 @@
 //! The reads behind one `fleet.state` pass (Issue #10196): the sweep
 //! registries, the review-label listings, the work finder's last tick and the
 //! planner stamps. None of them touches the ETA subsystem.
+//!
+//! Only the collector pass ([`gather`]) reads the forge: it resolves the repo
+//! slugs and visibility and walks the review listings, and keeps them in
+//! [`Reused`]. A tick pass ([`tick_input`], #11161) reads only local state
+//! and that copy.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
@@ -12,6 +18,7 @@ use super::{
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
+use crate::telemetry::RepoVisibility;
 use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
@@ -99,11 +106,12 @@ fn live_sweep_count(registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>
         .sum()
 }
 
-/// The live issue sweeps of every provisioned registry. Each registry lock is
-/// held only for the in-memory clone; checkpoint reads happen after.
-async fn held_sweeps(
+/// The live issue sweeps of every provisioned registry, each root named by
+/// `slug`. Each registry lock is held only for the in-memory clone;
+/// checkpoint reads happen after.
+fn held_sweeps(
     workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
+    slug: impl Fn(&str) -> Option<String>,
 ) -> Vec<HeldSweep> {
     let mut held = Vec::new();
     for registry in workspace_pool.provisioned_registries() {
@@ -117,12 +125,7 @@ async fn held_sweeps(
                 guard.config().checkpoint_dir(),
             )
         };
-        let Some(slug) = crate::observability::collector::resolve_repo_slug_cached(
-            slug_cache,
-            &root.to_string_lossy(),
-        )
-        .await
-        else {
+        let Some(slug) = slug(&root.to_string_lossy()) else {
             continue;
         };
         for info in snapshot.list(None) {
@@ -367,38 +370,165 @@ fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path)
     }
 }
 
-/// Everything one pass reads.
+/// Each repo's `main` CI status by lowercased slug, from `(root, slug)` pairs.
+fn main_ci_by_slug<'a>(
+    roots: impl Iterator<Item = (&'a Path, &'a str)>,
+) -> BTreeMap<String, MainCi> {
+    let health = crate::fleet_sync::checkout_ff::health_states();
+    roots
+        .map(|(root, slug)| (slug.to_string(), main_ci(&health, root)))
+        .collect()
+}
+
+/// What the last collector pass read from the forge, which every tick pass
+/// reuses as is (#11161): a tick pass makes no forge call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Reused {
+    pub managed: BTreeSet<String>,
+    pub listings: Vec<RepoListing>,
+    pub listed_at: Option<DateTime<Utc>>,
+    /// Root path to lowercased slug, for every root the collector cached.
+    pub slugs: HashMap<String, String>,
+    /// The managed `(root, slug)` pairs the collector's `main_ci` was read
+    /// from: unlike `slugs`, never an unprovisioned or respelled root.
+    pub roots: Vec<(PathBuf, String)>,
+    /// Lowercased slug to visibility. A repo missing here is private.
+    pub visibility: BTreeMap<String, RepoVisibility>,
+}
+
+impl Reused {
+    fn slug(&self, root: &str) -> Option<String> {
+        self.slugs.get(root).cloned()
+    }
+}
+
+static REUSED: Mutex<Option<Reused>> = Mutex::new(None);
+
+/// The last collector pass's reads; `None` before the first one.
+pub(super) fn reused() -> Option<Reused> {
+    REUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Keep `reused` for the tick passes until the next collector pass.
+pub(super) fn keep(reused: Reused) {
+    *REUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reused);
+}
+
+/// Everything one collector pass reads, and the part of it a tick pass
+/// reuses (without `visibility`, which the caller resolves).
 pub(super) async fn gather(
     workspace_root: &Path,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
     now: DateTime<Utc>,
-) -> FleetInput {
+) -> (FleetInput, Reused) {
+    // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
-    let held = held_sweeps(workspace_pool, slug_cache).await;
+    let held =
+        held_sweeps(workspace_pool, |root| slug_cache.get(root).map(|s| s.to_ascii_lowercase()));
     let listings = review_listings(&roots).await;
     let ready = ready_queue(&managed, slug_cache).await;
-    let health = crate::fleet_sync::checkout_ff::health_states();
-    let main_ci = roots
-        .iter()
-        .map(|(root, slug)| (slug.clone(), main_ci(&health, root)))
-        .collect();
+    let main_ci = main_ci_by_slug(
+        roots
+            .iter()
+            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    );
     let capacity = Some(capacity(
         workspace_root,
         live_sweep_count(&workspace_pool.provisioned_registries()),
     ));
-    FleetInput {
+    let listed_at = (!listings.is_empty()).then_some(now);
+    let reused = Reused {
+        managed: managed.clone(),
+        listings: listings.clone(),
+        listed_at,
+        roots,
+        slugs: slug_cache
+            .iter()
+            .map(|(root, slug)| (root.clone(), slug.to_ascii_lowercase()))
+            .collect(),
+        visibility: BTreeMap::new(),
+    };
+    let input = FleetInput {
         capacity,
         main_ci,
         host_id: host_id.to_string(),
         managed,
         held,
-        listed_at: (!listings.is_empty()).then_some(now),
+        listed_at,
         listings,
         ready,
+    };
+    (input, reused)
+}
+
+/// A tick pass's input (#11161): the registries and the work finder's last
+/// tick, host capacity and `main` CI, which are local, with the slugs and review listings of the last
+/// collector pass. Nothing here reads the forge.
+pub(super) fn tick_input(
+    workspace_root: &Path,
+    workspace_pool: &WorkspacePool,
+    host_id: &str,
+    reused: &Reused,
+) -> FleetInput {
+    FleetInput {
+        capacity: Some(capacity(
+            workspace_root,
+            live_sweep_count(&workspace_pool.provisioned_registries()),
+        )),
+        main_ci: tick_main_ci(reused),
+        held: held_sweeps(workspace_pool, |root| reused.slug(root)),
+        ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
+        ..reused_input(host_id, reused)
     }
+}
+
+/// A tick pass's `main` CI: the managed roots only, as the collector pass
+/// reads it, so the two passes never disagree about a repo.
+pub(super) fn tick_main_ci(reused: &Reused) -> BTreeMap<String, MainCi> {
+    main_ci_by_slug(
+        reused
+            .roots
+            .iter()
+            .map(|(root, slug)| (root.as_path(), slug.as_str())),
+    )
+}
+
+/// [`tick_input`] without the registries and the tick. Pure.
+pub(super) fn reused_input(host_id: &str, reused: &Reused) -> FleetInput {
+    FleetInput {
+        host_id: host_id.to_string(),
+        managed: reused.managed.clone(),
+        held: Vec::new(),
+        listings: reused.listings.clone(),
+        listed_at: reused.listed_at,
+        ready: None,
+        capacity: None,
+        main_ci: BTreeMap::new(),
+    }
+}
+
+/// The ready queue of `summary`, its roots named by the collector's slugs.
+/// Pure.
+pub(super) fn ready_input(summary: &WorkFinderTickSummary, reused: &Reused) -> ReadyQueue {
+    ready_from_tick(summary, |root| reused.slug(root), &reused.managed)
+}
+
+/// The seconds between passes: the work finder's tick interval once it has
+/// ticked in this process, else the collector's snapshot interval.
+pub(super) fn tick_interval_secs(workspace_root: &Path) -> u64 {
+    if crate::work_finder::last_tick_summary().is_none() {
+        return crate::observability::SNAPSHOT_INTERVAL.as_secs();
+    }
+    let config = crate::work_finder::read_work_finder_config(workspace_root);
+    crate::work_finder::resolve_interval_with_config(&config).as_secs()
 }
 
 /// This host's planner stamps: the daemon version, the hash of the

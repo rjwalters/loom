@@ -20,8 +20,10 @@
 //!
 //! # Anchors, deltas and chunks
 //!
-//! The emitter (`observability::fleet_state`) runs on the collector's 5-minute
-//! snapshot pass. It sends a **full anchor** (`anchor: true`, every row) on its
+//! The emitter (`observability::fleet_state`) runs after every work-finder
+//! tick (default 60 s, `autonomous.workFinder.intervalSecs`) and on the
+//! collector's 5-minute snapshot pass; `tick_interval_secs` names the
+//! cadence. It sends a **full anchor** (`anchor: true`, every row) on its
 //! first pass, whenever the planner stamps change, and at least every
 //! [`ANCHOR_INTERVAL_SECS`]. Between anchors it sends a **delta**
 //! (`anchor: false`) only when something changed: the changed or added rows,
@@ -60,9 +62,9 @@ use crate::telemetry::RepoVisibility;
 pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
 
 /// The longest gap between two full anchors, in seconds. A reader never has
-/// to look back further than this, plus one snapshot interval, to find a
-/// reconstruction base.
-pub const ANCHOR_INTERVAL_SECS: i64 = 3600;
+/// to look back further than this, plus one pass interval, to find a
+/// reconstruction base, so a lost delta is wrong for at most this long.
+pub const ANCHOR_INTERVAL_SECS: i64 = 300;
 
 /// The most bytes of JSON one record carries before it is split into chunks
 /// (~1 MB, a quarter of the ~4 MB OTLP/gRPC message limit). A row is ~100-180
@@ -442,6 +444,11 @@ pub struct FleetStateRecord {
     /// The planner regime stamps.
     #[serde(flatten)]
     pub stamps: PlannerStamps,
+    /// The seconds between the emitter's passes, the sampling resolution: the
+    /// work finder's tick interval, or 300 when it has not ticked. Absent
+    /// from an older emitter, which sampled every 300 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_interval_secs: Option<u64>,
     /// When the review listings were read. Absent when none completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census_at: Option<DateTime<Utc>>,
