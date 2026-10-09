@@ -104,7 +104,7 @@ fn at_returns_the_newest_emitted_estimate_not_after_t() {
     let mut sel = subject_selector();
     sel.kind = Some(Kind::Land);
     sel.at = Some(at(13) + chrono::Duration::minutes(30));
-    let got = newest_per_kind(read(&mut export(), &sel, since, until).unwrap());
+    let got = newest_per_kind(read_emitted(&mut export(), &sel, since, until).unwrap(), false);
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].estimate_id, "bbbb", "13:00 is the newest as_of <= 13:30");
 }
@@ -114,7 +114,7 @@ fn at_is_inclusive_and_before_the_first_estimate_is_none() {
     let (since, until) = window();
     let mut sel = subject_selector();
     sel.at = Some(at(12));
-    let got = newest_per_kind(read(&mut export(), &sel, since, until).unwrap());
+    let got = newest_per_kind(read_emitted(&mut export(), &sel, since, until).unwrap(), false);
     assert_eq!(
         got.iter()
             .map(|e| e.estimate_id.as_str())
@@ -128,7 +128,10 @@ fn at_is_inclusive_and_before_the_first_estimate_is_none() {
 #[test]
 fn without_at_each_kind_gets_its_newest() {
     let (since, until) = window();
-    let got = newest_per_kind(read(&mut export(), &subject_selector(), since, until).unwrap());
+    let got = newest_per_kind(
+        read_emitted(&mut export(), &subject_selector(), since, until).unwrap(),
+        false,
+    );
     let ids: Vec<_> = got
         .iter()
         .map(|e| (e.kind, e.estimate_id.as_str()))
@@ -201,4 +204,33 @@ fn an_unavailable_backend_is_reported() {
     let (since, until) = window();
     let err = read(&mut Down, &Selector::default(), since, until).unwrap_err();
     assert!(err.to_string().contains("no route"), "{err}");
+}
+
+#[test]
+fn a_primary_estimate_beats_a_newer_shadow_one_unless_a_heuristic_is_named() {
+    let (since, until) = window();
+    let primary = variant("pppp", 13);
+    let mut shadow = variant("aaaa-shadow", 13);
+    shadow.heuristic = "shadow-h".into();
+    let tag = |r: String, p: bool| {
+        let mut v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        v["is_primary"] = serde_json::Value::Bool(p);
+        v.to_string()
+    };
+    let text = [
+        tag(row(&primary, "r1", 1_000), true),
+        tag(row(&shadow, "r2", 1_000), false),
+    ]
+    .join("\n");
+    let mut rows = FileRows::parse(&text).unwrap();
+    let all = read_emitted(&mut rows, &subject_selector(), since, until).unwrap();
+    let got = newest_per_kind(all.clone(), false);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].estimate_id, "pppp", "shadow must not stand in for the current estimate");
+
+    let mut sel = subject_selector();
+    sel.heuristic = Some("shadow-h".into());
+    let mut rows = FileRows::parse(&text).unwrap();
+    let got = newest_per_kind(read_emitted(&mut rows, &sel, since, until).unwrap(), true);
+    assert_eq!(got[0].estimate_id, "aaaa-shadow", "naming the heuristic reaches the shadow");
 }

@@ -255,12 +255,12 @@ impl EtaExplainArgs {
                 })
             }
         };
-        let found = explain_read::read(reader.as_mut(), &selector, since, until)
+        let found = explain_read::read_emitted(reader.as_mut(), &selector, since, until)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let found = if subject {
-            explain_read::newest_per_kind(found)
+            explain_read::newest_per_kind(found, selector.heuristic.is_some())
         } else {
-            found
+            found.into_iter().map(|e| e.explanation).collect()
         };
         if found.is_empty() {
             match at {

@@ -40,13 +40,18 @@ pub const MAX_PAGES: u32 = 10;
 /// The estimates query. Every selector is optional: an empty string (or `0`
 /// for `issue`) matches anything. Keyset-paged over
 /// `(observed_timestamp, record_id)` like `OUTCOMES_SQL`; `at_ns` bounds the
-/// record's *event* time (`timestamp`, the estimate's `as_of`).
+/// record's *event* time (`timestamp`, the estimate's `as_of`); that bound is
+/// only safe because a record's timestamp is never earlier than its `as_of`
+/// (the client re-filters on `as_of`, so a looser bound could only drop rows).
+/// `is_primary` is the stored `loom.eta.primary` value: shadow estimates are
+/// emitted beside the current one, so the key being *present* says nothing.
 pub const ESTIMATE_SQL: &str = "\
 SELECT
     if(attributes_string['loom.record_id'] != '', attributes_string['loom.record_id'],
        concat('h:', toString(cityHash64(body, timestamp)))) AS record_id,
     attributes_string['loom.repo'] AS repo,
     attributes_string['loom.eta.estimate_id'] AS estimate_id,
+    attributes_bool['loom.eta.primary'] AS is_primary,
     body,
     toString(timestamp) AS event_time_ns,
     toString(observed_timestamp) AS knowable_time_ns
@@ -184,7 +189,34 @@ pub fn read(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
 ) -> Result<Vec<Explanation>, ExplainReadError> {
-    let mut out: Vec<Explanation> = Vec::new();
+    Ok(read_emitted(reader, selector, since, until)?
+        .into_iter()
+        .map(|e| e.explanation)
+        .collect())
+}
+
+/// An emitted explanation and whether it was the primary (current) estimate.
+#[derive(Debug, Clone)]
+pub struct Emitted {
+    /// The replayable record.
+    pub explanation: Explanation,
+    /// `loom.eta.primary`; `false` for a shadow candidate. A row without the
+    /// column (an older export) counts as primary.
+    pub primary: bool,
+}
+
+/// [`read`], keeping each row's `primary` flag for [`newest_per_kind`].
+///
+/// # Errors
+///
+/// See [`ExplainReadError`].
+pub fn read_emitted(
+    reader: &mut dyn SignozRead,
+    selector: &Selector,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Result<Vec<Emitted>, ExplainReadError> {
+    let mut out: Vec<Emitted> = Vec::new();
     let mut after = None;
     for _ in 0..MAX_PAGES {
         let query = PageQuery {
@@ -221,12 +253,25 @@ pub fn read(
             let Ok(e) = serde_json::from_str::<Explanation>(body) else {
                 continue;
             };
-            if selector.matches(&e) && !out.iter().any(|o| o.estimate_id == e.estimate_id) {
-                out.push(e);
+            let primary = match row.get("is_primary") {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Number(n)) => n.as_i64() != Some(0),
+                Some(Value::String(s)) => !matches!(s.trim(), "false" | "0"),
+                _ => true,
+            };
+            if selector.matches(&e)
+                && !out
+                    .iter()
+                    .any(|o| o.explanation.estimate_id == e.estimate_id)
+            {
+                out.push(Emitted {
+                    explanation: e,
+                    primary,
+                });
             }
         }
         if rows < PAGE_LIMIT {
-            out.sort_by_key(|e| e.as_of);
+            out.sort_by_key(|e| e.explanation.as_of);
             return Ok(out);
         }
         if last == after {
@@ -237,32 +282,28 @@ pub fn read(
     Err(ExplainReadError::TooManyRows)
 }
 
-/// The estimate(s) to explain out of `emitted`: the one named by id, else the
-/// newest per kind (the newest emitted with `as_of <= at`).
+/// The estimate(s) to explain out of `emitted`: the newest per kind (the
+/// newest emitted with `as_of <= at`). A primary row beats a shadow one of the
+/// same kind however old, matching `eta view --explain`'s current heuristic;
+/// `any_heuristic` (a `--heuristic` was named) lifts that, since asking for a
+/// heuristic is the only way to reach a shadow estimate.
 #[must_use]
-pub fn newest_per_kind(mut emitted: Vec<Explanation>) -> Vec<Explanation> {
+pub fn newest_per_kind(mut emitted: Vec<Emitted>, any_heuristic: bool) -> Vec<Explanation> {
     emitted.sort_by(|a, b| {
-        b.as_of
-            .cmp(&a.as_of)
-            .then_with(|| a.estimate_id.cmp(&b.estimate_id))
+        let rank = |e: &Emitted| any_heuristic || e.primary;
+        rank(b)
+            .cmp(&rank(a))
+            .then_with(|| b.explanation.as_of.cmp(&a.explanation.as_of))
+            .then_with(|| a.explanation.estimate_id.cmp(&b.explanation.estimate_id))
     });
     let mut out: Vec<Explanation> = Vec::new();
     for e in emitted {
-        if !out.iter().any(|o| o.kind == e.kind) {
-            out.push(e);
+        if !out.iter().any(|o| o.kind == e.explanation.kind) {
+            out.push(e.explanation);
         }
     }
     out.sort_by_key(|e| e.kind);
     out
-}
-
-/// [`FileRows`] over an operator's export, for a caller that holds the path.
-///
-/// # Errors
-///
-/// Unreadable or malformed export.
-pub fn file_reader(path: &std::path::Path) -> Result<FileRows, String> {
-    FileRows::read(path)
 }
 
 #[cfg(test)]
