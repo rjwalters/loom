@@ -147,6 +147,7 @@ impl PickSkipReason {
             | Qd::DeferredSaturation
             | Qd::DeferredOutOfSlice
             | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval
             | Qd::DispatchBackoff

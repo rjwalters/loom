@@ -228,6 +228,7 @@ pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 /// config). See [`resolve_extra_skip_labels_with_config`].
 pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
 
+pub mod affected_files;
 pub mod build_backoff;
 pub mod dispatch_plan;
 pub mod dispatch_plan_merge;
@@ -1863,6 +1864,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         let now = chrono::Utc::now();
 
         for item in ready {
+            cap.note_surface(idx, &item, in_flight.contains(&item.number));
             let key = ready_queue::key_of(idx, workspace_priority, &item, red);
             // `held_until` (Issue #9311): `None` for every disposition but
             // the five time-boxed holds below, which pass their computed
@@ -2092,7 +2094,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         if disposition == Qd::Dispatched {
             occupancy += 1;
             admitted_this_tick += 1;
-            cap.admit(cand.workspace_idx);
+            cap.admit_candidate(&cand);
         }
     }
 
