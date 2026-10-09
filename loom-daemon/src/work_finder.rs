@@ -2617,8 +2617,7 @@ where
             // BEFORE disk since #7512 — the eager-reclaim trigger below needs
             // to know whether disk is the axis that would bind the cap down,
             // which is a comparison against this term and `configured_max`.
-            let ram =
-                crate::ram_headroom::ram_headroom_limit_for(std::slice::from_ref(&workspace_root));
+            let ram = crate::ram_headroom::ram_headroom_limit();
             let mut disk = disk_headroom_limit(&workspace_root);
             // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
             // FIRST becomes the term that binds the cap down, run the existing
@@ -3009,11 +3008,10 @@ pub fn spawn_multi_work_finder_task(
             // RAM headroom (#5270): the second "dumb mode" machine-headroom
             // axis alongside disk, folded into the same `min(...)`. Read
             // BEFORE disk since #7512 — see the single-workspace loop above.
-            // #11094: sample every live agent scope's `memory.peak` first (a
-            // finished scope's peak is folded into the repo history), then
-            // charge admission with the observed per-repo peak.
-            crate::ram_peaks::record_tick(&crate::ram_peaks::live_scopes(&pool, &roots));
-            let ram = crate::ram_headroom::ram_headroom_limit_for(&roots);
+            // #11094: samples every live agent scope's `memory.peak` (folding
+            // finished scopes into the repo history) and charges admission
+            // with the observed per-repo peak.
+            let ram = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);

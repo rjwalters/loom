@@ -241,14 +241,42 @@ pub fn repo_key(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
-/// The cgroup v2 directory holding `loom-agents.slice` scopes for this user.
+/// The systemd slice `spawn-claude.sh` puts every agent scope in.
+pub const AGENTS_SLICE: &str = "loom-agents.slice";
+
+/// Relative cgroup path of a systemd slice unit. Dashes in a slice name encode
+/// its parent chain (systemd.slice(5)), so `loom-agents.slice` lives at
+/// `loom.slice/loom-agents.slice`, not directly under the user manager.
+#[must_use]
+pub fn slice_cgroup_path(slice: &str) -> Option<PathBuf> {
+    let stem = slice.strip_suffix(".slice")?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(
+        (0..parts.len())
+            .map(|i| format!("{}.slice", parts[..=i].join("-")))
+            .collect(),
+    )
+}
+
+/// The cgroup v2 directory holding [`AGENTS_SLICE`] scopes for `uid`, under the
+/// cgroup mount `cgroup_root`.
+#[must_use]
+pub fn agents_slice_dir_in(cgroup_root: &Path, uid: u32) -> Option<PathBuf> {
+    Some(
+        cgroup_root
+            .join(format!("user.slice/user-{uid}.slice/user@{uid}.service"))
+            .join(slice_cgroup_path(AGENTS_SLICE)?),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn agents_slice_dir() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let uid = std::fs::metadata("/proc/self").ok()?.uid();
-    Some(PathBuf::from(format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/loom-agents.slice"
-    )))
+    agents_slice_dir_in(Path::new("/sys/fs/cgroup"), uid)
 }
 
 /// Read `(memory.peak, memory.current)` of `scope` under `slice_dir`.
@@ -285,19 +313,22 @@ fn emit_ended(e: &EndedScope) {
 }
 
 /// The live agent scopes of every managed root, from each registry's claim
-/// locks. Agents without a stamped scope unit are skipped.
+/// locks (agents without a stamped scope unit are skipped), plus the total
+/// number of in-flight sweeps across those roots.
 #[must_use]
 pub fn live_scopes(
     pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
     roots: &[PathBuf],
-) -> Vec<LiveScope> {
+) -> (Vec<LiveScope>, usize) {
     let mut out = Vec::new();
+    let mut in_flight = 0;
     for root in roots {
         let registry = pool.get_or_provision(root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for a in sr.in_flight_snapshot() {
+            in_flight += 1;
             if let Some(scope) = a.scope_unit {
                 out.push(LiveScope {
                     scope,
@@ -307,7 +338,7 @@ pub fn live_scopes(
             }
         }
     }
-    out
+    (out, in_flight)
 }
 
 /// One observation pass over the live scopes of all managed roots. Reads the
@@ -390,6 +421,42 @@ mod tests {
         assert!(store.inflight.is_empty());
         assert!(store.repos.is_empty());
         assert_eq!(read_scope(Path::new("/nonexistent-loom-test"), "x.scope"), None);
+    }
+
+    #[test]
+    fn slice_cgroup_path_expands_dash_hierarchy() {
+        assert_eq!(
+            slice_cgroup_path("loom-agents.slice"),
+            Some(PathBuf::from("loom.slice/loom-agents.slice"))
+        );
+        assert_eq!(
+            slice_cgroup_path("a-b-c.slice"),
+            Some(PathBuf::from("a.slice/a-b.slice/a-b-c.slice"))
+        );
+        assert_eq!(slice_cgroup_path("plain.slice"), Some(PathBuf::from("plain.slice")));
+        assert_eq!(slice_cgroup_path("x.scope"), None);
+        assert_eq!(slice_cgroup_path("a--b.slice"), None);
+    }
+
+    #[test]
+    fn production_path_reads_a_scope_under_the_nested_slice() {
+        // Mirror the real cgroup tree that `systemd-run --user --scope
+        // --slice=loom-agents.slice` produces and resolve it the way
+        // `record_tick` does (via `agents_slice_dir_in`, not a hand-made dir).
+        let root = tempfile::tempdir().unwrap();
+        let scope = root.path().join(
+            "user.slice/user-1000.slice/user@1000.service/loom.slice/loom-agents.slice/loom-agent-1.scope",
+        );
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::write(scope.join("memory.peak"), "9000\n").unwrap();
+        std::fs::write(scope.join("memory.current"), "4000\n").unwrap();
+        let dir = agents_slice_dir_in(root.path(), 1000).unwrap();
+        assert_eq!(read_scope(&dir, "loom-agent-1.scope"), Some((9000, 4000)));
+        // The pre-fix flat path (no `loom.slice` parent) must not resolve.
+        let flat = root
+            .path()
+            .join("user.slice/user-1000.slice/user@1000.service/loom-agents.slice");
+        assert_eq!(read_scope(&flat, "loom-agent-1.scope"), None);
     }
 
     #[test]

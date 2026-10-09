@@ -181,16 +181,48 @@ pub fn ram_headroom_reserved(available_gb: u64, reserved_gb: u64, charge_gb: u64
     ram_headroom(available_gb.saturating_sub(reserved_gb), charge_gb)
 }
 
-/// Observed-history-aware RAM headroom for the given workspace roots (#11094).
+/// The RAM term of the total-concurrency cap. `additional` (see
+/// [`ram_headroom_reserved`]) already nets out the in-flight sweeps'
+/// reservations, so it counts only sweeps *beyond* the running ones; when
+/// `additive` it is added to `occupancy` so the dispatch comparison
+/// (`occupancy >= cap`) does not charge running work a second time. Otherwise
+/// it is the legacy total-cap figure (#11094). Saturating, so `usize::MAX`
+/// stays unbounded.
+#[must_use]
+pub fn ram_total_cap(additional: usize, occupancy: usize, additive: bool) -> usize {
+    if additive {
+        occupancy.saturating_add(additional)
+    } else {
+        additional
+    }
+}
+
+/// Sample the live agent scopes (folding finished scopes' peaks into the repo
+/// history), then return the RAM term for `roots` — the production tick entry
+/// point (#11094).
+#[must_use]
+pub fn ram_headroom_limit_tick(
+    pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
+    roots: &[std::path::PathBuf],
+) -> usize {
+    let (scopes, occupancy) = crate::ram_peaks::live_scopes(pool, roots);
+    crate::ram_peaks::record_tick(&scopes);
+    ram_headroom_limit_for(roots, occupancy)
+}
+
+/// Observed-history-aware RAM term for the given workspace roots (#11094),
+/// where `occupancy` is the number of sweeps already in flight.
 ///
 /// The per-sweep charge is the env override, else the largest observed
 /// per-repo high-water mark among `roots` (see [`crate::ram_peaks`]), else the
 /// flat default; the in-flight sweeps' not-yet-realised peaks are subtracted
 /// from the available memory first. With no history anywhere this is exactly
-/// [`ram_headroom_limit`]. The charge, its source and the reservation are
-/// logged (INFO on change, DEBUG otherwise).
+/// [`ram_headroom_limit`]. Once history applies the result is a total cap
+/// (`occupancy` + the sweeps that still fit; see [`ram_total_cap`]). The
+/// charge, its source, the repo that set it and the reservation are logged
+/// (INFO on change, DEBUG otherwise).
 #[must_use]
-pub fn ram_headroom_limit_for(roots: &[std::path::PathBuf]) -> usize {
+pub fn ram_headroom_limit_for(roots: &[std::path::PathBuf], occupancy: usize) -> usize {
     use crate::ram_peaks;
     let Some(available) = available_ram_gb() else {
         return ram_headroom_limit();
@@ -198,19 +230,29 @@ pub fn ram_headroom_limit_for(roots: &[std::path::PathBuf]) -> usize {
     let store = ram_peaks::store_path()
         .map(|p| ram_peaks::load(&p))
         .unwrap_or_default();
-    let observed = roots
+    let (observed_repo, observed) = roots
         .iter()
-        .filter_map(|r| store.repos.get(&ram_peaks::repo_key(r)))
-        .filter_map(|h| ram_peaks::high_water_bytes(h))
-        .max();
+        .filter_map(|r| {
+            let key = ram_peaks::repo_key(r);
+            let hw = ram_peaks::high_water_bytes(store.repos.get(&key)?)?;
+            Some((key, hw))
+        })
+        .max_by_key(|(_, hw)| *hw)
+        .unzip();
     let (charge, source) =
         ram_peaks::charge_gb(env_per_worktree_ram_gb(), observed, DEFAULT_PER_WORKTREE_RAM_GB);
     let reserved_gb = ram_peaks::reserved_bytes(&store).div_ceil(1024 * 1024 * 1024);
-    let headroom = ram_headroom_reserved(available, reserved_gb, charge);
+    let additional = ram_headroom_reserved(available, reserved_gb, charge);
+    let headroom = ram_total_cap(
+        additional,
+        occupancy,
+        reserved_gb > 0 || source == ram_peaks::ChargeSource::Observed,
+    );
     let line = format!(
-        "ram_headroom: charge={charge}GB source={} in_flight_reservation={reserved_gb}GB \
-         available={available}GB headroom={headroom}",
-        source.as_str()
+        "ram_headroom: charge={charge}GB source={} repo={} in_flight_reservation={reserved_gb}GB \
+         available={available}GB in_flight={occupancy} headroom={headroom}",
+        source.as_str(),
+        observed_repo.as_deref().unwrap_or("-")
     );
     static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let key = format!("{charge}/{}/{reserved_gb}/{headroom}", source.as_str());
@@ -331,6 +373,22 @@ mod tests {
         // and with 11 GB already realised elsewhere (available 19): 10/15 = 0.
         assert_eq!(ram_headroom_reserved(26, 9, 15), 1);
         assert_eq!(ram_headroom_reserved(19, 9, 15), 0);
+    }
+
+    #[test]
+    fn test_ram_total_cap_does_not_charge_running_sweeps_twice() {
+        // available 26, reservation 9, charge 15 -> one more sweep fits.
+        let additional = ram_headroom_reserved(26, 9, 15);
+        // One sweep already running: the cap is 1 + 1 = 2, so the dispatch
+        // comparison `occupancy >= cap` (1 >= 2) admits the second sweep ...
+        let cap = ram_total_cap(additional, 1, true);
+        assert_eq!(cap, 2);
+        assert!(crate::work_finder::resolve_dynamic_max_concurrent(usize::MAX, cap, 4) > 1);
+        // ... and not a third (2 >= 2).
+        assert_eq!(ram_total_cap(ram_headroom_reserved(19, 9, 15), 2, true), 2);
+        // Legacy figure is passed through untouched; usize::MAX stays unbounded.
+        assert_eq!(ram_total_cap(3, 5, false), 3);
+        assert_eq!(ram_total_cap(usize::MAX, 5, true), usize::MAX);
     }
 
     #[test]
