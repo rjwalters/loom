@@ -997,10 +997,12 @@ impl SweepRegistry {
 /// crash/exit outcome paths, so a 137/143 seen here is never the daemon's own.
 ///
 /// Session-lifetime model: **the daemon kills survivors** (#4980). When the
-/// leader dies, `reap_orphaned_group` SIGTERMs (then SIGKILLs) whatever is
-/// left in its process group — a `claude-wrapper.sh` retry included — before
-/// the claim is released, so no retry outlives the release. A surviving group
-/// is therefore not an exemption; only the external cause of death is.
+/// leader dies, `reap_orphaned_group` SIGTERMs whatever is left in its process
+/// group — a `claude-wrapper.sh` retry included — and defers a SIGKILL. A
+/// surviving group is therefore not an exemption; only the external cause of
+/// death is. It does NOT wait for the group to exit before the claim is
+/// released, so "no retry outlives the release" is not guaranteed here
+/// (#11076 acceptance criterion 2, still open).
 pub(crate) fn external_kill_exemption(exit_code: Option<i32>) -> Option<&'static str> {
     matches!(exit_code, Some(137 | 143))
         .then_some("leader terminated by SIGKILL/SIGTERM (external OOM kill or scope stop)")
