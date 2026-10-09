@@ -824,6 +824,27 @@ jobs:
           if [ -f .loom/config.json ]; then
             jq -e . .loom/config.json > /dev/null
           fi
+      - name: Check optional workflow templates parse as YAML (#9078)
+        if: ${{ !cancelled() }}
+        # Templates under defaults/optional/github-workflows/ are not live
+        # workflows here, so GitHub never parses them; a broken one (#9078: an
+        # unindented block-scalar line) only fails in the repo that copies it.
+        # An empty glob or a missing PyYAML fails this step rather than passing.
+        run: |
+          python3 - <<'EOF'
+          import glob, sys, yaml
+          files = sorted(glob.glob('defaults/optional/github-workflows/*.y*ml'))
+          if not files:
+              sys.exit('no templates found: the glob is stale')
+          bad = 0
+          for f in files:
+              try:
+                  yaml.safe_load(open(f))
+              except yaml.YAMLError as e:
+                  print(f'::error file={f}::{e}'.replace('\n', ' '))
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          EOF
 
       # component: CLAUDE.md Line Budget
       # Cheap structural check; always runs (CLAUDE.md is prepended to every
