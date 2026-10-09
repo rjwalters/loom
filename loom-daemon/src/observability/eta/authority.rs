@@ -33,7 +33,8 @@ static FALLBACK: Mutex<Option<BTreeSet<String>>> = Mutex::new(None);
 /// Whether this host emits only as a #10897 fallback (a non-authority host
 /// covering roster repos the authority is not declared to cover), so its
 /// records must not be stamped as the authority's (#10898).
-pub(super) fn is_fallback() -> bool {
+#[must_use]
+pub fn emitting_as_fallback() -> bool {
     FALLBACK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
