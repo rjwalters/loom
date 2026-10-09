@@ -215,60 +215,6 @@ fn pr_views_key_each_pr_to_the_issue_it_closes() {
 }
 
 #[test]
-fn part_of_slice_pr_keeps_its_fleet_state_row_with_no_active_sweep() {
-    let row = |number: u32, body: &str| RestIssue {
-        comments: 0,
-        number,
-        title: None,
-        labels: vec!["loom:review-requested".to_string()],
-        created_at: Some("2026-09-28T10:00:00Z".to_string()),
-        updated_at: Some("2026-09-28T11:00:00Z".to_string()),
-        closed_at: None,
-        state: "open".to_string(),
-        body: Some(body.to_string()),
-        author: None,
-        author_association: None,
-        is_pull_request: true,
-    };
-    let repo = "rjwalters/loom";
-    let listings = vec![vec![
-        row(601, "Part of #60"),
-        row(602, "Closes #61"),
-        row(603, "no reference"),
-    ]];
-    let now = as_of();
-    let mut tracker = Tracker::new(provenance());
-    tracker.on_listing(repo, &pr_views(&listings), now, 300);
-    tracker.on_pr_links(repo, &pr_links(&listings));
-    tracker.on_fleet_context(&[(repo.to_string(), listed_prs(&listings))], Default::default(), now);
-
-    let input = crate::observability::fleet_state::FleetInput {
-        host_id: "host-test".to_string(),
-        items: tracker.live_items(),
-        census: tracker.pr_census(),
-        slots: None,
-    };
-    let view = crate::observability::fleet_state::build_view(&input, &BTreeSet::new());
-    let state = &view.repos[repo];
-    assert_eq!(state.census.as_ref().unwrap().open, 3, "every listed PR is in the census");
-    assert_eq!(state.rows.len(), 2, "the unlinked PR has no issue to key a row by");
-    let slice = &state.rows[&60];
-    assert_eq!(slice.pr, Some(601));
-    assert_eq!(slice.stage, crate::eta::Stage::ReviewWait);
-    assert!(slice.entered_at <= now && slice.entered_at_lower_bound);
-    assert_eq!((slice.host.as_deref(), slice.slot), (None, None), "no sweep runs it");
-    assert_eq!(state.rows[&61].pr, Some(602), "the closing-ref PR is still the tracker's row");
-
-    // The anchor carries it.
-    let record = crate::observability::fleet_state::decide(&view, None, now).unwrap();
-    assert!(record.anchor);
-    assert!(record.repos[0]
-        .rows
-        .iter()
-        .any(|r| r.issue == 60 && r.pr == Some(601)));
-}
-
-#[test]
 fn incomplete_provenance_is_emitted_and_marked() {
     let tarball = Provenance {
         revision: "unknown".to_string(),

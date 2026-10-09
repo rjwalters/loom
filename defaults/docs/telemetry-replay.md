@@ -1,7 +1,7 @@
 # Telemetry Replay Contract
 
 Status: contract, emit-side facts (Issue #10196, slice 1) and the
-`fleet.state` record (slice 2). `loom-daemon telemetry replay --as-of <t>` and
+`fleet.state` record (slice R1). `loom-daemon telemetry replay --as-of <t>` and
 `--check` are later slices and do not exist yet.
 
 The question this contract answers: **what did the fleet look like at instant
@@ -85,40 +85,65 @@ slice.
 
 ## Fleet state (`fleet.state`)
 
-Each host with ETA enabled and an OTLP exporter sends `fleet.state` log
-records on its 5-minute snapshot pass. The field reference is in
-[`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per in-flight
-`(repo, issue)` it carries stage, entered-at, PR, host and slot, and per repo
-the open-PR census. The census counts open PRs under a Loom review label.
+Every host with an OTLP exporter sends `fleet.state` log records on its
+5-minute snapshot pass, whether or not ETA is enabled. **Each host emits its
+own view; nothing is elected.** The field reference is in
+[`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per `(repo, issue)`
+the host can see, it carries stage, entered-at and PR; a row for a sweep the
+host runs also carries `host` and `slot`; a `ready_wait` row carries the
+host's planner `rank` and the planner's inputs (star, starred-at, level,
+fleet priority, creation instant). Per repo it carries the open-PR census,
+which counts open PRs under a Loom review label.
 
-- **Anchor** (`loom.fleet.anchor = true`): the host's full state. Sent on the
-  first pass of every daemon process and at least every 3600 s after that.
+- **Anchor** (`loom.fleet.anchor = true`): the host's full view. Sent on the
+  first pass of every daemon process, whenever the planner stamps change, and
+  at least every 3600 s after that.
 - **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
   something changed. It holds the added or changed rows, the issues that left
   (`removed`), and the full census of each repo it names. `anchor_as_of` names
   the anchor the delta belongs to, and `prev_as_of` names the record it applies
   on top of.
+- **Chunks**: there is no row cap. A record over ~1 MB of JSON is split into
+  `loom.fleet.chunk_count` log records sharing `as_of`, numbered by
+  `loom.fleet.chunk_index`. Today's queue fits in one.
+- **Regime stamps**: every record carries `planner_version`,
+  `planner_config_hash` and (with a fleet store) `fleet_config_hash`. A change
+  in any of them is a regime boundary; the emitter starts a new anchor there,
+  and a reader fitting on a recent window cuts the window at it.
 
 To reconstruct one host's state at `t`:
 
 1. Keep only that host's `fleet.state` records knowable before `t`, deduped on
-   `loom.record_id`.
-2. Take the newest anchor among them, A. Because anchors are hourly, A is at
-   most about 65 minutes before `t` on a healthy host. With no anchor in that
-   window, the host's state at `t` is **unknown**, not empty.
-3. Apply, in `as_of` order, every delta whose `anchor_as_of` equals A's
-   `as_of`. For each repo entry, drop the `removed` issues, upsert the `rows`
-   by issue, and replace the census. A repo left with no rows and no census is
-   dropped.
+   `loom.record_id`. Group them by `as_of`; a group is usable only when it
+   holds all `chunk_count` chunks. The union of a group's chunks is the
+   record (a repo split across chunks contributes rows from each).
+2. Take the newest complete anchor among them, A. Because anchors are hourly,
+   A is at most about 65 minutes before `t` on a healthy host. With no
+   complete anchor in that window, the host's state at `t` is **unknown**, not
+   empty.
+3. Apply, in `as_of` order, every complete delta whose `anchor_as_of` equals
+   A's `as_of`. For each repo entry, drop the `removed` issues, upsert the
+   `rows` by issue, and replace the census. A repo left with no rows and no
+   census is dropped.
 4. Check the chain. Each applied delta's `prev_as_of` must equal the `as_of`
-   of the record applied before it. On a break (a delta lost or not yet
-   knowable), the state is exact only up to the break. Report it as partial
-   rather than guess.
+   of the record applied before it. On a break (a delta lost, incomplete, or
+   not yet knowable), the state is exact only up to the break. Report it as
+   partial rather than guess.
 
-The fleet at `t` is the union over covered hosts. Several hosts can report the
-same review-listed PR, so merge rows by `(repo, issue)` and prefer the row
-that has a `host`. That row comes from the host whose sweep holds the item. A
-row without one only says the PR is in review somewhere.
+### Reconciling hosts
+
+Hosts' views overlap by design: each manages a set of repos, sees their review
+listings, and ranks the ready queue by its own planner. Per `(repo, issue)` at
+`t`:
+
+1. Take the row from the host that holds the item (the row with a `host`).
+2. Else take any host's PR-stage row; else any host's `ready_wait` row. Its
+   `rank` is that host's rank; ranks are per host, so two hosts' ranks are two
+   true answers, not a conflict.
+3. Record the spread between hosts' views, and between them and the
+   webhook-derived label state, as a coverage/lag measure. A host whose view
+   lags the forge (for example a rate-limited listing cache) is measured, not
+   deduped away.
 
 A host restart begins a new chain with a fresh anchor. Records from before the
 restart never chain into it, because their `anchor_as_of` differs.
@@ -126,4 +151,7 @@ restart never chain into it, because their `anchor_as_of` differs.
 ## Not yet implemented
 
 - `loom-daemon telemetry replay --as-of <t>` and `--check`.
+- `fleet.state` hold and capacity facts (slice R8) and the committed
+  volume/coverage ClickHouse query (bytes/day, rows per anchor, anchors
+  missing chunks, hosts with no anchor in 2 h).
 - The collector-side receive stamp.

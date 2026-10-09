@@ -643,6 +643,53 @@ fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
+/// The PR rows of a repo's review listings, each keyed to the issue it
+/// closes. A PR that closes no issue is not tracked.
+#[must_use]
+pub fn pr_views(listings: &[Vec<RestIssue>]) -> Vec<PrView> {
+    let mut seen = BTreeSet::new();
+    let mut views = Vec::new();
+    for item in listings.iter().flatten() {
+        if !item.is_pull_request || !seen.insert(item.number) {
+            continue;
+        }
+        let Some(issue) =
+            super::ops::stage_dwell::closing_refs(item.body.as_deref().unwrap_or_default())
+                .first()
+                .copied()
+        else {
+            continue;
+        };
+        views.push(PrView {
+            number: item.number,
+            issue,
+            labels: item.labels.clone(),
+            created_at: parse_time(item.created_at.as_deref()),
+            updated_at: parse_time(item.updated_at.as_deref()),
+        });
+    }
+    views
+}
+
+/// Every listed PR with the issues its body links, by the work finder's rule
+/// (`linkage_refs`: closing keywords and `Part of`), for the star state
+/// (#10372).
+#[must_use]
+pub fn pr_links(listings: &[Vec<RestIssue>]) -> Vec<(u32, Vec<u32>)> {
+    let mut seen = BTreeSet::new();
+    listings
+        .iter()
+        .flatten()
+        .filter(|item| item.is_pull_request && seen.insert(item.number))
+        .map(|item| {
+            (
+                item.number,
+                crate::eta::star::body_links(item.body.as_deref().unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
 /// The open issues carrying a star label at any level: one ETag-conditional
 /// listing per label, the work finder's own URLs (a `304` costs no rate
 /// limit), walked past page 1 (#10389): a repo can have more than one page
@@ -853,9 +900,6 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
 /// starred issues (`None` when a listing failed or the repo lists no PR).
 type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
 
-/// One repo's slug and each listed PR's linked issues (`fleet.state` PR links).
-type RepoPrLinks = (String, Vec<(u32, Vec<u32>)>);
-
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
 /// when ETA is disabled.
 pub(super) async fn record(
@@ -875,7 +919,6 @@ pub(super) async fn record(
     // #10372: per repo, each listed PR's linked issues and the open starred
     // issues (`None` when any star listing failed: unknown, not unstarred).
     let mut stars: Vec<RepoStars> = Vec::new();
-    let mut pr_link_rows: Vec<RepoPrLinks> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
@@ -909,7 +952,6 @@ pub(super) async fn record(
             } else {
                 starred_issues(root).await
             };
-            pr_link_rows.push((slug.clone(), links.clone()));
             stars.push((slug.clone(), links, starred));
             repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
@@ -1051,9 +1093,6 @@ pub(super) async fn record(
                 .tracker
                 .on_star_context(slug, links, starred.as_deref(), listed_at);
         }
-        for (slug, links) in &pr_link_rows {
-            state.tracker.on_pr_links(slug, links);
-        }
         state.tracker.on_fleet_context(&fleet, events, listed_at);
     }
 
@@ -1185,12 +1224,6 @@ mod fit_swap;
 mod pr_resolved;
 mod stage_outcome;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
-#[path = "eta_fleet_input.rs"]
-mod fleet_input;
-pub(super) use fleet_input::fleet_state_input;
-#[path = "eta_listings.rs"]
-mod listings;
-pub use listings::{pr_links, pr_views};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

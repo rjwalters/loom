@@ -99,8 +99,8 @@ pub struct ListedPr {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct FleetView {
-    pub(super) roster: Vec<RosterEntry>,
+struct FleetView {
+    roster: Vec<RosterEntry>,
     /// The roster as a hold-aware model's training sees it (#10312): a
     /// tracked released `merge_wait` PR enters at its release. Captured with
     /// `roster`, from the tracker's state at the same observation.
@@ -175,10 +175,7 @@ impl PlanView {
 /// What the last pass observed.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PassContext {
-    pub(super) fleet: Option<FleetView>,
-    /// Each listed PR's linked issues (closing keywords and `Part of`), per
-    /// repo, as the last pass read them (#10196).
-    pub(super) pr_links: BTreeMap<(String, u32), Vec<u32>>,
+    fleet: Option<FleetView>,
     pub(super) plan: Option<PlanView>,
     /// Each listed PR's star timeline as the passes observed it (#10333),
     /// carried from pass to pass; a PR that leaves the listings drops out.
@@ -327,17 +324,6 @@ pub fn events_from_journal(rows: &[JournalEntry], known_at: DateTime<Utc>) -> Ev
     EventLog { from, events }
 }
 
-/// One repo's open review-label PRs from the last fleet view (#10196).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoPrCensus {
-    /// Lowercased `owner/repo`.
-    pub repo: String,
-    /// Distinct open PRs.
-    pub open: u32,
-    /// `open` by stage name; `held` for a PR with no single stage.
-    pub by_stage: BTreeMap<String, u32>,
-}
-
 impl Tracker {
     /// The fleet snapshots, loaded at `now` (#10500): the label-transition
     /// timeline the tracker dates a first-seen PR's stage entry and rework
@@ -346,50 +332,6 @@ impl Tracker {
     /// before the pass's listings.
     pub fn on_fleet_snapshots(&mut self, snapshots: &[FleetSnapshot], now: DateTime<Utc>) {
         self.context.timeline = Timeline::from_snapshots(snapshots, now);
-    }
-
-    /// The last fleet view's per-repo open-PR census and when it was
-    /// observed, one entry per completely listed repo, in repo order. `None`
-    /// before the first pass. A read of state the pass already stored, with
-    /// no estimation and no I/O (#10196).
-    #[must_use]
-    pub fn pr_census(&self) -> Option<(DateTime<Utc>, Vec<RepoPrCensus>)> {
-        let view = self.context.fleet.as_ref()?;
-        let mut by_repo: BTreeMap<&str, BTreeMap<u32, &'static str>> = view
-            .scope
-            .iter()
-            .map(|repo| (repo.as_str(), BTreeMap::new()))
-            .collect();
-        for entry in &view.roster {
-            let stage = entry.stage.map_or("held", |s| s.as_str());
-            by_repo
-                .entry(entry.repo.as_str())
-                .or_default()
-                .insert(entry.pr, stage);
-        }
-        let census = by_repo
-            .into_iter()
-            .map(|(repo, prs)| {
-                let mut by_stage: BTreeMap<String, u32> = BTreeMap::new();
-                for stage in prs.values() {
-                    *by_stage.entry((*stage).to_string()).or_default() += 1;
-                }
-                RepoPrCensus {
-                    repo: repo.to_string(),
-                    open: to_u32(prs.len()),
-                    by_stage,
-                }
-            })
-            .collect();
-        Some((view.observed_at, census))
-    }
-
-    /// The last dispatch plan's `(max_concurrent, occupancy)`, or `None`
-    /// before the first plan (#10196).
-    #[must_use]
-    pub fn plan_slots(&self) -> Option<(u32, Option<u32>)> {
-        let plan = self.context.plan.as_ref()?;
-        Some((plan.max_concurrent, plan.occupancy))
     }
 
     /// The fleet view one pass observed at `observed_at`: each completely

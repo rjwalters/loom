@@ -63,17 +63,6 @@ impl SweepRegistry {
             .values()
             .any(|info| info.overflow && !info.state.is_terminal())
     }
-
-    /// The ids of the non-terminal sweeps marked overflow, i.e. the sweep
-    /// holding the host's overflow slot (`fleet.state`'s `slot`, #10196).
-    #[must_use]
-    pub fn overflow_sweep_ids(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .filter(|(_, info)| info.overflow && !info.state.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -87,10 +76,8 @@ mod tests {
         let (mut reg, _) = fixture_registry(dir.path());
         let live = insert_running_at(&mut reg, 7, 1, chrono::Utc::now());
         assert!(!reg.overflow_in_flight());
-        assert!(reg.overflow_sweep_ids().is_empty());
         assert!(reg.mark_overflow(&live));
         assert!(reg.overflow_in_flight());
-        assert_eq!(reg.overflow_sweep_ids(), vec![live.clone()]);
         assert!(reg.get(&live).unwrap().overflow);
         assert!(!reg.mark_overflow("sweep-issue-404-1"), "unknown sweep");
 
@@ -99,7 +86,6 @@ mod tests {
         assert!(reg.mark_overflow("sweep-issue-8-1"));
         reg.entries.remove(&live);
         assert!(!reg.overflow_in_flight());
-        assert!(reg.overflow_sweep_ids().is_empty(), "a terminal sweep holds no slot");
     }
 
     #[test]

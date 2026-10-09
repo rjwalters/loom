@@ -1253,7 +1253,7 @@ pub fn spawn_task(
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
-    // read from the ETA tracker on the collector's snapshot pass.
+    // built on the collector's snapshot pass whether or not ETA is enabled.
     fleet_state::register_sink(otlp_queues.clone(), &host_id);
     let eta_handle =
         eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());

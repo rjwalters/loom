@@ -1,30 +1,44 @@
-//! `fleet.state` (Issue #10196, slice 2): one host's in-flight items and its
-//! repos' open-PR census, exported to SigNoz as OTLP logs so the fleet can be
-//! rebuilt at any instant `t` from SigNoz alone.
+//! `fleet.state` (Issue #10196): one host's own view of the queue and of the
+//! work it holds, exported to SigNoz as OTLP logs so the fleet can be rebuilt
+//! at any instant `t` from SigNoz alone.
 //!
 //! # Why a new kind
 //!
 //! `queue.snapshot` and `eta.snapshot` are native-HTTPS only (dashboard state
-//! keys). `queue.snapshot` holds only the ready queue, and neither has an
-//! entered-at, host or slot field. This kind is the slim state record a replay
-//! reader (`defaults/docs/telemetry-replay.md`) needs. It holds one row per
-//! in-flight `(repo, issue)` with stage, entered-at, PR, host and slot, plus a
-//! per-repo open-PR census.
+//! keys), and neither has an entered-at, host or slot field. This kind is the
+//! slim state record a replay reader (`defaults/docs/telemetry-replay.md`)
+//! needs: one row per `(repo, issue)` this host can see (the sweeps it holds,
+//! the PRs under a Loom review label, its ready queue with each item's planner
+//! rank and ranking inputs) plus a per-repo open-PR census.
 //!
-//! # Anchors and deltas
+//! # Every host emits its own view
+//!
+//! Nothing is elected. Each daemon reports what it holds and what it sees;
+//! two hosts reporting the same PR in review are two true views, and readers
+//! reconcile (`telemetry-replay.md`). The record does not depend on the ETA
+//! subsystem: it is emitted whenever an OTLP exporter exists.
+//!
+//! # Anchors, deltas and chunks
 //!
 //! The emitter (`observability::fleet_state`) runs on the collector's 5-minute
 //! snapshot pass. It sends a **full anchor** (`anchor: true`, every row) on its
-//! first pass and then at least every [`ANCHOR_INTERVAL_SECS`]. Between anchors
-//! it sends a **delta** (`anchor: false`) only when something changed. A delta
-//! holds the changed or added rows, the issues that left (`removed`), and the
-//! full census of each repo it names. A pass with no change sends nothing.
+//! first pass, whenever the planner stamps change, and at least every
+//! [`ANCHOR_INTERVAL_SECS`]. Between anchors it sends a **delta**
+//! (`anchor: false`) only when something changed: the changed or added rows,
+//! the issues that left (`removed`), and the full census of each repo it names.
 //!
-//! A reader reconstructs `t` by taking the newest anchor knowable before `t`
-//! and applying, in `as_of` order, every delta whose `anchor_as_of` names that
-//! anchor. Each delta's `prev_as_of` names the record it applies on top of, so
-//! a lost delta shows up as a broken chain. The reader then falls back to the
-//! next anchor instead of rebuilding wrong state.
+//! There is **no row cap**. A record whose JSON would exceed
+//! [`CHUNK_BYTES`] is split by [`split_into_chunks`] into several records that
+//! share `as_of` and carry `chunk_index` / `chunk_count`; nothing is dropped.
+//! The chunk size exists only because one OTLP/gRPC message is limited to
+//! about 4 MB. A reader treats a record as complete only when it has all
+//! `chunk_count` chunks.
+//!
+//! # Regime stamps
+//!
+//! Every record carries `planner_version`, `planner_config_hash` and, when the
+//! host reads a fleet store, `fleet_config_hash`. A change in any of them is a
+//! regime boundary, and the emitter starts a new anchor there.
 //!
 //! # Anti-leak rules
 //!
@@ -38,7 +52,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::eta::Stage;
 use crate::telemetry::RepoVisibility;
 
 /// Schema tag carried in every record.
@@ -49,12 +62,11 @@ pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
 /// reconstruction base.
 pub const ANCHOR_INTERVAL_SECS: i64 = 3600;
 
-/// Most rows one record carries. Measured: a row is ~70–130 bytes of JSON
-/// (≈130 with `host` and `slot`), so a full anchor stays under ~65 KB.
-/// Rows past the cap are counted in [`FleetStateRecord::rows_truncated`].
-/// Rows held by this host's sweeps are kept first, then PR stages, then
-/// `ready_wait`.
-pub const MAX_ROWS: usize = 500;
+/// The most bytes of JSON one record carries before it is split into chunks
+/// (~1 MB, a quarter of the ~4 MB OTLP/gRPC message limit). A row is ~100-180
+/// bytes, so a 3000-row anchor is one record; chunking engages only when the
+/// queue grows several-fold, and never drops a row.
+pub const CHUNK_BYTES: usize = 1_000_000;
 
 /// Log attribute keys this kind exports besides the generic `loom.kind` /
 /// `loom.record_id`. The collector's `transform/privacy` log `keep_keys` must
@@ -67,8 +79,53 @@ pub const FLEET_STATE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet.repos",
     "loom.fleet.rows",
     "loom.fleet.removed",
-    "loom.fleet.rows_truncated",
+    "loom.fleet.chunk_index",
+    "loom.fleet.chunk_count",
 ];
+
+/// The stage an item is in, as `fleet.state` reports it. Neutral (not tied to
+/// any estimator); the wire strings are the stage names the replay contract
+/// has always used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum FleetStage {
+    /// Ready (`loom:issue`), in this host's dispatch plan.
+    #[serde(rename = "ready_wait")]
+    ReadyWait,
+    /// A sweep on this host, from dispatch until its Curator phase completes.
+    #[serde(rename = "sweep.curator")]
+    SweepCurator,
+    /// A sweep on this host, Curator done, Builder not yet done.
+    #[serde(rename = "sweep.builder")]
+    SweepBuilder,
+    /// A PR waiting for, or receiving, a Judge verdict.
+    #[serde(rename = "review_wait")]
+    ReviewWait,
+    /// Doctor rework after `loom:changes-requested`.
+    #[serde(rename = "doctor")]
+    Doctor,
+    /// Approved (`loom:pr`), waiting to merge.
+    #[serde(rename = "merge_wait")]
+    MergeWait,
+    /// Approved, held for a human by an operator hold label.
+    #[serde(rename = "merge_hold")]
+    MergeHold,
+}
+
+impl FleetStage {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetStage::ReadyWait => "ready_wait",
+            FleetStage::SweepCurator => "sweep.curator",
+            FleetStage::SweepBuilder => "sweep.builder",
+            FleetStage::ReviewWait => "review_wait",
+            FleetStage::Doctor => "doctor",
+            FleetStage::MergeWait => "merge_wait",
+            FleetStage::MergeHold => "merge_hold",
+        }
+    }
+}
 
 /// Which dispatch slot a sweep holds on its host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,13 +137,17 @@ pub enum FleetSlot {
     Overflow,
 }
 
-/// One in-flight item.
+fn is_zero(n: &u8) -> bool {
+    *n == 0
+}
+
+/// One `(repo, issue)` as this host sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRow {
     /// Issue number.
     pub issue: u32,
-    /// The ETA stage the item is in.
-    pub stage: Stage,
+    /// The stage the item is in.
+    pub stage: FleetStage,
     /// When it entered `stage`.
     pub entered_at: DateTime<Utc>,
     /// `entered_at` is a lower bound (first seen mid-stage, e.g. after a
@@ -97,27 +158,74 @@ pub struct FleetStateRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u32>,
     /// The host whose sweep holds the item. Present only when **this** host
-    /// runs it. An item seen only through a review listing (a PR in review,
-    /// built anywhere) has no known host, so the field is absent rather than
-    /// guessed.
+    /// runs it. An item seen only through a listing has no known host, so the
+    /// field is absent rather than guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// The dispatch slot the sweep holds. Present exactly when `host` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<FleetSlot>,
+    /// `ready_wait` only: this host's planner rank, the 1-based position in
+    /// the work finder's dispatch order on its last tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+    /// `ready_wait` only: starred (`loom:operator-priority`, any level).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub star: bool,
+    /// `ready_wait` only: when it was starred, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_at: Option<DateTime<Utc>>,
+    /// `ready_wait` only: the effective operator priority level (0 absent).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub level: u8,
+    /// `ready_wait` only: the repo's fleet priority (the workspace priority
+    /// tier; lower dispatches first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_priority: Option<u32>,
+    /// `ready_wait` only: the issue's creation instant, the planner's age
+    /// input. Age at a record is `as_of - created_at`; the instant is sent
+    /// instead of the age so an unchanged row stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    /// `ready_wait` only: a red-main fix the planner boosted this tick.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub main_red_fix: bool,
 }
 
-/// One repo's open-PR census at the ETA pass's listing.
+impl FleetStateRow {
+    /// A row with only the stage facts set.
+    #[must_use]
+    pub fn new(issue: u32, stage: FleetStage, entered_at: DateTime<Utc>) -> Self {
+        FleetStateRow {
+            issue,
+            stage,
+            entered_at,
+            entered_at_lower_bound: false,
+            pr: None,
+            host: None,
+            slot: None,
+            rank: None,
+            star: false,
+            star_at: None,
+            level: 0,
+            fleet_priority: None,
+            created_at: None,
+            main_red_fix: false,
+        }
+    }
+}
+
+/// One repo's open-PR census from this host's review listings.
 ///
 /// It counts the open PRs under a Loom review label (`loom:review-requested`,
-/// `loom:changes-requested`, `loom:pr`), the listings the ETA pass already
-/// reads. An open PR carrying none of them is not counted.
+/// `loom:changes-requested`, `loom:pr`). An open PR carrying none of them is
+/// not counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetPrCensus {
     /// Distinct open PRs under a review label.
     pub open: u32,
-    /// `open` by stage: `review_wait`, `doctor`, `merge_wait`, and `held` for
-    /// a PR whose labels name no single stage (a hold).
+    /// `open` by stage: `review_wait`, `doctor`, `merge_wait`, `merge_hold`,
+    /// and `held` for a PR whose labels name no single stage.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_stage: BTreeMap<String, u32>,
 }
@@ -130,8 +238,7 @@ pub struct FleetStateRepo {
     #[serde(default)]
     pub visibility: RepoVisibility,
     /// The census. Absent means unknown at `as_of`, because the repo's
-    /// listings were incomplete or not read. It never means zero. A delta
-    /// always restates the census of each repo it names.
+    /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<FleetPrCensus>,
     /// On an anchor, every row. On a delta, rows added or changed since the
@@ -153,12 +260,32 @@ pub struct FleetSlots {
     pub occupancy: Option<u32>,
 }
 
-/// `fleet.state`: one host's in-flight items and open-PR census.
+/// The planner regime a record was observed under.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerStamps {
+    /// The daemon version whose planner produced the ranks.
+    #[serde(default)]
+    pub planner_version: String,
+    /// 12 hex of sha256 over the canonical JSON of the planner-relevant
+    /// effective config (`autonomous.workFinder`, `autonomous.mergeSequencing`).
+    #[serde(default)]
+    pub planner_config_hash: String,
+    /// The fleet store commit this host's last config pass resolved. Absent
+    /// when the host reads no fleet store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_config_hash: Option<String>,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// `fleet.state`: one host's view of its held work, review PRs and queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStateRecord {
     /// Always [`FLEET_STATE_SCHEMA`].
     pub schema: String,
-    /// The instant the state describes (the pass's tracker read).
+    /// The instant the state describes. Shared by every chunk of a record.
     pub as_of: DateTime<Utc>,
     /// `true` for a full anchor, `false` for a delta.
     pub anchor: bool,
@@ -168,20 +295,26 @@ pub struct FleetStateRecord {
     /// Delta only: the `as_of` of the record this delta applies on top of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_as_of: Option<DateTime<Utc>>,
-    /// When the census listings were read. Absent when no listing pass has
-    /// completed yet.
+    /// 0-based position of this chunk among the record's chunks.
+    #[serde(default)]
+    pub chunk_index: u32,
+    /// How many chunks the record at `as_of` was split into (1 = unsplit).
+    #[serde(default = "one")]
+    pub chunk_count: u32,
+    /// The planner regime stamps.
+    #[serde(flatten)]
+    pub stamps: PlannerStamps,
+    /// When the review listings were read. Absent when none completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census_at: Option<DateTime<Utc>>,
     /// Slot use from the last dispatch plan, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<FleetSlots>,
     /// On an anchor, every repo with rows or a census. On a delta, only the
-    /// repos that changed. Ordered by repo.
+    /// repos that changed. Ordered by repo. A chunk carries a slice of them;
+    /// one repo's rows may span chunks.
     #[serde(default)]
     pub repos: Vec<FleetStateRepo>,
-    /// In-flight rows dropped by the [`MAX_ROWS`] cap at this pass.
-    #[serde(default)]
-    pub rows_truncated: usize,
 }
 
 impl FleetStateRecord {
@@ -196,6 +329,91 @@ impl FleetStateRecord {
     pub fn removed_count(&self) -> usize {
         self.repos.iter().map(|r| r.removed.len()).sum()
     }
+}
+
+fn json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(0, |v| v.len())
+}
+
+/// Split `record` into chunks whose JSON is at most `max_bytes` each (one
+/// chunk, unchanged but for `chunk_index: 0, chunk_count: 1`, when it fits).
+/// Every chunk shares the header (`as_of`, `anchor`, stamps, `slots`, ...);
+/// the repos' rows and `removed` entries are packed in order, so the union of
+/// the chunks is exactly `record`: nothing is dropped. A repo whose entries
+/// span chunks repeats its `repo`, `visibility` and `census` in each. Pure.
+#[must_use]
+pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<FleetStateRecord> {
+    record.chunk_index = 0;
+    record.chunk_count = 1;
+    if json_len(&record) <= max_bytes {
+        return vec![record];
+    }
+    let repos = std::mem::take(&mut record.repos);
+    // Header plus room for multi-digit chunk numbers.
+    let budget = max_bytes.saturating_sub(json_len(&record) + 32);
+    let mut chunks: Vec<Vec<FleetStateRepo>> = Vec::new();
+    let mut current: Vec<FleetStateRepo> = Vec::new();
+    let mut used = 0;
+    for repo in repos {
+        let shell = FleetStateRepo {
+            rows: Vec::new(),
+            removed: Vec::new(),
+            ..repo.clone()
+        };
+        // `,"rows":[]` and `,"removed":[]` plus the separating comma.
+        let shell_len = json_len(&shell) + 24;
+        let mut piece: Option<FleetStateRepo> = None;
+        let units = repo
+            .rows
+            .into_iter()
+            .map(Ok)
+            .chain(repo.removed.into_iter().map(Err));
+        for unit in units {
+            let unit_len = match &unit {
+                Ok(row) => json_len(row),
+                Err(issue) => json_len(issue),
+            } + 1;
+            let opening = if piece.is_none() { shell_len } else { 0 };
+            if used + opening + unit_len > budget && (piece.is_some() || !current.is_empty()) {
+                current.extend(piece.take());
+                chunks.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            let entry = piece.get_or_insert_with(|| {
+                used += shell_len;
+                shell.clone()
+            });
+            match unit {
+                Ok(row) => entry.rows.push(row),
+                Err(issue) => entry.removed.push(issue),
+            }
+            used += unit_len;
+        }
+        // A repo with neither rows nor removals (a census-only entry).
+        let piece = piece.unwrap_or_else(|| {
+            if used + shell_len > budget && !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            used += shell_len;
+            shell
+        });
+        current.push(piece);
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    let count = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, repos)| FleetStateRecord {
+            chunk_index: u32::try_from(i).unwrap_or(u32::MAX),
+            chunk_count: count,
+            repos,
+            ..record.clone()
+        })
+        .collect()
 }
 
 #[cfg(test)]

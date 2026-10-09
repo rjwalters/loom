@@ -2692,51 +2692,72 @@ artifact is still held, and which mechanism removed each `loom:blocked`):
 
 ### `fleet.state`
 
-This host's in-flight items and its repos' open-PR census (Issue #10196,
-slice 2). It is the state record of the replay contract
-([`telemetry-replay.md`](telemetry-replay.md)). Envelopes carry
+This host's own view of the work it holds, the PRs under review in its repos,
+and its ready queue (Issue #10196). It is the state record of the replay
+contract ([`telemetry-replay.md`](telemetry-replay.md)). Envelopes carry
 `schema_version: 12` (the shared post-#8921 gate). The kind is **OTLP-only**:
 one log record per envelope, with the record JSON as the log **body** and a few
 `loom.fleet.*` scalars as attributes. `queue.snapshot` and `eta.snapshot` stay
 native-HTTPS dashboard keys and are unchanged.
 
-The collector builds it on the `host.health` interval, right after the ETA
-pass. It is a reader of state the ETA tracker already keeps: the tracker's
-live items, the review listings that pass read, and the last dispatch plan,
-plus the sweep registries' overflow marks. It makes no forge read of its own,
-and the ETA estimator is not touched. **No record at all** in two cases: ETA
-disabled (`autonomous.eta.enabled = false`, so there is no tracker) or no OTLP
-exporter. With ETA on, an anchor with zero rows is still sent, because it
-truthfully says "nothing in flight here".
+The collector builds it on the `host.health` interval. **Every host emits its
+own view; nothing is elected.** The record does not depend on ETA: it is sent
+whenever an OTLP exporter exists, whatever `autonomous.eta.enabled` says, and
+**no record at all** only when there is no OTLP exporter. An anchor with zero
+rows is still sent, because it truthfully says "nothing here". Rows come from
+three non-ETA sources:
 
-A row is keyed by issue. A listed PR whose body only says `Part of #N` (no closing
-keyword) is not a tracker item, so its row comes from the review roster and
-the pass's PR links instead: the first issue its body links, no `host` or
-`slot`, and `entered_at_lower_bound: true`. A tracker item for the same issue
-wins, then the lowest PR number. A PR linking no issue has no row and is in
-the census only.
+| Source | Rows | Notes |
+|---|---|---|
+| Sweep registries | the sweeps this host runs (`host`, `slot` set) | stage from the sweep's own checkpoint marker: none → `sweep.curator` (entered at dispatch), `curator-done` → `sweep.builder`, `builder-done` / `doctor-done` → `review_wait`, `judge-rejected` → `doctor`, `judge-done` / `merge-done` → `merge_wait`; `entered_at` is the marker's `timestamp` |
+| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings (a `304` is free). A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
+| Work finder's last tick | `ready_wait` for every ready-queue row that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks |
+
+When sources overlap on one `(repo, issue)`, the held row wins, then the PR
+row, then the `ready_wait` row. A listing row still in the same stage keeps its
+`entered_at` from pass to pass; a row new to a listing that was complete on the
+previous pass entered at this pass's `as_of`; any other row is first seen
+mid-stage and carries `entered_at_lower_bound: true`. A managed repo whose
+listing failed keeps that source's previous rows, and its `census` is absent.
 
 **Anchors and deltas.** The first pass of a daemon process sends a full
 **anchor** (`anchor: true`, every row), and so does any pass at which the last
-anchor is at least 3600 s old. Between anchors a pass sends a **delta**
-(`anchor: false`) only if rows, a census, the plan slots or `rows_truncated`
-changed. A delta
-holds the added or changed rows, the issues that left (`removed`), and the
-**full** census of each repo it names. A pass with no change sends nothing. The
-change test ignores `census_at`. A delta sent only because `rows_truncated`
-moved has an empty `repos`.
+anchor is at least 3600 s old or the planner stamps changed (a regime
+boundary). Between anchors a pass sends a **delta** (`anchor: false`) only if
+rows, a census or the plan slots changed. A delta holds the added or changed
+rows, the issues that left (`removed`), and the **full** census of each repo it
+names. A pass with no change sends nothing. The change test ignores
+`census_at`. A planner rank shift changes every row behind it, so it is a
+change.
+
+**No row cap; chunks by bytes.** Nothing is ever dropped. A record whose JSON
+would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
+limit) is split into several log records that share `as_of` and every header
+field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
+packed in order, and a repo that spans chunks repeats its `repo`,
+`visibility` and `census` in each. A ~3000-row queue (~100-180 bytes a row) is
+one record with `chunk_count: 1`. A reader uses a record only once it holds
+all `chunk_count` chunks of that `(host, as_of)`.
 
 | Field | Type | Notes |
 |---|---|---|
 | `schema` | string | `fleet-state/v1` |
-| `as_of` | RFC 3339 | the instant described; also the log `timestamp` |
+| `as_of` | RFC 3339 | the instant described; also the log `timestamp`; shared by every chunk |
 | `anchor` | bool | full anchor (`true`) or delta (`false`) |
 | `anchor_as_of` | RFC 3339 | the `as_of` of the anchor this record's chain started from (equal to `as_of` on an anchor) |
 | `prev_as_of` | RFC 3339, optional | delta only: the `as_of` of the record this delta applies on top of. A gap in the chain means a lost delta |
-| `census_at` | RFC 3339, optional | when the census listings were read |
+| `chunk_index` | integer | 0-based chunk number (missing decodes to `0`) |
+| `chunk_count` | integer | chunks the record at `as_of` was split into; `1` when unsplit (missing decodes to `1`) |
+| `planner_version` | string | the daemon version whose planner produced the ranks |
+| `planner_config_hash` | string | 12 hex of sha256 over the canonical JSON (sorted keys, no whitespace) of the effective `autonomous.workFinder` and `autonomous.mergeSequencing` blocks; unrelated config never moves it |
+| `fleet_config_hash` | string, optional | the fleet store commit this host's last fleet-sync config pass resolved; absent on a host with no fleet store |
+| `census_at` | RFC 3339, optional | when the review listings were read |
 | `slots` | object, optional | `{max_concurrent, occupancy?}` from the last work-finder dispatch plan |
 | `repos[]` | array | per repo, ordered by slug. An anchor lists every repo with rows or a census; a delta lists only repos that changed |
-| `rows_truncated` | integer | in-flight rows dropped by the 500-row cap (host-held rows kept first, then PR stages, then `ready_wait`) |
+
+A change in `planner_version`, `planner_config_hash` or `fleet_config_hash`
+marks a regime boundary; the emitter starts a fresh anchor there, so a reader
+can cut its window at the boundary instead of guessing.
 
 Each `repos[]` entry:
 
@@ -2744,30 +2765,35 @@ Each `repos[]` entry:
 |---|---|---|
 | `repo` | string | forge `owner/repo`, lowercased, never a local path |
 | `visibility` | `public` / `private` | missing or unknown decodes to `private` |
-| `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label (`loom:review-requested`, `loom:changes-requested`, `loom:pr`), with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `held`. **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
+| `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
 | `removed[]` | integers, optional | delta only: issues that left. A repo that left entirely has every prior issue here and no `census` |
 
-Each row (slim: about 70 to 130 bytes):
+Each row:
 
 | Field | Type | Notes |
 |---|---|---|
 | `issue` | integer | issue number |
-| `stage` | string | ETA stage: `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait` |
+| `stage` | string | `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`, `merge_hold` |
 | `entered_at` | RFC 3339 | when the item entered `stage` |
 | `entered_at_lower_bound` | bool, optional | present (`true`) when `entered_at` is only a lower bound, for example when the item was first seen mid-stage after a restart |
 | `pr` | integer, optional | the PR, when known |
-| `host` | string, optional | the host whose sweep holds the item. Present **only** when the emitting host runs it. A PR seen through a review listing has no known builder host, so the field is absent rather than guessed |
+| `host` | string, optional | the host whose sweep holds the item. Present **only** when the emitting host runs it; absent rather than guessed otherwise |
 | `slot` | `regular` / `overflow`, optional | the dispatch slot that sweep holds (`overflow` = the host's single `loom:operator-priority` overflow slot, #9244). Present exactly when `host` is |
+| `rank` | integer, optional | `ready_wait` only: this host's planner rank (1-based position in its dispatch order on the last work-finder tick). Per host: two hosts' ranks for one issue are two true answers |
+| `star` | bool, optional | `ready_wait` only: starred at any level (absent = `false`) |
+| `star_at` | RFC 3339, optional | `ready_wait` only: when it was starred, when known |
+| `level` | integer, optional | `ready_wait` only: effective operator priority level (absent = `0`) |
+| `fleet_priority` | integer, optional | `ready_wait` only: the repo's fleet (workspace) priority tier; lower dispatches first |
+| `created_at` | RFC 3339, optional | `ready_wait` only: the issue's creation instant, the planner's age input (age = `as_of - created_at`; the instant is sent so an unchanged row stays unchanged) |
+| `main_red_fix` | bool, optional | `ready_wait` only: a red-main fix the planner boosted this tick (absent = `false`) |
 
 Log attributes besides `loom.kind` and `loom.record_id`
 (`FLEET_STATE_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`
 `keep_keys`, contract-tested): `loom.fleet.schema`, `loom.fleet.anchor`,
 `loom.fleet.anchor_as_of`, `loom.fleet.repos`, `loom.fleet.rows`,
-`loom.fleet.removed`, `loom.fleet.rows_truncated`. Every review-listed PR is
-tracked by every host that manages its repo, so two hosts can each report the
-same `review_wait` row. A reader merges by `(repo, issue)` and prefers the row
-that carries a `host`.
+`loom.fleet.removed`, `loom.fleet.chunk_index`, `loom.fleet.chunk_count`.
+Each chunk is its own record with its own `loom.record_id`.
 
 ### `tokens.snapshot`
 
