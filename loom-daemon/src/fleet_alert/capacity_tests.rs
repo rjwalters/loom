@@ -9,7 +9,7 @@ use chrono::{Duration as Cd, TimeZone, Utc};
 
 use super::capacity::{KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG};
 use super::state::{AlertState, Kind, Transition};
-use super::task::{inbox_payload, run_tick, AlertSink};
+use super::task::{inbox_payload, run_tick, AlertSink, TickContext};
 use super::{classify, TokenCause};
 use crate::types::{
     CapView, CapacityReport, DaemonStatusReport, QueueDisposition, ReadyQueueRow,
@@ -87,7 +87,7 @@ fn t0() -> chrono::DateTime<Utc> {
 #[test]
 fn a_disk_limited_cap_and_a_starred_backlog_each_name_the_numbers() {
     let c = classify(&status(disk_limited(), 106), t0(), WINDOW, TokenCause::Exhausted);
-    let keys: Vec<_> = c.iter().map(|c| c.key).collect();
+    let keys: Vec<_> = c.iter().map(|c| c.key.as_str()).collect();
     assert_eq!(keys, vec![KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG]);
     let cap = &c[0];
     assert!(cap.headline.contains("Disk headroom"), "{}", cap.headline);
@@ -115,7 +115,7 @@ fn a_configured_cap_with_a_short_queue_asks_nothing() {
     assert!(classify(&status(configured, 12), t0(), WINDOW, TokenCause::Exhausted).is_empty());
     // A disk-limited cap is an ask even with nothing starred.
     let c = classify(&status(disk_limited(), 0), t0(), WINDOW, TokenCause::Exhausted);
-    assert_eq!(c.iter().map(|c| c.key).collect::<Vec<_>>(), vec![KEY_CAPACITY_LIMITED]);
+    assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_CAPACITY_LIMITED]);
     assert!(!c[0].headline.contains("starred"));
 }
 
@@ -131,11 +131,14 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         run_tick(
             &mut st,
             &sinks,
-            Some(&s),
+            &TickContext {
+                status: Some(&s),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(i64::from(m)),
-            WINDOW,
-            "worker-1",
-            None,
         );
     }
     let sent = inbox.lock().unwrap().clone();
@@ -157,11 +160,14 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         cleared.extend(run_tick(
             &mut st,
             &sinks,
-            Some(&status(freed, 12)),
+            &TickContext {
+                status: Some(&status(freed, 12)),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(m),
-            WINDOW,
-            "worker-1",
-            None,
         ));
     }
     assert_eq!(cleared.len(), 2);
