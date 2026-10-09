@@ -3059,9 +3059,11 @@ moved to a host that does not produce fires like a stalled one (within the
 row's deadline: 2 x cadence, or the captain-gauge `maxAgeSecs`). A separate
 `fleet-output-watch` thread reads every 5 min: the SigNoz logs table through
 the ETA reader's ClickHouse endpoint (`autonomous.eta.fleetRefresh.signoz.*`,
-newest record per kind and repo over 72 h) and the fleet store's
-`captain-gauges/v1` heartbeat; the alert tick only takes its latest reading, so
-the alert path itself still makes no network call. Per-repo rows are judged
+newest record per kind and repo over 72 h) and the captain's own
+`captain-gauges/v1` state (what its gauge passes last produced, read in-process,
+never from the fleet store); the alert tick only takes its latest reading. No
+forge call is made anywhere in this path (a source scan pins it), so a
+rate-limited `gh` neither delays an alert nor makes a gauge row fire. Per-repo rows are judged
 against the roster in the fleet store's on-disk cache; `eta.estimate` only
 against repos with an open item (a `sweep.started` not yet closed by a `land`
 `eta.outcome`) whose newest estimate is not a refusal. **Absent data fires**:

@@ -194,3 +194,27 @@ fn store_read_error_alerts_critical_through_run_tick() {
     let keys: BTreeSet<&str> = started.iter().map(|t| t.key.as_str()).collect();
     assert_eq!(keys.len(), started.len());
 }
+
+/// The module invariant (`fleet_alert/mod.rs`): no forge call anywhere in the
+/// alert path, so a rate-limited `gh` can neither delay an alert nor make a
+/// gauge row fire as unreadable (#10916).
+#[test]
+fn no_forge_call_in_output_feed() {
+    let code: String = include_str!("output_feed.rs")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "fetch_heartbeat",
+        "GhTransport",
+        "fleet_store::gh",
+        "hb_store",
+        "Command::new",
+    ] {
+        assert!(
+            !code.contains(needle),
+            "output_feed.rs must make no forge call, but mentions `{needle}`"
+        );
+    }
+}

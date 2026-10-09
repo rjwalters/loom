@@ -8,12 +8,15 @@
 //! - SigNoz logs, through the ClickHouse endpoint the ETA SigNoz reader
 //!   already uses (`autonomous.eta.fleetRefresh.signoz.endpoint` / `user` /
 //!   `credentialFile`; no new config surface);
-//! - the fleet store's `captain-gauges/v1` heartbeat (one conditional read).
+//! - the captain's own `captain-gauges/v1` state: what its gauge passes last
+//!   produced, read in-process (the watchdog runs on the captain, which is
+//!   the host that publishes the heartbeat). No store read, so no forge call.
 //!
-//! The reads are network calls, and the alert path makes none (its alerts
-//! must arrive while `gh` is rate-limited), so a separate refresher thread
-//! reads every [`REFRESH`] and the alert thread only takes its latest
-//! [`Reading`]. Failing loud, never silent:
+//! **No forge calls anywhere in this module**, so a rate-limited `gh` can
+//! neither block an alert nor make a gauge row fire as unreadable (pinned by
+//! `no_forge_call_in_output_feed`). The one network read is SigNoz, so a
+//! separate refresher thread reads every [`REFRESH`] and the alert thread
+//! only takes its latest [`Reading`]. Failing loud, never silent:
 //!
 //! - a failed read is the affected rows' firing condition, once the last
 //!   good read of that store is older than [`STALE_AFTER`] (so one transient
@@ -33,9 +36,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::fleet_outputs::observed::{self, Observed, Reading, Row};
-use crate::observability::captain_gauges::store::{
-    self as hb_store, FetchCache, Fetched, Heartbeat,
-};
+use crate::observability::captain_gauges::store::Heartbeat;
 
 /// The watchdog's singleton job name (armed on the captain only).
 pub const SINGLETON_JOB_NAME: &str = "fleet-output-watchdog";
@@ -52,11 +53,11 @@ pub trait OutputReader {
     ///
     /// Unconfigured, unreachable or refused.
     fn signoz(&mut self, now: DateTime<Utc>) -> Result<String, String>;
-    /// The captain-gauge heartbeat (`None`: the store has none).
+    /// What the captain's gauge passes last produced (`None`: nothing yet).
     ///
     /// # Errors
     ///
-    /// Unconfigured or unreadable.
+    /// The state could not be read.
     fn heartbeat(&mut self) -> Result<Option<Heartbeat>, String>;
     /// The fleet roster (lowercased `owner/repo`); empty when unknown.
     fn roster(&mut self) -> Vec<String>;
@@ -222,7 +223,7 @@ impl Feed {
 }
 
 fn refresh_loop(root: &Path, host: &str, slot: &Mutex<Slot>) {
-    let mut reader = LiveReader::new(root.to_path_buf());
+    let mut reader = LiveReader::new(root.to_path_buf(), host.to_string());
     let mut refresher = Refresher::default();
     loop {
         // A pure config read: only the captain spends the reads.
@@ -237,21 +238,18 @@ fn refresh_loop(root: &Path, host: &str, slot: &Mutex<Slot>) {
     }
 }
 
-/// The production reader: ClickHouse over HTTP, the store heartbeat through
-/// the store's own transport, the roster from the store cache. Config is
+/// The production reader: ClickHouse over HTTP, the gauge heartbeat from the
+/// captain's in-process state, the roster from the store cache. Config is
 /// re-resolved on every read.
 pub struct LiveReader {
     root: PathBuf,
-    cache: FetchCache,
+    host: String,
 }
 
 impl LiveReader {
     #[must_use]
-    pub fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            cache: FetchCache::default(),
-        }
+    pub fn new(root: PathBuf, host: String) -> Self {
+        Self { root, host }
     }
 }
 
@@ -279,14 +277,7 @@ impl OutputReader for LiveReader {
     }
 
     fn heartbeat(&mut self) -> Result<Option<Heartbeat>, String> {
-        let effective = crate::config_resolver::resolve_effective_config(&self.root);
-        let (loc, _) = hb_store::location_for(&effective, &|k| std::env::var(k).ok())
-            .ok_or_else(|| "no fleet store configured (fleet.repo)".to_string())?;
-        match hb_store::fetch_heartbeat(&self.root, &loc, &mut self.cache) {
-            Fetched::Updated | Fetched::NotModified => Ok(self.cache.heartbeat.clone()),
-            Fetched::Absent => Ok(None),
-            Fetched::Failed(e) => Err(e),
-        }
+        Ok(crate::observability::captain_gauges::produced_heartbeat(&self.host, Utc::now()))
     }
 
     fn roster(&mut self) -> Vec<String> {

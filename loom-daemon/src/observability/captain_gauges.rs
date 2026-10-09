@@ -461,6 +461,16 @@ pub fn captain_covers(job: &str, slug: &str) -> bool {
     })
 }
 
+/// What this host's own passes last produced, as the heartbeat it would
+/// publish at `now`; `None` before any job has finished. In-process state
+/// only (no store read, no forge call): the output watchdog runs on the
+/// captain and reads the gauge `as_of` here, so a rate-limited `gh` cannot
+/// make it fire (#10916).
+#[must_use]
+pub fn produced_heartbeat(host: &str, now: DateTime<Utc>) -> Option<Heartbeat> {
+    with(|s| (!s.produced.is_empty()).then(|| Heartbeat::new(host, now, s.produced.clone())))
+}
+
 /// Record that this host finished producing `job` for `repos` at `at` (its
 /// points are with the sink). Cheap and unconditional; only the captain
 /// publishes it.
