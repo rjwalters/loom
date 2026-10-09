@@ -30,7 +30,7 @@ pub const MAX_ROWS: usize = 20_000;
 /// One scored outcome's stage attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttributionRow {
-    /// The estimate scored; the fold's dedup key.
+    /// The estimate scored.
     pub estimate_id: String,
     /// The heuristic that made it.
     pub heuristic: String,
@@ -40,6 +40,10 @@ pub struct AttributionRow {
     pub repo: String,
     /// The issue.
     pub issue: u32,
+    /// The PR, when one existed: with `issue` and `actual_at` it names the
+    /// resolved case. Absent in a row written before it was logged.
+    #[serde(default)]
+    pub pr_number: Option<u32>,
     /// When the estimate was made.
     pub as_of: DateTime<Utc>,
     /// When the outcome happened.
@@ -67,6 +71,7 @@ impl AttributionRow {
             kind: resolved.estimate.kind,
             repo: resolved.estimate.repo.clone(),
             issue: resolved.estimate.issue,
+            pr_number: resolved.estimate.pr_number,
             as_of: resolved.estimate.as_of,
             actual_at: resolved.score.actual_at,
             observed_at,

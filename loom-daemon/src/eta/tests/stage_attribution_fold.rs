@@ -51,6 +51,7 @@ fn row(
         kind: Kind::Land,
         repo: "rjwalters/loom".into(),
         issue: 1,
+        pr_number: None,
         as_of: actual_at - Duration::hours(1),
         actual_at,
         observed_at: actual_at,
@@ -149,6 +150,72 @@ fn a_row_is_counted_once_however_often_it_is_logged() {
     again.observed_at += Duration::seconds(5);
     assert_eq!(records(&[a.clone(), again, a.clone()]), once);
     assert_eq!(records(std::slice::from_ref(&a)), once, "a re-run is the same records");
+}
+
+#[test]
+fn a_resolved_case_counts_once_per_heuristic_however_many_estimates_it_resolved() {
+    // One land outcome resolves every refresh estimate of its series: three
+    // estimate ids, one case (same issue, PR and `actual_at`).
+    let mut first = row("r0", "h1", 100, 30, -10, 5);
+    first.pr_number = Some(7);
+    first.as_of = first.actual_at - Duration::hours(3);
+    let mut refreshes = vec![first.clone()];
+    for (i, h) in [(1, 2), (2, 1)] {
+        let mut r = first.clone();
+        r.estimate_id = format!("r{i}");
+        r.as_of = r.actual_at - Duration::hours(h);
+        // Different predictions of the same case must not outweigh it.
+        r.attribution
+            .stages
+            .get_mut(&Stage::SweepBuilder)
+            .unwrap()
+            .contribution_sec = 900;
+        refreshes.push(r);
+    }
+    // A second PR on the same issue, resolving at the same instant, and a
+    // later lap of the first PR, are distinct cases.
+    let mut other_pr = first.clone();
+    other_pr.estimate_id = "p8".into();
+    other_pr.pr_number = Some(8);
+    other_pr
+        .attribution
+        .stages
+        .get_mut(&Stage::SweepBuilder)
+        .unwrap()
+        .contribution_sec = 10;
+    let mut lap2 = first.clone();
+    lap2.estimate_id = "l2".into();
+    lap2.actual_at -= Duration::days(1);
+    lap2.as_of = lap2.actual_at - Duration::hours(1);
+    lap2.attribution
+        .stages
+        .get_mut(&Stage::SweepBuilder)
+        .unwrap()
+        .contribution_sec = 20;
+    // Another heuristic's estimate of the same case is its own contribution.
+    let mut h2 = first.clone();
+    h2.estimate_id = "h2".into();
+    h2.heuristic = "h2".into();
+
+    let mut rows = refreshes;
+    rows.extend([other_pr, lap2, h2]);
+    let out = records(&rows);
+    let builder = find(&out, "h1", "sweep.builder");
+    // Three cases: the earliest-predicted estimate (30), PR 8 (10), lap 2 (20).
+    assert_eq!((builder.n, builder.bias_sec), (3, Some(20.0)));
+    assert_eq!(find(&out, "h1", UNATTRIBUTED).n, 3);
+    assert_eq!(find(&out, "h2", "sweep.builder").n, 1);
+    // The refreshes' log order, and a late observation of one, change nothing.
+    rows.reverse();
+    let late = {
+        let mut r = rows[rows.len() - 2].clone();
+        r.estimate_id = "late".into();
+        r.observed_at = cutoff(day()) + Duration::seconds(1);
+        r.as_of = r.actual_at - Duration::hours(9);
+        r
+    };
+    rows.push(late);
+    assert_eq!(records(&rows), out);
 }
 
 #[test]

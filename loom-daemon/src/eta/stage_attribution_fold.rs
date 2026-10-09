@@ -7,8 +7,13 @@
 //!   was both resolved (`actual_at`) and scored by this daemon
 //!   (`observed_at`) before the cutoff, so a later outcome, or a late write
 //!   of an earlier one, leaves the day's records bit-identical.
-//! - **Exactly once.** A row is one estimate (`estimate_id`); duplicates in
-//!   the log (a retried append) count once, the earliest-observed winning.
+//! - **Exactly once.** A row is one estimate, but the unit counted is the
+//!   resolved case, as in the nightly cohort rule: one outcome resolves every
+//!   pending estimate of its series (each refresh), so the rows of one
+//!   heuristic sharing `(repo, issue, pr_number, actual_at)` are one case and
+//!   count once, the earliest-predicted (`as_of`) winning. Distinct PRs, or
+//!   laps (a different `actual_at`), on one issue stay distinct cases.
+//!   Duplicates in the log (a retried append) collapse the same way.
 //!   Each day's records are persisted once (`nightly_folds::day_path`), so a
 //!   restart does not re-fold or duplicate them.
 //! - **Row budget.** One record per registered heuristic per [`Stage`] plus
@@ -43,21 +48,33 @@ pub fn cutoff(day: NaiveDate) -> DateTime<Utc> {
     Utc.from_utc_datetime(&day.and_time(NaiveTime::MIN)) + Duration::days(1)
 }
 
+/// A resolved case of one heuristic: repo (lowercased), issue, PR and the
+/// outcome instant.
+type CaseKey<'a> = (String, u32, Option<u32>, &'a str, DateTime<Utc>);
+
 /// The rows that count for `day`: inside the window, known before the
-/// cutoff, one per estimate.
+/// cutoff, one per resolved case and heuristic.
 fn window(rows: &[AttributionRow], day: NaiveDate) -> Vec<&AttributionRow> {
     let end = cutoff(day);
     let start = end - Duration::days(i64::from(WINDOW_DAYS));
-    let mut by_id: BTreeMap<&str, &AttributionRow> = BTreeMap::new();
+    let mut by_case: BTreeMap<CaseKey, &AttributionRow> = BTreeMap::new();
     for row in rows.iter().filter(|r| {
         r.kind == Kind::Land && r.actual_at >= start && r.actual_at < end && r.observed_at < end
     }) {
-        let slot = by_id.entry(row.estimate_id.as_str()).or_insert(row);
-        if (row.observed_at, row.actual_at) < (slot.observed_at, slot.actual_at) {
+        let key = (
+            row.repo.to_ascii_lowercase(),
+            row.issue,
+            row.pr_number,
+            row.heuristic.as_str(),
+            row.actual_at,
+        );
+        let slot = by_case.entry(key).or_insert(row);
+        let rank = |r: &AttributionRow| (r.as_of, r.observed_at, r.estimate_id.clone());
+        if rank(row) < rank(slot) {
             *slot = row;
         }
     }
-    by_id.into_values().collect()
+    by_case.into_values().collect()
 }
 
 /// `(n, bias, mean abs)` of `errors`.
