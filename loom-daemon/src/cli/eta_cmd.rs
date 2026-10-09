@@ -129,7 +129,9 @@ impl EtaCommand {
 /// been accumulating (gate 2). The gates themselves live in
 /// [`shadow::evaluate`] / [`shadow::promote_if_ready`] — this command cannot
 /// relax them, and `--apply` on a failing candidate is a refusal, not an
-/// override.
+/// override. It also requires the live non-refusal check (#10949,
+/// [`loom_daemon::eta::shadow_non_refusal`]): the candidate answered at least
+/// 95% of the passes `current` answered in the last 24 h.
 #[derive(clap::Args)]
 pub(crate) struct EtaPromoteArgs {
     /// Candidate heuristic id to promote (e.g. `land-v2`).
@@ -153,6 +155,11 @@ pub(crate) struct EtaPromoteArgs {
     /// evaluation that changes nothing.
     #[arg(long)]
     pub apply: bool,
+
+    /// Where the evidence behind this promotion is published (an issue
+    /// comment or write-up URL). Recorded in the decision log (#10949).
+    #[arg(long, value_name = "URL")]
+    pub evidence: Option<String>,
 
     /// Emit the decision record as JSON instead of the human report.
     #[arg(long)]
@@ -214,7 +221,11 @@ impl EtaPromoteArgs {
         let shortlist =
             lifecycle::shortlist_for(&root, &registry, current.id(), candidate.id(), now);
         let admitted = shortlist.admits(candidate.id());
-        let mut decision = if admitted.is_ok() && self.apply {
+        // #10949: a candidate that refuses where `current` answers must not
+        // be flipped in, whatever its pinball; read before `--apply` writes.
+        let non_refusal = ledger.non_refusal(kind, current.id(), candidate.id(), now);
+        let serves = non_refusal.status == shadow::GateStatus::Passed;
+        let mut decision = if admitted.is_ok() && serves && self.apply {
             let decision = shadow::promote_if_ready(
                 &mut ledger,
                 kind,
@@ -232,11 +243,13 @@ impl EtaPromoteArgs {
             let stats = ledger.stats(kind, current.id(), candidate.id());
             shadow::evaluate(kind, current.id(), candidate.id(), comparison.as_ref(), &stats, now)
         };
+        loom_daemon::eta::shadow_non_refusal::apply(&mut decision, non_refusal);
         if let Err(why) = admitted {
             decision.promote = false;
             decision.reason = why;
         }
         decision.shortlist = Some(shortlist);
+        decision.evidence = self.evidence;
 
         // Every evaluation is recorded, promoting or not: "why has this not
         // flipped yet?" is the question an operator actually asks.
@@ -269,6 +282,12 @@ fn render_decision(d: &shadow::PromotionDecision, applied: bool) -> String {
     let _ = writeln!(out, "  gate 2 live:     {} — {}", d.live.status.as_str(), d.live.detail);
     if let Some(a) = &d.adaptation {
         let _ = writeln!(out, "  adaptation:      {:?} — {}", a.status, a.detail);
+    }
+    if let Some(n) = &d.non_refusal {
+        let _ = writeln!(out, "  non-refusal:     {} — {}", n.status.as_str(), n.detail);
+    }
+    if let Some(evidence) = &d.evidence {
+        let _ = writeln!(out, "  evidence:        {evidence}");
     }
     let _ = writeln!(out, "  decision: {}", d.reason);
     match (&d.config_path, d.promote, applied) {
