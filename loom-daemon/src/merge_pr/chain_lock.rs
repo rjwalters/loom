@@ -88,11 +88,13 @@ use crate::merge_pr::stale_checks::CheckRun;
 
 /// The marker namespace.
 pub const MARKER_PREFIX: &str = "loom:chain-head-lock";
-/// Default cap: long enough for this repo's slowest required suite (~15 min).
-pub const DEFAULT_CAP_SECS: u64 = 1200;
+/// Default cap: sized above this repo's measured required-CI duration
+/// (~45 min as of 2026-10, #11221), so a re-dated head keeps its lock until
+/// its own checks report.
+pub const DEFAULT_CAP_SECS: u64 = 7200;
 /// Upper clamp on a configured cap. The bound is the point of the mechanism,
 /// so a typo like `120000` must not quietly turn it into a `main` freeze.
-pub const MAX_CAP_SECS: u64 = 3600;
+pub const MAX_CAP_SECS: u64 = 10800;
 /// Env override for the cap (beats config).
 pub const CAP_ENV: &str = "LOOM_CHAIN_LOCK_CAP_SECS";
 /// Config key for the cap.
