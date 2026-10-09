@@ -19,9 +19,10 @@
 //! sub-pass its own, so a level that stays true costs one cheap skipped
 //! `run_for` per tick between passes, never a forge round trip.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{disk_axis_binds_cap_down, EagerReclaimReport};
+use crate::disk_admission::DiskBudget;
 
 /// Why a pass was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,16 +136,43 @@ impl EagerTrigger {
         }
     }
 
+    /// Close a tick (sync, no I/O of its own): after a pass that ran, replace
+    /// the disk term with `reprobe()`; then [`Self::observe`] that final term
+    /// and return it. `reprobe` must compute the same term the caller's cap
+    /// uses — the edge re-arms from what this records as binding, so a
+    /// different term here would mis-arm it (#11191). It is not called when
+    /// no pass ran or the pass was skipped.
+    pub fn settle(
+        &mut self,
+        reading: &TickReading,
+        pass: Option<&EagerReclaimReport>,
+        reprobe: impl FnOnce() -> usize,
+    ) -> usize {
+        let (mut disk, mut free_now) = (reading.disk, reading.free_gb);
+        if let Some(report) = pass.filter(|p| p.skipped.is_none()) {
+            disk = reprobe();
+            free_now = report.free_gb_after;
+        }
+        self.observe(
+            disk_axis_binds_cap_down(disk, reading.ram, reading.configured_max),
+            free_now,
+            pass,
+        );
+        disk
+    }
+
     /// One dispatch tick, production wiring: probe free space and the floor,
     /// run [`super::run_for`] on the blocking pool if a pass is due, and
-    /// return the disk term to finalize the cap with (re-probed after a pass
-    /// that ran, so the cap is never clamped on a stale reading).
-    pub async fn tick(
+    /// return the disk term to finalize the cap with — `reprobe()` after a
+    /// pass that ran, so the cap is never clamped on a stale reading. `disk`
+    /// and `reprobe` must be the same term (see [`Self::settle`]).
+    pub async fn tick_with(
         &mut self,
         root: &Path,
         disk: usize,
         ram: usize,
         configured_max: usize,
+        reprobe: impl FnOnce() -> usize,
     ) -> usize {
         let probe_root = root.to_path_buf();
         let (free_gb, floor_gb, step_gb) =
@@ -159,23 +187,52 @@ impl EagerTrigger {
             floor_gb,
             step_gb,
         };
-        let mut disk = disk;
-        let mut free_now = free_gb;
         let mut pass = None;
         if let Some(reason) = self.evaluate(&reading) {
             let pass_root = root.to_path_buf();
-            if let Ok(report) =
-                tokio::task::spawn_blocking(move || super::run_for(&pass_root, reason)).await
-            {
-                if report.skipped.is_none() {
-                    disk = crate::disk_headroom::disk_headroom_limit(root);
-                    free_now = report.free_gb_after;
-                }
-                pass = Some(report);
-            }
+            pass = tokio::task::spawn_blocking(move || super::run_for(&pass_root, reason))
+                .await
+                .ok();
         }
-        self.observe(disk_axis_binds_cap_down(disk, ram, configured_max), free_now, pass.as_ref());
-        disk
+        self.settle(&reading, pass.as_ref(), reprobe)
+    }
+
+    /// [`Self::tick_with`] on the legacy flat term
+    /// ([`crate::disk_headroom::disk_headroom_limit`]).
+    pub async fn tick(
+        &mut self,
+        root: &Path,
+        disk: usize,
+        ram: usize,
+        configured_max: usize,
+    ) -> usize {
+        self.tick_with(root, disk, ram, configured_max, || {
+            crate::disk_headroom::disk_headroom_limit(root)
+        })
+        .await
+    }
+
+    /// The work finder's tick on the disk **admission** term (#11191):
+    /// [`crate::disk_admission::tick`] for `roots` on `root`'s volume feeds
+    /// the trigger, and after a pass that ran both the term and the per-repo
+    /// budget are re-ticked, so the cap, the budget and the trigger's
+    /// binding state all come from one post-reclaim reading.
+    pub async fn tick_admission(
+        &mut self,
+        roots: &[PathBuf],
+        root: &Path,
+        ram: usize,
+        configured_max: usize,
+    ) -> (usize, Option<DiskBudget>) {
+        let (disk, mut budget) = crate::disk_admission::tick(roots, root);
+        let disk = self
+            .tick_with(root, disk, ram, configured_max, || {
+                let (disk, fresh) = crate::disk_admission::tick(roots, root);
+                budget = fresh;
+                disk
+            })
+            .await;
+        (disk, budget)
     }
 }
 

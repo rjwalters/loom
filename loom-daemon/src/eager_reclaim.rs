@@ -337,8 +337,8 @@ pub struct EagerReclaimReport {
     /// `None` if unmeasurable (unknown != zero, #4164).
     pub free_gb_before: Option<u64>,
     /// Free GB immediately after. The dispatch loop does **not** read this to
-    /// finalize its cap — it re-probes `disk_headroom_limit` itself — this is
-    /// for the log line, the level trigger's next reference, and tests.
+    /// finalize its cap — it re-probes its own disk term (`EagerTrigger::settle`)
+    /// — this is for the log line, the level trigger's next reference, and tests.
     pub free_gb_after: Option<u64>,
     /// The highest tier this pass reached (1–3; 0 when skipped, #11192).
     pub tiers_run: u8,

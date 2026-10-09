@@ -32,7 +32,9 @@
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by [`resolve_dynamic_max_concurrent`]
 //! from two live inputs — the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]) and the host's
+//! ([`crate::disk_admission::tick`] since #11191: free space net of the
+//! in-flight sweeps' expected growth, at each repo's measured charge; the flat
+//! [`crate::disk_headroom::disk_headroom_limit`] when disabled) and the host's
 //! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
 //! — bounded by the per-machine operator ceiling
 //! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
@@ -127,7 +129,6 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 #[cfg(test)]
@@ -237,6 +238,7 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+mod tick_line;
 mod tick_report;
 mod tick_summary;
 use crate::types::QueueDisposition as Qd;
@@ -2615,12 +2617,15 @@ where
             // again while free space is below the floor or keeps falling, run
             // the existing reclaim passes for this workspace root right now
             // rather than waiting for the worktree reaper's own
-            // up-to-15-minute-away next tick. The disk term comes back
-            // re-probed after a pass, before this tick's cap is finalized —
-            // see `eager_reclaim::run_for`'s doc comment for the full
-            // rationale and the cooldown-safety argument.
-            let disk = eager_trigger
-                .tick(&workspace_root, disk_headroom_limit(&workspace_root), ram, configured_max)
+            // up-to-15-minute-away next tick. The disk term is #11191's
+            // admission term (one workspace, one charge, so the budget's cap
+            // term is the whole gate here; the per-repo hold is the
+            // multi-workspace loop's) and comes back re-ticked after a pass,
+            // before this tick's cap is finalized — see
+            // `EagerTrigger::tick_admission` and `eager_reclaim::run_for`.
+            let disk_roots = [workspace_root.clone()];
+            let (disk, _) = eager_trigger
+                .tick_admission(&disk_roots, &workspace_root, ram, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
@@ -3000,12 +3005,14 @@ pub fn spawn_multi_work_finder_task(
             tmpfs_warning::check_and_warn(&fallback_root);
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`
             // — the same root this machine-level disk term is probed against.
-            // Edge plus level (below the floor, or still falling); the disk
-            // term comes back re-probed after a pass, before this tick's cap
-            // is finalized. See the single-workspace loop above for the
-            // identical wiring and `eager_reclaim::EagerTrigger` for the rules.
-            let disk = eager_trigger
-                .tick(&fallback_root, disk_headroom_limit(&fallback_root), ram, configured_max)
+            // Edge plus level (below the floor, or still falling). The disk
+            // term is #11191's admission term (it nets out the in-flight
+            // sweeps' expected growth; the budget charges each repo its
+            // measured footprint); both come back re-ticked after a pass,
+            // before this tick's cap is finalized. See the single-workspace
+            // loop above and `EagerTrigger::tick_admission`.
+            let (disk, disk_budget) = eager_trigger
+                .tick_admission(&roots, &fallback_root, ram, configured_max)
                 .await;
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
@@ -3172,6 +3179,9 @@ pub fn spawn_multi_work_finder_task(
                 draining,
                 breaker_suppressed,
             );
+            // #11191: a repo whose disk charge does not fit is held, named.
+            let halt_causes = halt_cause::with_disk_holds(halt_causes, disk_budget.as_ref());
+            let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
             // Distinguish a pre-flight-advisory hold from the main-health /
@@ -3279,7 +3289,7 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),
-                (max_concurrent_per_repo, ram_budget),
+                (max_concurrent_per_repo, ram_budget, disk_budget),
                 &lanes,
                 &build_backoff_held.per_workspace,
             );
@@ -3299,70 +3309,20 @@ pub fn spawn_multi_work_finder_task(
             }
             was_halted = report.halted;
 
-            if report.dispatched > 0
-                || report.errors > 0
-                || report.skipped_quarantined > 0
-                || report.skipped_workspace_commands_missing > 0
-                || report.skipped_backoff > 0
-                || report.skipped_pr_open_backoff > 0
-                || report.skipped_noop_cooldown > 0
-                || report.skipped_declined > 0
-                || report.skipped_prless_retry > 0
-                || report.skipped_recheck_interval > 0
-                || report.skipped_host_constraint > 0
-                || report.skipped_pr_open > 0
-                || report.skipped_peer_claim > 0
-                || report.deferred_ramp_cap > 0
-                || report.deferred_saturation > 0
-                || report.deferred_out_of_slice > 0
-                || report.deferred_repo_cap > 0
-            {
-                log::info!(
-                    "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit} [fallback_root probe only], \
-                     min_workspace_healthy={min_workspace_healthy} [minimum across every \
-                     registered workspace's own resolved pool, #7527], disk={disk}, \
-                     ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
-                     {} workspace(s), \
-                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                     {} declined-skip, {} prless-retry-skip, \
-                     {} recheck-interval-skip, \
-                     {} host-constraint-skip, {} host-class-skip, \
-                     {} pr-open-skip, \
-                     {} peer-claim-skip, \
-                     {} deferred (capacity), {} deferred (ramp), \
-                     {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
-                     {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
-                     {} error(s), {} cross-host-collision(s)",
-                    pairs.len(),
-                    report.seen,
-                    report.dispatched,
-                    report.skipped_labeled,
-                    report.skipped_in_flight,
-                    report.skipped_quarantined,
-                    report.skipped_workspace_commands_missing,
-                    report.skipped_backoff,
-                    report.skipped_pr_open_backoff,
-                    report.skipped_noop_cooldown,
-                    report.skipped_declined,
-                    report.skipped_prless_retry,
-                    report.skipped_recheck_interval,
-                    report.skipped_host_constraint,
-                    report.skipped_host_class,
-                    report.skipped_pr_open,
-                    report.skipped_peer_claim,
-                    report.deferred_capacity,
-                    report.deferred_ramp_cap,
-                    report.deferred_saturation,
-                    report.deferred_out_of_slice,
-                    report.deferred_repo_cap,
-                    report.deferred_build_backoff,
-                    report.errors,
-                    report.collisions
-                );
-            }
+            // The tick line, with the disk budget's figures (#11191).
+            let tick_line = tick_line::TickLine {
+                max_concurrent,
+                pool_size,
+                token_limit,
+                min_workspace_healthy,
+                disk,
+                ram,
+                configured_max,
+                max_admissions_per_tick,
+                workspaces: pairs.len(),
+                disk_note: &disk_note,
+            };
+            tick_line::log(&report, &tick_line);
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 

@@ -568,3 +568,79 @@ fn test_resolve_fall_step_precedence() {
     assert_eq!(resolve_fall_step_gb(&config), 25, "zero falls through");
     std::env::remove_var(EAGER_RECLAIM_FALL_STEP_ENV);
 }
+
+// ===================================================================
+// #11191 x #11192: the term re-probed after a pass is the admission term
+// ===================================================================
+
+/// The #11191 admission term for one `loom` workspace charged `charge_gb`,
+/// with `inflight` pending sweeps, on a volume with `free` GB (halt floor 3).
+fn admission_term(free: u64, charge_gb: u64, inflight: u32) -> usize {
+    use crate::disk_admission::{assess, ChargeSource, RepoCharge};
+    const NOW: i64 = 1_000_000;
+    let mut store = crate::disk_footprint::Store::default();
+    for n in 0..inflight {
+        let key = crate::disk_footprint::issue_key("loom", n);
+        crate::disk_footprint::record_pending(&mut store, &key, "loom", Some(n), NOW);
+    }
+    let charges = vec![RepoCharge {
+        repo: "loom".into(),
+        gb: charge_gb,
+        source: ChargeSource::Observed,
+    }];
+    assess(free, 3, &store, charges, 8, NOW, None).cap_term()
+}
+
+#[test]
+fn test_the_term_after_a_pass_is_the_admission_term_not_the_flat_one() {
+    // A pass below the floor leaves 40G free. Flat: 40 / 8 = 5 slots. With one
+    // 20G sweep in flight that has written nothing yet: 40 - 3 - 20 = 17G
+    // left, which fits no further 20G sweep, so the term is the 1 in flight.
+    let (report, _) = run_tiered(&[Some(15), Some(40)]);
+    assert_eq!(report.free_gb_after, Some(40));
+    let (flat, admission) = (disk_term(Some(40)), admission_term(40, 20, 1));
+    assert_eq!((flat, admission), (5, 1));
+
+    let mut before = reading(Some(15));
+    before.disk = admission_term(15, 20, 1);
+    let mut trigger = EagerTrigger::default();
+    let disk = trigger.settle(&before, Some(&report), || admission_term(40, 20, 1));
+    assert_eq!(disk, admission, "the cap is finalized on the post-reclaim admission term");
+    assert_eq!(trigger, EagerTrigger::after_pass(40));
+}
+
+#[test]
+fn test_the_edge_rearms_from_the_admission_term() {
+    // After the pass the flat term still binds (5 < 12) but admission does
+    // not: a light repo (1G charge), nothing in flight, 37 slots. The trigger
+    // must record "not binding", so the next binding tick is a fresh edge.
+    let (report, _) = run_tiered(&[Some(15), Some(40)]);
+    let mut before = reading(Some(15));
+    before.disk = admission_term(15, 1, 0);
+    let mut trigger = EagerTrigger::default();
+    let disk = trigger.settle(&before, Some(&report), || admission_term(40, 1, 0));
+    assert_eq!(disk, 37);
+    assert!(disk_axis_binds_cap_down(disk_term(Some(40)), RAM, CEILING));
+    assert_eq!(trigger, EagerTrigger::default(), "disarmed by the admission term");
+
+    // A heavy sweep is admitted: same 40G free, the admission term now binds.
+    let mut next = reading(Some(40));
+    next.disk = admission_term(40, 20, 1);
+    assert_eq!(trigger.evaluate(&next), Some(TriggerReason::Edge));
+    // Had the flat term been recorded, this tick would not have fired.
+    assert_eq!(EagerTrigger::after_pass(40).evaluate(&next), None);
+}
+
+#[test]
+fn test_no_reprobe_without_a_pass_that_ran() {
+    let r = reading(Some(79));
+    let unreachable = || -> usize { panic!("re-probed without a pass") };
+    let mut trigger = EagerTrigger::default();
+    assert_eq!(trigger.settle(&r, None, unreachable), r.disk);
+    assert_eq!(trigger, EagerTrigger::after_pass(79));
+
+    let (mut skipped, _) = run_tiered(&[Some(79)]);
+    skipped.skipped = Some("cooldown".to_string());
+    assert_eq!(trigger.settle(&r, Some(&skipped), unreachable), r.disk);
+    assert_eq!(trigger, EagerTrigger::after_pass(79));
+}
