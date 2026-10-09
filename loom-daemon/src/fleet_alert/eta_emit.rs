@@ -53,7 +53,7 @@ pub fn condition(
     };
     let covered = hb.map_or(0, |h| h.repos_covered);
     Some(Condition {
-        key: KEY_ETA_SILENT,
+        key: KEY_ETA_SILENT.to_string(),
         headline: format!(
             "This host is the ETA authority but {since} ({covered} repo(s) covered). ETAs are \
              not reaching SigNoz or the dashboard."
@@ -61,6 +61,8 @@ pub fn condition(
         fix: "Run `loom-daemon eta doctor` and read config.last_emit; the usual cause is no OTLP \
               exporter (observability.exporters). `eta.estimate` is OTLP-only."
             .to_string(),
+        // Mirrors the critical SigNoz rule `alerts/eta-not-emitted.json`.
+        critical: true,
     })
 }
 
