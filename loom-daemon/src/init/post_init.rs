@@ -1056,7 +1056,6 @@ mod tests {
         };
 
         let writers = [
-            crate::observability::eta::pending_path(root),
             crate::ci_telemetry::state_dir(root).join("seen.jsonl"),
             crate::fleet_captain::shell_arm_registry_path(root),
             // A subsystem added after this test: must need no registration.

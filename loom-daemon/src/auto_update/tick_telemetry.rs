@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 
 use super::supersede::ArmedRoll;
 use super::{ArtifactResolution, UpdateCheck};
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
 /// One tick's decision and the readings it was made from.

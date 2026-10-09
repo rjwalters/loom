@@ -350,8 +350,8 @@ pub fn arm_singleton_job(job_name: &str, root: &Path, current_host_id: &str) -> 
 }
 
 /// Record `job_name` for a singleton job whose owner is not `fleet.captain`:
-/// the ETA jobs follow an explicit `fleet.etaAuthority` (#10918,
-/// [`crate::eta::job_owner`]). The caller has already decided whether the job
+/// the ETA jobs follow an explicit `fleet.etaAuthority` (#10918, decided by
+/// the ETA tree's `job_owner`). The caller has already decided whether the job
 /// runs here. `armed_here` lists it in the armed registry, and anything else
 /// removes it. The job has an owner either way, so it is never listed as
 /// captainless.
