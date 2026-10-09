@@ -246,6 +246,7 @@ fn fetch_trusted_comments_since(
     root: &Path,
     pr_number: u32,
     since: DateTime<Utc>,
+    repo: Option<&str>,
 ) -> Option<Vec<PrComment>> {
     // Render `since` in exactly the shape the forge emits for `created_at`
     // (`...Z`, second precision) so the jq `>` comparison — which is a raw
@@ -257,9 +258,8 @@ fn fetch_trusted_comments_since(
     let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     // `since=` lets the forge skip older comments (it filters on
     // `updated_at`, a superset of the `created_at` filter below).
-    let path = format!(
-        "repos/{{owner}}/{{repo}}/issues/{pr_number}/comments?per_page=100&since={since_iso}"
-    );
+    let base = repo_base(repo);
+    let path = format!("{base}/issues/{pr_number}/comments?per_page=100&since={since_iso}");
     let jq = format!(
         r#".[] | select(.created_at > "{since_iso}") | {{created_at, body, {}}}"#,
         crate::comment_trust::records::AUTHOR_JQ
@@ -288,6 +288,14 @@ fn fetch_trusted_comments_since(
     Some(comments)
 }
 
+/// The `repos/...` prefix for a forge read: the explicit `OWNER/REPO` when the
+/// caller names one, else `gh`'s own `{owner}/{repo}` resolution (the checkout,
+/// or an ambient `GH_REPO`). An explicit target must win so a read about
+/// another repository's claim never borrows this checkout's evidence.
+fn repo_base(repo: Option<&str>) -> String {
+    repo.map_or_else(|| "repos/{owner}/{repo}".to_string(), |r| format!("repos/{r}"))
+}
+
 pub(crate) fn fetch_most_recent_claim_activity_at(
     gh_bin: &Path,
     root: &Path,
@@ -295,7 +303,7 @@ pub(crate) fn fetch_most_recent_claim_activity_at(
     since: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     most_recent_claim_activity_at(
-        &fetch_trusted_comments_since(gh_bin, root, pr_number, since)?,
+        &fetch_trusted_comments_since(gh_bin, root, pr_number, since, None)?,
         since,
     )
 }
@@ -307,9 +315,10 @@ pub(crate) fn fetch_most_recent_judge_activity_at(
     root: &Path,
     pr_number: u32,
     since: DateTime<Utc>,
+    repo: Option<&str>,
 ) -> Option<DateTime<Utc>> {
     most_recent_judge_activity_at(
-        &fetch_trusted_comments_since(gh_bin, root, pr_number, since)?,
+        &fetch_trusted_comments_since(gh_bin, root, pr_number, since, repo)?,
         since,
     )
 }
@@ -322,8 +331,10 @@ pub(crate) fn fetch_most_recent_head_push_at(
     pr_number: u32,
     label: &str,
     since: DateTime<Utc>,
+    repo: Option<&str>,
 ) -> Option<DateTime<Utc>> {
-    let path = format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline?per_page=100");
+    let base = repo_base(repo);
+    let path = format!("{base}/issues/{pr_number}/timeline?per_page=100");
     let jq = format!(
         r#".[] | select((.event == "labeled" and .label.name == "{label}") or .event == "head_ref_force_pushed") | {{event, created_at, actor: .actor.login}}"#
     );
@@ -359,7 +370,8 @@ pub(crate) fn fetch_most_recent_head_push_at(
 /// for a `loom:reviewing` claim) or a claimant head force-push, whichever is
 /// newer, after `claimed_at`. Runs the exact fetch+predicate pairs
 /// `decide_pr`'s anchor uses, so the shell and the daemon cannot disagree on
-/// what keeps a claim alive (Issue #10235). `None` when neither exists or a
+/// what keeps a claim alive (Issue #10235). `repo` is the explicit
+/// `OWNER/REPO` the claim lives in (`None` = `gh`'s ambient resolution). `None` when neither exists or a
 /// read failed — the caller then keeps the marker-only age.
 #[must_use]
 pub fn extra_liveness_at(
@@ -367,10 +379,13 @@ pub fn extra_liveness_at(
     pr_number: u32,
     label: &str,
     claimed_at: DateTime<Utc>,
+    repo: Option<&str>,
 ) -> Option<DateTime<Utc>> {
     let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
     let judge = (label == "loom:reviewing")
-        .then(|| fetch_most_recent_judge_activity_at(&gh_bin, root, pr_number, claimed_at))
+        .then(|| fetch_most_recent_judge_activity_at(&gh_bin, root, pr_number, claimed_at, repo))
         .flatten();
-    judge.max(fetch_most_recent_head_push_at(&gh_bin, root, pr_number, label, claimed_at))
+    judge.max(fetch_most_recent_head_push_at(
+        &gh_bin, root, pr_number, label, claimed_at, repo,
+    ))
 }

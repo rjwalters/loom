@@ -593,6 +593,9 @@ pub(crate) enum ForgeAction {
         /// The claim's own `labeled` event time (RFC3339, `...Z`).
         #[arg(long, value_name = "TS")]
         claimed_at: String,
+        /// `OWNER/REPO` the claim lives in; default is `gh`'s own resolution.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
     },
 
     /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
@@ -971,8 +974,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             number,
             label,
             claimed_at,
+            repo,
         } => {
-            return super::forge_identity_cmd::claim_liveness(number, &label, &claimed_at);
+            return super::forge_identity_cmd::claim_liveness(
+                number,
+                &label,
+                &claimed_at,
+                repo.as_deref(),
+            );
         }
         ForgeAction::VerdictStaleNotice {
             label,

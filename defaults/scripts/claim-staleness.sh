@@ -303,7 +303,7 @@ if [[ -z "$CLAIM_STATE" ]]; then
         '[.[] | select(.body | contains($m))] | length' <<<"$AFTER_JSON")"
     # requires-daemon: forge optional   Without `claim-liveness` (absent or older binary) only the marker counts: the daemon's Judge-progress / claimant force-push signals (#10235) are then not folded in.
     LAST_ACTIVITY_AT="$(jq -r --arg m "${ACTIVITY_PREFIX}${CLAIMED_AT} -->" --arg c "$CLAIMED_AT" \
-        --arg x "$("${LOOM_DAEMON_BIN:-loom-daemon}" forge claim-liveness --number "$NUMBER" --label "$LABEL" --claimed-at "$CLAIMED_AT" 2>/dev/null || true)" \
+        --arg x "$("${LOOM_DAEMON_BIN:-loom-daemon}" forge claim-liveness --number "$NUMBER" --label "$LABEL" --claimed-at "$CLAIMED_AT" ${REPO_ARG:+--repo "$REPO_ARG"} 2>/dev/null || true)" \
         '([.[] | select(.body | contains($m)) | .created_at] + [$c] + ([$x | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))])) | max' <<<"$AFTER_JSON")"
 
     # Stand-down comments for THIS claim (prefix match covers both the legacy

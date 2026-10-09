@@ -254,7 +254,12 @@ pub(crate) fn trusted_comments(
 /// PR claim, as one RFC3339 timestamp (or nothing) — see
 /// [`loom_daemon::claim_reconciliation::extra_liveness_at`]. Exits 1 only on an
 /// unparseable `--claimed-at`; a failed forge read prints nothing (fail-safe).
-pub(crate) fn claim_liveness(number: u32, label: &str, claimed_at: &str) -> Result<()> {
+pub(crate) fn claim_liveness(
+    number: u32,
+    label: &str,
+    claimed_at: &str,
+    repo: Option<&str>,
+) -> Result<()> {
     let Ok(since) = chrono::DateTime::parse_from_rfc3339(claimed_at) else {
         eprintln!("forge claim-liveness: --claimed-at {claimed_at:?} is not RFC3339");
         std::process::exit(1)
@@ -264,6 +269,7 @@ pub(crate) fn claim_liveness(number: u32, label: &str, claimed_at: &str) -> Resu
         number,
         label,
         since.with_timezone(&chrono::Utc),
+        repo,
     ) {
         println!("{}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }

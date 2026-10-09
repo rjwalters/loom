@@ -2536,14 +2536,16 @@ pub mod forge {
                             if is_reviewing {
                                 super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
                                     fetch_most_recent_judge_activity_at(
-                                        gh_bin, root, r.number, since,
+                                        gh_bin, root, r.number, since, None,
                                     )
                                 })
                             } else {
                                 None
                             },
                             super::read_cache::HEAD_PUSH.get_or(key2, || {
-                                fetch_most_recent_head_push_at(gh_bin, root, r.number, label, since)
+                                fetch_most_recent_head_push_at(
+                                    gh_bin, root, r.number, label, since, None,
+                                )
                             }),
                         ),
                         None => (None, None),

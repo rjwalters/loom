@@ -288,3 +288,39 @@ fn head_push_counts_only_force_pushes_by_the_claimant() {
     let no_label = vec![tl("head_ref_force_pushed", p, "judge-bot")];
     assert_eq!(most_recent_head_push_at(&no_label, claimed_at), None);
 }
+
+/// A fake `gh` that appends its argv to `log` and prints nothing.
+fn recording_gh(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gh = dir.join("fake-gh-record.sh");
+    std::fs::write(&gh, format!("#!/usr/bin/env bash\necho \"$*\" >>\"{}\"\n", log.display()))
+        .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+/// #10235: an explicit `OWNER/REPO` names the repository for both extra
+/// liveness reads (Judge comments, head-push timeline) instead of `gh`'s
+/// checkout/ambient `{owner}/{repo}` — the checkout's evidence about a
+/// same-numbered item must never be borrowed for another repo's claim.
+#[test]
+#[serial_test::serial]
+fn extra_liveness_reads_name_the_explicit_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("argv.log");
+    let gh = recording_gh(dir.path(), &log);
+    let since = fixture_claimed_at();
+    let paths = |repo: Option<&str>| {
+        std::fs::write(&log, "").unwrap();
+        forge::fetch_most_recent_judge_activity_at(&gh, dir.path(), 7, since, repo);
+        forge::fetch_most_recent_head_push_at(&gh, dir.path(), 7, "loom:reviewing", since, repo);
+        std::fs::read_to_string(&log).unwrap()
+    };
+    let explicit = paths(Some("target/other"));
+    assert!(explicit.contains("repos/target/other/issues/7/comments"), "{explicit}");
+    assert!(explicit.contains("repos/target/other/issues/7/timeline"), "{explicit}");
+    assert!(!explicit.contains("{owner}"), "{explicit}");
+    let ambient = paths(None);
+    assert!(ambient.contains("repos/{owner}/{repo}/issues/7/comments"), "{ambient}");
+    assert!(ambient.contains("repos/{owner}/{repo}/issues/7/timeline"), "{ambient}");
+}
