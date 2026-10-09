@@ -1990,10 +1990,13 @@ assert_contains "--memory" "$docker_log" "containerized dispatch: --memory is ap
 # one fleet host). The --memory assert above and this one are single-line so
 # the frozen-at-1822-code-lines file stays within the file-size ratchet.
 # Issue #11190: the debuginfo cap the host-side seam chose (or an operator's
-# own value, here `full`) is forwarded BY NAME right after it, so the
-# in-container cargo builds with the value the worker log reports. Folded into
-# the same single assert line for the same ratchet reason.
-assert_contains "-e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG -e CARGO_PROFILE_TEST_DEBUG " "$docker_log" "containerized dispatch: the worker env carries CARGO_INCREMENTAL=0 (#8456) and the debuginfo cap by name (#11190)"
+# own value, here `full`) is forwarded BY NAME — `-e VAR` with no `=value` in
+# argv — so the in-container cargo builds with the value the worker log
+# reports. The names ride the generic env passthrough, so their position
+# follows `env` order: the assert extracts the three `-e` flags, sorts them,
+# and compares the exact set (a `NAME=value` form would fail the equality).
+# Folded into the same single assert line for the same ratchet reason.
+assert_eq "-e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_DEV_DEBUG -e CARGO_PROFILE_TEST_DEBUG" "$(grep -oE -- '-e CARGO_(INCREMENTAL|PROFILE_[A-Z]+_DEBUG)(=[^ ]*)?' <<<"$docker_log" | sort -u | paste -sd' ' -)" "containerized dispatch: the worker env carries CARGO_INCREMENTAL=0 (#8456) and the debuginfo cap by name, no value in argv (#11190)"
 assert_contains "# LOOM_DISPATCH_MODE mode=container" "$output" \
     "containerized dispatch: the canonical LOOM_DISPATCH_MODE marker names mode=container (#7430)"
 assert_contains "cpus=none" "$output" \

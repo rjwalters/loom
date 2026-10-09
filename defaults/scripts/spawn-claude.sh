@@ -856,12 +856,9 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # the value — or kept an operator's own — before it spawned this script,
     # and this re-exec runs spawn-claude.sh, not spawn-worker.sh, so nothing
     # inside the container re-runs that seam. Without this the worker log
-    # records the cap while the in-container cargo builds full DWARF.
-    for _containment_var in CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG; do
-        if [[ -n "${!_containment_var:-}" ]]; then
-            _containment_env+=(-e "$_containment_var")
-        fi
-    done
+    # records the cap while the in-container cargo builds full DWARF. The two
+    # names are forwarded by the env-passthrough `case` below, which already
+    # has exactly that shape (by name, only when present in `env`).
 
     # --- Env passthrough ---
     # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
@@ -884,7 +881,7 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_*)
+            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_* | CARGO_PROFILE_DEV_DEBUG | CARGO_PROFILE_TEST_DEBUG)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
