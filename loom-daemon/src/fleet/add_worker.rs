@@ -1707,3 +1707,8 @@ mod feed_egress_tests;
 // reason.
 #[cfg(test)]
 mod invoker_tests;
+
+// #9064: verify-script `status` exit-code handling, same reason.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod verify_status_tests;
