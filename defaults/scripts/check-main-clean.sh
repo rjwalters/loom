@@ -278,12 +278,15 @@ is_loom_owned() {
 # filter_loom_owned <porcelain-text> -> the same text with Loom-owned transient
 # lines removed. Parses each `git status --porcelain` v1 line (2 status chars +
 # space + path; rename lines carry "old -> new" and are keyed on the new path).
+# Only an R/C line is split on " -> ": git C-quotes a path containing spaces,
+# so a plain path holding a literal " -> " arrives as `?? "a -> b"`. A quoted
+# rename SIDE holding one is still mis-split (pre-existing, #11149 item 3).
 filter_loom_owned() {
     local in="$1" line path out=""
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         path="${line:3}"
-        if [[ "$path" == *" -> "* ]]; then
+        if [[ "${line:0:2}" == *[RC]* && "$path" == *" -> "* ]]; then
             path="${path##* -> }"
         fi
         path="${path%\"}"
@@ -737,12 +740,13 @@ EOF
 
 # Collect the offending (NEW) paths from the porcelain lines. Rename lines
 # ("old -> new") contribute BOTH sides so the rename is undone as a whole.
+# The split is gated on an R/C status for the reason `filter_loom_owned` gives.
 collect_offending_paths() {
     local line path
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         path="${line:3}"
-        if [[ "$path" == *" -> "* ]]; then
+        if [[ "${line:0:2}" == *[RC]* && "$path" == *" -> "* ]]; then
             OFFENDING_PATHS+=("$(unquote_path "${path%% -> *}")")
             path="${path##* -> }"
         fi
@@ -784,14 +788,15 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     # shellcheck source=lib/locate-daemon-bin.sh
     source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
     bt_bin=$(loom_daemon_self_bin_override || LOOM_LOCATE_DAEMON_BIN_QUIET=1 loom_locate_daemon_bin "$main_root" || true)
-    if [[ -n "$bt_bin" ]]; then
-        # A trailing empty record is the success sentinel: it only arrives when
-        # the subcommand exited 0, so a failed or absent subcommand stays bt_ok=0.
-        while IFS= read -r -d '' d; do
-            if [[ -z "$d" ]]; then bt_ok=1; else TAG_DIRS+=("$d"); fi
-        done < <("$bt_bin" stashes build-trees --workspace "$main_root" -z 2>/dev/null && printf '\0')
-    fi
+    # A trailing empty record is the success sentinel: it only arrives when
+    # the subcommand exited 0, so a failed or absent subcommand stays bt_ok=0.
+    while IFS= read -r -d '' d; do
+        if [[ -z "$d" ]]; then bt_ok=1; else TAG_DIRS+=("$d"); fi
+    done < <([[ -n "$bt_bin" ]] && "$bt_bin" stashes build-trees --workspace "$main_root" -z 2>/dev/null && printf '\0')
     if [[ "$bt_ok" -eq 0 ]]; then
+        # Dirs printed before a failure are dropped too (#11149), so the
+        # warning below is exactly true: nothing is excluded.
+        TAG_DIRS=()
         echo "WARNING: check-main-clean.sh: no loom-daemon with \`stashes build-trees\` (${bt_bin:-not found});" >&2
         echo "         cargo build trees will NOT be excluded and may be stashed into refs/stash (#11075)." >&2
         echo "         Update loom-daemon (\`loom update\`) to restore the exclusion." >&2
@@ -857,6 +862,12 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     for p in "${OFFENDING_PATHS[@]}"; do
         stash_pathspecs+=(":(literal,top)$p")
     done
+    # `git stash push -- <path>` fails on a STAGED deletion (the path is in
+    # neither index nor worktree, so its pathspec matches nothing) — and a
+    # rename's source, e.g. one into a build tree whose destination was just
+    # unstaged, is exactly that (#11149). Unstaging a deletion is lossless: the
+    # index entry it restores is HEAD's, and the deletion is stashed unstaged.
+    while IFS= read -r -d '' p; do git -C "$main_root" reset -q -- ":(literal,top)$p" >/dev/null 2>&1 || true; done < <(git -C "$main_root" diff --cached --no-renames --name-only --diff-filter=D -z -- "${stash_pathspecs[@]}" 2>/dev/null)
 
     # Remember the stack top BEFORE pushing. `git stash push` exits 0 and
     # creates NOTHING when the pathspec resolves to no local changes ("No local
