@@ -1968,6 +1968,7 @@ jobs:
       # #11075: check-main-clean.sh --quarantine asks `loom-daemon stashes
       # build-trees` which cargo build trees to exclude from the rescue stash.
       - name: check-main-clean (#3513, #11075)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-check-main-clean.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
@@ -2080,6 +2081,7 @@ jobs:
       # #11044: the fleet floor confirmation runs inside `loom-daemon
       # daemon-update`, so the suite pins this job's shared build.
       - name: loom-daemon-update fleet floor confirmation (#11044)
+        if: ${{ !cancelled() }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
