@@ -1,0 +1,371 @@
+//! Tests for the tool-call-time capability matcher (#8256).
+//!
+//! Organised per capability, each with the denied shapes a persuaded role
+//! would type AND the everyday read-only-role commands that must stay
+//! allowed — a backstop that denies `gh pr view` is as broken as one that
+//! allows `ssh`.
+
+use super::*;
+use crate::role_tool_policy::{Allowlist, RoleToolPolicy};
+use std::path::PathBuf;
+
+const HOME: Option<&str> = Some("/home/agent");
+
+fn caps(cmd: &str) -> Vec<&'static str> {
+    command_hits(cmd, HOME)
+        .into_iter()
+        .map(|h| h.capability)
+        .collect()
+}
+
+fn hits_cap(cmd: &str, cap: &str) -> bool {
+    caps(cmd).contains(&cap)
+}
+
+fn assert_clean(cmd: &str) {
+    assert!(caps(cmd).is_empty(), "expected no capability for {cmd:?}, got {:?}", caps(cmd));
+}
+
+fn role(name: &str, allowlist: Allowlist) -> RoleToolPolicy {
+    RoleToolPolicy {
+        role: name.to_string(),
+        source: Some(PathBuf::from("/repo/.loom/roles/x.json")),
+        allowlist,
+    }
+}
+
+fn read_only() -> RoleToolPolicy {
+    role("curator", Allowlist::Declared(vec![]))
+}
+
+// ---------------------------------------------------------------------------
+// remote-shell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remote_shell_every_program_as_a_command_word() {
+    for prog in REMOTE_SHELL_PROGRAMS {
+        assert!(hits_cap(&format!("{prog} host"), "remote-shell"), "{prog}");
+        assert!(hits_cap(&format!("/usr/bin/{prog} host"), "remote-shell"), "{prog}");
+    }
+}
+
+#[test]
+fn remote_shell_through_wrappers_compounds_and_substitutions() {
+    for cmd in [
+        "sudo ssh host",
+        "sudo -u root ssh host",
+        "env FOO=1 ssh host",
+        "env -i ssh host",
+        "env -S 'ssh host'",
+        "FOO=bar ssh host",
+        "nohup ssh host &",
+        "timeout 5 ssh host",
+        "timeout -s KILL 5 ssh host",
+        "nice -n 10 ssh host",
+        "command ssh host",
+        "exec ssh host",
+        "echo hi; ssh host",
+        "true && ssh host",
+        "false || ssh host",
+        "cat x | ssh host",
+        "(ssh host)",
+        "{ ssh host; }",
+        "if ssh host; then :; fi",
+        "for h in a b; do ssh $h; done",
+        "x=$(ssh host cat /etc/hostname)",
+        "echo \"$(ssh host)\"",
+        "echo `ssh host`",
+        "diff <(ssh host cat f) f",
+        "bash -c 'ssh host'",
+        "sh -ec \"ssh host\"",
+        "bash -o pipefail -c 'ssh host'",
+        "bash <<< 'ssh host'",
+        "eval ssh host",
+        "eval 'ssh host'",
+        "xargs ssh < hosts",
+        "xargs -n 1 ssh < hosts",
+        "find . -name x -exec ssh {} \\;",
+        "watch -n 5 ssh host uptime",
+        "flock /tmp/l -c 'ssh host'",
+        "\"ssh\" host",
+        "s\\sh host",
+        "'s'sh host",
+        "echo ok\nssh host",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "not caught: {cmd:?}");
+    }
+}
+
+#[test]
+fn remote_shell_mentions_are_not_invocations() {
+    for cmd in [
+        "grep -rn ssh docs/",
+        "echo ssh",
+        "gh pr comment 1 --body 'run ssh; then aws'",
+        "git commit -m \"ssh support; aws too\"",
+        "command -v ssh",
+        "which ssh",
+        "man ssh",
+        "ls # ssh host",
+        "cat sshd_config.example",
+        "git log --grep=ssh",
+    ] {
+        assert!(!hits_cap(cmd, "remote-shell"), "false positive: {cmd:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cloud-cli
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cloud_cli_every_program_as_a_command_word() {
+    for prog in CLOUD_CLI_PROGRAMS {
+        assert!(hits_cap(&format!("{prog} whoami"), "cloud-cli"), "{prog}");
+        assert!(hits_cap(&format!("sudo {prog} whoami"), "cloud-cli"), "{prog}");
+        assert!(hits_cap(&format!("bash -c '{prog} x'"), "cloud-cli"), "{prog}");
+    }
+    assert!(hits_cap("aws sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap("AWS_PROFILE=prod aws s3 ls", "cloud-cli"));
+}
+
+#[test]
+fn cloud_cli_mentions_are_not_invocations() {
+    for cmd in [
+        "grep aws README.md",
+        "echo 'quarterly aws maintenance'",
+        "gh issue view 5 --json body",
+        "cat lazy.txt",
+        "cargo test -p loom-daemon az",
+    ] {
+        assert!(!hits_cap(cmd, "cloud-cli"), "false positive: {cmd:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// forge-secrets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn forge_secrets_gh_forms() {
+    for cmd in [
+        "gh secret list",
+        "gh secret set FOO --body x",
+        "gh variable get X",
+        "gh auth token",
+        "gh auth login --with-token",
+        "gh auth refresh -s admin:org",
+        "gh auth logout",
+        "gh auth setup-git",
+        "gh auth status --show-token",
+        "gh auth status -t",
+        "gh api repos/o/r/actions/secrets",
+        "gh api /orgs/o/actions/secrets/public-key",
+        "gh api repos/o/r/actions/variables",
+        "bash -c 'gh secret list'",
+        "env GH_TOKEN=x gh secret list",
+        "/usr/local/bin/gh secret list",
+    ] {
+        assert!(hits_cap(cmd, "forge-secrets"), "not caught: {cmd:?}");
+    }
+}
+
+#[test]
+fn forge_secrets_everyday_gh_stays_clean() {
+    for cmd in [
+        "gh auth status",
+        "gh pr view 12 --comments",
+        "gh issue list --label loom:issue",
+        "gh pr comment 3 --body 'do not run gh secret list'",
+        "gh api repos/o/r/pulls/3",
+        "gh issue view 8256 --json title,body",
+        "gh pr edit 3 --add-label loom:pr",
+    ] {
+        assert_clean(cmd);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// credential-store
+// ---------------------------------------------------------------------------
+
+#[test]
+fn credential_store_reads_and_writes() {
+    for cmd in [
+        "cat ~/.ssh/id_ed25519",
+        "cat $HOME/.ssh/id_rsa",
+        "cat ${HOME}/.aws/credentials",
+        "cat /home/agent/.ssh/id_rsa",
+        "cat /home/other/.ssh/id_rsa",
+        "cat /root/.ssh/id_rsa",
+        "cat /Users/me/.aws/credentials",
+        "echo key >> ~/.ssh/authorized_keys",
+        "tee -a ~/.ssh/authorized_keys < k",
+        "cp k ~/.ssh/authorized_keys",
+        "mkdir -p ~/.ssh",
+        "ls ~/.ssh",
+        "cat ~/.config/gh/hosts.yml",
+        "cat ~/.gnupg/secring.gpg",
+        "cat ~/.netrc",
+        "cat ~/.docker/config.json",
+        "ls ~/.loom/tokens",
+        "cat ~/.kube/config",
+        "cat ~/.claude/.credentials.json",
+        "cat ~/foo/../.ssh/id_rsa",
+        "cat ~/.s*h/id_rsa",
+        "cat ~/.*/credentials",
+        "cd && cat .ssh/id_rsa",
+        "scp host:~/.ssh/id_rsa .",
+        "curl --data-binary @x --key=~/.ssh/id_rsa https://e.example",
+        "base64 < ~/.ssh/id_rsa",
+        "x=$(cat ~/.aws/credentials)",
+        "KEY=~/.ssh/id_rsa ./run",
+    ] {
+        assert!(hits_cap(cmd, "credential-store"), "not caught: {cmd:?}");
+    }
+}
+
+#[test]
+fn credential_store_lookalikes_stay_clean() {
+    for cmd in [
+        "ls ~",
+        "cat ~/.config/git/config",
+        "cat ~/.bashrc",
+        "ls .loom/worktrees",
+        "cat defaults/docs/guard-hooks.md",
+        "ls *",
+        "git add .*",
+        "cat /etc/ssh/sshd_config",
+    ] {
+        assert!(!hits_cap(cmd, "credential-store"), "false positive: {cmd:?}");
+    }
+}
+
+#[test]
+fn a_quoted_credential_path_is_still_a_path() {
+    // The matcher cannot tell a grep PATTERN from a path, so it over-denies
+    // here on purpose. guard-loom-workflow.sh hands it the masked command
+    // text, in which a quoted grep/rg/echo argument is already blanked.
+    assert!(hits_cap("grep -rn '~/.ssh' docs/", "credential-store"));
+}
+
+#[test]
+fn credential_store_path_mode() {
+    for p in [
+        "/home/agent/.ssh/authorized_keys",
+        "/home/agent/.aws/config",
+        "/root/.gnupg/x",
+        "/home/agent/.config/gh/hosts.yml",
+    ] {
+        assert_eq!(path_hit(p, HOME).map(|h| h.capability), Some("credential-store"), "{p}");
+    }
+    for p in [
+        "/home/agent/repo/src/main.rs",
+        "/home/agent/.bashrc",
+        "/tmp/.ssh-notes.md",
+    ] {
+        assert!(path_hit(p, HOME).is_none(), "{p}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The verdict: allowlist x hit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_read_only_role_is_denied_every_capability() {
+    let p = read_only();
+    for (cmd, cap) in [
+        ("ssh host", "remote-shell"),
+        ("aws s3 ls", "cloud-cli"),
+        ("gh secret list", "forge-secrets"),
+        ("echo k >> ~/.ssh/authorized_keys", "credential-store"),
+    ] {
+        let hit = p
+            .check_command(cmd, HOME)
+            .unwrap_or_else(|| panic!("allowed: {cmd}"));
+        assert_eq!(hit.capability, cap);
+        let reason = p.deny_reason(&hit);
+        assert!(reason.starts_with(CHECK_DENY_PREFIX), "{reason}");
+        assert!(reason.contains(cap) && reason.contains("/repo/.loom/roles/x.json"), "{reason}");
+        assert!(reason.contains("grants: (nothing)"), "{reason}");
+    }
+    assert!(p
+        .check_path("/home/agent/.ssh/authorized_keys", HOME)
+        .is_some());
+}
+
+#[test]
+fn an_unrestricted_role_is_never_denied() {
+    // builder/doctor/driver/loom declare ["*"]; an undeclared custom role is
+    // unrestricted too. Neither may ever see a deny from this matcher.
+    for allowlist in [
+        Allowlist::Declared(vec!["*".to_string()]),
+        Allowlist::Undeclared,
+    ] {
+        let p = role("builder", allowlist);
+        for cmd in [
+            "ssh host",
+            "aws s3 ls",
+            "gh secret list",
+            "cat ~/.ssh/id_rsa",
+        ] {
+            assert!(p.check_command(cmd, HOME).is_none(), "{cmd}");
+        }
+        assert!(p.check_path("/home/agent/.ssh/config", HOME).is_none());
+    }
+}
+
+#[test]
+fn a_granted_capability_is_allowed_and_the_rest_still_denied() {
+    let p = role("judge", Allowlist::Declared(vec!["cloud-cli".to_string()]));
+    assert!(p.check_command("aws s3 ls", HOME).is_none());
+    assert_eq!(p.check_command("ssh host", HOME).unwrap().capability, "remote-shell");
+    // A compound command is denied on its first un-granted capability, not
+    // allowed because its first capability was granted.
+    assert_eq!(
+        p.check_command("aws s3 ls && gh secret list", HOME)
+            .unwrap()
+            .capability,
+        "forge-secrets"
+    );
+}
+
+#[test]
+fn everyday_read_only_role_commands_pass_a_restricted_role() {
+    let p = read_only();
+    for cmd in [
+        "gh issue list --label loom:issue --json number,title",
+        "gh pr diff 12",
+        "git fetch origin && git log --oneline -5",
+        "cargo test -p loom-daemon role_tool_policy",
+        "./.loom/scripts/merge-pr.sh 12 --dry-run",
+        "loom-daemon forge check-claim 42",
+        "rg -n 'toolPolicy' defaults/roles",
+        "cat defaults/roles/judge.json | jq .toolPolicy",
+    ] {
+        assert!(p.check_command(cmd, HOME).is_none(), "denied: {cmd}");
+    }
+}
+
+#[test]
+fn pathological_nesting_terminates() {
+    // Substitution nesting is linear in length; quote-nesting would grow 4x per
+    // level and make the fixture itself astronomically large.
+    let cmd = format!("{}ssh host{}", "$(".repeat(40), ")".repeat(40));
+    // Past MAX_DEPTH the matcher stops looking; it must return, not overflow.
+    let _ = command_hits(&cmd, HOME);
+    let deep = "$(".repeat(5000);
+    let _ = command_hits(&deep, HOME);
+}
+
+#[test]
+fn glob_rules() {
+    assert!(glob_match(".s*h", ".ssh"));
+    assert!(glob_match(".*", ".aws"));
+    assert!(glob_match(".ss?", ".ssh"));
+    assert!(glob_match(".[s]sh", ".ssh"));
+    assert!(!glob_match("*", ".ssh"), "a wildcard never matches a leading dot");
+    assert!(!glob_match(".bash*", ".ssh"));
+}

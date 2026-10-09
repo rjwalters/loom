@@ -21,6 +21,12 @@
 //!
 //! # The canonical role-file basename, aliases resolved.
 //! loom-daemon role-tool-policy resolve-name development-worker   # -> builder
+//!
+//! # guard-loom-workflow.sh / guard-worktree-paths.sh (#8256): may the acting
+//! # role run this command / write this path? Exit 1 + a `BLOCKED
+//! # [role-tool-policy]` reason on stdout = deny.
+//! loom-daemon role-tool-policy check --roles-dir "$SCRIPT_DIR/../roles" \
+//!     --workspace "$SCRIPT_DIR/../.." --command "$COMMAND"
 //! ```
 //!
 //! The role argument is optional and defaults to `$LOOM_ROLE`, because that is
@@ -34,6 +40,7 @@
 //! | `resolve-name` | canonical name on stdout | the name is not usable as a role-file basename |
 //! | `deny-specs` | at least one spec on stdout | no restriction applies — emit nothing |
 //! | `restricted` | restrictive declaration; role JSON path on stdout | unrestricted, undeclared, or unresolvable |
+//! | `check` | allow | **deny**; reason on stdout, prefixed `BLOCKED [role-tool-policy]` |
 //!
 //! **`1` is an answer, not an error**, and that is what makes the call sites
 //! safe. Both scripts' degradation contract is "degrade to a byte-for-byte
@@ -44,6 +51,13 @@
 //!
 //! `--json` prints the full record on **both** exit codes, for a caller that
 //! wants the reason rather than just the verdict.
+//!
+//! `check` inverts that reading on purpose — its `1` is a **deny**, and the
+//! hooks only honour it with the prefix. Every *other* answer (no binary, a
+//! daemon predating `check`, a crash) is not an allow either: the hooks fail
+//! closed for the built-in read-only roles on it (`guard-hooks.md`, "Per-role
+//! tool restriction"). The identity half still fails open — an unresolvable
+//! or undeclared role is exit 0 — exactly as the spawn-time half does.
 //!
 //! # Forge-egress specs (#9989)
 //!
@@ -77,6 +91,46 @@ pub(crate) enum RoleToolPolicyCommand {
     /// Whether the role declares a restrictive allowlist (an array with no
     /// `"*"`). Exit 0 + the role JSON path on stdout when it does.
     Restricted(PolicyArgs),
+
+    /// The guard hooks' tool-call-time verdict (#8256): exit 0 = allow, exit
+    /// 1 = deny with a `BLOCKED [role-tool-policy]` reason on stdout.
+    Check(CheckArgs),
+}
+
+/// Exit code for a `check` deny.
+pub(crate) const EX_DENY: i32 = 1;
+
+#[derive(clap::Args)]
+pub(crate) struct CheckArgs {
+    #[command(flatten)]
+    pub policy: PolicyArgs,
+
+    /// The Bash command line to judge.
+    #[arg(
+        long,
+        value_name = "CMD",
+        required_unless_present = "path",
+        conflicts_with = "path"
+    )]
+    pub command: Option<String>,
+
+    /// The Edit/Write target path to judge (absolute).
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<String>,
+}
+
+impl CheckArgs {
+    /// The deny reason, or `None` to allow.
+    fn verdict(&self) -> Option<String> {
+        let policy = self.policy.resolve()?;
+        let home = std::env::var("HOME").ok();
+        let hit = match (&self.command, &self.path) {
+            (Some(cmd), _) => policy.check_command(cmd, home.as_deref()),
+            (None, Some(path)) => policy.check_path(path, home.as_deref()),
+            (None, None) => None,
+        }?;
+        Some(policy.deny_reason(&hit))
+    }
 }
 
 #[derive(clap::Args)]
@@ -241,6 +295,13 @@ impl RoleToolPolicyCommand {
                     EX_NO_RESTRICTION
                 }
             }
+            RoleToolPolicyCommand::Check(args) => match args.verdict() {
+                Some(reason) => {
+                    println!("{reason}");
+                    EX_DENY
+                }
+                None => 0,
+            },
         };
         std::process::exit(code);
     }
@@ -356,5 +417,82 @@ mod tests {
         .unwrap();
         assert_eq!(p.source.as_ref().unwrap(), &ws_roles.join("judge.json"));
         assert_eq!(p.deny_specs().len(), 38);
+    }
+
+    fn check(
+        role: &str,
+        dir: &std::path::Path,
+        command: Option<&str>,
+        path: Option<&str>,
+    ) -> Option<String> {
+        CheckArgs {
+            policy: args(role, dir),
+            command: command.map(str::to_string),
+            path: path.map(str::to_string),
+        }
+        .verdict()
+    }
+
+    #[test]
+    fn check_denies_a_read_only_role_and_names_its_role_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write_role(dir.path(), "curator", r#"{"toolPolicy":{"allowedCapabilities":[]}}"#);
+        let reason = check("curator", dir.path(), Some("bash -c 'ssh host'"), None).unwrap();
+        assert!(reason.starts_with("BLOCKED [role-tool-policy]: role 'curator'"), "{reason}");
+        assert!(reason.contains("remote-shell"), "{reason}");
+        assert!(
+            reason.contains(&dir.path().join("curator.json").display().to_string()),
+            "{reason}"
+        );
+        assert!(check("curator", dir.path(), Some("gh pr view 3"), None).is_none());
+        assert!(check("curator", dir.path(), None, Some("/root/.ssh/authorized_keys")).is_some());
+    }
+
+    #[test]
+    fn check_allows_builder_aliases_and_unresolvable_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        write_role(dir.path(), "builder", r#"{"toolPolicy":{"allowedCapabilities":["*"]}}"#);
+        for r in ["builder", "sweep-lifecycle", "development-worker"] {
+            assert!(check(r, dir.path(), Some("ssh host"), None).is_none(), "{r}");
+        }
+        // Identity fails open: no usable role name, or a role with no JSON.
+        assert!(check("../judge", dir.path(), Some("ssh host"), None).is_none());
+        assert!(check("custom", dir.path(), Some("ssh host"), None).is_none());
+    }
+
+    #[test]
+    fn the_shipped_role_jsons_declare_the_issue_8256_split() {
+        // One declaration per role (#8256): the seven read-only roles reach no
+        // sensitive capability, the four mutable/operator roles reach all.
+        let roles = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/roles");
+        for r in [
+            "architect",
+            "auditor",
+            "champion",
+            "curator",
+            "guide",
+            "hermit",
+            "judge",
+        ] {
+            let p = RoleToolPolicy::load(r, &[roles.join(format!("{r}.json"))]);
+            assert_eq!(p.allowlist, Allowlist::Declared(vec![]), "{r}");
+            for cmd in [
+                "ssh h",
+                "aws s3 ls",
+                "gh secret list",
+                "echo k >> ~/.ssh/authorized_keys",
+            ] {
+                assert!(p.check_command(cmd, Some("/home/a")).is_some(), "{r}: {cmd}");
+            }
+        }
+        for r in ["builder", "doctor", "driver", "loom"] {
+            let p = RoleToolPolicy::load(r, &[roles.join(format!("{r}.json"))]);
+            assert_eq!(p.allowlist, Allowlist::Declared(vec!["*".to_string()]), "{r}");
+            assert!(
+                p.check_command("ssh h && aws s3 ls", Some("/home/a"))
+                    .is_none(),
+                "{r}"
+            );
+        }
     }
 }

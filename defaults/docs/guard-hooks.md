@@ -13,6 +13,7 @@ see "Config tiers" below); the operating-core guides (`CLAUDE.md` and
 - [The Ungated Denial Floor](#the-ungated-denial-floor)
 - [Ask-Tier Composition (#7795)](#ask-tier-composition-7795)
 - [Credential content scan on commit and push (#9133)](#credential-content-scan-on-commit-and-push-9133)
+- [Per-role tool restriction (#8256)](#per-role-tool-restriction-8256)
 - [`loom-daemon guards status` and toggle messages (#10434)](#loom-daemon-guards-status-and-toggle-messages-10434)
 - [Custom Guard Hooks](#custom-guard-hooks)
 <!-- toc:end -->
@@ -462,6 +463,96 @@ guard allow, like every other unavailable check.
 A synthetic fixture that trips it goes in `.loom/secret-scan-allow`, one
 fingerprint per line with a reason. Never list a real credential there: remove
 it, and rotate it, since anything pushed to a public remote is disclosed.
+
+## Per-role tool restriction (#8256)
+
+Role prompts are public, and every role reads attacker-reachable text.
+[`untrusted-external-content.md`](untrusted-external-content.md) is prevention;
+it does not hold once a role **is** persuaded. This rule is the harness half: a
+role that does not declare a sensitive capability cannot reach it, whatever it
+was talked into.
+
+**The field.** Each role JSON (`defaults/roles/<role>.json`, installed as
+`.loom/roles/<role>.json`) carries `toolPolicy.allowedCapabilities`. The
+shipped roles split as follows:
+
+| Roles | `allowedCapabilities` |
+|---|---|
+| architect, auditor, champion, concierge, curator, guide, hermit, judge | `[]`: reaches none |
+| builder, doctor, driver, loom | `["*"]`: unrestricted, unchanged |
+
+The four capabilities, and the rules for the array (undeclared means
+unrestricted, `"*"` as a whole element is the only wildcard, an unknown name
+is inert), are in [`roles/README.md`](../roles/README.md) ("`toolPolicy.allowedCapabilities`").
+A consumer role with no `toolPolicy` is unrestricted, so adding the control
+never breaks a custom role.
+
+**The subcommand.** `loom-daemon role-tool-policy check` is the one decision:
+
+```bash
+loom-daemon role-tool-policy check [ROLE] --roles-dir <dir> --workspace <dir> --command "<bash line>"
+loom-daemon role-tool-policy check [ROLE] --roles-dir <dir> --workspace <dir> --path <abs path>
+```
+
+`ROLE` defaults to `$LOOM_ROLE`, with the daemon dispatch aliases resolved
+(`sweep-lifecycle` and `development-worker` map to builder, `pr-fixer` to
+doctor). Exit 0 allows. Exit 1 denies, with a reason on stdout that starts
+`BLOCKED [role-tool-policy]`. The matcher is a small shell lexer in
+`loom-daemon/src/role_tool_policy/command_match.rs`, unit-tested per capability:
+
+| Capability | Denied when |
+|---|---|
+| `remote-shell` | `ssh`, `scp`, `sftp`, `ssh-*`, `autossh` is a **command word** |
+| `cloud-cli` | `aws`, `gcloud`, `az`, `doctl`, `fly(ctl)`, `wrangler`, `heroku`, `kubectl`, `eksctl` is a command word |
+| `forge-secrets` | `gh secret`, `gh variable`, `gh auth token/login/refresh/logout/setup-git`, `gh auth status --show-token`, `gh api …/secrets` or `…/variables` |
+| `credential-store` | any word, redirect target or Edit/Write path is under `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.kube`, `~/.azure`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json`, `~/.loom/tokens` or `~/.claude/.credentials.json` |
+
+A command word is found the way the shell would find it. Quotes and backslashes
+are honoured, so `"s"sh` is `ssh` and `gh pr comment --body "use ssh"` is not a
+command. `;`, `&&`, `|` and newlines separate commands. `$(…)`, backticks and
+`<(…)` are analyzed as commands. The common wrappers are looked through:
+`sudo`, `env` (including `-S`), `timeout`, `nice`, `nohup`, `xargs`,
+`find -exec`, `watch`, `flock`, `eval`, `bash -c` and a here-string fed to a
+shell.
+
+**Enforcement points.** Every hook reads the declaration from its **own**
+install (`<hooks>/../roles`), never from the session's cwd, so a PR checked out
+in a worktree cannot grant its own session a capability.
+
+| Where | What |
+|---|---|
+| `guard-loom-workflow.sh` (Bash) | `check --command`, on the same masked text the merge redirect scans, so a quoted `grep`/`echo` argument never matches |
+| `guard-worktree-paths.sh` (Edit/Write) | `check --path` on the canonical target |
+| `guard-codex-bridge.sh` (Codex) | no code of its own: it already runs the two hooks above, so Codex shell and `apply_patch` calls get the same verdict |
+| `spawn-claude.sh` | `role-tool-policy deny-specs` becomes `--disallowedTools`. This is defense in depth only: a deny spec is a prefix glob that `bash -c 'ssh …'` walks past |
+| `spawn-codex.sh` | Codex has no `--disallowedTools`, so nothing is injected at spawn: on Codex a restricted policy is enforced only by the managed hook (through `guard-codex-bridge.sh`) |
+
+**Fail closed.** The hooks honour only two answers from `check`: exit 0, and
+exit 1 with the prefix. Any other answer is treated as an error. That covers a
+missing binary, a daemon that predates `check` (clap exits 2) and a crash. On
+an error the hooks **deny** the built-in read-only roles listed above and
+allow every other role. Allow is never the error path for a restricted role,
+but a Builder is never stopped by a daemon roll. The cost: a host whose
+installed hooks are newer than its daemon denies every Bash and Edit/Write
+call from those roles until the daemon is rolled, and the deny message says so.
+A consumer's own read-only role, unknown to the hook, fails open on this path.
+
+**No toggle, on purpose.** Every `guards.*` category above can be a whole-repo
+category error. This one cannot, because its configuration is the per-role
+declaration. A repo whose Judge really needs `aws` adds `"cloud-cli"` to
+`judge.json`, a reviewed change in the file that grants it. A single switch
+would disarm every role at once, which is the bypass this defends against.
+Toggles such as `guards.cloudCli` and `guards.worktreeIsolation: false` do
+not weaken it. Interactive sessions do not set `LOOM_ROLE`, so they are never
+restricted.
+
+**Known limits.** This is a backstop, not a sandbox. It cannot see a command
+assembled at run time (`p=ss; ${p}h host`), a script the session wrote and
+then ran, text piped into a shell's stdin, or the SSH transport `git fetch`
+uses. The credential-store match anchors on a home directory or a relative
+path that starts with a credential directory, so a path built from variables
+is not seen. Where the matcher cannot tell a pattern from a path (an unquoted
+`grep .ssh`), it over-denies.
 
 ## `loom-daemon guards status` and toggle messages (#10434)
 
