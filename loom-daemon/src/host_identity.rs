@@ -335,13 +335,13 @@ pub fn export_for_children() -> ResolvedHostId {
 /// containing something that is not an id) is replaced by `rename`; no valid
 /// id exists for it to re-key.
 ///
-/// The returned id is always **re-read from `path`** after placement, never
-/// assumed to be this call's candidate: two processes replacing the same
-/// invalid file each `rename` in turn, and the re-read makes the earlier one
-/// report the later one's id instead of its own overwritten one. (A replacer
-/// that re-reads *before* the later `rename` lands can still return its own
-/// id once; the window exists only while the file is invalid, and the
-/// process-lifetime cache plus every later read converge on the survivor.)
+/// Invalid-file replacement is serialized by an exclusive `flock` on a
+/// sidecar lock file ([`RecoveryLock`]), and validity is re-checked once the
+/// lock is held, so only the first replacer renames: later ones see its valid
+/// id and leave it alone. Every caller therefore reports the same surviving
+/// id, which the process-lifetime cache and `export_for_children` then
+/// agree with. The returned id is always **re-read from `path`** after
+/// placement, never assumed to be this call's candidate.
 pub fn load_or_create(path: &Path) -> std::io::Result<(String, bool)> {
     load_or_create_with(path, |from, to| std::fs::hard_link(from, to))
 }
@@ -362,9 +362,16 @@ fn load_or_create_with(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_valid(path)? {
             Some(_) => Ok(()),
-            // Present but invalid: replace it (the re-read below settles a
-            // race between two replacers).
-            None => std::fs::rename(&tmp, path),
+            // Present but invalid: replace it under the recovery lock, and
+            // re-check validity once held — a replacer that got there first
+            // has already put a valid id in place, which must win.
+            None => {
+                let _lock = RecoveryLock::acquire(dir)?;
+                match read_valid(path)? {
+                    Some(_) => Ok(()),
+                    None => std::fs::rename(&tmp, path),
+                }
+            }
         },
         // Hard links unsupported here: exclusive create in place.
         Err(_) => match write_owner_only(path, &candidate) {
@@ -378,6 +385,39 @@ fn load_or_create_with(
         .ok_or_else(|| std::io::Error::other("persisted host id vanished after creation"))?;
     let created = id == candidate;
     Ok((id, created))
+}
+
+/// Exclusive advisory lock (`flock` on `.<HOST_ID_FILENAME>.lock` beside the
+/// id file) held while replacing an invalid id file. Separate opens contend
+/// even within one process, so it serializes threads and processes alike; the
+/// kernel releases it when the file is dropped, so a crashed holder cannot
+/// leave it stuck. Taken only on the rare invalid-file path.
+struct RecoveryLock(#[allow(dead_code)] std::fs::File);
+
+impl RecoveryLock {
+    fn acquire(dir: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!(".{HOST_ID_FILENAME}.lock")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                // SAFETY: `file` owns a valid open descriptor for this call.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self(file))
+    }
 }
 
 /// [`read_valid`], retried briefly while the file reads empty: an `O_EXCL`

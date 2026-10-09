@@ -193,28 +193,63 @@ fn hard_link_refused_falls_back_to_exclusive_create() {
     assert_eq!(leftovers, 1, "temp file leaked");
 }
 
-/// Many replacers of one corrupt file: every caller gets a valid id read back
-/// from disk (never an unplaced candidate), the file ends valid, and the
-/// on-disk id is among those reported. The residual window — a replacer that
-/// re-reads before a later one's `rename` lands — is documented on
-/// [`load_or_create`]; it cannot recur once the file is valid.
+/// Many replacers of one corrupt file, with a controlled interleaving: a
+/// barrier inside the link seam holds every thread until all have observed
+/// `AlreadyExists` (and so all believe the file is invalid) before any enters
+/// recovery. Every caller must still report the same surviving id, exactly one
+/// must report having created it, and it must be the id on disk.
 #[test]
-fn concurrent_replacement_of_an_invalid_file_reports_the_on_disk_id() {
+fn concurrent_replacement_of_an_invalid_file_converges_on_one_id() {
+    const THREADS: usize = 8;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(HOST_ID_FILENAME);
     std::fs::write(&path, "not an id\n").unwrap();
-    let handles: Vec<_> = (0..8)
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
         .map(|_| {
             let path = path.clone();
-            std::thread::spawn(move || load_or_create(&path).unwrap())
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let link = |from: &Path, to: &Path| {
+                    let result = std::fs::hard_link(from, to);
+                    barrier.wait();
+                    result
+                };
+                load_or_create_with(&path, link).unwrap()
+            })
         })
         .collect();
     let results: Vec<(String, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let on_disk = std::fs::read_to_string(&path).unwrap().trim().to_string();
     assert!(is_valid_id(&on_disk));
-    assert!(results.iter().all(|(id, _)| is_valid_id(id)), "{results:?}");
-    assert!(results.iter().any(|(id, _)| *id == on_disk), "{results:?}");
+    assert!(results.iter().all(|(id, _)| *id == on_disk), "{results:?} vs {on_disk}");
+    assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1, "{results:?}");
     assert_eq!(load_or_create(&path).unwrap(), (on_disk, false));
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "temp file leaked: {leftovers:?}");
+}
+
+/// The resolver cache (and so `export_for_children`'s child identity) agrees
+/// with the file when several resolvers race to recover a corrupt id file.
+#[test]
+fn concurrent_resolution_of_an_invalid_file_caches_the_surviving_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(HOST_ID_FILENAME);
+    std::fs::write(&path, "\n").unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || resolve_persisted(&path).id)
+        })
+        .collect();
+    let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let on_disk = std::fs::read_to_string(&path).unwrap().trim().to_string();
+    assert!(ids.iter().all(|id| *id == on_disk), "{ids:?} vs {on_disk}");
+    assert_eq!(resolve_persisted(&path).id, on_disk, "cache hit must match the file");
 }
 
 /// An unwritable id location resolves to the `unknown` source (which
