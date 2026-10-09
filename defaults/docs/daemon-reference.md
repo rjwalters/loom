@@ -1456,15 +1456,37 @@ repos:
   - name: app             # unique
     dir: app              # clone directory under root (default: name); one path component
     remote: git@github.com:acme/app.git
-    fleet: true           # the daemon manages it (default false)
+    fleet: true           # the daemon manages it (default false); or `maintain`, below
     fleet_priority: 10    # dispatch tier, lower first (default 100)
     firewall: false       # true = never an unattended-agent target (default false)
 ```
 
-The desired workspace set is every record with `fleet: true` and not
-`firewall: true`. A record with **both** is a hard error for the whole roster,
-never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
-non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+The desired workspace set is every record with `fleet: true` or
+`fleet: maintain`, and not `firewall: true`. A record with **both** is a hard
+error for the whole roster, never a silent exclusion — so is a `fleet` other
+than `true`/`false`/`maintain`, a non-boolean `firewall`, a non-integer
+`fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+
+**`fleet: maintain`** (#11186) makes a repo **maintain-only**: it is
+registered and kept current exactly like `fleet: true` (the per-repo Loom
+resync, the checkout fast-forward, the floor checks), but the daemon never
+dispatches into it — no sweep, no role-runner tick, no idle-edge role, no epic
+dispatch (the `maintain-only` hold in
+[Dispatch holds](#dispatch-holds-10719)). Flipping a repo between `true` and
+`maintain` changes its registry entry in place; it is never removed and
+re-added. Use it for a repo the fleet should keep current but no agent should
+work in, such as the fleet's own admin repo. `fleet: false` is different: the
+repo is deregistered and its Loom install is no longer maintained at all.
+
+It is a value of `fleet` rather than a separate key on purpose. A daemon that
+predates it refuses the whole roster (`` `fleet` must be true or false (got
+"maintain") ``): that host makes no roster change of any kind, and the token
+pool's firewall input, read from the same roster, fails closed too, until the
+host runs a daemon that knows the value. A separate `dispatch: false` key
+would instead be ignored by an old daemon, like every other unknown key, which
+would register the repo and **dispatch into it**. So a store should start
+using `fleet: maintain` only once every host's daemon understands it, that is
+once `loom_min_version` is at or above the release that added it.
 
 **`loom_min_version`** (#10711): a top-level `"X.Y.Z"` string, the
 fleet-wide minimum Loom version. **Required since #10885**: it is what moves a
@@ -1566,13 +1588,17 @@ start for the startup-resolved knobs — see
 Diffs the desired set against the workspace registry (`~/.loom/workspaces.json`,
 `LOOM_WORKSPACES_PATH`): **adds** (desired, not registered), **removes**
 (registered, and the store has a record for that path that is not desired —
-`fleet: false` or `firewall: true`) and **priority changes**. A registered
+`fleet: false` or `firewall: true`), **mode changes** (a registered repo whose
+`fleet: maintain` differs from its registry entry's maintain-only mark,
+flipped in place, #11186) and **priority changes**. A registered
 workspace the store has no record for is reported as *unmanaged* and left
 alone. Paths are compared after the registry's own normalization.
 
 `--check` exits `1` when the registry differs. `--apply` performs the changes
-through the same code paths as `loom-daemon workspace remove` / `add` /
-`set-priority` (removes first), and only for repos already cloned under
+through the same code paths as `loom-daemon workspace remove` / `hold` /
+`release` / `add` / `set-priority` (removes first, then mode changes; a
+maintain-only add is registered maintain-only in the same write), and only for
+repos already cloned under
 `root` — a missing clone is reported and exits `1`, and is never cloned here.
 
 **Fails closed.** The roster carries the fleet's firewall inputs, so it is
@@ -1824,6 +1850,30 @@ cannot work with this daemon. The checkout copy is
 | compatible, or a resync owed (no `requires_daemon`) | not held | | no |
 | could not be read this pass | the previous verdict stands | | as before |
 
+- **`maintain-only` is the operator's hold (#11186).** A workspace whose
+  registry entry is marked maintain-only (the fleet store's `fleet: maintain`,
+  or `loom-daemon workspace hold <root>`) is held with the typed outcome
+  `maintain-only` and the `workspace_halted` cause `maintain_only`, on every
+  path in the table under "Where it is enforced". It differs from the
+  `W3`/`W4` holds above:
+
+  | | `install-incompatible` / `daemon-too-old` | `maintain-only` |
+  |---|---|---|
+  | Set by | the workspace pass's verdict | the registry entry's mark |
+  | Clears | when the pass's next verdict is clean | only when the mark is lifted (`fleet: true`, or `workspace release`) |
+  | Asks for a roll | `daemon-too-old` may | never |
+  | 30-minute "stood for N minutes" ERROR | yes | never: it is intended |
+  | Resync, checkout fast-forward, floor checks | run | run |
+
+  Both kinds can stand on one workspace at once. Each is set and cleared on
+  its own; dispatch is refused while either stands, and a refusal names
+  `maintain-only` first. The mark is read from the registry file whenever it
+  changes, so a `hold` or `release` takes effect on the next dispatch decision
+  with no restart. `loom-daemon status` shows it in the `Managed repos` table
+  as `maintain-only (fleet store)` or `maintain-only (operator)`, and
+  `status --json` as `per_repo[].maintain_only` (`{"by": "fleet-store" |
+  "operator", "since": …}`). The `Fleet store:` block lists only the pass's
+  own `W3`/`W4` holds.
 - **The ratchet guard.** A repo that is only *ahead* of this daemon is
   neither held nor a reason to roll. Hosts roll at different moments, so a
   host that has just rolled resyncs repos to a release the others do not run
@@ -1870,7 +1920,7 @@ cannot work with this daemon. The checkout copy is
   | Path | Refused by |
   |---|---|
   | Sweeps: the work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | the sweep registry, for issue and PR-set dispatch, with a typed `WorkspaceHeldDispatchError` before any lock, label flip or forge call |
-  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
+  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible`, `daemon_too_old` or `maintain_only` |
   | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
   | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
   | Epic supervisor (`LOOM_EPIC_SUPERVISOR=1`): singleton roles (Architect, Champion) and epic child sweeps | the supervisor skips the held workspace's whole tick, logged each tick. Its role dispatch runs the checkout's spawn script outside the registry, so it also refuses on its own with the same typed `WorkspaceHeldDispatchError` before that script runs |
@@ -2860,6 +2910,20 @@ ordering:
     (default `100`).
   - `loom-daemon workspace set-priority <path> N` retiers an already-registered
     repo.
+  - `loom-daemon workspace hold <path>` makes an already-registered repo
+    **maintain-only** (#11186): its Loom install is still resynced and its
+    checkout fast-forwarded, but no sweep, role or epic dispatch starts there.
+    `loom-daemon workspace release <path>` lifts it. Both edit the entry in
+    place and hot-apply; an unregistered path is an error.
+    `workspace add <path> --maintain-only` registers a repo maintain-only in
+    one write. The entry records who set it as `"maintain_only": {"by":
+    "operator" | "fleet-store", "since": …}`; an entry without the key is a
+    normal, dispatched workspace. These are for hosts no fleet store drives:
+    on a host with a fleet store and `fleet.autoApply`, the roster's
+    `fleet: true` / `fleet: maintain` wins on its next pass, exactly as it
+    does for `priority`. A daemon older than #11186 ignores the key and
+    dispatches into the repo, and rewriting the file with an older
+    `workspace` verb drops it.
   - `loom-daemon workspace list` prints a `PRIO` column, sorted highest-priority
     first (mutation order on disk is preserved).
 

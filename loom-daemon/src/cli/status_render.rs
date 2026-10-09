@@ -2605,6 +2605,9 @@ pub(crate) fn print_status_human(
             // it on dispatch; this is the operator-facing pointer to clean it
             // up (or, if the root is only transiently unavailable, e.g. an
             // unmounted volume, to leave it registered).
+            if let Some(mark) = &r.maintain_only {
+                println!("        {}: kept current, never dispatched into (#11186)", mark.label());
+            }
             if r.root_missing {
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
@@ -4682,6 +4685,7 @@ mod stash_status_render_tests {
     ) -> loom_daemon::types::RepoStatus {
         loom_daemon::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
+            maintain_only: None,
             priority: 100,
             in_flight_count: 0,
             health_gate_halted: false,
@@ -4930,6 +4934,7 @@ mod role_runner_diagnostic_source_render_tests {
     pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
+            maintain_only: None,
             priority: 100,
             in_flight_count: 0,
             health_gate_halted: false,

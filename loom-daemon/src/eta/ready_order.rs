@@ -87,9 +87,11 @@ enum Class {
     Refused(NoEstimateReason),
 }
 
-/// Halt causes local to the halted host: a peer can still dispatch.
+/// Halt causes local to the halted host: a peer can still dispatch. A
+/// maintain-only repo (#11186) is usually marked by the fleet store, so on
+/// every host: no peer will dispatch it either.
 fn host_local(cause: HaltCause) -> bool {
-    !matches!(cause, HaltCause::MainRed | HaltCause::CiBilling)
+    !matches!(cause, HaltCause::MainRed | HaltCause::CiBilling | HaltCause::MaintainOnly)
 }
 
 fn classify(row: &ReadyRow) -> Class {

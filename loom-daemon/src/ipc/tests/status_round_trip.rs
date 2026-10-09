@@ -56,6 +56,7 @@ fn test_daemon_status_request_response_round_trip() {
         },
         per_repo: vec![crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repo/a"),
+            maintain_only: None,
             priority: 100,
             in_flight_count: 0,
             health_gate_halted: true,

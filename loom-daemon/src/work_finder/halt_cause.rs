@@ -63,11 +63,15 @@ pub enum HaltCause {
     /// The root's installed Loom needs a newer daemon than this one (W4,
     /// #10719). Clears when this host has rolled.
     DaemonTooOld,
+    /// The registry marks the root maintain-only (#11186): the daemon keeps
+    /// its Loom install current and never dispatches into it. An operator's
+    /// choice; it clears only when the mark is lifted.
+    MaintainOnly,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -78,6 +82,7 @@ impl HaltCause {
         Self::CiBilling,
         Self::InstallIncompatible,
         Self::DaemonTooOld,
+        Self::MaintainOnly,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -107,6 +112,7 @@ impl HaltCause {
             Self::CiBilling => "ci_billing",
             Self::InstallIncompatible => "install_incompatible",
             Self::DaemonTooOld => "daemon_too_old",
+            Self::MaintainOnly => "maintain_only",
         }
     }
 }
