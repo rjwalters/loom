@@ -58,6 +58,10 @@
 //! - **Friction predictors** (#10521, [`Assembled::loops`], not model
 //!   inputs): `loop_features` at `t − LAG` over the repo's episodes, the same
 //!   builder serving calls. Files and CI are not logged, so those are `None`.
+//! - **Size and scope predictors** (#10960, [`Assembled::scope`], not model
+//!   inputs): `scope_features` at `t − LAG` over the logged file lists and
+//!   the repo's merges in the trailing 7 days, the same builder serving
+//!   calls. All unknown when no file log is given.
 //! - A row whose needed queue feature is `None` is dropped and counted in
 //!   [`RowStats::rows_dropped_missing`].
 //! - **Exit label**: `Some` iff `t + `[`EXIT_HORIZON_SEC`]` < H`; then whether
@@ -108,6 +112,7 @@ use crate::eta::priority_features::{
 use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
 use crate::eta::queue_features::{queue_features, QueueFeatures, QueueSubject, RosterEntry};
 use crate::eta::repo_priority::RosterRevision;
+use crate::eta::scope_features::{churn_context, scope_features, ScopeFeatures, ScopeInputs};
 use crate::eta::star::{LinkedStar, StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
@@ -168,6 +173,11 @@ pub struct Assembled {
     /// age, from the one builder serving also calls. File overlap and own-CI
     /// are `None` (not logged yet). Not read by the current fit.
     pub loops: Vec<LoopFeatures>,
+    /// `scope[i]` is the size and scope predictor set of `rows[i]` (#10960),
+    /// from the one builder serving also calls, over the file lists logged
+    /// before the row's cutoff. All unknown without a file log. Not read by
+    /// any fit yet.
+    pub scope: Vec<ScopeFeatures>,
     /// What was dropped.
     pub stats: RowStats,
     /// The data horizon `H` (see the module docs).
@@ -462,6 +472,15 @@ pub fn build_with_files(
                 .iter()
                 .map(|(repo, eps)| (*repo, repo_context(eps, cutoff)))
                 .collect();
+            // The repo's merges in the churn window, once per tick (#10960).
+            let merged: BTreeMap<&str, Vec<&StageEpisode>> = if files.is_some() {
+                repo_episodes
+                    .iter()
+                    .map(|(repo, eps)| (*repo, churn_context(eps, cutoff)))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
             for (pr, episode) in &open {
                 let Some(stage) = FitStage::from_stage(episode.stage) else {
                     continue;
@@ -522,6 +541,15 @@ pub fn build_with_files(
                     },
                     cutoff,
                 );
+                let scope = scope_features(
+                    &ScopeInputs {
+                        repo: &pr.repo,
+                        pr: pr.number,
+                        repo_episodes: merged.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
+                        files,
+                    },
+                    cutoff,
+                );
                 let rework = pr
                     .episodes
                     .iter()
@@ -556,6 +584,7 @@ pub fn build_with_files(
                         prio,
                         prio_v2,
                         loops,
+                        scope,
                     ),
                 ));
             }
@@ -568,12 +597,14 @@ pub fn build_with_files(
     let mut priority = Vec::with_capacity(keyed.len());
     let mut priority_inputs = Vec::with_capacity(keyed.len());
     let mut loops = Vec::with_capacity(keyed.len());
-    for ((key, _), (row, prio, prio_v2, lp)) in keyed {
+    let mut scope = Vec::with_capacity(keyed.len());
+    for ((key, _), (row, prio, prio_v2, lp, sc)) in keyed {
         row_keys.push(key);
         rows.push(row);
         priority.push(prio);
         priority_inputs.push(prio_v2);
         loops.push(lp);
+        scope.push(sc);
     }
 
     Assembled {
@@ -583,6 +614,7 @@ pub fn build_with_files(
         priority,
         priority_inputs,
         loops,
+        scope,
         stats,
         data_through: horizon,
     }
@@ -591,11 +623,11 @@ pub fn build_with_files(
 /// A dwell's canonical sort key: `(stage, repo, pr, entered_at)`.
 type DwellKey<'a> = (FitStage, &'a str, u32, DateTime<Utc>);
 
-/// One assembled row with its sort key, v1 priority candidates, v2 inputs and
-/// friction predictors (#10521).
+/// One assembled row with its sort key, v1 priority candidates, v2 inputs,
+/// friction predictors (#10521) and size and scope predictors (#10960).
 type KeyedRow = (
     (RowKey, FitStage),
-    (TrainingRow, PriorityFeatures, PriorityInputs, LoopFeatures),
+    (TrainingRow, PriorityFeatures, PriorityInputs, LoopFeatures, ScopeFeatures),
 );
 
 /// The dwells, in canonical order (see the module docs).

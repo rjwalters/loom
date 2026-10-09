@@ -40,6 +40,7 @@ use crate::eta::loop_features::{
     loop_features, repo_context, FileSnapshot, LoopFeatures, LoopInputs,
 };
 use crate::eta::queue_features::EventLog;
+use crate::eta::scope_features::{churn_context, scope_features, ScopeFeatures, ScopeInputs};
 use crate::eta::{AgeSource, Stage};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
@@ -53,6 +54,21 @@ impl Tracker {
         self.context
             .timeline()
             .loop_features(repo, pr, now, self.file_snapshots())
+    }
+
+    /// The size and scope predictors of `pr` of `repo` at `now` (#10960),
+    /// from the logged file lists and the timeline's merges at `now − LAG`,
+    /// as a training row at `t` reads them at `t − LAG`. `None` while no
+    /// file log is loaded (every input would be unknown).
+    #[must_use]
+    pub fn scope_features_of(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<ScopeFeatures> {
+        let files = self.file_snapshots()?;
+        Some(self.context.timeline().scope_features(repo, pr, now, files))
     }
 
     /// Start `key`'s track on first sight of its PR mid-`stage` (a restart,
@@ -348,6 +364,35 @@ impl Timeline {
                 repo_episodes: &context,
                 files,
                 ci: None,
+            },
+            cutoff,
+        )
+    }
+
+    /// The size and scope predictors of `pr` at `now − LAG` (#10960): the one
+    /// builder [`scope_features`] over the logged file lists and the repo's
+    /// merges in the churn window, as `fit::rows` calls it.
+    pub(super) fn scope_features(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+        files: &[FileSnapshot],
+    ) -> ScopeFeatures {
+        let cutoff = cutoff(now);
+        let key = repo.to_ascii_lowercase();
+        let all: Vec<&StageEpisode> = self
+            .prs
+            .range((key.clone(), 0)..=(key, u32::MAX))
+            .flat_map(|(_, episodes)| episodes.iter())
+            .collect();
+        let merged = churn_context(&all, cutoff);
+        scope_features(
+            &ScopeInputs {
+                repo,
+                pr,
+                repo_episodes: &merged,
+                files: Some(files),
             },
             cutoff,
         )

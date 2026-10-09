@@ -67,6 +67,7 @@ mod recency;
 mod regime;
 mod regime_serving;
 mod roster_history;
+mod scope_features;
 mod score;
 mod serve_parity;
 mod shadow;
