@@ -139,7 +139,7 @@
 #       reported, so merging now would move the base under it again (the
 #       #10163 livelock). Checked only under --auto or LOOM_CHAIN_LOCK_GUARD=1,
 #       before anything is written; nothing merged, nothing failed. Bounded
-#       by LOOM_CHAIN_LOCK_CAP_SECS (default 1200, max 3600);
+#       by LOOM_CHAIN_LOCK_CAP_SECS (default 7200, max 10800);
 #       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it. Same caller contract as exits
 #       3/4/5 — re-queue, never a failure comment.
 
