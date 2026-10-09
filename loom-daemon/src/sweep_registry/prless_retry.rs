@@ -555,7 +555,15 @@ impl SweepRegistry {
         exit_code: Option<i32>,
         duration_sec: i64,
         phase: Option<&str>,
+        group_survived: bool,
     ) {
+        if let Some(why) = prless_strike_exemption(exit_code, group_survived) {
+            log::info!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} death not counted as a PR-less \
+                 strike: {why} (#11076)"
+            );
+            return;
+        }
         let died = match exit_code {
             Some(code) => format!("crashed after {duration_sec}s (exit {code})"),
             None => format!("died after {duration_sec}s (no exit status observed)"),
@@ -584,7 +592,15 @@ impl SweepRegistry {
         open_pr: Option<OpenPrProbe>,
         exit_code: Option<i32>,
         duration_sec: i64,
+        group_survived: bool,
     ) {
+        if let Some(why) = prless_strike_exemption(exit_code, group_survived) {
+            log::info!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} exit not counted as a PR-less \
+                 strike: {why} (#11076)"
+            );
+            return;
+        }
         let ended = match exit_code {
             Some(code) => format!("exited {code} after {duration_sec}s"),
             None => format!("ended after {duration_sec}s (no exit status observed)"),
@@ -976,6 +992,30 @@ impl SweepRegistry {
     }
 }
 
+/// Issue #11076: a death that says nothing about the issue and so must not
+/// cost it a PR-less strike. `Some(reason)` exempts it.
+///
+/// - The leader was SIGKILLed / SIGTERMed (exit 137/143, or a raw negative
+///   signal status): an external OOM or `systemctl stop` of the sweep's scope,
+///   not the sweep's own work product.
+/// - The sweep's process group still had live members when the leader was
+///   reaped: a `claude-wrapper.sh` retry is alive, so the session is NOT over
+///   and the claim must not be released as PR-less.
+pub(crate) fn prless_strike_exemption(
+    exit_code: Option<i32>,
+    group_survived: bool,
+) -> Option<&'static str> {
+    if group_survived {
+        return Some("its process group still has live members (a wrapper retry is alive)");
+    }
+    match exit_code {
+        Some(137 | 143 | -9 | -15) => {
+            Some("terminated by SIGKILL/SIGTERM (external OOM or scope stop)")
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -983,6 +1023,40 @@ mod tests {
     use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
     use serial_test::serial;
     use tempfile::tempdir;
+
+    /// #11076: an external OOM / scope stop must not count as a PR-less strike.
+    #[test]
+    fn external_oom_or_scope_stop_is_not_a_prless_strike() {
+        for code in [137, 143] {
+            let mut reg = test_registry();
+            reg.note_prless_crash_outcome(11076, "s", Some(code), 900, Some("builder"), false);
+            reg.note_prless_exit_outcome(
+                11076,
+                "s",
+                Some(OpenPrProbe::NoneOpen),
+                Some(code),
+                900,
+                false,
+            );
+            assert_eq!(reg.prless_release_count(11076), 0, "exit {code} must not strike");
+        }
+        // Control: an ordinary failure still strikes.
+        let mut reg = test_registry();
+        reg.note_prless_crash_outcome(11076, "s", Some(1), 900, Some("builder"), false);
+        assert_eq!(reg.prless_release_count(11076), 1);
+    }
+
+    /// #11076: never release a claim while a wrapper retry (live group) exists.
+    #[test]
+    fn live_process_group_blocks_the_prless_release() {
+        let mut reg = test_registry();
+        reg.note_prless_crash_outcome(11076, "s", None, 900, Some("builder"), true);
+        reg.note_prless_exit_outcome(11076, "s", Some(OpenPrProbe::NoneOpen), Some(1), 900, true);
+        assert_eq!(reg.prless_release_count(11076), 0);
+        assert!(reg.prless_retry_remaining(11076, Utc::now()).is_none());
+        assert!(prless_strike_exemption(Some(1), true).is_some());
+        assert!(prless_strike_exemption(Some(1), false).is_none());
+    }
 
     /// A registry with forge writes disabled — the tests here drive the
     /// in-memory tally directly, which is the load-bearing half. The
@@ -1119,7 +1193,7 @@ mod tests {
     fn a_crash_with_no_sampled_pr_records_a_release_without_probing() {
         let mut reg = test_registry();
 
-        reg.note_prless_crash_outcome(7893, "sweep-stub", Some(1), 2510, Some("builder"));
+        reg.note_prless_crash_outcome(7893, "sweep-stub", Some(1), 2510, Some("builder"), false);
 
         assert_eq!(reg.prless_release_count(7893), 1);
         let reason = reg.prless_retry_reason(7893).unwrap();
@@ -1142,10 +1216,18 @@ mod tests {
             Some(OpenPrProbe::Open(8123)),
             Some(0),
             90,
+            false,
         );
         assert_eq!(reg.prless_release_count(7893), 0);
 
-        reg.note_prless_exit_outcome(7893, "sweep-stub", Some(OpenPrProbe::NoneOpen), Some(78), 41);
+        reg.note_prless_exit_outcome(
+            7893,
+            "sweep-stub",
+            Some(OpenPrProbe::NoneOpen),
+            Some(78),
+            41,
+            false,
+        );
         let reason = reg.prless_retry_reason(7893).unwrap();
         assert!(reason.contains("exited 78"), "names the exit status: {reason}");
         // #8912: the reason must describe a check that was ACTUALLY performed.

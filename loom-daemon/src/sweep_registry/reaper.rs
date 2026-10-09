@@ -1144,12 +1144,16 @@ impl SweepRegistry {
                 // Signal the group before the entry transitions terminal (after
                 // which nothing tracks the pgid at all). No-op when the group is
                 // already empty, which is the ordinary case.
+                // #11076: remember whether the group still had members — a
+                // live wrapper retry (or any survivor) means this death is not
+                // the end of the session, so it must not be struck PR-less.
+                let mut group_survived = false;
                 if let Some(pgid) = pgid {
                     let issue = match &kind {
                         SweepKind::Issue(n) => Some(*n),
                         SweepKind::PrSet(_) => None,
                     };
-                    self.reap_orphaned_group(&sweep_id, issue, pgid);
+                    group_survived = self.reap_orphaned_group(&sweep_id, issue, pgid);
                 }
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
@@ -1431,6 +1435,7 @@ impl SweepRegistry {
                                     exit_code,
                                     duration_sec,
                                     resume_phase_check.as_deref(),
+                                    group_survived,
                                 );
                             }
                             // Reaper-driven resume (Issue #4256): a crash whose
@@ -2132,6 +2137,7 @@ impl SweepRegistry {
                                     open_pr_probe,
                                     exit_code,
                                     duration_sec,
+                                    group_survived,
                                 );
                             }
                         }
