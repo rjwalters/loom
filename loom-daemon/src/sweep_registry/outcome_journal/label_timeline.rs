@@ -98,9 +98,10 @@ pub(crate) const MAX_JUDGE_VERDICTS: usize = 32;
 
 /// How long after a base-conflict flag comment its `loom:changes-requested`
 /// can land and still be read as the flag's (#9062). The pass writes the
-/// comment and the labels back to back (seconds); the bound keeps a flag whose
-/// relabel failed from swallowing a later, genuine Judge rejection.
-pub(crate) const BASE_CONFLICT_FLAG_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+/// comment and the labels back to back (seconds), and a failed relabel's retry
+/// lands about a minute later (#10451: ~50 s); the tight bound keeps a flag
+/// whose relabel failed from swallowing a later, genuine Judge rejection.
+pub(crate) const BASE_CONFLICT_FLAG_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
 
 /// The [`timeline_jq`] kind column of a base-conflict flag comment row.
 pub(crate) const FLAG_ROW_KIND: &str = "base-conflict-flag";
@@ -620,17 +621,30 @@ mod tests {
     }
 
     /// A flag whose relabel never landed must not swallow a genuine Judge
-    /// rejection long after it.
+    /// rejection after it — 4 minutes later is already outside the window.
     #[test]
     fn a_stale_flag_outside_the_window_does_not_hide_a_later_rejection() {
         let stdout = format!(
             "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
-             2026-09-18T14:00:00Z\t{CHANGES_REQUESTED_LABEL}\n",
+             2026-09-18T12:14:00Z\t{CHANGES_REQUESTED_LABEL}\n",
             flag_row("2026-09-18T12:10:00Z", "loom-fleet-dispatch[bot]", "NONE"),
         );
         let signals = signals_from_events(&parse_label_events(stdout.as_bytes(), &policy()));
         assert_eq!(signals.judge_verdicts.len(), 1);
         assert_eq!(signals.judge_verdicts[0].verdict, VERDICT_FAIL);
+    }
+
+    /// A relabel retried by the next pass (#10451: ~50 s after the flag)
+    /// still reads as the flag's, not a Judge verdict.
+    #[test]
+    fn a_retried_relabel_within_the_window_is_still_the_flags() {
+        let stdout = format!(
+            "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
+             2026-09-18T12:10:50Z\t{CHANGES_REQUESTED_LABEL}\n",
+            flag_row("2026-09-18T12:10:00Z", "loom-fleet-dispatch[bot]", "NONE"),
+        );
+        let signals = signals_from_events(&parse_label_events(stdout.as_bytes(), &policy()));
+        assert!(signals.judge_verdicts.is_empty());
     }
 
     /// The jq projection names the marker and keeps the comment's author.
