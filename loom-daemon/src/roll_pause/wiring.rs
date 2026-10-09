@@ -20,10 +20,15 @@
 //! `--settings` with the project's and the user's, so nothing the consumer
 //! configured is replaced, and no consumer-owned file is written.
 //!
-//! When the launch directory's own settings already run `roll-pause.sh` (the
-//! Loom repo), nothing is added: one firing per event is enough. A second one
-//! would also be harmless, because the ledger, park and safe-point writes are
-//! idempotent per tool call.
+//! Nothing is added only when the settings Claude Code will already load
+//! (the launch directory's `.claude/settings.json` and
+//! `.claude/settings.local.json`, plus the user's `settings.json`) run
+//! `roll-pause.sh` for every one of those events with a match-all matcher, as
+//! the Loom repo's committed settings do. Any gap (an event left out, or a
+//! matcher narrowed to some tools) gets the full injection: a second firing
+//! for an event that was already covered is harmless, because the ledger,
+//! park and safe-point writes are idempotent per tool call, while a missed
+//! call leaves the session unable to reach a safe point.
 
 use std::path::{Path, PathBuf};
 
@@ -57,17 +62,74 @@ pub fn resolve_hook(workspace_root: &Path, override_path: Option<&Path>) -> Opti
         .find(|p| p.is_file())
 }
 
-/// Whether the project settings in `launch_dir` already run `roll-pause.sh`
-/// from a hook entry.
+/// Whether a hook entry's matcher selects every tool. Claude Code treats an
+/// absent, empty or `*` matcher as match-all; `.*` is the same as a regex.
+fn matches_all_tools(matcher: Option<&serde_json::Value>) -> bool {
+    match matcher {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(m)) => matches!(m.trim(), "" | "*" | ".*"),
+        Some(_) => false,
+    }
+}
+
+/// Whether `settings` runs `roll-pause.sh` on `event` for every tool.
+fn covers_event(settings: &serde_json::Value, event: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                matches_all_tools(entry.get("matcher"))
+                    && entry
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|hooks| {
+                            hooks.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|c| c.contains("roll-pause.sh"))
+                            })
+                        })
+            })
+        })
+}
+
+/// The settings files Claude Code merges hooks from for a launch in
+/// `launch_dir`: the two project files, then the user's `settings.json`
+/// under `user_config_dir` when one is known.
 #[must_use]
-pub fn project_wires_hook(launch_dir: &Path) -> bool {
-    PROJECT_SETTINGS.iter().any(|rel| {
-        std::fs::read_to_string(launch_dir.join(rel))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|v| v.get("hooks").map(ToString::to_string))
-            .is_some_and(|hooks| hooks.contains("roll-pause.sh"))
-    })
+pub fn settings_files(launch_dir: &Path, user_config_dir: Option<&Path>) -> Vec<PathBuf> {
+    PROJECT_SETTINGS
+        .iter()
+        .map(|rel| launch_dir.join(rel))
+        .chain(user_config_dir.map(|d| d.join("settings.json")))
+        .collect()
+}
+
+/// Whether `files`, merged as Claude Code merges hooks, already run
+/// `roll-pause.sh` for every tool on every one of [`EVENTS`]. A file that is
+/// missing or not JSON contributes nothing.
+#[must_use]
+pub fn fully_wired(files: &[PathBuf]) -> bool {
+    let parsed: Vec<serde_json::Value> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .filter_map(|raw| serde_json::from_str(&raw).ok())
+        .collect();
+    EVENTS
+        .iter()
+        .all(|event| parsed.iter().any(|v| covers_event(v, event)))
+}
+
+/// The user-scope Claude config directory: `CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`.
+fn user_config_dir() -> Option<PathBuf> {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
 }
 
 /// `s` as one POSIX shell word.
@@ -96,16 +158,19 @@ pub fn settings_json(hook: &Path) -> String {
 /// The `--settings` arguments for a launch, or nothing.
 ///
 /// Nothing unless `item` is a valid daemon item id (an attended launch is
-/// never paused), a hook script resolves, and `launch_dir`'s project
-/// settings do not already wire it.
+/// never paused), a hook script resolves, and the settings Claude Code will
+/// load for `launch_dir` (its project files and the user settings under
+/// `user_config_dir`) do not already wire it fully (see [`fully_wired`]).
 #[must_use]
 pub fn settings_args(
     item: Option<&str>,
     workspace_root: &Path,
     launch_dir: &Path,
+    user_config_dir: Option<&Path>,
     override_path: Option<&Path>,
 ) -> Vec<String> {
-    if !item.is_some_and(valid_item_id) || project_wires_hook(launch_dir) {
+    if !item.is_some_and(valid_item_id) || fully_wired(&settings_files(launch_dir, user_config_dir))
+    {
         return Vec::new();
     }
     match resolve_hook(workspace_root, override_path) {
@@ -116,7 +181,8 @@ pub fn settings_args(
 
 /// [`settings_args`] from the process environment: the item from
 /// [`ITEM_ENV`], the workspace from `LOOM_PROJECT_ROOT` or the git main
-/// checkout of the cwd, the launch dir from the cwd.
+/// checkout of the cwd, the launch dir from the cwd, the user settings from
+/// `CLAUDE_CONFIG_DIR` or `~/.claude`.
 #[must_use]
 pub fn settings_args_from_env() -> Vec<String> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -131,6 +197,7 @@ pub fn settings_args_from_env() -> Vec<String> {
         item.as_deref(),
         &super::project_root(),
         &cwd,
+        user_config_dir().as_deref(),
         var(HOOK_PATH_ENV).map(PathBuf::from).as_deref(),
     )
 }
