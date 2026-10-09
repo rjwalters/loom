@@ -116,7 +116,10 @@ use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS
 
 use heads::{Asked, HeadAsk, Heads};
 pub use host::{host_gate, HostGateInputs, NotCurrent, ABANDON_AFTER, STUCK_AFTER_TICKS};
-pub(super) use host::{latest, mark_boot, mark_verified, spawn_pass};
+pub(super) use host::{latest, mark_boot, mark_verified, registered_roots, spawn_pass};
+/// The hand-off to the checkout step, for its tests (#10869).
+#[cfg(test)]
+pub(super) use host::{spawn_with, Ended};
 use memory::FailureKind;
 pub use memory::{Memory, OUTAGE_HOLD_CAP};
 use w2::attempt;
@@ -258,6 +261,17 @@ pub struct WorkspacePass {
     /// snapshot.
     #[serde(skip)]
     pub fetches: u32,
+    /// This pass's own decision to use the network: `fleet.autoApply` on, the
+    /// host in H0 ([`host_gate`], so also not paused) and no outage hold. The
+    /// checkout step that follows it (#10869) takes this as its own, so the
+    /// two halves never disagree. Not part of the snapshot.
+    #[serde(skip)]
+    pub online: bool,
+    /// Roots whose remote did not answer, or refused, and that this host is
+    /// backing off: nothing on this host asks them again before the backoff
+    /// ends. Not part of the snapshot.
+    #[serde(skip)]
+    pub backing_off: Vec<PathBuf>,
 }
 
 impl WorkspacePass {
@@ -430,8 +444,10 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     // The network is for a host that may write. One that may not (autoApply
     // off, paused, rolling, not a release build) reports from what its clones
     // already hold and asks nobody.
+    let online = mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none();
+    pass.online = online;
     let mut scan = Scan {
-        online: mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none(),
+        online,
         ..Scan::default()
     };
     let count = roots.len();
@@ -559,6 +575,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     pass.probes = scan.probes;
     pass.fetches = scan.fetches;
     pass.alerts = scan.alerts;
+    pass.backing_off = memory.remotes_backed_off(roots, (env.clock)());
     pass
 }
 
@@ -664,6 +681,23 @@ fn classify(
     match classify_head(env, root, gate, memory, scan, asked, &mut report) {
         Ok(found) => (report, found.map(|(branch, commit)| (nwo, branch, commit))),
         Err(e) => {
+            if let Some(low) = e.downcast_ref::<git::LowDisk>() {
+                // Below the disk floor the fetch was skipped (#10995). The
+                // remote answered, so this is neither a network outage nor a
+                // repo failure. It returns here, before the failure
+                // accounting below: no `no_answer`, no `record_failure`, no
+                // backoff, no alert. The workspace is reported from what the
+                // clone holds, and the next pass retries as soon as the disk
+                // has room.
+                log::info!("workspace_resync: {}: low-disk: {}", root.display(), low.0);
+                let mut offline = report_for(root);
+                offline.repo = Some(nwo.clone());
+                if classify_head(env, root, gate, memory, scan, Asked::No, &mut offline).is_ok() {
+                    report = offline;
+                }
+                report.reason = Some(format!("low-disk: {}", low.0));
+                return (report, None);
+            }
             // Which kind of failure: the remote did not answer (the host's,
             // reported once for the pass), the remote or the forge refused
             // this repo (the repo's own), or anything else.
@@ -715,6 +749,8 @@ fn classify_head(
             .cloned();
         if let Some(verdict) = settled {
             scan.answered(root, memory);
+            // The checkout half (#10869) trusts this answer instead of asking.
+            crate::fleet_sync::checkout_ff::note_remote_head(root, branch, commit);
             verdict.fill(report);
             return Ok(verdict.stale().then(|| (branch.clone(), commit.clone())));
         }
@@ -750,6 +786,7 @@ fn classify_head(
     };
     let commit = if let Some(head) = head {
         scan.answered(root, memory);
+        crate::fleet_sync::checkout_ff::note_remote_head(root, &branch, &head);
         if let Some(verdict) = known(&head) {
             return Ok(reuse(verdict, report));
         }
@@ -866,6 +903,7 @@ fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str) -> Result<bool> {
         .tempdir()?;
     git::export_surfaces(root, commit, tree.path())?;
     let diff = materialize_with(payload, tree.path())?;
+    crate::init::payload::surfaces::log_skipped_once(root, &diff.skipped_surfaces);
     Ok(diff.stamp_pending() || {
         let paths: Vec<String> = diff
             .added

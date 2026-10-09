@@ -1119,11 +1119,14 @@ pub fn spawn_multi_supervisor_thread(
                             // Per-repo main-health gate (#3930): each root gets
                             // its own halt state, so a red `main` in repo A halts
                             // only A's epic dispatch, never the siblings'.
-                            let supervisor =
-                                EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
-                                    .with_event_bus(event_bus.clone())
-                                    .with_health_gate(health_states.get_or_create(root))
-                                    .with_drain_flag(drain_flag.clone());
+                            let supervisor = EpicSupervisor::new(
+                                source,
+                                dispatcher,
+                                IssueCreationMutex::for_root(root),
+                            )
+                            .with_event_bus(event_bus.clone())
+                            .with_health_gate(health_states.get_or_create(root))
+                            .with_drain_flag(drain_flag.clone());
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());

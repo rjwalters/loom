@@ -38,8 +38,9 @@ pub(super) async fn run(
                 .plan_feature_reads(&readable, Utc::now(), budget)
         })
         .unwrap_or_default();
-    let count =
-        crate::eta::pr_features::total_cost(&reads) + file_reads(repos, workspace_root).await;
+    let count = crate::eta::pr_features::total_cost(&reads)
+        + file_reads(repos, workspace_root).await
+        + super::eta_marker_pass::run(repos, workspace_root).await;
     let root = workspace_root.to_path_buf();
     let slugs = readable.clone();
     let Ok((answers, stall)) = tokio::task::spawn_blocking(move || {

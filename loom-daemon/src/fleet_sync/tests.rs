@@ -516,6 +516,8 @@ fn sample_status() -> FleetSyncStatus {
         enforced: Enforcement::Proceed,
         floor: FloorPass::default(),
         workspaces: workspace_resync::WorkspacePass::default(),
+        checkouts: Vec::new(),
+        checkouts_note: None,
     }
 }
 
@@ -600,6 +602,14 @@ fn status_line_distinguishes_a_skipped_roster_from_a_clean_one() {
     assert!(line.contains("CACHED snapshot"), "{line}");
     assert!(line.contains("roster: not checked"), "{line}");
     assert!(!line.contains("roster: in sync"), "a skipped roster is not a clean one: {line}");
+}
+
+#[test]
+fn status_line_says_when_a_checkout_step_was_skipped_because_an_earlier_one_holds_it() {
+    let mut status = sample_status();
+    status.checkouts_note = Some(checkout_ff::BUSY_NOTE.to_string());
+    let line = render_line(Some(&status), Utc::now()).expect("a line");
+    assert!(line.contains(&format!("checkouts: {}", checkout_ff::BUSY_NOTE)), "{line}");
 }
 
 // ------------------------------------------------------------------------

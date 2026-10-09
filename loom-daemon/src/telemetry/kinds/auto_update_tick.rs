@@ -64,10 +64,8 @@ pub enum TickDecisionKind {
     Fetch,
     /// A source rebuild ran.
     Rebuild,
-    /// A roll is already armed; the tick waits for its drain.
+    /// A roll or drain is already armed; the tick leaves it to finish.
     DrainWait,
-    /// The armed roll's drain condition was declared unsatisfiable (#8998).
-    RollStall,
     /// The tick panicked. The loop recorded it and keeps running.
     Panic,
 }
@@ -83,7 +81,6 @@ impl TickDecisionKind {
             Self::Fetch => "fetch",
             Self::Rebuild => "rebuild",
             Self::DrainWait => "drain_wait",
-            Self::RollStall => "roll_stall",
             Self::Panic => "panic",
         }
     }
@@ -94,9 +91,11 @@ impl TickDecisionKind {
 pub struct DrainSnapshot {
     /// A drain/roll is armed.
     pub armed: bool,
-    /// It has survived at least one deadline refusal (dispatch paused).
+    /// It can no longer be superseded: its pause has stopped an agent, or it
+    /// is an operator drain. (Before #10831: it had survived a deadline
+    /// refusal.)
     pub pending: bool,
-    /// Deadlines this roll has refused so far.
+    /// Always `0` since #10831: a roll no longer refuses deadlines.
     pub refusals: u32,
     /// The artifact identity it rolls to, when the auto-updater armed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

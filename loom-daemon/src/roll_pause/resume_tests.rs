@@ -123,6 +123,58 @@ fn the_capture_watcher_gives_up_an_inherited_account_lease() {
     assert!(!release_inherited_lease(Some("2")), "never closes stdio");
     assert!(!lock_is_free(&lock));
 
-    assert!(release_inherited_lease(Some(&inherited.to_string())));
+    // #10832: only the dispatcher's own descriptor number is ever closed. The
+    // watcher's copy here is some other number, so the public entry point
+    // (which accepts the dispatcher's 198 only) leaves it alone.
+    assert_ne!(inherited, crate::tokens_pool::private_workspace::dispatch::LEASE_FD);
+    assert!(!release_inherited_lease(Some(&inherited.to_string())));
+    assert!(!lock_is_free(&lock), "a descriptor the dispatcher never names is not closed");
+    assert!(!release_lease_descriptor(Some(&inherited.to_string()), inherited + 1));
+    assert!(!release_lease_descriptor(Some("2"), 2), "never closes stdio");
+
+    assert!(release_lease_descriptor(Some(&inherited.to_string()), inherited));
     assert!(lock_is_free(&lock), "the lease is free once the watcher closed its copy");
+}
+
+const STORE_SID: &str = "4910f978-64b9-4654-942a-dae6514e859c";
+
+/// #10832: H5 only resumes a session the runtime will be able to find.
+#[test]
+fn a_claude_session_is_reachable_only_with_its_transcript_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().to_string_lossy().into_owned();
+    let missing = session_store_reachable("claude", STORE_SID, Some(&store)).unwrap_err();
+    assert!(missing.contains("no transcript"), "{missing}");
+    let project = tmp.path().join("projects").join("-r-repo");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(format!("{STORE_SID}.jsonl")), "{}").unwrap();
+    session_store_reachable("claude", STORE_SID, Some(&store)).unwrap();
+    assert!(session_store_reachable("claude", "not-a-session", Some(&store)).is_err());
+}
+
+#[test]
+fn a_codex_session_needs_its_recorded_home_with_usable_auth_and_its_rollout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("agent-3");
+    let store = home.to_string_lossy().into_owned();
+    let no_home = session_store_reachable("codex", STORE_SID, None).unwrap_err();
+    assert!(no_home.contains("no CODEX_HOME"), "{no_home}");
+    assert!(session_store_reachable("codex", STORE_SID, Some(&store))
+        .unwrap_err()
+        .contains("is gone"));
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(session_store_reachable("codex", STORE_SID, Some(&store))
+        .unwrap_err()
+        .contains("auth.json"));
+    std::fs::write(home.join("auth.json"), "{}").unwrap();
+    // No `sessions/` tree on this host (it lives in the session container).
+    session_store_reachable("codex", STORE_SID, Some(&store)).unwrap();
+    // A visible tree must hold the rollout.
+    let day = home.join("sessions").join("2026").join("10").join("08");
+    std::fs::create_dir_all(&day).unwrap();
+    assert!(session_store_reachable("codex", STORE_SID, Some(&store))
+        .unwrap_err()
+        .contains("no rollout"));
+    std::fs::write(day.join(format!("rollout-2026-10-08T00-00-00-{STORE_SID}.jsonl")), "").unwrap();
+    session_store_reachable("codex", STORE_SID, Some(&store)).unwrap();
 }

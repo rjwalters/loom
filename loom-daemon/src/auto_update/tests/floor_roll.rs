@@ -1,20 +1,22 @@
-//! Issue #10712: floor-driven roll targets, end to end through `decide` and
+//! Issues #10712 and #10885: the fleet floor end to end through `decide` and
 //! `run_tick`.
 //!
-//! The decision table is floor {unset, satisfied, below, unsatisfiable} x
-//! settle {0, 600} x supersede {no, yes}. Only a floor-driven roll skips
-//! settle, and every roll is pinned to the exact tag the verdict compared. The
-//! no-floor regression proof is that a satisfied or unset floor gives the
-//! decisions an untouched state gives, tick for tick. `select_target` and the
-//! verdict themselves are unit-tested in `auto_update/floor_roll.rs`.
+//! The decision table is floor {no store, unknown, satisfied, below,
+//! unsatisfiable} x settle {0, 600} x supersede {no, yes}. A host with a fleet
+//! store rolls only when it is below a floor a release can meet, on that tick
+//! and whatever `settleSecs` says; in every other row it does not roll, and a
+//! newer release, a re-published artifact or a newer source HEAD is not
+//! chased. A host with no fleet store keeps settle-gated autoUpdate.
+//! `select_target` and the verdict themselves are unit-tested in
+//! `auto_update/floor_roll.rs`.
 //!
 //! A sibling module rather than more lines in `tests.rs`, per
 //! `.loom/docs/file-size-policy.md`.
 
 use super::*;
-use crate::auto_update::roll_window::{RollWindowTuning, WindowGate};
 use crate::auto_update::supersede::ArmedRoll;
 use crate::auto_update::tick_telemetry::TickSummary;
+use crate::fleet_sync::FloorKnowledge;
 use crate::telemetry::kinds::auto_update_tick::TickDecisionKind;
 use std::sync::Mutex;
 
@@ -25,35 +27,41 @@ const NEWEST: &str = "0.19.900";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Floor {
-    Unset,
+    /// No fleet store: not a fleet host.
+    NoStore,
+    /// A fleet store, but no floor known.
+    Unknown,
     Satisfied,
     Below,
     Unsatisfiable,
 }
 
 impl Floor {
-    const ALL: [Self; 4] = [
-        Self::Unset,
+    const ALL: [Self; 5] = [
+        Self::NoStore,
+        Self::Unknown,
         Self::Satisfied,
         Self::Below,
         Self::Unsatisfiable,
     ];
 
-    fn value(self) -> Option<String> {
+    fn knowledge(self) -> FloorKnowledge {
+        let set = |v: &str| FloorKnowledge::Set(v.to_string());
         match self {
-            Self::Unset => None,
-            Self::Satisfied => Some("0.19.700".to_string()),
+            Self::NoStore => FloorKnowledge::NoStore,
+            Self::Unknown => FloorKnowledge::Unknown("no pass has completed".to_string()),
+            Self::Satisfied => set("0.19.700"),
             // The newest release (0.19.900) satisfies it.
-            Self::Below => Some("0.19.850".to_string()),
+            Self::Below => set("0.19.850"),
             // A typo: above every release.
-            Self::Unsatisfiable => Some("0.19.9000".to_string()),
+            Self::Unsatisfiable => set("0.19.9000"),
         }
     }
 }
 
 fn floored(dir: &Path, floor: Floor) -> AutoUpdateState {
     let mut state = state_with_record_dir(dir);
-    state.floor.set_basis(floor.value(), RUNNING);
+    state.floor.set_basis(floor.knowledge(), RUNNING);
     state
 }
 
@@ -83,10 +91,12 @@ fn probe(artifact: ArtifactResolution, fetch_calls: &Arc<AtomicUsize>) -> Artifa
 }
 
 /// Optionally armed with a pending roll to an older release (so a newer one
-/// supersedes it); records every `trigger_for` target and supersede.
+/// supersedes it); records every `trigger_pause_roll` target, its
+/// `target_source`, and every supersede.
 struct Trigger {
     armed: Mutex<Option<ArmedRoll>>,
     targets: Mutex<Vec<Option<String>>>,
+    sources: Mutex<Vec<pause_manifest::TargetSource>>,
     supersedes: Mutex<Vec<(String, String)>>,
 }
 
@@ -94,27 +104,22 @@ impl Trigger {
     fn new(pending: bool) -> Self {
         let armed = pending.then(|| ArmedRoll {
             target: Some("v0.19.850@cccc".to_string()),
-            pending: true,
+            committed: false,
             then_exit: false,
-            refusals: 1,
         });
         Self {
             armed: Mutex::new(armed),
             targets: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
             supersedes: Mutex::new(Vec::new()),
         }
     }
 }
 
-impl DrainTrigger for Trigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, target: Option<&str>) -> bool {
-        self.targets
-            .lock()
-            .unwrap()
-            .push(target.map(str::to_string));
+impl RollTrigger for Trigger {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        self.targets.lock().unwrap().push(target.label.clone());
+        self.sources.lock().unwrap().push(target.source.clone());
         true
     }
     fn roll_in_progress(&self) -> bool {
@@ -155,23 +160,51 @@ fn decision_table_floor_x_settle_x_supersede() {
                     usize::from(supersede),
                     "{case}"
                 );
-                // Settle is skipped only for a floor-driven roll; a supersede of
-                // one does not restart a settle wait.
-                let rolls = settle_secs == 0 || floor == Floor::Below;
+                // A fleet host rolls only below a floor a release meets, and
+                // then whatever settle says (a supersede of that roll does not
+                // restart a settle wait). Only a host with no fleet store
+                // chases the newest release, behind settle.
+                let rolls = floor == Floor::Below || (floor == Floor::NoStore && settle_secs == 0);
                 assert_eq!(fetch_calls.load(Ordering::SeqCst), usize::from(rolls), "{case}");
                 let pinned = format!("v{NEWEST}@{SHA_B}");
                 let expected: Vec<Option<String>> = if rolls { vec![Some(pinned)] } else { vec![] };
                 assert_eq!(*trigger.targets.lock().unwrap(), expected, "{case}");
-                let kind = if rolls {
-                    TickDecisionKind::Fetch
+                // #10831: floor-driven and autoUpdate rolls take the same pause
+                // trigger; only the recorded `target_source` differs.
+                let source = if floor == Floor::Below {
+                    pause_manifest::TargetSource::Floor
                 } else {
-                    TickDecisionKind::Defer
+                    pause_manifest::TargetSource::AutoUpdate
+                };
+                let sources: Vec<_> = if rolls { vec![source] } else { vec![] };
+                assert_eq!(*trigger.sources.lock().unwrap(), sources, "{case}");
+                let kind = match (rolls, floor) {
+                    (true, _) => TickDecisionKind::Fetch,
+                    // Held by the settle gate, with a target still tracked.
+                    (false, Floor::NoStore) => TickDecisionKind::Defer,
+                    // #10885: a fleet host that is not rolling tracks nothing.
+                    (false, _) => TickDecisionKind::Skip,
                 };
                 assert_eq!(summary.decision, kind, "{case}");
                 let note = status.snapshot().note.unwrap_or_default();
                 assert_eq!(note.contains("floor-driven"), floor == Floor::Below, "{case}: {note}");
-                // Only an unsatisfiable floor stalls, and it never holds a roll back.
+                // Only an unsatisfiable floor stalls. #10885: it no longer
+                // falls back to the newest release (0.19.900 > running here).
                 assert_eq!(summary.floor_stall.is_some(), floor == Floor::Unsatisfiable, "{case}");
+                assert_eq!(
+                    note.contains("fleet floor not known"),
+                    floor == Floor::Unknown,
+                    "{case}: {note}"
+                );
+                assert_eq!(
+                    note.contains("fleet floor 0.19.700 is met"),
+                    floor == Floor::Satisfied,
+                    "{case}: {note}"
+                );
+                if floor != Floor::NoStore && !rolls {
+                    assert!(state.tracked_target.is_none(), "{case}: no settle clock");
+                    assert!(state.first_stale_since.is_none(), "{case}: no settle ceiling");
+                }
                 assert_eq!(
                     note.contains("FLEET FLOOR UNSATISFIABLE"),
                     floor == Floor::Unsatisfiable,
@@ -226,13 +259,12 @@ fn a_supersede_of_a_floor_driven_roll_does_not_re_wait_settle() {
         DEFER,
     );
     assert_eq!(first.load(Ordering::SeqCst), 1, "the floor roll goes out at once");
-    // The drain for it times out and the roll goes pending.
+    // Its pause is armed and has not stopped anything yet.
     let target = trigger.targets.lock().unwrap()[0].clone();
     *trigger.armed.lock().unwrap() = Some(ArmedRoll {
         target,
-        pending: true,
+        committed: false,
         then_exit: false,
-        refusals: 1,
     });
     // A newer release lands; the host still runs 0.19.800, below the floor.
     let second = Arc::new(AtomicUsize::new(0));
@@ -246,12 +278,192 @@ fn a_supersede_of_a_floor_driven_roll_does_not_re_wait_settle() {
     );
 }
 
-/// The no-floor regression proof: across artifact shapes, settle windows, busy
-/// and idle hosts, and a sequence of ticks that walks through the settle
-/// window and its ceiling, an unset or satisfied floor decides exactly what an
-/// untouched state decides.
+/// One `decide` against `artifact` at `at` seconds, with a clean tree and a
+/// source checkout that is `source_ahead` of the running binary.
+fn decide_at(
+    state: &mut AutoUpdateState,
+    t0: Instant,
+    at: u64,
+    artifact: &ArtifactResolution,
+    source_ahead: bool,
+    settle: Duration,
+) -> TickDecision {
+    let check = if source_ahead {
+        stale(&format!("c{at}"))
+    } else {
+        no_source()
+    };
+    let inputs = TickInputs {
+        artifact,
+        check: &check,
+        tree_clean: true,
+        in_flight: 0,
+    };
+    state.decide(t0 + Duration::from_secs(at), &inputs, settle, DEFER)
+}
+
+/// A same-version artifact whose published sha differs from the installed one.
+fn republished() -> ArtifactResolution {
+    resolved(artifact(RUNNING, Some(RUNNING), Some(SHA_B), Some(SHA_A)))
+}
+
+/// #10885: with the floor met, nothing is chased. Not a newer release, not a
+/// re-published artifact, not a newer source HEAD, and not after the settle
+/// ceiling has elapsed, because no settle clock runs at all.
 #[test]
-fn an_unset_or_satisfied_floor_decides_exactly_as_before() {
+fn a_satisfied_floor_never_chases_a_newer_release_a_republish_or_source_head() {
+    let settle = Duration::from_secs(600);
+    let shapes: [(&str, ArtifactResolution, bool); 3] = [
+        ("newer release", newest(RUNNING), false),
+        ("re-published artifact", republished(), false),
+        ("source HEAD ahead", unresolved(), true),
+    ];
+    for (shape, artifact, source_ahead) in &shapes {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = floored(tmp.path(), Floor::Satisfied);
+        let t0 = Instant::now();
+        // Past the quiet period (600s) and the ceiling (3600s).
+        for at in [0_u64, 300, 700, 3_700, 7_300] {
+            let decision = decide_at(&mut state, t0, at, artifact, *source_ahead, settle);
+            let TickDecision::Skip(reason) = decision else {
+                panic!("{shape} t={at}: expected no roll, got {decision:?}");
+            };
+            assert!(reason.contains("fleet floor 0.19.700 is met"), "{shape}: {reason}");
+            assert!(reason.contains("not chasing"), "{shape}: {reason}");
+            assert!(state.tracked_target.is_none(), "{shape} t={at}");
+            assert!(state.stale_since.is_none(), "{shape} t={at}");
+            assert!(state.first_stale_since.is_none(), "{shape} t={at}");
+        }
+    }
+
+    // Through the tick: nothing fetched, nothing rebuilt, nothing armed, and
+    // the note names the floor and the release that was not chased.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Satisfied);
+    let (fetches, rebuilds) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let trigger = Trigger::new(false);
+    let status = AutoUpdateStatus::new(true);
+    for (_, artifact, source_ahead) in &shapes {
+        let mut probe = probe(artifact.clone(), &fetches);
+        probe.rebuild_calls = rebuilds.clone();
+        probe.tree_clean = Some(true);
+        probe.in_flight = 0;
+        if *source_ahead {
+            probe.check = stale("c1");
+        }
+        let summary = run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+        assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+        assert!(!summary.roll_armed);
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+    assert!(trigger.targets.lock().unwrap().is_empty());
+    let mut probe = probe(newest(RUNNING), &fetches);
+    run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+    let note = status.snapshot().note.unwrap_or_default();
+    assert!(note.contains("fleet floor 0.19.700 is met by running 0.19.800"), "{note}");
+    assert!(note.contains("not chasing release v0.19.900"), "{note}");
+    assert!(!note.contains("fetching"), "{note}");
+}
+
+/// #10885: a floor no release meets raises the stall and does not roll to the
+/// newest release instead, however long it stands.
+#[test]
+fn an_unsatisfiable_floor_does_not_fall_back_to_the_newest_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Unsatisfiable);
+    let settle = Duration::from_secs(600);
+    let t0 = Instant::now();
+    // 0.19.900 is newer than the running 0.19.800 but below the floor.
+    for at in [0_u64, 700, 3_700, 7_300] {
+        let decision = decide_at(&mut state, t0, at, &newest(RUNNING), false, settle);
+        assert!(matches!(decision, TickDecision::Skip(_)), "t={at}: {decision:?}");
+        let stall = state.floor.stall().expect("the typed stall stands");
+        assert_eq!(stall.newest, NEWEST);
+        assert!(state.first_stale_since.is_none(), "t={at}");
+    }
+}
+
+/// #10885: a fleet host whose floor is not known does nothing and says so.
+/// It never falls back to chasing the latest release or rebuilding.
+#[test]
+fn an_unknown_floor_rolls_nothing_and_says_the_floor_is_not_known() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Unknown);
+    let (fetches, rebuilds) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let trigger = Trigger::new(false);
+    let status = AutoUpdateStatus::new(true);
+    for (artifact, source_ahead) in [(newest(RUNNING), false), (unresolved(), true)] {
+        let mut probe = probe(artifact, &fetches);
+        probe.rebuild_calls = rebuilds.clone();
+        probe.tree_clean = Some(true);
+        probe.in_flight = 0;
+        if source_ahead {
+            probe.check = stale("c1");
+        }
+        let summary = run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+        assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+        assert!(!summary.roll_armed);
+        assert_eq!(summary.floor_stall, None);
+        let note = status.snapshot().note.unwrap_or_default();
+        assert!(note.contains("fleet floor not known (no pass has completed)"), "{note}");
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+    assert!(trigger.targets.lock().unwrap().is_empty());
+}
+
+/// #10885: below the floor with no release resolved (the newest tag has no
+/// assets yet, or the forge is unreachable), the host waits for the next tick.
+/// The source-rebuild path is not a substitute.
+#[test]
+fn below_the_floor_with_no_release_resolved_waits_and_never_rebuilds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Below);
+    let (fetches, rebuilds) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let mut probe = probe(unresolved(), &fetches);
+    probe.rebuild_calls = rebuilds.clone();
+    probe.tree_clean = Some(true);
+    probe.in_flight = 0;
+    probe.check = stale("c1");
+    let status = AutoUpdateStatus::new(true);
+    let trigger = Trigger::new(false);
+    let summary = run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+    assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    let note = status.snapshot().note.unwrap_or_default();
+    assert!(note.contains("no release resolved this tick"), "{note}");
+
+    // The release appears: the next tick rolls to it.
+    let mut probe = self::probe(newest(RUNNING), &fetches);
+    run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(600), DEFER);
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+}
+
+/// A running version that is not `X.Y.Z` cannot be compared with the floor:
+/// no version roll (fail closed), where it used to mean "no floor".
+#[test]
+fn an_uncomparable_running_version_rolls_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = state_with_record_dir(tmp.path());
+    state
+        .floor
+        .set_basis(FloorKnowledge::Set("0.19.850".to_string()), "dev");
+    let t0 = Instant::now();
+    let decision = decide_at(&mut state, t0, 0, &newest(RUNNING), false, Duration::ZERO);
+    let TickDecision::Skip(reason) = decision else {
+        panic!("expected no roll, got {decision:?}");
+    };
+    assert!(reason.contains("cannot be compared"), "{reason}");
+}
+
+/// A host with no fleet store is untouched by all of the above: an explicit
+/// `NoStore` basis decides exactly what a state that never heard of a floor
+/// decides, across artifact shapes, settle windows, busy and idle hosts, and a
+/// sequence of ticks that walks through the settle window and its ceiling.
+#[test]
+fn a_host_with_no_fleet_store_decides_exactly_as_before() {
     let shapes = [
         resolved(artifact("0.19.900", Some(RUNNING), Some(SHA_B), Some(SHA_A))), // Newer
         resolved(artifact(RUNNING, Some(RUNNING), Some(SHA_B), Some(SHA_A))),    // ShaDiffers
@@ -260,64 +472,140 @@ fn an_unset_or_satisfied_floor_decides_exactly_as_before() {
         unresolved(),
     ];
     let ticks = [0_u64, 300, 700, 1_000, 3_700];
-    for basis in [Floor::Unset, Floor::Satisfied] {
-        for (i, shape) in shapes.iter().enumerate() {
-            for settle_secs in [0_u64, 600] {
-                for in_flight in [0_usize, 3] {
-                    let tmp = tempfile::tempdir().unwrap();
-                    let mut before = state_with_record_dir(tmp.path());
-                    let mut after = floored(tmp.path(), basis);
-                    let t0 = Instant::now();
-                    for (n, at) in ticks.iter().enumerate() {
-                        // Alternate the source commit so the settle timer restarts
-                        // and the ceiling is what eventually lets it through.
-                        let check = stale(&format!("c{n}"));
-                        let inputs = TickInputs {
-                            artifact: shape,
-                            check: &check,
-                            tree_clean: true,
-                            in_flight,
-                        };
-                        let now = t0 + Duration::from_secs(*at);
-                        let settle = Duration::from_secs(settle_secs);
-                        assert_eq!(
-                            after.decide(now, &inputs, settle, DEFER),
-                            before.decide(now, &inputs, settle, DEFER),
-                            "basis={basis:?} shape={i} settle={settle_secs} in_flight={in_flight} t={at}"
-                        );
-                    }
-                    assert!(after.floor.stall().is_none());
+    let mut rolled = 0;
+    for (i, shape) in shapes.iter().enumerate() {
+        for settle_secs in [0_u64, 600] {
+            for in_flight in [0_usize, 3] {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut before = state_with_record_dir(tmp.path());
+                let mut after = floored(tmp.path(), Floor::NoStore);
+                let t0 = Instant::now();
+                for (n, at) in ticks.iter().enumerate() {
+                    // Alternate the source commit so the settle timer restarts
+                    // and the ceiling is what eventually lets it through.
+                    let check = stale(&format!("c{n}"));
+                    let inputs = TickInputs {
+                        artifact: shape,
+                        check: &check,
+                        tree_clean: true,
+                        in_flight,
+                    };
+                    let now = t0 + Duration::from_secs(*at);
+                    let settle = Duration::from_secs(settle_secs);
+                    let decided = after.decide(now, &inputs, settle, DEFER);
+                    assert_eq!(
+                        decided,
+                        before.decide(now, &inputs, settle, DEFER),
+                        "shape={i} settle={settle_secs} in_flight={in_flight} t={at}"
+                    );
+                    rolled += usize::from(matches!(
+                        decided,
+                        TickDecision::FetchArtifact { .. } | TickDecision::Rebuild { .. }
+                    ));
                 }
+                assert!(after.floor.stall().is_none());
             }
         }
     }
+    assert!(rolled > 0, "the table exercises rolls, not only skips");
 }
 
-/// An autoUpdate-only roll (floor satisfied) still honours the roll window.
+/// A store that stops being configured (`fleet.repo` removed, which takes a
+/// restart) returns the host to settle-gated autoUpdate without an instant
+/// roll: nothing was tracked while the floor held, so the settle clock starts
+/// at the tick that first sees no store.
 #[test]
-fn an_autoupdate_roll_still_honours_the_roll_window() {
+fn losing_the_fleet_store_starts_the_settle_clock_from_that_tick() {
     let tmp = tempfile::tempdir().unwrap();
     let mut state = floored(tmp.path(), Floor::Satisfied);
-    // A window that opens twelve hours from now.
-    let offset = (Utc::now().timestamp() + 43_200).rem_euclid(86_400) as u64;
-    state.window = WindowGate::new(RollWindowTuning {
-        period: Some(Duration::from_secs(86_400)),
-        offset: Duration::from_secs(offset),
-        open_for: Duration::from_secs(1800),
-        launchd_live_reload: false,
-    });
-    let fetch_calls = Arc::new(AtomicUsize::new(0));
-    let status = AutoUpdateStatus::new(true);
-    let trigger = Trigger::new(false);
-    let mut probe = probe(newest(RUNNING), &fetch_calls);
-    run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
-    assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
-    let note = status.snapshot().note.unwrap_or_default();
-    assert!(note.contains("scheduled wait"), "{note}");
+    let settle = Duration::from_secs(600);
+    let t0 = Instant::now();
+    // The newer release has been visible for two hours, never chased.
+    for at in [0_u64, 3_600, 7_200] {
+        let held = decide_at(&mut state, t0, at, &newest(RUNNING), false, settle);
+        assert!(matches!(held, TickDecision::Skip(_)), "t={at}");
+    }
+    state.floor.set_basis(FloorKnowledge::NoStore, RUNNING);
+    let removal = decide_at(&mut state, t0, 7_300, &newest(RUNNING), false, settle);
+    let TickDecision::Skip(reason) = removal else {
+        panic!("no roll on the removal tick, got {removal:?}");
+    };
+    assert!(reason.contains("within settle window"), "{reason}");
+    let mid = decide_at(&mut state, t0, 7_300 + 599, &newest(RUNNING), false, settle);
+    assert!(matches!(mid, TickDecision::Skip(_)), "{mid:?}");
+    let settled = decide_at(&mut state, t0, 7_300 + 600, &newest(RUNNING), false, settle);
+    assert!(matches!(settled, TickDecision::FetchArtifact { .. }), "{settled:?}");
 }
 
-/// An unsatisfiable floor alerts and keeps the work gate open: no drain is
-/// armed, dispatch is not paused, and the tick carries the typed stall.
+/// A trigger that refuses every roll, as H3 does while the failed-target
+/// guard (#10832, `pause_resume::attempt::gate`) holds a target back.
+#[derive(Default)]
+struct Refusing {
+    asked: Mutex<Vec<(pause_manifest::TargetSource, Option<String>)>>,
+}
+
+impl RollTrigger for Refusing {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((target.source.clone(), target.to_version.clone()));
+        false
+    }
+    fn roll_in_progress(&self) -> bool {
+        false
+    }
+    fn armed_roll(&self) -> Option<ArmedRoll> {
+        None
+    }
+}
+
+/// #10832's failed-target guard lives in H3, behind `trigger_pause_roll`. A
+/// floor roll skips settle but not that: every floor-driven tick offers its
+/// target (version and checksum, which the guard keys on) to the trigger, a
+/// refusal arms nothing, and the next tick offers it again.
+#[test]
+fn a_floor_roll_goes_through_the_trigger_every_tick_so_h3_can_hold_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Below);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let trigger = Refusing::default();
+    let status = AutoUpdateStatus::new(true);
+    for n in 1..=2 {
+        let mut probe = probe(newest(RUNNING), &fetches);
+        let settle = Duration::from_secs(600);
+        let summary = run_tick(&mut state, &status, &mut probe, &trigger, settle, DEFER);
+        assert!(!summary.roll_armed, "tick {n}");
+        assert_eq!(trigger.asked.lock().unwrap().len(), n, "tick {n}");
+        let note = status.snapshot().note.unwrap_or_default();
+        assert!(note.contains("could not start"), "tick {n}: {note}");
+    }
+    let asked = trigger.asked.lock().unwrap();
+    assert_eq!(asked[0], (pause_manifest::TargetSource::Floor, Some(NEWEST.to_string())));
+}
+
+/// #10880 relies on it: the tick that arms a roll writes the state file
+/// itself, because the roll's restart can end the process before the
+/// end-of-tick save (which `guarded_tick`, not `run_tick`, performs).
+#[test]
+fn the_arming_tick_persists_state_before_the_roll_can_restart() {
+    use crate::auto_update::persisted_state::{load, LoadOutcome, STATE_FILE};
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(STATE_FILE);
+    let mut state = floored(tmp.path(), Floor::Below);
+    state.attach_persistence(Some(path.clone()));
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let trigger = Trigger::new(false);
+    let status = AutoUpdateStatus::new(true);
+    let mut probe = probe(newest(RUNNING), &fetches);
+    let summary = run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
+    assert!(summary.roll_armed);
+    assert!(matches!(load(&path), LoadOutcome::Loaded(_)), "written before the arm");
+}
+
+/// An unsatisfiable floor alerts and keeps the work gate open: no pause is
+/// started (through the production trigger), dispatch is not paused, and the
+/// tick carries the typed stall.
 #[tokio::test]
 async fn an_unsatisfiable_floor_alerts_and_keeps_dispatching() {
     let tmp = tempfile::tempdir().unwrap();
@@ -326,7 +614,7 @@ async fn an_unsatisfiable_floor_alerts_and_keeps_dispatching() {
     let pool = Arc::new(WorkspacePool::new(bus.clone(), tokio::runtime::Handle::current()));
     let drain = Arc::new(DrainState::new());
     let trigger =
-        IpcDrainTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
+        IpcRollTrigger::new(drain.clone(), pool, root, bus, tokio::runtime::Handle::current());
     let mut state = floored(tmp.path(), Floor::Unsatisfiable);
     // The newest release is the running one: nothing for autoUpdate to do.
     let fetch_calls = Arc::new(AtomicUsize::new(0));

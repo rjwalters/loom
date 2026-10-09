@@ -187,6 +187,7 @@ fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation
     }
     explanation.result = None;
     explanation.contributions = None;
+    explanation.stage_predictions.clear();
     explanation.combination = None;
     explanation.twin_otter = None;
     explanation.enforce_cap();
@@ -257,6 +258,7 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         regime_adjustment: None,
         planner_version: None,
         held_heron: None,
+        stage_predictions: std::collections::BTreeMap::new(),
     }
 }
 
@@ -593,6 +595,7 @@ fn finish_estimate(
         tail_extrapolated,
     });
     explanation.contributions = Some(simulation.contributions);
+    explanation.stage_predictions = simulation.stage_predictions;
     explanation.enforce_cap();
     explanation
 }
