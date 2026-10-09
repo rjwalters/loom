@@ -262,9 +262,20 @@ loom-ui confirms it; track each disposition on #11098.
 | [`eta.backtest.fold` / `eta.backtest.summary`](#etabacktestfold-and-etabacktestsummary) | log, OTLP only | `observability/eta_nightly_folds.rs` | yes | drop, pending loom-ui agreement |
 | `loom.eta.health.*` (14 gauges, [`metric.points`](#metricpoints)) | metric | `observability/ops/eta_health.rs` | yes | drop, pending loom-ui agreement |
 
-All ETA-only emission goes through one place: the `eta::record`,
-`eta_snapshot::record` and `ops::eta_health::record` calls in
-`observability/collector.rs`.
+ETA-only records leave the daemon by two kinds of path, not one:
+
+- **Collector tick.** The `eta::record`, `eta_snapshot::record` and
+  `ops::eta_health::record` calls in `observability/collector.rs` emit
+  `eta.estimate` / `eta.outcome`, `eta.snapshot` and the `loom.eta.health.*`
+  gauges.
+- **Separate task paths.** Each of these has its own `spawn_task`
+  registration in `observability/mod.rs` and offers to the sink directly:
+  `eta.fit` from `observability/eta_fit.rs`, `eta.fleet_refresh` from
+  `observability/eta_fleet_refresh.rs`, and `eta.backtest.fold` /
+  `eta.backtest.summary` from `observability/eta_nightly_folds.rs`.
+
+Removal stages must cover both paths. The `eta.stage_outcome` and
+`pr.resolved` rows are owned by the files named in the table above.
 
 **Non-ETA records that borrow an ETA type.**
 [`pass.summary` / `pass.verdict`](#passsummary-and-passverdict),
