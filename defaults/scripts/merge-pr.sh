@@ -483,8 +483,9 @@ fi
 # existed. Labels here are verdict-gating/merge-gating data, i.e. the
 # deliberately-uncached class in docs/gh-cached.md, the same class the 15+
 # `forge_get_pr_nocache` rechecks further down already belong to.
-PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH") || \
-  error "Could not fetch PR #$PR_NUMBER"
+# A failed fetch names its cause -- status, meaning, forge message (#9192).
+_PRF_ERR="$(mktemp)"
+PR_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>"$_PRF_ERR") || error "Could not fetch PR #$PR_NUMBER -- $(forge_fetch_error_cause "$(cat "$_PRF_ERR"; rm -f "$_PRF_ERR")" "$PR_JSON")"; rm -f "$_PRF_ERR"; unset _PRF_ERR
 
 # Combined onto two lines (net code-line offset for the #8112 guard added
 # below — file-size-policy.md's "remove at least as much as you added"; a
