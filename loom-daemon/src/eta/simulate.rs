@@ -47,7 +47,8 @@
 //! [`super::explanation::RESIDUAL_LIFE_U_CAP`] — one uniform, as before.
 
 use super::explanation::{
-    Contributions, Explanation, StageMark, CONDITIONING_RESIDUAL_LIFE, RESIDUAL_LIFE_U_CAP,
+    Contributions, Explanation, ReplayEngine, StageMark, CONDITIONING_RESIDUAL_LIFE,
+    RESIDUAL_LIFE_U_CAP,
 };
 use super::grid;
 use super::stage_forecast::{apportion, StagePrediction, StagePredictions};
@@ -665,26 +666,35 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 ///
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.
+///
+/// A `little-v0` answer recomputes from its `queue` record (#10930). An
+/// explanation the size cap marked `replayable: false` answers `None`: the
+/// cap dropped a field this reads, and a fallback to another engine would
+/// be a different number.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    if explanation.replay_lost() {
+        return None;
+    }
     // A dependency composition (#10510) recomputes from its node records,
     // a held-heron answer (#10523) from its simulator record. Either may
     // then carry a calibration shift (an IPCW-wrapped base, #10524), applied
-    // below like any other base's.
-    let simulated = if let Some(record) = explanation
-        .dependencies
-        .as_ref()
-        .filter(|d| !d.nodes.is_empty())
-    {
-        super::dependency::recompute(record)?
-    } else if let Some(record) = &explanation.held_heron {
-        super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles)?
-    } else {
-        match &explanation.twin_otter {
-            Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
-            None => {
-                let spec = spec_from_explanation(explanation)?;
-                run(&spec).ok().map(|s| s.quantiles)?
-            }
+    // below like any other base's. `Explanation::replay_engine` mirrors this
+    // dispatch.
+    let simulated = match explanation.replay_engine() {
+        ReplayEngine::Dependency => {
+            super::dependency::recompute(explanation.dependencies.as_ref()?)?
+        }
+        ReplayEngine::HeldHeron => {
+            super::hazard_sim::solve(explanation.held_heron.as_ref()?, explanation.as_of)
+                .map(|s| s.quantiles)?
+        }
+        ReplayEngine::Queue => super::heuristics::recompute_little_v0(explanation.queue.as_ref()?)?,
+        ReplayEngine::TwinOtter => {
+            super::heuristics::recompute_twin_otter(explanation, explanation.twin_otter.as_ref()?)?
+        }
+        ReplayEngine::Path => {
+            let spec = spec_from_explanation(explanation)?;
+            run(&spec).ok().map(|s| s.quantiles)?
         }
     };
     let served = match (&explanation.recalibration, &explanation.calibration) {

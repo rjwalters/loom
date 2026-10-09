@@ -6,9 +6,14 @@
 //! [`FeatureOmitted`] reason, never a default; seconds are integers.
 //!
 //! Size: target [`TARGET_BYTES`], hard cap [`MAX_BYTES`] (the trace journal's
-//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then a
-//! twin-otter model slice, then the stage grids, then the stage marks, and
-//! names what it dropped in `truncated`.
+//! entry cap). [`Explanation::enforce_cap`] drops what the replay
+//! ([`super::simulate::run_explanation`]) never reads before anything it does
+//! read (#10930): `features` down to the input vector
+//! ([`Features::INPUT_VECTOR`]), then the stage marks, then the context
+//! lists. Only then does it drop a replay input (a twin-otter model slice, the
+//! dependency nodes, the stage grids, the remaining lists), and when it does it
+//! records `replayable: false` with the reason. It names every drop in
+//! `truncated`.
 
 use super::fit::{AftFit, FitStage, HazardFit, PathStats};
 pub use super::stall::Stalled;
@@ -38,12 +43,19 @@ pub const TRUNCATED_DEPENDENCY_NODES: &str = "dependencies.nodes";
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
 
-/// `truncated[]` entry when the stage marks were dropped.
+/// `truncated[]` entry when the stage marks (and `stage_predictions`) were
+/// dropped. Both are recomputable from the grids
+/// ([`super::simulate::run_marks`], [`super::simulate::run_predictions`]).
 pub const TRUNCATED_STAGE_MARKS: &str = "result.stage_marks";
 
+/// `truncated[]` entry when the lists no replay reads were dropped (#10930):
+/// `contributions`, the history's sources and per-source / per-host counts,
+/// `history_window.sources` and each stage's `grid_pct`. Only ever written
+/// when one of them was there.
+pub const TRUNCATED_CONTEXT: &str = "context";
+
 /// `truncated[]` entry when every remaining list was dropped (stages,
-/// branches, contributions, history detail) — the last resort that
-/// guarantees the cap.
+/// branches) — the last resort that guarantees the cap.
 pub const TRUNCATED_DETAIL: &str = "detail";
 
 /// One estimate, explained.
@@ -82,7 +94,9 @@ pub struct Explanation {
     pub result: Option<EstimateResult>,
     /// Which stages and branches dominate the result.
     pub contributions: Option<Contributions>,
-    /// Recorded context. `None` only when truncated.
+    /// Recorded context. Under the cap it is cut down to the input vector
+    /// ([`Features::INPUT_VECTOR`]) and `truncated` names `features`; it is
+    /// `None` only on an explanation recorded before #10930 that was cut.
     pub features: Option<Features>,
     /// Why features are null.
     pub features_omitted: Vec<FeatureOmitted>,
@@ -97,6 +111,17 @@ pub struct Explanation {
     pub stalled: Option<Stalled>,
     /// What [`Explanation::enforce_cap`] dropped, in drop order.
     pub truncated: Vec<String>,
+    /// `Some(false)` when [`Explanation::enforce_cap`] had to drop a field the
+    /// replay ([`super::simulate::run_explanation`]) reads (#10930): the
+    /// replay then answers `None` rather than a different number. Absent
+    /// otherwise, so every explanation that fits is byte-identical to one
+    /// made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayable: Option<bool>,
+    /// Why `replayable` is `false`: `truncated:<entry>`, naming the first
+    /// replay input the cap dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayable_reason: Option<String>,
     /// How a recalibrating heuristic (#10207) moved the simulated quantiles
     /// into `result`. Absent — and `result` is the simulation's own — for
     /// every other heuristic, so their explanations are byte-identical.
@@ -975,9 +1000,124 @@ impl Features {
         }
         omitted
     }
+
+    /// The input vector (#10930): the queue, capacity, hold, star and
+    /// priority context an estimate was made under. Every entry is a scalar
+    /// or a small fixed record, so the whole vector is a few hundred bytes,
+    /// and [`Explanation::enforce_cap`] keeps it when it cuts the rest of
+    /// `features`.
+    pub const INPUT_VECTOR: [&'static str; 21] = [
+        "queue_rank",
+        "queue_ready",
+        "queue_running",
+        "max_concurrent",
+        "active_sweeps_host",
+        "pool_usable_accounts",
+        "pool_exhausted",
+        "ahead",
+        "n_stage_repo",
+        "n_stage_fleet",
+        "open_prs_repo",
+        "repo_pr_open_skip",
+        "repo_pr_open_lockout",
+        "operator_hold",
+        "starred_any",
+        "star_source",
+        "priority",
+        "urgent",
+        "workspace_priority",
+        "attempt",
+        "doctor_cycles_so_far",
+    ];
+
+    /// These features with everything outside [`Self::INPUT_VECTOR`] set to
+    /// `None`.
+    #[must_use]
+    pub fn input_vector(&self) -> Features {
+        let Ok(serde_json::Value::Object(mut map)) = serde_json::to_value(self) else {
+            return Features::default();
+        };
+        map.retain(|name, _| Self::INPUT_VECTOR.contains(&name.as_str()));
+        serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
+    }
+}
+
+/// Which recompute [`super::simulate::run_explanation`] takes for an
+/// explanation: the field it dispatches on, in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayEngine {
+    /// `dependencies.nodes` ([`super::dependency::recompute`]).
+    Dependency,
+    /// `held_heron` ([`super::hazard_sim::solve`]).
+    HeldHeron,
+    /// `queue` (`little-v0`'s arithmetic).
+    Queue,
+    /// `twin_otter` (the recorded model slice).
+    TwinOtter,
+    /// The path simulation over the stage grids.
+    Path,
+}
+
+impl ReplayEngine {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayEngine::Dependency => "dependency",
+            ReplayEngine::HeldHeron => "held_heron",
+            ReplayEngine::Queue => "queue",
+            ReplayEngine::TwinOtter => "twin_otter",
+            ReplayEngine::Path => "path",
+        }
+    }
 }
 
 impl Explanation {
+    /// The recompute [`super::simulate::run_explanation`] dispatches to.
+    #[must_use]
+    pub fn replay_engine(&self) -> ReplayEngine {
+        if self
+            .dependencies
+            .as_ref()
+            .is_some_and(|d| !d.nodes.is_empty())
+        {
+            ReplayEngine::Dependency
+        } else if self.held_heron.is_some() {
+            ReplayEngine::HeldHeron
+        } else if self.queue.is_some() {
+            ReplayEngine::Queue
+        } else if self.twin_otter.is_some() {
+            ReplayEngine::TwinOtter
+        } else {
+            ReplayEngine::Path
+        }
+    }
+
+    /// Whether the cap dropped a field the replay reads (#10930).
+    #[must_use]
+    pub fn replay_lost(&self) -> bool {
+        self.replayable == Some(false)
+    }
+
+    /// Name `entry` in `truncated` (once).
+    fn note_truncated(&mut self, entry: &str) {
+        if !self.truncated.iter().any(|t| t == entry) {
+            self.truncated.push(entry.to_string());
+        }
+    }
+
+    /// Record that the replay lost `entry` (the first such drop wins).
+    fn lose_replay(&mut self, entry: &str) {
+        if self.replayable != Some(false) {
+            self.replayable = Some(false);
+            self.replayable_reason = Some(format!("truncated:{entry}"));
+        }
+    }
+
+    /// Whether the record fits [`MAX_BYTES`].
+    fn fits(&self) -> bool {
+        self.size_bytes() <= MAX_BYTES
+    }
     /// The `(p25, p50, p75)` remaining seconds, when there is an estimate.
     #[must_use]
     pub fn quantiles(&self) -> Option<(i64, i64, i64)> {
@@ -1004,28 +1144,67 @@ impl Explanation {
             .unwrap_or(usize::MAX)
     }
 
-    /// Enforce [`MAX_BYTES`]: drop `features`, then a twin-otter model
-    /// slice (only when there is one), then the stage grids, then the stage
-    /// marks, then every remaining list, stopping as soon as the record fits,
-    /// and recording each drop in `truncated`.
+    /// Enforce [`MAX_BYTES`], stopping as soon as the record fits and naming
+    /// each drop in `truncated` (#10930 for the order):
+    ///
+    /// 1. `features` cut down to the input vector ([`Features::INPUT_VECTOR`]),
+    ///    and `features_omitted` (`features`);
+    /// 2. the stage marks and `stage_predictions` (`result.stage_marks`);
+    /// 3. the lists no replay reads (`context`, [`TRUNCATED_CONTEXT`]).
+    ///
+    /// Nothing so far is read by [`super::simulate::run_explanation`], so the
+    /// record still replays exactly. Only then, a replay input:
+    ///
+    /// 4. a twin-otter model slice, the dependency nodes, the stage grids;
+    /// 5. the last resort: the stages and branches (`detail`).
+    ///
+    /// Dropping a field the explanation's [`ReplayEngine`] reads sets
+    /// `replayable: false` with the reason, and the replay answers `None`
+    /// from then on: never a different number.
     pub fn enforce_cap(&mut self) {
-        if self.size_bytes() <= MAX_BYTES {
+        if self.fits() {
             return;
         }
-        self.features = None;
+        self.features = self.features.as_ref().map(Features::input_vector);
         self.features_omitted.clear();
-        self.truncated.push(TRUNCATED_FEATURES.to_string());
-        if self.size_bytes() <= MAX_BYTES {
+        self.note_truncated(TRUNCATED_FEATURES);
+        if self.fits() {
             return;
         }
+        let had_marks = !self.stage_predictions.is_empty()
+            || self
+                .result
+                .as_ref()
+                .is_some_and(|r| !r.stage_marks.is_empty());
+        if had_marks {
+            if let Some(result) = &mut self.result {
+                result.stage_marks.clear();
+            }
+            self.stage_predictions.clear();
+            self.note_truncated(TRUNCATED_STAGE_MARKS);
+            if self.fits() {
+                return;
+            }
+        }
+        if self.drop_context() {
+            self.note_truncated(TRUNCATED_CONTEXT);
+            if self.fits() {
+                return;
+            }
+        }
+        // From here on every drop may be a replay input.
+        let engine = self.replay_engine();
         let dropped_model = self
             .twin_otter
             .as_mut()
             .and_then(|record| record.model.take())
             .is_some();
         if dropped_model {
-            self.truncated.push(TRUNCATED_TWIN_OTTER_MODEL.to_string());
-            if self.size_bytes() <= MAX_BYTES {
+            self.note_truncated(TRUNCATED_TWIN_OTTER_MODEL);
+            if engine == ReplayEngine::TwinOtter {
+                self.lose_replay(TRUNCATED_TWIN_OTTER_MODEL);
+            }
+            if self.fits() {
                 return;
             }
         }
@@ -1034,40 +1213,56 @@ impl Explanation {
             .as_mut()
             .is_some_and(|d| !std::mem::take(&mut d.nodes).is_empty());
         if dropped_nodes {
-            self.truncated.push(TRUNCATED_DEPENDENCY_NODES.to_string());
-            if self.size_bytes() <= MAX_BYTES {
+            self.note_truncated(TRUNCATED_DEPENDENCY_NODES);
+            if engine == ReplayEngine::Dependency {
+                self.lose_replay(TRUNCATED_DEPENDENCY_NODES);
+            }
+            if self.fits() {
                 return;
             }
         }
-        for entry in &mut self.stages {
-            entry.distribution.grid_pct.clear();
-            entry.distribution.grid_sec.clear();
-        }
-        self.truncated.push(TRUNCATED_GRIDS.to_string());
-        if self.size_bytes() <= MAX_BYTES {
-            return;
-        }
-        if let Some(result) = &mut self.result {
-            result.stage_marks.clear();
-        }
-        self.stage_predictions.clear();
-        self.truncated.push(TRUNCATED_STAGE_MARKS.to_string());
-        if self.size_bytes() <= MAX_BYTES {
-            return;
+        let had_grids = self
+            .stages
+            .iter()
+            .any(|e| !e.distribution.grid_sec.is_empty());
+        if had_grids {
+            for entry in &mut self.stages {
+                entry.distribution.grid_pct.clear();
+                entry.distribution.grid_sec.clear();
+            }
+            self.note_truncated(TRUNCATED_GRIDS);
+            if engine == ReplayEngine::Path {
+                self.lose_replay(TRUNCATED_GRIDS);
+            }
+            if self.fits() {
+                return;
+            }
         }
         // Last resort: keep the identity, provenance, subject and result;
         // drop every list. Nothing unbounded is left after this.
         self.stages.clear();
         self.branches = None;
-        self.contributions = None;
+        self.note_truncated(TRUNCATED_DETAIL);
+        if engine == ReplayEngine::Path {
+            self.lose_replay(TRUNCATED_DETAIL);
+        }
+    }
+
+    /// Drop the lists no replay reads ([`TRUNCATED_CONTEXT`]); whether any
+    /// was there.
+    fn drop_context(&mut self) -> bool {
+        let mut dropped = self.contributions.take().is_some();
         if let Some(window) = &mut self.history_window {
-            window.sources.clear();
+            dropped |= !std::mem::take(&mut window.sources).is_empty();
         }
         if let Some(history) = &mut self.history {
-            history.sources.clear();
-            history.samples_by_source.clear();
-            history.samples_by_host.clear();
+            dropped |= !std::mem::take(&mut history.sources).is_empty();
+            dropped |= !std::mem::take(&mut history.samples_by_source).is_empty();
+            dropped |= !std::mem::take(&mut history.samples_by_host).is_empty();
         }
-        self.truncated.push(TRUNCATED_DETAIL.to_string());
+        for entry in &mut self.stages {
+            dropped |= !std::mem::take(&mut entry.distribution.grid_pct).is_empty();
+        }
+        dropped
     }
 }
