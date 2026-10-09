@@ -87,9 +87,13 @@ fn the_reservation_refuses_a_heavy_repo_and_admits_a_light_one() {
     // The #11191 acceptance case: loom's mark is 25 GB (charge 28), one loom
     // sweep is in flight with 5 GB written, 40 GB free, 3 GB floor.
     let s = store(&[("loom", &[25])], &[("loom#1", "loom", 5)]);
+    // Both charges derive from the measured marks: 25 GB and a non-Rust 0.3 GB.
+    let (loom_gb, loom_src) = charge_gb(Some(25 * GIB), None, 8);
+    let (docs_gb, docs_src) = charge_gb(Some(GIB * 3 / 10), None, 8);
+    assert_eq!((loom_gb, docs_gb), (28, 1));
     let charges = vec![
-        charge("loom", 28, ChargeSource::Observed),
-        charge("docs", 1, ChargeSource::Observed),
+        charge("loom", loom_gb, loom_src),
+        charge("docs", docs_gb, docs_src),
     ];
     let b = assess(40, 3, &s, charges, 8, NOW, None);
     assert_eq!(b.reserved_gb, 23, "28 - 5 still to be written");
