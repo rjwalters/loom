@@ -25,6 +25,20 @@ fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     gate::label_names(&doc)
 }
 
+/// `forge verdict-body-check` (#9258): classify the body on stdin. An
+/// unreadable stdin is a rejection, never a pass.
+pub(crate) fn verdict_body_check() -> Result<()> {
+    use std::io::Read;
+    let mut body = String::new();
+    let result = match std::io::stdin().read_to_string(&mut body) {
+        Ok(_) => loom_daemon::verdict_body::check(&body),
+        Err(_) => Err(loom_daemon::verdict_body::Reject::Empty),
+    };
+    let (line, code) = loom_daemon::verdict_body::render(result);
+    println!("{line}");
+    std::process::exit(code)
+}
+
 /// `forge verdict-gate`.
 pub(crate) fn verdict_gate(
     pr: u64,

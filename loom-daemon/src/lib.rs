@@ -411,6 +411,8 @@ pub mod tokens_pool;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
+/// Is a verdict comment body a rationale at all? (`forge verdict-body-check`, #9258)
+pub mod verdict_body;
 pub mod verdict_equivalence;
 /// The verdict-time gate and label transition behind `post-verdict.sh` (#10581).
 pub mod verdict_gate;
