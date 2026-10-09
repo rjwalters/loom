@@ -367,6 +367,12 @@ pub fn arm_singleton_job(job_name: &str, root: &Path, current_host_id: &str) -> 
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(job_name.to_string());
+        // Captain-gated: a direct Authority -> Captain move (no disarm between)
+        // must not leave a stale authority-owned entry (#10925).
+        owned_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job_name);
         Ok(())
     } else {
         disarm_singleton_job(job_name);
@@ -680,6 +686,31 @@ mod tests {
         assert!(!armed_singleton_job_names().contains(&job));
 
         disarm_singleton_job(&job);
+    }
+
+    #[test]
+    fn direct_authority_to_captain_transition_clears_the_owned_entry() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL),
+            r#"{"fleet": {"captain": "loom-worker-1"}}"#,
+        );
+        for base in ["eta_nightly_folds", "eta_fleet_refresh"] {
+            let job = format!("{base}-{}", std::process::id());
+
+            record_owned_singleton_job(&job, true);
+            assert!(authority_owned_singleton_job_names().contains(&job));
+
+            // Same host becomes captain with no intervening disarm.
+            assert!(arm_singleton_job(&job, dir.path(), "loom-worker-1").is_ok());
+            assert!(armed_singleton_job_names().contains(&job));
+            assert!(
+                !authority_owned_singleton_job_names().contains(&job),
+                "captain-gated job must not stay authority-owned"
+            );
+
+            disarm_singleton_job(&job);
+        }
     }
 
     // ===== Durable shell-arm registry (#8901) =====
