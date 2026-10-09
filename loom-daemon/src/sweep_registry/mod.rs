@@ -140,9 +140,6 @@ pub(crate) mod roll_requeue;
 pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
-// #11191: every re-dispatch route is gated by disk admission.
-#[cfg(test)]
-mod disk_admission_tests;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;

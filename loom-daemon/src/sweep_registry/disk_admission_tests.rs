@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use tempfile::tempdir;
 
-use super::test_support::*;
 use crate::disk_admission::{DiskAdmissionRefused, TEST_SEAM};
 use crate::disk_footprint::Store;
+use crate::sweep_registry::test_support::*;
 use crate::types::SweepKind;
 
 /// Install a seam probe: `free_gb` free, 3 GB floor, an empty store (so the
