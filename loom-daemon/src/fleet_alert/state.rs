@@ -91,14 +91,14 @@ impl AlertState {
     pub fn step(&mut self, now: DateTime<Utc>, observed: &[Condition]) -> Vec<Transition> {
         let mut out = Vec::new();
         for c in observed {
-            let ctr = self.counters.entry(c.key.to_string()).or_default();
+            let ctr = self.counters.entry(c.key.clone()).or_default();
             ctr.good = 0;
             ctr.bad = ctr.bad.saturating_add(1);
             let bad = ctr.bad;
-            match self.active.get_mut(c.key) {
+            match self.active.get_mut(&c.key) {
                 None if bad >= self.debounce => {
                     self.active.insert(
-                        c.key.to_string(),
+                        c.key.clone(),
                         Persisted {
                             last_alert: Some(now),
                             headline: c.headline.clone(),
@@ -121,7 +121,7 @@ impl AlertState {
                 None => {}
             }
         }
-        let seen: Vec<&str> = observed.iter().map(|c| c.key).collect();
+        let seen: Vec<&str> = observed.iter().map(|c| c.key.as_str()).collect();
         // A persisted-active key not yet in `counters` (fresh after restart)
         // that is no longer observed still needs to clear.
         let orphans: Vec<String> = self
@@ -160,7 +160,7 @@ impl AlertState {
 fn transition(kind: Kind, c: &Condition) -> Transition {
     Transition {
         kind,
-        key: c.key.to_string(),
+        key: c.key.clone(),
         headline: c.headline.clone(),
         fix: c.fix.clone(),
     }

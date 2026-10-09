@@ -121,7 +121,7 @@ pub fn inbox_payload(t: &Transition, host: &str) -> serde_json::Value {
         "title": format!("Fleet DEGRADED on {host}: {}", t.key),
         "body": render_body(t),
         "who": host,
-        "severity": "normal",
+        "severity": if super::outputs::is_output_key(&t.key) { "critical" } else { "normal" },
     })
 }
 
@@ -160,13 +160,18 @@ pub fn run_tick(
     window: Duration,
     host: &str,
     pool_dir: Option<&Path>,
+    outputs: Option<&super::outputs::OutputWatch<'_>>,
 ) -> Vec<Transition> {
     // An unreachable status is "unknown", not "healthy": leave state alone.
     let Some(status) = status else {
         return Vec::new();
     };
     let cause = causes::token_cause(status.capacity.total_accounts, pool_dir);
-    let observed = classify(status, now, window, cause);
+    let mut observed = classify(status, now, window, cause);
+    // #10916: output-based watchdog for fleet singletons; absent data fires.
+    if let Some(watch) = outputs {
+        observed.extend(super::outputs::conditions(watch, now));
+    }
     let transitions = state.step(now, &observed);
     for t in &transitions {
         for sink in sinks {
@@ -252,6 +257,8 @@ pub fn spawn(
                     window,
                     &host,
                     pool_dir.as_deref(),
+                    // The real fleet-store/SigNoz OutputSource is a follow-up.
+                    None,
                 );
                 if !transitions.is_empty() {
                     state.save(&state_path);
