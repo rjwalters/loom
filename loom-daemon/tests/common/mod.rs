@@ -112,7 +112,33 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         .env(
             "LOOM_SESSION_FALLBACK_ROOT_FILE",
             fixture.join("session-reconcile-fallback-root.json"),
-        );
+        )
+        // #11024: the worktree reaper's `deep_clean::run_for` takes the real
+        // machine-wide build slot when the host is below the disk floor.
+        // Point the slot dir inside the fixture so a test daemon never
+        // contends for (or leaves state in) the host's `~/.loom/locks`.
+        .env("LOOM_BUILD_SLOT_DIR", fixture.join("build-slots"))
+        .env_remove("LOOM_BUILD_SLOT_HELD");
+    assert_build_slot_isolated(cmd, fixture);
+}
+
+/// Fails (panics) unless `cmd` will spawn a daemon whose build-slot dir
+/// resolves inside `fixture` rather than the host's (#11024).
+#[allow(dead_code)]
+pub fn assert_build_slot_isolated(cmd: &Command, fixture: &Path) {
+    let dir = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "LOOM_BUILD_SLOT_DIR")
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from);
+    match dir {
+        Some(d) if d.starts_with(fixture) => {}
+        other => panic!(
+            "spawned test daemon would resolve the host build-slot dir \
+             (LOOM_BUILD_SLOT_DIR = {other:?}, expected under {})",
+            fixture.display()
+        ),
+    }
 }
 
 /// Process-wide loud-failing `gh` stub (#10088): prints its args to stderr,
