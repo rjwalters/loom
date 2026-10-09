@@ -5,13 +5,17 @@
 //! * **The default branch** is what the pass already classified. Its W state
 //!   is the verdict: W4 holds as `daemon-too-old`, W3 as
 //!   `install-incompatible`. W3 already means "too old AND the payload
-//!   differs" (an empty diff is W0), so the hold keys on the diff. A
+//!   differs" (an empty diff is W0), so the hold keys on the diff. A W3 copy
+//!   that is behind but compatible ([`behind_compatible`]) is not held
+//!   (#11052); it stays W3, so the pass still resyncs it first. A
 //!   repo-ahead workspace is clear unless what the gate refused is an
 //!   interrupted newer resync, which holds and asks for no roll.
 //! * **The checkout** is `<root>/.loom/install-metadata.json` in the working
 //!   tree, gated exactly like the default branch's. The payload is diffed
-//!   against the working tree only when the stamp is too old, and the answer
-//!   is remembered per (HEAD, stamp).
+//!   against the working tree only when the stamp is too old and not behind
+//!   but compatible, and the answer is remembered per (HEAD, stamp). It is
+//!   judged again right after the checkout step fast-forwards the checkout
+//!   ([`rejudge_checkouts`]), so its hold clears in that same pass.
 //!
 //! A copy that could not be read this pass is [`Verdict::Unknown`], which
 //! keeps whatever the last pass found.
@@ -25,13 +29,37 @@
 //! W4 only.
 //!
 //! [`Verdict::Unknown`]: crate::workspace_hold::Verdict::Unknown
+//! [`behind_compatible`]: crate::workspace_hold::behind_compatible
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{daemon, git, Env, Memory, NotCurrent, WState, WorkspaceReport};
+use super::{git, Env, LazyPayload, Memory, NotCurrent, WState, WorkspaceReport};
 use crate::init::payload::{gate_metadata, materialize_with, ResyncRefusal};
-use crate::install_compat::{Compat, InstallMeta, INSTALL_METADATA_PATH};
-use crate::workspace_hold::{decide_hold, Finding, HoldKind, Observation, Verdict};
+use crate::install_compat::{
+    Compat, DaemonCompat, InstallMeta, Version, INSTALL_METADATA_PATH, SUPPORTS_INSTALLED,
+};
+use crate::workspace_hold::{
+    behind_compatible, decide_hold, Finding, HoldKind, Observation, Verdict,
+};
+
+/// What judging a copy needs: the running version, the floor and the
+/// payload. A pass builds it from its [`Env`]; the re-judge after a
+/// fast-forward builds it on its own.
+pub(in crate::fleet_sync) struct Judge<'a> {
+    pub running: Version,
+    pub floor: Option<Version>,
+    pub payload: &'a LazyPayload,
+}
+
+impl Judge<'_> {
+    fn daemon(&self) -> DaemonCompat {
+        DaemonCompat {
+            running: self.running,
+            supports_installed: Version::parse(SUPPORTS_INSTALLED).unwrap_or(self.running),
+            floor: self.floor,
+        }
+    }
+}
 
 /// The observations for a finished pass: `reports` are its workspaces.
 pub(super) fn observe(
@@ -40,43 +68,74 @@ pub(super) fn observe(
     gate: Result<(), NotCurrent>,
     memory: &mut Memory,
 ) -> Vec<Observation> {
+    let judge = Judge {
+        running: env.running,
+        floor: env.floor,
+        payload: env.payload,
+    };
     reports
         .iter()
         .map(|report| {
             let source = crate::init::is_loom_source_repo(&report.root);
             let default_branch = if source {
-                source_default_branch(env, &report.root)
+                source_default_branch(&judge, &report.root)
             } else {
-                from_report(env, report)
+                from_report(&judge, report)
             };
-            let checkout = checkout(env, &report.root, source, gate, memory);
-            let [default_branch, checkout] = [default_branch, checkout].map(|found| {
-                let w3 = found.verdict == Verdict::Hold(HoldKind::InstallIncompatible);
-                if source && w3 {
-                    Finding::clear()
-                } else {
-                    found
-                }
-            });
+            let checkout = checkout(&judge, &report.root, source, gate, memory);
             Observation {
                 root: report.root.clone(),
                 repo: report.repo.clone(),
-                default_branch,
-                checkout,
+                default_branch: unless_source(source, default_branch),
+                checkout: unless_source(source, checkout),
             }
         })
         .collect()
 }
 
-fn too_old(env: &Env<'_>, installed: Option<&str>) -> String {
-    let floor = env
+/// The Loom source repo is never resynced, so no W3 hold could clear there.
+fn unless_source(source: bool, found: Finding) -> Finding {
+    if source && found.verdict == Verdict::Hold(HoldKind::InstallIncompatible) {
+        Finding::clear()
+    } else {
+        found
+    }
+}
+
+/// The checkout copy of each of `roots`, judged now, for
+/// [`crate::workspace_hold::rejudge`]: right after the checkout step
+/// fast-forwarded them (#11052). The default-branch copy is
+/// [`Finding::unknown`], so it keeps what the pass found.
+pub(in crate::fleet_sync) fn checkout_observations(
+    judge: &Judge<'_>,
+    roots: &[PathBuf],
+    gate: Result<(), NotCurrent>,
+    memory: &mut Memory,
+    nwo: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<Observation> {
+    roots
+        .iter()
+        .map(|root| {
+            let source = crate::init::is_loom_source_repo(root);
+            Observation {
+                root: root.clone(),
+                repo: nwo(root),
+                default_branch: Finding::unknown(),
+                checkout: unless_source(source, checkout(judge, root, source, gate, memory)),
+            }
+        })
+        .collect()
+}
+
+fn too_old(judge: &Judge<'_>, installed: Option<&str>) -> String {
+    let floor = judge
         .floor
         .map_or_else(String::new, |f| format!(" or the fleet floor {f}"));
     format!(
-        "installed {} is too old for daemon {}{floor}, and its files differ from this daemon's \
-         payload",
+        "installed {} is too old for daemon {}{floor}, its files differ from this daemon's \
+         payload, and it records no requires_daemon this daemon meets",
         installed.unwrap_or("<unrecorded>"),
-        env.running
+        judge.running
     )
 }
 
@@ -93,7 +152,7 @@ fn refusal_detail(refusal: &ResyncRefusal) -> String {
 }
 
 /// The default-branch copy, from the state the pass gave the workspace.
-fn from_report(env: &Env<'_>, report: &WorkspaceReport) -> Finding {
+fn from_report(judge: &Judge<'_>, report: &WorkspaceReport) -> Finding {
     match report.state {
         WState::W4 => Finding::daemon_too_old(
             report.refusal.as_ref().map_or_else(
@@ -101,9 +160,12 @@ fn from_report(env: &Env<'_>, report: &WorkspaceReport) -> Finding {
                 refusal_detail,
             ),
             report.requires_daemon.as_deref(),
-            env.running,
+            judge.running,
         ),
-        WState::W3 => Finding::install_incompatible(too_old(env, report.installed.as_deref())),
+        // Behind, but its files say they work here: not held, still W3 to
+        // the resync (#11052).
+        WState::W3 if behind_compatible(&recorded(report), &judge.daemon()) => Finding::clear(),
+        WState::W3 => Finding::install_incompatible(too_old(judge, report.installed.as_deref())),
         // `RepoAhead` is the ratchet guard's case: ahead, yet compatible. The
         // one exception is an interrupted newer resync: held, and no demand.
         WState::RepoAhead => match &report.refusal {
@@ -117,33 +179,41 @@ fn from_report(env: &Env<'_>, report: &WorkspaceReport) -> Finding {
     }
 }
 
+/// The contract fields the pass recorded for the default branch.
+fn recorded(report: &WorkspaceReport) -> InstallMeta {
+    InstallMeta {
+        loom_version: report.installed.clone(),
+        requires_daemon: report.requires_daemon.clone(),
+    }
+}
+
 /// A finding from a gate answer, for a copy the pass did not classify.
 fn from_gate(
-    env: &Env<'_>,
+    judge: &Judge<'_>,
     meta: &InstallMeta,
     gate: &Result<Compat, ResyncRefusal>,
     diff_stale: Option<bool>,
 ) -> Finding {
-    match decide_hold(gate, diff_stale) {
+    match decide_hold(gate, diff_stale, behind_compatible(meta, &judge.daemon())) {
         Verdict::Unknown => Finding::unknown(),
         Verdict::Clear => Finding::clear(),
         // `Ok` is W3; a refusal here is an interrupted newer resync.
         Verdict::Hold(HoldKind::InstallIncompatible) => Finding::install_incompatible(
             gate.as_ref()
                 .err()
-                .map_or_else(|| too_old(env, meta.loom_version.as_deref()), refusal_detail),
+                .map_or_else(|| too_old(judge, meta.loom_version.as_deref()), refusal_detail),
         ),
         Verdict::Hold(HoldKind::DaemonTooOld) => Finding::daemon_too_old(
             gate.as_ref().err().map_or_else(String::new, refusal_detail),
             meta.requires_daemon.as_deref(),
-            env.running,
+            judge.running,
         ),
     }
 }
 
 /// The Loom source repo's default branch, which the pass skips. Local refs
 /// only. W4 only (see the module docs).
-fn source_default_branch(env: &Env<'_>, root: &Path) -> Finding {
+fn source_default_branch(judge: &Judge<'_>, root: &Path) -> Finding {
     let Some(branch) = git::default_branch(root) else {
         return Finding::unknown();
     };
@@ -151,21 +221,21 @@ fn source_default_branch(env: &Env<'_>, root: &Path) -> Finding {
         return Finding::unknown();
     };
     match git::metadata_at(root, &head) {
-        Ok(Some(raw)) => judge(env, &raw, Some(false)),
+        Ok(Some(raw)) => judged(judge, &raw, Some(false)),
         Ok(None) => Finding::clear(),
         Err(_) => Finding::unknown(),
     }
 }
 
-fn judge(env: &Env<'_>, raw: &str, diff_stale: Option<bool>) -> Finding {
-    let gate = gate_metadata(raw, &daemon(env));
+fn judged(judge: &Judge<'_>, raw: &str, diff_stale: Option<bool>) -> Finding {
+    let gate = gate_metadata(raw, &judge.daemon());
     let meta = InstallMeta::parse(raw).unwrap_or_default();
-    from_gate(env, &meta, &gate, diff_stale)
+    from_gate(judge, &meta, &gate, diff_stale)
 }
 
 /// The checkout copy: the working tree's install metadata.
 fn checkout(
-    env: &Env<'_>,
+    judge: &Judge<'_>,
     root: &Path,
     source: bool,
     gate: Result<(), NotCurrent>,
@@ -177,8 +247,12 @@ fn checkout(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Finding::clear(),
         Err(_) => return Finding::unknown(),
     };
-    let too_old = gate_metadata(&raw, &daemon(env)) == Ok(Compat::InstalledTooOld);
-    let diff_stale = if !too_old {
+    let daemon = judge.daemon();
+    let too_old = gate_metadata(&raw, &daemon) == Ok(Compat::InstalledTooOld);
+    // Behind but compatible is not held whatever the files are, so there is
+    // no payload to unpack for it.
+    let compatible = InstallMeta::parse(&raw).is_ok_and(|m| behind_compatible(&m, &daemon));
+    let diff_stale = if !too_old || compatible {
         None
     } else if source {
         Some(false)
@@ -186,19 +260,19 @@ fn checkout(
         // No release payload to diff against, so it cannot be known.
         None
     } else {
-        checkout_stale(env, root, &raw, memory)
+        checkout_stale(judge, root, &raw, memory)
     };
-    judge(env, &raw, diff_stale)
+    judged(judge, &raw, diff_stale)
 }
 
 /// Does this daemon's payload differ from the working tree's installed
 /// files? Remembered per (HEAD, stamp). `None` when it cannot be computed.
-fn checkout_stale(env: &Env<'_>, root: &Path, raw: &str, memory: &mut Memory) -> Option<bool> {
+fn checkout_stale(judge: &Judge<'_>, root: &Path, raw: &str, memory: &mut Memory) -> Option<bool> {
     let key = format!("{}\n{raw}", git::head(root).unwrap_or_default());
     if let Some((_, stale)) = memory.checkout.get(root).filter(|(known, _)| *known == key) {
         return Some(*stale);
     }
-    let payload = env.payload.get().ok()?;
+    let payload = judge.payload.get().ok()?;
     let diff = materialize_with(payload, root).ok()?;
     let stale = diff.stamp_pending() || {
         let paths: Vec<String> = diff
