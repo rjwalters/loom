@@ -179,6 +179,10 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     record(root, classify_report(mode == Mode::DryRun, &report), Some(&report));
     observer.finish(root, &report);
     log::info!("stale_blocked_release: {} — {} (#10556)", root.display(), report.summary());
+    if let Some(f) = report.failed.first() {
+        let (n, root) = (report.failed.len(), root.display());
+        log::warn!("stale_blocked_release: {root} — {n} write(s) failed; #{}: {}", f.number, f.why);
+    }
     Some(report)
 }
 
@@ -336,6 +340,33 @@ impl GhReleaseForge {
         )
     }
 
+    /// The memoized write-scope verdict, vetted under **`root`'s own
+    /// credential** — the per-owner `GH_CONFIG_DIR` the comment itself is
+    /// posted under, and the one the tick's gate already admitted.
+    ///
+    /// #10837: this used `may_write_from`, which probes the *process's*
+    /// credential. On a daemon whose home workspace is another owner's, every
+    /// cross-owner root (#5401) was refused here after its gate passed, so
+    /// each release failed before its audit comment, silently.
+    fn write_scope(&mut self) -> Result<(), String> {
+        let (root, gh) = (&self.root, &self.gh_bin);
+        let repo = self.repo.as_deref();
+        self.write_ok
+            .get_or_insert_with(|| {
+                let verdict = match repo {
+                    Some(r) => crate::write_scope::repo_writable_with(root, r, gh),
+                    None => crate::write_scope::root_writable_with(root, gh),
+                };
+                match verdict {
+                    crate::write_scope::Verdict::Allow(_) => Ok(()),
+                    crate::write_scope::Verdict::Deny(why) => {
+                        Err(format!("refusing the write (#9548): {why}"))
+                    }
+                }
+            })
+            .clone()
+    }
+
     fn get(&self, op: crate::forge_call_stats::ForgeOp, url: &str) -> Result<String, String> {
         store::cached_read(
             store::ConditionalRead::new(CALLER, op),
@@ -404,15 +435,7 @@ impl ReleaseForge for GhReleaseForge {
     }
 
     fn post_comment(&mut self, number: u64, is_pr: bool, body: &str) -> Result<(), String> {
-        let (root, repo) = (&self.root, self.repo.as_deref());
-        self.write_ok
-            .get_or_insert_with(|| match crate::write_scope::may_write_from(root, repo) {
-                crate::write_scope::Verdict::Allow(_) => Ok(()),
-                crate::write_scope::Verdict::Deny(why) => {
-                    Err(format!("refusing the write (#9548): {why}"))
-                }
-            })
-            .clone()?;
+        self.write_scope()?;
         crate::forge_comment::post_comment(
             &self.gh_bin,
             Some(&self.root),
@@ -424,6 +447,10 @@ impl ReleaseForge for GhReleaseForge {
         .map(|_| ())
     }
 }
+
+#[cfg(test)]
+#[path = "release_scope_tests.rs"]
+mod scope_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
