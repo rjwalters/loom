@@ -142,7 +142,10 @@ impl RollPauseCommand {
 pub(crate) enum AgentResumeCommand {
     /// The arguments spawn-claude.sh appends, NUL-separated: `--resume <id>
     /// <prompt>` (LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT), `--session-id
-    /// <id>` (LOOM_CLAUDE_SESSION_ID), or nothing. Exit 78 on a bad value.
+    /// <id>` (LOOM_CLAUDE_SESSION_ID), or nothing; then, for a daemon item
+    /// (LOOM_DAEMON_ITEM_ID), `--settings <json>` wiring the roll-pause hook
+    /// unless the launch dir's settings already do (#11049). Exit 78 on a
+    /// bad session value.
     ClaudeArgs,
     /// Check a Codex resume launch (session id, prompt, LOOM_CODEX_HOME
     /// pinned) and print its prompt. Exit 78 when it is not resumable.

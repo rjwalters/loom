@@ -62,7 +62,6 @@ test-check-merge-config.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
-test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh
@@ -84,6 +83,7 @@ test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
+test-critical-file-hold-tick.sh
 test-curator-rightsizing.sh
 test-default-branch.sh
 test-dependency-parse.sh

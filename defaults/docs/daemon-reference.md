@@ -1067,14 +1067,18 @@ full re-provision:
 
 ```bash
 mkdir -p ~/.config/systemd/user/loom-daemon.service.d
-printf '[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\nRestart=on-success\n' \
+printf '[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\n' \
   > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf
 systemctl --user daemon-reload
 ```
 
-A systemd drop-in's `Environment=` is additive and its `Restart=` overrides the
-base unit, so this one file fixes both defects (the missing supervisor env and
-the wrong restart policy) without touching the rendered base unit.
+A systemd drop-in's `Environment=` is additive, so this file adds the missing
+supervisor env without touching the rendered base unit. Once the daemon runs
+supervised, it writes the restart policy itself as `zz-loom-supervision.conf`
+(#11111; see "Supervisor exit-code contract"). An older copy of this hint also
+put `Restart=on-success` in `supervisor.conf`. That file sorts before
+`zz-loom-supervision.conf`, so the daemon's setting wins; the stale line is
+harmless and can be deleted.
 
 ### `fleet bootstrap-spice <ssh-host>` (#4931, Phase 1a)
 
@@ -4092,7 +4096,7 @@ order:
 | Kind | Carried when | Computed by |
 |------|--------------|-------------|
 | `tree` (#9124, #9576) | the two heads' trees are byte-identical | `forge_tree_unchanged::tree_unchanged` — `compare/{marker}...{head}` reporting `files: []` **together with** `status` `identical`/`ahead` |
-| `clean-merge` (#9416) | the head is a two-parent merge whose **first** parent is the reviewed head, whose second parent is a commit on the PR's base branch, and whose tree equals `git merge-tree --write-tree <reviewed> <base-parent>` — so no hand edits and no conflict resolution | `verdict_equivalence::clean_merge`, local git (never fetches; an absent object is no answer) |
+| `clean-merge` (#9416) | the head is the reviewed head plus only clean merges of the base and tree-identical commits (#10875): each merge is two-parent, its **first** parent reduces to the reviewed head, its second parent is a commit on the PR's base branch, and its tree equals `git merge-tree --write-tree <first> <base-parent>` — so no hand edits and no conflict resolution | `verdict_equivalence::clean_merge`, local git (never fetches; an absent object is no answer) |
 | `rebase-patch-identical` (#9416) | the PR's own merge-base-relative patch is byte-identical before and after the move — same file set, statuses, resulting blob ids and patch text | `verdict_equivalence::patch_identity`, comparing `compare/{base}...{reviewed}` with `compare/{base}...{head}` |
 
 `files: []` alone proves nothing for the `tree` kind: the three-dot compare diffs
@@ -9124,10 +9128,29 @@ a six-builder wave, each loss costing a full Rust rebuild.
 The reaper now also asks the filesystem, which the process table cannot
 contradict: **a worktree with any write in the last `N` minutes is live**,
 whatever the registry thinks. The probe reads the worktree's gitdir refs
-(`HEAD`/`index`/`logs/HEAD` — the only place a *commit* is observable, since
-committing touches no working-tree file), the build-artifact directories at
-depth 1 (a running `cargo` rewrites `target/debug/` constantly), and a bounded
-walk of the source tree, stopping at the first recent entry.
+(`HEAD`/`index` by mtime, `logs/HEAD` by its newest entry's own timestamp — the
+only place a *commit* is observable, since committing touches no working-tree
+file), the build-artifact directories at depth 1 (a running `cargo` rewrites
+`target/debug/` constantly), and a bounded walk of the source tree, stopping at
+the first recent entry.
+
+`logs/HEAD` is read by content, not mtime, since #11071: `git gc`'s `reflog
+expire --all` rewrites the `logs/HEAD` of **every** linked worktree without
+adding an entry, so on a busy host every kept worktree read as live and none was
+ever trimmed (31 hours on loom-worker-1, 40 GB held by idle `target/` dirs).
+
+**Order and logging (#11071).** Eligible directories are removed largest first.
+Each removal logs `category=worktree_target_idle` with the worktree, the
+directory, its bytes and `dry_run`; each artifact directory left in place logs
+why and its bytes (`info` when it holds anything). Below the floor, the eager
+tier runs the same reclaim across **every registered root** (its own probe root
+is usually the daemon's checkout, which has no worktrees), without the forge,
+and judges the floor **per volume** (filesystem device): it stops on each
+volume as soon as that volume's free space is back above `diskWarnFreeGb`, so a
+volume already above the floor keeps its caches and never ends the pass before
+a pressured volume is reached.
+`loom-daemon clean --dry-run` lists the same candidates; `clean` never removes
+them.
 
 Set `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES=0` to disable the gate and restore
 the pre-#8116 behavior. A worktree the daemon cannot read is never reclaimed
@@ -12173,13 +12196,42 @@ The daemon encodes WHY it exits in its exit code (`ipc.rs`,
 - **A `kill -9` of a systemd-supervised daemon is relaunched**, because it is
   indistinguishable from an OOM kill. Stop with `loom-daemon-stop.sh` or
   `systemctl --user disable --now`.
-- **Existing installs pick the new unit up on re-render**: `loom-daemon-update.sh
-  --relaunch` (re-renders via `loom-daemon-start.sh`; on a fleet worker it
-  rewrites the same `loom-daemon.service`), or any fresh `loom-daemon-start.sh`
-  against a stopped daemon. A plain supervised restart (exit 0) does NOT
-  re-render: the relaunched process runs under the unit systemd already has
-  loaded. `fleet add-worker` skips its `daemon-unit` step on a worker whose unit
-  is already enabled, so use `--relaunch` there too.
+- **Existing installs get these settings at the next daemon startup (#11111)**,
+  with no re-render. A daemon running under systemd on Linux writes them to
+  `~/.config/systemd/user/<unit>.service.d/zz-loom-supervision.conf` and runs
+  `systemctl --user daemon-reload`. The file holds the `[Unit]` start limit and
+  the `[Service]` directives of the same `systemd_supervision_block()`, with an
+  empty `RestartPreventExitStatus=` / `SuccessExitStatus=` before each value,
+  because those keys add to the base unit's lists. The shared block also
+  carries `KillMode=mixed` and `TimeoutStopSec=20`. Recent units already set
+  both, but a pre-#5119 `fleet add-worker` unit lacks them and a pre-#4862
+  canonical unit runs the default `KillMode=control-group`; on those hosts the drop-in sets
+  them as intended. It is rewritten only when its content differs. systemd
+  reads the settings when the daemon exits, so the next exit is supervised by
+  them; a floor roll is enough to deliver them fleet-wide.
+  It covers the canonical unit and the `fleet add-worker` unit alike. A failure
+  is logged at WARN and the daemon carries on. Nothing is written under launchd
+  or when unsupervised. Only the unit's own main process writes: the daemon
+  checks that `systemctl --user show -p MainPID --value <unit>` is its own pid,
+  and skips (at DEBUG) on a mismatch, an empty value, `0`, or a failed query. A
+  sweep child or test daemon that inherited `LOOM_DAEMON_SUPERVISOR=systemd`
+  therefore never writes the live unit's drop-in or reloads the user manager
+  (#8077). systemd applies drop-ins in file-name order and the
+  last one wins, so the `zz-` name sorts after any operator drop-in, including
+  the pre-#11111 retrofit's `supervisor.conf` with `Restart=on-success` and
+  `systemctl edit`'s `override.conf`. A drop-in that still sorts after it and
+  sets the same keys would win (or, for the two list keys, append to its
+  lists); startup names such a file at WARN. Only the unit's own `.d`
+  directory is scanned for such files. Writing the
+  drop-in also removes a `50-supervision.conf`, the name an unreleased build
+  used, so two copies never coexist.
+- **The unit file itself is re-rendered** only by `loom-daemon-update.sh
+  --relaunch` or a fresh `loom-daemon-start.sh` against a stopped daemon; a
+  supervised restart (exit 0) does not re-render it.
+- **`loom-daemon-start.sh` runs `systemctl --user reset-failed <unit>` before
+  `enable --now` (#11111).** Once the start limit trips, the unit is
+  `failed (Result: start-limit-hit)` and systemd refuses a start for up to
+  `StartLimitIntervalSec`; the reset lets an operator start it at once.
 
 ### macOS TCC hygiene under launchd (#3980)
 
@@ -12674,7 +12726,13 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   - **Who is requeued, and how it is recorded.** An agent younger than
     `pauseRoll.minResumableAgeSecs` (`young-agent-reset`), one with no resumable
     session (`session-not-resumable`), and one that missed the budget
-    (`pause-budget-missed`). Each requeue restores the label through the usual
+    (`pause-budget-missed`). A missed item's manifest entry and its
+    `daemon.roll.item` event carry `safe_point_miss` (#11049): `no-hook` (the
+    pause hook never ran for it), `no-tool-call` (it ran, but no call started
+    in the window), or `hook-refused` (it ran in the window but recorded no
+    safe point), with the evidence. A Claude sweep gets the hook wiring from
+    its launch (`--settings`, from `agent-resume claude-args`), not from the
+    consumer's `.claude/settings.json`. Each requeue restores the label through the usual
     claim-restore path (a closed issue is never re-queued, a parked one stays
     parked), posts **one comment** naming the roll (`from → to`), the phase and
     age reached, the reason and whether a worktree with uncommitted edits is

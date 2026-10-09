@@ -585,6 +585,13 @@ offers every line past a byte cursor (`export-cursor.json`) to the configured
 exporter queue(s), so records reach SigNoz whenever `observability` is
 enabled. Only complete lines are read.
 
+> **Memory attribution (#11114).** A dated Linux investigation of daemon memory
+> with CI telemetry off/on, the streamed export, the poll cycle and the dedupe
+> ledger is in
+> [`docs/notes/ci-telemetry-memory-attribution-11114.md`](https://github.com/rjwalters/loom/blob/main/docs/notes/ci-telemetry-memory-attribution-11114.md).
+> The poll cycle is bounded; the ledger's memory grows with history (#11159,
+> #11160).
+
 ### Journal rotation (#11045)
 
 The journal is never read whole. The torn-tail repair reads only the last

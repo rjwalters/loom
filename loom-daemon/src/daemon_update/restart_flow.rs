@@ -398,14 +398,16 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
         }
 
         // A unit that is NOT `active` after that settle will NOT come back on
-        // its own: `Restart=on-success` fires only for a clean-exit relaunch,
-        // never for a stop-timeout escalation (`failed`, Result=timeout) nor a
-        // completed stop (`inactive`). Only a genuinely `active` unit on a pid
+        // its own: systemd never relaunches a completed stop (`inactive`), a
+        // stay-down exit code, or a unit past its start limit (`failed`,
+        // Result=start-limit-hit), and a pre-#11058 `Restart=on-success` unit
+        // does not relaunch a stop-timeout escalation (`failed`, Result=timeout)
+        // either. Only a genuinely `active` unit on a pid
         // the poll simply failed to observe is left alone — touching that
         // would risk bouncing a healthy daemon.
         if active_state != "active" {
             out::warn(&format!(
-                "Unit is in a non-running state (ActiveState={}, Result={}) — systemd will NOT auto-relaunch it (Restart=on-success does not fire for a failed/stopped unit). Self-healing via 'systemctl --user reset-failed {2} && systemctl --user start {2}'.",
+                "Unit is in a non-running state (ActiveState={}, Result={}) — systemd will NOT auto-relaunch a failed or stopped unit. Self-healing via 'systemctl --user reset-failed {2} && systemctl --user start {2}'.",
                 none_or_unknown(&active_state),
                 none_or_unknown(&unit_result),
                 p.sup.systemd_unit
@@ -454,7 +456,7 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
     };
     out::err("");
     out::err("To finish the roll, re-render the unit and relaunch under systemd supervision");
-    out::err("(this installs Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd so");
+    out::err("(this installs Restart=always + LOOM_DAEMON_SUPERVISOR=systemd so");
     out::err("the NEXT roll can use the supervised path) while preserving the live unit's LOOM_*");
     out::err("autonomy env — run:");
     out::err("  loom-daemon-update.sh --relaunch      (or: LOOM_DAEMON_UPDATE_RELAUNCH=1 loom-daemon-update.sh)");
@@ -469,7 +471,7 @@ fn systemd_restart(p: &Plan<'_>) -> ! {
     out::err("the daemon gracefully (SIGTERM) so sweep children reparent and keep working.");
     out::err("If you must relaunch by hand, prefer the graceful sequence over stop+enable:");
     out::err(&format!(
-        "  kill -TERM {pid_hint}   # daemon exits by signal; children reparent; not relaunched (Restart=on-success does not fire)"
+        "  kill -TERM {pid_hint}   # daemon exits by signal; children reparent; not relaunched (143 is a stay-down exit)"
     ));
     out::err(&format!(
         "  {}                                  # re-render + enable --now the supervised unit",

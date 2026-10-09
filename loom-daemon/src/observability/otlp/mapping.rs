@@ -5,6 +5,9 @@
 mod auto_update;
 mod ci;
 mod eta;
+mod fact_id;
+mod fleet_state;
+mod host_export;
 mod metadata;
 mod ops;
 mod pass;
@@ -631,25 +634,26 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         }
         TelemetryRecord::AutoUpdateTick(_)
         | TelemetryRecord::TokenRankingRefresh(_)
+        | TelemetryRecord::HostExport(_)
         | TelemetryRecord::PassSummary(_)
-        | TelemetryRecord::PassVerdict(_) => {
+        | TelemetryRecord::PassVerdict(_)
+        | TelemetryRecord::FleetState(_)
+        | TelemetryRecord::PickDecision(_) => {
             // One record, stamped at its own time; the body is the record's
             // JSON. Issue #10414: one self-update decision (the tick's start).
             // Issue #10744: one token-ranking refresh round (the round's
             // start). Issue #10752: one pass / one artifact verdict (when
-            // decided). Each `log_parts` is `None` for every other kind.
+            // decided). Issue #10196: one fleet-state snapshot (rows +
+            // census; anchor/delta scalars ride as `loom.fleet.*`
+            // attributes). Issue #10212: one pick decision (the ranked
+            // candidates). Each `log_parts` is `None` for every other kind.
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
-                .or_else(|| pass::log_parts(r))?;
-            time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::PickDecision(_) => {
-            // Issue #10212: body is the record's JSON (the ranked candidates).
-            let (event_name, severity, at, attributes, body) =
-                pick_decision::log_parts(&envelope.record)?;
+                .or_else(|| host_export::log_parts(r))
+                .or_else(|| pass::log_parts(r))
+                .or_else(|| fleet_state::log_parts(r))
+                .or_else(|| pick_decision::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -699,6 +703,10 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     attributes.retain(|kv| kv.key != "loom.kind");
     attributes.insert(0, kv_string("loom.kind", envelope.record.kind().to_string()));
     attributes.insert(0, kv_string("loom.record_id", record_id(envelope)));
+    // Issue #11125: outcome facts also carry a host-independent id.
+    if let Some(fact) = fact_id::of(&envelope.record) {
+        attributes.insert(2, kv_string("loom.fact_id", fact));
+    }
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

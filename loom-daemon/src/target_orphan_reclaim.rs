@@ -280,7 +280,16 @@ pub fn vet_root(repo_root: &Path, root: &ScanRoot) -> Result<(), String> {
     if root.scope == RootScope::Shared {
         return Ok(());
     }
-    let Ok(relative) = root.dir.strip_prefix(repo_root) else {
+    vet_path_inside(repo_root, &root.dir)
+}
+
+/// [`vet_root`]'s check for a root inside the repo, for any `dir` under any
+/// `base`: every component below `base` is a real directory (a symlink at any
+/// level refuses it) and `dir`'s canonical path is strictly inside `base`'s.
+/// Also how the kept-worktree artifact reclaim vets `<worktree>/target`
+/// (#11071).
+pub fn vet_path_inside(repo_root: &Path, dir: &Path) -> Result<(), String> {
+    let Ok(relative) = dir.strip_prefix(repo_root) else {
         return Err(format!("not under the repo root {}", repo_root.display()));
     };
     let mut walked = repo_root.to_path_buf();
@@ -301,7 +310,7 @@ pub fn vet_root(repo_root: &Path, root: &ScanRoot) -> Result<(), String> {
             Err(e) => return Err(format!("{}: {e}", walked.display())),
         }
     }
-    let (Ok(real_root), Ok(real_repo)) = (root.dir.canonicalize(), repo_root.canonicalize()) else {
+    let (Ok(real_root), Ok(real_repo)) = (dir.canonicalize(), repo_root.canonicalize()) else {
         return Err("could not canonicalize the root or the repo root".to_string());
     };
     if real_root == real_repo || !real_root.starts_with(&real_repo) {
@@ -463,7 +472,7 @@ fn issue_numbers(name: &str) -> Vec<u32> {
 
 /// The newest mtime anywhere under `path`, and the total size, without
 /// following symlinks. An unreadable child is skipped.
-fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
+pub(crate) fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
     let meta = std::fs::symlink_metadata(path)?;
     let own: DateTime<Utc> = meta.modified().map_or_else(|_| Utc::now(), DateTime::from);
     if !meta.is_dir() {
@@ -718,7 +727,7 @@ pub fn host_configured_target_dirs(repo_root: &Path) -> Vec<PathBuf> {
 /// The production open-handle probe. `None` when neither `/proc` nor `lsof`
 /// is available: `find_processes_using_directory` would then report "no
 /// holders", and this pass must not read that as "free".
-fn production_open_handles(path: &Path) -> Option<bool> {
+pub(crate) fn production_open_handles(path: &Path) -> Option<bool> {
     let probe_available = (cfg!(target_os = "linux") && Path::new("/proc/self").is_dir())
         || std::process::Command::new("lsof")
             .arg("-v")

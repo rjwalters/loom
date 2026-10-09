@@ -92,8 +92,8 @@ pub const EXIT_STARTUP_FAILURE: i32 = 1;
 /// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Likewise
 /// returns `Some("systemd")` when `LOOM_DAEMON_SUPERVISOR=systemd`
 /// (case-insensitive) is present — a value the systemd unit's `Environment=`
-/// bakes in, relying on `Restart=on-success` to relaunch the daemon after the
-/// clean `EXIT_RESTART` exit. Any other or absent value ⇒ `None` (the daemon is
+/// bakes in, relying on `Restart=always` (#11058) to relaunch the daemon after
+/// the clean `EXIT_RESTART` exit. Any other or absent value ⇒ `None` (the daemon is
 /// unsupervised: nohup / Linux without a recognized supervisor / `--foreground`),
 /// and the restart primitive must refuse to end the process because nothing
 /// would bring it back.
@@ -222,9 +222,11 @@ pub fn build_restart_decision(in_flight: usize) -> (Response, bool) {
                     a systemd --user service (e.g. a fleet worker provisioned before #4640), \
                     retrofit it instead of restarting manually: mkdir -p \
                     ~/.config/systemd/user/loom-daemon.service.d && printf \
-                    '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\nRestart=on-success\\n' \
+                    '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\n' \
                     > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
-                    systemctl --user daemon-reload."
+                    systemctl --user daemon-reload. Once supervised, the daemon writes \
+                    its own Restart= supervision drop-in (zz-loom-supervision.conf, #11111) at \
+                    startup."
                     .to_string(),
             },
             false,

@@ -1463,8 +1463,10 @@ pub fn cleanup_worktree(
 pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<String> {
     let before = stash_ref_commit(worktree_path);
     let msg = format!("{QUARANTINE_STASH_LABEL} {label}");
+    // #11075: never write a cargo build tree (content-verified marker, any
+    // name, ignored or not) into refs/stash — see `generated_artifact`.
     let status = Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", &msg])
+        .args(crate::generated_artifact::quarantine_stash_args(worktree_path, &msg))
         .current_dir(worktree_path)
         .status();
     if !status.is_ok_and(|s| s.success()) {
