@@ -139,9 +139,14 @@ impl<F: ForgeReads> Diff<'_, F> {
         exit: StageExit,
         next_stage: Option<FleetStage>,
         forge_at: Option<DateTime<Utc>>,
+        source: Option<Source>,
     ) -> StageOutcomeRecord {
         let left_at = forge_at.unwrap_or(self.now).min(self.now);
-        let entered_at = (!was.entered_at_lower_bound).then_some(was.entered_at);
+        // Only a sweep's own checkpoint dates its entry. A polled row's
+        // `entered_at` is the pass that first saw it: the entry fell somewhere
+        // between the previous pass and that one, so it is not an instant.
+        let entered_at =
+            (source == Some(Source::Held) && !was.entered_at_lower_bound).then_some(was.entered_at);
         let completed = !matches!(exit, StageExit::CutShort | StageExit::Unknown);
         let dwell_sec = entered_at
             .filter(|_| completed)
@@ -257,6 +262,7 @@ pub fn diff(
                         exit,
                         Some(now.stage),
                         forge_at,
+                        was_repo.sources.get(&issue).copied(),
                     )));
                 }
                 None => {
@@ -281,9 +287,15 @@ pub fn diff(
                         Some(_) => (StageExit::CutShort, None),
                         None => (StageExit::Unknown, None),
                     };
-                    out.push(TelemetryRecord::StageOutcome(
-                        diff.record(repo, issue, was, exit, None, forge_at),
-                    ));
+                    out.push(TelemetryRecord::StageOutcome(diff.record(
+                        repo,
+                        issue,
+                        was,
+                        exit,
+                        None,
+                        forge_at,
+                        was_repo.sources.get(&issue).copied(),
+                    )));
                 }
             }
         }

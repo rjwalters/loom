@@ -199,7 +199,7 @@ fn a_stage_outcome_with_no_forge_instant_is_still_emitted_at_the_pass() {
 }
 
 #[test]
-fn a_stage_outcome_with_an_exact_entry_has_a_dwell() {
+fn a_polled_entry_between_two_passes_has_no_dwell() {
     let mut forge = Forge::default();
     let approved_at = t0() + Duration::minutes(8);
     forge
@@ -214,9 +214,11 @@ fn a_stage_outcome_with_an_exact_entry_has_a_dwell() {
         Duration::minutes(5),
         &mut forge,
     );
+    // The review began at some instant in (t0, t0 + 5m]; the pass that first
+    // saw it is not that instant, so an exact dwell would be a guess.
     let r = stages(&out[2])[0];
-    assert_eq!(r.entered_at, Some(t0() + Duration::minutes(5)));
-    assert_eq!(r.dwell_sec, Some(180));
+    assert_eq!(r.entered_at, None);
+    assert_eq!(r.dwell_sec, None);
 }
 
 #[test]
@@ -341,6 +343,8 @@ fn a_held_sweep_advancing_is_a_stage_outcome_without_a_forge_instant() {
     let r = stages(&out[1])[0];
     assert_eq!((r.stage, r.exit), (FleetStage::SweepCurator, StageExit::Advance));
     assert_eq!(r.forge_transition_at, None);
+    assert_eq!(r.entered_at, Some(t0() - Duration::minutes(20)), "the checkpoint dates it");
+    assert_eq!(r.dwell_sec, Some(1500));
     assert_eq!(forge.reads, 0, "a sweep stage has no forge label");
 }
 
