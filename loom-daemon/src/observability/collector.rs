@@ -994,6 +994,10 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
+    // This host's view of its held sweeps, review PRs and ready queue over
+    // OTLP (Issue #10196), independent of ETA. Hourly anchor, deltas only on
+    // change; its review listings are ETag-cached (warm after stage_dwell).
+    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
