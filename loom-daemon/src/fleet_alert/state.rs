@@ -23,6 +23,8 @@ pub struct Transition {
     pub key: String,
     pub headline: String,
     pub fix: String,
+    /// Inbox severity is `critical` (see [`Condition::critical`]).
+    pub critical: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -148,6 +150,7 @@ impl AlertState {
                         key: key.clone(),
                         headline: p.headline,
                         fix: String::new(),
+                        critical: false,
                     });
                 }
                 self.counters.remove(&key);
@@ -163,5 +166,6 @@ fn transition(kind: Kind, c: &Condition) -> Transition {
         key: c.key.clone(),
         headline: c.headline.clone(),
         fix: c.fix.clone(),
+        critical: c.critical,
     }
 }

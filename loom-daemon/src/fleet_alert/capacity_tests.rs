@@ -9,7 +9,7 @@ use chrono::{Duration as Cd, TimeZone, Utc};
 
 use super::capacity::{KEY_CAPACITY_LIMITED, KEY_STAR_BACKLOG};
 use super::state::{AlertState, Kind, Transition};
-use super::task::{inbox_payload, run_tick, AlertSink};
+use super::task::{inbox_payload, run_tick, AlertSink, TickContext};
 use super::{classify, TokenCause};
 use crate::types::{
     CapView, CapacityReport, DaemonStatusReport, QueueDisposition, ReadyQueueRow,
@@ -131,12 +131,14 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         run_tick(
             &mut st,
             &sinks,
-            Some(&s),
+            &TickContext {
+                status: Some(&s),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(i64::from(m)),
-            WINDOW,
-            "worker-1",
-            None,
-            None,
         );
     }
     let sent = inbox.lock().unwrap().clone();
@@ -158,12 +160,14 @@ fn each_ask_reaches_the_inbox_exactly_once_without_safehouse() {
         cleared.extend(run_tick(
             &mut st,
             &sinks,
-            Some(&status(freed, 12)),
+            &TickContext {
+                status: Some(&status(freed, 12)),
+                window: WINDOW,
+                host: "worker-1",
+                pool_dir: None,
+                outputs: None,
+            },
             t0() + Cd::minutes(m),
-            WINDOW,
-            "worker-1",
-            None,
-            None,
         ));
     }
     assert_eq!(cleared.len(), 2);

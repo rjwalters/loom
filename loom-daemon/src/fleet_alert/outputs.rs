@@ -20,7 +20,7 @@ pub struct OutputWatch<'a> {
     pub roster: &'a [String],
 }
 
-/// Whether an alert key belongs to the output watchdog (delivered critical).
+/// Whether an alert key belongs to the output watchdog.
 #[must_use]
 pub fn is_output_key(key: &str) -> bool {
     key.starts_with(KEY_PREFIX)
@@ -48,6 +48,7 @@ pub fn conditions(watch: &OutputWatch<'_>, now: DateTime<Utc>) -> Vec<Condition>
                      emitting. See `fleet_outputs::SINGLETON_OUTPUTS`.",
                     c.job, c.record_kind
                 ),
+                critical: c.severity == Severity::Critical,
             }
         })
         .collect()

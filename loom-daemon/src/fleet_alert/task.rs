@@ -121,7 +121,7 @@ pub fn inbox_payload(t: &Transition, host: &str) -> serde_json::Value {
         "title": format!("Fleet DEGRADED on {host}: {}", t.key),
         "body": render_body(t),
         "who": host,
-        "severity": if super::outputs::is_output_key(&t.key) { "critical" } else { "normal" },
+        "severity": if t.critical { "critical" } else { "normal" },
     })
 }
 
@@ -150,18 +150,31 @@ impl AlertSink for InboxSink {
     }
 }
 
+/// Per-tick inputs other than the alert state and sinks.
+pub struct TickContext<'a> {
+    pub status: Option<&'a DaemonStatusReport>,
+    pub window: Duration,
+    pub host: &'a str,
+    pub pool_dir: Option<&'a Path>,
+    /// #10916: output-based watchdog data; `None` skips the watchdog.
+    pub outputs: Option<&'a super::outputs::OutputWatch<'a>>,
+}
+
 /// One evaluation pass. Delivers every transition to every sink (a failing
 /// sink never suppresses the others) and returns the transitions.
 pub fn run_tick(
     state: &mut AlertState,
     sinks: &[Box<dyn AlertSink>],
-    status: Option<&DaemonStatusReport>,
+    ctx: &TickContext<'_>,
     now: DateTime<Utc>,
-    window: Duration,
-    host: &str,
-    pool_dir: Option<&Path>,
-    outputs: Option<&super::outputs::OutputWatch<'_>>,
 ) -> Vec<Transition> {
+    let TickContext {
+        status,
+        window,
+        host,
+        pool_dir,
+        outputs,
+    } = *ctx;
     // An unreachable status is "unknown", not "healthy": leave state alone.
     let Some(status) = status else {
         return Vec::new();
@@ -249,17 +262,15 @@ pub fn spawn(
             loop {
                 let status = fetch_status(&socket_path);
                 let pool_dir = status.as_ref().and_then(|s| s.token_pool_dir.clone());
-                let transitions = run_tick(
-                    &mut state,
-                    &sinks,
-                    status.as_ref(),
-                    Utc::now(),
+                let ctx = TickContext {
+                    status: status.as_ref(),
                     window,
-                    &host,
-                    pool_dir.as_deref(),
+                    host: &host,
+                    pool_dir: pool_dir.as_deref(),
                     // The real fleet-store/SigNoz OutputSource is a follow-up.
-                    None,
-                );
+                    outputs: None,
+                };
+                let transitions = run_tick(&mut state, &sinks, &ctx, Utc::now());
                 if !transitions.is_empty() {
                     state.save(&state_path);
                 }

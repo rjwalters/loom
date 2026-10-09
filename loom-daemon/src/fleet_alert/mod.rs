@@ -57,6 +57,8 @@ pub struct Condition {
     pub headline: String,
     /// What to do about it.
     pub fix: String,
+    /// Deliver to the inbox as `critical` (evaluator severity), else `normal`.
+    pub critical: bool,
 }
 
 /// Evaluate a status report. `token_cause` is the best-effort reason the pool
@@ -78,6 +80,7 @@ pub fn classify(
         let (why, fix) = causes::token_text(token_cause);
         out.push(Condition {
             key: KEY_TOKENS.to_string(),
+            critical: false,
             headline: format!(
                 "Token pool has ZERO healthy accounts ({}/{} healthy, {} exhausted): {why}. \
                  Every dispatch dies at token selection.",
@@ -94,6 +97,7 @@ pub fn classify(
     if status.main_health_gate_halted {
         out.push(Condition {
             key: KEY_DISPATCH.to_string(),
+            critical: false,
             headline: "Dispatch is HALTED by the main-health gate (main is red).".to_string(),
             fix: "Fix or revert the commit that broke main; dispatch resumes on its own."
                 .to_string(),
@@ -101,6 +105,7 @@ pub fn classify(
     } else if tick_halted && !tokens_zero {
         out.push(Condition {
             key: KEY_DISPATCH.to_string(),
+            critical: false,
             headline: "Dispatch is HALTED: the last work-finder tick halted.".to_string(),
             fix: "Run `loom-daemon health` and read the dispatch section for the halt reason."
                 .to_string(),
@@ -124,6 +129,7 @@ pub fn classify(
         names.dedup();
         out.push(Condition {
             key: KEY_ROLES.to_string(),
+            critical: false,
             headline: format!(
                 "{} role(s) have PERSISTENT failures: {}.",
                 names.len(),
