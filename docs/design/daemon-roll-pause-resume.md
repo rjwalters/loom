@@ -216,8 +216,11 @@ The contract:
    stopped.
 2. **Every paused, reset or requeued item loses its whole tree at H4**, and the
    old binary owns that teardown. Nothing from an agent's tree may outlive H4.
-   On systemd it is `systemctl --user stop <scope_unit>`, which kills the whole
-   cgroup, including `setsid` descendants. On launchd it is the orphan reaper's
+   On systemd it is a stop of `<scope_unit>`, which kills the whole cgroup,
+   including `setsid` descendants. The stop is queued with `--no-block` and
+   the cgroup is sent `SIGKILL` after a 5 s grace, so H4 never waits on
+   systemd's stop job (#11051). H4 runs the teardowns in parallel (8 at once)
+   and ends its stop phase at the pause budget plus a 15 s margin. On launchd it is the orphan reaper's
    freeze-first tree kill over the worktree-attributed and pgid-attributed
    seeds. A pgid-only `kill(-pgid)` is not enough
    (`orphan_process_reaper.rs:16-35`). For session-exec items it is the `.cancel`

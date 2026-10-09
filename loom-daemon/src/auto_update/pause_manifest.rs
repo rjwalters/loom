@@ -172,6 +172,11 @@ pub struct Roll {
     pub pause_started_at: DateTime<Utc>,
     #[serde(default)]
     pub pause_completed_at: Option<DateTime<Utc>>,
+    /// How long H4's stop phase (steps 4-7) took, from the first stop to the
+    /// last tree stopped (#11051). Bounded by the pause budget plus the stop
+    /// margin.
+    #[serde(default)]
+    pub pause_duration_ms: Option<u64>,
     #[serde(default)]
     pub pause_budget_secs: Option<u64>,
     #[serde(default)]

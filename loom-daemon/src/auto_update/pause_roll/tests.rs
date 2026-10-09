@@ -120,6 +120,8 @@ pub(super) struct FakeHost {
     pub(super) pending: AtomicUsize,
     pub(super) dead: Mutex<BTreeSet<String>>,
     pub(super) torn: Mutex<Vec<String>>,
+    /// Items whose process group the stop bound killed (#11051).
+    pub(super) forced: Mutex<Vec<String>>,
     /// Held item -> the pause run holding it.
     pub(super) held: Mutex<BTreeMap<String, String>>,
     /// The pause runs holding dispatch closed.
@@ -166,6 +168,11 @@ impl PauseHost for FakeHost {
         self.torn.lock().unwrap().push(c.id.clone());
         self.dead.lock().unwrap().insert(c.id.clone());
         TeardownReport::default()
+    }
+    fn force_kill(&self, c: &Candidate) -> bool {
+        self.forced.lock().unwrap().push(c.id.clone());
+        self.dead.lock().unwrap().insert(c.id.clone());
+        true
     }
     fn refresh_lease(&self, c: &Candidate, _timeout: Duration) -> Result<(), String> {
         self.leases.lock().unwrap().push(c.id.clone());
@@ -832,6 +839,9 @@ impl PauseHost for RegistryHost {
     }
     fn teardown(&self, c: &Candidate) -> TeardownReport {
         teardown::teardown_tree(&c.tree_spec(), Duration::from_millis(300))
+    }
+    fn force_kill(&self, c: &Candidate) -> bool {
+        teardown::force_kill_group(&c.tree_spec())
     }
     fn refresh_lease(&self, c: &Candidate, _timeout: Duration) -> Result<(), String> {
         self.leases.lock().unwrap().push(c.id.clone());

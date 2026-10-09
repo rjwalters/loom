@@ -348,6 +348,19 @@ pub struct CheckoutPass {
     pub low_disk: u32,
 }
 
+impl CheckoutPass {
+    /// The checkouts this pass fast-forwarded, for the dispatch hold's
+    /// re-judge (#11052).
+    #[must_use]
+    pub fn fast_forwarded(&self) -> Vec<PathBuf> {
+        self.transitions
+            .iter()
+            .filter(|t| t.report.state == CheckoutState::FastForwarded)
+            .map(|t| t.report.root.clone())
+            .collect()
+    }
+}
+
 fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
