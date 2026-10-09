@@ -20,13 +20,13 @@
 //!
 //! The same [`SignozRead`] seam as the in-sweep snapshot: [`ExplainHttp`]
 //! (the shared [`ClickhouseHttp`] with [`ESTIMATE_SQL`]'s extra bound
-//! parameters) and [`FileRows`] (an operator's `clickhouse-client` export of
+//! parameters) and [`FileRows`](super::fleet_signoz_refresh::FileRows) (an operator's `clickhouse-client` export of
 //! [`ESTIMATE_SQL`], and the tests' recorded fixture). A row's body is
 //! re-parsed and re-filtered here, so a transport that ignores a selector
 //! (the file reader) still gives the right answer.
 
 use super::explanation::Explanation;
-use super::fleet_signoz_refresh::{ClickhouseHttp, FileRows, PageQuery, ReadError, SignozRead};
+use super::fleet_signoz_refresh::{ClickhouseHttp, PageQuery, ReadError, SignozRead};
 use super::Kind;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
