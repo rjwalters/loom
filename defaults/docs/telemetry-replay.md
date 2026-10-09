@@ -1,9 +1,9 @@
 # Telemetry Replay Contract
 
 Status: contract, emit-side facts, committed replay SQL (Issue #10196,
-slices 1 and R3/R4), the `fleet.state` record (slice R1) and
-`loom-daemon telemetry-replay --as-of <t>` (slice R6). `--check` is a later
-slice and does not exist yet.
+slices 1 and R3/R4), the `fleet.state` record (slice R1),
+`loom-daemon telemetry-replay --as-of <t>` (slice R6) and its `--check`
+against the forge with the daily agreement report (slice R7, #11128).
 
 The question this contract answers: **what did the fleet look like at instant
 `t`, as a daemon running at `t` could have known it?** ETA backtesting
@@ -65,8 +65,12 @@ The replay SQL is committed at
 [`observability/signoz/replay-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/replay-queries.sql):
 fleet state at `t` (anchors plus deltas, merged per `(repo, issue)`, preferring
 the row that carries a `host`), the spread between hosts' views, coverage at
-`t`, anchor completeness and volume, and outcome facts. It filters on
-`created_at < t` and dedupes with `LIMIT 1 BY`. It introduces no row caps.
+`t`, anchor completeness and volume, outcome facts, and agreement with the
+forge (queries 6-7, below). It filters on `created_at < t` and dedupes with
+`LIMIT 1 BY`. It introduces no row caps. The shared prefix rebuilds the state
+at a run of sample instants (`t`, `t - step`, … `t - span`, each reading only
+records knowable before itself); queries 1-3 read the instant `t` only and
+bind `span = 0`.
 
 Per issue, the **last** operation on a host's chain wins, so an issue that is
 removed, re-added and removed again stays deleted. A host's state is used only
@@ -253,8 +257,8 @@ elected; it computes no estimate or statistic.
   The old `autonomous.eta.fleetRefresh.signoz.*` key is read as a fallback for
   one release, with a deprecation warning (it goes with #11098).
 - **Offline**: `--print-sql` prints both queries for `clickhouse-client
-  --param_t=… --param_window=… --param_repo= --format JSONEachRow`; feed the
-  combined output back with `--from-file`.
+  --param_t=… --param_window=… --param_repo= --param_span=0 --param_step=300
+  --format JSONEachRow`; feed the combined output back with `--from-file`.
 - **`t` is UTC**, bound as a `DateTime64(3)` parameter; the store's server
   timezone must be UTC (as SigNoz deploys it).
 - **The SQL decides.** Where the committed SQL and the prose above differ
@@ -270,9 +274,100 @@ owner-only file at call time and never logged) and `FileRows`. Nothing in it
 or in the replay command depends on `eta/`, so both survive the ETA
 subsystem's removal (#11098).
 
+## Agreement with the forge (`--check`, the daily report)
+
+`loom-daemon telemetry-replay --check` asks whether each host's
+reconstructed view agrees with the forge. The forge is the system of record;
+the comparison is in SQL (queries 6 and 7 of `replay-queries.sql`, run as
+committed), never re-typed in Rust:
+
+```bash
+loom-daemon telemetry-replay --check                       # the last hour, ending 10 min ago
+loom-daemon telemetry-replay --check --as-of 2026-10-04T13:00:00Z \
+  --span-sec 86400 --step-sec 300 --threshold 600          # the daily 24 h report
+```
+
+**The comparator** is the webhook-derived label state. The loom-ui webhook
+Worker files one `label.transition` record per `loom:*` label change (and per
+opened / closed / reopened of an item carrying one; contract:
+`loom-daemon/src/eta/fleet_events_webhook.rs` until loom-ui owns the reader)
+and exports it to SigNoz with resource `service.name = loom-ui-d1-export` and
+the D1 record as a flat JSON body. Loom does not own that schema; the body
+keys `kind`, `repo`, `target` (`issue` / `pr`), `number`, `action`, `label`
+and `at` (the Worker's receipt time) are the whole dependency, pinned by a
+unit test. The forge state at an instant is built from the rows whose `at` is
+before it, whenever the export inserted them: a label is on when its last
+`labeled` / `unlabeled` was `labeled`, and an item whose last lifecycle row is
+`closed` is `closed`. An item with no webhook row yet is `no_forge_record`,
+never "no labels". Run the check over instants at least the export latency in
+the past (the default ends 10 minutes ago).
+
+**Stage ↔ label**, the one mapping (the SQL's agreement block repeats it):
+
+| `fleet.state` stage | forge stage | labels on the item |
+|---|---|---|
+| `ready_wait` | `ready_wait` | issue: `loom:issue`, not `loom:building` |
+| `sweep.curator`, `sweep.builder` | `building` | issue: `loom:building` |
+| `review_wait` | `review_wait` | PR: `loom:review-requested`, the only review label |
+| `doctor` | `doctor` | PR: `loom:changes-requested`, the only review label; or no review label and `loom:treating` |
+| `merge_wait` | `merge_wait` | PR: `loom:pr`, the only review label, no hold label |
+| `merge_hold` | `merge_hold` | PR: `loom:pr`, the only review label, and a hold label (the label registry's `merge_hold` set: `loom:operator`, `loom:operator-decision`, `loom:operator-only`) |
+
+A PR stage is compared on the row's `pr`; a row without one is `no_pr`. A
+stage outside the table is `unmapped`. `no_pr`, `no_forge_record` and
+`unmapped` rows are counted as not comparable, never as disagreements.
+
+**Disagreement.** Each covered host's **own** rows are compared; nothing is
+merged or elected. A disagreement is a run of consecutive sample instants at
+which the same `(host, repo, issue, host stage, forge stage)` disagreed; its
+duration is the run's instants times `--step-sec`. Only a host whose chain is
+`complete` at an instant has rows there, so an instant where the host is not
+covered ends the run: time while a host is not reporting never counts, and an
+uncovered host is reported `unknown`, never as disagreeing. The comparison
+runs one way: every row a covered host reports is checked, but a forge item a
+host does not report is not flagged (a host sees only its own repos and its
+own sweeps, and a PR that links no issue is census-only). Records whose
+received chunks differ from `chunk_count` are counted per host
+(`incomplete_anchors`, `incomplete_deltas`) and never used.
+
+**Threshold and exit codes.** `--threshold` (default 600 s: two
+`fleet.state` passes, so a normal listing lag never trips it):
+
+| Exit | Meaning |
+|---|---|
+| 0 | every covered host agrees with the forge within the threshold |
+| 1 | a covered host disagreed for longer; each such run is printed `FAIL` with the host, item, both stages and the duration |
+| 2 | the store or the `--from-file` export could not be read |
+
+**The report.** Per host (query 7): instants sampled and covered,
+`coverage` (`covered` at every instant, `partial`, or `unknown`) with the chain
+states it was uncovered in, rows compared / agreeing / disagreeing / not
+comparable, `longest_disagreement_sec` (its view lag), the runs over the
+threshold, and its incomplete anchors and deltas. Then every disagreement run
+(query 6). `--json` prints the same. It is a contract check, not a statistic:
+counts, lag and coverage only; any model of lag belongs to loom-ui.
+
+**The daily 24 h report** is query 7 with `t = now - 10 min`,
+`span = 86400`, `step = 300`, `threshold = 600` (the second command above).
+Offline: `--check --print-sql` prints queries 6 and 7 for `clickhouse-client
+--param_t=… --param_window=3900 --param_repo= --param_span=86400
+--param_step=300 --param_threshold=600 --format JSONEachRow`; feed the
+combined output back with `--check --from-file`. Its output is operational
+evidence, posted on #10196 by the operator or a scheduled run; no PR can
+produce it. `tests/signoz_replay_queries.rs` and
+`tests/telemetry_replay_fixture_store.rs` run both queries over
+`fixtures/signoz_replay/agreement.sql` in a pinned ClickHouse.
+
+**Cost.** The prefix rebuilds every host's state at each instant from the
+records knowable in that instant's window, so a 24 h report at 5-minute steps
+does 289 reconstructions in one query. Lengthen `--step-sec` if it is slow;
+never cap rows.
+
+Coverage here is the chain's completeness, as in query 3. `host.export`'s
+`exported_kinds` gate (R2) is not applied yet.
+
 ## Not yet implemented
 
-- `loom-daemon telemetry-replay --check` (#11128).
 - `fleet.state` hold and capacity facts (slice R8) and the committed
   volume/coverage ClickHouse query (bytes/day, rows per anchor, anchors
   missing chunks, hosts with no anchor in 2 h).
