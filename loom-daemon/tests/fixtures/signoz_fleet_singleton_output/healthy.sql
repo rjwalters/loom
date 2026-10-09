@@ -134,3 +134,20 @@ SELECT
     map(), map(),
     map('host.id', 'host-authority')
 FROM (SELECT number AS k FROM numbers(5)) AS days;
+
+-- Fleet activity (the rule's independent roster, see `roster_gap.sql`): all 30
+-- repos leave a `pass.summary` every 5 min. Every one of them has a fresh
+-- `eta.fleet_refresh`, so the roster must add no firing series, and it must
+-- not make the idle org/r29 or the all-abstaining org/r30 owe estimates.
+INSERT INTO signoz_logs.distributed_logs_v2
+    (timestamp, body, attributes_string, attributes_number, attributes_bool, resources_string)
+SELECT
+    toUInt64(1791453600 - 72 * 3600 + k * 300) * 1000000000,
+    '{}',
+    map('loom.kind', 'pass.summary',
+        'loom.repo', concat('org/r', leftPad(toString(n), 2, '0')),
+        'loom.pass.mechanism', 'release-stale-blocked'),
+    map(), map(),
+    map('host.id', 'host-authority')
+FROM (SELECT number + 1 AS n FROM numbers(30)) AS repos
+CROSS JOIN (SELECT number AS k FROM numbers(864)) AS slots;

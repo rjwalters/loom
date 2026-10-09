@@ -12,19 +12,37 @@
 //! The rule is `max(timestamp) GROUP BY loom.kind[, loom.repo]` over the logs
 //! table (`loom.kind` is on every OTLP log record since #10899/#10934), with
 //! one deadline per watched `fleet_outputs::SINGLETON_OUTPUTS` row embedded in
-//! the query. Two halves, as in `signoz_queue_starvation_alert.rs`:
+//! the query. A `per_repo` row is expected for every repo the fleet is
+//! working on, read from an independent roster (any repo with a
+//! [`ROSTER_KINDS`] record in the window), never only from the output being
+//! watched: a repo that never emitted it, or stopped longer ago than the
+//! window, has no record of its own to be discovered from (the PR #11030
+//! Judge's blocking finding). Two halves, as in
+//! `signoz_queue_starvation_alert.rs`:
 //!
 //! 1. **No drift, in ordinary CI (no Docker).** The deadlines the query
 //!    embeds are parsed back out of the committed JSON and asserted equal to
 //!    `SingletonOutput::deadline()` of the registry rows; every registry row
 //!    is either watched or excluded here with a structural reason; every
-//!    attribute the query reads is forwarded by the collector.
+//!    attribute the query reads is forwarded by the collector; the roster
+//!    kinds are log kinds independent of every watched output.
 //! 2. **It separates an outage from a healthy fleet**, on `clickhouse local`
 //!    in the pinned image (`#[ignore]`d; CI runs it with `--ignored`): the
 //!    10-07 replay fires within the deadline (2 x cadence), a healthy fleet
 //!    with an idle repo and an all-abstaining repo does not, and an empty
-//!    logs table fires every row. Each predicate that keeps a quiet repo
-//!    quiet has its breaking mutation run.
+//!    logs table fires every row. A roster repo with no output history, and
+//!    one whose outage is older than the window, fire while another repo is
+//!    healthy. Each predicate that keeps a quiet repo quiet, and the roster
+//!    itself, has its breaking mutation run.
+//!
+//! **What the roster does NOT cover.** It is fleet *activity*: a repo whose
+//! hosts emit none of [`ROSTER_KINDS`] in the window (no work finder or role
+//! runner serving it, or none with an OTLP exporter) is not expected, and
+//! only its own old records (inside the window) keep it visible. The
+//! `per_active_repo` row (`eta.estimate`) is not roster-expanded: owing
+//! estimates needs the forge's open items, which SigNoz does not hold, so an
+//! estimate outage older than the window is lost to this rule and left to
+//! the in-daemon path (`fleet_outputs::estimate_owed`, #10924).
 //!
 //! **What this does NOT establish.** No record went through SigNoz's ingester
 //! and no rule evaluator or notification ran; this is `clickhouse local` over
@@ -54,6 +72,15 @@ const COLLECTOR: &str = include_str!("../../defaults/observability/collector/con
 const SCHEMA: &str = include_str!("fixtures/signoz_fleet_singleton_output/schema.sql");
 const INCIDENT: &str = include_str!("fixtures/signoz_fleet_singleton_output/incident.sql");
 const HEALTHY: &str = include_str!("fixtures/signoz_fleet_singleton_output/healthy.sql");
+const ROSTER_GAP: &str = include_str!("fixtures/signoz_fleet_singleton_output/roster_gap.sql");
+
+/// The record kinds whose `loom.repo` is the rule's roster of repos the fleet
+/// is working on. Each is emitted by the host that works the repo (the
+/// `loom:blocked` release pass, once per pass per workspace; a role tick; a
+/// sweep start), never by a fleet singleton, so a silent singleton cannot
+/// also empty the roster. `the_roster_is_read_from_an_independent_signal`
+/// pins this list to the query and checks the independence.
+const ROSTER_KINDS: &[&str] = &["pass.summary", "role_tick.outcome", "sweep.started"];
 
 /// Registry rows this rule deliberately does not watch, each with the reason.
 /// `every_registry_row_is_watched_or_excluded_for_a_structural_reason` checks
@@ -368,6 +395,56 @@ fn the_window_and_frequency_fit_the_registry_deadlines() {
     );
 }
 
+/// The query's roster reads exactly [`ROSTER_KINDS`], and each is an OTLP log
+/// kind (so `loom.kind` / `loom.repo` reach SigNoz) that is neither a watched
+/// output, nor a closing kind, nor any `SINGLETON_OUTPUTS` row, nor an
+/// `eta.*` kind: the roster must not go quiet when a singleton does.
+#[test]
+fn the_roster_is_read_from_an_independent_signal() {
+    let query = embedded_query(&rule());
+    let roster = &query[query
+        .find("roster AS (")
+        .expect("the query's roster CTE is gone")..];
+    let marker = "attributes_string['loom.kind'] IN (";
+    let start = roster
+        .find(marker)
+        .expect("the roster's kind filter is gone")
+        + marker.len();
+    let end = start
+        + roster[start..]
+            .find(')')
+            .expect("unterminated roster kind list");
+    let embedded: BTreeSet<String> = roster[start..end]
+        .split(',')
+        .map(|k| {
+            let k = k.trim();
+            assert!(k.starts_with('\'') && k.ends_with('\''), "roster kind {k:?} is not quoted");
+            k.trim_matches('\'').to_owned()
+        })
+        .collect();
+    let expected: BTreeSet<String> = ROSTER_KINDS.iter().map(|k| (*k).to_owned()).collect();
+    assert_eq!(embedded, expected, "the query's roster kinds drifted from ROSTER_KINDS");
+
+    let watched = expected_registry();
+    for kind in ROSTER_KINDS {
+        assert!(
+            TELEMETRY_KINDS
+                .iter()
+                .any(|m| m.kind == *kind && m.otlp == TelemetryKindOtlp::Logs),
+            "roster kind {kind} is not an OTLP Logs kind, so no log record carries it"
+        );
+        assert!(!kind.starts_with("eta."), "roster kind {kind} is produced by the ETA jobs");
+        assert!(
+            !SINGLETON_OUTPUTS.iter().any(|o| o.record_kind == *kind),
+            "roster kind {kind} is a fleet singleton's own output"
+        );
+        assert!(
+            !watched.contains_key(*kind) && !watched.values().any(|(_, _, c)| c == kind),
+            "roster kind {kind} is read by the rule as an output"
+        );
+    }
+}
+
 #[test]
 fn go_duration_strings_parse() {
     assert_eq!(duration_ms("72h0m0s"), 259_200_000);
@@ -556,4 +633,88 @@ fn absent_data_fires_every_watched_row() {
         .map(|k| (k, String::new()))
         .collect();
     assert_eq!(firing(&series), expected);
+}
+
+/// The PR #11030 Judge's finding, case 1: `org/r02` is on the roster (its
+/// `pass.summary` records) but has never emitted `eta.fleet_refresh`, while
+/// `org/r01` refreshes on time. Case 2: `org/r03`'s refresh stopped 100 h ago,
+/// 28 h older than the window, while a sweep still runs there (its slug
+/// spelled `Org/R03`). Both fire, and nothing else does: the idle `org/r02`
+/// and the all-abstaining `org/r04` owe no estimates although both are on the
+/// roster. The fleet-level `eta.fleet_refresh` series alone stays quiet, which
+/// is exactly why the per-repo series must come from the roster.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn roster_repos_without_output_fire_while_another_repo_is_healthy() {
+    let (_, evaluated_at) = anchor(ROSTER_GAP);
+    let series = run(&embedded_query(&rule()), ROSTER_GAP, evaluated_at);
+    let refresh = |repo: &str| ("eta.fleet_refresh".to_owned(), repo.to_owned());
+    assert_eq!(firing(&series), BTreeSet::from([refresh("org/r02"), refresh("org/r03")]));
+    assert!(
+        series[&refresh("")] <= 0.0,
+        "the fleet-level series fires on its own; this case no longer isolates the roster"
+    );
+    for repo in ["org/r01", "org/r04"] {
+        assert!(series.contains_key(&refresh(repo)), "{repo}'s refresh series must be returned");
+    }
+    for repo in ["org/r02", "org/r04"] {
+        let estimate = ("eta.estimate".to_owned(), repo.to_owned());
+        assert!(
+            series.get(&estimate).is_none_or(|v| *v <= 0.0),
+            "{repo} owes no estimate; the roster must not make it owe one"
+        );
+    }
+    assert!(
+        !series.contains_key(&refresh("Org/R03")),
+        "repo slugs are compared case-insensitively, so Org/R03 is org/r03"
+    );
+}
+
+/// The outage keeps firing as it ages: one evaluation per day for a week past
+/// the window, `org/r03` (refresh last seen 100 h before the anchor) stays
+/// firing while its roster activity continues. The scenario's other records
+/// are pinned to the anchor, so only org/r03's series is asserted.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn an_outage_older_than_the_window_keeps_firing() {
+    let (_, evaluated_at) = anchor(ROSTER_GAP);
+    let query = embedded_query(&rule());
+    let r03 = ("eta.fleet_refresh".to_owned(), "org/r03".to_owned());
+    // The roster needs activity in each window: a sweep 2 h before each
+    // evaluation instant, appended to the scenario.
+    for day in 0..7_i64 {
+        let at = evaluated_at + day * 86_400;
+        let scenario = format!(
+            "{ROSTER_GAP}\nINSERT INTO signoz_logs.distributed_logs_v2 \
+             (timestamp, body, attributes_string, attributes_number, attributes_bool, \
+             resources_string) VALUES (toUInt64({}) * 1000000000, '{{}}', \
+             map('loom.kind', 'sweep.started', 'loom.repo', 'org/r03'), map(), map(), \
+             map('host.id', 'host-worker-3'));",
+            at - 2 * 3600
+        );
+        let series = run(&query, &scenario, at);
+        assert!(
+            firing(&series).contains(&r03),
+            "org/r03's outage stopped firing {day} day(s) past the anchor: {series:?}"
+        );
+    }
+}
+
+/// Counterfactual: with the roster emptied, both roster cases go silent. This
+/// is the Judge's reduction run on ClickHouse: discovering expected repos only
+/// from the watched output hides a repo that never emitted it and one whose
+/// outage left the window.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn the_roster_is_load_bearing() {
+    let query = embedded_query(&rule());
+    let marker = "IN ('pass.summary', 'role_tick.outcome', 'sweep.started')";
+    assert!(query.contains(marker), "mutation marker {marker:?} is gone from the query");
+    let no_roster = query.replace(marker, "IN ('')");
+    let (_, evaluated_at) = anchor(ROSTER_GAP);
+    let fired = firing(&run(&no_roster, ROSTER_GAP, evaluated_at));
+    assert!(
+        fired.is_empty(),
+        "counterfactual: without the roster the missing repos must be invisible, got {fired:?}"
+    );
 }
