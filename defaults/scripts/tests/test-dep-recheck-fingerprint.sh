@@ -216,9 +216,9 @@ out2="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict block
 assert_ne "$(field "$out" CONCLUSION_HASH)" "$(field "$out2" CONCLUSION_HASH)" \
     "T7c: a changed --block-reason (same verdict) still changes CONCLUSION_HASH"
 # #8254: --block-reason is canonicalized (trim/collapse/casefold) before hashing; #9308:
-# the hash is PERSISTED, so pin the report's string to its exact cross-release digest.
-out_9308="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict blocked --block-reason 'depends on #64, itself blocked on cross-repo 2AMLogic/klayout-tools#1962 (OPEN)')"
-assert_eq "e8876061202241c6|depends on #64, itself blocked on cross-repo 2AMLogic/klayout-tools#1962 (OPEN)" "$(field "$out_9308" CONCLUSION_HASH)|$(field "$out_9308" BLOCK_REASON)" "T7f: #9308 golden CONCLUSION_HASH, reason echoed verbatim"
+# the hash is PERSISTED, so pin a report-shaped string to the digest recheck/tests.rs also pins.
+out_9308="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict blocked --block-reason 'depends on #64, itself blocked on cross-repo example-org/tool-repo#1962 (OPEN)')"
+assert_eq "11c70776d73fce96|depends on #64, itself blocked on cross-repo example-org/tool-repo#1962 (OPEN)" "$(field "$out_9308" CONCLUSION_HASH)|$(field "$out_9308" BLOCK_REASON)" "T7f: #9308 golden CONCLUSION_HASH, reason echoed verbatim"
 out_case="$(echo '{"prs":[]}' | "$TARGET_SCRIPT" dep-recheck --stdin --verdict blocked --block-reason "  Doctor   Cycle	Exhausted ")"
 assert_eq "$(field "$out" CONCLUSION_HASH)" "$(field "$out_case" CONCLUSION_HASH)" \
     "T7d: a --block-reason differing only in case/whitespace yields the SAME CONCLUSION_HASH"

@@ -331,6 +331,21 @@ fn the_reported_block_reason_hashes_to_its_pinned_canonical_digest() {
     }
 }
 
+/// A genericized, report-shaped reason shared verbatim with T7f in
+/// `defaults/scripts/tests/test-dep-recheck-fingerprint.sh` (which ships to
+/// every install, so it cannot name a private org, #6190). One vector, one
+/// digest, pinned at both the Rust and the CLI layer.
+const SHARED_CLI_REASON: &str =
+    "depends on #64, itself blocked on cross-repo example-org/tool-repo#1962 (OPEN)";
+
+#[test]
+fn the_cli_shared_block_reason_hashes_to_the_same_digest_t7f_pins() {
+    // payload: "blocked\n\n<lowercased reason>\n" (fourth field empty)
+    let o = compute(&[], Some("blocked"), SHARED_CLI_REASON, "");
+    assert_eq!(o.conclusion_hash, "11c70776d73fce96");
+    assert_eq!(o.block_reason, SHARED_CLI_REASON);
+}
+
 #[test]
 fn the_reports_other_digest_is_exactly_the_pre_8320_uncanonicalized_formula() {
     // #9308's two observed values are not build randomness: 41df30ee... is the
