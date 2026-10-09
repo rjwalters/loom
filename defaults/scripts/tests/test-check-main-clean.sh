@@ -1118,6 +1118,38 @@ else
 fi
 rm -rf "$REPO"
 
+# -------- Test: --quarantine never stashes a cargo target tree (#11075) --------
+echo "Test 11075: --quarantine excludes CACHEDIR.TAG trees from refs/stash"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+for d in target-x .cargo-target; do
+    mkdir -p "$REPO/$d/debug"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n' > "$REPO/$d/CACHEDIR.TAG"
+    printf 'bin\n' > "$REPO/$d/debug/artifact.o"
+done
+mkdir -p "$REPO/target-staged"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/target-staged/CACHEDIR.TAG"
+printf 'bin\n' > "$REPO/target-staged/a.o"
+git -C "$REPO" add target-staged
+# An untagged target/ is hand-authored content and MUST still be rescued.
+mkdir -p "$REPO/target"; printf 'keep\n' > "$REPO/target/hand.txt"
+printf 'def leaked(): pass\n' > "$REPO/leaked_module.py"
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
+if [[ "$RC" -eq 4 ]]; then pass "quarantine with target trees present exits 4"; else fail "expected 4, got $RC; out=$out"; fi
+STASH_FILES=$( { git -C "$REPO" ls-tree -r --name-only 'stash@{0}^3' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}^2' 2>/dev/null; } )
+if grep -q 'leaked_module.py' <<<"$STASH_FILES" && grep -q '^target/hand.txt' <<<"$STASH_FILES"; then
+    pass "real untracked files (and untagged target/) are still stashed"
+else
+    fail "rescue weakened; stash holds: $STASH_FILES"
+fi
+if grep -qE '^(target-x|target-staged|\.cargo-target)/' <<<"$STASH_FILES"; then
+    fail "cargo target tree leaked into refs/stash: $STASH_FILES"
+else
+    pass "no CACHEDIR.TAG tree blob in refs/stash"
+fi
+rm -rf "${REPO:?}"
+
 # -------- Summary --------
 echo ""
 if [[ "$TESTS_FAILED" -eq 0 ]]; then

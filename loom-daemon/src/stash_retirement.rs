@@ -335,6 +335,50 @@ fn is_generated_artifact(path: &str) -> bool {
     })
 }
 
+/// First line of a cargo-written `CACHEDIR.TAG` (cache-dir tagging spec).
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Directories (stash-relative, no trailing slash; `""` = repo root) that hold
+/// a signature-verified `CACHEDIR.TAG` among `paths` (#11075). Content-based,
+/// never name-based: an untagged `target/` may be hand-authored and so is not
+/// matched. `read_blob` returns the stash's bytes for a path.
+fn cachedir_tag_dirs(
+    paths: &[String],
+    read_blob: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> BTreeSet<String> {
+    let mut dirs = BTreeSet::new();
+    for path in paths {
+        let Some(dir) = path
+            .strip_suffix("CACHEDIR.TAG")
+            .filter(|d| d.is_empty() || d.ends_with('/'))
+        else {
+            continue;
+        };
+        if read_blob(path).is_some_and(|b| b.starts_with(CACHEDIR_TAG_SIGNATURE)) {
+            dirs.insert(dir.trim_end_matches('/').to_string());
+        }
+    }
+    dirs
+}
+
+/// Whether `path` lies under (or is) a verified cargo tag directory.
+fn is_under_cachedir_tree(path: &str, tag_dirs: &BTreeSet<String>) -> bool {
+    if tag_dirs.is_empty() {
+        return false;
+    }
+    if tag_dirs.contains("") {
+        return true;
+    }
+    let mut prefix = path;
+    while let Some((parent, _)) = prefix.rsplit_once('/') {
+        if tag_dirs.contains(parent) {
+            return true;
+        }
+        prefix = parent;
+    }
+    false
+}
+
 /// Why one path inside a stash is (or is not) safe to lose along with the
 /// stash. Every "safe" variant is an identity or provenance *proof*, never a
 /// judgement about importance.
@@ -532,8 +576,13 @@ fn superseding_commit(repo_root: &Path, path: &str, target_blob: &str) -> Option
 /// string classes, then the two-object-id `HEAD` comparison, then the bounded
 /// history walk. A `.venv/` path in a 1,700-file stash therefore costs no
 /// subprocesses at all.
-fn classify_path(repo_root: &Path, stash_ref: &str, path: &str) -> PathVerdict {
-    if is_generated_artifact(path) {
+fn classify_path(
+    repo_root: &Path,
+    stash_ref: &str,
+    path: &str,
+    tag_dirs: &BTreeSet<String>,
+) -> PathVerdict {
+    if is_generated_artifact(path) || is_under_cachedir_tree(path, tag_dirs) {
         return PathVerdict::GeneratedArtifact;
     }
     if is_ignorable_dirt_with_readers(
@@ -583,10 +632,12 @@ pub fn classify_stash_content(repo_root: &Path, stash_ref: &str) -> ContentVerdi
         };
     }
 
+    let tag_dirs =
+        cachedir_tag_dirs(&changed_paths, &mut |p| read_stash_blob(repo_root, stash_ref, p));
     let verdicts: Vec<(String, PathVerdict)> = changed_paths
         .into_iter()
         .map(|path| {
-            let verdict = classify_path(repo_root, stash_ref, &path);
+            let verdict = classify_path(repo_root, stash_ref, &path, &tag_dirs);
             (path, verdict)
         })
         .collect();
@@ -1098,6 +1149,33 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
         ] {
             assert!(!is_generated_artifact(path), "must not be treated as generated: {path}");
         }
+    }
+
+    #[test]
+    fn cachedir_tag_tree_is_generated_but_untagged_target_is_not() {
+        let sig = b"Signature: 8a477f597d28d172789f06886806bc55\n".to_vec();
+        let paths: Vec<String> = [
+            "target-x/CACHEDIR.TAG",
+            "target-x/debug/a.o",
+            ".loom/target-doctor-1/CACHEDIR.TAG",
+            "fake/CACHEDIR.TAG",
+            "target/CACHEDIR.TAG.bak",
+        ]
+        .map(String::from)
+        .to_vec();
+        let tag_dirs = cachedir_tag_dirs(&paths, &mut |p| {
+            if p.starts_with("fake/") {
+                Some(b"nope".to_vec())
+            } else {
+                Some(sig.clone())
+            }
+        });
+        assert!(is_under_cachedir_tree("target-x/debug/a.o", &tag_dirs));
+        assert!(is_under_cachedir_tree(".loom/target-doctor-1/x/y.o", &tag_dirs));
+        // Hand-authored `target/` without a verified tag is NOT generated.
+        assert!(!is_under_cachedir_tree("target/spec.md", &tag_dirs));
+        assert!(!is_under_cachedir_tree("fake/x.rs", &tag_dirs));
+        assert!(!is_generated_artifact("target/spec.md"));
     }
 
     // ---------- test git repo fixture ----------

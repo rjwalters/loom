@@ -2178,3 +2178,63 @@ fn quarantine_dirty_worktree_returns_none_when_nothing_to_stash() {
 
     assert_eq!(quarantine_dirty_worktree(dir.path(), "issue=1 reason=test"), None);
 }
+
+fn stash_tree_files(dir: &Path) -> String {
+    let mut all = String::new();
+    for rev in ["refs/stash", "refs/stash^3"] {
+        let out = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        all.push_str(&String::from_utf8_lossy(&out.stdout));
+    }
+    all
+}
+
+#[test]
+fn quarantine_dirty_worktree_never_stashes_cachedir_tag_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo_with_seed_commit(dir.path());
+    let sig = "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n";
+    for t in ["target-x", ".loom/target-doctor-1"] {
+        let d = dir.path().join(t).join("debug");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(dir.path().join(t).join("CACHEDIR.TAG"), sig).unwrap();
+        std::fs::write(d.join("artifact.o"), "bin").unwrap();
+    }
+    // Staged copy of a target tree must be excluded too.
+    let staged = dir.path().join("target-staged");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("CACHEDIR.TAG"), sig).unwrap();
+    std::fs::write(staged.join("a.o"), "bin").unwrap();
+    git(dir.path(), &["add", "target-staged"]);
+    // An untagged target/ is hand-authored and still rescued.
+    std::fs::create_dir_all(dir.path().join("target")).unwrap();
+    std::fs::write(dir.path().join("target/hand.txt"), "keep").unwrap();
+    std::fs::write(dir.path().join("real.txt"), "work").unwrap();
+
+    quarantine_dirty_worktree(dir.path(), "issue=11075 reason=test")
+        .expect("real dirt must still be quarantined");
+    let files = stash_tree_files(dir.path());
+    assert!(files.contains("real.txt"), "{files}");
+    assert!(files.contains("target/hand.txt"), "{files}");
+    assert!(!files.contains("target-x/"), "{files}");
+    assert!(!files.contains("target-doctor-1"), "{files}");
+    assert!(!files.contains("target-staged"), "{files}");
+}
+
+#[test]
+fn cachedir_tag_dirs_requires_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo_with_seed_commit(dir.path());
+    std::fs::create_dir_all(dir.path().join("fake")).unwrap();
+    std::fs::write(dir.path().join("fake/CACHEDIR.TAG"), "not a signature").unwrap();
+    std::fs::create_dir_all(dir.path().join("real")).unwrap();
+    std::fs::write(
+        dir.path().join("real/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    assert_eq!(cachedir_tag_dirs(dir.path()), vec!["real".to_string()]);
+}

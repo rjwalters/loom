@@ -1463,8 +1463,28 @@ pub fn cleanup_worktree(
 pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<String> {
     let before = stash_ref_commit(worktree_path);
     let msg = format!("{QUARANTINE_STASH_LABEL} {label}");
+    // #11075: never write a cargo target tree (any dir holding a
+    // signature-verified CACHEDIR.TAG, whatever its name) into refs/stash.
+    let mut args: Vec<String> = ["stash", "push", "--include-untracked", "-m", &msg]
+        .map(String::from)
+        .to_vec();
+    let tag_dirs = cachedir_tag_dirs(worktree_path);
+    if !tag_dirs.is_empty() {
+        // A pathspec exclude only limits the worktree diff: STAGED entries
+        // under a tag dir would still be recorded in the stash's index
+        // commit. Unstage them first (content stays on disk).
+        let mut reset = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
+        reset.extend(tag_dirs.iter().map(|d| format!(":(literal){d}")));
+        let _ = Command::new("git")
+            .args(&reset)
+            .current_dir(worktree_path)
+            .status();
+        args.push("--".to_string());
+        args.push(".".to_string());
+        args.extend(tag_dirs.iter().map(|d| format!(":(exclude,literal){d}")));
+    }
     let status = Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", &msg])
+        .args(&args)
         .current_dir(worktree_path)
         .status();
     if !status.is_ok_and(|s| s.success()) {
@@ -1476,6 +1496,45 @@ pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<St
     } else {
         None
     }
+}
+
+/// First line every cargo-written `CACHEDIR.TAG` carries (the cache-dir tagging spec).
+const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Worktree-relative directories (no trailing slash) containing a
+/// signature-verified `CACHEDIR.TAG` — tracked, staged or untracked. These
+/// are generated build trees that must never be stashed (#11075).
+fn cachedir_tag_dirs(worktree_path: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)CACHEDIR.TAG",
+            ":(glob)**/CACHEDIR.TAG",
+        ])
+        .current_dir(worktree_path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .filter(|f| {
+            std::fs::read_to_string(worktree_path.join(f))
+                .is_ok_and(|c| c.starts_with(CACHEDIR_TAG_SIGNATURE))
+        })
+        .map(|f| f.strip_suffix("CACHEDIR.TAG").unwrap_or(f).trim_end_matches('/').to_string())
+        // A tag at the worktree root would exclude everything; skip it.
+        .filter(|d| !d.is_empty())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// The current `refs/stash` tip's commit sha, or `None` if the ref does not

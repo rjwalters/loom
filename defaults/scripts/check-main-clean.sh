@@ -749,6 +749,50 @@ collect_offending_paths() {
     done <<< "$effective_status"
 }
 
+# Cargo target trees (#11075). Any directory holding a signature-verified
+# CACHEDIR.TAG is a generated build-output tree (cargo writes one into every
+# target dir, whatever its name: target-x/, .loom/target-doctor-N/,
+# .cargo-target/). Stashing one writes hundreds of MB into refs/stash (stash 7 /
+# #10516 had 7,119 files), so the quarantine rescue must never include it.
+CACHEDIR_SIG='Signature: 8a477f597d28d172789f06886806bc55'
+TAG_DIRS=()
+collect_tag_dirs() {
+    TAG_DIRS=()
+    local f d
+    while IFS= read -r -d '' f; do
+        [[ -n "$f" ]] || continue
+        if [[ -r "$main_root/$f" ]] && head -c 64 "$main_root/$f" 2>/dev/null | grep -q "^$CACHEDIR_SIG"; then
+            d="${f%CACHEDIR.TAG}"
+            TAG_DIRS+=("${d%/}")
+        fi
+    done < <(git -C "$main_root" ls-files -z --cached --others --exclude-standard \
+        -- ':(glob)CACHEDIR.TAG' ':(glob)**/CACHEDIR.TAG' 2>/dev/null)
+}
+
+# under_tag_dir <path> -> 0 when <path> is (or lies under) a tag dir.
+under_tag_dir() {
+    local p="${1%/}" t
+    for t in "${TAG_DIRS[@]}"; do
+        [[ -z "$t" ]] && return 0
+        [[ "$p" == "$t" || "$p" == "$t"/* ]] && return 0
+    done
+    return 1
+}
+
+# drop_tag_status <porcelain-text> -> the text minus lines for paths under a tag dir.
+drop_tag_status() {
+    local line path out=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        path="${line:3}"
+        [[ "$path" == *" -> "* ]] && path="${path##* -> }"
+        path=$(unquote_path "$path")
+        under_tag_dir "$path" && continue
+        out+="$line"$'\n'
+    done <<< "$1"
+    printf '%s' "${out%$'\n'}"
+}
+
 if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
     stash_msg="loom-quarantine: $QUARANTINE_LABEL"
@@ -772,10 +816,19 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     fi
     effective_status="$recheck_status"
 
+    collect_tag_dirs
     OFFENDING_PATHS=()
     if [[ -n "$effective_status" ]]; then
         collect_offending_paths
     fi
+    # Cargo target trees are never rescued (#11075): drop paths that are, or
+    # lie under, a CACHEDIR.TAG dir; exclude tag dirs nested under a collapsed
+    # untracked parent (e.g. `?? .loom/`) via the pathspecs below.
+    kept_paths=()
+    for p in "${OFFENDING_PATHS[@]}"; do
+        under_tag_dir "$p" || kept_paths+=("$p")
+    done
+    OFFENDING_PATHS=("${kept_paths[@]}")
 
     if [[ "${#OFFENDING_PATHS[@]}" -eq 0 ]]; then
         # Nothing left to rescue. Emit this as its OWN structured result rather
@@ -815,6 +868,13 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     for p in "${OFFENDING_PATHS[@]}"; do
         stash_pathspecs+=(":(literal,top)$p")
     done
+    for p in "${TAG_DIRS[@]}"; do
+        [[ -n "$p" ]] || continue
+        # Exclude pathspecs only limit the worktree diff; unstage any staged
+        # copies so the stash's index commit cannot carry them either.
+        git -C "$main_root" reset -q -- ":(literal,top)$p" >/dev/null 2>&1 || true
+        stash_pathspecs+=(":(exclude,literal,top)$p")
+    done
 
     # Remember the stack top BEFORE pushing. `git stash push` exits 0 and
     # creates NOTHING when the pathspec resolves to no local changes ("No local
@@ -844,6 +904,7 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
             <(printf '%s\n' "$post_status" | sort) \
             | sed '/^$/d')
     fi
+    post_effective=$(drop_tag_status "$post_effective")
     if [[ -n "$post_effective" ]]; then
         quarantine_fail "residual dirt remains after stash: $(printf '%s' "$post_effective" | tr '\n' ';')"
     fi
