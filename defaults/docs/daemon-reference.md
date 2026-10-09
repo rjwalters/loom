@@ -6318,8 +6318,9 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   ([Run-state enforcement](#run-state-enforcement-9598)): a fleet-paused host
   below the floor still rolls. The roll replaces the pause's hold with a
   supervised drain, restarts once nothing is in flight, and the daemon comes
-  back still paused (#10979). An operator stop on record (`restart
-  --abort-drain`, or an operator stop) does hold a roll: that tick is skipped.
+  back still paused (#10979). An operator stop on record (written by `restart
+  --drain --then-exit` or `fleet drain`) does hold a roll: that tick is
+  skipped. `restart --abort-drain` clears that record and releases the hold.
   A `stopped` host exits at boot, before the loop starts.
 
 ### Sweep-outcome issue write-back (#9056)

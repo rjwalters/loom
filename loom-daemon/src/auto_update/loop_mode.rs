@@ -22,7 +22,8 @@
 //! floor. There is no per-host opt-out from a floor roll: a fleet-paused
 //! host below the floor still rolls (the roll replaces the pause's hold with a
 //! supervised drain, and the daemon comes back still paused, #10979). Only an
-//! operator stop on record (`restart --abort-drain`) holds a roll, by skipping
+//! operator stop on record (written by `restart --drain --then-exit` or
+//! `fleet drain`; `restart --abort-drain` clears it) holds a roll, by skipping
 //! the tick; a `stopped` host exits at boot, before this loop exists.
 //!
 //! There is one loop and one roll path (`trigger_pause_roll`); this module
