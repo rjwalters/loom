@@ -16,7 +16,9 @@
 //! the managed launcher (#9987) first when a policy resolves one, then the
 //! front, then whatever `PATH` already had — so with no policy the front's own
 //! conditional reads go to the next `gh` (e.g. the 2am telemetry shim), which
-//! keeps seeing every forge call.
+//! keeps seeing every forge call. `tests/agent_gh_front_path_order.rs`
+//! pins this (#11176): with no `LOOM_GH_BIN`, both a passthrough and a served
+//! read's conditional request reach a stub `gh` placed second on `PATH`.
 //!
 //! This is a cost optimisation, not a guard: every failure is a no-op with at
 //! most a stderr warning, and [`run`] always exits 0. It does nothing when
