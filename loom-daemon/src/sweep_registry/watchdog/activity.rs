@@ -84,7 +84,11 @@ pub(crate) fn transcript_idle(
     if let Ok(entries) = std::fs::read_dir(projects_dir.join(project_slug(&worktree))) {
         for path in entries.flatten().map(|e| e.path()) {
             if path.extension().is_some_and(|e| e == "jsonl") {
-                consider(idle_of(&path));
+                // The parent plus its nested subagent transcripts: subagent
+                // records are not duplicated into the parent.
+                for t in session_transcripts(&path) {
+                    consider(idle_of(&t));
+                }
             }
         }
     }
@@ -167,6 +171,27 @@ mod tests {
         fs::write(sub.join("a.jsonl"), "{}\n").unwrap();
         let idle = transcript_idle(&projects, &root, 7, WITHIN).unwrap();
         assert!(idle < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn fresh_worktree_subagent_transcript_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let (projects, root) = (t.path().join("p"), t.path().join("ws"));
+        let worktree = root.join(".loom").join("worktrees").join("issue-7");
+        let dir = projects.join(project_slug(&worktree));
+        fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("s.jsonl");
+        fs::write(&parent, "{}\n").unwrap();
+        age(&parent, 9000);
+        let sub = dir.join("s").join("subagents");
+        fs::create_dir_all(&sub).unwrap();
+        let nested = sub.join("a.jsonl");
+        fs::write(&nested, "{}\n").unwrap();
+        let idle = transcript_idle(&projects, &root, 7, WITHIN).unwrap();
+        assert!(idle < Duration::from_secs(60));
+        age(&nested, 9000);
+        let idle = transcript_idle(&projects, &root, 7, WITHIN).unwrap();
+        assert!(idle >= Duration::from_secs(9000));
     }
 
     #[test]
