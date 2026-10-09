@@ -280,7 +280,7 @@ impl HostGateInputs {
             verified,
             draining,
             roll_pending,
-            // False from the moment startup finds a live pause manifest until
+            // True from the moment startup finds a live pause manifest until
             // H5 has finished with it (#11016).
             resume_pending: !crate::roll_pause::suppress::host_verified(),
             // An unreadable identity at boot proves nothing either way.

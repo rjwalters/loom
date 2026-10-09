@@ -903,6 +903,7 @@ fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str) -> Result<bool> {
         .tempdir()?;
     git::export_surfaces(root, commit, tree.path())?;
     let diff = materialize_with(payload, tree.path())?;
+    crate::init::payload::surfaces::log_skipped_once(root, &diff.skipped_surfaces);
     Ok(diff.stamp_pending() || {
         let paths: Vec<String> = diff
             .added
