@@ -1,6 +1,7 @@
 //! Native runtime dispatch behind the existing spawn-worker.sh invocation contract.
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
+pub mod cargo_debuginfo;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -651,6 +652,12 @@ fn run_preflight(
     // Docker boundaries that bypass it (spawn-claude.sh's containment,
     // spawn-codex.sh's session-exec) export it explicitly on their own.
     command.env("CARGO_INCREMENTAL", "0");
+    // #11190: cap dev/test debuginfo (default `line-tables-only`) beside it,
+    // without overriding an ambient CARGO_PROFILE_*_DEBUG, the repo's own
+    // `[profile.*] debug`, or a `cargo.debuginfo: "full"` opt-out.
+    let debuginfo = cargo_debuginfo::decide(&cargo_debuginfo::inputs_for(root));
+    command.envs(debuginfo.vars.iter().map(|(k, v)| (*k, v.as_str())));
+    let _ = writeln!(log, "{}", debuginfo.marker);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own
