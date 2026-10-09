@@ -22,9 +22,11 @@
 //! * Keyset paging, so truncation and reordering lose nothing: each request
 //!   re-anchors `since` at the cursor (less 1s, so an exclusive `since` also
 //!   works) instead of walking page numbers over a list that moves under
-//!   updates; page numbers only advance inside one same-second run. A pass
-//!   takes at most [`MAX_PAGES`] pages of new rows (and [`MAX_REQUESTS`]
-//!   requests); whatever it did not reach is still past the cursor next tick.
+//!   updates; page numbers only advance inside one same-second run, which is
+//!   revisited before the cursor leaves its second (see [`walk`]) and resumed
+//!   at the persisted page next tick. A pass takes at most [`MAX_PAGES`] pages
+//!   of new rows (and [`MAX_REQUESTS`] requests); whatever it did not reach is
+//!   still past the cursor next tick.
 //! * The first run looks back [`LOOKBACK_HOURS`] only.
 //! * The cursor advances only after a successful scan, and only to the key of
 //!   what was scanned, so a failed tick retries. "Successful" means every
@@ -180,6 +182,12 @@ pub(crate) struct Cursor {
     /// the rest of a same-second run cut by the page cap is still taken and
     /// the part already taken is not.
     pub seen: BTreeSet<i64>,
+    /// Listing page the walk last read inside the run at [`Self::at`]; the
+    /// next poll resumes there (re-reading that page as overlap) instead of
+    /// re-walking the `seen` prefix, so a same-second run longer than one
+    /// poll's request bound still makes progress across ticks. A hint only:
+    /// 1 is always correct, just slower.
+    pub resume: usize,
 }
 
 impl Cursor {
@@ -187,6 +195,7 @@ impl Cursor {
         Self {
             at,
             seen: BTreeSet::new(),
+            resume: 1,
         }
     }
 
@@ -208,7 +217,7 @@ impl Cursor {
 
 /// Persisted cursor, if present and parseable. A file without `seen` (the
 /// first #10150 format) loads with an empty set: the items at that second are
-/// rescanned once, which the marker makes a no-op.
+/// rescanned once, which the marker makes a no-op. A missing `page` is 1.
 pub(crate) fn load_cursor(root: &Path) -> Option<Cursor> {
     let text = std::fs::read_to_string(cursor_path(root)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -217,7 +226,13 @@ pub(crate) fn load_cursor(root: &Path) -> Option<Cursor> {
         None => BTreeSet::new(),
         Some(s) => serde_json::from_value(s.clone()).ok()?,
     };
-    Some(Cursor { at, seen })
+    let resume = v
+        .get("page")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| usize::try_from(p).ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(1);
+    Some(Cursor { at, seen, resume })
 }
 
 /// Atomically persist the cursor (tmp + rename).
@@ -227,7 +242,11 @@ pub(crate) fn save_cursor(root: &Path, cursor: &Cursor) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    let body = serde_json::json!({ "cursor": fmt_ts(cursor.at), "seen": cursor.seen });
+    let body = serde_json::json!({
+        "cursor": fmt_ts(cursor.at),
+        "seen": cursor.seen,
+        "page": cursor.resume,
+    });
     std::fs::write(&tmp, body.to_string())?;
     std::fs::rename(&tmp, &path)
 }
@@ -259,6 +278,21 @@ fn fetch_closed_page(
 /// rows the cap cut off, or that an update moved later mid-walk, are still past
 /// the returned cursor. A same-second run longer than a page cannot move the
 /// anchor, so only then does the page number advance.
+///
+/// Numbered pages over a listing that moves are the one unsafe step: an update
+/// to a row already read shifts every unread row one slot earlier, so the next
+/// page can skip one. Two rules keep that from losing a row:
+///
+/// * A pass over a run never advances past the run's second from a deeper page
+///   after taking a new row at that second. It restarts at the pass's first
+///   page instead, and only a pass that took nothing new at the second (every
+///   row on the way already `seen`) may move on. Each restart needs a fresh
+///   row, so restarts are bounded; any not finished by [`MAX_REQUESTS`] resume
+///   next tick, the cursor still at the second.
+/// * The page reached is persisted as [`Cursor::resume`], so a run longer than
+///   one poll's bound is walked a slice per tick rather than re-reading its
+///   `seen` prefix forever. A resume page past the end of the listing falls
+///   back to page 1.
 pub(crate) fn walk(
     start: &Cursor,
     mut fetch: impl FnMut(&str, usize) -> Result<Vec<ClosedItem>, String>,
@@ -266,18 +300,39 @@ pub(crate) fn walk(
     let mut cur = start.clone();
     let mut batch: Vec<ClosedItem> = Vec::new();
     let mut in_batch: HashSet<i64> = HashSet::new();
-    let (mut page, mut pages_taken) = (1, 0);
+    // `base`: first page of the current pass over the run at `cur.at`.
+    let mut base = start.resume.max(1);
+    let (mut page, mut pages_taken) = (base, 0);
+    // A new row at the run's second was taken in this pass.
+    let mut dirty = false;
+    let mut last_page = page;
     for _ in 0..MAX_REQUESTS {
         // Less 1s: correct whether the forge's `since` is inclusive or not.
         let since = fmt_ts(cur.at - ChronoDuration::seconds(1));
         let mut rows = fetch(&since, page)?;
+        if rows.is_empty() && page == base && base > 1 {
+            // The resume hint overshot the listing: start over from page 1.
+            base = 1;
+            page = 1;
+            last_page = 1;
+            dirty = false;
+            continue;
+        }
         let full = rows.len() >= PAGE_SIZE;
         rows.sort_by_key(|r| (r.updated_at, r.number));
         let anchor = cur.at;
-        let mut took = false;
+        let (mut took, mut deferred) = (false, false);
         for r in rows {
             if !cur.admits(&r) {
                 continue;
+            }
+            if r.updated_at > anchor && page != base && dirty {
+                // The run may have rows this deep read slid past; revisit it.
+                deferred = true;
+                continue;
+            }
+            if r.updated_at == anchor {
+                dirty = true;
             }
             cur.take(&r);
             took = true;
@@ -286,12 +341,24 @@ pub(crate) fn walk(
                 batch.push(r);
             }
         }
+        last_page = page;
         pages_taken += usize::from(took);
-        if !full || pages_taken >= MAX_PAGES {
+        let moved = cur.at != anchor;
+        if moved {
+            (base, page, last_page, dirty) = (1, 1, 1, false);
+        }
+        if pages_taken >= MAX_PAGES {
             break;
         }
-        page = if cur.at == anchor { page + 1 } else { 1 };
+        if deferred {
+            (page, dirty) = (base, false);
+        } else if !full {
+            break;
+        } else if !moved {
+            page += 1;
+        }
     }
+    cur.resume = last_page;
     Ok((batch, cur))
 }
 

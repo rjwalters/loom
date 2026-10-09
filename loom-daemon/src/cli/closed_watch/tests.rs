@@ -142,6 +142,7 @@ fn cursor_round_trips_its_seen_set_and_reads_the_old_format() {
     let c = Cursor {
         at: ts("2026-10-04T10:00:00Z"),
         seen: BTreeSet::from([4, 9]),
+        resume: 3,
     };
     save_cursor(dir.path(), &c).unwrap();
     assert_eq!(load_cursor(dir.path()), Some(c));
@@ -161,6 +162,7 @@ fn scanned_rows_stay_scanned_but_a_later_update_rescans() {
         &Cursor {
             at: ts("2026-10-04T10:00:00Z"),
             seen: BTreeSet::from([3]),
+            resume: 1,
         },
     )
     .unwrap();
@@ -318,7 +320,15 @@ fn capped_listing_never_drops_a_close_updated_past_the_cap() {
 /// across polls, and no poll exceeds the request bound.
 #[test]
 fn same_second_runs_across_page_boundaries_are_scanned_exactly_once() {
-    for (total, per_second) in [(700, 700), (1200, 1), (1000, 7), (1050, 150), (520, 100)] {
+    for (total, per_second) in [
+        (700, 700),
+        (1200, 1),
+        (1000, 7),
+        (1050, 150),
+        (520, 100),
+        (2101, 2101),
+        (2500, 2000),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         save_at(dir.path(), "2026-10-04T09:00:00Z");
         let rows: Vec<ClosedItem> = (1..=total)
@@ -365,6 +375,88 @@ fn update_reordering_the_listing_mid_walk_loses_nothing() {
     );
     assert_eq!(out, PollOutcome::Scanned { closed: 300 });
     assert_eq!(scanned, (1..=300).collect::<HashSet<_>>());
+}
+
+/// Judge P1 on #10180 (round 2). 300 rows share one second, a sentinel comes
+/// later. #50, already read, is updated right after the second read of page 1,
+/// which slides unread #101 onto page 1 while the walk is on page 2. The walk
+/// must not move past the shared second until it has re-read the run.
+#[test]
+fn update_during_same_second_paging_does_not_skip_an_unseen_row() {
+    let dir = tempfile::tempdir().unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
+    let mut rows: Vec<ClosedItem> = (1..=300).map(|n| item(n, "2026-10-04T10:00:00Z")).collect();
+    rows.push(item(301, "2026-10-04T10:30:00Z"));
+    let rows = RefCell::new(rows);
+    let calls = RefCell::new(0);
+    let mut scanned: HashSet<i64> = HashSet::new();
+    let fetch = |since: &str, page: usize| {
+        let out = serve(&rows.borrow(), since, page);
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 2 {
+            rows.borrow_mut()[49].updated_at = ts("2026-10-04T11:59:00Z");
+        }
+        Ok(out)
+    };
+    let out = poll_with(dir.path(), now(), fetch, |batch| {
+        scanned.extend(batch.iter().map(|i| i.number));
+        Ok(())
+    });
+    assert!(matches!(out, PollOutcome::Scanned { .. }), "{out:?}");
+    // Every row of the shared second, including #50 (read before it moved),
+    // #101 (the one a numbered walk skips) and the sentinel.
+    assert_eq!(scanned, (1..=301).collect::<HashSet<_>>());
+}
+
+/// Judge P2 on #10180 (round 2). 2,101 rows at one second exceed what
+/// `MAX_REQUESTS` pages can cover; the later-second sentinel behind them must
+/// still be reached, and every row scanned exactly once.
+#[test]
+fn run_longer_than_the_request_bound_still_reaches_a_later_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
+    let mut rows: Vec<ClosedItem> = (1..=2101)
+        .map(|n| item(n, "2026-10-04T10:00:00Z"))
+        .collect();
+    rows.push(item(2102, "2026-10-04T10:30:00Z"));
+    assert!(rows.len() > MAX_REQUESTS * PAGE_SIZE);
+    let rows = RefCell::new(rows);
+    let (scanned, max_requests) = drain(dir.path(), &rows, 50);
+    assert_eq!(scanned.len(), 2102);
+    assert!(scanned.values().all(|c| *c == 1));
+    assert!(max_requests <= MAX_REQUESTS);
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T10:30:00Z"));
+}
+
+/// A resume hint past the end of the listing (rows left it) is only a hint.
+#[test]
+fn stale_resume_hint_falls_back_to_page_one() {
+    let dir = tempfile::tempdir().unwrap();
+    save_cursor(
+        dir.path(),
+        &Cursor {
+            at: ts("2026-10-04T10:00:00Z"),
+            seen: BTreeSet::new(),
+            resume: 9,
+        },
+    )
+    .unwrap();
+    let rows = vec![
+        item(1, "2026-10-04T10:00:00Z"),
+        item(2, "2026-10-04T10:00:00Z"),
+    ];
+    let mut scanned = Vec::new();
+    let out = poll_with(
+        dir.path(),
+        now(),
+        |since, page| Ok(serve(&rows, since, page)),
+        |b| {
+            scanned.extend(b.iter().map(|i| i.number));
+            Ok(())
+        },
+    );
+    assert_eq!(out, PollOutcome::Scanned { closed: 2 });
+    assert_eq!(scanned, vec![1, 2]);
 }
 
 #[test]
