@@ -28,6 +28,9 @@ impl Forge {
     fn set_comments(&self, lines: &str) {
         std::fs::write(self.ws.join("comments.txt"), lines).unwrap();
     }
+    fn fail_reads(&self, n: u32) {
+        std::fs::write(self.ws.join(format!("read-fail-{n}")), "x").unwrap();
+    }
     fn fail_edits(&self, fail: bool) {
         let p = self.ws.join("edit-fail");
         if fail {
@@ -79,6 +82,7 @@ fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/*/issues/* ]]; then\n\
          n=\"${{2##*/}}\"\n\
+         if [[ -f \"{ws}/read-fail-$n\" ]]; then exit 1; fi\n\
          if [[ -f \"{ws}/issue-$n.json\" ]]; then cat \"{ws}/issue-$n.json\"; else \
          printf '{{\"state\":\"open\",\"body\":\"\",\"labels\":[]}}\\n'; fi\n\
          exit 0\n\
@@ -438,4 +442,76 @@ fn threshold_resolves_env_over_config_over_default() {
     std::env::set_var(NOOP_HOLD_THRESHOLD_ENV, "0");
     assert_eq!(resolve_noop_cooldown_config(dir.path()).hold_threshold, 0);
     std::env::remove_var(NOOP_HOLD_THRESHOLD_ENV);
+}
+
+#[test]
+#[serial]
+fn an_unreadable_dependency_never_releases_an_applied_hold() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    let body = "## Dependencies\n- [ ] #77 the upstream\n";
+    forge.set_issue(ISSUE, "open", body, &["loom:issue"]);
+    forge.set_issue(77, "open", "", &[]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE));
+    forge.set_issue(ISSUE, "open", body, &["loom:blocked"]);
+    forge.fail_reads(77);
+    let edits = forge.calls("issue edit").len();
+    reg.reconcile_noop_holds(std::time::Instant::now() + RECONCILE_INTERVAL * 2);
+    assert!(reg.noop_hold_applied(ISSUE), "a transient read failure keeps the hold");
+    assert_eq!(forge.calls("issue edit").len(), edits, "no label write on an unread dependency");
+}
+
+#[test]
+#[serial]
+fn an_applied_hold_is_released_after_a_daemon_restart() {
+    let (mut reg, forge, dir) = forge_registry(2);
+    reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
+    reg.record_noop_release(ISSUE, Some("human gate: operator must approve".into()));
+    assert!(reg.noop_hold_applied(ISSUE));
+    let parked = [
+        "loom:operator-priority",
+        "loom:operator-only",
+        "loom:operator-decision",
+    ];
+    reflect_park(&forge, &parked);
+
+    // A fresh registry over the same logs dir: the in-memory table is empty.
+    let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+    config.gh_bin = Some(dir.path().join("fake-gh-noop-hold.sh"));
+    config.skip_label_flip = false;
+    config.journal_path = Some(dir.path().join("journal.json"));
+    let mut restarted = SweepRegistry::new(config);
+    restarted.set_noop_cooldown_config(NoopCooldownConfig {
+        hold_threshold: 2,
+        ..NoopCooldownConfig::default()
+    });
+    assert!(!restarted.noop_hold_applied(ISSUE));
+
+    // Unchanged inputs: the recovered hold stays.
+    let t0 = std::time::Instant::now();
+    restarted.reconcile_noop_holds(t0);
+    assert!(restarted.noop_hold_applied(ISSUE), "hold recovered from disk");
+
+    // An approval comment lands; the recovered hold is released unaided.
+    forge.set_comments("9:2026-10-08T00:00:00Z\n");
+    restarted.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * 2);
+    assert!(!restarted.noop_hold_applied(ISSUE));
+    let lift = forge.calls("issue edit").pop().unwrap();
+    assert!(lift.contains("--remove-label loom:operator-only"), "{lift}");
+    assert!(lift.contains("--add-label loom:issue"), "{lift}");
+}
+
+/// The checkpointed crash wrapper (what `reap_once` calls) feeds the hold for a
+/// Curator-only death, and skips an externally-killed one.
+#[test]
+#[serial]
+fn checkpointed_curator_only_crash_feeds_the_hold_unless_externally_killed() {
+    let (mut reg, _forge, _dir) = forge_registry(3);
+    reg.note_prless_crash_outcome(ISSUE, "sweep-oom", Some(137), 60, Some("curator-done"));
+    assert_eq!(reg.noop_streak_count(ISSUE), 0, "an OOM kill is environmental");
+    reg.note_prless_crash_outcome(ISSUE, "sweep-b", Some(1), 60, Some("builder-done"));
+    assert_eq!(reg.noop_streak_count(ISSUE), 0, "past the Curator is not a no-op");
+    reg.note_prless_crash_outcome(ISSUE, "sweep-1", Some(1), 60, Some("curator-done"));
+    assert_eq!(reg.noop_streak_count(ISSUE), 1);
 }

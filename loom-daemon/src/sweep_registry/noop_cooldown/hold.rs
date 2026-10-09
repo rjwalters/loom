@@ -43,11 +43,14 @@
 //! daemon already held means someone removed the park and re-offered it — it
 //! starts a fresh streak at 1 rather than re-holding immediately.
 //!
-//! # State is host-local
+//! # State across restarts
 //!
-//! The streak lives in this process's memory like the cooldown itself. A
-//! daemon restart loses it; the hold then trips again within
-//! `hold_threshold` runs. The durable artefact — the park label — is
+//! The pre-hold streak count lives in this process's memory like the cooldown
+//! itself; a restart loses it and the hold trips again within
+//! `hold_threshold` runs. An *applied* hold's ownership (issue, park kind,
+//! announced fingerprint) is mirrored to `noop-holds.json` under the logs dir
+//! ([`persist`]) and reloaded before the first count or reconciliation, so a
+//! restart cannot strand a parked issue. The park label itself is
 //! forge-visible, which is what every other host reads.
 
 use super::fingerprint::{choose_park, IssueSnapshot, ParkKind, MAX_DEPENDENCY_READS};
@@ -102,6 +105,10 @@ const RECONCILE_PER_TICK: usize = 2;
 pub(crate) struct NoopCooldownTable {
     cooldowns: HashMap<u32, NoopCooldownState>,
     streaks: HashMap<u32, NoopStreak>,
+    /// Persisted holds have been reloaded into `streaks` (once per process).
+    restored: bool,
+    /// Last serialized holds file contents (skips redundant rewrites).
+    persisted: String,
 }
 
 impl std::ops::Deref for NoopCooldownTable {
@@ -235,6 +242,7 @@ impl SweepRegistry {
         if threshold == 0 {
             return;
         }
+        self.restore_noop_holds();
         if sweep_id.is_some()
             && self
                 .noop_cooldown
@@ -268,6 +276,7 @@ impl SweepRegistry {
         });
         if !snapshot.open || already_parked {
             self.noop_cooldown.streaks.remove(&issue);
+            self.persist_noop_holds();
             return;
         }
         let fingerprint = snapshot.fingerprint();
@@ -315,6 +324,7 @@ impl SweepRegistry {
                 NoopHoldOutcome::VetoedNoForge => {}
             }
         }
+        self.persist_noop_holds();
     }
 
     /// Release daemon-applied holds whose inputs have changed (Issue #10156).
@@ -330,6 +340,7 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
+        self.restore_noop_holds();
         let mut due: Vec<u32> = self
             .noop_cooldown
             .streaks
@@ -349,6 +360,7 @@ impl SweepRegistry {
             }
             self.reconcile_one_hold(issue);
         }
+        self.persist_noop_holds();
     }
 
     fn reconcile_one_hold(&mut self, issue: u32) {
@@ -584,8 +596,8 @@ impl SweepRegistry {
 
     /// Build the [`IssueSnapshot`] for `issue`, or `None` when any part cannot
     /// be read (REST throughout: GraphQL exhaustion is routine at fleet
-    /// scale). A dependency that cannot be read is recorded as `?`, which
-    /// merely restarts the streak.
+    /// scale). A dependency that cannot be read makes the snapshot
+    /// inconclusive (`None`): never counted, never a release.
     fn fetch_noop_snapshot(&self, issue: u32) -> Option<IssueSnapshot> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let slug = format!("{owner}/{repo}");
@@ -617,18 +629,20 @@ impl SweepRegistry {
             OpenPrProbe::NoneOpen => "none".to_string(),
             OpenPrProbe::ProbeFailed => return None,
         };
-        let dependencies = crate::dep_classify::refs::parse_named_blocker_refs(&body, &slug)
+        let mut dependencies = Vec::new();
+        for r in crate::dep_classify::refs::parse_named_blocker_refs(&body, &slug)
             .into_iter()
             .take(MAX_DEPENDENCY_READS)
-            .map(|r| {
-                let state = r
-                    .split_once('#')
-                    .and_then(|(s, n)| Some((s, n.parse::<u32>().ok()?)))
-                    .and_then(|(s, n)| self.read_issue_rest(s, n))
-                    .map_or("?", |(open, _, _)| if open { "open" } else { "closed" });
-                (r, state.to_string())
-            })
-            .collect();
+        {
+            // A dependency that cannot be read leaves the whole snapshot
+            // inconclusive: a `?` placeholder would differ from a recorded
+            // `open` and release a hold on no observed change.
+            let (open, _, _) = r
+                .split_once('#')
+                .and_then(|(s, n)| Some((s, n.parse::<u32>().ok()?)))
+                .and_then(|(s, n)| self.read_issue_rest(s, n))?;
+            dependencies.push((r, if open { "open" } else { "closed" }.to_string()));
+        }
         Some(IssueSnapshot {
             labels,
             open,
@@ -638,6 +652,8 @@ impl SweepRegistry {
         })
     }
 }
+
+mod persist;
 
 #[cfg(test)]
 mod tests;

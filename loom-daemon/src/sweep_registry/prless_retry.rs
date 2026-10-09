@@ -577,6 +577,11 @@ impl SweepRegistry {
         // `None` open-PR verdict: this branch never probed, so let the bound
         // run (and memo-serve) its own.
         self.note_prless_terminal_outcome(issue, sweep_id, None, &reason, exit_code);
+        // #10156: a checkpointed Curator-only death feeds the no-op hold too,
+        // except an externally-killed one (environmental, not the issue's).
+        if external_kill_exemption(exit_code).is_none() {
+            self.note_curator_only_outcome(issue, sweep_id, phase);
+        }
     }
 
     /// `reap_once`'s **checkpoint-less exit** call site (Issue #7972) — the

@@ -39,6 +39,23 @@ impl ParkKind {
         }
     }
 
+    /// Stable tag for the persisted-holds file.
+    pub(super) fn tag(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::HumanGate => "human-gate",
+        }
+    }
+
+    /// Inverse of [`Self::tag`].
+    pub(super) fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "blocked" => Some(Self::Blocked),
+            "human-gate" => Some(Self::HumanGate),
+            _ => None,
+        }
+    }
+
     /// Closed telemetry vocabulary for the loop's failure class.
     pub(crate) fn failure_class(self) -> &'static str {
         match self {
