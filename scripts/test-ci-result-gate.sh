@@ -25,6 +25,10 @@ run "push: image jobs skipped by changes-push passes" 0 push "{\"changes\":$K,\"
 run "push: changes-push failed fails" 1 push "{\"changes\":$K,\"changes-push\":$F,\"worker-base-image\":$S,\"worker-image-smoke\":$S}" "changes-push: failure"
 run "push: changes-push cancelled fails" 1 push "{\"changes\":$K,\"changes-push\":$C,\"worker-image-smoke\":$S}" "changes-push: cancelled"
 run "PR: image jobs skipped with Detect Changes failed fails" 1 pull_request "{\"changes\":$F,\"changes-push\":$K,\"worker-image-smoke\":$K}" "worker-image-smoke: skipped because Detect Changes was failure"
+# #10846: the main-push-only cache writer `worker-buildcache`.
+run "PR: worker-buildcache skipped passes" 0 pull_request "{\"changes\":$S,\"worker-base-image\":$S,\"worker-buildcache\":$K}"
+run "merge_group: worker-buildcache skipped passes" 0 merge_group "{\"changes\":$K,\"worker-base-image\":$S,\"worker-buildcache\":$K}"
+run "push: worker-buildcache failed fails" 1 push "{\"changes\":$K,\"changes-push\":$S,\"worker-buildcache\":$F}" "worker-buildcache: failure"
 run "empty needs fails closed" 2 pull_request "{}"
 run "missing needs fails closed" 2 pull_request ""
 
