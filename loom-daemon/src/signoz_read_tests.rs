@@ -206,3 +206,30 @@ fn page_query_filter_looks_up_by_name() {
     assert_eq!(q.filter("repo"), Some("acme/app"));
     assert_eq!(q.filter("host"), None);
 }
+
+#[test]
+fn endpoint_config_prefers_the_neutral_key_and_names_legacy_fallbacks() {
+    let config = serde_json::json!({
+        "telemetry": {"signoz": {"endpoint": " https://new:8443 ", "user": ""}},
+        "autonomous": {"eta": {"fleetRefresh": {"signoz": {
+            "endpoint": "https://old:8443",
+            "user": "reader",
+            "credentialFile": "/home/me/.config/loom/signoz.key"
+        }}}}
+    });
+    let c = EndpointConfig::from_config(&config);
+    assert_eq!(c.endpoint.as_deref(), Some("https://new:8443"));
+    // An empty neutral value falls back to the legacy one, and says so.
+    assert_eq!(c.user.as_deref(), Some("reader"));
+    assert_eq!(
+        c.credential_file.as_deref(),
+        Some(Path::new("/home/me/.config/loom/signoz.key"))
+    );
+    assert_eq!(c.legacy, ["user", "credentialFile"]);
+
+    let neutral_only = EndpointConfig::from_config(&serde_json::json!({
+        "telemetry": {"signoz": {"endpoint": "https://new:8443"}}
+    }));
+    assert!(neutral_only.legacy.is_empty());
+    assert_eq!(EndpointConfig::from_config(&serde_json::json!({})), EndpointConfig::default());
+}

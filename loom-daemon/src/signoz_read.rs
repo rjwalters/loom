@@ -4,8 +4,8 @@
 //! This is transport only. It knows nothing about what a query selects or
 //! what a row means: callers bring their own SQL and their own row parser.
 //! It moved here from `eta/fleet_signoz_refresh.rs` so it survives the ETA
-//! subsystem's removal (#11098); nothing in this module may depend on
-//! `crate::eta`.
+//! subsystem's removal (#11098); nothing in this module may depend on the
+//! `eta` module.
 //!
 //! # The paging contract
 //!
@@ -306,6 +306,75 @@ impl ClickhouseHttp {
                 .join()
                 .unwrap_or_else(|_| Err(ReadError::Unavailable("reader thread panicked".into())))
         })
+    }
+}
+
+/// Where the telemetry store's ClickHouse is, from configuration.
+///
+/// The neutral key is `telemetry.signoz.{endpoint,user,credentialFile}`. For
+/// one release the old `autonomous.eta.fleetRefresh.signoz.*` key is read as a
+/// per-field fallback (`legacy` names the fields that came from it, so the
+/// caller can warn once), letting #11098 Stage 3 delete `autonomous.eta.*`
+/// without breaking replay. `credentialFile` is a **path** to an owner-only
+/// file, never the secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EndpointConfig {
+    /// `http(s)://host:port`.
+    pub endpoint: Option<String>,
+    /// ClickHouse user.
+    pub user: Option<String>,
+    /// Owner-only password file.
+    pub credential_file: Option<PathBuf>,
+    /// The fields read from the deprecated `autonomous.eta` key.
+    pub legacy: Vec<&'static str>,
+}
+
+/// The neutral configuration key.
+pub const ENDPOINT_CONFIG_KEY: &str = "telemetry.signoz";
+/// The deprecated key read as a fallback for one release.
+pub const LEGACY_ENDPOINT_CONFIG_KEY: &str = "autonomous.eta.fleetRefresh.signoz";
+
+impl EndpointConfig {
+    /// Resolve from an effective config document.
+    #[must_use]
+    pub fn from_config(config: &Value) -> Self {
+        let block = |path: &str| {
+            path.split('.')
+                .try_fold(config, |node, key| node.get(key))
+                .cloned()
+        };
+        let neutral = block(ENDPOINT_CONFIG_KEY);
+        let legacy = block(LEGACY_ENDPOINT_CONFIG_KEY);
+        let read = |b: &Option<Value>, key: &str| {
+            b.as_ref()
+                .and_then(|b| b.get(key))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let mut out = EndpointConfig::default();
+        let mut pick = |key: &'static str| {
+            read(&neutral, key).or_else(|| {
+                let old = read(&legacy, key);
+                if old.is_some() {
+                    out.legacy.push(key);
+                }
+                old
+            })
+        };
+        let endpoint = pick("endpoint");
+        let user = pick("user");
+        let credential_file = pick("credentialFile").map(PathBuf::from);
+        out.endpoint = endpoint;
+        out.user = user;
+        out.credential_file = credential_file;
+        out
+    }
+
+    /// Resolve from `repo_root`'s effective Loom configuration.
+    #[must_use]
+    pub fn read(repo_root: &Path) -> Self {
+        Self::from_config(&crate::config_resolver::resolve_effective_config(repo_root))
     }
 }
 

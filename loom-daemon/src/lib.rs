@@ -385,6 +385,7 @@ pub mod target_orphan_reclaim;
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
 pub mod telemetry;
+pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
