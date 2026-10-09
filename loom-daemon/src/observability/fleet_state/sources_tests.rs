@@ -180,3 +180,18 @@ fn no_repo_is_ever_ready_complete() {
     assert_eq!(short.rows.len(), 40);
     assert!(!second.repos["acme/short"].rows.contains_key(&999));
 }
+
+#[test]
+fn account_counts_separate_exhausted_from_other_unavailable() {
+    use super::parse_account_counts;
+    let ranking =
+        "a|available|0.1\nb|exhausted|0.99\nc|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n";
+    assert_eq!(parse_account_counts(ranking), Some((1, 1)));
+    // Blocked, rate-limited and unknown accounts are not exhausted.
+    assert_eq!(
+        parse_account_counts("c|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n"),
+        Some((0, 0))
+    );
+    assert_eq!(parse_account_counts("b|exhausted|0.99\n"), Some((0, 1)));
+    assert_eq!(parse_account_counts("# only a comment\n"), None);
+}

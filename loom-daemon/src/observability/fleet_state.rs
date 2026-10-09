@@ -322,6 +322,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
 
     let mut observed: BTreeMap<Source, BTreeSet<String>> = BTreeMap::new();
     let mut census: BTreeMap<String, FleetPrCensus> = BTreeMap::new();
+    // Label-derived hold kind of every listed PR that names an issue, so a
+    // sweep-owned row (which wins on precedence) can still carry the hold.
+    let mut pr_holds: BTreeMap<(String, u32), Option<FleetHoldKind>> = BTreeMap::new();
     for listing in &input.listings {
         observed
             .entry(Source::Review)
@@ -337,6 +340,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 .by_stage
                 .entry(stage.map_or("held", FleetStage::as_str).to_string())
                 .or_default() += 1;
+            if let Some(issue) = pr.issue {
+                let slot = pr_holds
+                    .entry((listing.repo.clone(), issue))
+                    .or_insert(None);
+                *slot = slot.or_else(|| hold_kind(&pr.labels));
+            }
             if let (Some(stage), Some(issue)) = (stage, pr.issue) {
                 let row = FleetStateRow {
                     pr: Some(pr.number),
@@ -411,6 +420,24 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 _ => row.entered_at_lower_bound = !prev_observed(source, &repo),
             }
         }
+        // A sweep-owned row keeps its stage/host/slot provenance but takes
+        // its hold from the linked PR's labels. A repo whose listing failed
+        // this pass leaves the hold unknown, so the previous one carries.
+        let review_read = observed
+            .get(&Source::Review)
+            .is_some_and(|set| set.contains(&repo));
+        if source == Source::Held {
+            row.hold_kind = if review_read {
+                pr_holds.get(&(repo.clone(), issue)).copied().flatten()
+            } else {
+                was.and_then(|w| w.hold_kind)
+            };
+        }
+        let hold_source = if source == Source::Held {
+            Source::Review
+        } else {
+            source
+        };
         // Hold timing. A hold seen before keeps its start; a new one starts
         // now (a lower bound when the listing was not seen last pass); one
         // that cleared is stamped with the pass that saw it clear, and keeps
@@ -422,9 +449,11 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             }
             (Some(_), _) => {
                 row.held_since = Some(now);
-                row.held_since_lower_bound = !prev_observed(source, &repo);
+                row.held_since_lower_bound = !prev_observed(hold_source, &repo);
             }
-            (None, Some(was)) if was.hold_kind.is_some() && source != Source::Held => {
+            (None, Some(was))
+                if was.hold_kind.is_some() && (source != Source::Held || review_read) =>
+            {
                 row.hold_released_at = Some(now);
             }
             (None, Some(was)) => row.hold_released_at = was.hold_released_at,

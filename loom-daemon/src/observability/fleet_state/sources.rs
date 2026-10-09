@@ -281,23 +281,32 @@ fn ready_from_tick(
     }
 }
 
-/// Healthy and exhausted token accounts in the rotation ranking at
+/// Available and exhausted token accounts in the rotation ranking at
 /// `workspace_root`; `None` when the ranking is missing or empty.
 fn account_counts(workspace_root: &Path) -> Option<(u32, u32)> {
     let ranking = crate::tokens_pool::paths::resolve_tokens_dir(workspace_root).join(".ranking");
-    let contents = std::fs::read_to_string(ranking).ok()?;
-    let (mut usable, mut exhausted) = (0, 0);
+    parse_account_counts(&std::fs::read_to_string(ranking).ok()?)
+}
+
+/// `(available, exhausted)` over the ranking `contents`. Only
+/// `AccountHealth::Available` is usable and only `AccountHealth::Exhausted`
+/// is exhausted; `rate_limited`, `blocked` and unknown words are neither.
+/// `None` when no account is listed.
+pub(super) fn parse_account_counts(contents: &str) -> Option<(u32, u32)> {
+    use crate::capacity::AccountHealth;
+    let (mut listed, mut usable, mut exhausted) = (0_u32, 0_u32, 0_u32);
     for line in contents.lines().filter(|l| l.contains('|')) {
         let Some(row) = crate::tokens_pool::select::parse_ranking_line(line) else {
             continue;
         };
-        if crate::capacity::AccountHealth::parse(&row.status).is_healthy() {
-            usable += 1;
-        } else {
-            exhausted += 1;
+        listed += 1;
+        match AccountHealth::parse(&row.status) {
+            AccountHealth::Available => usable += 1,
+            AccountHealth::Exhausted => exhausted += 1,
+            AccountHealth::RateLimited | AccountHealth::Blocked | AccountHealth::Unknown => {}
         }
     }
-    (usable + exhausted > 0).then_some((usable, exhausted))
+    (listed > 0).then_some((usable, exhausted))
 }
 
 /// This host's capacity facts. Only discrete values: no utilisation fraction.

@@ -891,3 +891,52 @@ fn fleet_state_v1_old_record_decodes() {
     let text = serde_json::to_string(&record).unwrap();
     assert!(!text.contains("hold_") && !text.contains("capacity") && !text.contains("main_ci"));
 }
+
+/// A live sweep on issue 20 (stage `sweep.builder`, regular slot) beside the
+/// PR 21 that closes it, carrying `pr_labels`.
+fn sweep_with_pr_labels(pr_labels: &[&str]) -> FleetInput {
+    let mut i = with_pr_labels(pr_labels);
+    i.held = vec![held(REPO, 20, FleetStage::SweepBuilder, false)];
+    i
+}
+
+#[test]
+fn sweep_owned_row_takes_hold_from_its_pr_and_releases() {
+    let t1 = t0() + Duration::minutes(5);
+    let t2 = t0() + Duration::minutes(10);
+    let t3 = t0() + Duration::minutes(15);
+    let t4 = t0() + Duration::minutes(20);
+    let v0 = build_view(&sweep_with_pr_labels(&["loom:pr"]), None, t0());
+    assert_eq!(v0.repos[REPO].sources[&20], Source::Held);
+
+    // The hold appears on the sweep's winning row; provenance is kept.
+    let v1 = build_view(&sweep_with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v0), t1);
+    let row = &v1.repos[REPO].rows[&20];
+    assert_eq!(v1.repos[REPO].sources[&20], Source::Held);
+    assert_eq!(row.stage, FleetStage::SweepBuilder);
+    assert_eq!(row.host.as_deref(), Some("robb-studio"));
+    assert_eq!(row.slot, Some(FleetSlot::Regular));
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert!(!row.held_since_lower_bound);
+
+    // A failed listing leaves the hold unknown: it carries, nothing clears.
+    let mut failed = sweep_with_pr_labels(&[]);
+    failed.listings.clear();
+    let v2 = build_view(&failed, Some(&v1), t2);
+    let row = &v2.repos[REPO].rows[&20];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert_eq!(row.hold_released_at, None);
+
+    // The listing returns and the hold is gone: cleared, stamped once.
+    let v3 = build_view(&sweep_with_pr_labels(&["loom:pr"]), Some(&v2), t3);
+    let row = &v3.repos[REPO].rows[&20];
+    assert_eq!((row.hold_kind, row.held_since), (None, None));
+    assert_eq!(row.hold_released_at, Some(t3));
+    assert_eq!(row.stage, FleetStage::SweepBuilder);
+
+    // The stamp persists while nothing changes.
+    let v4 = build_view(&sweep_with_pr_labels(&["loom:pr"]), Some(&v3), t4);
+    assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
+}
