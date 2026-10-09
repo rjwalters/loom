@@ -1168,6 +1168,42 @@ assert_allow "#8217 non-regression: top-level literal-path resolution still allo
 
 echo ""
 
+echo -e "${YELLOW}--- #10422: rm-looking text in a non-shell interpreter heredoc is data ---${NC}"
+RM10422_PY=$(cat <<'TESTCMD_EOF'
+python3 - <<'PY'
+t = '''
+  rm -f "$S26"
+  rm -f "$R26/.loom-local/local.json" x
+'''
+print(t)
+PY
+TESTCMD_EOF
+)
+RM10422_CAT_BASH=$(cat <<'TESTCMD_EOF'
+cat <<'PY' | bash
+  rm -f "$S26"
+PY
+TESTCMD_EOF
+)
+RM10422_LIVE_AFTER=$(cat <<'TESTCMD_EOF'
+python3 - <<'PY'
+print(1)
+PY
+rm -rf "$X"
+TESTCMD_EOF
+)
+assert_allow "#10422: quoted python3 stdin heredoc containing rm -f var text is data" \
+    "$RM10422_PY" "$REPO_ROOT"
+assert_deny "#10422: same body fed to a bash heredoc still denies" \
+    "${RM10422_PY/python3 -/bash}" "$REPO_ROOT"
+assert_deny "#10422: same body fed to sh -s heredoc still denies" \
+    "${RM10422_PY/python3 -/sh -s}" "$REPO_ROOT"
+assert_deny "#10422: cat heredoc piped to bash still denies" \
+    "$RM10422_CAT_BASH" "$REPO_ROOT"
+assert_deny "#10422: live rm after a python3 heredoc still denies" \
+    "$RM10422_LIVE_AFTER" "$REPO_ROOT"
+echo ""
+
 # =========================================================================
 
 print_summary
