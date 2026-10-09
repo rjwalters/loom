@@ -21,9 +21,9 @@ use loom_daemon::fleet_store::reload;
 use loom_daemon::fleet_store::render::{self, Drift};
 use loom_daemon::fleet_store::roster::{self, Change, Registered};
 use loom_daemon::fleet_store::{self as store, state, StoreLocation};
-use loom_daemon::workspace_registry::{self as registry, WorkspaceRegistry};
+use loom_daemon::workspace_registry::{self as registry, MaintainOnlySource, WorkspaceRegistry};
 
-use super::workspace_fleet::handle_workspace_command;
+use super::workspace_fleet::{handle_workspace_command_by, WorkspaceRoot};
 use crate::WorkspaceAction;
 
 /// `loom-daemon fleet-config` arguments.
@@ -477,6 +477,7 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
         .map(|w| Registered {
             root: w.root.clone(),
             priority: w.priority,
+            maintain_only: w.maintain_only.is_some(),
         })
         .collect();
     let plan = roster::plan(&parsed, &registered, &registry::normalize_path, &|p: &Path| {
@@ -512,22 +513,38 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
             Change::Remove { path, .. } => WorkspaceAction::Remove {
                 path: path.to_string_lossy().to_string(),
             },
-            Change::Add { path, priority, .. } => WorkspaceAction::Add {
+            Change::Add {
+                path,
+                priority,
+                maintain_only,
+                ..
+            } => WorkspaceAction::Add {
                 path: path.to_string_lossy().to_string(),
                 priority: *priority,
                 config_overrides: None,
                 no_init: false,
+                maintain_only: *maintain_only,
             },
             Change::SetPriority { path, to, .. } => WorkspaceAction::SetPriority {
                 path: path.to_string_lossy().to_string(),
                 priority: *to,
             },
+            Change::SetMaintainOnly { path, to, .. } => {
+                let root = WorkspaceRoot {
+                    path: path.to_string_lossy().to_string(),
+                };
+                if *to {
+                    WorkspaceAction::Hold(root)
+                } else {
+                    WorkspaceAction::Release(root)
+                }
+            }
             Change::MissingClone { .. } => {
                 unapplied += 1;
                 continue;
             }
         };
-        handle_workspace_command(action)?;
+        handle_workspace_command_by(action, MaintainOnlySource::FleetStore)?;
     }
     if unapplied > 0 {
         eprintln!(

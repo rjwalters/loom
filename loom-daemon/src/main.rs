@@ -1240,7 +1240,19 @@ enum WorkspaceAction {
         /// first-time consumer install layered on top, clobbering that work.
         #[arg(long)]
         no_init: bool,
+
+        /// Register it maintain-only (#11186): kept current, never dispatched
+        /// into. Same as `workspace hold` right after, in one write.
+        #[arg(long)]
+        maintain_only: bool,
     },
+    /// Make a registered workspace maintain-only (#11186): the daemon keeps
+    /// its Loom install current (resync, checkout fast-forward, floor checks)
+    /// but starts no sweep, role or epic dispatch there. Hot-applies. On a
+    /// host a fleet store drives, the roster (`fleet: maintain`) wins.
+    Hold(cli::workspace_fleet::WorkspaceRoot),
+    /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
+    Release(cli::workspace_fleet::WorkspaceRoot),
     /// Set the dispatch priority tier of an already-registered workspace (#3946).
     SetPriority {
         /// Path to the repo root (normalized the same way as `add`).
