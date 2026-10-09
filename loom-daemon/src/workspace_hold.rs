@@ -28,8 +28,10 @@
 //! | a contract field that cannot be ordered (`0.20.0-rc1`), `requires_daemon` above this daemon | `daemon-too-old` | yes, `requires_daemon` |
 //! | a contract field that cannot be ordered, `requires_daemon` at or below this daemon | `daemon-too-old` | no |
 //! | a contract field that cannot be ordered, `requires_daemon` missing or unorderable too | `daemon-too-old` | yes, `running + 1` (WARN once per workspace) |
-//! | too old for this daemon or the floor, files differ (W3) | `install-incompatible` | no |
+//! | too old for this daemon or the floor, files differ (W3), and no `requires_daemon` on record | `install-incompatible` | no |
+//! | below this daemon's `supports_installed`, files differ (W3) | `install-incompatible` | no |
 //! | a resync to a release above this daemon was interrupted there | `install-incompatible` | no |
+//! | behind only the floor, `requires_daemon` at or below this daemon (W3) | none, still resynced first | no |
 //! | too old by its stamp, files equal the payload | none (W0) | no |
 //! | installed by a newer daemon, `requires_daemon` at or below this one | none | no |
 //! | compatible, or a resync owed | none | no |
@@ -65,6 +67,21 @@
 //! reason) finishes the resync. Raising a roll demand from it would be the
 //! ratchet again: it names a release, not a need.
 //!
+//! # Behind, but compatible (#11052)
+//!
+//! A floor roll leaves every repo one release behind the new floor at once.
+//! Holding each until some host resynced it idled the fleet for 15-20
+//! minutes. The contract already says whether the older files still work
+//! here, from both sides: their `requires_daemon` is at or below this daemon,
+//! and their `loom_version` is at or above this daemon's
+//! `supports_installed`. A W3 copy that meets both is behind only the fleet
+//! floor; it is not held. It is still W3 to the resync, which takes it first.
+//!
+//! Held still: a W3 copy with no `requires_daemon` on record (nothing says
+//! its files work with this daemon), one below `supports_installed` (a
+//! declared break), and every W4, unorderable and interrupted-resync case
+//! above. See [`behind_compatible`].
+//!
 //! # Scope of a hold
 //!
 //! A hold stops **new** dispatch into **one** workspace. It never pauses the
@@ -92,7 +109,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::init::payload::ResyncRefusal;
-use crate::install_compat::{Compat, Version};
+use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version};
 use crate::work_finder::halt_cause::HaltCause;
 
 /// Event-bus topic hold transitions (`set`, `cleared`, `standing`) are
@@ -108,9 +125,10 @@ pub const ALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 #[serde(rename_all = "kebab-case")]
 pub enum HoldKind {
     /// W3: the installed files are too old for this daemon or the fleet
-    /// floor, and differ from this daemon's payload. Also a resync to a newer
-    /// release that was interrupted, leaving files from two releases. Either
-    /// way a resync clears it, and it asks for no roll.
+    /// floor, differ from this daemon's payload, and nothing on record says
+    /// they still work here ([`behind_compatible`] is false). Also a resync
+    /// to a newer release that was interrupted, leaving files from two
+    /// releases. Either way a resync clears it, and it asks for no roll.
     InstallIncompatible,
     /// W4: the installed files need a newer daemon than this one, or record a
     /// version that cannot be ordered against it.
@@ -221,8 +239,15 @@ pub enum Verdict {
 /// changes no file writes no stamp, so a copy whose files already equal the
 /// payload keeps an old `loom_version` forever. Its files are current, so it
 /// is W0, and a hold keyed on the stamp alone would never clear.
+///
+/// `behind_compatible` is [`behind_compatible`] for the copy: a W3 copy for
+/// which it is true is not held, whatever the diff says (#11052).
 #[must_use]
-pub fn decide_hold(gate: &Result<Compat, ResyncRefusal>, diff_stale: Option<bool>) -> Verdict {
+pub fn decide_hold(
+    gate: &Result<Compat, ResyncRefusal>,
+    diff_stale: Option<bool>,
+    behind_compatible: bool,
+) -> Verdict {
     match gate {
         // Needs a newer daemon, or cannot be ordered so it may.
         Err(ResyncRefusal::NeedsNewerDaemon { .. } | ResyncRefusal::UnrecognizedVersion { .. }) => {
@@ -243,6 +268,8 @@ pub fn decide_hold(gate: &Result<Compat, ResyncRefusal>, diff_stale: Option<bool
             | ResyncRefusal::LoomSourceRepo
             | ResyncRefusal::NotAReleaseBuild,
         ) => Verdict::Clear,
+        // Behind only the floor, and its files say they work here.
+        Ok(Compat::InstalledTooOld) if behind_compatible => Verdict::Clear,
         Ok(Compat::InstalledTooOld) => match diff_stale {
             Some(true) => Verdict::Hold(HoldKind::InstallIncompatible),
             Some(false) => Verdict::Clear,
@@ -252,6 +279,26 @@ pub fn decide_hold(gate: &Result<Compat, ResyncRefusal>, diff_stale: Option<bool
         Ok(Compat::NeedsNewerDaemon) => Verdict::Hold(HoldKind::DaemonTooOld),
         Ok(Compat::Compatible | Compat::ResyncOwed) => Verdict::Clear,
     }
+}
+
+/// Whether a copy that is too old (W3) still works with this daemon, by the
+/// contract alone (#11052). Pure.
+///
+/// True when its `requires_daemon` parses and is at or below the running
+/// daemon, and its `loom_version` parses and is at or above
+/// `supports_installed`: it is behind the fleet floor, nothing more. False
+/// when `requires_daemon` is missing or does not parse (nothing on record
+/// says the files work here, so it stays held to be safe), and when the
+/// version is below `supports_installed` (the daemon declared that break).
+#[must_use]
+pub fn behind_compatible(installed: &InstallMeta, daemon: &DaemonCompat) -> bool {
+    let parse = |v: &Option<String>| v.as_deref().and_then(Version::parse);
+    let (Some(requires), Some(version)) =
+        (parse(&installed.requires_daemon), parse(&installed.loom_version))
+    else {
+        return false;
+    };
+    requires <= daemon.running && version >= daemon.supports_installed
 }
 
 /// The daemon version a `daemon-too-old` copy asks for, if any.
@@ -462,6 +509,28 @@ pub struct GuessedDemand {
     pub version: Version,
 }
 
+/// The holds a roll left, timed until the last of them clears (#11052).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollCleared {
+    /// The first workspace pass after this daemon started: the roll.
+    pub since: DateTime<Utc>,
+    /// When the last of them cleared.
+    pub at: DateTime<Utc>,
+    /// How many workspaces were held for `install-incompatible` meanwhile.
+    pub held: usize,
+}
+
+/// The `install-incompatible` holds since this daemon started.
+#[derive(Debug, Clone, Default)]
+struct RollEpisode {
+    /// The first pass, once one has run.
+    since: Option<DateTime<Utc>>,
+    /// Every root held for `install-incompatible` since then.
+    seen: std::collections::HashSet<PathBuf>,
+    /// The episode has ended: logged once, never reopened in this process.
+    closed: bool,
+}
+
 /// The hold state one pass leaves for the next. Pure: [`Holds::step`] is the
 /// whole state machine, and the process-wide copy lives behind [`apply`].
 #[derive(Debug, Default)]
@@ -469,6 +538,12 @@ pub struct Holds {
     entries: HashMap<PathBuf, Entry>,
     /// Roots whose guessed demand has been reported, while it stands.
     guessed_reported: std::collections::HashSet<PathBuf>,
+    /// The roll's holds, timed (#11052).
+    roll: RollEpisode,
+    /// Every workspace's default branch was judged by the last full pass.
+    all_judged: bool,
+    /// Set when the roll's last hold cleared, until taken.
+    roll_cleared: Option<RollCleared>,
 }
 
 impl Holds {
@@ -484,6 +559,64 @@ impl Holds {
     ) -> Vec<Transition> {
         let mut previous = std::mem::take(&mut self.entries);
         let mut transitions = Vec::new();
+        for seen in observations {
+            let before = previous.remove(&normalize(&seen.root));
+            self.fold(seen, before, running, now, alert_after, &mut transitions);
+        }
+        for (root, gone) in previous {
+            if let Some(was) = gone.hold() {
+                let demand = gone.demand().map(|(v, _)| v);
+                transitions.push(Transition {
+                    event: "cleared",
+                    root,
+                    repo: gone.repo,
+                    hold: was,
+                    demand: demand.map(|v| v.to_string()),
+                    running: running.to_string(),
+                });
+            }
+        }
+        self.all_judged = observations
+            .iter()
+            .all(|seen| seen.default_branch.verdict != Verdict::Unknown);
+        self.roll.since.get_or_insert(now);
+        self.track_roll(now);
+        transitions
+    }
+
+    /// Fold in a fresh verdict for some workspaces between passes: the
+    /// checkout copy right after `checkout_ff` moved it (#11052). Unlike
+    /// [`Self::step`], a workspace not in `observations` is left as it is, and
+    /// one no pass has seen yet is not added.
+    pub fn rejudge(
+        &mut self,
+        observations: &[Observation],
+        running: Version,
+        now: DateTime<Utc>,
+        alert_after: Duration,
+    ) -> Vec<Transition> {
+        let mut transitions = Vec::new();
+        for seen in observations {
+            let root = normalize(&seen.root);
+            if let Some(before) = self.entries.remove(&root) {
+                self.fold(seen, Some(before), running, now, alert_after, &mut transitions);
+            }
+        }
+        self.track_roll(now);
+        transitions
+    }
+
+    /// One workspace's observation over what it was before.
+    fn fold(
+        &mut self,
+        seen: &Observation,
+        before: Option<Entry>,
+        running: Version,
+        now: DateTime<Utc>,
+        alert_after: Duration,
+        transitions: &mut Vec<Transition>,
+    ) {
+        let root = normalize(&seen.root);
         let event =
             |event, root: &Path, repo: &Option<String>, hold, demand: Option<Version>| Transition {
                 event,
@@ -493,74 +626,99 @@ impl Holds {
                 demand: demand.map(|v| v.to_string()),
                 running: running.to_string(),
             };
-        for seen in observations {
-            let root = normalize(&seen.root);
-            let before = previous.remove(&root);
-            let was = before.as_ref().and_then(Entry::hold);
-            let was_demand = before.as_ref().and_then(Entry::demand).map(|(v, _)| v);
-            let [old_default, old_checkout] = before
+        let was = before.as_ref().and_then(Entry::hold);
+        let was_demand = before.as_ref().and_then(Entry::demand).map(|(v, _)| v);
+        let [old_default, old_checkout] = before
+            .as_ref()
+            .map_or([None, None], |entry| entry.copies.clone());
+        let keep = |finding: &Finding, old: Option<Standing>| match finding.verdict {
+            Verdict::Unknown => old,
+            Verdict::Clear => None,
+            Verdict::Hold(kind) => Some(Standing {
+                kind,
+                detail: finding.detail.clone(),
+                demand: finding.demand,
+                guessed: finding.guessed,
+                seen: now,
+            }),
+        };
+        let mut entry = Entry {
+            repo: seen.repo.clone(),
+            copies: [
+                keep(&seen.default_branch, old_default),
+                keep(&seen.checkout, old_checkout),
+            ],
+            since: now,
+            alerted: None,
+        };
+        let Some((copy, standing)) = entry.deciding().map(|(c, s)| (c, s.clone())) else {
+            if let Some(was) = was {
+                transitions.push(event("cleared", &root, &seen.repo, was, was_demand));
+            }
+            return;
+        };
+        // The clock runs for as long as the workspace is held for the same
+        // reason; a W3 hold that becomes W4 starts a new one.
+        if let Some(was) = was.as_ref().filter(|was| was.kind == standing.kind) {
+            entry.since = was.since;
+            entry.alerted = before.as_ref().and_then(|b| b.alerted);
+        }
+        let demand = entry.demand().map(|(v, _)| v);
+        if let Some(hold) = entry.hold() {
+            let changed = was
                 .as_ref()
-                .map_or([None, None], |entry| entry.copies.clone());
-            let keep = |finding: &Finding, old: Option<Standing>| match finding.verdict {
-                Verdict::Unknown => old,
-                Verdict::Clear => None,
-                Verdict::Hold(kind) => Some(Standing {
-                    kind,
-                    detail: finding.detail.clone(),
-                    demand: finding.demand,
-                    guessed: finding.guessed,
-                    seen: now,
-                }),
-            };
-            let mut entry = Entry {
-                repo: seen.repo.clone(),
-                copies: [
-                    keep(&seen.default_branch, old_default),
-                    keep(&seen.checkout, old_checkout),
-                ],
-                since: now,
-                alerted: None,
-            };
-            let Some((copy, standing)) = entry.deciding().map(|(c, s)| (c, s.clone())) else {
-                if let Some(was) = was {
-                    transitions.push(event("cleared", &root, &seen.repo, was, was_demand));
-                }
-                continue;
-            };
-            // The clock runs for as long as the workspace is held for the
-            // same reason; a W3 hold that becomes W4 starts a new one.
-            if let Some(was) = was.as_ref().filter(|was| was.kind == standing.kind) {
-                entry.since = was.since;
-                entry.alerted = before.as_ref().and_then(|b| b.alerted);
+                .is_none_or(|was| (was.kind, was.copy) != (standing.kind, copy));
+            // Due once it has stood for `alert_after`, and then again every
+            // `alert_after` since the last alert: a hold nothing clears must
+            // not go quiet.
+            let last = entry.alerted.unwrap_or(hold.since);
+            let due = chrono::Duration::from_std(alert_after)
+                .is_ok_and(|after| now.signed_duration_since(last) >= after);
+            if changed {
+                transitions.push(event("set", &root, &seen.repo, hold.clone(), demand));
             }
-            let demand = entry.demand().map(|(v, _)| v);
-            if let Some(hold) = entry.hold() {
-                let changed = was
-                    .as_ref()
-                    .is_none_or(|was| (was.kind, was.copy) != (standing.kind, copy));
-                // Due once it has stood for `alert_after`, and then again
-                // every `alert_after` since the last alert: a hold nothing
-                // clears must not go quiet.
-                let last = entry.alerted.unwrap_or(hold.since);
-                let due = chrono::Duration::from_std(alert_after)
-                    .is_ok_and(|after| now.signed_duration_since(last) >= after);
-                if changed {
-                    transitions.push(event("set", &root, &seen.repo, hold.clone(), demand));
-                }
-                if due {
-                    entry.alerted = Some(now);
-                    transitions.push(event("standing", &root, &seen.repo, hold, demand));
-                }
-            }
-            self.entries.insert(root, entry);
-        }
-        for (root, gone) in previous {
-            if let Some(was) = gone.hold() {
-                let demand = gone.demand().map(|(v, _)| v);
-                transitions.push(event("cleared", &root, &gone.repo, was, demand));
+            if due {
+                entry.alerted = Some(now);
+                transitions.push(event("standing", &root, &seen.repo, hold, demand));
             }
         }
-        transitions
+        self.entries.insert(root, entry);
+    }
+
+    /// Follow the roll's `install-incompatible` holds. The episode ends the
+    /// first time none of them stands and the last full pass judged every
+    /// workspace's default branch, so one the pass budget has not reached yet
+    /// cannot end it early. An episode that held nothing ends silently.
+    fn track_roll(&mut self, now: DateTime<Utc>) {
+        let Some(since) = self.roll.since.filter(|_| !self.roll.closed) else {
+            return;
+        };
+        let held = |e: &Entry| {
+            e.hold()
+                .is_some_and(|h| h.kind == HoldKind::InstallIncompatible)
+        };
+        for (root, entry) in &self.entries {
+            if held(entry) {
+                self.roll.seen.insert(root.clone());
+            }
+        }
+        if !self.all_judged || self.entries.values().any(held) {
+            return;
+        }
+        self.roll.closed = true;
+        if !self.roll.seen.is_empty() {
+            self.roll_cleared = Some(RollCleared {
+                since,
+                at: now,
+                held: self.roll.seen.len(),
+            });
+        }
+    }
+
+    /// The roll's holds have all cleared since the last call: once per
+    /// process.
+    pub fn take_roll_cleared(&mut self) -> Option<RollCleared> {
+        self.roll_cleared.take()
     }
 
     /// The workspaces whose demand became a guess since the last call: each
@@ -682,10 +840,8 @@ pub fn apply(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let transitions = holds.step(observations, running, now, ALERT_AFTER);
-    let standing = holds.holds();
-    let demand = holds.demand();
     let guessed = holds.newly_guessed();
-    drop(holds);
+    let standing = publish(holds, &transitions, now, bus);
     for g in &guessed {
         log::warn!(
             "workspace_hold: {}: its installed Loom records a version that cannot be ordered and \
@@ -698,13 +854,48 @@ pub fn apply(
             g.version
         );
     }
+    observations
+        .iter()
+        .filter_map(|seen| Some((seen.root.clone(), standing.get(&normalize(&seen.root))?.clone())))
+        .collect()
+}
+
+/// [`apply`] for a few workspaces between passes: their fresh verdicts are
+/// folded in, every other workspace keeps its hold (#11052). The checkout
+/// step calls it for each checkout it just fast-forwarded, so a checkout
+/// copy's hold clears in the same pass the checkout caught up.
+pub fn rejudge(
+    observations: &[Observation],
+    running: Version,
+    now: DateTime<Utc>,
+    bus: Option<&crate::event_bus::EventBus>,
+) {
+    let mut holds = state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let transitions = holds.rejudge(observations, running, now, ALERT_AFTER);
+    publish(holds, &transitions, now, bus);
+}
+
+/// Publish the holds and the demand for dispatch and the roll, then log and
+/// announce `transitions` and the roll's clearing. Returns the holds standing.
+fn publish(
+    mut holds: std::sync::MutexGuard<'_, Holds>,
+    transitions: &[Transition],
+    now: DateTime<Utc>,
+    bus: Option<&crate::event_bus::EventBus>,
+) -> HashMap<PathBuf, WorkspaceHold> {
+    let standing = holds.holds();
+    let demand = holds.demand();
+    let cleared = holds.take_roll_cleared();
+    drop(holds);
     if let Ok(mut cell) = published().write() {
         cell.clone_from(&standing);
     }
     if let Ok(mut cell) = demand_cell().lock() {
         *cell = demand;
     }
-    for t in &transitions {
+    for t in transitions {
         let name = t
             .repo
             .clone()
@@ -734,10 +925,24 @@ pub fn apply(
             let _ = bus.publish_generic(TOPIC, payload);
         }
     }
-    observations
-        .iter()
-        .filter_map(|seen| Some((seen.root.clone(), standing.get(&normalize(&seen.root))?.clone())))
-        .collect()
+    if let Some(c) = cleared {
+        log::info!("workspace_hold: {}", roll_cleared_line(&c));
+    }
+    standing
+}
+
+/// The INFO line for the roll's last hold clearing.
+#[must_use]
+pub fn roll_cleared_line(c: &RollCleared) -> String {
+    let took = c.at.signed_duration_since(c.since);
+    format!(
+        "every install-incompatible hold since this daemon started has cleared: {} workspace(s) \
+         were held, and the last cleared {}m{:02}s after the first workspace pass ({})",
+        c.held,
+        took.num_minutes(),
+        took.num_seconds() % 60,
+        c.since.format("%Y-%m-%dT%H:%M:%SZ")
+    )
 }
 
 /// For the standing alert: says when this pass could not read the copy, so
