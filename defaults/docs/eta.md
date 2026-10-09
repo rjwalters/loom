@@ -1814,9 +1814,17 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
 - **File-list log (#10550).** See [File-list log](#file-list-log-10550):
   predictor 1 is logged and passed as `files: Some(..)` in the fit and in
   serving.
-- **Still open (#10550).** The SigNoz `ci.run` reader (forge check runs only
-  to fill gaps), so own CI stays unknown (`ci_known = 0`) in training and
-  serving alike. The loom-experiments walk-forward backtest and its results
+- **CI-run log (#10737).** `eta::ci_log` (`ci-runs.jsonl` beside the file
+  log): runs keyed `(repo, head_sha)` with `completed_at` apart from
+  `known_at`, mapped to the PR head known at the cutoff from the file log's
+  head history (unknown or ambiguous head: unknown; stale heads, other repos
+  and branch runs never count). Last completed run by `(completed_at, run_id,
+  attempt)`; only `success` and `failure`/`timed_out`/`startup_failure` are
+  outcomes, `cancelled`, `neutral`, `skipped` and unknown are ignored.
+  Fit and serving both read it. Coverage limit: nothing appends yet.
+- **Still open (#10550, #10737).** The live producer (SigNoz timeline reader
+  into `ci_log::append`; forge check runs only to fill gaps), so own CI stays
+  unknown (`ci_known = 0`) in training and serving alike until it lands. The loom-experiments walk-forward backtest and its results
   (pinball against twin-otter-b, late surprise with paired CIs, starred /
   held / sequenced subsets) have not been run: they need loom-experiments and
   fleet data, not the sweep host. Promotion is the #10233 gate's decision.

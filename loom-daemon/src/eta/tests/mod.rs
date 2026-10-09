@@ -8,6 +8,7 @@ mod backtest_priority;
 mod backtest_subsets;
 mod backtest_union;
 mod censoring;
+mod ci_log;
 mod conditioning;
 mod config;
 mod conformal;

@@ -54,6 +54,7 @@ use super::hold;
 use super::ready::plan_max_age_secs;
 use super::timeline::{Dated, Timeline};
 use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
+use crate::eta::ci_log::CiLog;
 use crate::eta::explanation::{FeatureOmitted, Features};
 use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::fleet::FleetSnapshot;
@@ -195,6 +196,9 @@ pub(super) struct PassContext {
     /// Each open PR's changed-file list as logged (#10550); `None` until a
     /// host loads the log, which leaves the overlap predictor unknown.
     file_snapshots: Option<Vec<FileSnapshot>>,
+    /// The logged CI runs with the PR head history (#10737); `None` until a
+    /// host loads them, which leaves the own-CI predictor unknown.
+    ci_log: Option<CiLog>,
 }
 
 impl PassContext {
@@ -545,6 +549,17 @@ impl Tracker {
     /// (`None`: unknown, so the predictor stays unknown).
     pub fn set_file_snapshots(&mut self, files: Option<Vec<FileSnapshot>>) {
         self.context.file_snapshots = files;
+    }
+
+    /// Hand the tracker the logged CI runs (#10737), what the serving side's
+    /// own-CI predictor reads exactly as `eta fit` does (`None`: unknown).
+    pub fn set_ci_log(&mut self, ci_log: Option<CiLog>) {
+        self.context.ci_log = ci_log;
+    }
+
+    /// The logged CI runs (#10737), or `None` when none were loaded.
+    pub(super) fn ci_log(&self) -> Option<&CiLog> {
+        self.context.ci_log.as_ref()
     }
 
     /// The logged file lists (#10550), or `None` when none were loaded.

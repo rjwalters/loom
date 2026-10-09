@@ -974,7 +974,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, (loaded_fit, roster), (snapshots, files)) =
+    let ((history, events), repo_ids, (loaded_fit, roster), (snapshots, files, ci_log)) =
         tokio::task::spawn_blocking(move || {
             let ids: BTreeMap<String, u64> = slugs
                 .iter()
@@ -994,12 +994,15 @@ pub(super) async fn record(
             // #10500: the label timeline serving dates first-seen PRs from
             let snapshots = crate::eta::fleet::load_all(&journal_root);
             // #10550: ...and the per-PR file lists the fit reads beside them.
-            (
-                load_history(&history_roots, &journal_root, &host),
-                ids,
-                (loaded_fit, roster),
-                (snapshots, crate::eta::pr_file_log::load(&journal_root)),
-            )
+            (load_history(&history_roots, &journal_root, &host), ids, (loaded_fit, roster), {
+                let files = crate::eta::pr_file_log::load(&journal_root);
+                // #10737: ...and the CI runs, mapped by the same head history.
+                let ci_log = crate::eta::ci_log::CiLog::new(
+                    &crate::eta::ci_log::load(&journal_root),
+                    &files,
+                );
+                (snapshots, files, ci_log)
+            })
         })
         .await
         .unwrap_or_default();
@@ -1049,6 +1052,7 @@ pub(super) async fn record(
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
         state.tracker.set_fleet_history(roster);
         state.tracker.set_file_snapshots(Some(files));
+        state.tracker.set_ci_log(Some(ci_log));
         state.tracker.friction = book;
         state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;

@@ -31,6 +31,7 @@
 //! transition observed a pass after its label) reaches the model too.
 
 use super::{Item, ItemKey, PrView, StageTrack, Tracker};
+use crate::eta::ci_log::CiLog;
 use crate::eta::episodes::{EpisodeEnd, EpisodeNext, StageEpisode};
 use crate::eta::fit::rows::{data_horizon, is_open_at};
 use crate::eta::fit::KNOWABLE_LAG_SEC;
@@ -52,7 +53,7 @@ impl Tracker {
     pub fn loop_features_of(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LoopFeatures {
         self.context
             .timeline()
-            .loop_features(repo, pr, now, self.file_snapshots())
+            .loop_features(repo, pr, now, self.file_snapshots(), self.ci_log())
     }
 
     /// Start `key`'s track on first sight of its PR mid-`stage` (a restart,
@@ -323,13 +324,15 @@ impl Timeline {
     /// The friction predictors of `pr` at `now − LAG` (#10521): the one
     /// builder [`loop_features`] over the PR's episodes and its repo's, as
     /// `fit::rows` calls it. File lists are the logged ones (#10550; `None`
-    /// until loaded), CI runs are not logged yet.
+    /// until loaded), CI runs are the
+    /// logged ones too (#10737).
     pub(super) fn loop_features(
         &self,
         repo: &str,
         pr: u32,
         now: DateTime<Utc>,
         files: Option<&[FileSnapshot]>,
+        ci_log: Option<&CiLog>,
     ) -> LoopFeatures {
         let cutoff = cutoff(now);
         let key = repo.to_ascii_lowercase();
@@ -340,6 +343,7 @@ impl Timeline {
             .collect();
         let own: Vec<&StageEpisode> = self.episodes(repo, pr).iter().collect();
         let context = repo_context(&all, cutoff);
+        let ci = ci_log.and_then(|l| l.observations(repo, pr, cutoff));
         loop_features(
             &LoopInputs {
                 repo,
@@ -347,7 +351,7 @@ impl Timeline {
                 own: &own,
                 repo_episodes: &context,
                 files,
-                ci: None,
+                ci: ci.as_deref(),
             },
             cutoff,
         )

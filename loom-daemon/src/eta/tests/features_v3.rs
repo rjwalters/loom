@@ -150,3 +150,64 @@ fn file_lists_and_ci_after_as_of_move_no_column() {
     let none = model_features_v3(&ModelInputsV3::default());
     assert_eq!((none[n + 7], none[n + 9]), (0.0, 0.0));
 }
+
+#[test]
+fn logged_ci_reaches_fit_and_serving_alike_and_never_leaks() {
+    use crate::eta::ci_log::{CiLog, CiRecord};
+    let snaps = fleet();
+    let mk = |sha: &str, id: u64, done: f64, known: f64, c: &str| CiRecord {
+        repo: REPO.into(),
+        head_sha: sha.into(),
+        run_id: id,
+        run_attempt: 1,
+        workflow: "ci".into(),
+        completed_at: h(done),
+        known_at: h(known),
+        conclusion: Some(c.into()),
+    };
+    let mut files = Vec::new();
+    for pr in [1, 2] {
+        files.push(FileSnapshot {
+            repo: REPO.into(),
+            pr,
+            known_at: h(0.5),
+            files: vec!["a.rs".into()],
+            head_sha: Some("aaa".into()),
+            complete: true,
+            additions: None,
+            deletions: None,
+            listed: None,
+        });
+    }
+    let records = vec![
+        mk("aaa", 1, 4.0, 4.0, "failure"),
+        mk("aaa", 2, 7.0, 7.0, "success"),
+    ];
+    let log = CiLog::new(&records, &files);
+    let a = rows::build_with_logs(&snaps, cutoff(), None, None, Some(&files), Some(&log));
+    let known = a.rows.len();
+    assert!(known > 0);
+    let mut tracker = Tracker::new(provenance());
+    tracker.on_fleet_snapshots(&snaps, h(10.0));
+    tracker.set_file_snapshots(Some(files.clone()));
+    tracker.set_ci_log(Some(log));
+    let mut seen_known = false;
+    for (i, k) in a.row_keys.iter().enumerate() {
+        let train = training_inputs_v3(&a, i).unwrap();
+        let served = tracker.loop_features_of(&k.repo, k.pr, k.at);
+        assert_eq!(train.loops, served, "#{} at {}", k.pr, k.at);
+        seen_known |= served.own_ci_failed.is_some();
+    }
+    assert!(seen_known, "some row knows its CI");
+    // A pre-cutoff completion observed only later changes no historical row.
+    let mut leaked = records.clone();
+    leaked.push(mk("aaa", 3, 5.0, 40.0, "failure"));
+    let log2 = CiLog::new(&leaked, &files);
+    let b = rows::build_with_logs(&snaps, cutoff(), None, None, Some(&files), Some(&log2));
+    for i in 0..known {
+        assert_eq!(
+            training_inputs_v3(&a, i).unwrap().loops,
+            training_inputs_v3(&b, i).unwrap().loops
+        );
+    }
+}

@@ -24,6 +24,7 @@ use super::coeffs::{self, CoefficientFile, FitMeta, FitWindow, Fitter};
 use super::features_v2::PriorityCoverage;
 use super::rows::{self, Assembled};
 use super::{v2, v3, FitStage};
+use crate::eta::ci_log::{self, CiLog};
 use crate::eta::fleet::{self, FleetSnapshot};
 use crate::eta::loop_features::{FileSnapshot, LoopCoverage};
 use crate::eta::pr_file_log;
@@ -184,7 +185,21 @@ pub fn fit_snapshots_with_files(
     fleet_history: Option<&[RosterRevision]>,
     files: Option<&[FileSnapshot]>,
 ) -> (CoefficientFile, Assembled) {
-    let assembled = rows::build_with_files(snapshots, as_of, star, fleet_history, files);
+    fit_snapshots_with_logs(snapshots, as_of, fitter, star, fleet_history, files, None)
+}
+
+/// [`fit_snapshots_with_files`], also reading the logged CI runs (#10737).
+#[must_use]
+pub fn fit_snapshots_with_logs(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    fitter: &Fitter,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+    files: Option<&[FileSnapshot]>,
+    ci_log: Option<&CiLog>,
+) -> (CoefficientFile, Assembled) {
+    let assembled = rows::build_with_logs(snapshots, as_of, star, fleet_history, files, ci_log);
     let meta = fit_meta(&assembled, as_of, fitter);
     let file = coeffs::fit(&meta, &assembled.rows, &assembled.dwells);
     (file, assembled)
@@ -260,13 +275,16 @@ fn fit_loaded(
     let (history, roster_history) = roster_history::load_for(root, as_of);
     // #10550: the file lists the daemon logged, as known at each row's cutoff.
     let files = pr_file_log::load(root);
-    let (file, assembled) = fit_snapshots_with_files(
+    // #10737: the logged CI runs, mapped to each row's PR head as known then.
+    let ci_log = CiLog::new(&ci_log::load(root), &files);
+    let (file, assembled) = fit_snapshots_with_logs(
         snapshots,
         as_of,
         fitter,
         Some(&star),
         history.as_deref(),
         Some(&files),
+        Some(&ci_log),
     );
     let dir = coeffs::fit_dir(root);
     let path = out.map_or_else(|| dir.join(coeffs::path_for(as_of)), Path::to_path_buf);

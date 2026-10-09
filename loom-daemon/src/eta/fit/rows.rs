@@ -92,6 +92,7 @@ use super::{
     clock, DwellEnd, DwellRow, FitStage, MergeLabel, ModelInputs, TrainingRow, EXIT_HORIZON_SEC,
     KNOWABLE_LAG_SEC, ROW_STEP_SEC, WINDOW_DAYS,
 };
+use crate::eta::ci_log::CiLog;
 use crate::eta::episodes::{EpisodeEnd, EpisodeNext, StageEpisode};
 use crate::eta::flag_timeline::{flags_before, FlagChange};
 use crate::eta::fleet::FleetSnapshot;
@@ -399,6 +400,21 @@ pub fn build_with_files(
     fleet_history: Option<&[RosterRevision]>,
     files: Option<&[FileSnapshot]>,
 ) -> Assembled {
+    build_with_logs(snapshots, as_of, star, fleet_history, files, None)
+}
+
+/// [`build_with_files`], also reading the logged CI runs (#10737) for the
+/// own-CI predictor: each row sees the runs of the head its PR had, and the
+/// runs known, before its cutoff (`None`: unknown).
+#[must_use]
+pub fn build_with_logs(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+    files: Option<&[FileSnapshot]>,
+    ci_log: Option<&CiLog>,
+) -> Assembled {
     let lag = Duration::seconds(KNOWABLE_LAG_SEC);
     let step = Duration::seconds(ROW_STEP_SEC);
     let exit_horizon = Duration::seconds(EXIT_HORIZON_SEC);
@@ -511,6 +527,7 @@ pub fn build_with_files(
                     .and_then(|r| r.linked_at(pr.number, cutoff));
                 let own_flags = PriorityState::from_flags(&pr.flags, cutoff).unwrap_or_default();
                 let prio_v2 = priority_inputs(&subject, &own_flags, linked.as_ref(), &ctx, t);
+                let ci = ci_log.and_then(|l| l.observations(&pr.repo, pr.number, cutoff));
                 let loops = loop_features(
                     &LoopInputs {
                         repo: &pr.repo,
@@ -518,7 +535,7 @@ pub fn build_with_files(
                         own: &pr.episodes,
                         repo_episodes: context.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
                         files,
-                        ci: None,
+                        ci: ci.as_deref(),
                     },
                     cutoff,
                 );
