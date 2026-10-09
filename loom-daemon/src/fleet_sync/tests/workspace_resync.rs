@@ -1166,3 +1166,5 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 mod bounds;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
+#[path = "workspace_resync_surfaces.rs"]
+mod surfaces;
