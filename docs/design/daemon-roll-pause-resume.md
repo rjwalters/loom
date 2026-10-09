@@ -819,7 +819,7 @@ version it is running and acts on that tick, through `trigger_pause_roll`.
 | Floor knowledge | Running vs floor | Behaviour |
 |---|---|---|
 | no fleet store (not a fleet host) | n/a | Opt-in autoUpdate, unchanged apart from the window: artifact path and source path behind the settle gate and its `6 × settleSecs` ceiling. `target_source = autoupdate`. |
-| unknown | n/a | No version roll. The tick's note says the floor is not known and why. Fail closed: a host that may have a floor must not chase the latest release. |
+| unknown | n/a | No roll for the floor. The tick's note says the floor is not known and why. Fail closed: a host that may have a floor must not chase the latest release. A workspace that needs a newer daemon (`repo_ahead`, below) still rolls the host, to a real published release. |
 | set | below; the newest release is at or above the floor | Floor roll on this tick. No settle. The target is the newest release at or above the floor, at its exact tag. |
 | set | below; the newest release is below the floor | The `FloorStallReport` ERROR alert; dispatch continues. The host does not roll to the newest release instead. |
 | set | below; no release resolved this tick | No roll; the next tick asks again. The source-rebuild path is not used. |

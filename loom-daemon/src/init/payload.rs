@@ -333,8 +333,10 @@ impl ResyncRefusal {
     /// [`Self::NeedsNewerDaemon`] holds dispatch as `daemon-too-old` and asks
     /// for a roll. [`Self::RepoAheadOfDaemon`] is compatible: no hold, no
     /// roll. [`Self::PendingAheadOfDaemon`] holds dispatch and asks for no
-    /// roll. [`Self::UnrecognizedVersion`] is not in this set, yet holds and
-    /// asks for a roll, because it may need a newer daemon.
+    /// roll. [`Self::UnrecognizedVersion`] is not in this set, yet holds,
+    /// because it may need a newer daemon; it asks for a roll only when its
+    /// `requires_daemon` is above this daemon, or names nothing that parses
+    /// ([`crate::workspace_hold::demanded`]).
     #[must_use]
     pub fn repo_ahead_of_daemon(&self) -> bool {
         matches!(

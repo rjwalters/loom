@@ -112,12 +112,94 @@ fn the_other_refusals() {
 }
 
 #[test]
-fn the_demand_is_requires_daemon_or_any_newer_release() {
+fn the_demand_is_requires_daemon_when_it_parses_else_any_newer_release() {
     let running = v("0.19.900");
-    assert_eq!(demanded(Some("0.19.950"), running), v("0.19.950"));
-    assert_eq!(demanded(Some("0.20.0-rc1"), running), v("0.19.901"));
-    assert_eq!(demanded(None, running), v("0.19.901"));
-    assert_eq!(demanded(Some("0.19.800"), running), v("0.19.901"));
+    assert_eq!(demanded(Some("0.19.950"), running), Some(v("0.19.950")));
+    // A parsed requires_daemon this daemon meets names no need: no demand.
+    assert_eq!(demanded(Some("0.19.800"), running), None);
+    assert_eq!(demanded(Some("0.19.900"), running), None);
+    // Only when nothing parses is the demand a guess.
+    assert_eq!(demanded(Some("0.20.0-rc1"), running), Some(v("0.19.901")));
+    assert_eq!(demanded(None, running), Some(v("0.19.901")));
+    assert!(demand_is_guessed(Some("0.20.0-rc1")));
+    assert!(demand_is_guessed(None));
+    assert!(!demand_is_guessed(Some("0.19.800")));
+}
+
+/// The ratchet edge: a `loom_version` that cannot be ordered holds dispatch
+/// in all three cases, and asks for a roll only when `requires_daemon` says
+/// this daemon is too old, or names nothing that parses.
+#[test]
+fn an_unorderable_version_holds_and_demands_by_requires_daemon_alone() {
+    let d = daemon(RUNNING, None);
+    // What the pass builds for the copy: the gate, the verdict, the finding.
+    let finding = |requires: Option<&str>| {
+        let m = meta(Some("0.20.0-rc1"), requires);
+        let g = gate(&m, &d);
+        assert!(
+            matches!(g, Err(ResyncRefusal::UnrecognizedVersion { .. })),
+            "{requires:?}: {g:?}"
+        );
+        assert_eq!(decide_hold(&g, None), Verdict::Hold(HoldKind::DaemonTooOld));
+        Finding::daemon_too_old(String::new(), m.requires_daemon.as_deref(), d.running)
+    };
+    for (requires, want, guessed) in [
+        // Needs a newer daemon: demands exactly that.
+        (Some("0.19.950"), Some("0.19.950"), false),
+        // Met by this daemon: held, no demand.
+        (Some("0.19.772"), None, false),
+        (Some(RUNNING), None, false),
+        // Nothing parses: held, `running + 1`, and reported.
+        (None, Some("0.19.901"), true),
+        (Some("soon"), Some("0.19.901"), true),
+    ] {
+        let found = finding(requires);
+        assert_eq!(found.verdict, Verdict::Hold(HoldKind::DaemonTooOld), "{requires:?}");
+        assert_eq!(found.demand, want.map(v), "{requires:?}");
+        assert_eq!(found.guessed, guessed, "{requires:?}");
+
+        let mut holds = Holds::default();
+        let root = "/nonexistent/odd";
+        holds.step(&[obs(root, found.clone(), found)], v(RUNNING), t0(), ALERT_AFTER);
+        assert!(holds.holds().contains_key(Path::new(root)), "{requires:?}: held");
+        assert_eq!(holds.demand().map(|d| d.version), want.map(str::to_string), "{requires:?}");
+        let reported = holds.newly_guessed();
+        assert_eq!(reported.len(), usize::from(guessed), "{requires:?}: {reported:?}");
+    }
+}
+
+#[test]
+fn a_guessed_demand_is_reported_once_while_it_stands() {
+    let mut holds = Holds::default();
+    let (a, b) = ("/nonexistent/a", "/nonexistent/b");
+    let guess = || Finding::daemon_too_old("odd".into(), None, v(RUNNING));
+    let pass = |holds: &mut Holds, a_finding: Finding, at| {
+        holds.step(
+            &[
+                obs(a, a_finding, Finding::clear()),
+                obs(b, w4("0.19.950"), Finding::clear()),
+            ],
+            v(RUNNING),
+            at,
+            ALERT_AFTER,
+        );
+        holds.newly_guessed()
+    };
+    let first = pass(&mut holds, guess(), t0());
+    assert_eq!(
+        first,
+        [GuessedDemand {
+            root: PathBuf::from(a),
+            repo: Some("acme/a".into()),
+            version: v("0.19.901"),
+        }]
+    );
+    // Not again while it stands, also across a pass that cannot read it.
+    assert!(pass(&mut holds, guess(), t0() + mins(1)).is_empty());
+    assert!(pass(&mut holds, Finding::unknown(), t0() + mins(2)).is_empty());
+    // Gone, then back: reported again.
+    assert!(pass(&mut holds, Finding::clear(), t0() + mins(3)).is_empty());
+    assert_eq!(pass(&mut holds, guess(), t0() + mins(4)).len(), 1);
 }
 
 // ----------------------------------------------------------------------------

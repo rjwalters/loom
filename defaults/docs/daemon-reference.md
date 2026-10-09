@@ -1802,7 +1802,9 @@ cannot work with this daemon. The checkout copy is
 | Verdict for a copy | Hold | Typed outcome | Asks for a roll |
 |---|---|---|---|
 | its `requires_daemon` is above the running daemon (`W4`) | held | `daemon-too-old` | yes |
-| a contract field that cannot be ordered, such as `0.20.0-rc1` | held | `daemon-too-old` | yes |
+| a contract field that cannot be ordered, such as `0.20.0-rc1`, and `requires_daemon` above the running daemon | held | `daemon-too-old` | yes, for `requires_daemon` |
+| a contract field that cannot be ordered, and `requires_daemon` at or below the running daemon | held | `daemon-too-old` | no |
+| a contract field that cannot be ordered, and no `requires_daemon` that parses | held | `daemon-too-old` | yes, for any release after this one; WARN once per workspace |
 | too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
 | a resync to a release above this daemon was interrupted there (`resync_pending`) | held | `install-incompatible` | no |
 | too old by its stamp, files equal to the payload (`W0`) | not held | | no |
@@ -1817,6 +1819,15 @@ cannot work with this daemon. The checkout copy is
   forward one release at a time. While the newer files' `requires_daemon` is
   at or below this daemon, this host keeps working the repo, never resyncs it
   downward, and reports `repo-ahead`.
+- **A version that cannot be ordered rolls only for a need.** Such a copy
+  is held, because it may be newer than this daemon. Whether it also asks
+  for a roll is decided by its `requires_daemon` alone when that parses:
+  above this daemon it asks for that version, at or below it asks for
+  nothing. Asking for "any newer release" there would make the host chase
+  every new release for as long as the odd version stays. Only when
+  `requires_daemon` is missing or cannot be ordered either does the copy ask
+  for any release after this one, and the daemon logs that at WARN once per
+  workspace so a person fixes the metadata.
 - **An interrupted newer resync is held, and asks for no roll.** When
   `resync_pending` names a release above this daemon, some of that release's
   files are in place while the stamp, written last, is still the old
@@ -6066,12 +6077,12 @@ What it does depends on whether the host reads a fleet store (`fleet.repo`):
 | Floor | Running vs floor | This tick |
 |---|---|---|
 | no fleet store | n/a | Opt-in `autoUpdate` as before: the newest release (or a newer source checkout) behind `settleSecs` and its `6 ×` ceiling. `target_source = autoupdate` |
-| unknown | n/a | No version roll. `last tick:` says `fleet floor not known (…)` and why |
+| unknown | n/a | No roll for the floor. `last tick:` says `fleet floor not known (…)` and why. A workspace that needs a newer daemon still rolls the host (the last row) |
 | set | below; the newest release is at or above it | Pause-and-roll now, no settle, to that release's exact tag. `target_source = floor` |
 | set | below; the newest release is below it | `FLEET FLOOR UNSATISFIABLE` at ERROR. No roll; dispatch continues |
 | set | below; no release resolved | No roll; the next tick asks again |
 | set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
-| any store | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest release at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
+| any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
 
 - **A fleet host moves only when the floor moves.** It does not chase the
   newest release and does not rebuild itself from source as `main` advances.
@@ -6086,9 +6097,10 @@ What it does depends on whether the host reads a fleet store (`fleet.repo`):
 - **The floor is unknown** when a store is configured but no floor is known:
   the startup pass has not completed and no earlier snapshot records one, the
   store carries no `loom_min_version`, or the store could not be started. The
-  host does nothing rather than fall back to chasing the latest release, logs
-  one WARN when it enters that state, and repeats the reason on every tick's
-  note. Before the first pass of a new process completes, the floor the
+  host does nothing for the floor rather than fall back to chasing the latest
+  release, logs one WARN when it enters that state, and repeats the reason on
+  every tick's note. It still rolls for a workspace that needs a newer daemon
+  (the last table row), to a real published release. Before the first pass of a new process completes, the floor the
   previous process recorded in `fleet-sync-status.json` counts as set.
 - **A floor bump rolls every host within about one sync interval.** Rolls are
   not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so

@@ -4,9 +4,11 @@
 //!
 //! The demand is [`crate::workspace_hold::repo_ahead_min`], rebuilt on every
 //! workspace pass. It is raised only by a workspace whose `requires_daemon`
-//! is above the running version (W4) or whose version cannot be ordered. A
-//! repo that is merely ahead and still compatible raises nothing: that is the
-//! ratchet guard (see [`crate::workspace_hold`]).
+//! is above the running version (W4), or whose version cannot be ordered and
+//! whose `requires_daemon` is above the running version or does not parse
+//! ([`crate::workspace_hold::demanded`]). A repo that is merely ahead and
+//! still compatible raises nothing: that is the ratchet guard (see
+//! [`crate::workspace_hold`]).
 //!
 //! It is a second floor and nothing more. [`RepoAheadState`] classifies it
 //! with the floor's own [`floor_verdict`], and its target enters

@@ -25,7 +25,9 @@
 //! | Verdict for a copy | Hold | Roll demand |
 //! |---|---|---|
 //! | its `requires_daemon` is above this daemon (W4) | `daemon-too-old` | yes |
-//! | a contract field that cannot be ordered (`0.20.0-rc1`) | `daemon-too-old` | yes |
+//! | a contract field that cannot be ordered (`0.20.0-rc1`), `requires_daemon` above this daemon | `daemon-too-old` | yes, `requires_daemon` |
+//! | a contract field that cannot be ordered, `requires_daemon` at or below this daemon | `daemon-too-old` | no |
+//! | a contract field that cannot be ordered, `requires_daemon` missing or unorderable too | `daemon-too-old` | yes, `running + 1` (WARN once per workspace) |
 //! | too old for this daemon or the floor, files differ (W3) | `install-incompatible` | no |
 //! | a resync to a release above this daemon was interrupted there | `install-incompatible` | no |
 //! | too old by its stamp, files equal the payload | none (W0) | no |
@@ -43,8 +45,18 @@
 //! ([`crate::install_compat`]) says whether the newer files still work here:
 //! while their `requires_daemon` is at or below this daemon, this host keeps
 //! working the repo, never resyncs it downward, and only reports the state.
-//! Only a copy that *needs* a newer daemon (or whose version cannot be
-//! ordered, so it may) holds dispatch and raises [`repo_ahead_min`].
+//! Only a copy that *needs* a newer daemon holds dispatch and raises
+//! [`repo_ahead_min`].
+//!
+//! A copy whose version cannot be ordered (`0.20.0-rc1`) is held, because it
+//! may be newer. Whether it also asks for a roll is decided by its
+//! `requires_daemon` alone when that parses: above this daemon it demands
+//! that version, at or below it demands nothing. A demand of "any release
+//! after this one" there would make the host chase every new release, with
+//! no settle, for as long as the odd version stays. Only when
+//! `requires_daemon` is missing or unorderable too does the copy demand
+//! `running + 1`, and that is logged at WARN once per workspace so a person
+//! fixes the metadata.
 //!
 //! An interrupted resync to a newer release is held too, and asks for no
 //! roll. `requires_daemon` is stamped last, so the half-applied files are a
@@ -242,15 +254,26 @@ pub fn decide_hold(gate: &Result<Compat, ResyncRefusal>, diff_stale: Option<bool
     }
 }
 
-/// The daemon version a `daemon-too-old` copy asks for: its `requires_daemon`
-/// when that is a version above `running`, else "any release after this
-/// one" (a version that cannot be ordered names no release to wait for).
+/// The daemon version a `daemon-too-old` copy asks for, if any.
+///
+/// A `requires_daemon` that parses decides alone: above `running` it is the
+/// demand, at or below it there is none (the copy is held for a version that
+/// cannot be ordered, but nothing says it needs a newer daemon). Only when it
+/// is missing or does not parse is the demand "any release after this one",
+/// [`Version::next_patch`]; see [`demand_is_guessed`].
 #[must_use]
-pub fn demanded(requires_daemon: Option<&str>, running: Version) -> Version {
-    requires_daemon
-        .and_then(Version::parse)
-        .filter(|r| *r > running)
-        .unwrap_or_else(|| running.next_patch())
+pub fn demanded(requires_daemon: Option<&str>, running: Version) -> Option<Version> {
+    match requires_daemon.and_then(Version::parse) {
+        Some(requires) => (requires > running).then_some(requires),
+        None => Some(running.next_patch()),
+    }
+}
+
+/// True when [`demanded`] falls back to `running + 1`: no version names the
+/// release the copy needs.
+#[must_use]
+pub fn demand_is_guessed(requires_daemon: Option<&str>) -> bool {
+    requires_daemon.and_then(Version::parse).is_none()
 }
 
 /// One copy's verdict, with what a person and the roll need to know.
@@ -262,6 +285,9 @@ pub struct Finding {
     pub detail: String,
     /// The daemon version a `daemon-too-old` copy asks for.
     pub demand: Option<Version>,
+    /// The demand is `running + 1` because no version names one
+    /// ([`demand_is_guessed`]).
+    pub guessed: bool,
 }
 
 impl Finding {
@@ -282,6 +308,7 @@ impl Finding {
             verdict,
             detail: String::new(),
             demand: None,
+            guessed: false,
         }
     }
 
@@ -292,16 +319,19 @@ impl Finding {
             verdict: Verdict::Hold(HoldKind::InstallIncompatible),
             detail,
             demand: None,
+            guessed: false,
         }
     }
 
-    /// A W4 hold asking for a daemon at or above [`demanded`].
+    /// A W4 hold asking for a daemon at or above [`demanded`], when that
+    /// names one.
     #[must_use]
     pub fn daemon_too_old(detail: String, requires_daemon: Option<&str>, running: Version) -> Self {
         Self {
             verdict: Verdict::Hold(HoldKind::DaemonTooOld),
             detail,
-            demand: Some(demanded(requires_daemon, running)),
+            demand: demanded(requires_daemon, running),
+            guessed: demand_is_guessed(requires_daemon),
         }
     }
 }
@@ -357,6 +387,8 @@ struct Standing {
     kind: HoldKind,
     detail: String,
     demand: Option<Version>,
+    /// [`Finding::guessed`].
+    guessed: bool,
     /// The pass that last judged the copy held.
     seen: DateTime<Utc>,
 }
@@ -407,6 +439,27 @@ impl Entry {
             .rev()
             .max_by_key(|(version, _)| *version)
     }
+
+    /// The guessed demand of either copy, when one has one.
+    fn guessed(&self) -> Option<Version> {
+        self.copies
+            .iter()
+            .flatten()
+            .filter(|s| s.guessed)
+            .find_map(|s| s.demand)
+    }
+}
+
+/// A workspace whose roll demand is a guess (`running + 1`): a version
+/// cannot be ordered and `requires_daemon` does not name one either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuessedDemand {
+    /// The registered root.
+    pub root: PathBuf,
+    /// `OWNER/REPO`, when known.
+    pub repo: Option<String>,
+    /// The version guessed.
+    pub version: Version,
 }
 
 /// The hold state one pass leaves for the next. Pure: [`Holds::step`] is the
@@ -414,6 +467,8 @@ impl Entry {
 #[derive(Debug, Default)]
 pub struct Holds {
     entries: HashMap<PathBuf, Entry>,
+    /// Roots whose guessed demand has been reported, while it stands.
+    guessed_reported: std::collections::HashSet<PathBuf>,
 }
 
 impl Holds {
@@ -453,6 +508,7 @@ impl Holds {
                     kind,
                     detail: finding.detail.clone(),
                     demand: finding.demand,
+                    guessed: finding.guessed,
                     seen: now,
                 }),
             };
@@ -505,6 +561,30 @@ impl Holds {
             }
         }
         transitions
+    }
+
+    /// The workspaces whose demand became a guess since the last call: each
+    /// is reported once while its guess stands, and again only after it has
+    /// gone away and come back.
+    pub fn newly_guessed(&mut self) -> Vec<GuessedDemand> {
+        let mut found: Vec<GuessedDemand> = self
+            .entries
+            .iter()
+            .filter_map(|(root, entry)| {
+                Some(GuessedDemand {
+                    root: root.clone(),
+                    repo: entry.repo.clone(),
+                    version: entry.guessed()?,
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| a.root.cmp(&b.root));
+        let before = std::mem::replace(
+            &mut self.guessed_reported,
+            found.iter().map(|g| g.root.clone()).collect(),
+        );
+        found.retain(|g| !before.contains(&g.root));
+        found
     }
 
     /// Every standing hold, by normalized root.
@@ -604,7 +684,20 @@ pub fn apply(
     let transitions = holds.step(observations, running, now, ALERT_AFTER);
     let standing = holds.holds();
     let demand = holds.demand();
+    let guessed = holds.newly_guessed();
     drop(holds);
+    for g in &guessed {
+        log::warn!(
+            "workspace_hold: {}: its installed Loom records a version that cannot be ordered and \
+             no requires_daemon that parses, so this host asks for any release after {running} \
+             ({}) and will roll for it. Fix the workspace's .loom/install-metadata.json; this \
+             is logged once while it stands",
+            g.repo
+                .clone()
+                .unwrap_or_else(|| g.root.display().to_string()),
+            g.version
+        );
+    }
     if let Ok(mut cell) = published().write() {
         cell.clone_from(&standing);
     }

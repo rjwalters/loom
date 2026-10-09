@@ -208,3 +208,67 @@ fn the_stall_alert_is_logged_when_it_starts_and_then_once_per_reminder() {
     assert!(state.stall().is_none());
     assert!(!state.driving());
 }
+
+/// The ratchet edge, end to end: a workspace whose `loom_version` cannot be
+/// ordered, on a fleet host whose floor is met, with a newer release out.
+/// The hold pass's demand goes through `RepoAheadState` into `run_tick`. The
+/// host rolls only when `requires_daemon` is above it, or names nothing.
+#[test]
+fn an_unorderable_version_rolls_a_fleet_host_only_when_requires_daemon_says_so() {
+    use crate::install_compat::{DaemonCompat, InstallMeta, Version};
+    use crate::workspace_hold::{decide_hold, Finding, HoldKind, Holds, Observation, Verdict};
+    let running = Version::parse(RUNNING).unwrap();
+    let d = DaemonCompat {
+        running,
+        supports_installed: Version::parse("0.19.0").unwrap(),
+        floor: None,
+    };
+    for (requires, rolls) in [
+        (Some("0.19.870"), true),
+        // Met by this daemon: held, and NO roll, though 0.19.900 is out.
+        (Some("0.19.772"), false),
+        (Some(RUNNING), false),
+        // Nothing parses: the `running + 1` guess still rolls.
+        (None, true),
+    ] {
+        let case = format!("requires={requires:?}");
+        let m = InstallMeta {
+            loom_version: Some("0.20.0-rc1".into()),
+            requires_daemon: requires.map(str::to_string),
+        };
+        let g = crate::init::payload::resync_gate(&m, &d);
+        assert_eq!(decide_hold(&g, None), Verdict::Hold(HoldKind::DaemonTooOld), "{case}");
+        let found = Finding::daemon_too_old(String::new(), requires, running);
+        let mut holds = Holds::default();
+        let seen = Observation {
+            root: PathBuf::from("/nonexistent/acme-app"),
+            repo: Some("acme/app".into()),
+            default_branch: found.clone(),
+            checkout: found,
+        };
+        holds.step(&[seen], running, Utc::now(), Duration::from_secs(1800));
+        assert_eq!(holds.holds().len(), 1, "{case}: held in every case");
+        let demand = holds.demand().map(|d| Demand {
+            version: d.version,
+            workspace: d.repo.unwrap_or_default(),
+        });
+
+        for settle_secs in [0, 600] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = floored(tmp.path(), Floor::Satisfied);
+            state.repo_ahead.set_basis(demand.clone(), RUNNING);
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let mut probe = probe(newest(RUNNING), &fetch_calls);
+            let trigger = Trigger::new(false);
+            let status = AutoUpdateStatus::new(true);
+            let settle = Duration::from_secs(settle_secs);
+            run_tick(&mut state, &status, &mut probe, &trigger, settle, DEFER);
+            assert_eq!(
+                fetch_calls.load(Ordering::SeqCst),
+                usize::from(rolls),
+                "{case} {settle_secs}"
+            );
+            assert_eq!(trigger.targets.lock().unwrap().len(), usize::from(rolls), "{case}");
+        }
+    }
+}
