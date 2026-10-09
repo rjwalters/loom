@@ -161,6 +161,9 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `host.export` (#11124).
+pub mod host_export;
+
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
@@ -474,6 +477,12 @@ macro_rules! telemetry_kind_table {
             /// how many probes used a metered API key. OTLP-only. See
             /// [`token_ranking_refresh`].
             TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// This host's export view (Issue #11124, R2 of #10196): active
+            /// exporters, queue depth, cumulative `dropped_total` per exporter
+            /// and the last successful flush. OTLP-only. See [`host_export`].
+            HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
