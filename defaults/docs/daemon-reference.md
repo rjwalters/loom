@@ -1987,14 +1987,68 @@ are in memory and reset on restart. Each workspace's state and reason appear on
 the `Fleet store:` status block and under `workspaces` in
 `fleet-sync-status.json`.
 
-The resync covers the payload surfaces only: `.loom/{roles,scripts,hooks,docs,runtimes}/`,
-`.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc` and
-`.claude/commands/loom/`. It does not yet touch `.loom/config.json`,
-`.loom/CLAUDE.md`, `.gitignore`, `.agents/skills/`, `.claude/README.md`,
-`.claude/biome.jsonc`, `.github/CONFIGURATION.md`, or the retired-file sweep and
-`package.json` edit that `resync-installed.sh` performs (#10895). It also does not
-fast-forward a host's own checkout (#10869), so a host keeps running its old
-installed scripts until that checkout is updated.
+The resync does not fast-forward a host's own checkout (#10869), so a host keeps
+running its old installed scripts until that checkout is updated.
+
+#### What a resync refreshes (#10895)
+
+One table in the daemon (`loom-daemon/src/init/payload/surfaces.rs`) names every
+surface. All of them are diffed against the default branch together, so a
+release that changes none of them makes no claim and no commit in any repo, and
+a second resync at the same release writes nothing.
+
+| Surface | Rule |
+|---|---|
+| `.loom/{roles,scripts,hooks,docs,runtimes}/`, `.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc`, `.claude/commands/loom/` | the installer's own payload step: written, and removed only when `installed_files` lists the file |
+| `.agents/skills/loom-<name>/SKILL.md` | written when absent or when the file carries the `<!-- loom-managed-skill -->` marker; one without the marker is never written or removed. A marker-carrying skill the release no longer generates is removed |
+| `.claude/README.md`, `.github/CONFIGURATION.md` | copied, only when the repo already has the file |
+| `.claude/biome.jsonc` | copied, created when absent |
+| `.gitignore` | only the Loom-managed block is merged (as `loom-daemon update-gitignore` does), and only when the file exists. The file is never listed in `installed_files` |
+| `.loom/CLAUDE.md`, `.loom/AGENTS.md` | re-rendered from the release's template with the install date the file already carries, so an unchanged template changes nothing. Only when the file exists and has an `**Installation Date**:` line |
+| files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
+
+A path pinned in `.loom/resync-ignore` is never written or removed, in either
+form the shell resync accepts (`.agents/skills/loom-<name>/SKILL.md` or
+`agents-skills/loom-<name>/SKILL.md`, `.claude/commands/loom/<name>.md` or
+`commands/loom/<name>.md`). A symlink, or a surface reached through a symlinked
+directory, is left alone. A file the repo's ignore rules exclude is never
+committed.
+
+Removing a dropped skill is something only the daemon resync does (the shell
+resync never removes one), and it goes by the marker, not by who wrote the
+file: a copy of a Loom skill kept under another `loom-<name>/` directory with
+the marker line still in it is removed on the next resync. To keep a customised
+skill, detach it: delete the `<!-- loom-managed-skill -->` line from its
+`SKILL.md` (or pin the path). Loom then never writes or removes it.
+
+One file a resync cannot use does not stop the rest. A `.gitignore` or guide
+that is not UTF-8, or a directory where a `SKILL.md` or `.claude/biome.jsonc`
+should be, is skipped: the daemon logs one warning naming the repo and the
+path, never writes or removes that file, and resyncs every other surface. A
+guide with no `**Installation Date**:` line is logged once per repo at `info`,
+since it stays at its old template until the repo is reinstalled. Both are
+logged once per repo and path for the life of the daemon, not once per tick.
+
+The first resync after a host moves to a release with these surfaces can commit
+more than usual in each repo: the skills are backfilled, and a guide rendered
+from an older template is brought up to date.
+
+**Install-time only.** No daemon resync touches these. The installer or
+`resync-installed.sh` does:
+
+| Surface | Why |
+|---|---|
+| `.loom/config.json` | Consumer configuration. The installer merges it on a reinstall and nothing migrates a key afterwards, so **a release that renames or retires a config key must keep reading the old key**. Fleet-wide configuration reaches hosts through the fleet store instead |
+| `package.json` (`loom-workspace` stub) | The removal of its `version` field is a one-time migration (#4285) |
+| root `CLAUDE.md` | Repo-customized. Removing a leftover `**Loom Version**` header is a one-time migration (#6612, #8147) |
+| `.gitattributes` `merge=ours` block and the local `merge.ours.driver` | They resolve per-host resync commits that conflict on the stamp (#4528). The daemon resync has one writer per change. An existing block is left as it is, and local git config cannot be committed |
+| forge labels | The drift check against `.github/labels.yml` is a forge read and a report, not an installed file. Run `sync-labels.sh` |
+
+Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
+`.github/labels.yml`, `.github/workflows/` and `.claude/agents/`.
+
+Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
+a release with these surfaces is the fleet floor.
 
 ### ETA fit publication branch (#10395)
 

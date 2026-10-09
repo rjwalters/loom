@@ -117,9 +117,6 @@ impl std::error::Error for LowDisk {}
 /// Prefix of the throwaway worktree's directory name; the pid follows.
 pub(super) const WORKTREE_PREFIX: &str = ".resync-";
 
-/// The payload's surfaces in a consumer tree, as `git archive` pathspecs.
-const SURFACES: &[&str] = &[".loom", ".claude/commands/loom"];
-
 /// What the remote did with the push.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Push {
@@ -347,11 +344,13 @@ pub(super) fn metadata_at(root: &Path, commit: &str) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
-/// Write the payload surfaces of `commit` into `dest` (a temp dir), so the
-/// payload can be diffed against the default branch without a checkout.
+/// Write the resync surfaces of `commit` into `dest` (a temp dir), so the
+/// payload can be diffed against the default branch without a checkout. The
+/// pathspecs are the resync's own surface table (#10895); `git archive` fails
+/// on one the tree lacks, so each is checked first.
 pub(super) fn export_surfaces(root: &Path, commit: &str, dest: &Path) -> Result<()> {
     let mut args = vec!["archive", "--format=tar", commit, "--"];
-    for surface in SURFACES {
+    for surface in crate::init::payload::surfaces::export_pathspecs() {
         let spec = format!("{commit}:{surface}");
         if run(root, root, &["cat-file", "-e", &spec], QUICK)?
             .status

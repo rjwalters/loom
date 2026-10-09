@@ -1172,3 +1172,5 @@ mod bounds;
 mod head_check;
 #[path = "workspace_resync_hold.rs"]
 mod hold_pass;
+#[path = "workspace_resync_surfaces.rs"]
+mod surfaces;
