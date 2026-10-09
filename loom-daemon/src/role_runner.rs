@@ -276,40 +276,6 @@ const IMPLAUSIBLY_FAST_TICK: Duration = Duration::from_secs(10);
 /// not a config knob — the interval cadence is the tunable backstop.
 const IDLE_TRIGGER_DEBOUNCE: Duration = Duration::from_secs(60);
 
-/// Process-wide count of ticks skipped with [`RoleTickOutcome::NoTokenPool`]
-/// (#4642) — a distinct, independently-attributable tally, deliberately never
-/// folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments (mirrors the named per-reason skip counters
-/// in `sweep_registry.rs`, e.g. `OpenPrDispatchError`/`DispatchBackoffError`).
-static NO_TOKEN_POOL_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far for having no available
-/// token pool (see [`RoleTickOutcome::NoTokenPool`]). Exposed for tests and
-/// future status surfacing; the daemon does not reset this across its
-/// lifetime.
-#[must_use]
-pub fn no_token_pool_skip_count() -> u64 {
-    NO_TOKEN_POOL_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Process-wide count of ticks skipped with
-/// [`RoleTickOutcome::PoolExhausted`] (issue #7607) — a distinct,
-/// independently-attributable tally, deliberately never folded into the
-/// generic [`RoleTickOutcome::Failure`] count a real invocation failure
-/// increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]: a pool present but
-/// fully exhausted (every account bad-marked or `.ranking`-hard-excluded) is
-/// self-healing, not a code/config defect.
-static POOL_EXHAUSTED_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far because the resolved
-/// token pool was present but had zero spawnable accounts (see
-/// [`RoleTickOutcome::PoolExhausted`]). Exposed for tests and future status
-/// surfacing; the daemon does not reset this across its lifetime.
-#[must_use]
-pub fn pool_exhausted_skip_count() -> u64 {
-    POOL_EXHAUSTED_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
 /// Sink for the fleet-wide empty-pool advisory feed (issue #7607): the role
 /// runner calls this once per [`RoleTickOutcome::PoolExhausted`] tick so a
 /// pool discovered exhausted by a *role* trips the same #6614 cross-source
@@ -343,41 +309,6 @@ impl PoolExhaustedObserver for crate::workspace_pool::WorkspacePool {
                 .record_role_tick_pool_exhausted(role);
         }
     }
-}
-
-/// Process-wide count of ticks skipped with
-/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028, follow-up to #5001 AC2/
-/// AC3) — a distinct, independently-attributable tally, deliberately never
-/// folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
-/// this is a permanent config conflict, not a transient failure worth
-/// retrying identically forever.
-static MODEL_RUNTIME_MISMATCH_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far for a provable
-/// model/runtime mismatch (see [`RoleTickOutcome::ModelRuntimeMismatch`]).
-/// Exposed for tests and future status surfacing; the daemon does not reset
-/// this across its lifetime.
-#[must_use]
-pub fn model_runtime_mismatch_skip_count() -> u64 {
-    MODEL_RUNTIME_MISMATCH_SKIP_COUNT.load(Ordering::Relaxed)
-}
-
-/// Process-wide count of ticks skipped with [`RoleTickOutcome::LoadSkipped`]
-/// (issue #6637) — a distinct, independently-attributable tally, deliberately
-/// never folded into the generic [`RoleTickOutcome::Failure`] count a real
-/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
-/// the tick ceiling fired while the host was measurably saturated, which is
-/// evidence against (not for) the invocation itself being broken.
-static LOAD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Total number of role-runner ticks skipped so far because the tick ceiling
-/// was reached under measured host saturation (see
-/// [`RoleTickOutcome::LoadSkipped`]). Exposed for tests and future status
-/// surfacing; the daemon does not reset this across its lifetime.
-#[must_use]
-pub fn load_skipped_count() -> u64 {
-    LOAD_SKIPPED_COUNT.load(Ordering::Relaxed)
 }
 
 /// One standalone support role this module knows how to dispatch: its name
@@ -1208,7 +1139,7 @@ fn terminate_timed_out(
     let tail = clean_and_cap_detail(&tail_of_file(log_path));
     match load_per_core {
         Some(lpc) if lpc.is_finite() && lpc >= ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD => {
-            LOAD_SKIPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+            LOAD_SKIPPED_COUNT.record();
             RoleTickOutcome::LoadSkipped {
                 load_per_core: lpc,
                 detail: tail,
@@ -4040,6 +3971,18 @@ use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
     ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL, UNSET_EFFORT_SOURCE,
+};
+
+// Per-reason skipped-tick tallies, with a race-free per-thread view for
+// tests (#9409) — see `role_runner/skip_counters.rs`.
+mod skip_counters;
+pub use skip_counters::{
+    load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
+    pool_exhausted_skip_count,
+};
+use skip_counters::{
+    LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
+    POOL_EXHAUSTED_SKIP_COUNT,
 };
 
 #[cfg(test)]

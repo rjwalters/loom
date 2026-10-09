@@ -312,7 +312,9 @@ pub fn ingest_launch_log(
     // launch on the same account) may already have bad-marked this
     // `(account, class)` pair. `escalate_bad_for_class` skips the write only
     // when that existing mark lasts at least as long as the one this log
-    // implies, and replaces it otherwise — so a proxy's 60s `rate-limited`
+    // implies, or is an equally strong duplicate written moments earlier
+    // (#9847 — the proxy marks seconds to minutes before this pass runs), and
+    // replaces it otherwise — so a proxy's 60s `rate-limited`
     // from a bare 429 is upgraded to the 6h `exhausted` the log proves, and a
     // weaker late signal never shortens a stronger mark. The check and the
     // write share one lock, on the proxied and unproxied paths alike.

@@ -168,7 +168,7 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body() {
     let claude = crate::tokens_pool::select::spawnable_pool_state(workspace.path());
     assert_eq!((claude.total, claude.usable), (1, 0));
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())
         .with_gh_bin(ws.gh.clone())
@@ -176,7 +176,11 @@ fn codex_pinned_role_spawns_despite_an_exhausted_claude_pool_body() {
 
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert!(marker.exists(), "the codex-pinned tick must actually reach the spawn");
-    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    assert_eq!(
+        POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(),
+        before,
+        "no pool skip may be counted"
+    );
     assert!(
         !judge_log(workspace.path()).contains("SKIPPED BEFORE SPAWN"),
         "no pre-spawn skip marker may be written: {}",
@@ -202,7 +206,7 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body() {
     let _env = EnvGuard::new(profiles.path());
     let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
 
     let RoleTickOutcome::PoolExhausted {
@@ -217,7 +221,7 @@ fn codex_pinned_role_with_no_codex_account_skips_naming_the_codex_pool_body() {
     // be reported as the self-healing hold.
     assert_eq!(hold, PoolHold::Unprovisioned);
     assert!(!marker.exists(), "the doomed spawn must never run");
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let log = judge_log(workspace.path());
     assert!(
@@ -413,7 +417,7 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     assert_eq!(file, PoolStateFile::Inventory);
     assert_eq!((state.enabled, state.spawnable), (0, 0), "{state:?}");
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = judge_runner(workspace.path()).invoke("judge", "/loom:judge");
 
     let RoleTickOutcome::PoolExhausted { pool, hold, .. } = outcome else {
@@ -422,7 +426,7 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     assert_eq!(pool, CredentialPool::CodexAccounts, "#8444: gated_pool stays the codex pool");
     assert_eq!(hold, PoolHold::Unreadable(PoolStateFile::Inventory));
     assert!(!marker.exists(), "a launch the selector would kill must never run");
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let log = judge_log(workspace.path());
     assert!(
@@ -682,7 +686,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
         &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let outcome = ScriptRoleInvocationRunner::new(root.to_path_buf()).invoke("curator", "/x");
     let RoleTickOutcome::PoolExhausted {
         total,
@@ -696,7 +700,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
     assert_eq!((total, pool), (1, CredentialPool::ClaudeTokens));
     assert_eq!(hold, PoolHold::SelfHealing, "#8444: the Claude arm is only ever self-healing");
     assert!(!marker.exists());
-    assert_eq!(pool_exhausted_skip_count(), before + 1);
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 
     let pool_dir = crate::tokens_pool::select::spawnable_pool_state(root).dir;
     let expected_reason = format!(
@@ -947,7 +951,7 @@ fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skippin
         true,
     );
 
-    let before = pool_exhausted_skip_count();
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())
         .with_gh_bin(ws.gh.clone())
@@ -959,7 +963,11 @@ fn an_exhausted_claude_pool_falls_through_via_role_preference_instead_of_skippin
         "codex",
         "the tick must fall through to codex and actually spawn"
     );
-    assert_eq!(pool_exhausted_skip_count(), before, "no pool skip may be counted");
+    assert_eq!(
+        POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(),
+        before,
+        "no pool skip may be counted"
+    );
     let log = judge_log(workspace.path());
     assert!(!log.contains("SKIPPED BEFORE SPAWN"), "{log}");
 }
