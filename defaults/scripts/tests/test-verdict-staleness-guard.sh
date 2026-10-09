@@ -1472,7 +1472,7 @@ unmarked 271 "@-" "loom:pr" "loom:ci-failure"
 run_guard 271 --clear --anchor
 assert_eq "12/1/0" "$RC/$(get_field "$OUT" CLEARED)/$(get_field "$OUT" ANCHORED)" "(u2) --clear --anchor -> exit 12, CLEARED=1, ANCHORED=0"
 assert_contains "$WRITES" "--add-label loom:review-requested --remove-label loom:pr --remove-label loom:changes-requested --remove-label loom:ci-failure" "(u2) re-queued, loom:pr and its per-tree companion removed"
-assert_contains "$COMMENTS_POSTED" "<!-- loom:unanchored-approval head=$SHA_B -->" "(u2) comment carries the unanchored-approval marker"
+assert_contains "$COMMENTS_POSTED" "<!-- loom:verdict-stale unanchored head=$SHA_B -->" "(u2) comment carries the unanchored-approval marker"
 assert_contains "$COMMENTS_POSTED" "carried no verdict-sha marker; re-review required" "(u2) comment says why"
 assert_not_contains "$COMMENTS_POSTED" "loom:verdict-sha" "(u2) no verdict-sha marker is posted (that would anchor it)"
 assert_contains "$DAEMON" "forge disable-auto-merge 271" "(u2) an armed auto-merge is stood down too"
@@ -1486,7 +1486,7 @@ assert_contains "$OUT" "clear suppressed" "(u3) REASON names the hold"
 
 # (u4) Idempotent: the explanation already on the PR is not posted twice; the
 #      label flip is retried.
-unmarked 273 "<!-- loom:unanchored-approval head=$SHA_B -->" "loom:pr"
+unmarked 273 "<!-- loom:verdict-stale unanchored head=$SHA_B -->" "loom:pr"
 run_guard 273 --clear
 assert_eq "12" "$RC" "(u4) Retry -> exit 12"
 assert_contains "$WRITES" "--remove-label loom:pr" "(u4) the label flip is retried"

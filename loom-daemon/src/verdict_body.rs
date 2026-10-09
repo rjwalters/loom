@@ -58,9 +58,9 @@ impl Reject {
             Self::Dash => "the body is exactly '-': '--body -' posts a literal dash, it does \
                            not read stdin (use --body-file -)"
                 .to_string(),
-            Self::AtToken => "the body is a lone '@' token ('@-' or '@path'): like 'gh pr \
-                              comment --body @path', that posts the literal string and reads \
-                              nothing (use --body-file <path> or --body-file -)"
+            Self::AtToken => "the body is a lone '@' token ('@-' or '@path'): '--body @path' \
+                              posts the literal string and reads nothing (use --body-file \
+                              <path> or --body-file -)"
                 .to_string(),
             Self::TooShort(n) => format!(
                 "the body has {n} non-whitespace characters, fewer than {MIN_NON_WS_CHARS}: \

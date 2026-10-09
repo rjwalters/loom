@@ -57,7 +57,7 @@
 #                     with MARKER_SHA empty, and --clear re-queues it exactly like
 #                     step 5 (hold labels still suppress the write), commenting
 #                     "approval carried no verdict-sha marker; re-review
-#                     required" under `<!-- loom:unanchored-approval head=… -->`.
+#                     required" under `<!-- loom:verdict-stale unanchored head=… -->`.
 #                     When markers could NOT be authenticated it stays
 #                     UNVERIFIABLE (exit 11, --anchor suppressed) — and exit 11
 #                     on a `loom:pr` is never merged (champion-pr-merge.md).
@@ -518,7 +518,7 @@ MARKER_SHA="$(tail -n 1 <<<"$MARKER_LINES" | cut -f2)"
 # never merged, and re-queued by --clear (step 5). post-verdict.sh marks every
 # verdict, so a markerless loom:pr bypassed it. Only when markers could be read
 # (TRUSTED=1); a markerless loom:changes-requested still takes 3/3b below.
-[[ -z "$MARKER_SHA" && "$VERDICT_TOKEN" == approved && "$TRUSTED" -eq 1 ]] && UNANCHORED_MARKER="<!-- loom:unanchored-approval head=$HEAD_SHA -->" STALE_TITLE="Approval re-queued — it carried no verdict-sha marker; re-review required"
+[[ -z "$MARKER_SHA" && "$VERDICT_TOKEN" == approved && "$TRUSTED" -eq 1 ]] && UNANCHORED_MARKER="<!-- loom:verdict-stale unanchored head=$HEAD_SHA -->" STALE_TITLE="Approval re-queued — it carried no verdict-sha marker; re-review required"
 if [[ -z "$MARKER_SHA" && -z "${UNANCHORED_MARKER:-}" ]]; then
   UNVERIFIABLE_REASON="verdict label $VERDICT_LABEL present but no <!-- loom:verdict-sha ... verdict=$VERDICT_TOKEN --> marker from a trusted author found — failing safe, verdict kept"
   [[ "$TRUSTED" -eq 1 ]] || UNVERIFIABLE_REASON="$UNVERIFIABLE_REASON; markers could not be authenticated (loom-daemon forge trusted-comments unavailable), so every marker was treated as absent and --anchor is suppressed (#9548)"

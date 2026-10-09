@@ -31,8 +31,13 @@ use super::{decide_anchor, gh_call, AnchorAction, VerdictKind, VerdictPr, Verdic
 
 /// The marker the re-queue comment carries. The shell guard
 /// (`verdict-staleness-guard.sh --clear`) writes the same one for the same
-/// transition, so the two paths' comments read alike.
-pub(super) const UNANCHORED_APPROVAL_MARKER_PREFIX: &str = "<!-- loom:unanchored-approval head=";
+/// transition, so the two paths' comments read alike. It is a variant of the
+/// existing `loom:verdict-stale` marker (the re-queue revokes a verdict too)
+/// rather than a new `loom:` token, which the ratcheted non-label marker list
+/// in `tests/label_literal_guard.rs` would refuse. The `unanchored` word keeps
+/// it distinct from the `from=… to=…` form that dedup matches.
+pub(super) const UNANCHORED_APPROVAL_MARKER_PREFIX: &str =
+    "<!-- loom:verdict-stale unanchored head=";
 
 /// Handle one `Keep(Unverifiable)` verdict. `anchoring` is the
 /// `LOOM_VERDICT_ANCHOR` switch, read once per pass by the caller. It gates
