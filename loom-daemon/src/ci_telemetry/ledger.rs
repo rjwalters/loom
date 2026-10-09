@@ -364,6 +364,15 @@ pub struct Ledger {
     log_wanted: BTreeMap<(String, u64), LogTarget>,
     /// `(repo, job_id)` → (cumulative attempts, last named reason).
     log_failures: BTreeMap<(String, u64), (u32, String)>,
+    /// True while the file holds `unit` lines (envelope payloads) a
+    /// compaction would fold into key-only `seen` lines: set when such a
+    /// line is loaded or committed, cleared by a compaction (#11160).
+    has_uncompacted_units: bool,
+    /// On-disk size right after the last compaction this process ran
+    /// (`0` = none yet). Compaction keeps every `seen` key, so a ledger
+    /// that stays above the threshold afterwards must not be rewritten
+    /// again until it has really grown.
+    compacted_size: u64,
 }
 
 impl Ledger {
@@ -372,7 +381,13 @@ impl Ledger {
     /// unparseable complete line is skipped with a warning.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         let (lines, repaired) = read_repaired_lines(&path)?;
-        Ok(Self::from_lines(path, lines, repaired))
+        let mut ledger = Self::from_lines(path, lines, repaired);
+        // A loaded file with no `unit` lines is already compact: skip the
+        // redundant rewrite a fresh process would otherwise do (#11160).
+        if !ledger.has_uncompacted_units {
+            ledger.compacted_size = std::fs::metadata(&ledger.path).map_or(0, |m| m.len());
+        }
+        Ok(ledger)
     }
 
     /// Load the ledger read-only (for `status`): never repairs, so it is
@@ -393,6 +408,8 @@ impl Ledger {
             repaired,
             log_wanted: BTreeMap::new(),
             log_failures: BTreeMap::new(),
+            has_uncompacted_units: false,
+            compacted_size: 0,
         };
         let mut units: Vec<PendingUnit> = Vec::new();
         for line in lines {
@@ -406,6 +423,7 @@ impl Ledger {
                     logs,
                     envelopes,
                 }) => {
+                    ledger.has_uncompacted_units = true;
                     let key = UnitKey {
                         repo,
                         run_id,
@@ -546,6 +564,7 @@ impl Ledger {
         }
         append_durable(&self.path, buffer.as_bytes())?;
         self.next_seq = seq;
+        self.has_uncompacted_units = true;
         for unit in &committed {
             self.seen.insert(unit.key.clone());
         }
@@ -735,9 +754,19 @@ impl Ledger {
     /// `threshold` bytes and nothing is pending. Atomic: temp file + fsync +
     /// rename + directory fsync, so a crash leaves either the old or the new
     /// ledger, never a mix.
+    ///
+    /// A no-op (`Ok(false)`) unless a rewrite could actually shrink the
+    /// file (#11160): compaction keeps every `seen` key, so a compacted
+    /// ledger can itself exceed `threshold`; it is rewritten again only
+    /// when `unit` lines were committed since, or the file has grown past
+    /// twice its last compacted size.
     pub fn compact_if_large(&mut self, threshold: u64) -> io::Result<bool> {
         let size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         if size <= threshold || !self.pending.is_empty() {
+            return Ok(false);
+        }
+        let grown = self.compacted_size > 0 && size > self.compacted_size.saturating_mul(2);
+        if self.compacted_size > 0 && !self.has_uncompacted_units && !grown {
             return Ok(false);
         }
         let mut buffer = String::new();
@@ -814,6 +843,8 @@ impl Ledger {
                 let _ = dir.sync_all();
             }
         }
+        self.has_uncompacted_units = false;
+        self.compacted_size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         Ok(true)
     }
 }
