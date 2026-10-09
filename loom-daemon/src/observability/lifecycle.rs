@@ -474,6 +474,123 @@ pub fn checkpoint_completed(
     );
 }
 
+/// `loom.timing_source` of a phase attempt the sweep orchestrator opened at
+/// the instant it dispatched that phase's subagent (#9935).
+pub const CHECKPOINT_BEGIN_SOURCE: &str = "checkpoint_begin_observed";
+
+/// Sweep phases whose checkpoints are journalled as role attempts.
+const CHECKPOINT_ROLES: [&str; 5] = ["curator", "builder", "judge", "doctor", "merge"];
+
+/// `sweep-checkpoint begin` (#9935): open a sweep phase's Phase + RoleAttempt
+/// at its dispatch instant. Telemetry only — the checkpoint file, which drives
+/// resume, is never touched. The phase's later `*-done`/`judge-rejected`
+/// write completes this attempt through [`checkpoint_observation`]'s
+/// owned-start branch, so the span measures dispatch → completion instead of
+/// the zero-duration synthetic span a completion with no observed start gets.
+pub fn checkpoint_begun(
+    root: &Path,
+    issue: u32,
+    role: &str,
+    attempt: Option<u32>,
+    model: Option<&str>,
+) {
+    let primary = checkpoint_workspace(root);
+    let root = primary.as_path();
+    if !super::tracing::enabled(root) {
+        return;
+    }
+    let Some((journal, root_context, launcher)) = inherited_context(root) else {
+        return;
+    };
+    checkpoint_begin_observation(
+        &journal,
+        &root_context,
+        Some(launcher),
+        issue,
+        role,
+        attempt,
+        model,
+    );
+}
+
+fn checkpoint_begin_observation(
+    journal: &Journal,
+    root: &TraceContext,
+    launcher: Option<TraceContext>,
+    issue: u32,
+    role: &str,
+    attempt: Option<u32>,
+    model: Option<&str>,
+) -> Option<ActiveSpan> {
+    if !CHECKPOINT_ROLES.contains(&role) {
+        return None;
+    }
+    let issue_text = issue.to_string();
+    // `loom.attempt.worked` is deliberately absent: it is decided at the close.
+    let mut metadata = attributes(&[
+        ("loom.phase", role),
+        ("loom.role", role),
+        ("loom.issue", &issue_text),
+        ("loom.timing_source", CHECKPOINT_BEGIN_SOURCE),
+    ]);
+    if let Some(attempt) = attempt {
+        metadata.insert("loom.attempt".into(), attempt.to_string());
+    }
+    if let Some(model) = model {
+        metadata.insert("loom.configured_model".into(), model.into());
+    }
+    let at = Utc::now();
+    let active = journal.active().ok()?;
+    metadata.extend(execution_scope(&active, root));
+    // A re-dispatch of the same phase (the earlier subagent died without its
+    // checkpoint) supersedes the begun attempt it replaces. Its outcome is
+    // unknown, so `worked` stays absent.
+    for stale in active.iter().filter(|a| {
+        a.record.name == SpanName::RoleAttempt
+            && a.record
+                .attributes
+                .get("loom.role")
+                .is_some_and(|v| v == role)
+            && a.record.attributes.get("loom.issue") == Some(&issue_text)
+            && a.record
+                .attributes
+                .get("loom.timing_source")
+                .is_some_and(|v| v == CHECKPOINT_BEGIN_SOURCE)
+    }) {
+        let close = attributes(&[("loom.result", "superseded")]);
+        let _ = journal.finish(stale, at, SpanStatus::Unset, close.clone());
+        if let Some(phase) = active.iter().find(|p| {
+            p.record.name == SpanName::Phase
+                && stale.record.parent_span_id.as_ref() == Some(&p.record.context.span_id)
+        }) {
+            let _ = journal.finish(phase, at, SpanStatus::Unset, close);
+        }
+    }
+    let links = launcher
+        .map(|context| crate::telemetry::trace::SpanLink { context })
+        .into_iter()
+        .collect();
+    let phase = journal
+        .start_linked(
+            child_context(root, SpanName::Phase, at, &metadata),
+            Some(root),
+            SpanName::Phase,
+            at,
+            metadata.clone(),
+            links,
+        )
+        .ok()?;
+    journal
+        .start(
+            child_context(&phase.record.context, SpanName::RoleAttempt, at, &metadata),
+            Some(&phase.record.context),
+            SpanName::RoleAttempt,
+            at,
+            metadata,
+        )
+        .ok()
+}
+
 pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
     let Some(candidate) =
         std::env::var_os("LOOM_WORKSPACE").and_then(|p| PathBuf::from(p).canonicalize().ok())
@@ -536,7 +653,7 @@ fn checkpoint_observation(
     let role = phase
         .strip_suffix("-done")
         .or_else(|| phase.strip_suffix("-rejected"));
-    let Some(role @ ("curator" | "builder" | "judge" | "doctor" | "merge")) = role else {
+    let Some(role) = role.filter(|role| CHECKPOINT_ROLES.contains(role)) else {
         return;
     };
     let result = if phase == "judge-rejected" {
@@ -588,6 +705,9 @@ fn checkpoint_observation(
     }
     // An explicitly launched role already has an authoritative start. Its
     // checkpoint completes that same attempt; never fabricate a second one.
+    // A begun attempt names its issue (#9935): parallel builders in one wave
+    // share this journal, so one issue's checkpoint must not close another's.
+    let issue_text = issue.to_string();
     if let Ok(active) = active {
         if let Some(attempt_span) = active
             .iter()
@@ -597,6 +717,10 @@ fn checkpoint_observation(
                         .attributes
                         .get("loom.role")
                         .is_some_and(|v| v == role)
+                    && a.record
+                        .attributes
+                        .get("loom.issue")
+                        .is_none_or(|v| *v == issue_text)
             })
             .max_by_key(|a| a.record.started_at)
         {

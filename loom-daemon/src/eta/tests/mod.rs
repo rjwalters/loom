@@ -74,6 +74,7 @@ mod shadow;
 mod shadow_fleet;
 mod shadow_gate;
 mod shadow_lifecycle;
+mod shadow_non_refusal;
 mod shadow_stats;
 mod stage_forecast;
 mod stall;

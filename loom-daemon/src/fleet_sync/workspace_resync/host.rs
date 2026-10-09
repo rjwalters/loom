@@ -413,6 +413,39 @@ fn run_live(
     pass
 }
 
+/// Judge the checkout copy of each of `roots` again, right after the checkout
+/// step fast-forwarded them, and fold the verdicts into the dispatch holds
+/// (#11052). So a checkout-copy hold clears in the pass the checkout caught
+/// up, not one interval later. Blocking (it may diff the payload against a
+/// checkout that is still too old). Skipped, and left to the next pass, while
+/// the pass memory is taken.
+pub(in crate::fleet_sync) fn rejudge_checkouts(
+    roots: &[PathBuf],
+    enforcer: Option<&dyn Enforcer>,
+    bus: Option<&EventBus>,
+) {
+    let (Some(enforcer), Some(running), false) =
+        (enforcer, Version::parse(env!("CARGO_PKG_VERSION")), roots.is_empty())
+    else {
+        return;
+    };
+    let Ok(mut guard) = memory().try_lock() else {
+        return;
+    };
+    let payload = LazyPayload::new(Payload::embedded);
+    let judge = super::hold::Judge {
+        running,
+        floor: crate::fleet_sync::loom_min_version()
+            .as_deref()
+            .and_then(Version::parse),
+        payload: &payload,
+    };
+    let gate = super::host_gate(&HostGateInputs::live(enforcer));
+    let seen = super::hold::checkout_observations(&judge, roots, gate, &mut guard, &github_nwo);
+    drop(guard);
+    crate::workspace_hold::rejudge(&seen, running, Utc::now(), bus);
+}
+
 // ============================================================================
 // Single flight
 // ============================================================================
@@ -536,7 +569,12 @@ pub(in crate::fleet_sync) fn spawn_pass<T: Send + 'static>(
         (inputs.clone(), enforcer.clone(), bus.clone(), bus.clone());
     let pass = move || run_live(&owned, mode, enforcer.as_deref(), pass_bus.as_deref());
     let finish = move |ended: Ended<(WorkspacePass, Option<T>)>| match ended {
-        Ended::Done((found, after)) => {
+        Ended::Done((mut found, after)) => {
+            // The checkout step may have re-judged a hold since the pass
+            // (#11052): show the holds as they stand now.
+            for workspace in &mut found.workspaces {
+                workspace.hold = crate::workspace_hold::hold_for(&workspace.root);
+            }
             if let Ok(mut latest) = latest_cell().lock() {
                 latest.clone_from(&found);
             }

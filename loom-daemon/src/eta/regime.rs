@@ -15,8 +15,9 @@
 //!   scored outcomes, standardised against the older baseline residuals, and
 //!   yields a `drifted` flag. [`Drift::inflation`] exposes a plain widening
 //!   factor; [`drift_about`] centres the check on a calibrator's own shift.
-//!   Both are consumed by `land-2026-10-06-swift-tern`'s conformal layer
-//!   ([`super::conformal_ipcw::calibrate_drift_aware`], #10524).
+//!   Both are consumed by the drift-aware IPCW calibrator
+//!   ([`super::conformal_ipcw::calibrate_drift_aware`], #10524; the
+//!   `land-2026-10-06-swift-tern` shadow that served it is retired, #10949).
 //!
 //! - [`serve`] applies [`adjust`]'s factor to a served estimate only while
 //!   [`drift`] has tripped for its stage ([`gated`]), and records it as the

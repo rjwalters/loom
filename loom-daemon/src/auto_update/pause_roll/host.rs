@@ -120,8 +120,13 @@ pub trait PauseHost: Send + Sync {
     fn hold(&self, c: &Candidate, held: bool, run: &str);
     /// Whether `c`'s agent process is still running.
     fn is_alive(&self, c: &Candidate) -> bool;
-    /// Stop `c`'s whole process tree.
+    /// Stop `c`'s whole process tree. Called from H4's stop pool, several at
+    /// once (#11051).
     fn teardown(&self, c: &Candidate) -> TeardownReport;
+    /// `SIGKILL` `c`'s process group without running any external command:
+    /// what H4 does to a tree whose teardown has not returned by the stop
+    /// bound (#11051). `true` when the signal was sent.
+    fn force_kill(&self, c: &Candidate) -> bool;
     /// Refresh `c`'s lease record once.
     ///
     /// # Errors
@@ -400,6 +405,10 @@ impl PauseHost for DaemonPauseHost {
 
     fn teardown(&self, c: &Candidate) -> TeardownReport {
         teardown::teardown_tree(&c.tree_spec(), teardown::TERM_GRACE)
+    }
+
+    fn force_kill(&self, c: &Candidate) -> bool {
+        teardown::force_kill_group(&c.tree_spec())
     }
 
     fn refresh_lease(&self, c: &Candidate, timeout: Duration) -> Result<(), String> {

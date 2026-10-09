@@ -31,6 +31,12 @@
 //! 6. Refresh each paused item's lease once, so the next start has a full TTL.
 //! 7. At the budget deadline, tear down whatever is still `stopping` and
 //!    requeue it (`pause-budget-missed`).
+//!
+//! Every teardown in steps 4, 5 and 7 runs on a pool ([`stops`], #11051):
+//! H4 hands a tree over and goes on polling, so the stops run in parallel and
+//! the budget-missed items are all stopped at the deadline, not one after
+//! another. The stop phase ends at the budget plus a fixed margin
+//! ([`PauseRollTuning::stop_bound`]) whatever the teardowns do.
 //! 8. Do the requeue forge writes. A write that does not finish in the forge
 //!    window stays `planned` in the manifest for the next start.
 //! 9. Rewrite the manifest with `phase = paused`. **Never** remove a paused
@@ -96,6 +102,7 @@ use crate::sweep_registry::roll_requeue::RollRequeueNotice;
 pub(crate) mod host;
 pub(crate) mod ledger;
 mod refusal;
+mod stops;
 mod supervise;
 pub(crate) mod teardown;
 
@@ -125,9 +132,14 @@ const FORGE_FLOOR: Duration = Duration::from_secs(30);
 /// dispatch is mid-spawn for at most `TOKEN_NAME_CAPTURE_TIMEOUT` (5 s).
 const PENDING_SETTLE_MAX: Duration = Duration::from_secs(30);
 /// What H4 may take beyond its settle window, pause budget and forge floor
-/// before its supervisor ends it: the teardowns that run after the budget
-/// deadline (a few seconds each) and scheduling slack.
+/// before its supervisor ends it: the stop margin and scheduling slack.
 const H4_DEADLINE_MARGIN: Duration = Duration::from_secs(90);
+/// How many trees H4 stops at once (#11051).
+pub const DEFAULT_STOP_CONCURRENCY: usize = 8;
+/// How long past the pause budget H4 waits for the teardowns still running
+/// before it kills their process groups (#11051). A teardown normally takes a
+/// few seconds: the scope's 5 s grace, then the tree kill's 3 s grace.
+pub const DEFAULT_STOP_MARGIN: Duration = Duration::from_secs(15);
 
 /// What a roll is rolling to, and who asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +190,10 @@ pub struct PauseRollTuning {
     pub forge_floor: Duration,
     /// H4's allowance beyond settle + budget + forge floor ([`Self::h4_deadline`]).
     pub deadline_margin: Duration,
+    /// How many trees H4 stops at once.
+    pub stop_concurrency: usize,
+    /// How long past the budget the stop phase may run ([`Self::stop_bound`]).
+    pub stop_margin: Duration,
 }
 
 impl PauseRollTuning {
@@ -194,6 +210,8 @@ impl PauseRollTuning {
             pending_settle: PENDING_SETTLE_MAX,
             forge_floor: FORGE_FLOOR,
             deadline_margin: H4_DEADLINE_MARGIN,
+            stop_concurrency: DEFAULT_STOP_CONCURRENCY,
+            stop_margin: DEFAULT_STOP_MARGIN,
         }
     }
 
@@ -540,50 +558,6 @@ impl Run<'_> {
         H4Outcome::StoodDown { promoted }
     }
 
-    /// Stop `idx`'s tree. `false` when the pause no longer owns the drain (so
-    /// nothing was stopped).
-    fn stop(&mut self, idx: usize) -> bool {
-        if !self.drain.pause_commit_stop(self.gen()) {
-            return false;
-        }
-        let report = self.host.teardown(&self.work[idx].cand);
-        let w = &mut self.work[idx];
-        w.teardown_ms = Some(report.elapsed_ms);
-        w.item.stopped_at = Some(Utc::now());
-        let id = w.item.id.clone();
-        if !report.survivors.is_empty() {
-            log::error!(
-                "pause_roll: {id}: {} process(es) survived the teardown: {:?}",
-                report.survivors.len(),
-                report.survivors
-            );
-        }
-        let detail = format!(
-            "{} pid(s){}{}",
-            report.pids.len(),
-            if report.scope_stopped {
-                ", scope stopped"
-            } else {
-                ""
-            },
-            report
-                .scope_note
-                .as_deref()
-                .map_or_else(String::new, |n| format!(", {n}; used the process tree"))
-        );
-        // The teardown signalled less than the recorded tree (a recycled pid,
-        // or no process table): say so in the log and in the manifest.
-        let detail = match &report.reach_note {
-            Some(note) => {
-                log::error!("pause_roll: {id}: {note}");
-                format!("{detail}; {note}")
-            }
-            None => detail,
-        };
-        self.event(Some(&id), "stopped", Some(detail));
-        true
-    }
-
     fn notice(&self, idx: usize) -> RollRequeueNotice {
         let w = &self.work[idx];
         RollRequeueNotice {
@@ -680,6 +654,7 @@ pub(crate) fn run_h4_with(
                 staged_at: Some(plan.staged_at),
                 pause_started_at,
                 pause_completed_at: None,
+                pause_duration_ms: None,
                 pause_budget_secs: Some(tuning.pause_budget.as_secs()),
                 min_resumable_age_secs: Some(tuning.min_resumable_age_secs),
                 max_age_secs: tuning.lease_ttl.as_secs(),
@@ -792,12 +767,14 @@ pub(crate) fn run_h4_with(
     enter!(4);
     let stop_started = Instant::now();
     let deadline = stop_started + tuning.pause_budget;
+    let stop_bound = stop_started + tuning.stop_bound();
+    let mut pool = stops::StopPool::new(Arc::clone(&run.host), tuning.stop_concurrency);
     let mut stopped_any = false;
     for idx in 0..run.work.len() {
         if run.work[idx].item.disposition != Disposition::Requeue {
             continue;
         }
-        if !run.stop(idx) {
+        if !run.start_stop(&mut pool, idx) {
             if stopped_any {
                 break; // unreachable: a committed pause cannot lose the drain
             }
@@ -864,7 +841,7 @@ pub(crate) fn run_h4_with(
                 PauseOwnership::Gone => return run.stand_down(false),
             }
         }
-        let mut progressed = false;
+        let mut progressed = run.collect_stops(&mut pool);
         for idx in pending {
             let dir = run.work[idx].cand.pause_dir.clone();
             // Only a record that answers THIS request: one left by an earlier
@@ -873,7 +850,7 @@ pub(crate) fn run_h4_with(
                 .as_deref()
                 .and_then(|d| roll_pause::read_safe_point_for(d, &request));
             if let Some(sp) = safe_point {
-                if !run.stop(idx) {
+                if !run.start_stop(&mut pool, idx) {
                     let promoted =
                         drain.pause_ownership(plan.generation) == PauseOwnership::Promoted;
                     return run.stand_down(promoted);
@@ -899,7 +876,7 @@ pub(crate) fn run_h4_with(
                 }
                 let id = w.item.id.clone();
                 run.event(Some(&id), "safe_point", Some(format!("parked {}", sp.parked_tool)));
-                run.report(idx, "none");
+                // Its `daemon.roll.item` goes out when its teardown finishes.
             } else if !run.host.is_alive(&run.work[idx].cand) {
                 // It ended by itself before a safe point: not paused. The
                 // existing crash path decides between resume and requeue at
@@ -927,9 +904,11 @@ pub(crate) fn run_h4_with(
     }
 
     // ---- Step 7: the budget deadline -----------------------------------------
+    // Every item still `stopping` is handed to the pool now, together, and the
+    // stop phase then waits for the teardowns until the stop bound.
     drain.pause_enter_step(plan.generation, 7);
     for idx in stopping(&run) {
-        if !run.stop(idx) {
+        if !run.start_stop(&mut pool, idx) {
             // Only reachable with nothing stopped yet.
             let promoted = drain.pause_ownership(plan.generation) == PauseOwnership::Promoted;
             return run.stand_down(promoted);
@@ -941,7 +920,19 @@ pub(crate) fn run_h4_with(
         let id = w.item.id.clone();
         run.event(Some(&id), "budget_missed", None);
     }
-    let stop_secs = stop_started.elapsed().as_secs();
+    run.finish_stops(&mut pool, stop_bound);
+    drop(pool);
+    let stop_elapsed = stop_started.elapsed();
+    let stop_secs = stop_elapsed.as_secs();
+    let stop_ms = u64::try_from(stop_elapsed.as_millis()).unwrap_or(u64::MAX);
+    run.manifest.roll.pause_duration_ms = Some(stop_ms);
+    log::warn!(
+        "pause_roll: every agent is stopped: the pause took {stop_ms}ms (budget {}s, bound {}s, \
+         {} item(s))",
+        tuning.pause_budget.as_secs(),
+        tuning.stop_bound().as_secs(),
+        run.work.len()
+    );
     drain.pause_update(plan.generation, |p| p.stop_secs = Some(stop_secs));
     run.save_best_effort();
 
@@ -1044,7 +1035,7 @@ pub(crate) fn run_h4_with(
     }
     run.manifest.phase = Phase::Paused;
     run.manifest.roll.pause_completed_at = Some(Utc::now());
-    run.event(None, "pause_completed", None);
+    run.event(None, "pause_completed", Some(format!("stop phase {stop_ms}ms")));
     run.save_best_effort();
 
     // ---- Step 10: hand back to the caller, which exits ------------------------
@@ -1062,6 +1053,7 @@ pub(crate) fn run_h4_with(
             "pause_budget_secs": tuning.pause_budget.as_secs(),
             "settle_secs": settle_secs,
             "stop_secs": stop_secs,
+            "stop_ms": stop_ms,
             "total_secs": started.elapsed().as_secs(),
         }),
     );
@@ -1087,3 +1079,8 @@ mod hardening_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "pause_roll/handoff_tests.rs"]
 mod handoff_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "pause_roll/stops_tests.rs"]
+mod stops_tests;

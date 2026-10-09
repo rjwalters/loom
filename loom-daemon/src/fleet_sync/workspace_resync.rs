@@ -21,7 +21,9 @@
 //! waited for.
 //!
 //! W3 and W4 hold new dispatch into the workspace, and W4 makes this host a
-//! roll candidate ([`crate::workspace_hold`], #10719). A repo that is only
+//! roll candidate ([`crate::workspace_hold`], #10719). A W3 repo that is
+//! behind only the floor and whose `requires_daemon` this daemon meets is not
+//! held (#11052); it is still resynced first. A repo that is only
 //! repo-ahead is neither held nor a reason to roll: this host keeps working
 //! it and never resyncs it downward. The one repo-ahead case that is held (and
 //! still no reason to roll) is a resync to a newer release that was
@@ -124,7 +126,9 @@ use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS
 
 use heads::{Asked, HeadAsk, Heads};
 pub use host::{host_gate, HostGateInputs, NotCurrent, ABANDON_AFTER, STUCK_AFTER_TICKS};
-pub(super) use host::{latest, mark_boot, mark_verified, registered_roots, spawn_pass};
+pub(super) use host::{
+    latest, mark_boot, mark_verified, registered_roots, rejudge_checkouts, spawn_pass,
+};
 /// The hand-off to the checkout step, for its tests (#10869).
 #[cfg(test)]
 pub(super) use host::{spawn_with, Ended};

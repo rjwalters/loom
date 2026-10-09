@@ -3,10 +3,10 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::super::log_record_for;
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind, AUTO_UPDATE_LOG_ATTRIBUTE_KEYS,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 fn record() -> AutoUpdateTickRecord {

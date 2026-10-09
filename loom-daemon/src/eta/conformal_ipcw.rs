@@ -1,5 +1,6 @@
 //! IPCW split-conformal calibration over a short, recent window (#10524):
-//! the calibrator behind `land-2026-10-06-quick-tern`.
+//! the calibrator behind the retired `land-2026-10-06-quick-tern` (#10949),
+//! still available offline through [`super::conformal_wrap`].
 //!
 //! # Why a second calibrator
 //!
@@ -59,7 +60,7 @@
 //!
 //! # Drift-aware variant (#10524 slice 3)
 //!
-//! [`calibrate_drift_aware`] (`land-2026-10-06-swift-tern`) adds the #10528
+//! [`calibrate_drift_aware`] (the retired `land-2026-10-06-swift-tern`) adds the #10528
 //! drift check: a drift-shortened half-life ladder. The interval inflation
 //! the check would ask for is recorded but withheld. See its doc.
 //!
@@ -436,8 +437,8 @@ pub fn calibrate(
 }
 
 /// [`calibrate`], made **drift-aware** with the #10528 drift check
-/// ([`regime::drift_about`]); the calibrator behind
-/// `land-2026-10-06-swift-tern`. Pure.
+/// ([`regime::drift_about`]); the calibrator behind the retired
+/// `land-2026-10-06-swift-tern` (#10949). Pure.
 ///
 /// For a stage cell, the residuals `ln(actual / p50)` of `base`'s landings
 /// known before `as_of` are checked by CUSUM against the default fit's

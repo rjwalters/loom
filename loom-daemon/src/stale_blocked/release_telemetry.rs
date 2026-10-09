@@ -40,12 +40,12 @@ use chrono::{DateTime, Utc};
 
 use super::release::{Report, Skip};
 use super::release_items::{Item, ItemVerdict};
-use crate::eta::Provenance;
 use crate::gh_invocation::caller_scope::{self, Scope};
 use crate::telemetry::kinds::pass::{
     BlockerState, GithubSpend, PassMode, PassOutcome, PassSummaryRecord, PassVerdictRecord,
     REPO_UNRESOLVED,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
 /// Seconds between re-emissions of an unchanged verdict (`0` = every pass).

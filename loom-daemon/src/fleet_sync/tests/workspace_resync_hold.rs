@@ -6,7 +6,17 @@ use crate::workspace_hold::{HeldCopy, HoldKind, Holds, Observation, Verdict, ALE
 
 /// A pass by `host`, then what it tells the hold, folded into `holds`.
 fn hold_pass(host: &Host<'_>, floor: Option<&str>, holds: &mut Holds) -> Vec<Observation> {
-    let pass = host.pass_with(Mode::Write, &|| Ok(()), floor);
+    hold_pass_in(host, Mode::Write, floor, holds).1
+}
+
+/// [`hold_pass`] in `mode`, with the pass itself.
+fn hold_pass_in(
+    host: &Host<'_>,
+    mode: Mode,
+    floor: Option<&str>,
+    holds: &mut Holds,
+) -> (WorkspacePass, Vec<Observation>) {
+    let pass = host.pass_with(mode, &|| Ok(()), floor);
     let forge = host.fx.forge.clone();
     let env = Env {
         host: host.name,
@@ -25,7 +35,7 @@ fn hold_pass(host: &Host<'_>, floor: Option<&str>, holds: &mut Holds) -> Vec<Obs
     };
     let seen = observations(&env, &pass, &mut host.memory.borrow_mut());
     holds.step(&seen, v(host.version), host.now.get(), ALERT_AFTER);
-    seen
+    (pass, seen)
 }
 
 fn verdicts(seen: &[Observation]) -> (Verdict, Verdict) {
@@ -89,9 +99,16 @@ fn a_too_old_checkout_is_held_only_while_its_files_differ() {
     assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Clear));
     assert!(holds.holds().is_empty());
 
-    // The checkout's files really are old: held, on the checkout copy.
+    // The checkout's files really are old, but its requires_daemon is met:
+    // behind only the floor, so not held (#11052).
     write(&host.root.join(".loom/scripts/a.sh"), "#!/bin/sh\necho old\n");
     write(&host.root.join(INSTALL_METADATA_PATH), &metadata("0.19.801", Some("0.19.772")));
+    let seen = hold_pass(&host, floor, &mut holds);
+    assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Clear));
+    assert!(holds.holds().is_empty());
+
+    // The same with no requires_daemon on record: held, on the checkout copy.
+    write(&host.root.join(INSTALL_METADATA_PATH), &metadata("0.19.802", None));
     let seen = hold_pass(&host, floor, &mut holds);
     assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Hold(HoldKind::InstallIncompatible)));
     let hold = holds.holds().into_values().next().unwrap();
@@ -221,4 +238,107 @@ fn a_w4_workspace_in_backoff_keeps_its_requirement_demand_and_detail() {
     let hold = holds.holds().into_values().next().unwrap();
     assert!(hold.detail.contains("0.19.890"), "{}", hold.detail);
     assert!(!hold.detail.contains("backoff"), "{}", hold.detail);
+}
+
+// ----------------------------------------------------------------------------
+// #11052: behind but compatible, and the checkout re-judge
+// ----------------------------------------------------------------------------
+
+/// The floor roll: the default branch is one floor behind, its files differ,
+/// and its `requires_daemon` is met. It is W3, so the resync still takes it,
+/// but nothing is held while it waits.
+#[test]
+fn a_compatible_w3_repo_is_not_held_and_is_still_resynced() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+    let (check, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert_eq!(only(&check).state, WState::W3);
+    assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Clear));
+    assert!(holds.holds().is_empty(), "no dispatch hold");
+    assert_eq!(holds.demand(), None);
+    // Still a resync candidate: the next writing pass resyncs it.
+    let before = fx.origin_head();
+    let pass = host.pass_with(Mode::Write, &|| Ok(()), floor);
+    assert_eq!(only(&pass).state, WState::W0);
+    assert_ne!(fx.origin_head(), before, "resynced");
+}
+
+/// The same repo with no `requires_daemon` on record: nothing vouches for
+/// its files, so it is held until the resync lands.
+#[test]
+fn a_w3_repo_whose_requires_daemon_cannot_be_read_is_held() {
+    let fx = Fixture::new(Seed {
+        requires: None,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    let (check, seen) = hold_pass_in(&host, Mode::Check, Some("0.19.850"), &mut holds);
+    assert_eq!(only(&check).state, WState::W3);
+    let held = Verdict::Hold(HoldKind::InstallIncompatible);
+    assert_eq!(verdicts(&seen), (held, held));
+    let hold = holds.holds().into_values().next().unwrap();
+    assert_eq!((hold.kind, hold.copy), (HoldKind::InstallIncompatible, HeldCopy::DefaultBranch));
+    assert!(hold.detail.contains("no requires_daemon"), "{}", hold.detail);
+    assert_eq!(holds.demand(), None);
+}
+
+/// A checkout held for its old files clears in the same pass the checkout
+/// step fast-forwards it: the step's moved roots are judged again at once.
+#[test]
+fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
+    use crate::fleet_sync::checkout_ff;
+    let fx = Fixture::new(Seed {
+        requires: None,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+    // The writing pass resyncs the default branch; this host's checkout is
+    // still the old install, and holds.
+    let (pass, seen) = hold_pass_in(&host, Mode::Write, floor, &mut holds);
+    assert_eq!(only(&pass).state, WState::W0);
+    let held = Verdict::Hold(HoldKind::InstallIncompatible);
+    assert_eq!(verdicts(&seen), (Verdict::Clear, held));
+    let hold = holds.holds().into_values().next().unwrap();
+    assert_eq!(hold.copy, HeldCopy::Checkout);
+
+    // The checkout step of that same pass fast-forwards the checkout.
+    let env = checkout_ff::Env {
+        write: true,
+        held: &|| None,
+        gate_in_flight: &|_| false,
+        hold: &|_| Some(checkout_ff::MoveHold::free()),
+        network: true,
+        backing_off: &|_| false,
+        confirmed: &|_, _| None,
+        breaker_open: &|| false,
+        budget: None,
+        elapsed: &|| Duration::ZERO,
+        clock: &|| host.now.get(),
+    };
+    let roots = [host.root.clone()];
+    let moved = checkout_ff::run(&env, &roots, &mut checkout_ff::Memory::default());
+    assert_eq!(moved.fast_forwarded(), roots, "{:?}", moved.checkouts);
+
+    // And re-judges what it moved, without waiting for the next pass.
+    let judge = super::super::hold::Judge {
+        running: v(host.version),
+        floor: floor.map(v),
+        payload: &host.payload,
+    };
+    let seen = super::super::hold::checkout_observations(
+        &judge,
+        &moved.fast_forwarded(),
+        Ok(()),
+        &mut host.memory.borrow_mut(),
+        &|_| Some(REPO.to_string()),
+    );
+    assert_eq!(verdicts(&seen), (Verdict::Unknown, Verdict::Clear));
+    let events = holds.rejudge(&seen, v(host.version), host.now.get(), ALERT_AFTER);
+    assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["cleared"]);
+    assert!(holds.holds().is_empty(), "cleared in the same pass");
 }

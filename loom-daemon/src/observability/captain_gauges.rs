@@ -73,7 +73,7 @@
 //! | `fleet.captainGauges.standDown` | `false` | on a dispatcher: stop producing a job for the repos a fresh heartbeat covers (env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` overrides) |
 //! | `fleet.captainGauges.maxAgeSecs` | `1800` | a job's `as_of` older than this is stale: the dispatcher falls back to local production |
 //! | `fleet.captainGauges.publishIntervalSecs` | `600` | how often the captain writes the heartbeat |
-//! | `fleet.captainGauges.ref` | `fleet.etaFitRef` | the store branch the heartbeat lives on |
+//! | `fleet.captainGauges.ref` | `eta-fit` (legacy fallback: `fleet.etaFitRef`) | the store branch the heartbeat lives on |
 //! | `fleet.captainGauges.starFacts` | `false` | captain: produce `star-facts`; dispatcher: skip the liveness evaluator for repos it reports star-free |
 //! | `fleet.captainGauges.queueBlocked` | `false` | captain: produce `queue-blocked`; dispatcher: build its snapshot's blocked rows from it |
 //! | `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | the staleness bound for `star-facts` alone (see below) |

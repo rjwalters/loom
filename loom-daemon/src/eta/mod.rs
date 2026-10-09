@@ -164,6 +164,7 @@ pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
 pub mod shadow_lifecycle;
+pub mod shadow_non_refusal;
 pub mod shadow_stats;
 pub mod simulate;
 pub mod stage_forecast;
@@ -430,70 +431,10 @@ impl fmt::Display for NoEstimateReason {
     }
 }
 
-/// Which Loom build computed a record — required on every ETA record
-/// (operator requirement on #9289). Sourced from
-/// [`crate::telemetry::trace::provenance::daemon`], the same source every
-/// span's `loom.daemon.*` attributes come from.
-///
-/// A build whose revision or tree state is `unknown` (a tarball build) still
-/// emits, so no data is lost, but with `complete: false`; accuracy queries
-/// exclude incomplete rows, because a result that cannot be pinned to a
-/// commit cannot be attributed to a heuristic's code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Provenance {
-    /// Loom version (`CARGO_PKG_VERSION`).
-    pub version: String,
-    /// Full 40-hex git SHA, or `unknown` for a tarball build.
-    pub revision: String,
-    /// `clean`, `dirty` or `unknown`.
-    pub tree_state: String,
-    /// `revision` is a full 40-hex SHA and `tree_state` is `clean` or
-    /// `dirty`: the build is pinned. Always [`Provenance::completeness`] of
-    /// the other two fields.
-    pub complete: bool,
-}
-
-/// Whether `revision` is a full 40-hex lowercase git SHA.
-fn is_full_sha(revision: &str) -> bool {
-    revision.len() == 40
-        && revision
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-impl Provenance {
-    /// The running binary.
-    #[must_use]
-    pub fn current() -> Self {
-        let build = crate::telemetry::trace::provenance::daemon();
-        Provenance {
-            version: build.version.to_string(),
-            revision: build.revision.to_string(),
-            tree_state: build.tree_state.to_string(),
-            complete: Self::completeness(build.revision, build.tree_state),
-        }
-    }
-
-    /// Whether a build with `revision` and `tree_state` is fully pinned.
-    #[must_use]
-    pub fn completeness(revision: &str, tree_state: &str) -> bool {
-        is_full_sha(revision) && matches!(tree_state, "clean" | "dirty")
-    }
-
-    /// Whether every field is well formed: a non-empty version, a full
-    /// 40-hex revision or the build system's literal `unknown`, a known tree
-    /// state, and a `complete` flag that matches them. An ETA record whose
-    /// provenance fails this is never emitted. An `unknown` revision or tree
-    /// state is well formed (and emitted), but not [`Self::complete`].
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let revision_ok = self.revision == "unknown" || is_full_sha(&self.revision);
-        !self.version.trim().is_empty()
-            && revision_ok
-            && matches!(self.tree_state.as_str(), "clean" | "dirty" | "unknown")
-            && self.complete == Self::completeness(&self.revision, &self.tree_state)
-    }
-}
+/// Which Loom build computed a record. Moved to the neutral
+/// [`crate::telemetry::provenance`] (#11098, Stage 2) because non-ETA records
+/// embed it too; re-exported here so ETA code keeps its path.
+pub use crate::telemetry::provenance::Provenance;
 
 /// What an estimate is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,19 +714,14 @@ impl Registry {
                 // #10528: twin-otter-b plus the drift-gated regime
                 // adjustment; registered ahead of the other -b wrappers.
                 Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
-                // #10524: wraps twin-otter-b; registered before `-b` so
-                // `-b` stays last but for tandem-wren.
-                Box::new(heuristics::LandQuickTern::new(fit.clone())),
-                // #10524 slice 3: quick-tern made drift-aware (#10528).
-                Box::new(heuristics::LandSwiftTern::new(fit.clone())),
+                // #10524's IPCW wrappers quick-tern and swift-tern (over
+                // `-b`) and bold-lark (over keen-wren) are retired (#10949).
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 // #10508: twin-otter-b's priority-aware successor, also
                 // before `-b`.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
-                // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
-                Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
                 // #10521: keen-wren's friction-aware successor, before
                 // twin-otter-b.
                 Box::new(heuristics::LandLoopKite::new(fit_v3.clone())),

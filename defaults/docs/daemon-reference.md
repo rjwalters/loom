@@ -1771,7 +1771,7 @@ workspace's default branch (never the working tree) and classifies it:
 |---|---|---|
 | `W0` | the installed files equal this daemon's payload | nothing |
 | `W1` | compatible, but the files differ | tries the claim |
-| `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first |
+| `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first. Dispatch is held only if nothing vouches for the files (see "Dispatch holds") |
 | `W4` | the installed files need a newer daemon, or record a version that cannot be ordered | reports only |
 | `repo-ahead` | installed by a newer daemon, and still compatible with this one | reports only |
 | `skipped` | the Loom source repo, a non-GitHub origin, or no Loom on the default branch | nothing |
@@ -1814,8 +1814,10 @@ cannot work with this daemon. The checkout copy is
 | a contract field that cannot be ordered, such as `0.20.0-rc1`, and `requires_daemon` above the running daemon | held | `daemon-too-old` | yes, for `requires_daemon` |
 | a contract field that cannot be ordered, and `requires_daemon` at or below the running daemon | held | `daemon-too-old` | no |
 | a contract field that cannot be ordered, and no `requires_daemon` that parses | held | `daemon-too-old` | yes, for any release after this one; WARN once per workspace |
-| too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
+| too old for this daemon or the floor, **and** the files differ from the payload (`W3`), **and** no `requires_daemon` that parses | held | `install-incompatible` | no |
+| below this daemon's `supports_installed`, and the files differ (`W3`) | held | `install-incompatible` | no |
 | a resync to a release above this daemon was interrupted there (`resync_pending`) | held | `install-incompatible` | no |
+| behind only the floor, `requires_daemon` at or below the running daemon (`W3`) | not held; still resynced first | | no |
 | too old by its stamp, files equal to the payload (`W0`) | not held | | no |
 | installed by a newer daemon, `requires_daemon` at or below this one (`repo-ahead`) | not held | | no |
 | compatible, or a resync owed (no `requires_daemon`) | not held | | no |
@@ -1828,6 +1830,16 @@ cannot work with this daemon. The checkout copy is
   forward one release at a time. While the newer files' `requires_daemon` is
   at or below this daemon, this host keeps working the repo, never resyncs it
   downward, and reports `repo-ahead`.
+- **Behind, but compatible, is not held (#11052).** A floor roll leaves
+  every repo one release behind the new floor at once, and the fleet resyncs
+  a few repos a minute. Holding each until its resync landed left hosts idle
+  for 15-20 minutes. A `W3` copy whose `requires_daemon` is at or below the
+  running daemon, and whose `loom_version` is at or above the daemon's
+  `supports_installed`, is behind only the floor: its own files say they work
+  here. It is not held. It is still `W3`, so the pass still resyncs it, and
+  first. A `W3` copy with no `requires_daemon` that parses is held, because
+  nothing on record says its files work with this daemon. So is one below
+  `supports_installed`, which is a break the daemon declared.
 - **A version that cannot be ordered rolls only for a need.** Such a copy
   is held, because it may be newer than this daemon. Whether it also asks
   for a roll is decided by its `requires_daemon` alone when that parses:
@@ -1868,10 +1880,19 @@ cannot work with this daemon. The checkout copy is
   it is what clears a `W3` hold. A terminal a person opens over IPC is not
   dispatch. Until the first workspace pass after a restart has finished there
   are no holds at all (see "After a restart" below).
-- **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
-  first pass after a resync has landed on the default branch and this host's
-  checkout is current. `W4` clears once this host runs a daemon at or above
-  `requires_daemon`. A workspace that leaves the registry is dropped.
+- **How it clears.** The holds are rebuilt on every pass. A `W3` hold on the
+  default branch clears on the first pass after a resync has landed there. A
+  `W3` hold on the checkout copy is judged again right after the checkout
+  step fast-forwards that checkout, so it clears in the same pass the
+  checkout caught up, not one interval later. `W4` clears once this host runs
+  a daemon at or above `requires_daemon`. A workspace that leaves the
+  registry is dropped.
+- **How long a roll held dispatch.** When the last `install-incompatible`
+  hold since the daemon started clears, the daemon logs one INFO line: how
+  many workspaces were held and how long after the first workspace pass the
+  last one cleared. It waits until a pass has judged every workspace's
+  default branch, so one the pass budget has not reached yet cannot end it
+  early. Once per process; a roll that held nothing logs nothing.
 - **A hold that stands for 30 minutes alerts** at ERROR, and again every 30
   minutes for as long as it stands. Every set, clear and standing alert is
   published on the event-bus topic `fleet_sync.workspace_hold`. The
@@ -8054,7 +8075,7 @@ are unchanged on every host. Code: `observability/captain_gauges.rs`.
 | `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
 | `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
 | `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
-| `fleet.captainGauges.ref` | `fleet.etaFitRef` (`eta-fit`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
+| `fleet.captainGauges.ref` | `eta-fit` (legacy fallback: `fleet.etaFitRef`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
 | `fleet.captainGauges.starFacts` | `false` | Part 2 job **`star-facts`**. Captain (with `enabled`): list every operator label per repo and publish how many open starred issues each has. Dispatcher (with `standDown`): skip the starred-issue liveness evaluator for a repo the captain freshly reports as having none |
 | `fleet.captainGauges.queueBlocked` | `false` | Part 2 job **`queue-blocked`**. Captain: list `loom:blocked` per repo and publish number, creation time and label names. Dispatcher: build its `queue.snapshot` blocked rows from that instead of listing |
 | `fleet.captainGauges.starFactsMaxAgeSecs` | `900` | The staleness bound for `star-facts` alone, in place of `maxAgeSecs`: two collector passes plus slack. A believed "no star here" is a skipped liveness pass, so this bounds how long a new star can go unevaluated when the captain stops reporting. While it produces `star-facts`, the captain republishes at least every `starFactsMaxAgeSecs − 600` s (300 s at the default) so its facts stay inside the bound |

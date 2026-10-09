@@ -417,10 +417,21 @@ pub(in crate::fleet_sync) fn after_resync(
 ) {
     let (write, gate, bus) = (inputs.auto_apply, registered_gate(), bus.clone());
     let enforcer = enforcer.clone();
+    let hold_bus = bus.clone();
     let step = move |began: Instant, resync: &WorkspacePass| {
         let roots = crate::fleet_sync::workspace_resync::registered_roots;
         let held = || write_hold_now(enforcer.as_deref());
-        timer_step(memory(), &roots, write, &held, resync, began, gate.as_ref())
+        let stepped = timer_step(memory(), &roots, write, &held, resync, began, gate.as_ref());
+        // #11052: a checkout this step moved is judged again now, so its
+        // hold clears in this pass rather than the next.
+        if let Stepped::Ran(pass) = &stepped {
+            crate::fleet_sync::workspace_resync::rejudge_checkouts(
+                &pass.fast_forwarded(),
+                enforcer.as_deref(),
+                hold_bus.as_deref(),
+            );
+        }
+        stepped
     };
     (step, move |stepped| publish(stepped, bus.as_deref()))
 }

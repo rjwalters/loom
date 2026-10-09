@@ -623,17 +623,10 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("recalibrate.rs", include_str!("../recalibrate.rs")),
     // #10489: the conformal calibration the even-lark heuristic calls.
     ("conformal.rs", include_str!("../conformal.rs")),
-    // #10524: the IPCW conformal calibration the quick-tern heuristic calls.
+    // #10524: the IPCW conformal calibration the retired quick-tern /
+    // swift-tern / bold-lark called (#10949; offline via `conformal_wrap`),
+    // and the drift check brisk-petrel still calls.
     ("conformal_ipcw.rs", include_str!("../conformal_ipcw.rs")),
-    (
-        "heuristics/land_quick_tern.rs",
-        include_str!("../heuristics/land_quick_tern.rs"),
-    ),
-    // #10524 slice 3: the drift-aware variant and the drift check it calls.
-    (
-        "heuristics/land_swift_tern.rs",
-        include_str!("../heuristics/land_swift_tern.rs"),
-    ),
     ("regime.rs", include_str!("../regime.rs")),
     // #10523: the hold/sequence simulator and the heuristic that routes to it.
     ("hazard_sim.rs", include_str!("../hazard_sim.rs")),
@@ -655,7 +648,6 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ),
     // #10508: twin-otter-b's priority-aware successor, and the v2 transform
     // the evaluation core calls for it.
-    ("heuristics/land_bold_lark.rs", include_str!("../heuristics/land_bold_lark.rs")),
     ("heuristics/land_keen_wren.rs", include_str!("../heuristics/land_keen_wren.rs")),
     ("heuristics/land_loop_kite.rs", include_str!("../heuristics/land_loop_kite.rs")),
     ("fit/features_v2.rs", include_str!("../fit/features_v2.rs")),

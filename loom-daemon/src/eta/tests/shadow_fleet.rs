@@ -17,6 +17,9 @@ const AMBER_HERON: &str = "land-2026-10-04-amber-heron";
 const FRESH_TIDE: &str = "land-2026-10-04-fresh-tide";
 const TWIN_OTTER: &str = "land-2026-10-04-twin-otter";
 const CALM_PLOVER: &str = "land-2026-10-06-calm-plover";
+const QUICK_TERN: &str = "land-2026-10-06-quick-tern";
+const SWIFT_TERN: &str = "land-2026-10-06-swift-tern";
+const BOLD_LARK: &str = "land-2026-10-06-bold-lark";
 
 /// Every built-in id and its declared tier. A new registration fails this
 /// test until its tier is written down here: the tier is a decision, not a
@@ -30,11 +33,8 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-v4", Tier::Candidate),
     ("little-v0", Tier::Baseline),
     ("land-2026-10-06-brisk-petrel", Tier::Candidate),
-    ("land-2026-10-06-quick-tern", Tier::Candidate),
-    ("land-2026-10-06-swift-tern", Tier::Candidate),
     ("land-2026-10-06-held-heron", Tier::Candidate),
     ("land-2026-10-06-keen-wren", Tier::Candidate),
-    ("land-2026-10-06-bold-lark", Tier::Candidate),
     ("land-2026-10-06-loop-kite", Tier::Candidate),
     ("land-2026-10-04-twin-otter-b", Tier::Candidate),
     ("land-2026-10-06-tandem-wren", Tier::Candidate),
@@ -57,7 +57,16 @@ fn retired_ids_are_unregistered_and_answer_retired() {
     let registry = Registry::builtin();
     assert_eq!(
         RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        [LAND_V3, AMBER_HERON, FRESH_TIDE, TWIN_OTTER, CALM_PLOVER]
+        [
+            LAND_V3,
+            AMBER_HERON,
+            FRESH_TIDE,
+            TWIN_OTTER,
+            CALM_PLOVER,
+            QUICK_TERN,
+            SWIFT_TERN,
+            BOLD_LARK
+        ]
     );
     for (id, kind) in RETIRED {
         assert!(!registry.registers(*kind, id), "{id} is retired, so not registered");
@@ -138,7 +147,7 @@ fn the_default_budget_is_current_plus_the_alternates_cap() {
 fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     let registry = Registry::builtin();
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(|h| h.id()).collect();
-    assert_eq!(land.len(), 14);
+    assert_eq!(land.len(), 11);
     // Exactly at the land count: fine.
     assert!(registry.check_budget(land.len()).is_ok());
 
@@ -148,13 +157,13 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
         BudgetExceeded {
             kind: Kind::Land,
             max_active: 3,
-            registered: 14,
+            registered: 11,
             excess: land[3..].to_vec(),
         }
     );
     let message = over.to_string();
     assert!(message.contains("maxActive is 3"), "{message}");
-    assert!(message.contains("14 land heuristics"), "{message}");
+    assert!(message.contains("11 land heuristics"), "{message}");
     for id in &land[3..] {
         assert!(message.contains(id), "{message} names {id}");
     }
@@ -163,7 +172,7 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     }
 
     // One over: only the last registration is the excess.
-    let one = registry.check_budget(13).unwrap_err();
+    let one = registry.check_budget(land.len() - 1).unwrap_err();
     assert_eq!(one.excess, ["land-2026-10-06-tandem-wren"]);
 }
 
