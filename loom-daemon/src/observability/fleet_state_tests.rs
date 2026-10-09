@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use super::{
-    build_view, decide, held_stage, needs_anchor, planner_config_hash, pr_stage, Emitted,
-    FleetInput, FleetStateSink, FleetView, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing,
-    Source,
+    build_view, decide, held_stage, hold_kind, needs_anchor, planner_config_hash, pr_stage,
+    Emitted, FleetInput, FleetStateSink, FleetView, HeldSweep, ListedPr, ReadyItem, ReadyQueue,
+    RepoListing, Source,
 };
 use crate::observability::queue::QueueSink;
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
-    FleetStateRow, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
+    split_into_chunks, FleetCapacity, FleetHoldKind, FleetSlot, FleetSlots, FleetStage,
+    FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps, ANCHOR_INTERVAL_SECS,
+    CHUNK_BYTES,
 };
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
@@ -91,6 +92,8 @@ fn input() -> FleetInput {
                 occupancy: Some(1),
             }),
         }),
+        capacity: None,
+        main_ci: BTreeMap::new(),
     }
 }
 
@@ -714,4 +717,177 @@ fn no_ready_row_outlives_its_absence_from_the_observed_set() {
             .get(OTHER)
             .is_some_and(|rows| rows.contains_key(&7)));
     }
+}
+
+fn labels(list: &[&str]) -> Vec<String> {
+    list.iter().map(|l| (*l).to_string()).collect()
+}
+
+/// An input whose only PR (21, issue 20) carries `pr_labels`.
+fn with_pr_labels(pr_labels: &[&str]) -> FleetInput {
+    let mut i = input();
+    i.held.clear();
+    i.listings[0].prs = vec![ListedPr {
+        number: 21,
+        labels: labels(pr_labels),
+        issue: Some(20),
+    }];
+    i
+}
+
+#[test]
+fn hold_kind_wire_strings_are_pinned() {
+    let wire: Vec<&str> = FleetHoldKind::ALL.iter().map(|k| k.as_str()).collect();
+    assert_eq!(
+        wire,
+        [
+            "operator",
+            "operator_only",
+            "operator_decision",
+            "merge_risk",
+            "critical_file",
+            "ac_hold",
+            "blocked",
+            "other"
+        ]
+    );
+    for kind in FleetHoldKind::ALL {
+        assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+    }
+}
+
+#[test]
+fn hold_kind_comes_from_the_labels() {
+    assert_eq!(hold_kind(&labels(&["loom:pr"])), None);
+    assert_eq!(hold_kind(&labels(&["loom:pr", "loom:operator"])), Some(FleetHoldKind::Operator));
+    assert_eq!(
+        hold_kind(&labels(&["loom:operator", "loom:operator-only"])),
+        Some(FleetHoldKind::OperatorOnly)
+    );
+    assert_eq!(
+        hold_kind(&labels(&["loom:operator-decision", "loom:operator"])),
+        Some(FleetHoldKind::OperatorDecision)
+    );
+    assert_eq!(hold_kind(&labels(&["loom:blocked"])), Some(FleetHoldKind::Blocked));
+}
+
+#[test]
+fn hold_appears_then_releases_across_two_deltas() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(5);
+    let t2 = t0() + Duration::minutes(10);
+    let t3 = t0() + Duration::minutes(15);
+    let v0 = build_view(&with_pr_labels(&["loom:pr"]), None, t0());
+    let anchor = decide(&v0, &stamps, None, t0()).unwrap();
+    assert!(anchor.anchor);
+    let e0 = emitted(v0.clone(), t0(), t0());
+
+    // The hold appears.
+    let v1 = build_view(&with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v0), t1);
+    let d1 = decide(&v1, &stamps, Some(&e0), t1).unwrap();
+    let row = &entry(&d1, REPO).rows[0];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Operator));
+    assert_eq!(row.held_since, Some(t1));
+    assert!(!row.held_since_lower_bound);
+    assert_eq!(row.hold_released_at, None);
+    let e1 = emitted(v1.clone(), t1, t0());
+
+    // Still held: no change, no delta (and the start is kept).
+    let v2 = build_view(&with_pr_labels(&["loom:pr", "loom:operator"]), Some(&v1), t2);
+    assert_eq!(v2.repos[REPO].rows[&20].held_since, Some(t1));
+    assert!(decide(&v2, &stamps, Some(&e1), t2).is_none_or(|d| d.repos.is_empty()));
+
+    // It clears: the clearing delta says when, and the hold fields are gone.
+    let v3 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v2), t3);
+    let d3 = decide(&v3, &stamps, Some(&emitted(v2, t2, t0())), t3).unwrap();
+    let row = &entry(&d3, REPO).rows[0];
+    assert_eq!(row.hold_kind, None);
+    assert_eq!(row.held_since, None);
+    assert_eq!(row.hold_released_at, Some(t3));
+    // The stamp is kept, so the next pass is quiet.
+    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(5));
+    assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
+    let e3 = emitted(v3, t3, t0());
+    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(5)).is_none());
+}
+
+#[test]
+fn a_hold_first_seen_without_a_prior_listing_is_a_lower_bound() {
+    let v = build_view(&with_pr_labels(&["loom:pr", "loom:blocked"]), None, t0());
+    let row = &v.repos[REPO].rows[&20];
+    assert_eq!(row.hold_kind, Some(FleetHoldKind::Blocked));
+    assert!(row.held_since_lower_bound);
+}
+
+fn capacity(live: u32) -> FleetCapacity {
+    FleetCapacity {
+        live_workers: live,
+        accounts_usable: Some(3),
+        accounts_exhausted: Some(1),
+        host_breaker: Some("closed".to_string()),
+        rate_limit_breaker: Some("closed".to_string()),
+        admission_brake_held: Some(false),
+    }
+}
+
+#[test]
+fn capacity_change_produces_delta() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(5);
+    let mut i = input();
+    i.capacity = Some(capacity(2));
+    let v0 = build_view(&i, None, t0());
+    let e0 = emitted(v0.clone(), t0(), t0());
+    assert!(decide(&v0, &stamps, None, t0()).unwrap().capacity == Some(capacity(2)));
+
+    // Otherwise unchanged, capacity unchanged: nothing to send.
+    let v1 = build_view(&i, Some(&v0), t1);
+    assert!(decide(&v1, &stamps, Some(&e0), t1).is_none());
+
+    // Only `live_workers` changed: a delta carrying the capacity.
+    i.capacity = Some(capacity(3));
+    let v2 = build_view(&i, Some(&v0), t1);
+    let delta = decide(&v2, &stamps, Some(&e0), t1).unwrap();
+    assert!(!delta.anchor);
+    assert!(delta.repos.is_empty());
+    assert_eq!(delta.capacity, Some(capacity(3)));
+}
+
+#[test]
+fn main_ci_rides_each_repo_entry_and_a_change_is_a_delta() {
+    let stamps = stamps();
+    let t1 = t0() + Duration::minutes(5);
+    let mut i = input();
+    i.main_ci.insert(REPO.to_string(), MainCi::Green);
+    let v0 = build_view(&i, None, t0());
+    let anchor = decide(&v0, &stamps, None, t0()).unwrap();
+    assert_eq!(entry(&anchor, REPO).main_ci, Some(MainCi::Green));
+    assert_eq!(entry(&anchor, OTHER).main_ci, None);
+    let e0 = emitted(v0.clone(), t0(), t0());
+    i.main_ci.insert(REPO.to_string(), MainCi::Red);
+    let v1 = build_view(&i, Some(&v0), t1);
+    let delta = decide(&v1, &stamps, Some(&e0), t1).unwrap();
+    assert_eq!(delta.repos.len(), 1);
+    assert_eq!(delta.repos[0].main_ci, Some(MainCi::Red));
+}
+
+#[test]
+fn fleet_state_v1_old_record_decodes() {
+    let old = serde_json::json!({
+        "schema": "fleet-state/v1",
+        "as_of": "2026-10-04T12:00:00Z",
+        "anchor": true,
+        "anchor_as_of": "2026-10-04T12:00:00Z",
+        "repos": [{"repo": "a/b", "rows": [{
+            "issue": 1, "stage": "review_wait", "entered_at": "2026-10-04T11:00:00Z"
+        }]}]
+    });
+    let record: FleetStateRecord = serde_json::from_value(old).unwrap();
+    assert_eq!(record.capacity, None);
+    assert_eq!(record.repos[0].main_ci, None);
+    let row = &record.repos[0].rows[0];
+    assert_eq!((row.hold_kind, row.held_since, row.hold_released_at), (None, None, None));
+    // And the new fields stay off the wire when unset.
+    let text = serde_json::to_string(&record).unwrap();
+    assert!(!text.contains("hold_") && !text.contains("capacity") && !text.contains("main_ci"));
 }
