@@ -587,7 +587,7 @@ enabled. Only complete lines are read.
 
 > **Memory attribution (#11114).** A dated Linux investigation of daemon memory
 > with CI telemetry off/on and a streamed export is in
-> [`docs/notes/ci-telemetry-memory-attribution-11114.md`](../../docs/notes/ci-telemetry-memory-attribution-11114.md).
+> [`docs/notes/ci-telemetry-memory-attribution-11114.md`](https://github.com/rjwalters/loom/blob/main/docs/notes/ci-telemetry-memory-attribution-11114.md).
 
 ### Journal rotation (#11045)
 
