@@ -319,10 +319,16 @@ stage outside the table is `unmapped`. `no_pr`, `no_forge_record` and
 
 **Disagreement.** Each covered host's **own** rows are compared; nothing is
 merged or elected. A disagreement is a run of consecutive sample instants at
-which the same `(host, repo, issue, host stage, forge stage)` disagreed; its
-duration is the run's instants times `--step-sec`. Only a host whose chain is
-`complete` at an instant has rows there, so an instant where the host is not
-covered ends the run: time while a host is not reporting never counts, and an
+which the same host disagreed with the forge about the same item `(host, repo,
+issue, PR)` (a PR retarget starts a new run); its duration is the run's
+instants times `--step-sec`. The stages are reported, not keyed on: a run goes
+on while the forge or the host changes stage and the two still disagree, so a
+stale host whose item moves on (`merge_wait`, then `doctor`, ...) is one long
+run, not several short ones. Each run reports the latest host/forge stage pair
+and every forge stage seen. An instant that agrees or is not comparable ends
+the run. Only a host whose chain is `complete` at an instant has rows there,
+so an instant where the host is not covered ends the run too: time while a
+host is not reporting never counts, and an
 uncovered host is reported `unknown`, never as disagreeing. The comparison
 runs one way: every row a covered host reports is checked, but a forge item a
 host does not report is not flagged (a host sees only its own repos and its
@@ -336,7 +342,7 @@ received chunks differ from `chunk_count` are counted per host
 | Exit | Meaning |
 |---|---|
 | 0 | every covered host agrees with the forge within the threshold |
-| 1 | a covered host disagreed for longer; each such run is printed `FAIL` with the host, item, both stages and the duration |
+| 1 | a covered host disagreed for longer; each such run is printed `FAIL` with the host, item, the latest stage pair (plus the forge stages seen, when it changed) and the duration |
 | 2 | the store or the `--from-file` export could not be read |
 
 **The report.** Per host (query 7): instants sampled and covered,

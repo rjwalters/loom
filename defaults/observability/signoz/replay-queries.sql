@@ -330,9 +330,14 @@ LIMIT 1 BY attributes_string['loom.fact_id'];
 -- Only a host whose chain is `complete` at an instant has rows there, so an
 -- uncovered host never disagrees: query 7 reports it `unknown`. A
 -- disagreement's duration is the run of consecutive sample instants at which
--- the same (host, item, host stage, forge stage) disagreed, times `step`; an
--- instant where the host is not covered ends the run (time while a host is not
--- reporting never counts). The check fails on a run longer than `threshold`.
+-- the same host disagreed with the forge about the same item (repo, issue and
+-- PR; a PR retarget starts a new run), times `step`. The stages are data, not
+-- part of the key: a run continues while the forge or the host changes stage
+-- and the two still disagree (a stale host whose forge item moves on is one
+-- long run, not several short ones), and it reports the latest stage pair and
+-- every forge stage seen. An instant that agrees, is not comparable, or where
+-- the host is not covered ends the run (time while a host is not reporting
+-- never counts). The check fails on a run longer than `threshold`.
 -- The comparison runs one way: it checks every row a covered host reports. A
 -- forge item a host does not report is not flagged, because a host sees only
 -- its own repos and its own sweeps, and a PR that links no issue is census-only.
@@ -429,7 +434,10 @@ compared AS (                   -- per instant, host and row: agree, disagree, o
         ON e.t = f.t AND e.repo_key = f.repo AND e.target = f.target AND e.number = f.number
 ),
 runs AS (                       -- each disagreement: a run of consecutive covered instants
-    SELECT emitter, repo, issue, pr, host_stage, forge_stage,
+    SELECT emitter, repo, issue, pr,              -- the run's key: the host's item only
+           argMax(hs, t)                          AS host_stage,   -- the latest pair, as data
+           argMax(fs, t)                          AS forge_stage,
+           arraySort(groupUniqArray(fs))          AS forge_stages, -- every forge stage in the run
            count() * {step:UInt32}                AS disagree_sec,
            min(t)                                 AS first_at,
            max(t)                                 AS last_at,
@@ -437,14 +445,13 @@ runs AS (                       -- each disagreement: a run of consecutive cover
            max(forge_since)                       AS forge_since,
            disagree_sec > {threshold:UInt32}      AS over_threshold
     FROM (
-        SELECT *,
+        SELECT *, host_stage AS hs, forge_stage AS fs,
                intDiv(dateDiff('second', t, {t:DateTime64(3)}), greatest({step:UInt32}, 1))
-                 + row_number() OVER (PARTITION BY emitter, repo, issue, pr, host_stage, forge_stage
-                                      ORDER BY t) AS island
+                 + row_number() OVER (PARTITION BY emitter, repo, issue, pr ORDER BY t) AS island
         FROM compared
         WHERE verdict = 'disagree'
     )
-    GROUP BY emitter, repo, issue, pr, host_stage, forge_stage, island
+    GROUP BY emitter, repo, issue, pr, island
 ),
 hosts AS (                      -- every host seen in the last day before the first instant
     SELECT DISTINCT resources_string['host.name'] AS emitter
@@ -476,7 +483,7 @@ incomplete AS (                 -- records whose received chunks != chunk_count,
 -- 6. Disagreements (`telemetry-replay --check`): one row per run, longest
 --    first. A row with `over_threshold` fails the check. Prepend the replay
 --    prefix.
-SELECT emitter, repo, issue, pr, host_stage, forge_stage, disagree_sec,
+SELECT emitter, repo, issue, pr, host_stage, forge_stage, forge_stages, disagree_sec,
        first_at, last_at, host_entered_at, forge_since, over_threshold
 FROM runs
 ORDER BY over_threshold DESC, disagree_sec DESC, emitter, repo, issue, first_at;

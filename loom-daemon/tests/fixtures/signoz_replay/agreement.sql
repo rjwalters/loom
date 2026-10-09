@@ -25,6 +25,13 @@
 --   h-stuck   covered, repo rjwalters/other. 5 review_wait PR 500; the forge
 --             moves PR 500 to loom:pr at 12:19 and the host never follows.
 --             Disagrees 12:20-13:00: 9 instants, 2700 s, over the threshold.
+--   h-drift   covered, repo rjwalters/drift. 4 review_wait PR 400 throughout;
+--             the forge moves PR 400 to loom:pr at 12:24 (merge_wait), then to
+--             loom:changes-requested at 12:34 (doctor), then back to
+--             loom:review-requested at 12:44. Disagrees 12:25-12:40 about
+--             one item while the forge changes stage partway: each stage
+--             alone is 2 instants (600 s, not over the threshold), the one
+--             run is 4 instants, 1200 s, over it.
 --   h-gap     the same stale row as h-stuck (rjwalters/loom 5, PR 500, same
 --             forge move), but every chain is broken (a lost delta after each
 --             anchor). Never covered: unknown, never a disagreement.
@@ -70,6 +77,11 @@ FROM values('h String, id String, k String, c String, m Map(String, Float64), b 
      '{"schema":"fleet-state/v1","as_of":"2026-10-04T11:00:00Z","anchor":true,"anchor_as_of":"2026-10-04T11:00:00Z","repos":[{"repo":"rjwalters/other","rows":[{"issue":5,"stage":"review_wait","entered_at":"2026-10-04T10:00:00Z","pr":500}]}]}'),
     ('h-stuck', 'st-a2', 'fleet.state', '2026-10-04 12:00:10', map(),
      '{"schema":"fleet-state/v1","as_of":"2026-10-04T12:00:00Z","anchor":true,"anchor_as_of":"2026-10-04T12:00:00Z","repos":[{"repo":"rjwalters/other","rows":[{"issue":5,"stage":"review_wait","entered_at":"2026-10-04T10:00:00Z","pr":500}]}]}'),
+    -- h-drift
+    ('h-drift', 'dr-a1', 'fleet.state', '2026-10-04 11:00:10', map(),
+     '{"schema":"fleet-state/v1","as_of":"2026-10-04T11:00:00Z","anchor":true,"anchor_as_of":"2026-10-04T11:00:00Z","repos":[{"repo":"rjwalters/drift","rows":[{"issue":4,"stage":"review_wait","entered_at":"2026-10-04T10:00:00Z","pr":400}]}]}'),
+    ('h-drift', 'dr-a2', 'fleet.state', '2026-10-04 12:00:10', map(),
+     '{"schema":"fleet-state/v1","as_of":"2026-10-04T12:00:00Z","anchor":true,"anchor_as_of":"2026-10-04T12:00:00Z","repos":[{"repo":"rjwalters/drift","rows":[{"issue":4,"stage":"review_wait","entered_at":"2026-10-04T10:00:00Z","pr":400}]}]}'),
     -- h-gap (the 11:05 and 11:59 deltas are lost)
     ('h-gap', 'gp-a1', 'fleet.state', '2026-10-04 11:00:10', map(),
      '{"schema":"fleet-state/v1","as_of":"2026-10-04T11:00:00Z","anchor":true,"anchor_as_of":"2026-10-04T11:00:00Z","repos":[{"repo":"rjwalters/loom","rows":[{"issue":5,"stage":"review_wait","entered_at":"2026-10-04T10:00:00Z","pr":500}]}]}'),
@@ -122,6 +134,14 @@ FROM values('repo String, target String, number UInt32, action String, label Str
     ('rjwalters/loom', 'pr',    500, 'labeled',   'loom:review-requested',  '2026-10-04T10:00:00.000Z'),
     ('rjwalters/loom', 'pr',    500, 'unlabeled', 'loom:review-requested',  '2026-10-04T12:19:00.000Z'),
     ('rjwalters/loom', 'pr',    500, 'labeled',   'loom:pr',                '2026-10-04T12:19:00.000Z'),
+    -- h-drift's PR 400: merge_wait at 12:24, doctor at 12:34, review_wait at 12:44
+    ('rjwalters/drift', 'pr',   400, 'labeled',   'loom:review-requested',  '2026-10-04T10:00:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'unlabeled', 'loom:review-requested',  '2026-10-04T12:24:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'labeled',   'loom:pr',                '2026-10-04T12:24:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'unlabeled', 'loom:pr',                '2026-10-04T12:34:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'labeled',   'loom:changes-requested', '2026-10-04T12:34:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'unlabeled', 'loom:changes-requested', '2026-10-04T12:44:00.000Z'),
+    ('rjwalters/drift', 'pr',   400, 'labeled',   'loom:review-requested',  '2026-10-04T12:44:00.000Z'),
     -- h-chunk's item, closed long before
     ('rjwalters/loom', 'issue', 6,   'labeled',   'loom:issue',             '2026-10-04T10:00:00.000Z'),
     ('rjwalters/loom', 'issue', 6,   'closed',    '',                       '2026-10-04T10:30:00.000Z')

@@ -169,7 +169,9 @@ fn telemetry_replay_check_fails_on_the_covered_host_past_the_threshold_only() {
         .failures()
         .map(|d| (d.emitter.as_str(), d.issue, d.disagree_sec))
         .collect();
-    assert_eq!(failures, [("h-stuck", 5, 2700)]);
+    // h-drift's one disagreement spans two forge stages (600 s each): one
+    // 1200 s run, over the threshold.
+    assert_eq!(failures, [("h-stuck", 5, 2700), ("h-drift", 4, 1200)]);
     // The unit tests' recorded export is this run, not a hand-written copy.
     assert_eq!(c, check::assemble_export(&params, CHECK_EXPORT).unwrap());
 }
@@ -184,6 +186,6 @@ fn telemetry_replay_check_agrees_when_only_uncovered_or_short_disagreements_rema
     let gap = c.hosts.iter().find(|h| h.emitter == "h-gap").unwrap();
     assert_eq!(gap.coverage, "unknown");
     assert!(c.disagreements.iter().all(|d| d.emitter == "h-lag"));
-    // --threshold raises the bar: 2700 s no longer fails at 3000 s.
+    // --threshold raises the bar: neither 2700 s nor 1200 s fails at 3000 s.
     assert_eq!(run_check(&check_params("", 3000)).exit_code(), EXIT_AGREE);
 }

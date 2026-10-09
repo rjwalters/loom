@@ -104,10 +104,15 @@ pub struct Disagreement {
     pub repo: String,
     pub issue: u64,
     pub pr: u64,
-    /// The stage the host's own view names.
+    /// The stage the host's own view names at the run's last instant. A run
+    /// is keyed on the host's item, not on a stage pair: it continues while
+    /// either side changes stage and the two still disagree.
     pub host_stage: String,
-    /// The stage the forge's labels name (`none`, `closed`, or a stage).
+    /// The stage the forge's labels name (`none`, `closed`, or a stage) at the
+    /// run's last instant.
     pub forge_stage: String,
+    /// Every forge stage seen during the run, sorted.
+    pub forge_stages: Vec<String>,
     /// Consecutive covered instants disagreeing, times the step.
     pub disagree_sec: u64,
     pub first_at: String,
@@ -192,6 +197,7 @@ fn disagreement(row: &Value) -> Result<Disagreement, String> {
         pr: uint(row, "pr")?,
         host_stage: text(row, "host_stage")?,
         forge_stage: text(row, "forge_stage")?,
+        forge_stages: strings(row, "forge_stages")?,
         disagree_sec: uint(row, "disagree_sec")?,
         first_at: text(row, "first_at")?,
         last_at: text(row, "last_at")?,
@@ -353,9 +359,14 @@ pub fn render(check: &Check) -> String {
         } else {
             format!("#{}", d.pr)
         };
+        let seen = if d.forge_stages.len() > 1 {
+            format!(" (forge seen {})", d.forge_stages.join(","))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "  {mark} {} {}#{} pr={pr} host={} forge={} for {}s ({} .. {}, forge since {})",
+            "  {mark} {} {}#{} pr={pr} host={} forge={}{seen} for {}s ({} .. {}, forge since {})",
             d.emitter,
             d.repo,
             d.issue,

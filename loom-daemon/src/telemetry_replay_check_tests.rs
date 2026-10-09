@@ -120,7 +120,7 @@ fn telemetry_replay_check_a_covered_host_disagreeing_past_the_threshold_exits_1(
     let c = check(EXPORT);
     assert_eq!(c.exit_code(), EXIT_DISAGREE);
     let failures: Vec<_> = c.failures().collect();
-    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert_eq!(failures.len(), 2, "{failures:#?}");
     let d = failures[0];
     assert_eq!(
         (d.emitter.as_str(), d.repo.as_str(), d.issue, d.pr),
@@ -137,8 +137,38 @@ fn telemetry_replay_check_a_covered_host_disagreeing_past_the_threshold_exits_1(
         ),
         "{text}"
     );
-    assert!(text.contains("DISAGREE: 1 disagreement(s)"), "{text}");
-    assert!(text.contains("hosts: 6 (3 covered, 0 partial, 3 unknown)"), "{text}");
+    assert!(text.contains("DISAGREE: 2 disagreement(s)"), "{text}");
+    assert!(text.contains("hosts: 7 (4 covered, 0 partial, 3 unknown)"), "{text}");
+}
+
+#[test]
+fn telemetry_replay_check_one_disagreement_across_forge_stage_changes_is_one_run() {
+    // h-drift holds review_wait for PR 400 while the forge moves it to
+    // merge_wait (2 instants) and then doctor (2 instants). Each stage alone
+    // is 600 s, not over the threshold; the one run about the item is 1200 s.
+    let c = check(&only(&["h-drift"]));
+    assert_eq!(c.exit_code(), EXIT_DISAGREE);
+    assert_eq!(c.disagreements.len(), 1, "{:#?}", c.disagreements);
+    let d = &c.disagreements[0];
+    assert_eq!((d.repo.as_str(), d.issue, d.pr), ("rjwalters/drift", 4, 400));
+    assert_eq!((d.host_stage.as_str(), d.forge_stage.as_str()), ("review_wait", "doctor"));
+    assert_eq!(d.forge_stages, ["doctor", "merge_wait"]);
+    assert_eq!((d.disagree_sec, d.over_threshold), (1200, true));
+    assert_eq!(
+        (d.first_at.as_str(), d.last_at.as_str()),
+        ("2026-10-04 12:25:00.000", "2026-10-04 12:40:00.000")
+    );
+    let h = host(&c, "h-drift");
+    assert_eq!((h.longest_disagreement_sec, h.disagreements_over_threshold), (1200, 1));
+    assert_eq!((h.agreeing, h.disagreeing), (9, 4));
+    let text = render(&c);
+    assert!(
+        text.contains(
+            "FAIL h-drift rjwalters/drift#4 pr=#400 host=review_wait forge=doctor \
+             (forge seen doctor,merge_wait) for 1200s"
+        ),
+        "{text}"
+    );
 }
 
 #[test]

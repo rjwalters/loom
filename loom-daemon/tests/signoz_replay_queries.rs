@@ -301,9 +301,10 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
 
     // emitter, coverage, covered/13, compared, agreeing, disagreeing,
     // not_comparable, longest, over threshold, incomplete anchors.
-    let expected: [ReportRow; 6] = [
+    let expected: [ReportRow; 7] = [
         ("h-agree", "covered", 13, 52, 52, 0, 26, 0, 0, 0),
         ("h-chunk", "unknown", 0, 0, 0, 0, 0, 0, 0, 2),
+        ("h-drift", "covered", 13, 13, 9, 4, 0, 1200, 1, 0),
         ("h-gap", "unknown", 0, 0, 0, 0, 0, 0, 0, 0),
         ("h-lag", "covered", 13, 13, 12, 1, 0, 300, 0, 0),
         ("h-silent", "unknown", 0, 0, 0, 0, 0, 0, 0, 0),
@@ -331,8 +332,10 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
     assert_eq!(states("h-chunk"), serde_json::json!(["incomplete_anchor"]));
     assert_eq!(states("h-silent"), serde_json::json!(["no_anchor"]));
 
-    // Query 6: the stuck covered host fails; the short lag does not; the
-    // uncovered host holding the same stale row is absent.
+    // Query 6: the stuck covered host fails; the host whose item the forge
+    // moved through two stages mid-disagreement is one run and fails; the
+    // short lag does not; the uncovered host holding the same stale row is
+    // absent.
     let got: Vec<_> = runs
         .iter()
         .map(|r| {
@@ -351,9 +354,16 @@ fn the_agreement_report_has_one_row_per_host_and_only_covered_hosts_disagree() {
         got,
         [
             ("h-stuck", "rjwalters/other", 5, "review_wait", "merge_wait", 2700, 1),
+            ("h-drift", "rjwalters/drift", 4, "review_wait", "doctor", 1200, 1),
             ("h-lag", "rjwalters/loom", 3, "ready_wait", "building", 300, 0),
         ]
     );
     assert_eq!(text(&runs[0], "first_at"), "2026-10-04 12:20:00.000");
     assert_eq!(text(&runs[0], "forge_since"), "2026-10-04 12:19:00.000");
+    assert_eq!(runs[0]["forge_stages"], serde_json::json!(["merge_wait"]));
+    // The drift run spans both forge stages: one run, the latest pair reported.
+    assert_eq!(text(&runs[1], "first_at"), "2026-10-04 12:25:00.000");
+    assert_eq!(text(&runs[1], "last_at"), "2026-10-04 12:40:00.000");
+    assert_eq!(text(&runs[1], "forge_since"), "2026-10-04 12:34:00.000");
+    assert_eq!(runs[1]["forge_stages"], serde_json::json!(["doctor", "merge_wait"]));
 }
