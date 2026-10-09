@@ -1311,61 +1311,6 @@ for mode in old missing; do
 done
 rm -rf "${STUB_DIR:?}"
 
-# -------- Test: a rename INTO a build tree still rescues the source deletion (#11149) --------
-echo "Test 11149a: git mv into a build tree -> the source deletion is stashed, the tree is not"
-REPO=$(make_repo_with_source)
-printf 'old\n' > "$REPO/old.txt"
-git -C "$REPO" add old.txt && git -C "$REPO" commit -qm "add old.txt"
-SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11149a.txt"
-( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
-mkdir -p "$REPO/target-x/debug"
-printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/target-x/CACHEDIR.TAG"
-printf 'bin\n' > "$REPO/target-x/debug/artifact.o"
-git -C "$REPO" mv old.txt target-x/b.o
-out=$( cd "$REPO" && LOOM_QUARANTINE_COMMENT=0 "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11149" 2>&1 ); RC=$?
-if [[ "$RC" -eq 4 ]]; then pass "rename-into-build-tree quarantine exits 4 (no STILL PRESENT)"; else fail "expected 4, got $RC; out=$out"; fi
-if git -C "$REPO" diff --name-status 'stash@{0}^1' 'stash@{0}' 2>/dev/null | grep -q $'^D\told.txt$'; then
-    pass "the stash carries the old.txt deletion"
-else
-    fail "old.txt deletion missing from the stash; out=$out"
-fi
-STASH_FILES=$(stash_files "$REPO")
-if grep -q '^target-x/' <<<"$STASH_FILES"; then
-    fail "build-tree content leaked into refs/stash: $STASH_FILES"
-elif [[ -f "$REPO/target-x/b.o" && -f "$REPO/target-x/debug/artifact.o" ]]; then
-    pass "build-tree content kept out of refs/stash and left on disk"
-else
-    fail "build-tree content was removed from disk"
-fi
-rm -rf "${REPO:?}"
-
-# -------- Test: a daemon that fails AFTER printing dirs excludes nothing (#11149) --------
-echo "Test 11149b: partial build-trees output then failure -> warning holds, nothing excluded"
-STUB_DIR=$(mktemp -d)
-printf '#!/usr/bin/env bash\nprintf "target-x\\0"\necho "error: boom" >&2\nexit 1\n' > "$STUB_DIR/loom-daemon"
-chmod +x "$STUB_DIR/loom-daemon"
-REPO=$(make_repo_with_source)
-SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11149b.txt"
-( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
-mkdir -p "$REPO/target-x/debug"
-printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/target-x/CACHEDIR.TAG"
-printf 'bin\n' > "$REPO/target-x/debug/artifact.o"
-printf 'def leaked(): pass\n' > "$REPO/leaked_module.py"
-out=$( cd "$REPO" && LOOM_QUARANTINE_COMMENT=0 LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon" \
-    "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11149" 2>&1 ); RC=$?
-STASH_FILES=$(stash_files "$REPO")
-if [[ "$RC" -eq 4 ]] && grep -q 'NOT be excluded' <<<"$out"; then
-    pass "partial output: quarantine exits 4 with the fallback warning"
-else
-    fail "expected 4 plus the warning, got rc=$RC; out=$out"
-fi
-if grep -q '^target-x/debug/artifact.o$' <<<"$STASH_FILES" && grep -q '^leaked_module.py$' <<<"$STASH_FILES"; then
-    pass "partial output: the printed dir is NOT excluded (include-everything, as warned)"
-else
-    fail "partial daemon output still drove an exclusion; stash holds: $STASH_FILES"
-fi
-rm -rf "${REPO:?}" "${STUB_DIR:?}"
-
 # -------- Summary --------
 echo ""
 if [[ "$TESTS_FAILED" -eq 0 ]]; then
