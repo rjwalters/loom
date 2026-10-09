@@ -222,9 +222,16 @@ mod tests {
             "epic_supervisor::spawn_multi_supervisor_thread(",
             "spawn_multi_work_finder_task(",
             "spawn_multi_role_task(",
-            "spawn_auto_update_task(",
+            // #10954: the self-update loop is spawned through `loop_mode`.
+            "auto_update::loop_mode::start(",
         ] {
             assert!(spawn < at(producer), "H5 holds dispatch before `{producer}`");
         }
+        // #10954: the loop's mode is decided from the startup pass's
+        // classification (fleet host or not), so that pass runs first.
+        assert!(
+            start < at("auto_update::loop_mode::start("),
+            "fleet_sync::start decides the mode"
+        );
     }
 }

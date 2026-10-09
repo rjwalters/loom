@@ -577,8 +577,11 @@ fixture. A behaviour change is a new id registered beside the old one
        point (`ANSWER_RATE_SLACK`) below `current`'s. It is counted
        **once per tracker pass** per live subject, carrying each heuristic's
        last emitted state forward — never as answered rows over all rows, because a refusal
-       is emitted once and never refreshed while an answer is refreshed every
+       is emitted once and never refreshed (bar `stale_inputs`, re-emitted every pass, #10973) while an answer is refreshed every
        few minutes;
+       a `stale_inputs` series re-emits at most 10 times an hour (half the
+       hourly cap, so the recovery row is never starved), and those refusal
+       rows score nothing, so they never form shadow pairs;
      - its p25–p75 coverage inside `[40%, 60%]`;
      - the **day consistency check**: pairs are folded by the UTC day of
        their `as_of`, a day goes to whichever side had the lower mean
@@ -2545,7 +2548,8 @@ triggers:
   ETA failure costs only ETA and never the observability collector.
 
 An unchanged estimate is refreshed every `refreshSecs` (300); a changed stage,
-rework count or refusal reason emits at once; a series is capped at 20
+rework count or refusal reason emits at once, and a `stale_inputs` refusal is
+re-emitted every pass while it persists (#10973); a series is capped at 20
 emissions per rolling hour. Every emitted estimate waits for its outcome in
 `.loom/state/eta/pending.jsonl`, which survives a restart (an entry whose
 heuristic is no longer registered is dropped on restore). It is per-host

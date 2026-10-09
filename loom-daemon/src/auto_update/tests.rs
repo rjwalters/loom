@@ -154,7 +154,8 @@ fn test_config_project_tier_overrides_legacy() {
 // ===================================================================
 
 #[test]
-#[serial]
+// #10954: `TickTuning::resolve` reads this env too, under the same key.
+#[serial(loom_auto_update_env)]
 fn test_resolve_enabled_default_is_false() {
     std::env::remove_var(AUTO_UPDATE_ENABLE_ENV);
     assert!(
@@ -164,7 +165,8 @@ fn test_resolve_enabled_default_is_false() {
 }
 
 #[test]
-#[serial]
+// #10954: `TickTuning::resolve` reads this env too, under the same key.
+#[serial(loom_auto_update_env)]
 fn test_resolve_enabled_config_then_env() {
     std::env::remove_var(AUTO_UPDATE_ENABLE_ENV);
     assert!(resolve_enabled(&AutoUpdateConfig {

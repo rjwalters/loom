@@ -48,7 +48,8 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
             String::new()
         };
         out.push(Condition {
-            key: KEY_CAPACITY_LIMITED,
+            key: KEY_CAPACITY_LIMITED.to_string(),
+            critical: false,
             headline: format!(
                 "{what} is capping concurrency at {effective}, below the configured {}{stars_part}.",
                 cap.configured
@@ -67,7 +68,8 @@ pub fn conditions(tick: &WorkFinderTickSummary) -> Vec<Condition> {
         });
         let rounds = waiting.div_ceil(effective.max(1));
         out.push(Condition {
-            key: KEY_STAR_BACKLOG,
+            key: KEY_STAR_BACKLOG.to_string(),
+            critical: false,
             headline: format!(
                 "{waiting} starred issues are waiting for {effective} slot(s) on this host, more \
                  than {STAR_BACKLOG_FACTOR}x the cap: a new star is now position {} in a FIFO \

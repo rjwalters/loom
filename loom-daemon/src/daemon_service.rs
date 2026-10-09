@@ -2022,8 +2022,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
 
-    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Opt-in via
-    // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
+    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Without a fleet
+    // store, opt-in via `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
     // source checkout advances past the commit this binary was built from, the
     // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
     // and rolls onto the fresh binary via pause-and-roll (#10831) — every
@@ -2036,32 +2036,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // whole daemon (its subject is the daemon process itself — one binary, one
     // source checkout, one restart), NOT a `spawn_multi_*` per-workspace fan-out.
     // Config is read from the daemon's default workspace, like the sibling readers.
-    // Default OFF (side effects on the running process). Cloned handles here because
-    // `event_bus` is moved into `IpcServer::new` below.
-    let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
-    auto_update::removed_settings::warn_if_set(&auto_update_config);
-    let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
-        log::info!("auto_update: enabled ({})", tuning.describe());
-        let probe = auto_update::ScriptAutoUpdateProbe::new(
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-        );
-        let trigger = auto_update::IpcRollTrigger::new(
-            drain_state.clone(),
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-            event_bus.clone(),
-            tokio::runtime::Handle::current(),
-        );
-        let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
-    } else {
-        log::debug!(
-            "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
-        );
-        None
-    };
+    // #10954: spawned on every fleet host (fleet_sync::start ran above), and on a
+    // host with no fleet store only when autoUpdate is enabled — see `loop_mode`.
+    let _auto_update_handle =
+        auto_update::loop_mode::start(&sweep_workspace, &workspace_pool, &drain_state, &event_bus);
 
     // Independent, opt-in idle exit (#4467). The daemon only exits; the host
     // guard retains sole authority to power off.
