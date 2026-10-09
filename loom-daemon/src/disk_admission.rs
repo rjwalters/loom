@@ -13,14 +13,17 @@
 //! - `free` is the worktree-root volume's free space ([`worktree_root_free_gb`]).
 //! - `floor` is the disk-full halt floor ([`crate::disk_full_halt`], 3 GB by
 //!   default), so admission stops before the terminal halt would.
-//! - `charge(R)` resolves, first match wins: R's observed high-water mark plus
-//!   [`MARGIN_PCT`] ([`crate::disk_footprint`]), else R's configured
-//!   [`REPO_CHARGE_KEY`], else the global `LOOM_PER_WORKTREE_GB` (8 GB).
-//!   Rounded up to whole GB, minimum 1, so a repo that builds nothing stays
-//!   cheap.
-//! - `reserved` charges each running sweep (and role run) for what it is still
-//!   expected to write, not for what it already wrote: that part is already
-//!   gone from `free`.
+//! - `charge(R)` is R's observed sweep high-water mark plus [`MARGIN_PCT`]
+//!   ([`crate::disk_footprint`]), rounded up to whole GB, minimum 1, so a repo
+//!   that builds nothing stays cheap. R's configured [`REPO_CHARGE_KEY`] is a
+//!   floor under it (`max(observed, configured)`), so an operator can always
+//!   raise a repo whose footprint is under-measured. With no history: the
+//!   configured value, else the global `LOOM_PER_WORKTREE_GB` (8 GB).
+//! - `reserved` charges each running sweep for what it is still expected to
+//!   write, not for what it already wrote: that part is already gone from
+//!   `free`. A role run (curator, judge, ...) is reserved against its own
+//!   role's mark in that repo, never the repo's sweep charge, and not at all
+//!   before that role has a mark.
 //!
 //! # Where it is enforced
 //!
@@ -50,8 +53,8 @@ use crate::types::SweepKind;
 /// Env switch: `0`/`false`/`off`/`no` disables disk admission (legacy term).
 pub const ENABLE_ENV: &str = "LOOM_DISK_ADMISSION";
 
-/// Per-repo `.loom/config.json` key: this repo's charge (GB) while it has no
-/// observed history.
+/// Per-repo `.loom/config.json` key: a floor (GB) under this repo's charge,
+/// and the charge itself while it has no observed history.
 pub const REPO_CHARGE_KEY: &str = "autonomous.workFinder.diskChargeGb";
 
 /// Safety margin (percent) added on top of an observed high-water mark.
@@ -60,9 +63,10 @@ pub const MARGIN_PCT: u64 = 10;
 /// Where a repo's charge came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargeSource {
-    /// The repo's observed high-water mark.
+    /// The repo's observed high-water mark (at or above any configured floor).
     Observed,
-    /// The repo's configured [`REPO_CHARGE_KEY`].
+    /// The repo's configured [`REPO_CHARGE_KEY`] (no history, or history
+    /// below it).
     RepoConfig,
     /// The global `LOOM_PER_WORKTREE_GB`.
     Default,
@@ -87,20 +91,31 @@ pub struct RepoCharge {
     pub source: ChargeSource,
 }
 
-/// Resolve a charge: observed mark plus margin (whole GB, rounded up) >
-/// per-repo config > global default. Each is floored at 1 GB.
+/// `bytes` plus [`MARGIN_PCT`].
+#[must_use]
+pub fn with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes / 100 * MARGIN_PCT)
+}
+
+/// Resolve a charge: the observed mark plus margin (whole GB, rounded up),
+/// never below the per-repo config; with no mark, the config, else the global
+/// default. Each is floored at 1 GB.
 #[must_use]
 pub fn charge_gb(
     observed_bytes: Option<u64>,
     repo_config_gb: Option<u64>,
     global_gb: u64,
 ) -> (u64, ChargeSource) {
+    let config = repo_config_gb.map(|gb| gb.max(1));
     if let Some(bytes) = observed_bytes {
-        let padded = bytes.saturating_add(bytes / 100 * MARGIN_PCT);
-        return (padded.div_ceil(GIB).max(1), ChargeSource::Observed);
+        let observed = with_margin(bytes).div_ceil(GIB).max(1);
+        return match config {
+            Some(gb) if gb > observed => (gb, ChargeSource::RepoConfig),
+            _ => (observed, ChargeSource::Observed),
+        };
     }
-    if let Some(gb) = repo_config_gb {
-        return (gb.max(1), ChargeSource::RepoConfig);
+    if let Some(gb) = config {
+        return (gb, ChargeSource::RepoConfig);
     }
     (global_gb.max(1), ChargeSource::Default)
 }
@@ -152,8 +167,11 @@ pub struct DiskBudget {
 }
 
 /// Bytes the in-flight units of `store` are still expected to write: for
-/// each counted unit, its repo's charge (from `charges` when the repo is one
-/// of them, else its own history or `global_gb`) minus what it has written.
+/// each counted sweep, its repo's charge (from `charges` when the repo is one
+/// of them, else its own history or `global_gb`) minus what it has written;
+/// for each role run, its role's own mark in that repo plus margin minus what
+/// it has written (nothing while the role has no mark: a role run is
+/// measured as it grows, and most never build).
 /// `exclude` skips one unit key (the dispatch being decided: a re-dispatch
 /// replaces its predecessor rather than adding to it).
 #[must_use]
@@ -171,14 +189,20 @@ pub fn reserved_bytes(
         if Some(key.as_str()) == exclude || !unit.counts(fresh, now) {
             continue;
         }
-        if unit.is_sweep(key) {
-            sweeps += 1;
-        }
-        let gb = charges.iter().find(|c| c.repo == unit.repo).map_or_else(
-            || charge_gb(store.high_water_bytes(&unit.repo), None, global_gb).0,
-            |c| c.gb,
-        );
-        total = total.saturating_add(gb.saturating_mul(GIB).saturating_sub(unit.current_bytes));
+        let expected = match disk_footprint::role_of_key(key).filter(|_| unit.issue.is_none()) {
+            Some(role) => store
+                .role_high_water_bytes(&unit.repo, &role)
+                .map_or(0, with_margin),
+            None => {
+                sweeps += 1;
+                let gb = charges.iter().find(|c| c.repo == unit.repo).map_or_else(
+                    || charge_gb(store.high_water_bytes(&unit.repo), None, global_gb).0,
+                    |c| c.gb,
+                );
+                gb.saturating_mul(GIB)
+            }
+        };
+        total = total.saturating_add(expected.saturating_sub(unit.current_bytes));
     }
     (total, sweeps)
 }
@@ -327,6 +351,57 @@ fn log_budget(b: &DiskBudget) {
     *last = Some(key);
 }
 
+/// Whether the store was stale on the last tick (`None` before the first).
+static STALE_STATE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// A change in the footprint store's freshness between two ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalenessEdge {
+    /// The store just went stale; the last sample is this many seconds old.
+    BecameStale(i64),
+    /// The store is fresh again.
+    Recovered,
+}
+
+/// The freshness edge since the last call, if any. A store that has never
+/// been sampled is not stale, just new.
+fn staleness_edge(
+    state: &std::sync::Mutex<Option<bool>>,
+    store: &Store,
+    now: i64,
+) -> Option<StalenessEdge> {
+    let stale = store.sampled_at.is_some() && !store.fresh(now);
+    let mut last = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let was_stale = last.replace(stale).unwrap_or(false);
+    match (was_stale, stale) {
+        (false, true) => {
+            Some(StalenessEdge::BecameStale(now.saturating_sub(store.sampled_at.unwrap_or(now))))
+        }
+        (true, false) => Some(StalenessEdge::Recovered),
+        _ => None,
+    }
+}
+
+/// WARN on the edge into stale (the sampled units stop counting, so only
+/// pending units are reserved for), INFO on recovery.
+fn log_staleness(edge: Option<StalenessEdge>) {
+    match edge {
+        Some(StalenessEdge::BecameStale(age)) => log::warn!(
+            "disk_admission: the disk footprint store is stale (last sample {age}s ago, limit \
+             {}s); in-flight sweeps' growth is no longer reserved for, so only live free space \
+             and the per-repo charges gate admission until the sampler catches up (#11191)",
+            disk_footprint::STALE_AFTER_SECS
+        ),
+        Some(StalenessEdge::Recovered) => log::info!(
+            "disk_admission: the disk footprint store is fresh again; in-flight reservation \
+             restored (#11191)"
+        ),
+        None => {}
+    }
+}
+
 /// The work finder's disk term and per-repo budget for `roots`, measured on
 /// `fallback_root`'s worktree-root volume. Starts (or re-points) the
 /// footprint sampler. Disabled or unmeasurable: the legacy flat term and no
@@ -341,13 +416,14 @@ pub fn tick(roots: &[PathBuf], fallback_root: &Path) -> (usize, Option<DiskBudge
         return (crate::disk_headroom::disk_headroom_limit(fallback_root), None);
     };
     let store = disk_footprint::load_current();
+    let now = disk_footprint::now_secs();
+    log_staleness(staleness_edge(&STALE_STATE, &store, now));
     let global = per_worktree_gb();
     let charges = roots
         .iter()
         .map(|r| charge_for_root(r, &store, global))
         .collect();
-    let budget =
-        assess(free, floor_gb(), &store, charges, global, disk_footprint::now_secs(), None);
+    let budget = assess(free, floor_gb(), &store, charges, global, now, None);
     log_budget(&budget);
     (budget.cap_term(), Some(budget))
 }

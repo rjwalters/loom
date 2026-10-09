@@ -22,11 +22,34 @@
 //! # What a unit is
 //!
 //! - An **issue sweep** (a live claim lock under `<repo>/.loom/locks/issue-N`):
-//!   its worktree (`<worktree-root>/issue-N`) plus every live Loom run dir
-//!   (`<repo>/.loom/targets/<role>-<run>`, #8370) whose owner pid is the
-//!   lock's pid or in the lock's process group. Key `<repo>#<N>`.
-//! - Any **other live run dir** (a role-runner tick, a PR-set sweep): the dir
-//!   alone. Key `<repo>:<dir name>`.
+//!   its worktree (`<worktree-root>/issue-N`), the worktree's #8458
+//!   per-worktree target dir when its `.loom-cargo-target-dir` marker names
+//!   one, and every live Loom run dir (`<repo>/.loom/targets/<role>-<run>`,
+//!   #8370) whose owner pid is the lock's pid or in the lock's process group.
+//!   Key `<repo>#<N>`.
+//! - A **PR-set sweep** (live `<repo>/.loom/locks/pr-N` locks sharing one
+//!   owner pid): the run dirs that owner holds. Key `<repo>#prs-<lowest N>`,
+//!   the key admission records it under.
+//! - Any **other live run dir**: the dir alone, key `<repo>:<dir name>`. Its
+//!   role is read from the dir name ([`run_dir_role`]). A sweep role
+//!   ([`SWEEP_ROLES`]) is still a sweep; anything else (a curator, champion,
+//!   judge or guide tick) is a **role run**.
+//!
+//! # Two histories (#11191 review)
+//!
+//! Sweeps fold into the per-repo history ([`Store::repos`]) that sets the
+//! repo's charge. Role runs never do: a curator tick's run dir holds only its
+//! owner file, and twenty of them would otherwise age a 26 GB build out of
+//! the window. They fold into a per-`<repo>:<role>` history
+//! ([`Store::role_runs`]) instead, and admission reserves a live role run
+//! against its own role's mark, not the repo's sweep charge.
+//!
+//! A unit is folded only when its peak is at least [`MIN_FOLD_BYTES`] (a run
+//! dir holding only its owner file never built) and its build output was
+//! measured at least once. A sweep in a Cargo repo whose build went somewhere
+//! no probe can see (an operator `CARGO_TARGET_DIR`, a containerized run) is
+//! not folded, and a WARN names the repo once, so the repo keeps its
+//! configured or default charge instead of learning a source-only footprint.
 //!
 //! Admission also records a *pending* unit the moment it admits a dispatch
 //! ([`record_pending`]), so a sweep that no sample has seen yet is reserved
@@ -35,9 +58,9 @@
 //! Every probe is best-effort: an unreadable lock or dir is skipped, never an
 //! error. A repo with no history keeps its configured or default charge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +89,57 @@ pub const STALE_AFTER_SECS: i64 = 600;
 /// Bytes per GiB.
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
+/// A unit whose peak stays below this never built anything (a role run's dir
+/// holds only its owner file, a few bytes); it is not folded into any history.
+pub const MIN_FOLD_BYTES: u64 = 1024 * 1024;
+
+/// Run-dir roles that are sweeps (fold into the repo's sweep history), as
+/// `worker_spawn` names a derived dir from `LOOM_ROLE`. Every other role is a
+/// role run.
+pub const SWEEP_ROLES: &[&str] = &["sweep-lifecycle", "sweep", "loom", "builder"];
+
+/// The role a run dir was created for, read from its name: a role-runner
+/// tick's `<role>-role-<role>-<time>-<rand>`, or a derived
+/// `<role>-<pid>-<time>` (trailing all-digit segments dropped).
+#[must_use]
+pub fn run_dir_role(name: &str) -> String {
+    if let Some((role, _)) = name.split_once("-role-") {
+        return role.to_string();
+    }
+    let mut s = name;
+    while let Some((head, tail)) = s.rsplit_once('-') {
+        if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        s = head;
+    }
+    s.to_string()
+}
+
+/// The role-run role of the unit under `key`, or `None` for a sweep. Derived
+/// from the key alone, so a store written before roles mattered classifies
+/// the same way: `<repo>#...` is a sweep, `<repo>:<dir>` is a role run unless
+/// its dir names a [`SWEEP_ROLES`] role.
+#[must_use]
+pub fn role_of_key(key: &str) -> Option<String> {
+    if key.contains('#') {
+        return None;
+    }
+    let name = key.rsplit_once(':').map_or(key, |(_, n)| n);
+    let role = run_dir_role(name);
+    (!SWEEP_ROLES.contains(&role.as_str())).then_some(role)
+}
+
+/// The [`Store::role_runs`] key for `role` in `repo`.
+#[must_use]
+pub fn role_key(repo: &str, role: &str) -> String {
+    format!("{repo}:{role}")
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// One in-flight unit's last sample.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unit {
@@ -81,6 +155,11 @@ pub struct Unit {
     /// has seen it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_since: Option<i64>,
+    /// Whether any sample measured this unit's build output (always true for
+    /// a unit with nothing to build). A unit that ends without it is not
+    /// folded into history.
+    #[serde(default = "yes")]
+    pub build_measured: bool,
 }
 
 impl Unit {
@@ -93,20 +172,19 @@ impl Unit {
             None => store_fresh,
         }
     }
-
-    /// Whether this unit is a sweep (issue or PR set) rather than a role run.
-    #[must_use]
-    pub fn is_sweep(&self, key: &str) -> bool {
-        self.issue.is_some() || key.contains('#')
-    }
 }
 
 /// On-disk state: per-repo footprint history plus the in-flight units.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Store {
-    /// Repo -> recent per-run peak footprints (bytes), oldest first.
+    /// Repo -> recent per-sweep peak footprints (bytes), oldest first.
     #[serde(default)]
     pub repos: BTreeMap<String, Vec<u64>>,
+    /// `<repo>:<role>` -> recent role-run peak footprints (bytes), oldest
+    /// first. Kept apart from `repos` so role ticks never wash out a sweep's
+    /// mark (#11191 review).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_runs: BTreeMap<String, Vec<u64>>,
     /// Unit key -> last sample.
     #[serde(default)]
     pub inflight: BTreeMap<String, Unit>,
@@ -131,6 +209,15 @@ impl Store {
             .and_then(|h| h.iter().copied().max())
             .filter(|&b| b > 0)
     }
+
+    /// The observed high-water mark (bytes) of `role` runs in `repo`.
+    #[must_use]
+    pub fn role_high_water_bytes(&self, repo: &str, role: &str) -> Option<u64> {
+        self.role_runs
+            .get(&role_key(repo, role))
+            .and_then(|h| h.iter().copied().max())
+            .filter(|&b| b > 0)
+    }
 }
 
 /// A unit seen live by one sample.
@@ -140,6 +227,8 @@ pub struct LiveUnit {
     pub repo: String,
     pub issue: Option<u32>,
     pub bytes: u64,
+    /// `bytes` covers the unit's build output (or it has none to build).
+    pub build_measured: bool,
 }
 
 /// A unit that was live and is gone now, with the peak folded into history.
@@ -148,6 +237,18 @@ pub struct Ended {
     pub key: String,
     pub repo: String,
     pub peak_bytes: u64,
+    /// Where the peak went: `Some(history key)` when folded, `None` when not.
+    pub folded_into: Option<String>,
+    /// Not folded because its build output was never measured.
+    pub unmeasured: bool,
+}
+
+fn push_history(hist: &mut Vec<u64>, peak: u64) {
+    hist.push(peak);
+    if hist.len() > HISTORY_LEN {
+        let excess = hist.len() - HISTORY_LEN;
+        hist.drain(..excess);
+    }
 }
 
 /// The key of an issue sweep's unit.
@@ -159,11 +260,17 @@ pub fn issue_key(repo: &str, issue: u32) -> String {
 /// Fold one sample into `store`. Live units are upserted (peak is monotonic,
 /// and a sample adopts a pending unit of the same key). A tracked unit that
 /// is not live is dropped: a pending one only once its grace has run out, and
-/// without touching history; a sampled one has its peak folded into its
-/// repo's history and is returned.
+/// without touching history; a sampled one is returned, and its peak folded
+/// into its sweep or role history unless it never built ([`MIN_FOLD_BYTES`])
+/// or its build output was never measured.
 pub fn observe(store: &mut Store, live: &[LiveUnit], now: i64) -> Vec<Ended> {
     for l in live {
-        let prev_peak = store.inflight.get(&l.key).map_or(0, |u| u.peak_bytes);
+        let prev = store
+            .inflight
+            .get(&l.key)
+            .filter(|u| u.pending_since.is_none());
+        let prev_peak = prev.map_or(0, |u| u.peak_bytes);
+        let prev_measured = prev.is_some_and(|u| u.build_measured);
         store.inflight.insert(
             l.key.clone(),
             Unit {
@@ -172,6 +279,7 @@ pub fn observe(store: &mut Store, live: &[LiveUnit], now: i64) -> Vec<Ended> {
                 current_bytes: l.bytes,
                 peak_bytes: l.bytes.max(prev_peak),
                 pending_since: None,
+                build_measured: l.build_measured || prev_measured,
             },
         );
     }
@@ -193,16 +301,22 @@ pub fn observe(store: &mut Store, live: &[LiveUnit], now: i64) -> Vec<Ended> {
         if u.pending_since.is_some() || u.peak_bytes == 0 {
             continue;
         }
-        let hist = store.repos.entry(u.repo.clone()).or_default();
-        hist.push(u.peak_bytes);
-        if hist.len() > HISTORY_LEN {
-            let excess = hist.len() - HISTORY_LEN;
-            hist.drain(..excess);
-        }
+        let role = (u.issue.is_none()).then(|| role_of_key(&key)).flatten();
+        let unmeasured = !u.build_measured;
+        let folded_into = (u.peak_bytes >= MIN_FOLD_BYTES && !unmeasured).then(|| {
+            let (map, hkey) = match &role {
+                Some(role) => (&mut store.role_runs, role_key(&u.repo, role)),
+                None => (&mut store.repos, u.repo.clone()),
+            };
+            push_history(map.entry(hkey.clone()).or_default(), u.peak_bytes);
+            hkey
+        });
         ended.push(Ended {
             key,
             repo: u.repo,
             peak_bytes: u.peak_bytes,
+            folded_into,
+            unmeasured,
         });
     }
     store.sampled_at = Some(now);
@@ -221,6 +335,7 @@ pub fn record_pending(store: &mut Store, key: &str, repo: &str, issue: Option<u3
             current_bytes: 0,
             peak_bytes: 0,
             pending_since: Some(now),
+            build_measured: true,
         },
     );
 }
@@ -273,15 +388,26 @@ struct LockOwnerLite {
     pgid: Option<u32>,
 }
 
-/// The live claim locks under `<root>/.loom/locks`.
+/// The live issue claim locks (`issue-N`) under `<root>/.loom/locks`.
 #[must_use]
 pub fn live_locks(root: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<LockInfo> {
+    live_locks_named(root, "issue-", alive)
+}
+
+/// The live PR-set member locks (`pr-N`) under `<root>/.loom/locks`; `issue`
+/// holds the PR number.
+#[must_use]
+pub fn live_pr_locks(root: &Path, alive: &dyn Fn(u32) -> bool) -> Vec<LockInfo> {
+    live_locks_named(root, "pr-", alive)
+}
+
+fn live_locks_named(root: &Path, prefix: &str, alive: &dyn Fn(u32) -> bool) -> Vec<LockInfo> {
     let Ok(entries) = std::fs::read_dir(root.join(".loom").join("locks")) else {
         return Vec::new();
     };
     let mut out: Vec<LockInfo> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().starts_with("issue-"))
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
         .filter_map(|e| std::fs::read_to_string(e.path().join("owner.json")).ok())
         .filter_map(|raw| serde_json::from_str::<LockOwnerLite>(&raw).ok())
         .filter(|o| alive(o.owner_pid))
@@ -322,33 +448,88 @@ pub fn live_run_dirs(
     out
 }
 
+/// One repo's probe results, for [`assemble`].
+#[derive(Debug, Clone, Copy)]
+pub struct RepoScan<'a> {
+    pub repo: &'a str,
+    pub worktree_root: &'a Path,
+    /// The repo root has a `Cargo.toml`, so its sweeps build (the same test
+    /// `run_target_dir::decide` uses).
+    pub builds: bool,
+    pub locks: &'a [LockInfo],
+    pub pr_locks: &'a [LockInfo],
+    pub run_dirs: &'a [RunDir],
+}
+
+/// The filesystem probes [`assemble`] uses, injected for tests.
+pub struct Probes<'a> {
+    /// Bytes under a path (0 when unreadable).
+    pub size_of: &'a dyn Fn(&Path) -> u64,
+    /// A worktree's #8458 per-worktree target dir, from its
+    /// `.loom-cargo-target-dir` marker.
+    pub worktree_target: &'a dyn Fn(&Path) -> Option<PathBuf>,
+}
+
 /// Assemble one repo's live units from its locks and run dirs (pure apart
-/// from `size_of`). Each run dir belongs to the first lock whose pid owns it
-/// or whose process group it is in; the rest are units of their own.
+/// from the probes). Each run dir belongs to the first lock (issue, then PR
+/// set) whose pid owns it or whose process group it is in; the rest are units
+/// of their own.
 #[must_use]
-pub fn assemble(
-    repo: &str,
-    worktree_root: &Path,
-    locks: &[LockInfo],
-    run_dirs: &[RunDir],
-    size_of: &dyn Fn(&Path) -> u64,
-) -> Vec<LiveUnit> {
+pub fn assemble(scan: &RepoScan<'_>, probes: &Probes<'_>) -> Vec<LiveUnit> {
+    let RepoScan {
+        repo,
+        worktree_root,
+        builds,
+        locks,
+        pr_locks,
+        run_dirs,
+    } = *scan;
     let mut claimed = vec![false; run_dirs.len()];
-    let mut out = Vec::new();
-    for lock in locks {
-        let mut bytes = size_of(&worktree_root.join(format!("issue-{}", lock.issue)));
+    // Sum the unclaimed run dirs `owner` holds; returns (bytes, any found).
+    let mut claim = |owner_pid: u32, pgid: Option<u32>| -> (u64, bool) {
+        let (mut bytes, mut found) = (0u64, false);
         for (i, rd) in run_dirs.iter().enumerate() {
-            let same_group = lock.pgid.is_some() && rd.pgid == lock.pgid;
-            if !claimed[i] && (rd.owner_pid == lock.owner_pid || same_group) {
+            let same_group = pgid.is_some() && rd.pgid == pgid;
+            if !claimed[i] && (rd.owner_pid == owner_pid || same_group) {
                 claimed[i] = true;
-                bytes = bytes.saturating_add(size_of(&rd.path));
+                found = true;
+                bytes = bytes.saturating_add((probes.size_of)(&rd.path));
             }
         }
+        (bytes, found)
+    };
+    let mut out = Vec::new();
+    for lock in locks {
+        let worktree = worktree_root.join(format!("issue-{}", lock.issue));
+        let mut bytes = (probes.size_of)(&worktree);
+        // #8458: a per-worktree target dir lives outside the worktree.
+        let marker = (probes.worktree_target)(&worktree).filter(|t| !t.starts_with(&worktree));
+        if let Some(target) = &marker {
+            bytes = bytes.saturating_add((probes.size_of)(target));
+        }
+        let (run_bytes, run_found) = claim(lock.owner_pid, lock.pgid);
         out.push(LiveUnit {
             key: issue_key(repo, lock.issue),
             repo: repo.to_string(),
             issue: Some(lock.issue),
+            bytes: bytes.saturating_add(run_bytes),
+            build_measured: !builds || marker.is_some() || run_found,
+        });
+    }
+    // PR sets: one unit per owner, keyed by its lowest PR.
+    let mut sets: BTreeMap<u32, (u32, Option<u32>)> = BTreeMap::new();
+    for l in pr_locks {
+        let e = sets.entry(l.owner_pid).or_insert((l.issue, l.pgid));
+        e.0 = e.0.min(l.issue);
+    }
+    for (owner_pid, (first, pgid)) in sets {
+        let (bytes, found) = claim(owner_pid, pgid);
+        out.push(LiveUnit {
+            key: format!("{repo}#prs-{first}"),
+            repo: repo.to_string(),
+            issue: None,
             bytes,
+            build_measured: !builds || found,
         });
     }
     for (rd, _) in run_dirs.iter().zip(&claimed).filter(|(_, c)| !**c) {
@@ -360,20 +541,87 @@ pub fn assemble(
             key: format!("{repo}:{name}"),
             repo: repo.to_string(),
             issue: None,
-            bytes: size_of(&rd.path),
+            bytes: (probes.size_of)(&rd.path),
+            build_measured: true,
         });
     }
     out
 }
 
 /// Measure the live units of one workspace root.
+///
+/// Sizes are `dir_size_bytes`: apparent file lengths, with a hard-linked file
+/// counted once per link (cargo uplifts each final binary as a hard link into
+/// `deps/`). Both err toward a larger footprint, so the charge errs toward
+/// over-reserving, the safe direction.
 #[must_use]
 pub fn live_units(root: &Path) -> Vec<LiveUnit> {
     let repo = crate::ram_peaks::repo_key(root);
     let locks = live_locks(root, &pid_alive);
+    let pr_locks = live_pr_locks(root, &pid_alive);
     let run_dirs = live_run_dirs(root, &pid_alive, &pgid_of);
+    let worktree_root = crate::worktree_root::worktree_root(root);
+    let builds = root.join("Cargo.toml").is_file();
+    if builds {
+        warn_if_ambient_target(&repo);
+    }
     let size_of = |p: &Path| crate::worktree_disk_status::dir_size_bytes(p).unwrap_or(0);
-    assemble(&repo, &crate::worktree_root::worktree_root(root), &locks, &run_dirs, &size_of)
+    let worktree_target =
+        |wt: &Path| crate::worktree_ops::cargo_target::per_worktree::marker_value(wt);
+    let scan = RepoScan {
+        repo: &repo,
+        worktree_root: &worktree_root,
+        builds,
+        locks: &locks,
+        pr_locks: &pr_locks,
+        run_dirs: &run_dirs,
+    };
+    assemble(
+        &scan,
+        &Probes {
+            size_of: &size_of,
+            worktree_target: &worktree_target,
+        },
+    )
+}
+
+/// Repos already warned about unmeasurable build output (once per repo per
+/// daemon process).
+static UNMEASURED_WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Whether `repo` has not been warned about yet (and mark it warned).
+fn first_unmeasured_warning(repo: &str) -> bool {
+    UNMEASURED_WARNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(repo.to_string())
+}
+
+fn unmeasured_warning(repo: &str, why: &str) -> String {
+    format!(
+        "disk_footprint: {repo}'s build output cannot be measured ({why}); its sweeps are not \
+         folded into its disk charge history, so it is charged its configured \
+         `{}` or the default `LOOM_PER_WORKTREE_GB`. Set `{}` in {repo}'s \
+         .loom/config.json to its real per-sweep footprint (#11191)",
+        crate::disk_admission::REPO_CHARGE_KEY,
+        crate::disk_admission::REPO_CHARGE_KEY,
+    )
+}
+
+/// An operator `CARGO_TARGET_DIR` in the daemon's environment reaches every
+/// spawn (`run_target_dir` precedence 2): the builds go to one shared dir no
+/// unit can be charged for. Warn once per Cargo repo.
+fn warn_if_ambient_target(repo: &str) {
+    let Some(dir) = std::env::var_os("CARGO_TARGET_DIR").filter(|v| !v.is_empty()) else {
+        return;
+    };
+    if first_unmeasured_warning(repo) {
+        let why = format!(
+            "an operator CARGO_TARGET_DIR={} is shared by every sweep",
+            dir.to_string_lossy()
+        );
+        log::warn!("{}", unmeasured_warning(repo, &why));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,16 +643,39 @@ pub fn store_path() -> Option<PathBuf> {
     )
 }
 
-/// Load the store; a missing or corrupt file is an empty store.
+/// Load the store. A missing file is an empty store. A corrupt one is also
+/// an empty store, but never silently: it is moved aside to
+/// `<path>.corrupt-<unix secs>` (so the next save cannot overwrite the
+/// evidence) and a WARN names both paths, since every repo's charge drops to
+/// its configured or default value until history rebuilds.
 #[must_use]
 pub fn load(path: &Path) -> Store {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Store::default();
+    };
+    match serde_json::from_str(&raw) {
+        Ok(store) => store,
+        Err(e) => {
+            let aside = PathBuf::from(format!("{}.corrupt-{}", path.display(), now_secs()));
+            let moved = std::fs::rename(path, &aside);
+            log::warn!(
+                "disk_footprint: {} is corrupt ({e}); {}; starting from an empty store, so \
+                 every repo is charged its configured or default disk charge until its \
+                 history rebuilds (#11191)",
+                path.display(),
+                match moved {
+                    Ok(()) => format!("moved it aside to {}", aside.display()),
+                    Err(re) => format!("could not move it aside to {}: {re}", aside.display()),
+                }
+            );
+            Store::default()
+        }
+    }
 }
 
-/// Atomically persist the store (best effort).
+/// Atomically persist the store (best effort). The temp file is named for
+/// this process, so a second process writing the same store (a CLI path;
+/// [`STORE_LOCK`] is process-local) never shares a half-written temp.
 pub fn save(path: &Path, store: &Store) {
     let Ok(json) = serde_json::to_string_pretty(store) else {
         return;
@@ -412,7 +683,7 @@ pub fn save(path: &Path, store: &Store) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -453,18 +724,40 @@ pub fn sample_once(roots: &[PathBuf]) {
     let live: Vec<LiveUnit> = roots.iter().flat_map(|r| live_units(r)).collect();
     let ended = with_store(|s| observe(s, &live, now_secs())).unwrap_or_default();
     for e in ended {
-        log::info!(
-            "disk_footprint: {} (repo {}) ended at a peak of {:.2} GiB; folded into the repo's \
-             disk charge history (#11191)",
-            e.key,
-            e.repo,
-            e.peak_bytes as f64 / GIB as f64
-        );
+        let gib = e.peak_bytes as f64 / GIB as f64;
+        match &e.folded_into {
+            Some(h) => log::info!(
+                "disk_footprint: {} (repo {}) ended at a peak of {gib:.2} GiB; folded into \
+                 the {h} disk history (#11191)",
+                e.key,
+                e.repo,
+            ),
+            None if e.unmeasured => {
+                if first_unmeasured_warning(&e.repo) {
+                    let why = format!(
+                        "{} ended without its target dir ever being found: no Loom run dir, no \
+                         per-worktree marker; an operator CARGO_TARGET_DIR or a containerized run",
+                        e.key
+                    );
+                    log::warn!("{}", unmeasured_warning(&e.repo, &why));
+                } else {
+                    log::debug!(
+                        "disk_footprint: {} ended with its build output unmeasured; not folded",
+                        e.key
+                    );
+                }
+            }
+            None => log::debug!(
+                "disk_footprint: {} ended at {} bytes, below the fold floor; not folded",
+                e.key,
+                e.peak_bytes
+            ),
+        }
     }
 }
 
 static SAMPLER_ROOTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-static SAMPLER: OnceLock<()> = OnceLock::new();
+static SAMPLER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 fn sample_interval() -> std::time::Duration {
     let secs = std::env::var(SAMPLE_SECS_ENV)
@@ -475,26 +768,52 @@ fn sample_interval() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Hand the sampler the current workspace roots, starting it on first call.
-/// The walk runs on its own thread so a large target dir never stalls the
-/// work-finder loop.
+/// One sampler iteration, with a panic caught and logged: a bad probe costs
+/// one sample, never the thread.
+fn sample_guarded(roots: &[PathBuf]) {
+    sample_guarded_with(roots, &sample_once);
+}
+
+fn sample_guarded_with(roots: &[PathBuf], sample: &dyn Fn(&[PathBuf])) {
+    let run = std::panic::AssertUnwindSafe(|| sample(roots));
+    if let Err(panic) = std::panic::catch_unwind(run) {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic".to_string());
+        log::error!("disk_footprint: a sample panicked ({what}); retrying next interval (#11191)");
+    }
+}
+
+/// Hand the sampler the current workspace roots, starting it on first call,
+/// and restarting it if it has died. The walk runs on its own thread so a
+/// large target dir never stalls the work-finder loop.
 pub fn publish_roots(roots: &[PathBuf]) {
     *SAMPLER_ROOTS.lock().unwrap_or_else(PoisonError::into_inner) = roots.to_vec();
-    SAMPLER.get_or_init(|| {
-        let spawned = std::thread::Builder::new()
-            .name("disk-footprint".into())
-            .spawn(|| loop {
-                let roots = SAMPLER_ROOTS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                sample_once(&roots);
-                std::thread::sleep(sample_interval());
-            });
-        if let Err(e) = spawned {
-            log::warn!("disk_footprint: could not start the sampler thread: {e}");
-        }
-    });
+    let mut sampler = SAMPLER.lock().unwrap_or_else(PoisonError::into_inner);
+    let restart = match sampler.as_ref() {
+        None => false,
+        Some(h) if h.is_finished() => true,
+        Some(_) => return,
+    };
+    if restart {
+        log::warn!("disk_footprint: the sampler thread had stopped; restarting it (#11191)");
+    }
+    let spawned = std::thread::Builder::new()
+        .name("disk-footprint".into())
+        .spawn(|| loop {
+            let roots = SAMPLER_ROOTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            sample_guarded(&roots);
+            std::thread::sleep(sample_interval());
+        });
+    match spawned {
+        Ok(h) => *sampler = Some(h),
+        Err(e) => log::warn!("disk_footprint: could not start the sampler thread: {e}"),
+    }
 }
 
 #[cfg(test)]

@@ -26,8 +26,9 @@ fn store(history: &[(&str, &[u64])], inflight: &[(&str, &str, u64)]) -> Store {
         .map(|(key, repo, gb)| LiveUnit {
             key: (*key).into(),
             repo: (*repo).into(),
-            issue: Some(1),
+            issue: key.contains('#').then_some(1),
             bytes: gb * GIB,
+            build_measured: true,
         })
         .collect();
     let ended = observe(&mut s, &live, NOW);
@@ -57,6 +58,17 @@ fn the_fallback_order_is_observed_then_repo_config_then_global() {
 }
 
 #[test]
+fn a_configured_charge_is_a_floor_under_the_observed_mark() {
+    // #11191 review: a repo whose builds are under-measured (an operator
+    // CARGO_TARGET_DIR) learns a tiny mark; its configured charge must win.
+    assert_eq!(charge_gb(Some(GIB / 2), Some(30), 8), (30, ChargeSource::RepoConfig));
+    // A mark above the configured floor still wins.
+    assert_eq!(charge_gb(Some(40 * GIB), Some(30), 8), (44, ChargeSource::Observed));
+    // Equal: reported as observed.
+    assert_eq!(charge_gb(Some(GIB * 9 / 10), Some(1), 8), (1, ChargeSource::Observed));
+}
+
+#[test]
 fn the_repo_config_key_is_read_from_the_repo() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("docs-site");
@@ -71,9 +83,16 @@ fn the_repo_config_key_is_read_from_the_repo() {
         charge_for_root(&root, &empty, 8),
         charge("docs-site", 2, ChargeSource::RepoConfig)
     );
-    // History outranks the config.
+    // History above the config outranks it (5 GB + 10% -> 6 > 2) ...
     let s = store(&[("docs-site", &[5])], &[]);
-    assert_eq!(charge_for_root(&root, &s, 8).source, ChargeSource::Observed);
+    assert_eq!(charge_for_root(&root, &s, 8), charge("docs-site", 6, ChargeSource::Observed));
+    // ... and the config is a floor under history below it.
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"autonomous":{"workFinder":{"diskChargeGb":12}}}"#,
+    )
+    .unwrap();
+    assert_eq!(charge_for_root(&root, &s, 8), charge("docs-site", 12, ChargeSource::RepoConfig));
     // No config, no history: the global default.
     let bare = tmp.path().join("bare");
     std::fs::create_dir_all(&bare).unwrap();
@@ -120,11 +139,66 @@ fn a_unit_charges_only_what_it_has_not_yet_written() {
 #[test]
 fn units_of_repos_outside_the_tick_use_their_own_history_or_the_default() {
     // `anvil` is not one of this tick's roots: charged from its own history
-    // (20 GB -> 22). `other` has none: the global default (8).
-    let s = store(&[("anvil", &[20])], &[("anvil#1", "anvil", 2), ("other:judge-1", "other", 1)]);
+    // (20 GB -> 22). `other` has none: the global default (8). A run dir of a
+    // sweep role is a sweep too.
+    let s = store(
+        &[("anvil", &[20])],
+        &[
+            ("anvil#1", "anvil", 2),
+            ("other:sweep-lifecycle-7-1", "other", 1),
+        ],
+    );
     let (bytes, sweeps) = reserved_bytes(&s, &[], 8, NOW, None);
     assert_eq!(bytes, (22 - 2) * GIB + (8 - 1) * GIB);
-    assert_eq!(sweeps, 2, "an issue unit and a run-dir unit both count");
+    assert_eq!(sweeps, 2, "an issue unit and a sweep run-dir unit both count");
+}
+
+/// #11191 review: idle role ticks (curator, champion, guide) each hold a run
+/// dir with only its owner file. They must not each be reserved at loom's
+/// 29 GB sweep charge, which would hold every sweep on the host.
+#[test]
+fn concurrent_idle_role_ticks_do_not_reserve_full_charges() {
+    let s = store(
+        &[("loom", &[26])],
+        &[
+            ("loom:curator-role-curator-20261009T100000Z-aaaa0001", "loom", 0),
+            ("loom:champion-role-champion-20261009T100000Z-aaaa0002", "loom", 0),
+            ("loom:guide-role-guide-20261009T100000Z-aaaa0003", "loom", 0),
+            ("loom:judge-role-judge-20261009T100000Z-aaaa0004", "loom", 0),
+        ],
+    );
+    let loom = charge("loom", 29, ChargeSource::Observed);
+    let b = assess(40, 3, &s, vec![loom.clone()], 8, NOW, None);
+    assert_eq!(b.reserved_gb, 0, "no role has a mark yet: nothing reserved");
+    assert_eq!(b.sweeps_in_flight, 0, "role runs are not sweeps");
+    assert!(b.fits(0), "a loom sweep still admits: 29 <= 37");
+
+    // Once judges have been seen building 7 GB, a live judge is reserved at
+    // its own mark (+10%), still never the repo's 29 GB.
+    let mut s = s;
+    s.role_runs.insert("loom:judge".into(), vec![7 * GIB]);
+    let b = assess(40, 3, &s, vec![loom], 8, NOW, None);
+    assert_eq!(b.reserved_gb, (7 * GIB + 7 * GIB / 100 * 10).div_ceil(GIB));
+    assert_eq!(b.reserved_gb, 8);
+    assert!(b.fits(0), "29 <= 40 - 3 - 8");
+}
+
+#[test]
+fn the_store_going_stale_is_an_edge_logged_once() {
+    let state = std::sync::Mutex::new(None);
+    let mut s = store(&[], &[]);
+    // Never sampled: new, not stale.
+    let fresh_store = Store::default();
+    assert_eq!(staleness_edge(&state, &fresh_store, NOW), None);
+    assert_eq!(staleness_edge(&state, &s, NOW), None);
+    let later = NOW + crate::disk_footprint::STALE_AFTER_SECS;
+    assert_eq!(
+        staleness_edge(&state, &s, later),
+        Some(StalenessEdge::BecameStale(crate::disk_footprint::STALE_AFTER_SECS))
+    );
+    assert_eq!(staleness_edge(&state, &s, later + 60), None, "only on the edge");
+    s.sampled_at = Some(later + 60);
+    assert_eq!(staleness_edge(&state, &s, later + 61), Some(StalenessEdge::Recovered));
 }
 
 #[test]

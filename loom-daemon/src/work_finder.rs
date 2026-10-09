@@ -32,7 +32,9 @@
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by [`resolve_dynamic_max_concurrent`]
 //! from two live inputs — the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]) and the host's
+//! ([`crate::disk_admission::tick`] since #11191: free space net of the
+//! in-flight sweeps' expected growth, at each repo's measured charge; the flat
+//! [`crate::disk_headroom::disk_headroom_limit`] when disabled) and the host's
 //! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
 //! — bounded by the per-machine operator ceiling
 //! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
@@ -127,7 +129,6 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 #[cfg(test)]
@@ -2613,7 +2614,13 @@ where
             // to know whether disk is the axis that would bind the cap down,
             // which is a comparison against this term and `configured_max`.
             let ram = crate::ram_headroom::ram_headroom_limit();
-            let mut disk = disk_headroom_limit(&workspace_root);
+            // #11191: one workspace, one charge, so the budget's cap term
+            // (sweeps in flight + what still fits at this repo's measured
+            // charge after the in-flight reservation) is the whole gate here;
+            // the per-repo hold and `disk_reservation` halt cause are the
+            // multi-workspace loop's. Disabled: the legacy flat term.
+            let disk_roots = [workspace_root.clone()];
+            let mut disk = crate::disk_admission::tick(&disk_roots, &workspace_root).0;
             // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
             // FIRST becomes the term that binds the cap down, run the existing
             // reclaim passes for this workspace root right now rather than
@@ -2628,7 +2635,7 @@ where
                     crate::eager_reclaim::run_for(&root_for_task)
                 })
                 .await;
-                disk = disk_headroom_limit(&workspace_root);
+                disk = crate::disk_admission::tick(&disk_roots, &workspace_root).0;
             }
             // Re-armed from the POST-reclaim reading, so a pass that actually
             // freed space lets a genuine future crossing fire again.

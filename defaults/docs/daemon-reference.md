@@ -4681,19 +4681,39 @@ reserved = sum over in-flight units u of max(0, charge(u.repo) - written(u))
 |---|---|
 | `free` | free GB on the worktree-root volume (`df -Pk`, as before) |
 | `floor` | the disk-full halt floor (`LOOM_DISK_FULL_HALT_GB`, default 3), so admission stops before the terminal halt |
-| `charge(R)` | first match wins: R's **observed** high-water mark + 10%, else R's `autonomous.workFinder.diskChargeGb` (**config**, per repo), else `LOOM_PER_WORKTREE_GB` (**default**, 8). Whole GB rounded up, minimum 1 — a repo that builds nothing measures well under 1 GB and is charged 1 |
+| `charge(R)` | R's **observed** sweep high-water mark + 10%, whole GB rounded up, minimum 1 (a repo that builds nothing measures well under 1 GB and is charged 1). R's `autonomous.workFinder.diskChargeGb` (**config**, per repo) is a **floor** under it: the charge is `max(observed, configured)`, so a configured value always raises an under-measured repo. With no history: the config, else `LOOM_PER_WORKTREE_GB` (**default**, 8) |
+| `charge(u)` for a role run | a role-runner tick (curator, champion, judge, guide, …) is reserved against **its own role's** mark in that repo + 10%, never the repo's sweep charge, and not at all before that role has a mark |
 | `written(u)` | what an in-flight unit has on disk now; already gone from `free`, so it is not charged twice |
 
 **Measurement.** A `disk-footprint` sampler thread (every
 `LOOM_DISK_SAMPLE_SECS`, default 60) measures every live unit of every
-managed repo: an issue sweep is its worktree (`issue-N`) plus every live
-`.loom/targets/` run dir (#8370) owned by the claim lock's pid or process
-group; any other live run dir (a role-runner tick, a PR-set sweep) is a unit
-of its own. When a unit ends, its peak is folded into the repo's history (the
-last 20 runs) in `~/.loom/disk-footprints.json` (`LOOM_DISK_FOOTPRINT_PATH`);
-the charge is the max of that history. The worktree volume's per-worktree
-cargo target dirs (#8458, `cargo.perWorktreeTargetDir`) live outside both and
-are not measured; a repo using them should set `diskChargeGb`.
+managed repo:
+
+- an **issue sweep** is its worktree (`issue-N`), plus the per-worktree cargo
+  target dir its `.loom-cargo-target-dir` marker names (#8458,
+  `cargo.perWorktreeTargetDir`, which lives outside the worktree), plus every
+  live `.loom/targets/` run dir (#8370) owned by the claim lock's pid or
+  process group;
+- a **PR-set sweep** is the run dirs held by the owner of its `pr-N` locks;
+- any **other live run dir** is a unit of its own. Its role comes from the dir
+  name: a sweep role (`sweep-lifecycle`, `builder`) is a sweep; anything else
+  is a **role run**.
+
+When a sweep ends, its peak is folded into the repo's history (the last 20
+sweeps); when a role run ends, into a separate per-repo, per-role history, so
+a stream of curator or guide ticks never ages a heavy build out of the repo's
+window. A unit that peaked under 1 MiB never built (a role run's dir holding
+only its owner file) and is not folded at all. Both histories live in
+`~/.loom/disk-footprints.json` (`LOOM_DISK_FOOTPRINT_PATH`); a repo's charge
+is the max of its sweep history. Sizes are apparent file lengths with
+hard-linked files (cargo's uplifted binaries) counted once per link, so the
+measurement errs toward over-charging.
+
+**Unmeasurable build output.** A sweep in a Cargo repo whose build output no
+probe finds (an operator `CARGO_TARGET_DIR` in the daemon's environment, a
+containerized run) is **not** folded into history, and the daemon logs a
+WARN naming the repo once per process. Such a repo keeps its configured or
+default charge: set `diskChargeGb` to its real per-sweep footprint.
 
 **Where it applies.**
 
@@ -4721,13 +4741,23 @@ figures in `disk=N [...]`.
 
 **Fail-open cases.** An unmeasurable `df` keeps the legacy term and skips the
 seam check (#4164). A store whose last sample is older than 10 minutes
-reserves nothing for its sampled units. `LOOM_DISK_ADMISSION=0` turns the whole
-mechanism off.
+reserves nothing for its sampled units (live free space and the per-repo
+charges still apply); the daemon logs a WARN on the edge into stale and an
+INFO when it recovers. A sampler iteration that panics is caught and logged,
+and a sampler thread that has died is restarted on the next tick. A corrupt
+store file is moved aside to `<path>.corrupt-<unix secs>` with a WARN and
+replaced by an empty store, so every repo falls back to its configured or
+default charge until its history rebuilds. `LOOM_DISK_ADMISSION=0` turns the
+whole mechanism off.
+
+The single-workspace work-finder loop uses the same budget's cap term (its
+one repo's charge, net of the reservation); the per-repo hold and the
+`disk_reservation` halt cause belong to the multi-workspace loop.
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `LOOM_DISK_ADMISSION` | on | `0`/`false`/`off` restores the legacy flat disk term |
-| `autonomous.workFinder.diskChargeGb` (repo config) | unset | the repo's charge while it has no observed history |
+| `autonomous.workFinder.diskChargeGb` (repo config) | unset | a floor under the repo's charge (`max(observed, configured)`), and the charge itself while it has no history |
 | `LOOM_PER_WORKTREE_GB` | 8 | the global fallback charge (and the legacy term's divisor) |
 | `LOOM_DISK_FULL_HALT_GB` | 3 | the floor admission keeps clear |
 | `LOOM_DISK_SAMPLE_SECS` | 60 | sampler interval |
