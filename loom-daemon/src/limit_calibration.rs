@@ -38,7 +38,7 @@
 //!   would still need days to accrue a baseline before it could detect
 //!   anything — a strictly worse starting position than a data source that
 //!   already has months of history.
-//! - `LOOM_CLAUDE_MONITOR_DIR` (honored via
+//! - `LOOM_LLM_MONITOR_DIR` / `LOOM_CLAUDE_MONITOR_DIR` (honored via
 //!   [`crate::tokens_pool::monitor::claude_monitor_dir`]) already relocates
 //!   this exact directory for [`crate::tokens_pool::monitor_db`]'s live
 //!   credential import, so this module inherits the same test/override story
@@ -327,8 +327,9 @@ fn aggregate_weekly_points(samples: &[(String, DateTime<Utc>, f64)]) -> Vec<Dail
 // I/O: claude-monitor `usage_history` + activity.db `resource_usage`
 // ============================================================================
 
-/// `~/.claude-monitor/usage.db` (or `LOOM_CLAUDE_MONITOR_DIR` if set) — the
-/// same resolution [`crate::tokens_pool::monitor_db`] uses for its live
+/// `<monitor-dir>/usage.db` — `LOOM_LLM_MONITOR_DIR`, else the deprecated
+/// `LOOM_CLAUDE_MONITOR_DIR`, else `~/.llm-monitor`, else `~/.claude-monitor`
+/// (#8849). The same resolution [`crate::tokens_pool::monitor_db`] uses for its live
 /// credential import.
 #[must_use]
 pub fn default_monitor_db_path() -> PathBuf {
@@ -366,8 +367,8 @@ fn weekly_points_from_monitor_db(
 ) -> Result<Vec<DailyWeeklyPoints>, String> {
     if !monitor_db_path.is_file() {
         return Err(format!(
-            "claude-monitor database not found at {} (is claude-monitor installed on this \
-             host? set LOOM_CLAUDE_MONITOR_DIR to point elsewhere)",
+            "llm-monitor database not found at {} (is llm-monitor, formerly claude-monitor, \
+             installed on this host? set LOOM_LLM_MONITOR_DIR to point elsewhere)",
             monitor_db_path.display()
         ));
     }

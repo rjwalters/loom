@@ -2406,13 +2406,13 @@ spawn path can actually pick.
 **Provisioning a managed-repo pool.** Bootstrap the shared pool once per machine:
 
 ```bash
-# Preferred on a host running claude-monitor — reads the live credential store
-# (~/.claude-monitor/usage.db -> oauth_credentials, opened mode=ro), so no
+# Preferred on a host running llm-monitor — reads the live credential store
+# (~/.llm-monitor/usage.db, or ~/.claude-monitor on 1.x -> oauth_credentials, mode=ro), so no
 # accounts.env is needed on this machine at all:
 loom-daemon tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
 loom-daemon tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
 
-# Without claude-monitor — materialize from the accounts.env snapshot instead:
+# Without llm-monitor — materialize from the accounts.env snapshot instead:
 loom-daemon tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
 loom-daemon tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
 ```
@@ -2420,7 +2420,8 @@ loom-daemon tokens check --ranking         # ranks the effective pool (shared wh
 Every consumer repo the daemon dispatches into then falls back to that one pool —
 no per-repo `loom-daemon tokens bootstrap` required. A repo that *wants* its own isolated
 pool can still `loom-daemon tokens bootstrap` locally; the per-repo pool always wins.
-Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
+Selection sources (`~/.llm-monitor/accounts.env` — `~/.claude-monitor` on 1.x; see
+token-pool.md "Monitor directory resolution" — and repo-local `.env`) are
 unchanged for `bootstrap` — `--shared` only redirects the *destination* of the
 materialized pool. `import-from-monitor` bypasses `accounts.env` entirely and
 takes claude-monitor as authoritative for pool membership (use `loom-daemon tokens pin`
@@ -5945,7 +5946,7 @@ account health can no longer *slow dispatch down*, only warn about it):
    deliberately **not** what gates dispatch (#5270 dropped that role
    entirely). On the state
    change into a pressured reading it emits an add-capacity advisory naming
-   concrete levers — add accounts to `~/.claude-monitor/accounts.env` +
+   concrete levers — add accounts to `~/.llm-monitor/accounts.env` +
    `loom-daemon tokens bootstrap`, or buy API credits, then re-probe with
    `loom-daemon tokens check --ranking` — with the current numbers (queued
    count, healthy/total accounts, exhausted count, estimated drain time at
