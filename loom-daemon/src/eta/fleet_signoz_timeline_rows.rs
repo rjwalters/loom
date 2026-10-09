@@ -68,10 +68,8 @@
 //! A row whose knowable-at is before its own event time is rejected: no
 //! genuine observation precedes the event.
 
-use super::fleet_signoz::RowCursor;
-use super::fleet_signoz_refresh::{
-    ClickhouseHttp, Limits, PageQuery, ReadError, SignozRead, SignozStop,
-};
+use super::fleet_signoz_refresh::{repo_query, Limits, SignozStop};
+use crate::signoz_read::{ClickhouseHttp, PageQuery, ReadError, RowCursor, SignozRead};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -843,13 +841,7 @@ pub fn walk(
             let detail = format!("window not exhausted after {} page(s)", limits.max_pages);
             return fail(report, SignozStop::PageLimit, detail);
         }
-        let query = PageQuery {
-            repo: repo.to_string(),
-            since,
-            until,
-            after: after.clone(),
-            limit,
-        };
+        let query = repo_query(repo, since, until, after.clone(), limit);
         let body = match reader.page(&query) {
             Ok(body) => body,
             Err(ReadError::Unavailable(why) | ReadError::Refused(why)) => {

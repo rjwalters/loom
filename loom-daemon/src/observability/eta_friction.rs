@@ -143,7 +143,8 @@ async fn lockouts(slug_cache: &mut HashMap<String, String>) -> Option<Tick> {
     }
     let locked = fold_lockouts(rows);
     let mut failed = BTreeSet::new();
-    for root in &summary.listing_failed {
+    // #11139: a partial listing is unknown too, never "unlocked".
+    for root in summary.listing_not_whole() {
         if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
             failed.insert(slug.to_ascii_lowercase());
         }

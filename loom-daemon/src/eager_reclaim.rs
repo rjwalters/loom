@@ -63,6 +63,14 @@
 //! root in the first place. The scheduled reaper still walks every registered
 //! root on its own cadence, unchanged.
 //!
+//! One exception (#11071): the idle kept-worktree artifact sub-pass
+//! ([`crate::worktree_reaper::reclaim_idle_targets_below_floor`]) walks every
+//! registered root. On a fleet host the probe root is the daemon's own
+//! checkout, which has no worktrees, so a probe-root-only pass could never
+//! reach the multi-GB `target/` dirs actually filling the volume. It makes no
+//! forge calls and removes no worktree, and it stops as soon as free space is
+//! back above the floor, so the fan-out costs local probes only.
+//!
 //! # Docker eager default (product decision, #7512)
 //!
 //! [`crate::docker_image_clean::run_for`] is called unconditionally here, same
@@ -92,6 +100,7 @@ use crate::docker_image_clean::DockerRetentionReport;
 use crate::git_tmp_reclaim::GitTmpReclaimReport;
 use crate::scratch_reclaim::ScratchReclaimReport;
 use crate::target_orphan_reclaim::TargetOrphanReport;
+use crate::worktree_reaper::ReclaimReport;
 
 // ============================================================================
 // Constants
@@ -262,6 +271,9 @@ pub struct EagerReclaimReport {
     pub at: DateTime<Utc>,
     /// The aborted-fetch `.git/objects` temp-file sub-pass's report (#10995).
     pub git_tmp: Option<GitTmpReclaimReport>,
+    /// The idle kept-worktree artifact sub-pass's report: every registered
+    /// root, largest first, stopping above the floor (#11071).
+    pub idle_targets: Option<ReclaimReport>,
 }
 
 fn gb_or_unknown(free_gb: Option<u64>) -> String {
@@ -304,12 +316,22 @@ impl EagerReclaimReport {
             .target_orphans
             .as_ref()
             .map_or_else(|| "n/a".to_string(), TargetOrphanReport::summary);
+        let idle = self.idle_targets.as_ref().map_or_else(
+            || "n/a".to_string(),
+            |r| {
+                format!(
+                    "{} dir(s) ({})",
+                    r.removed.len(),
+                    crate::tmpfs_reclaim::human_size(r.bytes_freed())
+                )
+            },
+        );
         format!(
             "eager_reclaim: {} disk axis binds the dispatch cap down ({} free) — ran an \
              out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's own \
-             scheduled pass: worktrees {} removed, deep-clean {deep}, docker {docker}, scratch \
-             {scratch}, git-tmp {git_tmp}, cargo-target orphans {target_orphans} — now {} free \
-             vs. floor {}G (#7512)",
+             scheduled pass: worktrees {} removed, idle worktree targets {idle}, deep-clean \
+             {deep}, docker {docker}, scratch {scratch}, git-tmp {git_tmp}, cargo-target orphans \
+             {target_orphans} — now {} free vs. floor {}G (#7512)",
             self.repo_root.display(),
             gb_or_unknown(self.free_gb_before),
             self.worktrees_removed,
@@ -358,6 +380,9 @@ pub struct SubPasses<'a> {
     pub free_gb: &'a dyn Fn(&Path) -> Option<u64>,
     /// [`crate::git_tmp_reclaim::run_for`] (#10995).
     pub git_tmp: &'a dyn Fn(&Path) -> GitTmpReclaimReport,
+    /// [`crate::worktree_reaper::reclaim_idle_targets_below_floor`], curried
+    /// with the floor (#11071).
+    pub idle_targets: &'a dyn Fn(&Path) -> ReclaimReport,
 }
 
 /// Everything one [`run_pass`] needs besides its injected seams.
@@ -409,6 +434,7 @@ pub fn run_pass(
         target_orphans: None,
         at: inputs.now,
         git_tmp: None,
+        idle_targets: None,
     };
 
     if !inputs.enabled {
@@ -435,6 +461,10 @@ pub fn run_pass(
     // #10995: cheap and precise, so before the pressure-gated deep pass, which
     // then re-probes free space after it — as in `reap_repo`.
     let git_tmp = (passes.git_tmp)(repo_root);
+    // #11071: kept worktrees' idle build caches, largest first, until free
+    // space is back above the floor. Before the deep pass, which must only
+    // touch the primary checkout when this was not enough.
+    let idle_targets = (passes.idle_targets)(repo_root);
     let deep_clean = (passes.deep_clean)(repo_root);
     let docker = (passes.docker)(repo_root);
     let scratch = (passes.scratch)(repo_root);
@@ -454,6 +484,7 @@ pub fn run_pass(
         target_orphans: Some(target_orphans),
         at: inputs.now,
         git_tmp: Some(git_tmp),
+        idle_targets: Some(idle_targets),
     }
 }
 
@@ -528,6 +559,11 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let target_orphans = crate::target_orphan_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
     let git_tmp = crate::git_tmp_reclaim::run_for;
+    let idle_targets = |root: &Path| {
+        let report = crate::worktree_reaper::reclaim_idle_targets_below_floor(root, floor_gb);
+        crate::worktree_reaper::log_idle_target_report(root, &report);
+        report
+    };
     let passes = SubPasses {
         reap_worktrees: &reap_worktrees,
         deep_clean: &deep_clean,
@@ -536,6 +572,7 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
         target_orphans: &target_orphans,
         free_gb: &free_gb,
         git_tmp: &git_tmp,
+        idle_targets: &idle_targets,
     };
 
     let report = run_pass(repo_root, &inputs, &passes);
@@ -715,6 +752,19 @@ mod tests {
         }
     }
 
+    fn stub_idle_target_report() -> ReclaimReport {
+        ReclaimReport {
+            removed: vec![crate::worktree_reaper::ArtifactDir {
+                class: "issue",
+                num: 9243,
+                worktree: std::path::PathBuf::from("/repo/.loom/worktrees/issue-9243"),
+                name: "target".to_string(),
+                bytes: 23 * 1024 * 1024 * 1024,
+            }],
+            ..ReclaimReport::default()
+        }
+    }
+
     fn run_with_counters(inputs: &EagerReclaimInputs, counters: &Counters) -> EagerReclaimReport {
         let now = inputs.now;
         let reap = |_: &Path| {
@@ -742,6 +792,10 @@ mod tests {
             counters.order.borrow_mut().push("git_tmp");
             stub_git_tmp_report(root, now)
         };
+        let idle_targets = |_: &Path| {
+            counters.order.borrow_mut().push("idle_targets");
+            stub_idle_target_report()
+        };
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
@@ -750,6 +804,7 @@ mod tests {
             target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
+            idle_targets: &idle_targets,
         };
         run_pass(Path::new("/repo"), inputs, &passes)
     }
@@ -775,6 +830,7 @@ mod tests {
             vec![
                 "worktrees",
                 "git_tmp",
+                "idle_targets",
                 "deep",
                 "docker",
                 "scratch",
@@ -783,6 +839,7 @@ mod tests {
             "must mirror worktree_reaper::reap_repo's own sequencing"
         );
         assert!(report.git_tmp.is_some());
+        assert_eq!(report.idle_targets.as_ref().unwrap().removed.len(), 1);
         assert!(report.deep_clean.is_some());
         assert!(report.docker.is_some());
         assert!(report.scratch.is_some());
@@ -809,7 +866,7 @@ mod tests {
         inputs.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.is_none());
-        assert_eq!(counters.total(), 6);
+        assert_eq!(counters.total(), 7);
     }
 
     #[test]
@@ -860,6 +917,7 @@ mod tests {
         let target_orphans = |root: &Path| stub_target_orphan_report(root);
         let free_gb = |_: &Path| Some(1u64);
         let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
+        let idle_targets = |_: &Path| ReclaimReport::default();
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
@@ -868,6 +926,7 @@ mod tests {
             target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
+            idle_targets: &idle_targets,
         };
         let report = run_pass(Path::new("/repo"), &base_inputs(now), &passes);
 
@@ -995,6 +1054,7 @@ mod tests {
             "scratch",
             "git-tmp",
             "cargo-target orphans",
+            "idle worktree targets 1 dir(s) (23.0G)",
             "floor 20G",
         ] {
             assert!(line.contains(needle), "log line missing {needle}: {line}");

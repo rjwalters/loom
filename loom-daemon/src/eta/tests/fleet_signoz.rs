@@ -11,14 +11,13 @@ use crate::eta::config::HistoryScopeMode;
 use crate::eta::explanation::HistoryScope;
 use crate::eta::fleet::{self, FORGE_HOST};
 use crate::eta::fleet_signoz::{self, reject, SignozSnapshot, SIGNOZ_SNAPSHOT_SCHEMA};
-use crate::eta::fleet_signoz_refresh::{
-    fetch, refresh, ClickhouseHttp, FileRows, Limits, PageQuery, ReadError, SignozRead, SignozStop,
-};
+use crate::eta::fleet_signoz_refresh::{fetch, refresh, repo_query, Limits, SignozStop};
 use crate::eta::heuristics::{FinishV1, LandV1};
 use crate::eta::history::{SampleSource, StageSamples};
 use crate::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Heuristic, NoEstimateReason, Stage,
 };
+use crate::signoz_read::{ClickhouseHttp, FileRows, PageQuery, ReadError, SignozRead};
 use crate::telemetry::{PhaseDuration, SweepOutcomeRecord, TelemetryEnvelope, TelemetryRecord};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
@@ -704,13 +703,8 @@ fn the_clickhouse_reader_binds_every_query_parameter_and_refuses_non_http() {
         credential_file: None,
         timeout: std::time::Duration::from_secs(1),
     };
-    let query = PageQuery {
-        repo: REPO.to_string(),
-        since: as_of() - Duration::days(1),
-        until: as_of(),
-        after: Some((42, "rec-01".to_string())),
-        limit: 7,
-    };
+    let query =
+        repo_query(REPO, as_of() - Duration::days(1), as_of(), Some((42, "rec-01".to_string())), 7);
     let url = reader.url(&query).unwrap();
     let pairs: std::collections::BTreeMap<String, String> =
         url.query_pairs().into_owned().collect();
@@ -732,33 +726,4 @@ fn the_clickhouse_reader_binds_every_query_parameter_and_refuses_non_http() {
         ..reader
     };
     assert!(file.url(&query).is_err());
-}
-
-#[cfg(unix)]
-#[test]
-fn a_credential_file_readable_by_others_is_refused_and_never_echoed() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("signoz-read.key");
-    std::fs::write(&path, "s3cret-value\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let mut reader = ClickhouseHttp {
-        // Unroutable on purpose: the credential check must fail first.
-        endpoint: "http://127.0.0.1:9".to_string(),
-        user: Some("reader".to_string()),
-        credential_file: Some(path),
-        timeout: std::time::Duration::from_millis(200),
-    };
-    let query = PageQuery {
-        repo: REPO.to_string(),
-        since: as_of() - Duration::days(1),
-        until: as_of(),
-        after: None,
-        limit: 1,
-    };
-    let Err(ReadError::Unavailable(why)) = reader.page(&query) else {
-        panic!("a group/world-readable credential must be refused");
-    };
-    assert!(why.contains("readable by group or others"), "{why}");
-    assert!(!why.contains("s3cret"), "{why}");
 }
