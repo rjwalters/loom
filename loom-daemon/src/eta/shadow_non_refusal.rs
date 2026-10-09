@@ -21,7 +21,9 @@
 //! cannot be read off them: weeks of `no_model` passes would drown it. The
 //! window has to be recent, so the passes are bucketed by UTC hour
 //! ([`AnswerHour`]) and the newest [`MAX_HOURS`] kept. A ledger written before
-//! this existed reads empty, and the check refuses until a day accrues.
+//! this existed reads empty, and the check refuses until a day accrues: the
+//! comparison's oldest bucket must be at least [`WINDOW_HOURS`] old, so a
+//! fresh ledger holding one burst of passes cannot pass.
 //!
 //! Pure apart from the ledger it reads: no clock (the caller passes `now`),
 //! no file, no forge.
@@ -76,6 +78,20 @@ pub struct NonRefusal {
     pub min_rate: f64,
     /// The passes required.
     pub min_passes: usize,
+    /// Start of the hour the comparison was first observed (its oldest
+    /// bucket); `None` for a ledger with no buckets for it.
+    #[serde(default)]
+    pub observed_since: Option<DateTime<Utc>>,
+    /// Whole hours observed as of `until`; the check needs [`WINDOW_HOURS`].
+    #[serde(default)]
+    pub observed_hours: Option<i64>,
+}
+
+/// The start of the hour a bucket key names.
+fn parse_hour_key(key: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(&format!("{key}:00:00"), "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .map(|t| t.and_utc())
 }
 
 /// `YYYY-MM-DDTHH`, the bucket key of `at`.
@@ -132,6 +148,14 @@ impl ShadowLedger {
             current: current.to_string(),
             candidate: candidate.to_string(),
         });
+        // The oldest bucket is when this comparison was first observed: the
+        // trailing window alone cannot tell a day of evidence from one burst.
+        let observed_since = self
+            .answer_hours
+            .get(&encoded)
+            .and_then(|hours| hours.keys().next())
+            .and_then(|key| parse_hour_key(key));
+        let observed_hours = observed_since.map(|t| (now - t).num_hours());
         let (mut current_answered, mut candidate_answered) = (0, 0);
         for (_, bucket) in self
             .answer_hours
@@ -146,6 +170,13 @@ impl ShadowLedger {
             (current_answered > 0).then(|| candidate_answered as f64 / current_answered as f64);
         let pct = |r: f64| r * 100.0;
         let (status, detail) = match rate {
+            _ if observed_hours.map_or(true, |h| h < WINDOW_HOURS) => (
+                GateStatus::Failed,
+                format!(
+                    "{current} vs {candidate} observed for {} h, {WINDOW_HOURS} h required",
+                    observed_hours.unwrap_or(0).max(0)
+                ),
+            ),
             _ if current_answered < MIN_PASSES => (
                 GateStatus::Failed,
                 format!(
@@ -182,6 +213,8 @@ impl ShadowLedger {
             rate,
             min_rate: MIN_RATE,
             min_passes: MIN_PASSES,
+            observed_since,
+            observed_hours,
         }
     }
 }
