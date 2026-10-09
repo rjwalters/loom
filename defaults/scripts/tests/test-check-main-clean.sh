@@ -1150,10 +1150,80 @@ else
 fi
 rm -rf "${REPO:?}"
 
-# -------- Test: ignored / root / .rustc_info.json markers (#11075 review) --------
-echo "Test 11075b: ignored marker, .rustc_info.json-only tree, root-level tag"
+# stash_files <repo> -> every path in stash@{0}'s worktree, index and untracked trees.
+stash_files() {
+    local r
+    for r in 'stash@{0}' 'stash@{0}^2' 'stash@{0}^3'; do
+        git -C "$1" ls-tree -r --name-only "$r" 2>/dev/null || true
+    done
+}
+
+# -------- Test: IGNORED markers, .rustc_info.json-only trees, staged artifacts (#11075) --------
+echo "Test 11075b: --quarantine finds ignored / untagged cargo markers on disk"
 REPO=$(make_repo_with_source)
+printf 'CACHEDIR.TAG\n.rustc_info.json\n' >> "$REPO/.gitignore"
+git -C "$REPO" commit -q -am "ignore cargo markers"
 SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075b.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+SIG='Signature: 8a477f597d28d172789f06886806bc55'
+mkdir -p "$REPO/target-x/debug" "$REPO/cargo-out/debug" "$REPO/target-staged" "$REPO/nested/target-y/debug"
+printf '%s\n' "$SIG" > "$REPO/target-x/CACHEDIR.TAG"
+printf 'bin\n' > "$REPO/target-x/debug/artifact.o"
+# No CACHEDIR.TAG at all: only cargo's .rustc_info.json (the #9748 / #9989 shape).
+printf '{"rustc_fingerprint":1234,"outputs":{}}\n' > "$REPO/cargo-out/.rustc_info.json"
+printf 'bin\n' > "$REPO/cargo-out/debug/b.o"
+# Staged artifacts beside an ignored marker (`git add` skips the marker itself).
+printf '%s\n' "$SIG" > "$REPO/target-staged/CACHEDIR.TAG"
+printf 'bin\n' > "$REPO/target-staged/a.o"
+git -C "$REPO" add target-staged
+# A tree nested in a collapsed untracked parent next to real work.
+printf '%s\n' "$SIG" > "$REPO/nested/target-y/CACHEDIR.TAG"
+printf 'bin\n' > "$REPO/nested/target-y/debug/c.o"
+printf 'notes\n' > "$REPO/nested/notes.txt"
+printf 'def leaked(): pass\n' > "$REPO/leaked_module.py"
+out=$( cd "$REPO" && LOOM_QUARANTINE_COMMENT=0 "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
+if [[ "$RC" -eq 4 ]]; then pass "ignored-marker quarantine exits 4 (no residual-dirt failure)"; else fail "expected 4, got $RC; out=$out"; fi
+STASH_FILES=$(stash_files "$REPO")
+if grep -q '^leaked_module.py$' <<<"$STASH_FILES" && grep -q '^nested/notes.txt$' <<<"$STASH_FILES"; then
+    pass "real work beside ignored-marker trees is still stashed"
+else
+    fail "rescue weakened; stash holds: $STASH_FILES"
+fi
+if grep -qE '^(target-x|cargo-out|target-staged|nested/target-y)/' <<<"$STASH_FILES"; then
+    fail "build tree with ignored/untagged marker leaked into refs/stash: $STASH_FILES"
+else
+    pass "no ignored-marker / .rustc_info.json tree blob in refs/stash"
+fi
+if [[ -f "$REPO/target-staged/a.o" && -f "$REPO/cargo-out/debug/b.o" ]]; then
+    pass "build-tree content left on disk"
+else
+    fail "build-tree content was removed from disk"
+fi
+rm -rf "${REPO:?}"
+
+# -------- Test: a repo-root CACHEDIR.TAG does not make every path a build tree (#11075) --------
+echo "Test 11075c: a root-level CACHEDIR.TAG never suppresses the rescue"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075c.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/CACHEDIR.TAG"
+printf '{"rustc_fingerprint":1}\n' > "$REPO/.rustc_info.json"
+mkdir -p "$REPO/src"; printf 'work\n' > "$REPO/src/real.rs"
+printf 'modified tracked content\n' > "$REPO/tracked_source.py"
+out=$( cd "$REPO" && LOOM_QUARANTINE_COMMENT=0 "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
+if [[ "$RC" -eq 4 ]]; then pass "root-tag quarantine exits 4"; else fail "expected 4, got $RC; out=$out"; fi
+STASH_FILES=$(stash_files "$REPO")
+if grep -q '^src/real.rs$' <<<"$STASH_FILES" && [[ "$(cat "$REPO/tracked_source.py")" == "original tracked content" ]]; then
+    pass "root-level marker ignored: real work still rescued"
+else
+    fail "root-level CACHEDIR.TAG suppressed the rescue; stash holds: $STASH_FILES"
+fi
+rm -rf "${REPO:?}"
+
+# -------- Test: bogus .rustc_info.json, .loom/-nested tree, ignored tag beside staged file (#11075) --------
+echo "Test 11075d: bogus .rustc_info.json is not a marker; ignored/untagged trees excluded"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075d.txt"
 printf 'CACHEDIR.TAG\n' > "$REPO/.gitignore"
 git -C "$REPO" add .gitignore && git -C "$REPO" commit -qm "ignore tags"
 ( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
@@ -1174,7 +1244,7 @@ printf 'keep\n' > "$REPO/notcargo/keep.txt"
 # (d) root-level tag must not turn every path into "build output"
 printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/CACHEDIR.TAG"
 printf 'def real(): pass\n' > "$REPO/real_work.py"
-out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075b" 2>&1 ); RC=$?
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
 STASH_FILES=$( { git -C "$REPO" ls-tree -r --name-only 'stash@{0}^3' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}^2' 2>/dev/null; } )
 if grep -q 'real_work.py' <<<"$STASH_FILES" && grep -q '^notcargo/keep.txt' <<<"$STASH_FILES"; then
     pass "root-level tag ignored; real dirt and bogus-marker siblings still rescued"
@@ -1187,6 +1257,7 @@ else
     pass "ignored CACHEDIR.TAG and .rustc_info.json-only trees excluded (incl. staged)"
 fi
 rm -rf "${REPO:?}"
+
 
 # -------- Summary --------
 echo ""

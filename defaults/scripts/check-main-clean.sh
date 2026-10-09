@@ -749,59 +749,79 @@ collect_offending_paths() {
     done <<< "$effective_status"
 }
 
-# Cargo target trees (#11075). Any directory holding a signature-verified
-# CACHEDIR.TAG is a generated build-output tree (cargo writes one into every
-# target dir, whatever its name: target-x/, .loom/target-doctor-N/,
-# .cargo-target/). Stashing one writes hundreds of MB into refs/stash (stash 7 /
-# #10516 had 7,119 files), so the quarantine rescue must never include it.
+# Cargo target trees (#11075). A directory is a generated build-output tree
+# when it holds a cargo marker whose CONTENT proves cargo wrote it, whatever its
+# name (target-x/, .loom/target-doctor-N/, .cargo-target/): a CACHEDIR.TAG with
+# the cache-dir-tagging signature, or a .rustc_info.json JSON object carrying
+# rustc_fingerprint (cargo writes one at every target root; some real trees had
+# no tag at all, e.g. .loom/target-issue-9748/). Stashing one writes hundreds
+# of MB into refs/stash (stash 7 / #10516 had 7,119 files), so the quarantine
+# rescue must never include it. Mirrors loom-daemon's generated_artifact.rs.
+#
+# Markers are checked ON DISK for every ancestor directory of what the stash
+# would capture (untracked, modified, staged), so an IGNORED marker beside
+# stashable artifacts is still found. The repo root is never a build tree: a
+# root-level tag would otherwise exclude every path and rescue nothing.
 CACHEDIR_SIG='Signature: 8a477f597d28d172789f06886806bc55'
 TAG_DIRS=()
-# tag_marker_ok <file> -> 0 when <file> is a genuine cargo target-root marker:
-# a CACHEDIR.TAG whose first line carries the spec signature, or a
-# .rustc_info.json object holding "rustc_fingerprint". Pipeline-free on purpose
-# (the pipefail early-exit-consumer baseline allows none).
-tag_marker_ok() {
-    local file="$1" line="" content=""
-    [[ -r "$file" ]] || return 1
-    case "$file" in
-        */CACHEDIR.TAG|CACHEDIR.TAG)
-            IFS= read -r line < "$file" 2>/dev/null || true
-            [[ "$line" == "$CACHEDIR_SIG"* ]]
-            ;;
-        */.rustc_info.json|.rustc_info.json)
-            content=$(head -c 4096 "$file" 2>/dev/null) || true
-            [[ "$content" == "{"* && "$content" == *'"rustc_fingerprint"'* ]]
-            ;;
-        *) return 1 ;;
-    esac
-}
-collect_tag_dirs() {
-    TAG_DIRS=()
-    local f d
-    # No --exclude-standard: an ignored marker must still be discovered, since
-    # its sibling artifacts can be stashable regardless of ignore rules.
-    while IFS= read -r -d '' f; do
-        [[ -n "$f" ]] || continue
-        tag_marker_ok "$main_root/$f" || continue
-        d="${f%CACHEDIR.TAG}"
-        [[ "$d" == "$f" ]] && d="${f%.rustc_info.json}"
-        d="${d%/}"
-        # A root-level marker would classify every path as build output; ignore it.
-        [[ -n "$d" ]] || continue
-        TAG_DIRS+=("$d")
-    done < <(git -C "$main_root" ls-files -z --cached --others \
-        -- ':(glob)CACHEDIR.TAG' ':(glob)**/CACHEDIR.TAG' \
-           ':(glob).rustc_info.json' ':(glob)**/.rustc_info.json' 2>/dev/null)
+
+# is_build_tree_dir <repo-relative dir> -> 0 when it holds a verified cargo marker.
+is_build_tree_dir() {
+    local d="$main_root/$1" line=""
+    if [[ -f "$d/CACHEDIR.TAG" ]]; then
+        IFS= read -r line < "$d/CACHEDIR.TAG" 2>/dev/null || true
+        [[ "$line" == "$CACHEDIR_SIG"* ]] && return 0
+    fi
+    if [[ -f "$d/.rustc_info.json" ]]; then
+        line=""
+        IFS= read -r line < "$d/.rustc_info.json" 2>/dev/null || true
+        if [[ "$line" =~ ^[[:space:]]*\{ ]] \
+            && grep -q '"rustc_fingerprint"[[:space:]]*:' "$d/.rustc_info.json" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # under_tag_dir <path> -> 0 when <path> is (or lies under) a tag dir.
 under_tag_dir() {
     local p="${1%/}" t
-    for t in "${TAG_DIRS[@]}"; do
+    for t in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do
         [[ -n "$t" ]] || continue
         [[ "$p" == "$t" || "$p" == "$t"/* ]] && return 0
     done
     return 1
+}
+
+collect_tag_dirs() {
+    TAG_DIRS=()
+    local f d last=""
+    while IFS= read -r -d '' f; do
+        [[ "$f" == */* ]] || continue   # a root-level file: the root is never a tree
+        d="${f%/*}"
+        [[ "$d" == "$last" ]] && continue
+        under_tag_dir "$d" && { last="$d"; continue; }
+        # Walk up until reaching an ancestor of the previous file's dir (git
+        # lists sorted, so those were already checked); stop at the root.
+        while [[ -n "$d" && "$last" != "$d" && "$last" != "$d"/* ]]; do
+            is_build_tree_dir "$d" && TAG_DIRS+=("$d")
+            if [[ "$d" == */* ]]; then d="${d%/*}"; else d=""; fi
+        done
+        last="${f%/*}"
+    done < <(
+        git -C "$main_root" ls-files -z --others --exclude-standard 2>/dev/null || true
+        git -C "$main_root" diff -z --name-only 2>/dev/null || true
+        git -C "$main_root" diff -z --name-only --cached 2>/dev/null || true
+    )
+}
+
+# only_tag_content <collapsed-untracked-dir> -> 0 when everything untracked
+# beneath it lies under a tag dir (so the porcelain line is build output only).
+only_tag_content() {
+    local specs=(":(literal,top)$1") t rest
+    for t in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do specs+=(":(exclude,literal,top)$t"); done
+    rest=$(git -C "$main_root" ls-files --others --exclude-standard -- "${specs[@]}" 2>/dev/null) || return 1
+    [[ -z "$rest" ]]
 }
 
 # drop_tag_status <porcelain-text> -> the text minus lines for paths under a tag dir.
@@ -813,6 +833,7 @@ drop_tag_status() {
         [[ "$path" == *" -> "* ]] && path="${path##* -> }"
         path=$(unquote_path "$path")
         under_tag_dir "$path" && continue
+        [[ "${line:0:2}" == "??" && "$path" == */ ]] && only_tag_content "$path" && continue
         out+="$line"$'\n'
     done <<< "$1"
     printf '%s' "${out%$'\n'}"
@@ -850,10 +871,10 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     # lie under, a CACHEDIR.TAG dir; exclude tag dirs nested under a collapsed
     # untracked parent (e.g. `?? .loom/`) via the pathspecs below.
     kept_paths=()
-    for p in "${OFFENDING_PATHS[@]}"; do
+    for p in ${OFFENDING_PATHS[@]+"${OFFENDING_PATHS[@]}"}; do
         under_tag_dir "$p" || kept_paths+=("$p")
     done
-    OFFENDING_PATHS=("${kept_paths[@]}")
+    OFFENDING_PATHS=(${kept_paths[@]+"${kept_paths[@]}"})
 
     if [[ "${#OFFENDING_PATHS[@]}" -eq 0 ]]; then
         # Nothing left to rescue. Emit this as its OWN structured result rather
@@ -893,8 +914,7 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     for p in "${OFFENDING_PATHS[@]}"; do
         stash_pathspecs+=(":(literal,top)$p")
     done
-    for p in "${TAG_DIRS[@]}"; do
-        [[ -n "$p" ]] || continue
+    for p in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do
         # Exclude pathspecs only limit the worktree diff; unstage any staged
         # copies so the stash's index commit cannot carry them either.
         git -C "$main_root" reset -q -- ":(literal,top)$p" >/dev/null 2>&1 || true

@@ -220,6 +220,9 @@ pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
 pub mod forge_tree_unchanged;
 pub mod forge_wait_checks;
+/// Generated content a quarantine must never stash: name-based artifacts and
+/// content-verified cargo build trees (#5690, #11075).
+pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;

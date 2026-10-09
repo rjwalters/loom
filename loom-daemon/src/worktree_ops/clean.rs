@@ -1463,28 +1463,10 @@ pub fn cleanup_worktree(
 pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<String> {
     let before = stash_ref_commit(worktree_path);
     let msg = format!("{QUARANTINE_STASH_LABEL} {label}");
-    // #11075: never write a cargo target tree (any dir holding a
-    // signature-verified CACHEDIR.TAG, whatever its name) into refs/stash.
-    let mut args: Vec<String> = ["stash", "push", "--include-untracked", "-m", &msg]
-        .map(String::from)
-        .to_vec();
-    let tag_dirs = cachedir_tag_dirs(worktree_path);
-    if !tag_dirs.is_empty() {
-        // A pathspec exclude only limits the worktree diff: STAGED entries
-        // under a tag dir would still be recorded in the stash's index
-        // commit. Unstage them first (content stays on disk).
-        let mut reset = vec!["reset".to_string(), "-q".to_string(), "--".to_string()];
-        reset.extend(tag_dirs.iter().map(|d| format!(":(literal){d}")));
-        let _ = Command::new("git")
-            .args(&reset)
-            .current_dir(worktree_path)
-            .status();
-        args.push("--".to_string());
-        args.push(".".to_string());
-        args.extend(tag_dirs.iter().map(|d| format!(":(exclude,literal){d}")));
-    }
+    // #11075: never write a cargo build tree (content-verified marker, any
+    // name, ignored or not) into refs/stash — see `generated_artifact`.
     let status = Command::new("git")
-        .args(&args)
+        .args(crate::generated_artifact::quarantine_stash_args(worktree_path, &msg))
         .current_dir(worktree_path)
         .status();
     if !status.is_ok_and(|s| s.success()) {
@@ -1496,63 +1478,6 @@ pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<St
     } else {
         None
     }
-}
-
-/// First line every cargo-written `CACHEDIR.TAG` carries (the cache-dir tagging spec).
-const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
-
-/// Whether `content` is a genuine cargo target-root marker for file name `name`:
-/// a `CACHEDIR.TAG` with the spec signature, or a `.rustc_info.json` object
-/// holding `rustc_fingerprint` (cargo writes one at every target root).
-fn is_target_marker(name: &str, content: &str) -> bool {
-    match name {
-        "CACHEDIR.TAG" => content.starts_with(CACHEDIR_TAG_SIGNATURE),
-        ".rustc_info.json" => {
-            content.trim_start().starts_with('{') && content.contains("\"rustc_fingerprint\"")
-        }
-        _ => false,
-    }
-}
-
-/// Worktree-relative directories (no trailing slash) containing a verified
-/// cargo target-root marker (`CACHEDIR.TAG` or `.rustc_info.json`) — tracked,
-/// staged, untracked or gitignored. These are generated build trees that must
-/// never be stashed (#11075). Discovery deliberately ignores `.gitignore`: an
-/// ignored marker's sibling artifacts can still be stashable.
-fn cachedir_tag_dirs(worktree_path: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--",
-            ":(glob)CACHEDIR.TAG",
-            ":(glob)**/CACHEDIR.TAG",
-            ":(glob).rustc_info.json",
-            ":(glob)**/.rustc_info.json",
-        ])
-        .current_dir(worktree_path)
-        .output()
-    else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter(|f| !f.is_empty())
-        .filter_map(|f| {
-            let (dir, name) = f.rsplit_once('/').unwrap_or(("", f));
-            // A marker at the worktree root would exclude everything; skip it.
-            if dir.is_empty() {
-                return None;
-            }
-            let content = std::fs::read_to_string(worktree_path.join(f)).ok()?;
-            is_target_marker(name, &content).then(|| dir.to_string())
-        })
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs
 }
 
 /// The current `refs/stash` tip's commit sha, or `None` if the ref does not
