@@ -61,6 +61,9 @@
 //! the trial deployment is #9006, and the real-canary gap is #8525.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -91,7 +94,7 @@ fn clickhouse(script: &str, format: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),

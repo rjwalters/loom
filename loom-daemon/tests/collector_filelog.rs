@@ -14,6 +14,9 @@
 //! output, model replies, and the malformed line) never appearing anywhere
 //! in the exported record — not even in `body`, which `keep_keys` does not
 //! touch.
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::{
     fs,
     process::Command,
@@ -162,7 +165,7 @@ impl Trial {
             &format!("{}:/run/secrets:ro", secrets.display()),
             "-v",
             &format!("{}:/var/lib/otelcol", out.display()),
-            IMAGE,
+            &hub_image::resolve(IMAGE),
             "--config=/etc/otelcol/config.yaml",
         ]);
         self.started = true;

@@ -20,6 +20,9 @@
 //!   counting rows inflates the answer rate from 0.5 to 0.75.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -41,7 +44,7 @@ fn clickhouse(script: &str) -> String {
             "-i",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--param_since={SINCE}"),
