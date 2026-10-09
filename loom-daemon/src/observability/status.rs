@@ -17,6 +17,9 @@ use super::exporter;
 #[derive(Debug)]
 pub struct ExportStatus {
     inner: std::sync::Mutex<crate::types::ObservabilityExportStatus>,
+    /// The exporter's own queue, attached once at startup (#11115) so a
+    /// snapshot can report live pressure.
+    queue: std::sync::OnceLock<std::sync::Arc<super::queue::DurableQueue>>,
 }
 
 // Allow expect_used: a poisoned status mutex means another thread panicked
@@ -54,7 +57,14 @@ impl ExportStatus {
         initial.refresh_endpoint_scope();
         ExportStatus {
             inner: std::sync::Mutex::new(initial),
+            queue: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach this exporter's queue so [`Self::snapshot`] reports its
+    /// pressure counters (#11115). First attach wins.
+    pub fn attach_queue(&self, queue: std::sync::Arc<super::queue::DurableQueue>) {
+        let _ = self.queue.set(queue);
     }
 
     /// Record `count` envelopes acked by the backend. Clears the consecutive-
@@ -114,6 +124,7 @@ impl ExportStatus {
             inner: std::sync::Mutex::new(crate::types::ObservabilityExportStatus::misconfigured(
                 endpoint, detail,
             )),
+            queue: std::sync::OnceLock::new(),
         }
     }
 
@@ -130,6 +141,7 @@ impl ExportStatus {
             .clone();
         snapshot.state = snapshot.classify(chrono::Utc::now());
         snapshot.refresh_endpoint_scope();
+        snapshot.queue = self.queue.get().map(|queue| queue.pressure());
         snapshot
     }
 }

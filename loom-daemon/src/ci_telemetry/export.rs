@@ -18,6 +18,14 @@
 //! queue offer and the cursor save (the same posture as every other
 //! backfill); every CI record carries stable GitHub/trace identities, so a
 //! re-offered record is recognisable downstream.
+//!
+//! **Bounded admission (#11115).** Records are offered through
+//! [`QueueSink::offer_backfill`], which never evicts: when any exporter queue
+//! is at its backfill limit the pass stops at that line and leaves it (and
+//! everything after it) behind the cursor for the next pass. A fan-out offer
+//! accepted by one exporter but deferred by another is re-offered later, so
+//! the already-accepting exporter sees a duplicate (at-least-once), never a
+//! silent omission.
 
 use std::fs::File;
 use std::io;
@@ -30,7 +38,7 @@ use super::ledger::{complete_len, scan_lines};
 use super::rotation::{self, RotationPolicy};
 use super::state::CycleLock;
 use super::{journal_path, read_config, state_dir};
-use crate::observability::queue::QueueSink;
+use crate::observability::queue::{Admission, QueueSink};
 use crate::telemetry::TelemetryEnvelope;
 
 /// Persisted progress through the journal.
@@ -159,11 +167,24 @@ fn export_locked(root: &Path, path: &Path, queue: &dyn QueueSink) -> (usize, Exp
         }
         match serde_json::from_str::<TelemetryEnvelope>(text) {
             Ok(envelope) => {
-                if let Err(error) = queue.offer_durable(envelope) {
-                    log::warn!("ci_telemetry: export queue refused a record, will retry: {error}");
-                    return false;
+                match queue.offer_backfill(envelope) {
+                    Ok(Admission::Admitted) => offered += 1,
+                    Ok(Admission::Deferred) => {
+                        // #11115: stop at the first unadmitted record; it
+                        // stays behind the cursor and no work is spent on
+                        // the rest of the journal this pass.
+                        log::debug!(
+                            "ci_telemetry: export deferred — exporter queue at its backfill limit"
+                        );
+                        return false;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "ci_telemetry: export queue refused a record, will retry: {error}"
+                        );
+                        return false;
+                    }
                 }
-                offered += 1;
             }
             Err(error) => log::warn!("ci_telemetry: skipping unparseable journal line: {error}"),
         }

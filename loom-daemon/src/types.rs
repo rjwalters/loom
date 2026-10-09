@@ -1883,7 +1883,7 @@ pub struct DeepCleanRepoStatus {
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, NEVER_EXPORTED_GRACE_FLOOR_SECS,
+    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod forge_events;

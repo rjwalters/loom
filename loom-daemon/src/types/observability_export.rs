@@ -152,6 +152,38 @@ pub struct ObservabilityExportStatus {
     /// trusting this flag.
     #[serde(default)]
     pub endpoint_loopback: bool,
+    /// This exporter's own durable-queue pressure (#11115): depth, capacity,
+    /// and the cumulative drop / deferral counters. `None` before the queue
+    /// is attached (and for older payloads). See [`ObservabilityQueuePressure`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<ObservabilityQueuePressure>,
+}
+
+/// Per-exporter queue pressure (#11115), the status-path companion of
+/// `DurableQueue`. Counters are **session-scoped**: they start at zero when
+/// the daemon process opens the queue and are never persisted.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservabilityQueuePressure {
+    /// Envelopes currently queued (not yet acknowledged by the backend).
+    #[serde(default)]
+    pub depth: u64,
+    /// The queue's hard capacity.
+    #[serde(default)]
+    pub capacity: u64,
+    /// Occupancy at or above which bulk backfill is deferred rather than
+    /// admitted (always `<= capacity`).
+    #[serde(default)]
+    pub backfill_limit: u64,
+    /// Envelopes **evicted** (oldest-first) because an ordinary producer
+    /// pushed into a full queue. Real loss. Session-scoped.
+    #[serde(default)]
+    pub dropped_total: u64,
+    /// Bulk-backfill offers **refused** because the queue was at its backfill
+    /// limit. Not loss: the record stays behind the journal cursor and is
+    /// re-offered on a later pass, so one record may be counted many times.
+    /// Session-scoped.
+    #[serde(default)]
+    pub backfill_deferred_total: u64,
 }
 
 /// Floor on the never-exported grace window — a fresh exporter is never called

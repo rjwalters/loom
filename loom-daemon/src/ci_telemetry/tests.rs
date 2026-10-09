@@ -7,6 +7,7 @@
 //! `ci_telemetry::logs`, the module under test).
 
 mod api_parsing;
+mod backfill_admission;
 mod billing_block;
 mod captain_gate;
 mod credential_rejection;

@@ -1094,6 +1094,7 @@ pub fn spawn_task(
         let queue = Arc::new(DurableQueue::open(queue_path, capacity));
         let export_status =
             Arc::new(ExportStatus::started(&host_id, endpoint, name, flush_interval.as_secs()));
+        export_status.attach_queue(queue.clone());
         let sender_handle = match entry.kind {
             ExporterKind::Https => {
                 // Host-identity mismatch detection (Issue #4830) is created and

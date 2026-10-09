@@ -70,7 +70,27 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     dropped_total: u64,
+    /// Bulk-backfill offers refused at the backfill limit (#11115).
+    deferred_total: u64,
     head_sequence: u128,
+}
+
+/// Outcome of a bounded bulk-backfill offer (#11115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Every sink took the record.
+    Admitted,
+    /// At least one sink was at its backfill limit; the caller must keep the
+    /// record behind its cursor and retry on a later pass.
+    Deferred,
+}
+
+/// Occupancy ceiling for bulk backfill: 75% of `capacity` (never above it).
+/// The remaining quarter is headroom that ordinary lifecycle/CI producers
+/// can use without evicting anything while a replay is in progress.
+#[must_use]
+pub fn backfill_limit(capacity: usize) -> usize {
+    capacity - capacity / 4
 }
 
 /// An in-process queue cursor plus immutable payload snapshot. Sequence identity
@@ -85,6 +105,15 @@ pub struct DurableQueue {
     path: PathBuf,
     capacity: usize,
     state: Mutex<QueueState>,
+}
+
+impl std::fmt::Debug for DurableQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableQueue")
+            .field("path", &self.path)
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DurableQueue {
@@ -110,6 +139,7 @@ impl DurableQueue {
             state: Mutex::new(QueueState {
                 items,
                 dropped_total: 0,
+                deferred_total: 0,
                 head_sequence: 0,
             }),
         }
@@ -178,6 +208,58 @@ impl DurableQueue {
     #[must_use]
     pub fn dropped_total(&self) -> u64 {
         self.lock().dropped_total
+    }
+
+    /// Total bulk-backfill offers refused at the backfill limit over this
+    /// queue's lifetime (session-scoped). Deferral is not loss.
+    #[must_use]
+    pub fn deferred_total(&self) -> u64 {
+        self.lock().deferred_total
+    }
+
+    /// Live pressure snapshot for the status path (#11115).
+    #[must_use]
+    pub fn pressure(&self) -> crate::types::ObservabilityQueuePressure {
+        let state = self.lock();
+        crate::types::ObservabilityQueuePressure {
+            depth: state.items.len() as u64,
+            capacity: self.capacity as u64,
+            backfill_limit: backfill_limit(self.capacity) as u64,
+            dropped_total: state.dropped_total,
+            backfill_deferred_total: state.deferred_total,
+        }
+    }
+
+    /// True when a bulk-backfill offer would be admitted right now. Counts a
+    /// deferral when it is not. Advisory under concurrency; the push itself
+    /// ([`Self::push_bounded`]) re-checks under the lock.
+    fn backfill_room(&self) -> bool {
+        let mut state = self.lock();
+        if state.items.len() < backfill_limit(self.capacity) {
+            true
+        } else {
+            state.deferred_total += 1;
+            false
+        }
+    }
+
+    /// Bounded, non-evicting durable enqueue for bulk backfill (#11115):
+    /// admits only while occupancy is below [`backfill_limit`]; otherwise
+    /// counts a deferral and returns [`Admission::Deferred`] without touching
+    /// the queue. Ordinary [`Self::push`] keeps its drop-oldest behavior.
+    pub fn push_bounded(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        {
+            let mut state = self.lock();
+            if state.items.len() >= backfill_limit(self.capacity) {
+                state.deferred_total += 1;
+                return Ok(Admission::Deferred);
+            }
+        }
+        // A concurrent producer may fill the gap between the check and the
+        // push; that producer's own push is what would evict, never ours
+        // beyond one slot of the 25% headroom.
+        self.push_inner(envelope, true)?;
+        Ok(Admission::Admitted)
     }
 
     /// Clone up to `n` envelopes from the front of the queue **without**
@@ -253,6 +335,15 @@ pub trait QueueSink: Send + Sync {
     /// context for immediately after (trace spans): the queue file and its
     /// directory must reach stable storage before returning `Ok(())`.
     fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()>;
+
+    /// Bounded admission for bulk journal replay (#11115). Unlike
+    /// [`Self::offer_durable`] this must never evict already-queued records:
+    /// a sink at its backfill limit answers [`Admission::Deferred`] and the
+    /// caller leaves the record behind its persisted cursor. The default
+    /// (for sinks with no capacity notion) is an unconditional durable offer.
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        self.offer_durable(envelope).map(|()| Admission::Admitted)
+    }
 }
 
 impl QueueSink for DurableQueue {
@@ -262,6 +353,10 @@ impl QueueSink for DurableQueue {
 
     fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
         self.push_durable(envelope)
+    }
+
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        self.push_bounded(envelope)
     }
 }
 
@@ -303,6 +398,32 @@ impl QueueSink for FanoutQueue {
             queue.push_durable(envelope.clone())?;
         }
         Ok(())
+    }
+
+    /// All-or-defer across unequal queues (#11115): every queue is checked
+    /// first (each full queue counts its own deferral, so pressure is
+    /// attributed per exporter), and the record is pushed only when **all**
+    /// have room. A concurrent producer filling a queue between the check
+    /// and the push, or a persistence failure on a later queue, can still
+    /// leave earlier queues holding the record while the cursor does not
+    /// advance; the retry re-offers it, so delivery is at-least-once (a
+    /// duplicate, never an omission).
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        let mut all_have_room = true;
+        for queue in &self.queues {
+            // No short-circuit: every saturated exporter records its deferral.
+            all_have_room &= queue.backfill_room();
+        }
+        if !all_have_room {
+            return Ok(Admission::Deferred);
+        }
+        let mut admission = Admission::Admitted;
+        for queue in &self.queues {
+            if queue.push_bounded(envelope.clone())? == Admission::Deferred {
+                admission = Admission::Deferred;
+            }
+        }
+        Ok(admission)
     }
 }
 
