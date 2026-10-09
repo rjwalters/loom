@@ -216,8 +216,7 @@ API call. A probe failure resolves to `private` — the same fail-safe default.
 ## Exported-facts contract (external ETA consumers, #11098)
 
 ETA is moving out of Loom (decision #11078). loom-ui rebuilds it from label
-webhooks, `github-read`, SigNoz and the records below
-([2AMLogic/loom-ui#3006](https://github.com/2AMLogic/loom-ui/issues/3006)).
+webhooks, `github-read`, SigNoz and the records below (tracked on #11098).
 Loom keeps no ETA logic. Its one obligation is to keep exporting the facts in
 the first table. This section only points at each kind's own section, which
 remains the field reference.
@@ -233,7 +232,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Record | Signal | Owner (emit site, under `loom-daemon/src/`) |
 |---|---|---|
 | [`sweep.outcome`](#sweepoutcome) | log, native + OTLP | `sweep_registry/outcome_journal.rs`, `observability/collector.rs`, `sweep_registry/prless_retry/durable.rs`, `observability/backfill.rs` |
-| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`, `queue.rs`, `shutdown.rs`, `backfill.rs`) |
+| [`sweep.started`](#sweepstarted) / [`sweep.phase`](#sweepphase) / [`sweep.completed`](#sweepcompleted) / [`sweep.identity`](#sweepidentity) | log, native + OTLP | `observability/collector.rs` (+ `collector/identity.rs`), `observability/queue.rs`, `observability/shutdown.rs`, `observability/backfill.rs` |
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
@@ -250,8 +249,7 @@ them a non-ETA default without changing what is emitted.
 
 **ETA-only records.** Only ETA code emits these. Each one either gets a non-ETA
 owner or is dropped with loom-ui's agreement. No disposition is final until
-loom-ui confirms it on
-[loom-ui#3006](https://github.com/2AMLogic/loom-ui/issues/3006).
+loom-ui confirms it; track each disposition on #11098.
 
 | Record | Signal | Sole emit site (under `loom-daemon/src/`) | ETA-only | Disposition |
 |---|---|---|---|---|
