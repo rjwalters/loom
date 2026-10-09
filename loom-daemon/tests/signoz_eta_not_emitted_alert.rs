@@ -140,8 +140,20 @@ fn open_prs(fingerprint: u64, state: &str, value: u32) -> String {
     )
 }
 
-/// One `eta.estimate` log record at `ts_ms`.
+/// One `eta.estimate` log record at `ts_ms`, stamped by the authority the
+/// way `otlp::mapping::eta::push_authority` stamps it.
 fn estimate_log(ts_ms: i64) -> String {
+    format!(
+        "INSERT INTO signoz_logs.logs_v2 (timestamp, body, attributes_string) VALUES \
+         ({}, '{{}}', map('loom.eta.estimate_id', 'e-{ts_ms}', 'loom.eta.authority', \
+         'loom-worker-1'));\n",
+        ts_ms * 1_000_000
+    )
+}
+
+/// An `eta.estimate` with no `loom.eta.authority` stamp: what a pre-#10498
+/// build emits regardless of authority (every row before 2026-10-08 09:00Z).
+fn unstamped_estimate_log(ts_ms: i64) -> String {
     format!(
         "INSERT INTO signoz_logs.logs_v2 (timestamp, body, attributes_string) VALUES \
          ({}, '{{}}', map('loom.eta.estimate_id', 'e-{ts_ms}'));\n",
