@@ -605,6 +605,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
+        settled: BTreeSet::new(),
         view: None,
         at: None,
     },

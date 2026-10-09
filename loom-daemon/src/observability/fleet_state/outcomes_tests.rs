@@ -2,7 +2,7 @@
 //! Nothing here touches the ETA subsystem: no ETA state exists in these tests,
 //! which is the daemon with `autonomous.eta.enabled = false`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -196,6 +196,119 @@ fn a_stage_outcome_with_no_forge_instant_is_still_emitted_at_the_pass() {
     assert_eq!(r.forge_transition_at, None, "a stale label event is not this move");
     assert_eq!(r.left_at, t0() + Duration::minutes(5));
     assert_eq!(r.resolution_sec, Some(300));
+}
+
+#[test]
+fn a_label_event_inside_the_preceding_interval_is_not_this_move() {
+    // The previous pass (12:05) already saw `review_wait`; a `loom:pr` event
+    // at 12:02 is from an earlier visit, not the move seen at 12:10.
+    let mut forge = Forge::default();
+    forge
+        .labels
+        .insert(21, [("loom:pr".to_string(), t0() + Duration::minutes(2))].into());
+    let out = run(
+        &[
+            input(&[], Vec::new()),
+            input(&[(21, "loom:review-requested", 20)], Vec::new()),
+            input(&[(21, "loom:pr", 20)], Vec::new()),
+        ],
+        Duration::minutes(5),
+        &mut forge,
+    );
+    let r = stages(&out[2])[0];
+    assert_eq!(r.forge_transition_at, None);
+    assert_eq!(r.left_at, t0() + Duration::minutes(10));
+    assert_eq!(r.resolution_sec, Some(300));
+}
+
+fn held_merge_wait() -> HeldSweep {
+    HeldSweep {
+        repo: REPO.to_string(),
+        issue: 20,
+        stage: FleetStage::MergeWait,
+        entered_at: t0() - Duration::minutes(20),
+        entered_at_lower_bound: false,
+        pr: Some(21),
+        overflow: false,
+    }
+}
+
+fn merged_at_7() -> (DateTime<Utc>, Forge) {
+    let merged_at = t0() + Duration::minutes(7);
+    let mut forge = Forge::default();
+    forge.pulls.insert(
+        21,
+        PullFacts {
+            merged_at: Some(merged_at),
+            closed_at: Some(merged_at),
+        },
+    );
+    (merged_at, forge)
+}
+
+#[test]
+fn a_held_row_persisting_across_a_merge_gives_one_landed_outcome() {
+    let (merged_at, mut forge) = merged_at_7();
+    let out = run(
+        &[
+            input(&[(21, "loom:pr", 20)], vec![held_merge_wait()]),
+            input(&[], vec![held_merge_wait()]),
+            input(&[], vec![held_merge_wait()]),
+            input(&[], Vec::new()),
+            input(&[], Vec::new()),
+        ],
+        Duration::minutes(10),
+        &mut forge,
+    );
+    let records = stages(&out[1]);
+    assert_eq!(records.len(), 1, "{out:?}");
+    assert_eq!(records[0].exit, StageExit::Landed);
+    assert_eq!(records[0].stage, FleetStage::MergeWait);
+    assert_eq!(records[0].next_stage, None);
+    assert_eq!(records[0].forge_transition_at, Some(merged_at));
+    assert_eq!(resolved(&out[1]).len(), 1);
+    // The sweep then disappears: the merge is not reported a second time, nor
+    // as `unknown`.
+    for later in &out[2..] {
+        assert!(stages(later).is_empty(), "{later:?}");
+    }
+}
+
+#[test]
+fn a_ready_row_surviving_the_review_departure_gives_landed_not_advance() {
+    use crate::observability::fleet_state::{ReadyItem, ReadyQueue};
+    let (merged_at, mut forge) = merged_at_7();
+    let ready = || {
+        let mut with_ready = input(&[], Vec::new());
+        with_ready.ready = Some(ReadyQueue {
+            items: vec![ReadyItem {
+                repo: REPO.to_string(),
+                issue: 20,
+                rank: 1,
+                star: false,
+                star_at: None,
+                level: 0,
+                fleet_priority: 0,
+                created_at: None,
+                main_red_fix: false,
+            }],
+            listed: [REPO.to_string()].into(),
+            complete: BTreeSet::new(),
+            slots: None,
+        });
+        with_ready
+    };
+    let out = run(
+        &[input(&[(21, "loom:pr", 20)], Vec::new()), ready(), ready()],
+        Duration::minutes(10),
+        &mut forge,
+    );
+    let records = stages(&out[1]);
+    assert_eq!(records.len(), 1, "{out:?}");
+    assert_eq!(records[0].exit, StageExit::Landed);
+    assert_eq!(records[0].next_stage, None);
+    assert_eq!(records[0].forge_transition_at, Some(merged_at));
+    assert!(stages(&out[2]).is_empty(), "{:?}", out[2]);
 }
 
 #[test]

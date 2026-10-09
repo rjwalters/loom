@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use super::{FleetView, RepoListing, Source, MERGE_HOLD_LABELS, REVIEW_LABELS};
 use crate::telemetry::kinds::fleet_state::{FleetStage, FleetStateRow};
@@ -76,6 +76,10 @@ pub struct Memory {
     /// Departed PRs whose `pulls/{n}` read failed, per repo (number → issue),
     /// retried each pass until read.
     pub unread: Listed,
+    /// PRs whose terminal stage outcome was emitted while a source still
+    /// supplied their row (repo, PR number); the row's later stage changes or
+    /// departure add no second one. Pruned once no row carries the PR.
+    pub settled: BTreeSet<(String, u32)>,
     /// The previous view.
     pub view: Option<FleetView>,
     /// When the previous pass ran.
@@ -103,6 +107,16 @@ fn stage_labels(stage: FleetStage) -> Vec<&'static str> {
     }
 }
 
+/// The terminal exit and forge instant a resolved PR gives its row, if the PR
+/// merged or closed.
+fn resolution_exit(facts: &PullFacts) -> Option<(StageExit, DateTime<Utc>)> {
+    match (facts.merged_at, facts.closed_at) {
+        (Some(at), _) => Some((StageExit::Landed, at)),
+        (None, Some(at)) => Some((StageExit::CutShort, at)),
+        (None, None) => None,
+    }
+}
+
 /// How a row left its stage.
 struct Leaving {
     exit: StageExit,
@@ -124,9 +138,10 @@ impl<F: ForgeReads> Diff<'_, F> {
         (self.now - self.prev_at).num_seconds().max(0)
     }
 
-    /// The forge instant of `pr` entering `stage`, when it falls in the
-    /// window this pass could have observed (a stale `labeled` event from an
-    /// earlier visit to the stage is not this move).
+    /// The forge instant of `pr` entering `stage`, when it falls after the
+    /// previous observation and no later than this one: the previous view
+    /// had the row elsewhere, so an older `labeled` event (an earlier visit
+    /// to the stage, even one inside the preceding interval) is not this move.
     fn label_instant(&mut self, repo: &str, pr: u32, stage: FleetStage) -> Option<DateTime<Utc>> {
         let labels = stage_labels(stage);
         if labels.is_empty() || self.budget == 0 {
@@ -135,8 +150,7 @@ impl<F: ForgeReads> Diff<'_, F> {
         self.budget -= 1;
         let times = self.forge.label_times(repo, pr)?;
         let at = labels.iter().filter_map(|l| times.get(*l)).max().copied()?;
-        let earliest = self.prev_at - Duration::seconds(self.interval());
-        (at > earliest && at <= self.now).then_some(at)
+        (at > self.prev_at && at <= self.now).then_some(at)
     }
 
     fn record(
@@ -247,11 +261,39 @@ pub fn diff(
         }
     }
     memory.unread = unread;
+    let mut settled = std::mem::take(&mut memory.settled);
 
     let empty = super::RepoView::default();
     for (repo, was_repo) in &prev.repos {
         let now_repo = pass.view.repos.get(repo).unwrap_or(&empty);
         for (&issue, was) in &was_repo.rows {
+            if was
+                .pr
+                .is_some_and(|pr| settled.contains(&(repo.clone(), pr)))
+            {
+                continue;
+            }
+            // A PR that left the review listings and merged or closed ends
+            // its row's stage even when another source (a held sweep, a stale
+            // ready tick) still supplies the row: reconcile that before
+            // treating the surviving row as an ordinary stage change.
+            if let (Some(pr), true) = (was.pr, now_repo.rows.contains_key(&issue)) {
+                if let Some((exit, at)) =
+                    resolved.get(&(repo.clone(), pr)).and_then(resolution_exit)
+                {
+                    let leaving = Leaving {
+                        exit,
+                        next_stage: None,
+                        forge_at: Some(at),
+                    };
+                    let source = was_repo.sources.get(&issue).copied();
+                    out.push(TelemetryRecord::StageOutcome(
+                        diff.record(repo, issue, was, source, leaving),
+                    ));
+                    settled.insert((repo.clone(), pr));
+                    continue;
+                }
+            }
             match now_repo.rows.get(&issue) {
                 Some(now) if now.stage == was.stage => {}
                 Some(now) => {
@@ -310,6 +352,13 @@ pub fn diff(
             }
         }
     }
+    settled.retain(|(repo, pr)| {
+        pass.view
+            .repos
+            .get(repo)
+            .is_some_and(|v| v.rows.values().any(|row| row.pr == Some(*pr)))
+    });
+    memory.settled = settled;
     out
 }
 
@@ -323,6 +372,7 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
     Memory {
         listed,
         unread: memory.unread,
+        settled: memory.settled,
         view: Some(pass.view.clone()),
         at: Some(pass.now),
     }
