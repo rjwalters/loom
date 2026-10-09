@@ -880,25 +880,6 @@ const SYMLINKED_DEST_HELP_BLOCK: &str =
 /// `LOOM_DAEMON_BIN_DIR` entry, which follows the `LOOM_DAEMON_BIN` entry.
 const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
 
-/// The stale-entry-point remediation the frozen shell printed after the
-/// flagged entries: a Python-package explanation and an `rm` hint for EVERY
-/// flagged entry, whatever it was. `ARGV0` is `loom-daemon-update.sh`.
-const STALE_REMEDIATION_SHELL: &str = "These do NOT resolve to the current loom-daemon binary. Loom's Python package
-was retired (epic #4081 Phase 4, #4557), so nothing regenerates them — they are
-frozen and will shadow the real binary's entry points (incident #4079).
-Remove them, e.g.:  rm <path>    (or 'pipx uninstall loom-tools')
-Or run:  loom-daemon-update.sh --prune-stale-entry-points   (removes exactly the stale Python console scripts above, #5139).
-";
-
-/// What #11069 prints in its place when no flagged entry is a Python console
-/// script or a shim — the only shape this corpus produces (every fixture entry
-/// is a `#!/bin/sh` script). Spelled out here, independently of
-/// `entry_points.rs`, so the class verifies the EXACT intended text.
-const STALE_REMEDIATION_UNRELATED: &str = "These do NOT resolve to the current loom-daemon binary, and can shadow its entry points (incident #4079).
-Entries that are not Python console scripts or shims were not installed as Loom entry points, and --prune-stale-entry-points leaves them alone.
-Find out what each one is before removing anything.
-";
-
 /// Divergence classes, each recognised by MECHANISM.
 // Every class so far is a documented `--help` addition, so the shared
 // `HelpDocuments` prefix names the mechanism rather than repeating the type.
@@ -950,8 +931,8 @@ enum Divergence {
     /// remove (it had told them to delete provisioning's rollback copy). For
     /// an advisory listing only non-Python, non-shim entries, the port's
     /// stderr must equal the shell's stderr with exactly
-    /// [`STALE_REMEDIATION_SHELL`] replaced, once, by
-    /// [`STALE_REMEDIATION_UNRELATED`]. The header, every per-entry line and
+    /// `stale_remediation::STALE_REMEDIATION_SHELL` replaced, once, by
+    /// `stale_remediation::STALE_REMEDIATION_UNRELATED`. The header, every per-entry line and
     /// the suppression line are unchanged. Risk direction: advisory text only
     /// — the scan, the exit code and the prune are untouched. Any other stderr
     /// difference stays unexplained.
@@ -968,12 +949,10 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     }
     let mut found = Vec::new();
     if shell.stderr != port.stderr {
-        match replace_unique(&shell.stderr, STALE_REMEDIATION_SHELL, STALE_REMEDIATION_UNRELATED) {
-            Some(expected) if expected == port.stderr => {
-                found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
-            }
-            _ => return Err(()),
+        if !stale_remediation::explains(&shell.stderr, &port.stderr) {
+            return Err(());
         }
+        found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
     }
     if shell.stdout == port.stdout {
         return Ok(found);
@@ -1021,83 +1000,6 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
         }
     }
     Err(())
-}
-
-/// `text` with the single occurrence of `old` — which must start a line —
-/// replaced by `new`; `None` when it is absent or not unique.
-fn replace_unique(text: &str, old: &str, new: &str) -> Option<String> {
-    let needle = format!("\n{old}");
-    if text.matches(&needle).count() != 1 {
-        return None;
-    }
-    Some(text.replacen(&needle, &format!("\n{new}"), 1))
-}
-
-/// The #11069 class admits exactly the intended replacement and nothing else.
-#[test]
-fn the_stale_remediation_divergence_class_is_narrow() {
-    let base = Answer {
-        rc: 3,
-        stdout: String::new(),
-        stderr: format!(
-            "Stale 'loom-*' entry points found on PATH (1):\n  - /x/loom-foo — script, not a loom-daemon shim\n{STALE_REMEDIATION_SHELL}Suppress this check with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.\n"
-        ),
-    };
-    let with_stderr = |stderr: String| Answer {
-        stderr,
-        ..base.clone()
-    };
-    let good = with_stderr(
-        base.stderr
-            .replace(STALE_REMEDIATION_SHELL, STALE_REMEDIATION_UNRELATED),
-    );
-    assert_eq!(
-        classify(&base, &good),
-        Ok(vec![Divergence::StaleAdvisoryNoRmForUnprunableEntries])
-    );
-
-    // The old text kept, or the `rm` hint left in alongside the new text.
-    assert_eq!(
-        classify(&base, &with_stderr(base.stderr.replace("rm <path>", "rm -f <path>"))),
-        Err(())
-    );
-    let both = base.stderr.replace(
-        STALE_REMEDIATION_SHELL,
-        &format!("{STALE_REMEDIATION_UNRELATED}{STALE_REMEDIATION_SHELL}"),
-    );
-    assert_eq!(classify(&base, &with_stderr(both)), Err(()));
-    // A per-entry line changed alongside the replacement.
-    assert_eq!(
-        classify(&base, &with_stderr(good.stderr.replace("loom-foo", "loom-bar"))),
-        Err(())
-    );
-    // The right stderr with a different exit code.
-    assert_eq!(
-        classify(
-            &base,
-            &Answer {
-                rc: 0,
-                ..good.clone()
-            }
-        ),
-        Err(())
-    );
-    // A shell answer with no remediation block cannot be explained by it.
-    let plain = Answer {
-        rc: 3,
-        stdout: String::new(),
-        stderr: "x\n".to_string(),
-    };
-    assert_eq!(
-        classify(
-            &plain,
-            &Answer {
-                stderr: "y\n".to_string(),
-                ..plain.clone()
-            }
-        ),
-        Err(())
-    );
 }
 
 /// `text` with `block` inserted at the start of the single line beginning with
@@ -1666,3 +1568,6 @@ mod corpus;
 #[path = "differential_daemon_update/floor_check_help.rs"]
 mod floor_check_help;
 use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/stale_remediation.rs"]
+mod stale_remediation;
