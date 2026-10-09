@@ -67,6 +67,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::generated_artifact::{self as generated, is_generated_artifact};
 use crate::main_health_gate::is_ignorable_dirt_with_readers;
 use crate::quarantine_stash_status::{self, StashOrigin, QUARANTINE_STASH_LABEL};
 
@@ -273,68 +274,6 @@ pub fn list_all_stashes(repo_root: &Path) -> Result<Vec<AnyStashEntry>, String> 
 // Condition 1: content check
 // ============================================================================
 
-/// Path components that are unambiguously machine-generated: a virtualenv, a
-/// dependency tree, or an interpreter/tool cache. These normally never reach
-/// a stash at all (they are gitignored, and `git stash push --include-untracked`
-/// does not stash ignored files) — they land in a quarantine stash only in a
-/// repo that forgot to ignore them, which is exactly #5690's worst case (one
-/// stash of 1,749 files, 1,743 of them `.venv/` and `__pycache__`).
-///
-/// Deliberately **narrower** than "things a `.gitignore` usually lists":
-/// `dist/`, `build/`, `out/`, and `target/` are excluded because each is a
-/// plausible hand-authored source directory in some project, and a false
-/// "generated" call here deletes real work. Every entry below is a name no
-/// project authors by hand.
-///
-/// This class is local to stash retirement and is **not** added to
-/// [`crate::main_health_gate`]'s dirty-tree ignore list: that list decides
-/// whether the gate may hard-reset a live working tree, a different question
-/// with a different blast radius.
-const GENERATED_ARTIFACT_COMPONENTS: &[&str] = &[
-    "__pycache__",
-    ".venv",
-    "venv",
-    "node_modules",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".tox",
-    ".ipynb_checkpoints",
-];
-
-/// Suffixes of a whole path component that mark it generated — `.egg-info`
-/// directories (setuptools metadata) are named `<pkg>.egg-info`, so they need
-/// a suffix match rather than an exact one.
-const GENERATED_ARTIFACT_COMPONENT_SUFFIXES: &[&str] = &[".egg-info"];
-
-/// Basename suffixes that mark a single generated file (compiled Python
-/// bytecode) rather than a whole directory.
-const GENERATED_ARTIFACT_FILE_SUFFIXES: &[&str] = &[".pyc", ".pyo"];
-
-/// Exact basenames that are always OS/tooling droppings.
-const GENERATED_ARTIFACT_BASENAMES: &[&str] = &[".DS_Store"];
-
-/// Whether `path` is provably machine-generated content
-/// ([`GENERATED_ARTIFACT_COMPONENTS`] and friends) — the "no real work at
-/// all" class that made up 58 of #5690's 148 stashes.
-#[must_use]
-fn is_generated_artifact(path: &str) -> bool {
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    if GENERATED_ARTIFACT_BASENAMES.contains(&basename)
-        || GENERATED_ARTIFACT_FILE_SUFFIXES
-            .iter()
-            .any(|s| basename.ends_with(s))
-    {
-        return true;
-    }
-    path.split('/').any(|component| {
-        GENERATED_ARTIFACT_COMPONENTS.contains(&component)
-            || GENERATED_ARTIFACT_COMPONENT_SUFFIXES
-                .iter()
-                .any(|s| component.ends_with(s))
-    })
-}
-
 /// Why one path inside a stash is (or is not) safe to lose along with the
 /// stash. Every "safe" variant is an identity or provenance *proof*, never a
 /// judgement about importance.
@@ -357,7 +296,8 @@ pub enum PathVerdict {
     /// re-stamped install manifest, or an installed-surface copy whose bytes
     /// match its committed `defaults/` source.
     IgnorableDirt,
-    /// Machine-generated content per [`is_generated_artifact`].
+    /// Machine-generated content per [`is_generated_artifact`], or a path under
+    /// a content-verified cargo build tree ([`generated::build_tree_dirs_in`]).
     GeneratedArtifact,
     /// None of the above proofs applies. Not necessarily precious — just not
     /// provably recoverable, which is the only thing this module is allowed
@@ -583,10 +523,18 @@ pub fn classify_stash_content(repo_root: &Path, stash_ref: &str) -> ContentVerdi
         };
     }
 
+    // #11075: a cargo target tree is generated whatever its name; proven by a
+    // marker's stashed content, never by the directory name.
+    let trees =
+        generated::build_tree_dirs_in(&changed_paths, |p| read_stash_blob(repo_root, stash_ref, p));
     let verdicts: Vec<(String, PathVerdict)> = changed_paths
         .into_iter()
         .map(|path| {
-            let verdict = classify_path(repo_root, stash_ref, &path);
+            let verdict = if generated::is_under_build_tree(&path, &trees) {
+                PathVerdict::GeneratedArtifact
+            } else {
+                classify_path(repo_root, stash_ref, &path)
+            };
             (path, verdict)
         })
         .collect();
@@ -1059,45 +1007,6 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
         repo.write("README.md", "hello\n");
         repo.commit_all("initial");
         assert!(list_all_stashes(repo.path()).unwrap().is_empty());
-    }
-
-    // ---------- generated-artifact classification ----------
-
-    #[test]
-    fn generated_artifact_matches_the_no_real_work_class() {
-        for path in [
-            "sim/.venv/lib/python3.12/site-packages/numpy/__init__.py",
-            "venv/bin/activate",
-            "tools/__pycache__/helper.cpython-312.pyc",
-            "src/thing.pyc",
-            "web/node_modules/left-pad/index.js",
-            "src/mypkg.egg-info/PKG-INFO",
-            ".pytest_cache/v/cache/lastfailed",
-            ".mypy_cache/3.12/foo.data.json",
-            ".ruff_cache/content",
-            "notebooks/.ipynb_checkpoints/x-checkpoint.ipynb",
-            "docs/.DS_Store",
-        ] {
-            assert!(is_generated_artifact(path), "expected generated: {path}");
-        }
-    }
-
-    #[test]
-    fn generated_artifact_does_not_swallow_plausible_source_directories() {
-        // `dist/`, `build/`, `out/`, `target/` are deliberately NOT in the
-        // set: each is a real hand-authored source directory somewhere, and a
-        // false "generated" call here deletes work irrecoverably.
-        for path in [
-            "dist/index.js",
-            "build/Makefile",
-            "out/report.txt",
-            "target/spec.md",
-            "src/venv_helpers.py",
-            "src/node_modules_shim.ts",
-            "docs/pycache-notes.md",
-        ] {
-            assert!(!is_generated_artifact(path), "must not be treated as generated: {path}");
-        }
     }
 
     // ---------- test git repo fixture ----------
