@@ -33,12 +33,6 @@ toml = "1.1"
 # drops reqwest's default blocking/cookie/multipart surface this exporter
 # never touches.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "json"] }
-# Ed25519 verification of signed operator-decision markers (#10827). Already
-# compiled into this binary as rustls' crypto provider (via reqwest above), so
-# naming it directly adds no new crate; the feature set matches what rustls
-# already enables, so feature unification changes nothing. Verify-only: Loom
-# never holds a signing key.
-aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
 libc = "0.2"
 # OTLP wire-format types for the optional `otlp` exporter (#4858, Epic #4702
 # Phase 4) — gated behind the `otlp` feature so a default (`HttpsExporter`-

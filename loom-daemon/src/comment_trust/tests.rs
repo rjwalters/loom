@@ -239,9 +239,6 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("forge_merge_queue/lifecycle_tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
-        // #10827: proves a verified signed decision leaves the same
-        // comment's verdict marker untrusted.
-        ("comment_trust/promotion_gate/tests.rs", "test fixture"),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();

@@ -205,20 +205,8 @@ pub fn fetch_comment_listing(
     repo_root: &Path,
     use_cache: bool,
 ) -> Option<Vec<u8>> {
-    rest_listing(&format!("repos/{repo}/issues/{number}/comments"), repo_root, use_cache)
-}
-
-/// The raw REST issue events listing (`labeled`/`unlabeled` with their
-/// `actor`, oldest first) for issue `number` of `repo`, uncached: the
-/// promotion gate's star provenance (#10827). `None` when `gh` failed.
-#[must_use]
-pub fn fetch_issue_events(repo: &str, number: &str, repo_root: &Path) -> Option<Vec<u8>> {
-    rest_listing(&format!("repos/{repo}/issues/{number}/events"), repo_root, false)
-}
-
-/// One paginated REST listing (`gh api <path> --paginate` stdout).
-fn rest_listing(path: &str, repo_root: &Path, use_cache: bool) -> Option<Vec<u8>> {
-    let out = crate::script_helpers::run_gh(&["api", path, "--paginate"], repo_root, use_cache);
+    let path = format!("repos/{repo}/issues/{number}/comments");
+    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], repo_root, use_cache);
     Some(out.ok_output()?.stdout.clone())
 }
 

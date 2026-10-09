@@ -225,18 +225,9 @@ chmod +x "$STUB_DIR/gh"
 #       mirroring the real predicate for these fixtures' shapes (insider
 #       association, or the default fleet App family App-spelled);
 #       $STUB_DIR/trust-verb-missing simulates a binary predating the verb.
-#   loom-daemon forge promotion-gate --issue N  (#10827) -> $STUB_DIR/gate-<N>
-#       when staged, else GATE=ELIGIBLE; $STUB_DIR/gate-verb-missing simulates
-#       a binary predating the verb.
 cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
-if [[ "$1" == "forge" && "$2" == "promotion-gate" && ! -f "$STUB_DIR_FROM_ENV/gate-verb-missing" ]]; then
-  echo "$*" >> "$STUB_DIR_FROM_ENV/gate-calls.log"
-  if [[ -f "$STUB_DIR_FROM_ENV/gate-$4" ]]; then cat "$STUB_DIR_FROM_ENV/gate-$4"; exit 1; fi
-  printf 'GATE=ELIGIBLE\nREASON=trusted body author\nNOTICE=none\n'
-  exit 0
-fi
 if [[ "$1" == "forge" && "$2" == "trusted-comments" && ! -f "$STUB_DIR_FROM_ENV/trust-verb-missing" ]]; then
   exec jq -c '[.[] | select(
       ((.author_association // "") | ascii_upcase | IN("OWNER","MEMBER","COLLABORATOR"))
@@ -315,7 +306,6 @@ reset_state() {
     rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR"/edit-fail-*
     rm -f "$STUB_DIR"/comment-writes.log "$STUB_DIR"/edit-writes.log
     rm -f "$STUB_DIR"/comments-fail-* "$STUB_DIR"/trust-verb-missing
-    rm -f "$STUB_DIR"/gate-[0-9]* "$STUB_DIR"/gate-verb-missing "$STUB_DIR"/gate-calls.log
 }
 
 run_sut() {
@@ -667,51 +657,6 @@ issue_json "OPEN" "$(labels_json "loom:curated")" "[]" > "$STUB_DIR/issue-503.js
 : > "$STUB_DIR/comments-fail-503"
 run_sut --issue 503
 assert_eq "1" "$RC" "(t4) comment fetch failure -> exit 1"
-
-# (g1) #10827 author gate: an untrusted body author with no trusted signal is
-#      HOLD -> GATED, exit 14, and nothing is written or posted -- on every
-#      re-run (idempotent, no repeated comments).
-gate_case() {
-    reset_state
-    issue_json "OPEN" "$(labels_json "loom:curated")" \
-      "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: Tier 2 (goal-supporting)")]" \
-      > "$STUB_DIR/issue-$1.json"
-    stage_verify "$1" "$(labels_json "loom:issue" "tier:goal-supporting")"
-}
-for G in "HOLD" "UNAVAILABLE"; do
-    gate_case 10827
-    printf 'GATE=%s\nREASON=the body author bot[bot] is not a trusted author\nNOTICE=needed\n' "$G" > "$STUB_DIR/gate-10827"
-    for run in 1 2; do
-        run_sut --issue 10827 --apply
-        assert_eq "14" "$RC" "(g1) gate $G run $run -> exit 14"
-        assert_eq "GATED" "$(get_field "$OUT" DECISION)" "(g1) gate $G run $run -> DECISION=GATED"
-        assert_contains "$OUT" "GATE=$G" "(g1) gate $G run $run: REASON names the gate answer"
-        assert_eq "" "$EDITS" "(g1) gate $G run $run: no label edit (loom:issue never added)"
-        assert_eq "" "$COMMENTS_POSTED" "(g1) gate $G run $run: no comment posted"
-    done
-done
-
-# (g2) A binary predating the verb prints no GATE= line: fails closed.
-gate_case 10828
-: > "$STUB_DIR/gate-verb-missing"
-run_sut --issue 10828 --apply
-assert_eq "14" "$RC" "(g2) missing promotion-gate verb -> exit 14 (fails closed)"
-assert_contains "$OUT" "GATE=UNAVAILABLE" "(g2) reported as UNAVAILABLE"
-assert_eq "" "$EDITS" "(g2) no label edit"
-
-# (g3) ELIGIBLE (trusted author, star, or verified signed approve) promotes as
-#      before, and the gate was asked about the right issue and repository.
-gate_case 10829
-run_sut --issue 10829 --apply
-assert_eq "12" "$RC" "(g3) gate ELIGIBLE -> COMPLETED as before"
-assert_contains "$EDITS" "loom:issue" "(g3) loom:issue added"
-assert_contains "$(cat "$STUB_DIR/gate-calls.log")" "promotion-gate --issue 10829 --repo" "(g3) gate asked about #10829 on the vetted repo"
-
-# (g4) Report-only runs never consult the gate (nothing would be written).
-gate_case 10830
-run_sut --issue 10830
-assert_eq "11" "$RC" "(g4) report-only MISMATCH unchanged"
-assert_eq "" "$(cat "$STUB_DIR/gate-calls.log" 2>/dev/null)" "(g4) gate not consulted without --apply"
 
 echo
 echo "--- Doc pins: champion-issue-promo.md ships the reordered write-then-verify Step 3b and the Pass 0c reconciliation loop (#6862) ---"

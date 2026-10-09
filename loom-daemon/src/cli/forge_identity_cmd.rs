@@ -296,32 +296,6 @@ fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Op
     serde_json::to_vec(&items).ok()
 }
 
-/// `forge promotion-gate` (#10827): the author gate on automatic promotion,
-/// as `KEY=VALUE` lines. Exit 0 for `ELIGIBLE`, 1 for `HOLD`, 3 for
-/// `UNAVAILABLE`; callers read the `GATE=` line.
-pub(crate) fn promotion_gate(issue: u64, repo: Option<&str>) -> Result<()> {
-    use loom_daemon::comment_trust::promotion_gate as gate;
-    let out = gate::evaluate(&workspace(), repo.unwrap_or("{owner}/{repo}"), issue);
-    let one_line = |s: &str| s.replace(['\n', '\r'], " ");
-    println!("GATE={}", out.gate.word());
-    println!("REASON={}", one_line(out.gate.reason()));
-    println!("DETAIL={}", one_line(&out.detail));
-    let notice = match (&out.gate, out.notice_posted) {
-        (gate::Gate::Hold(_), false) => "needed",
-        (gate::Gate::Hold(_), true) => "posted",
-        _ => "none",
-    };
-    println!("NOTICE={notice}");
-    if notice == "needed" {
-        println!("NOTICE_BODY={}", one_line(&gate::notice_body(&out.gate)));
-    }
-    std::process::exit(match out.gate {
-        gate::Gate::Eligible(_) => 0,
-        gate::Gate::Hold(_) => 1,
-        gate::Gate::Unavailable(_) => 3,
-    })
-}
-
 /// One REST comment in the `gh --json comments` field names.
 fn gh_comment(c: &Value) -> Value {
     json!({

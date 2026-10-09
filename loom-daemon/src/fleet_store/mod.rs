@@ -25,8 +25,6 @@
 //!   source for roster, state and tiers when the store has it (#10705).
 //! - [`admins`] — the fleet admin roster (`fleet/admins.json`) that comment
 //!   trust consults (#10303). Fails closed.
-//! - [`decision_signers`] — the public keys that sign operator-decision
-//!   markers (`fleet/decision-signers.json`, #10827). Fails closed.
 //! - [`render`] — the host's machine tier and host-local tier, and drift.
 //! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
@@ -45,7 +43,6 @@
 
 pub mod admins;
 pub mod compiled;
-pub mod decision_signers;
 pub mod fetch;
 pub mod floor;
 pub mod gh;
@@ -85,11 +82,6 @@ pub const FLEET_DEFAULTS_PATH: &str = "fleet/defaults.json";
 /// publishes it, and comment trust fails closed while it is.
 pub const ADMINS_PATH: &str = "fleet/admins.json";
 
-/// Store-relative path of the operator-decision signer keys (#10827): the
-/// Ed25519 public keys whose signed `loom:operator-decision` markers count as
-/// a fleet admin's decision. Public keys only; fails closed while absent.
-pub const DECISION_SIGNERS_PATH: &str = "fleet/decision-signers.json";
-
 /// Store-relative path of the compiled fleet document (#10705). Fetched when
 /// the store has it; when present it is the only source of the roster, run
 /// state and config tiers ([`compiled`]), and the legacy files above are the
@@ -116,12 +108,7 @@ pub fn host_local_path(host: &str) -> String {
 pub fn is_contract_path(path: &str) -> bool {
     if matches!(
         path,
-        ROSTER_PATH
-            | STATE_PATH
-            | FLEET_DEFAULTS_PATH
-            | ADMINS_PATH
-            | DECISION_SIGNERS_PATH
-            | FLEET_JSON_PATH
+        ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH | FLEET_JSON_PATH
     ) {
         return true;
     }
