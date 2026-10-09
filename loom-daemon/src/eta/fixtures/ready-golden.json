@@ -546,7 +546,17 @@
       }
     ],
     "no_estimate_reason": null,
-    "truncated": []
+    "truncated": [],
+    "stage_predictions": {
+      "ready_wait": {
+        "entry_p50": 0,
+        "entry_p90": 0,
+        "dwell_p50": 7723,
+        "dwell_p90": 10454,
+        "alloc": 7723,
+        "reach_pct": 100
+      }
+    }
   },
   "land": {
     "schema": "eta-explanation/v1",
@@ -1469,6 +1479,56 @@
       }
     ],
     "no_estimate_reason": null,
-    "truncated": []
+    "truncated": [],
+    "stage_predictions": {
+      "sweep.curator": {
+        "entry_p50": 7758,
+        "entry_p90": 10353,
+        "dwell_p50": 535,
+        "dwell_p90": 1040,
+        "alloc": 629,
+        "reach_pct": 100
+      },
+      "sweep.builder": {
+        "entry_p50": 8369,
+        "entry_p90": 11046,
+        "dwell_p50": 2744,
+        "dwell_p90": 6182,
+        "alloc": 3286,
+        "reach_pct": 100
+      },
+      "review_wait": {
+        "entry_p50": 11514,
+        "entry_p90": 15362,
+        "dwell_p50": 1183,
+        "dwell_p90": 2751,
+        "alloc": 1336,
+        "reach_pct": 100
+      },
+      "doctor": {
+        "entry_p50": 12547,
+        "entry_p90": 16434,
+        "dwell_p50": 1388,
+        "dwell_p90": 2946,
+        "alloc": 602,
+        "reach_pct": 44
+      },
+      "merge_wait": {
+        "entry_p50": 13623,
+        "entry_p90": 18227,
+        "dwell_p50": 166,
+        "dwell_p90": 702,
+        "alloc": 304,
+        "reach_pct": 100
+      },
+      "ready_wait": {
+        "entry_p50": 0,
+        "entry_p90": 0,
+        "dwell_p50": 7758,
+        "dwell_p90": 10353,
+        "alloc": 7773,
+        "reach_pct": 100
+      }
+    }
   }
 }

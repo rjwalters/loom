@@ -1,6 +1,6 @@
 //! ETA wiring (#9289): feeds the [`crate::eta::tracker::Tracker`] from the
 //! event bus and the forge, writes the stage-sample journal, and emits
-//! `eta.estimate` / `eta.outcome`.
+//! `eta.estimate` / `eta.outcome` / `eta.stage_outcome` (#10929).
 //!
 //! Two triggers, per the operator decisions on #9289:
 //!
@@ -224,6 +224,8 @@ pub fn deliver(
             resolved.score.error_sec
         );
         let (repo_id, issue) = (resolved.estimate.repo_id, resolved.estimate.issue);
+        let attribution =
+            crate::eta::stage_forecast::attribute_scored(&resolved.estimate, &resolved.score);
         let record = EtaOutcomeRecord {
             estimate: resolved.estimate,
             loom: loom.clone(),
@@ -231,6 +233,7 @@ pub fn deliver(
             outcome_source: resolved.outcome_source,
             outcome_resolution_sec: resolved.outcome_resolution_sec,
             result: resolved.result,
+            attribution,
         };
         if !record.has_provenance() {
             log::warn!("eta: dropped {line}: invalid provenance");
@@ -425,10 +428,15 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     dirty.dedup();
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
-    if let Some(state) = lock().as_mut() {
-        note_outcomes(state, &effects.outcomes, now);
-    }
+    let stages = match lock().as_mut() {
+        Some(state) => {
+            note_outcomes(state, &effects.outcomes, now);
+            stage_outcome::build(&effects.journal, state.tracker.pending(), &effects.outcomes, now)
+        }
+        None => Vec::new(),
+    };
     authority::deliver_checked(emissions, effects.outcomes, &host_id, dry_run);
+    stage_outcome::emit(stages, &host_id, dry_run);
 }
 
 /// The workspace root → slug, resolving and caching on first sight.
@@ -1130,6 +1138,8 @@ pub(super) async fn record(
         .unwrap_or_default();
     append_journal(workspace_root, &rows);
     pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
+    let stages = stage_outcome::build(&rows, &pending, &outcomes, now);
+    stage_outcome::emit(stages, &host_id, dry_run);
     let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
@@ -1168,8 +1178,10 @@ async fn ready_rows(
         rows.push(ReadyRow {
             repo: slug,
             issue: row.issue,
+            rank: row.rank,
             plan: row.plan,
             disposition: row.disposition,
+            detail: row.detail,
             facts: IssueRow {
                 workspace_priority: row.workspace_priority,
                 created_at: row.created_at,
@@ -1203,11 +1215,14 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
 mod authority;
 mod estimate_pass;
 use estimate_pass::estimate_locked;
+#[path = "eta_marker_pass.rs"]
+mod eta_marker_pass;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
 mod pr_resolved;
+mod stage_outcome;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]

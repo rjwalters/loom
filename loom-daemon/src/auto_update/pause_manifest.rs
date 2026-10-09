@@ -1,9 +1,9 @@
 //! The pause manifest, schema v1 (issue #10830; design
 //! `docs/design/daemon-roll-pause-resume.md` §6).
 //!
-//! A roll records every in-flight agent here before it stops any of them (H4),
-//! and the new binary resumes or requeues from it (H5). Nothing calls this
-//! from the roll path yet: PR 2 (#10831) writes it, PR 3 (#10832) reads it.
+//! A roll records every in-flight agent here before it stops any of them (H4,
+//! `pause_roll`, #10831), and the next start resumes or requeues from it (H5,
+//! `pause_resume`, #10832).
 //!
 //! # Compatibility rules (§6), and how they are enforced
 //!
@@ -73,12 +73,7 @@ pub const FROZEN_V1_CORE: &[&str] = &[
 /// `~/.loom/` (the directory `auto-update-artifact-roll.json` uses).
 #[must_use]
 pub fn manifest_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(super::AUTO_UPDATE_STATE_DIR_ENV) {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir.trim()).join(MANIFEST_FILE));
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".loom").join(MANIFEST_FILE))
+    super::state_dir().map(|d| d.join(MANIFEST_FILE))
 }
 
 macro_rules! open_enum {
@@ -204,10 +199,19 @@ pub struct ResumeHandle {
     /// `{name, account}` for a session-exec item.
     #[serde(default)]
     pub container: Option<serde_json::Value>,
+    /// The Codex sandbox mode of the original launch (#10831), so H5 resumes
+    /// under the same one instead of re-deriving it.
+    #[serde(default)]
+    pub sandbox: Option<String>,
     #[serde(default)]
     pub resume_count: u32,
     #[serde(default)]
     pub resume_of: Option<String>,
+    /// The sweep id the claim's lease record is published under, when it is
+    /// not the item's own id (#10832): a run that was itself resumed keeps
+    /// renewing the record its first dispatch wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_sweep_id: Option<String>,
 }
 
 /// The safe point an item reached before it was stopped.

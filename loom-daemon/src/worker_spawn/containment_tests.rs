@@ -626,8 +626,9 @@ fn managed_gh_never_mounts_the_host_gh_config() {
     assert!(!managed.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
 }
 
-/// #10607: the agent `gh` front's sink (the daemon's) is parity-mounted
-/// read-write and named to the container, so its rows outlive `--rm`.
+/// #10607: the agent `gh` front's sink (the daemon's) is named to the
+/// container, and its `contained/` subdirectory — never the whole sink — is
+/// mounted read-write there, so its rows outlive `--rm`.
 #[test]
 fn the_agent_front_sink_is_parity_mounted_read_write_and_named() {
     let _g = env_lock();
@@ -638,8 +639,9 @@ fn the_agent_front_sink_is_parity_mounted_read_write_and_named() {
     crate::forge_call_stats::set_test_sink_dir(Some(sink.clone()));
     let args = build(&profile(None, Some("1g")), &[]);
     crate::forge_call_stats::set_test_sink_dir(None);
-    let spec = format!("{0}:{0}", sink.display());
-    assert!(args.contains(&spec), "a read-write parity mount: {args:?}");
+    let spec = format!("{}/contained:{}", sink.display(), sink.display());
+    assert!(args.contains(&spec), "a read-write mount of contained/ only: {args:?}");
+    assert!(!args.contains(&format!("{0}:{0}", sink.display())), "never the whole sink");
     let assign = format!("LOOM_FORGE_CALL_STATS_DIR={}", sink.display());
     assert!(args.contains(&assign), "{args:?}");
     assert!(sink.is_dir(), "created owner-only before docker could make it root-owned");
@@ -676,7 +678,11 @@ fn a_sink_dir_that_is_not_a_sink_is_neither_mounted_nor_assigned_nor_changed() {
         let args = build(&profile(None, Some("1g")), &[]);
         crate::forge_call_stats::set_test_sink_dir(None);
         let d = home.path().display().to_string();
-        assert!(!args.contains(&format!("{d}:{d}")), "{dir_mode:o}: mounted {args:?}");
+        assert!(
+            !args.iter().any(|a| a.ends_with(&format!(":{d}"))),
+            "{dir_mode:o}: mounted {args:?}"
+        );
+        assert!(!home.path().join("contained").exists(), "{dir_mode:o}: created a subdir");
         assert!(
             !args
                 .iter()

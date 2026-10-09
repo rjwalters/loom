@@ -405,9 +405,11 @@ pub fn docker_command_with(
     // is the container boundary itself, not a flag.
     // #10607: the agent `gh` front's sink, resolved ONCE so the mount below
     // and the `-e` assignment further down always name the same directory —
-    // and only a directory that is a sink (`worker_sink_dir`).
-    let sink = crate::forge_call_stats::agent::worker_sink_dir();
-    let mounts = extra_mounts(&root, log, workspace, egress.is_some(), sink.as_deref());
+    // and only a directory that is a sink (`worker_sink_dir`). What is
+    // mounted there is the sink's `contained/` subdirectory only.
+    let sink = crate::forge_call_stats::agent::worker_sink_dir()
+        .and_then(|dir| crate::forge_call_stats::agent::container_mount(&dir));
+    let mounts = extra_mounts(&root, log, workspace, egress.is_some(), sink.as_ref());
     for (host, container, read_only) in mounts {
         command.arg("-v").arg(mount(&host, &container, read_only));
     }
@@ -458,7 +460,7 @@ pub fn docker_command_with(
         .arg(format!("LOOM_NATIVE_CONTAINMENT={KIND}"));
     // #10607: the host sink the front writes, by assignment (and mounted in
     // `extra_mounts`); the by-name pass below must not re-read the host's.
-    if let Some(dir) = &sink {
+    if let Some((_, dir)) = &sink {
         let key = crate::forge_call_stats::agent::SINK_DIR_ENV;
         command.arg("-e").arg(format!("{key}={}", dir.display()));
     }
@@ -661,7 +663,7 @@ fn extra_mounts(
     log: Option<&Path>,
     workspace: &Path,
     managed_gh: bool,
-    sink: Option<&Path>,
+    sink: Option<&(PathBuf, PathBuf)>,
 ) -> Vec<(PathBuf, String, bool)> {
     let mut out = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -706,10 +708,11 @@ fn extra_mounts(
         }
     }
     // #10607: the agent `gh` front's sink (the daemon's, already checked to
-    // be a sink by the caller), parity-mounted read-write so a contained
-    // worker's rows outlive `--rm`.
-    if let Some(dir) = sink.filter(|d| !d.starts_with(workspace)) {
-        out.push((dir.to_path_buf(), dir.display().to_string(), false));
+    // be a sink by the caller): its `contained/` subdirectory, mounted
+    // read-write at the sink's path so a contained worker's rows outlive
+    // `--rm` and the host's own rows stay out of its reach.
+    if let Some((host, dir)) = sink.filter(|(_, d)| !d.starts_with(workspace)) {
+        out.push((host.clone(), dir.display().to_string(), false));
     }
     out
 }

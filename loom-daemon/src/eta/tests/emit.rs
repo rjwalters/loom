@@ -1,6 +1,6 @@
 //! The emit policy.
 
-use crate::eta::emit::{EmitState, Signature, Trigger, HOURLY_CAP};
+use crate::eta::emit::{EmitState, Signature, Trigger, HOURLY_CAP, STALE_CAP};
 use crate::eta::{NoEstimateReason, Stage};
 use chrono::{Duration, TimeZone, Utc};
 
@@ -72,4 +72,47 @@ fn emit_policy() {
     assert!(flapping
         .decide(at_stage(Stage::MergeWait), later, 300)
         .is_some());
+}
+
+#[test]
+fn stale_inputs_refreshes_at_any_time() {
+    let t0 = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
+    let stale = Signature {
+        reason: Some(NoEstimateReason::StaleInputs),
+        ..at_stage(Stage::ReadyWait)
+    };
+    let mut state = EmitState::default();
+    assert_eq!(state.decide(stale, t0, 300), Some(Trigger::First));
+    state.record(stale, t0);
+    for secs in [1, 30, 60, 299, 10_000] {
+        assert_eq!(
+            state.decide(stale, t0 + Duration::seconds(secs), 300),
+            Some(Trigger::Refresh),
+            "{secs}s"
+        );
+    }
+}
+
+#[test]
+fn a_long_stale_stall_leaves_room_for_the_recovery_transition() {
+    let t0 = Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap();
+    let stale = Signature {
+        reason: Some(NoEstimateReason::StaleInputs),
+        ..at_stage(Stage::ReadyWait)
+    };
+    let fresh = at_stage(Stage::ReadyWait);
+    let mut state = EmitState::default();
+    let mut emitted = 0;
+    // One pass a minute, well over the hourly cap's worth of passes.
+    let passes = HOURLY_CAP + 5;
+    for i in 0..passes {
+        let now = t0 + Duration::seconds(i as i64 * 60);
+        if state.decide(stale, now, 300).is_some() {
+            state.record(stale, now);
+            emitted += 1;
+        }
+    }
+    assert_eq!(emitted, STALE_CAP, "stale re-emits stop at half the cap");
+    let now = t0 + Duration::seconds(passes as i64 * 60);
+    assert_eq!(state.decide(fresh, now, 300), Some(Trigger::Transition));
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::auto_update::supersede::ArmedRoll;
+use crate::fleet_sync::FloorWake;
 use crate::observability::ops::capture::capture;
 use crate::telemetry::ops::MetricName;
 use crate::telemetry::TelemetryRecord;
@@ -73,17 +74,19 @@ impl AutoUpdateProbe for ScriptedProbe {
     }
 }
 
-/// A trigger that accepts every drain, optionally reporting an armed roll.
+/// A trigger that accepts every drain, optionally reporting an armed roll,
+/// and reports each roll it is asked for on `arms` when set.
 #[derive(Default)]
 struct Trigger {
     armed: Mutex<Option<ArmedRoll>>,
+    arms: Option<tokio::sync::mpsc::UnboundedSender<RollTarget>>,
 }
 
-impl DrainTrigger for Trigger {
-    fn trigger(&self) -> bool {
-        true
-    }
-    fn trigger_for(&self, _target: Option<&str>) -> bool {
+impl RollTrigger for Trigger {
+    fn trigger_pause_roll(&self, target: &RollTarget) -> bool {
+        if let Some(tx) = &self.arms {
+            let _ = tx.send(target.clone());
+        }
         true
     }
     fn roll_in_progress(&self) -> bool {
@@ -117,10 +120,19 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         interval,
         settle,
         defer_deadline: Duration::from_secs(3600),
-        roll_stall_deadlines: 3,
-        roll_stall_cooldown: Duration::from_secs(3600),
-        roll_window: roll_window::RollWindowTuning::default(),
+        chase_enabled: true,
     }
+}
+
+/// A floor feed with a fixed reading and a wake of its own, so no test
+/// depends on (or disturbs) fleet-sync's process-wide floor.
+fn feed(knowledge: crate::fleet_sync::FloorKnowledge) -> (FloorFeed, &'static FloorWake) {
+    let wake: &'static FloorWake = Box::leak(Box::new(FloorWake::new()));
+    (FloorFeed::new(move || knowledge.clone(), wake), wake)
+}
+
+fn no_store() -> FloorFeed {
+    feed(crate::fleet_sync::FloorKnowledge::NoStore).0
 }
 
 const NOW: Duration = Duration::from_secs(0);
@@ -188,16 +200,16 @@ fn a_tick_with_a_roll_already_armed_reports_drain_wait_and_the_drain() {
                 ArtifactResolution::Resolved(info) => info,
                 ArtifactResolution::Unresolved(_) => unreachable!(),
             })),
-            pending: true,
+            committed: true,
             then_exit: false,
-            refusals: 1,
         })),
+        arms: None,
     };
     let status = AutoUpdateStatus::new(true);
     let summary = run_tick(&mut state(&dir), &status, &mut probe, &trigger, NOW, NOW);
     assert_eq!(summary.decision, TickDecisionKind::DrainWait, "{}", summary.note);
     assert!(summary.drain.armed && summary.drain.pending);
-    assert_eq!(summary.drain.refusals, 1);
+    assert_eq!(summary.drain.refusals, 0, "no deadline refusals are counted any more");
 }
 
 /// The #10414 failure mode: before the fix a panicking tick ended the loop
@@ -211,8 +223,9 @@ fn a_panicking_tick_is_recorded_not_fatal() {
     let status = AutoUpdateStatus::new(true);
     let mut st = state(&dir);
     let tune = tuning(Duration::from_secs(900), NOW);
-    let (summary, captured) =
-        capture(|| guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune));
+    let (summary, captured) = capture(|| {
+        guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store())
+    });
     assert_eq!(summary.decision, TickDecisionKind::Panic);
     assert!(status.snapshot().note.unwrap().contains("tick panicked"));
     let faults: Vec<_> = captured
@@ -229,8 +242,9 @@ fn a_panicking_tick_is_recorded_not_fatal() {
     assert!(record.has_provenance());
 
     // The next tick runs normally on the same state.
-    let (next, _) =
-        capture(|| guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune));
+    let (next, _) = capture(|| {
+        guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store())
+    });
     assert_eq!(next.decision, TickDecisionKind::Fetch);
 }
 
@@ -243,8 +257,9 @@ fn every_tick_emits_one_record_with_provenance() {
     let status = AutoUpdateStatus::new(true);
     let tune = tuning(Duration::from_secs(900), Duration::from_secs(600));
     let mut st = state(&dir);
-    let (_, captured) =
-        capture(|| guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune));
+    let (_, captured) = capture(|| {
+        guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store())
+    });
     let [TelemetryRecord::AutoUpdateTick(record)] = captured.records.as_slice() else {
         panic!("one auto_update.tick record");
     };
@@ -264,8 +279,14 @@ async fn the_loop_keeps_ticking_after_a_panicking_tick() {
     let resolves = probe.resolves.clone();
     let status = Arc::new(AutoUpdateStatus::new(true));
     let tune = tuning(Duration::from_millis(20), NOW);
-    let handle =
-        tokio::spawn(run_loop(state(&dir), probe, Trigger::default(), status.clone(), tune));
+    let handle = tokio::spawn(run_loop(
+        state(&dir),
+        probe,
+        Trigger::default(),
+        status.clone(),
+        tune,
+        no_store(),
+    ));
     // Ticks run serially, so the fifth resolve starting proves ticks 1-4 (two
     // panics, then two normal) each completed and published their status. The
     // timeout is only a hang guard, never the pass condition.
@@ -351,4 +372,179 @@ fn a_settle_defer_names_the_quiet_period_and_the_ceiling() {
         "6 x 14400 s from the first observation: {}",
         summary.note
     );
+}
+
+/// #10885: the loop's first tick runs at spawn, not one interval later, so a
+/// host that starts below its floor arms its pause-and-roll on that tick. The
+/// interval here is an hour; the timeout is only a hang guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_starts_below_its_floor_arms_on_the_startup_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = ScriptedProbe::new(newer("999.0.1", env!("CARGO_PKG_VERSION")));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let trigger = Trigger {
+        arms: Some(tx),
+        ..Trigger::default()
+    };
+    let (floor, _) = feed(crate::fleet_sync::FloorKnowledge::Set("999.0.0".to_string()));
+    let status = Arc::new(AutoUpdateStatus::new(true));
+    // A week of settle: only a floor roll ignores it.
+    let tune = tuning(Duration::from_secs(3600), Duration::from_secs(7 * 86_400));
+    let handle = tokio::spawn(run_loop(state(&dir), probe, trigger, status, tune, floor));
+    let armed = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await;
+    handle.abort();
+    let target = armed
+        .expect("armed on the startup tick")
+        .expect("a roll target");
+    assert_eq!(target.source, pause_manifest::TargetSource::Floor);
+    assert_eq!(target.to_version.as_deref(), Some("999.0.1"));
+}
+
+/// #10885: a floor change wakes the loop at once instead of at the next
+/// interval (an hour here), and a wake with no change behind it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_floor_change_ticks_now_and_no_change_waits_for_the_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(ArtifactResolution::Unresolved("none".to_string()));
+    let (resolve_tx, mut resolves) = tokio::sync::mpsc::unbounded_channel();
+    probe.resolve_notify = Some(resolve_tx);
+    let (floor, wake) = feed(crate::fleet_sync::FloorKnowledge::NoStore);
+    let status = Arc::new(AutoUpdateStatus::new(true));
+    let tune = tuning(Duration::from_secs(3600), NOW);
+    let handle =
+        tokio::spawn(run_loop(state(&dir), probe, Trigger::default(), status.clone(), tune, floor));
+    let guard = Duration::from_secs(60);
+    let first = tokio::time::timeout(guard, resolves.recv()).await;
+    assert_eq!(first, Ok(Some(1)), "the startup tick");
+    // Let the startup tick finish, then check nothing else is coming.
+    tokio::time::timeout(guard, async {
+        while status.snapshot().note.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the startup tick published");
+    let idle = tokio::time::timeout(Duration::from_millis(300), resolves.recv()).await;
+    assert!(idle.is_err(), "no tick without a floor change before the interval");
+
+    wake.bump();
+    let woken = tokio::time::timeout(guard, resolves.recv()).await;
+    handle.abort();
+    assert_eq!(woken, Ok(Some(2)), "the floor change ticked the loop at once");
+}
+
+// ===================================================================
+// #10954: the floor applies to every fleet host, autoUpdate on or off
+// ===================================================================
+
+/// `X.Y.Z` with the patch moved by `by`, from the version `guarded_tick`
+/// compares the floor with (this build's).
+fn running_plus(by: u64) -> String {
+    let running = env!("CARGO_PKG_VERSION");
+    let (head, patch) = running.rsplit_once('.').unwrap();
+    format!("{head}.{}", patch.parse::<u64>().unwrap() + by)
+}
+
+/// One `guarded_tick` of a loop spawned with `autonomous.autoUpdate.enabled`
+/// off, recording every roll the trigger is asked for.
+fn floor_only_tick(
+    feed: &FloorFeed,
+    artifact: ArtifactResolution,
+) -> (TickSummary, Vec<RollTarget>, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(artifact);
+    let resolves = probe.resolves.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let trigger = Trigger {
+        armed: Mutex::new(None),
+        arms: Some(tx),
+    };
+    let tune = TickTuning {
+        chase_enabled: false,
+        ..tuning(Duration::from_secs(900), Duration::from_secs(600))
+    };
+    let status = AutoUpdateStatus::new(true);
+    let (summary, _) =
+        capture(|| guarded_tick(&mut state(&dir), &status, &mut probe, &trigger, &tune, feed));
+    let mut arms = Vec::new();
+    while let Ok(target) = rx.try_recv() {
+        arms.push(target);
+    }
+    (summary, arms, resolves.load(Ordering::SeqCst))
+}
+
+fn set_floor(version: &str) -> FloorFeed {
+    feed(crate::fleet_sync::FloorKnowledge::Set(version.to_string())).0
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_below_the_floor_rolls_on_that_tick() {
+    let running = env!("CARGO_PKG_VERSION");
+    // The newest release (with its assets) is above the floor: it is the target.
+    let (summary, arms, _) =
+        floor_only_tick(&set_floor(&running_plus(1)), newer(&running_plus(2), running));
+    assert_eq!(summary.decision, TickDecisionKind::Fetch, "{}", summary.note);
+    assert!(summary.roll_armed, "{}", summary.note);
+    let [target] = arms.as_slice() else {
+        panic!("one trigger_pause_roll, got {arms:?}");
+    };
+    assert_eq!(target.source, pause_manifest::TargetSource::Floor);
+    assert_eq!(target.to_version.as_deref(), Some(running_plus(2).as_str()));
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_at_the_floor_ignores_a_newer_release() {
+    let running = env!("CARGO_PKG_VERSION");
+    // Running at the floor, and running above it (the "0.1.0" floor is below
+    // the running version).
+    for floor in [running, "0.1.0"] {
+        let (summary, arms, _) =
+            floor_only_tick(&set_floor(floor), newer(&running_plus(3), running));
+        assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+        assert!(!summary.roll_armed);
+        assert!(arms.is_empty(), "{arms:?}");
+    }
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_and_an_unknown_floor_does_nothing() {
+    let running = env!("CARGO_PKG_VERSION");
+    let unknown = crate::fleet_sync::FloorKnowledge::Unknown("no pass yet".to_string());
+    let (summary, arms, _) = floor_only_tick(&feed(unknown).0, newer(&running_plus(3), running));
+    assert!(!summary.roll_armed, "{}", summary.note);
+    assert!(arms.is_empty(), "{arms:?}");
+    assert!(summary.note.contains("not known"), "{}", summary.note);
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_rolls_for_a_workspace_that_needs_a_newer_daemon() {
+    let running = env!("CARGO_PKG_VERSION");
+    // The floor is met; a registered workspace needs a newer daemon.
+    let feed = set_floor(running).with_demand(floor_roll::repo_ahead::Demand {
+        version: running_plus(1),
+        workspace: "acme/app".to_string(),
+    });
+    let (summary, arms, _) = floor_only_tick(&feed, newer(&running_plus(2), running));
+    assert!(summary.roll_armed, "{}", summary.note);
+    let [target] = arms.as_slice() else {
+        panic!("one trigger_pause_roll, got {arms:?}");
+    };
+    assert_eq!(target.source, pause_manifest::TargetSource::RepoAhead);
+}
+
+/// A host with no fleet store and autoUpdate off spawns no loop at all
+/// (`loop_mode::LoopMode::decide`). Should a floor-only loop's host lose its
+/// store mid-run, its ticks check nothing rather than start chasing.
+#[test]
+fn a_non_fleet_host_with_autoupdate_off_never_rolls() {
+    let running = env!("CARGO_PKG_VERSION");
+    let mode = loop_mode::LoopMode::decide(&crate::fleet_sync::FloorKnowledge::NoStore, false);
+    assert!(!mode.spawns());
+
+    let (summary, arms, resolves) = floor_only_tick(&no_store(), newer(&running_plus(3), running));
+    assert_eq!(summary.decision, TickDecisionKind::Skip);
+    assert!(!summary.roll_armed);
+    assert!(arms.is_empty(), "{arms:?}");
+    assert_eq!(resolves, 0, "no release is even resolved");
+    assert!(summary.note.contains("not a fleet host"), "{}", summary.note);
 }

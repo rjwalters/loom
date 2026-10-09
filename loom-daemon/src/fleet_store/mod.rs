@@ -50,6 +50,7 @@ pub mod pending_restart;
 pub mod propose;
 pub mod reload;
 pub mod render;
+pub mod resync_claim;
 pub mod roster;
 pub mod state;
 pub mod yaml;

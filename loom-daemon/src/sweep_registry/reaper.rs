@@ -1118,7 +1118,9 @@ impl SweepRegistry {
         let mut events_to_emit: Vec<Event> = Vec::new();
 
         for (sweep_id, pid, pgid, state, kind, started_at) in candidates {
-            if !matches!(state, SweepState::Running | SweepState::Pending) {
+            // #10831: a sweep a roll's H4 pause holds keeps its lock (`roll_pause::hold`).
+            let live = matches!(state, SweepState::Running | SweepState::Pending);
+            if !live || crate::roll_pause::hold::is_held(&sweep_id) {
                 continue;
             }
             // Sample the live checkpoint phase BEFORE the liveness probe

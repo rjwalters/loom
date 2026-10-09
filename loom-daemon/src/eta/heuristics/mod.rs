@@ -75,7 +75,10 @@ pub use land_v3::{
     INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
 };
 pub use land_v4::{LandV4, LAND_V4};
-pub use little_v0::{is_shadow_only, wait_sec, LittleV0, LITTLE_V0};
+pub use little_v0::{
+    is_shadow_only, recompute as recompute_little_v0, wait_sec, LittleV0, LITTLE_V0,
+    MAX_SHAPE as LITTLE_V0_MAX_SHAPE,
+};
 pub use start_v1::{StartV1, START_V1};
 
 /// The heuristic whose track record the calibration log (#10207) records.
@@ -175,6 +178,7 @@ fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation
     }
     explanation.result = None;
     explanation.contributions = None;
+    explanation.stage_predictions.clear();
     explanation.combination = None;
     explanation.twin_otter = None;
     explanation.enforce_cap();
@@ -237,6 +241,8 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         no_estimate_reason: None,
         stalled: stall::binding(&input.stalls, as_of),
         truncated: Vec::new(),
+        replayable: None,
+        replayable_reason: None,
         recalibration: None,
         calibration: None,
         twin_otter: None,
@@ -245,6 +251,7 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         regime_adjustment: None,
         planner_version: None,
         held_heron: None,
+        stage_predictions: std::collections::BTreeMap::new(),
     }
 }
 
@@ -581,6 +588,7 @@ fn finish_estimate(
         tail_extrapolated,
     });
     explanation.contributions = Some(simulation.contributions);
+    explanation.stage_predictions = simulation.stage_predictions;
     explanation.enforce_cap();
     explanation
 }

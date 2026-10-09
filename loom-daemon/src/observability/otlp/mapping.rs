@@ -152,6 +152,13 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
 /// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
 /// logs, and metrics batches without `host.health` — it falls back to the
 /// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
+///
+/// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
+/// same string as `host.id` and `service.instance.id`. For a daemon that is
+/// [`host_identity()`](crate::sweep_registry::host_identity) — the
+/// operator-assigned `$LOOM_HOST_ID` when set, else the OS hostname
+/// (`$HOSTNAME`, then the `hostname` binary). It is set here, on every signal,
+/// so a receiver reached without a collector still gets a readable host axis.
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
     let version = daemon_version
         .filter(|v| !v.is_empty())
@@ -160,6 +167,7 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
+        kv_string("host.name", host_id),
         kv_string("service.version", version),
     ];
     Resource {
@@ -603,22 +611,21 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaFleetRefresh(_)
         | TelemetryRecord::EtaFit(_)
         | TelemetryRecord::EtaBacktestFold(_)
-        | TelemetryRecord::EtaBacktestSummary(_) => {
+        | TelemetryRecord::EtaBacktestSummary(_)
+        | TelemetryRecord::PrResolved(_)
+        | TelemetryRecord::EtaStageOutcome(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
-            // explanation); scalars ride as `loom.eta.*` attributes.
+            // explanation); scalars ride as `loom.eta.*` attributes. Issues
+            // #10519 / #10929: `pr.resolved` and `eta.stage_outcome` are
+            // stamped at the merge/close or stage exit, and observed when the
+            // daemon saw it (knowable-at).
             let (event_name, severity, at, mut attributes, body) =
                 eta::log_parts(&envelope.record)?;
             eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
             time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::PrResolved(r) => {
-            // Issue #10519: event time is the merge/close instant, and the
-            // observed timestamp is when the daemon saw it (knowable-at).
-            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
-            time_unix_nano = at;
-            observed_time_unix_nano = nanos(r.observed_at);
+            if let Some(observed) = eta::observed_at(&envelope.record) {
+                observed_time_unix_nano = nanos(observed);
+            }
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }

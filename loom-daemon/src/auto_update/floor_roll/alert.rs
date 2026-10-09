@@ -146,6 +146,7 @@ impl FloorState {
 mod tests {
     use super::super::Release;
     use super::*;
+    use crate::fleet_sync::FloorKnowledge;
     use chrono::TimeZone;
 
     const FLOOR: &str = "9.0.0";
@@ -169,7 +170,7 @@ mod tests {
     /// A state with an unsatisfiable floor standing, nothing alerted yet.
     fn stalled() -> FloorState {
         let mut state = FloorState::default();
-        state.set_basis(Some(FLOOR.to_string()), RUNNING);
+        state.set_basis(FloorKnowledge::Set(FLOOR.to_string()), RUNNING);
         state.observe(Some(&rel("0.19.900")));
         assert!(state.stall().is_some());
         state
@@ -205,13 +206,13 @@ mod tests {
         assert!(!state.alert_due(t0() + mins(30), REMINDER));
 
         // A different (still unsatisfiable) floor.
-        state.set_basis(Some("8.0.0".to_string()), RUNNING);
+        state.set_basis(FloorKnowledge::Set("8.0.0".to_string()), RUNNING);
         state.observe(Some(&rel("0.19.901")));
         assert!(state.alert_due(t0() + mins(45), REMINDER), "floor changed");
         assert_eq!(state.stall_state().unwrap().floor, "8.0.0");
 
         // A different running version.
-        state.set_basis(Some("8.0.0".to_string()), "0.19.801");
+        state.set_basis(FloorKnowledge::Set("8.0.0".to_string()), "0.19.801");
         state.observe(Some(&rel("0.19.901")));
         assert!(state.alert_due(t0() + mins(46), REMINDER), "running changed");
         assert_eq!(state.stall_state().unwrap().running, "0.19.801");
@@ -259,7 +260,7 @@ mod tests {
     fn no_stall_never_alerts() {
         let mut state = FloorState::default();
         assert!(!state.alert_due(t0(), REMINDER));
-        state.set_basis(Some("0.19.850".to_string()), RUNNING);
+        state.set_basis(FloorKnowledge::Set("0.19.850".to_string()), RUNNING);
         state.observe(None);
         assert!(!state.alert_due(t0(), REMINDER), "unresolved is noted, not alerted");
         state.observe(Some(&rel("0.19.900")));
@@ -278,7 +279,7 @@ mod tests {
         // observed, and the record round-trips unchanged.
         let mut same = FloorState::default();
         same.restore_stall_state(saved.clone());
-        same.set_basis(Some(FLOOR.to_string()), RUNNING);
+        same.set_basis(FloorKnowledge::Set(FLOOR.to_string()), RUNNING);
         assert_eq!(same.stall(), before.stall());
         assert_eq!(same.stall_state(), saved);
 
@@ -290,7 +291,10 @@ mod tests {
         ] {
             let mut other = FloorState::default();
             other.restore_stall_state(saved.clone());
-            other.set_basis(floor.map(str::to_string), running);
+            other.set_basis(
+                floor.map_or(FloorKnowledge::NoStore, |f| FloorKnowledge::Set(f.to_string())),
+                running,
+            );
             assert!(other.stall().is_none(), "{floor:?} {running}");
             assert_eq!(other.stall_state(), None, "{floor:?} {running}");
         }

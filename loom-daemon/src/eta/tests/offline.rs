@@ -84,6 +84,7 @@ fn outcome_line(
         outcome_source: "bus".to_string(),
         outcome_resolution_sec: None,
         result: None,
+        attribution: None,
     };
     LoggedLine {
         observed_at,

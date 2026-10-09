@@ -107,6 +107,7 @@ pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
+pub mod explain;
 pub mod explanation;
 pub mod fit;
 pub mod flag_timeline;
@@ -134,6 +135,8 @@ pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
+pub mod hold_kind;
+pub mod hold_marker_log;
 pub mod job_owner;
 pub mod journal;
 pub mod labels;
@@ -149,6 +152,7 @@ pub mod pr_file_log;
 pub mod priority_features;
 pub mod priority_inputs;
 pub mod queue_features;
+pub mod ready_order;
 pub mod recalibrate;
 pub mod recency;
 pub mod regime;
@@ -161,6 +165,7 @@ pub mod shadow_fleet;
 pub mod shadow_lifecycle;
 pub mod shadow_stats;
 pub mod simulate;
+pub mod stage_forecast;
 pub mod stage_queue;
 pub mod stall;
 pub mod stall_features;
@@ -594,6 +599,17 @@ pub struct DispatchInput {
     pub saturation_held: bool,
     /// The tick the plan came from.
     pub plan_at: DateTime<Utc>,
+    /// Why this host's planner gave the row no position although the fleet
+    /// can still dispatch it (#10903): its disposition, plus the halt cause
+    /// for a host-local `workspace_halted` (`workspace_halted:token_pool`).
+    /// `None` for a row the planner positioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_here: Option<String>,
+    /// A time-boxed hold's expiry (#9311, #10903): the row cannot be admitted
+    /// before it. Its remaining time from `plan_at` is added to
+    /// [`Self::admission_delay_sec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 impl DispatchInput {
@@ -606,7 +622,10 @@ impl DispatchInput {
 
     /// Fixed seconds from its admitting slot freeing to the dispatch: half a
     /// tick (the mean wait for the next tick), plus one whole tick per full
-    /// admission batch ahead of it when it needs no turnover at all.
+    /// admission batch ahead of it when it needs no turnover at all, plus
+    /// what is left of a time-boxed hold ([`Self::held_until`]) at the tick.
+    /// The hold is added, not overlapped with the queue wait: an upper bound
+    /// when both are long.
     #[must_use]
     pub fn admission_delay_sec(&self) -> i64 {
         let tick = i64::try_from(self.tick_interval_secs).unwrap_or(i64::MAX / 4);
@@ -614,7 +633,12 @@ impl DispatchInput {
             (0, Some(cap)) if cap > 0 => i64::from(self.ahead / cap),
             _ => 0,
         };
-        tick / 2 + batches.saturating_mul(tick)
+        let held = self
+            .held_until
+            .map_or(0, |until| (until - self.plan_at).num_seconds().max(0));
+        (tick / 2)
+            .saturating_add(batches.saturating_mul(tick))
+            .saturating_add(held)
     }
 }
 

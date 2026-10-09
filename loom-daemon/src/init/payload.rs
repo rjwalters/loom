@@ -22,33 +22,23 @@
 //! rules (#5971: only Loom-owned files are ever removed), the internal skip
 //! list and the executable bits are the installer's own.
 //!
-//! Consumer configuration (`.loom/config.json`) and the template-substituted
-//! scaffolding (`.loom/CLAUDE.md` carries an install date, so regenerating it
-//! would never be an empty diff) are not part of the payload diff.
+//! # The surfaces beyond the installer step
 //!
-//! # Scope gap against `resync-installed.sh`
+//! `resync-installed.sh` refreshes more than the payload step writes. Those
+//! surfaces, and the one table that names them, are in [`surfaces`] (#10895):
+//! `.agents/skills/` (marker-gated), `.claude/README.md`,
+//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the Loom-managed block
+//! of `.gitignore`, the two template-substituted guides (`.loom/CLAUDE.md`,
+//! `.loom/AGENTS.md`, re-rendered with the install date they already carry)
+//! and the retired-payload sweep. Each is a step over the same staging tree,
+//! so it is diffed and applied like any payload file.
 //!
-//! The payload diff is narrower than the shell resync it will replace. After
-//! a payload resync the stamp says "release X" while every surface below can
-//! still be at an older release. Each needs an owner before
-//! `fleet-resync.sh` is retired (#10718 / #10719):
-//!
-//! * `.agents/skills/` (the Codex role prompts; marker-gated in the script)
-//! * `.claude/README.md` and `.github/CONFIGURATION.md`
-//! * `.claude/biome.jsonc`
-//! * the retired-payload sweep: files a release deliberately retires. Here a
-//!   file is removed only when `installed_files` lists it, so a retired file
-//!   an older installer never recorded stays
-//! * the `package.json` edit that deletes the `loom-workspace` stub's
-//!   `version` field
-//! * the leftover `**Loom Version**` header removal in `CLAUDE.md` and
-//!   `.loom/CLAUDE.md`
-//! * the Loom-managed `.gitignore` block (`loom-daemon update-gitignore`)
-//! * the `merge=ours` driver for `install-metadata.json` (`.gitattributes`
-//!   block plus local git config)
-//! * the forge label drift check against `.github/labels.yml`
-//! * the `.loom/.resync-in-progress` marker file ([`apply`] records an
-//!   interrupted run in the metadata instead, see below)
+//! Left to the installer and `resync-installed.sh`, deliberately
+//! ([`surfaces::INSTALL_TIME_ONLY`]): consumer configuration
+//! (`.loom/config.json`), the `package.json` stub's `version` removal, the
+//! root `CLAUDE.md` header, the `merge=ours` driver and the forge label drift
+//! check. The `.loom/.resync-in-progress` marker has no counterpart either:
+//! [`apply`] records an interrupted run in the metadata instead, see below.
 //!
 //! # What a resync writes
 //!
@@ -59,7 +49,8 @@
 //! `requires_daemon` and `last_resync` in `.loom/install-metadata.json`.
 //! It also records the added and changed paths in `installed_files` and
 //! drops the removed ones, so a file a resync adds can be retired by a later
-//! one. Every other key is kept.
+//! one. The repo's own `.gitignore` is the exception: Loom merges a block
+//! into it and never lists it as Loom-owned. Every other key is kept.
 //!
 //! # A failed resync is retried
 //!
@@ -85,11 +76,19 @@
 //! cannot be ordered against this daemon, so it could be newer. Only an
 //! absent, empty or `"unknown"` value counts as "not recorded".
 //!
-//! # Only a release build resyncs
+//! An interrupted resync is covered too. `loom_version` is stamped last, so a
+//! tree a NEWER daemon was part-way through still shows the old version;
+//! [`gate_metadata`] reads the `resync_pending` target and refuses when it is
+//! above this daemon, so an older host never completes (and so rolls back) a
+//! newer host's partial apply.
 //!
-//! `build.rs` packs the working tree, so a daemon built from a checkout with
-//! uncommitted changes embeds files that are no release. [`Stamp::this_binary`]
-//! carries the build's tree state and the gate refuses unless it is `clean`.
+//! # Only an official release build resyncs
+//!
+//! `build.rs` packs whatever tree it is run in, so a developer's build or a
+//! feature branch's embeds files that are no release, even from a clean
+//! checkout. [`Stamp::this_binary`] sets `release_build` only for a binary the
+//! release workflow built and whose release tag the forge confirmed
+//! ([`crate::release_provenance`]); the gate refuses every other payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -99,6 +98,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
+
+pub(crate) mod surfaces;
 
 use super::file_ops::force_merge_dir_with_report_filtered;
 use super::repo_owned::OwnershipBoundary;
@@ -134,10 +135,12 @@ pub struct Stamp {
     pub commit: Option<String>,
     /// The oldest daemon these files work with.
     pub requires_daemon: String,
-    /// The payload is the tracked `defaults/` tree of `commit`, unmodified.
-    /// False for a build from a dirty checkout, or one that could not tell
-    /// (`LOOM_DAEMON_GIT_DIRTY` is `dirty` or `unknown`); such a payload is
-    /// never applied.
+    /// The payload is an official release's: the binary was built by the
+    /// release workflow for `v<version>`, and the forge confirmed that tag
+    /// names `commit` ([`crate::release_provenance`]). False for every other
+    /// build (a developer's, a feature branch's, CI's), and for a release
+    /// build whose tag has not been confirmed yet; such a payload is never
+    /// applied.
     pub release_build: bool,
 }
 
@@ -153,7 +156,7 @@ impl Stamp {
             version: Version::parse(env!("CARGO_PKG_VERSION"))?,
             commit,
             requires_daemon: REQUIRES_DAEMON.to_string(),
-            release_build: crate::self_update::BUILT_TREE_STATE == "clean",
+            release_build: crate::release_provenance::is_verified(),
         })
     }
 }
@@ -235,6 +238,11 @@ pub struct PayloadDiff {
     stamp_pending: bool,
     stamp: Stamp,
     staging: TempDir,
+    /// Surfaces left exactly as the workspace has them because their own
+    /// file there is unusable. None is in the lists above. The caller that
+    /// knows which repo this is reports them
+    /// ([`surfaces::log_skipped_once`]).
+    pub(crate) skipped_surfaces: Vec<surfaces::Skipped>,
 }
 
 impl PayloadDiff {
@@ -272,8 +280,9 @@ pub enum ResyncRefusal {
     /// The Loom source checkout installs from its own `defaults/` (dogfood
     /// symlinks); a resync never writes there.
     LoomSourceRepo,
-    /// This daemon was not built from a clean checkout, so its embedded
-    /// payload is not the files of any release.
+    /// This daemon is not a verified official release build
+    /// ([`crate::release_provenance`]), so its embedded payload is not known
+    /// to be the files of any release.
     NotAReleaseBuild,
     /// A contract field holds a value that is not `MAJOR.MINOR.PATCH` (for
     /// example `0.20.0-rc1`). It cannot be ordered against this daemon, so it
@@ -302,14 +311,40 @@ pub enum ResyncRefusal {
         /// This daemon's running version.
         running: Version,
     },
+    /// A NEWER daemon started a resync here and did not finish it: the
+    /// metadata's `resync_pending` names a version above this daemon's. Some
+    /// of that release's files may already be in place while `loom_version`
+    /// still shows the old one, so completing the run from this payload would
+    /// roll them back (#10718).
+    PendingAheadOfDaemon {
+        /// The version the interrupted resync was installing.
+        pending: Version,
+        /// This daemon's running version.
+        running: Version,
+    },
 }
 
 impl ResyncRefusal {
-    /// True for the two "repo ahead of daemon" refusals: the inputs to the
-    /// host's `repo_ahead_target` and the `daemon-too-old` dispatch hold.
+    /// True for the "repo ahead of daemon" refusals: a resync from this
+    /// payload would downgrade the workspace, so none is attempted.
+    ///
+    /// This is not the dispatch hold's test, and not the roll demand's
+    /// ([`crate::workspace_hold::decide_hold`], #10719). Of the three, only
+    /// [`Self::NeedsNewerDaemon`] holds dispatch as `daemon-too-old` and asks
+    /// for a roll. [`Self::RepoAheadOfDaemon`] is compatible: no hold, no
+    /// roll. [`Self::PendingAheadOfDaemon`] holds dispatch and asks for no
+    /// roll. [`Self::UnrecognizedVersion`] is not in this set, yet holds,
+    /// because it may need a newer daemon; it asks for a roll only when its
+    /// `requires_daemon` is above this daemon, or names nothing that parses
+    /// ([`crate::workspace_hold::demanded`]).
     #[must_use]
     pub fn repo_ahead_of_daemon(&self) -> bool {
-        matches!(self, Self::NeedsNewerDaemon { .. } | Self::RepoAheadOfDaemon { .. })
+        matches!(
+            self,
+            Self::NeedsNewerDaemon { .. }
+                | Self::RepoAheadOfDaemon { .. }
+                | Self::PendingAheadOfDaemon { .. }
+        )
     }
 }
 
@@ -321,7 +356,8 @@ impl std::fmt::Display for ResyncRefusal {
             Self::LoomSourceRepo => write!(f, "the Loom source checkout is never resynced"),
             Self::NotAReleaseBuild => write!(
                 f,
-                "this daemon was not built from a clean checkout; its payload is not a release"
+                "this daemon is not a verified official release build; its payload is never \
+                 applied"
             ),
             Self::UnrecognizedVersion { field, value } => write!(
                 f,
@@ -336,6 +372,11 @@ impl std::fmt::Display for ResyncRefusal {
                 f,
                 "repo ahead of daemon: installed loom_version {installed} is newer than running \
                  {running}; resyncing would downgrade it"
+            ),
+            Self::PendingAheadOfDaemon { pending, running } => write!(
+                f,
+                "repo ahead of daemon: a resync to {pending} was interrupted here and this \
+                 daemon runs {running}; completing it from this payload would downgrade it"
             ),
         }
     }
@@ -408,6 +449,42 @@ pub fn resync_gate(
     Ok(compat)
 }
 
+/// [`resync_gate`] over the raw text of an `install-metadata.json`, plus the
+/// one check that needs a key [`InstallMeta`] does not carry: an interrupted
+/// resync (`resync_pending`) that a NEWER daemon started is refused, because
+/// `loom_version` is stamped last and so still shows the old release while
+/// some of the newer files are already in place. Pure.
+///
+/// # Errors
+/// The refusal: unparseable metadata, anything [`resync_gate`] refuses, or a
+/// pending resync this daemon cannot be ordered at or above.
+pub fn gate_metadata(raw: &str, daemon: &DaemonCompat) -> Result<Compat, ResyncRefusal> {
+    let installed =
+        InstallMeta::parse(raw).map_err(|e| ResyncRefusal::UnreadableMetadata(e.to_string()))?;
+    let compat = resync_gate(&installed, daemon)?;
+    let pending = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| v.get(PENDING_KEY).cloned());
+    match pending {
+        None | Some(Value::Null) => Ok(compat),
+        Some(Value::String(s)) => match Version::parse(&s) {
+            Some(v) if v > daemon.running => Err(ResyncRefusal::PendingAheadOfDaemon {
+                pending: v,
+                running: daemon.running,
+            }),
+            Some(_) => Ok(compat),
+            None => Err(ResyncRefusal::UnrecognizedVersion {
+                field: PENDING_KEY,
+                value: s,
+            }),
+        },
+        Some(other) => Err(ResyncRefusal::UnrecognizedVersion {
+            field: PENDING_KEY,
+            value: other.to_string(),
+        }),
+    }
+}
+
 /// Stage this binary's embedded payload against `dest` and report the diff.
 /// Writes only to a private temp dir; `dest` is not touched.
 ///
@@ -427,7 +504,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .tempdir()
         .context("create the resync staging dir")?;
     let stage = staging.path();
-    let roots = surface_roots(payload.defaults());
+    let roots = resync_roots(payload.defaults());
 
     // Seed staging with the workspace's current surfaces plus the ownership
     // evidence, so the installer's ownership-gated clean sees what it would
@@ -440,12 +517,22 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .map(String::as_str)
         .chain([INSTALL_METADATA_PATH, RESYNC_IGNORE_PATH])
     {
+        // An extra surface reached through a symlinked parent (`.agents` or
+        // `.github` linked elsewhere) is the workspace's to keep, like a
+        // symlinked file.
+        if surfaces::is_extra(rel) && under_symlink(dest, rel) {
+            skipped.push(rel.to_string());
+            continue;
+        }
         seed(&dest.join(rel), &stage.join(rel), rel, &mut skipped)
             .with_context(|| format!("stage {rel}"))?;
     }
 
-    let shipped =
+    let mut shipped =
         install_into(payload.defaults(), stage).map_err(|e| anyhow!("stage the payload: {e}"))?;
+    let mut skipped_surfaces = Vec::new();
+    surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
+        .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     let ownership = OwnershipBoundary::load(dest);
     let mut diff = PayloadDiff {
@@ -455,6 +542,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         stamp_pending: resync_is_pending(dest),
         stamp: payload.stamp().clone(),
         staging,
+        skipped_surfaces,
     };
     let mut staged = BTreeMap::new();
     let mut installed = BTreeMap::new();
@@ -590,15 +678,25 @@ fn gate_workspace(dest: &Path, stamp: &Stamp) -> Result<Compat, ResyncRefusal> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ResyncRefusal::NotInstalled),
         Err(e) => return Err(ResyncRefusal::UnreadableMetadata(e.to_string())),
     };
-    let installed =
-        InstallMeta::parse(&raw).map_err(|e| ResyncRefusal::UnreadableMetadata(e.to_string()))?;
     let daemon = DaemonCompat {
         running: *running,
         supports_installed: Version::parse(crate::install_compat::SUPPORTS_INSTALLED)
             .unwrap_or(*running),
         floor: None,
     };
-    resync_gate(&installed, &daemon)
+    gate_metadata(&raw, &daemon)
+}
+
+/// Every repo-relative root a resync diffs: the installer step's, then the
+/// extra surfaces of [`surfaces::EXTRA_SURFACES`].
+pub(crate) fn resync_roots(defaults: &Path) -> Vec<String> {
+    let mut roots = surface_roots(defaults);
+    for surface in surfaces::EXTRA_SURFACES {
+        if !roots.iter().any(|r| r == surface.path) {
+            roots.push(surface.path.to_string());
+        }
+    }
+    roots
 }
 
 /// Every repo-relative path the payload step can write, in a stable order.
@@ -703,7 +801,17 @@ fn diff_excludes(path: &str, skipped: &[String], ownership: &OwnershipBoundary) 
             || path
                 .strip_prefix(s.as_str())
                 .is_some_and(|r| r.starts_with('/'))
-    }) || ownership.is_declared_repo_owned(path)
+    }) || surfaces::pin_names(path)
+        .iter()
+        .any(|name| ownership.is_declared_repo_owned(name))
+}
+
+/// A directory above `rel` in `dest` is a symlink.
+fn under_symlink(dest: &Path, rel: &str) -> bool {
+    Path::new(rel).ancestors().skip(1).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && fs::symlink_metadata(dest.join(dir)).is_ok_and(|m| m.file_type().is_symlink())
+    })
 }
 
 fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
@@ -751,7 +859,8 @@ fn prune_empty_parents(dest: &Path, rel: &str) {
     }
 }
 
-/// Metadata key that marks a resync as started and not yet stamped.
+/// Metadata key that marks a resync as started and not yet stamped. Its value
+/// is the version that resync was installing; [`gate_metadata`] reads it.
 const PENDING_KEY: &str = "resync_pending";
 
 /// The workspace's metadata records a resync that never reached its stamp.
@@ -806,8 +915,9 @@ fn restamp_metadata(dest: &Path, diff: &PayloadDiff) -> Result<()> {
 
 /// Keep `installed_files` true to what this resync wrote: the added and
 /// changed paths are Loom's (so a later release can retire them), the removed
-/// ones are gone. Existing entries keep their order; a value that is not an
-/// array is left alone.
+/// ones are gone. A file Loom only merges into (`.gitignore`) is never listed:
+/// the list is deletion evidence. Existing entries keep their order; a value
+/// that is not an array is left alone.
 fn record_ownership(obj: &mut serde_json::Map<String, Value>, diff: &PayloadDiff) {
     let entry = obj
         .entry("installed_files")
@@ -821,7 +931,8 @@ fn record_ownership(obj: &mut serde_json::Map<String, Value>, diff: &PayloadDiff
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
-    for rel in diff.added.iter().chain(&diff.changed) {
+    let owned = diff.added.iter().chain(&diff.changed);
+    for rel in owned.filter(|rel| surfaces::records_ownership(rel)) {
         if listed.insert(rel.clone()) {
             list.push(Value::String(rel.clone()));
         }

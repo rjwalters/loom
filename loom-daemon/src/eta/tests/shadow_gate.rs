@@ -477,6 +477,8 @@ fn ready_row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
         },
         disposition: crate::types::QueueDisposition::DeferredCapacity,
         facts: crate::eta::tracker::IssueRow::default(),
+        rank: issue as usize,
+        detail: None,
     }
 }
 

@@ -67,15 +67,41 @@ whole tick per full `max_admissions_per_tick` batch ahead when no turnover is
 needed. The draws are never age-conditioned. `start` ends there; `land` for
 an unstarted issue continues from `sweep.curator` in the same path, so its
 queue wait and post-dispatch stages are combined by one resampling pass
-(stages independent, as everywhere). A ready row the plan gives no position
-(`blocked`, or no plan on this host — the single-workspace loop publishes
-none) is refused `no_dispatch_plan`. Too few turnover samples is
+(stages independent, as everywhere). Too few turnover samples is
 `insufficient_samples`, whatever the position: the tick interval alone never
 makes a number. v1 limits: turnover history is upper-biased when the pool ran
 below its cap; a repo-cap or out-of-slice deferral is recorded (as the row's
-`gate` in `path.dispatch`), not modelled; and a `held_until` hold (#9311)
-rides only `blocked` rows, which have no position, so it is refused
-`no_dispatch_plan` rather than turned into a start time.
+`gate` in `path.dispatch`), not modelled; and the slots and turnovers are the
+estimating host's own, not the fleet's (#10944).
+
+**Rows this host's planner does not position (#10903).** The single ETA
+authority estimates for the whole fleet, so a ready row its own planner
+cannot dispatch is still estimated when another host can
+(`eta::ready_order`):
+
+- **Not here**: `host_constraint`, `host_class_refused`, `peer_claim`,
+  `workspace_commands_missing`, `dispatch_error`, and `workspace_halted` for
+  a host-local cause (`gate_pending`, `token_pool`, `preflight_advisory`,
+  `drain`, `breaker`, `write_scope`; a red `main` halts every host and stays
+  refused).
+- **Time-held**: `recheck_interval`, `dispatch_backoff`, `noop_cooldown` and
+  `prless_retry` rows with a `held_until` (#9311). What is left of the hold at
+  the tick is added to `admission_delay_sec`. The hold is added to the queue
+  wait, not overlapped with it, so this is an upper bound when both are long.
+
+Such a row is slotted into the planner's order by the work finder's own
+comparator rank: `ahead` counts the waiting rows ranked before it, and
+`position` is one past their highest planner position. Only waiting rows
+count, because only they share this host's slots. That keeps every waiting
+row's input byte-identical. `path.dispatch.not_here` (and the
+`loom.eta.not_here` attribute) names the reason, for example
+`peer_claim` or `workspace_halted:token_pool`; `path.dispatch.held_until`
+carries a hold's expiry.
+
+A row parked by a hold label (`parked`, `hard_exclusion`, `labelled_blocked`)
+is refused `blocked`. Every other row with no position is refused
+`no_dispatch_plan`: `quarantined`, `open_pr`, `declined`, a hold with no
+clock, or no plan on this host (the single-workspace loop publishes none).
 
 Human-gated stages (intake, approval) are outside the model: an issue there
 has no estimate, with a reason (below). An approved PR under an operator hold
@@ -261,6 +287,83 @@ only.
   within one listing interval now closes at the approval (verdict `pass`), as
   the forge measures it, instead of at the release.
 
+### Hold kind and who released it (#10958, Slice 1)
+
+`op_hold` is one bit for every operator hold. Slice 1 adds the inputs that
+split it. It logs data and adds a classifier; no shipped heuristic reads
+either yet. The model that uses them (hold-kind release rates, hour-of-week,
+operator activity) is Slice 2.
+
+**The marker log.** `pr-hold-markers.jsonl`, beside the fleet snapshots
+(`eta::hold_marker_log`), holds one row per trusted Champion hold or release
+marker in a comment:
+
+| Marker | Meaning |
+|---|---|
+| `champion:merge-risk-hold` | criterion #2's hold opened (or re-armed) |
+| `champion:critical-file-hold` | criterion #3's hold opened (or re-armed) |
+| `champion:ac-hold pr=<n> sha=<sha>` | the linked issue's close is held (posted on the issue; logged against PR `n`) |
+| `champion:merge-risk-hold-cleared`, `champion:critical-file-hold-cleared` | Champion closed the episode |
+| `champion:critical-file-release-respected`, `champion:hold-release-respected:<sha>` | Champion acknowledged a human's release |
+
+A row is `{repo, pr, thread, kind, head, comment_id, created_at,
+fetched_at, source}`. `head` comes from the marker or from the comment's
+`champion:hold-state head=<sha>` line. A marker counts only on a line of its
+own, outside a fenced code block, and only from an author
+`comment_trust` believes. A quoted or untrusted marker is prose. Other
+Champion markers (digests, notices, defers) are not hold state. No marker
+exists for a stale-check budget hold: that hold is a label only.
+
+**Reads.** The ETA pass reads the repo-wide comment listing,
+`issues/comments?since=…&sort=updated&direction=asc`, as ETag'd
+conditional GETs through the reader Apps (op `comment.list`). It makes at
+most `MARKER_READ_BUDGET` (6) calls per pass across all repos, and none
+while the rate-limit breaker is open. A repo's first walk starts 28 days
+back (`BACKFILL_DAYS`). After each full page, `since` moves to the newest
+`updated_at` seen, so the walk never pages deep. A short page means the
+repo is caught up. After that, a quiet repo costs one `304` per pass. Rows
+are keyed `(repo, comment_id, kind)`, so the overlap a walk re-reads adds
+nothing. Rows from the first walk are `source: backfill`; later rows are
+`live`, so a fit can drop backfilled rows as an ablation. A marker is
+knowable from its comment's `created_at`, an immutable forge timestamp.
+The residual leak is an edit or delete made after `as_of`, which the log
+never sees.
+
+**Coverage.** The cursor (`pr-hold-markers.cursor`) records each repo's
+coverage: complete from `backfill_from` through `caught_up_at`. An instant
+outside that span is *unknown*, never "no marker".
+
+**The classifier** (`eta::hold_kind`, `RepoHolds`) is pure. It reads by
+slug: the raw event cache's PR label rows plus the repo's marker rows.
+
+- **Spells.** The hold labels in force (`merge_hold` labels, their
+  companions, `loom:blocked`) are replayed strictly before the cutoff. A
+  spell opens when the set becomes non-empty. It ends when the set empties
+  (released), or when the PR merges or closes while held.
+- **Kind.** The labels give the kind on their own: `operator_decision`,
+  then `operator_only` (including `-mechanical`), `operator`, `blocked`,
+  `other`. The latest marker posted in the spell refines it, counting from
+  30 minutes before the spell's first label. A hold marker names the kind
+  (`merge_risk`, `critical_file`, `ac_hold`) and its head. A re-arm at a new
+  head is a newer marker. A release marker with the label still in force
+  means a human put the hold back, so the label kind stands. When the
+  marker log does not cover the spell, the kind is the label kind and
+  `marker_known` is false.
+- **Release.** A release was Champion's when a `-cleared` marker lies within
+  15 minutes (`CLOSER_WINDOW_SEC`) of the labels emptying. Otherwise it was
+  a human's, as `champion-critical-file-hold.md` infers: an open episode
+  whose label is gone can only mean a human removed it. The verdict is
+  `pending` until the window has passed with coverage, so a closer posted
+  after the cutoff never changes an earlier row. No forge `actor` is read:
+  on a host whose writes use a person's token, fleet and operator writes
+  share one login.
+
+A fact is usable only if it is strictly before the cutoff (`t − LAG` in
+training, `as_of` in serving). `eta/tests/hold_kind.rs` checks this: it
+adds labels, merges, closers and backfilled markers at or after each
+cutoff, and every spell stays unchanged. It also checks that the disk read
+matches the in-memory inputs.
+
 ## Heuristics and versioning
 
 | id | kind | reads | an approved path ends |
@@ -408,8 +511,11 @@ fixture. A behaviour change is a new id registered beside the old one
        point (`ANSWER_RATE_SLACK`) below `current`'s. It is counted
        **once per tracker pass** per live subject, carrying each heuristic's
        last emitted state forward — never as answered rows over all rows, because a refusal
-       is emitted once and never refreshed while an answer is refreshed every
+       is emitted once and never refreshed (bar `stale_inputs`, re-emitted every pass, #10973) while an answer is refreshed every
        few minutes;
+       a `stale_inputs` series re-emits at most 10 times an hour (half the
+       hourly cap, so the recovery row is never starved), and those refusal
+       rows score nothing, so they never form shadow pairs;
      - its p25–p75 coverage inside `[40%, 60%]`;
      - the **day consistency check**: pairs are folded by the UTC day of
        their `as_of`, a day goes to whichever side had the lower mean
@@ -1904,6 +2010,22 @@ path completion time, so its `p50_at` is exactly `eta_p50_at`; a stage no
 path visits carries `null` times, never a fabricated one. A timeline can be
 drawn from `stage_marks` alone.
 
+`stage_predictions` (#10929) is the per-stage forecast, keyed by stage, for
+each stage still ahead. It holds:
+
+- `entry_p50` / `entry_p90`: the first entry, which for the terminal stage
+  too is the *entry*, not the completion;
+- `dwell_p50` / `dwell_p90`: the total time in the stage across visits;
+- `reach_pct`: the percentage of paths that visit the stage.
+
+Values are whole seconds from `as_of`, and entry and dwell are taken over
+the paths that visit the stage. `alloc` is the stage's share of the p50
+total, from the paths ranked p40–p60, and the stages' `alloc` values sum to
+the simulated p50. Like the marks, all of this is read off the draws already
+made, so no quantile moves. `run_predictions` recomputes it from the
+explanation's own fields. Only the path engine fills it; other heuristics
+omit it. It is dropped with `stage_marks` under the size cap.
+
 `held_heron` (#10523) is how a `land-2026-10-06-held-heron` simulator
 answer recomputes. It is the competing-risks chain for a held or sequenced
 PR: the rates, the evidence and the solution's settings (see
@@ -2320,7 +2442,7 @@ ORDER BY share;
 | `human_gated` | intake or approval (`loom:triage`, `loom:curating`, `loom:curated`) |
 | `insufficient_samples` | a needed stage or the verdict history is under the sample floor |
 | `beyond_history` | the item has been in its stage longer than all but 5 samples (never `land-v4`, which answers with a flagged tail estimate) |
-| `no_dispatch_plan` | not started, and the dispatch plan gives it no position (blocked, or no plan on this host) |
+| `no_dispatch_plan` | not started, the dispatch plan gives it no position, and no other host could dispatch it either (`quarantined`, `open_pr`, a red `main`, a hold with no clock), or there is no plan on this host. A row only this host cannot dispatch is estimated with `path.dispatch.not_here` instead (#10903) |
 | `unknown_stage` | no stage label, or contradictory ones |
 | `stale_inputs` | a ready item whose dispatch plan is older than 15 minutes (or three ticks) |
 | `no_model` | a fitted heuristic (`land-2026-10-04-twin-otter-b` on a PR stage) has no usable coefficient file: none loaded (always, in the CLI), no direct model, a cutoff at or after `as_of`, or malformed coefficients |
@@ -2351,7 +2473,8 @@ triggers:
   ETA failure costs only ETA and never the observability collector.
 
 An unchanged estimate is refreshed every `refreshSecs` (300); a changed stage,
-rework count or refusal reason emits at once; a series is capped at 20
+rework count or refusal reason emits at once, and a `stale_inputs` refusal is
+re-emitted every pass while it persists (#10973); a series is capped at 20
 emissions per rolling hour. Every emitted estimate waits for its outcome in
 `.loom/state/eta/pending.jsonl`, which survives a restart (an entry whose
 heuristic is no longer registered is dropped on restore). It is per-host
@@ -2401,6 +2524,17 @@ before p90 existed. The outcome row also exports `loom.eta.p25_sec`,
 `loom.eta.p75_sec` and `loom.eta.p90_sec`, so an interval can be read without
 joining the estimate. The promotion gate decides on `pinball4_loss_sec` and
 gates on `above_p90` (#10233; see "Adding a v2, and comparing it").
+
+**Which stage caused the miss (#10929).** `eta.outcome.attribution` splits
+`error_sec` by stage. Each forecast or observed stage contributes
+`actual_dwell − alloc`, where the actual is the time observed in the stage
+after `as_of`. `unattributed_sec` holds what no stage explains: inexactly
+observed time, an applied stall, and a calibration or regime shift. The parts
+always sum to `error_sec`. `dominant_stage` names the largest contribution.
+Each stage boundary is also its own record, `eta.stage_outcome` (entry, exit,
+dwell and exit kind, plus the newest open estimate per series), so a
+predicted-vs-actual stage timeline can be drawn per item. The nightly
+per-heuristic, per-stage bias rollup is a follow-up.
 
 **Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
 before any PR are *not* abandonments — a replacement PR or a later sweep
@@ -2499,7 +2633,7 @@ items which are not in it at all.
 
 ## CLI (`loom-daemon eta`)
 
-Ten subcommands. All are read-only except `eta promote --apply`, which writes
+Eleven subcommands. All are read-only except `eta promote --apply`, which writes
 one config key, `eta fleet backfill|refresh`, which writes only the snapshot
 cache, `eta fit`, which writes only a coefficient file, and `eta retire
 --file`, which files issues and records them. Nothing here writes
@@ -2510,6 +2644,17 @@ accepts `--repo-root PATH` (default: the current directory).
 - **`loom-daemon eta backfill [--repo OWNER/NAME] [--limit N] [--dry-run]`** —
   seeds `.loom/logs/eta-stage-samples.jsonl` from `pr-latency`'s own
   forge-derived history (#9325).
+- **`loom-daemon eta explain --file F [--diff F2] [--id ID] [--json]`** —
+  replays one logged estimate from its explanation export (one
+  `eta-explanation/v1` object per line, or a single object), checks the replay
+  against the recorded p25/p50/p75/p90 (`exact`, `MISMATCH`, or `not replayable`
+  with the reason when the 32 KiB cap dropped a replay input), prints the
+  per-stage breakdown and each input's marginal `Δp50` / `Δp90` (perturbed one at
+  a time, deterministic seed). With `--diff` it swaps each changed input from the
+  first estimate into the second and ranks them by `|Δp50|`, printing the
+  non-additive residual (#10930). Runs anywhere; reads no live state. Explain by
+  `estimate_id` from SigNoz, a live `repo#N`, and the hindsight
+  `loom.eta.input_error.*` outcome attributes are later slices of #10930.
 - **`loom-daemon eta backtest --heuristic ID [--compare ID] [--since RFC3339] [--json]`**
   — leak-free replay of a heuristic against real `sweep.outcome` history: mean
   pinball loss, p25–p75 coverage and bias, stability of the predicted landing
