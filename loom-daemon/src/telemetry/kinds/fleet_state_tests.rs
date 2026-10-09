@@ -65,9 +65,11 @@ fn record() -> FleetStateRecord {
             max_concurrent: 4,
             occupancy: Some(1),
         }),
+        capacity: None,
         repos: vec![FleetStateRepo {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus {
@@ -89,6 +91,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
         .map(|(i, repo)| FleetStateRepo {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -330,6 +333,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: None,
@@ -339,6 +343,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
+            main_ci: None,
             ready_complete: true,
             ready_replace: false,
             census: Some(FleetPrCensus::default()),
@@ -378,6 +383,7 @@ fn ready_replace_is_additive_and_rides_every_chunk() {
     r.repos = vec![FleetStateRepo {
         repo: "acme/a".to_string(),
         visibility: RepoVisibility::Private,
+        main_ci: None,
         ready_complete: false,
         ready_replace: true,
         census: None,
