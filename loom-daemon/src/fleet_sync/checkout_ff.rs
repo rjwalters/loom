@@ -178,7 +178,7 @@ pub use host::BUSY_NOTE;
 pub(super) use host::{after_resync, announce, note_remote_head, startup};
 #[cfg(test)]
 pub(in crate::fleet_sync) use host::{boot_step, online_at_boot, timer_step, Stepped};
-pub use host::{hold_for_move, GateProbe, MoveHold};
+pub use host::{health_states, hold_for_move, GateProbe, MoveHold};
 
 /// Event-bus topic a checkout state transition is published on.
 pub const TOPIC: &str = "fleet_sync.checkout";

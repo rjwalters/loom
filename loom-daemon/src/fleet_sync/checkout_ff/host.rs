@@ -15,6 +15,7 @@ use crate::event_bus::EventBus;
 use crate::fleet_state::{Enforcement, Enforcer};
 use crate::fleet_sync::workspace_resync::{host_gate, HostGateInputs, NotCurrent, WorkspacePass};
 use crate::fleet_sync::{FleetSyncStatus, PassInputs};
+use crate::main_health_gate::WorkspaceHealthStates;
 
 /// "Is a main-health gate run building in this root right now?" In production,
 /// `WorkspaceHealthStates::is_gate_in_flight`.
@@ -142,6 +143,37 @@ pub(super) fn heard(root: &Path, branch: &str, since: DateTime<Utc>) -> Option<S
     let heads = remote_heads().lock().ok()?;
     let (b, head, at) = heads.get(root)?;
     (b == branch && *at >= since).then(|| head.clone())
+}
+
+// ============================================================================
+// The main-health gate's states
+// ============================================================================
+
+fn health_cell() -> &'static OnceLock<Arc<WorkspaceHealthStates>> {
+    static HEALTH: OnceLock<Arc<WorkspaceHealthStates>> = OnceLock::new();
+    &HEALTH
+}
+
+/// The daemon's per-repo main-health states, made once at boot, and
+/// registered as what the timer's checkout step asks whether a gate run is
+/// building in a checkout (the gate builds in the main checkout, which must
+/// not move under it). Every call after the first returns the same states.
+///
+/// A process global, like the other boot-time singletons the daemon
+/// registers: the states are made long after [`crate::fleet_sync::start`],
+/// and they are read from the workspace resync's own task.
+#[must_use]
+pub fn health_states() -> Arc<WorkspaceHealthStates> {
+    health_cell()
+        .get_or_init(|| Arc::new(WorkspaceHealthStates::new()))
+        .clone()
+}
+
+/// The gate probe the timer's step uses: `None` until [`health_states`] has
+/// made the states (no gate can run before then).
+fn registered_gate() -> Option<GateProbe> {
+    let health = health_cell().get()?.clone();
+    Some(Arc::new(move |root: &Path| health.is_gate_in_flight(root)))
 }
 
 /// The rate-limit breaker's name for this step.
@@ -372,16 +404,18 @@ pub(super) fn write_hold_now(enforcer: Option<&dyn Enforcer>) -> Option<&'static
 /// `enforcer` is the drain state the step reads its write hold from, live,
 /// before each merge. With none there is no way to know the host is not
 /// paused, so nothing is written (the resync half makes no pass at all then).
+///
+/// The gate probe is the registered [`health_states`], read when the tick
+/// builds its step.
 pub(in crate::fleet_sync) fn after_resync(
     inputs: &PassInputs,
     enforcer: &Option<Arc<dyn Enforcer>>,
-    gate: &Option<GateProbe>,
     bus: &Option<Arc<EventBus>>,
 ) -> (
     impl FnOnce(Instant, &WorkspacePass) -> Stepped + Send + 'static,
     impl FnOnce(Stepped) + Send + 'static,
 ) {
-    let (write, gate, bus) = (inputs.auto_apply, gate.clone(), bus.clone());
+    let (write, gate, bus) = (inputs.auto_apply, registered_gate(), bus.clone());
     let enforcer = enforcer.clone();
     let step = move |began: Instant, resync: &WorkspacePass| {
         let roots = crate::fleet_sync::workspace_resync::registered_roots;

@@ -1176,24 +1176,9 @@ pub struct Started {
     pub repo: String,
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
-    gate: Option<checkout_ff::GateProbe>,
 }
 
 impl Started {
-    /// Tell the timer's checkout fast-forward (#10869) how to ask whether a
-    /// main-health gate run is building in a workspace: the gate builds in
-    /// the main checkout, which must not move under it. The gate's states do
-    /// not exist yet when [`start`] runs, so they are handed over here.
-    #[must_use]
-    pub fn gated_by(
-        mut self,
-        health: &std::sync::Arc<crate::main_health_gate::WorkspaceHealthStates>,
-    ) -> Self {
-        let health = health.clone();
-        self.gate = Some(std::sync::Arc::new(move |root: &Path| health.is_gate_in_flight(root)));
-        self
-    }
-
     /// The daemon workspace this host syncs from — the fallback sweep root an
     /// [`crate::fleet_state::IpcEnforcer`]'s drain request needs.
     #[must_use]
@@ -1210,7 +1195,7 @@ impl Started {
         self,
         enforcer: Option<std::sync::Arc<dyn Enforcer>>,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_timer(self.inputs, self.bus, enforcer, self.gate)
+        spawn_timer(self.inputs, self.bus, enforcer)
     }
 }
 
@@ -1313,7 +1298,6 @@ pub async fn start(
         repo: inputs.location.repo.clone(),
         inputs,
         bus,
-        gate: None,
     })
 }
 
@@ -1377,7 +1361,6 @@ fn spawn_timer(
     inputs: PassInputs,
     bus: Option<std::sync::Arc<crate::event_bus::EventBus>>,
     enforcer: Option<std::sync::Arc<dyn Enforcer>>,
-    gate: Option<checkout_ff::GateProbe>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mode = if inputs.auto_apply {
@@ -1392,7 +1375,7 @@ fn spawn_timer(
         // #10869: the checkout half runs on that same task, right after the
         // resync pass, so a resync this host just pushed is fast-forwarded to
         // in the same pass and the two never run at once.
-        let then = || checkout_ff::after_resync(&inputs, &enforcer, &gate, &bus);
+        let then = || checkout_ff::after_resync(&inputs, &enforcer, &bus);
         let (step, after) = then();
         workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
         loop {

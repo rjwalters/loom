@@ -1331,7 +1331,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // that repo's dispatch — never the siblings'. With an empty registry (the
     // common single-workspace case) exactly one root is keyed, reducing to the
     // pre-#3930 single-flag behavior byte-for-byte.
-    let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
+    // #10869: made through `checkout_ff`, which registers them so the timer's
+    // checkout fast-forward asks whether a gate run is building in a checkout
+    // before it moves it.
+    let workspace_health_states = loom_daemon::fleet_sync::checkout_ff::health_states();
 
     // Shared drain-and-restart state (Issue #4090). Constructed here — before the
     // epic supervisor, work-finder, and role runner — so its flag can be threaded
@@ -1349,9 +1352,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // mid-run — it is armed HERE, rather than inside `fleet_sync::start`
     // above, because neither the drain state nor the workspace pool it drains
     // through exists at the point in boot where the startup render must happen.
-    // #10869: the timer's checkout fast-forward asks these states whether a
-    // gate run is building in a checkout before it moves it.
-    let fleet_started = fleet_started.map(|s| s.gated_by(&workspace_health_states));
     let drain_state = loom_daemon::fleet_state::wire(fleet_started, &workspace_pool, &event_bus);
     let drain_flag = drain_state.flag();
 
