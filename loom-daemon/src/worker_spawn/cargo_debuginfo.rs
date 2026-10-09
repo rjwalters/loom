@@ -19,7 +19,7 @@
 //! * a `debug` key the repo (or a cargo config the build would read) sets for
 //!   that profile is left alone;
 //! * `cargo.debuginfo` in `.loom/config.json` (env `LOOM_CARGO_DEBUGINFO`)
-//!   picks the level, and `"full"` / `"inherit"` turn the cap off.
+//!   picks the level, and `"full"` / `"inherit"` / `false` turn the cap off.
 //!
 //! `test` inherits `debug` from `dev`, so a `dev` choice made anywhere (ambient
 //! or repo) also suppresses the `test` variable — injecting it would override
@@ -39,7 +39,10 @@ pub const DEV_VAR: &str = "CARGO_PROFILE_DEV_DEBUG";
 pub const TEST_VAR: &str = "CARGO_PROFILE_TEST_DEBUG";
 
 /// Settings that turn the cap off and leave cargo's own resolution alone.
-const OPT_OUT: [&str; 2] = ["full", "inherit"];
+/// `false` is the JSON bool `cargo.debuginfo: false` (read as its string
+/// form): someone who writes it means "no cap", and it reads the same way as
+/// `LOOM_CARGO_DEBUGINFO=false`.
+const OPT_OUT: [&str; 3] = ["full", "inherit", "false"];
 /// Levels that may be injected: every cargo `debug` value below full.
 const LEVELS: [&str; 6] = [
     "none",
@@ -222,7 +225,7 @@ mod tests {
 
     #[test]
     fn opt_out_injects_nothing() {
-        for s in ["full", "inherit", " full "] {
+        for s in ["full", "inherit", " full ", "false"] {
             let d = decide(&Inputs {
                 setting: Some(s.into()),
                 ..Inputs::default()

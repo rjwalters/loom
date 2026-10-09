@@ -1087,7 +1087,8 @@ Beside it, the dispatcher caps dev/test debuginfo (#11190):
 `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` are set to
 `line-tables-only`. These are `${VAR:-default}` defaults. An ambient value, or a
 `debug` key the repo sets in its `dev` or `test` profile table, is kept. The
-per-repo opt-out is `cargo.debuginfo: "full"` (env `LOOM_CARGO_DEBUGINFO`).
+per-repo opt-out is `cargo.debuginfo: "full"` or `false` (env
+`LOOM_CARGO_DEBUGINFO`).
 Details:
 [`build-gate.md` → Worker builds cap debuginfo at `line-tables-only`](build-gate.md).
 

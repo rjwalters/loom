@@ -34,6 +34,8 @@ fn clear_env() {
         "LOOM_SWEEP_CONTAINER_RESERVED_MEMORY_MB",
         "LOOM_SWEEP_CLAIM_OWNED",
         "CARGO_TARGET_DIR",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
         "KIMI_CODE_HOME",
         "KIMI_MODEL_API_KEY",
         "LOOM_NATIVE_CONTAINMENT",
@@ -494,6 +496,31 @@ fn a_cargo_cache_inside_the_workspace_is_not_mounted_twice() {
 }
 
 #[test]
+fn a_host_set_debuginfo_choice_is_forwarded_by_name_into_the_container() {
+    // #11190: the in-container seam keeps a CARGO_PROFILE_*_DEBUG it sees as
+    // ambient. If the passthrough dropped the host's value, that seam would
+    // inject its line-tables-only default over the operator's own choice.
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "full");
+    std::env::set_var("CARGO_PROFILE_TEST_DEBUG", "full");
+    let args = build(&profile(None, Some("1g")), &[]);
+    for name in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        assert!(
+            args.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+            "{name} must be forwarded by name: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with(&format!("{name}="))),
+            "{name} goes by name, so docker reads the host value as is: {args:?}"
+        );
+    }
+    clear_env();
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
 fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(!forwarded_by_name("LOOM_OPENCODE_BIN"));
     assert!(!forwarded_by_name("LOOM_PI_BIN"));
@@ -509,6 +536,8 @@ fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(forwarded_by_name("LOOM_WORK_ORIGIN"));
     assert!(forwarded_by_name("LOOM_SWEEP_CLAIM_OWNED"));
     assert!(forwarded_by_name("GH_TOKEN"));
+    assert!(forwarded_by_name("CARGO_PROFILE_DEV_DEBUG"));
+    assert!(forwarded_by_name("CARGO_PROFILE_TEST_DEBUG"));
 }
 
 #[test]

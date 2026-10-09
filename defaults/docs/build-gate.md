@@ -862,17 +862,32 @@ The level is configurable per repo, with an opt-out:
 
 `cargo.debuginfo` (env override `LOOM_CARGO_DEBUGINFO`; env > config > default)
 takes `line-tables-only` (the default), `limited`, `line-directives-only`,
-`none`, `0` or `1` to inject that level, and `full` or `inherit` to inject
-nothing and leave cargo's own resolution alone. Use the opt-out for a repo whose
+`none`, `0` or `1` to inject that level, and `full`, `inherit` or `false` (the
+JSON bool works too) to inject nothing and leave cargo's own resolution alone. Use the opt-out for a repo whose
 agents need a debugger. An unrecognized value falls back to the default. Each
 spawn writes one `# LOOM_CARGO_DEBUGINFO …` line to the worker log saying what
 it set and what it kept, and why. For example:
 `dev=kept(repo-profile) test=kept(inherits-dev)`.
 
-Docker boundaries: a containment container re-enters the seam inside the
-container. `spawn-codex.sh`'s session-exec forwards both variables by name with
-the other Loom context variables. The private-workspace Codex transport does not
-forward them.
+Docker boundaries:
+
+- **Native containment** (Pi, OpenCode) re-execs `spawn-worker.sh`, which
+  re-enters the seam inside the container. Both variables are in its by-name
+  env passthrough, so a value set on the host is ambient in the container and
+  is kept.
+- **Claude containment** re-execs `spawn-claude.sh`, not `spawn-worker.sh`, so
+  nothing in the container re-runs the seam. `spawn-claude.sh` forwards both
+  variables by name next to `-e CARGO_INCREMENTAL=0`, carrying the values the
+  host-side seam chose or kept.
+- `spawn-codex.sh`'s session-exec forwards both variables by name with the other
+  Loom context variables. The private-workspace Codex transport does not
+  forward them.
+
+A host that shares one `CARGO_TARGET_DIR` between worker and interactive builds
+no longer shares artifacts between the two: cargo does not reuse an artifact
+built with a different debuginfo setting. Set `cargo.debuginfo: "full"`, or the same
+`CARGO_PROFILE_*_DEBUG` in the interactive shell, if that matters more than the
+disk the cap saves.
 
 Not covered: a cargo workspace that is not at the repo root (for example
 `src-tauri/`). Its `[profile]` table is not read, so the cap applies over it.

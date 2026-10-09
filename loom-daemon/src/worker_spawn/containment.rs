@@ -330,7 +330,19 @@ fn forwarded_by_name(name: &str) -> bool {
     }
     name.starts_with("LOOM_")
         || name.starts_with("SAFEHOUSE")
-        || matches!(name, "GH_TOKEN" | "GITHUB_TOKEN" | "NO_COLOR" | "TERM" | "CARGO_TARGET_DIR")
+        || matches!(
+            name,
+            "GH_TOKEN"
+                | "GITHUB_TOKEN"
+                | "NO_COLOR"
+                | "TERM"
+                | "CARGO_TARGET_DIR"
+                // An operator's own debuginfo choice (#11190): the in-container
+                // seam only keeps a value it can see as ambient, so without
+                // these it would inject its default over the host's setting.
+                | "CARGO_PROFILE_DEV_DEBUG"
+                | "CARGO_PROFILE_TEST_DEBUG"
+        )
 }
 
 /// Build the `docker run` command that re-execs `spawn-worker.sh` inside the

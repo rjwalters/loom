@@ -654,7 +654,10 @@ fn run_preflight(
     command.env("CARGO_INCREMENTAL", "0");
     // #11190: cap dev/test debuginfo (default `line-tables-only`) beside it,
     // without overriding an ambient CARGO_PROFILE_*_DEBUG, the repo's own
-    // `[profile.*] debug`, or a `cargo.debuginfo: "full"` opt-out.
+    // `[profile.*] debug`, or a `cargo.debuginfo: "full"` opt-out. Native
+    // containment forwards both names so the in-container seam sees a host
+    // value as ambient; spawn-claude.sh's containment forwards the values
+    // chosen here, since its re-exec never re-enters this seam.
     let debuginfo = cargo_debuginfo::decide(&cargo_debuginfo::inputs_for(root));
     command.envs(debuginfo.vars.iter().map(|(k, v)| (*k, v.as_str())));
     let _ = writeln!(log, "{}", debuginfo.marker);

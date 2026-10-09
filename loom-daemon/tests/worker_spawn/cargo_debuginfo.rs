@@ -5,6 +5,31 @@ use std::process::Command;
 
 /// #11190: the dev/test debuginfo cap the seam injects, as the worker sees it.
 fn debuginfo(root: &std::path::Path, runtime: &str, tweak: &dyn Fn(&mut Command)) -> [String; 2] {
+    let out = spawn(root, runtime, tweak);
+    let text = String::from_utf8_lossy(&out.stdout);
+    ["DEV", "TEST"].map(|p| {
+        let prefix = format!("child_env CARGO_PROFILE_{p}_DEBUG=");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+/// The `# LOOM_CARGO_DEBUGINFO` marker the seam writes to the worker log (stderr
+/// here, as no `--log` is given).
+fn marker(root: &std::path::Path, tweak: &dyn Fn(&mut Command)) -> String {
+    let out = spawn(root, "claude", tweak);
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find(|l| l.starts_with("# LOOM_CARGO_DEBUGINFO"))
+        .unwrap_or_default()
+        .to_string()
+}
+fn spawn(
+    root: &std::path::Path,
+    runtime: &str,
+    tweak: &dyn Fn(&mut Command),
+) -> std::process::Output {
     let mut c = worker(root, runtime);
     c.env("CARGO_HOME", root.join("cargo-home"))
         .env_remove("LOOM_CARGO_DEBUGINFO")
@@ -15,14 +40,7 @@ fn debuginfo(root: &std::path::Path, runtime: &str, tweak: &dyn Fn(&mut Command)
     tweak(&mut c);
     let out = c.output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let text = String::from_utf8_lossy(&out.stdout);
-    ["DEV", "TEST"].map(|p| {
-        let prefix = format!("child_env CARGO_PROFILE_{p}_DEBUG=");
-        text.lines()
-            .find_map(|l| l.strip_prefix(&prefix))
-            .unwrap_or_default()
-            .to_string()
-    })
+    out
 }
 #[test]
 fn cargo_debuginfo_is_capped_for_sweep_and_role_runs_unless_already_chosen() {
@@ -54,6 +72,15 @@ fn cargo_debuginfo_is_capped_for_sweep_and_role_runs_unless_already_chosen() {
         c.env("CARGO_PROFILE_DEV_DEBUG", "full");
     };
     assert_eq!(debuginfo(d.path(), "claude", &ambient), ["full".to_string(), String::new()]);
+    // The worker log records what was set and what was kept, and why.
+    assert_eq!(
+        marker(d.path(), &sweep),
+        "# LOOM_CARGO_DEBUGINFO dev=line-tables-only test=line-tables-only (#11190)"
+    );
+    assert_eq!(
+        marker(d.path(), &ambient),
+        "# LOOM_CARGO_DEBUGINFO dev=kept(ambient) test=kept(inherits-dev) (#11190)"
+    );
     // The env override picks the level.
     let limited = |c: &mut Command| {
         c.env("LOOM_CARGO_DEBUGINFO", "limited");
@@ -77,4 +104,8 @@ fn cargo_debuginfo_is_capped_for_sweep_and_role_runs_unless_already_chosen() {
     config(d.path(), serde_json::json!({"cargo":{"debuginfo":"full"}}));
     assert_eq!(debuginfo(d.path(), "claude", &sweep), none());
     assert_eq!(debuginfo(d.path(), "pi", &role), none());
+    assert!(marker(d.path(), &sweep).starts_with("# LOOM_CARGO_DEBUGINFO off setting=full"));
+    // A JSON `false` reads as "no cap", not as an unrecognized level.
+    config(d.path(), serde_json::json!({"cargo":{"debuginfo":false}}));
+    assert_eq!(debuginfo(d.path(), "claude", &sweep), none());
 }
