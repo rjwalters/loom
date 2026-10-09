@@ -17,6 +17,25 @@
 //!   published on the event bus, and recorded in the host-level snapshot
 //!   `loom-daemon status` renders — **without writing anything**, unless
 //!   `fleet.autoApply` is on.
+//! - **The fleet version floor** (`loom_min_version`, #10711): every pass reads
+//!   it from the snapshot into a process-wide value ([`loom_min_version`]),
+//!   not into the config tiers, so a change takes effect on the next tick with
+//!   no restart. A malformed value keeps the last good floor and alerts. The
+//!   self-update loop rolls a host below it (`auto_update::floor_roll`, #10712),
+//!   reads it as three values ([`floor_knowledge`]) and is woken when a pass
+//!   resolves a different floor ([`floor_wake`], #10885).
+//! - **The workspace resync** ([`workspace_resync`], #10718): after each timer
+//!   pass, and once at startup, every registered repo's installed Loom is
+//!   compared with this daemon's own payload and, on a host in H0 with
+//!   `fleet.autoApply` on, resynced under a per-repo claim. It runs on its
+//!   own task, one pass at a time, and the timer never waits for it.
+//! - **The checkout fast-forward** ([`checkout_ff`], #10869): each registered
+//!   workspace's main checkout is fast-forwarded to its default branch when it
+//!   is clean and strictly behind, so a resync that landed on the forge is the
+//!   one this host dispatches from. It runs inside the startup pass (before
+//!   any dispatch producer exists), and then on the workspace resync's own
+//!   task, right after each resync pass, so the timer never waits for it
+//!   either. It writes only with `fleet.autoApply` on.
 //!
 //! # Invariants this module keeps
 //!
@@ -63,9 +82,17 @@ use serde_json::Value;
 
 use crate::fleet_state::{self, Enforcement, Enforcer, StatePass};
 use crate::fleet_store::fetch::{self, Freshness, Policy, Transport};
+use crate::fleet_store::floor::{self, FloorRead};
 use crate::fleet_store::render::{self, Drift};
 use crate::fleet_store::roster::{self, Change, Plan, Registered};
 use crate::fleet_store::{self as store, StoreLocation};
+
+pub mod checkout_ff;
+mod floor_knowledge;
+pub mod offline_floor;
+pub mod workspace_resync;
+
+pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
 
 /// Config key for the timer cadence.
 pub const SYNC_INTERVAL_KEY: &str = "fleet.syncIntervalSecs";
@@ -275,12 +302,30 @@ pub fn config_pass(
         let drift = render::drift(target);
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
+        let mut detail = describe_drift(&drift);
         if mode == Mode::Write && drifted {
-            match render::write(target, &stamp) {
-                Ok((w, _backup)) => wrote = w,
-                Err(e) => {
-                    error = Some(format!("writing {}: {e:#}", target.path.display()));
+            let lost = render::lost_top_level_keys(target);
+            if lost.is_empty() {
+                match render::write(target, &stamp) {
+                    Ok((w, _backup)) => wrote = w,
+                    Err(e) => {
+                        error = Some(format!("writing {}: {e:#}", target.path.display()));
+                    }
                 }
+            } else {
+                // Lossy-reduction guard (2am#1653), automated-path half: no
+                // operator is present on this path to answer an
+                // `--allow-reduce` prompt, so the write is simply skipped and
+                // the loss surfaced via `error`/`detail` instead.
+                let msg = format!(
+                    "{} would DROP top-level block(s) the file on disk carries: {} — \
+                     refusing to write; the store never had them (`fleet-config propose \
+                     adopt` proposes adding them to the store first)",
+                    target.tier.name(),
+                    lost.join(", ")
+                );
+                error = Some(msg.clone());
+                detail = Some(msg);
             }
         }
         tiers.push(TierReport {
@@ -288,7 +333,7 @@ pub fn config_pass(
             path: target.path.clone(),
             drifted,
             wrote,
-            detail: describe_drift(&drift),
+            detail,
         });
     }
     ConfigPass {
@@ -360,14 +405,8 @@ pub fn roster_pass(
     now: DateTime<Utc>,
 ) -> Result<Plan> {
     let loaded = fetch::load(transport, cache_dir, location, Policy::FailClosed, now)?;
-    let text = loaded.snapshot.text(store::ROSTER_PATH)?.ok_or_else(|| {
-        anyhow!(
-            "the store has no {} (commit {})",
-            store::ROSTER_PATH,
-            loaded.snapshot.short_commit()
-        )
-    })?;
-    let parsed = roster::parse(&text, home)?;
+    let parsed = roster::from_snapshot(&loaded.snapshot, home)?
+        .ok_or_else(|| anyhow!(roster::missing_message(&loaded.snapshot)))?;
     Ok(roster::plan(&parsed, registered, normalize, is_cloned))
 }
 
@@ -438,6 +477,133 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
 }
 
 // ============================================================================
+// The fleet version floor (#10711)
+// ============================================================================
+
+/// What one pass resolved for the fleet-wide minimum Loom version
+/// (`loom_min_version`, [`crate::fleet_store::floor`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorPass {
+    /// The floor in force after this pass, `X.Y.Z`; `None` when unset.
+    pub floor: Option<String>,
+    /// The store path the floor was read from this pass (`fleet.json` /
+    /// `repos.yml`); `None` when unset or carried over.
+    pub source: Option<String>,
+    /// Whether [`FloorPass::floor`] is the last good floor carried over
+    /// because this pass could not read a valid one (see `error`).
+    pub carried: bool,
+    /// Why this pass could not read a valid floor, when it could not. Raised
+    /// as an alert: a malformed floor is never read as "no floor".
+    pub error: Option<String>,
+}
+
+impl FloorPass {
+    /// Nothing to report: no floor and no error. A snapshot in this state
+    /// omits the field entirely, so a host with no floor writes the same
+    /// `fleet-sync-status.json` it did before #10711.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.floor.is_none() && self.error.is_none()
+    }
+}
+
+/// Decide the floor in force from this pass's `read` and the `last_good` floor.
+///
+/// - absent: unset (the operator removed it);
+/// - valid: that floor;
+/// - malformed, or the snapshot could not be read at all (`Err`): keep
+///   `last_good` (unset on a first-ever bad read) and report why.
+#[must_use]
+pub fn resolve_floor(read: Result<FloorRead, String>, last_good: Option<&str>) -> FloorPass {
+    let keep = |why: String| FloorPass {
+        floor: last_good.map(str::to_string),
+        source: None,
+        carried: last_good.is_some(),
+        error: Some(match last_good {
+            Some(f) => format!("{why} — keeping the last good floor {f}"),
+            None => format!("{why} — no previous floor, so none is in force"),
+        }),
+    };
+    match read {
+        Ok(FloorRead::Absent) => FloorPass::default(),
+        Ok(FloorRead::Valid { version, source }) => FloorPass {
+            floor: Some(version),
+            source: Some(source.to_string()),
+            ..FloorPass::default()
+        },
+        Ok(FloorRead::Malformed { source, detail }) => {
+            keep(format!("{source}: malformed `{}`: {detail}", floor::KEY))
+        }
+        Err(e) => keep(format!("could not read `{}`: {e}", floor::KEY)),
+    }
+}
+
+/// Read the floor from the cached snapshot the config half of this pass just
+/// refreshed. [`Policy::Offline`]: no extra forge request — the state and
+/// config halves already revalidated the cache (or fell back to it).
+fn floor_half(
+    cache_dir: &Path,
+    location: &StoreLocation,
+    last_good: Option<&str>,
+    now: DateTime<Utc>,
+) -> FloorPass {
+    let read = fetch::load(&NoTransport, cache_dir, location, Policy::Offline, now)
+        .map(|loaded| floor::read(&loaded.snapshot))
+        .map_err(|e| format!("{e:#}"));
+    resolve_floor(read, last_good)
+}
+
+/// The transport [`Policy::Offline`] never calls.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn get(&self, api_path: &str, _: Option<&str>, _: Option<&str>) -> Result<fetch::Reply> {
+        Err(anyhow!("offline read attempted a forge request ({api_path})"))
+    }
+}
+
+/// The process-wide floor: `None` until a pass has resolved one.
+fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
+    static CELL: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_floor(floor: Option<String>) {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = Some(floor);
+    }
+}
+
+/// The fleet-wide minimum Loom version (`loom_min_version`, `X.Y.Z`) in force
+/// on this host, as of the last fleet-sync pass; `None` when the store sets
+/// none, when no pass has run, or when `fleet.repo` is unset. Updated every
+/// tick without a restart. The self-update loop reads it every tick to drive
+/// floor rolls ([`crate::auto_update::floor_roll`], #10712).
+#[must_use]
+pub fn loom_min_version() -> Option<String> {
+    floor_cell().lock().ok().and_then(|g| g.clone().flatten())
+}
+
+/// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
+/// daemon version a registered workspace NEEDS and this host does not run.
+pub use crate::workspace_hold::repo_ahead_min;
+
+/// The last good floor for this pass to fall back on: this process's value
+/// once a pass has resolved one, else what the previous process recorded in
+/// its snapshot — so a malformed value right after a restart still cannot
+/// silently drop a floor.
+fn last_good_floor() -> Option<String> {
+    if let Some(resolved) = floor_cell().lock().ok().and_then(|g| g.clone()) {
+        return resolved;
+    }
+    cached_status()
+        .or_else(probe_status)
+        .and_then(|s| s.floor.floor)
+}
+
+// ============================================================================
 // The host-level snapshot `loom-daemon status` renders
 // ============================================================================
 
@@ -485,6 +651,28 @@ pub struct FleetSyncStatus {
     /// drain-and-exit was refused and it merely held dispatch instead.
     #[serde(default = "default_enforced")]
     pub enforced: Enforcement,
+    /// The fleet version floor this pass resolved (#10711). `#[serde(default)]`
+    /// so a pre-#10711 snapshot still reads back, and omitted when unset so a
+    /// host with no floor writes the same snapshot it did before.
+    #[serde(default, skip_serializing_if = "FloorPass::is_unset")]
+    pub floor: FloorPass,
+    /// Each registered workspace's installed-Loom state (#10718). Filled by
+    /// the timer after each pass ([`run_pass`] carries the previous findings
+    /// forward); omitted until a workspace pass has run.
+    #[serde(
+        default,
+        skip_serializing_if = "workspace_resync::WorkspacePass::is_unset"
+    )]
+    pub workspaces: workspace_resync::WorkspacePass,
+    /// Each registered workspace's main checkout, as the last checkout pass
+    /// found it (#10869). `#[serde(default)]` so an older snapshot still reads
+    /// back, and omitted until a checkout pass has run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkouts: Vec<checkout_ff::CheckoutReport>,
+    /// Why the last checkout step checked nothing, when it did not
+    /// ([`checkout_ff::BUSY_NOTE`]); `checkouts` are then from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkouts_note: Option<String>,
 }
 
 fn default_enforced() -> Enforcement {
@@ -498,10 +686,12 @@ impl FleetSyncStatus {
         self.config.drifted() || self.roster.drifted()
     }
 
-    /// Whether either half of the pass failed.
+    /// Whether either half of the pass failed, or the floor could not be read
+    /// (#10711) — which routes a malformed floor through the same warn log and
+    /// [`DRIFT_TOPIC`] alert as every other fleet-sync failure.
     #[must_use]
     pub fn errored(&self) -> bool {
-        self.config.error.is_some() || self.roster.error.is_some()
+        self.config.error.is_some() || self.roster.error.is_some() || self.floor.error.is_some()
     }
 }
 
@@ -542,6 +732,43 @@ pub fn publish(status: &FleetSyncStatus) {
     }
 }
 
+/// Put a finished workspace pass (#10718) on the current snapshot. Before the
+/// first snapshot exists there is nothing to update; the timer's next publish
+/// carries it.
+fn publish_workspaces(found: &workspace_resync::WorkspacePass) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        status.workspaces.clone_from(found);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// Put a finished checkout step (#10869) on the current snapshot, as
+/// [`publish_workspaces`] does for the workspace pass: its reports, or (with
+/// `found` `None`) only the note saying why it checked nothing.
+fn publish_checkouts(found: Option<&[checkout_ff::CheckoutReport]>, note: Option<&str>) {
+    let updated = cell().lock().ok().and_then(|mut guard| {
+        let status = guard.as_mut()?;
+        if let Some(found) = found {
+            status.checkouts = found.to_vec();
+        }
+        status.checkouts_note = note.map(str::to_string);
+        Some(status.clone())
+    });
+    let (Some(status), Some(path)) = (updated, status_path()) else {
+        return;
+    };
+    if let Err(e) = write_status(&path, &status) {
+        log::warn!("fleet_sync: could not write {}: {e:#}", path.display());
+    }
+}
+
 fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
@@ -577,7 +804,21 @@ pub fn probe_status() -> Option<FleetSyncStatus> {
 /// Remove a snapshot left behind by an earlier, configured run. Called when
 /// `fleet.repo` is no longer set, so `loom-daemon status` never reports a store
 /// this host has stopped reading.
+///
+/// Also forgets the process-wide floor (#10792): with no store there is no
+/// floor, so [`loom_min_version`] returns `None` and [`last_good_floor`] finds
+/// neither a cell value nor a file. The cell goes back to "no pass has run",
+/// not `Some(None)`. A config *error* (`Err` from `resolve_config`) does not
+/// come through here: keeping the last good floor is the safe failure.
 pub fn clear_status() {
+    if let Ok(mut guard) = floor_cell().lock() {
+        *guard = None;
+    }
+    // The in-memory snapshot also carries the floor ([`last_good_floor`] reads
+    // it), so it goes too; otherwise the "forgotten" floor would come back.
+    if let Ok(mut guard) = cell().lock() {
+        *guard = None;
+    }
     let Some(path) = status_path() else {
         return;
     };
@@ -615,6 +856,15 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     head.push(')');
     let mut lines = vec![head];
     lines.extend(state_lines(s));
+    lines.extend(floor_lines(&s.floor));
+    let interval = std::time::Duration::from_secs(s.interval_secs);
+    lines.extend(s.workspaces.lines_at(Some((now, interval))));
+    lines.extend(checkout_ff::lines(&s.checkouts));
+    lines.extend(
+        s.checkouts_note
+            .iter()
+            .map(|note| format!("  checkouts: {note}")),
+    );
     for tier in &s.config.tiers {
         let detail = tier.detail.as_deref().unwrap_or("in sync");
         let verb = if tier.wrote {
@@ -656,6 +906,24 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
         );
     }
     Some(lines.join("\n"))
+}
+
+/// The floor lines of the `Fleet store:` block (#10711). Empty when no floor
+/// is set and none was malformed, so `status` is unchanged for such a host.
+fn floor_lines(f: &FloorPass) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(floor) = &f.floor {
+        let from = match (&f.source, f.carried) {
+            (_, true) => " (LAST GOOD floor, carried over)".to_string(),
+            (Some(src), false) => format!(" (from {src})"),
+            (None, false) => String::new(),
+        };
+        lines.push(format!("  {}: {floor}{from}", floor::KEY));
+    }
+    if let Some(e) = &f.error {
+        lines.push(format!("  {}: ERROR — {e}", floor::KEY));
+    }
+    lines
 }
 
 /// The run-state lines of the `Fleet store:` block (#9598) — the *desired*
@@ -760,6 +1028,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         },
     };
     let roster = roster_half(inputs, &transport, &config, mode, now);
+    // #10711: the floor, from the snapshot the halves above just refreshed,
+    // into the process-wide value — never the config tiers, whose
+    // `autonomous.autoUpdate` changes need a restart.
+    let floor = floor_half(&inputs.cache, &inputs.location, last_good_floor().as_deref(), now);
+    // #10885: a floor that differs from the previous pass's wakes the
+    // self-update loop, so it acts now and not at its next interval.
+    floor_knowledge::record_floor(&floor);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -772,6 +1047,12 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         roster,
         state,
         enforced,
+        floor,
+        // The last workspace pass's findings, until this tick's replace them.
+        workspaces: cached_status().map(|s| s.workspaces).unwrap_or_default(),
+        // Likewise the last checkout pass's (#10869).
+        checkouts: cached_status().map(|s| s.checkouts).unwrap_or_default(),
+        checkouts_note: cached_status().and_then(|s| s.checkouts_note),
     }
 }
 
@@ -956,13 +1237,21 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #10885: not a fleet host, so it has no floor by definition.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;
         }
         Err(e) => {
+            // #10885: a store is named but unusable. Still a fleet host: its
+            // floor is unknown, never absent.
+            floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
             log::warn!("fleet_sync: disabled — {e:#}");
             return None;
         }
     };
+    // #10885: from here on this is a fleet host, whether or not syncing can
+    // start. Until a pass resolves a floor it is unknown, never absent.
+    floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Configured);
     let host = crate::sweep_registry::host_identity();
     if let Err(e) = store::validate_host(&host) {
         log::warn!("fleet_sync: disabled — {e:#}");
@@ -1004,6 +1293,7 @@ pub async fn start(
         inputs.host,
         inputs.interval.as_secs()
     );
+    workspace_resync::mark_boot();
     let state = startup_pass(&inputs, bus.as_deref()).await;
     // Diverges on `stopped`: this host is not meant to be up at all.
     let hold_note = fleet_state::enforce_at_boot(&state, &inputs.host, &inputs.location.repo).await;
@@ -1028,16 +1318,23 @@ pub async fn start(
 /// `fleet.syncIntervalSecs` and enforces then.
 async fn startup_pass(inputs: &PassInputs, bus: Option<&crate::event_bus::EventBus>) -> StatePass {
     let owned = inputs.clone();
-    let join =
-        tokio::task::spawn_blocking(move || run_pass(&owned, "startup", Mode::Write, Utc::now()));
+    let join = tokio::task::spawn_blocking(move || {
+        let mut status = run_pass(&owned, "startup", Mode::Write, Utc::now());
+        // #10869: inside the startup pass, so a daemon that just rolled
+        // dispatches from the checkout its new installed files are in.
+        let moved = checkout_ff::startup(&owned, &mut status);
+        (status, moved)
+    });
     let capped = match resolve_startup_timeout(&|k| std::env::var(k).ok()) {
         Some(cap) => tokio::time::timeout(cap, join).await.map_err(|_| cap),
         None => Ok(join.await),
     };
     match capped {
-        Ok(Ok(status)) => {
+        Ok(Ok((status, moved))) => {
+            workspace_resync::mark_verified();
             publish(&status);
             report(&status, bus);
+            checkout_ff::announce(&moved, bus);
             status.state
         }
         Ok(Err(e)) => {
@@ -1077,6 +1374,16 @@ fn spawn_timer(
         } else {
             Mode::Check
         };
+        // #10718: the workspace resync also runs once at startup, now that the
+        // startup pass is done and the drain state exists. It runs on its own
+        // task (one at a time), so nothing here ever waits for git.
+        //
+        // #10869: the checkout half runs on that same task, right after the
+        // resync pass, so a resync this host just pushed is fast-forwarded to
+        // in the same pass and the two never run at once.
+        let then = || checkout_ff::after_resync(&inputs, &enforcer, &bus);
+        let (step, after) = then();
+        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
         loop {
             tokio::time::sleep(inputs.interval).await;
             let owned = inputs.clone();
@@ -1091,8 +1398,15 @@ fn spawn_timer(
                     if let Some(e) = enforcer.as_deref() {
                         enforce(&mut status, e, bus.as_deref());
                     }
+                    status.workspaces = workspace_resync::latest();
                     publish(&status);
                     report(&status, bus.as_deref());
+                    // #10718: last, so the floor is current and a hold this
+                    // pass just placed is already in the drain flag. Not
+                    // awaited: see `workspace_resync::host`.
+                    workspace_resync::mark_verified();
+                    let (step, after) = then();
+                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

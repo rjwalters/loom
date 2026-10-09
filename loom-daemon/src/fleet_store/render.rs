@@ -10,6 +10,12 @@
 //!   ([`crate::config_resolver::LOCAL_CONFIG_REL`]). A store without that file
 //!   leaves the local tier untouched.
 //!
+//! When the store has the compiled `fleet.json` (#10705), the three inputs are
+//! its `config.defaults`, `config.hosts.<host>.defaults` and
+//! `config.hosts.<host>.local` instead, with the same merge and the same
+//! "host overlay required, local tier optional" rules; the legacy files are
+//! read only when `fleet.json` is absent.
+//!
 //! Drift is **semantic**: a target whose parsed JSON equals the rendered value
 //! is in sync regardless of formatting, and is not rewritten (so a no-op render
 //! never churns backups). A write keeps exactly one timestamped backup of the
@@ -66,6 +72,29 @@ pub fn render(
     local_path: &Path,
 ) -> Result<Vec<Target>> {
     super::validate_host(host)?;
+    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
+        let overlay = doc.host_defaults(host).ok_or_else(|| {
+            anyhow!(
+                "host `{host}` is not in the store (no config.hosts.{host}.defaults in {} at \
+                 commit {}); set LOOM_HOST_ID or pass --host",
+                super::FLEET_JSON_PATH,
+                snapshot.short_commit()
+            )
+        })?;
+        let mut out = vec![Target {
+            tier: Tier::Machine,
+            path: machine_path.to_path_buf(),
+            value: crate::config_resolver::deep_merge(doc.fleet_defaults(), overlay),
+        }];
+        if let Some(local) = doc.host_local(host) {
+            out.push(Target {
+                tier: Tier::Local,
+                path: local_path.to_path_buf(),
+                value: local.clone(),
+            });
+        }
+        return Ok(out);
+    }
     let base = require_object(snapshot, super::FLEET_DEFAULTS_PATH)?.ok_or_else(|| {
         anyhow!(
             "the store has no {} (commit {})",
@@ -148,6 +177,35 @@ pub fn drift(target: &Target) -> Drift {
 #[must_use]
 pub fn check_exit_code(drifts: &[Drift]) -> i32 {
     i32::from(drifts.iter().any(|d| *d != Drift::InSync))
+}
+
+/// The top-level keys the file on disk carries that `target`'s rendered
+/// value does not — a **lossy reduction** if written (2am#1653's ask: the
+/// writer that clobbered two Macs' machine-tier config set out to update
+/// one block and wrote the file fresh, losing `runtimes`, `autonomous`,
+/// `safehouse` and `forge` for ~10 h). The store is the tier's record of
+/// truth, so a legitimate reduction happens — but it must never happen by
+/// default: the caller refuses until the operator names it (`--allow-reduce`,
+/// or `fleet-config propose adopt [--host <HOST>]` to push the blocks INTO
+/// the store first, which is what adopt's `plan()` already does).
+///
+/// Returns the lost key names in file order; empty when the file is absent,
+/// unparseable (a separate error class) or the target loses nothing.
+#[must_use]
+pub fn lost_top_level_keys(target: &Target) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(&target.path) else {
+        return Vec::new();
+    };
+    let Ok(current) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let (Value::Object(cur), Value::Object(want)) = (&current, &target.value) else {
+        return Vec::new();
+    };
+    cur.keys()
+        .filter(|k| !want.contains_key(*k))
+        .cloned()
+        .collect()
 }
 
 /// A path-by-path diff from `current` (on disk) to `wanted` (rendered):

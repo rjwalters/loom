@@ -10,6 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use crate::forge_listing::RestIssue;
 use crate::star_liveness::forge::{ForgeComment, SearchHit, StarForge};
+use crate::star_liveness::inherited_star::{parse_marker, StarEvent, StarKind};
 use crate::star_liveness::task::{LivenessState, RepoInput};
 use crate::star_liveness::Settings;
 use crate::types::{ReadyQueueRow, StarLivenessReport};
@@ -21,6 +22,10 @@ pub struct Repo {
     pub comments: BTreeMap<u32, Vec<ForgeComment>>,
     /// Every comment posted through the fake: (number, body).
     pub posted: Vec<(u32, String)>,
+    /// Label listings made through the fake.
+    pub listings: usize,
+    /// The label of each listing, in order.
+    pub listed: Vec<String>,
     /// Comment reads made through the fake.
     pub comment_reads: usize,
     /// Issue searches made through the fake.
@@ -32,6 +37,47 @@ pub struct Repo {
     pub fail_listing: bool,
     /// Labels whose removal fails (write-failure injection).
     pub fail_remove: Vec<String>,
+    /// Make every `post_comment` fail.
+    pub fail_post: bool,
+    /// Native "blocked by" dependencies per issue (#10307).
+    pub blocked_by: BTreeMap<u32, Vec<(String, u32)>>,
+    /// Label writes made through the fake: (number, "+label" / "-label").
+    pub label_writes: Vec<(u32, String)>,
+    /// Body writes made through the fake: (number, new body).
+    pub body_writes: Vec<(u32, String)>,
+    /// Every body write fails (#10307 provenance-first).
+    pub fail_body_write: bool,
+    /// Every native dependency read fails (#10307: a 5xx or rate limit).
+    pub fail_blocked_by: bool,
+    /// The star events of each item (#10012 §3), oldest first: written by
+    /// star label writes and star comments through the fake, and by
+    /// [`World::human_star`].
+    pub star_log: BTreeMap<u32, Vec<StarEvent>>,
+    /// The fake clock behind `star_log` and the `updated_at` bumps.
+    pub seq: u32,
+    /// Timeline reads made through the fake.
+    pub timeline_reads: usize,
+}
+
+impl Repo {
+    /// Advance the clock and stamp `number` as updated now.
+    fn touch(&mut self, number: u32) -> String {
+        self.seq += 1;
+        let at = (t(12, 0) + chrono::Duration::seconds(i64::from(self.seq)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if let Some(item) = self.items.get_mut(&number) {
+            item.updated_at = Some(at.clone());
+        }
+        at
+    }
+
+    fn log_star(&mut self, number: u32, kind: StarKind) {
+        let at = self.touch(number);
+        self.star_log
+            .entry(number)
+            .or_default()
+            .push(StarEvent { at, kind });
+    }
 }
 
 /// A forge world: repos by slug.
@@ -40,7 +86,9 @@ pub struct World(pub Rc<RefCell<BTreeMap<String, Repo>>>);
 
 impl World {
     pub fn repo(&self, slug: &str) -> std::cell::RefMut<'_, Repo> {
-        std::cell::RefMut::map(self.0.borrow_mut(), |m| m.entry(slug.to_string()).or_default())
+        std::cell::RefMut::map(self.0.borrow_mut(), |m| {
+            m.entry(slug.to_ascii_lowercase()).or_default()
+        })
     }
 
     pub fn add(&self, slug: &str, item: RestIssue) {
@@ -55,6 +103,35 @@ impl World {
     /// A comment with every field chosen by the test.
     pub fn comment_full(&self, slug: &str, number: u32, c: ForgeComment) {
         self.repo(slug).comments.entry(number).or_default().push(c);
+    }
+
+    /// A person stars `number` on GitHub (a `labeled` event after
+    /// everything before it).
+    pub fn human_star(&self, slug: &str, number: u32) {
+        let mut repo = self.repo(slug);
+        if let Some(item) = repo.items.get_mut(&number) {
+            if !item.labels.iter().any(|l| l == STAR) {
+                item.labels.push(STAR.to_string());
+            }
+        }
+        repo.log_star(number, StarKind::Labeled);
+    }
+
+    /// A person takes the star off `number`.
+    pub fn human_unstar(&self, slug: &str, number: u32) {
+        let mut repo = self.repo(slug);
+        if let Some(item) = repo.items.get_mut(&number) {
+            item.labels.retain(|l| l != STAR);
+        }
+        repo.touch(number);
+    }
+
+    /// Whether `number` carries the star now.
+    pub fn starred(&self, slug: &str, number: u32) -> bool {
+        self.repo(slug)
+            .items
+            .get(&number)
+            .is_some_and(|i| i.labels.iter().any(|l| l == STAR))
     }
 
     pub fn posted(&self, slug: &str) -> Vec<(u32, String)> {
@@ -76,7 +153,9 @@ pub struct FakeForge {
 
 impl StarForge for FakeForge {
     fn list_open(&mut self, label: &str) -> Result<Vec<RestIssue>> {
-        let repo = self.world.repo(&self.slug);
+        let mut repo = self.world.repo(&self.slug);
+        repo.listings += 1;
+        repo.listed.push(label.to_string());
         if repo.fail_listing {
             return Err(anyhow!("listing failed"));
         }
@@ -124,14 +203,37 @@ impl StarForge for FakeForge {
             .collect())
     }
 
+    fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        if self.world.repo(&self.slug).fail_blocked_by {
+            return Err(anyhow!("HTTP 502 from the dependency endpoint"));
+        }
+        Ok(self
+            .world
+            .repo(&self.slug)
+            .blocked_by
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn star_events(&mut self, number: u32) -> Result<Vec<StarEvent>> {
+        let mut repo = self.world.repo(&self.slug);
+        repo.timeline_reads += 1;
+        Ok(repo.star_log.get(&number).cloned().unwrap_or_default())
+    }
+
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        repo.label_writes.push((number, format!("+{label}")));
         let item = repo
             .items
             .get_mut(&number)
             .ok_or_else(|| anyhow!("no #{number}"))?;
         if !item.labels.iter().any(|l| l == label) {
             item.labels.push(label.to_string());
+            if label == STAR {
+                repo.log_star(number, StarKind::Labeled);
+            }
         }
         Ok(())
     }
@@ -141,16 +243,40 @@ impl StarForge for FakeForge {
         if repo.fail_remove.iter().any(|l| l == label) {
             return Err(anyhow!("removing {label} from #{number} failed"));
         }
+        repo.label_writes.push((number, format!("-{label}")));
         if let Some(item) = repo.items.get_mut(&number) {
             item.labels.retain(|l| l != label);
+        }
+        if label == STAR {
+            repo.touch(number);
         }
         Ok(())
     }
 
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        if repo.fail_post {
+            return Err(anyhow!("post failed"));
+        }
         repo.posted.push((number, body.to_string()));
         repo.comments.entry(number).or_default().push(bot(body));
+        if let Some(m) = parse_marker(body) {
+            repo.log_star(number, StarKind::Inherited { root: m.root });
+        }
+        Ok(())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        if repo.fail_body_write {
+            return Err(anyhow!("HTTP 502 editing #{number}"));
+        }
+        repo.body_writes.push((number, body.to_string()));
+        let item = repo
+            .items
+            .get_mut(&number)
+            .ok_or_else(|| anyhow!("no #{number}"))?;
+        item.body = Some(body.to_string());
         Ok(())
     }
 }
@@ -178,6 +304,7 @@ pub fn outsider(body: &str) -> ForgeComment {
 /// An open issue.
 pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
     RestIssue {
+        comments: 0,
         number,
         title: Some(format!("issue {number}")),
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
@@ -187,6 +314,7 @@ pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
         state: "open".to_string(),
         body: Some(String::new()),
         author: None,
+        author_association: None,
         is_pull_request: false,
     }
 }
@@ -226,9 +354,12 @@ pub fn repo_input(slug: &str) -> RepoInput {
     }
 }
 
+/// Test settings: escalation and label materialization on (materialization
+/// is also default-on in production since #10012; [`Settings::default`]).
 pub fn settings() -> Settings {
     Settings {
         escalate: true,
+        materialize_labels: true,
         ..Settings::default()
     }
 }
@@ -240,6 +371,10 @@ pub struct Host {
     /// Every fleet-comms notice this host's passes produced (#9321), in order
     /// — the test-side stand-in for the event-bus publish `task::spawn` does.
     pub notices: Vec<crate::star_liveness::escalate::Notice>,
+    /// `propagate` for [`Host::pass`]. Tests about escalation and the
+    /// watchdog turn it off so a starred PR's label write (which moves the
+    /// PR's fingerprint and posts a marker) does not mix into what they count.
+    pub propagate: bool,
 }
 
 impl Host {
@@ -248,6 +383,15 @@ impl Host {
             id: id.to_string(),
             state: LivenessState::default(),
             notices: Vec::new(),
+            propagate: true,
+        }
+    }
+
+    /// A host whose passes do not propagate the star (see [`Host::propagate`]).
+    pub fn without_propagation(id: &str) -> Self {
+        Self {
+            propagate: false,
+            ..Self::new(id)
         }
     }
 
@@ -269,7 +413,11 @@ impl Host {
         intents: Vec<crate::star_liveness::intents::StarIntent>,
         now: DateTime<Utc>,
     ) -> StarLivenessReport {
-        self.pass_with(world, repos, intents, now, settings())
+        let settings = Settings {
+            propagate: self.propagate,
+            ..settings()
+        };
+        self.pass_with(world, repos, intents, now, settings)
     }
 
     pub fn pass_with(

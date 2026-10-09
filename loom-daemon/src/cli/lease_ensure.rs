@@ -54,6 +54,16 @@
 //! (exit 4), and it only ever runs inside an agent session (see
 //! [`SessionEnv`]).
 //!
+//! ## A declined publish is retried, not final (#10570)
+//!
+//! A claim made while a released sweep's lease is still inside its TTL gets
+//! publish exit 4. That used to end the attempt, leaving the claim leaseless
+//! and reclaimable by any host once the leftover aged out (#10161). A
+//! retryable decline now spawns a bounded deferred publisher ([`deferred`]),
+//! and an attended lease identity is stable per watched session
+//! ([`session_sweep_id`]) so a session's second call re-attaches to its own
+//! lease instead of being declined by it.
+//!
 //! ## Live output for the same claim (#10116)
 //!
 //! The same blind spot hides the agent's output: the daemon's `session.output`
@@ -67,7 +77,9 @@
 //! and an OTLP exporter are
 //! configured, and skipped outright for a daemon-dispatched child, whose
 //! output the daemon already publishes. Like the lease, it never fails or
-//! delays the claim.
+//! delays the claim. Because `worktree.sh` discards this stderr, the outcome
+//! line is also kept in `.loom/logs/live-output-attended/last-start.log`
+//! (#10125).
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -147,7 +159,8 @@ pub(crate) struct LeaseEnsureArgs {
 
     /// The durable pid the renewal loop watches for its whole lifetime.
     ///
-    /// MUST be computed by the CALLER as `${CLAUDE_PID:-$PPID}` — never `$$`,
+    /// MUST be computed by the CALLER as
+    /// `${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}` — never `$$`,
     /// which is the one-shot tool-call subshell that exits the instant the call
     /// returns, so the loop would self-terminate on its first wake-up and the
     /// lease would age out anyway (#8193 finding 1). This subcommand only
@@ -182,6 +195,15 @@ pub(crate) struct LeaseEnsureArgs {
     /// Repo checkout to operate in. Defaults to the current directory.
     #[arg(long, default_value = ".")]
     pub(crate) workspace: String,
+
+    /// Internal (#10570): run as the detached deferred publisher that a
+    /// declined publish spawns. See [`deferred`].
+    #[arg(long, hide = true)]
+    pub(crate) deferred: bool,
+
+    /// Internal (#10570): seconds between the deferred publisher's attempts.
+    #[arg(long, hide = true, default_value_t = deferred::DEFAULT_RETRY_INTERVAL_SECS)]
+    pub(crate) retry_interval: u64,
 }
 
 /// The parts of the process environment this decision reads, captured up front
@@ -192,6 +214,9 @@ pub(crate) struct SessionEnv {
     pub(crate) dispatched_issue: Option<String>,
     /// Whether any of [`SESSION_MARKERS`] is set and non-empty.
     pub(crate) session_present: bool,
+    /// Whether `LOOM_SWEEP_RUN_ID` is set: an in-session `/loom:sweep` run
+    /// already names its own stable lease identity, which publish then uses.
+    pub(crate) run_id_set: bool,
 }
 
 impl SessionEnv {
@@ -212,8 +237,26 @@ impl SessionEnv {
         Self {
             dispatched_issue: non_empty(DISPATCHED_MARKER),
             session_present: SESSION_MARKERS.iter().any(|k| non_empty(k).is_some()),
+            run_id_set: non_empty("LOOM_SWEEP_RUN_ID").is_some(),
         }
     }
+}
+
+/// The lease identity an attended session publishes under (#10570): stable for
+/// the life of the watched session process, so a second `lease ensure` from
+/// the same session (a `worktree.sh N` reuse) finds its OWN fresh lease and
+/// re-attaches, instead of seeing it as a live peer and being declined.
+/// `None` when the pid's start identity cannot be read; publish then falls
+/// back to its own per-call id.
+pub(crate) fn session_sweep_id(watch_pid: u32) -> Option<String> {
+    let ident = super::lease_renewer::start_identity(watch_pid)?;
+    let token: String = ident
+        .split_once(':')
+        .map_or(ident.as_str(), |(_, v)| v)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    (!token.is_empty()).then(|| format!("sweep-insession-s{watch_pid}-{token}"))
 }
 
 /// What one `lease ensure` run did. Every variant is a success from the
@@ -246,6 +289,14 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
+    /// A decline a later attempt can turn into a lease (#10570): exit 4 (a
+    /// peer's lease is still within its TTL — possibly a released sweep's
+    /// leftover record) or exit 2 (the publish `gh` call failed). The deferred
+    /// publisher retries only these; everything else is a settled answer.
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::PublishDeclined(Some(2 | 4)))
+    }
+
     /// The one stderr line this subcommand prints. Every path says something:
     /// a lease mechanism that is silent when it declines is exactly how #8193
     /// went unnoticed for as long as it did.
@@ -275,8 +326,9 @@ impl Outcome {
             ),
             Self::PublishDeclined(code) => format!(
                 "publish for issue #{issue} exited {code:?} (4 = another sweep, on this host or \
-                 another, holds a fresh lease; 2 = the publish gh call failed) — proceeding \
-                 without a lease"
+                 another, holds a fresh lease; 2 = the publish gh call failed) — this claim has \
+                 NO lease yet, so another host's orphan recovery may reclaim it once that lease \
+                 ages out"
             ),
             Self::PublishUnparseable(line) => format!(
                 "could not parse '<host> <sweep-id>' out of sweep-lease-publish.sh's output for \
@@ -301,8 +353,22 @@ impl Outcome {
 
 impl LeaseEnsureArgs {
     pub(crate) fn run(self) -> Result<()> {
+        if self.deferred {
+            deferred::run(&self);
+            return Ok(());
+        }
         let outcome = self.ensure(&SessionEnv::from_process());
-        eprintln!("lease ensure: {}", outcome.describe(self.issue));
+        let line = outcome.describe(self.issue);
+        eprintln!("lease ensure: {line}");
+        deferred::record(&self.workspace, self.issue, &line);
+        // #10570: a declined publish used to be final, so a claim made while a
+        // released sweep's lease was still inside its TTL never got a lease of
+        // its own and was reclaimed once that leftover aged out.
+        if outcome.is_retryable() {
+            let line = deferred::spawn(&self);
+            eprintln!("lease ensure: {line}");
+            deferred::record(&self.workspace, self.issue, &line);
+        }
         self.attend_live_output(&outcome);
         Ok(())
     }
@@ -365,7 +431,7 @@ impl LeaseEnsureArgs {
             return Outcome::ScriptsMissing(root);
         }
 
-        match self.publish(&publish_script, &root) {
+        match self.publish(&publish_script, &root, env) {
             Ok((host, sweep_id)) => self.start_renewal(&renew_script, &root, &host, &sweep_id),
             Err(outcome) => outcome,
         }
@@ -379,10 +445,22 @@ impl LeaseEnsureArgs {
     /// stderr, so the parse below is the documented contract rather than a
     /// guess. Every failure is folded into an `Outcome` and swallowed: a lease
     /// is evidence, never a precondition (#6179's fail-open contract).
-    fn publish(&self, publish_script: &Path, root: &Path) -> Result<(String, String), Outcome> {
-        let output = Command::new(publish_script)
-            .arg("publish")
-            .arg(self.issue.to_string())
+    fn publish(
+        &self,
+        publish_script: &Path,
+        root: &Path,
+        env: &SessionEnv,
+    ) -> Result<(String, String), Outcome> {
+        let mut command = Command::new(publish_script);
+        command.arg("publish").arg(self.issue.to_string());
+        // An in-session sweep's `LOOM_SWEEP_RUN_ID` wins inside the script.
+        if let Some(id) = (!env.run_id_set)
+            .then(|| session_sweep_id(self.watch_pid))
+            .flatten()
+        {
+            command.arg("--sweep-id").arg(id);
+        }
+        let output = command
             .current_dir(root)
             .output()
             .map_err(|e| Outcome::PublishUnavailable(e.to_string()))?;
@@ -421,6 +499,7 @@ impl LeaseEnsureArgs {
         host: &str,
         sweep_id: &str,
     ) -> Outcome {
+        mark_inherited_fds_cloexec();
         let result = Command::new(renew_script)
             .arg("start")
             .arg(self.issue.to_string())
@@ -452,6 +531,42 @@ impl LeaseEnsureArgs {
         }
     }
 }
+
+/// Mark every fd above 2 that this process inherited as close-on-exec, so the
+/// renewal loop `start_renewal` spawns cannot inherit it (#10203).
+///
+/// `worktree.sh` keeps its caller's stdout on fd 3 and calls `lease ensure`;
+/// Rust's `Command` passes every non-CLOEXEC fd straight through, and the
+/// detached loop then held the read side of a `worktree.sh N | tail` pipe open
+/// for its whole 4h lifetime. This is a one-shot CLI that never means to hand
+/// an inherited fd to a child, so marking them all is safe; the fds stay open
+/// here, they just stop crossing `exec`. Done in the parent rather than in
+/// `pre_exec` because enumerating `/dev/fd` allocates, which is not safe
+/// between fork and exec.
+pub(crate) fn mark_inherited_fds_cloexec() {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    // Collect first: the directory handle is itself an fd, closed once
+    // `entries` drops, and fcntl on its stale number is a harmless EBADF.
+    let fds: Vec<libc::c_int> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in fds {
+        // SAFETY: F_GETFD/F_SETFD only read and set the descriptor's own
+        // close-on-exec flag; they touch no memory, and a number that is no
+        // longer open just returns -1 (EBADF), which is ignored.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+pub(crate) mod deferred;
 
 #[cfg(test)]
 mod tests;

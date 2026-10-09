@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -127,10 +127,29 @@ pub trait StarForge {
     /// The search failed.
     fn search_open_issues(&mut self, phrase: &str) -> Result<Vec<SearchHit>>;
 
+    /// The events that put the star on an item, from its timeline: each
+    /// `labeled` event for the star and each trusted star comment
+    /// ([`super::inherited_star::star_events_from_timeline`]). Read only for
+    /// an item whose star propagation might own (#10012 §3).
+    ///
+    /// # Errors
+    /// The read failed.
+    fn star_events(&mut self, number: u32) -> Result<Vec<super::inherited_star::StarEvent>>;
+
     /// This daemon's own forge login, when the forge can name it (an App
     /// installation token cannot). Used only to trust its own markers.
     fn self_login(&mut self) -> Option<String> {
         None
+    }
+
+    /// The issues the forge's native dependency graph says block `number`
+    /// ("blocked by"), as `(owner/repo, N)`, open ones only (#10307). A forge
+    /// without the feature answers none.
+    ///
+    /// # Errors
+    /// The read failed.
+    fn blocked_by(&mut self, _number: u32) -> Result<Vec<(String, u32)>> {
+        Ok(Vec::new())
     }
 
     /// Add `label` (a no-op when already present).
@@ -150,6 +169,12 @@ pub trait StarForge {
     /// # Errors
     /// The write failed.
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()>;
+
+    /// Replace an issue's body (the level provenance marker, #10307).
+    ///
+    /// # Errors
+    /// The write failed.
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()>;
 }
 
 /// [`StarForge`] over `gh api`, for the repo checked out at `root` whose
@@ -194,68 +219,39 @@ impl GhStarForge {
 
     /// Conditional GET of `url` (a REST path), accounted under `op` (#9831):
     /// `Ok(Some(body))` on a `200` or a `304` served from the stored body,
-    /// `Ok(None)` on a `404`.
+    /// `Ok(None)` on a `404`. The shared [`store::cached_get`] (#10480).
     fn cached_get(&self, op: ForgeOp, url: &str) -> Result<Option<String>> {
-        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
-            return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
-        }
-        let cwd = Some(self.root.as_path());
-        let target = store::resolve_target(cwd, Some(&self.slug));
-        let key = store::daemon_cache_key(cwd, &target, url);
-        let disk =
-            store::daemon_store_dir().map(|d| store::entry_path_with_prefix(&d, "star-", &key));
-        let sent = mem_cache()
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&key).cloned())
-            .or_else(|| {
-                let e = store::read_disk_entry(disk.as_deref()?)?;
-                Some(Arc::new(e))
-            });
-        let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
-        let (status, response, stderr) =
-            store::fetch_conditional(site(op), &self.gh_bin, cwd, &target, url, sent_etag)?;
-        match response {
-            Some(r) if r.status == 304 => match sent {
-                Some(e) => Ok(Some(e.body.clone())),
-                None => {
-                    // A 304 with nothing sent is anomalous: drop and re-fetch.
-                    if let Ok(mut m) = mem_cache().lock() {
-                        m.remove(&key);
-                    }
-                    if let Some(p) = &disk {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    Err(anyhow!("gh api {url}: 304 but the cache entry vanished"))
-                }
-            },
-            Some(r) if r.status == 200 && status.success() => {
-                if let Some(etag) = r.etag.clone() {
-                    let entry = store::DiskEntry {
-                        etag,
-                        body: r.body.clone(),
-                    };
-                    if let Some(p) = &disk {
-                        store::write_disk_entry(p, &entry);
-                    }
-                    if let Ok(mut m) = mem_cache().lock() {
-                        m.insert(key, Arc::new(entry));
-                    }
-                }
-                Ok(Some(r.body))
-            }
-            Some(r) if r.status == 404 => Ok(None),
-            _ => {
-                crate::rate_limit_breaker::global_observe_failure(&stderr, "star_liveness");
-                Err(anyhow!("gh api {url} failed: {stderr}"))
-            }
-        }
+        store::cached_get(
+            site(op),
+            &self.gh_bin,
+            Some(self.root.as_path()),
+            Some(&self.slug),
+            url,
+            "star-",
+        )
     }
 }
 
-fn mem_cache() -> &'static Mutex<HashMap<String, Arc<store::DiskEntry>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<store::DiskEntry>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The open issues in a `GET …/dependencies/blocked_by` answer, as
+/// `(owner/repo, N)` from each item's `html_url` (PRs and closed items
+/// dropped). Anything unparseable is skipped.
+#[must_use]
+pub fn parse_blocked_by(body: &str, slug: &str) -> Vec<(String, u32)> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|v| v.get("pull_request").is_none())
+        .filter(|v| {
+            v.get("state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("open"))
+        })
+        .filter_map(|v| v.get("html_url")?.as_str())
+        .filter_map(|u| super::edges::ref_target(u, slug))
+        .collect()
 }
 
 /// Percent-encode a query value (unreserved characters pass through).
@@ -275,6 +271,8 @@ fn url_encode(s: &str) -> String {
 /// Comment pages are fetched until one is short; a hard cap bounds a runaway.
 const COMMENT_PAGE: usize = 100;
 const COMMENT_MAX_PAGES: usize = 50;
+/// Timeline pages read for one ownership check (#10012 §3).
+const TIMELINE_MAX_PAGES: usize = 20;
 
 #[derive(serde::Deserialize)]
 struct RawUser {
@@ -304,12 +302,7 @@ impl StarForge for GhStarForge {
     }
 
     fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
-        let Some(body) = self.cached_get(
-            // A single-issue read: no inventory row exists for it (#9831).
-            ForgeOp::uninventoried("single-issue REST read has no inventory row"),
-            &self.issue_path(number),
-        )?
-        else {
+        let Some(body) = self.cached_get(ops::ISSUE_VIEW_STATE, &self.issue_path(number))? else {
             return Ok(None);
         };
         Ok(crate::forge_listing::parse_rest_issues(&format!("[{body}]"))?
@@ -373,6 +366,40 @@ impl StarForge for GhStarForge {
             .collect())
     }
 
+    fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        let url = format!("{}/dependencies/blocked_by?per_page=100", self.issue_path(number));
+        let Some(body) = self.cached_get(
+            ForgeOp::uninventoried("native issue-dependency read has no inventory row (#10307)"),
+            &url,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(parse_blocked_by(&body, &self.slug))
+    }
+
+    fn star_events(&mut self, number: u32) -> Result<Vec<super::inherited_star::StarEvent>> {
+        let me = self.self_login();
+        let mut all = Vec::new();
+        for page in 1..=TIMELINE_MAX_PAGES {
+            let url =
+                format!("{}/timeline?per_page={COMMENT_PAGE}&page={page}", self.issue_path(number));
+            let Some(body) = self.cached_get(ops::TIMELINE_READ, &url)? else {
+                return Err(anyhow!("gh api {url} failed: HTTP 404"));
+            };
+            let raw: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow!("parse timeline page {page} of {url}: {e}"))?;
+            let n = raw.as_array().map_or(0, Vec::len);
+            all.extend(super::inherited_star::star_events_from_timeline(&raw, me.as_deref()));
+            if n < COMMENT_PAGE {
+                return Ok(all);
+            }
+        }
+        // A timeline longer than the cap: the newest events are unread, and
+        // the owner rule keys on the latest one. Refuse rather than guess.
+        Err(anyhow!("timeline of #{number} exceeds {TIMELINE_MAX_PAGES} pages"))
+    }
+
     fn self_login(&mut self) -> Option<String> {
         static CACHE: OnceLock<Mutex<HashMap<PathBuf, LoginLookup>>> = OnceLock::new();
         // Registers the configured fleet App with `trust` for this process.
@@ -408,6 +435,14 @@ impl StarForge for GhStarForge {
         let path = format!("{}/comments", self.issue_path(number));
         let field = format!("body={body}");
         self.api(&["-X", "POST", &path, "-f", &field], &path)
+            .map(|_| ())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let path = self.issue_path(number);
+        // `-f` is a raw field: a body starting with `@` is never read as a file.
+        let field = format!("body={body}");
+        self.api(&["-X", "PATCH", &path, "-f", &field], &path)
             .map(|_| ())
     }
 }

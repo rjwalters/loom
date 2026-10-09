@@ -70,6 +70,10 @@ pub struct ModelProfile {
     pub provider_definition: BTreeMap<String, Value>,
     #[serde(default)]
     pub allowed_efforts: Vec<String>,
+    /// How this profile is billed (#10749): `subscription` (a flat-rate plan,
+    /// e.g. the z.ai coding plan), `api` (metered) or `local`. Absent: a
+    /// profile that reads a provider credential is treated as metered.
+    pub billing: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -271,6 +275,33 @@ pub fn resolve(
     name: &str,
     profile: &ModelProfile,
 ) -> Result<Selection, LaunchError> {
+    let (selection, required) = resolve_shape(runtime, name, profile)?;
+    require_set(name, &required)?;
+    Ok(selection)
+}
+
+/// Fail closed (78) when a required credential variable is unset or empty.
+pub fn require_set(name: &str, required: &[String]) -> Result<(), LaunchError> {
+    let unset = missing(required);
+    if !unset.is_empty() {
+        return Err(LaunchError::config(format!(
+            "model profile '{name}' requires environment variables that are unset: {}",
+            unset.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// [`resolve`] minus its "required variables are set" check, returning the
+/// set it would have checked (#9473). A launch routed through the LLM gateway
+/// never reads those variables — the gateway's virtual key replaces them — so
+/// [`select`] and `worker profile-check` apply [`require_set`] only when the
+/// profile is not routed.
+pub fn resolve_shape(
+    runtime: &str,
+    name: &str,
+    profile: &ModelProfile,
+) -> Result<(Selection, Vec<String>), LaunchError> {
     let provider = profile
         .providers
         .get(runtime)
@@ -318,13 +349,6 @@ pub fn resolve(
             ));
         }
     }
-    let unset = missing(&mapping.required);
-    if !unset.is_empty() {
-        return Err(LaunchError::config(format!(
-            "model profile '{name}' requires environment variables that are unset: {}",
-            unset.join(", ")
-        )));
-    }
     let provider_options = provider_block(&profile.provider_options, runtime, "providerOptions")?;
     let provider_definition =
         provider_block(&profile.provider_definition, runtime, "providerDefinition")?;
@@ -338,7 +362,7 @@ pub fn resolve(
         .map(CredentialEnv::names)
         .unwrap_or_default();
     reject_literal_secrets(&blocks, &declared)?;
-    Ok(Selection {
+    let selection = Selection {
         provider,
         model: profile.model.clone(),
         effort: profile.effort.clone(),
@@ -349,7 +373,8 @@ pub fn resolve(
         provider_definition,
         credential_pool: profile.credential_pool.clone(),
         credential_proxy: profile.credential_proxy.clone(),
-    })
+    };
+    Ok((selection, mapping.required))
 }
 
 pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Selection, LaunchError> {
@@ -374,7 +399,13 @@ pub fn select(runtime: &str, options: &Options, config: &Value) -> Result<Select
         }
     }
     let (name, profile) = lookup(options.profile.as_deref(), config)?;
-    let mut selection = resolve(runtime, &name, &profile)?;
+    let (mut selection, required) = resolve_shape(runtime, &name, &profile)?;
+    // #9473: a routed launch takes its key from the LLM gateway, so its
+    // provider variables need not be set. An opted-in profile the gateway
+    // refuses is left to `spawn-worker`'s own `plan` call, which reports it.
+    if matches!(super::llm_gateway::plan(runtime, &selection, config), Ok(None)) {
+        require_set(&name, &required)?;
+    }
     if let Some(model) = options.model.clone() {
         if model != profile.model {
             return Err(LaunchError::config("bare model differs from the selected profile; use provider/model or define a model profile"));
@@ -420,6 +451,7 @@ mod tests {
             provider_options: BTreeMap::new(),
             provider_definition: BTreeMap::new(),
             allowed_efforts: Vec::new(),
+            billing: None,
         }
     }
 
@@ -503,6 +535,32 @@ mod tests {
             selection.credentials,
             vec![("ZAI_API_KEY".to_string(), "ZAI_API_KEY".to_string())]
         );
+    }
+
+    /// #9473: `resolve_shape` reports the required set instead of failing on
+    /// it (a gateway-routed launch never reads those variables), while
+    /// `resolve` — every unrouted caller — still fails closed exactly as before.
+    #[test]
+    fn resolve_shape_defers_the_required_check_that_resolve_still_enforces() {
+        let credential_targets = BTreeMap::from([(
+            "test-runtime".to_string(),
+            CredentialTargets::Map(BTreeMap::from([(
+                "LOOM_TEST_9473_NEVER_SET".to_string(),
+                "CHILD_KEY".to_string(),
+            )])),
+        )]);
+        let profile = profile_with_credentials(
+            CredentialEnv::Many(vec!["LOOM_TEST_9473_NEVER_SET".to_string()]),
+            credential_targets,
+        );
+        let (selection, required) = resolve_shape("test-runtime", "gw", &profile).unwrap();
+        assert_eq!(required, vec!["LOOM_TEST_9473_NEVER_SET"]);
+        assert_eq!(
+            selection.credentials,
+            vec![("LOOM_TEST_9473_NEVER_SET".to_string(), "CHILD_KEY".to_string())]
+        );
+        let error = resolve("test-runtime", "gw", &profile).unwrap_err();
+        assert!(error.message.contains("LOOM_TEST_9473_NEVER_SET"), "{}", error.message);
     }
 
     /// Regression for the Judge's blocking finding on #8701: an array-form

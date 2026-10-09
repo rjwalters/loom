@@ -17,14 +17,15 @@
 //! - **Newton:** from a warm start (stage intercepts = per-stage mean of `y`,
 //!   `log σ` = per-stage `ln std(y)`, features 0) — an all-zero start
 //!   diverges, its Hessian indefinite from the first step — with Levenberg
-//!   damping and Armijo backtracking; stops at `‖g‖∞ < 1e-10` or a full step
-//!   under `1e-13`.
+//!   damping and Armijo backtracking; stops at `‖g‖∞ < 1e-10`, a full step
+//!   under `1e-13`, or the noise floor (`math::DECREASE_RTOL`, #10501).
 
 use std::collections::BTreeMap;
 
 use super::coeffs::AftFit;
 use super::math::{
     mirror_upper, newton, norm_logpdf, norm_logsf, standardization, standardize, Derivatives, Stop,
+    DECREASE_RTOL, STEP_RTOL,
 };
 use super::{
     model_features, FitStage, TrainingRow, AFT_L2, MIN_DUR_H, MIN_STAGE_EXITS, MIN_STAGE_ROWS,
@@ -38,11 +39,11 @@ const GRAD_TOL: f64 = 1e-10;
 const STEP_TOL: f64 = 1e-13;
 
 /// One included row, ready for the likelihood.
-struct Obs {
+struct Obs<const N: usize> {
     /// Index into the model's stages.
     k: usize,
     /// Standardized features.
-    z: [f64; N_FEATURES],
+    z: [f64; N],
     /// `ln(max(dur_h, MIN_DUR_H))`.
     y: f64,
     /// A merge (not censored).
@@ -52,10 +53,10 @@ struct Obs {
 }
 
 /// The likelihood over the included rows. Parameters are
-/// `[K stage intercepts, 20 feature coefficients, K log σ]`.
-struct Problem {
+/// `[K stage intercepts, N feature coefficients, K log σ]`.
+struct Problem<const N: usize> {
     stages: usize,
-    obs: Vec<Obs>,
+    obs: Vec<Obs<N>>,
     total_weight: f64,
 }
 
@@ -73,31 +74,44 @@ pub fn eligible_stages(rows: &[TrainingRow]) -> Vec<FitStage> {
         .collect()
 }
 
-/// Fit the direct model over `rows`, in the order given. `None` when no stage
-/// passes the gate.
+/// Fit the direct model over `rows`, in the order given, on the
+/// `eta-fit/v1` features ([`model_features`]). `None` when no stage passes
+/// the gate.
 #[must_use]
 pub fn fit(rows: &[TrainingRow]) -> Option<AftFit> {
+    let xs: Vec<[f64; N_FEATURES]> = rows.iter().map(|r| model_features(&r.inputs)).collect();
+    fit_x(rows, &xs)
+}
+
+/// [`fit`] over precomputed feature vectors: `xs[i]` is `rows[i]`'s `N`
+/// model features (`eta-fit/v2`, #10508). The arithmetic is the same for
+/// every `N`.
+///
+/// # Panics
+///
+/// `xs` is not as long as `rows`.
+#[must_use]
+pub fn fit_x<const N: usize>(rows: &[TrainingRow], xs: &[[f64; N]]) -> Option<AftFit> {
+    assert_eq!(rows.len(), xs.len(), "one feature vector per row");
     let stages = eligible_stages(rows);
     if stages.is_empty() {
         return None;
     }
-    let included: Vec<(usize, &TrainingRow)> = rows
+    let included: Vec<(usize, &TrainingRow, &[f64; N])> = rows
         .iter()
-        .filter_map(|r| stages.iter().position(|s| *s == r.stage).map(|k| (k, r)))
+        .zip(xs)
+        .filter_map(|(r, x)| stages.iter().position(|s| *s == r.stage).map(|k| (k, r, x)))
         .collect();
     let mut group_rows: BTreeMap<&str, usize> = BTreeMap::new();
-    for (_, r) in &included {
+    for (_, r, _) in &included {
         *group_rows.entry(r.group.as_str()).or_default() += 1;
     }
-    let xs: Vec<[f64; N_FEATURES]> = included
-        .iter()
-        .map(|(_, r)| model_features(&r.inputs))
-        .collect();
+    let xs: Vec<[f64; N]> = included.iter().map(|(_, _, x)| **x).collect();
     let (mu, sd) = standardization(&xs);
-    let obs: Vec<Obs> = included
+    let obs: Vec<Obs<N>> = included
         .iter()
         .zip(&xs)
-        .map(|((k, r), x)| Obs {
+        .map(|((k, r, _), x)| Obs {
             k: *k,
             z: standardize(x, &mu, &sd),
             y: r.merge.dur_h.max(MIN_DUR_H).ln(),
@@ -113,6 +127,8 @@ pub fn fit(rows: &[TrainingRow]) -> Option<AftFit> {
     let stop = Stop {
         grad_tol: GRAD_TOL,
         step_tol: STEP_TOL,
+        decrease_rtol: DECREASE_RTOL,
+        step_rtol: STEP_RTOL,
     };
     let min = newton(
         problem.warm_start(),
@@ -120,7 +136,7 @@ pub fn fit(rows: &[TrainingRow]) -> Option<AftFit> {
         |theta| problem.derivatives(theta),
         |theta| problem.objective(theta),
     );
-    let nb = problem.stages + N_FEATURES;
+    let nb = problem.stages + N;
     Some(AftFit {
         stages,
         mu,
@@ -136,10 +152,10 @@ pub fn fit(rows: &[TrainingRow]) -> Option<AftFit> {
     })
 }
 
-impl Problem {
+impl<const N: usize> Problem<N> {
     /// Stage intercepts plus feature coefficients.
     fn n_beta(&self) -> usize {
-        self.stages + N_FEATURES
+        self.stages + N
     }
 
     /// Stage intercepts = per-stage mean of `y`; `log σ` = per-stage
@@ -162,7 +178,7 @@ impl Problem {
     }
 
     /// `(r, log σ_k)` for one row.
-    fn residual(&self, o: &Obs, theta: &[f64]) -> (f64, f64) {
+    fn residual(&self, o: &Obs<N>, theta: &[f64]) -> (f64, f64) {
         let nb = self.n_beta();
         let eta = theta[o.k]
             + o.z

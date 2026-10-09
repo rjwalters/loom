@@ -15,6 +15,13 @@
 //! - **Without one** (an ad-hoc daemon tick): its own root, tag
 //!   `loom.github.invoke.*`, keyed by the same facts. `context_source=missing`.
 //!
+//! Besides process truth (`github.outcome`, `github.exit_code`), the span
+//! carries what GitHub billed — HTTP status, `304`, request count, billed
+//! resource and credential identity ([`super::billing`], #10343). Since
+//! #10752 it also carries `github.caller` (the daemon pass inside whose
+//! [`super::caller_scope`] it ran), `github.repo` (the repo the ledger booked
+//! it under) and, on a write, `github.number` (the issue/PR it targets).
+//!
 //! `github.invocation` is `<pid>.<seq>` — the process id and a process-local
 //! counter — so two invocations that start in the same clock tick under the
 //! same parent never share a span ID. Every derivation input is an attribute
@@ -61,7 +68,47 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.launcher",
     "github.api",
     "context_source",
+    // #10343: what GitHub billed ([`super::billing::Billing`]).
+    "github.http.status",
+    "github.http.not_modified",
+    "github.http.requests",
+    "github.http.source",
+    "github.billing",
+    "github.resource",
+    "github.account",
+    "github.cred_owner",
+    "github.role",
+    // #10752: the daemon pass the call served ([`super::caller_scope`]), the
+    // repo the ledger booked it under, and the number(s) a write targets.
+    "github.caller",
+    "github.repo",
+    "github.number",
 ];
+
+/// At most this many numbers in a write span's `github.number`.
+const MAX_WRITE_NUMBERS: usize = 5;
+
+/// The issue/PR number(s) a write targets, comma-joined in argv order: the
+/// `repos/{o}/{r}/(issues|pulls)/{n}` path of a `gh api` write, or the
+/// selectors of a `gh issue|pr` write ([`super::own_writes::written_targets`],
+/// whose loose `gh issue|pr` parse can also pick up a numeric flag value).
+/// `None` when the argv names none (GraphQL, a comment edited by id).
+fn write_numbers(inv: &GhInvocation) -> Option<String> {
+    let mut numbers: Vec<u32> = Vec::new();
+    for (_, n) in super::own_writes::written_targets(&inv.args, inv.target.slug().as_deref()) {
+        if !numbers.contains(&n) {
+            numbers.push(n);
+        }
+    }
+    numbers.truncate(MAX_WRITE_NUMBERS);
+    (!numbers.is_empty()).then(|| {
+        numbers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
 
 /// The stderr marker the managed launcher (C4, #9987) prints when it refuses
 /// to route a request (`routing.denied`). Only a captured run can see it; a
@@ -89,7 +136,16 @@ pub enum Outcome {
     CollectFailed,
     /// The managed launcher refused to route the request.
     RoutingRefused,
+    /// The managed launcher exited `78`: routing is blocked (#9987).
+    RoutingBlocked,
+    /// The managed launcher exited `69`: its adapter is down (#9987).
+    AdapterUnavailable,
 }
+
+/// The managed launcher's exit status for "routing blocked" (EX_CONFIG).
+pub const EXIT_ROUTING_BLOCKED: i32 = 78;
+/// The managed launcher's exit status for "adapter unavailable" (EX_UNAVAILABLE).
+pub const EXIT_ADAPTER_UNAVAILABLE: i32 = 69;
 
 impl Outcome {
     #[must_use]
@@ -102,11 +158,13 @@ impl Outcome {
             Outcome::SpawnFailed => "spawn_failed",
             Outcome::CollectFailed => "collect_failed",
             Outcome::RoutingRefused => "routing_refused",
+            Outcome::RoutingBlocked => "routing_blocked",
+            Outcome::AdapterUnavailable => "adapter_unavailable",
         }
     }
 
     /// Every value, for vocabulary tests and docs.
-    pub const ALL: [Outcome; 7] = [
+    pub const ALL: [Outcome; 9] = [
         Outcome::Ok,
         Outcome::ExitNonzero,
         Outcome::Signaled,
@@ -114,6 +172,8 @@ impl Outcome {
         Outcome::SpawnFailed,
         Outcome::CollectFailed,
         Outcome::RoutingRefused,
+        Outcome::RoutingBlocked,
+        Outcome::AdapterUnavailable,
     ];
 }
 
@@ -158,6 +218,10 @@ pub fn classify_passthrough(
 fn classify_status(status: std::process::ExitStatus, refused: bool) -> (Outcome, Option<i32>) {
     match status.code() {
         Some(0) => (Outcome::Ok, Some(0)),
+        Some(EXIT_ROUTING_BLOCKED) => (Outcome::RoutingBlocked, Some(EXIT_ROUTING_BLOCKED)),
+        Some(EXIT_ADAPTER_UNAVAILABLE) => {
+            (Outcome::AdapterUnavailable, Some(EXIT_ADAPTER_UNAVAILABLE))
+        }
         Some(code) if refused => (Outcome::RoutingRefused, Some(code)),
         Some(code) => (Outcome::ExitNonzero, Some(code)),
         None => (Outcome::Signaled, None),
@@ -319,6 +383,7 @@ impl InvocationSpan {
         outcome: Outcome,
         exit_code: Option<i32>,
         ended_at: DateTime<Utc>,
+        billing: &super::billing::Billing,
     ) -> SpanRecord {
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
@@ -335,6 +400,22 @@ impl InvocationSpan {
         .collect();
         if let Some(code) = exit_code {
             attributes.insert("github.exit_code".into(), code.to_string());
+        }
+        for (key, value) in billing.attributes() {
+            attributes.insert(key.to_string(), value);
+        }
+        // #10752: which pass drove the call, and what a write touched, so a
+        // label change joins to the mechanism that made it.
+        if let Some(caller) = super::caller_scope::current() {
+            attributes.insert("github.caller".into(), caller.to_string());
+        }
+        if let Some(repo) = &billing.repo {
+            attributes.insert("github.repo".into(), repo.clone());
+        }
+        if inv.intent == super::AccessIntent::Write {
+            if let Some(numbers) = write_numbers(inv) {
+                attributes.insert("github.number".into(), numbers);
+            }
         }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
         SpanRecord {
@@ -354,16 +435,22 @@ impl InvocationSpan {
         }
     }
 
-    /// Emit the span and, for a non-`ok` outcome, the local completion record.
+    /// Emit the span (with `billing`'s HTTP truth and identity, #10343) and,
+    /// for a non-`ok` outcome, the local completion record.
     pub fn finish(
         self,
         inv: &GhInvocation,
         launcher: super::GhBinSource,
         outcome: Outcome,
         exit_code: Option<i32>,
+        billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
-        let span = self.record(inv, launcher, outcome, exit_code, ended_at);
+        super::caller_scope::note(
+            inv.intent == super::AccessIntent::Write,
+            billing.status == Some(304),
+        );
+        let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
         if outcome != Outcome::Ok {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));
         }

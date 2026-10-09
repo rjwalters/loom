@@ -544,3 +544,153 @@ fn an_unbounded_cpu_axis_emits_no_flag_at_all() {
     assert!(!args.iter().any(|a| a.starts_with("loom.dispatch.cpus")), "{args:?}");
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
 }
+
+fn build_with(egress: Option<&crate::forge_egress::worker_env::WorkerEgress>) -> Vec<String> {
+    let command = docker_command_with(
+        &profile(None, None),
+        Path::new("/srv/repo"),
+        Path::new("/srv/repo"),
+        None,
+        &[OsString::from("-p"), OsString::from("x")],
+        &[],
+        None,
+        egress,
+    )
+    .expect("docker command");
+    argv(&command)
+}
+
+#[test]
+fn managed_gh_withholds_tokens_and_carries_the_policy_read_only() {
+    use crate::forge_egress::worker_env::WorkerEgress;
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let launcher = bin.join("gh");
+    std::fs::write(&launcher, "x").unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, "{}").unwrap();
+    let egress = WorkerEgress {
+        launcher: launcher.clone(),
+        upstream_gh: None,
+        policy_file: policy.clone(),
+        credential_file: None,
+        required: true,
+    };
+    let managed = build_with(Some(&egress));
+    let plain = build_with(None);
+    std::env::remove_var("GH_TOKEN");
+    // No policy: today's behaviour, token forwarded by name.
+    assert!(plain.contains(&"GH_TOKEN".to_string()), "{plain:?}");
+    assert!(!plain.iter().any(|a| a.contains("GITHUB_EGRESS_POLICY")));
+    // Policy: no token, launcher dir + policy mounted ro at their host paths.
+    assert!(!managed.contains(&"GH_TOKEN".to_string()), "{managed:?}");
+    let ro = |p: &Path| format!("{0}:{0}:ro", p.display());
+    assert!(managed.contains(&ro(&bin)), "{managed:?}");
+    assert!(managed.contains(&ro(&policy)), "{managed:?}");
+    assert!(managed.contains(&format!("GITHUB_EGRESS_POLICY={}", policy.display())));
+    assert!(managed.contains(&format!("LOOM_FORGE_EGRESS_POLICY={}", policy.display())));
+}
+
+#[test]
+fn managed_gh_never_mounts_the_host_gh_config() {
+    let _g = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/gh")).unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let old = (
+        std::env::var_os("HOME"),
+        std::env::var_os("GH_TOKEN"),
+        std::env::var_os("GITHUB_TOKEN"),
+    );
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("GH_TOKEN");
+    std::env::remove_var("GITHUB_TOKEN");
+    let unmanaged = extra_mounts("/root", None, ws.path(), false, None);
+    let managed = extra_mounts("/root", None, ws.path(), true, None);
+    for (k, v) in [
+        ("HOME", old.0),
+        ("GH_TOKEN", old.1),
+        ("GITHUB_TOKEN", old.2),
+    ] {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    assert!(unmanaged.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
+    assert!(!managed.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
+}
+
+/// #10607: the agent `gh` front's sink (the daemon's) is named to the
+/// container, and its `contained/` subdirectory — never the whole sink — is
+/// mounted read-write there, so its rows outlive `--rm`.
+#[test]
+fn the_agent_front_sink_is_parity_mounted_read_write_and_named() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let host = tempfile::tempdir().unwrap();
+    let sink = host.path().join("loom-forge-call-stats");
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.clone()));
+    let args = build(&profile(None, Some("1g")), &[]);
+    crate::forge_call_stats::set_test_sink_dir(None);
+    let spec = format!("{}/contained:{}", sink.display(), sink.display());
+    assert!(args.contains(&spec), "a read-write mount of contained/ only: {args:?}");
+    assert!(!args.contains(&format!("{0}:{0}", sink.display())), "never the whole sink");
+    let assign = format!("LOOM_FORGE_CALL_STATS_DIR={}", sink.display());
+    assert!(args.contains(&assign), "{args:?}");
+    assert!(sink.is_dir(), "created owner-only before docker could make it root-owned");
+    // Off: neither.
+    let args = build(&profile(None, Some("1g")), &[]);
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+    assert!(!args.iter().any(|a| a.contains("loom-forge-call-stats")), "{args:?}");
+}
+
+/// #10607 review S1, the containment path: the sink comes from the same
+/// variable it is mounted by, so an existing directory is only inspected.
+/// One that is not a sink — a private dir with a `.bashrc`, a 0755 home, a
+/// group-writable dir — is neither mounted nor assigned, and is left exactly
+/// as it was (no chmod, no purge of its files).
+#[cfg(unix)]
+#[test]
+fn a_sink_dir_that_is_not_a_sink_is_neither_mounted_nor_assigned_nor_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let cases: [(u32, &str); 3] = [
+        (0o700, ".bashrc"),
+        (0o755, ".profile"),
+        (0o770, "notes.txt"),
+    ];
+    for (dir_mode, file) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let foreign = home.path().join(file);
+        std::fs::write(&foreign, "keep me").unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(dir_mode)).unwrap();
+        crate::forge_call_stats::set_test_sink_dir(Some(home.path().to_path_buf()));
+        let args = build(&profile(None, Some("1g")), &[]);
+        crate::forge_call_stats::set_test_sink_dir(None);
+        let d = home.path().display().to_string();
+        assert!(
+            !args.iter().any(|a| a.ends_with(&format!(":{d}"))),
+            "{dir_mode:o}: mounted {args:?}"
+        );
+        assert!(!home.path().join("contained").exists(), "{dir_mode:o}: created a subdir");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("LOOM_FORGE_CALL_STATS_DIR=")),
+            "{dir_mode:o}: assigned {args:?}"
+        );
+        assert_eq!(mode(home.path()), dir_mode, "the refused directory's mode is untouched");
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "keep me", "{dir_mode:o}: purged");
+    }
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}

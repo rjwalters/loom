@@ -206,6 +206,8 @@ pub enum HealPassOutcome {
     /// provisioned, a real provision when not — indistinguishable from here,
     /// by design: the underlying heal is idempotent either way).
     Healed,
+    /// The host opted out (#10179): nothing provisioned.
+    HostDisabled,
     /// The pass could not run to a successful completion (spawn error,
     /// non-zero exit, or timeout). Never fatal — logged and retried on the
     /// next tick.
@@ -222,7 +224,30 @@ pub fn run_pass(repo_root: &Path, timeout: Duration) -> HealPassOutcome {
     let Some(loom_dir) = crate::autonomy_marker::resolve_loom_dir() else {
         return HealPassOutcome::NoLoomDir;
     };
-    let marker_path = crate::autonomy_marker::resolve_marker_path(&loom_dir);
+    run_pass_with_marker(
+        repo_root,
+        timeout,
+        &crate::autonomy_marker::resolve_marker_path(&loom_dir),
+    )
+}
+
+/// [`run_pass`] against an explicit marker path (test seam; no env reads).
+#[must_use]
+pub fn run_pass_with_marker(
+    repo_root: &Path,
+    timeout: Duration,
+    marker_path: &Path,
+) -> HealPassOutcome {
+    let marker_path = marker_path.to_path_buf();
+    // #10179: never (re)provision the watchdog job on a disabled host.
+    if crate::host_optout::check_at(
+        &crate::host_optout::disabled_path(&marker_path),
+        "watchdog-provisioning",
+    )
+    .is_err()
+    {
+        return HealPassOutcome::HostDisabled;
+    }
     if !marker_path.exists() {
         return HealPassOutcome::MarkerAbsent;
     }
@@ -352,6 +377,9 @@ pub fn spawn_watchdog_provisioning_guard_task(
                 Ok(HealPassOutcome::ScriptMissing) => log::debug!(
                     "watchdog_provisioning_guard: marker present but loom-daemon-start.sh not \
                      found under this repo root — skipping this pass"
+                ),
+                Ok(HealPassOutcome::HostDisabled) => log::debug!(
+                    "watchdog_provisioning_guard: host disabled by operator (#10179) - skipping"
                 ),
                 Ok(HealPassOutcome::Healed) => log::debug!(
                     "watchdog_provisioning_guard: --heal-watchdog-only pass completed (#5405)"
@@ -738,5 +766,22 @@ mod tests {
 
         handle.abort();
         std::env::remove_var("LOOM_SOCKET_PATH");
+    }
+
+    #[test]
+    fn host_disabled_never_provisions_even_with_marker_and_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("autonomy-desired");
+        fs::write(&marker, "started_at=x\n").unwrap();
+        crate::host_optout::write_at(&crate::host_optout::disabled_path(&marker), "r", "w")
+            .unwrap();
+        let ran = tmp.path().join("ran");
+        write_executable_script(
+            &tmp.path().join(".loom/scripts/cli/loom-daemon-start.sh"),
+            &format!("#!/bin/sh\ntouch {}\n", ran.display()),
+        );
+        let out = run_pass_with_marker(tmp.path(), Duration::from_secs(5), &marker);
+        assert!(matches!(out, HealPassOutcome::HostDisabled));
+        assert!(!ran.exists());
     }
 }

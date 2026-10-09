@@ -278,6 +278,7 @@ fn rows(stage: FitStage, n: usize, exits: usize) -> Vec<TrainingRow> {
         .map(|i| TrainingRow {
             starred_any: None,
             star_source: None,
+            planner_version: None,
             stage,
             group: format!("g#{i}"),
             inputs: ModelInputs {

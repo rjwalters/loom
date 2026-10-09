@@ -130,6 +130,7 @@ fn restart_closes_only_provably_gone_processes_with_unknown_execution_result() {
             assert_eq!(s.context, span.record.context);
             assert_eq!(s.status, SpanStatus::Unset);
             assert_eq!(s.attributes["loom.result"], "process_lost");
+            assert_eq!(s.attributes["loom.failure_class"], "supervisor-lost");
             assert_eq!(s.attributes["loom.recovered"], "true");
             Ok(())
         })
@@ -417,6 +418,75 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
     assert!(attempt.ended_at - attempt.started_at >= chrono::Duration::seconds(1450));
 }
 
+/// #10637: a checkpoint observation names an issue; it must also name the
+/// repository and sweep, copied from its execution's root so they join that
+/// root exactly. Covers both synthetic sources (phase and attempt), the
+/// owned-start completion, and a root that lacks the keys (left absent).
+#[test]
+fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = attributes(&[
+        ("loom.repo", "TwoAM-Fixture/Loom-UI"),
+        ("loom.sweep_id", "sweep-issue-18-1790000000"),
+    ]);
+    let observed = |name: &str, root_attrs: TraceAttributes, owned: bool, source: &str| {
+        let journal = Journal::for_context(&dir.path().join(format!("{name}.json")));
+        let root = TraceContext::root(true);
+        journal
+            .start(root.clone(), None, SpanName::Sweep, Utc::now(), root_attrs)
+            .unwrap();
+        if owned {
+            let attrs = attributes(&[("loom.role", "builder")]);
+            let phase = journal
+                .start(root.child(), Some(&root), SpanName::Phase, Utc::now(), attrs.clone())
+                .unwrap();
+            journal
+                .start(
+                    phase.record.context.child(),
+                    Some(&phase.record.context),
+                    SpanName::RoleAttempt,
+                    Utc::now(),
+                    attrs,
+                )
+                .unwrap();
+        }
+        checkpoint_observation(&journal, &root, None, 18, "builder-done", None, None, None, source);
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(spans.len(), 2, "{name}: the phase and its attempt, root still open");
+        spans
+    };
+    let cases = [
+        ("write", SYNTHETIC_TIMING_SOURCES[0], false),
+        ("poll", SYNTHETIC_TIMING_SOURCES[1], false),
+        ("owned", "checkpoint_write_observed", true),
+    ];
+    for (name, source, owned) in cases {
+        for span in observed(name, scope.clone(), owned, source) {
+            assert!(matches!(span.name, SpanName::Phase | SpanName::RoleAttempt));
+            for (key, value) in &scope {
+                assert_eq!(
+                    span.attributes.get(key),
+                    Some(value),
+                    "{name}: {key} on {:?}",
+                    span.name
+                );
+            }
+            assert_eq!(span.attributes["loom.issue"], "18");
+        }
+    }
+    for span in observed("bare-root", TraceAttributes::new(), false, SYNTHETIC_TIMING_SOURCES[0]) {
+        for key in scope.keys() {
+            assert!(!span.attributes.contains_key(key), "{key} must stay absent, never guessed");
+        }
+    }
+}
+
 /// `finish_attempt` writes the flag onto both the attempt and its phase, and
 /// `None` leaves the key **absent** — the "unknown != zero" half of the
 /// contract. A caller that cannot tell must not publish a guess.
@@ -478,7 +548,12 @@ mod role_tick_spans {
     use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
 
     fn traced_root() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // Mixed case on purpose: with no origin and no `LOOM_REPO`, the
+        // basename is the tick root's repo name (#10637).
+        let dir = tempfile::Builder::new()
+            .prefix("Loom-UI-")
+            .tempdir()
+            .unwrap();
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),
@@ -592,6 +667,7 @@ mod role_tick_spans {
     #[test]
     #[serial_test::serial] // `loom.repo` resolution reads the process-global `LOOM_REPO`
     fn a_tick_that_launches_keeps_its_role_attempt_span() {
+        std::env::remove_var("LOOM_REPO");
         let cases = vec![
             (RoleTickOutcome::Success, "success", "success", SpanStatus::Ok),
             (
@@ -633,6 +709,16 @@ mod role_tick_spans {
             assert_eq!(root.attributes["loom.sweep_id"], trace.execution);
             assert_eq!(root.attributes["loom.timing_source"], "owned_boundary");
             assert_eq!(root.attributes[ATTEMPT_WORKED], "true");
+            // #10637: `loom.repo` keeps the repo's own spelling, and the trace
+            // ID still derives from its lowercase, so the span carries its
+            // own derivation input.
+            let repo = dir.path().file_name().unwrap().to_str().unwrap();
+            assert!(repo.starts_with("Loom-UI-"), "{repo}");
+            assert_eq!(root.attributes["loom.repo"], repo);
+            assert_eq!(
+                trace.context,
+                TraceContext::derived("execution", &[&repo.to_ascii_lowercase(), &trace.execution]),
+            );
             assert!(
                 !files_under(dir.path(), crate::observability::runtime_usage::join::JOIN_DIR)
                     .is_empty(),
@@ -640,4 +726,153 @@ mod role_tick_spans {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #9935: `sweep-checkpoint begin` gives a sweep phase an observed start
+// ---------------------------------------------------------------------------
+
+fn drained_spans(journal: &Journal) -> Vec<crate::telemetry::trace::SpanRecord> {
+    let mut spans = Vec::new();
+    journal
+        .drain(|s| {
+            spans.push(s);
+            Ok(())
+        })
+        .unwrap();
+    spans
+}
+
+/// Begin then done: one attempt, completed with a real duration and
+/// `worked=true`, carrying the execution scope and the begin's attributes.
+#[test]
+fn a_begun_phase_completes_with_its_real_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let scope = attributes(&[("loom.repo", "o/r"), ("loom.sweep_id", "sweep-1")]);
+    journal
+        .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
+        .unwrap();
+    for role in ["curator", "builder", "judge", "doctor"] {
+        let begun =
+            checkpoint_begin_observation(&journal, &root, None, 9935, role, Some(1), Some("opus"))
+                .unwrap();
+        assert_eq!(begun.record.attributes["loom.timing_source"], CHECKPOINT_BEGIN_SOURCE);
+        assert!(!begun.record.attributes.contains_key(ATTEMPT_WORKED));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let phase = if role == "judge" {
+            "judge-done".to_owned()
+        } else {
+            format!("{role}-done")
+        };
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            9935,
+            &phase,
+            Some(1),
+            None,
+            Some(7),
+            "checkpoint_write_observed",
+        );
+    }
+    let spans = drained_spans(&journal);
+    assert_eq!(spans.len(), 8, "one phase + one attempt per role, never a second");
+    for span in &spans {
+        assert_eq!(span.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+        assert_eq!(span.attributes[ATTEMPT_WORKED], "true");
+        assert!(span.ended_at - span.started_at >= chrono::Duration::milliseconds(5));
+        assert_eq!(span.attributes["loom.sweep_id"], "sweep-1");
+        assert_eq!(span.attributes["loom.configured_model"], "opus");
+        assert_eq!(span.attributes["loom.issue"], "9935");
+    }
+}
+
+/// Begin with no done: the attempt stays open (no fabricated close) until the
+/// execution ends, which closes it `exit_unobserved` with `worked` absent.
+#[cfg(feature = "otlp")]
+#[test]
+fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let span = begin(root_dir, "sweep-9935", SpanName::Sweep, TraceAttributes::new()).unwrap();
+    checkpoint_begin_observation(&span.journal, span.context(), None, 9935, "builder", None, None)
+        .unwrap();
+    assert_eq!(span.journal.active().unwrap().len(), 3, "root, phase, attempt all open");
+    finish_execution(root_dir, "sweep-9935", "failure", TraceAttributes::new()).unwrap();
+    let spans = drained_spans(&span.journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "exit_unobserved");
+    assert_eq!(attempt.attributes["loom.timing_source"], "terminal_observed");
+    assert!(!attempt.attributes.contains_key(ATTEMPT_WORKED));
+}
+
+/// Parallel builders share one orchestrator journal: each issue's checkpoint
+/// completes its own begun attempt. A re-dispatch supersedes the earlier begin
+/// with `worked` absent, and a done with no begin stays synthetic.
+#[test]
+fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let first_a =
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
+    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None).unwrap();
+    let second_a =
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None).unwrap();
+    for issue in [1, 2] {
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            issue,
+            "builder-done",
+            None,
+            None,
+            None,
+            "checkpoint_write_observed",
+        );
+    }
+    // No begin for issue 3: the synthetic zero-duration completion is unchanged.
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        3,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    let spans = drained_spans(&journal);
+    let attempt = |context: &TraceContext| spans.iter().find(|s| s.context == *context).unwrap();
+    let superseded = attempt(&first_a.record.context);
+    assert_eq!(superseded.attributes["loom.result"], "superseded");
+    assert!(!superseded.attributes.contains_key(ATTEMPT_WORKED));
+    for (owned, issue) in [(&second_a, "1"), (&b, "2")] {
+        let span = attempt(&owned.record.context);
+        assert_eq!(span.attributes["loom.issue"], issue);
+        assert_eq!(span.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+        assert_eq!(span.attributes[ATTEMPT_WORKED], "true");
+    }
+    let synthetic = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.issue"] == "3")
+        .unwrap();
+    assert_eq!(synthetic.started_at, synthetic.ended_at);
+    assert_eq!(synthetic.attributes["loom.timing_source"], "checkpoint_write_observed");
+    assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
+    assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
 }

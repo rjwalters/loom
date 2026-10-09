@@ -3,18 +3,18 @@
 //! rates counted per tracker pass, the per-day win rate, and the ledger
 //! defects that would have silently reset or biased all of it.
 
+use super::shadow::{BACKTEST_CASES, PASSING_PAIRS};
 use super::{as_of, history_a, input_at, provenance};
 use crate::eta::backtest::Comparison;
-use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2};
+use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2, LAND_V4};
 use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind};
 use crate::eta::shadow::{
     self, wilson, GateStatus, PromotionDecision, ShadowLedger, DECISION_SCHEMA, MIN_FOLDS,
-    MIN_LIVE_PAIRS,
 };
 use crate::eta::tracker::{
-    censor, EstimateContext, PassAnswers, ReadyPlan, ReadyRow, Resolved, Tracker, CENSOR_SOURCE,
-    PENDING_MAX_AGE_DAYS, SLOT_TURNOVER_REPO,
+    censor, EstimateContext, ItemKey, PassAnswers, PrState, PrView, ReadyPlan, ReadyRow, Resolved,
+    Tracker, CENSOR_SOURCE, PENDING_MAX_AGE_DAYS, SLOT_TURNOVER_REPO,
 };
 use crate::eta::{Heuristic, Kind, Registry, Stage};
 use crate::types::{DispatchPlanContext, PlanGate, PlanSlots, PlanState, RowPlan};
@@ -66,8 +66,8 @@ const fn side(loss: f64, covered: bool, late: bool) -> Side {
     }
 }
 
-/// Record a pair of `current` and `candidate` at `as_of() + offset`.
-fn record(ledger: &mut ShadowLedger, offset: i64, current: Side, candidate: Side) {
+/// Record a pair of `current` and `candidate` for `issue` at `as_of() + offset`.
+fn record(ledger: &mut ShadowLedger, issue: u32, offset: i64, current: Side, candidate: Side) {
     let at = as_of() + Duration::seconds(offset);
     let q = (0, 0, 0, Some(0));
     let mut group = vec![
@@ -79,6 +79,7 @@ fn record(ledger: &mut ShadowLedger, offset: i64, current: Side, candidate: Side
         r.score.pinball4_loss_sec = Some(s.loss);
         r.score.covered = Some(s.covered);
         r.score.above_p90 = Some(s.late);
+        r.estimate.issue = issue;
     }
     ledger.record(&current_land, &group);
 }
@@ -94,13 +95,13 @@ fn answers(passes: usize, current: bool, candidate: bool) -> Vec<PassAnswers> {
     vec![pass; passes]
 }
 
-/// `n` pairs over `days` UTC days; pair `i` is `f(i)`.
+/// `n` pairs over `days` UTC days, each its own item; pair `i` is `f(i)`.
 fn ledger(n: usize, days: i64, f: impl Fn(usize) -> (Side, Side)) -> ShadowLedger {
     let mut ledger = ShadowLedger::default();
     for i in 0..n {
         let offset = (i as i64 % days) * 86_400 + i as i64 * 10;
         let (current, candidate) = f(i);
-        record(&mut ledger, offset, current, candidate);
+        record(&mut ledger, 10_000 + i as u32, offset, current, candidate);
     }
     ledger.record_answers(&current_land, &answers(n, true, true));
     ledger
@@ -113,7 +114,7 @@ fn winning(i: usize) -> (Side, Side) {
 
 /// A backtest the candidate wins, on every walk-forward fold.
 fn won_backtest() -> Comparison {
-    super::shadow::comparison(1000.0, 800.0, 40)
+    super::shadow::comparison(1000.0, 800.0, BACKTEST_CASES)
 }
 
 fn decide(ledger: &ShadowLedger) -> PromotionDecision {
@@ -123,7 +124,7 @@ fn decide(ledger: &ShadowLedger) -> PromotionDecision {
 
 #[test]
 fn the_fixture_ledger_passes_on_its_own() {
-    let decision = decide(&ledger(MIN_LIVE_PAIRS, 10, winning));
+    let decision = decide(&ledger(PASSING_PAIRS, 10, winning));
     assert!(decision.promote, "{}", decision.reason);
     assert_eq!(decision.live.stats.day_wins.days, 10);
 }
@@ -187,7 +188,7 @@ fn an_unreadable_ledger_is_set_aside_loudly_never_silently_reset() {
 
 #[test]
 fn an_old_decision_record_still_parses_and_the_schema_tag_is_unchanged() {
-    let decision = decide(&ledger(MIN_LIVE_PAIRS, 10, winning));
+    let decision = decide(&ledger(PASSING_PAIRS, 10, winning));
     assert_eq!(decision.schema, DECISION_SCHEMA);
     assert_eq!(DECISION_SCHEMA, "eta-promotion-decision/v1", "additive, so still v1");
     assert_eq!(decision.live.min_folds, MIN_FOLDS);
@@ -223,7 +224,7 @@ fn an_old_decision_record_still_parses_and_the_schema_tag_is_unchanged() {
 fn a_candidate_that_wins_on_pinball_but_is_late_22_percent_of_the_time_is_refused() {
     // current is late 10% of the time, the candidate 22% — while beating it
     // on loss every single day.
-    let late = ledger(MIN_LIVE_PAIRS, 10, |i| {
+    let late = ledger(PASSING_PAIRS, 10, |i| {
         let (mut current, mut candidate) = winning(i);
         current.late = i.is_multiple_of(10);
         candidate.late = i % 50 < 11;
@@ -256,11 +257,11 @@ fn a_candidate_that_wins_on_pinball_but_is_late_22_percent_of_the_time_is_refuse
 
 #[test]
 fn an_answer_rate_regression_is_refused() {
-    let mut ledger = ledger(MIN_LIVE_PAIRS, 10, winning);
-    // Ten more passes where only `current` answered: 50/60 vs 60/60.
-    ledger.record_answers(&current_land, &answers(10, true, false));
+    let mut ledger = ledger(PASSING_PAIRS, 10, winning);
+    // Twenty more passes where only `current` answered: 100/120 vs 120/120.
+    ledger.record_answers(&current_land, &answers(20, true, false));
     let stats = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
-    assert_eq!(stats.answer_pairs, 60);
+    assert_eq!(stats.answer_pairs, 120);
     assert_eq!(stats.current_answer_rate, Some(1.0));
     let decision = decide(&ledger);
     assert!(!decision.promote);
@@ -272,7 +273,7 @@ fn refusing_the_hard_cases_buys_the_candidate_nothing() {
     // The candidate refuses every case current found hard. On the
     // common decidable subset those cases leave BOTH sides' loss sums, so
     // the refusal is no loss advantage...
-    let mut ledger = ledger(MIN_LIVE_PAIRS, 10, winning);
+    let mut ledger = ledger(PASSING_PAIRS, 10, winning);
     let before = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
     for i in 0..20 {
         let offset = 20 * 86_400 + i * 10;
@@ -307,7 +308,7 @@ fn one_lucky_day_does_not_carry_the_per_day_win_rate() {
     // Day 0: the candidate is flawless and current terrible. Days 1-9: the
     // candidate is slightly worse. The pooled mean favours the candidate —
     // 54s vs 145s — but it won one day of ten.
-    let ledger = ledger(MIN_LIVE_PAIRS, 10, |i| {
+    let ledger = ledger(PASSING_PAIRS, 10, |i| {
         if i.is_multiple_of(10) {
             (side(1000.0, true, false), side(0.0, i.is_multiple_of(2), false))
         } else {
@@ -329,7 +330,7 @@ fn one_lucky_day_does_not_carry_the_per_day_win_rate() {
 
 #[test]
 fn fewer_than_min_folds_decided_days_is_not_enough() {
-    let short = ledger(MIN_LIVE_PAIRS, MIN_FOLDS as i64 - 1, winning);
+    let short = ledger(PASSING_PAIRS, MIN_FOLDS as i64 - 1, winning);
     let decision = decide(&short);
     assert!(!decision.promote);
     assert!(
@@ -340,7 +341,7 @@ fn fewer_than_min_folds_decided_days_is_not_enough() {
         "{}",
         decision.live.detail
     );
-    assert!(decide(&ledger(MIN_LIVE_PAIRS, MIN_FOLDS as i64, winning)).promote);
+    assert!(decide(&ledger(PASSING_PAIRS, MIN_FOLDS as i64, winning)).promote);
 }
 
 #[test]
@@ -356,6 +357,39 @@ fn the_wilson_interval_is_deterministic_and_correct() {
 }
 
 #[test]
+fn refreshing_the_same_items_manufactures_no_live_evidence() {
+    // 600 winning pairs over 10 days, but only 30 items refreshed 20 times
+    // each: plenty of pairs, nowhere near enough independent items.
+    let mut refreshed = ShadowLedger::default();
+    for i in 0..600_usize {
+        let offset = (i as i64 % 10) * 86_400 + i as i64 * 10;
+        let (current, candidate) = winning(i);
+        record(&mut refreshed, 10_000 + (i % 30) as u32, offset, current, candidate);
+    }
+    refreshed.record_answers(&current_land, &answers(600, true, true));
+    let stats = refreshed.stats(Kind::Land, LAND_V1, LAND_V2);
+    assert_eq!(stats.loss4_pairs, 600);
+    let item = stats.item_test.as_ref().unwrap();
+    assert_eq!((item.distinct_items, item.observations), (30, 600));
+    let decision = decide(&refreshed);
+    assert!(!decision.promote);
+    assert!(decision.live.detail.contains("30 distinct item(s)"), "{}", decision.live.detail);
+}
+
+#[test]
+fn the_per_item_sums_are_bounded_and_evict_the_least_recently_seen() {
+    let mut ledger = ShadowLedger::default();
+    let n = shadow::MAX_ITEMS + 5;
+    for i in 0..n {
+        let offset = i as i64 * 600;
+        record(&mut ledger, i as u32, offset, side(100.0, true, false), side(60.0, true, false));
+    }
+    let items = ledger.items.values().next().unwrap();
+    assert_eq!(items.len(), shadow::MAX_ITEMS);
+    assert!(!items.keys().any(|k| k.ends_with("#0")), "the oldest item went first");
+}
+
+#[test]
 fn the_per_day_folds_are_bounded() {
     let ledger = ledger(400, 200, winning);
     assert_eq!(ledger.days.values().next().unwrap().len(), shadow::MAX_DAYS);
@@ -367,14 +401,17 @@ fn the_per_day_folds_are_bounded() {
 fn an_expiring_estimate_past_its_p90_is_scored_as_a_late_surprise_first() {
     let mut tracker = Tracker::new(provenance());
     let hour = 3600;
-    tracker.restore_pending(vec![
-        // p90 one hour: decided late long before it expires.
-        summary(LAND_V1, 0, (600, 1200, 1800, Some(hour))),
-        // p90 of 40 days: not yet behind it at expiry — undecided.
-        summary(LAND_V2, 0, (600, 1200, 1800, Some(40 * 24 * hour))),
-        // No p90 recorded: undecided.
-        summary("land-v3", 0, (600, 1200, 1800, None)),
-    ]);
+    tracker.restore_pending(
+        vec![
+            // p90 one hour: decided late long before it expires.
+            summary(LAND_V1, 0, (600, 1200, 1800, Some(hour))),
+            // p90 of 40 days: not yet behind it at expiry — undecided.
+            summary(LAND_V2, 0, (600, 1200, 1800, Some(40 * 24 * hour))),
+            // No p90 recorded: undecided.
+            summary(LAND_V4, 0, (600, 1200, 1800, None)),
+        ],
+        &Registry::builtin(),
+    );
     let early = tracker.expire(as_of() + Duration::days(1));
     assert_eq!((early.dropped, early.censored.len()), (0, 0), "nothing expires early");
 
@@ -440,6 +477,8 @@ fn ready_row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
         },
         disposition: crate::types::QueueDisposition::DeferredCapacity,
         facts: crate::eta::tracker::IssueRow::default(),
+        rank: issue as usize,
+        detail: None,
     }
 }
 
@@ -534,4 +573,132 @@ fn answer_rates_are_counted_once_per_pass_not_once_per_emitted_row() {
     let stats = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
     assert_eq!(stats.answer_pairs, 6);
     assert_eq!(stats.current_answer_rate, Some(0.5));
+}
+
+// ------------------------------------- retired heuristics (#10484)
+
+/// `land-v3` and `land-2026-10-04-amber-heron` left the registry on
+/// 2026-10-06. A ledger and a pending set persisted before that still name
+/// them: both must load, the live pairs must be untouched, the restored
+/// pending entries for them are dropped before a landing or a censoring can
+/// score them (no `eta.outcome`, no new ledger pair), and a promotion
+/// evaluation naming a retired candidate never promotes.
+#[test]
+fn legacy_entries_for_retired_heuristics_load_cleanly_and_are_ignored() {
+    let retired = ["land-v3", "land-2026-10-04-amber-heron"];
+    let registry = Registry::builtin();
+    for id in retired {
+        assert!(registry.get(id).is_none(), "{id} is retired");
+    }
+
+    let at = as_of() + Duration::seconds(500);
+    let current_land = |_: Kind| LAND_V1.to_string();
+    let q = (600, 1200, 1800, Some(3600));
+    let mut ledger = ShadowLedger::default();
+    for id in retired {
+        ledger.record(
+            &current_land,
+            &[
+                resolved(summary(LAND_V1, 0, q), OutcomeKind::Landed, at),
+                resolved(summary(id, 0, q), OutcomeKind::Landed, at),
+            ],
+        );
+    }
+    ledger.record(
+        &current_land,
+        &[
+            resolved(summary(LAND_V1, 1, q), OutcomeKind::Landed, at),
+            resolved(summary(LAND_V2, 1, q), OutcomeKind::Landed, at),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = shadow::ledger_path(dir.path());
+    shadow::write_ledger(&path, &ledger).unwrap();
+    let (loaded, note) = shadow::load_ledger(&path, as_of());
+    assert_eq!(note, None, "a legacy ledger is not an unreadable one");
+    assert_eq!(loaded, ledger);
+    assert_eq!(loaded.stats(Kind::Land, LAND_V1, LAND_V2).pairs, 1, "live pairs intact");
+
+    // Pending estimates naming retired ids, persisted with a decided p90 so
+    // both scoring paths would take them, are dropped at restore: the item
+    // that lands and the item that is censored at expiry score only the
+    // registered heuristics, so no `eta.outcome` and no ledger pair names a
+    // retired id.
+    let landed_issue = 9289;
+    let censored_issue = 9290;
+    let for_issue = |id: &str, issue: u32| {
+        let mut s = summary(id, 0, (600, 1200, 1800, Some(3600)));
+        s.issue = issue;
+        s
+    };
+    let mut persisted = Vec::new();
+    for issue in [landed_issue, censored_issue] {
+        for id in [LAND_V1, LAND_V2].into_iter().chain(retired) {
+            persisted.push(for_issue(id, issue));
+        }
+    }
+    let mut tracker = Tracker::new(provenance());
+    let dropped = tracker.restore_pending(persisted, &registry);
+    assert_eq!(dropped, 4, "both retired ids, on both items");
+    assert_eq!(tracker.pending().len(), 4);
+    assert!(tracker
+        .pending()
+        .iter()
+        .all(|p| !retired.contains(&p.heuristic.as_str())));
+
+    let repo = "rjwalters/loom";
+    let listed = PrView {
+        number: 9301,
+        issue: landed_issue,
+        labels: vec!["loom:pr".to_string()],
+        created_at: Some(as_of()),
+        updated_at: Some(as_of()),
+    };
+    tracker.on_listing(repo, &[listed], at, 300);
+    let merged = tracker.on_pr_resolved(
+        &ItemKey::new(repo, landed_issue),
+        PrState::Merged(at),
+        at + Duration::seconds(60),
+    );
+    let landed: Vec<&str> = merged
+        .outcomes
+        .iter()
+        .map(|r| r.estimate.heuristic.as_str())
+        .collect();
+    assert_eq!(landed, [LAND_V1, LAND_V2], "the landing scores only registered ids");
+
+    let expired = tracker.expire(as_of() + Duration::days(PENDING_MAX_AGE_DAYS + 1));
+    assert_eq!(expired.dropped, 2);
+    let censored: Vec<&str> = expired
+        .censored
+        .iter()
+        .map(|r| r.estimate.heuristic.as_str())
+        .collect();
+    assert_eq!(censored, [LAND_V1, LAND_V2], "censoring scores only registered ids");
+    assert!(tracker.pending().is_empty());
+
+    // What the daemon folds into the shadow ledger (`note_outcomes`) and
+    // emits as `eta.outcome` (`deliver`) is exactly these outcomes.
+    let mut live = ShadowLedger::default();
+    live.record(&current_land, &merged.outcomes);
+    live.record(&current_land, &expired.censored);
+    for id in retired {
+        let stats = live.stats(Kind::Land, LAND_V1, id);
+        assert_eq!((stats.pairs, stats.late_pairs), (0, 0), "no ledger pair for retired {id}");
+    }
+    let keys: Vec<(String, String)> = live
+        .all()
+        .into_iter()
+        .map(|st| (st.key.current, st.key.candidate))
+        .collect();
+    assert_eq!(keys, [(LAND_V1.to_string(), LAND_V2.to_string())], "only the live pair");
+    let stats = live.stats(Kind::Land, LAND_V1, LAND_V2);
+    assert_eq!((stats.pairs, stats.late_pairs), (1, 2), "landed pair + censored late pair");
+
+    // A promotion evaluation for a retired candidate never promotes.
+    for id in retired {
+        let stats = loaded.stats(Kind::Land, LAND_V1, id);
+        let decision = shadow::evaluate(Kind::Land, LAND_V1, id, None, &stats, as_of());
+        assert!(!decision.promote, "a retired candidate is never promoted");
+    }
 }

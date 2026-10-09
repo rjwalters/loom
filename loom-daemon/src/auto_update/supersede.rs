@@ -1,32 +1,28 @@
-//! Supersede-not-stack for an already-armed drain-and-restart roll (#8514).
+//! Supersede-not-stack for an already-armed roll (#8514).
 //!
-//! Before this module, [`super::run_tick`] short-circuited on
-//! [`DrainTrigger::roll_in_progress`](super::DrainTrigger::roll_in_progress)
-//! whenever *any* roll was armed. A newer release published while a roll was
-//! sitting pending — dispatch paused, waiting for in-flight sweeps to reach
-//! zero — was therefore ignored until that roll completed or spent its whole
-//! paused-dispatch budget. The host spent up to two hours paused converging on
-//! a binary that had already been superseded.
+//! [`super::run_tick`] short-circuits on
+//! [`RollTrigger::roll_in_progress`](super::RollTrigger::roll_in_progress)
+//! whenever a roll or drain is armed. A newer release published while a roll
+//! is armed should not be ignored in favour of a binary that is already stale.
 //!
-//! The decision is pure and lives here (rather than in `auto_update.rs`, which
-//! is over `.loom/docs/file-size-policy.md`'s threshold and frozen) so every
-//! branch is a unit-test assertion rather than something only reachable by
-//! driving a real daemon to a real deadline.
+//! The decision is pure and lives here so every branch is a unit-test
+//! assertion.
 //!
-//! **Conservative by construction.** The pause this replaces exists to protect
-//! a #6007 fail-safe whose earlier, simpler form deadlocked the work finder, so
-//! a supersede only happens when *all* of these hold:
+//! Since #10831 an armed roll is a pause roll, which lasts seconds to a couple
+//! of minutes (its pause budget) rather than the hours a wait-for-zero drain
+//! could sit pending, so a supersede is rare. The rule (design
+//! `docs/design/daemon-roll-pause-resume.md` §10): **a newer target replaces
+//! the old one until H4 has started stopping agents; after that it is too
+//! late.** A supersede only happens when *all* of these hold:
 //!
-//! - the armed roll is **pending** (it has already survived a deadline refusal)
-//!   — a first-attempt drain is still inside the deadline it was given and is
-//!   left completely alone;
+//! - the armed roll has **not committed** (it has stopped no agent yet);
 //! - it is a **relaunch** roll, never a `fleet drain` teardown (`then_exit`);
 //! - it carries a **known target** — a roll this daemon's auto-updater armed
 //!   and labelled, never an operator's `restart --drain`;
 //! - a release artifact **resolves, is actionable, and has a different
 //!   identity** than that target.
 //!
-//! Anything else keeps pre-#8514 behaviour exactly: skip the tick.
+//! Anything else skips the tick.
 
 use super::{ArtifactInfo, ArtifactResolution};
 
@@ -38,18 +34,12 @@ pub struct ArmedRoll {
     /// ([`artifact_roll_target`]), or `None` for a drain the auto-updater did
     /// not arm (an operator `restart --drain`, a source-path roll).
     pub target: Option<String>,
-    /// `true` once the roll has survived at least one deadline refusal and is
-    /// being retained with dispatch paused.
-    pub pending: bool,
+    /// `true` once the roll can no longer be superseded: its H4 pause has
+    /// stopped an agent, or it is not a pause roll at all (an operator drain).
+    pub committed: bool,
     /// `true` when the armed drain's terminal action is "stop and stay down"
     /// (a `fleet drain` teardown), which is never superseded.
     pub then_exit: bool,
-    /// How many drain deadlines this roll has already refused
-    /// ([`crate::ipc::DrainDescriptor::refusals`]). Read by #8998's
-    /// unsatisfiability tracker, which sums it *across* roll lifetimes — the
-    /// field restarts at `0` on every fresh drain, which is exactly why
-    /// counting only the live roll's refusals could never conclude anything.
-    pub refusals: u32,
 }
 
 /// What a tick should do about a roll that is already armed (#8514).
@@ -96,8 +86,8 @@ pub fn decide_armed_roll(
     armed: Option<&ArmedRoll>,
     artifact: &ArtifactResolution,
 ) -> ArmedRollAction {
-    const ARMED: &str = "a drain-and-restart roll is already armed (dispatch paused, waiting for \
-                         in-flight sweeps to reach zero) — skipping this tick";
+    const ARMED: &str = "a roll or drain is already armed (dispatch paused, restart coming) — \
+                         skipping this tick";
 
     let Some(armed) = armed else {
         return ArmedRollAction::Skip(ARMED.to_string());
@@ -108,9 +98,10 @@ pub fn decide_armed_roll(
              release]"
         ));
     }
-    if !armed.pending {
+    if armed.committed {
         return ArmedRollAction::Skip(format!(
-            "{ARMED} [first attempt, still inside its own deadline]"
+            "{ARMED} [it has already stopped agents, or is an operator drain: too late to \
+             supersede]"
         ));
     }
     let Some(target) = armed.target.as_deref() else {
@@ -144,14 +135,14 @@ pub fn decide_armed_roll(
     }
 }
 
-/// The note published when a pending roll is superseded (#8514), so `status`
+/// The note published when an armed roll is superseded (#8514), so `status`
 /// and the daemon log both explain why the pause ended early.
 #[must_use]
 pub fn supersede_note(from: &str, to: &str) -> String {
     format!(
         "a newer release artifact ({to}) was published while the roll to {from} was still pending \
-         — superseding it: dispatch resumes, and the roll re-arms for {to} rather than waiting \
-         out the paused-dispatch budget for a binary that is already stale"
+         (no agent stopped yet) — superseding it: its pause requests are withdrawn, and the roll \
+         re-arms for {to} rather than restarting onto a binary that is already stale"
     )
 }
 
@@ -170,6 +161,7 @@ mod tests {
             target: None,
             installed_version: Some(installed.to_string()),
             installed_sha256: Some("aaaa".to_string()),
+            on_disk_version: None,
         }
     }
 
@@ -180,9 +172,8 @@ mod tests {
     fn pending(target: &str) -> ArmedRoll {
         ArmedRoll {
             target: Some(target.to_string()),
-            pending: true,
+            committed: false,
             then_exit: false,
-            refusals: 1,
         }
     }
 
@@ -205,16 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn a_first_attempt_roll_is_left_inside_its_own_deadline() {
+    fn a_committed_roll_is_too_late_to_supersede() {
         let armed = ArmedRoll {
             target: Some("v0.19.24@aaaa".to_string()),
-            pending: false,
+            committed: true,
             then_exit: false,
-            refusals: 0,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(
-            matches!(&action, ArmedRollAction::Skip(r) if r.contains("first attempt")),
+            matches!(&action, ArmedRollAction::Skip(r) if r.contains("too late")),
             "{action:?}"
         );
     }
@@ -223,9 +213,8 @@ mod tests {
     fn a_teardown_drain_is_never_superseded() {
         let armed = ArmedRoll {
             target: Some("v0.19.24@aaaa".to_string()),
-            pending: true,
+            committed: false,
             then_exit: true,
-            refusals: 1,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(
@@ -238,9 +227,8 @@ mod tests {
     fn an_untargeted_roll_is_never_superseded() {
         let armed = ArmedRoll {
             target: None,
-            pending: true,
+            committed: false,
             then_exit: false,
-            refusals: 1,
         };
         let action = decide_armed_roll(Some(&armed), &newer());
         assert!(

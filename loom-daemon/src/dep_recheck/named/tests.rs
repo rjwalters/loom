@@ -439,3 +439,31 @@ fn an_unchecked_entry_with_no_state_renders_null_and_does_not_block() {
     assert_eq!(compute(&i.deps).deps, "3:null");
     assert_eq!(verdict(&i.deps), "clear");
 }
+
+/// #9274: the stale-blocked prose read must not see a checklist line twice.
+#[test]
+fn mask_checklist_lines_blanks_only_lines_the_checklist_accounts_for() {
+    let body = "Blocked by #7 outside the section.\n\
+                ## Dependencies\n\
+                - [ ] Blocked by #187: ratification pending\n\
+                - [ ] vendor sign-off. Requires #188 first\n\
+                - [x] #189: parsed and ticked\n\
+                - [x] done once Requires #190 lands\n\
+                Requires #191 in plain section prose.\n\
+                ## Notes\n\
+                - [ ] Blocked by #192 in another section\n";
+    let masked = mask_checklist_lines(body);
+    for kept in ["#7", "#190", "#191", "#192", "## Dependencies", "## Notes"] {
+        assert!(masked.contains(kept), "{kept} must survive:\n{masked}");
+    }
+    for gone in ["#187", "#188", "#189"] {
+        assert!(!masked.contains(gone), "{gone} must be masked:\n{masked}");
+    }
+    assert_eq!(masked.lines().count(), body.lines().count());
+}
+
+#[test]
+fn mask_checklist_lines_without_a_section_is_identity() {
+    let body = "Blocked by #7.\n- [ ] Blocked by #8\n";
+    assert_eq!(mask_checklist_lines(body), body.trim_end_matches('\n'));
+}

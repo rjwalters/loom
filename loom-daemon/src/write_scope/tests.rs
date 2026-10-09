@@ -76,13 +76,13 @@ fn remotes_on_another_host_are_not_candidates() {
 
 // ---- the decision ----------------------------------------------------------
 
-struct FakeProbe {
+pub(super) struct FakeProbe {
     answer: Permission,
-    calls: Cell<u32>,
+    pub(super) calls: Cell<u32>,
 }
 
 impl FakeProbe {
-    fn new(answer: Permission) -> Self {
+    pub(super) fn new(answer: Permission) -> Self {
         Self {
             answer,
             calls: Cell::new(0),
@@ -291,12 +291,12 @@ fn a_registered_fixture_is_admitted_only_with_write() {
 /// Write a disk-cache entry as if the probe had recorded it `age` ago. It is
 /// the on-disk format `probe::Cached` reads; the probe itself has no seeding
 /// hook.
-fn seed_disk(key_dir: Option<&Path>, repo: &str, write: bool, age: std::time::Duration) {
+pub(super) fn seed_disk(key_dir: Option<&Path>, repo: &str, write: bool, age: std::time::Duration) {
     seed_disk_for(key_dir, &probe::CacheScope::GitHub, repo, write, age);
 }
 
 /// [`seed_disk`] under an explicit cache scope.
-fn seed_disk_for(
+pub(super) fn seed_disk_for(
     key_dir: Option<&Path>,
     scope: &probe::CacheScope,
     repo: &str,
@@ -347,379 +347,6 @@ fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
-// ---- Gitea (#9699) ---------------------------------------------------------
-
-#[test]
-fn gitea_permissions_classify() {
-    use probe::classify_gitea_permissions as classify;
-    assert_eq!(
-        classify(r#"{"permissions":{"admin":false,"push":true,"pull":true}}"#),
-        Some(Permission::Write)
-    );
-    assert_eq!(
-        classify(r#"{"permissions":{"admin":true,"push":false,"pull":true}}"#),
-        Some(Permission::Write)
-    );
-    assert_eq!(
-        classify(r#"{"permissions":{"admin":false,"push":false,"pull":true}}"#),
-        Some(Permission::Insufficient("repository role `pull`".into()))
-    );
-    assert_eq!(
-        classify(r#"{"permissions":{"admin":false,"push":false,"pull":false}}"#),
-        Some(Permission::Insufficient("repository role `none`".into()))
-    );
-    // Not a repo object with permissions: the caller answers Unknown.
-    assert_eq!(classify(r#"{"message":"Not Found"}"#), None);
-    assert_eq!(classify(r#"{"permissions":null}"#), None);
-    assert_eq!(classify("not json"), None);
-}
-
-/// One-request loopback Gitea stub: answers the first connection with
-/// `status` + `body` and hands back the raw request bytes, so a test can
-/// assert the `Authorization` header arrived (written to curl's stdin by the
-/// probe, never its argv).
-fn gitea_stub(
-    status: &'static str,
-    body: &'static str,
-) -> (String, std::thread::JoinHandle<String>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
-        request
-    });
-    (format!("http://{addr}"), handle)
-}
-
-/// Isolate config resolution from the machine and clear the Gitea env, the
-/// way `forge_cmd`'s own env tests do. Callers must hold the
-/// `loom_config_env` serial group.
-fn isolate_gitea_env() {
-    std::env::set_var("LOOM_CONFIG_DEFAULTS_FILE", "");
-    for k in ["GITEA_TOKEN", "FORGE_TOKEN", "GITEA_URL", "GITEA_USERNAME"] {
-        std::env::remove_var(k);
-    }
-}
-
-fn clear_gitea_env() {
-    for k in ["GITEA_TOKEN", "FORGE_TOKEN", "GITEA_URL", "GITEA_USERNAME"] {
-        std::env::remove_var(k);
-    }
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn a_gitea_push_credential_is_write_through_a_stub_api() {
-    isolate_gitea_env();
-    let (base, request) = gitea_stub(
-        "200 OK",
-        r#"{"full_name":"acme/w","permissions":{"admin":false,"push":true,"pull":true}}"#,
-    );
-    std::env::set_var("GITEA_URL", &base);
-    std::env::set_var("GITEA_TOKEN", "stub-token");
-    let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    assert_eq!(probe.permission("acme/w"), Permission::Write);
-    let request = request.join().unwrap();
-    assert!(
-        request.contains("Authorization: token stub-token"),
-        "the credential must ride the request: {request}"
-    );
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn a_gitea_pull_only_credential_is_insufficient() {
-    isolate_gitea_env();
-    let (base, request) =
-        gitea_stub("200 OK", r#"{"permissions":{"admin":false,"push":false,"pull":true}}"#);
-    std::env::set_var("GITEA_URL", &base);
-    std::env::set_var("GITEA_TOKEN", "stub-token");
-    let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    assert_eq!(
-        probe.permission("acme/w"),
-        Permission::Insufficient("repository role `pull`".into())
-    );
-    request.join().unwrap();
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn a_gitea_api_that_refuses_fails_closed() {
-    isolate_gitea_env();
-    let (base, request) = gitea_stub("404 Not Found", r#"{"message":"Not Found"}"#);
-    std::env::set_var("GITEA_URL", &base);
-    std::env::set_var("GITEA_TOKEN", "stub-token");
-    let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    let p = probe.permission("acme/w");
-    assert!(
-        matches!(p, Permission::Unknown(ref why) if why.contains("404")),
-        "a non-200 must be Unknown naming the status, got {p:?}"
-    );
-    request.join().unwrap();
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn gitea_falls_back_to_forge_token_and_to_unknown_without_any() {
-    isolate_gitea_env();
-    let (base, request) =
-        gitea_stub("200 OK", r#"{"permissions":{"admin":false,"push":true,"pull":true}}"#);
-    std::env::set_var("GITEA_URL", &base);
-    std::env::set_var("FORGE_TOKEN", "generic-token");
-    let dir = tempfile::tempdir().unwrap();
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    assert_eq!(probe.permission("acme/w"), Permission::Write);
-    assert!(
-        request
-            .join()
-            .unwrap()
-            .contains("Authorization: token generic-token"),
-        "FORGE_TOKEN is the generic fallback credential"
-    );
-    // With neither token configured the probe cannot answer — before any
-    // network call — and the caller fails closed.
-    clear_gitea_env();
-    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    let p = probe.permission("acme/w");
-    assert!(
-        matches!(p, Permission::Unknown(ref why) if why.contains("token is required")),
-        "no credential at all must be Unknown naming why, got {p:?}"
-    );
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn gitea_env_overrides_beat_the_config_file() {
-    isolate_gitea_env();
-    let (base, request) =
-        gitea_stub("200 OK", r#"{"permissions":{"admin":false,"push":true,"pull":true}}"#);
-    let dir = tempfile::tempdir().unwrap();
-    let loom = dir.path().join(".loom");
-    std::fs::create_dir_all(&loom).unwrap();
-    // A config that would answer from a dead port if it won.
-    std::fs::write(
-        loom.join("config.json"),
-        r#"{"forge":{"gitea":{"url":"http://127.0.0.1:9","token":"config-token"}}}"#,
-    )
-    .unwrap();
-    std::env::set_var("GITEA_URL", &base);
-    std::env::set_var("GITEA_TOKEN", "env-token");
-    let probe = probe::GiteaProbe::for_root(dir.path());
-    assert_eq!(probe.permission("acme/w"), Permission::Write);
-    assert!(
-        request
-            .join()
-            .unwrap()
-            .contains("Authorization: token env-token"),
-        "env beats config for both url and token"
-    );
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn gitea_cache_ids_differ_by_connection() {
-    isolate_gitea_env();
-    let mk = |url: &str, token: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        let loom = dir.path().join(".loom");
-        std::fs::create_dir_all(&loom).unwrap();
-        std::fs::write(
-            loom.join("config.json"),
-            format!(r#"{{"forge":{{"gitea":{{"url":"{url}","token":"{token}"}}}}}}"#),
-        )
-        .unwrap();
-        dir
-    };
-    let a = mk("https://gitea.one.example.com", "tok-a");
-    let b = mk("https://gitea.two.example.com", "tok-b");
-    let pa = probe::GiteaProbe::for_root(a.path());
-    let pa2 = probe::GiteaProbe::for_root(a.path());
-    let pb = probe::GiteaProbe::for_root(b.path());
-    assert_eq!(pa.cache_id(), pa2.cache_id(), "same connection, same key");
-    assert_ne!(pa.cache_id(), pb.cache_id(), "two Gitea workspaces never share a cache entry");
-    // An unresolvable connection has no id: it never shares a cache entry.
-    let empty = tempfile::tempdir().unwrap();
-    assert_eq!(probe::GiteaProbe::for_root(empty.path()).cache_id(), "");
-    clear_gitea_env();
-}
-
-#[test]
-#[serial_test::serial(loom_config_env, write_scope_cache)]
-fn a_seeded_gitea_cache_entry_answers_through_the_same_connection_id() {
-    isolate_gitea_env();
-    let dir = tempfile::tempdir().unwrap();
-    let loom = dir.path().join(".loom");
-    std::fs::create_dir_all(&loom).unwrap();
-    // The config URL is a dead port: a cache miss would probe and answer
-    // Unknown, so a Write here can only come from the cache.
-    std::fs::write(
-        loom.join("config.json"),
-        r#"{"forge":{"gitea":{"url":"http://127.0.0.1:9","token":"config-token"}}}"#,
-    )
-    .unwrap();
-    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
-    probe::clear_memory();
-    let scope = probe::GiteaProbe::for_root(dir.path()).cache_scope();
-    assert!(matches!(scope, probe::CacheScope::Gitea { .. }), "{scope:?}");
-    seed_disk_for(None, &scope, "acme/g", true, std::time::Duration::from_secs(60));
-    let cached = probe::Cached {
-        inner: probe::GiteaProbe::for_root(dir.path()),
-        key_dir: None,
-    };
-    assert_eq!(cached.permission("acme/g"), Permission::Write);
-    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
-    clear_gitea_env();
-}
-
-/// The Judge's repro on #9817: a GitHub WRITE for the same `owner/repo`
-/// slug, under the same credential dir, must never answer a Gitea probe —
-/// neither inside the TTL (a direct cache hit) nor inside the 24 h grace (an
-/// `Unknown` upgraded to WRITE).
-#[test]
-#[serial_test::serial(loom_config_env, write_scope_cache)]
-fn a_github_write_never_answers_an_unresolved_gitea_probe() {
-    isolate_gitea_env();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
-    let cred = dir.path().join("cred");
-    let unresolved = || probe::Cached {
-        // No URL, no token: the connection cannot resolve.
-        inner: probe::GiteaProbe::for_root(dir.path()),
-        key_dir: Some(cred.clone()),
-    };
-    assert_eq!(unresolved().cache_scope(), probe::CacheScope::Unresolved);
-    for (what, age) in [("inside the TTL", 60), ("inside the grace", 2 * 3600)] {
-        probe::clear_memory();
-        seed_disk(Some(&cred), "acme/w", true, std::time::Duration::from_secs(age));
-        // Warm the memory side too, as a GitHub probe in this process would.
-        let github = probe::Cached {
-            inner: FakeProbe::new(Permission::Write),
-            key_dir: Some(cred.clone()),
-        };
-        assert_eq!(github.permission("acme/w"), Permission::Write);
-        let p = unresolved().permission("acme/w");
-        assert!(
-            matches!(p, Permission::Unknown(_)),
-            "{what}: an unresolved Gitea connection must refuse, got {p:?}"
-        );
-    }
-    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
-    clear_gitea_env();
-}
-
-/// A resolved Gitea connection is keyed apart from GitHub as well: a GitHub
-/// WRITE for the same slug and credential dir does not satisfy it, inside the
-/// TTL or the grace (its own probe, a dead port, cannot answer).
-#[test]
-#[serial_test::serial(loom_config_env, write_scope_cache)]
-fn a_github_write_never_answers_a_resolved_gitea_probe() {
-    isolate_gitea_env();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
-    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
-    std::env::set_var("GITEA_TOKEN", "gitea-token");
-    let cred = dir.path().join("cred");
-    for age in [60, 2 * 3600] {
-        probe::clear_memory();
-        seed_disk(Some(&cred), "acme/w", true, std::time::Duration::from_secs(age));
-        let gitea = probe::Cached {
-            inner: probe::GiteaProbe::for_root(dir.path()),
-            key_dir: Some(cred.clone()),
-        };
-        assert!(matches!(gitea.cache_scope(), probe::CacheScope::Gitea { .. }));
-        let p = gitea.permission("acme/w");
-        assert!(
-            matches!(p, Permission::Unknown(_)),
-            "a GitHub entry {age}s old must not answer Gitea, got {p:?}"
-        );
-    }
-    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
-    clear_gitea_env();
-}
-
-/// The reverse: a cached Gitea WRITE never satisfies the GitHub probe for the
-/// same slug and credential dir.
-#[test]
-#[serial_test::serial(loom_config_env, write_scope_cache)]
-fn a_gitea_write_never_answers_the_github_probe() {
-    isolate_gitea_env();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
-    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
-    std::env::set_var("GITEA_TOKEN", "gitea-token");
-    probe::clear_memory();
-    let cred = dir.path().join("cred");
-    let scope = probe::GiteaProbe::for_root(dir.path()).cache_scope();
-    seed_disk_for(Some(&cred), &scope, "acme/w", true, std::time::Duration::from_secs(60));
-    let github = probe::Cached {
-        inner: FakeProbe::new(Permission::Insufficient("repository role `pull`".into())),
-        key_dir: Some(cred.clone()),
-    };
-    assert_eq!(
-        github.permission("acme/w"),
-        Permission::Insufficient("repository role `pull`".into())
-    );
-    assert_eq!(github.inner.calls.get(), 1, "the GitHub probe had to ask");
-    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
-    clear_gitea_env();
-}
-
-/// The two key spaces are disjoint by construction, and an unresolved
-/// connection (or a resolved one with no id) has no key at all.
-#[test]
-fn cache_keys_are_namespaced_by_forge_and_host() {
-    use probe::CacheScope;
-    let dir = Some(Path::new("/cred"));
-    let gitea = |url: &str| CacheScope::Gitea {
-        base_url: url.into(),
-        id: "abc".into(),
-    };
-    let gh = probe::cache_key(dir, &CacheScope::GitHub, "acme/w").unwrap();
-    let ga = probe::cache_key(dir, &gitea("https://a.example"), "acme/w").unwrap();
-    let gb = probe::cache_key(dir, &gitea("https://b.example"), "acme/w").unwrap();
-    assert_ne!(gh, ga);
-    assert_ne!(ga, gb, "the base URL is part of the key");
-    assert_eq!(probe::cache_key(dir, &CacheScope::Unresolved, "acme/w"), None);
-    let no_id = CacheScope::Gitea {
-        base_url: "https://a.example".into(),
-        id: String::new(),
-    };
-    assert_eq!(probe::cache_key(dir, &no_id, "acme/w"), None);
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn a_gitea_credential_with_a_line_break_does_not_resolve() {
-    isolate_gitea_env();
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("GITEA_URL", "http://127.0.0.1:9");
-    std::env::set_var("GITEA_TOKEN", "tok\r\nX-Injected: 1");
-    let gitea = probe::GiteaProbe::for_root(dir.path());
-    assert_eq!(gitea.cache_scope(), probe::CacheScope::Unresolved);
-    let p = gitea.permission("acme/w");
-    assert!(matches!(p, Permission::Unknown(ref why) if why.contains("line break")), "{p:?}");
-    clear_gitea_env();
-}
-
 // ---- structural: every daemon write path is scoped -------------------------
 
 /// How a reviewed file's forge writes are scoped.
@@ -747,11 +374,13 @@ enum Scope {
     /// write goes only through the store's `WriteTransport` (the writer App,
     /// `GhTransport::write_raw`), never a `gh` child of its own; the file
     /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
-    /// named caller reaches the named call only under `RefreshGate::Captain`,
-    /// so only the declared captain writes.
+    /// named caller reaches the named call only under its captain `gate`
+    /// (e.g. `RefreshGate::Captain`), so only the declared captain (or the
+    /// single refresher it stands for) writes.
     FleetStore {
         caller: &'static str,
         call: &'static str,
+        gate: &'static str,
         why: &'static str,
     },
     /// Matches the pattern but is not a forge write.
@@ -779,14 +408,30 @@ fn daemon_write_paths_are_scoped() {
             "claim_reconciliation/merge_sequence_sticky.rs",
             Via(PASS, "merge-sequence sticky operator-release record"),
         ),
+        (
+            "claim_reconciliation/merge_sequence_landing.rs",
+            Via(PASS, "merge-sequence landing-order comment upsert (#10634)"),
+        ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        ("fleet_sync/workspace_resync/host.rs", Gated),
+        (
+            "fleet_store/resync_claim.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         ("star_liveness/task.rs", Gated),
+        (
+            "star_liveness/parent_link.rs",
+            Via("cli/forge_action.rs", "`forge parent link` is vetted via write_target"),
+        ),
         (
             "star_liveness/forge.rs",
             Via("star_liveness/task.rs", "repos pass the task's gate"),
@@ -797,16 +442,27 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("eta/retire_filing.rs", Gated),
+        ("intake_reconcile/singleton.rs", Gated),
+        ("stale_blocked/release_gh.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
         ),
         ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/roll_requeue.rs",
+            Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
+        ),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
             Via(DISPATCH, "acts on dispatched sweeps"),
+        ),
+        (
+            "sweep_registry/park_hold.rs",
+            Via(DISPATCH, "body park record of a dispatched sweep's quarantine / PR-less hold"),
         ),
         (
             "sweep_registry/outcome_journal/writeback.rs",
@@ -816,7 +472,9 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
+        ("forge_rerun.rs", Gated),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
+        ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
@@ -825,9 +483,57 @@ fn daemon_write_paths_are_scoped() {
             "forge_comment.rs",
             Via("cli/forge_action.rs", "the `forge comment` verb is vetted via write_target; the internal `post_comment` sites are pre-vetted by their own callers"),
         ),
+        (
+            "forge_merge_queue/github.rs",
+            Via(
+                "cli/forge_action.rs",
+                "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
+                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
+                 behind QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
+        (
+            "forge_merge_queue/gh_lifecycle.rs",
+            Via(
+                "cli/forge_action.rs",
+                "PR comment (grant marker) / label POST+DELETE writes (#10256) are the \
+                 `GhLifecycleForge` seam. `forge merge-queue handoff|revoke` are vetted via \
+                 write_target (Handoff, Revoke) before dispatch; `reconcile` is vetted by \
+                 may_write_from in lifecycle_cli.rs inside its queue-mode branch. The \
+                 automated callers are behind other gates: `daemon_tick` and the disarm \
+                 path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
+                 after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
+                 shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
+                 behind QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
+        (
+            "forge_merge_queue/group_github.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the merge-group commit-status POST (#10256) is `StatusApi::post_status` on \
+                 `GhLifecycleForge`, reached only through `revoke_for_transition_groups`, \
+                 whose callers are exactly the gh_lifecycle.rs ones above: `forge \
+                 merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
+                 gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
+                 before any forge call in direct mode, refuses a non-sha target, and only \
+                 ever writes `failure` (withdraws authority); dormant behind \
+                 QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
         ("cli/forge_action.rs", Gated),
+        ("cli/forge_verdict_cmd.rs", ShellVetted("post-verdict.sh")),
         ("role_runner/launch.rs", Gated),
+        // #10832: gives back the claim label a role run a roll could not
+        // resume had taken; `release_claim` gates on the root itself.
+        ("role_runner/roll_resume.rs", Gated),
+        (
+            "roll_pause/claim_breadcrumb.rs",
+            NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
+        ),
         ("operator_decision/cli.rs", Gated),
+        ("forge_priority_labels.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
@@ -840,8 +546,18 @@ fn daemon_write_paths_are_scoped() {
             "eta/fit/publish.rs",
             FleetStore {
                 caller: "observability/eta_fleet_refresh.rs",
-                call: "distribute_publish(root, &captain",
-                why: "the captain publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
+                call: "distribute_publish(root, &publisher",
+                gate: "RefreshGate::Captain | RefreshGate::Authority)",
+                why: "the refresher (the captain, or the explicit ETA authority, #10918) publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
+            },
+        ),
+        (
+            "observability/captain_gauges/store.rs",
+            FleetStore {
+                caller: "observability/captain_gauges.rs",
+                call: "publish_heartbeat(root, loc",
+                gate: "Role::Captain { captain } => {",
+                why: "the armed captain publishes its fleet-gauge heartbeat (W12)",
             },
         ),
         (
@@ -857,6 +573,14 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("follow-up on the issue this watchdog filed"),
         ),
         (
+            "forge_probe.rs",
+            NotAWrite(
+                "the hosted-trial probe writes to the candidate instance's disposable \
+                 repo ($GITEA_QUAL_* runbook env) — never the daemon's managed forge: \
+                 no gh, no forge credential path (#9789)",
+            ),
+        ),
+        (
             "dep_recheck/decide.rs",
             NotAWrite("action names; writes go through dep_classify"),
         ),
@@ -866,10 +590,26 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
         ),
         (
+            "gh_invocation/affinity.rs",
+            NotAWrite("derives a read's routing key from argv; only its tests name `--method`"),
+        ),
+        (
+            "gh_invocation/cwd_route.rs",
+            NotAWrite("classifies an invocation's argv to refuse mutations a reader route, runs none"),
+        ),
+        (
             "gh_invocation/api_kind.rs",
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
+        (
+            "gh_invocation/own_writes.rs",
+            NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
+        ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "observability/pick_journal.rs",
+            NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
+        ),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
@@ -878,6 +618,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
+        (
+            "observability/otlp/relay/server.rs",
+            NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let writes = regex::Regex::new(
@@ -960,14 +704,19 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
-            FleetStore { caller, call, why } => {
+            FleetStore {
+                caller,
+                call,
+                gate,
+                why,
+            } => {
                 let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
                 // The guard is the first statement of `publish`, not merely defined.
-                let guarded = text.find("pub fn publish(").is_some_and(|f| {
-                    text[f..]
-                        .find(") -> Result<PublishKind> {")
-                        .map(|b| text[f + b..].trim_start_matches(") -> Result<PublishKind> {"))
+                let guarded = text.find("fn publish(").is_some_and(|f| {
+                    let sig = &text[f..];
+                    sig.find(") -> Result<")
+                        .and_then(|b| sig[b..].find(" {\n").map(|o| &sig[b + o + 3..]))
                         .is_some_and(|body| {
                             body.trim_start()
                                 .starts_with("refuse_reviewed_branch(loc, base_ref)?;")
@@ -982,11 +731,11 @@ fn daemon_write_paths_are_scoped() {
                      write only through WriteTransport and refuse the reviewed branch"
                 );
                 let caller_text = std::fs::read_to_string(src.join(caller)).unwrap_or_default();
-                let gate = caller_text.find("RefreshGate::Captain)");
+                let gated_at = caller_text.find(gate);
                 let at = caller_text.find(call);
                 assert!(
-                    gate.is_some() && at.is_some() && gate < at,
-                    "{file} ({why}): {caller} must reach `{call}` only under RefreshGate::Captain"
+                    gated_at.is_some() && at.is_some() && gated_at < at,
+                    "{file} ({why}): {caller} must reach `{call}` only under {gate}"
                 );
                 let name = call.split('(').next().unwrap_or(call);
                 let callers: Vec<&str> = sources

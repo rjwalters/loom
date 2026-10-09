@@ -76,6 +76,20 @@ pub enum SpanName {
     /// own/external attribution.
     #[serde(rename = "loom.ratelimit.trip")]
     RateLimitTrip,
+    /// One reader App withdrawal (W4-A): an instant span, its own root
+    /// trace, naming the App, owner, resource, end and reset source.
+    #[serde(rename = "forge.reader.withdrawn")]
+    ForgeReaderWithdrawn,
+    /// One read-pool spill-latch transition (W4-B): an instant span, its own
+    /// root trace, naming the repo, resource, home and target reader, mode
+    /// and release instant.
+    #[serde(rename = "forge.reader.spill")]
+    ForgeReaderSpill,
+    /// One read a reader route deferred (W4-C): an instant span, its own
+    /// root trace, naming the operation, class, reader, owner, resource and
+    /// until.
+    #[serde(rename = "forge.read.shed")]
+    ForgeReadShed,
 }
 
 impl SpanName {
@@ -100,6 +114,9 @@ impl SpanName {
             Self::DispatchDisposition => "loom.dispatch.disposition",
             Self::GithubInvoke => "invoke github",
             Self::RateLimitTrip => "loom.ratelimit.trip",
+            Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
+            Self::ForgeReaderSpill => "forge.reader.spill",
+            Self::ForgeReadShed => "forge.read.shed",
         }
     }
 }
@@ -144,6 +161,13 @@ pub struct SpanRecord {
     pub links: Vec<SpanLink>,
 }
 
+/// The span's one-line status description (#10640). [`SpanStatus`] carries
+/// no message, so the description rides the journalled record as this
+/// attribute; the OTLP encoder moves it into `Status.message` on an `Error`
+/// span instead of exporting it as an attribute. Writers put only a fixed
+/// template plus machine-derived values here, never log text.
+pub const STATUS_MESSAGE: &str = "loom.status_message";
+
 /// Applied again at export so a restored queue cannot bypass emission policy.
 pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
     attributes
@@ -169,6 +193,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.configured_model"
                     | "loom.result"
                     | "loom.failure_class"
+                    | "loom.exit_code"
+                    | STATUS_MESSAGE
+                    // Issue #10642: the cause on a `no-phase-signal` sweep.
+                    | "loom.no_phase.exit"
+                    | "loom.no_phase.last_step"
+                    | "loom.no_phase.reason"
                     | "loom.host.mem_total_bytes"
                     | "loom.host.mem_available_bytes"
                     | "loom.host.mem_compressed_bytes"
@@ -194,6 +224,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
             ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
+                || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)

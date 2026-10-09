@@ -1,0 +1,92 @@
+{
+  "schema": "eta-explain/v1",
+  "estimate_id": "4e0ca2e1084015ed",
+  "heuristic": "land-v1",
+  "kind": "land",
+  "as_of": "2026-09-20T12:00:00Z",
+  "subject": "rjwalters/loom#9289",
+  "engine": "path",
+  "recorded": [
+    943,
+    2004,
+    3552,
+    4879
+  ],
+  "replayed": [
+    943,
+    2004,
+    3552,
+    4879
+  ],
+  "parity": {
+    "status": "exact"
+  },
+  "truncated": [],
+  "breakdown_source": "stage_predictions",
+  "stages": [
+    {
+      "stage": "review_wait",
+      "entry_p50_sec": 0,
+      "dwell_p50_sec": 1182,
+      "p50_share": 0.692,
+      "reach_pct": 100
+    },
+    {
+      "stage": "doctor",
+      "entry_p50_sec": 695,
+      "dwell_p50_sec": 1371,
+      "p50_share": 0.167,
+      "reach_pct": 46
+    },
+    {
+      "stage": "merge_wait",
+      "entry_p50_sec": 1743,
+      "dwell_p50_sec": 172,
+      "p50_share": 0.141,
+      "reach_pct": 100
+    }
+  ],
+  "inputs": [
+    {
+      "name": "current_stage.rework_rounds",
+      "value": 0.0,
+      "kind": "count",
+      "perturbed": 1.0,
+      "dp50_sec": -728,
+      "dp90_sec": -1463
+    },
+    {
+      "name": "branches.changes_requested.p_by_attempt.0",
+      "value": 0.45,
+      "kind": "probability",
+      "perturbed": 0.55,
+      "dp50_sec": 378,
+      "dp90_sec": 318
+    },
+    {
+      "name": "path.include_merge",
+      "value": 1.0,
+      "kind": "flag",
+      "perturbed": 0.0,
+      "dp50_sec": -253,
+      "dp90_sec": -238
+    },
+    {
+      "name": "current_stage.age_sec",
+      "value": 0.0,
+      "kind": "seconds",
+      "perturbed": 60.0,
+      "dp50_sec": -60,
+      "dp90_sec": -60
+    },
+    {
+      "name": "branches.changes_requested.p_by_attempt.1",
+      "value": 0.222,
+      "kind": "probability",
+      "perturbed": 0.322,
+      "dp50_sec": 36,
+      "dp90_sec": 397
+    }
+  ],
+  "context": {}
+}

@@ -111,12 +111,14 @@ fn width(e: &Explanation) -> i64 {
 // ------------------------------------------------- registration and purity
 
 #[test]
-fn land_v3_is_registered_but_not_current() {
+fn land_v3_is_retired_from_the_registry_but_still_a_pure_heuristic() {
+    // Retired 2026-10-06 (#10484): the module survives as `land-v4`'s grid
+    // step and stays directly callable, but is no longer in the live set.
     let registry = Registry::builtin();
-    let v3 = registry.get(LAND_V3).expect("land-v3 is registered");
-    assert_eq!(v3.kind(), Kind::Land);
+    assert!(registry.get(LAND_V3).is_none(), "land-v3 is not registered");
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
-    assert!(registry.for_kind(Kind::Land).any(|h| h.id() == LAND_V3));
+    assert!(!registry.for_kind(Kind::Land).any(|h| h.id() == LAND_V3));
+    assert_eq!(LandV3.kind(), Kind::Land);
 }
 
 #[test]

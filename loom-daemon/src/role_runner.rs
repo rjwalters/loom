@@ -1010,6 +1010,9 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    /// Set by [`roll_resume`] when this runner relaunches a session a daemon
+    /// roll paused (#10832), instead of starting a fresh tick.
+    roll_resume: Option<roll_resume::RoleRollResume>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -1025,6 +1028,7 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            roll_resume: None,
         }
     }
 
@@ -1089,6 +1093,8 @@ impl ScriptRoleInvocationRunner {
 }
 
 mod invocation;
+/// #10832: resuming a role run a daemon roll paused.
+pub(crate) mod roll_resume;
 
 /// The per-role log file every invocation — real or skipped — writes to:
 /// `<logs_dir>/role-<role>.log`.
@@ -2333,7 +2339,9 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
 // ============================================================================
 
 /// Shared "a role invocation is currently running" set, keyed by
-/// `(workspace_root, role_name)`.
+/// `(workspace_root, role_name, lane)`. Lane `0` is the one classic run per
+/// `(root, role)`; only doctor's per-repository width opens lanes above it
+/// (#10632, [`concurrent_dispatch::lanes`]).
 ///
 /// Shared (one instance, cloned) between the interval role loops
 /// ([`spawn_multi_role_task`]) and the idle-edge-triggered path
@@ -2342,7 +2350,7 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
 /// idle path refuses to fire while the entry is present (and vice versa). This
 /// is **in-process shared state only** — deliberately not an event-bus topic
 /// (the taxonomy is frozen, #4364).
-pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str)>>>;
+pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str, usize)>>>;
 
 static ROLE_RUN_START_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -2408,7 +2416,7 @@ pub fn role_run_start_generation() -> u64 {
 #[derive(Debug)]
 pub struct RoleRunGuard {
     set: InProgressGuard,
-    key: (PathBuf, &'static str),
+    key: (PathBuf, &'static str, usize),
 }
 
 /// The outcome of one role-agent admission attempt ([`RoleRunGuard::admit`]).
@@ -2525,7 +2533,7 @@ impl RoleRunGuard {
         ceiling: usize,
         role_budget: usize,
     ) -> RoleAdmission {
-        let key = (root, role);
+        let key = (root, role, 0);
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
             if guard.contains(&key) {
@@ -2535,7 +2543,7 @@ impl RoleRunGuard {
             if active >= ceiling {
                 return RoleAdmission::CeilingReached { active, ceiling };
             }
-            let role_active = guard.iter().filter(|(_, r)| *r == role).count();
+            let role_active = guard.iter().filter(|(_, r, _)| *r == role).count();
             if role_active >= role_budget {
                 return RoleAdmission::RoleBudgetReached {
                     role,
@@ -2659,7 +2667,9 @@ impl IdleTrigger {
 ///    switch, which only decides whether the loops start at all. When
 ///    `onIdle` roles are configured for `root` but the gate is off, this is
 ///    the silent-no-op the issue exists to fix — see
-///    [`warn_if_idle_configured_but_disabled`].
+///    [`warn_if_idle_configured_but_disabled`]. Then bail on the host shard,
+///    an archived repo, or a held workspace ([`crate::workspace_hold`],
+///    #10719).
 /// 4. Per configured on-idle role ([`resolve_on_idle_roles`]): skip if inside
 ///    the debounce window, or if an interval / idle run already holds the
 ///    in-progress guard; else record the fire and acquire the guard.
@@ -2714,6 +2724,19 @@ pub fn plan_idle_runs(
         );
         return Vec::new();
     }
+    if roster::repo_is_archived(root, None) {
+        log::debug!("role_runner: idle edge for {} suppressed — archived (#10562)", root.display());
+        return Vec::new();
+    }
+    // #10719: a held workspace starts no role. The hold stops new sweeps, the
+    // in-flight set drains, and that very drain is what raises this idle edge —
+    // so without this the hold would itself launch every `onIdle` role. The
+    // edge was already observed above, so the bookkeeping stays right.
+    // After the gates above, so it is logged (with the hold's reason) only
+    // for an edge that would otherwise have started a role.
+    if crate::workspace_hold::refuse_role_start(root, "idle edge") {
+        return Vec::new();
+    }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
     // config. Resolved ONCE for the whole edge rather than per-spec so a single
     // idle edge cannot admit a burst that each individually passed a
@@ -2723,6 +2746,9 @@ pub fn plan_idle_runs(
     let ceiling = resolve_max_concurrent(config);
     let mut out = Vec::new();
     for spec in resolve_on_idle_roles(config) {
+        if matches!(idle_gate::gate(root, spec.name), Some(idle_gate::IdleGateDecision::Deny(_))) {
+            continue;
+        }
         if !trigger.debounce_ok(root, spec.name, now) {
             log::debug!(
                 "role_runner: idle edge for {} — {} within {}s debounce, skipping",
@@ -2925,6 +2951,7 @@ pub fn observe_and_fire_idle(
             root.display(),
             name
         );
+        triggers::log_idle_launch(root, name);
         tokio::spawn(async move {
             // Held for the whole invocation; the in-progress entry clears when
             // this guard drops (every exit path — success/failure/panic).
@@ -3128,6 +3155,11 @@ fn decide_root_tick_detailed(
             root.display(),
             describe_shard_refusal(&shard)
         );
+        return concurrent_dispatch::RootTickDecision::Skip;
+    }
+    // #10562: every role writes to the forge; an archived repo refuses all of it.
+    if roster::repo_is_archived(root, None) {
+        log::debug!("role_runner: {} tick for {} skipped — archived", spec.name, root.display());
         return concurrent_dispatch::RootTickDecision::Skip;
     }
     // Resolved-role-list diagnostic (#5654 AC1): computed once per root per
@@ -3377,6 +3409,7 @@ pub fn spawn_multi_role_task(
         // Missing-root warn-once-per-period state (#4326), shared discipline
         // with `work_finder` via `filter_missing_roots`.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        let mut held_roots_logged: HashSet<PathBuf> = HashSet::new();
         let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
             spec,
             interval,
@@ -3443,6 +3476,8 @@ pub fn spawn_multi_role_task(
             // warn-and-skip, never auto-remove (`loom-daemon status` flags it,
             // `workspace remove` clears it).
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
+            // #10719: no role tick starts in a held workspace (W3/W4).
+            let roots = crate::workspace_hold::filter_held(roots, &mut held_roots_logged);
             let _report = dispatcher.dispatch_tick(roots, &in_progress);
         }
     })
@@ -3975,6 +4010,14 @@ pub mod concurrent_dispatch;
 // Demand-weighted width and Champion-first reservation (#9392) — see
 // `role_runner/demand.rs`.
 pub mod demand;
+
+// Pipeline-empty gate for hermit/architect idle generation (#10817) — see
+// `role_runner/idle_gate.rs`.
+pub mod idle_gate;
+
+// Event-driven curator/auditor/guide triggers (#10816) — see
+// `role_runner/triggers.rs`.
+pub mod triggers;
 
 // The per-invocation result type (#8056) — see `role_runner/outcome.rs`.
 mod outcome;

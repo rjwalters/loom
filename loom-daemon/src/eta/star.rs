@@ -30,8 +30,12 @@
 //! # Unknown coverage
 //!
 //! [`RepoStar::state_at`] returns `None` when the repo's cache has no pulls
-//! (link) or issue-events coverage before `cutoff`: a lack of coverage is not
-//! "unstarred".
+//! (link) or issue-events coverage before `cutoff`, **or** when `cutoff` is
+//! after the instant the cache was last known caught up
+//! ([`RepoStar::synced_through`], from the listings' cursor stamps): a lack of
+//! coverage is not "unstarred". A cache that stops advancing (for one, while
+//! SigNoz covers its repo, #10520) therefore turns unknown after its stamp
+//! rather than reading every later link or star as absent.
 //!
 //! # Not a model input
 //!
@@ -40,6 +44,7 @@
 //! `defaults/docs/eta.md`), so coefficient files are unchanged.
 
 use super::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
+use super::fleet_signoz_history::SOURCE_SIGNOZ;
 use super::labels::FLAG_STARRED;
 use crate::worktree_ops::gh::linkage_refs;
 use chrono::{DateTime, Utc};
@@ -241,16 +246,40 @@ pub struct RepoStar {
     pub links_from: Option<DateTime<Utc>>,
     /// The earliest issue row: the issue-events listing's coverage.
     pub issue_events_from: Option<DateTime<Utc>>,
+    /// The cache is complete through this instant (the earliest of its
+    /// listings' [`super::fleet_events::EndpointCursor::synced_through`]); a
+    /// cutoff after it is uncovered. `None`: never stamped, no upper bound.
+    pub synced_through: Option<DateTime<Utc>>,
 }
 
 impl RepoStar {
-    /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows count:
-    /// the coverage floors name the forge listings, and an imported
+    /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows set
+    /// coverage: the coverage floors name the forge listings, and an imported
     /// webhook-mirror row (#10197) would move them and replay a star twice.
+    /// A [`SOURCE_SIGNOZ`] row (#10746) is a star change only: it sets no
+    /// floor and no stamp, so it counts only where the forge listings cover.
     #[must_use]
     pub fn from_events(events: &[RawEvent]) -> Self {
         let mut star = RepoStar::default();
-        for e in events.iter().filter(|e| e.source == SOURCE_FORGE) {
+        for e in events {
+            if e.source == SOURCE_SIGNOZ {
+                // A star change SigNoz dated (#10746): a star change only. It
+                // sets no coverage floor; the forge listings' rows do.
+                let label = e.label.as_deref().filter(|l| is_star_label(l));
+                if let (ItemKind::Issue, Some(_), EventKind::LabelAdded | EventKind::LabelRemoved) =
+                    (e.item_kind, label, e.kind)
+                {
+                    star.issue_stars.push(IssueStarChange {
+                        issue: e.item,
+                        at: e.event_time,
+                        starred: e.kind == EventKind::LabelAdded,
+                    });
+                }
+                continue;
+            }
+            if e.source != SOURCE_FORGE {
+                continue;
+            }
             let min = |slot: &mut Option<DateTime<Utc>>| {
                 *slot = Some(slot.map_or(e.event_time, |x| x.min(e.event_time)));
             };
@@ -306,10 +335,14 @@ impl RepoStar {
         Some(linked_star_at(links, &self.issue_stars, cutoff))
     }
 
-    /// `pr`'s links, when both listings cover `cutoff`.
+    /// `pr`'s links, when both listings cover `cutoff`: from below (a row
+    /// before it) and from above (synced through it, when stamped).
     fn covered_links(&self, pr: u32, cutoff: DateTime<Utc>) -> Option<&[StarLink]> {
         let covered = |from: Option<DateTime<Utc>>| from.is_some_and(|f| f < cutoff);
         if !covered(self.links_from) || !covered(self.issue_events_from) {
+            return None;
+        }
+        if self.synced_through.is_some_and(|through| cutoff > through) {
             return None;
         }
         Some(self.links.get(&pr).map_or(&[][..], Vec::as_slice))
@@ -325,21 +358,35 @@ pub struct StarInputs {
 }
 
 impl StarInputs {
-    /// Read the raw event cache of each of `repos` under `root`.
+    /// Read the raw event cache of each of `repos` under `root`, bounded
+    /// above by its cursor's stamps ([`listing_keys`]).
     #[must_use]
     pub fn load(root: &std::path::Path, repos: &[String]) -> Self {
+        use super::fleet_events::{cursor_path, events_path, load_events, EventsCursor};
         let mut inputs = StarInputs::default();
         for repo in repos {
-            let events =
-                super::fleet_events::load_events(&super::fleet_events::events_path(root, repo));
+            let events = load_events(&events_path(root, repo));
             if !events.is_empty() {
-                inputs
-                    .repos
-                    .insert(repo.to_ascii_lowercase(), RepoStar::from_events(&events));
+                let mut star = RepoStar::from_events(&events);
+                star.synced_through = EventsCursor::read(&cursor_path(root, repo), repo)
+                    .synced_through(&listing_keys());
+                inputs.repos.insert(repo.to_ascii_lowercase(), star);
             }
         }
         inputs
     }
+}
+
+/// The cursor keys of the repo-wide listings star coverage reads: issue
+/// events and pulls (links).
+#[must_use]
+pub fn listing_keys() -> Vec<String> {
+    use super::fleet_events_forge::ForgeEndpoint;
+    ForgeEndpoint::ALL
+        .into_iter()
+        .filter(|e| e.per_pr().is_none())
+        .map(|e| format!("{SOURCE_FORGE}:{}", e.name()))
+        .collect()
 }
 
 /// The linked issues of a PR body, by the work finder's rule.
@@ -574,6 +621,65 @@ mod tests {
         assert_eq!(star.state_at(4, 0, None, at(CUT)).unwrap().source, StarSource::None);
         // An empty repo cache: no coverage at all.
         assert_eq!(RepoStar::default().state_at(3, 0, None, at(CUT)), None);
+    }
+
+    /// #10520 (judge round 3): a raw cache that stopped syncing at `T` (e.g.
+    /// while SigNoz covers its repo) must not read a cutoff after `T` as
+    /// "unstarred" — a link or star added after `T` is simply missing from
+    /// it. Before `T` the cache answers; after it, unknown.
+    #[test]
+    fn a_cutoff_after_the_cache_stopped_syncing_is_unknown_not_unstarred() {
+        let events = vec![
+            raw(9, ItemKind::Issue, EventKind::LabelAdded, Some("loom:blocked"), 20),
+            raw(4, ItemKind::Pr, EventKind::ClosingRef, Some("closes"), 10).with_target(Some(9)),
+        ];
+        let mut star = RepoStar::from_events(&events);
+        // Unstamped: no upper bound (a pre-#10520 cache) — unchanged.
+        assert_eq!(star.state_at(3, 0, None, at(CUT)).unwrap().source, StarSource::None);
+        // Synced through 100; PR 3's link to a starred issue lands at 150,
+        // after the cache stopped, so it is not in the cache.
+        star.synced_through = Some(at(100));
+        assert_eq!(star.state_at(3, 0, None, at(100)).unwrap().source, StarSource::None);
+        assert_eq!(star.state_at(3, 0, None, at(200)), None, "after T: unknown, not unstarred");
+        assert_eq!(star.linked_at(3, at(200)), None);
+        assert!(star.linked_at(3, at(50)).is_some());
+    }
+
+    /// [`StarInputs::load`] bounds each repo by the earliest stamp of its two
+    /// repo-wide listings, and leaves an unstamped cache unbounded.
+    #[test]
+    fn load_bounds_coverage_by_the_listings_synced_through() {
+        use crate::eta::fleet_events::{self, EventLog, EventsCursor};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = "o/r".to_string();
+        let events = vec![
+            raw(9, ItemKind::Issue, EventKind::LabelAdded, Some("loom:blocked"), 20),
+            raw(4, ItemKind::Pr, EventKind::ClosingRef, Some("closes"), 10).with_target(Some(9)),
+        ];
+        EventLog::open(&fleet_events::events_path(root, &repo))
+            .unwrap()
+            .append(&events)
+            .unwrap();
+        let unbounded = StarInputs::load(root, std::slice::from_ref(&repo));
+        assert_eq!(unbounded.repos["o/r"].synced_through, None);
+
+        let cursor_file = fleet_events::cursor_path(root, &repo);
+        let keys = listing_keys();
+        assert_eq!(keys, vec!["forge:issues-events".to_string(), "forge:pulls".to_string()]);
+        fleet_events::mark_synced_through(&cursor_file, &repo, &keys[0], at(300)).unwrap();
+        fleet_events::mark_synced_through(&cursor_file, &repo, &keys[1], at(100)).unwrap();
+        // Never moved back.
+        fleet_events::mark_synced_through(&cursor_file, &repo, &keys[1], at(50)).unwrap();
+        assert_eq!(
+            EventsCursor::read(&cursor_file, &repo).endpoints[&keys[1]].synced_through,
+            Some(at(100))
+        );
+        let bounded = StarInputs::load(root, std::slice::from_ref(&repo));
+        let star = &bounded.repos["o/r"];
+        assert_eq!(star.synced_through, Some(at(100)), "the earliest listing stamp");
+        assert!(star.state_at(3, 0, None, at(100)).is_some());
+        assert_eq!(star.state_at(3, 0, None, at(101)), None);
     }
 
     #[test]

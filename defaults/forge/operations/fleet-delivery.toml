@@ -73,6 +73,12 @@ path = "loom-daemon/src/credential_preflight/pool.rs"
 [[operation.callers]]
 kind = "installer"
 path = "scripts/install/validate-target.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/workflow_scope.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
 
 [[operation]]
 id = "identity.actor-trust"
@@ -153,6 +159,45 @@ notes = "Never record a token value in evidence. The accounting layer records pr
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/lib/github-app-token.sh"
+
+[[operation]]
+id = "identity.prohibited-unmanaged-egress"
+group = "identity-authentication"
+summary = "Typed bypasses of the managed gh launcher (`gh api https://…`, `gh auth login|setup-git|refresh`, a GH_HOST override) — prohibited under an enforcing routing policy."
+profile = "required-coordination"
+disposition = "prohibition"
+class = "write"
+inputs = []
+outputs = []
+required_fields = []
+actor = "operator"
+permissions = ["metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::identity-prohibited-unmanaged-egress"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [
+  "gh api https://",
+  "gh auth login",
+  "gh auth setup-git",
+  "gh auth refresh",
+], routes = [] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = []
+notes = "Classified as a PROHIBITION, not an active operation (#9989, C6 of epic #9983): each form reaches the forge with an unmanaged origin or credential, outside the managed launcher's routing. The callers below are the `loom:forge-egress` guard classifier and the role tool-policy deny-spec table (`role_tool_policy/forge_egress.rs`), which name these commands only in order to DENY them and to point at the managed alternative — the opposite of a caller, listed here so the forge-inventory gate resolves their `gh api` / `gh auth` text to this decision."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_egress/guard.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/role_tool_policy/forge_egress.rs"
 
 # --- quota-caching-errors ----------------------------------------------------
 
@@ -351,6 +396,9 @@ path = "loom-daemon/src/gh_repo_env.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/release_gh.rs"
 
 [[operation]]
 id = "repo.list-for-owner"
@@ -386,6 +434,47 @@ unknowns = [
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/ci_telemetry/owners.rs"
+
+[[operation]]
+id = "repo.list-for-installation"
+group = "repository-discovery-creation"
+summary = "List every repository a credential's App installation reaches, with its id and visibility."
+profile = "fleet-bootstrap"
+disposition = "optional"
+class = "read"
+inputs = ["host"]
+outputs = ["id", "full_name", "private", "total_count"]
+required_fields = []
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::repo-list-for-installation"
+test_status = "implemented"
+test_path = "loom-daemon/src/forge_repo_facts/installation_tests.rs"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [
+  "gh api --include installation/repositories",
+], routes = [
+  "GET installation/repositories",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "complete"
+exclusion_reason = "A quota optimisation, not a requirement: one listing per credential replaces the per-repository `repo.view` reads for visibility, repo identity and the write-scope probe's installation leg. A credential the endpoint refuses (a user token) and a provider with no installation concept keep those per-repository reads, which is what `LOOM_INSTALLATION_SNAPSHOT=0` restores everywhere."
+preflight = "warn-and-disable"
+unknowns = [
+  "the listing is defined for an App installation token only; a provider with no equivalent of 'every repository this credential reaches, in one read' has nothing to serve it from",
+  "an unavailable or partial listing must read as PRIVATE and as no write grant, never as the last known answer",
+]
+notes = "Per credential, conditional per page (If-None-Match), revalidated at most hourly. A refused reader App is withdrawn for its own bucket and never trips the host-wide breaker; the writer's refusal does."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_repo_facts/installation.rs"
 
 [[operation]]
 id = "repo.create-and-clone"
@@ -466,6 +555,49 @@ unknowns = [
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet_store/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_store/gh.rs"
+
+[[operation]]
+id = "git.default-branch-heads"
+group = "git-objects-remote-writes"
+summary = "Read the default branch's name and head commit for a batch of repositories in one request."
+profile = "fleet-bootstrap"
+disposition = "optional"
+class = "read"
+inputs = ["owner", "repo_names"]
+outputs = ["default_branch", "head_sha"]
+required_fields = []
+actor = "daemon"
+permissions = ["contents:read", "metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::git-default-branch-heads"
+test_status = "implemented"
+test_path = "loom-daemon/src/fleet_sync/tests/workspace_resync_heads.rs"
+owner = "daemon-fleet"
+risk = "normal"
+github = { commands = [
+  "gh api graphql (repository.defaultBranchRef.target.oid, aliased per repository)",
+], routes = [] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "complete"
+exclusion_reason = "A quota optimisation, not a requirement: one query per owner replaces one `git ls-remote` per repository in the workspace resync's per-tick head check. When the query is unavailable or fails, that check falls back to `git ls-remote` per repository, which needs no forge API at all."
+preflight = "warn-and-disable"
+unknowns = [
+  "GraphQL is a POST: there is no ETag and no free 304, so each query costs one point on the credential's GraphQL bucket whether or not any head moved",
+  "an installation token sees only its own installation's repositories, so the batch is per owner; a provider with no batched ref read keeps the per-repository `git ls-remote`",
+  "a repository the credential cannot see answers NOT_FOUND, exactly like a deleted one, so that answer is confirmed with `git ls-remote` under the repository's own credential before it is reported",
+]
+notes = "One aliased query per owner per fleet-sync tick, up to 100 repositories each, under the writer credential. Sent only by a host that may write (fleet.autoApply on, in H0) and never while the rate-limit breaker is open."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_sync/workspace_resync/heads.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet_store/gh.rs"
@@ -577,12 +709,15 @@ owner = "daemon-ci-telemetry"
 risk = "normal"
 github = { commands = [
   "gh run rerun",
+  "loom-daemon forge rerun",
 ], routes = [
   "POST repos/{owner}/{repo}/actions/runs/{id}/rerun",
+  "POST repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs",
+  "POST repos/{owner}/{repo}/actions/jobs/{id}/rerun",
 ] }
 platform_support = "unknown"
-adapter_coverage = "none"
-caller_integration = "none"
+adapter_coverage = "partial"
+caller_integration = "partial"
 exclusion_reason = "Re-running CI is remediation, not a lifecycle requirement; Loom's CI policy is explicitly conservative (never cancel a distinct commit's run) and a rerun is an operator or Doctor action."
 preflight = "warn-and-disable"
 unknowns = []
@@ -590,6 +725,12 @@ notes = "An observed `run cancel` in CI YAML is workflow-level concurrency polic
 [[operation.callers]]
 kind = "workflow"
 path = ".github/workflows/ci.yml"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-result-gate.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_rerun.rs"
 
 # --- releases-distribution ---------------------------------------------------
 
@@ -635,6 +776,13 @@ path = "loom-daemon/src/release_resolve/resolve.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/release_fetch/fetch.rs"
+# The install-compat CI proof (#10716) resolves the oldest release at or
+# above REQUIRES_DAEMON and downloads its binary. A delayed publication is
+# skipped (the new daemon stands in), so it never blocks a merge; a forge
+# outage during the lookup fails the step on purpose, as a proof step.
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/install_compat_harness.rs"
 
 [[operation]]
 id = "release.publish"

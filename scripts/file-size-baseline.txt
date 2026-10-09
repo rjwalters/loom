@@ -14,7 +14,6 @@
 1657 defaults/scripts/claude-wrapper.sh
 1184 defaults/scripts/cli/loom-daemon-start.sh
 1011 defaults/scripts/lib/forge-helpers.sh
-1035 defaults/scripts/merge-pr.sh
 2030 defaults/scripts/tests/test-loom-daemon-start.sh
 3205 defaults/scripts/tests/test-loom-daemon-update.sh
 1846 defaults/scripts/tests/test-loom-daemon-watchdog.sh
@@ -24,7 +23,7 @@
 1365 install.sh
 1598 loom-daemon/src/agent_session/spawn.rs
 1427 loom-daemon/src/auto_update/tests.rs
-1565 loom-daemon/src/claim_reconciliation.rs
+1503 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs
 3655 loom-daemon/src/cli/status_render.rs
 1913 loom-daemon/src/credential_preflight.rs
@@ -40,7 +39,7 @@
 2299 loom-daemon/src/init/scaffolding/tests.rs
 1916 loom-daemon/src/init/tests.rs
 1344 loom-daemon/src/install_self_check.rs
-2319 loom-daemon/src/ipc.rs
+2301 loom-daemon/src/ipc.rs
 4099 loom-daemon/src/ipc/tests.rs
 1045 loom-daemon/src/main.rs
 1788 loom-daemon/src/main_health_gate.rs
@@ -78,7 +77,7 @@
 2370 loom-daemon/src/worktree_ops/clean.rs
 1702 loom-daemon/src/worktree_ops/clean/tests.rs
 1589 loom-daemon/src/worktree_ops/orphan_recovery.rs
-1943 loom-daemon/src/worktree_reaper.rs
+1790 loom-daemon/src/worktree_reaper.rs
 1468 mcp-loom/src/tools/sweeps.ts
 1082 mcp-loom/src/tools/terminals.ts
 1488 scripts/install-loom.sh

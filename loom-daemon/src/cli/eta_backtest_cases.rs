@@ -23,7 +23,8 @@ use serde::Deserialize;
 
 use loom_daemon::cmd_out::Query;
 use loom_daemon::eta::backtest::{
-    self, cases_from_pr_records, parse_pr_records, PrCaseRecord, PrCaseSummary, ReplayCase,
+    self, cases_from_pr_records_with_roster, parse_pr_records, PrCaseRecord, PrCaseSummary,
+    ReplayCase,
 };
 use loom_daemon::script_helpers::gh_query;
 
@@ -267,7 +268,21 @@ pub(crate) fn add_pr_cases(
         records.extend(fetched);
     }
 
-    let (pr_cases, summary) = cases_from_pr_records(&records);
+    // The `eta-fit/v2` priority inputs (#10508): the cached fleet roster
+    // history, or unknown (never today's `repos.yml`) when there is none.
+    let now = chrono::Utc::now();
+    let history = loom_daemon::eta::roster_history::load_for(root, now).0;
+    // The linked-issue star of each record, from the cached raw events where
+    // they cover it; otherwise the record stays unread (unknown).
+    let repos: Vec<String> = records
+        .iter()
+        .map(|r| r.repo.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let stars = loom_daemon::eta::star::StarInputs::load(root, &repos);
+    backtest::fill_linked_stars(&mut records, &stars, now);
+    let (pr_cases, summary) = cases_from_pr_records_with_roster(&records, history.as_deref());
     let (merged, dropped) = backtest::merge_case_sets(base, pr_cases);
     Ok((merged, Some(describe(&summary, dropped))))
 }
@@ -359,6 +374,9 @@ mod tests {
             repo: Some("rjwalters/loom".to_string()),
             repo_root: Some(root.to_path_buf()),
             json: false,
+            fit_dir: None,
+            adaptation: false,
+            wrap: None,
             pr_cases: cases,
         }
     }

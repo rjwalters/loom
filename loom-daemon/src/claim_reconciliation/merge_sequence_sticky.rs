@@ -42,11 +42,11 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use super::{gh_pr, SequenceEdge, SequenceMarker, SequencePr, SEQUENCE_LABEL};
+use super::{gh_pr, PredecessorState, SequenceEdge, SequenceMarker, SequencePr, SEQUENCE_LABEL};
 use crate::claim_reconciliation::gh_call;
 use crate::forge_tree_unchanged::{tree_unchanged, verdict_tree_carveout_enabled};
 use crate::merge_pr::sequence::{
-    html_comment_spans, is_full_sha, parse, parse_live, states_or_ends_hold,
+    html_comment_spans, is_full_sha, marker_text, parse, parse_live, states_or_ends_hold,
 };
 
 /// The record prefix: `<!-- loom:sequence operator-released after=N
@@ -94,6 +94,57 @@ pub fn effective_follower<'a>(
         }
         _ => Cow::Borrowed(pr),
     }
+}
+
+/// #10465: the marker re-anchored to the predecessor's live head when that
+/// head moved off `marker.pred_head` by a tree-identical commit (the same
+/// `kind=tree` proof as the follower rule). `None` when nothing needs
+/// re-anchoring or the move is not proven tree-identical (unanswered and
+/// negative comparisons both keep today's void/replan). Only an OPEN
+/// predecessor is re-anchored; a merged one is judged by [`super::evaluate`].
+/// Covers hard (human) and `source=pass` markers alike.
+pub fn reanchor_predecessor(
+    marker: &SequenceMarker,
+    pred: Option<&PredecessorState>,
+    same_tree: impl FnOnce(&str, &str) -> bool,
+) -> Option<SequenceMarker> {
+    let pred = pred.filter(|p| p.open && !p.merged)?;
+    let live = pred.head_sha.as_deref().filter(|h| !h.is_empty())?;
+    if live == marker.pred_head || !same_tree(&marker.pred_head, live) {
+        return None;
+    }
+    log::info!(
+        "claim_reconciliation (merge sequence): predecessor #{} moved {} -> {} with an identical          tree (kind=tree) — hold re-anchored, not voided (#10465)",
+        marker.after,
+        marker.pred_head,
+        live
+    );
+    Some(SequenceMarker {
+        pred_head: live.to_string(),
+        ..marker.clone()
+    })
+}
+
+/// Post the re-anchored marker as the follower's newest marker comment (the
+/// newest trusted marker wins, so the hold now pins the live head). No
+/// "voided/replanned" note and the label stays. Idempotent: an identical
+/// marker line already present suppresses the repeat.
+pub(super) fn record_reanchor(
+    gh_bin: &Path,
+    root: &Path,
+    follower: u32,
+    marker: &SequenceMarker,
+) -> anyhow::Result<()> {
+    let body = format!(
+        "{}\n**Landing order kept** — #{} was re-dated with a tree-identical commit, so the \
+         recorded order after it still holds. The marker now pins its new head.\n\n\
+         ---\n\
+         *Automated by loom-daemon claim reconciliation (#10465)*",
+        marker_text(marker),
+        marker.after
+    );
+    gh_pr(gh_bin, root, &["comment", &follower.to_string(), "--body", &body])?;
+    Ok(())
 }
 
 // --- Rule 2: sticky operator releases --------------------------------------
@@ -154,9 +205,29 @@ fn timestamp(v: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffs
     chrono::DateTime::parse_from_rfc3339(v.pointer("/created_at")?.as_str()?).ok()
 }
 
+/// When a timeline comment last took its current body: the later of its
+/// `created_at` and `updated_at`. The #10634 landing upsert PATCHes a new
+/// marker into an existing comment, so `created_at` alone back-dates it
+/// (Judge, PR #10651). An absent `updated_at` (or JSON `null`) means never
+/// edited; a present but unparseable one is an unknown (`None`).
+fn comment_timestamp(v: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let created = timestamp(v)?;
+    match v.pointer("/updated_at") {
+        None | Some(serde_json::Value::Null) => Some(created),
+        Some(u) => {
+            let updated = chrono::DateTime::parse_from_rfc3339(u.as_str()?).ok()?;
+            Some(created.max(updated))
+        }
+    }
+}
+
 /// Is the newest `loom:sequenced` label event in `events` (a paginated
 /// issue-timeline body) a removal by an actor `is_fleet` does not claim,
 /// made AFTER the comment that wrote `marker`?
+///
+/// A carrying comment is dated by the later of its `created_at` and
+/// `updated_at`: the landing upsert (#10634) edits a marker into an existing
+/// comment in place, and the marker is only as old as that edit.
 ///
 /// `Some(false)` for no such event, a newest `labeled`, a fleet actor, or a
 /// removal no newer than the marker comment (it released an earlier hold,
@@ -207,7 +278,7 @@ pub fn operator_unlabeled(
             && str_at(e, "/body").is_some_and(|b| carries_marker(&b, marker))
     }) {
         // Any carrying comment with an unreadable timestamp is an unknown.
-        let at = timestamp(c)?;
+        let at = comment_timestamp(c)?;
         marker_at = Some(marker_at.map_or(at, |m: chrono::DateTime<_>| m.max(at)));
     }
     Some(removed_at > marker_at?)

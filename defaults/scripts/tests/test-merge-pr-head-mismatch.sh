@@ -398,10 +398,14 @@ retired "the awk source-order scan asserting _is_head_mismatch_response appeared
 # the merge call — a window the armed queue could not see at all. Assert that
 # re-validation exists and routes to the same exit-3 re-queue signal.
 _reval_body="$(awk '/^_revalidate_merge_guards\(\) \{/{f=1} f; f && /^}/{exit}' "$MERGE_PR_SRC")"
+retired "the grep for the in-shell 'fresh_sha\" != \"\$MERGE_PRECONDITION_SHA' comparison" \
+    "--auto compares the post-wait head against \$MERGE_PRECONDITION_SHA" \
+    "the comparison left merge-pr.sh in the #8191 revalidate-head slice; it is Rust in loom-daemon/src/merge_pr/revalidate_head.rs, so no grep of this file can pass" \
+    "loom-daemon/tests/merge_pr_revalidate_head_differential.rs (frozen retired comparison vs the verb), a_moved_head_reports_the_fresh_sha in src/merge_pr/revalidate_head/tests.rs, and test-merge-pr-auto-blocked-settle.sh AC3 (behavioural: exit 3 naming both SHAs)"
 TESTS_RUN=$((TESTS_RUN + 1))
 # Here-strings, never pipes: `grep -q` exits on first match and would SIGPIPE
 # the producer under `set -o pipefail` (#7771 class).
-if grep -qF -- 'fresh_sha" != "$MERGE_PRECONDITION_SHA' <<<"$_reval_body" && \
+if grep -qF -- 'merge-pr revalidate-head --precondition-sha "${MERGE_PRECONDITION_SHA:-}"' <<<"$_reval_body" && \
    grep -qF -- 'error_head_moved' <<<"$_reval_body"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: --auto re-reads the head after its wait and routes a move to error_head_moved (exit 3, #8410)"
@@ -487,12 +491,40 @@ fi
 # on a PR whose only problem was that CI outran LOOM_AUTO_MERGE_TIMEOUT.
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 5' "$CHAMPION_MD" \
-   && grep -q 'Exception: exit codes 3, 4 and 5' "$CHAMPION_MD"; then
+   && grep -q 'Exception: exit codes 3-7' "$CHAMPION_MD"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: champion-pr-merge.md branches on exit 5 and its exception section covers it (#8896)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md does not wire merge-pr.sh's exit 5 (#8896)"
+fi
+
+# #10167's exit 6 (deferred behind another PR's chain-head merge lock) is the
+# same family: branched on in Step 3, listed in the exception section, and
+# documented in the script header and the exceptions doc.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 6' "$CHAMPION_MD" \
+   && grep -q '^- \*\*6\*\* — ' "$CHAMPION_MD" \
+   && grep -q '^#   6 = deferred' "$MERGE_PR_SRC" \
+   && [[ -f "$EXIT_CODE_DOC" ]] && grep -q '^| `6` |' "$EXIT_CODE_DOC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: exit 6 (chain-head merge lock defer) is wired in Champion and documented (#10167)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: exit 6 (chain-head merge lock defer) is not wired/documented (#10167)"
+fi
+
+# #10628: Champion's exit 7 (merge-queue step withheld the direct merge) is
+# listed next to 3-6 in the exception section AND in the exceptions doc.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$CHAMPION_MD" ]] && grep -q '"\$MERGE_RC" -eq 7' "$CHAMPION_MD" \
+   && grep -q '^- \*\*7\*\* — ' "$CHAMPION_MD" \
+   && [[ -f "$EXIT_CODE_DOC" ]] && grep -q '^| `7` |' "$EXIT_CODE_DOC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: exit 7 (merge-queue step) is wired in Champion and documented next to 3-6 (#10628)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: exit 7 (merge-queue step) is not documented next to 3-6 (#10628)"
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))

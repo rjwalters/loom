@@ -52,6 +52,15 @@ pub struct Args {
     pub restart_now: bool,
     pub fetch_mode: FetchMode,
     pub resolve_json: bool,
+    /// `--tag <TAG>` (#10709): resolve exactly this release instead of the
+    /// newest one. `None` is today's `latest` resolution, unchanged.
+    pub tag: Option<String>,
+    /// `--yes` (#11044): install without the fleet floor confirmation.
+    /// `LOOM_DAEMON_UPDATE_YES` is read where the check runs.
+    pub yes: bool,
+    /// `--to-floor` (#11044): install exactly the fleet floor's release.
+    /// Resolved into `tag` + `--fetch` once the floor is read.
+    pub to_floor: bool,
 }
 
 impl Args {
@@ -76,6 +85,9 @@ impl Args {
             restart_now: super::util::env_truthy("LOOM_DAEMON_UPDATE_RESTART_NOW"),
             fetch_mode: FetchMode::Auto,
             resolve_json: false,
+            tag: None,
+            yes: false,
+            to_floor: false,
         };
         // Falsy first, then truthy — the shell ran both tests unconditionally
         // and the second only fires for a value the first did not match.
@@ -117,7 +129,20 @@ impl Args {
                 "--fetch" => a.fetch_mode = FetchMode::Force,
                 "--no-fetch" => a.fetch_mode = FetchMode::Off,
                 "--resolve-json" => a.resolve_json = true,
+                "--tag" => {
+                    let next = argv
+                        .get(i + 1)
+                        .filter(|v| !v.is_empty() && !v.starts_with('-'));
+                    let Some(tag) = next else {
+                        out::err("--tag requires a release TAG argument (e.g. v0.19.831)");
+                        std::process::exit(1);
+                    };
+                    a.tag = Some(tag.clone());
+                    i += 1;
+                }
                 "--prune-stale-entry-points" => a.prune_stale = true,
+                "--yes" => a.yes = true,
+                "--to-floor" => a.to_floor = true,
                 other => {
                     out::err(&format!("Unknown option '{other}'"));
                     out::say_err("Use --help for usage");
@@ -133,9 +158,54 @@ impl Args {
             );
             std::process::exit(1);
         }
+        if let Some(conflict) = to_floor_conflict(&a) {
+            out::err(conflict);
+            std::process::exit(1);
+        }
+        if let Some(conflict) = tag_conflict(&a) {
+            out::err(conflict);
+            std::process::exit(1);
+        }
 
         a
     }
+}
+
+/// Why `--tag` cannot be honoured alongside the rest of `a`, if it cannot.
+///
+/// A pinned tag names a release to FETCH: `--no-fetch` would silently ignore
+/// it, and `--resolve-json` answers through the daemon's own resolver, which
+/// has no pin. Refusing beats pretending the pin applied.
+fn tag_conflict(a: &Args) -> Option<&'static str> {
+    a.tag.as_ref()?;
+    if a.fetch_mode == FetchMode::Off {
+        return Some("--tag names a release to fetch; it cannot be combined with --no-fetch (or LOOM_DAEMON_UPDATE_FETCH=0).");
+    }
+    if a.resolve_json {
+        return Some("--tag cannot be combined with --resolve-json.");
+    }
+    None
+}
+
+/// Why `--to-floor` cannot be honoured alongside the rest of `a`, if it
+/// cannot. It becomes `--fetch --tag v<floor>`, so it conflicts with an
+/// explicit tag and with everything a tag conflicts with.
+fn to_floor_conflict(a: &Args) -> Option<&'static str> {
+    if !a.to_floor {
+        return None;
+    }
+    if a.tag.is_some() {
+        return Some(
+            "--to-floor installs the fleet floor's own release; it cannot be combined with --tag.",
+        );
+    }
+    if a.fetch_mode == FetchMode::Off {
+        return Some("--to-floor fetches the floor's release; it cannot be combined with --no-fetch (or LOOM_DAEMON_UPDATE_FETCH=0).");
+    }
+    if a.resolve_json {
+        return Some("--to-floor cannot be combined with --resolve-json.");
+    }
+    None
 }
 
 /// `show_help()` — the script's leading comment block, verbatim.
@@ -178,7 +248,12 @@ mod tests {
             "--fetch",
             "--no-fetch",
             "--resolve-json",
+            "--tag",
             "--prune-stale-entry-points",
+            "--yes",
+            "--to-floor",
+            "LOOM_DAEMON_UPDATE_YES",
+            "Fleet floor check",
         ] {
             assert!(help.contains(flag), "help.txt lost {flag}");
         }
@@ -207,6 +282,47 @@ mod tests {
         assert_eq!(a.fetch_mode, FetchMode::Force);
         let a = Args::parse(&argv(&["--no-fetch"]));
         assert_eq!(a.fetch_mode, FetchMode::Off);
+        assert_eq!(Args::parse(&argv(&["--fetch"])).tag, None, "no --tag: unpinned");
+        let a = Args::parse(&argv(&["--fetch", "--tag", "v0.19.831"]));
+        assert_eq!(a.fetch_mode, FetchMode::Force);
+        assert_eq!(a.tag.as_deref(), Some("v0.19.831"));
+    }
+
+    #[test]
+    fn a_pinned_tag_conflicts_with_no_fetch_and_resolve_json_only() {
+        // `--fetch` on the argv so an ambient LOOM_DAEMON_UPDATE_FETCH=0
+        // cannot turn this parse into a conflict that exits the test process;
+        // every other mode is set on the struct directly.
+        let mut a = Args::parse(&argv(&["--fetch", "--tag", "v1.2.3"]));
+        assert!(tag_conflict(&a).is_none(), "--fetch");
+        a.fetch_mode = FetchMode::Auto;
+        assert!(tag_conflict(&a).is_none(), "auto mode");
+        a.fetch_mode = FetchMode::Off;
+        assert!(tag_conflict(&a).is_some(), "--no-fetch would ignore the pin");
+        a.fetch_mode = FetchMode::Force;
+        a.resolve_json = true;
+        assert!(tag_conflict(&a).is_some(), "--resolve-json has no pin");
+        a.tag = None;
+        assert!(tag_conflict(&a).is_none(), "no tag, no conflict");
+    }
+
+    #[test]
+    fn yes_and_to_floor_parse_and_to_floor_conflicts_like_a_tag() {
+        let a = Args::parse(&argv(&["--yes"]));
+        assert!(a.yes && !a.to_floor);
+        let a = Args::parse(&argv(&["--fetch", "--to-floor"]));
+        assert!(a.to_floor && !a.yes);
+        assert!(to_floor_conflict(&a).is_none());
+        let mut b = Args::parse(&argv(&["--fetch"]));
+        b.to_floor = true;
+        b.tag = Some("v1.2.3".to_string());
+        assert!(to_floor_conflict(&b).is_some(), "--tag");
+        b.tag = None;
+        b.fetch_mode = FetchMode::Off;
+        assert!(to_floor_conflict(&b).is_some(), "--no-fetch");
+        b.fetch_mode = FetchMode::Force;
+        b.resolve_json = true;
+        assert!(to_floor_conflict(&b).is_some(), "--resolve-json");
     }
 
     #[test]

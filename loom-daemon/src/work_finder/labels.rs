@@ -103,3 +103,22 @@ pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
 /// property (#10013), so outside tests this name is documentation only.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";
+
+/// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
+/// for carrying a hard-exclusion label (#7528), naming the rule.
+///
+/// DEBUG rather than INFO on purpose. The candidate listing re-evaluates the
+/// same rows every tick, so an INFO here would reproduce the #6440
+/// 865-refusals-in-an-hour shape for an intake backlog that is doing exactly
+/// what it should (sitting still until a maintainer clears the label). The
+/// operator-visible signal is the per-tick `declined-skip` count on the
+/// `work_finder: tick — …` line, plus the reaper's threshold WARN
+/// (`SweepRegistry::record_decline`) for an issue that actually reached
+/// dispatch and burned a session.
+pub(super) fn log_hard_exclusion_skip(issue: u32, rule: &str) {
+    log::debug!(
+        "work_finder: skipping issue #{issue} — carries the hard-exclusion label `{rule}`, \
+         which every Loom role declines on; a maintainer must remove it (or close the issue) \
+         before it is dispatchable (#7528)"
+    );
+}

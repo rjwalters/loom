@@ -182,6 +182,8 @@ pub(crate) fn input_for(row: &TwinOtterInput, at: DateTime<Utc>) -> EstimateInpu
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
+        dependencies: None,
     }
 }
 
@@ -214,15 +216,17 @@ fn hours_to_sec(q: [f64; 4]) -> (i64, i64, i64, i64) {
 
 // ---------------------------------------------------------- registration
 
+/// `land-2026-10-04-twin-otter` is retired (#10528): unregistered, tier
+/// `retired`, with or without a fit. Its evaluation is still served, as
+/// `land-2026-10-04-twin-otter-b`'s PR stages.
 #[test]
-fn twin_otter_is_registered_last_as_a_land_shadow_with_or_without_a_fit() {
+fn twin_otter_is_retired_and_its_evaluation_is_served_by_b() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
-        let ids = registry.ids();
-        assert_eq!(ids[ids.len() - 2], LAND_TWIN_OTTER, "-b (#10244) follows it");
-        assert_eq!(registry.get(LAND_TWIN_OTTER).map(Heuristic::kind), Some(Kind::Land));
-        let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land[land.len() - 2], LAND_TWIN_OTTER);
+        assert!(!registry.registers(Kind::Land, LAND_TWIN_OTTER));
+        assert!(registry.get(LAND_TWIN_OTTER).is_none());
+        assert_eq!(registry.tier_of(LAND_TWIN_OTTER), Some(crate::eta::Tier::Retired));
+        assert_eq!(registry.get(LAND_TWIN_OTTER_B).map(Heuristic::kind), Some(Kind::Land));
         // Shadow: never the default `current`.
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
         assert_eq!(Registry::default_current(Kind::Land), "land-v1");
@@ -239,12 +243,8 @@ fn twin_otter_is_registered_last_as_a_land_shadow_with_or_without_a_fit() {
 fn without_a_usable_fit_every_estimate_refuses_no_model() {
     let input = review_input();
     let history = StageSamples::default();
-    // No file at all: `builtin()`.
-    let builtin = Registry::builtin();
-    let none = builtin
-        .get(LAND_TWIN_OTTER)
-        .unwrap()
-        .estimate(&input, &history);
+    // No file at all.
+    let none = twin_otter(None).estimate(&input, &history);
     // A file with no direct model.
     let mut no_aft = fixture_fit(fit_as_of());
     no_aft.aft = None;
@@ -554,6 +554,8 @@ fn the_cap_drops_the_model_slice_after_features_and_only_when_present() {
     assert_eq!(record.fit_id.len(), 16, "the identity survives");
     assert_eq!(e.quantiles_with_p90(), answer, "the numbers survive");
     assert_eq!(run_explanation(&e), None, "without the slice nothing recomputes");
+    assert_eq!(e.replayable, Some(false), "and the record says so (#10930)");
+    assert_eq!(e.replayable_reason.as_deref(), Some("truncated:twin_otter.model"));
 
     // An explanation with no slice never names one.
     let mut v1 = crate::eta::heuristics::LandV1.estimate(&review_input(), &history_a());
@@ -731,13 +733,13 @@ fn land_emission(emissions: &[crate::eta::tracker::Emission], id: &str) -> (bool
 }
 
 /// End to end: a held approved PR (`loom:pr` + `loom:operator`) gets a
-/// twin-otter shadow answer from `merge_hold`, while the primary `land-v1`
-/// still refuses it `blocked`.
+/// twin-otter answer from `merge_hold` (served by `-b`, #10528), while the
+/// primary `land-v1` still refuses it `blocked`.
 #[test]
 fn a_tracker_pass_estimates_a_held_pr_with_twin_otter_only() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(as_of() - Duration::days(1)))));
     let emissions = tracker_pass(&fitted, &["loom:pr", "loom:operator"]);
-    let (primary, twin) = land_emission(&emissions, LAND_TWIN_OTTER);
+    let (primary, twin) = land_emission(&emissions, LAND_TWIN_OTTER_B);
     assert!(!primary);
     assert!(twin.result.is_some(), "{:?}", twin.no_estimate_reason);
     assert_eq!(twin.current_stage.as_ref().map(|c| c.stage), Some(Stage::MergeHold));
@@ -756,11 +758,12 @@ fn a_tracker_pass_with_a_fit_adds_a_twin_otter_shadow_and_leaves_the_primary_alo
     let without = tracker_pass(&Registry::builtin(), &labels);
     let land = land_emission;
 
-    let (primary, twin) = land(&with_fit, LAND_TWIN_OTTER);
+    // Twin-otter's evaluation, served by `-b` (twin-otter retired, #10528).
+    let (primary, twin) = land(&with_fit, LAND_TWIN_OTTER_B);
     assert!(!primary, "a shadow, never the primary");
     assert!(twin.result.is_some(), "{:?}", twin.no_estimate_reason);
     assert_eq!(twin.twin_otter.as_ref().unwrap().input.sequenced, 1);
-    let (_, refused) = land(&without, LAND_TWIN_OTTER);
+    let (_, refused) = land(&without, LAND_TWIN_OTTER_B);
     assert_eq!(refused.no_estimate_reason, Some(NoEstimateReason::NoModel));
 
     // The primary `land-v1` explanation is byte-identical either way.
@@ -793,17 +796,23 @@ fn at_stage(stage: Stage) -> EstimateInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: input.as_of,
+        not_here: None,
+        held_until: None,
     });
     input
 }
 
 #[test]
-fn twin_otter_b_is_registered_after_twin_otter_as_a_land_shadow() {
+fn twin_otter_b_is_registered_before_tandem_wren_as_a_land_shadow() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
-        assert_eq!(registry.ids().last(), Some(&LAND_TWIN_OTTER_B));
+        // `land-2026-10-06-tandem-wren` (#10510) composes over `-b`, after it;
+        // `land-2026-10-04-twin-otter`, once before it, is retired (#10528).
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land[land.len() - 2..], [LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
+        assert_eq!(
+            land[land.len() - 2..],
+            [LAND_TWIN_OTTER_B, crate::eta::heuristics::LAND_TANDEM_WREN]
+        );
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
     }
 }

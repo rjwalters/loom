@@ -40,6 +40,8 @@
 //!   (claim and quarantine reconciliation, star liveness, sweep dispatch, and
 //!   every scheduled role tick), which is also where the refusal is logged,
 //!   once per change of reason.
+//! - [`repo_writable`] before the workspace resync (#10718) takes a repo's
+//!   claim: its target is the workspace's `origin`, named explicitly.
 //! - `loom-daemon forge may-write` for shell, wrapped by `loom_write_repo` in
 //!   `defaults/scripts/lib/forge-helpers.sh`; the `forge issue|pr` write
 //!   passthroughs and the auto-merge verbs vet with it before they run.
@@ -66,6 +68,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod probe;
+mod probe_snapshot;
 pub(crate) mod target;
 
 use probe::{Permission, PermissionProbe};
@@ -390,3 +393,7 @@ pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod gitea_tests;

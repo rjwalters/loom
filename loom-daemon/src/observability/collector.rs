@@ -817,6 +817,7 @@ fn terminal_records(
             story_points: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
             // (the real `sweep.outcome`) computes. Absent, never fabricated.
             attempt_index: None,
@@ -836,10 +837,29 @@ fn terminal_records(
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
+///
+/// With repo facts on (W3a) the slug comes from the fingerprint-invalidated
+/// repo-facts record instead (`gh repo view` semantics, no forge call when
+/// warm), so a moved remote is seen; `Legacy` keeps the path below.
 pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
+    if crate::forge_repo_facts::enabled() {
+        use crate::forge_repo_facts::{canonical, GhRepoEnv, Lookup};
+        let root = std::path::PathBuf::from(workspace_root);
+        match tokio::task::spawn_blocking(move || canonical(&root, GhRepoEnv::Ignore)).await {
+            Ok(Lookup::Fact(f)) => {
+                let slug = f.full_name();
+                cache.insert(workspace_root.to_string(), slug.clone());
+                return Some(slug);
+            }
+            // `Unavailable` (a failed verify, or its backoff) keeps the
+            // last-known slug or the legacy lookup rather than dropping
+            // the record.
+            Ok(Lookup::Unavailable | Lookup::Legacy) | Err(_) => {}
+        }
+    }
     if let Some(slug) = cache.get(workspace_root) {
         return Some(slug.clone());
     }
@@ -938,6 +958,17 @@ async fn sample_snapshots(
     )
     .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // This host's export view (Issue #11124): per-exporter queue depth,
+    // cumulative drops and last flush. Facts only; every host emits its own.
+    queue.offer(TelemetryEnvelope::new(
+        host_id,
+        TelemetryRecord::HostExport(crate::telemetry::kinds::host_export::HostExportRecord::build(
+            host_id,
+            Utc::now(),
+            &super::global_export_statuses(),
+            &super::global_export_queue_stats(),
+        )),
+    ));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
@@ -946,7 +977,9 @@ async fn sample_snapshots(
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
-    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
+    // skips the repos a fresh captain covers (`captain_gauges`).
+    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
@@ -967,6 +1000,15 @@ async fn sample_snapshots(
     // file reads, no forge call; a no-op without the ops sink. After the
     // snapshot so it reports this pass's built snapshot.
     super::ops::eta_health::record(workspace_root).await;
+    // Per-account Codex session-container state (Issue #10455): export the
+    // gauge from the always-on watch's newest observations. No docker call
+    // here (the watch owns the bounded snapshot), so a wedged Docker cannot
+    // stall this pass; the WARN lives in the watch and runs without telemetry.
+    super::ops::codex_session::record();
+    // This host's view of its held sweeps, review PRs and ready queue over
+    // OTLP (Issue #10196), independent of ETA. Hourly anchor, deltas only on
+    // change; its review listings are ETag-cached (warm after stage_dwell).
+    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1555,10 +1597,14 @@ where
             }
         };
         let priority = priorities.get(&root).copied();
+        // #10763: this host's release-pass tallies for the repo, if it ticked.
+        let stale_blocked_release =
+            crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
             priority,
+            stale_blocked_release,
         });
     }
     // Deterministic order (the dashboard renders this list directly) and

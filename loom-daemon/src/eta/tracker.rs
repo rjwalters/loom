@@ -296,6 +296,8 @@ pub struct Tracker {
     orphaned: usize,
     /// Pending estimates dropped by the [`MAX_PENDING`] cap.
     cap_dropped: usize,
+    /// Of those, whole series lost: more distinct series than the cap.
+    cap_series_dropped: usize,
     /// The last pass's fleet view and dispatch plan, for `features` (#10201).
     context: features::PassContext,
     /// Latest queue-friction readings (#10193), copied onto every estimate's
@@ -305,6 +307,9 @@ pub struct Tracker {
     answers: Vec<answers::PassAnswers>,
     /// What passes observed of PR-to-issue links and issue stars (#10372).
     star: star_book::StarBook,
+    /// Dependency edges and parent landings (#10510), filled by the
+    /// caller's forge reads, never by the tracker (`tracker_dependency.rs`).
+    pub dependencies: super::dependency::DependencyBook,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -314,6 +319,9 @@ pub struct Dropped {
     pub orphaned: usize,
     /// Dropped by the [`MAX_PENDING`] cap.
     pub over_cap: usize,
+    /// Of those, the last estimate of a series (#10496): only when there
+    /// are more distinct series than the cap, so such a series is lost.
+    pub series_over_cap: usize,
 }
 
 /// The stage entered when sweep phase `phase` completes, for the phases that
@@ -336,10 +344,12 @@ impl Tracker {
             loom,
             orphaned: 0,
             cap_dropped: 0,
+            cap_series_dropped: 0,
             context: features::PassContext::default(),
             friction: super::friction::FrictionBook::default(),
             answers: Vec::new(),
             star: star_book::StarBook::default(),
+            dependencies: super::dependency::DependencyBook::default(),
         }
     }
 
@@ -348,6 +358,7 @@ impl Tracker {
         Dropped {
             orphaned: std::mem::take(&mut self.orphaned),
             over_cap: std::mem::take(&mut self.cap_dropped),
+            series_over_cap: std::mem::take(&mut self.cap_series_dropped),
         }
     }
 
@@ -357,10 +368,23 @@ impl Tracker {
         &self.pending
     }
 
-    /// Restore pending estimates persisted by an earlier process.
-    pub fn restore_pending(&mut self, pending: Vec<EstimateSummary>) {
-        self.pending = pending;
+    /// Restore pending estimates persisted by an earlier process, keeping
+    /// only those whose heuristic `registry` still registers for their kind.
+    /// Returns how many were dropped.
+    ///
+    /// A retired heuristic (#10484) must produce no live output, and a pending
+    /// estimate is live output deferred: left in place, its landing or p90
+    /// censoring would score it, write shadow-ledger pairs and emit an
+    /// `eta.outcome` under the retired id for up to [`PENDING_MAX_AGE_DAYS`].
+    /// Dropping it here, before anything can score it, is the one gate.
+    pub fn restore_pending(&mut self, pending: Vec<EstimateSummary>, registry: &Registry) -> usize {
+        let before = pending.len();
+        self.pending = pending
+            .into_iter()
+            .filter(|p| registry.registers(p.kind, &p.heuristic))
+            .collect();
         self.pending.sort_by_key(|p| p.as_of);
+        before - self.pending.len()
     }
 
     /// Items currently tracked.
@@ -767,18 +791,9 @@ impl Tracker {
                 continue;
             };
             if is_new || item.stage.is_none() && item.verdict_pending_since.is_none() {
-                // First sight mid-stage: entry is at most `updated_at` ago.
-                let entered_at = pr.updated_at.unwrap_or(now).min(now);
-                if stage == Stage::Doctor {
-                    item.rework_rounds = item.rework_rounds.max(1);
-                }
-                item.stage = Some(StageTrack {
-                    stage,
-                    entered_at,
-                    source: AgeSource::UpdatedAtLowerBound,
-                    exact: false,
-                });
-                let item = item.clone();
+                // First sight mid-stage: dated from the label timeline, else
+                // at most `updated_at` ago (#10500, `tracker_timeline.rs`).
+                let item = self.first_sight(&key, pr, stage, now);
                 let mut row = self.row("label.first_seen", &item, now);
                 row.next_stage = Some(stage);
                 row.raw = serde_json::json!({"labels": pr.labels, "updated_at": pr.updated_at});
@@ -1176,6 +1191,7 @@ impl Tracker {
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
         let (features, omitted) =
             self.recorded_features(key, item, &hold::described(&current), ctx, now, false);
+        let queue = self.stage_queue_for(key, item, &current, now);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1186,6 +1202,8 @@ impl Tracker {
             dispatch: item.ready.clone().filter(|_| ready_only),
             stalls,
             held,
+            queue,
+            dependencies: None,
         })
     }
 
@@ -1222,14 +1240,22 @@ impl Tracker {
             None => self.items.keys().cloned().collect(),
         };
         let mut out = Vec::new();
+        // #10510: one graph per call, `None` unless an edge was observed.
+        let graph = self.dependency_graph(ctx, now);
         for key in targets {
-            let Some(item) = self.items.get(&key).cloned() else {
+            // #10500: the item as the model reads it, reconciled against the
+            // label timeline (`tracker_timeline.rs`); the tracked item itself
+            // keeps its own observations.
+            let Some(item) = self.items.get(&key).map(|i| self.model_view(i, now)) else {
                 continue;
             };
             for kind in [Kind::Start, Kind::Finish, Kind::Land] {
-                let Some(input) = self.input_for(&key, &item, kind, ctx, now) else {
+                let Some(mut input) = self.input_for(&key, &item, kind, ctx, now) else {
                     continue;
                 };
+                if kind == Kind::Land {
+                    input.dependencies.clone_from(&graph);
+                }
                 let configured = match kind {
                     Kind::Start => ctx.current_start,
                     Kind::Finish => ctx.current_finish,
@@ -1312,8 +1338,12 @@ pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
 #[path = "tracker_hold.rs"]
 mod hold;
 
+#[path = "tracker_timeline.rs"]
+mod timeline;
+
 pub use ready::{
-    ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
+    dispatch_input, waiting_position, ReadyPlan, ReadyRow, READY_FIRST_SEEN,
+    READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
 };
 
 /// Merge several effects.
@@ -1328,3 +1358,8 @@ pub fn merged(all: Vec<Effects>) -> Effects {
 
 #[path = "tracker_star.rs"]
 mod star_book;
+
+#[path = "tracker_dependency.rs"]
+mod dependency_graph;
+
+pub use dependency_graph::DependencyCandidate;

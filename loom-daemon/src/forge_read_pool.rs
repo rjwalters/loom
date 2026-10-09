@@ -44,6 +44,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use crate::forge_bucket_book::Resource;
+
 /// Env override for the read pool, highest precedence — mirroring
 /// `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH`'s precedence over
 /// `forge.githubApp.*` in `github-app-token.sh`.
@@ -174,6 +176,49 @@ pub fn assignment_index(owner_repo: &str, len: usize) -> Option<usize> {
     Some((u64::from_be_bytes(bytes) % len as u64) as usize)
 }
 
+/// SHA-256 of `domain` + `owner_repo` (lowercased) + `|` + `affinity_key`,
+/// first 8 bytes big-endian, mod `len` — the shared shape of
+/// [`split_index`] and [`spill_index`].
+fn keyed_index(domain: &[u8], owner_repo: &str, affinity_key: &str, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(domain);
+    hasher.update(owner_repo.to_ascii_lowercase().as_bytes());
+    hasher.update(b"|");
+    hasher.update(affinity_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    Some((u64::from_be_bytes(bytes) % len as u64) as usize)
+}
+
+/// The reader index that serves one request of a **split** repo (W4-B):
+/// SHA-256 of `"loom-read-pool/split/v1:" + owner_repo (lowercased) + "|" +
+/// affinity_key`, first 8 bytes big-endian, mod `len`.
+///
+/// Per request rather than per repo, so a hot repo's reads spread across
+/// the pool, but keyed by the request's identity
+/// ([`crate::gh_invocation::affinity_key`]), so one URL always lands on one
+/// reader and keeps that reader's ETag. Same cross-host contract as
+/// [`assignment_index`]: changing it moves every split URL once.
+#[must_use]
+pub fn split_index(owner_repo: &str, affinity_key: &str, len: usize) -> Option<usize> {
+    keyed_index(b"loom-read-pool/split/v1:", owner_repo, affinity_key, len)
+}
+
+/// The spill hash of one request (W4-B): SHA-256 of
+/// `"loom-read-pool/spill/v1:" + owner_repo (lowercased) + "|" +
+/// affinity_key`, first 8 bytes big-endian, mod `len`. A **partial** spill
+/// moves exactly the requests with `spill_index(.., 2) == Some(1)`, so the
+/// moved half is the same on every host and every tick of the episode.
+#[must_use]
+pub fn spill_index(owner_repo: &str, affinity_key: &str, len: usize) -> Option<usize> {
+    keyed_index(b"loom-read-pool/spill/v1:", owner_repo, affinity_key, len)
+}
+
 /// Pick the member that should serve reads for `owner_repo`, skipping any
 /// member currently withdrawn.
 ///
@@ -210,10 +255,16 @@ pub fn select_for_repo_at<'a>(
         return None;
     }
     let start = assignment_index(owner_repo, pool.len())?;
-    (0..pool.len()).find_map(|offset| {
-        let member = &pool[(start + offset) % pool.len()];
-        (!is_withdrawn_at(&member.app_id, now)).then_some(member)
-    })
+    walk_order(start, pool.len())
+        .map(|i| &pool[i])
+        .find(|member| !is_withdrawn_at(&member.app_id, now))
+}
+
+/// The one deterministic walk every reader choice uses (W4-B): `start`,
+/// then forward around a pool of `len`. Two hosts that agree on `start` and
+/// on which members are unusable land on the same member.
+pub fn walk_order(start: usize, len: usize) -> impl Iterator<Item = usize> {
+    (0..len).map(move |offset| (start + offset) % len)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +316,206 @@ pub fn is_withdrawn_at(app_id: &str, now: SystemTime) -> bool {
         return false; // fail open: a poisoned lock must not withdraw everything
     };
     map.get(app_id).is_some_and(|&until| now < until)
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawal scoped to one (app, owner, resource) bucket (W4-A)
+// ---------------------------------------------------------------------------
+
+/// Which of an installation's rate-limit pools a scoped withdrawal covers.
+///
+/// GitHub meters each `(App, owner)` installation separately and, within it,
+/// each resource separately: an exhausted `core` pool for one owner says
+/// nothing about the same App's `graphql` pool, or about its installation on
+/// another owner. [`ResourceScope::All`] is for failures that are not about
+/// one pool — a secondary (abuse/concurrency) limit, or bad credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ResourceScope {
+    Core,
+    Graphql,
+    Search,
+    /// Every resource of the installation.
+    All,
+}
+
+impl ResourceScope {
+    /// The scope covering exactly `resource`.
+    #[must_use]
+    pub fn of(resource: Resource) -> Self {
+        match resource {
+            Resource::Core => Self::Core,
+            Resource::Graphql => Self::Graphql,
+            Resource::Search => Self::Search,
+        }
+    }
+
+    /// Whether this scope covers `resource`.
+    #[must_use]
+    pub fn covers(self, resource: Resource) -> bool {
+        self == Self::All || self == Self::of(resource)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Graphql => "graphql",
+            Self::Search => "search",
+            Self::All => "all",
+        }
+    }
+}
+
+/// `(app id, owner lowercased, scope)` -> the instant it becomes eligible.
+type ScopedKey = (String, String, ResourceScope);
+
+fn scoped_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
+    static SCOPED: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
+    SCOPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Withdraw reader `app_id` from `owner`'s `scope` until `until`. Like
+/// [`withdraw_until`], an existing withdrawal is only ever extended, never
+/// shortened. Returns the instant the withdrawal now ends (the longer of the
+/// held and the requested one).
+pub fn withdraw_scoped_until(
+    app_id: &str,
+    owner: &str,
+    scope: ResourceScope,
+    until: SystemTime,
+) -> SystemTime {
+    let Ok(mut map) = scoped_withdrawals().lock() else {
+        return until; // a poisoned lock must not take reads down
+    };
+    let held = map
+        .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
+        .or_insert(until);
+    if until > *held {
+        *held = until;
+    }
+    *held
+}
+
+/// The scoped withdrawals that are about **budget** (a primary or secondary
+/// rate limit), as opposed to a refused credential. Same key and end as the
+/// entry [`withdraw_scoped_budget_until`] also writes to the scoped table.
+fn budget_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
+    static BUDGET: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
+    BUDGET.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`withdraw_scoped_until`] for a rate limit: the reader is out of
+/// **budget** for `owner`'s `scope`, which is the one reason a deferrable
+/// read may be shed (W4-C) rather than sent to the writer. Returns the
+/// instant the scoped withdrawal now ends.
+pub fn withdraw_scoped_budget_until(
+    app_id: &str,
+    owner: &str,
+    scope: ResourceScope,
+    until: SystemTime,
+) -> SystemTime {
+    let held = withdraw_scoped_until(app_id, owner, scope, until);
+    if let Ok(mut map) = budget_withdrawals().lock() {
+        let slot = map
+            .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
+            .or_insert(held);
+        if held > *slot {
+            *slot = held;
+        }
+    }
+    held
+}
+
+/// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`
+/// because of a rate limit (that resource's or [`ResourceScope::All`]'s) —
+/// not a credential failure, a coverage miss or a stale token.
+#[must_use]
+pub fn is_budget_withdrawn_at(
+    app_id: &str,
+    owner: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> bool {
+    let Ok(map) = budget_withdrawals().lock() else {
+        return false; // unknown cause: never shed on it
+    };
+    let owner = owner.to_ascii_lowercase();
+    [ResourceScope::of(resource), ResourceScope::All]
+        .into_iter()
+        .any(|scope| {
+            map.get(&(app_id.to_string(), owner.clone(), scope))
+                .is_some_and(|&until| now < until)
+        })
+}
+
+/// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`,
+/// by a withdrawal of that resource or of [`ResourceScope::All`].
+#[must_use]
+pub fn is_withdrawn_scoped_at(
+    app_id: &str,
+    owner: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> bool {
+    let Ok(map) = scoped_withdrawals().lock() else {
+        return false; // fail open, as is_withdrawn_at
+    };
+    let owner = owner.to_ascii_lowercase();
+    [ResourceScope::of(resource), ResourceScope::All]
+        .into_iter()
+        .any(|scope| {
+            map.get(&(app_id.to_string(), owner.clone(), scope))
+                .is_some_and(|&until| now < until)
+        })
+}
+
+/// When reader `app_id`'s App-wide withdrawal ends, if it is withdrawn at
+/// `now` (W4-B: the instant an exhausted route can expect it back).
+#[must_use]
+pub fn withdrawn_until(app_id: &str, now: SystemTime) -> Option<SystemTime> {
+    let map = withdrawals().lock().ok()?;
+    map.get(app_id).copied().filter(|&until| now < until)
+}
+
+/// When reader `app_id`'s scoped withdrawal from `owner`'s `resource` ends
+/// (the later of that resource's and [`ResourceScope::All`]'s), if one is
+/// live at `now` (W4-B: a spill latch entered on a withdrawal releases no
+/// earlier than this).
+#[must_use]
+pub fn scoped_withdrawal_until(
+    app_id: &str,
+    owner: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    let map = scoped_withdrawals().lock().ok()?;
+    let owner = owner.to_ascii_lowercase();
+    [ResourceScope::of(resource), ResourceScope::All]
+        .into_iter()
+        .filter_map(|scope| {
+            map.get(&(app_id.to_string(), owner.clone(), scope))
+                .copied()
+        })
+        .filter(|&until| now < until)
+        .max()
+}
+
+/// Every scoped withdrawal still live at `now`, as `(app id, owner, scope,
+/// until)` in key order — what `loom-daemon status` lists.
+#[must_use]
+pub fn live_scoped_withdrawals(
+    now: SystemTime,
+) -> Vec<(String, String, ResourceScope, SystemTime)> {
+    let Ok(map) = scoped_withdrawals().lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = map
+        .iter()
+        .filter(|(_, &until)| now < until)
+        .map(|((app, owner, scope), &until)| (app.clone(), owner.clone(), *scope, until))
+        .collect();
+    out.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +579,44 @@ mod tests {
             assert_eq!(assignment_index(repo, 3), Some(*want_n3), "N=3 mismatch for {repo}");
             assert_eq!(assignment_index(repo, 4), Some(*want_n4), "N=4 mismatch for {repo}");
         }
+    }
+
+    #[test]
+    fn assignment_at_n2_puts_loom_on_the_second_reader() {
+        // W4-B golden row, computed independently in Python:
+        // SHA-256("loom-read-pool/v1:rjwalters/loom")[..8] BE mod 2 = 1.
+        assert_eq!(assignment_index("rjwalters/loom", 2), Some(1));
+    }
+
+    #[test]
+    fn split_and_spill_indices_match_their_golden_tables() {
+        // W4-B cross-host contract, computed independently in Python
+        // (hashlib.sha256(prefix + owner_repo.lower() + "|" + key), first 8
+        // bytes big-endian, mod 4), not by calling these functions. N=4 guards
+        // the byte order: every row's little-endian answer differs from at
+        // least one of the two columns (split rows 1 and 3; spill all four).
+        let unit = "\u{1f}";
+        let golden: &[(&str, String, usize, usize)] = &[
+            // (owner_repo, affinity_key, split N=4, spill N=4)
+            ("acme/hot", format!("api{unit}repos/acme/hot/issues/1"), 0, 2),
+            ("acme/hot", "repos/acme/hot/issues?state=open".to_string(), 1, 2),
+            ("rjwalters/loom", "repos/rjwalters/loom/pulls/42".to_string(), 0, 1),
+            ("acme/widgets", format!("api{unit}repos/acme/widgets/commits"), 3, 0),
+        ];
+        for (repo, key, split, spill) in golden {
+            assert_eq!(split_index(repo, key, 4), Some(*split), "split {repo} {key:?}");
+            assert_eq!(spill_index(repo, key, 4), Some(*spill), "spill {repo} {key:?}");
+            // The owner/repo is lowercased before hashing.
+            assert_eq!(split_index(&repo.to_uppercase(), key, 4), Some(*split));
+        }
+        assert_eq!(split_index("acme/hot", "k", 0), None);
+        assert_eq!(spill_index("acme/hot", "k", 0), None);
+    }
+
+    #[test]
+    fn the_walk_starts_at_start_and_wraps() {
+        assert_eq!(walk_order(2, 4).collect::<Vec<_>>(), vec![2, 3, 0, 1]);
+        assert_eq!(walk_order(0, 0).count(), 0);
     }
 
     #[test]

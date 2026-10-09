@@ -67,12 +67,14 @@ fn build(
 /// `forge_call_stats` row is not `unknown`. One table for both families keeps
 /// a name's mapping in exactly one place.
 ///
-/// `None` is deliberate, not debt, for: issue views (`claim.labels`,
-/// `claim.issue_labels`, `claim.issue_state`, `heal.issue_view`,
-/// `model.issue_body*`) and PR-by-label listings (`claim.pr_list_claimed`,
-/// `verdict.pr_list`, `*.pr_list`, `snapshot.*`) — the inventory has no
-/// single-issue-view or PR-list-by-label row — plus the mixed-purpose
-/// `*.pr_view` dispatchers and `star.api` (a generic `gh api` passthrough).
+/// `None` is deliberate, not debt, for: GraphQL issue views (`claim.labels`,
+/// `claim.issue_labels`, `claim.issue_state`, `model.issue_body*`) and
+/// PR-by-label listings (`claim.pr_list_claimed`, `verdict.pr_list`,
+/// `*.pr_list`, `snapshot.*`) — the inventory has no single-issue-view or
+/// PR-list-by-label row — plus `star.api` (a generic `gh api` passthrough).
+/// `heal.issue_view` is absent because it is an ETag'd REST read that names
+/// its own `issue.view-state` op (#10507); the `*.pr_view` dispatch arms are
+/// gone (#10507).
 #[must_use]
 pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
     Some(match op {
@@ -80,6 +82,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_timeline"
         | "guard.open_pr_timeline"
         | "outcome.label_timeline"
+        | "restore.label_timeline"
         | "sequence.label_timeline" => ops::TIMELINE_READ,
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
@@ -88,9 +91,11 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
+        | "chain_lock.comments"
         | "roster.comments" => ops::COMMENT_LIST,
-        "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
-        "claim.pr_list_by_head" => ops::PR_LIST_BY_HEAD,
+        "claim.pr_labels" | "sequence.predecessor" | "chain_lock.pr_base" => ops::PR_VIEW_STATE,
+        "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
+        "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
@@ -98,6 +103,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_release"
         | "heal.issue_add_label"
         | "intake.add_triage"
+        | "intake.remove_triage"
         | "verdict.clear_labels"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
@@ -105,7 +111,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.label"
         | "quarantine.release"
         | "restore.label"
-        | "prless.hold_label" => ops::ISSUE_EDIT_LABELS,
+        | "prless.hold_label"
+        | "park_hold.issue_labels" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
@@ -118,7 +125,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
         | "prless.comment" => ops::COMMENT_CREATE,
-        "roster.delete" | "roster.patch" => ops::COMMENT_EDIT_DELETE,
+        "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
+            ops::COMMENT_EDIT_DELETE
+        }
         _ => return None,
     })
 }
@@ -126,6 +135,12 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
 /// A read ([`AccessIntent::Read`]) — the common case.
 pub(crate) fn read(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
     inv(op, AccessIntent::Read, gh_bin, root)
+}
+
+/// A read pinned to the writer: a read-back of a forge fact this daemon just
+/// wrote itself, where a reader App could still lag the write (W4-C).
+pub(crate) fn read_own_write(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
+    read(op, gh_bin, root).writer_identity()
 }
 
 /// A write ([`AccessIntent::Write`]).

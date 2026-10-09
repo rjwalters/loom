@@ -175,7 +175,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Determine Loom repository root (where this script lives)
-LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# requires-daemon: host optional   #10179 opted-out host refuses installs (guard on next line); absent/older binary (no `host` verb, exit 1/2) proceeds unguarded.
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; command -v loom-daemon >/dev/null 2>&1 && { _hc="$(loom-daemon host check --entry-point install-loom.sh 2>&1)"; [ $? -ne 10 ] || { printf '%s\n' "$_hc" >&2; exit 1; }; } || true  # only exit 10 = disabled; an older binary (1/2 for unknown `host`) proceeds
 
 # ANSI color codes
 RED='\033[0;31m'
@@ -1886,7 +1887,7 @@ LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\"/\\\"}"
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
-  "loom_commit": "${LOOM_COMMIT}",
+  "loom_commit": "${LOOM_COMMIT}",$(loom_source_requires_daemon_field "$LOOM_ROOT" 2>/dev/null)
   "install_date": "$(date +%Y-%m-%d)",
   "loom_source_remote": "${LOOM_SOURCE_REMOTE}",
   "installed_files": ${INSTALLED_FILES_JSON}

@@ -369,6 +369,132 @@ fn dispatch_yields_to_a_young_leaseless_foreign_building_claim() {
     );
 }
 
+/// Like [`set_claim_labeled_at`], but the timeline read ALSO answers the
+/// actor-bearing `max_by` query (Issue #10345) with `actor<TAB>timestamp`.
+fn set_claim_event(ws: &Path, actor: &str, secs_ago: i64) {
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_gh).unwrap();
+    let generic = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then";
+    assert!(script.contains(generic), "the shared harness's generic arm changed shape");
+    let ts = (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+    let arm = format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *\"/timeline\"* ]]; then\n\
+         if [[ \"$*\" == *max_by* ]]; then printf '%s\\t%s\\n' '{actor}' '{ts}'; \
+         else printf '%s\\n' '{ts}'; fi\n\
+         exit 0\n\
+         fi\n\
+         {generic}",
+    );
+    std::fs::write(&fake_gh, script.replacen(generic, &arm, 1)).unwrap();
+}
+
+/// Like [`set_claim_event`], but the timestamp is anchored to the dispatch under
+/// test instead of baked at fixture setup (Issue #10786). The fake `gh` records
+/// the epoch second of the dispatcher's own `--add-label loom:building` flip
+/// (the first `gh` call after `episode_start`), and the timeline answers one
+/// second before it. That satisfies both legs of the guard at once: the event
+/// PREDATES `episode_start` (so the leaseless-label yield fires) and sits within
+/// the 2s own-flip attribution slack of the flip window. Nothing depends on how
+/// long fixture setup took before dispatch started; only the one process spawn
+/// between `episode_start` and the flip matters.
+fn set_claim_event_now(ws: &Path, actor: &str) {
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&fake_gh).unwrap();
+    let generic = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then";
+    let shebang = "#!/usr/bin/env bash\n";
+    assert!(script.contains(generic), "the shared harness's generic arm changed shape");
+    assert!(script.starts_with(shebang), "the shared harness's shebang changed shape");
+    let flip_file = ws.join("claim-flip-epoch");
+    let record = format!(
+        "{shebang}\
+         if [[ \"$*\" == *\"--add-label loom:building\"* ]]; then date +%s > \"{flip}\"; fi\n",
+        flip = flip_file.display(),
+    );
+    let arm = format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *\"/timeline\"* ]]; then\n\
+         n=$(( $(cat \"{flip}\" 2>/dev/null || date +%s) - 1 ))\n\
+         ts=$(date -u -d \"@$n\" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+         date -u -r \"$n\" +%Y-%m-%dT%H:%M:%SZ)\n\
+         if [[ \"$*\" == *max_by* ]]; then printf '%s\\t%s\\n' '{actor}' \"$ts\"; \
+         else printf '%s\\n' \"$ts\"; fi\n\
+         exit 0\n\
+         fi\n\
+         {generic}",
+        flip = flip_file.display(),
+    );
+    let patched = script
+        .replacen(generic, &arm, 1)
+        .replacen(shebang, &record, 1);
+    std::fs::write(&fake_gh, patched).unwrap();
+}
+
+/// **#10345 AC3.** A leaseless yield whose `loom:building` event was created by
+/// this daemon's own fleet identity inside its own flip window is a phantom:
+/// the label is reverted (`loom:building` removed, `loom:issue` restored) as
+/// part of the standdown.
+#[test]
+#[serial]
+fn leaseless_yield_to_own_flip_reverts_the_phantom_label() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_event_now(dir.path(), "loom-fleet-dispatch");
+
+    let err = registry
+        .dispatch(&SweepKind::Issue(10345), None, None, None, None)
+        .expect_err("a leaseless label inside the own flip window still yields");
+    assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "got: {err:#}");
+    assert!(!spawn_log.exists(), "no builder may spawn");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        gh_calls.contains("--remove-label loom:building"),
+        "the phantom loom:building must be removed; gh log: {gh_calls}"
+    );
+    assert!(
+        gh_calls.contains("--add-label loom:issue"),
+        "loom:issue must be restored; gh log: {gh_calls}"
+    );
+}
+
+/// **#5270/#9453 protection.** A foreign actor's young label is a hand-claim:
+/// no label removal, even when its timestamp sits inside the flip window.
+#[test]
+#[serial]
+fn leaseless_yield_to_a_foreign_actor_keeps_the_label() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_event(dir.path(), "some-human", 1);
+
+    let err = registry
+        .dispatch(&SweepKind::Issue(10346), None, None, None, None)
+        .expect_err("a foreign hand-claim must refuse this dispatch");
+    assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "got: {err:#}");
+    assert!(!spawn_log.exists());
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building")
+            && !gh_calls.contains("--add-label loom:issue"),
+        "a foreign hand-claim's label must be left intact; gh log: {gh_calls}"
+    );
+}
+
+/// The shared bot identity at an unrelated time is another lane's claim.
+#[test]
+#[serial]
+fn leaseless_yield_to_the_fleet_actor_outside_the_flip_window_keeps_the_label() {
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, _spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
+    set_claim_event(dir.path(), "loom-fleet-dispatch", 300);
+
+    registry
+        .dispatch(&SweepKind::Issue(10347), None, None, None, None)
+        .expect_err("a young fleet-actor label from an unrelated time must refuse");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("--remove-label loom:building"),
+        "an unattributable label must be left intact; gh log: {gh_calls}"
+    );
+}
+
 /// The anti-wedge complement of the regression above, and the reason the leg
 /// reuses orphan recovery's 10-minute label grace: a `loom:building` older than
 /// that grace is the shape a finished or abandoned claim leaves behind. If it

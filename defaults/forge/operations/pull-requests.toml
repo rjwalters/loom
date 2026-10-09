@@ -89,6 +89,52 @@ path = "loom-daemon/src/forge_check_open_pr.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/lib/worktree-forge-pr-check.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
+
+[[operation]]
+id = "pr.list-open"
+group = "pr-creation-discovery-state"
+summary = "List every open PR of a repo (the daemon's PR-side reconciliation passes, client-side label filter; the open-linked-PR guard's leg 0)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "state"]
+outputs = ["number", "state", "draft", "labels", "head_ref", "head_sha", "base_ref", "updated_at", "body", "author_association"]
+required_fields = ["number", "state", "labels", "head_ref"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-list-open"
+test_status = "declared"
+owner = "daemon-sweep"
+risk = "normal"
+github = { commands = [
+  "gh pr list",
+], routes = [
+  "GET repos/{owner}/{repo}/pulls",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+notes = "ETag'd REST pages (#10349); an unchanged repo answers with free 304s. A truncated listing is a completeness bug, not a display one. Since #10514 it is also leg 0 of both open-linked-PR probes (body linking phrase or feature/issue-N head); the closes-graph is only their fallback."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/worktree_ops/linked_pr_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/pr_planning/listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/observability/eta_friction.rs"
 
 [[operation]]
 id = "pr.view-state"
@@ -191,6 +237,15 @@ path = "defaults/.claude/commands/loom/doctor.md"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/judge.md"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "pr.commits-and-compare"
@@ -230,6 +285,9 @@ path = "loom-daemon/src/forge_tree_unchanged.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/blame-issue.sh"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "git.fetch-branch"
@@ -395,6 +453,42 @@ kind = "role-prompt"
 path = "defaults/.claude/commands/loom/judge.md"
 
 # --- issue-closing-relationships ---------------------------------------------
+
+[[operation]]
+id = "issue.closed-by-pull-requests"
+group = "issue-closing-relationships"
+summary = "Resolve, for a batch of issues, which PRs are declared to close each one (number and state)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "issue_numbers"]
+outputs = ["pr_numbers", "pr_states", "total_count"]
+required_fields = ["pr_numbers", "total_count"]
+actor = "daemon"
+permissions = ["pull_requests:read", "issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::issue-closed-by-pull-requests"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [
+  "gh api graphql (issue.closedByPullRequestsReferences, aliased per issue)",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "REST has no equivalent: timeline cross-referenced events do not say whether a closing keyword was used, so this read is GraphQL-only on GitHub",
+  "whether another forge exposes the issue-to-closing-PR direction at all, rather than only the PR-to-issue one (pr.closing-issue-references)",
+]
+notes = "The opposite direction of pr.closing-issue-references. Batched as one aliased query per 100 issues with gh's own arguments (first: 100, closed-unmerged PRs excluded) so the verdicts match `gh issue view --json closedByPullRequestsReferences`."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/batch.rs"
 
 [[operation]]
 id = "pr.closing-issue-references"

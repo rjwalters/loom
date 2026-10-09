@@ -25,7 +25,12 @@
 //!    working checkout, so an unattended `cargo build --release` there would
 //!    compile whatever is uncommitted into the running daemon. The loop refuses
 //!    to build unless [`crate::self_update::source_tree_clean`] is `Some(true)`.
-//!    It never runs `git pull` on the operator's behalf.
+//!    It never runs `git pull` on the operator's behalf. (Fleet-sync may
+//!    fast-forward this checkout, as it does every registered workspace, on a
+//!    host with `fleet.autoApply` on — only when it is clean and strictly
+//!    behind, and never while this loop's update script is running in it:
+//!    [`crate::fleet_sync::checkout_ff`], #10869. That is not this loop
+//!    pulling, and this gate is unchanged by it.)
 //! 3. **Backoff on failure** — a source tree that does not compile must not
 //!    retry every tick forever. Retryable build failures back off exponentially
 //!    with a ceiling; the terminal give-up state is surfaced in `loom-daemon status`.
@@ -39,9 +44,12 @@
 //!    `update_available: true` for a day+). After `deferDeadlineSecs` of
 //!    continuous deferral the loop rebuilds anyway, at **reduced CPU priority**
 //!    (`nice(19)`), so the stampede is mitigated rather than merely postponed.
-//! 5. **In-flight sweeps survive** — the roll goes through #4090's **drain**
-//!    path, not a bare restart, so dispatched sweeps finish first and stay in
-//!    the registry rather than being orphaned as bare processes.
+//! 5. **In-flight work is paused, never orphaned** — the roll goes through
+//!    pause-and-roll ([`pause_roll`], #10831), not a bare restart: every
+//!    daemon-dispatched agent is stopped at a safe point and recorded in the
+//!    pause manifest (or requeued, with a reason), and only then does the
+//!    daemon exit for its supervised relaunch. Before #10831 the roll waited
+//!    for in-flight work to reach zero instead, which a busy host never did.
 //! 6. **Flags replay exactly** — the restart exits into launchd
 //!    `KeepAlive:SuccessfulExit`, which relaunches from the plist's persisted
 //!    `ProgramArguments`/`EnvironmentVariables`, so the daemon comes back with
@@ -122,6 +130,18 @@
 //! only `Some(true)` triggers a rebuild. `None` (a tarball install with no
 //! source checkout, or `BUILT_COMMIT == "unknown"`) means "do nothing" — never
 //! "stale".
+//!
+//! # Fleet hosts move only when the floor moves (Issue #10885)
+//!
+//! Everything above (chasing the newest release, the source fallback, the
+//! settle window and its ceiling) is the behaviour of a host with **no fleet
+//! store**. A host that reads one (`fleet.repo`) has a floor,
+//! `loom_min_version`, and that floor is the only thing that moves it: below
+//! the floor it rolls on the tick that sees it, with no settle; at or above it,
+//! or while the floor is not known, it does nothing. It never chases a newer
+//! release and never rebuilds itself from source. [`floor_roll`] has the rule
+//! table. There is no roll window on any host; its removed settings are
+//! accepted and ignored with a warning ([`removed_settings`]).
 //!
 //! # Process-global, not per-workspace
 //!
@@ -265,20 +285,9 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
-    /// `autonomous.autoUpdate.rollStallDeadlines` — how many drain deadlines may
-    /// expire, summed across roll lifetimes, with the in-flight sweep count
-    /// never improving before the roll is declared unsatisfiable and abandoned
-    /// (#8998). A zero/invalid value is dropped to `None`: `0` would declare
-    /// every armed roll unsatisfiable on sight.
-    pub roll_stall_deadlines: Option<u32>,
-    /// `autonomous.autoUpdate.rollStallCooldownSecs` — how long a standing
-    /// unsatisfiability declaration may stand before it expires and one more
-    /// bounded roll attempt is released (#9010). A zero/invalid value is dropped
-    /// to `None`: `0` would clear a declaration on the tick it was made, which is
-    /// #8998's livelock re-entered through the knob.
-    pub roll_stall_cooldown_secs: Option<u64>,
-    /// #9132's window knobs (`rollWindowSecs`, `rollWindowOffsetSecs`, `launchdLiveReload`).
-    pub roll_window: roll_window::RollWindowConfig,
+    /// #10885: the removed keys this block still sets (see
+    /// [`removed_settings`]). They are ignored; this only feeds the warning.
+    pub removed_keys: Vec<&'static str>,
 }
 
 /// Read `.loom/config.json → autonomous.autoUpdate` through
@@ -308,22 +317,14 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .get("deferDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
-        roll_stall_deadlines: block
-            .get("rollStallDeadlines")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0),
-        roll_stall_cooldown_secs: block
-            .get("rollStallCooldownSecs")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&s| s > 0),
-        roll_window: roll_window::RollWindowConfig::from_block(block),
+        removed_keys: removed_settings::keys_in(block),
     }
 }
 
 /// Resolve whether the loop is enabled with precedence **env > config >
 /// default(false)**. This loop is opt-in (side effects on the running process),
-/// so an absent config leaves it **off**.
+/// so an absent config leaves it **off**. #10954: on a fleet host the loop runs
+/// whatever this says; it governs only a host with no fleet store ([`loop_mode`]).
 #[must_use]
 pub fn resolve_enabled(config: &AutoUpdateConfig) -> bool {
     if let Ok(v) = std::env::var(AUTO_UPDATE_ENABLE_ENV) {
@@ -412,8 +413,6 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
-    /// #9132: the roll schedule, or `None` when no window is configured.
-    pub roll_window: Option<roll_window::RollWindowStatus>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -529,10 +528,14 @@ pub struct ArtifactInfo {
     pub asset_sha256: Option<String>,
     /// The release target triple this host resolved to.
     pub target: Option<String>,
-    /// The installed binary's version, as `loom-daemon --version` reports it.
+    /// The version the verdict compares against: since #10710 the RUNNING
+    /// process's own version (see [`native_probe::with_running_basis`]).
     pub installed_version: Option<String>,
-    /// The installed binary's own sha256 (of the file on disk).
+    /// The on-disk binary's sha256 — only when it is the running version's
+    /// file; `None` when a different version is staged there (#10710).
     pub installed_sha256: Option<String>,
+    /// The on-disk binary's `--version` — diagnostic only (#10710).
+    pub on_disk_version: Option<String>,
 }
 
 /// The result of one artifact-resolution attempt.
@@ -569,32 +572,35 @@ mod artifact_verdict;
 
 pub use artifact_verdict::{classify_artifact, ArtifactVerdict};
 
-/// The roll trigger (`DrainTrigger`/`IpcDrainTrigger`) and the pure
-/// supersede-not-stack decision — both moved to sibling modules (#8514) because
-/// this file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
-mod drain_trigger;
-// `pub` because `DrainTrigger::armed_roll` names `supersede::ArmedRoll` in a
+/// The roll trigger (`RollTrigger`/`IpcRollTrigger`, #10831) and the pure
+/// supersede-not-stack decision (#8514), in sibling modules.
+mod roll_trigger;
+// `pub` because `RollTrigger::armed_roll` names `supersede::ArmedRoll` in a
 // publicly re-exported trait.
 pub mod supersede;
 
-pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
+pub use roll_trigger::{IpcRollTrigger, RollTrigger};
 
-/// #8998's unsatisfiable-drain detector. A sibling module for the same two
-/// reasons #8513/#8514 were: this file is over
-/// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
-/// whole value is that it terminates belongs next to the tests that prove it.
-pub mod roll_stall;
+/// Pause-and-roll (design `docs/design/daemon-roll-pause-resume.md`): the
+/// pause manifest (§6) and the resume/requeue classifier (#10830), and the H4
+/// pause every roll trigger goes through (#10831). The resume side is #10832.
+pub mod pause_classify;
+pub mod pause_manifest;
+pub mod pause_resume;
+pub mod pause_roll;
+/// #10713: `auto_update_state.json` (settle clocks, floor alert).
+pub mod persisted_state;
+pub use pause_roll::RollTarget;
+/// #10712: floor-driven roll targets (target selection, settle skip, stall).
+pub mod floor_roll;
 /// #9132: schedule-driven rolls (window, per-host offset, one arm per window).
-pub mod roll_window;
+pub mod removed_settings;
 /// The loop's resolved knob set, bundled — see the module doc for why a fourth
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
-pub use roll_stall::{
-    resolve_roll_stall_cooldown, resolve_roll_stall_deadlines, RollStallReport,
-    AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS_ENV, AUTO_UPDATE_ROLL_STALL_DEADLINES_ENV,
-    DEFAULT_ROLL_STALL_COOLDOWN_SECS, DEFAULT_ROLL_STALL_DEADLINES,
-};
 pub use tuning::TickTuning;
+/// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
+pub mod loop_mode;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -624,18 +630,26 @@ const ARTIFACT_ROLL_RECORD_FILE: &str = "auto-update-artifact-roll.json";
 /// `~/.loom`). Exists for tests and for a host whose state home is elsewhere.
 pub const AUTO_UPDATE_STATE_DIR_ENV: &str = "LOOM_AUTO_UPDATE_STATE_DIR";
 
-/// Resolve the artifact-roll record path: `$LOOM_AUTO_UPDATE_STATE_DIR` when
-/// set and non-empty, else `~/.loom/`. `None` when neither resolves (no home
-/// directory) — the loop then runs record-less, which only costs the
-/// loop-suppression above, never correctness of the fetch itself.
+/// The auto-update state dir: `$LOOM_AUTO_UPDATE_STATE_DIR` when set and
+/// non-empty, else `~/.loom/`. `None` when neither resolves (no home
+/// directory). Shared by the artifact-roll record and the pause manifest
+/// (#10831), so both always live side by side.
 #[must_use]
-fn artifact_roll_record_path() -> Option<PathBuf> {
+pub fn state_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var(AUTO_UPDATE_STATE_DIR_ENV) {
         if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir.trim()).join(ARTIFACT_ROLL_RECORD_FILE));
+            return Some(PathBuf::from(dir.trim()));
         }
     }
-    dirs::home_dir().map(|h| h.join(".loom").join(ARTIFACT_ROLL_RECORD_FILE))
+    dirs::home_dir().map(|h| h.join(".loom"))
+}
+
+/// Resolve the artifact-roll record path under [`state_dir`]. `None` runs the
+/// loop record-less, which only costs the loop-suppression above, never
+/// correctness of the fetch itself.
+#[must_use]
+fn artifact_roll_record_path() -> Option<PathBuf> {
+    state_dir().map(|d| d.join(ARTIFACT_ROLL_RECORD_FILE))
 }
 
 /// Read the persisted artifact-roll record. Soft-fails to `None` on a missing
@@ -705,9 +719,11 @@ pub trait AutoUpdateProbe: Send {
     /// resolution failure at fetch time is a plain retryable failure, not a
     /// silent downgrade to a source build.
     ///
-    /// `low_priority` has the same meaning as on [`Self::rebuild`].
-    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
-        let _ = low_priority;
+    /// `tag` (#10709) is the release the verdict compared; the child installs
+    /// exactly it, never a newer one that appeared since. `low_priority` has
+    /// the same meaning as on [`Self::rebuild`].
+    fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
+        let _ = (tag, low_priority);
         RebuildOutcome::Retryable("this probe cannot fetch release artifacts".to_string())
     }
 
@@ -854,7 +870,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
         native_probe::native_resolution(&root)
     }
 
-    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
+    fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
         let Some(root) = self.script_root() else {
             return RebuildOutcome::Retryable(format!(
                 "{} — cannot fetch",
@@ -880,7 +896,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
             &root,
             self.timeout,
             low_priority,
-            &["--fetch"],
+            &native_probe::fetch_args(tag),
             repo.as_deref(),
         )
     }
@@ -1009,10 +1025,16 @@ fn run_update_script_with(
     if let Some(repo) = repo {
         command.env("LOOM_DAEMON_UPDATE_GH_REPO", repo);
     }
+    // #11044: the daemon's own roll must never stop at the fleet floor
+    // confirmation (there is no terminal, and stdin is /dev/null).
+    command.env(crate::daemon_update::floor_guard::INVOKER_ENV, "daemon");
     if low_priority {
         nice_child(&mut command);
     }
 
+    // #10869: the script verifies its build against this checkout's HEAD, so
+    // fleet-sync's fast-forward must not move it until the script has exited.
+    let _checkout = crate::fleet_sync::checkout_ff::hold_for_self_update(cwd);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1217,13 +1239,13 @@ pub struct AutoUpdateState {
     /// surface — a persistently stale-repo host is stuck exactly as a
     /// terminal/backoff one is, just for a different reason.
     stale_repo: stale_repo::StaleRepoStreak,
-    /// #8998's episode tracker: drain deadlines counted **across** roll
-    /// lifetimes, so a roll that is abandoned and re-armed (or superseded onto a
-    /// newer release, which restarts #6007's paused-dispatch budget) cannot hide
-    /// the fact that its wait condition is unreachable.
-    roll_stall: roll_stall::RollStallTracker,
-    /// #9132's schedule gate (inert unless `rollWindowSecs` is configured).
-    window: roll_window::WindowGate,
+    /// #10712: the fleet floor's basis and last verdict (inert on a host with
+    /// no fleet store).
+    floor: floor_roll::FloorState,
+    /// #10719: the repo-ahead demand's basis and last verdict (inert while unset).
+    repo_ahead: floor_roll::repo_ahead::RepoAheadState,
+    /// #10713: where this state is persisted (disabled unless attached).
+    persist: persisted_state::Persistence,
 }
 
 impl AutoUpdateState {
@@ -1246,32 +1268,6 @@ impl AutoUpdateState {
             artifact_record_path: path,
             ..Self::default()
         }
-    }
-
-    /// Set #8998's unsatisfiability threshold (the resolved
-    /// `rollStallDeadlines` knob). A builder rather than a `new` argument so
-    /// every existing construction site — and every test — keeps the default.
-    #[must_use]
-    pub fn with_roll_stall_deadlines(mut self, deadlines: u32) -> Self {
-        self.roll_stall.set_threshold(deadlines);
-        self
-    }
-
-    /// Whether #8998's episode is running, i.e. whether a tick with no armed
-    /// roll still has to read the in-flight count to advance (or clear) it.
-    fn roll_stall_active(&self) -> bool {
-        self.roll_stall.is_active()
-    }
-
-    /// Fold one tick's view of the armed roll into #8998's tracker. `Some` once
-    /// the roll's wait condition is unsatisfiable.
-    fn observe_roll_stall(
-        &mut self,
-        now: DateTime<Utc>,
-        armed: Option<&supersede::ArmedRoll>,
-        in_flight: usize,
-    ) -> Option<RollStallReport> {
-        self.roll_stall.observe(now, armed, in_flight)
     }
 
     /// Decide this tick, artifact first (Issue #7609).
@@ -1305,6 +1301,19 @@ impl AutoUpdateState {
                 // No artifact resolved this tick at all — any stale-repo
                 // streak from a previous tick no longer applies (#8513).
                 self.stale_repo.reset();
+                self.floor.observe(None);
+                self.repo_ahead.observe(None);
+                // #10885: a fleet host never rebuilds itself from source. With
+                // no release resolved it has nothing to roll to this tick.
+                if self.floor.fleet_host() {
+                    self.clear_tracking();
+                    let unchased = (check.update_available == Some(true))
+                        .then_some("the source checkout's newer HEAD (no source rebuilds)");
+                    return TickDecision::Skip(format!(
+                        "no artifact ({reason}) → {}",
+                        self.floor.hold_reason(unchased)
+                    ));
+                }
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
                     TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
@@ -1338,6 +1347,12 @@ impl AutoUpdateState {
         settle: Duration,
     ) -> TickDecision {
         let verdict = classify_artifact(info);
+        // #10712: below a satisfiable fleet floor, this release is the floor target.
+        let floor_target = self.floor.observe(Some(&floor_roll::Release::of(info)));
+        // #10719: so is it for a workspace that needs a newer daemon.
+        let ahead_target = self
+            .repo_ahead
+            .observe(Some(&floor_roll::Release::of(info)));
         // Issue #8513: the streak counts only genuinely CONSECUTIVE
         // stale-repo ticks, so anything else this tick resolved drops it —
         // but the reset must not run before the `StaleRepo` arm increments,
@@ -1349,7 +1364,10 @@ impl AutoUpdateState {
         let (target, why) = match verdict {
             ArtifactVerdict::UpToDate { version, why } => {
                 self.clear_tracking();
-                return TickDecision::Skip(format!("artifact {version}: {why} → up to date"));
+                let staged = native_probe::staged_note(info);
+                return TickDecision::Skip(format!(
+                    "artifact {version}: {why}{staged} → up to date"
+                ));
             }
             ArtifactVerdict::StaleRepo {
                 artifact,
@@ -1370,8 +1388,9 @@ impl AutoUpdateState {
             } => (
                 artifact_target_id(&artifact, info),
                 format!(
-                    "artifact {artifact} > installed {} → fetching",
-                    installed.as_deref().unwrap_or("<none>")
+                    "artifact {artifact} > installed {}{} → fetching",
+                    installed.as_deref().unwrap_or("<none>"),
+                    native_probe::staged_note(info)
                 ),
             ),
             ArtifactVerdict::ShaDiffers {
@@ -1407,6 +1426,18 @@ impl AutoUpdateState {
             }
         };
 
+        // #10885: a fleet host rolls only for the floor, and (#10719) for a
+        // registered workspace that needs a newer daemon. With neither target
+        // this tick (floor met, unknown, or unsatisfiable; no workspace needs
+        // a newer daemon) the newer release or re-published artifact above is
+        // not chased, and nothing is tracked, so no settle clock accumulates.
+        if self.floor.fleet_host() && floor_target.is_none() && ahead_target.is_none() {
+            self.clear_tracking();
+            let seen = why.trim_end_matches(" → fetching");
+            let unchased = format!("release {} ({seen})", info.tag);
+            return TickDecision::Skip(self.floor.hold_reason(Some(&unchased)));
+        }
+
         self.track_target(now, Some(target));
         // Shared bookkeeping with the source path: an idle observation re-arms
         // gate 4's continuous-busy clock for whichever path consults it next.
@@ -1418,17 +1449,30 @@ impl AutoUpdateState {
         if let Some(skip) = self.terminal_or_backoff_gate(now) {
             return skip;
         }
-        if let Some(skip) = self.settle_gate(now, settle) {
-            return skip;
+        // #10712: a floor-driven roll skips settle (and so does its supersede,
+        // which re-decides here still floor-driven); autoUpdate rolls do not.
+        // A repo-ahead demand (#10719) skips settle the same way. Only a host
+        // with no fleet store reaches the settle gate (#10885).
+        let selected = self
+            .floor
+            .select(floor_target.as_ref(), ahead_target.as_ref(), info);
+        if selected.source == floor_roll::TargetSource::AutoUpdate {
+            if let Some(skip) = self.settle_gate(now, settle) {
+                return skip;
+            }
         }
         // NO in-flight gate here (Issue #8252): a fetch is not a build, so it
         // is never deferred behind the build-stampede guard — only niced when
         // the host is busy, exactly as the post-deadline path used to do,
         // minus the wait. `defer_deadline` is consumed by `decide_source` only.
         TickDecision::FetchArtifact {
-            version: info.version.clone(),
-            tag: info.tag.clone(),
-            why,
+            why: format!(
+                "{why}{}{}",
+                self.floor.why_suffix(&selected),
+                self.repo_ahead.why_suffix(&selected)
+            ),
+            version: selected.version,
+            tag: selected.tag,
             low_priority: in_flight > 0,
         }
     }
@@ -1566,8 +1610,9 @@ impl AutoUpdateState {
         if !quiet_settled && !ceiling_settled {
             // #10414: name both clocks. A fleet whose release cadence is shorter
             // than `settle` never satisfies the quiet period, so the ceiling is
-            // the real roll time — and it is in-memory, restarted by a daemon
-            // restart. Without this, 48 identical notes hid a ~24 h lag.
+            // the real roll time. It was in-memory until #10713 persisted it
+            // (a restart onto the same binary keeps it). Without this, 48
+            // identical notes hid a ~24 h lag.
             let left = |since: Option<Instant>, window: Duration| {
                 since.map_or(window, |s| window.saturating_sub(now.duration_since(s)))
             };
@@ -1701,16 +1746,17 @@ impl AutoUpdateState {
                     self.backoff_until = None;
                     self.backoff = None;
                     self.last_roll = Some(Utc::now());
-                    format!("{installed} + provisioned; drain-and-restart triggered")
+                    format!("{installed} + provisioned; pause-and-roll triggered")
                 } else {
-                    // The binary IS provisioned, but the drain was refused
-                    // (e.g. no supervisor). Do not treat as a build failure —
-                    // launchd will pick up the fresh binary on the next
-                    // supervised restart. Surface it without backing off.
+                    // The binary IS provisioned, but the pause-and-roll could
+                    // not start (no supervisor, no state directory, or the
+                    // previous roll's manifest is still live). Do not treat as
+                    // a build failure — the fresh binary is picked up on the
+                    // next supervised restart. Surface it without backing off.
                     self.last_roll = Some(Utc::now());
                     format!(
-                        "{installed} + provisioned, but drain-and-restart was refused (no \
-                         supervisor?) — restart manually to run the fresh binary"
+                        "{installed} + provisioned, but the pause-and-roll could not start (no \
+                         supervisor? see the daemon log) — restart manually to run the fresh binary"
                     )
                 }
             }
@@ -1760,7 +1806,6 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
-            roll_window: self.window.status(),
         }
     }
 }

@@ -40,7 +40,12 @@
 use super::coeffs::{self, CoefficientFile, Fitter};
 use super::FEATURES;
 use crate::fleet_store::fetch::{write_atomic, Transport};
+// Shared with the captain gauges heartbeat; moved to the neutral
+// `fleet_store::publication` (#11098, Stage 2).
 use crate::fleet_store::propose::WriteTransport;
+pub(crate) use crate::fleet_store::publication::{
+    blob_sha, contents_path, ensure_ok, refuse_reviewed_branch_for, validate_branch_for, RAW,
+};
 use crate::fleet_store::StoreLocation;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -415,12 +420,6 @@ fn write_status(root: &Path, status: &PubStatus) {
 // Fetch (non-captain)
 // ---------------------------------------------------------------------------
 
-fn contents_path(loc: &StoreLocation, path: &str) -> String {
-    format!("repos/{}/contents/{path}?ref={}", loc.repo, loc.reference)
-}
-
-const RAW: &str = "application/vnd.github.raw+json";
-
 /// Fetch the captain's newest publication, verify it and install it into
 /// `fit_dir`. Never panics and never leaves a half-written file: an error of
 /// any kind is a [`FetchKind`] outcome, recorded in the status file, and the
@@ -580,33 +579,7 @@ pub enum PublishKind {
     AlreadyPublished,
 }
 
-fn ensure_ok(reply: &crate::fleet_store::fetch::Reply, what: &str, repo: &str) -> Result<()> {
-    if (200..300).contains(&reply.status) {
-        return Ok(());
-    }
-    let hint = if reply.status == 403 || reply.status == 404 || reply.status == 422 {
-        " — check the writer App has contents:write on the store and the eta-fit branch is \
-         exempt from the main ruleset"
-    } else {
-        ""
-    };
-    bail!("{what} in {repo}: HTTP {}{hint}", reply.status)
-}
-
-/// The blob sha of `path` on the branch, or `None` when absent.
-fn blob_sha(t: &dyn Transport, loc: &StoreLocation, path: &str) -> Result<Option<String>> {
-    let r = t.get(&contents_path(loc, path), None, None)?;
-    match r.status {
-        200 => {
-            let v: Value = serde_json::from_str(&r.body).context("malformed contents response")?;
-            Ok(v.get("sha").and_then(Value::as_str).map(str::to_string))
-        }
-        404 => Ok(None),
-        s => bail!("HTTP {s} reading {path} in {}", loc.repo),
-    }
-}
-
-fn put_file(
+pub(crate) fn put_file(
     wt: &dyn WriteTransport,
     loc: &StoreLocation,
     path: &str,
@@ -627,7 +600,7 @@ fn put_file(
 }
 
 /// Create the publication branch from `base_ref` when it does not exist.
-fn ensure_branch(
+pub(crate) fn ensure_branch(
     t: &dyn Transport,
     wt: &dyn WriteTransport,
     loc: &StoreLocation,
@@ -665,30 +638,7 @@ fn ensure_branch(
 ///
 /// When `reference` is not a plain, canonical branch name.
 pub fn validate_publication_ref(reference: &str) -> Result<()> {
-    crate::fleet_store::validate_ref(reference)
-        .with_context(|| format!("`{REF_KEY}` `{reference}` is invalid"))?;
-    if reference.starts_with("refs/")
-        || reference.starts_with("heads/")
-        || reference
-            .split('/')
-            .any(|seg| seg.is_empty() || seg.starts_with('.'))
-    {
-        bail!(
-            "`{REF_KEY}` `{reference}` must be a bare branch name \
-             (no `refs/` or `heads/` prefix, no empty or dot-led segment)"
-        );
-    }
-    Ok(())
-}
-
-/// The branch `reference` names, for comparison only: trimmed, without a
-/// leading `refs/heads/` or `heads/`, without trailing `/`.
-fn branch_name(reference: &str) -> &str {
-    let r = reference.trim();
-    r.strip_prefix("refs/heads/")
-        .or_else(|| r.strip_prefix("heads/"))
-        .unwrap_or(r)
-        .trim_end_matches('/')
+    validate_branch_for(REF_KEY, reference)
 }
 
 /// This autonomous write may land only on the dedicated publication branch,
@@ -697,26 +647,17 @@ fn branch_name(reference: &str) -> &str {
 /// (`FleetStore`), so it is enforced here rather than left to the ruleset.
 /// The publication branch must be valid and canonical
 /// ([`validate_publication_ref`]); both sides are normalized
-/// ([`branch_name`]) and compared case-insensitively, so `refs/heads/main`,
+/// and compared case-insensitively, so `refs/heads/main`,
 /// `Main` or `fleet.ref = refs/heads/stable` against `stable` are refused.
-fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
-    validate_publication_ref(&loc.reference)?;
-    let r = branch_name(&loc.reference);
-    if r.eq_ignore_ascii_case(branch_name(base_ref)) || r.eq_ignore_ascii_case("main") {
-        bail!(
-            "refusing to publish the eta fit to `{r}` in {}: `{REF_KEY}` must name a dedicated \
-             branch, not the store's reviewed branch",
-            loc.repo
-        );
-    }
-    Ok(())
+pub(crate) fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
+    refuse_reviewed_branch_for(REF_KEY, "the eta fit", loc, base_ref)
 }
 
 /// Whether `cur` (the store's envelope) is the publication `env` would make:
 /// every field equal (schema, fit, window, **captain**, fitter, file, sha)
 /// except `published_at`. A former captain's envelope for the same fit is
 /// not: the new captain must republish it, or every host would refuse it.
-fn same_publication(cur: &Envelope, env: &Envelope) -> bool {
+pub(crate) fn same_publication(cur: &Envelope, env: &Envelope) -> bool {
     Envelope {
         published_at: env.published_at,
         ..cur.clone()

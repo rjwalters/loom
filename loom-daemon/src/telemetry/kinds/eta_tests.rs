@@ -37,6 +37,8 @@ fn estimate() -> EtaEstimateRecord {
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
+        dependencies: None,
     };
     // No history: a refusal, which must carry provenance all the same.
     EtaEstimateRecord {
@@ -60,6 +62,7 @@ fn outcome() -> EtaOutcomeRecord {
         outcome_source: "pulls_read".to_string(),
         outcome_resolution_sec: Some(120),
         result: None,
+        attribution: None,
     }
 }
 
@@ -71,6 +74,8 @@ fn both_eta_kinds_are_registered_otlp_logs_only() {
         "eta.outcome",
         "eta.fleet_refresh",
         "eta.fit",
+        "eta.backtest.fold",
+        "eta.backtest.summary",
     ] {
         let meta = TELEMETRY_KINDS
             .iter()

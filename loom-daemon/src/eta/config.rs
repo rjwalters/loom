@@ -7,7 +7,10 @@
 //! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
+//! | `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true`: the captain's nightly walk-forward backtest folds (#10492) |
+//! | `nightlyFolds.retirementFiling` | `LOOM_ETA_RETIREMENT_FILING_ENABLED` | `false`: the captain's nightly task files retirement proposals as issues after the folds (#10525) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
+//! | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (floor 1; #10525, #10549, #10521) |
 //!
 //! `autonomous.eta.fleetRefresh.*` (#10263) — the daemon task that backfills
 //! and refreshes the fleet snapshots (`observability::eta_fleet_refresh`).
@@ -22,6 +25,8 @@
 //! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` (#10329) |
 //! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 //! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
+//! | `gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100` (min `2`): forge gap-fill reads per repo per cycle with SigNoz history on (#10520) |
+//! | `signoz.historyPrimary` | `LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY` | `false` (opt-in): with `signoz.enabled`, SigNoz is the history source and the forge only gap-fills (#10520) |
 
 use super::Kind;
 use std::path::Path;
@@ -104,6 +109,17 @@ pub const DEFAULT_FLEET_REFRESH_RESERVE: u64 = 1500;
 /// Default backfill depth, in days.
 pub const DEFAULT_FLEET_REFRESH_BACKFILL_DAYS: i64 = 21;
 
+/// Default forge gap-fill reads per repo per cycle when SigNoz is the
+/// history source (#10520). Conservative: a covered window needs none, and a
+/// pass that needs more resumes next cycle.
+pub const DEFAULT_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 100;
+
+/// Smallest gap-fill budget accepted (#10520): one listing page plus one
+/// timeline page, so every cycle of an uncovered pass makes progress (an
+/// interrupted timeline resumes at its next page). Lower values, `0`
+/// included, are raised to it.
+pub const MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS: u64 = 2;
+
 /// Shallowest backfill accepted: one day more than the daily fit's window,
 /// so a fresh host's first fit sees a whole window of history.
 pub const MIN_FLEET_REFRESH_BACKFILL_DAYS: i64 = super::fit::WINDOW_DAYS + 1;
@@ -112,8 +128,14 @@ pub const MIN_FLEET_REFRESH_BACKFILL_DAYS: i64 = super::fit::WINDOW_DAYS + 1;
 /// fleet snapshots fresh ahead of the daily fit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetRefreshConfig {
-    /// Run the task at all (also requires `autonomous.eta.enabled`).
+    /// Refresh on this host (also requires `autonomous.eta.enabled`). The
+    /// explicit ETA authority refreshes even when this is `false` from config
+    /// (#10918); see [`Self::env_enabled`].
     pub enabled: bool,
+    /// The raw `LOOM_ETA_FLEET_REFRESH_ENABLED` override, when set. An env
+    /// `false` is the hard stop: the task is not spawned at all, on the ETA
+    /// authority too (#10918).
+    pub env_enabled: Option<bool>,
     /// Seconds between cycles.
     pub interval_secs: u64,
     /// Forge calls per cycle for refresh passes, host-wide.
@@ -124,6 +146,9 @@ pub struct FleetRefreshConfig {
     pub reserve_calls: u64,
     /// How far back a backfill reaches, in days.
     pub backfill_days: i64,
+    /// Forge gap-fill reads per repo per cycle when SigNoz is the history
+    /// source (#10520).
+    pub gap_fill_max_calls_per_pass: u64,
     /// The SigNoz in-sweep half (#9758), refreshed on the same cadence.
     pub signoz: FleetSignozConfig,
 }
@@ -132,11 +157,13 @@ impl Default for FleetRefreshConfig {
     fn default() -> Self {
         FleetRefreshConfig {
             enabled: true,
+            env_enabled: None,
             interval_secs: DEFAULT_FLEET_REFRESH_INTERVAL_SECS,
             max_calls_per_cycle: DEFAULT_FLEET_REFRESH_MAX_CALLS,
             backfill_max_calls_per_cycle: DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS,
             reserve_calls: DEFAULT_FLEET_REFRESH_RESERVE,
             backfill_days: DEFAULT_FLEET_REFRESH_BACKFILL_DAYS,
+            gap_fill_max_calls_per_pass: DEFAULT_FLEET_REFRESH_GAP_FILL_MAX_CALLS,
             signoz: FleetSignozConfig::default(),
         }
     }
@@ -171,6 +198,10 @@ pub struct FleetSignozConfig {
     pub page_size: u32,
     /// Pages per repo per cycle.
     pub max_pages: u32,
+    /// With [`Self::enabled`], take fleet-refresh history from SigNoz first
+    /// and read the forge only to fill gaps (#10520). Off by default
+    /// (opt-in) so enabling SigNoz never silently switches the fit's input.
+    pub history_primary: bool,
 }
 
 impl Default for FleetSignozConfig {
@@ -182,6 +213,7 @@ impl Default for FleetSignozConfig {
             credential_file: None,
             page_size: DEFAULT_FLEET_SIGNOZ_PAGE_SIZE,
             max_pages: DEFAULT_FLEET_SIGNOZ_MAX_PAGES,
+            history_primary: false,
         }
     }
 }
@@ -205,8 +237,20 @@ pub struct EtaConfig {
     pub current_land: Option<String>,
     /// Run the daily refit (#10245); only when [`Self::enabled`] too.
     pub fit_enabled: bool,
+    /// Run the nightly walk-forward backtest folds (#10492) — on the fleet
+    /// captain only (`fleet.captain` gates it); only when [`Self::enabled`] too.
+    pub nightly_folds_enabled: bool,
+    /// After the nightly folds, file retirement proposals (#10525) as
+    /// forge issues — on the captain only, and only with
+    /// [`Self::nightly_folds_enabled`]. Default **off**: it is the one
+    /// outward write the fold task makes.
+    pub retirement_filing_enabled: bool,
     /// The fleet snapshot refresh task (#10263).
     pub fleet_refresh: FleetRefreshConfig,
+    /// The shadow budget (#10525): most registered heuristics per kind. A
+    /// registry over it does not start the tracker
+    /// ([`super::Registry::check_budget`]).
+    pub shadow_max_active: usize,
 }
 
 impl Default for EtaConfig {
@@ -220,7 +264,10 @@ impl Default for EtaConfig {
             current_finish: None,
             current_land: None,
             fit_enabled: true,
+            nightly_folds_enabled: true,
+            retirement_filing_enabled: false,
             fleet_refresh: FleetRefreshConfig::default(),
+            shadow_max_active: super::shadow_fleet::DEFAULT_MAX_ACTIVE,
         }
     }
 }
@@ -283,6 +330,19 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
         resolved.fit_enabled = v;
     }
 
+    if let Some(v) = get("nightlyFolds")
+        .and_then(|f| f.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        resolved.nightly_folds_enabled = v;
+    }
+    if let Some(v) = get("nightlyFolds")
+        .and_then(|f| f.get("retirementFiling"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        resolved.retirement_filing_enabled = v;
+    }
+
     if let Some(v) = env("LOOM_ETA_ENABLED").as_deref().and_then(parse_bool) {
         resolved.enabled = v;
     }
@@ -301,6 +361,31 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     if let Some(v) = env("LOOM_ETA_FIT_ENABLED").as_deref().and_then(parse_bool) {
         resolved.fit_enabled = v;
     }
+    if let Some(v) = get("shadow")
+        .and_then(|b| b.get("maxActive"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        resolved.shadow_max_active = usize::try_from(v).unwrap_or(usize::MAX);
+    }
+    if let Some(v) = env("LOOM_ETA_SHADOW_MAX_ACTIVE").and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        resolved.shadow_max_active = v;
+    }
+    resolved.shadow_max_active = resolved
+        .shadow_max_active
+        .max(super::shadow_fleet::MIN_MAX_ACTIVE);
+    if let Some(v) = env("LOOM_ETA_NIGHTLY_FOLDS_ENABLED")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        resolved.nightly_folds_enabled = v;
+    }
+    if let Some(v) = env("LOOM_ETA_RETIREMENT_FILING_ENABLED")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        resolved.retirement_filing_enabled = v;
+    }
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
     resolved.fleet_refresh = resolve_fleet_refresh(block.and_then(|b| b.get("fleetRefresh")), &env);
     resolved
@@ -317,10 +402,10 @@ fn resolve_fleet_refresh(
     if let Some(v) = get("enabled").and_then(serde_json::Value::as_bool) {
         c.enabled = v;
     }
-    if let Some(v) = env("LOOM_ETA_FLEET_REFRESH_ENABLED")
+    c.env_enabled = env("LOOM_ETA_FLEET_REFRESH_ENABLED")
         .as_deref()
-        .and_then(parse_bool)
-    {
+        .and_then(parse_bool);
+    if let Some(v) = c.env_enabled {
         c.enabled = v;
     }
     let u64_key = |slot: &mut u64, key: &str, var: &str| {
@@ -343,6 +428,11 @@ fn resolve_fleet_refresh(
         "LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS",
     );
     u64_key(&mut c.reserve_calls, "reserveCalls", "LOOM_ETA_FLEET_REFRESH_RESERVE");
+    u64_key(
+        &mut c.gap_fill_max_calls_per_pass,
+        "gapFillMaxCallsPerPass",
+        "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS",
+    );
     if let Some(v) = get("backfillDays").and_then(serde_json::Value::as_i64) {
         c.backfill_days = v;
     }
@@ -352,6 +442,9 @@ fn resolve_fleet_refresh(
     }
     c.interval_secs = c.interval_secs.max(MIN_FLEET_REFRESH_INTERVAL_SECS);
     c.backfill_days = c.backfill_days.max(MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    c.gap_fill_max_calls_per_pass = c
+        .gap_fill_max_calls_per_pass
+        .max(MIN_FLEET_REFRESH_GAP_FILL_MAX_CALLS);
     c.signoz = resolve_fleet_signoz(get("signoz"), env);
     c
 }
@@ -392,6 +485,15 @@ fn resolve_fleet_signoz(
         .and_then(parse_bool)
     {
         c.enabled = v;
+    }
+    if let Some(v) = get("historyPrimary").and_then(serde_json::Value::as_bool) {
+        c.history_primary = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        c.history_primary = v;
     }
     c.endpoint = text("endpoint", "LOOM_ETA_FLEET_SIGNOZ_ENDPOINT");
     c.user = text("user", "LOOM_ETA_FLEET_SIGNOZ_USER");

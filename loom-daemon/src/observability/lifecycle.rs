@@ -232,8 +232,9 @@ pub fn host_attributes() -> TraceAttributes {
 /// Fixed-reason admission attributes for one role tick outcome.
 ///
 /// The reason set here is a **closed taxonomy of literals**
-/// (`failure` / `runtime-rejected` / `no-token-pool` / `pool-exhausted` /
-/// `model-runtime-mismatch` / `load-ceiling`) — plus one additional literal,
+/// (`session-down` / `session-mount-stale` / `runtime-rejected` /
+/// `no-token-pool` / `pool-exhausted` / `model-runtime-mismatch` /
+/// `load-ceiling`) — plus one additional literal,
 /// `preflight-rejected`, emitted by a second site outside this function
 /// (`worker_spawn::run`'s preflight-rejection span) that does not go through
 /// a [`crate::role_runner::RoleTickOutcome`] at all. The free-form detail text that
@@ -245,6 +246,11 @@ pub fn host_attributes() -> TraceAttributes {
 /// an operator reports about: the measured load against the timeout ceiling,
 /// which pool gated and how large it was, and which capabilities the runtime
 /// lacked — all finite, machine-derived values.
+///
+/// A `Failure` other than those two session refusals carries **no** admission
+/// reason (#10640): it was admitted and launched, so the pre-#10640 `failure`
+/// literal only repeated `loom.result`. Why it failed is [`FAILURE_CLASS`],
+/// stamped from the observing site's [`RoleFailure`] by [`role_invocation`].
 ///
 /// Since #9420 the same close also carries [`ATTEMPT_WORKED`], read off the
 /// outcome's [`crate::telemetry::RoleTickResult::spawned`] — the existing,
@@ -258,9 +264,21 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
     insert_worked(&mut attrs, Some(result.spawned()));
     match outcome {
         RoleTickOutcome::Success | RoleTickOutcome::QueueEmpty => {}
-        RoleTickOutcome::Failure(_) => {
-            attrs.insert("loom.admission.reason".into(), "failure".into());
+        // #10455: a container-down refusal is its own cause, not a bare failure.
+        RoleTickOutcome::Failure(reason)
+            if crate::role_tick_telemetry::is_session_down_reason(reason) =>
+        {
+            attrs.insert("loom.admission.reason".into(), "session-down".into());
         }
+        // #10364: so is a refusal because the container lacks the workdir mount.
+        RoleTickOutcome::Failure(reason)
+            if crate::role_tick_telemetry::is_session_mount_stale_reason(reason) =>
+        {
+            attrs.insert("loom.admission.reason".into(), "session-mount-stale".into());
+        }
+        // #10640: any other failure was admitted and launched — no admission
+        // reason; its cause is the `loom.failure_class` stamped on the close.
+        RoleTickOutcome::Failure(_) => {}
         RoleTickOutcome::RuntimeRejected(rejection) => {
             attrs.insert("loom.admission.reason".into(), "runtime-rejected".into());
             insert_nonempty_bounded(&mut attrs, "loom.runtime", &rejection.runtime);
@@ -456,6 +474,123 @@ pub fn checkpoint_completed(
     );
 }
 
+/// `loom.timing_source` of a phase attempt the sweep orchestrator opened at
+/// the instant it dispatched that phase's subagent (#9935).
+pub const CHECKPOINT_BEGIN_SOURCE: &str = "checkpoint_begin_observed";
+
+/// Sweep phases whose checkpoints are journalled as role attempts.
+const CHECKPOINT_ROLES: [&str; 5] = ["curator", "builder", "judge", "doctor", "merge"];
+
+/// `sweep-checkpoint begin` (#9935): open a sweep phase's Phase + RoleAttempt
+/// at its dispatch instant. Telemetry only — the checkpoint file, which drives
+/// resume, is never touched. The phase's later `*-done`/`judge-rejected`
+/// write completes this attempt through [`checkpoint_observation`]'s
+/// owned-start branch, so the span measures dispatch → completion instead of
+/// the zero-duration synthetic span a completion with no observed start gets.
+pub fn checkpoint_begun(
+    root: &Path,
+    issue: u32,
+    role: &str,
+    attempt: Option<u32>,
+    model: Option<&str>,
+) {
+    let primary = checkpoint_workspace(root);
+    let root = primary.as_path();
+    if !super::tracing::enabled(root) {
+        return;
+    }
+    let Some((journal, root_context, launcher)) = inherited_context(root) else {
+        return;
+    };
+    checkpoint_begin_observation(
+        &journal,
+        &root_context,
+        Some(launcher),
+        issue,
+        role,
+        attempt,
+        model,
+    );
+}
+
+fn checkpoint_begin_observation(
+    journal: &Journal,
+    root: &TraceContext,
+    launcher: Option<TraceContext>,
+    issue: u32,
+    role: &str,
+    attempt: Option<u32>,
+    model: Option<&str>,
+) -> Option<ActiveSpan> {
+    if !CHECKPOINT_ROLES.contains(&role) {
+        return None;
+    }
+    let issue_text = issue.to_string();
+    // `loom.attempt.worked` is deliberately absent: it is decided at the close.
+    let mut metadata = attributes(&[
+        ("loom.phase", role),
+        ("loom.role", role),
+        ("loom.issue", &issue_text),
+        ("loom.timing_source", CHECKPOINT_BEGIN_SOURCE),
+    ]);
+    if let Some(attempt) = attempt {
+        metadata.insert("loom.attempt".into(), attempt.to_string());
+    }
+    if let Some(model) = model {
+        metadata.insert("loom.configured_model".into(), model.into());
+    }
+    let at = Utc::now();
+    let active = journal.active().ok()?;
+    metadata.extend(execution_scope(&active, root));
+    // A re-dispatch of the same phase (the earlier subagent died without its
+    // checkpoint) supersedes the begun attempt it replaces. Its outcome is
+    // unknown, so `worked` stays absent.
+    for stale in active.iter().filter(|a| {
+        a.record.name == SpanName::RoleAttempt
+            && a.record
+                .attributes
+                .get("loom.role")
+                .is_some_and(|v| v == role)
+            && a.record.attributes.get("loom.issue") == Some(&issue_text)
+            && a.record
+                .attributes
+                .get("loom.timing_source")
+                .is_some_and(|v| v == CHECKPOINT_BEGIN_SOURCE)
+    }) {
+        let close = attributes(&[("loom.result", "superseded")]);
+        let _ = journal.finish(stale, at, SpanStatus::Unset, close.clone());
+        if let Some(phase) = active.iter().find(|p| {
+            p.record.name == SpanName::Phase
+                && stale.record.parent_span_id.as_ref() == Some(&p.record.context.span_id)
+        }) {
+            let _ = journal.finish(phase, at, SpanStatus::Unset, close);
+        }
+    }
+    let links = launcher
+        .map(|context| crate::telemetry::trace::SpanLink { context })
+        .into_iter()
+        .collect();
+    let phase = journal
+        .start_linked(
+            child_context(root, SpanName::Phase, at, &metadata),
+            Some(root),
+            SpanName::Phase,
+            at,
+            metadata.clone(),
+            links,
+        )
+        .ok()?;
+    journal
+        .start(
+            child_context(&phase.record.context, SpanName::RoleAttempt, at, &metadata),
+            Some(&phase.record.context),
+            SpanName::RoleAttempt,
+            at,
+            metadata,
+        )
+        .ok()
+}
+
 pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
     let Some(candidate) =
         std::env::var_os("LOOM_WORKSPACE").and_then(|p| PathBuf::from(p).canonicalize().ok())
@@ -488,6 +623,21 @@ pub(crate) fn checkpoint_workspace(root: &Path) -> PathBuf {
     root.to_owned()
 }
 
+/// The execution's own scope (#10637): `loom.repo` and `loom.sweep_id` as its
+/// root span carries them. `prepare_execution` stamps both on every sweep
+/// root, so a checkpoint span that names only an issue also names the
+/// repository and sweep it belongs to, with values that join that root's
+/// exactly. A key the root lacks, or a root no longer open, stays absent.
+fn execution_scope(active: &[ActiveSpan], root: &TraceContext) -> TraceAttributes {
+    let Some(span) = active.iter().find(|span| span.record.context == *root) else {
+        return TraceAttributes::new();
+    };
+    ["loom.repo", "loom.sweep_id"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_owned(), span.record.attributes.get(key)?.clone())))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_observation(
     journal: &Journal,
@@ -503,7 +653,7 @@ fn checkpoint_observation(
     let role = phase
         .strip_suffix("-done")
         .or_else(|| phase.strip_suffix("-rejected"));
-    let Some(role @ ("curator" | "builder" | "judge" | "doctor" | "merge")) = role else {
+    let Some(role) = role.filter(|role| CHECKPOINT_ROLES.contains(role)) else {
         return;
     };
     let result = if phase == "judge-rejected" {
@@ -549,9 +699,16 @@ fn checkpoint_observation(
         metadata.insert("loom.pr_number".into(), pr.to_string());
     }
     let at = Utc::now();
+    let active = journal.active();
+    if let Ok(active) = &active {
+        metadata.extend(execution_scope(active, root));
+    }
     // An explicitly launched role already has an authoritative start. Its
     // checkpoint completes that same attempt; never fabricate a second one.
-    if let Ok(active) = journal.active() {
+    // A begun attempt names its issue (#9935): parallel builders in one wave
+    // share this journal, so one issue's checkpoint must not close another's.
+    let issue_text = issue.to_string();
+    if let Ok(active) = active {
         if let Some(attempt_span) = active
             .iter()
             .filter(|a| {
@@ -560,6 +717,10 @@ fn checkpoint_observation(
                         .attributes
                         .get("loom.role")
                         .is_some_and(|v| v == role)
+                    && a.record
+                        .attributes
+                        .get("loom.issue")
+                        .is_none_or(|v| *v == issue_text)
             })
             .max_by_key(|a| a.record.started_at)
         {
@@ -653,7 +814,7 @@ pub fn prepare_execution(
             crate::telemetry::trace::STORY_KEY_VERSION.into(),
         );
     } else {
-        metadata.insert("loom.repo".into(), TraceStore::fallback_repo(root));
+        metadata.insert("loom.repo".into(), TraceStore::repo_attribute(root));
     }
     if let Some(span) = begin(root, execution, SpanName::Sweep, metadata) {
         span.command(command);
@@ -668,6 +829,9 @@ pub fn finish_execution(
     result: &str,
     metadata: TraceAttributes,
 ) -> Option<TraceContext> {
+    // #10964: the execution is over, so its relay token stops working —
+    // before the tracing gate, which the relay does not depend on.
+    super::agent_relay::end_execution(execution);
     if !super::tracing::enabled(root) {
         return None;
     }
@@ -748,6 +912,7 @@ pub fn execution_adopted(root: &Path, execution: &str) {
 }
 
 pub fn child_exited(root: &Path, execution: &str, result: &str) {
+    super::agent_relay::end_execution(execution);
     let store = TraceStore::new(root);
     if let Ok(saved) = TraceStore::load(&store.path(root, execution)) {
         finish_owned_runtime(
@@ -852,6 +1017,9 @@ fn recover_orphans(journal: &Journal) {
         },
         attributes(&[
             ("loom.result", "process_lost"),
+            // #10640: what recovery knows — the child and its supervisor both
+            // exited before either recorded a close. Status stays unset.
+            (role_failure::FAILURE_CLASS, "supervisor-lost"),
             ("loom.recovered", "true"),
             ("loom.timing_source", "recovery_observed"),
         ]),
@@ -918,9 +1086,13 @@ thread_local! {
     static ROLE_CONTEXT: std::cell::RefCell<Option<RoleSlot>> = const { std::cell::RefCell::new(None) };
 }
 
-pub fn role_command(command: &mut Command) {
+/// Stamp the in-flight role tick's context on its launch, opening the
+/// `loom.role_attempt` root. Returns the tick's [`role_execution_id`] on the
+/// call that opens it (#10743), even when tracing is off and no span opened.
+pub fn role_command(command: &mut Command) -> Option<String> {
     ROLE_CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
+        let mut opened = None;
         if let Some(RoleSlot::Pending {
             root,
             role,
@@ -928,12 +1100,14 @@ pub fn role_command(command: &mut Command) {
             started_at,
         }) = slot.as_ref()
         {
+            opened = Some(execution.clone());
             *slot = open_role_attempt(root, role, execution, *started_at).map(RoleSlot::Open);
         }
         if let Some(RoleSlot::Open(span)) = slot.as_ref() {
             span.command(command);
         }
-    });
+        opened
+    })
 }
 
 /// Journal a launching tick's `loom.role_attempt` root, started at the tick's
@@ -944,7 +1118,8 @@ fn open_role_attempt(
     execution: &str,
     started_at: chrono::DateTime<Utc>,
 ) -> Option<Span> {
-    let repo = TraceStore::fallback_repo(root);
+    // #10637: GitHub's spelling; the trace ID keys on its lowercase.
+    let repo = TraceStore::repo_attribute(root);
     // Host memory state at the launch — the other end of this span's host
     // snapshot pair (the end lands in `finish_execution`), so a
     // deferred/killed/timed-out attempt carries the host state at both
@@ -986,6 +1161,9 @@ pub struct RoleTrace {
     pub execution: String,
     /// When the root span started.
     pub started_at: chrono::DateTime<Utc>,
+    /// Why the tick failed, when it did (#10640) — the same class, code and
+    /// message its root span closed with, for the story copies.
+    pub failure: Option<RoleFailure>,
 }
 
 /// Run one role tick under its `loom.role_attempt` root span — **if it
@@ -1001,6 +1179,7 @@ pub fn role_invocation(
 ) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
     let started_at = Utc::now();
     let execution = role_execution_id(role, started_at);
+    role_failure::clear();
     ROLE_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(RoleSlot::Pending {
             root: root.to_path_buf(),
@@ -1010,21 +1189,35 @@ pub fn role_invocation(
         });
     });
     let outcome = invoke();
+    let noted = role_failure::take();
     let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
         return (outcome, None);
     };
+    let failure = role_failure::for_outcome(&outcome, noted);
     let trace = Some(RoleTrace {
         context: span.context().clone(),
         execution: execution.clone(),
         started_at: span.active.record.started_at,
+        failure: failure.clone(),
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
     // The fixed-reason admission attributes (deferred-for-load vs rejected vs
-    // pool-gated vs mismatch) ride the finish alongside the host state there.
-    finish_execution(root, &execution, &result, admission_attributes(&outcome));
+    // pool-gated vs mismatch) ride the finish alongside the host state there,
+    // and a failure adds its class, exit code and status message (#10640).
+    let mut close = admission_attributes(&outcome);
+    if let Some(failure) = &failure {
+        close.extend(failure.attributes());
+    }
+    finish_execution(root, &execution, &result, close);
     (outcome, trace)
 }
+
+mod role_failure;
+pub use role_failure::{
+    note_role_failure, RoleFailure, EXIT_CODE, FAILURE_CLASS, ROLE_FAILURE_ATTRIBUTE_KEYS,
+    UNCLASSIFIED,
+};
 
 #[cfg(test)]
 mod tests;

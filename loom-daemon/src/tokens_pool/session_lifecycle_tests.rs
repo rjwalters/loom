@@ -58,6 +58,7 @@ impl FakeRunner {
             ContainerState {
                 id: format!("{container}-id"),
                 running: true,
+                restarting: false,
                 started_at: Some("2026-09-05T00:00:00Z".into()),
                 image: Some("ghcr.io/rjwalters/loom-worker-session:test".into()),
                 workspace,
@@ -979,6 +980,26 @@ fn host_session_run_args_drop_capabilities_and_privilege_escalation() {
 }
 
 #[test]
+fn host_session_run_args_restart_unless_stopped() {
+    // Issue #10452: a Docker engine restart or host reboot must bring the
+    // session back on its own. `unless-stopped` (not `always`) because
+    // `SessionLifecycle::stop` removes the container, and a policy must never
+    // fight an operator's deliberate stop.
+    let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
+    let at = args
+        .iter()
+        .position(|a| a == "--restart")
+        .expect("a restart policy is set");
+    assert_eq!(args.get(at + 1).map(String::as_str), Some("unless-stopped"));
+    assert_eq!(
+        args.iter().filter(|a| *a == "--restart").count(),
+        1,
+        "exactly one restart policy: {args:?}"
+    );
+    assert!(at < args.len() - 1, "the policy precedes the image: {args:?}");
+}
+
+#[test]
 fn host_session_run_args_label_the_posture_spawn_codex_checks() {
     let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
     assert!(args.contains(&format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}")));
@@ -1161,3 +1182,9 @@ mod controls;
 /// Issue #10103: the accounts registry's daemon root owns App-token dirs.
 #[path = "session_lifecycle_owner_tests.rs"]
 mod owner;
+
+#[path = "session_lifecycle_stop_tests.rs"]
+mod stop_race;
+
+#[path = "session_lifecycle_hold_roots_tests.rs"]
+mod hold_roots;

@@ -45,6 +45,9 @@ pub const AUTO_UPDATE: &str = "auto_update";
 pub const ETA_FLEET_REFRESH: &str = "eta_fleet_refresh";
 /// Task name of the 5-minute ETA pass (run by the observability collector).
 pub const ETA_PASS: &str = "eta_pass";
+/// Task name of the Codex session-container watch (#10600): its snapshot is
+/// what dispatch selection and `loom-daemon status` read.
+pub const CODEX_SESSION_WATCH: &str = "codex_session_watch";
 /// Prefix of the per-role role-runner loops: `role_runner.<role>`.
 pub const ROLE_RUNNER_PREFIX: &str = "role_runner.";
 

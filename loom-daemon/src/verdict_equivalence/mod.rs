@@ -14,7 +14,7 @@
 //! | Head moved by | Carried when | Kind |
 //! |---|---|---|
 //! | a tree-identical commit (a #8248/#8508 re-date push, an empty commit) | always | [`EquivalenceKind::Tree`] |
-//! | a clean automatic merge of the base into the branch | the new head is a two-parent merge whose FIRST parent is the reviewed head, whose second parent is on the PR's base branch, and whose tree equals `git merge-tree --write-tree <reviewed> <base-parent>` | [`EquivalenceKind::CleanMerge`] |
+//! | a clean automatic merge of the base into the branch, possibly with tree-identical commits before or after it (#10875) | the merge is two-parent, its FIRST parent reduces to the reviewed head, its second parent is on the PR's base branch, and its tree equals `git merge-tree --write-tree <first> <base-parent>` | [`EquivalenceKind::CleanMerge`] |
 //! | a rebase onto a newer base | the PR's own merge-base-relative patch is byte-identical | [`EquivalenceKind::RebasePatchIdentical`] |
 //! | anything else (new commits, edited hunks, conflict resolution) | never | — |
 //!
@@ -72,6 +72,8 @@ pub mod patch_identity;
 
 #[cfg(test)]
 mod fetch_tests;
+#[cfg(test)]
+mod noop_chain_tests;
 #[cfg(test)]
 mod tests;
 
@@ -141,10 +143,11 @@ impl EquivalenceKind {
                  differences), so the reviewed code IS the code at the new head"
             }
             Self::CleanMerge => {
-                "the new head is a two-parent merge whose first parent is the reviewed head, \
-                 whose second parent is a commit on this PR's base branch, and whose tree is \
-                 exactly what `git merge-tree --write-tree` produces from those two — i.e. the \
-                 clean automatic merge of the base, with no hand edits and no conflict resolution"
+                "the new head is the reviewed head plus only clean automatic merges of this PR's \
+                 base branch and tree-identical commits: each merge's second parent is a commit on \
+                 the base branch, its first parent reduces to the reviewed head, and its tree is \
+                 exactly what `git merge-tree --write-tree` produces from those two — no hand \
+                 edits and no conflict resolution"
             }
             Self::RebasePatchIdentical => {
                 "the PR's own patch relative to its merge base is byte-identical before and \
@@ -415,24 +418,6 @@ pub fn assess(
         reviewed,
         head,
     )
-}
-
-/// [`detect`] with both kill switches passed in explicitly, so the
-/// "switched off => nothing asked, no answer" contract is unit-testable without
-/// mutating process env (the same split
-/// [`crate::forge_tree_unchanged`] uses for its own switch).
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn detect_with(
-    carveout_enabled: bool,
-    new_kinds_enabled: bool,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    pr: u32,
-    reviewed: &str,
-    head: &str,
-) -> Equivalence {
-    assess_with(carveout_enabled, new_kinds_enabled, gh_bin, cwd, pr, reviewed, head).equivalence
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,11 +1,12 @@
 //! Online interval recalibration (#10207): the point-in-time fit, censoring,
 //! the per-stage → pooled fallback, the identity on an empty table, the
-//! registered shadow heuristic, and the backtest / outcome-log wiring.
+//! transform over `land-v2` (the `amber-heron` shadow that applied it was
+//! retired 2026-10-06, #10484; the machinery stays), and the backtest / outcome-log wiring.
 
 use super::{as_of, history_a, history_a_envelopes, input_at, provenance};
 use crate::eta::backtest::{self, Filter};
 use crate::eta::calibration_log;
-use crate::eta::heuristics::{LandAmberHeron, LandV2, CALIBRATION_BASE, LAND_AMBER_HERON, LAND_V2};
+use crate::eta::heuristics::{LandV2, CALIBRATION_BASE, LAND_TWIN_OTTER_B, LAND_V2};
 use crate::eta::recalibrate::{
     apply, fit_table, recalibrate, CalibrationObservation, CalibrationTable, Mode, Weighting,
     MIN_POOLED_EVENTS, MIN_STAGE_EVENTS, OBSERVATION_SCHEMA,
@@ -33,6 +34,10 @@ fn landed(id: &str, stage: Stage, made: i64, p50: i64, remaining: i64) -> Calibr
         p50_sec: p50,
         actual_at: Some(at(made + remaining)),
         resolved_at: Some(at(made + remaining)),
+        age_sec: None,
+        p25_sec: None,
+        p75_sec: None,
+        p90_sec: None,
     }
 }
 
@@ -191,14 +196,8 @@ fn an_empty_table_returns_the_base_estimate_unchanged() {
     let out =
         recalibrate(base.clone(), &CalibrationTable::empty(as_of()), LAND_V2, Mode::SpreadOnly);
     assert_eq!(serde_json::to_string(&out).unwrap(), serde_json::to_string(&base).unwrap());
-
-    // And the heuristic with no calibration evidence is its own base path.
-    let plain = LandAmberHeron.estimate(&input_at(Stage::ReviewWait, 0, 0), &history);
-    assert!(plain.recalibration.is_none());
-    assert!(!serde_json::to_string(&plain)
-        .unwrap()
-        .contains("recalibration"));
-    assert_eq!(run_explanation(&plain), plain.quantiles_with_p90());
+    assert!(out.recalibration.is_none());
+    assert_eq!(run_explanation(&out), out.quantiles_with_p90());
 }
 
 // ------------------------------------------------------- the transform
@@ -253,56 +252,40 @@ fn a_known_ratio_distribution_is_bracketed_at_its_nominal_coverage() {
     assert!((full_p50 - 3_600).abs() < 200, "3x late median recovered: {full_p50}");
 }
 
-// ------------------------------------------------- the shadow heuristic
+// ------------------------------------------- the transform over land-v2
 
 #[test]
-fn the_recalibrating_heuristic_is_registered_not_current_and_recomputes_exactly() {
+fn the_retired_shadow_is_unregistered_and_the_transform_still_recomputes_exactly() {
     let registry = Registry::builtin();
-    assert!(registry
-        .for_kind(Kind::Land)
-        .any(|h| h.id() == LAND_AMBER_HERON));
+    assert!(registry.get("land-2026-10-04-amber-heron").is_none(), "retired, #10484");
     assert_eq!(Registry::default_current(Kind::Land), "land-v1");
     assert_eq!(CALIBRATION_BASE, LAND_V2);
 
-    let mut history = history_a();
-    history.calibration = log_uniform(Stage::ReviewWait, 60, "rw");
+    let history = history_a();
+    let observations = log_uniform(Stage::ReviewWait, 60, "rw");
     let input = input_at(Stage::ReviewWait, 0, 0);
-    let estimate = LandAmberHeron.estimate(&input, &history);
-    assert_eq!(estimate.heuristic, LAND_AMBER_HERON);
+    let table = fit_table(&observations, LAND_V2, input.as_of, Weighting::default());
+    let estimate =
+        recalibrate(LandV2.estimate(&input, &history), &table, LAND_V2, Mode::SpreadOnly);
     let record = estimate.recalibration.as_ref().expect("recalibrated");
     assert_eq!(record.level, "stage");
     assert_eq!(record.base_heuristic, LAND_V2);
-    assert_eq!(record.fitted_as_of, input.as_of);
     let (p25, p50, p75) = estimate.quantiles().unwrap();
     assert_eq!(p50, record.base_p50_sec, "the median is kept");
     assert!(p25 <= p50 && p50 <= p75 && p75 <= record.p90_sec);
-    // Explanation first: the result recomputes from the explanation alone.
     assert_eq!(run_explanation(&estimate), estimate.quantiles_with_p90());
     assert_eq!(estimate.quantiles_with_p90().unwrap().3, record.p90_sec);
     let parsed: crate::eta::Explanation =
         serde_json::from_str(&serde_json::to_string(&estimate).unwrap()).unwrap();
     assert_eq!(run_explanation(&parsed), estimate.quantiles_with_p90());
-    // Deterministic.
-    let again = LandAmberHeron.estimate(&input, &history);
-    assert_eq!(
-        serde_json::to_string(&again).unwrap(),
-        serde_json::to_string(&estimate).unwrap()
-    );
-    // Every other heuristic ignores the calibration evidence entirely.
-    let mut bare = history.clone();
-    bare.calibration.clear();
-    assert_eq!(
-        serde_json::to_string(&LandV2.estimate(&input, &history)).unwrap(),
-        serde_json::to_string(&LandV2.estimate(&input, &bare)).unwrap()
-    );
 }
 
 // ------------------------------------------------------------- wiring
 
 #[test]
-fn backtest_compares_it_with_land_v2_on_the_identical_replay_set() {
+fn backtest_replay_yields_one_calibration_observation_per_scored_case() {
     let envelopes = history_a_envelopes();
-    let mut history = history_a();
+    let history = history_a();
     let cases = backtest::cases_from_envelopes(&envelopes);
     let replayed = backtest::calibration_from_replay(&LandV2, &history, &cases, &provenance());
     let land_v2 = backtest::run(&LandV2, &history, &cases, Filter::default(), &provenance());
@@ -310,20 +293,6 @@ fn backtest_compares_it_with_land_v2_on_the_identical_replay_set() {
     assert!(replayed
         .iter()
         .all(|o| o.actual_at.is_some() && o.as_of <= o.actual_at.unwrap()));
-    history.calibration = replayed;
-    let comparison = backtest::compare(
-        &LandV2,
-        &LandAmberHeron,
-        &history,
-        &cases,
-        Filter::default(),
-        &provenance(),
-    )
-    .unwrap();
-    assert_eq!(comparison.a.heuristic, LAND_V2);
-    assert_eq!(comparison.b.heuristic, LAND_AMBER_HERON);
-    assert_eq!(comparison.a.overall.n, comparison.b.overall.n);
-    assert!(comparison.b.overall.n > 0);
 }
 
 #[test]
@@ -351,9 +320,15 @@ fn only_landed_land_estimates_become_observations_and_the_log_round_trips() {
     let mut foreign = summary.clone();
     foreign.estimate_id = "pending-foreign".to_string();
     foreign.heuristic = "land-v1".to_string();
-    let combined = calibration_log::combine(read, &[summary, other, foreign]);
-    assert_eq!(combined.len(), 2);
+    // #10524: twin-otter-b is a calibration base too (the offline IPCW wrap's).
+    let mut twin = summary.clone();
+    twin.estimate_id = "pending-twin".to_string();
+    twin.heuristic = LAND_TWIN_OTTER_B.to_string();
+    let combined = calibration_log::combine(read, &[summary, other, foreign, twin]);
+    assert_eq!(combined.len(), 3);
     assert_eq!(combined[0], row);
     assert_eq!(combined[1].estimate_id, "pending-other");
     assert_eq!(combined[1].actual_at, None);
+    assert_eq!(combined[2].estimate_id, "pending-twin");
+    assert_eq!(combined[2].heuristic, LAND_TWIN_OTTER_B);
 }

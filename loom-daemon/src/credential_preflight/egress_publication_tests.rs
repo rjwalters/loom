@@ -187,7 +187,7 @@ fn required_stance_resolves_from_policy_and_unreadable_fails_closed() {
 #[test]
 fn gateway_owned_preflight_holds_no_token() {
     let p = gateway_owned_preflight();
-    assert!(p.minted_gh_token.is_none());
+    assert!(p.minted.is_none());
     assert_eq!(p.report.mechanism, "gateway");
 }
 
@@ -341,6 +341,14 @@ fn required_startup_scrubs_pre_existing_per_owner_tokens_and_assert_is_clean() {
             .count()
     };
     assert_eq!(token_findings(), 3, "precondition: every profile holds a token");
+    let side = crate::forge_identity::Sidecar {
+        app_id: "1".into(),
+        installation_id: "2".into(),
+        ..Default::default()
+    };
+    for d in &all {
+        crate::forge_identity::sidecar::write_sidecar(d, &side).unwrap();
+    }
 
     egress_pub::publish_tokenless_everywhere(&dir, "github.com").unwrap();
 
@@ -348,6 +356,8 @@ fn required_startup_scrubs_pre_existing_per_owner_tokens_and_assert_is_clean() {
         let hosts = std::fs::read_to_string(d.join("hosts.yml")).unwrap();
         assert_eq!(hosts, "github.com:\n    git_protocol: https\n", "{}", d.display());
         assert!(!crate::forge_egress::probe::profile_holds_token(d));
+        // #10571: a token-less profile names no minted identity.
+        assert!(crate::forge_identity::read_sidecar(d).is_none(), "{}", d.display());
     }
     assert_eq!(token_findings(), 0, "assert must be clean after the scrub");
 }

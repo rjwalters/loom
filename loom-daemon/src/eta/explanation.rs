@@ -6,9 +6,14 @@
 //! [`FeatureOmitted`] reason, never a default; seconds are integers.
 //!
 //! Size: target [`TARGET_BYTES`], hard cap [`MAX_BYTES`] (the trace journal's
-//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then a
-//! twin-otter model slice, then the stage grids, then the stage marks, and
-//! names what it dropped in `truncated`.
+//! entry cap). [`Explanation::enforce_cap`] drops what the replay
+//! ([`super::simulate::run_explanation`]) never reads before anything it does
+//! read (#10930): `features` down to the input vector
+//! ([`Features::INPUT_VECTOR`]), then the stage marks, then the context
+//! lists. Only then does it drop a replay input (a twin-otter model slice, the
+//! dependency nodes, the stage grids, the remaining lists), and when it does it
+//! records `replayable: false` with the reason. It names every drop in
+//! `truncated`.
 
 use super::fit::{AftFit, FitStage, HazardFit, PathStats};
 pub use super::stall::Stalled;
@@ -22,7 +27,7 @@ use std::collections::BTreeMap;
 pub const MAX_BYTES: usize = 32 * 1024;
 
 /// The size an ordinary explanation should stay under.
-pub const TARGET_BYTES: usize = 8 * 1024;
+pub const TARGET_BYTES: usize = 10 * 1024;
 
 /// `truncated[]` entry when `features` was dropped.
 pub const TRUNCATED_FEATURES: &str = "features";
@@ -31,15 +36,26 @@ pub const TRUNCATED_FEATURES: &str = "features";
 /// (#10243). Only ever written when the slice was there.
 pub const TRUNCATED_TWIN_OTTER_MODEL: &str = "twin_otter.model";
 
+/// `truncated[]` entry when a dependency composition's node records were
+/// dropped (#10510). Only ever written when they were there.
+pub const TRUNCATED_DEPENDENCY_NODES: &str = "dependencies.nodes";
+
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
 
-/// `truncated[]` entry when the stage marks were dropped.
+/// `truncated[]` entry when the stage marks (and `stage_predictions`) were
+/// dropped. Both are recomputable from the grids
+/// ([`super::simulate::run_marks`], [`super::simulate::run_predictions`]).
 pub const TRUNCATED_STAGE_MARKS: &str = "result.stage_marks";
 
+/// `truncated[]` entry when the lists no replay reads were dropped (#10930):
+/// `contributions`, the history's sources and per-source / per-host counts,
+/// `history_window.sources` and each stage's `grid_pct`. Only ever written
+/// when one of them was there.
+pub const TRUNCATED_CONTEXT: &str = "context";
+
 /// `truncated[]` entry when every remaining list was dropped (stages,
-/// branches, contributions, history detail) — the last resort that
-/// guarantees the cap.
+/// branches) — the last resort that guarantees the cap.
 pub const TRUNCATED_DETAIL: &str = "detail";
 
 /// One estimate, explained.
@@ -78,7 +94,9 @@ pub struct Explanation {
     pub result: Option<EstimateResult>,
     /// Which stages and branches dominate the result.
     pub contributions: Option<Contributions>,
-    /// Recorded context. `None` only when truncated.
+    /// Recorded context. Under the cap it is cut down to the input vector
+    /// ([`Features::INPUT_VECTOR`]) and `truncated` names `features`; it is
+    /// `None` only on an explanation recorded before #10930 that was cut.
     pub features: Option<Features>,
     /// Why features are null.
     pub features_omitted: Vec<FeatureOmitted>,
@@ -93,17 +111,102 @@ pub struct Explanation {
     pub stalled: Option<Stalled>,
     /// What [`Explanation::enforce_cap`] dropped, in drop order.
     pub truncated: Vec<String>,
+    /// `Some(false)` when [`Explanation::enforce_cap`] had to drop a field the
+    /// replay ([`super::simulate::run_explanation`]) reads (#10930): the
+    /// replay then answers `None` rather than a different number. Absent
+    /// otherwise, so every explanation that fits is byte-identical to one
+    /// made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayable: Option<bool>,
+    /// Why `replayable` is `false`: `truncated:<entry>`, naming the first
+    /// replay input the cap dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayable_reason: Option<String>,
     /// How a recalibrating heuristic (#10207) moved the simulated quantiles
     /// into `result`. Absent — and `result` is the simulation's own — for
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recalibration: Option<super::recalibrate::Recalibration>,
+    /// How a conformal calibration wrapper (#10489) moved the base's four
+    /// quantiles into `result`: the base, the trailing window, the shift per
+    /// quantile and the evidence behind it. Absent — and `result` is the
+    /// simulation's own — for every other heuristic, so their explanations
+    /// are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<super::conformal::Calibration>,
     /// What `land-2026-10-04-twin-otter` (#10243) evaluated: the coefficient
     /// file, the adapted input, both parts' quantiles and the model slice
     /// that recomputes them. Absent for every other heuristic and on every
     /// refusal, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twin_otter: Option<TwinOtterRecord>,
+    /// What `little-v0` (#10208) computed its queue estimate from. Absent for
+    /// every other heuristic, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueRecord>,
+    /// How a dependency composition (#10510) composed, or refused, the
+    /// estimate over the item's parents. Absent for every other heuristic
+    /// and for an item with no parent, so their explanations are
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<super::dependency::DependencyRecord>,
+    /// What `land-2026-10-06-held-heron` (#10523) simulated for a held or
+    /// sequenced PR: the side state, the hazards and their evidence, and
+    /// everything the forward solution reads. Absent for every other
+    /// heuristic, and for a held-heron answer served by twin-otter-b, so
+    /// their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_heron: Option<super::hazard_sim::HeldHeronRecord>,
+    /// The latent-regime residual adjustment applied to a stage (#10528).
+    /// Absent when no adjustment applied (below the row floor, or the recent
+    /// residuals are noise), so every such explanation is byte-identical to
+    /// one made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_adjustment: Option<RegimeAdjustment>,
+    /// The planner regime the estimate was served under
+    /// ([`super::planner_version::planner_version`], #10528). Stamped once at
+    /// the serve seam; absent otherwise, so such explanations are
+    /// byte-identical to ones made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_version: Option<String>,
+    /// The per-stage forecast (#10929, [`super::stage_forecast`]): for each
+    /// stage still ahead, its entry and dwell p50/p90 in seconds from
+    /// `as_of`, its reach, and its share of the p50. Filled by the path
+    /// engine, which reads it from the draws `combination` already made.
+    /// Absent for every other heuristic and on a refusal, so their
+    /// explanations are byte-identical to ones made before the field existed.
+    /// Dropped together with `result.stage_marks` under the cap.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_predictions: super::stage_forecast::StagePredictions,
+}
+
+/// A stage's latent-regime adjustment ([`super::regime::adjust`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeAdjustment {
+    /// The adjusted stage's wire name.
+    pub stage: String,
+    /// Multiplier on the stage's served duration.
+    pub factor: f64,
+    /// Residuals inside the window.
+    pub n_recent: u64,
+    /// The residual weight half-life, seconds.
+    pub half_life: i64,
+}
+
+impl RegimeAdjustment {
+    /// The record for `adjustment`; `None` when it is the identity.
+    #[must_use]
+    pub fn of(adjustment: &super::regime::Adjustment) -> Option<Self> {
+        if adjustment.is_identity() {
+            return None;
+        }
+        Some(Self {
+            stage: adjustment.stage.as_str().to_string(),
+            factor: adjustment.factor,
+            n_recent: u64::try_from(adjustment.n_recent).unwrap_or(u64::MAX),
+            half_life: adjustment.half_life_sec,
+        })
+    }
 }
 
 /// A twin-otter answer, recorded so it can be recomputed from the
@@ -151,6 +254,56 @@ pub struct TwinOtterModelRecord {
     pub aft: AftFit,
     /// Every stage's dwell curve and next-stage table: a path walks them all.
     pub path_stats: PathStats,
+}
+
+/// One later stage's recency-weighted service time in a [`QueueRecord`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    /// The stage.
+    pub stage: Stage,
+    /// `repo` or `host`: the level the samples came from.
+    pub level: String,
+    /// Samples read.
+    pub n: usize,
+    /// Recency-weighted mean duration, seconds (three decimals).
+    pub mean_sec: f64,
+}
+
+/// The inputs and arithmetic of a `little-v0` estimate: enough to re-derive
+/// `result.p50_sec` as `round(items_ahead / drain_rate_per_hr * 3600) +
+/// round(sum of service[].mean_sec)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueRecord {
+    /// The stage the item is queued in.
+    pub stage: Stage,
+    /// `repo` or `fleet`.
+    pub scope: String,
+    /// Items ahead in that stage and scope.
+    pub items_ahead: u32,
+    /// Exponentially weighted exits per hour.
+    pub drain_rate_per_hr: f64,
+    /// Half life of the weighting, seconds.
+    pub half_life_sec: i64,
+    /// Window the exits were read from, seconds before `as_of`.
+    pub window_sec: i64,
+    /// Exits observed in the window.
+    pub exits: u32,
+    /// `items_ahead / drain_rate`, whole seconds.
+    pub wait_sec: i64,
+    /// Half life of the service-time weighting, seconds.
+    pub service_half_life_sec: i64,
+    /// One entry per later stage on the path.
+    pub service: Vec<ServiceRecord>,
+    /// Sum of the service means, whole seconds.
+    pub service_total_sec: i64,
+    /// Gamma-posterior draws behind the interval.
+    pub draws: usize,
+    /// Gamma shape (the exit count, capped).
+    pub gamma_shape: u32,
+    /// The seed, `0x…`.
+    pub seed: String,
+    /// `splitmix64`.
+    pub rng: String,
 }
 
 /// The current stage as the estimate saw it.
@@ -300,7 +453,8 @@ pub struct Distribution {
     pub p75: i64,
     /// 90th percentile.
     pub p90: i64,
-    /// How a calibrating heuristic (`land-v3`, #9970) derived `grid_sec`
+    /// How a calibrating heuristic (`land-v4`, via the retired `land-v3`'s
+    /// grid step, #9970) derived `grid_sec`
     /// from the raw grid. Absent — and `grid_sec` is the raw grid — for
     /// every heuristic that draws from history unadjusted, so every earlier
     /// heuristic's explanation is byte-identical.
@@ -513,12 +667,15 @@ pub struct Contributions {
 }
 
 /// Recorded context. `null` = not measured, with a [`FeatureOmitted`]
-/// reason. No v1 heuristic reads these (`land-v3` reads two).
+/// reason. No v1 heuristic reads these (`land-v4` reads two, through the
+/// retired `land-v3`'s grid step).
 ///
 /// The fields from `ahead` on (#10201) post-date the first shipped v1
 /// payloads: an explanation recorded before them still parses (a missing
 /// `Option` reads as `None`), so the change is additive and the schema stays
-/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s.
+/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s;
+/// the read and stall features' are [`super::pr_features`]'s and
+/// [`super::stall_features`]'s (#10232).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Features {
     /// Current labels.
@@ -677,6 +834,73 @@ pub struct Features {
     /// Where the star comes from: `none`, `pr`, `issue` or `both`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_source: Option<String>,
+    /// The `eta-fit/v2` priority inputs (#10508), built by the one builder
+    /// the fit calls ([`crate::eta::priority_inputs`]). Read only by
+    /// `land-2026-10-06-keen-wren`; absent when the item has no PR listed
+    /// in a fleet view before `as_of`, and then not in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::eta::fit::features_v2::PriorityInputs>,
+    /// The `eta-fit/v3` friction predictors (#10521), built by the one
+    /// builder the fit calls ([`crate::eta::loop_features`]) over the fleet
+    /// snapshots' label timeline at `as_of − LAG`. Read only by
+    /// `land-2026-10-06-loop-kite`; absent when the item has no PR, and then
+    /// not in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loops: Option<crate::eta::loop_features::LoopFeatures>,
+    /// The size and scope predictors (#10960), built by the one builder the
+    /// fit calls ([`crate::eta::scope_features`]) over the logged file lists
+    /// at `as_of − LAG`. Recorded for analysis; read by no heuristic yet.
+    /// Absent when the item has no PR or no file log is loaded, and then not
+    /// in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::eta::scope_features::ScopeFeatures>,
+    /// The host's REST (`core`) rate-limit calls left (#10232).
+    #[serde(default)]
+    pub ratelimit_core_remaining: Option<u32>,
+    /// When the REST budget resets.
+    #[serde(default)]
+    pub ratelimit_core_reset_at: Option<DateTime<Utc>>,
+    /// The host's GraphQL rate-limit calls left.
+    #[serde(default)]
+    pub ratelimit_graphql_remaining: Option<u32>,
+    /// When the GraphQL budget resets.
+    #[serde(default)]
+    pub ratelimit_graphql_reset_at: Option<DateTime<Utc>>,
+    /// The rate-limit breaker: `closed` or `cooldown`.
+    #[serde(default)]
+    pub breaker_state: Option<String>,
+    /// When the breaker's cooldown releases.
+    #[serde(default)]
+    pub breaker_cooldown_until: Option<DateTime<Utc>>,
+    /// Required contexts on the PR's head not yet completed (or not yet
+    /// registered). Optional checks never count.
+    #[serde(default)]
+    pub checks_pending: Option<u32>,
+    /// Required contexts on the PR's head that failed. Optional checks
+    /// never count.
+    #[serde(default)]
+    pub checks_failed: Option<u32>,
+    /// Every check run or status on the PR's head not yet completed,
+    /// required or not. Kept apart from `checks_pending` (#10334).
+    #[serde(default)]
+    pub checks_all_pending: Option<u32>,
+    /// Every check run or status on the PR's head that failed, required or
+    /// not. Kept apart from `checks_failed` (#10334).
+    #[serde(default)]
+    pub checks_all_failed: Option<u32>,
+    /// The writer credential's REST (`core`) calls left (#10334).
+    #[serde(default)]
+    pub ratelimit_writer_core_remaining: Option<u32>,
+    /// The writer credential's GraphQL calls left.
+    #[serde(default)]
+    pub ratelimit_writer_graphql_remaining: Option<u32>,
+    /// The fewest calls left over the item's serving reader and the writer,
+    /// both pools: the most constrained identity.
+    #[serde(default)]
+    pub ratelimit_min_remaining: Option<u32>,
+    /// Whether that most constrained identity is at zero (not yet reset).
+    #[serde(default)]
+    pub ratelimit_exhausted: Option<bool>,
 }
 
 /// Why a feature is null.
@@ -690,7 +914,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 56] = [
+    pub const NAMES: [&'static str; 70] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -747,6 +971,20 @@ impl Features {
         "pr_merge_conflict",
         "pr_friction_observed_at",
         "operator_hold",
+        "ratelimit_core_remaining",
+        "ratelimit_core_reset_at",
+        "ratelimit_graphql_remaining",
+        "ratelimit_graphql_reset_at",
+        "breaker_state",
+        "breaker_cooldown_until",
+        "checks_pending",
+        "checks_failed",
+        "checks_all_pending",
+        "checks_all_failed",
+        "ratelimit_writer_core_remaining",
+        "ratelimit_writer_graphql_remaining",
+        "ratelimit_min_remaining",
+        "ratelimit_exhausted",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not
@@ -769,9 +1007,124 @@ impl Features {
         }
         omitted
     }
+
+    /// The input vector (#10930): the queue, capacity, hold, star and
+    /// priority context an estimate was made under. Every entry is a scalar
+    /// or a small fixed record, so the whole vector is a few hundred bytes,
+    /// and [`Explanation::enforce_cap`] keeps it when it cuts the rest of
+    /// `features`.
+    pub const INPUT_VECTOR: [&'static str; 21] = [
+        "queue_rank",
+        "queue_ready",
+        "queue_running",
+        "max_concurrent",
+        "active_sweeps_host",
+        "pool_usable_accounts",
+        "pool_exhausted",
+        "ahead",
+        "n_stage_repo",
+        "n_stage_fleet",
+        "open_prs_repo",
+        "repo_pr_open_skip",
+        "repo_pr_open_lockout",
+        "operator_hold",
+        "starred_any",
+        "star_source",
+        "priority",
+        "urgent",
+        "workspace_priority",
+        "attempt",
+        "doctor_cycles_so_far",
+    ];
+
+    /// These features with everything outside [`Self::INPUT_VECTOR`] set to
+    /// `None`.
+    #[must_use]
+    pub fn input_vector(&self) -> Features {
+        let Ok(serde_json::Value::Object(mut map)) = serde_json::to_value(self) else {
+            return Features::default();
+        };
+        map.retain(|name, _| Self::INPUT_VECTOR.contains(&name.as_str()));
+        serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
+    }
+}
+
+/// Which recompute [`super::simulate::run_explanation`] takes for an
+/// explanation: the field it dispatches on, in its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayEngine {
+    /// `dependencies.nodes` ([`super::dependency::recompute`]).
+    Dependency,
+    /// `held_heron` ([`super::hazard_sim::solve`]).
+    HeldHeron,
+    /// `queue` (`little-v0`'s arithmetic).
+    Queue,
+    /// `twin_otter` (the recorded model slice).
+    TwinOtter,
+    /// The path simulation over the stage grids.
+    Path,
+}
+
+impl ReplayEngine {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayEngine::Dependency => "dependency",
+            ReplayEngine::HeldHeron => "held_heron",
+            ReplayEngine::Queue => "queue",
+            ReplayEngine::TwinOtter => "twin_otter",
+            ReplayEngine::Path => "path",
+        }
+    }
 }
 
 impl Explanation {
+    /// The recompute [`super::simulate::run_explanation`] dispatches to.
+    #[must_use]
+    pub fn replay_engine(&self) -> ReplayEngine {
+        if self
+            .dependencies
+            .as_ref()
+            .is_some_and(|d| !d.nodes.is_empty())
+        {
+            ReplayEngine::Dependency
+        } else if self.held_heron.is_some() {
+            ReplayEngine::HeldHeron
+        } else if self.queue.is_some() {
+            ReplayEngine::Queue
+        } else if self.twin_otter.is_some() {
+            ReplayEngine::TwinOtter
+        } else {
+            ReplayEngine::Path
+        }
+    }
+
+    /// Whether the cap dropped a field the replay reads (#10930).
+    #[must_use]
+    pub fn replay_lost(&self) -> bool {
+        self.replayable == Some(false)
+    }
+
+    /// Name `entry` in `truncated` (once).
+    fn note_truncated(&mut self, entry: &str) {
+        if !self.truncated.iter().any(|t| t == entry) {
+            self.truncated.push(entry.to_string());
+        }
+    }
+
+    /// Record that the replay lost `entry` (the first such drop wins).
+    fn lose_replay(&mut self, entry: &str) {
+        if self.replayable != Some(false) {
+            self.replayable = Some(false);
+            self.replayable_reason = Some(format!("truncated:{entry}"));
+        }
+    }
+
+    /// Whether the record fits [`MAX_BYTES`].
+    fn fits(&self) -> bool {
+        self.size_bytes() <= MAX_BYTES
+    }
     /// The `(p25, p50, p75)` remaining seconds, when there is an estimate.
     #[must_use]
     pub fn quantiles(&self) -> Option<(i64, i64, i64)> {
@@ -798,59 +1151,125 @@ impl Explanation {
             .unwrap_or(usize::MAX)
     }
 
-    /// Enforce [`MAX_BYTES`]: drop `features`, then a twin-otter model
-    /// slice (only when there is one), then the stage grids, then the stage
-    /// marks, then every remaining list, stopping as soon as the record fits,
-    /// and recording each drop in `truncated`.
+    /// Enforce [`MAX_BYTES`], stopping as soon as the record fits and naming
+    /// each drop in `truncated` (#10930 for the order):
+    ///
+    /// 1. `features` cut down to the input vector ([`Features::INPUT_VECTOR`]),
+    ///    and `features_omitted` (`features`);
+    /// 2. the stage marks and `stage_predictions` (`result.stage_marks`);
+    /// 3. the lists no replay reads (`context`, [`TRUNCATED_CONTEXT`]).
+    ///
+    /// Nothing so far is read by [`super::simulate::run_explanation`], so the
+    /// record still replays exactly. Only then, a replay input:
+    ///
+    /// 4. a twin-otter model slice, the dependency nodes, the stage grids;
+    /// 5. the last resort: the stages and branches (`detail`).
+    ///
+    /// Dropping a field the explanation's [`ReplayEngine`] reads sets
+    /// `replayable: false` with the reason, and the replay answers `None`
+    /// from then on: never a different number.
     pub fn enforce_cap(&mut self) {
-        if self.size_bytes() <= MAX_BYTES {
+        if self.fits() {
             return;
         }
-        self.features = None;
+        self.features = self.features.as_ref().map(Features::input_vector);
         self.features_omitted.clear();
-        self.truncated.push(TRUNCATED_FEATURES.to_string());
-        if self.size_bytes() <= MAX_BYTES {
+        self.note_truncated(TRUNCATED_FEATURES);
+        if self.fits() {
             return;
         }
+        let had_marks = !self.stage_predictions.is_empty()
+            || self
+                .result
+                .as_ref()
+                .is_some_and(|r| !r.stage_marks.is_empty());
+        if had_marks {
+            if let Some(result) = &mut self.result {
+                result.stage_marks.clear();
+            }
+            self.stage_predictions.clear();
+            self.note_truncated(TRUNCATED_STAGE_MARKS);
+            if self.fits() {
+                return;
+            }
+        }
+        if self.drop_context() {
+            self.note_truncated(TRUNCATED_CONTEXT);
+            if self.fits() {
+                return;
+            }
+        }
+        // From here on every drop may be a replay input.
+        let engine = self.replay_engine();
         let dropped_model = self
             .twin_otter
             .as_mut()
             .and_then(|record| record.model.take())
             .is_some();
         if dropped_model {
-            self.truncated.push(TRUNCATED_TWIN_OTTER_MODEL.to_string());
-            if self.size_bytes() <= MAX_BYTES {
+            self.note_truncated(TRUNCATED_TWIN_OTTER_MODEL);
+            if engine == ReplayEngine::TwinOtter {
+                self.lose_replay(TRUNCATED_TWIN_OTTER_MODEL);
+            }
+            if self.fits() {
                 return;
             }
         }
-        for entry in &mut self.stages {
-            entry.distribution.grid_pct.clear();
-            entry.distribution.grid_sec.clear();
+        let dropped_nodes = self
+            .dependencies
+            .as_mut()
+            .is_some_and(|d| !std::mem::take(&mut d.nodes).is_empty());
+        if dropped_nodes {
+            self.note_truncated(TRUNCATED_DEPENDENCY_NODES);
+            if engine == ReplayEngine::Dependency {
+                self.lose_replay(TRUNCATED_DEPENDENCY_NODES);
+            }
+            if self.fits() {
+                return;
+            }
         }
-        self.truncated.push(TRUNCATED_GRIDS.to_string());
-        if self.size_bytes() <= MAX_BYTES {
-            return;
-        }
-        if let Some(result) = &mut self.result {
-            result.stage_marks.clear();
-        }
-        self.truncated.push(TRUNCATED_STAGE_MARKS.to_string());
-        if self.size_bytes() <= MAX_BYTES {
-            return;
+        let had_grids = self
+            .stages
+            .iter()
+            .any(|e| !e.distribution.grid_sec.is_empty());
+        if had_grids {
+            for entry in &mut self.stages {
+                entry.distribution.grid_pct.clear();
+                entry.distribution.grid_sec.clear();
+            }
+            self.note_truncated(TRUNCATED_GRIDS);
+            if engine == ReplayEngine::Path {
+                self.lose_replay(TRUNCATED_GRIDS);
+            }
+            if self.fits() {
+                return;
+            }
         }
         // Last resort: keep the identity, provenance, subject and result;
         // drop every list. Nothing unbounded is left after this.
         self.stages.clear();
         self.branches = None;
-        self.contributions = None;
+        self.note_truncated(TRUNCATED_DETAIL);
+        if engine == ReplayEngine::Path {
+            self.lose_replay(TRUNCATED_DETAIL);
+        }
+    }
+
+    /// Drop the lists no replay reads ([`TRUNCATED_CONTEXT`]); whether any
+    /// was there.
+    fn drop_context(&mut self) -> bool {
+        let mut dropped = self.contributions.take().is_some();
         if let Some(window) = &mut self.history_window {
-            window.sources.clear();
+            dropped |= !std::mem::take(&mut window.sources).is_empty();
         }
         if let Some(history) = &mut self.history {
-            history.sources.clear();
-            history.samples_by_source.clear();
-            history.samples_by_host.clear();
+            dropped |= !std::mem::take(&mut history.sources).is_empty();
+            dropped |= !std::mem::take(&mut history.samples_by_source).is_empty();
+            dropped |= !std::mem::take(&mut history.samples_by_host).is_empty();
         }
-        self.truncated.push(TRUNCATED_DETAIL.to_string());
+        for entry in &mut self.stages {
+            dropped |= !std::mem::take(&mut entry.distribution.grid_pct).is_empty();
+        }
+        dropped
     }
 }

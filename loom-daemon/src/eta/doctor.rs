@@ -2,7 +2,7 @@
 //! (`cli/eta_doctor_cmd.rs`) gathers [`Facts`] from this host, read-only, and
 //! [`evaluate`] turns them into one verdict per check, walking the pipeline
 //! in order: `config` -> `data` -> `fit` -> `serving` -> `snapshot_feed` ->
-//! `outcomes`. Every WARN and FAIL carries the exact remedy.
+//! `outcomes` -> `backtest` (the nightly fold scoreboard, #10492). Every WARN and FAIL carries the exact remedy.
 //!
 //! No I/O here, so every verdict is table-testable: a wrong remedy or a wrong
 //! classification passes the type checker and misleads an operator, which is
@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use crate::eta::fit::publish::{FetchKind, PubStatus};
 use crate::eta::fit::run;
 use crate::eta::health::RefreshCycleState;
+use crate::eta::nightly_folds;
+use crate::eta::regime::DriftState;
 use crate::telemetry::kinds::eta_fit::EtaFitRecord;
 
 /// A snapshot older than this is a FAIL.
@@ -125,6 +127,13 @@ pub enum Gate {
         /// The captain's host id.
         captain: String,
     },
+    /// `fleet.etaAuthority` names this host: it refreshes and folds (#10918).
+    Authority,
+    /// `fleet.etaAuthority` names another host, which refreshes and folds.
+    AuthorityElsewhere {
+        /// The authority's host id.
+        authority: String,
+    },
 }
 
 /// `config` link inputs.
@@ -143,6 +152,29 @@ pub struct ConfigFacts {
     pub otlp_exporter: bool,
     /// The native HTTPS exporter is configured (`eta.snapshot` is native-only).
     pub native_exporter: bool,
+    /// The fleet's ETA authority as this host resolves it (#10498).
+    pub authority: AuthorityFacts,
+}
+
+/// The ETA authority resolution as the doctor sees it (#10498).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityFacts {
+    /// The authority host id, `None` when no host qualifies.
+    pub host: Option<String>,
+    /// Why (`explicit`, `fleet_refresh`, `lowest_id_fallback`, `no_candidate`).
+    pub reason: String,
+    /// This host is the authority.
+    pub is_local: bool,
+    /// Other qualifying hosts: a conflict when non-empty.
+    pub others: Vec<String>,
+    /// The resolver's one-line explanation.
+    pub detail: String,
+    /// The last authority pass against the cached fleet roster (#10897);
+    /// [`State::Unknown`](crate::eta::coverage::State::Unknown) when no pass
+    /// was recorded here or the roster is unknown.
+    pub coverage: crate::eta::coverage::Coverage,
+    /// The host whose pass `coverage` describes (this host's view).
+    pub coverage_host: Option<String>,
 }
 
 /// One repo in the `data` link.
@@ -159,6 +191,22 @@ pub struct RepoFacts {
     pub snapshot_as_of: Option<DateTime<Utc>>,
     /// An in-progress backfill's start.
     pub backfill_since: Option<DateTime<Utc>>,
+    /// The last SigNoz-primary pass: its source and gap-fill request count
+    /// (#10520); `None` when SigNoz history has not run for the repo.
+    pub history: Option<crate::eta::fleet_signoz_history::HistoryNote>,
+}
+
+/// `; history <source>, N gap-fill request(s) at <when>` (#10520), or
+/// nothing when SigNoz history has not run for the repo.
+fn history_text(r: &RepoFacts) -> String {
+    r.history.map_or_else(String::new, |h| {
+        format!(
+            "; history {}, {} gap-fill request(s) on its last cycle ({})",
+            h.source.as_str(),
+            h.gap_fill_calls,
+            h.at.to_rfc3339()
+        )
+    })
 }
 
 /// `data` link inputs.
@@ -184,6 +232,9 @@ pub struct FitFacts {
     /// The captain-published fit state (`fit-pub/status.json`, #10395);
     /// default when the file is absent.
     pub published: PubStatus,
+    /// The `eta-fit/v2` lane's state (`fit-pub/status-v2.json`, #10508);
+    /// default when the file is absent. Independent of [`Self::published`].
+    pub published_v2: PubStatus,
 }
 
 /// One heuristic's pending-estimate tally.
@@ -232,6 +283,37 @@ pub struct OutcomeFacts {
     pub oldest_pending: Option<DateTime<Utc>>,
     /// Pending estimates.
     pub pending: u64,
+    /// Per-stage drift verdicts over the last 6 h of scored outcomes
+    /// (#10528), one per stage that has any recent outcome.
+    pub drift: Vec<DriftFacts>,
+}
+
+/// One stage's drift verdict ([`super::regime::drift`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftFacts {
+    /// The stage's wire name.
+    pub stage: String,
+    /// The one heuristic whose scored outcomes were checked (the serving
+    /// `land` heuristic when the calibration log records it, else the
+    /// calibration base); heuristics are never pooled.
+    pub heuristic: String,
+    /// Scored outcomes in the last 6 h.
+    pub n_recent: u64,
+    /// The tri-state verdict: `Unknown` below the sample floor.
+    pub state: DriftState,
+    /// Whether the serving `land` heuristic scales its ETAs for drift
+    /// (`land-2026-10-06-brisk-petrel`, #10528). `false` for every other.
+    pub adjusted: bool,
+}
+
+/// `backtest` link inputs (#10492): the captain's nightly walk-forward folds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BacktestFacts {
+    /// `autonomous.eta.nightlyFolds.enabled`.
+    pub enabled: bool,
+    /// The newest run (`.loom/state/eta/backtest/summary.json`), when this
+    /// host has run one.
+    pub state: Option<nightly_folds::State>,
 }
 
 /// Everything the doctor reads.
@@ -249,6 +331,8 @@ pub struct Facts {
     pub serving: ServingFacts,
     /// `outcomes`.
     pub outcomes: OutcomeFacts,
+    /// `backtest`.
+    pub backtest: BacktestFacts,
 }
 
 /// Whether any check failed (the CLI's exit code 1).
@@ -266,6 +350,7 @@ pub fn evaluate(facts: &Facts) -> Vec<Check> {
     out.extend(serving(facts));
     out.extend(snapshot_feed(facts));
     out.extend(outcomes(facts));
+    out.extend(backtest(facts));
     out
 }
 
@@ -306,13 +391,19 @@ fn config(f: &Facts) -> Vec<Check> {
         "LOOM_ETA_FIT_ENABLED",
         c.eta_enabled,
     ));
-    out.push(switch(
-        "fleet_refresh",
-        c.fleet_refresh_enabled,
-        "autonomous.eta.fleetRefresh.enabled",
-        "LOOM_ETA_FLEET_REFRESH_ENABLED",
-        false,
-    ));
+    out.push(if !c.fleet_refresh_enabled && f.data.gate == Gate::Authority {
+        Check::ok("config", "fleet_refresh", "autonomous.eta.fleetRefresh.enabled is off here, but this host is the explicit ETA authority, so it refreshes anyway (#10918)")
+    } else {
+        switch(
+            "fleet_refresh",
+            c.fleet_refresh_enabled,
+            "autonomous.eta.fleetRefresh.enabled",
+            "LOOM_ETA_FLEET_REFRESH_ENABLED",
+            false,
+        )
+    });
+    out.push(authority(&c.authority));
+    out.push(authority_coverage(&c.authority));
     out.push(if c.otlp_exporter {
         Check::ok("config", "otlp_exporter", "an OTLP exporter is configured")
     } else {
@@ -338,6 +429,52 @@ fn config(f: &Facts) -> Vec<Check> {
     out
 }
 
+/// #10498: which host is the fleet's one ETA authority, and why.
+fn authority(a: &AuthorityFacts) -> Check {
+    if a.host.is_none() || !a.others.is_empty() {
+        return Check::bad(
+            "config",
+            "authority",
+            Status::Warn,
+            format!("ETA authority: {}", a.detail),
+            "set fleet.etaAuthority (or LOOM_ETA_AUTHORITY) to the one host that should emit \
+             eta.* records",
+        );
+    }
+    Check::ok("config", "authority", format!("ETA authority: {}", a.detail))
+}
+
+/// #10897: the authority's last pass against the fleet roster. Prints the
+/// host the view belongs to, since a non-authority host only has its own.
+fn authority_coverage(a: &AuthorityFacts) -> Check {
+    use crate::eta::coverage::State;
+    let whose = a.coverage_host.as_deref().unwrap_or("this host");
+    match a.coverage.state {
+        State::Unknown => Check::skip(
+            "config",
+            "authority_coverage",
+            format!(
+                "authority coverage unknown: no authority pass recorded on this host or no \
+                 fleet roster cached (fleet.repo); reporting {whose}'s view"
+            ),
+        ),
+        State::Full => Check::ok(
+            "config",
+            "authority_coverage",
+            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
+        ),
+        State::Short => Check::bad(
+            "config",
+            "authority_coverage",
+            Status::Warn,
+            format!("ETA authority covers {} ({whose}'s last pass)", a.coverage.describe()),
+            "move fleet.etaAuthority to a host that manages every roster repo (other hosts \
+             keep emitting the uncovered repos meanwhile; declare fleet.etaAuthorityCovers once \
+             it is fixed), or wait for the workspace-less authority (#10897 Slice 2)",
+        ),
+    }
+}
+
 fn data(f: &Facts) -> Vec<Check> {
     let (c, d) = (&f.config, &f.data);
     let mut out = Vec::new();
@@ -346,9 +483,10 @@ fn data(f: &Facts) -> Vec<Check> {
         .iter()
         .filter(|r| r.snapshot_as_of.is_some())
         .count();
-    let standing_down = matches!(d.gate, Gate::StandDown { .. });
-    let refreshes = c.fleet_refresh_enabled && !standing_down;
+    let standing_down = matches!(d.gate, Gate::StandDown { .. } | Gate::AuthorityElsewhere { .. });
+    let refreshes = (c.fleet_refresh_enabled || d.gate == Gate::Authority) && !standing_down;
     out.push(match &d.gate {
+        Gate::Authority => Check::ok("data", "captain_gate", "this host is the ETA authority (fleet.etaAuthority): it refreshes for every host, whoever fleet.captain names and whatever its own fleetRefresh.enabled says (#10918)"),
         _ if !c.fleet_refresh_enabled => Check::skip(
             "data",
             "captain_gate",
@@ -373,6 +511,11 @@ fn data(f: &Facts) -> Vec<Check> {
             "data",
             "captain_gate",
             format!("standing down for captain {captain}; fitting on {with_snapshots} snapshot(s)"),
+        ),
+        Gate::AuthorityElsewhere { authority } => Check::ok(
+            "data",
+            "captain_gate",
+            format!("standing down: the ETA authority {authority} (fleet.etaAuthority) refreshes for every host (#10918)"),
         ),
     });
     for r in &d.repos {
@@ -402,7 +545,7 @@ fn data(f: &Facts) -> Vec<Check> {
                 "data",
                 &name,
                 if refreshes { Status::Fail } else { Status::Warn },
-                "no snapshot",
+                format!("no snapshot{}", history_text(r)),
                 if refreshes {
                     "run `loom-daemon eta fleet backfill --repo OWNER/NAME`, or let the refresh loop backfill it"
                 } else if standing_down {
@@ -416,7 +559,8 @@ fn data(f: &Facts) -> Vec<Check> {
                 let backfill = r
                     .backfill_since
                     .map(|b| format!("; backfill in progress since {}", b.to_rfc3339()))
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    + &history_text(r);
                 let interval = i64::try_from(c.interval_secs).unwrap_or(i64::MAX / 4);
                 if f.now - as_of > Duration::hours(SNAPSHOT_FAIL_HOURS) {
                     Check::bad(
@@ -455,7 +599,7 @@ fn data(f: &Facts) -> Vec<Check> {
 
 fn refresh_loop(f: &Facts) -> Check {
     let (c, d) = (&f.config, &f.data);
-    if !c.fleet_refresh_enabled || !c.eta_enabled {
+    if (!c.fleet_refresh_enabled && d.gate != Gate::Authority) || !c.eta_enabled {
         return Check::skip("data", "refresh_loop", "fleet refresh is off");
     }
     let Some(cycle) = &d.refresh_cycle else {
@@ -492,7 +636,7 @@ fn refresh_loop(f: &Facts) -> Check {
             cycle
                 .captain
                 .as_ref()
-                .map(|c| format!(" (captain {c})"))
+                .map(|c| format!(" (refresher {c})"))
                 .unwrap_or_default(),
             if reasons.is_empty() {
                 String::new()
@@ -511,7 +655,7 @@ fn fit(f: &Facts) -> Vec<Check> {
             "fit",
             "coefficient_file",
             Status::Fail,
-            "no coefficient file: twin-otter refuses no_model",
+            "no coefficient file: twin-otter-b refuses no_model",
             fit_remedy(x.last_check.as_ref()),
         ),
         Some((id, cutoff)) if f.now - *cutoff > Duration::hours(FIT_FAIL_HOURS) => Check::bad(
@@ -545,7 +689,8 @@ fn fit(f: &Facts) -> Vec<Check> {
         ),
         Some(r) => last_check(f.now, r),
     });
-    out.push(published_fit(f.now, &x.published));
+    out.push(published_fit(f.now, &x.published, "published_fit"));
+    out.push(published_fit(f.now, &x.published_v2, "published_fit_v2"));
     let snapshot_dates: Vec<DateTime<Utc>> = f
         .data
         .repos
@@ -572,23 +717,24 @@ fn fit(f: &Facts) -> Vec<Check> {
     out
 }
 
-/// The captain-published fit (#10395). Informational unless the last fetch or
+/// The captain-published fit (#10395), for the lane `check` names
+/// (`published_fit` for v1, `published_fit_v2` for #10508's v2 lane). Informational unless the last fetch or
 /// publish failed: an absent or stale publication just means this host uses
 /// its own fit, or refuses `no_model`, exactly as before publication existed.
-fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
+fn published_fit(now: DateTime<Utc>, p: &PubStatus, check: &str) -> Check {
     let publish_failed = p.publish_error.as_deref();
     let Some(kind) = p.kind else {
         return match publish_failed {
             Some(e) => Check::bad(
                 "fit",
-                "published_fit",
+                check,
                 Status::Warn,
                 format!("captain publish failing: {e}"),
                 "check `fleet.repo`, `fleet.etaFitRef` and the captain's write credential",
             ),
             None => Check::skip(
                 "fit",
-                "published_fit",
+                check,
                 "no published fit: this host uses its own fit, or refuses no_model",
             ),
         };
@@ -611,23 +757,23 @@ fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
         FetchKind::Installed | FetchKind::Current | FetchKind::NotModified
             if publish_failed.is_none() =>
         {
-            Check::ok("fit", "published_fit", detail)
+            Check::ok("fit", check, detail)
         }
-        FetchKind::Absent => Check::skip(
+        FetchKind::Absent if publish_failed.is_none() => Check::skip(
             "fit",
-            "published_fit",
+            check,
             format!("{detail}: nothing published, this host uses its own fit or refuses no_model"),
         ),
         FetchKind::Stale => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             format!("{detail}: stale publication ignored, this host uses its own fit or refuses no_model"),
             "the captain has stopped publishing; see the captain's `eta doctor` (fit.last_check, fit.published_fit)",
         ),
         _ => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             detail,
             "the previous fit stays in service; check `fleet.repo`/`fleet.etaFitRef` and the refusal code",
@@ -743,7 +889,7 @@ fn serving(f: &Facts) -> Vec<Check> {
             "serving",
             "twin_otter_model",
             Status::Fail,
-            "no coefficient file loaded: land-2026-10-04-twin-otter refuses no_model",
+            "no coefficient file loaded: land-2026-10-04-twin-otter-b refuses no_model on PR stages",
             "see the `fit` link: a fit must be written before twin-otter can answer",
         )
     });
@@ -851,6 +997,54 @@ fn outcomes(f: &Facts) -> Vec<Check> {
             format!("{} paired outcome(s); a promotion gate needs 50", p.pairs),
         ));
     }
+    if o.drift.is_empty() {
+        out.push(Check::skip(
+            "outcomes",
+            "drift",
+            "no scored outcome in the last 6h: nothing to check for regime drift",
+        ));
+    }
+    for d in &o.drift {
+        let name = format!("drift {}", d.stage);
+        out.push(match d.state {
+            DriftState::Drifted => Check::bad(
+                "outcomes",
+                &name,
+                Status::Warn,
+                if d.adjusted {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are scaled by the drift-gated regime adjustment ({} is serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                } else {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it (only the {} candidate adjusts, and it is not serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                },
+                "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
+            ),
+            DriftState::Unknown => Check::ok(
+                "outcomes",
+                &name,
+                format!(
+                    "{} scored {} outcome(s) in 6h: drift unknown (below the {}-outcome floor)",
+                    d.n_recent,
+                    d.heuristic,
+                    super::MIN_SAMPLES
+                ),
+            ),
+            DriftState::Stable => Check::ok(
+                "outcomes",
+                &name,
+                format!("{} scored {} outcome(s) in 6h, no drift", d.n_recent, d.heuristic),
+            ),
+        });
+    }
     out.push(match o.oldest_pending {
         None => Check::skip("outcomes", "oldest_pending", "no pending estimates"),
         Some(at) => Check::ok(
@@ -859,6 +1053,97 @@ fn outcomes(f: &Facts) -> Vec<Check> {
             format!("{} pending; oldest estimate is {} old", o.pending, age(f.now, at)),
         ),
     });
+    out
+}
+
+/// A run older than this means the daily task is not folding (it folds once a
+/// day, so one missed day is normal).
+pub const BACKTEST_STALE_DAYS: i64 = 3;
+
+/// The nightly fold scoreboard: one line per challenger heuristic, from the
+/// newest `summary.json`. Only the captain folds, so on any other host this is
+/// a SKIP, never a failure.
+fn backtest(f: &Facts) -> Vec<Check> {
+    let b = &f.backtest;
+    if !b.enabled {
+        return vec![Check::skip(
+            "backtest",
+            "nightly_folds",
+            "autonomous.eta.nightlyFolds.enabled is off: no nightly walk-forward folds",
+        )];
+    }
+    let Some(state) = &b.state else {
+        let who = match &f.data.gate {
+            Gate::StandDown { captain } => format!("the fleet captain ({captain}) runs it"),
+            Gate::AuthorityElsewhere { authority } => {
+                format!("the ETA authority ({authority}, fleet.etaAuthority) runs it")
+            }
+            Gate::NoCaptain => {
+                "no fleet.captain is declared, so no host runs it: set `fleet.captain`".to_string()
+            }
+            _ => "it runs once a day after 00:30 UTC".to_string(),
+        };
+        return vec![Check::skip(
+            "backtest",
+            "nightly_folds",
+            format!("no nightly fold has run on this host; {who}"),
+        )];
+    };
+    let mut out = Vec::new();
+    let stale = f.now - state.written_at > Duration::days(BACKTEST_STALE_DAYS);
+    out.push(if stale {
+        Check::bad(
+            "backtest",
+            "nightly_folds",
+            Status::Warn,
+            format!("newest fold is {} ({} old)", state.day, age(f.now, state.written_at)),
+            "the daily task folds after 00:30 UTC on the fleet captain: check the daemon log for `eta nightly folds`, and that `fleet.captain` names this host",
+        )
+    } else {
+        Check::ok(
+            "backtest",
+            "nightly_folds",
+            format!("newest fold {} ({} old)", state.day, age(f.now, state.written_at)),
+        )
+    });
+    if state.summaries.is_empty() {
+        out.push(Check::skip(
+            "backtest",
+            "scoreboard",
+            "no challenger heuristic is registered against `current`",
+        ));
+    }
+    for s in &state.summaries {
+        let rate = match (s.win_rate, s.ci_low) {
+            (Some(rate), Some(low)) => {
+                format!(
+                    "won {}/{} day(s) ({:.0}%, 95% lower bound {:.1}%)",
+                    s.wins,
+                    s.days,
+                    rate * 100.0,
+                    low * 100.0
+                )
+            }
+            _ => "no decided day yet".to_string(),
+        };
+        out.push(Check::ok(
+            "backtest",
+            &format!("scoreboard {}", s.heuristic),
+            format!(
+                "{rate} vs {}; backtest gate {} ({} case(s){}; needs {} decided days): {}",
+                s.compared_to,
+                if s.gate_ready { "READY" } else { "not ready" },
+                s.cases,
+                match (&s.fitted_from, s.cases_before_fit) {
+                    (None, _) => ", no coefficient file".to_string(),
+                    (Some(_), 0) => String::new(),
+                    (Some(d), n) => format!(", {n} predicted before the oldest fit ({d}) left out"),
+                },
+                s.min_folds,
+                s.gate_detail
+            ),
+        ));
+    }
     out
 }
 

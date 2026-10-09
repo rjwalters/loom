@@ -1118,7 +1118,9 @@ impl SweepRegistry {
         let mut events_to_emit: Vec<Event> = Vec::new();
 
         for (sweep_id, pid, pgid, state, kind, started_at) in candidates {
-            if !matches!(state, SweepState::Running | SweepState::Pending) {
+            // #10831: a sweep a roll's H4 pause holds keeps its lock (`roll_pause::hold`).
+            let live = matches!(state, SweepState::Running | SweepState::Pending);
+            if !live || crate::roll_pause::hold::is_held(&sweep_id) {
                 continue;
             }
             // Sample the live checkpoint phase BEFORE the liveness probe
@@ -1477,8 +1479,9 @@ impl SweepRegistry {
                                 // `NoneOpen` and `ProbeFailed` fall through to
                                 // ordinary handling (unchanged pre-#4452
                                 // behavior — a probe failure never triggers a
-                                // resume dispatch).
-                                if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue) {
+                                // resume dispatch). W9: read live, never the
+                                // memo: here an `Open` answer PERMITS a dispatch.
+                                if let OpenPrProbe::Open(pr) = self.live_open_pr_probe(issue) {
                                     // Deterministic-no-op guard (Issue #5614). A
                                     // surviving checkpoint means the sweep skill
                                     // never reached its delete-on-success step —

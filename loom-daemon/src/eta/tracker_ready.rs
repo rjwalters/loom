@@ -4,13 +4,15 @@
 //!
 //! Only ready rows with no running sweep and no PR are the plan's to
 //! describe; an item the sweep or a review listing already tracks is left
-//! alone. A row enters `ready_wait` at the tracker's first sight of it, which
+//! alone. A row this host's planner gives no position but the fleet can
+//! still dispatch is placed by [`crate::eta::ready_order`] (#10903) and
+//! estimated with its reason in `not_here`. A row enters `ready_wait` at the tracker's first sight of it, which
 //! is a lower bound, so leaving the stage never yields a duration — the
 //! `ready_wait` history is the slot-turnover journal rows alone, never whole
 //! queue waits.
 
 use super::{Effects, ItemKey, StageTrack, Tracker};
-use crate::eta::labels::ready_row_reason;
+use crate::eta::ready_order::{placements, Placed, Placement};
 use crate::eta::{AgeSource, DispatchInput, NoEstimateReason, Stage};
 use crate::observability::ops::turnaround::Turnover;
 use crate::types::{DispatchPlanContext, PlanState, QueueDisposition, RowPlan};
@@ -39,10 +41,17 @@ pub struct ReadyRow {
     pub repo: String,
     /// Issue.
     pub issue: u32,
+    /// Its 1-based rank in the work finder's comparator order over every
+    /// row (`ReadyQueueRow::rank`): what places a row the planner gave no
+    /// position (#10903).
+    pub rank: usize,
     /// Its plan fields.
     pub plan: RowPlan,
     /// What the work finder did with it (`open_pr` is `pr-open-skip`).
     pub disposition: QueueDisposition,
+    /// The row's detail (`ReadyQueueRow::detail`): the park label, or the
+    /// halt cause of a `workspace_halted` row.
+    pub detail: Option<String>,
     /// The issue's own facts from the queue row (#10231).
     pub facts: super::IssueRow,
 }
@@ -65,10 +74,77 @@ pub(super) fn plan_max_age_secs(context: &DispatchPlanContext) -> i64 {
     READY_PLAN_MAX_AGE_SECS.max(tick.saturating_mul(3))
 }
 
-fn waiting(plan: &RowPlan) -> Option<u32> {
+/// A waiting (`next`/`queued`) row's plan position; `None` for every other row.
+#[must_use]
+pub fn waiting_position(plan: &RowPlan) -> Option<u32> {
     match plan.plan_state {
         PlanState::Next | PlanState::Queued => plan.position,
         _ => None,
+    }
+}
+
+/// The [`DispatchInput`] a positioned row of a plan is estimated from:
+/// `waiting` is every waiting row's position ([`waiting_position`], any order),
+/// `context` and `plan_at` the tick's plan block and completion time. `None`
+/// for a row with no position. Pure: the one place the tracker (#9326) and
+/// the planner preview ([`crate::eta::planner_sim`], #10528) derive it.
+#[must_use]
+pub fn dispatch_input(
+    plan: &RowPlan,
+    waiting: &[u32],
+    context: &DispatchPlanContext,
+    plan_at: DateTime<Utc>,
+) -> Option<DispatchInput> {
+    let position = plan.position?;
+    let gate = plan
+        .gate
+        .and_then(|g| serde_json::to_value(g).ok())
+        .and_then(|v| v.as_str().map(str::to_string));
+    let ahead = to_u32(waiting.iter().filter(|&&p| p < position).count());
+    Some(slotted(position, plan.plan_state, gate, ahead, context, plan_at))
+}
+
+/// The [`DispatchInput`] of a row [`crate::eta::ready_order`] placed
+/// (#10903): its own position and `ahead`, no gate, the reason and any hold
+/// expiry, and the tick's slots like every other row.
+fn placed_input(
+    placed: &Placed,
+    context: &DispatchPlanContext,
+    plan_at: DateTime<Utc>,
+) -> DispatchInput {
+    let mut input =
+        slotted(placed.position, PlanState::Queued, None, placed.ahead, context, plan_at);
+    input.not_here = Some(placed.not_here.clone());
+    input.held_until = placed.held_until;
+    input
+}
+
+/// A [`DispatchInput`] from a row's place and the tick's slots.
+fn slotted(
+    position: u32,
+    plan_state: PlanState,
+    gate: Option<String>,
+    ahead: u32,
+    context: &DispatchPlanContext,
+    plan_at: DateTime<Utc>,
+) -> DispatchInput {
+    let slots = &context.slots;
+    DispatchInput {
+        position,
+        plan_state: plan_state_name(plan_state).to_string(),
+        gate,
+        ahead,
+        free_slots: if slots.saturation_held {
+            0
+        } else {
+            to_u32(slots.free.unwrap_or(0))
+        },
+        max_admissions_per_tick: slots.max_admissions_per_tick.map(to_u32),
+        tick_interval_secs: context.tick_interval_secs.unwrap_or(0),
+        saturation_held: slots.saturation_held,
+        plan_at,
+        not_here: None,
+        held_until: None,
     }
 }
 
@@ -79,8 +155,10 @@ fn to_u32(n: usize) -> u32 {
 impl Tracker {
     /// The ready rows of the last work-finder tick, observed at `now`.
     ///
-    /// Every waiting row with a position gets a [`DispatchInput`]; every
-    /// other non-running row is refused `no_dispatch_plan`. A ready item that
+    /// Every waiting row with a position gets a [`DispatchInput`], and so
+    /// does every row [`crate::eta::ready_order`] places (#10903: this host
+    /// cannot dispatch it, the fleet can); every other non-running row is
+    /// refused with the reason [`placements`] gives. A ready item that
     /// left a *complete* plan without being dispatched (relabelled, closed)
     /// queues one `issues/{n}` read, offered by the next
     /// [`Tracker::on_listing`] pass like every other outstanding check. An
@@ -93,21 +171,23 @@ impl Tracker {
         now: DateTime<Utc>,
     ) -> Effects {
         let mut effects = Effects::default();
-        let tick = plan.context.tick_interval_secs.unwrap_or(0);
         let stale = (now - plan.at).num_seconds() > plan_max_age_secs(&plan.context);
         self.context.plan = Some(super::features::PlanView::of(rows, plan));
-        let slots = &plan.context.slots;
-        let mut positions: Vec<u32> = rows.iter().filter_map(|r| waiting(&r.plan)).collect();
+        let mut positions: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| waiting_position(&r.plan))
+            .collect();
         positions.sort_unstable();
+        let placed = placements(rows);
         let mut seen = Vec::new();
-        for row in rows {
+        for (row, placement) in rows.iter().zip(&placed) {
             let key = ItemKey::new(&row.repo, row.issue);
             // The row's issue facts, observed when the tick completed. Kept
             // on an item that already exists; a new one takes them below.
             if let Some(item) = self.items.get_mut(&key) {
                 item.facts.note_issue(&row.facts, plan.at);
             }
-            if row.plan.plan_state == PlanState::Running {
+            if *placement == Placement::Running {
                 // Dispatched: the bus event settles it. Not a departure.
                 seen.push(key);
                 continue;
@@ -120,42 +200,26 @@ impl Tracker {
                 continue;
             }
             seen.push(key.clone());
-            let reason = if stale {
-                Some(NoEstimateReason::StaleInputs)
-            } else {
-                ready_row_reason(&row.plan)
-            };
-            let ready = match (reason, row.plan.position) {
-                (None, Some(position)) => Some(DispatchInput {
-                    position,
-                    plan_state: plan_state_name(row.plan.plan_state).to_string(),
-                    gate: row
-                        .plan
-                        .gate
-                        .and_then(|g| serde_json::to_value(g).ok())
-                        .and_then(|v| v.as_str().map(str::to_string)),
-                    ahead: to_u32(positions.iter().filter(|&&p| p < position).count()),
-                    free_slots: if slots.saturation_held {
-                        0
-                    } else {
-                        to_u32(slots.free.unwrap_or(0))
-                    },
-                    max_admissions_per_tick: slots.max_admissions_per_tick.map(to_u32),
-                    tick_interval_secs: tick,
-                    saturation_held: slots.saturation_held,
-                    plan_at: plan.at,
-                }),
-                _ => None,
+            let (reason, ready) = match placement {
+                _ if stale => (Some(NoEstimateReason::StaleInputs), None),
+                Placement::Refused(reason) => (Some(*reason), None),
+                Placement::Placed(p) => (None, Some(placed_input(p, &plan.context, plan.at))),
+                Placement::Running | Placement::Waiting => {
+                    match dispatch_input(&row.plan, &positions, &plan.context, plan.at) {
+                        Some(input) => (None, Some(input)),
+                        None => (Some(NoEstimateReason::NoDispatchPlan), None),
+                    }
+                }
             };
             let loom = self.loom.clone();
             let dispatch_raw = serde_json::to_value(&ready).unwrap_or(serde_json::Value::Null);
             let item = self.item(&row.repo, row.issue);
             item.facts.note_issue(&row.facts, plan.at);
             let first_sight = !item.in_ready_queue;
+            let place = |r: &DispatchInput| (r.position, r.ahead, r.not_here.clone(), r.held_until);
             let changed = first_sight
                 || item.refused != reason
-                || item.ready.as_ref().map(|r| (r.position, r.ahead))
-                    != ready.as_ref().map(|r| (r.position, r.ahead));
+                || item.ready.as_ref().map(place) != ready.as_ref().map(place);
             item.in_ready_queue = true;
             item.needs_issue_read = false;
             item.refused = reason;

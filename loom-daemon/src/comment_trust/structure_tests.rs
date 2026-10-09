@@ -54,7 +54,7 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "forge_check_claim.rs",
         "lease + lease-yield reader in read_freshest_live_lease (FETCH_SITES, #9453)",
     ),
-    ("merge_pr/redate.rs", "writer; reader in remedy_with (FETCH_SITES)"),
+    ("merge_pr/redate.rs", "writer; reader in remedy_with_sync (FETCH_SITES)"),
     (
         "merge_pr/redate/budget.rs",
         "pure parser over remedy_with's trusted listing (#9590)",
@@ -64,6 +64,14 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ("quarantine_reconciliation.rs", "reader (FETCH_SITES)"),
     ("role_runner/roster.rs", "writer; reader in read_roster_comments (FETCH_SITES)"),
     ("role_shard/roster.rs", "constants and pure parsers"),
+    (
+        "stale_blocked/batch.rs",
+        "parked issues' own closing refs + comment text for an advisory, not the linked-PR guard",
+    ),
+    (
+        "stale_blocked/release.rs",
+        "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
+    ),
     (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
@@ -105,10 +113,18 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "probe_open_linked_pr_rest",
         "parse_open_linked_pr_timeline_trusted(",
     ),
+    // #10514: leg 0 (the open-PR listing) first; the old union is the fallback.
+    ("worktree_ops/gh.rs", "probe_open_linked_pr", "linked_pr_listing::probe("),
+    ("worktree_ops/gh.rs", "legacy_union", "parse_open_linked_pr_timeline_trusted("),
     (
-        "worktree_ops/gh.rs",
-        "probe_open_linked_pr",
-        "parse_open_linked_pr_timeline_trusted(",
+        "worktree_ops/linked_pr_listing.rs",
+        "probe",
+        "classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy)",
+    ),
+    (
+        "worktree_ops/linked_pr_listing.rs",
+        "classify_open_linked_pr_rows",
+        "policy.known_untrusted(",
     ),
     ("worktree_ops/gh.rs", "parse_open_linked_pr_trusted", "drop_untrusted_fork_prs("),
     // Posting-dedup of its own notice, not a control read.
@@ -125,12 +141,31 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // must filter it (`policy.trusted_listing(`), checked below.
     ("premise_check/cli.rs", "forge_inputs", "trusted_inputs("),
     ("premise_check/cli.rs", "trusted_inputs", "policy.trusted_listing("),
-    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_listing("),
+    // #10025's GraphQL fallback: it returns the raw listing + issue object to
+    // `forge_inputs`, which hands both to `trusted_inputs(` (checked above),
+    // so the records reach `policy.trusted_listing(` like the REST ones.
+    // `graphql_listing_and_object` selects `comments(...)` through the
+    // `COMMENTS_QUERY` const, which the scanner cannot see; listed anyway.
+    ("premise_check/cli.rs", "graphql_listing_and_object", ""),
+    ("premise_check/cli.rs", "parse_graphql_comments", ""),
+    ("merge_pr/redate.rs", "remedy_with_sync", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),
     ("role_runner/roster.rs", "delete_roster_comment", ""),
     ("role_runner/roster.rs", "patch_roster_comment", ""),
+    // `check-stale-blocked` (#10480): a read-only advisory that reports and
+    // never acts, reading blocker prose and a parked issue's own closing refs —
+    // the same reads `dep_recheck/forge.rs` makes, not a control read. Also
+    // `notify-cleared-blockers` (#10515), which acts only by posting an
+    // advisory comment and never edits a label.
+    ("stale_blocked/batch.rs", "comments", ""),
+    ("stale_blocked/batch.rs", "closing_refs_query", ""),
+    ("stale_blocked/batch.rs", "parse_closing_refs", ""),
+    // #10556's release pass: the raw listing goes to `release::execute`, which
+    // trusts each comment through `policy.trusts_json` before reading a hold
+    // or idempotency marker from it.
+    ("stale_blocked/release_gh.rs", "comments", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

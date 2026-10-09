@@ -202,6 +202,11 @@ _write_exit_sidecar() {
     fi
 }
 
+# #10830: keep the pinned session id as a shell variable for the retry check in
+# run_with_retry, but stop exporting it, so the claude CLI (and every Bash call
+# it makes) never inherits it.
+export -n LOOM_CLAUDE_SESSION_ID
+
 # Logging helpers
 log_info() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [INFO] $*" >&2
@@ -1783,7 +1788,7 @@ _auth_dead_phrase() {
     # reason string instead of falling through to the generic default — grep
     # returns the LEFTMOST match, so the quoted `"type":"` wrapper is never
     # captured with it.
-    m="$(echo "${output}" | grep -ioE "401[^a-z]*authentication_error|(OAuth )?(access )?token (has been|was) revoked|authentication_error|invalid bearer token|OAuth token has expired|token has expired" | head -1)"
+    m="$(echo "${output}" | grep -ioE "401[^a-z]*authentication_error|(OAuth )?(access )?token (has been |was )?revoked|authentication_error|invalid bearer token|OAuth token has expired|token has expired" | head -1)"
     echo "${m:-401/invalid credential}"
 }
 
@@ -2499,8 +2504,7 @@ _run_via_script() {
 
 # Main retry loop with exponential backoff
 run_with_retry() {
-    local attempt=1
-    local exit_code=0
+    local attempt=1 exit_code=0
     local output=""
     # Account-rotation bookkeeping (#3738). Rotations do NOT consume a
     # MAX_RETRIES attempt; this independent cap is a loop guard for the
@@ -2539,6 +2543,11 @@ run_with_retry() {
         fi
 
         log_info "Attempt ${attempt}/${MAX_RETRIES}: Starting Claude CLI"
+        # #10830: spawn-claude.sh pins `--session-id` (LOOM_CLAUDE_SESSION_ID), and
+        # Claude refuses a second launch with an id whose transcript exists
+        # ("Session ID ... is already in use"). Once it does, every retry resumes
+        # the same session instead, which also keeps the id the daemon recorded.
+        compgen -G "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/${LOOM_CLAUDE_SESSION_ID:-none}.jsonl" >/dev/null && set -- "${@/#--session-id/--resume}"
         write_retry_state "running" "${attempt}"
 
         # Run Claude CLI, capturing both stdout and stderr
@@ -2792,7 +2801,7 @@ run_with_retry() {
             log_error "Re-authenticate the affected account(s), then run 'loom-daemon tokens unblock <name>'."
             echo "# ACCOUNT_POOL_EXHAUSTED" >&2
             clear_retry_state
-            return 1
+            return 78  # EX_CONFIG: no alternate account (#10294)
         fi
 
         # Check if this is a transient error worth retrying

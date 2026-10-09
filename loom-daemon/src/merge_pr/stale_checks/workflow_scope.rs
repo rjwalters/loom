@@ -527,7 +527,15 @@ fn affected_components(workflow: &Workflow, touched: &Touched) -> Option<BTreeSe
     for req in REQUIRED_CHECKS {
         let job = workflow.job_named(req.context)?;
         markers_agree(job, req.components)?;
-        let closure = workflow.needs_closure(&job.key)?;
+        let mut closure = workflow.needs_closure(&job.key)?;
+        // An aggregate (#10444) does not re-own the jobs of the required
+        // contexts it folds in: an edit there is attributed to THEIR
+        // components, which `specs_for` judges as part of the aggregate
+        // anyway. Jobs only the aggregate reaches (or that both share, like
+        // `build-daemon`) stay in its closure.
+        for agg in req.aggregates {
+            closure.remove(&workflow.job_named(agg)?.key);
+        }
         for component in req.components {
             let hit = touched.jobs.iter().any(|k| closure.contains(k))
                 || touched.components.iter().any(|(k, name)| {

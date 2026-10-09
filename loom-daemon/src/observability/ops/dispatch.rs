@@ -76,8 +76,8 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | `halted_main_red` | a main-health gate held a workspace |
 /// | `halted_ci_billing` | as above, but an owner's Actions jobs are billing-blocked (#10113) |
 /// | `saturation_held` | the saturation admission brake was engaged |
-/// | `build_backoff_held` | the build back-off (#9410) was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
+/// | `build_backoff_held` | the build back-off (#9410) deferred at least one candidate |
 /// | `no_eligible_work` | no ready candidates at all |
 /// | `capacity_full` | candidates deferred by the concurrency or ramp cap |
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
@@ -97,10 +97,14 @@ pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static 
         "halted_main_red"
     } else if report.saturation_held {
         "saturation_held"
-    } else if report.build_backoff_held {
-        "build_backoff_held"
     } else if report.errors > 0 {
         "error"
+    } else if report.deferred_build_backoff > 0 {
+        // Keyed on an actual deferral, not on `build_backoff_held` (#10624):
+        // since the hold is per repo, one repo can stay engaged for days, and
+        // "any repo held" would mask every idle, capacity-full or failed tick
+        // as a back-off hold.
+        "build_backoff_held"
     } else if report.seen == 0 {
         "no_eligible_work"
     } else if report.deferred_capacity + report.deferred_ramp_cap > 0 {
@@ -371,8 +375,9 @@ pub fn record_tick(
     // failed-repo discipline (unresolvable roots are dropped, the same
     // accepted edge case its own `failed_slugs` documents).
     let repo_refs = resolved_repo_refs(&report.admissions, &report.queue, roots);
+    // #11139: a partial listing is no evidence of a cleared lock either.
     let failed: Vec<String> = report
-        .listing_failed
+        .listing_not_whole()
         .iter()
         .filter_map(|idx| repo_refs.get(idx).map(|r| r.repo.clone()))
         .collect();

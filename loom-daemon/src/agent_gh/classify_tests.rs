@@ -127,8 +127,23 @@ const PASSTHROUGH: &[&str] = &[
     "api graphql -f query='mutation { addComment }'",
     "api graphql -f query='{ viewer { login } }'",
     // Reads the ETag modules do not reproduce.
-    "pr checks 42",
     "pr checks 42 --watch",
+    "pr checks 42 --watch --fail-fast",
+    "pr checks 42 --watch -i 30",
+    "pr checks 42 --required",
+    "pr checks 42 --web",
+    "pr checks 42 -w",
+    "pr checks 42 --json name,bucket --jq '.[] | select(.bucket==\"fail\")'",
+    "pr checks 42 --json name -q .",
+    "pr checks 42 --json name --template '{{.}}'",
+    "pr checks 42 --json name,workflow",
+    "pr checks 42 --json event",
+    "pr checks feature/issue-42",
+    "pr checks https://github.com/o/r/pull/42",
+    "pr checks",
+    "pr checks 42 -R github.com/o/r",
+    "pr checks 42 --help",
+    "issue checks 42",
     "pr diff 42",
     "pr diff 42 --name-only",
     "pr status",
@@ -159,6 +174,12 @@ const PASSTHROUGH: &[&str] = &[
     "pr view --json number",
     "pr view feature/issue-1 --json number",
     "pr view 42 --json mergeStateStatus,statusCheckRollup",
+    // GraphQL `contexts` order is not REST-derivable, so the rollup is not
+    // reproducible exactly: passthrough until #10629.
+    "pr view 42 --json statusCheckRollup",
+    "pr view 42 --json statusCheckRollup --repo o/r",
+    "pr view 42 --json state,statusCheckRollup -R o/r",
+    "pr view 42 --json statusCheckRollup --jq '.statusCheckRollup[].conclusion'",
     "pr view 42 --json reviews",
     "issue list --label loom:issue",
     "issue list --label loom:issue --json number,labels",
@@ -172,6 +193,22 @@ const PASSTHROUGH: &[&str] = &[
     "pr list --json number,headRefName",
     "pr list --author app/dependabot --json number",
 ];
+
+/// `pr checks` shapes served by [`super::super::pr_checks`] (#10516).
+const CHECKS: &[&str] = &[
+    "pr checks 42",
+    "pr checks 10543 --repo rjwalters/loom",
+    "pr checks 7 -R o/r --json bucket,name",
+    "pr checks 7 --json=name,state,bucket,link,startedAt,completedAt,description",
+    "pr checks --json bucket,name 7",
+];
+
+#[test]
+fn pr_checks_snapshots_route_to_the_rest_checks_front() {
+    for cmd in CHECKS {
+        assert_eq!(classify(&argv(cmd)), Route::EtagChecks, "gh {cmd}");
+    }
+}
 
 #[test]
 fn views_route_to_the_etag_view() {
@@ -196,7 +233,7 @@ fn mutations_api_and_unknown_shapes_pass_through() {
 
 #[test]
 fn table_is_at_least_sixty_real_vectors() {
-    assert!(VIEWS.len() + LISTS.len() + PASSTHROUGH.len() >= 60);
+    assert!(VIEWS.len() + LISTS.len() + CHECKS.len() + PASSTHROUGH.len() >= 60);
 }
 
 #[test]

@@ -229,6 +229,36 @@ fn an_operator_removal_older_than_the_live_marker_is_not_a_release() {
     assert_eq!(ev(&[marker_comment(&other, "2026-10-05T07:00:00Z"), late]), None);
 }
 
+/// Judge finding on PR #10651: the #10634 landing upsert PATCHes a marker
+/// into a comment that already existed, so the comment's `created_at` is
+/// older than the marker it now carries. A removal between the original post
+/// and the edit released the OLD marker, not this one: the carrying comment
+/// is dated by the later of `created_at` and `updated_at`.
+#[test]
+fn a_removal_before_an_in_place_edit_does_not_release_the_edited_marker() {
+    let m = marker_2_after_1();
+    let ev = |e: &[serde_json::Value]| operator_unlabeled(&timeline(e), &m, fleet);
+    let edited = |updated: serde_json::Value| {
+        let mut c = marker_comment(&m, "2026-10-05T07:00:00Z");
+        c["updated_at"] = updated;
+        c
+    };
+    let labeled = label_event("labeled", Some("loom-fleet-dispatch[bot]"), "2026-10-05T07:00:01Z");
+    let removal = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:00:00Z");
+    // Posted at 07:00, operator removal at 08:00, edited in place at 09:00.
+    let patched = edited(serde_json::json!("2026-10-05T09:00:00Z"));
+    assert_eq!(ev(&[labeled.clone(), removal.clone(), patched.clone()]), Some(false));
+    // A removal after the edit is still a release.
+    let after = label_event("unlabeled", Some("rjwalters"), "2026-10-05T09:30:00Z");
+    assert_eq!(ev(&[labeled.clone(), patched, after]), Some(true));
+    // `updated_at` equal to (or absent beside) `created_at` changes nothing.
+    let unedited = edited(serde_json::json!("2026-10-05T07:00:00Z"));
+    assert_eq!(ev(&[labeled.clone(), removal.clone(), unedited]), Some(true));
+    // An unreadable `updated_at` is an unknown, never a release.
+    let garbled = edited(serde_json::json!("later"));
+    assert_eq!(ev(&[labeled, removal, garbled]), None);
+}
+
 #[test]
 fn the_decision_is_scoped_to_the_pair_and_the_tree() {
     let live = pr(2, &redated(), &["loom:pr"]);
@@ -285,7 +315,9 @@ fn fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
          'api '*/issues/*/timeline*) n=\"${{2#*/issues/}}\"; n=\"${{n%%/*}}\"; cat \"{d}/timeline-$n.json\" || exit 1 ;;\n\
          'api '*/compare/*) cat \"{d}/compare.json\" || exit 1 ;;\n\
          'api '*/pulls/*) cat \"{d}/pull-${{2##*/}}.json\" || exit 1 ;;\n\
-         'pr view') if [ \"$5\" = files ]; then cat \"{d}/files-$3.json\" || exit 1; else cat \"{d}/labels-$3.txt\" 2>/dev/null || true; fi ;;\n\
+         'api --include') n=\"${{3%/files*}}\"; n=\"${{n##*/}}\"; [ -f \"{d}/files-$n.json\" ] || exit 1;\
+           printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; cat \"{d}/files-$n.json\" ;;\n\
+         'pr view') echo FORBIDDEN >> \"{log}\"; exit 97 ;;\n\
          'pr comment'|'pr edit') exit 0 ;;\n\
          *) exit 1 ;;\nesac\n",
         log = log.display(),
@@ -347,7 +379,7 @@ fn setup(
         &serde_json::json!({"state": "open", "merged": false, "head": {"sha": sha(1)}, "updated_at": now}),
     );
     for (n, path) in [(1, "lib.rs"), (2, "lib.rs"), (3, "other.rs")] {
-        write(d, &format!("files-{n}.json"), &serde_json::json!({"files": [{"path": path}]}));
+        write(d, &format!("files-{n}.json"), &serde_json::json!([{"filename": path}]));
     }
     let files: Vec<_> = (0..compare_files)
         .map(|i| serde_json::json!({"filename": format!("f{i}.rs")}))
@@ -376,7 +408,10 @@ fn tick(
     if let Some(v) = prev {
         std::env::set_var(MERGE_SEQUENCE_ENABLED_ENV, v);
     }
-    (stats, std::fs::read_to_string(&log).unwrap())
+    let calls = std::fs::read_to_string(&log).unwrap();
+    // #10507: the label side comes from the listing — no `gh pr view` read.
+    assert!(!calls.contains("FORBIDDEN"), "a GraphQL read was attempted:\n{calls}");
+    (stats, calls)
 }
 
 #[cfg(unix)]
@@ -498,4 +533,59 @@ fn a_tree_identical_re_date_keeps_the_hold_and_its_pins() {
     assert_eq!(stats.voided, 1, "{calls}");
     assert!(calls.contains("pr edit 2 --remove-label loom:sequenced"), "{calls}");
     assert!(calls.contains("loom:sequence replanned"), "{calls}");
+}
+
+// --- #10465: predecessor head moves --------------------------------------------
+
+fn pred_at(head: &str) -> PredecessorState {
+    PredecessorState {
+        open: true,
+        merged: false,
+        head_sha: Some(head.to_string()),
+        updated_at: None,
+    }
+}
+
+#[test]
+fn a_tree_identical_predecessor_redate_reanchors_pass_and_human_markers() {
+    let live = sha(0x901);
+    for source in [Some("pass".to_string()), None] {
+        let m = SequenceMarker {
+            source: source.clone(),
+            ..marker_2_after_1()
+        };
+        let p = pred_at(&live);
+        // Without re-anchoring the hold would void.
+        assert_eq!(
+            hold_action(&m, Some(&p), Some(&sha(2)), false, 72.0),
+            HoldAction::VoidAndReplan
+        );
+        let anchored = reanchor_predecessor(&m, Some(&p), |_, l| l == live).expect("re-anchored");
+        assert_eq!(anchored.pred_head, live);
+        assert_eq!((anchored.after, &anchored.plan, &anchored.source), (1, &m.plan, &source));
+        assert_ne!(
+            hold_action(&anchored, Some(&p), Some(&sha(2)), false, 72.0),
+            HoldAction::VoidAndReplan
+        );
+    }
+}
+
+#[test]
+fn a_changed_or_unanswered_predecessor_comparison_still_voids() {
+    let m = marker_2_after_1();
+    let p = pred_at(&sha(0x901));
+    assert_eq!(reanchor_predecessor(&m, Some(&p), |_, _| false), None);
+    assert_eq!(reanchor_predecessor(&m, None, |_, _| true), None);
+    // An unmoved head, a closed predecessor, and a merged one need nothing.
+    assert_eq!(reanchor_predecessor(&m, Some(&pred_at(&sha(1))), |_, _| true), None);
+    let closed = PredecessorState {
+        open: false,
+        ..pred_at(&sha(0x901))
+    };
+    assert_eq!(reanchor_predecessor(&m, Some(&closed), |_, _| true), None);
+    let merged = PredecessorState {
+        merged: true,
+        ..pred_at(&sha(0x901))
+    };
+    assert_eq!(reanchor_predecessor(&m, Some(&merged), |_, _| true), None);
 }

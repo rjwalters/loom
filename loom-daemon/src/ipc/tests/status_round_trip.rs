@@ -93,7 +93,9 @@ fn test_daemon_status_request_response_round_trip() {
         drain_note: None,
         drain_roll: None,
         drain_paused_by_day: std::collections::BTreeMap::new(),
+        pause_resume: None,
         auto_update_enabled: true,
+        auto_update_mode: Some("fleet floor only (autoUpdate.enabled=false)".to_string()),
         auto_update_last_check: Some(chrono::Utc::now()),
         auto_update_last_roll: Some(chrono::Utc::now()),
         auto_update_consecutive_failures: 2,
@@ -104,8 +106,19 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
-        auto_update_roll_window: None,
         task_liveness: Vec::new(),
+        session_containers: Some(crate::session_status::SessionContainersReport {
+            observation: "available".into(),
+            degraded: true,
+            degraded_reason: Some("1 of 1 session seat(s) not serving: agent-1 stopped".into()),
+            accounts: vec![crate::session_status::SeatStatus {
+                account: "agent-1".into(),
+                state: "stopped".into(),
+                degraded: true,
+                ..crate::session_status::SeatStatus::default()
+            }],
+            ..crate::session_status::SessionContainersReport::default()
+        }),
         host_breaker: None,
         admission_brake: None,
         rate_limit_breaker: None,
@@ -147,6 +160,8 @@ fn test_daemon_status_request_response_round_trip() {
                 inherited_from: None,
                 operator_priority_at: None,
                 last_progress_at: None,
+                level: 2,
+                level_inherited_from: Some("o/other#7".to_string()),
             }],
             ..Default::default()
         }),
@@ -255,6 +270,12 @@ fn test_daemon_status_request_response_round_trip() {
     match back {
         Response::DaemonStatus(r) => {
             assert_eq!(r.token_pool_size, 4);
+            let sessions = r
+                .session_containers
+                .as_ref()
+                .expect("session containers survive");
+            assert!(sessions.degraded);
+            assert_eq!(sessions.accounts[0].state, "stopped");
             let landing = r
                 .operator_priority_landing
                 .as_ref()
@@ -268,6 +289,10 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
+            assert_eq!(
+                r.auto_update_mode.as_deref(),
+                Some("fleet floor only (autoUpdate.enabled=false)")
+            );
             assert_eq!(r.auto_update_consecutive_failures, 2);
             assert_eq!(r.auto_update_backoff_secs, Some(120));
             assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));

@@ -6,6 +6,607 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-08
+- **Issue #8667** (closed): Fleet feed: ModelLabels.tsx needs a Kimi/Moonshot label+icon mapping (marketing-site repo, follow-up to #8564/#8507)
+- **Issue #8863** (closed): loom-daemon clean fails the whole workspace when a landed branch is still checked out in a worktree
+- **Issue #9349** (closed): Live verification: story.queue_dwell spans carry loom.attempt 1..N in a real story trace (after the 2am D32 amendment)
+- **Issue #9360** (closed): buildGate fails on native dispatch workers: 4 env-sensitive unit tests (TMPDIR length, capability set, model env)
+- **PR #9852**: test(daemon): clear ambient runtime pins so buildGate is not a function of the shell (#9360)
+- **PR #9897**: feat(forge): the hosted-qualification probe runner, slice 1 (#9789)
+- **Issue #9945** (closed): forge-probe disposable issue titles don't follow the ${GITEA_QUAL_RUN_NS} prefix convention
+- **Issue #10012** (closed): Propagate loom:operator-priority from a starred parent to its child issues and PRs, daemon-enforced and removed with the parent's star
+- **Issue #10013** (closed): Label registry: one JSON file holding every label's properties, replacing the scattered daemon and shell label tables
+- **Issue #10019** (closed): daemon: read loom label state from the dashboard's webhook-fed fleet state instead of polling GitHub
+- **Issue #10050** (closed): C3 follow-up: git credential separation in provisioning + pinned upstream gh (rest of #9986)
+- **Issue #10118** (closed): main-red-fix issues sit in loom:triage while main stays red: the red-main lane only reorders candidates, so an unpromoted fix never enters it
+- **PR #10128**: feat(work-finder): admit unpromoted red-main fixes on a red repo, escalate if unclaimed (#10118)
+- **PR #10183**: docs(auto_update): document the scheduled roll window (follow-up to #10141)
+- **Issue #10195** (closed): observability: lock in long-term retention for all Loom telemetry — live SigNoz already keeps 10y; reconcile 7d/30d trial docs, aux tables, loom-ui store
+- **Issue #10256** (closed): merge queue Phase B: guard-preserving Champion handoff and revocation safety (parent #9978)
+- **Issue #10294** (closed): claude-wrapper: 'OAuth token revoked' is classified RECOVERABLE — retried 5x (~17 min) and never bad-marked
+- **Issue #10326** (closed): GitHub Actions blocked by billing/spending limit for 2amlogic
+- **Issue #10333** (closed): ETA next version: priority-aware queue position — star (and future priority levels) in dispatch-order 'ahead', star dynamics, validated offline
+- **Issue #10348** (closed): sweep-lease-renew: restore <=24 calls/h per held lease after #10272's per-cycle issue-state read
+- **PR #10374**: fix(sweep-lease-renew): restore <=24 calls/h per lease where the state read buys nothing (#10348)
+- **Issue #10388** (closed): merge-pr: evaluate cheap tree checks (conflict markers, prompt ratchet) locally on the merge tree instead of CI re-date loops — approved PRs exhaust re-date budgets on busy main
+- **PR #10417**: fix(spawn): scrub ambient ANTHROPIC_* credentials before pool-token dispatch (#10413)
+- **Issue #10426** (closed): eta doctor: report the captain fit publication state (published fit_id, captain, age, refusal/stale fallback) — deferred from #10395
+- **Issue #10473** (closed): [Parent #10470] Follow-up B: Source-revision and tag-ancestry validation, tag-movement/asset-replacement tests
+- **Issue #10474** (closed): [Parent #10470] Follow-up C: Publish required-mode signature evidence to access inventory/drift monitoring
+- **Issue #10518** (closed): create-pr.sh: copy the closing issue's priority labels when it opens the PR (#10012 slice: creation-time star copy)
+- **PR #10546**: feat: create-pr.sh copies the closing issues' priority labels onto the PR
+- **PR #10554**: merge-pr.sh: refuse workflow-file PRs when gh token lacks 'workflow' scope (#10539)
+- **Issue #10570** (closed): Orphan recovery strips loom:building claims made outside the recovering host (has_valid_claim reads a host-local claim file)
+- **Issue #10571** (closed): forge_bucket_book: one (account, owner, resource) key carries two interleaved rate-limit buckets
+- **Issue #10581** (closed): Judge approved a PR at the same head it had just changes-requested, with CI red (loom:pr + loom:changes-requested + loom:ci-failure together)
+- **PR #10590**: feat(star_liveness): materialize the inherited star as the label, removed with the root's star (#10012 slice 1b)
+- **Issue #10591** (closed): Star propagation slice 2: the star-liveness pass stars PRs linked to a starred or inherited-star issue, and removes it on unstar (#10012 AC 8)
+- **Issue #10606** (closed): Cleanup after #10568: genericize 2AMLogic refs in daemon tests; refresh stale parse_dependencies quote in sweep-wave-lifecycle.md
+- **Issue #10611** (closed): release_fetch: default keyless identity rejects every push-to-main auto-release (SAN is refs/heads/main, not refs/tags/<tag>)
+- **Issue #10637** (closed): telemetry: loom.role_attempt lowercases loom.repo, and checkpoint-observed attempts carry no loom.repo or loom.sweep_id
+- **Issue #10640** (closed): telemetry: failed loom.role_attempt spans carry no reason — 849/day (28% of Judge ticks), most under 5 s, status and class empty
+- **PR #10644**: feat(agent_gh): record every agent gh call into the daemon's sink (#10607 slice A)
+- **PR #10645**: feat(forge): key bucket readings by the identity minted into each credential dir (#10571)
+- **PR #10648**: feat: publish signature evidence journal (#10474)
+- **PR #10652**: fix(telemetry): canonical loom.repo on role attempts; repo + sweep on checkpoint spans (#10637)
+- **PR #10655**: fix(observability): failed role_attempt spans say why they failed (#10640)
+- **PR #10659**: feat(daemon-update): source-revision/tag-ancestry validation and tag-movement detection (#10473)
+- **PR #10665**: Record no-phase-signal cause; count phaseless deaths durably toward PR-less hold (#10642)
+- **Issue #10670** (closed): main CI cancels in-progress runs: should keep oldest + newest so main verifies continuously
+- **PR #10677**: ci: pin "never cancel a started main run" with a lint and a main cancel split (#10670)
+- **PR #10678**: fix(worktree): attended lease call site PID chain + visible outcome (#10570)
+- **PR #10684**: feat(judge): gate verdicts and apply exclusive verdict labels in post-verdict.sh (#10581)
+- **PR #10685**: Genericize 2AMLogic refs in daemon tests; refresh parse_dependencies quote (#10606)
+- **Issue #10691** (closed): Reconcile #10644 (agent gh passthrough recording slice A) with W5 ledger booking on main
+- **Issue #10710** (closed): Roll verdict compares the RUNNING version, not the on-disk probe
+- **Issue #10712** (closed): Floor-driven roll target skips settle; unsatisfiable floor alerts and keeps dispatching
+- **Issue #10713** (closed): Persist auto-update state across restarts (settle ceiling, window, typed stall)
+- **Issue #10716** (closed): Compatibility contract: install-metadata loom_version/requires_daemon, daemon supports_installed, CI proof (D3/D4)
+- **Issue #10717** (closed): Resync payload from the running release; empty diff writes nothing
+- **PR #10723**: chore(harness): track latest CLIs — codex 0.160.1→0.161.0 opencode 1.18.34→1.18.35
+- **Issue #10730** (closed): docs(eta): refresh even-lark registry budget after loop-kite
+- **PR #10735**: test(labels): unregistered literal guard + script lockstep + registry-backed hard-exclusion script (#10013 slice 3a)
+- **Issue #10736** (closed): ETA friction source: persist PR-head file snapshots and wire point-in-time overlap into fit and serving
+- **Issue #10744** (closed): Token-ranking refresh probes api.anthropic.com every 600 s on every daemon host with no span or metric
+- **PR #10751**: feat(merge-pr): port post-wait head re-read decision to Rust (#8191 slice)
+- **PR #10759**: feat(champion): promote every pass, configurable tier caps, send NEEDS REVISION to Curator (#10753)
+- **PR #10761**: feat(telemetry): export the loom:blocked release pass to SigNoz with pass.summary, pass.verdict and github.caller
+- **PR #10762**: feat(tokens): token_ranking.refresh telemetry per refresh round (#10744)
+- **Issue #10765** (closed): Daemon IPC: status --json takes >10s (up to 120s) and IPC intermittently times out while the daemon is alive
+- **Issue #10766** (closed): loom-daemon clean: treats a branch still checked out by a kept worktree as an error, failing the whole clean pass
+- **Issue #10774** (closed): docs(eta): shadow-fleet Tiers table 'retired' row omits land-2026-10-06-calm-plover
+- **Issue #10781** (closed): eta backtest: merge_case_sets drops one same-issue PR's case and doubles another when only one merged in a sweep
+- **Issue #10787** (closed): status --json: add --section selection so callers can fetch a few fields cheaply
+- **Issue #10789** (closed): install_to follow-ups: symlinked-dest test, doc note, sweep orphaned temp files
+- **Issue #10792** (closed): Floor seam follow-ups: loom_min_version() when fleet.repo unset, restart read-back test, strict quoting
+- **Issue #10816** (closed): Balance slice 3: event-driven triggers for curator, auditor and guide (replace fixed intervals)
+- **Issue #10824** (closed): CI: build the release loom-daemon once per run and share it with the image-smoke jobs
+- **Issue #10826** (closed): Build and Release: release only from main commits with green CI (workflow_run on CI success), oldest-running + newest-pending
+- **Issue #10830** (closed): Pause-and-roll PR 1: resume handles, safe-point pause hook, pause manifest + classifier, and live stop/resume test (#10715)
+- **PR #10833**: ci(release): release only from main commits with green CI (workflow_run on CI success), oldest-running + newest-pending (#10826)
+- **PR #10840**: fix(fleet_store): floor seam follow-ups — clear on unset store, canonical X.Y.Z, read via compiled fleet.json (#10792)
+- **PR #10842**: ci: build the release loom-daemon once, share with image smokes (#10824)
+- **PR #10843**: fix(auto_update): judge the roll verdict on the running version, not the on-disk probe (#10710)
+- **PR #10844**: merge queue Phase B6: merge_group check runner and group pass (#10256)
+- **PR #10848**: fix(clean): skip branches held by a kept worktree instead of erroring (#10766)
+- **PR #10849**: docs(eta): first measurement of IPCW wrap over twin-otter-b (#10524 slice 6)
+- **Issue #10851** (closed): clean: follow-ups from #10848 (update-refs holders, locale-stable fallback, Kept count, tests)
+- **PR #10852**: fix(daemon-update): sweep stale install staging files; document symlinked dest (#10789)
+- **PR #10853**: daemon: build DaemonStatus off the tokio workers; export IPC latency by kind (#10765)
+- **PR #10855**: feat(role_runner): event-driven curator, auditor and guide triggers (#10816)
+- **PR #10856**: fix(claude-wrapper): 'OAuth token revoked' rotates as auth-dead (#10294)
+- **PR #10858**: clean: update-refs holders, C-locale branch -D, held_branches count (#10851)
+- **PR #10859**: auto-update: floor-driven roll target skips settle; unsatisfiable floor alerts and keeps dispatching (#10712)
+- **Issue #10860** (closed): preflight: 1200s budget runs out in test-installer.sh on loaded hosts, blocking correct PRs
+- **Issue #10861** (closed): status: single-flight the DaemonStatus build (concurrent builds unbounded after #10853)
+- **PR #10863**: Compatibility contract: install-metadata requires_daemon, daemon supports_installed, CI proof (#10716)
+- **PR #10864**: Pause-and-roll PR 1: pin session ids, safe-point pause hook, pause manifest and classifier (#10830)
+- **PR #10865**: fix(preflight): path-scope test-installer, name the stage on timeout, keep the claim (#10860)
+- **Issue #10866** (closed): floor roll: follow-ups from #10859 (rate-limit unsatisfiable ERROR, closed-window test, unparseable latest, alert flicker)
+- **PR #10872**: refactor(labels): derive eta hold sets from the registry (#10013 slice)
+- **PR #10876**: test(labels): bound script-hand-listed label sets by registry (#10013 slice 3b)
+- **PR #10877**: feat(auto_update): persist settle clocks, window consumption and a typed stall state across restarts
+- **PR #10878**: feat: embed the install payload in loom-daemon and resync from it; an empty diff writes nothing
+- **PR #10879**: feat(status): add --section to status --json with a section-scoped daemon build
+- **PR #10883**: fix(forge-probe): run_ns is the full disposable-title namespace (#9945)
+- **PR #10891**: feat(eta): censored in-flight scoring and issue-bootstrap late-surprise CI in the backtest (#9970 Slice 2)
+- **PR #10894**: feat(labels): move propagation table into the label registry (#10013 AC 6)
+- **Issue #10899** (closed): eta.* OTLP logs lack loom.kind — breaks query-by-kind (#9881)
+- **PR #10904**: feat(eta): authority coverage check and non-authority fallback (Part of #10897, Slice 1)
+- **Issue #10905** (closed): Fleet store: move ETA roster history and fleet-config propose off the legacy repos.yml/state.yml/defaults.json
+- **PR #10907**: feat(eta): read the roster history from fleet.json, repos.yml before it (#10905)
+- **PR #10908**: feat(merge-pr): port the --auto poll-arm wait-or-timeout decision to Rust (#8191 slice)
+- **PR #10909**: feat(star_liveness): materialize the inherited operator star by default (#10012)
+- **PR #10910**: feat(hyperparams): champion group for promotion-throughput knobs (#10753)
+- **PR #10911**: fix(lease): retry declined attended lease publish, stable session lease id (#10570)
+- **PR #10915**: feat(fleet-config): propose edits fleet.yml and regenerates its renders (#10905)
+- **Issue #10917** (closed): Process: PRs that move work between hosts need a 'Rollout check' (production signal) verified after the fleet rolls
+- **Issue #10918** (closed): ETA fit stays fresh when fleet.etaAuthority is not the captain: snapshot refresh and nightly folds follow the authority (Part of #10897)
+- **PR #10922**: docs: require a Rollout check section on host-move PRs
+- **PR #10923**: feat(eta): fleet refresh and nightly folds follow an explicit ETA authority (#10918)
+- **PR #10927**: fix(eta): score each case once when one issue has two PRs (#10781)
+- **PR #10934**: fix(otlp): stamp loom.kind centrally on every OTLP log record (#10899)
+- **PR #10943**: feat(fleet_outputs): singleton output registry + pure watchdog evaluator (#10916 slice 1)
+- **PR #10947**: fix(eta): fit the fleet authority's eta.snapshot: 2000 rows, 1 MiB budget (#10928)
+- **PR #10956**: fix(fleet_outputs): idle-repo and captain-gauge deadline fixes for slice 1 (#10916 slice 1b)
+- **PR #10969**: fix(auto-update): rate-limit the unsatisfiable-floor ERROR; unparseable latest is unresolved; no alert flicker (#10866)
+- **PR #10970**: feat(status): single-flight the DaemonStatus build (#10861)
+
+### 2026-10-07
+- **Issue #9372** (closed): merge-pr.sh closes stacked child PRs instead of retargeting them
+- **Issue #9473** (closed): feat(daemon): env-driven LLM gateway endpoint/key injection for spawned harnesses (2am D39 fleet rollout)
+- **Issue #9728** (closed): fleet-captain bin-target tests read the host's machine-level config tier (3 failures on any host with fleet.captain in private defaults)
+- **Issue #9850** (closed): buildGate reds on every fleet worker: 3 cli::fleet_captain_cmd tests read the host's private defaults (cfg(test) isolation is inert in the bin target)
+- **PR #10053**: ci(labels): extend drift check to the registry (#10013 slice 1 follow-up)
+- **Issue #10137** (closed): mail-send: resolve the ingest key and inbox URL like the daemon does, and keep flagging when they're missing
+- **PR #10147**: mail-send: resolve inbox URL and ingest key file like the daemon; flag gaps in health (#10137)
+- **Issue #10179** (closed): Durable host opt-out: a stopped daemon keeps coming back (start/installer/update/agents re-provision it)
+- **PR #10185**: feat(merge-pr): port the post-merge worktree removal itself to Rust (#8191 slice)
+- **Issue #10203** (closed): worktree.sh | tail hangs for hours: the lease renewer inherits the caller's fd 3 (pipe)
+- **PR #10205**: feat(host): durable host opt-out marker (autonomy-disabled)
+- **PR #10248**: fix(lease): keep the lease renewer from holding the caller's pipe open
+- **Issue #10271** (closed): Fleet workers: work_finder/stage_dwell/star_liveness/eta fail 86–99% of ~30k gh calls/h (target=none); invoke-github spans lack the GitHub identity
+- **Issue #10350** (closed): Merge sequencing serializes PRs that only share a hot file (lib.rs mod list): order by real merge conflict, and rank ⭐⭐ ahead of ⭐
+- **Issue #10364** (closed): [Epic #10452] Host-mounted Codex session containers don't track workspace registry changes (missing new repos, keeping removed ones)
+- **PR #10366**: Merge sequencing: order PRs by real merge conflict, not shared filename (#10350)
+- **Issue #10391** (closed): ETA pipeline health: emit eta.fit + per-host health gauges, add 'eta doctor', alerts, and a loom↔loom-ui snapshot contract test — today every link is verified by hand
+- **PR #10406**: fix(merge-pr): retarget stacked children before deleting parent branch (#9372)
+- **Issue #10452** (closed): Epic: Daemon-supervised Codex session containers
+- **Issue #10465** (closed): Re-date loops: sequence pins void on tree-identical re-dates, readiness isn't transitive, and #10397's cure can't reach merging hosts
+- **Issue #10485** (closed): security(review): enforce exact-head CI before posting or promoting approval
+- **PR #10486**: feat(post-verdict): enforce exact-head all-CI before posting approval (#10485)
+- **Issue #10489** (closed): ETA: generic per-stage calibration wrapper (censoring-aware conformal) so any heuristic's p25–p90 hit their targets — land-v2 covers ~10% of p25–p75
+- **Issue #10492** (closed): ETA: nightly walk-forward backtest fold on the captain (eta.backtest.fold records + scoreboard in eta doctor / loom-ui)
+- **Issue #10501** (closed): eta fit: false 'unconverged' flags — stopping rule too strict (3/10 fits flagged, coefficients match reference to 1e-6)
+- **PR #10509**: test(eta): eta.snapshot producer golden + vendored loom-ui consumer contract (#10391 slice 3/3)
+- **Issue #10511** (closed): ETA history from SigNoz first: build label/merge/CI/queue timelines from SigNoz records, forge reads only to fill gaps (0 GitHub calls where SigNoz covers)
+- **Issue #10520** (closed): ETA history from SigNoz, slice 3: wire SigNoz reader as primary source with budgeted forge gap-fill
+- **Issue #10521** (closed): ETA: friction predictors from the error analysis — file-overlap with open PRs, review-loop history, own CI failure, repo Judge rejection rate; fix stage-age form
+- **Issue #10526** (closed): ETA: fill the dependency book on the ETA authority from forge reads (follow-up to #10510)
+- **PR #10532**: feat(eta): nightly walk-forward backtest folds on the fleet captain (#10492)
+- **PR #10540**: feat(merge-pr): default-on merge.reverifyStaleChecks + guards floor warning (#10465)
+- **Issue #10567** (closed): security(merge): hold when the CI-run conclusion gate is unavailable or unreadable
+- **Issue #10580** (closed): fleet_captain_cmd bin tests read the host's private config defaults tier (fail on fleet workers)
+- **PR #10582**: security(merge): hold when the CI-run conclusion gate is unavailable or unreadable
+- **PR #10585**: merge queue Phase B3: wire Champion handoff (Part of #10256)
+- **Issue #10586** (closed): ETA eta-fit/v2: fleet-store repos.yml history reader for repo_rank / fleet dispatch position, and v2 fit publication (#10508 slice 3)
+- **Issue #10598** (closed): Flaky test: the_observed_fourteen_claim_loop_cannot_recur off by one second (two Utc::now() reads)
+- **Issue #10600** (closed): [Epic #10452] Session-container state in loom-daemon status and the dashboard; retire manual recreate steps
+- **Issue #10601** (closed): verdict-staleness guard posts 'verdict cleared' when its label edit failed (ran as a personal account without label rights)
+- **PR #10603**: feat(eta): land-2026-10-06-loop-kite, eta-fit/v3 fit + serving + paired backtest (#10521)
+- **Issue #10626** (closed): eta nightly folds: case identity breaks when same-issue cases resolve out of order (double-scored / dropped)
+- **Issue #10628** (closed): champion: document MERGE_RC=7 and surface undetermined/unknown-verb merge-queue step outcomes (#10585 follow-up)
+- **PR #10631**: feat(eta): land-2026-10-06-brisk-petrel, drift-gated regime adjustment on the serving path (#10528 slice 2)
+- **PR #10635**: fix(session): reconciler recreates drifted session containers when idle (#10364 part B)
+- **PR #10657**: feat(eta): publish the eta-fit/v2 file from captain to fleet hosts (#10508, slice 4)
+- **Issue #10661** (closed): [Epic #10452] Session hold hardening: stop-on-missing race, root sets, Ctrl-C, untested lift paths
+- **Issue #10662** (closed): Shell test suites can run against a stale loom-daemon binary and mask real failures
+- **PR #10664**: feat(eta): land-2026-10-06-even-lark replaces calm-plover: conformal calibration on the seconds scale (#10489)
+- **PR #10667**: feat(intake): run intake reconcile once per fleet, on the captain, from reader ETag listings (W7)
+- **PR #10669**: feat(forge-calls): count --paginate pages and book agent gh passthroughs (W5)
+- **Issue #10671** (closed): ETA SigNoz timeline: fix row shapes against live SigNoz (d1sync source class, cross-exporter dedupe, merged bools, noop, CI keys; gate label-set path)
+- **PR #10673**: perf(forge): captain makes the liveness idle probe and loom:blocked listing for the fleet (W12 part 2)
+- **PR #10675**: perf(hygiene): hold reads for one pass, remember only merged, confirm every removal (W6 PR2)
+- **PR #10676**: test(shell): one daemon resolver for shell suites, with a source-commit check (#10662)
+- **PR #10681**: test: deterministic ceiling assertion in fourteen-claim-loop test
+- **PR #10682**: fix(verdict-staleness-guard): flip labels before announcing clear (#10601)
+- **PR #10690**: feat(eta): starred/held/sequenced subset breakdown in every backtest report (#10524)
+- **Issue #10694** (closed): Decide how PR #10631 (brisk-petrel) fits the land shadow budget
+- **Issue #10695** (closed): Champion: Merge-Risk Hold Digest
+- **PR #10697**: feat(eta): SigNoz as primary fleet-refresh history, budgeted forge gap-fill (#10520)
+- **Issue #10705** (closed): Fleet store: read the compiled fleet.json instead of parsing repos.yml/state.yml and the JSON tiers; retire fleet_store/yaml.rs
+- **Issue #10708** (closed): Atomic daemon binary install: write then rename, never unlink+write
+- **Issue #10709** (closed): Pin the update child's fetch to the exact target tag
+- **Issue #10711** (closed): Read loom_min_version from the fleet-store snapshot (floor seam)
+- **Issue #10714** (closed): Design: pause-and-resume contract for in-flight work across a daemon roll (D2)
+- **PR #10722**: feat(eta): shadow lifecycle - short-list, retirement proposals, item-clustered promotion statistics (#10525)
+- **PR #10724**: feat(session): session-container state in status, one drift definition, watch coverage (#10600)
+- **PR #10725**: fix(session): hold and removal-record hardening (#10661)
+- **Issue #10726** (closed): Flaky under load: reaper_consecutive_declines_accrue_and_cross_the_warn_threshold (2 != 3) consumes preflight attempts
+- **Issue #10727** (closed): verdict_equivalence rebase-patch test returns Indeterminate under full-suite load (flaky in build-gate)
+- **PR #10728**: feat(merge-pr): port --help text to loom-daemon merge-pr usage (#8191 slice)
+- **PR #10731**: refactor(labels): derive pr_latency, merge_pr, eta and queue_blocked sets from the registry (#10013 slice 2b)
+- **PR #10732**: feat(eta): schedule retirement-proposal filing from the nightly folds (#10525 slice)
+- **PR #10733**: feat(merge-pr): port the discovered-worktree classification to Rust (#8191 slice)
+- **PR #10740**: test(daemon): pin the machine config tier off in bin/integration tests that resolve it (#9850)
+- **PR #10741**: feat(merge-pr): port the telemetry retries-used derivation to Rust (#8191 slice)
+- **PR #10742**: feat(eta): log per-PR file lists for the #10521 friction predictors (#10550 item 1)
+- **Issue #10743** (closed): Role-runner and epic-supervisor Claude sessions never get the opt-in Claude Code OTel env (#9215 is wired into sweep spawns only)
+- **PR #10745**: feat(eta): eta doctor surfaces fit-pub/status-v2.json (#10508 slice 5)
+- **Issue #10746** (closed): ETA SigNoz-primary: keep linked-issue star coverage advancing before historyPrimary defaults on (#10697 follow-ups)
+- **PR #10747**: feat(eta): generic IpcwWrap + eta backtest --wrap (#10524 slice 5)
+- **Issue #10749** (closed): loom.runtime.usage has no billing tag: a metered fallback (z.ai, Cerebras, Friendli, API-key pool entry) is indistinguishable from subscription use
+- **Issue #10750** (closed): Codex usage exports no cost estimate: gpt-6.1-sol / gpt-6-astra missing from the pricing card (0.5 B tokens/day unpriced)
+- **PR #10754**: feat(eta): eta backtest --adaptation, regime-layer t_p50/t_cov/t_alarm on real residuals (#10528)
+- **PR #10757**: feat(observability): Claude Code OTel env on role-runner and epic-supervisor launches (#10743)
+- **Issue #10763** (closed): Release pass (#10583) does nothing on the fleet after roll: dry-run plans 3 releases in loom-ui, fleet applies none
+- **PR #10764**: feat(daemon): env-driven LLM gateway routing for spawned native harnesses (#9473)
+- **PR #10768**: feat(eta): conditional roster-history listings and an append-only observation archive (#10586)
+- **PR #10776**: feat(eta): replayed cases carry eta-fit/v2 priority inputs (#10508)
+- **PR #10777**: feat(pricing): price Codex gpt-6 models and WARN on unpriced usage spans (#10750)
+- **PR #10778**: fix(eta): scale-aware noise-floor stop for the fit's Newton driver
+- **PR #10779**: fix(eta): align the SigNoz timeline reader with live row shapes (#10671)
+- **PR #10780**: ETA: ingest phrases, sub-issues, epic phases, stacked PRs into the dependency book (#10526)
+- **PR #10782**: fix(eta): stable nightly-fold case identity when same-issue PRs land out of order (#10626)
+- **PR #10783**: feat(fleet-store): read loom_min_version from the fleet-store snapshot (floor seam)
+- **PR #10784**: fix(daemon-update): atomic binary install (write then rename, never unlink+write)
+- **PR #10785**: feat(fleet-store): read the compiled fleet.json (legacy fallback; fail closed when invalid)
+- **Issue #10786** (closed): Flaky under load: lease_episode test leaseless_yield_to_own_flip_reverts_the_phantom_label
+- **PR #10788**: fix(eta): keep star coverage advancing under SigNoz history; per-listing freeze; resolve gap-filled closes (#10746)
+- **PR #10790**: feat(merge-queue): group-wide authorization protocol (Phase B4)
+- **PR #10791**: fix(stale-blocked): run the release pass from its own task; report every tick outcome (#10763)
+- **PR #10793**: feat(telemetry): llm.billing tags on loom.runtime.run and usage spans (#10749)
+- **PR #10794**: feat(eta): planner_version stamps and regime restriction (#10528 slice a)
+- **Issue #10798** (closed): test: failed_spawn_releases_prepared_reservation_without_a_child flakes under heavy host load (lease still held after failed spawn)
+- **Issue #10799** (closed): proc_exec: a normal-exit command can return success with EMPTY stdout when output readers miss the fixed 500ms drain grace (fail-open risk under load)
+- **PR #10801**: feat(eta): backtest/nightly records carry linked-issue star (#10508, slice)
+- **Issue #10803** (closed): Flaky under load: auto_update::runner::tests::the_loop_keeps_ticking_after_a_panicking_tick
+- **Issue #10804** (closed): Flaky under load: sweep_registry::reaper::container_stop::cancel_latency_tests::stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads
+- **PR #10805**: test(sweep_registry): anchor leaseless own-flip claim event to the dispatch, not fixture setup (#10786)
+- **PR #10806**: test(sweep_registry): wait on the child's real exit instead of a fixed 50ms sleep (#10726)
+- **PR #10807**: fix(proc_exec): never report success with missing output after a normal exit (#10799)
+- **PR #10808**: test(auto_update): await the 5th resolve instead of sleeping in the panicking-tick test (#10803)
+- **PR #10809**: feat(eta): eta simulate --planner pre-deploy planner preview (#10528 slice b)
+- **PR #10810**: merge queue Phase B5: GitHub group adapters, group-aware revocation wiring (Part of #10256)
+- **PR #10811**: feat(eta): linked-issue-aware star subsets and paired per-subset backtest (#10508)
+- **PR #10812**: test(private_workspace): serialize forking and lease-holding tests with a process-wide fork guard (#10798)
+- **PR #10813**: test(container_stop): prove off-lock discovery by ordering, not wall-clock latency (#10804)
+- **PR #10814**: test(#10727): make verdict_equivalence failures self-explaining
+- **Issue #10817** (closed): Balance slice 4: key hermit/architect idle generation off per-repo pipeline-empty, not a free host slot
+- **PR #10818**: feat(daemon-update): pin the auto-update fetch to the verdict's exact release tag
+- **PR #10820**: docs(daemon): pause-and-resume contract for in-flight work across a daemon roll (#10714)
+- **PR #10821**: Balance slice 4: gate hermit/architect idle generation on pipeline-empty (#10817)
+- **Issue #10822** (closed): CI: make image-smoke Docker builds cache-backed and mirror-resilient (no more 30-min timeouts)
+- **Issue #10823** (closed): CI: run the full loom-daemon suite once (under --features otlp), cover default-feature-only code via check/clippy + targeted tests, full default suite nightly
+- **PR #10834**: ci: build the loom-worker base image once with a registry cache; apt retries/mirror; cap docker steps at 10 min (#10822)
+- **PR #10835**: ci: run the full loom-daemon suite once under --features otlp (#10823)
+
+### 2026-10-06
+- **Issue #9274** (closed): check-stale-blocked: 54 of 80 reported stale blocks were false positives, in four fixable classes
+- **Issue #9737** (closed): Flaky test: disabled_is_phase1_admission_with_no_ledger_read_or_listing admits 4 over a budget of 3 (fast-finishing runner race)
+- **PR #9958**: feat(fleet-config): refuse a lossy machine-tier render by default (2am#1653's ask, guard side)
+- **Issue #9985** (closed): loom-daemon: one `gh` spawn choke point with CI scan test and client-side `invoke github` telemetry (#9983 C2)
+- **Issue #9987** (closed): Run 2am's managed gh launcher everywhere Loom spawns gh: worker PATH, containers, outcome codes (#9983 C4)
+- **Issue #10025** (closed): Curator scripts on REST exhaustion: check-duplicate says 'Not authenticated', premise-check fails closed, post-comment has no GraphQL fallback
+- **Issue #10039** (closed): Curator's per-issue gh issue view/edit fan-out exhausts the shared GraphQL pool
+- **Issue #10040** (closed): Guide unblock treats a merged-PR blocker as unresolved (gh reports MERGED, loop requires CLOSED)
+- **Issue #10062** (closed): docs: drop the Gitea Cloud runbook; point GITEA_QUAL_* names at self-hosted gitea-1 (2am)
+- **PR #10064**: docs: drop the Gitea Cloud runbook; point GITEA_QUAL_* at self-hosted gitea-1
+- **Issue #10067** (closed): credentials.md: reference the D1 token for loom-fleet-telemetry (sweep-facts / LSI)
+- **PR #10068**: docs(credentials): reference the D1 token for loom-fleet-telemetry (#10067)
+- **PR #10076**: fix(curator): survive REST exhaustion in check-duplicate, premise-check, post-comment (#10025)
+- **Issue #10089** (closed): loom-daemon spends ~1,200-1,500 REST calls/hour of the shared pool, and its breaker books ~98% of it as external
+- **Issue #10116** (closed): Attended-session agents emit no issue-tagged output, so the loom-ui issue log panel is empty for them
+- **Issue #10125** (closed): Attended live-output tailer: surface start diagnostics, close finished subagent runs promptly, tidy state files
+- **Issue #10161** (closed): Daemon-side loom:blocked writers (quarantine, PR-less hold) still park without a body park record
+- **Issue #10163** (closed): Merge-chain head livelocks: version-bump commits and unrelated merges re-stale its checks faster than a re-date can finish
+- **Issue #10167** (closed): Daemon-enforced chain-head merge lock while a sequenced head re-dates (split from #10163)
+- **PR #10184**: fix(session-output): keep the attended start outcome, end a returned subagent's run, sweep stale tailer files (#10125)
+- **Issue #10208** (closed): eta: little-v0 — zero-parameter queue baseline (items ahead ÷ recent drain rate, plus service time) reported beside every candidate
+- **PR #10228**: feat(star): create-issue.sh --parent links and stars a child (#10012 slice 3)
+- **Issue #10255** (closed): merge queue Phase A: dormant typed controls, config, and capability preflight (parent #9978)
+- **PR #10281**: eta: read features (PR size, checks, issue markers) and stall signals — #10232
+- **PR #10288**: eta: little-v0 zero-parameter queue floor baseline (#10208)
+- **PR #10306**: merge queue Phase A: dormant typed controls, champion.mergeMode, capability preflight (#10255)
+- **Issue #10307** (closed): Operator priority levels: ⭐⭐ loom:operator-high-priority (capped) above the star, inherited by every open blocker across repos, built to take ⭐⭐⭐ later
+- **PR #10315**: feat(star-liveness): level 2 reaches every blocker across managed repos as loom:high-priority-inherited (#10307 part 2)
+- **Issue #10334** (closed): ETA features: required-check scope and per-identity rate-limit signal (follow-up to PR #10281 / #10232)
+- **Issue #10343** (closed): Follow-up to #10282: github.http.* attrs, uncovered gh callers, rate_limit reconciliation
+- **Issue #10345** (closed): Follow-up to #10337: revert loom:building on a phantom leaseless yield; skip unlabeled epics in work finder
+- **PR #10354**: chore(deps): update pnpm to v11.27.1
+- **Issue #10373** (closed): docs(eta): drop stale 'in-sweep out of scope' paragraph and add fleetRefresh.signoz keys to daemon-reference (#9758 follow-up)
+- **PR #10381**: docs(eta): document SigNoz in-sweep half in eta.md and daemon-reference (#10373)
+- **Issue #10382** (closed): claim_reconciliation follow-ups to #10363: REST for changed-files and linked-PR reads, plus listing edge cases (dedupe, >300 cap)
+- **PR #10423**: feat(eta): backtest --half-life-days + fresh-tide recency backtest results (#10325)
+- **PR #10428**: feat(merge-pr): daemon-enforced chain-head merge lock while a sequenced head re-dates (#10167)
+- **PR #10431**: feat(eta): per-host ETA health gauges loom.eta.health.* (#10391 slice 2/3)
+- **Issue #10432** (closed): pick.decision: record the serving role's ranked queue, acted items, and Curator candidates
+- **Issue #10434** (closed): loom-daemon guards status: show effective guard config + source, warn on misconfiguration
+- **PR #10436**: feat: loom-daemon guards status + toggle-naming guard messages (#10434)
+- **Issue #10443** (closed): park-record: support cross-repo blockers (OWNER/REPO#N) — today they parse as the local repo's #N
+- **Issue #10444** (closed): Merge gate passes when CI's Detect Changes job is cancelled (runner not acquired): Rust lint/tests skip, #10403 merged untested
+- **PR #10446**: feat(forge-egress): run the managed gh launcher in workers and containers (#9987)
+- **PR #10447**: ci: CI Result aggregate gate + merge-pr CI-run conclusion check (#10444)
+- **Issue #10448** (closed): chain-head merge lock (#10428) follow-ups: hold until the head lands, not until checks finish; cut the per-check API cost from ~11 REST calls
+- **PR #10449**: feat(daemon): forge_repo_facts — local base-repo resolver and canonical owner record
+- **PR #10451**: feat(forge): attribute every ledger row to its billed GitHub bucket
+- **Issue #10453** (closed): [Epic #10452] Session reconciler: restart missing/stopped Codex session containers from the daemon
+- **Issue #10454** (closed): [Epic #10452] Liveness-aware Codex selection: pass over accounts whose session container is down
+- **Issue #10455** (closed): [Epic #10452] Container-down visibility: SigNoz session state, undemoted WARN, distinct tick outcome
+- **PR #10457**: chore(deps-dev): bump source-map-js from 1.2.1 to 1.2.2 in /mcp-loom
+- **PR #10458**: chore(deps): bump proxy-addr from 2.0.7 to 2.0.8 in /mcp-loom
+- **PR #10459**: chore(harness): track latest CLIs — codex 0.160.0→0.160.1
+- **PR #10460**: feat(forge): withdraw a reader per (app, owner, resource) until the real reset (W4-A)
+- **PR #10461**: feat(merge-pr): re-date budget exhaustion -> base sync handoff (#10388 slice 2)
+- **PR #10462**: test(role_runner): gate runs in disabled-demand admission test (#9737)
+- **PR #10464**: perf(claim_reconciliation): REST for changed-files and by-head PR reads (#10382 slice 1)
+- **PR #10466**: feat(forge): route_read — per-URL split for hot repos and a capacity spill latch (W4-B)
+- **PR #10469**: Re-date loops: re-anchor sequence pins, transitive readiness, reverify floor warning (#10465)
+- **PR #10475**: feat(release-fetch): opt-in required signature assurance mode (Part of #10470)
+- **Issue #10476** (closed): feat(builder): enforce local pre-flight test gate execution before PR creation to eliminate Judge review failure loops
+- **PR #10477**: feat(builder): in-session bounded pre-PR gate (loom-daemon preflight)
+- **PR #10478**: fix(merge-pr): chain lock holds until head lands, cheaper lock check (#10448)
+- **PR #10479**: feat(forge): route untargeted reads to the reader pool and shed deferrable ones (W4-C)
+- **Issue #10480** (closed): check-stale-blocked spends one GraphQL call per issue (1,741 in 5 min on one sweep): batch it
+- **Issue #10481** (closed): red main: write_scope scan rejects gh_invocation/affinity.rs; egress surface lint rejects hostname-flag in daemon-reference.md
+- **PR #10482**: fix(red-main): list affinity.rs as NotAWrite; reword --hostname in daemon-reference (#10481)
+- **Issue #10484** (closed): ETA: retire land-v3 and land-2026-10-04-amber-heron from the live shadow set (dominated in live outcomes)
+- **PR #10487**: telemetry: pick.decision records the serving queue and the agent's real decisions (#10212)
+- **PR #10488**: perf(stale-blocked): batch check-stale-blocked forge reads (PR A of #10480)
+- **PR #10490**: feat(eta): all-check counts and per-identity rate-limit signal (#10334)
+- **PR #10491**: ETA: retire land-v3 and land-2026-10-04-amber-heron from the live shadow set
+- **PR #10493**: fix(forge_pull_listing): complete, consistent open-PR listing + head-paired mergeable (#10382 slice 2)
+- **Issue #10496** (closed): eta: MAX_PENDING cap is hit within ~5 h, so live ETA scoring drops long-lead estimates and inflates late surprise
+- **PR #10497**: feat(eta): land-2026-10-06-calm-plover, censoring-aware conformal calibration wrapper (#10489)
+- **Issue #10498** (closed): ETA: one authority per fleet — only the fleet-refresh host computes/fits/emits ETAs, so SigNoz holds one accurate series (no per-host duplicates)
+- **PR #10499**: daemon: revert provably-own phantom loom:building on leaseless yield (#10345)
+- **Issue #10500** (closed): ETA twin-otter: train/serve skew — tracker serves age/counts/rework/stage differently from eta fit's training rows (+0.75h pinball, +15.6pp late surprise)
+- **Issue #10502** (closed): Move notify-cleared-blockers onto the batched stale-blocked gatherer (gather_all)
+- **PR #10503**: feat(stale-blocked): budget floor and forge_cost for check-stale-blocked (#10480)
+- **PR #10505**: fix(eta): thin redundant pending estimates per series at the cap (#10496)
+- **PR #10506**: feat(eta): one ETA authority per fleet (#10498)
+- **Issue #10507** (closed): claim_reconciliation: serve per-pass PR/issue view reads (claim.pr_labels, heal.issue_view, sequence.pr_view, review_conflict.pr_view) over ETag'd REST, not GraphQL
+- **Issue #10510** (closed): ETA: dependency-aware ETAs — blocked/stacked/sequenced items start after their parents (Monte Carlo max over parents' land draws, not max of medians)
+- **Issue #10514** (closed): sweep guard: open-PR check (guard.open_pr_graphql, ~630 GraphQL/h fleet) → ETag'd REST; writer-App GraphQL at 85%
+- **Issue #10515** (closed): merge-pr.sh daemon guards spend ~5.3k GraphQL issue-view/day on turian (2k/h spikes) → ETag'd REST, one read per issue per merge
+- **Issue #10516** (closed): Agent gh front for interactive sessions + serve pr checks from ETag'd REST (~10k agent GraphQL/day on turian)
+- **Issue #10519** (closed): ETA history from SigNoz, slice 2: SigNoz timeline reader (label, merge/close, CI, queue)
+- **PR #10522**: perf(claim): move four claim-pass GraphQL reads to REST or no read (#10507)
+- **Issue #10523** (closed): ETA: land-2026-10-06-held-heron — hybrid shadow heuristic (twin-otter-b + competing-risks simulator for held/sequenced states), offline −0.53 h vs twin-otter-b (loom-experiments#19)
+- **PR #10527**: perf(notify-cleared-blockers): read via the batched REST+ETag gatherer, cited-only (#10515)
+- **PR #10529**: feat(merge-queue): fail-closed authorization protocol (Phase B1 of #10256)
+- **PR #10530**: perf(forge): conditional reads for visibility.repo and worktree issue probes (#10512, slice 1)
+- **PR #10531**: eta: serve twin-otter from training's features (train/serve parity, every forge merge) (#10500)
+- **PR #10534**: feat(eta): eta-fit/v2 priority inputs and shared builder (#10508, slice 1)
+- **PR #10535**: feat(agent_gh): gh front for interactive sessions via SessionStart (#10516 slice A)
+- **PR #10536**: stale-checks: scope Role Prompt Prefix freshness to the files its checker reads
+- **PR #10537**: feat(star-liveness): propagation rule table for star, external, tier (#10012 slice 4)
+- **PR #10538**: feat(eta): shadow-model tiers, per-kind shadow budget, candidate-only promotion (#10525, slice 1)
+- **PR #10541**: feat(eta): land-2026-10-06-quick-tern, IPCW split-conformal calibration over twin-otter-b (#10524)
+- **PR #10542**: perf(guard): answer the open-PR probes from the cached open-PR listing (#10514)
+- **PR #10543**: feat(guard): loom:forge-egress hook rule + guards.forgeEgress toggle (slice 1 of #9989)
+- **PR #10544**: feat(forge-egress): managed gh launcher dir first on daemon-rendered PATH (#9987)
+- **PR #10545**: docs(adr): cross-host dedupe design for read-only forge pollers (#10512)
+- **PR #10547**: feat(eta): observed_at on ci.* records + point-in-time filter (slice 1 of #10511)
+- **Issue #10549** (closed): ETA: retire land-2026-10-04-fresh-tide (fails backtest gate) and raise eta.snapshot alternates cap 8 → 12 (budget default 13)
+- **PR #10551**: feat(eta): add point-in-time friction predictors and cumulative stage age
+- **PR #10552**: feat(eta): retire land-2026-10-04-fresh-tide; alternates cap 8 -> 12; maxActive default 13 (#10549)
+- **Issue #10553** (closed): Guide unblock sweep only re-checks the first 30 loom:blocked issues per repo (gh issue list default limit)
+- **Issue #10556** (closed): Daemon tick releases loom:blocked when every recorded blocker has closed (no LLM pass)
+- **PR #10557**: fix(eta): calm-plover tail fix + issue-bootstrap CI on paired backtest deltas; walk-forward backtest results (#10489)
+- **PR #10560**: fix(guide): treat MERGED blocker as resolved in unblock loop (#10040)
+- **PR #10561**: fix(guide): explicit --limit on loom:blocked unblock listings
+- **Issue #10562** (closed): check-stale-blocked, release tick and role runner skip archived repositories (report them separately)
+- **PR #10563**: ETA: latent-regime residual adaptation and drift check (slice 1 of #10528)
+- **PR #10564**: feat(eta): land-2026-10-06-held-heron — twin-otter-b + hold/sequence simulator for held/sequenced PRs (#10523)
+- **PR #10565**: feat(observability): bucket-keyed ratelimit gauges, HTTP truth on invoke github spans, shadow recipe (#10343 slice 1)
+- **PR #10566**: merge queue Phase B2: dormant lifecycle (handoff, drop reconciliation, merge confirmation, telemetry)
+- **PR #10568**: park-record: support cross-repo blockers (OWNER/REPO#N)
+- **PR #10569**: prompts: CI snapshots via forge wait-checks instead of gh pr checks (#10516 slice C)
+- **PR #10573**: fix(stale-blocked): close four false-positive classes (#9274)
+- **PR #10576**: Daemon holds (quarantine, PR-less hold) write a body park record before loom:blocked (#10161)
+- **PR #10577**: feat(eta): eta-fit/v3 feature layout over the friction predictors (#10521)
+- **PR #10579**: feat(eta): dependency-aware ETAs, land-2026-10-06-tandem-wren (#10510)
+- **PR #10583**: feat(daemon): deterministic loom:blocked release pass (#10556)
+- **PR #10584**: feat(forge-egress): forge-egress --disallowedTools specs in role-tool-policy (#9989 slice 2)
+- **PR #10587**: feat(eta): eta-fit/v2 fit and land-2026-10-06-keen-wren in shadow (#10508, slice 2)
+- **PR #10588**: stale-checks: scope Role Prompt Prefix freshness to the files its checker reads (#9748)
+- **PR #10589**: feat(eta): walk-forward --fit-dir replay + IPCW tail rule for quick-tern (#10524)
+- **PR #10593**: feat(star_liveness): star the PR of a starred or inherited-star issue, remove on unstar (#10012 AC 8)
+- **PR #10594**: fix(session): restart host-mode Codex session containers unless stopped
+- **PR #10595**: chore(deps): update dependency @modelcontextprotocol/sdk to v1.31.0 [security]
+- **PR #10599**: perf(hygiene): explicit-target, conditional, fresh issue/PR reads (W6 PR1)
+- **PR #10604**: feat(eta): land-2026-10-06-swift-tern, drift-aware IPCW conformal calibration (#10524 slice 3)
+- **PR #10605**: Skip archived repositories in check-stale-blocked and the role runner (#10562)
+- **PR #10608**: feat(guard): conditional 2.5/2.7 issue reads; a crash resume never trusts the open-PR memo (W9)
+- **PR #10609**: docs: gitea-1 CI/delivery qualification runbook (#9790, partial)
+- **PR #10610**: feat: container-down visibility - codex session state gauge, WARN, SESSION_DOWN outcome
+- **PR #10614**: feat(eta): fleet roster history reader for eta-fit/v2 (#10508, slice 3)
+- **PR #10615**: feat(daemon): session reconcile pass for Codex session containers (#10453)
+- **Issue #10616** (closed): loom-daemon CLI: clap-derive debug stack frames leave ~0.1 MB headroom on the 2 MiB test stack
+- **PR #10617**: Liveness-aware Codex selection: pass over accounts whose session container is down (#10454)
+- **PR #10619**: docs(observability): uncovered gh callers tracking for #10343
+- **PR #10620**: fix(session): detect mount drift both ways and refuse stale-mount dispatch (#10364 part A)
+- **PR #10621**: feat(observability): forge stage-dwell gauges as a fleet-captain singleton (W12 part 1)
+- **PR #10622**: feat(agent-gh): serve gh pr checks from ETag'd REST (#10516)
+- **PR #10623**: test(cli): parse the whole Cli on an 8 MiB thread via one shared helper (#10616)
+- **Issue #10624** (closed): build back-off (#9410) is host-wide: one repo's PR debt holds new builds in every repo
+- **Issue #10632** (closed): Doctor throughput: one PR per run and one instance per repo can't drain a deep changes-requested backlog
+- **Issue #10633** (closed): Doctor gets HTTP 403 on CI status (wait-checks) and on job rerun
+- **Issue #10634** (closed): merge-sequencing re-posts identical 'Landing order recorded' comment ~hourly (and concurrently)
+- **Issue #10639** (closed): red main: write_scope/tests.rs crossed the 1000-line file-size threshold (1002) after #10621
+- **PR #10641**: feat(repo-facts): per-credential installation snapshot for visibility, repo identity and write scope (W8)
+- **PR #10643**: fix(ci): split write_scope/tests.rs back under the file-size budget (main red)
+- **PR #10647**: feat(eta): land-2026-10-06-bold-lark, IPCW conformal wrapper over keen-wren (#10524 slice 4)
+- **PR #10650**: fix(work_finder): make the #9410 build back-off a per-repo WIP limit (#10624)
+- **PR #10651**: fix(merge-sequence): upsert one landing-order comment per PR, one writer per workspace
+- **PR #10658**: fix(forge): classify CI 403s (permission vs rate limit); add forge rerun (#10633)
+- **Issue #10660** (closed): [Epic #10452] Converge Codex selection's Docker read on the session-state snapshot (third read path)
+- **PR #10663**: feat(role-runner): per-repository doctor lanes on distinct assigned PRs (#10632)
+- **PR #10666**: feat(eta): SigNoz timeline reader and daemon pr.resolved record (#10519)
+- **PR #10668**: fix(selection): read session-container liveness from the shared snapshot (#10660)
+
+### 2026-10-05
+- **Issue #8801** (closed): Credential discovery convention: agents should not need operators to re-state where keys live every session
+- **Issue #9226** (closed): create-pr.sh has no REST fallback for a GraphQL rate limit, so a Builder can be left unable to file its PR at all
+- **Issue #9340** (closed): judge-fallback-guard.sh Step 1 hard-fails under GraphQL exhaustion though its whole decision is REST-derivable (Step 2 already is)
+- **Issue #9571** (closed): merge-pr: re-verify stale deterministic ratchets on the merged tree instead of demanding a new CI run
+- **Issue #9779** (closed): Gitea qualification: define identity, capability errors and the supported self-hosted profile
+- **Issue #9872** (closed): Split the shared personal GITHUB_TOKEN per consumer — daemon, Superset panel and agents drained one 5,000/hr bucket
+- **Issue #9873** (closed): star_liveness keeps probing through an exhausted rate limit — ~40 doomed 403s/hour while the breaker is tripped
+- **Issue #9877** (closed): star_liveness polls through rate-limit exhaustion — it should consult the #4429 breaker like claim_reconciliation does
+- **PR #9886**: docs(forge): the forge contract — identity, outcomes, evidence (#9779)
+- **Issue #9924** (closed): forge_contract::InstanceOrigin::parse accepts a scheme with no host (e.g. "https://")
+- **Issue #9995** (closed): forge egress: wire gh_invocation resolver's policy-launcher rung to the C1 policy reader (follow-up to #9984)
+- **Issue #9996** (closed): forge egress: run `forge egress doctor` after resync-installed.sh (follow-up to #9984)
+- **Issue #10022** (closed): daemon: export rate_limit_breaker trips, own/external attribution and quota gauges to SigNoz
+- **PR #10046**: docs(curator): cut GraphQL fan-out (REST, two-pool check, cap 3)
+- **PR #10048**: forge egress: run doctor after resync-installed.sh (#9996)
+- **PR #10059**: forge egress: wire gh resolver policy-launcher rung (#9995)
+- **PR #10061**: feat(daemon): export rate-limit breaker trips, attribution and quota gauges (#10022)
+- **Issue #10120** (closed): Attended live output: wire roles that never claim an issue (Judge, Curator, Champion, ...) into live-output-attend
+- **Issue #10151** (closed): star_liveness escalates stale blocks to the operator instead of unblocking or routing to Curator
+- **PR #10158**: feat(live-output): attend Curator and Judge runs from code they already run
+- **PR #10162**: fix(star-liveness): resolve stale blocks instead of escalating them
+- **Issue #10168** (closed): forge egress doctor reports a host with no egress policy as clean (origin: unconfigured, 0 findings, exit 0) while 2am's doctor exits 2 on the same host
+- **PR #10175**: feat(forge-egress): doctor reports unconfigured hosts; managed hosts exit 2 (#10168)
+- **PR #10182**: feat(merge-pr): prove restamp-only base moves never stale; export re-date pressure (#10163 PR 1)
+- **Issue #10210** (closed): eta: model stalls explicitly — quota reset, pool cooldown, breaker, holds as a 'not before T' term; stop refusing beyond_history
+- **Issue #10233** (closed): eta: promotion gate and accuracy views — late-surprise + answer-rate gate, common decidable subset, per-day win-rate CI, stability/convergence, multi-fold backtest — #10211 Slice B
+- **PR #10259**: feat(eta): model stalls explicitly; stop refusing beyond_history (land-v4) (#10210)
+- **PR #10261**: feat(gh): route more daemon gh spawns through GhInvocation (#10089, partial)
+- **PR #10268**: telemetry: log each role's pick decision per tick (pick.decision)
+- **PR #10272**: fix(lease-renew): single-owner renewers, stop on closed issue (#10229)
+- **Issue #10282** (closed): GitHub telemetry gaps: daemon span export is opt-in and silent when off, several recurring callers have no span, and spans count gh processes not HTTP requests
+- **Issue #10297** (closed): merge-pr freshness guard starves approved PRs under high main churn: re-date → CI → fresh Judge → merge never beats the next base move
+- **Issue #10298** (closed): eta fleet refresh: daemon syncs only the issue-events listing, not main's pulls endpoint (closing refs go stale)
+- **PR #10299**: eta: multi-fold backtest - union-with-refusals comparison, walk-forward daily folds, landing-instant stability (#10233 PR 2)
+- **Issue #10305** (closed): eta backtest: derive PR-history land-case stages via stage_from_pr_labels so operator-held PRs replay as merge_hold
+- **PR #10308**: feat(operator-priority): levels table, ⭐⭐ loom:operator-high-priority, level-first ordering (#10307 part 1)
+- **PR #10320**: fix(eta): stage PR-history land cases via stage_from_pr_labels (merge_hold replay)
+- **PR #10321**: fix(eta): daemon fleet refresh syncs the pulls listing too, reader-only (#10298)
+- **PR #10324**: feat(eta): SigNoz-sourced in-sweep half of fleet history (#9758)
+- **Issue #10329** (closed): eta fleet refresh runs on every host against one shared App budget — exhausts it hourly, tripping the global breaker
+- **Issue #10330** (closed): forge wait-checks: ETag'd, backed-off CI wait for agents — replace gh pr checks --watch / pr view polling in role prompts
+- **Issue #10331** (closed): Agent gh reads cached by default: route read-only gh calls through the ETag cache (and a reader App) at the gh choke point
+- **PR #10340**: chore(deps): update clickhouse/clickhouse-server docker tag to v25.12.11
+- **PR #10344**: feat(observability): telemetry visibility Slice A (Part of #10282)
+- **PR #10347**: feat(gh): route pipeline_snapshot and the credential helper through GhInvocation (#9985)
+- **Issue #10349** (closed): claim_reconciliation: serve label PR listings from the ETag'd REST forge_listing, not GraphQL gh pr list (~2.5k GraphQL/h)
+- **PR #10351**: feat(forge): forge wait-checks — ETag'd, backed-off CI wait for agents (#10330 slice 1)
+- **PR #10356**: fix: REST fallback for create-pr.sh on GraphQL rate limit; judge-fallback-guard Step 1 REST-only (#9226, #9340)
+- **PR #10358**: fix(lease-renew): App credential routing, sliding window, stop no-lease loops (#10229)
+- **PR #10363**: perf(claim_reconciliation): serve open-PR listings from ETag'd REST pulls (#10349)
+- **PR #10365**: docs(roles): builder/doctor/judge wait on CI via forge wait-checks (#10330 slice 2)
+- **PR #10368**: feat(eta): webhook-mirror source for the raw event cache (#10197, increment 4)
+- **PR #10369**: feat(gh): name forge_op at unknown sites; cache per-tick conflict/sequence reads (#10089)
+- **PR #10370**: feat(agent_gh): ETag-revalidated gh read front for agent sessions (#10331)
+- **Issue #10371** (closed): Merge sequencing: approved PRs convoy behind a non-approved head (5 approved PRs held by one changes-requested PR) — order ready-first
+- **Issue #10372** (closed): twin-otter: 'starred' ignores the linked issue's star — 54% of starred work looks unstarred; starred p90 exceedance 28–33% vs 10%
+- **PR #10378**: Route GhInvocation reads to reader Apps; report the credential's rate-limit pool (#9872)
+- **PR #10380**: Merge sequencing: order ready-first, never hold approved PRs behind a non-ready head (#10371)
+- **Issue #10383** (closed): eta: purity scan HEURISTIC_SOURCES misses land-twin-otter-b, land-v4, stall, little-v0, stage_queue
+- **PR #10384**: fix(eta): run fleet refresh on the fleet captain only; reserve per installation; backfill default 600
+- **PR #10385**: feat(eta): shared PR-or-linked-issue star state for fit and serving (#10372)
+- **Issue #10389** (closed): twin-otter star listing reads only page 1 of starred issues (>100 open stars) — starred PRs past page 1 look unstarred
+- **Issue #10390** (closed): eta.snapshot: add rows[].alternates[] (shadow land heuristics) so loom-ui's Experimental beta-ETA toggle has data — toggle shipped, upstream half never built
+- **Issue #10395** (closed): Distribute the captain's fitted ETA coefficients to every host — today declaring fleet.captain would leave non-captain hosts at no_model
+- **PR #10396**: feat(gh): name pr.view-state at PR watch and verdict base-ref reads (#10089)
+- **PR #10397**: merge-pr: opt-in re-verification of cheap stale checks on the merge tree (#10388 slice 1)
+- **Issue #10398** (closed): merge sequencing re-sequences a PR after a tree-identical re-date, undoing an operator's loom:sequenced release (feeds #10163 livelock)
+- **PR #10399**: test(eta): keep HEURISTIC_SOURCES in sync with heuristics/ (#10383)
+- **PR #10400**: fix(eta): read every page of the starred-issue listing (#10389)
+- **Issue #10401** (closed): eta star listing: a mid-walk page shift can still drop one starred issue (false unstar for one pass)
+- **PR #10402**: feat(eta): priority-aware queue features through the dispatch ordering (#10333)
+- **PR #10403**: feat(eta): distribute the captain's fitted ETA coefficients to every host (#10395)
+- **PR #10407**: feat(eta): eta.fit record and read-only 'eta doctor' (slice 1 of #10391)
+- **PR #10408**: fix(merge-sequence): tree-identical re-date keeps sequencing state; operator releases stick (#10398)
+- **PR #10409**: eta.snapshot: add rows[].alternates[] for shadow land heuristics (#10390)
+- **PR #10411**: feat(gh): drain the raw gh spawn allowlist to empty (#10089)
+- **PR #10412**: fix(forge_listing): revalidate earlier pages after a multi-page walk
+- **Issue #10416** (closed): Set guards.cloudCli:false in loom's tracked .loom/config.json (stop aws/docker ask-prompts repo-wide)
+- **PR #10419**: feat(daemon): auto_update.tick telemetry, per-task liveness, hardened self-update and fleet-refresh loops
+- **PR #10421**: chore(config): set guards.cloudCli=false repo-wide
+- **PR #10425**: fix(forge_contract): reject host-less scheme in InstanceOrigin::parse
+- **Issue #10433** (closed): Set guards.cloudCli:false in loom's tracked .loom/config.json (stop aws/docker ask-prompts repo-wide)
+- **PR #10435**: fix(ci_telemetry): Link-header pages keep the caller's repo; artifact downloads go reader-then-writer
+- **PR #10437**: feat(work_finder): persist operator starred-at across daemon restarts
+- **PR #10445**: feat(eta/doctor): report the captain-published fit state (#10395)
+- **PR #10450**: perf: REST-first loom:blocked listing in quarantine reconciliation (#9243)
+
+### 2026-10-04
+- **PR #10051**: feat(credential_preflight): routing-preserving hosts.yml, no GitHub credential on required hosts (#9986)
+- **PR #10063**: merge-pr.sh: repo-configured pre-merge tree checks (merge.treeChecks, --allow-red-tree)
+- **PR #9969**: fix(harness): Codex 0.160.0 in the session image; track harness CLIs at latest
+- **PR #10266**: feat(eta): recency-weighted stage samples with effective-N fallback (#10209)
+- **PR #10322**: fix(eta): released merge_wait PR queue position matches training (#10312)
+- **PR #10318**: Comment trust: fleet admin roster from fleet store (#10303)
+- **PR #9745**: feat(merge-pr): consolidation landing reconciliation (#9689)
+- **PR #10056**: fix(sweep-lease-fence): closed PR head is not a collision; lease legs always run (#10027)
+- **PR #10310**: fix(eta): serve held PRs' twin-otter input from merge_hold and refresh it (#10284)
+- **PR #10293**: feat(eta): cache PR reviews and check runs; CI and approval in fleet_state(t) (#10197, increment 3)
+- **PR #10242**: feat(eta): land replay cases from merged PRs' label timelines (#9579)
+- **PR #10301**: fix(eta): fleet_state's HeldForHuman is merge_hold's single held rule (#10278)
+- **PR #10300**: ci: merge_group qualification audit + eligibility check (#10257 slice 1)
+- **PR #10296**: fix(eta): a backfill skipped before its first call holds the fit (#10292)
+- **PR #10295**: feat(eta): twin-otter-b composes land-v2 for pre-PR stages (#10244)
+- **PR #10289**: feat(eta): daemon task backfills and refreshes fleet snapshots before the daily fit (#10263)
+- **PR #10276**: eta: fit wiring — flag timeline, training rows, eta fit CLI, daily refit (#10245)
+- **PR #10246**: feat(eta): add the merge_hold stage and a stage-episode record from PR label timelines
+- **PR #10285**: eta: populate item features from in-process data (tier, priority, issue age, sweep metadata, verdicts, first-pass rate) — #10231
+- **PR #10286**: eta: promotion gate measures late surprise, answer rate, per-day wins on the common decidable subset (#10233 PR 1)
+- **PR #10279**: feat(eta): cache PR closing refs and reconstruct the open-PR lockout (#10197, increment 2)
+- **PR #10277**: eta: register land-2026-10-04-twin-otter as a shadow land heuristic (#10243)
+- **PR #10252**: feat(eta): log queue-friction features and add the offline walk-forward comparison (#10193 step 1 + step 2 machinery)
+- **PR #10260**: feat(eta): twin-otter evaluation core with fixture parity
+- **PR #10267**: feat(telemetry): replay contract, loom.record_id, host.health export coverage (#10196 slice 1)
+- **PR #10270**: eta: idempotent backfill; document censored rows vs backtest (#9750)
+- **PR #10250**: feat(eta): raw forge event cache + fleet_state(t) + agreement report (#10197, increment 1)
+- **PR #10265**: feat(star-liveness): name the deferral, queue position and binding cap; capacity asks without Safehouse (#10214)
+- **PR #10258**: feat(eta): add eta::fit, per-stage hazards, a censored log-normal AFT and KM path stats for eta-fit/v1
+- **PR #10253**: feat(eta): online interval recalibration for land estimates (#10207)
+- **PR #10241**: feat(eta): record queue, drain and friction features on every estimate (#10201)
+- **PR #10251**: fix(live_gh_guard): spawn the asserted guard stand-in by path, not bare gh
+- **PR #10240**: feat(eta): record p90 on every estimate and score late surprises
+- **PR #10236**: fix(worktree): lease a claim only after the last refusal gate (#10204)
+- **PR #10227**: test: fence LOOM_CODEX_PROFILE_ROOT so no test can write the real ~/.loom (#9964)
+- **PR #10226**: feat(eta): land-v3 registered-not-current with offline calibration tests (#9970, Slice 1)
+- **PR #10219**: feat(gh): count cli merge_pr_consolidate gh spawns via GhInvocation (#10089, incr 7)
+- **PR #10224**: test(daemon): fail the lib/bin test run when a test spawns the real gh (#10138)
+- **PR #10220**: fix(rate_limit_breaker): credential-scoped reset evidence, safehouse gating, dispatch-path reporting
+- **PR #10217**: feat(forge-calls): wire call-identity accounting into real forge call sites
+- **PR #10216**: feat(merge-sequence): release holds between PRs sharing no changed file (#10077)
+- **PR #10058**: forge egress: hermetic PolicySources seam + run_bounded drain/process-group (#9999)
+- **PR #10213**: docs: mark SigNoz 7d/30d retention as trial-only (#10195)
+- **PR #9961**: fix(git): put every Rust git-fetch sink behind `--` and guard the two forge-facing ones
+- **PR #10073**: feat(star-liveness): parent/child edge resolver; every child of a starred issue inherits (#10012 slice 1a)
+- **PR #10155**: perf(daemon): route comment writes, worktree gh, lease and ETag/CI/fleet gh spawns through GhInvocation (#10089)
+- **PR #10202**: fix(test): make merge-pr response oracle loud and race-free
+- **PR #10192**: feat(fleet_alert): alert the operator when fleet health goes DEGRADED (#10164)
+- **PR #10176**: feat(intake): reconcile unlabeled issues into loom:triage; drop Curator fallback (#10041)
+- **PR #10141**: feat(auto_update): roll on a scheduled window instead of arming a drain on every build
+- **Issue #9986** (closed): credential_preflight: routing-preserving hosts.yml on observe hosts, no GitHub credential on required hosts, git credential separated (#9983 C3)
+- **Issue #10026** (closed): merge-pr.sh: repo-configured pre-merge tree checks — refuse merges whose merge tree fails cheap cross-PR guards (migration prefixes, typecheck)
+- **Issue #9968** (closed): Codex lane down since 09-30: session image pins Codex 0.149.1, which cannot run gpt-6-astra — track harness CLIs at latest
+- **Issue #10312** (closed): eta: released held PR's merge_wait queue position uses the approval, training uses the release (twin-otter train/serve skew)
+- **Issue #10303** (closed): Comment trust: resolve fleet admins from the fleet-gitops admin roster instead of hardcoding per-repo forge.trustedCommenters
+- **Issue #9972** (closed): consolidate-reconcile: transient gh read failure in steps 5/6 is silently skipped, not flagged unread
+- **Issue #9689** (closed): Merge consolidation: land verified candidates and reconcile component PRs safely (9063 later increment)
+- **Issue #10027** (closed): sweep-lease-fence: a closed PR's preserved feature/issue-N head is a permanent BRANCH_COLLISION, and leg 5 suppresses the lease check
+- **Issue #10284** (closed): eta: twin-otter's held-PR estimate imputes stage-dependent features and is never refreshed
+- **Issue #9579** (closed): eta backtest scores zero land cases: land replay cases need pr_latency history, not just in-sweep merge phases
+- **Issue #10278** (closed): eta: fleet_state's HeldForHuman disagrees with merge_hold's held rule (stage_from_pr_labels)
+- **Issue #10292** (closed): eta fleet refresh: fit hold ignores backfills skipped before their first call (reserve/budget/halt)
+- **Issue #10244** (closed): eta: pre-PR items policy for twin-otter before promotion — compose with land-v2's pre-PR path or fit pre-PR stages
+- **Issue #10263** (closed): eta: daemon task to backfill + refresh fleet snapshots on a cadence (before the daily fit) — otherwise twin-otter has no training data on fleet hosts
+- **Issue #10245** (closed): eta: loom-daemon eta fit wiring — training rows from queue_features + episodes + flag timeline, daily refit trigger, leak test — #10221 Slice B
+- **Issue #10218** (closed): eta: give land a held-for-a-human stage (merge_hold) and build its stage history from the webhook label stream
+- **Issue #10231** (closed): eta: populate the remaining declared features from in-process data (tier, priority, issue age, sweep runtime/model/effort/attempt, verdicts, first-pass rate) — #10201 Slice B
+- **Issue #10243** (closed): eta: register land-2026-10-04-twin-otter as shadow — wire features, load coefficient file at registry build, explanation fields, refresh stability — #10222 Slice B
+- **Issue #10222** (closed): eta: register land-2026-10-04-twin-otter as a shadow heuristic — blend of fitted stage-by-stage and direct models, p25–p90
+- **Issue #9750** (closed): eta: backfill appends open-segment rows every run with no dedupe, so land-v2 sees duplicates and backfilled history never reaches its backtest
+- **Issue #10214** (closed): star-liveness: no-capacity escalations hide queue depth and the binding limit — 106 ready stars behind a disk-limited cap of 2 stalled a data-loss fix for hours with no human-reachable signal
+- **Issue #10264** (closed): work-finder: a ranked / urgent tier above plain stars so a data-loss fix can jump a starred backlog (follow-up to #10214)
+- **Issue #10221** (closed): eta: loom-daemon eta fit — daily point-in-time fit of per-stage exit hazards and a censored log-normal model, written as a versioned coefficient file
+- **Issue #10207** (closed): eta: online interval recalibration for land estimates — refit per-stage spread from the outcome journal, censoring-aware, shadow-gated
+- **Issue #10201** (closed): eta: tracker fills only 11 of 33 declared features — populate the rest plus queue context for started items, so ETA training data starts accruing
+- **Issue #9990** (closed): feat(merge): add GitHub Merge Queue mode as an optional per-repo specification to pilot on fast-moving repos
+- **Issue #10249** (closed): Build failure on main (since 741187a1c): gh_spawn_choke_point ratchet fails on 3 raw Command::new("gh") sites in src/live_gh_guard.rs (#10138 vs #9985) — every PR red
+- **Issue #10211** (closed): eta: promotion gate and accuracy views measure what users feel — p90 + late-surprise rate, stability, convergence, answer rate, multi-fold
+- **Issue #10247** (closed): main red: gh_spawn_choke_point flags live_gh_guard.rs test-only bare gh spawns (#10138 vs #9985 ratchet)
+- **Issue #10204** (closed): worktree.sh publishes an in-session lease and starts its 4h renewer even when the claim is then refused
+- **Issue #9964** (closed): Test fixture 'alice' leaks into the real ~/.loom/codex-profiles (LOOM_CODEX_PROFILE_ROOT set_var race)
+- **Issue #10138** (closed): loom-daemon cargo tests call live GitHub via gh on the operator's token (~1,840 calls/day on 2026-10-03)
+- **Issue #8997** (closed): rate_limit_breaker: a trip still costs ~200 doomed calls, the reset probe reads the wrong budget, and safehouse never consults the breaker
+- **Issue #9831** (closed): Forge inventory: wire the call-identity accounting into real forge call sites
+- **Issue #10077** (closed): merge sequencing chains every PR in a transitive overlap group: 32 open PRs serialized, edges between PRs that share no files
+- **Issue #9999** (closed): forge egress: hermetic PolicySources seam for dispatch/spawn tests + run_bounded pipe/process-group handling (follow-up to #9984)
+- **Issue #9479** (closed): git: four Rust git-fetch sinks lack the #9106 refname guard and `--` separator (defence in depth)
+- **Issue #10189** (closed): Flaky on main: merge_pr_response_differential shell oracle returns 'other' (1.08s run) — make oracle failures loud
+- **Issue #10164** (closed): Alert the operator when fleet health goes DEGRADED (zero healthy tokens, dispatch HALTED, persistent role failures)
+- **Issue #10041** (closed): Curator intake starves unlabeled issues: Priority-2 fallback runs only when loom:triage is empty (186 never curated)
+
+
 ### 2026-10-04
 - **PR #10172**: fix(forge-inventory): baseline operator_decision/cli.rs growth (3 -> 4)
 - **Issue #10171** (closed): Main red: forge_inventory baseline missing operator_decision/cli.rs growth (3 -> 4)

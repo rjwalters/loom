@@ -222,6 +222,15 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
     ".loom/sweep-run/",
+    // Loom-owned per-run cargo target dirs (#8370): `worker_spawn` exports one
+    // as CARGO_TARGET_DIR for every role run, and `role_runner` / the orphan
+    // sweep remove them. Gigabytes of build output, never committable.
+    ".loom/targets/",
+    // Per-role/ad-hoc cargo target dirs under other names (#11075) — any dir
+    // cargo writes a CACHEDIR.TAG into must stay out of `git status` and so
+    // out of quarantine stashes.
+    ".loom/target*/",
+    ".cargo-target*/",
     // `.loom/state/` is daemon-written, per-host runtime state, ignored
     // WHOLESALE (#9592). It used to be ignored one subsystem at a time
     // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
@@ -502,12 +511,18 @@ pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, de
     let commit = metadata.commit.as_deref().unwrap_or("unknown");
     let source = derive_loom_source(defaults_dir);
 
-    let obj = json!({
+    let mut obj = json!({
         "loom_version": version,
         "loom_commit": commit,
         "install_date": metadata.install_date,
         "installed_files": [],
     });
+    // The compatibility contract (#10716): the oldest daemon these files work
+    // with. Omitted rather than `null` when unknown; a reader treats either as
+    // "not recorded", which classifies as a resync owed.
+    if let Some(req) = &metadata.requires_daemon {
+        obj["requires_daemon"] = json!(req);
+    }
 
     match serde_json::to_string_pretty(&obj) {
         Ok(mut contents) => {
@@ -723,6 +738,7 @@ mod tests {
             version: Some(version.to_string()),
             commit: Some(commit.to_string()),
             install_date: "2026-07-27".to_string(),
+            requires_daemon: Some("0.19.772".to_string()),
         }
     }
 
@@ -743,6 +759,7 @@ mod tests {
         assert_eq!(v["loom_version"], "0.15.0");
         assert_eq!(v["loom_commit"], "ebf4fc55");
         assert_eq!(v["install_date"], "2026-07-27");
+        assert_eq!(v["requires_daemon"], "0.19.772", "#10716 contract field");
         assert!(v["installed_files"].is_array());
         // #5624: install-metadata.json is committed, so it must never carry
         // the installing machine's absolute path.
@@ -813,6 +830,7 @@ mod tests {
             version: None,
             commit: None,
             install_date: "2026-07-27".to_string(),
+            requires_daemon: None,
         };
         write_install_metadata(workspace, &meta, &defaults);
 
@@ -821,6 +839,31 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["loom_version"], "unknown");
         assert_eq!(v["loom_commit"], "unknown");
+        assert!(v.get("requires_daemon").is_none(), "an unknown claim is omitted, not null");
+    }
+
+    #[test]
+    fn written_metadata_round_trips_through_the_contract_reader() {
+        // #10716: what init writes is what the daemon's reader classifies.
+        use crate::install_compat::{classify, Compat, DaemonCompat, InstallMeta, Version};
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        let defaults = workspace.join("srcroot").join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+        write_install_metadata(workspace, &metadata("0.19.876", "abc1234"), &defaults);
+
+        let raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let meta = InstallMeta::parse(&raw).unwrap();
+        assert_eq!(meta.loom_version.as_deref(), Some("0.19.876"));
+        assert_eq!(meta.requires_daemon.as_deref(), Some("0.19.772"));
+        let daemon = DaemonCompat {
+            running: Version::parse("0.19.876").unwrap(),
+            supports_installed: Version::parse("0.19.0").unwrap(),
+            floor: None,
+        };
+        assert_eq!(classify(&meta, &daemon), Compat::Compatible);
     }
 
     #[test]
@@ -1018,7 +1061,6 @@ mod tests {
         };
 
         let writers = [
-            crate::observability::eta::pending_path(root),
             crate::ci_telemetry::state_dir(root).join("seen.jsonl"),
             crate::fleet_captain::shell_arm_registry_path(root),
             // A subsystem added after this test: must need no registration.
@@ -1158,6 +1200,10 @@ mod tests {
             ".loom/manifest.json",
             ".loom/stuck-config.json",
             ".loom/metrics/",
+            // #8370: Loom-owned per-run cargo target dirs.
+            ".loom/targets/",
+            ".loom/target*/",
+            ".cargo-target*/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
             ".loom/native-tools/",

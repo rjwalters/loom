@@ -153,6 +153,15 @@
   description: "Curator-enriched, awaiting approval. Additive; coexists with loom:issue. Applied by: Curator only."
   color: "10B981"  # emerald-500
 
+# loom:needs-revision (#10753): Champion's NEEDS REVISION verdict routes the
+# issue to Curator instead of waiting for someone to edit it. Champion's
+# discovery skips the label; Curator revises the body (a dated `## Revision`
+# section) and removes it, and the changed body hash brings Champion back.
+# Bounded: see .loom/docs/promotion-throughput.md.
+- name: loom:needs-revision
+  description: "Champion asked for a revision: Curator revises the body, then removes this. Applied by: Champion."
+  color: "6EE7B7"  # emerald-300 - one step back from loom:curated
+
 # Status Labels
 - name: loom:blocked
   description: "Implementation blocked, needs help or clarification"
@@ -262,10 +271,12 @@
 # starts from Curator), and may run one starred sweep over the concurrency
 # cap. Skip/park labels still win: a starred issue carrying loom:blocked,
 # loom:operator-only, loom:operator-decision or loom:operator is never
-# dispatched. Applied by: humans (directly or via the loom-ui star). Removed
-# by: humans.
+# dispatched. Applied by: humans (directly or via the loom-ui star), and, for the
+# children of a starred parent, inherited (#10012: `create-issue.sh --parent`
+# stars a new child; the audit comment names `inherited_from=#P`). Removed by:
+# humans; a star propagation applied goes with the parent's star.
 - name: loom:operator-priority
-  description: "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star."
+  description: "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children"
   color: "CA8A04"  # yellow-600 - matches loom-ui's star
 
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the
@@ -285,7 +296,7 @@
 # loom:high-priority-inherited (#10307) is DERIVED, never a human's or a
 # role's: the daemon's star-liveness pass writes it on every open issue that
 # blocks a loom:operator-high-priority issue, directly or transitively (across
-# managed repos), with a provenance comment naming the source, and removes it
+# managed repos), with a body provenance marker naming the source, and removes it
 # once no level-2 source reaches the issue. Every reader treats it exactly
 # like level 2. It never counts toward the level-2 cap and is never accepted
 # from a loom-ui intent. Applied by / removed by: the loom-daemon

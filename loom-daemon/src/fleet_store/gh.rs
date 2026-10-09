@@ -158,11 +158,23 @@ impl GhTransport {
         intent: AccessIntent,
         cred: &Credential,
     ) -> GhInvocation {
+        self.invocation_within(op, forge_op, intent, cred, GH_TIMEOUT)
+    }
+
+    /// [`Self::invocation`] with its own deadline.
+    fn invocation_within(
+        &self,
+        op: &'static str,
+        forge_op: ForgeOp,
+        intent: AccessIntent,
+        cred: &Credential,
+        timeout: Duration,
+    ) -> GhInvocation {
         let dir = match cred {
             Credential::ConfigDir { dir, .. } => Some(dir.as_path()),
             Credential::Ambient => None,
         };
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+        GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout)
             .forge_op(forge_op)
             .identity_scope(None, Some(&self.repo))
             .program(&self.gh_bin)
@@ -184,6 +196,89 @@ impl GhTransport {
         }
     }
 
+    /// One read under the WRITER credential, skipping the reader (#10718).
+    ///
+    /// For a ref this transport itself wrote: a reader App that is not
+    /// installed on the repo answers `404`, which a caller would take for
+    /// "the ref is gone". Reading under the identity that created the ref
+    /// cannot disagree with the write that follows.
+    ///
+    /// # Errors
+    /// `gh` could not complete the request at all; any HTTP status is `Ok`.
+    pub(crate) fn get_as_writer(&self, api_path: &str) -> Result<Reply> {
+        let (response, stderr, _) = self.run(&self.writer(), api_path, None, None)?;
+        let response = response.ok_or_else(|| {
+            anyhow::anyhow!(
+                "gh api {api_path} failed before an HTTP response: {}",
+                if stderr.is_empty() {
+                    "no output"
+                } else {
+                    &stderr
+                }
+            )
+        })?;
+        Ok(Reply {
+            status: response.status,
+            etag: response.etag,
+            body: response.body,
+        })
+    }
+
+    /// One GraphQL read under the WRITER credential (#10987): the workspace
+    /// resync's batched default-branch head query, one request for every
+    /// repo of one owner. The writer for the same reason as
+    /// [`Self::get_as_writer`]: a reader App that is not installed on a repo
+    /// answers `NOT_FOUND` for it, which would read as "the repo is gone".
+    ///
+    /// Returns the response body. `gh` exits non-zero when the answer carries
+    /// any `errors` entry and still prints the partial `data`, so the caller
+    /// parses the body and judges each alias. A failed request is shown to
+    /// the rate-limit breaker; one with no body at all is an error.
+    ///
+    /// # Errors
+    /// `gh` could not run, timed out, or printed no body.
+    pub(crate) fn graphql_as_writer(
+        &self,
+        forge_op: ForgeOp,
+        query: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let cred = self.writer();
+        let field = format!("query={query}");
+        let inv = self
+            .invocation_within("fleet_store_graphql", forge_op, AccessIntent::Read, &cred, timeout)
+            .args(["api", "graphql", "-f", field.as_str()]);
+        let out = match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(_) => anyhow::bail!("the GraphQL query timed out after {}s", timeout.as_secs()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to invoke {}", self.gh_bin));
+            }
+        };
+        *self.last_used.borrow_mut() = Some(cred);
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !out.status.success() {
+            // A GraphQL rate limit is a `200` whose body says so: the breaker
+            // reads both. A per-alias `NOT_FOUND` does not trip it.
+            crate::rate_limit_breaker::global_observe_failure(
+                &format!("{stderr}\n{body}"),
+                "fleet_store",
+            );
+        }
+        if body.is_empty() {
+            anyhow::bail!(
+                "the GraphQL query got no answer: {}",
+                if stderr.is_empty() {
+                    "no output"
+                } else {
+                    &stderr
+                }
+            );
+        }
+        Ok(body)
+    }
+
     /// One write call (`gh api --method POST/PUT … --input <file>`), always
     /// under the writer credential — never the reader, which is never granted
     /// write scope on the store (see the module docs). Any HTTP status,
@@ -200,15 +295,18 @@ impl GhTransport {
             .write_all(payload.as_bytes())
             .and_then(|()| input.flush())
             .context("writing the gh api request body")?;
-        let inv = self
+        let mut inv = self
             .invocation(
                 "fleet_store_write",
                 ops::GIT_WRITE_REFS_AND_CONTENTS,
                 AccessIntent::Write,
                 &cred,
             )
-            .args(["api", "--include", "--method", method, api_path, "--input"])
-            .arg(input.path());
+            .args(["api", "--include", "--method", method, api_path]);
+        // A DELETE carries no body (#10718: deleting the resync claim ref).
+        if method != "DELETE" {
+            inv = inv.arg("--input").arg(input.path());
+        }
         let out = self.output(inv)?;
         let response =
             crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));
@@ -250,7 +348,12 @@ impl Transport for GhTransport {
         if use_reader {
             let status = response.as_ref().map(|r| r.status);
             let ok = matches!(status, Some(200..=299 | 304));
-            if !ok && crate::forge_identity::classify_failure(&stderr, status).is_some() {
+            let headers = response.as_ref().map(|r| &r.ratelimit);
+            let resource = crate::forge_bucket_book::Resource::Core;
+            if !ok
+                && crate::forge_identity::classify_failure(&stderr, status, headers, resource)
+                    .is_some()
+            {
                 // A reader that cannot serve this store (not installed on the
                 // owner, rate-limited) costs one request, then the writer.
                 *self.reader_failed.borrow_mut() = true;
@@ -286,10 +389,10 @@ fn writer_credential(workspace_root: &Path, repo: &str) -> Credential {
         cwd: workspace_root.to_path_buf(),
     };
     match minter.mint(repo) {
-        GithubAppOutcome::Minted { token, .. } => {
+        ref outcome @ GithubAppOutcome::Minted { .. } => {
             let dir =
                 cp::github_app_gh_config_dir_for_owner(workspace_root, cp::owner_of_nwo(repo));
-            match cp::publish_github_app_token(&dir, &token) {
+            match cp::publish_outcome(&dir, outcome, repo) {
                 Ok(()) => Credential::ConfigDir {
                     dir,
                     label: "writer app".to_string(),

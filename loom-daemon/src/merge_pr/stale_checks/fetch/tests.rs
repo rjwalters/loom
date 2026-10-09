@@ -264,11 +264,12 @@ fn a_pr_that_does_not_touch_ci_yml_costs_no_reads_and_stays_unscoped() {
 #[test]
 fn a_prs_ci_yml_edit_is_attributed_against_the_head_workflow() {
     let dir = tempfile::tempdir().unwrap();
-    // A block no required context runs.
+    // A block no granular required context runs — only the `CI Result`
+    // aggregate (#10444), which needs every job.
     let gh = pr_gh_stub(dir.path(), &pr_entry(line_of("  backend-tests:") + 3));
     assert_eq!(
         pr_ci_scope(gh.to_str().unwrap(), "o/r", "9065", "deadbeef", &[pr_file(CI_WORKFLOW)]),
-        CiScope::Scoped(std::collections::BTreeSet::new()),
+        CiScope::Scoped(std::iter::once("CI Result".to_string()).collect()),
     );
 
     // Both reads happened, and the workflow one was pinned to the PR HEAD —

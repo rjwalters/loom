@@ -249,6 +249,53 @@ fn concurrent_creators_observe_one_identity() {
     assert!(values.iter().all(|v| v == &values[0]));
 }
 
+/// A second open file description holding the store's directory lock, the
+/// way a forked child holds it between `fork` and `exec`.
+fn hold_store_lock(root: &std::path::Path) -> std::fs::File {
+    let dir = root.join(".loom/logs/trace-context");
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    held
+}
+
+/// #10955: a lock that is released a moment later (an inherited descriptor
+/// closing at `exec`) is waited out instead of failing the caller.
+#[test]
+fn a_briefly_held_store_lock_is_waited_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = hold_store_lock(dir.path());
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(held);
+    });
+    let store = TraceStore::new(dir.path());
+    store
+        .load_or_create(dir.path(), "sweep-issue-10955")
+        .unwrap();
+    releaser.join().unwrap();
+}
+
+/// … and the wait is bounded: a lock that stays held is still an error, soon.
+#[test]
+fn a_store_lock_that_stays_held_is_reported_busy_within_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = hold_store_lock(dir.path());
+    let store = TraceStore::new(dir.path());
+    let started = std::time::Instant::now();
+    let error = store
+        .load_or_create(dir.path(), "sweep-issue-10955")
+        .unwrap_err();
+    assert_eq!(error.to_string(), "trace context store busy");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400), "it waited");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "it gave up");
+}
+
 pub(crate) fn span(context: TraceContext) -> SpanRecord {
     let now = Utc::now();
     SpanRecord {
@@ -375,6 +422,39 @@ fn execution_root_is_derived_from_repo_and_sweep_id() {
         saved.context,
         "recreating the execution recomputes the same trace"
     );
+}
+
+/// #10637: `loom.repo` on a span keyed by [`TraceStore::fallback_repo`] is the
+/// same repo spelled as GitHub spells it, and its ASCII lowercase is always
+/// exactly the key. A canonical record naming the repo supplies the spelling;
+/// with no record, or one naming a different repo (a renamed or transferred
+/// remote), the name stays as written. `LOOM_GH_BIN` is the fake forge's
+/// (the `loom_config_env` key); the default group guards `LOOM_REPO`.
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn repo_attribute_spells_the_key_as_github_does() {
+    repo_attribute_body();
+}
+
+#[serial_test::serial]
+fn repo_attribute_body() {
+    use crate::forge_repo_facts::test_support::{Env, Forge};
+    std::env::remove_var("LOOM_REPO");
+    let check = |remote: &str, forge_says: &str, facts: &str, expected: &str| {
+        let env = Env::new(&[("LOOM_REPO_FACTS", facts)]);
+        let url = format!("https://github.com/{remote}.git");
+        let root = env.repo("r", &[("origin", url.as_str())]);
+        let forge = Forge::new(env.tmp.path(), forge_says);
+        std::env::set_var("LOOM_GH_BIN", &forge.gh);
+        let attribute = TraceStore::repo_attribute(&root);
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(attribute, expected, "origin {remote}, forge {forge_says}, facts {facts}");
+        assert_eq!(attribute.to_ascii_lowercase(), TraceStore::fallback_repo(&root));
+    };
+    check("twoam-fixture/loom-ui", "TwoAM-Fixture/Loom-UI", "1", "TwoAM-Fixture/Loom-UI");
+    check("TwoAM-Fixture/Loom-UI", "TwoAM-Fixture/Loom-UI", "0", "TwoAM-Fixture/Loom-UI");
+    check("twoam-fixture/loom-ui", "TwoAM-Fixture/Loom-UI", "0", "twoam-fixture/loom-ui");
+    check("oldco-fixture/app", "NewCo-Fixture/App", "1", "oldco-fixture/app");
 }
 
 #[test]

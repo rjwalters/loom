@@ -1,5 +1,6 @@
-//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289) and
-//! `eta.fleet_refresh` (#10263) and `eta.fit` (#10391).
+//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289),
+//! `eta.fleet_refresh` (#10263), `eta.fit` (#10391), `pr.resolved`
+//! (#10519) and `eta.stage_outcome` (#10929).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -53,6 +54,37 @@ fn opt_int(attributes: &mut Vec<KeyValue>, key: &str, value: Option<i64>) {
     }
 }
 
+/// #10498: only the fleet's ETA authority emits estimates, outcomes and
+/// stage outcomes (#10929), so the emitting host *is* the authority. Pushes
+/// `loom.eta.authority` for those three kinds; a no-op for every other record. Kept here, not in the caller,
+/// because this file is the one place `loom.eta.*` attributes are produced
+/// (`tests/eta_artifacts.rs` scans it).
+pub(super) fn push_authority(
+    attributes: &mut Vec<KeyValue>,
+    record: &TelemetryRecord,
+    host_id: &str,
+) {
+    if matches!(
+        record,
+        TelemetryRecord::EtaEstimate(_)
+            | TelemetryRecord::EtaOutcome(_)
+            | TelemetryRecord::EtaStageOutcome(_)
+    ) {
+        attributes.push(kv_string("loom.eta.authority", host_id.to_string()));
+    }
+}
+
+/// The knowable-at instant of a record whose event time is not when the
+/// daemon observed it: `pr.resolved` (#10519) and `eta.stage_outcome`
+/// (#10929). `None` for every other kind.
+pub(super) fn observed_at(record: &TelemetryRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    match record {
+        TelemetryRecord::PrResolved(r) => Some(r.observed_at),
+        TelemetryRecord::EtaStageOutcome(r) => Some(r.observed_at),
+        _ => None,
+    }
+}
+
 /// `(event_name, severity, record time, attributes, body)` for an ETA
 /// record; `None` for every other kind.
 pub(super) fn log_parts(
@@ -90,6 +122,28 @@ pub(super) fn log_parts(
             }
             if let Some(reason) = e.no_estimate_reason {
                 attributes.push(kv_string("loom.eta.no_estimate_reason", reason.as_str()));
+            }
+            // #10903: a ready row this host's planner cannot dispatch, and why.
+            let not_here = e.path.as_ref().and_then(|p| p.dispatch.as_ref());
+            if let Some(not_here) = not_here.and_then(|d| d.input.not_here.as_deref()) {
+                attributes.push(kv_string("loom.eta.not_here", not_here));
+            }
+            // #10930: the fit this estimate used, and the queue / capacity
+            // inputs it was made under, as attributes: an estimate joins
+            // `eta.fit` and a replay's inputs are queryable without the body
+            // (whose 32 KiB cap can cut them).
+            if let Some(twin) = &e.twin_otter {
+                attributes.push(kv_string("loom.eta.fit_id", twin.fit_id.clone()));
+            }
+            if let Some(f) = &e.features {
+                opt_int(&mut attributes, "loom.eta.queue_rank", f.queue_rank.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_ready", f.queue_ready.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_running", f.queue_running.map(i64::from));
+                opt_int(
+                    &mut attributes,
+                    "loom.eta.max_concurrent",
+                    f.max_concurrent.map(i64::from),
+                );
             }
             let body = serde_json::to_string(e).unwrap_or_default();
             Some(("eta.estimate", SeverityNumber::Info, nanos(e.as_of), attributes, body))
@@ -135,6 +189,16 @@ pub(super) fn log_parts(
             }
             if let Some(late) = s.above_p90 {
                 attributes.push(kv_bool("loom.eta.above_p90", late));
+            }
+            // #10929: the stage that dominates the miss, and what no stage
+            // explains; the per-stage split is in the body.
+            if let Some(a) = &r.attribution {
+                attributes
+                    .push(kv_int("loom.eta.attribution.unattributed_sec", a.unattributed_sec));
+                if let Some(stage) = a.dominant_stage {
+                    attributes
+                        .push(kv_string("loom.eta.attribution.dominant_stage", stage.as_str()));
+                }
             }
             if let Some(loss) = s.pinball4_loss_sec {
                 attributes.push(kv_double("loom.eta.pinball4_loss_sec", loss));
@@ -237,9 +301,137 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.fit", SeverityNumber::Info, nanos(r.started_at), attributes, body))
         }
+        TelemetryRecord::PrResolved(r) => {
+            // #10519: stamped at the merge/close instant; the caller sets the
+            // observed timestamp to `observed_at` (the knowable-at time).
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_int("loom.pr_number", i64::from(r.pr_number)),
+                kv_string("loom.eta.pr.state", r.state.as_str()),
+                kv_string("loom.eta.pr.resolved_at", instant(r.resolved_at)),
+                kv_string("loom.eta.pr.observed_at", instant(r.observed_at)),
+                kv_int("loom.eta.pr.resolution_sec", r.resolution_sec),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(&mut attributes, "loom.issue", r.issue.map(i64::from));
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
+        }
+        TelemetryRecord::EtaStageOutcome(r) => {
+            // #10929: stamped at `left_at`; the caller sets the observed
+            // timestamp to `observed_at` (the knowable-at time).
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_int("loom.issue", i64::from(r.issue)),
+                kv_string("loom.eta.stage_outcome.stage", r.stage.as_str()),
+                kv_string("loom.eta.stage_outcome.exit", r.exit.as_str()),
+                kv_string("loom.eta.stage_outcome.left_at", instant(r.left_at)),
+                kv_int(
+                    "loom.eta.stage_outcome.open_estimates",
+                    i64::try_from(r.open_estimates).unwrap_or(i64::MAX),
+                ),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(&mut attributes, "loom.pr_number", r.pr_number.map(i64::from));
+            opt_int(&mut attributes, "loom.eta.stage_outcome.dwell_sec", r.dwell_sec);
+            for (key, value) in [
+                (
+                    "loom.eta.stage_outcome.next_stage",
+                    r.next_stage.map(|s| s.as_str().to_string()),
+                ),
+                ("loom.eta.stage_outcome.entered_at", r.entered_at.map(instant)),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value));
+                }
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.stage_outcome", SeverityNumber::Info, nanos(r.left_at), attributes, body))
+        }
+        TelemetryRecord::EtaBacktestFold(r) => {
+            // #10492: one heuristic's fold for one day; stamped at its cutoff.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.eta.backtest.fold.fold_id", r.fold_id.clone()),
+                kv_string("loom.eta.backtest.fold.heuristic", r.heuristic.clone()),
+                kv_string("loom.eta.backtest.fold.kind", r.kind.clone()),
+                kv_string("loom.eta.backtest.fold.day", r.day.clone()),
+                kv_string("loom.eta.backtest.fold.compared_to", r.compared_to.clone()),
+                kv_bool("loom.eta.backtest.fold.is_current", r.is_current),
+                kv_int("loom.eta.backtest.fold.n_cases", to_i64(r.n_cases)),
+                kv_int("loom.eta.backtest.fold.n_answered", to_i64(r.n_answered)),
+                kv_int("loom.eta.backtest.fold.paired_pairs", to_i64(r.paired_pairs)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.backtest.fold.answer_rate", r.answer_rate),
+                ("loom.eta.backtest.fold.pinball4_loss_sec", r.pinball4_loss_sec),
+                ("loom.eta.backtest.fold.cov_25_75", r.cov_25_75),
+                ("loom.eta.backtest.fold.late_surprise", r.late_surprise),
+                ("loom.eta.backtest.fold.delta_pinball4_loss_sec", r.delta_pinball4_loss_sec),
+                ("loom.eta.backtest.fold.delta_answer_rate", r.delta_answer_rate),
+                ("loom.eta.backtest.fold.delta_late_surprise", r.delta_late_surprise),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_double(key, value));
+                }
+            }
+            if let Some(win) = r.win {
+                attributes.push(kv_bool("loom.eta.backtest.fold.win", win));
+            }
+            if let Some(fit_id) = &r.fit_id {
+                attributes.push(kv_string("loom.eta.backtest.fold.fit_id", fit_id.clone()));
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.backtest.fold", SeverityNumber::Info, nanos(r.cutoff), attributes, body))
+        }
+        TelemetryRecord::EtaBacktestSummary(r) => {
+            // #10492: one challenger's rolling standing; stamped at its cutoff.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.eta.backtest.summary.summary_id", r.summary_id.clone()),
+                kv_string("loom.eta.backtest.summary.heuristic", r.heuristic.clone()),
+                kv_string("loom.eta.backtest.summary.kind", r.kind.clone()),
+                kv_string("loom.eta.backtest.summary.compared_to", r.compared_to.clone()),
+                kv_string("loom.eta.backtest.summary.as_of_day", r.as_of_day.clone()),
+                kv_int("loom.eta.backtest.summary.cases", to_i64(r.cases)),
+                kv_int("loom.eta.backtest.summary.days", to_i64(r.days)),
+                kv_int("loom.eta.backtest.summary.wins", to_i64(r.wins)),
+                kv_int("loom.eta.backtest.summary.ties", to_i64(r.ties)),
+                kv_int("loom.eta.backtest.summary.min_folds", to_i64(r.min_folds)),
+                kv_bool("loom.eta.backtest.summary.gate_ready", r.gate_ready),
+                kv_string("loom.eta.backtest.summary.gate_detail", r.gate_detail.clone()),
+                kv_int("loom.eta.backtest.summary.cases_before_fit", to_i64(r.cases_before_fit)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.backtest.summary.win_rate", r.win_rate),
+                ("loom.eta.backtest.summary.ci_low", r.ci_low),
+                ("loom.eta.backtest.summary.ci_high", r.ci_high),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_double(key, value));
+                }
+            }
+            if let Some(day) = &r.fitted_from {
+                attributes.push(kv_string("loom.eta.backtest.summary.fitted_from", day.clone()));
+            }
+            if let Some(fit_id) = &r.fit_id {
+                attributes.push(kv_string("loom.eta.backtest.summary.fit_id", fit_id.clone()));
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.backtest.summary", SeverityNumber::Info, nanos(r.cutoff), attributes, body))
+        }
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "eta_stage_outcome_tests.rs"]
+mod stage_outcome_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -280,6 +472,8 @@ mod tests {
             dispatch: None,
             stalls: Vec::new(),
             held: None,
+            queue: Vec::new(),
+            dependencies: None,
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,
@@ -331,6 +525,46 @@ mod tests {
             Some(Value::StringValue("9d8e226ce0123456789abcdef0123456789abcde".to_string()))
         );
         assert_eq!(log.time_unix_nano, super::nanos(record.explanation.as_of));
+        assert!(attr(&log, "loom.eta.not_here").is_none(), "only a placed ready row has one");
+    }
+
+    /// #10903: a ready row this host's planner did not position carries why.
+    #[test]
+    fn a_placed_ready_row_carries_not_here() {
+        use crate::eta::explanation::{DispatchRecord, PathRecord};
+        let mut record = record();
+        let as_of = record.explanation.as_of;
+        record.explanation.path = Some(PathRecord {
+            start: Stage::ReadyWait,
+            include_merge: true,
+            terminal: Stage::MergeWait,
+            merge_share: None,
+            merge_share_n: None,
+            dispatch: Some(DispatchRecord {
+                input: crate::eta::DispatchInput {
+                    position: 3,
+                    plan_state: "queued".to_string(),
+                    gate: None,
+                    ahead: 2,
+                    free_slots: 0,
+                    max_admissions_per_tick: None,
+                    tick_interval_secs: 60,
+                    saturation_held: false,
+                    plan_at: as_of,
+                    not_here: Some("peer_claim".to_string()),
+                    held_until: None,
+                },
+                turnovers: 3,
+                admission_delay_sec: 30,
+            }),
+        });
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::EtaEstimate(record));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(
+            attr(&log, "loom.eta.not_here"),
+            Some(Value::StringValue("peer_claim".to_string()))
+        );
+        assert!(crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS.contains(&"loom.eta.not_here"));
     }
 
     #[test]
@@ -367,6 +601,7 @@ mod tests {
             outcome_source: "sweep_terminal".to_string(),
             outcome_resolution_sec: Some(0),
             result: Some("exited".to_string()),
+            attribution: None,
         };
         // The keys #10211 added are actually emitted, so the allowlist check
         // below is not vacuous for them.
@@ -402,7 +637,8 @@ mod tests {
                             "loom.repo",
                             "loom.issue",
                             "loom.pr_number",
-                            "loom.record_id"
+                            "loom.record_id",
+                            "loom.kind"
                         ]
                         .contains(&kv.key.as_str()),
                     "{} is not allowlisted",
@@ -430,6 +666,7 @@ mod tests {
                 outcome_source: "pulls_read".to_string(),
                 outcome_resolution_sec: Some(0),
                 result: None,
+                attribution: None,
             };
             log_record_for(&TelemetryEnvelope::new("host", TelemetryRecord::EtaOutcome(record)))
                 .unwrap()
@@ -481,6 +718,8 @@ mod tests {
             snapshot_id: Some("feedface".to_string()),
             as_of: Some(at),
             duration_ms: 12,
+            gap_fill_calls: Some(0),
+            history_source: Some("signoz".to_string()),
             loom: record().explanation.loom.clone(),
         };
         let envelope =
@@ -491,7 +730,7 @@ mod tests {
         for kv in &log.attributes {
             assert!(
                 ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                    || ["loom.repo", "loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
                 "{} is not allowlisted",
                 kv.key
             );
@@ -568,7 +807,7 @@ mod tests {
         for kv in &log.attributes {
             assert!(
                 ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                    || ["loom.repo", "loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
                 "{} is not allowlisted",
                 kv.key
             );
@@ -585,5 +824,58 @@ mod tests {
         };
         let parsed: EtaFitRecord = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, fit);
+    }
+
+    #[test]
+    fn a_pr_resolved_record_is_stamped_at_the_merge_and_observed_at_the_pass() {
+        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
+        use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
+        let merged_at = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+        let observed_at = merged_at + chrono::Duration::seconds(240);
+        let resolved = PrResolvedRecord {
+            repo: "rjwalters/loom".to_string(),
+            pr_number: 10547,
+            issue: Some(10511),
+            state: PrResolution::Merged,
+            resolved_at: merged_at,
+            observed_at,
+            resolution_sec: 0,
+            loom: record().explanation.loom.clone(),
+        };
+        let envelope =
+            TelemetryEnvelope::new("host", TelemetryRecord::PrResolved(resolved.clone()));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.event_name, "pr.resolved");
+        assert_eq!(log.time_unix_nano, super::nanos(merged_at), "event time");
+        assert_eq!(log.observed_time_unix_nano, super::nanos(observed_at), "knowable-at");
+        for kv in &log.attributes {
+            assert!(
+                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                    || [
+                        "loom.repo",
+                        "loom.record_id",
+                        "loom.kind",
+                        "loom.pr_number",
+                        "loom.issue"
+                    ]
+                    .contains(&kv.key.as_str()),
+                "{} is not allowlisted",
+                kv.key
+            );
+        }
+        for key in ETA_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .filter(|k| k.starts_with("loom.eta.pr."))
+        {
+            assert!(attr(&log, key).is_some(), "{key} is emitted");
+        }
+        assert_eq!(attr(&log, "loom.pr_number"), Some(Value::IntValue(10547)));
+        assert_eq!(attr(&log, "loom.eta.pr.state"), Some(Value::StringValue("merged".to_string())));
+        assert!(attr(&log, "loom.eta.authority").is_none(), "not an estimate");
+        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
+            panic!("string body");
+        };
+        let parsed: PrResolvedRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, resolved);
     }
 }

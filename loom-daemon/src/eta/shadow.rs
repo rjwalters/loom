@@ -23,17 +23,23 @@
 //!    phase-2 backtest for that kind ([`super::backtest::compare`]), over the
 //!    identical replay set — judged on the **union** of cases counting
 //!    refusals (#10233): lower paired mean `pinball4_loss_sec` on the cases
-//!    both answered, with no answer-rate or late-surprise regression — and
-//!    the win must hold across the walk-forward daily folds: at least
-//!    [`MIN_FOLDS`] decided days, the 95% Wilson lower bound of the per-day
-//!    win rate above 50%. Failing this, the live gate is not even consulted
+//!    both answered, with no answer-rate or late-surprise regression — then
+//!    the item-clustered primary test and the day consistency check
+//!    ([`super::shadow_stats`], #10525): the paired difference's 95%
+//!    item-bootstrap interval below 0 over at least
+//!    [`super::shadow_stats::MIN_DISTINCT_ITEMS`] distinct items, and at least
+//!    [`MIN_FOLDS`] decided walk-forward days with a majority won. Failing
+//!    this, the live gate is not even consulted
 //!    — a heuristic that cannot win on history it can be re-run against has no
 //!    business being judged on a live sample nobody can replay.
 //! 2. **Live** (#10233), every figure on the **common decidable subset** —
 //!    the pairs where both sides are decidable for that figure:
-//!    - at least [`MIN_LIVE_PAIRS`] pairs carrying a p90 on both sides, and
-//!      the candidate's paired mean `pinball4_loss_sec` (q = .25, .5, .75,
-//!      .9 — the deciding loss) no worse than `current`'s;
+//!    - the primary test (#10525): the paired `pinball4_loss_sec` difference
+//!      (q = .25, .5, .75, .9 — the deciding loss) with its 95%
+//!      item-clustered bootstrap interval below 0, over at least
+//!      [`super::shadow_stats::MIN_DISTINCT_ITEMS`] distinct items
+//!      ([`ShadowLedger::items`]): every refresh is used, each item counts
+//!      once in the uncertainty;
 //!    - no late-surprise regression: the candidate's `actual > p90` rate at
 //!      most [`LATE_SURPRISE_SLACK`] above `current`'s, over at least
 //!      [`MIN_LIVE_PAIRS`] pairs where both are decided (censored outcomes
@@ -43,9 +49,16 @@
 //!      [`ANSWER_RATE_SLACK`] below `current`'s;
 //!    - the candidate's p25–p75 coverage inside
 //!      `[`[`COVERAGE_MIN`]`, `[`COVERAGE_MAX`]`]`;
-//!    - the win holds day by day: over at least [`MIN_FOLDS`] decided UTC
-//!      days of `as_of`, the 95% Wilson lower bound of the candidate's
-//!      per-day win rate on the deciding loss is above 50%.
+//!    - the consistency check: at least [`MIN_FOLDS`] decided UTC days of
+//!      `as_of`, a strict majority won on the deciding loss (the Wilson
+//!      interval is recorded, not gating; #10525).
+//!
+//! Every decision also records the adaptation-time comparison
+//! ([`super::shadow_stats::adaptation_check`]); a measured regression refuses.
+//!
+//! Only a `candidate`-tier heuristic is ever promoted (#10525,
+//! [`super::shadow_fleet`]): a `baseline` or `retired` one is refused whatever
+//! its numbers, and the decision records the tier.
 //!
 //! Either gate failing leaves `current` exactly as it was. Every evaluation —
 //! promoting or not — produces a [`PromotionDecision`] carrying the numbers
@@ -66,7 +79,7 @@
 use super::backtest::Comparison;
 use super::score::Score;
 use super::tracker::{PassAnswers, Resolved};
-use super::Kind;
+use super::{Kind, Tier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -291,6 +304,10 @@ pub struct PairedStats {
     /// The candidate's per-day win rate on the deciding loss.
     #[serde(default)]
     pub day_wins: DayWins,
+    /// The item-clustered primary test (#10525); `None` in a record logged
+    /// before it existed, and from [`PairedStats::of`] alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_test: Option<super::shadow_stats::ItemTest>,
 }
 
 impl PairedStats {
@@ -317,6 +334,7 @@ impl PairedStats {
             current_answer_rate: share(sums.current_answered, sums.answer_pairs),
             candidate_answer_rate: share(sums.candidate_answered, sums.answer_pairs),
             day_wins: DayWins::default(),
+            item_test: None,
         }
     }
 
@@ -345,13 +363,39 @@ pub struct ShadowLedger {
     /// Per comparison, the deciding-loss sums of each UTC day of `as_of`
     /// (`YYYY-MM-DD`), newest [`MAX_DAYS`] kept (#10233).
     pub days: BTreeMap<String, BTreeMap<String, DaySums>>,
+    /// Per comparison, the paired deciding-loss difference of each item
+    /// (`repo#issue`), the unit the primary test resamples (#10525,
+    /// [`super::shadow_stats`]); at most [`MAX_ITEMS`], least recently seen
+    /// evicted first. A ledger written before it reads empty, so the primary
+    /// test refuses until items accumulate.
+    pub items: BTreeMap<String, BTreeMap<String, ItemSums>>,
+    /// Per comparison, the conditional answer counts of each UTC hour, newest
+    /// [`super::shadow_non_refusal::MAX_HOURS`] kept: the live non-refusal
+    /// check's evidence (#10949). A ledger written before it reads empty.
+    pub answer_hours: super::shadow_non_refusal::AnswerHours,
 }
 
 /// Most per-day folds kept per comparison; the oldest go first.
 pub const MAX_DAYS: usize = 120;
 
+/// Most items kept per comparison (#10525): at the fleet's median of ~50
+/// landings a day that is over a month, far beyond what the gate needs.
+pub const MAX_ITEMS: usize = 2_000;
+
+/// One item's paired deciding-loss sums for one comparison (#10525).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ItemSums {
+    /// Paired observations of the item (every refresh that scored both sides).
+    pub pairs: usize,
+    /// Σ of candidate minus `current` `pinball4_loss_sec` over them.
+    pub delta_loss4_sec: f64,
+    /// Newest UTC day of `as_of` it was seen (`YYYY-MM-DD`), for eviction.
+    pub last_day: String,
+}
+
 /// `kind|current|candidate`, the map key for a [`PairKey`].
-fn encode(key: &PairKey) -> String {
+pub(super) fn encode(key: &PairKey) -> String {
     format!("{}|{}|{}", key.kind.as_str(), key.current, key.candidate)
 }
 
@@ -393,7 +437,7 @@ impl ShadowLedger {
             });
         }
 
-        for ((_, _, kind, as_of), group) in groups {
+        for ((repo, issue, kind, as_of), group) in groups {
             let current_id = current(kind);
             let Some(base) = group.iter().find(|s| s.heuristic == current_id) else {
                 continue;
@@ -424,10 +468,15 @@ impl ShadowLedger {
                     sums.loss4_pairs += 1;
                     sums.current_loss4_sec += current_loss4;
                     sums.candidate_loss4_sec += candidate_loss4;
+                    let day_key = as_of.format("%Y-%m-%d").to_string();
+                    record_item(
+                        self.items.entry(encoded.clone()).or_default(),
+                        format!("{repo}#{issue}"),
+                        candidate_loss4 - current_loss4,
+                        &day_key,
+                    );
                     let days = self.days.entry(encoded).or_default();
-                    let day = days
-                        .entry(as_of.format("%Y-%m-%d").to_string())
-                        .or_default();
+                    let day = days.entry(day_key).or_default();
                     day.pairs += 1;
                     day.current_loss4_sec += current_loss4;
                     day.candidate_loss4_sec += candidate_loss4;
@@ -460,7 +509,7 @@ impl ShadowLedger {
     }
 
     /// The encoded key of `(kind, current, candidate)`, registered.
-    fn key_for(&mut self, kind: Kind, current: &str, candidate: &str) -> String {
+    pub(super) fn key_for(&mut self, kind: Kind, current: &str, candidate: &str) -> String {
         let key = PairKey {
             kind,
             current: current.to_string(),
@@ -485,11 +534,19 @@ impl ShadowLedger {
 
     fn stats_of(&self, encoded: &str, key: PairKey) -> PairedStats {
         let sums = self.pairs.get(encoded).copied().unwrap_or_default();
-        let stats = PairedStats::of(key, sums);
-        match self.days.get(encoded) {
-            Some(days) => stats.with_days(days),
-            None => stats,
+        let mut stats = PairedStats::of(key, sums);
+        if let Some(days) = self.days.get(encoded) {
+            stats = stats.with_days(days);
         }
+        let items: super::offline::evaluate::IssueSums = self
+            .items
+            .get(encoded)
+            .into_iter()
+            .flatten()
+            .map(|(item, s)| (item.clone(), (s.delta_loss4_sec, s.pairs)))
+            .collect();
+        stats.item_test = Some(super::shadow_stats::item_test(&items));
+        stats
     }
 
     /// Every comparison the ledger holds evidence for.
@@ -508,7 +565,30 @@ impl ShadowLedger {
         let encoded = encode(key);
         self.pairs.remove(&encoded);
         self.days.remove(&encoded);
+        self.items.remove(&encoded);
+        self.answer_hours.remove(&encoded);
         self.keys.remove(&encoded);
+    }
+}
+
+/// Add one paired difference to `item`, evicting the least recently seen
+/// item (ties by key) beyond [`MAX_ITEMS`].
+fn record_item(items: &mut BTreeMap<String, ItemSums>, item: String, delta: f64, day: &str) {
+    let entry = items.entry(item).or_default();
+    entry.pairs += 1;
+    entry.delta_loss4_sec += delta;
+    if entry.last_day.as_str() < day {
+        entry.last_day = day.to_string();
+    }
+    while items.len() > MAX_ITEMS {
+        let oldest = items
+            .iter()
+            .min_by(|a, b| a.1.last_day.cmp(&b.1.last_day).then_with(|| a.0.cmp(b.0)))
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => items.remove(&k),
+            None => break,
+        };
     }
 }
 
@@ -577,6 +657,10 @@ pub struct BacktestGate {
     /// Decided days the per-day win rate required.
     #[serde(default)]
     pub min_folds: usize,
+    /// The item-clustered primary test (#10525); `None` when no comparison
+    /// was available, and in a record logged before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_test: Option<super::shadow_stats::ItemTest>,
 }
 
 /// The live gate's verdict and the numbers behind it.
@@ -620,6 +704,27 @@ pub struct PromotionDecision {
     pub current: String,
     /// The challenger.
     pub candidate: String,
+    /// The challenger's tier (#10525); only a `candidate` is ever promoted.
+    /// `None` for an id this build never shipped, and in a record logged
+    /// before tiers existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_tier: Option<Tier>,
+    /// The nightly-fold short-list this evaluation consulted (#10525); `None`
+    /// in a record logged before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortlist: Option<super::shadow_lifecycle::Shortlist>,
+    /// The adaptation-time comparison (#10525, #10528); `None` in a record
+    /// logged before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptation: Option<super::shadow_stats::AdaptationCheck>,
+    /// The live non-refusal check (#10949); `None` from [`evaluate`] alone
+    /// and in a record logged before it existed. `eta promote` always sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_refusal: Option<super::shadow_non_refusal::NonRefusal>,
+    /// Where the evidence behind this evaluation is published (an issue
+    /// comment, a write-up), as given to `eta promote --evidence` (#10949).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
     /// Gate 1.
     pub backtest: BacktestGate,
     /// Gate 2 — `NotReached` when gate 1 failed.
@@ -665,26 +770,48 @@ pub fn evaluate(
             answer_rate_slack: ANSWER_RATE_SLACK,
         }
     };
-    let promote = backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
-    let reason = if promote {
+    // #10525: the gate considers only `candidate` heuristics. An id this
+    // build never shipped (a test double) is judged on the numbers alone; the
+    // CLI refuses an unknown id before it gets here.
+    let candidate_tier = super::shadow_fleet::builtin_tier(candidate);
+    let promotable = candidate_tier.is_none_or(|tier| tier == Tier::Candidate);
+    let promote =
+        promotable && backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
+    let reason = if let Some(tier) = candidate_tier.filter(|_| !promotable) {
+        format!(
+            "{candidate} is a {tier} heuristic and is never promoted: \
+             the gate considers only candidate heuristics (#10525)"
+        )
+    } else if promote {
         format!("both gates passed: {} then {}", backtest.detail, live.detail)
     } else if backtest.status == GateStatus::Passed {
         format!("live gate failed: {}", live.detail)
     } else {
         format!("backtest gate failed: {}", backtest.detail)
     };
-    PromotionDecision {
+    let mut decision = PromotionDecision {
         schema: DECISION_SCHEMA.to_string(),
         at,
         kind,
         current: current.to_string(),
         candidate: candidate.to_string(),
+        candidate_tier,
+        shortlist: None,
+        adaptation: None,
+        non_refusal: None,
+        evidence: None,
         backtest,
         live,
         promote,
         reason,
         config_path: None,
-    }
+    };
+    // No build measures adaptation time yet (#10528): recorded, not gating.
+    super::shadow_stats::apply_adaptation(
+        &mut decision,
+        super::shadow_stats::adaptation_check(None, None),
+    );
+    decision
 }
 
 /// Which report in `comparison` belongs to `id`.
@@ -701,7 +828,16 @@ fn report_for<'a>(
     }
 }
 
-fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>) -> BacktestGate {
+/// The backtest half of the promotion gate for `candidate` against `current`
+/// on `comparison` — the one implementation `eta promote` ([`evaluate`]) and
+/// the nightly folds' `gate_ready` (#10492) both call, so the two cannot
+/// disagree on the same data.
+#[must_use]
+pub fn backtest_gate(
+    current: &str,
+    candidate: &str,
+    comparison: Option<&Comparison>,
+) -> BacktestGate {
     let fail = |detail: String| BacktestGate {
         status: GateStatus::Failed,
         detail,
@@ -717,6 +853,7 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
         candidate_mean_pinball4_loss_sec: None,
         day_wins: DayWins::default(),
         min_folds: MIN_FOLDS,
+        item_test: None,
     };
     let Some(comparison) = comparison else {
         return fail("no backtest was run".to_string());
@@ -746,6 +883,10 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
     let candidate_loss4 = side(p.a_mean_pinball4_loss_sec, p.b_mean_pinball4_loss_sec, false);
     let current_answers = side(p.a_answer_rate, p.b_answer_rate, true);
     let candidate_answers = side(p.a_answer_rate, p.b_answer_rate, false);
+    // `delta_pinball4_loss_sec` is `b − a`: the candidate's minus current's
+    // exactly when current is `a`.
+    let item =
+        super::shadow_stats::item_test_of(p.delta_pinball4_loss_sec, p.delta4_items, !current_is_a);
     let gate = |status: GateStatus, detail: String| BacktestGate {
         status,
         detail,
@@ -769,6 +910,7 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
         candidate_mean_pinball4_loss_sec: candidate_loss4,
         day_wins,
         min_folds: MIN_FOLDS,
+        item_test: Some(item.clone()),
     };
     let pct = |rate: Option<f64>| rate.unwrap_or(0.0) * 100.0;
     if p.loss4_pairs == 0 {
@@ -793,39 +935,19 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
         pct(current_answers),
         p.cases
     );
+    // `better` carries the answer-rate and late-surprise safeguards.
     if comparison.better.as_deref() != Some(candidate) {
         return gate(GateStatus::Failed, format!("{figures}: {candidate} does not win"));
     }
-    // The win is not one lucky day: walk-forward daily folds, the same rule
-    // as the live gate's.
-    if day_wins.days < MIN_FOLDS {
-        return gate(
-            GateStatus::Failed,
-            format!("{figures}, but {} decided day(s), {MIN_FOLDS} required", day_wins.days),
-        );
+    // #10525: the primary test is item-clustered, then the walk-forward
+    // daily folds are the consistency check — the same rules as live.
+    if !item.passed {
+        return gate(GateStatus::Failed, format!("{figures}, but {}", item.detail));
     }
-    let low = day_wins.ci_low.unwrap_or(0.0);
-    if low <= 0.5 {
-        return gate(
-            GateStatus::Failed,
-            format!(
-                "{figures}, but the per-day win rate {}/{} has 95% lower bound {:.1}%, \
-                 not above 50%",
-                day_wins.wins,
-                day_wins.days,
-                low * 100.0
-            ),
-        );
+    match super::shadow_stats::day_consistency(&day_wins) {
+        Err(why) => gate(GateStatus::Failed, format!("{figures}, but {why}")),
+        Ok(days) => gate(GateStatus::Passed, format!("{figures}, {}, {days}", item.detail)),
     }
-    gate(
-        GateStatus::Passed,
-        format!(
-            "{figures}, won {}/{} day(s) (95% lower bound {:.1}%)",
-            day_wins.wins,
-            day_wins.days,
-            low * 100.0
-        ),
-    )
 }
 
 fn live_gate(stats: &PairedStats) -> LiveGate {
@@ -842,23 +964,28 @@ fn live_gate(stats: &PairedStats) -> LiveGate {
     let fail = |detail: String| gate(GateStatus::Failed, detail);
     let pct = |rate: f64| rate * 100.0;
 
-    // 1. The deciding loss: four-quantile pinball, on the pairs where both
-    //    sides carry a p90.
-    if stats.loss4_pairs < MIN_LIVE_PAIRS {
-        return fail(format!(
-            "{} live pair(s) with a p90 on both sides, {MIN_LIVE_PAIRS} required",
-            stats.loss4_pairs
-        ));
-    }
+    // 1. The primary test (#10525): the paired four-quantile pinball
+    //    difference, item-clustered bootstrap CI excluding 0, over at least
+    //    MIN_DISTINCT_ITEMS distinct items. Refreshes of one item are one
+    //    sample, however many there are.
     let (Some(current_loss), Some(candidate_loss)) =
         (stats.current_mean_pinball4_loss_sec, stats.candidate_mean_pinball4_loss_sec)
     else {
-        return fail("no paired losses to compare".to_string());
+        return fail(format!(
+            "{} live pair(s) with a p90 on both sides: no paired losses to compare",
+            stats.loss4_pairs
+        ));
     };
     if candidate_loss > current_loss {
         return fail(format!(
             "paired mean pinball4 {candidate_loss:.1}s is worse than {current_loss:.1}s"
         ));
+    }
+    let Some(item) = stats.item_test.as_ref() else {
+        return fail("no item-level paired evidence for the primary test".to_string());
+    };
+    if !item.passed {
+        return fail(item.detail.clone());
     }
 
     // 2. No late-surprise regression, on the pairs where both are decided.
@@ -916,39 +1043,25 @@ fn live_gate(stats: &PairedStats) -> LiveGate {
         ));
     }
 
-    // 5. The win is not one lucky day: a per-day win rate over at least
-    //    MIN_FOLDS decided days, its 95% lower bound above a coin flip.
-    let wins = stats.day_wins;
-    if wins.days < MIN_FOLDS {
-        return fail(format!(
-            "{} decided day(s) of paired evidence, {MIN_FOLDS} required",
-            wins.days
-        ));
-    }
-    let low = wins.ci_low.unwrap_or(0.0);
-    if low <= 0.5 {
-        return fail(format!(
-            "per-day win rate {}/{} has 95% lower bound {:.1}%, not above 50%",
-            wins.wins,
-            wins.days,
-            pct(low)
-        ));
-    }
+    // 5. Consistency (#10525): at least MIN_FOLDS decided days, a majority
+    //    won, so the win is not one regime. Days are not the significance
+    //    unit; the primary test above is.
+    let days = match super::shadow_stats::day_consistency(&stats.day_wins) {
+        Ok(days) => days,
+        Err(why) => return fail(format!("day consistency: {why}")),
+    };
     gate(
         GateStatus::Passed,
         format!(
-            "{} pair(s), paired mean pinball4 {candidate_loss:.1}s vs {current_loss:.1}s, \
+            "{}, paired mean pinball4 {candidate_loss:.1}s vs {current_loss:.1}s, \
              late surprise {:.1}% vs {:.1}%, answer rate {:.1}% vs {:.1}%, coverage {:.1}%, \
-             won {}/{} day(s) (95% lower bound {:.1}%)",
-            stats.loss4_pairs,
+             {days}",
+            item.detail,
             pct(candidate_late),
             pct(current_late),
             pct(candidate_answers),
             pct(current_answers),
             pct(coverage),
-            wins.wins,
-            wins.days,
-            pct(low)
         ),
     )
 }

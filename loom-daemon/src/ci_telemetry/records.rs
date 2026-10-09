@@ -499,8 +499,9 @@ fn step_name(raw: &str) -> String {
 /// Which family a matrix leg's shard attributes describe (#9089).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShardKind {
-    /// A `cargo nextest run --partition count:k/N` leg (`Rust Unit Tests`,
-    /// `Rust OTLP Feature Tests`).
+    /// A `cargo nextest run --partition count:k/N` leg (`Rust Unit Tests`;
+    /// the former `Rust OTLP Feature Tests` family was folded into it by
+    /// #10823, and its historical rows still parse as this kind).
     NextestPartition,
     /// A `run-ci-suites.sh` / `LOOM_CI_SHARD` round-robin leg (`Shell Test
     /// Suites`).
@@ -531,8 +532,9 @@ pub struct ShardInfo {
 
 /// Parse a job's shard identity from its display name (#9089). `ci.yml`'s two
 /// sharded job families already print `(index/total)` in their `name:` —
-/// `Rust Unit Tests (1/3)`, `Rust OTLP Feature Tests (2/3)`, `Shell Test
-/// Suites (hermetic, 1/2)` — so a trailing `(…k/N)` group is a strong,
+/// `Rust Unit Tests (1/3)`, `Shell Test Suites (hermetic, 1/2)` (the former
+/// `Rust OTLP Feature Tests (k/N)` family was folded into `Rust Unit Tests`
+/// by #10823) — so a trailing `(…k/N)` group is a strong,
 /// no-extra-API-call signal: the jobs listing the poller already fetches
 /// carries it. The `Shell Test Suites` prefix distinguishes the round-robin
 /// shell-shard family (`LOOM_CI_SHARD`) from the nextest-partition family
@@ -715,6 +717,9 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
     let workflow = run.workflow();
     let ctx = run_context(&repo.full_name, run.id, run.run_attempt);
     let trigger_reason = run.trigger_reason().as_str();
+    // #10511: the knowable-at instant — when this daemon built the record
+    // from what GitHub returned, not GitHub's own event time.
+    let observed_at = Some(Utc::now());
     let record = CiRunRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -736,6 +741,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         duration_ms: duration,
         queued_ms: run.queued_ms(),
         trigger_reason: Some(trigger_reason.to_string()),
+        observed_at,
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Run,
@@ -751,6 +757,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         started_at,
         completed_at,
         duration_ms: duration,
+        observed_at,
     };
     let span = SpanRecord {
         context: ctx.clone(),
@@ -830,6 +837,8 @@ pub fn job_envelopes_with_reason(
     let run_span = run_context(&repo.full_name, run.id, job.run_attempt).span_id;
     let shard = parse_shard(&job.name);
     let dependency_wait_ms = job.dependency_wait_ms(baseline);
+    // #10511: see `run_envelopes`.
+    let observed_at = Some(Utc::now());
     let record = CiJobRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -850,6 +859,7 @@ pub fn job_envelopes_with_reason(
         shard_index: shard.index,
         shard_total: shard.total,
         shard_kind: shard.kind.as_str().to_string(),
+        observed_at,
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Job,
@@ -865,6 +875,7 @@ pub fn job_envelopes_with_reason(
         started_at,
         completed_at,
         duration_ms: duration,
+        observed_at,
     };
     let span = SpanRecord {
         context: ctx.clone(),

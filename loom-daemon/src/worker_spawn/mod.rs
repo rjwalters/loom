@@ -10,6 +10,9 @@ pub(crate) mod credential;
 pub mod egress_proxy;
 mod harness;
 pub mod launch_outcome;
+// #9473: route opted-in API-key profiles through the host's LLM gateway;
+// `pub(crate)` so the daemon's dispatch surfaces can call `guard_dispatch`.
+pub(crate) mod llm_gateway;
 mod opencode_version;
 mod profile_check;
 pub(crate) mod profiles;
@@ -281,6 +284,29 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
     result
 }
 
+/// The billing class of a native-harness launch (#10749). The profile is
+/// re-looked-up for its declared `billing` and whether it names a credential.
+fn native_llm_billing(
+    selection: &profiles::Selection,
+    config: &serde_json::Value,
+    credential_source: &str,
+) -> crate::observability::llm_billing::LlmBilling {
+    let profile = selection
+        .profile
+        .as_deref()
+        .and_then(|name| profiles::lookup(Some(name), config).ok())
+        .map(|(_, profile)| profile);
+    crate::observability::llm_billing::LlmBilling::native(
+        selection.profile.as_deref(),
+        profile.as_ref().and_then(|p| p.billing.as_deref()),
+        profile.as_ref().map_or_else(
+            || !selection.credential_sources.is_empty(),
+            |p| p.credential_env.is_some(),
+        ),
+        credential_source,
+    )
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -312,6 +338,30 @@ fn run_preflight(
     {
         return Err(LaunchError::config("invalid runtime name"));
     }
+    // #9987: on a policy-governed host the managed launcher must be the first
+    // `gh` this worker (and its children) resolve. Its directory goes first on
+    // this process's own PATH so the admission below, the runtime child and
+    // the container re-exec all observe one environment. No policy (or a
+    // repo-origin one) resolves to `None` and nothing changes; an invalid one
+    // refuses, `observe` logs. Tests inject `egress_sources`, never the env.
+    let admission = egress_sources
+        .map_or_else(
+            crate::forge_egress::worker_env::WorkerEgress::admit_process,
+            crate::forge_egress::worker_env::WorkerEgress::admit,
+        )
+        .map_err(|f| LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f)))?;
+    for warning in &admission.warnings {
+        log::warn!("{}", crate::forge_egress::worker_env::observe_message(warning));
+    }
+    let worker_egress = admission.egress;
+    if let (None, Some(path)) = (
+        egress_sources,
+        worker_egress
+            .as_ref()
+            .and_then(|e| e.worker_path(std::env::var_os("PATH").as_deref())),
+    ) {
+        std::env::set_var("PATH", path);
+    }
     // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
     // is its `forge egress assert`. Under `enforcement.api = required` a routing
     // finding means no worker is spawned; `observe` logs; no policy is a no-op.
@@ -338,7 +388,7 @@ fn run_preflight(
             crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
                 .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
-        let selection = profiles::select(&runtime, &options, &config)?;
+        let mut selection = profiles::select(&runtime, &options, &config)?;
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
         trace_identity.insert("loom.model".into(), selection.model.clone());
         if let Some(effort) = &selection.effort {
@@ -348,6 +398,11 @@ fn run_preflight(
             trace_identity.insert("loom.configured_model".into(), model.clone());
         }
 
+        // #9473: decided after profile selection and before both containment
+        // and the credential ladder — a routed launch reads no provider key.
+        // Reads no secret yet; an opted-in profile it cannot route refuses.
+        let gateway = llm_gateway::plan(&runtime, &selection, &config)?;
+
         // Per-sweep ephemeral containment (issue #8403). Decided here, after
         // admission and profile selection (so a misconfigured launch still
         // fails fast on the host) but BEFORE prompt expansion and binding
@@ -355,6 +410,13 @@ fn run_preflight(
         // against its own isolated directories, not against the shared
         // workspace the host would use.
         if let Some(profile) = containment::resolve(&config) {
+            if gateway.is_some() {
+                return Err(LaunchError::config(
+                    "this model profile is routed through the LLM gateway, which contained \
+                     launches do not support yet; turn off runtimes.containment.native or \
+                     drop the profile from LOOM_LLM_GATEWAY_PROFILES (#9473)",
+                ));
+            }
             // Forward the profile's credential variables by NAME: every
             // declared source (profile resolution re-runs inside the container
             // and fails closed on an unset required source), plus each mapped
@@ -378,7 +440,14 @@ fn run_preflight(
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config)?;
-            let mut command = containment::docker_command(
+            if worker_egress.as_ref().is_some_and(|e| e.required)
+                && !containment::image_has_python3(&profile.image)
+            {
+                return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
+                    &crate::forge_egress::worker_env::python3_missing_finding(&profile.image),
+                )));
+            }
+            let mut command = containment::docker_command_with(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
@@ -386,7 +455,9 @@ fn run_preflight(
                 &args.args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
+                worker_egress.as_ref(),
             )?;
+            llm_gateway::scrub(&mut command);
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
                 .map_err(|e| LaunchError::config(e.to_string()))?;
@@ -406,7 +477,19 @@ fn run_preflight(
         containment::materialize_launch_dirs();
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
-        let credential = credential::resolve(root, &selection)?;
+        let gateway = gateway.map(llm_gateway::Plan::open).transpose()?;
+        let credential = match &gateway {
+            Some(route) => {
+                route.adapt(&runtime, &mut selection);
+                route.credential()
+            }
+            None => credential::resolve(root, &selection)?,
+        };
+        // #10749: how this launch is billed, from the profile's declared class
+        // and the credential source actually resolved. Enumerated vocabulary
+        // plus the profile name only; never a key, account or path.
+        let llm_billing = native_llm_billing(&selection, &config, credential.source.as_str());
+        llm_billing.stamp(&mut trace_identity);
         let expanded = options
             .prompt
             .as_deref()
@@ -420,6 +503,9 @@ fn run_preflight(
             root,
             role.is_some() || prompt_role.is_some(),
         )?;
+        if let Some(route) = &gateway {
+            route.finish(&runtime, &selection.provider, &mut command)?;
+        }
         log = attach_log(&mut command, options.log.as_deref())?;
         // `credentialAccount` is an account NAME, never key material (#8401).
         // `promptBytes` (#8506) is the expanded prompt's size, so an E2BIG-class
@@ -438,7 +524,11 @@ fn run_preflight(
             Some(profile) => crate::runtime_preference::Tap::with_profile(&runtime, profile),
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
-        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        writeln!(log, "# LOOM_LAUNCH {}", serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)})).map_err(|e| LaunchError::config(e.to_string()))?;
+        if let Some(route) = &gateway {
+            writeln!(log, "{}", route.marker(&runtime))
+                .map_err(|e| LaunchError::config(e.to_string()))?;
+        }
         command
     } else {
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
@@ -461,6 +551,11 @@ fn run_preflight(
         command.args(&args.args);
         command
     };
+    // #9473 red line: the gateway contract never crosses into the exec'd
+    // process — not `spawn-claude.sh` / `spawn-codex.sh` (subscription seats),
+    // and not a native harness either, which holds a routed key only under
+    // its own provider-key variable (`llm_gateway::Route::credential`).
+    llm_gateway::scrub(&mut command);
     let private_selection = if runtime == "codex"
         && std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none()
         && nonempty_env("LOOM_CODEX_NO_EXEC").is_none()
@@ -511,11 +606,31 @@ fn run_preflight(
         selection.apply(&mut command);
     }
     command.env("LOOM_RUNTIME", &runtime);
+    // #10607: the same sink variables every tmux session gets (W5,
+    // `agent_session::isolation`), so the worker's `gh` front books into this
+    // host's sink whatever TMPDIR its runtime pins. An absent directory is
+    // created owner-only first, so a container's mount of it finds it
+    // private; an existing one is only inspected, never changed.
+    let _ = crate::forge_call_stats::agent::worker_sink_dir();
+    command.envs(crate::agent_session::isolation::ledger_vars());
     // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
     // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
     // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`
-    // opts out; see defaults/docs/gh-cached.md.
-    if let Some(path) = crate::agent_gh::worker_path(std::env::var_os("PATH").as_deref()) {
+    // opts out; see defaults/docs/gh-cached.md. #9987: the managed launcher
+    // stays ahead of the front; under `enforcement.api = required` a worker
+    // whose first `gh` is anything else is not spawned. The order is
+    // `agent_gh::session_path`, shared with interactive sessions (#10516).
+    let current = std::env::var_os("PATH");
+    let path = crate::agent_gh::session_path(current.as_deref(), worker_egress.as_ref());
+    if let Some(finding) = worker_egress
+        .as_ref()
+        .and_then(|e| e.launcher_first_finding(path.as_deref().or(current.as_deref())))
+    {
+        return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
+            &finding,
+        )));
+    }
+    if let Some(path) = path {
         command.env("PATH", path);
     }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
@@ -544,13 +659,37 @@ fn run_preflight(
     // role-runner tick or an interactive spawn (no single worktree to attribute
     // a target dir to), and a no-op on a host whose cargo output is not
     // redirected outside the worktree in the first place.
-    if let Some(dir) = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
+    let per_worktree = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
         root,
         nonempty_env("LOOM_SWEEP_CLAIM_OWNED").as_deref(),
         nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
-    ) {
-        command.env("CARGO_TARGET_DIR", &dir);
+    );
+    if let Some(dir) = &per_worktree {
+        command.env("CARGO_TARGET_DIR", dir);
         let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8458)", dir.display());
+    }
+    // #8370: every other run gets a Loom-owned dir under `.loom/targets/`, so
+    // the agent never improvises one nothing reclaims. `exec()` below keeps
+    // this pid, so the owner file names the harness for the whole run.
+    let run_id = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp());
+    let (ambient, planned, role) = (
+        nonempty_env("CARGO_TARGET_DIR"),
+        nonempty_env(crate::run_target_dir::RUN_TARGET_DIR_ENV),
+        nonempty_env("LOOM_ROLE"),
+    );
+    let run_inputs = crate::run_target_dir::SpawnInputs {
+        per_worktree: per_worktree.as_deref(),
+        ambient: ambient.as_deref(),
+        containerized: nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+        planned: planned.as_deref(),
+        role: role.as_deref(),
+        run_id: &run_id,
+    };
+    if let Some(dir) = crate::run_target_dir::decide(root, &run_inputs)
+        .and_then(|dir| crate::run_target_dir::provision(&dir, std::process::id()))
+    {
+        command.env("CARGO_TARGET_DIR", &dir);
+        let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8370)", dir.display());
     }
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {
@@ -582,6 +721,18 @@ fn run_preflight(
     log.flush()
         .map_err(|e| LaunchError::config(e.to_string()))?;
     trace_identity.insert("loom.runtime".into(), runtime.clone());
+    // #10749: Claude/Codex (legacy adapters) are classified by runtime; a
+    // native harness already stamped its own billing above.
+    if !trace_identity.contains_key(crate::observability::llm_billing::BILLING_KEY) {
+        let metered_backstop = nonempty_env(crate::launch_env::PREFERENCE_MARKER_ENV)
+            .is_some_and(|marker| marker.contains(" backstop="));
+        crate::observability::llm_billing::LlmBilling::for_runtime(
+            &runtime,
+            nonempty_env("LOOM_MODEL_PROFILE").as_deref(),
+            metered_backstop,
+        )
+        .stamp(&mut trace_identity);
+    }
     // Host memory state at the runtime's launch (this span's begin boundary;
     // the daemon stamps the end boundary when the child exits or is observed
     // gone). Clones of this identity carry the snapshot onto the RuntimeRun

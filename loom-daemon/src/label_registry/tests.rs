@@ -59,6 +59,48 @@ fn validation_rejects_bad_registries() {
 }
 
 #[test]
+fn validation_rejects_bad_propagate() {
+    let good: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+    let idx = |name: &str| reg().labels.iter().position(|l| l.name == name).unwrap();
+    let (ext, tier) = (idx("external"), idx("tier:maintenance"));
+    let mutate = |i: usize, key: &str, val: serde_json::Value| {
+        let mut v = good.clone();
+        v["labels"][i]["propagate"][key] = val;
+        Registry::parse(&v.to_string())
+    };
+    assert!(mutate(ext, "direction", "child-to-parent".into()).is_err());
+    assert!(mutate(ext, "add", "sometimes".into()).is_err());
+    assert!(mutate(ext, "bogus", true.into()).is_err());
+    // A rank gap, and two rules sharing a rank.
+    assert!(mutate(ext, "rank", 9.into()).is_err());
+    assert!(mutate(ext, "rank", 1.into()).is_err());
+    // A family default without a family; a family that is not the prefix.
+    assert!(mutate(tier, "family", serde_json::Value::Null).is_err());
+    assert!(mutate(ext, "family", "tier:".into()).is_err());
+    // Family members must agree.
+    assert!(mutate(tier, "to_prs", true.into()).is_err());
+}
+
+#[test]
+fn propagate_holds_the_10012_table() {
+    let named: Vec<(&str, u32)> = reg()
+        .labels
+        .iter()
+        .filter_map(|l| l.propagate.as_ref().map(|p| (l.name.as_str(), p.rank)))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("loom:operator-priority", 1),
+            ("tier:goal-advancing", 3),
+            ("tier:goal-supporting", 3),
+            ("tier:maintenance", 3),
+            ("external", 2),
+        ]
+    );
+}
+
+#[test]
 fn registry_covers_every_label_in_both_labels_yml_copies() {
     for rel in [".github/labels.yml", "defaults/.github/labels.yml"] {
         let yml = std::fs::read_to_string(repo_root().join(rel)).unwrap();
@@ -178,27 +220,43 @@ fn work_finder_name_constants_match_their_registry_properties() {
     assert_eq!(decision.requires_base.as_deref(), Some("loom:operator-only"));
 }
 
-// --- lockstep: one test per remaining hand-listed table (slice 2b) ------------
+// --- slice 2b: more derived tables, pinned to their previous literals --------
 
 #[test]
-fn lockstep_operator_gate_labels() {
+fn derived_operator_gate_labels_equal_the_previous_literal() {
     assert_eq!(
         set(crate::pr_latency::OPERATOR_GATE_LABELS.iter().copied()),
-        prop("operator_gate")
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:needs-capability"
+        ])
     );
 }
 
 #[test]
-fn lockstep_pr_latency_hold_labels() {
+fn derived_pr_latency_hold_labels_equal_the_previous_set() {
+    // Previously: gates + parks + every `loom:operator-` label except the
+    // priority levels. Over the registry's labels that is exactly this set.
     let all: Vec<&str> = reg().labels.iter().map(|l| l.name.as_str()).collect();
     let got = crate::pr_latency::hold_labels(&all);
-    assert_eq!(set(got.iter().map(String::as_str)), prop("hold"));
+    assert_eq!(
+        set(got.iter().map(String::as_str)),
+        set([
+            "loom:blocked",
+            "loom:operator",
+            "loom:operator-only",
+            "loom:needs-capability",
+            "loom:operator-blocked",
+            "loom:operator-mechanical",
+            "loom:operator-decision",
+            "loom:operator-objective",
+        ])
+    );
 }
 
 #[test]
-fn lockstep_eta_hold_labels() {
-    // eta::labels::hold_labels = blocked + park + skip (minus the claim) +
-    // queue_blocked's co-labels.
+fn derived_eta_hold_labels_and_queue_blocked_colabels() {
     let mut want: BTreeSet<&str> = BTreeSet::new();
     want.insert(crate::observability::queue_blocked::BLOCKED_LABEL);
     want.extend(prop("park"));
@@ -213,22 +271,42 @@ fn lockstep_eta_hold_labels() {
         set(crate::observability::queue_blocked::HOLD_LABELS
             .iter()
             .copied()),
-        prop("blocked_colabel")
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-mechanical",
+            "loom:needs-capability"
+        ])
     );
 }
 
 #[test]
-fn lockstep_merge_pr_blocking_in_order() {
+fn derived_merge_pr_blocking_equals_the_previous_literal_in_order() {
+    // Order matters: the guard reports the first match in this order.
     assert_eq!(
-        crate::merge_pr::labels::BLOCKING.to_vec(),
-        reg().with_property("contradicts_approval").unwrap()
+        *crate::merge_pr::labels::BLOCKING,
+        [
+            "loom:changes-requested",
+            "loom:blocked",
+            "loom:operator",
+            "loom:sequenced",
+            "loom:review-requested"
+        ]
     );
 }
 
 #[test]
-fn lockstep_human_gated_labels() {
-    assert_eq!(set(crate::eta::labels::HUMAN_GATED_LABELS.iter().copied()), prop("human_gated"));
+fn derived_human_gated_labels_equal_the_previous_literal() {
+    assert_eq!(
+        *crate::eta::labels::HUMAN_GATED_LABELS,
+        ["loom:triage", "loom:curating", "loom:curated"]
+    );
 }
+
+// dep_classify's operator-only base/sub-kind labels are single named labels
+// (each with its own writer and marker), not a set, so they stay consts; this
+// test keeps them and the registry's requires_base/remove_with pairing (#5671)
+// in lockstep.
 
 #[test]
 fn lockstep_dep_classify_operator_only_kinds() {
@@ -249,4 +327,30 @@ fn lockstep_dep_classify_operator_only_kinds() {
         .map(|l| l.name.as_str())
         .collect();
     assert_eq!(requiring, set(base.remove_with.iter().map(String::as_str)));
+}
+
+#[test]
+fn derived_eta_operator_hold_sets_match_the_previous_literals() {
+    use crate::eta::labels::{
+        MERGE_HOLD_COMPANION_LABELS, MERGE_HOLD_LABELS, OPERATOR_HOLD_LABELS,
+    };
+    assert_eq!(
+        set(MERGE_HOLD_LABELS.iter().copied()),
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-decision"
+        ])
+    );
+    assert_eq!(*MERGE_HOLD_COMPANION_LABELS, ["loom:operator-mechanical"]);
+    // Order is load-bearing: `operator_hold_label` reports the first match.
+    assert_eq!(
+        *OPERATOR_HOLD_LABELS,
+        [
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-decision",
+            "loom:operator-mechanical"
+        ]
+    );
 }

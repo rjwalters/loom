@@ -40,6 +40,7 @@
 //! are weighted rather than dropped.
 
 use super::history::{selection_of, SampleSource, Selection, StageSample, StageSamples};
+use super::regime::DriftState;
 use super::{Stage, MIN_SAMPLES};
 use chrono::{DateTime, Utc};
 
@@ -91,6 +92,37 @@ pub fn resolve_half_life(ages_sec: &[i64], base_sec: i64, floor: usize) -> Optio
         half_life = half_life.saturating_mul(2);
     }
     None
+}
+
+/// Divisor applied to the base half-life when the drift check has tripped
+/// (#10528): the system changed, so forget the old regime faster.
+pub const DRIFTED_DIVISOR: i64 = 4;
+
+/// Multiplier applied to the base half-life when the system is stable
+/// (#10528): nothing changed, so lean on more history.
+pub const STABLE_MULTIPLIER: i64 = 2;
+
+/// [`resolve_half_life`] with a drift-aware base (#10528): the base is
+/// shortened by [`DRIFTED_DIVISOR`] when `drift` is
+/// [`DriftState::Drifted`], lengthened by [`STABLE_MULTIPLIER`] when
+/// [`DriftState::Stable`], and unchanged when [`DriftState::Unknown`] — so
+/// with no drift information the answer is exactly [`resolve_half_life`]'s.
+/// The effective-N floor still applies: a shortened half-life is doubled
+/// back up until the floor is met, so it never rests on fewer than `floor`
+/// effective samples.
+#[must_use]
+pub fn resolve_half_life_adaptive(
+    ages_sec: &[i64],
+    base_sec: i64,
+    floor: usize,
+    drift: DriftState,
+) -> Option<i64> {
+    let adapted = match drift {
+        DriftState::Unknown => base_sec,
+        DriftState::Stable => base_sec.saturating_mul(STABLE_MULTIPLIER),
+        DriftState::Drifted => base_sec / DRIFTED_DIVISOR,
+    };
+    resolve_half_life(ages_sec, adapted, floor)
 }
 
 /// Round to six decimals, as every float in an explanation is stored.

@@ -10,11 +10,20 @@
 //!   probe's `used` per pool split into this host's own ledger share and the
 //!   external share. `own`/`external` are omitted, not zeroed, when the probe
 //!   carried no `used` or the forge-call ledger is off.
-//! - **`github.ratelimit.{remaining,used,reset}` gauges**, labelled
-//!   `resource` (`core`|`graphql`) and `account` (the credential identity), on
-//!   the collector's rate-limit tick: one `gh api rate_limit` probe (free —
-//!   it does not count against the quota), falling back to the breaker's
-//!   trip-time budget when the probe fails.
+//! - **`github.ratelimit.{remaining,used,reset}` gauges** (W1, #10343), one
+//!   series per billed bucket: every point is labelled `resource`,
+//!   `account`, `owner` and `role` (and a bucket point `installation`). On
+//!   an App host every reading in [`crate::forge_bucket_book`] is exported
+//!   once per tick, and the 60 s `gh api rate_limit` probe (free — it does
+//!   not count against the quota) is booked there under the primary
+//!   directory's own key (the identity minted into it, #10571) first, so no
+//!   point leaves without an `owner` and the legacy owner-less series no
+//!   longer interleaves with a bucket's. An ambient-login host (an operator's
+//!   own `gh`) has no bucket book entries of its own: it exports the probe
+//!   (falling back to the breaker's trip-time budget) as `owner="-"`,
+//!   `role="ambient"`.
+//! - **`loom.forge.calls`** (W1): the facade's delta counter
+//!   ([`super::forge_calls`]), flushed on this tick.
 //! - **`github.ratelimit.breaker_skips{reason=<job>}`**, a delta counter: one
 //!   per pass a job skipped because the breaker was suppressing. Skip sites
 //!   call [`record_skip`] (via `rate_limit_breaker::global_skip_pass`), which
@@ -24,7 +33,9 @@
 //! **No secret leaves the host.** `account` is `app-<app id>` for the
 //! daemon's GitHub App credential, a validated GitHub login for an ambient
 //! `gh` credential, else `unknown` — never a token, token hash or path
-//! ([`app_account_label`], [`login_account_label`]).
+//! ([`app_account_label`], [`login_account_label`]). `owner` is a validated
+//! GitHub owner (lowercased), `unknown`, or [`AMBIENT_OWNER`]; `role` is one
+//! of `writer`, `reader`, [`AMBIENT_ROLE`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -299,9 +310,23 @@ pub fn login_account_label(login: &str) -> String {
     }
 }
 
-/// Gauges for one budget reading, labelled `resource` and `account`.
+/// The `owner` label of a point that is not one App installation's bucket
+/// (the convention `forge.reader.owner` uses for "App-wide").
+pub const AMBIENT_OWNER: &str = "-";
+
+/// The `role` label of an ambient-login host's points.
+pub const AMBIENT_ROLE: &str = "ambient";
+
+/// Gauges for one budget reading, labelled `resource`, `account`, `owner`
+/// and `role` — an ambient-login host's probe ([`AMBIENT_OWNER`],
+/// [`AMBIENT_ROLE`]); an App host books its probe instead ([`book_budget`]).
 #[must_use]
-pub fn quota_points(budget: &BudgetSnapshot, account: &str) -> Vec<MetricPoint> {
+pub fn quota_points(
+    budget: &BudgetSnapshot,
+    account: &str,
+    owner: &str,
+    role: &str,
+) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     for (resource, remaining, used, reset) in [
         ("core", budget.core_remaining, budget.core_used, budget.core_reset),
@@ -311,6 +336,8 @@ pub fn quota_points(budget: &BudgetSnapshot, account: &str) -> Vec<MetricPoint> 
             MetricPoint::int(name, value)
                 .label("resource", resource)
                 .label("account", account)
+                .label("owner", owner)
+                .label("role", role)
         };
         points.push(point(MetricName::GithubRateLimitRemaining, clamp(remaining)));
         if let Some(used) = used {
@@ -319,6 +346,130 @@ pub fn quota_points(budget: &BudgetSnapshot, account: &str) -> Vec<MetricPoint> 
         points.push(point(MetricName::GithubRateLimitReset, reset.timestamp()));
     }
     points
+}
+
+/// Gauges for every believed bucket-book reading (W1), labelled
+/// `resource`, `account`, `owner`, `installation` (#10571, `-` when no
+/// sidecar named one) and `role` — one series per billed bucket. `role` is
+/// `writer` for the workspace's writer App (`writer_account`: the App
+/// minted into the primary credential directory, else the roster's —
+/// [`writer_account_for`]) and `reader` for any other App.
+#[must_use]
+pub fn bucket_points(
+    readings: &[(crate::forge_bucket_book::BucketKey, crate::forge_bucket_book::Reading)],
+    writer_account: &str,
+) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for (key, reading) in readings {
+        let role = if key.account == writer_account {
+            "writer"
+        } else {
+            "reader"
+        };
+        let point = |name, value| {
+            MetricPoint::int(name, value)
+                .label("resource", key.resource.as_str())
+                .label("account", key.account.as_str())
+                .label("owner", key.owner.as_str())
+                .label("installation", key.installation.as_str())
+                .label("role", role)
+        };
+        if let Some(remaining) = reading.remaining {
+            points.push(point(MetricName::GithubRateLimitRemaining, clamp(remaining)));
+        }
+        if let Some(used) = reading.used {
+            points.push(point(MetricName::GithubRateLimitUsed, clamp(used)));
+        }
+        points.push(point(MetricName::GithubRateLimitReset, reading.reset_epoch));
+    }
+    points
+}
+
+/// Book one 60 s probe reading into the bucket book (#10343) under
+/// `(account, owner, core|graphql)`, witnessed by `installation`, with
+/// [`Source::Probe`], read at the
+/// snapshot's `probed_at`. Only a live probe is booked: the breaker's
+/// trip-time fallback would carry the wrong `observed_at`.
+///
+/// [`Source::Probe`]: crate::forge_bucket_book::Source::Probe
+pub fn book_budget(
+    budget: &BudgetSnapshot,
+    account: &str,
+    owner: &str,
+    installation: Option<&str>,
+) {
+    use crate::forge_bucket_book::{insert, BucketKey, Reading, Resource, Source};
+    for (resource, remaining, used, reset) in [
+        (Resource::Core, budget.core_remaining, budget.core_used, budget.core_reset),
+        (
+            Resource::Graphql,
+            budget.graphql_remaining,
+            budget.graphql_used,
+            budget.graphql_reset,
+        ),
+    ] {
+        insert(
+            BucketKey::new(account, owner, resource).with_installation(installation),
+            Reading {
+                limit: None,
+                remaining: Some(remaining),
+                used,
+                reset_epoch: reset.timestamp(),
+                observed_at: budget.probed_at.timestamp(),
+                source: Source::Probe,
+            },
+        );
+    }
+}
+
+/// Which kind of host a gauge tick runs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeHost {
+    /// The daemon runs under its GitHub App credential: the probe reads the
+    /// writer App's bucket for the workspace's own owner.
+    App {
+        account: String,
+        owner: String,
+        installation: Option<String>,
+    },
+    /// An ambient `gh` login (an operator's machine).
+    Ambient,
+}
+
+/// What one tick does with its probe: an App host books a live reading and
+/// exports nothing here (its points come from [`bucket_points`]); an
+/// ambient host exports the probe, or the breaker's still-open `fallback`,
+/// labelled with `account()`.
+pub fn probe_points(
+    host: &ProbeHost,
+    probed: Option<BudgetSnapshot>,
+    fallback: impl FnOnce() -> Option<BudgetSnapshot>,
+    account: impl FnOnce() -> String,
+) -> Vec<MetricPoint> {
+    match host {
+        ProbeHost::App {
+            account,
+            owner,
+            installation,
+        } => {
+            if let Some(budget) = &probed {
+                book_budget(budget, account, owner, installation.as_deref());
+            }
+            Vec::new()
+        }
+        ProbeHost::Ambient => probed
+            .or_else(fallback)
+            .map(|b| quota_points(&b, &account(), AMBIENT_OWNER, AMBIENT_ROLE))
+            .unwrap_or_default(),
+    }
+}
+
+/// Emit `points` in batches no larger than one record carries, so a busy
+/// interval's `loom.forge.calls` series are never truncated.
+fn emit_chunked(sink: &super::OpsSink, points: Vec<MetricPoint>, since: Option<DateTime<Utc>>) {
+    for chunk in points.chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD) {
+        sink.emit_metrics_since(chunk.to_vec(), since);
+    }
 }
 
 /// The collector's rate-limit tick: one free `gh api rate_limit` probe and
@@ -340,14 +491,60 @@ pub struct AccountCache {
     pub resolved_at: DateTime<Utc>,
 }
 
-fn resolve_account(workspace_root: &Path) -> String {
+/// Whether the daemon runs under its GitHub App credential: its process
+/// `GH_CONFIG_DIR` is the workspace's App config dir.
+fn on_app_host(workspace_root: &Path) -> bool {
     let app_dir = crate::credential_preflight::github_app_gh_config_dir(workspace_root);
-    let on_app = std::env::var_os("GH_CONFIG_DIR").is_some_and(|d| Path::new(&d) == app_dir);
-    if on_app {
-        return crate::forge_identity::cached(workspace_root)
-            .writer
-            .map_or_else(|| "unknown".to_string(), |w| app_account_label(&w.app_id));
+    std::env::var_os("GH_CONFIG_DIR").is_some_and(|d| Path::new(&d) == app_dir)
+}
+
+/// The tick's [`ProbeHost`] for the workspace at `workspace_root`.
+fn probe_host(workspace_root: &Path) -> ProbeHost {
+    probe_host_for(workspace_root, on_app_host(workspace_root))
+}
+
+/// [`probe_host`] with the App-host predicate supplied. The App key is the
+/// identity [`crate::forge_bucket_book::probe_targets`] uses for the same
+/// `.loom/gh-config` directory — its sidecar's, else the roster and remote
+/// ([`crate::forge_bucket_book::dir_identity`], #10571) — so the 60 s probe
+/// adds no key of its own.
+fn probe_host_for(workspace_root: &Path, on_app: bool) -> ProbeHost {
+    if !on_app {
+        return ProbeHost::Ambient;
     }
+    let id = primary_identity(workspace_root);
+    ProbeHost::App {
+        account: id.account,
+        owner: id.owner.unwrap_or_else(|| "unknown".to_string()),
+        installation: id.installation,
+    }
+}
+
+/// The identity minted into the workspace's primary credential directory.
+fn primary_identity(workspace_root: &Path) -> crate::forge_bucket_book::CredIdentity {
+    let dir = crate::credential_preflight::github_app_gh_config_dir(workspace_root);
+    let class = crate::forge_bucket_book::DirClass::PrimaryWriter {
+        root: workspace_root.to_path_buf(),
+    };
+    crate::forge_bucket_book::dir_identity(&dir, &class).unwrap_or_else(|| {
+        crate::forge_bucket_book::CredIdentity {
+            account: crate::forge_bucket_book::writer_account(workspace_root),
+            owner: crate::forge_bucket_book::primary_owner(workspace_root),
+            installation: None,
+            source: crate::forge_bucket_book::IdentitySource::Derived,
+        }
+    })
+}
+
+/// The writer App's account label for [`bucket_points`]' `role`: the App
+/// minted into the primary credential directory, else the roster's.
+#[must_use]
+pub fn writer_account_for(workspace_root: &Path) -> String {
+    primary_identity(workspace_root).account
+}
+
+/// An ambient host's account label: the `gh` login (one core call).
+fn resolve_account() -> String {
     forge::viewer_login().map_or_else(|| "unknown".to_string(), |l| login_account_label(&l))
 }
 
@@ -379,10 +576,10 @@ pub fn cached_account(
     label
 }
 
-fn account(workspace_root: &Path, now: DateTime<Utc>) -> String {
+fn account(now: DateTime<Utc>) -> String {
     let mut guard = ACCOUNT.lock().unwrap_or_else(PoisonError::into_inner);
     let suppressed = crate::rate_limit_breaker::global_is_suppressed();
-    cached_account(&mut guard, now, suppressed, || resolve_account(workspace_root))
+    cached_account(&mut guard, now, suppressed, resolve_account)
 }
 
 /// The breaker's trip-time reading as a gauge fallback, only while every
@@ -396,8 +593,10 @@ pub fn fresh_fallback(
     budget.filter(|b| b.core_reset.min(b.graphql_reset) > now)
 }
 
-/// One rate-limit tick: flush the skip counter, probe the budget (falling
-/// back to the breaker's trip-time reading) and export the gauges. Returns
+/// One rate-limit tick: flush the skip counter, ingest agent `gh` front rows
+/// (#10607), probe the budget (booking it
+/// on an App host, else falling back to the breaker's trip-time reading)
+/// and export the gauges — the bucket book's once, after the probe. Returns
 /// before any probe when no OTLP exporter is running.
 pub async fn record(workspace_root: &Path) {
     let Some(sink) = super::global_ops_sink() else {
@@ -409,15 +608,34 @@ pub async fn record(workspace_root: &Path) {
         .unwrap_or_else(PoisonError::into_inner)
         .replace(now);
     sink.emit_metrics_since(drain_skip_points(), since);
+    // #10607: the agent `gh` fronts' new sink rows join this drain.
+    let now_s = now.timestamp();
+    let _ = tokio::task::spawn_blocking(move || crate::forge_call_stats::ingest::tick(now_s)).await;
+    emit_chunked(sink, super::forge_calls::drain_points(), since);
+    sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
-        let budget = crate::rate_limit_breaker::forge::probe_budget(now).or_else(|| {
-            fresh_fallback(crate::rate_limit_breaker::global().and_then(|b| b.last_budget()), now)
-        })?;
-        Some(quota_points(&budget, &account(&root, now)))
+        let host = probe_host(&root);
+        let points = probe_points(
+            &host,
+            crate::rate_limit_breaker::forge::probe_budget(now),
+            || {
+                fresh_fallback(
+                    crate::rate_limit_breaker::global().and_then(|b| b.last_budget()),
+                    now,
+                )
+            },
+            || account(now),
+        );
+        (points, writer_account_for(&root))
     })
     .await;
-    if let Ok(Some(points)) = sampled {
+    let Ok((points, writer)) = sampled else {
+        return;
+    };
+    let book = crate::forge_bucket_book::snapshot(Utc::now().timestamp());
+    emit_chunked(sink, bucket_points(&book, &writer), None);
+    if !points.is_empty() {
         sink.emit_metrics(points);
     }
 }
@@ -437,6 +655,8 @@ mod forge {
             GhTarget::None,
             Duration::from_secs(30),
         )
+        // Asker-dependent: `/user` is whoever asks (W4-C writer_only).
+        .writer_identity()
         .args(["api", "user", "--jq", ".login"])
         .run();
         let CmdOutcome::Ran(output) = outcome else {

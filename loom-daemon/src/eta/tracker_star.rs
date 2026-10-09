@@ -134,9 +134,19 @@ impl Tracker {
     /// its current run and on/off instants. Empty when the repo has no fresh
     /// observation before `now`.
     pub(super) fn linked_star(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LinkedStar {
+        self.linked_star_known(repo, pr, now).unwrap_or_default()
+    }
+
+    /// [`Self::linked_star`], but `None` (unknown) when the repo has no fresh
+    /// observation before `now`, for the v2 priority inputs (#10508).
+    pub(super) fn linked_star_known(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<LinkedStar> {
         self.star_inputs(repo, pr, now)
             .map(|(links, changes)| linked_star_at(&links, &changes, now))
-            .unwrap_or_default()
     }
 
     /// `pr`'s links and every star change of `repo` (lowercased), when the

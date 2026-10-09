@@ -28,7 +28,7 @@
 --     leg, shard imbalance (`loom.ci.shard.{index,total,kind}`). Both are
 --     `None` on a job GitHub reported no `created_at` for, or a job whose
 --     display name carries no `(k/N)` shard suffix (`ci.yml`'s two sharded
---     job families: `Rust Unit Tests` / `Rust OTLP Feature Tests` via
+--     job families: `Rust Unit Tests` via
 --     `cargo nextest run --partition`, and `Shell Test Suites` via
 --     `LOOM_CI_SHARD`).
 --   * Sections 11-13 (#9089) and 16-17 (#9456) are the ONLY sections that read
@@ -56,6 +56,10 @@
 --     a test missing from these results is below the floor or outside the cap,
 --     never evidence it did not run. Reading them as a complete test inventory
 --     is the one wrong way to use them (7 days).
+--   * Section 18 (#10670) reads `ci.run` and `ci.job` log records: main's
+--     push-run cancellations split into pending runs superseded by the
+--     concurrency bound (expected) and started runs cancelled (a rule-2
+--     violation) (7 days).
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
@@ -91,7 +95,7 @@
 --     < ci-queries.sql
 --
 -- Parameters (all five must be bound; every one is used):
---   since         DateTime (UTC) lower bound for sections 0-1 and 3-8
+--   since         DateTime (UTC) lower bound for sections 0-1, 3-8 and 18
 --   repo          'owner/name' to scope to one repository, '' for the whole org
 --   bucket_hours  trend bucket width for sections 1 and 3 (24 = daily, 168 = weekly)
 --   window_hours  section 2 compares [now - w, now) against [now - 2w, now - w)
@@ -969,10 +973,11 @@ LIMIT {top:UInt32};
 --     spans the leg emitted -- at `nextest::MAX_TEST_SPANS_PER_JOB` the cap is
 --     binding and `leg_tail_s` is a floor, not a total.
 --
---     `job` is in the GROUP BY precisely because `ci.yml` has TWO
---     nextest-partition families both sharding 1..3: comparing a `Rust Unit
---     Tests` leg against a `Rust OTLP Feature Tests` leg of the same `(k/N)`
---     compares two unrelated partitions.
+--     `job` is in the GROUP BY precisely so a second
+--     nextest-partition family sharding 1..3 (the `Rust OTLP Feature Tests`
+--     family existed until #10823) would not be merged with `Rust Unit Tests`:
+--     legs of different families with the same `(k/N)` are unrelated
+--     partitions.
 --
 --     TRACES, 7 days.
 WITH tests AS (
@@ -1004,3 +1009,80 @@ FROM tests
 GROUP BY repo, workflow, run_id, job, shard_index, shard_total
 ORDER BY run_id DESC, leg_tail_s DESC
 LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 18. Main cancellation split (#10670). How often a default-branch push run
+--     ends `cancelled`, and WHY. `ci.yml` bounds main with one concurrency
+--     group and `cancel-in-progress: false` (ci-principles.md rule 2): the
+--     oldest run keeps running, the newest waits, and every push in between
+--     supersedes the previous still-PENDING run. Such a run never started, so
+--     GitHub created no job for it, and it carries no `ci.job` record here.
+--     That is the bound working, and during a merge burst it is most of main's
+--     `cancelled` count (2026-10-06: 54 of 100 main runs, all job-less).
+--
+--     The two kinds of `cancelled` are therefore told apart by whether ANY
+--     `ci.job` record exists for the run attempt:
+--       * `superseded_before_start` -- no job: a pending run dropped by the
+--         concurrency bound. Expected; not a verdict on the commit.
+--       * `cancelled_after_start`   -- at least one job: a started main run
+--         was cancelled. A rule-2 violation (or a human pressing Cancel) and
+--         must stay 0; loom-daemon's `main_cancel` lint is what keeps workflow
+--         edits from reintroducing one (#7779 was this column at 22/30).
+--     `verified_ratio` is the share of main runs that reached a verdict
+--     (neither cancelled nor unreported) -- how continuously main is checked.
+--
+--     Section 3 already shows a workflow's overall cancelled ratio from
+--     metrics, but metric labels carry no ref or event, so it cannot isolate
+--     main pushes from PR supersession; this section can. The default branch
+--     is matched as `main` (the run's `head_branch`; `refs/heads/main` is
+--     accepted too); edit the literals for a repository whose default branch
+--     differs. A job record can lag its run
+--     record by one poll, so a run cancelled in the last few minutes may
+--     briefly read `superseded_before_start`. `run_jobs` reads one day
+--     before `since`, so a run that completed just after `since` keeps the
+--     job records stamped just before it.
+--
+--     Logs-backed (`ci.run` + `ci.job` records): 7 days.
+WITH main_runs AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           attributes_string['loom.ci.workflow'] AS workflow,
+           toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+           toUInt32(attributes_number['loom.ci.run_attempt']) AS run_attempt,
+           attributes_string['loom.ci.conclusion'] AS conclusion
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.run'
+      AND attributes_string['loom.ci.event'] = 'push'
+      AND attributes_string['loom.ci.ref'] IN ('main', 'refs/heads/main')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY repo, run_id, run_attempt
+),
+run_jobs AS (
+    SELECT attributes_string['loom.repo'] AS repo,
+           toUInt64(attributes_number['loom.ci.run_id']) AS run_id,
+           toUInt32(attributes_number['loom.ci.attempts']) AS run_attempt,
+           uniqExact(toUInt64(attributes_number['loom.ci.job_id'])) AS jobs
+    FROM signoz_logs.logs_v2
+    WHERE body = 'ci.job'
+      -- One day of lookback before `since`: a run whose `ci.run` record lands
+      -- just after `since` can have job records stamped just before it, and
+      -- dropping those would misread a started run as superseded.
+      AND timestamp >= (toUInt64(toUnixTimestamp({since:DateTime})) - 86400) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    GROUP BY repo, run_id, run_attempt
+)
+SELECT r.repo AS repo, r.workflow AS workflow,
+       count() AS runs,
+       countIf(r.conclusion = 'success') AS success,
+       countIf(r.conclusion IN ('failure', 'timed_out', 'startup_failure')) AS failed,
+       countIf(r.conclusion = 'cancelled') AS cancelled,
+       countIf(r.conclusion = 'cancelled' AND j.jobs = 0) AS superseded_before_start,
+       countIf(r.conclusion = 'cancelled' AND j.jobs > 0) AS cancelled_after_start,
+       countIf(r.conclusion = '') AS unreported,
+       round(cancelled / runs, 3) AS cancelled_ratio,
+       round((runs - cancelled - unreported) / runs, 3) AS verified_ratio
+FROM main_runs AS r
+LEFT JOIN run_jobs AS j
+  ON j.repo = r.repo AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt
+GROUP BY repo, workflow
+ORDER BY cancelled_after_start DESC, runs DESC, repo, workflow;

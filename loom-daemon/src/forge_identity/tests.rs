@@ -6,6 +6,7 @@ fn ident(app: &str, slug: Option<&str>) -> Identity {
         app_id: app.to_string(),
         slug: slug.map(str::to_string),
         private_key_path: PathBuf::from(format!("/keys/{app}.pem")),
+        owners: None,
     }
 }
 
@@ -191,7 +192,7 @@ fn write_reader_dir(
     expires: chrono::DateTime<chrono::Utc>,
 ) -> PathBuf {
     let dir = reader_dir(ws, owner, reader);
-    publish(&dir, "ghs_test", reader, "999", &expires.to_rfc3339()).unwrap();
+    publish(&dir, "ghs_test", reader, owner, "999", &expires.to_rfc3339()).unwrap();
     dir
 }
 
@@ -321,17 +322,23 @@ fn refresh_publishes_each_reader_for_each_owner_and_withdraws_failures() {
 
 /// Structural guard (#9537 AC): reader credentials are only ever requested
 /// from the reviewed READ call sites. A new caller of `read_credential` /
-/// `apply_read_credential` must be added here deliberately, by someone who
+/// `apply_read_credential` / `route_read` (W4-B) must be added here deliberately, by someone who
 /// has checked that the call it serves is a read.
 #[test]
 fn only_reviewed_read_paths_request_reader_credentials() {
     const ALLOWED: &[&str] = &[
         "forge_identity.rs",
         "forge_identity/tests.rs",
+        // W4-B: the one routing step `read_credential` now wraps.
+        "forge_identity/route.rs",
         "forge_etag_store.rs", // issue listings + cached views (GET, conditional)
         // #10263: the ETA fleet refresh's repo set — issue listings and PR
         // timelines, GETs only, through `fetch_with_reader`.
         "observability/eta_fleet_refresh.rs",
+        // #10232: resolves which reader serves a repo only to derive the public
+        // `reader:<app id>@<owner>` bucket label; the credential is discarded
+        // and no request is made with it.
+        "eta/stall_features.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
         // #9872: the `GhInvocation` choke point. Only `AccessIntent::Read` +
@@ -340,13 +347,25 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // pins it).
         "gh_invocation/mod.rs",
         "gh_invocation/reader_route.rs",
+        // W4-C: the choke point's class-aware chain (the same reviewed
+        // routing step, with the router injected).
+        "gh_invocation/reader_route_v2.rs",
+        // W7: the ETag store's W4-C deferrable chain (`ConditionalRead::
+        // deferrable`), the same reviewed routing step with the router injected.
+        "forge_etag_store/deferrable.rs",
         // #10391: `eta doctor` resolves (never uses) a reader per repo to say
         // whether one exists; it makes no forge call at all.
         "eta/doctor_facts.rs",
+        // W8: the installation snapshot reads `installation/repositories`
+        // under the repo's reader (token env stripped) for visibility and
+        // identity only; the write-scope probe passes the writer explicitly.
+        "forge_repo_facts/installation.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let re = regex::Regex::new(r"\b(read_credential|read_credential_in|apply_read_credential)\b")
-        .unwrap();
+    let re = regex::Regex::new(
+        r"\b(read_credential|read_credential_in|apply_read_credential|route_read|route_read_in)\b",
+    )
+    .unwrap();
     let mut offenders = Vec::new();
     let mut stack = vec![src.clone()];
     while let Some(dir) = stack.pop() {
@@ -383,25 +402,31 @@ fn only_reviewed_read_paths_request_reader_credentials() {
 }
 
 #[test]
-fn failures_are_scoped_app_wide_or_to_one_repo() {
-    use super::Failure::{App, Coverage};
+fn failures_are_rate_limits_credentials_or_coverage() {
+    let c = |s, h| classify_failure_in(RoutingMode::Scoped, s, h, None, Resource::Core);
     assert_eq!(
-        classify_failure("gh: API rate limit exceeded for installation (HTTP 403)", Some(403)),
-        Some(App)
+        c("gh: API rate limit exceeded for installation (HTTP 403)", Some(403)),
+        Some(Failure::rate_limited(Resource::Core))
     );
+    assert!(
+        matches!(
+            c("secondary rate limit", Some(403)),
+            Some(Failure::RateLimited {
+                secondary: true,
+                ..
+            })
+        ),
+        "a rate-limited 403 is a rate limit, not coverage"
+    );
+    assert_eq!(c("", Some(429)), Some(Failure::rate_limited(Resource::Core)));
+    assert_eq!(c("Bad credentials (HTTP 401)", Some(401)), Some(Failure::Credential));
+    assert_eq!(c("gh: Not Found (HTTP 404)", Some(404)), Some(Failure::Coverage));
     assert_eq!(
-        classify_failure("secondary rate limit", Some(403)),
-        Some(App),
-        "rate-limited 403 is App-wide"
+        c("Resource not accessible by integration (HTTP 403)", Some(403)),
+        Some(Failure::Coverage)
     );
-    assert_eq!(classify_failure("", Some(429)), Some(App));
-    assert_eq!(classify_failure("Bad credentials (HTTP 401)", Some(401)), Some(App));
-    assert_eq!(classify_failure("gh: Not Found (HTTP 404)", Some(404)), Some(Coverage));
-    assert_eq!(
-        classify_failure("Resource not accessible by integration (HTTP 403)", Some(403)),
-        Some(Coverage)
-    );
-    assert_eq!(classify_failure("Server Error (HTTP 502)", Some(502)), None);
+    assert_eq!(c("Server Error (HTTP 502)", Some(502)), None);
+    assert!(Failure::Credential.is_app_wide() && !Failure::Coverage.is_app_wide());
 }
 
 #[test]
@@ -417,7 +442,7 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
         .map(|i| format!("owner/repo-{i}"))
         .find(|repo| reader_for(&r, repo).unwrap().app_id == first)
         .unwrap();
-    withdraw_after(&first, "owner/repo-0", Failure::Coverage, None, "test");
+    withdraw_after(&first, "owner/repo-0", Failure::Coverage, "test");
     assert_ne!(
         reader_for(&r, "owner/repo-0").unwrap().app_id,
         first,
@@ -432,14 +457,20 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
 }
 
 #[test]
-fn an_app_withdrawal_honours_the_reported_reset() {
-    let reset = SystemTime::now() + Duration::from_secs(1800);
-    withdraw_after("reset-app", "o/r", Failure::App, Some(reset), "test");
-    assert!(forge_read_pool::is_withdrawn_at(
-        "reset-app",
-        SystemTime::now() + Duration::from_secs(1700)
+fn a_rate_limit_withdrawal_honours_the_reported_reset_for_that_bucket_only() {
+    let now = SystemTime::now();
+    let reset = now + Duration::from_secs(1800);
+    let f = Failure::rate_limited(Resource::Core).with_reset(Some(reset));
+    withdraw_after_in(RoutingMode::Scoped, "930001", "o/r", f, "test", now, &|_, _, _| None);
+    let during = now + Duration::from_secs(1700);
+    assert!(forge_read_pool::is_withdrawn_scoped_at("930001", "o", Resource::Core, during));
+    assert!(!forge_read_pool::is_withdrawn_scoped_at(
+        "930001",
+        "o",
+        Resource::Core,
+        reset + Duration::from_secs(1)
     ));
-    assert!(!forge_read_pool::is_withdrawn_at("reset-app", reset + Duration::from_secs(1)));
+    assert!(!forge_read_pool::is_withdrawn_at("930001", during), "not App-wide");
 }
 
 #[test]

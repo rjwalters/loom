@@ -65,7 +65,6 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "roster.comments",
         "claim.pr_labels",
         "sequence.predecessor",
-        "claim.pr_list_by_head",
         "intake.list_open",
         "quarantine.issue_list",
         "claim.issue_reclaim",
@@ -74,6 +73,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.issue_release",
         "heal.issue_add_label",
         "intake.add_triage",
+        "intake.remove_triage",
         "verdict.clear_labels",
         "sequence.pr_edit",
         "review_conflict.pr_edit",
@@ -84,6 +84,8 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "review_conflict.pr_comment",
         "roster.delete",
         "roster.patch",
+        "sequence.comment_patch",
+        "sequence.comment_delete",
         "guard.open_pr_timeline",
         "outcome.label_timeline",
         "guard.open_pr_graphql",
@@ -92,6 +94,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.label",
         "quarantine.release",
         "restore.label",
+        "restore.label_timeline",
         "prless.hold_label",
         "guard.lease_comment",
         "guard.lease_yield_comment",
@@ -100,17 +103,15 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "watchdog.stale_comment",
         "outcome.writeback_comment",
         "prless.comment",
+        "park_hold.issue_view",
+        "park_hold.issue_body",
+        "park_hold.issue_labels",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
         assert!(ops::ALL_INVENTORIED.contains(&op), "{name} -> {op:?} not inventoried");
     }
-    for deliberate in [
-        "claim.issue_state",
-        "claim.issue_labels",
-        "star.api",
-        "sequence.pr_view",
-    ] {
+    for deliberate in ["claim.issue_state", "claim.issue_labels", "star.api"] {
         assert_eq!(gh_call::forge_op_for(deliberate), None, "{deliberate}");
     }
 }

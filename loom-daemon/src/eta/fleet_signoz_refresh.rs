@@ -27,17 +27,18 @@
 //!
 //! [`OUTCOMES_SQL`] against the telemetry store's ClickHouse
 //! (`signoz_logs.distributed_logs_v2`, the table the repo's other SigNoz
-//! queries read), returned as `JSONEachRow`. Two transports carry it:
-//! [`ClickhouseHttp`] (ClickHouse's HTTP interface, bound query parameters,
-//! credential read from an owner-only file at call time and never logged) and
-//! [`FileRows`] (the rows of an export an operator ran with `clickhouse-client`
-//! — and the recorded-fixture reader the tests use).
+//! queries read), returned as `JSONEachRow`. The transports are the neutral
+//! SigNoz read client in [`crate::signoz_read`] (#10196 R6):
+//! [`ClickhouseHttp`](crate::signoz_read::ClickhouseHttp) (as a
+//! [`SqlPages`](crate::signoz_read::SqlPages) over [`OUTCOMES_SQL`]) and
+//! [`FileRows`](crate::signoz_read::FileRows) (an operator's
+//! `clickhouse-client` export, and the tests' fixtures).
 
-use super::fleet_signoz::{self, parse_row, BuildStats, ParsedRow, RowCursor, SignozSnapshot};
+use super::fleet_signoz::{self, parse_row, BuildStats, ParsedRow, SignozSnapshot};
+use crate::signoz_read::{PageQuery, ReadError, RowCursor, SignozRead};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The outcomes query: every exported `sweep.outcome` of `{repo}` knowable in
 /// `[{since_ns}, {until_ns}]`, after the keyset position
@@ -73,56 +74,23 @@ LIMIT {limit:UInt32}
 FORMAT JSONEachRow
 ";
 
-/// One page request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageQuery {
-    /// `owner/repo`.
-    pub repo: String,
-    /// Oldest knowable-at, inclusive.
-    pub since: DateTime<Utc>,
-    /// Newest knowable-at, inclusive: the snapshot's `as_of`.
-    pub until: DateTime<Utc>,
-    /// Resume strictly after this `(observed_timestamp ns, record_id)`;
-    /// `None` on the first page.
-    pub after: Option<RowCursor>,
-    /// Rows per page.
-    pub limit: u32,
-}
-
-impl PageQuery {
-    /// The bound query parameters, by the names [`OUTCOMES_SQL`] uses.
-    #[must_use]
-    pub fn params(&self) -> Vec<(&'static str, String)> {
-        let (after_ns, after_id) = self.after.clone().unwrap_or((0, String::new()));
-        let ns = |at: DateTime<Utc>| at.timestamp_nanos_opt().unwrap_or(0).max(0).to_string();
-        vec![
-            ("repo", self.repo.clone()),
-            ("since_ns", ns(self.since)),
-            ("until_ns", ns(self.until)),
-            ("after_ns", after_ns.max(0).to_string()),
-            ("after_id", after_id),
-            ("limit", self.limit.to_string()),
-        ]
+/// The page request for `repo`'s outcomes: the only filter [`OUTCOMES_SQL`]
+/// binds is `{repo}`, which [`FileRows`](crate::signoz_read::FileRows) applies to the row's `repo` column.
+#[must_use]
+pub fn repo_query(
+    repo: &str,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    after: Option<RowCursor>,
+    limit: u32,
+) -> PageQuery {
+    PageQuery {
+        filters: vec![("repo".to_string(), repo.to_string())],
+        since,
+        until,
+        after,
+        limit,
     }
-}
-
-/// Why a page could not be read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadError {
-    /// The backend did not answer (connection, timeout, missing credential).
-    Unavailable(String),
-    /// It answered with an error status.
-    Refused(String),
-}
-
-/// The fetch seam: one page of [`OUTCOMES_SQL`]'s `JSONEachRow` output.
-pub trait SignozRead {
-    /// Read one page.
-    ///
-    /// # Errors
-    ///
-    /// The page could not be read; the walk stops and publishes nothing.
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError>;
 }
 
 /// Why a walk stopped.
@@ -228,13 +196,7 @@ pub fn fetch(
                 format!("window not exhausted after {} page(s)", limits.max_pages),
             );
         }
-        let query = PageQuery {
-            repo: repo.to_string(),
-            since,
-            until: as_of,
-            after: after.clone(),
-            limit,
-        };
+        let query = repo_query(repo, since, as_of, after.clone(), limit);
         let body = match reader.page(&query) {
             Ok(body) => body,
             Err(ReadError::Unavailable(why) | ReadError::Refused(why)) => {
@@ -346,195 +308,4 @@ pub fn run_cycle(
         }
     }
     reports
-}
-
-/// Rows from a `JSONEachRow` export, served page by page under the same
-/// filter, order and keyset [`OUTCOMES_SQL`] applies. The import path for an
-/// operator's `clickhouse-client` export, and the tests' recorded fixture.
-#[derive(Debug, Clone)]
-pub struct FileRows {
-    rows: Vec<(RowCursor, Option<String>, String)>,
-}
-
-impl FileRows {
-    /// Parse `text`. Rows the query would never return in any order (no
-    /// `knowable_time_ns` / `record_id`) are a malformed export.
-    ///
-    /// # Errors
-    ///
-    /// A line is not a JSON object or lacks the paging columns.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let mut rows = Vec::new();
-        for (n, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value =
-                serde_json::from_str(line).map_err(|e| format!("line {}: not JSON: {e}", n + 1))?;
-            let ns = match value.get("knowable_time_ns") {
-                Some(Value::Number(v)) => v.as_i64(),
-                Some(Value::String(s)) => s.trim().parse().ok(),
-                _ => None,
-            }
-            .ok_or_else(|| format!("line {}: no integer knowable_time_ns", n + 1))?;
-            let id = match value.get("record_id") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Null) => String::new(),
-                _ => return Err(format!("line {}: no record_id column", n + 1)),
-            };
-            let repo = value
-                .get("repo")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            rows.push(((ns, id), repo, line.to_string()));
-        }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(FileRows { rows })
-    }
-
-    /// [`Self::parse`] the file at `path`.
-    ///
-    /// # Errors
-    ///
-    /// Unreadable, or malformed as for [`Self::parse`].
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        Self::parse(&text)
-    }
-}
-
-impl SignozRead for FileRows {
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError> {
-        let since = query.since.timestamp_nanos_opt().unwrap_or(0);
-        let until = query.until.timestamp_nanos_opt().unwrap_or(i64::MAX);
-        let lines: Vec<&str> = self
-            .rows
-            .iter()
-            .filter(|(cursor, repo, _)| {
-                repo.as_deref()
-                    .is_some_and(|r| r.eq_ignore_ascii_case(&query.repo))
-                    && cursor.0 >= since
-                    && cursor.0 <= until
-                    && query.after.as_ref().is_none_or(|after| cursor > after)
-            })
-            .take(query.limit as usize)
-            .map(|(_, _, line)| line.as_str())
-            .collect();
-        Ok(lines.join("\n"))
-    }
-}
-
-/// [`OUTCOMES_SQL`] over ClickHouse's HTTP interface: `POST` the query, bind
-/// the parameters as `param_*`, authenticate with `X-ClickHouse-User` /
-/// `X-ClickHouse-Key`.
-///
-/// The password is read from `credential_file` on every page and dropped
-/// immediately; it never reaches a log line, an error string or a file. A
-/// credential file readable by group or others is refused (unix), per the
-/// owner-only rule in `credential-storage.md`.
-#[derive(Debug, Clone)]
-pub struct ClickhouseHttp {
-    /// `http(s)://host:port`.
-    pub endpoint: String,
-    /// ClickHouse user.
-    pub user: Option<String>,
-    /// Owner-only password file.
-    pub credential_file: Option<PathBuf>,
-    /// Per-request timeout.
-    pub timeout: std::time::Duration,
-}
-
-impl ClickhouseHttp {
-    fn password(&self) -> Result<Option<String>, ReadError> {
-        let Some(path) = &self.credential_file else {
-            return Ok(None);
-        };
-        let unavailable = |why: &str| {
-            ReadError::Unavailable(format!("credential file {}: {why}", path.display()))
-        };
-        let meta = std::fs::metadata(path).map_err(|_| unavailable("unreadable"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(unavailable("readable by group or others; chmod 600 it"));
-            }
-        }
-        let _ = meta;
-        let secret = std::fs::read_to_string(path).map_err(|_| unavailable("unreadable"))?;
-        let secret = secret.trim().to_string();
-        if secret.is_empty() {
-            return Err(unavailable("empty"));
-        }
-        Ok(Some(secret))
-    }
-
-    /// The request URL: the endpoint plus every bound parameter.
-    ///
-    /// # Errors
-    ///
-    /// The endpoint is not an `http(s)` URL.
-    pub fn url(&self, query: &PageQuery) -> Result<reqwest::Url, ReadError> {
-        let mut url = reqwest::Url::parse(&self.endpoint)
-            .map_err(|e| ReadError::Unavailable(format!("invalid endpoint: {e}")))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(ReadError::Unavailable("endpoint is not http(s)".to_string()));
-        }
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (name, value) in query.params() {
-                pairs.append_pair(&format!("param_{name}"), &value);
-            }
-        }
-        Ok(url)
-    }
-}
-
-impl SignozRead for ClickhouseHttp {
-    fn page(&mut self, query: &PageQuery) -> Result<String, ReadError> {
-        let url = self.url(query)?;
-        let password = self.password()?;
-        let user = self.user.clone();
-        let timeout = self.timeout;
-        // A private current-thread runtime on its own thread: callers are
-        // synchronous (the CLI, or the refresh task's `spawn_blocking`), and
-        // this must not depend on — or block — whichever runtime they are in.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| ReadError::Unavailable(format!("runtime: {e}")))?;
-                    runtime.block_on(async move {
-                        let client = reqwest::Client::builder()
-                            .timeout(timeout)
-                            .build()
-                            .map_err(|e| ReadError::Unavailable(format!("client: {e}")))?;
-                        let mut request = client.post(url).body(OUTCOMES_SQL);
-                        if let Some(user) = user {
-                            request = request.header("X-ClickHouse-User", user);
-                        }
-                        if let Some(password) = password {
-                            request = request.header("X-ClickHouse-Key", password);
-                        }
-                        let response = request.send().await.map_err(|e| {
-                            ReadError::Unavailable(format!("request failed: {}", e.without_url()))
-                        })?;
-                        let status = response.status();
-                        let body = response.text().await.map_err(|e| {
-                            ReadError::Unavailable(format!("body: {}", e.without_url()))
-                        })?;
-                        if !status.is_success() {
-                            let head: String = body.chars().take(200).collect();
-                            return Err(ReadError::Refused(format!("HTTP {status}: {head}")));
-                        }
-                        Ok(body)
-                    })
-                })
-                .join()
-                .unwrap_or_else(|_| Err(ReadError::Unavailable("reader thread panicked".into())))
-        })
-    }
 }

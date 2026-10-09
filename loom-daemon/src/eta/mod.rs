@@ -17,7 +17,7 @@
 //! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
 //! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
 //! a close. Every path-engine heuristic still refuses it as `blocked` (the
-//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! shadow `land-2026-10-04-twin-otter-b` estimates it from its fit's own
 //! `merge_hold` stage), and the `merge_wait` samples still run from the
 //! approval to the merge, hold
 //! included (the **pooled** definition); the hold-free `merge_wait` and the
@@ -94,13 +94,20 @@
 //! gates, in order — the phase-2 [`backtest`] first, then live paired scoring
 //! — and the switch that flips the config is [`shadow`].
 
+pub mod authority;
 pub mod backtest;
 pub mod calibration_log;
 pub mod config;
+pub mod conformal;
+pub mod conformal_ipcw;
+pub mod conformal_wrap;
+pub mod coverage;
+pub mod dependency;
 pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
+pub mod explain;
 pub mod explanation;
 pub mod fit;
 pub mod flag_timeline;
@@ -113,30 +120,61 @@ pub mod fleet_events_pulls;
 pub mod fleet_events_reviews;
 pub mod fleet_events_webhook;
 pub mod fleet_fetch;
+pub mod fleet_log;
 pub mod fleet_refresh;
 pub mod fleet_signoz;
+pub mod fleet_signoz_history;
 pub mod fleet_signoz_refresh;
+pub mod fleet_signoz_timeline;
+pub mod fleet_signoz_timeline_rows;
 pub mod fleet_state;
 pub mod fleet_state_prs;
 pub mod friction;
 pub mod grid;
+pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
+pub mod hold_kind;
+pub mod hold_marker_log;
+pub mod job_owner;
 pub mod journal;
 pub mod labels;
+pub mod loop_features;
+pub mod nightly_folds;
 pub mod offline;
+pub mod planner_sim;
+pub mod planner_version;
+pub mod point_in_time;
+pub mod pr_features;
+pub(crate) mod pr_features_forge;
+pub mod pr_file_log;
 pub mod priority_features;
+pub mod priority_inputs;
 pub mod queue_features;
+pub mod ready_order;
 pub mod recalibrate;
 pub mod recency;
+pub mod regime;
+pub mod repo_priority;
+pub mod retire_filing;
+pub mod roster_history;
+pub mod scope_features;
 pub mod score;
 pub mod shadow;
+pub mod shadow_fleet;
+pub mod shadow_lifecycle;
+pub mod shadow_non_refusal;
+pub mod shadow_stats;
 pub mod simulate;
+pub mod stage_forecast;
+pub mod stage_queue;
 pub mod stall;
+pub mod stall_features;
 pub mod star;
 pub mod tracker;
 pub mod twin_otter;
+pub mod walk_forward;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -150,6 +188,7 @@ use std::sync::Arc;
 
 pub use explanation::Explanation;
 pub use history::StageSamples;
+pub use shadow_fleet::Tier;
 
 /// The explanation schema tag every estimate carries.
 pub const EXPLANATION_SCHEMA: &str = "eta-explanation/v1";
@@ -357,6 +396,13 @@ pub enum NoEstimateReason {
     /// loaded, it has no direct model, its cutoff is not strictly before
     /// `as_of`, or its coefficients are malformed.
     NoModel,
+    /// A dependency composition (#10510): the item is on a dependency cycle.
+    DependencyCycle,
+    /// A dependency composition: a parent is not in the graph.
+    BlockedByUnknown,
+    /// A dependency composition: a parent has no estimate. The explanation's
+    /// `dependencies.blocked_by` names it and its reason.
+    BlockedBy,
 }
 
 impl NoEstimateReason {
@@ -372,6 +418,9 @@ impl NoEstimateReason {
             NoEstimateReason::UnknownStage => "unknown_stage",
             NoEstimateReason::StaleInputs => "stale_inputs",
             NoEstimateReason::NoModel => "no_model",
+            NoEstimateReason::DependencyCycle => "dependency_cycle",
+            NoEstimateReason::BlockedByUnknown => "blocked_by_unknown",
+            NoEstimateReason::BlockedBy => "blocked_by",
         }
     }
 }
@@ -382,70 +431,10 @@ impl fmt::Display for NoEstimateReason {
     }
 }
 
-/// Which Loom build computed a record — required on every ETA record
-/// (operator requirement on #9289). Sourced from
-/// [`crate::telemetry::trace::provenance::daemon`], the same source every
-/// span's `loom.daemon.*` attributes come from.
-///
-/// A build whose revision or tree state is `unknown` (a tarball build) still
-/// emits, so no data is lost, but with `complete: false`; accuracy queries
-/// exclude incomplete rows, because a result that cannot be pinned to a
-/// commit cannot be attributed to a heuristic's code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Provenance {
-    /// Loom version (`CARGO_PKG_VERSION`).
-    pub version: String,
-    /// Full 40-hex git SHA, or `unknown` for a tarball build.
-    pub revision: String,
-    /// `clean`, `dirty` or `unknown`.
-    pub tree_state: String,
-    /// `revision` is a full 40-hex SHA and `tree_state` is `clean` or
-    /// `dirty`: the build is pinned. Always [`Provenance::completeness`] of
-    /// the other two fields.
-    pub complete: bool,
-}
-
-/// Whether `revision` is a full 40-hex lowercase git SHA.
-fn is_full_sha(revision: &str) -> bool {
-    revision.len() == 40
-        && revision
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-impl Provenance {
-    /// The running binary.
-    #[must_use]
-    pub fn current() -> Self {
-        let build = crate::telemetry::trace::provenance::daemon();
-        Provenance {
-            version: build.version.to_string(),
-            revision: build.revision.to_string(),
-            tree_state: build.tree_state.to_string(),
-            complete: Self::completeness(build.revision, build.tree_state),
-        }
-    }
-
-    /// Whether a build with `revision` and `tree_state` is fully pinned.
-    #[must_use]
-    pub fn completeness(revision: &str, tree_state: &str) -> bool {
-        is_full_sha(revision) && matches!(tree_state, "clean" | "dirty")
-    }
-
-    /// Whether every field is well formed: a non-empty version, a full
-    /// 40-hex revision or the build system's literal `unknown`, a known tree
-    /// state, and a `complete` flag that matches them. An ETA record whose
-    /// provenance fails this is never emitted. An `unknown` revision or tree
-    /// state is well formed (and emitted), but not [`Self::complete`].
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let revision_ok = self.revision == "unknown" || is_full_sha(&self.revision);
-        !self.version.trim().is_empty()
-            && revision_ok
-            && matches!(self.tree_state.as_str(), "clean" | "dirty" | "unknown")
-            && self.complete == Self::completeness(&self.revision, &self.tree_state)
-    }
-}
+/// Which Loom build computed a record. Moved to the neutral
+/// [`crate::telemetry::provenance`] (#11098, Stage 2) because non-ETA records
+/// embed it too; re-exported here so ETA code keeps its path.
+pub use crate::telemetry::provenance::Provenance;
 
 /// What an estimate is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +541,17 @@ pub struct DispatchInput {
     pub saturation_held: bool,
     /// The tick the plan came from.
     pub plan_at: DateTime<Utc>,
+    /// Why this host's planner gave the row no position although the fleet
+    /// can still dispatch it (#10903): its disposition, plus the halt cause
+    /// for a host-local `workspace_halted` (`workspace_halted:token_pool`).
+    /// `None` for a row the planner positioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_here: Option<String>,
+    /// A time-boxed hold's expiry (#9311, #10903): the row cannot be admitted
+    /// before it. Its remaining time from `plan_at` is added to
+    /// [`Self::admission_delay_sec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 impl DispatchInput {
@@ -564,7 +564,10 @@ impl DispatchInput {
 
     /// Fixed seconds from its admitting slot freeing to the dispatch: half a
     /// tick (the mean wait for the next tick), plus one whole tick per full
-    /// admission batch ahead of it when it needs no turnover at all.
+    /// admission batch ahead of it when it needs no turnover at all, plus
+    /// what is left of a time-boxed hold ([`Self::held_until`]) at the tick.
+    /// The hold is added, not overlapped with the queue wait: an upper bound
+    /// when both are long.
     #[must_use]
     pub fn admission_delay_sec(&self) -> i64 {
         let tick = i64::try_from(self.tick_interval_secs).unwrap_or(i64::MAX / 4);
@@ -572,7 +575,12 @@ impl DispatchInput {
             (0, Some(cap)) if cap > 0 => i64::from(self.ahead / cap),
             _ => 0,
         };
-        tick / 2 + batches.saturating_mul(tick)
+        let held = self
+            .held_until
+            .map_or(0, |until| (until - self.plan_at).num_seconds().max(0));
+        (tick / 2)
+            .saturating_add(batches.saturating_mul(tick))
+            .saturating_add(held)
     }
 }
 
@@ -604,6 +612,15 @@ pub struct EstimateInput {
     /// heuristic estimates from it (plus the hold's stall term) instead of
     /// refusing; every other heuristic ignores it.
     pub held: Option<CurrentStage>,
+    /// Per-stage queue context (#10208): items ahead and the recent drain
+    /// rate of the stage the item is in, computed by the tracker from events
+    /// observed before `as_of`. Empty when no fleet view was observed yet.
+    /// Only `little-v0` reads it.
+    pub queue: Vec<stage_queue::StageQueue>,
+    /// The pass's dependency graph (#10510), point-in-time: only a
+    /// dependency composition ([`dependency::compose`]) reads it. `None`
+    /// when no edge was observed.
+    pub dependencies: Option<Arc<dependency::DependencyGraph>>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -624,6 +641,13 @@ pub trait Heuristic: Send + Sync {
     fn models_hold(&self) -> bool {
         false
     }
+    /// What it is for (#10525): a `candidate` unless it declares otherwise.
+    /// Only a candidate is promotable and offered in the ETA chooser; a
+    /// baseline is a reference every candidate is scored beside. No
+    /// registered heuristic is `retired` (a retired id is unregistered).
+    fn tier(&self) -> Tier {
+        Tier::Candidate
+    }
 }
 
 /// Every shipped heuristic, and which one is `current` per kind.
@@ -631,6 +655,12 @@ pub struct Registry {
     heuristics: Vec<Box<dyn Heuristic>>,
     /// The coefficient file the fitted heuristics were built with.
     fit: Option<Arc<fit::CoefficientFile>>,
+    /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with
+    /// (#10508).
+    fit_v2: Option<Arc<fit::CoefficientFile>>,
+    /// The `eta-fit/v3` file `land-2026-10-06-loop-kite` was built with
+    /// (#10521).
+    fit_v3: Option<Arc<fit::CoefficientFile>>,
 }
 
 impl Registry {
@@ -642,34 +672,106 @@ impl Registry {
     }
 
     /// The built-in heuristics, the fitted ones built with `fit`. Pure.
-    /// `land-2026-10-04-twin-otter` (and its pre-PR composition `-b`, last)
-    /// are registered **always**, with
-    /// or without a file, so its refusals are on the record too.
+    /// `land-2026-10-04-twin-otter-b` (the fitted twin-otter evaluation plus
+    /// its pre-PR composition) is registered **always**, with or without a
+    /// file, so its refusals are on the record too. `land-2026-10-04-twin-otter`
+    /// itself is retired (#10528); `-b` still evaluates it for PR stages.
     #[must_use]
     pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
+        Self::with_fits(fit, None)
+    }
+
+    /// [`Self::with_fit`], with `fit_v2` the `eta-fit/v2` file (#10508)
+    /// `land-2026-10-06-keen-wren` reads; each heuristic gets only the
+    /// schema it reads. Pure.
+    #[must_use]
+    pub fn with_fits(
+        fit: Option<Arc<fit::CoefficientFile>>,
+        fit_v2: Option<Arc<fit::CoefficientFile>>,
+    ) -> Self {
+        Self::with_all_fits(fit, fit_v2, None)
+    }
+
+    /// [`Self::with_fits`], with `fit_v3` the `eta-fit/v3` file (#10521)
+    /// `land-2026-10-06-loop-kite` reads. Pure.
+    #[must_use]
+    pub fn with_all_fits(
+        fit: Option<Arc<fit::CoefficientFile>>,
+        fit_v2: Option<Arc<fit::CoefficientFile>>,
+        fit_v3: Option<Arc<fit::CoefficientFile>>,
+    ) -> Self {
         Registry {
             heuristics: vec![
                 Box::new(heuristics::StartV1),
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
-                Box::new(heuristics::LandV3),
-                Box::new(heuristics::LandAmberHeron),
-                Box::new(heuristics::LandFreshTide::default()),
+                // #10489: conformal calibration over land-v2 on the seconds
+                // scale; it replaced the retired log-scale calm-plover here.
+                Box::new(heuristics::LandEvenLark),
                 Box::new(heuristics::LandV4),
-                Box::new(heuristics::LandTwinOtter::new(fit.clone())),
+                Box::new(heuristics::LittleV0),
+                // #10528: twin-otter-b plus the drift-gated regime
+                // adjustment; registered ahead of the other -b wrappers.
+                Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
+                // #10524's IPCW wrappers quick-tern and swift-tern (over
+                // `-b`) and bold-lark (over keen-wren) are retired (#10949).
+                // #10523: twin-otter-b plus the hold/sequence simulator;
+                // also before `-b`.
+                Box::new(heuristics::LandHeldHeron::new(fit.clone())),
+                // #10508: twin-otter-b's priority-aware successor, also
+                // before `-b`.
+                Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
+                // #10521: keen-wren's friction-aware successor, before
+                // twin-otter-b.
+                Box::new(heuristics::LandLoopKite::new(fit_v3.clone())),
+                // `land-2026-10-04-twin-otter` is retired (#10528): its
+                // evaluation lives on inside `-b`, which stays registered.
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
+                Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),
             ],
             fit,
+            fit_v2,
+            fit_v3,
         }
     }
 
     /// The built-in heuristics with the newest coefficient file under
     /// `workspace_root` whose cutoff is strictly before `before`
-    /// ([`fit::load_latest`]). The registry's only I/O.
+    /// ([`fit::load_latest`]), and the newest `eta-fit/v2` file by the same
+    /// rule ([`fit::v2::load_latest_v2`]), and the newest `eta-fit/v3` file
+    /// ([`fit::v3::load_latest_v3`]). The registry's only I/O.
     #[must_use]
     pub fn load(workspace_root: &Path, before: DateTime<Utc>) -> Self {
-        Self::with_fit(fit::load_latest(workspace_root, before).map(Arc::new))
+        Self::with_all_fits(
+            fit::load_latest(workspace_root, before).map(Arc::new),
+            fit::v2::load_latest_v2(workspace_root, before).map(Arc::new),
+            fit::v3::load_latest_v3(workspace_root, before).map(Arc::new),
+        )
+    }
+
+    /// The `eta-fit/v3` file `land-2026-10-06-loop-kite` was built with.
+    #[must_use]
+    pub fn fit_v3(&self) -> Option<&fit::CoefficientFile> {
+        self.fit_v3.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_v3_id(&self) -> Option<&str> {
+        self.fit_v3.as_deref().map(|f| f.id.as_str())
+    }
+
+    /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with.
+    #[must_use]
+    pub fn fit_v2(&self) -> Option<&fit::CoefficientFile> {
+        self.fit_v2.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_v2_id(&self) -> Option<&str> {
+        self.fit_v2.as_deref().map(|f| f.id.as_str())
     }
 
     /// The coefficient file the fitted heuristics were built with.
@@ -693,10 +795,43 @@ impl Registry {
             .map(|h| h.as_ref())
     }
 
+    /// Whether `id` is a registered heuristic predicting `kind`. A persisted
+    /// estimate naming anything else (a retired id, #10484) is not scored.
+    #[must_use]
+    pub fn registers(&self, kind: Kind, id: &str) -> bool {
+        self.get(id).is_some_and(|h| h.kind() == kind)
+    }
+
     /// Every registered id.
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {
         self.heuristics.iter().map(|h| h.id()).collect()
+    }
+
+    /// `id`'s tier (#10525): a registered heuristic's declared one,
+    /// [`Tier::Retired`] for a retired id ([`shadow_fleet::RETIRED`]), `None`
+    /// for an id this build never shipped.
+    #[must_use]
+    pub fn tier_of(&self, id: &str) -> Option<Tier> {
+        self.get(id)
+            .map(|h| h.tier())
+            .or_else(|| shadow_fleet::is_retired(id).then_some(Tier::Retired))
+    }
+
+    /// Hold the registry to the shadow budget (#10525): at most `max_active`
+    /// registered heuristics per kind, the current one included.
+    ///
+    /// # Errors
+    ///
+    /// A kind registers more; the error names it and the heuristics past the
+    /// budget, in registration order.
+    pub fn check_budget(&self, max_active: usize) -> Result<(), shadow_fleet::BudgetExceeded> {
+        shadow_fleet::check_budget(
+            [Kind::Start, Kind::Finish, Kind::Land]
+                .into_iter()
+                .map(|kind| (kind, self.for_kind(kind).map(|h| h.id()).collect())),
+            max_active,
+        )
     }
 
     /// Every registered heuristic that predicts `kind`, in registration
@@ -723,10 +858,12 @@ impl Registry {
     }
 
     /// The current heuristic for `kind`: `configured` when it names a
-    /// registered heuristic of that kind, else the default.
+    /// registered heuristic of that kind that is not shadow-only (`little-v0`
+    /// is never current), else the default.
     #[must_use]
     pub fn current(&self, kind: Kind, configured: Option<&str>) -> &dyn Heuristic {
         configured
+            .filter(|id| !heuristics::is_shadow_only(id))
             .and_then(|id| self.get(id))
             .filter(|h| h.kind() == kind)
             .or_else(|| self.get(Self::default_current(kind)))

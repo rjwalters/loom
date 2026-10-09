@@ -5,10 +5,15 @@
 mod auto_update;
 mod ci;
 mod eta;
+mod fact_id;
+mod fleet_state;
+mod host_export;
 mod metadata;
 mod ops;
+mod pass;
 mod pick_decision;
 mod session_output;
+mod token_ranking;
 
 use std::collections::BTreeMap;
 
@@ -150,6 +155,13 @@ fn severity_text(severity: SeverityNumber) -> &'static str {
 /// record, threaded in by [`build_metrics_request`]) wins; otherwise — traces,
 /// logs, and metrics batches without `host.health` — it falls back to the
 /// exporting build's own `CARGO_PKG_VERSION` (Issue #9028).
+///
+/// `host.name` (Issue #10977) has one source: the envelope's `host_id`, the
+/// same string as `host.id` and `service.instance.id`. For a daemon that is
+/// [`host_identity()`](crate::sweep_registry::host_identity) — the
+/// operator-assigned `$LOOM_HOST_ID` when set, else the OS hostname
+/// (`$HOSTNAME`, then the `hostname` binary). It is set here, on every signal,
+/// so a receiver reached without a collector still gets a readable host axis.
 pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> Resource {
     let version = daemon_version
         .filter(|v| !v.is_empty())
@@ -158,6 +170,7 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
         kv_string("service.name", "loom-daemon"),
         kv_string("service.instance.id", host_id),
         kv_string("host.id", host_id),
+        kv_string("host.name", host_id),
         kv_string("service.version", version),
     ];
     Resource {
@@ -209,23 +222,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
     // other kind's body stays the event name, byte-identical on the wire.
     let mut body_override: Option<String> = None;
-    // Issue #9881: every log record carries its kind as an ORDINARY attribute.
-    // The dashboard's log queries cannot filter on the log `name` column
-    // (SigNoz lowers it to JSON_VALUE on the body and this ClickHouse build
-    // rejects the JSON functions — loom-ui#747), so they discriminate on
-    // `loom.kind` instead. Nothing stamped it: the only rows that ever
-    // matched were d1sync bring-up rows whose payload-copy `kind` predates
-    // the omit list, which is exactly why `charts-outcomes` appeared to
-    // "stop on 2026-09-29" while sweeps kept running — it was reading the
-    // backfill's tail, not live emission. Stamp it here so every
-    // lifecycle-kind log is queryable by kind; the gateway's `keep_keys`
-    // allowlist must admit the key (`sweep_facts_gateway_survival.rs`
-    // guards the pairing).
-    let kind_attribute = kv_string("loom.kind", envelope.record.kind().to_string());
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
@@ -257,7 +256,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         }
         TelemetryRecord::SweepIdentity(r) => {
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
@@ -296,7 +294,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // unresolved case is stamped explicitly instead of a path ever
             // being written.
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
@@ -324,7 +321,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9442: `loom.repo` only when the slug resolved;
             // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
@@ -373,7 +369,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // alongside the sweep lifecycle kinds (not as a metric) because a
             // tick is an event with a result and a detail string, not a gauge.
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.role", r.role.clone()),
@@ -430,7 +425,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
@@ -509,7 +503,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
-                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
@@ -619,27 +612,48 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         TelemetryRecord::EtaEstimate(_)
         | TelemetryRecord::EtaOutcome(_)
         | TelemetryRecord::EtaFleetRefresh(_)
-        | TelemetryRecord::EtaFit(_) => {
+        | TelemetryRecord::EtaFit(_)
+        | TelemetryRecord::EtaBacktestFold(_)
+        | TelemetryRecord::EtaBacktestSummary(_)
+        | TelemetryRecord::PrResolved(_)
+        | TelemetryRecord::EtaStageOutcome(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
-            // explanation); scalars ride as `loom.eta.*` attributes.
-            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            // explanation); scalars ride as `loom.eta.*` attributes. Issues
+            // #10519 / #10929: `pr.resolved` and `eta.stage_outcome` are
+            // stamped at the merge/close or stage exit, and observed when the
+            // daemon saw it (knowable-at).
+            let (event_name, severity, at, mut attributes, body) =
+                eta::log_parts(&envelope.record)?;
+            eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
             time_unix_nano = at;
+            if let Some(observed) = eta::observed_at(&envelope.record) {
+                observed_time_unix_nano = nanos(observed);
+            }
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::AutoUpdateTick(_) => {
-            // Issue #10414: one self-update decision, stamped at the tick's
-            // start; the body is the record's JSON.
-            let (event_name, severity, at, attributes, body) =
-                auto_update::log_parts(&envelope.record)?;
-            time_unix_nano = at;
-            body_override = Some(body);
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::PickDecision(_) => {
-            // Issue #10212: body is the record's JSON (the ranked candidates).
-            let (event_name, severity, at, attributes, body) =
-                pick_decision::log_parts(&envelope.record)?;
+        TelemetryRecord::AutoUpdateTick(_)
+        | TelemetryRecord::TokenRankingRefresh(_)
+        | TelemetryRecord::HostExport(_)
+        | TelemetryRecord::PassSummary(_)
+        | TelemetryRecord::PassVerdict(_)
+        | TelemetryRecord::FleetState(_)
+        | TelemetryRecord::PickDecision(_) => {
+            // One record, stamped at its own time; the body is the record's
+            // JSON. Issue #10414: one self-update decision (the tick's start).
+            // Issue #10744: one token-ranking refresh round (the round's
+            // start). Issue #10752: one pass / one artifact verdict (when
+            // decided). Issue #10196: one fleet-state snapshot (rows +
+            // census; anchor/delta scalars ride as `loom.fleet.*`
+            // attributes). Issue #10212: one pick decision (the ranked
+            // candidates). Each `log_parts` is `None` for every other kind.
+            let r = &envelope.record;
+            let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
+                .or_else(|| token_ranking::log_parts(r))
+                .or_else(|| host_export::log_parts(r))
+                .or_else(|| pass::log_parts(r))
+                .or_else(|| fleet_state::log_parts(r))
+                .or_else(|| pick_decision::log_parts(r))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -678,9 +692,21 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     };
     // Issue #10196: every log kind carries a content-derived record id so a
     // replay reader can dedupe at-least-once delivery (`LIMIT 1 BY`) without
-    // a per-kind rule. Inserted first so the 64-attribute bound never drops it.
+    // a per-kind rule. Issue #9881: every log kind also carries its kind as an
+    // ORDINARY `loom.kind` attribute — the dashboard cannot filter on the log
+    // `name` column (loom-ui#747), so it discriminates on this key, which the
+    // gateway's `keep_keys` admits (`loom_kind_discriminator.rs`). Stamped
+    // HERE, once, from the registry tag (#10899: the per-arm stamp missed
+    // every `eta.*`, `ci.*` and newer kind, so `loom.kind LIKE 'eta%'` read
+    // "no ETAs ever"). Both go first so the 64-attribute bound never drops them.
     let mut attributes = attributes;
+    attributes.retain(|kv| kv.key != "loom.kind");
+    attributes.insert(0, kv_string("loom.kind", envelope.record.kind().to_string()));
     attributes.insert(0, kv_string("loom.record_id", record_id(envelope)));
+    // Issue #11125: outcome facts also carry a host-independent id.
+    if let Some(fact) = fact_id::of(&envelope.record) {
+        attributes.insert(2, kv_string("loom.fact_id", fact));
+    }
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

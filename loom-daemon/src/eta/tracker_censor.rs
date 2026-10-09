@@ -17,9 +17,11 @@
 //! #10211), or whose p90 is not yet behind `now`, is undecided and is dropped
 //! as before.
 
+use super::Kind;
 use super::{Resolved, Tracker, MAX_PENDING, PENDING_MAX_AGE_DAYS};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind};
 use chrono::{DateTime, Duration, Utc};
+use std::collections::{HashMap, HashSet};
 
 /// The `outcome_source` of a censored outcome.
 pub const CENSOR_SOURCE: &str = "pending_expiry";
@@ -54,10 +56,80 @@ pub fn censor(estimate: &EstimateSummary, now: DateTime<Utc>) -> Option<Resolved
     })
 }
 
+/// Evict up to `excess` redundant estimates from `pending` (ordered oldest
+/// first), keeping each series' earliest and latest. A series is
+/// `(repo, issue, kind, heuristic)`. Each round removes every other middle
+/// estimate of each series, oldest candidates first, so the survivors stay
+/// spread across the series' whole lead range. Returns the number evicted.
+fn thin_redundant(pending: &mut Vec<EstimateSummary>, mut excess: usize) -> usize {
+    let mut evicted = 0;
+    while excess > 0 {
+        let mut series: HashMap<(&str, u32, Kind, &str), Vec<usize>> = HashMap::new();
+        for (i, p) in pending.iter().enumerate() {
+            series
+                .entry((p.repo.as_str(), p.issue, p.kind, p.heuristic.as_str()))
+                .or_default()
+                .push(i);
+        }
+        let mut candidates: Vec<usize> = series
+            .values()
+            .filter(|ix| ix.len() >= 3)
+            .flat_map(|ix| ix[1..ix.len() - 1].iter().copied().step_by(2))
+            .collect();
+        if candidates.is_empty() {
+            break;
+        }
+        candidates.sort_unstable();
+        candidates.truncate(excess);
+        let doomed: HashSet<usize> = candidates.into_iter().collect();
+        let mut i = 0;
+        pending.retain(|_| {
+            let keep = !doomed.contains(&i);
+            i += 1;
+            keep
+        });
+        evicted += doomed.len();
+        excess -= doomed.len();
+    }
+    evicted
+}
+
+/// Reduce series still holding two or more estimates to their earliest,
+/// up to `excess` evictions, oldest candidates first (#10496). The second
+/// thinning tier: it runs once [`thin_redundant`] has nothing left to thin,
+/// so that a pair gives up its later refresh before any other series loses
+/// its only estimate. Returns the number evicted.
+fn thin_to_earliest(pending: &mut Vec<EstimateSummary>, excess: usize) -> usize {
+    let mut series: HashMap<(&str, u32, Kind, &str), Vec<usize>> = HashMap::new();
+    for (i, p) in pending.iter().enumerate() {
+        series
+            .entry((p.repo.as_str(), p.issue, p.kind, p.heuristic.as_str()))
+            .or_default()
+            .push(i);
+    }
+    let mut candidates: Vec<usize> = series
+        .values()
+        .flat_map(|ix| ix[1..].iter().copied())
+        .collect();
+    candidates.sort_unstable();
+    candidates.truncate(excess);
+    let doomed: HashSet<usize> = candidates.into_iter().collect();
+    let mut i = 0;
+    pending.retain(|_| {
+        let keep = !doomed.contains(&i);
+        i += 1;
+        keep
+    });
+    doomed.len()
+}
+
 impl Tracker {
     /// Drop pending estimates older than [`PENDING_MAX_AGE_DAYS`] — scoring
-    /// each decided late surprise among them first — and the oldest past
-    /// [`MAX_PENDING`].
+    /// each decided late surprise among them first — and the excess past
+    /// [`MAX_PENDING`], in three tiers: redundant middle refreshes, then
+    /// each series' later estimates down to its earliest, and only then —
+    /// when there are more distinct series than the cap — whole series,
+    /// oldest first.
     pub fn expire(&mut self, now: DateTime<Utc>) -> Expired {
         let before = self.pending.len();
         let cutoff = now - Duration::days(PENDING_MAX_AGE_DAYS);
@@ -67,13 +139,28 @@ impl Tracker {
         self.pending = keep;
         let mut censored: Vec<Resolved> = expiring.iter().filter_map(|p| censor(p, now)).collect();
         if self.pending.len() > MAX_PENDING {
+            // Evict redundant refreshes per series first (#10496): the oldest
+            // estimate of a series is its longest-lead one, which scoring
+            // needs most, so a series keeps its earliest and latest.
             let excess = self.pending.len() - MAX_PENDING;
-            // The oldest are the long-horizon estimates scoring needs most;
-            // the caller warns when this is non-zero. A decided late surprise
-            // among them is still scored on the way out.
+            self.cap_dropped += thin_redundant(&mut self.pending, excess);
+        }
+        if self.pending.len() > MAX_PENDING {
+            // Then pairs give up their later estimate, so no series is lost
+            // while another still holds two.
+            let excess = self.pending.len() - MAX_PENDING;
+            self.cap_dropped += thin_to_earliest(&mut self.pending, excess);
+        }
+        if self.pending.len() > MAX_PENDING {
+            // Only when distinct series alone exceed the cap: every series is
+            // down to one estimate, so each eviction loses a whole series.
+            // The oldest go, and a decided late surprise among them is still
+            // scored on the way out.
+            let excess = self.pending.len() - MAX_PENDING;
             let over: Vec<EstimateSummary> = self.pending.drain(..excess).collect();
             censored.extend(over.iter().filter_map(|p| censor(p, now)));
             self.cap_dropped += excess;
+            self.cap_series_dropped += excess;
         }
         Expired {
             dropped: before - self.pending.len(),

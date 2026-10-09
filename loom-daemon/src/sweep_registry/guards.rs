@@ -23,9 +23,14 @@ pub(crate) mod claim_label;
 
 /// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
 mod gh_exec;
+/// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
+/// frozen by `scripts/file-size-baseline.txt`.
+pub(crate) mod issue_snapshot;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
+/// The dispatch path's memo gating (resume reads live) and refusal ledger (W9).
+pub(crate) mod refusal_memo;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -542,6 +547,16 @@ impl SweepRegistry {
     /// [`reap_gh_timeout`] exactly like the label flips so it cannot block the
     /// dispatch path.
     ///
+    /// **Leg 0: the cached open-PR listing (#10514).** Each round first reads
+    /// the ETag'd REST open-PR listing the claim-reconciliation passes already
+    /// keep warm (an unchanged repo is a free `304`) and classifies it with
+    /// [`crate::worktree_ops::linked_pr_listing`]: a `Closes`/`Part of #N`
+    /// body or a same-repo `feature/issue-N` head links, under the same H14
+    /// fork-trust rule. A read listing is the verdict; the GraphQL/timeline
+    /// union below runs only when it could not be read, and a failed read is
+    /// never "no PR" (#7863). The listing does not see sidebar links or
+    /// cross-repo / URL-form closing references (see that module).
+    ///
     /// The query itself
     /// ([`crate::worktree_ops::gh::open_linked_pr_args`]) and its
     /// classification ([`crate::worktree_ops::gh::parse_open_linked_pr`] — the
@@ -621,7 +636,14 @@ impl SweepRegistry {
             );
             return OpenPrProbe::Open(memo.pr);
         }
+        self.live_open_pr_probe(issue)
+    }
 
+    /// [`Self::probe_open_linked_pr`] without the fresh-memo short circuit:
+    /// the forge answers (with the #6058 retry and the #6788 known-PR recheck
+    /// backstop). Every decision that a memo answer would *permit* rather
+    /// than refuse, the #4256 resume, calls this (W9, see `refusal_memo`).
+    pub(crate) fn live_open_pr_probe(&self, issue: u32) -> OpenPrProbe {
         for attempt in 1..=OPEN_PR_PROBE_MAX_ATTEMPTS {
             let verdict = self.probe_open_linked_pr_transports(issue);
             if verdict != OpenPrProbe::ProbeFailed {
@@ -833,11 +855,27 @@ impl SweepRegistry {
         guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
-    /// One GraphQL/REST union round of [`probe_open_linked_pr`]. A closing PR
-    /// is decisive; an empty closes-graph still needs the timeline (#7757).
-    /// Extracted so the #6058 retry loop above can invoke it more than once
-    /// without duplicating the transport-selection logic.
+    /// One round of [`probe_open_linked_pr`]. Leg 0 (#10514): the cached REST
+    /// open-PR listing of the repo resolved here (never `origin`'s, which a
+    /// fork clone points elsewhere) — when it reads, its verdict is final. Only a listing that could not be
+    /// read falls back to the GraphQL/REST union: a closing PR is decisive; an
+    /// empty closes-graph still needs the timeline (#7757). Extracted so the
+    /// #6058 retry loop above can invoke it more than once.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
+        // Every leg needs the repo, and each answers `ProbeFailed` without it
+        // (#4452): resolve once, so an unresolvable repo costs one call, not three.
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        let (root, gh, nwo) =
+            (&self.config.workspace_root, self.resolved_gh(), format!("{owner}/{repo}"));
+        let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
+        let target = (nwo.as_str(), issue);
+        let listed =
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, target, bound);
+        if let Some(verdict) = listed {
+            return verdict;
+        }
         let graphql = self.probe_open_linked_pr_graphql(issue);
         if matches!(graphql, OpenPrProbe::Open(_)) {
             return graphql;
@@ -1104,8 +1142,11 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: read back after this daemon's own flip, so the writer that
+        // made it answers (a reader may lag the write).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
+            .writer_identity()
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1150,6 +1191,26 @@ impl SweepRegistry {
                     return Some((o.to_string(), r.to_string()));
                 }
             }
+        }
+        // W3a: the repo-facts record (fingerprint-invalidated, `gh repo view`
+        // semantics) answers without a forge call, and each answer also
+        // refreshes the in-process cache. `Legacy` AND `Unavailable` fall
+        // through to that cache + `gh repo view` below: every guard
+        // downstream fails OPEN on `None`, so a failed record verify (a
+        // blip, the breaker, the 300 s suspect backoff that follows it)
+        // must never cost a repo answer the process already had or that
+        // the pre-facts path would still produce.
+        match self.owner_repo_fact() {
+            crate::forge_repo_facts::Lookup::Fact(f) => {
+                let pair = (f.owner, f.name);
+                *self
+                    .owner_repo_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pair.clone());
+                return Some(pair);
+            }
+            crate::forge_repo_facts::Lookup::Unavailable
+            | crate::forge_repo_facts::Lookup::Legacy => {}
         }
         if let Some(cached) = self
             .owner_repo_cache
@@ -1498,8 +1559,10 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: verifies this daemon's own just-written lease (and its
+        // callers fail open after a few retries), so the writer reads it.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.arg("api")
+        cmd = cmd.writer_identity().arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")
@@ -2662,14 +2725,15 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            6,
+            7,
             "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
              probe, Issue #4887's follow-up `loom:operator-only` probe — the fake `gh` prints \
              nothing so both park probes read as absent, Issue #4653's `is_pr` probe's \
              `resolve_owner_repo` lookup — which bails before the second `gh api` call since \
              the fake `gh` prints nothing for `repo view` — Issue #9463's closed-state probe \
-             (an unverifiable state fails open to the restore) — then the edit — 5 calls) to \
-             invoke gh six times total; got cwds: {cwds:?}"
+             (an unverifiable state fails open to the restore) — Issue #10955's label-history \
+             read (an empty history fails open to the restore) — then the edit — 6 calls) to \
+             invoke gh seven times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
@@ -3721,6 +3785,10 @@ mod union_tests;
 #[cfg(test)]
 #[path = "guards_preflip_tests.rs"]
 mod preflip_tests;
+
+#[cfg(test)]
+#[path = "guards_listing_tests.rs"]
+mod listing_tests;
 
 // Issue #8263's `gh api` GH_REPO regression coverage. A plain child module
 // (guards/repo_env_tests.rs) rather than another `#[path]` sibling: this file

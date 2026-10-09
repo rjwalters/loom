@@ -3,9 +3,13 @@
 //! The `gh`-calling paths are exercised by the stubbed-`gh` shell suite,
 //! `defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh` — the
 //! same split `cli/stale_blocked.rs` uses. The population filter itself
-//! (`cited_among`) is tested in `stale_blocked/tests.rs`.
+//! (`cited_among`) is tested in `stale_blocked/tests.rs`, and the cited-only
+//! gathering's forge-call counts in `stale_blocked/notify_tests.rs`.
 
 use super::*;
+use loom_daemon::dep_recheck::extract;
+use loom_daemon::stale_blocked::cited_among;
+use loom_daemon::stale_blocked::notify::has_marker;
 
 fn input_with_comment(body: &str) -> extract::Input {
     extract::Input {
@@ -71,4 +75,32 @@ fn parse_close_targets_treats_no_references_as_empty_not_an_error() {
 #[test]
 fn parse_close_targets_reports_unreadable_output_as_an_error() {
     assert!(parse_close_targets(b"not json").is_err());
+}
+
+/// #10515: the per-merge path must stay on the batched REST + ETag gatherer.
+/// A per-artifact `gh issue view` here is a GraphQL read per open
+/// `loom:blocked` artifact per merge — the regression this pins.
+#[test]
+fn notify_never_reads_the_forge_per_artifact() {
+    let src = include_str!("../notify_cleared_blockers.rs");
+    for banned in [
+        "dep_recheck::forge",
+        "gh_query",
+        "\"issue\", \"view\"",
+        "stale_blocked::gather",
+        "list_blocked",
+    ] {
+        assert!(!src.contains(banned), "notify_cleared_blockers.rs must not use `{banned}`");
+    }
+}
+
+/// #9274: an Unticked citer is notified, and the reason names the unticked box.
+#[test]
+fn unticked_reason_names_the_ref_and_the_unticked_box() {
+    let r = unticked_reason(&["#200".to_string()], 0);
+    assert!(r.contains("#200"), "{r}");
+    assert!(r.contains("checklist box is still unticked"), "{r}");
+    assert!(!r.contains("no readable ref"), "{r}");
+    let r = unticked_reason(&[], 2);
+    assert!(r.contains("2 unchecked line(s) with no readable ref"), "{r}");
 }

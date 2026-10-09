@@ -39,7 +39,8 @@
 //! the next tick retries); accepting would hand an unverified binary the right
 //! to replace it.
 
-use super::{checksum, glibc, signature};
+use super::evidence::{self, EvidenceFacts, EvidenceOutcome};
+use super::{checksum, glibc, signature, source};
 use crate::cmd_out::{self, CmdOutcome};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -69,6 +70,68 @@ pub struct FetchInputs<'a> {
     pub cosign_identity_env: Option<String>,
     /// `LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER`.
     pub cosign_oidc_issuer_env: Option<String>,
+}
+
+/// Env: opt in to required-assurance mode (#10470). Default off = "present-only".
+pub const REQUIRE_SIGNATURE_ENV: &str = "LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE";
+/// Env: optional approved release-workflow path (e.g. `release.yml`) pinned
+/// into the derived keyless identity. Unset keeps the `[^@]+` default.
+pub const APPROVED_WORKFLOW_ENV: &str = "LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW";
+
+/// Signature assurance policy (#10470).
+///
+/// The default is the "present-only" compatibility mode (#5054): an unsigned
+/// release or an unverifiable signature is a loud skip, never a block. With
+/// `require_signature` set (the "required" mode) both become a refusal before
+/// anything is provisioned. Default-constructed it changes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignaturePolicy {
+    /// Refuse [`signature::SignatureState::Skipped`] / `Unavailable`.
+    pub require_signature: bool,
+    /// Optional approved workflow path for the keyless identity pin; also the
+    /// "policy revision" recorded in the evidence line.
+    pub approved_workflow: Option<String>,
+    /// Approved source anchor (#10473), required mode only; see [`source`].
+    pub approved_source_anchor: source::AnchorSetting,
+    /// Local adoption record for tag-movement / asset-replacement detection
+    /// (#10473); `None` disables it.
+    pub adoption_record: Option<PathBuf>,
+}
+
+impl SignaturePolicy {
+    /// Read the policy from the environment (env > default; the update loop
+    /// has no config-file knobs, see daemon-reference).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            approved_source_anchor: source::parse_anchor(
+                std::env::var(source::APPROVED_SOURCE_ANCHOR_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+            adoption_record: source::default_record_path(),
+            ..Self::from_values(
+                std::env::var(REQUIRE_SIGNATURE_ENV).ok().as_deref(),
+                std::env::var(APPROVED_WORKFLOW_ENV).ok().as_deref(),
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn from_values(require: Option<&str>, workflow: Option<&str>) -> Self {
+        let require_signature = require.is_some_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        });
+        let approved_workflow = workflow
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string);
+        Self {
+            require_signature,
+            approved_workflow,
+            ..Self::default()
+        }
+    }
 }
 
 /// The verified artifact, plus every fact the shell wrapper's own globals
@@ -163,7 +226,18 @@ impl Drop for ScratchDir {
     }
 }
 
-fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], dest: &Path) -> bool {
+/// Download the assets of release `tag` matching `patterns` into `dest`
+/// (`gh release download --clobber`, through [`crate::gh_invocation::GhInvocation`]
+/// so the call is counted). `true` on success. Also used by the
+/// install-compat CI proof (`crate::install_compat_harness`).
+#[must_use]
+pub fn download(
+    repo_root: &Path,
+    repo_slug: &str,
+    tag: &str,
+    patterns: &[&str],
+    dest: &Path,
+) -> bool {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade, so the download is counted.
     let op = Operation::new("release.download");
@@ -313,9 +387,60 @@ fn read_version_output(bin_path: &Path) -> String {
 
 const ABORT_LINE: &str = "Aborting the update; the running daemon (if any) is left untouched.";
 
-/// Download + verify one release artifact.
+/// Download + verify one release artifact under the default present-only
+/// policy.
 #[must_use]
 pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
+    fetch_and_verify_with_policy(inputs, &SignaturePolicy::default())
+}
+
+/// The `err()`-worded refusal for required mode, one distinct message per
+/// non-verified state. `Unavailable` is a tooling/identity gap, never worded
+/// as tampering (#8754).
+fn required_refusal_lines(state: signature::SignatureState, bin_name: &str) -> Vec<String> {
+    let head = match state {
+        signature::SignatureState::Skipped => format!(
+            "Required signature assurance is on ({REQUIRE_SIGNATURE_ENV}): unsigned release -- \
+             no signature was published for {bin_name}, so nothing could be verified."
+        ),
+        _ => format!(
+            "Required signature assurance is on ({REQUIRE_SIGNATURE_ENV}): assurance unavailable \
+             (tooling) -- a signature for {bin_name} could not be checked on this host (no \
+             cosign/codesign, an underivable signer identity, or no resolvable public key). This \
+             is NOT evidence of tampering."
+        ),
+    };
+    vec![
+        head,
+        "Refusing the artifact before provisioning. Unset the variable to return to the \
+         present-only compatibility mode."
+            .to_string(),
+        ABORT_LINE.to_string(),
+    ]
+}
+
+/// Download + verify one release artifact under `policy` (#10470). In
+/// required mode a verified outcome's `signature_line` ends with the
+/// `LOOM_SIGNATURE_EVIDENCE` record; see [`evidence`] for the durable record
+/// (#10474) via [`evidence::fetch_and_verify_with_evidence`].
+#[must_use]
+pub fn fetch_and_verify_with_policy(
+    inputs: &FetchInputs<'_>,
+    policy: &SignaturePolicy,
+) -> FetchOutcome {
+    evidence::fetch_and_verify_with_evidence(inputs, policy).0
+}
+
+/// The verification itself. Records every verdict into `facts` (#10474).
+///
+/// Ordering invariant: the candidate binary is never executed (`--version`)
+/// before checksum, signature and the required-mode gate have all passed.
+pub(super) fn verify_core(
+    inputs: &FetchInputs<'_>,
+    policy: &SignaturePolicy,
+    facts: &mut EvidenceFacts,
+) -> FetchOutcome {
+    facts.outcome = EvidenceOutcome::DownloadFailed;
     let scratch = match ScratchDir::create() {
         Ok(s) => s,
         Err(e) => {
@@ -354,6 +479,7 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
 
     // ---- checksum: unconditional ----
     if !checksum::verify(&bin_path, &sha_path) {
+        facts.outcome = EvidenceOutcome::ChecksumMismatch;
         return FetchOutcome::VerificationFailed {
             lines: vec![
                 format!(
@@ -365,6 +491,8 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
         };
     }
     let checksum_line = format!("Checksum verified: {bin_name} matches {sha_name}.");
+    facts.asset_sha256 = crate::release_resolve::host::sha256_file(&bin_path);
+    facts.outcome = EvidenceOutcome::SignatureMaterialUnavailable;
 
     // ---- signature: download when published, verify when present ----
     //
@@ -390,20 +518,29 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
         None
     };
 
-    let sig_result = signature::verify(&signature::VerifyInputs {
-        target: inputs.target,
-        bin_path: &bin_path,
-        sig_path: sig_path.as_deref(),
-        cert_path: cert_path.as_deref(),
-        repo_root: inputs.repo_root,
-        repo_slug: inputs.repo_slug,
-        tag: inputs.tag,
-        cosign_pubkey_env: inputs.cosign_pubkey_env.as_deref(),
-        cosign_identity_env: inputs.cosign_identity_env.as_deref(),
-        cosign_oidc_issuer_env: inputs.cosign_oidc_issuer_env.as_deref(),
-    });
+    let sig_result = signature::verify_with_workflow(
+        &signature::VerifyInputs {
+            target: inputs.target,
+            bin_path: &bin_path,
+            sig_path: sig_path.as_deref(),
+            cert_path: cert_path.as_deref(),
+            repo_root: inputs.repo_root,
+            repo_slug: inputs.repo_slug,
+            tag: inputs.tag,
+            cosign_pubkey_env: inputs.cosign_pubkey_env.as_deref(),
+            cosign_identity_env: inputs.cosign_identity_env.as_deref(),
+            cosign_oidc_issuer_env: inputs.cosign_oidc_issuer_env.as_deref(),
+        },
+        policy.approved_workflow.as_deref(),
+    );
 
+    facts.signature_state = sig_result.state;
     if sig_result.outcome == signature::Outcome::Failed {
+        facts.outcome = if sig_result.inconclusive {
+            EvidenceOutcome::SignatureInconclusive
+        } else {
+            EvidenceOutcome::SignatureInvalid
+        };
         return FetchOutcome::VerificationFailed {
             lines: vec![
                 sig_result.message,
@@ -411,6 +548,60 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
                 ABORT_LINE.to_string(),
             ],
         };
+    }
+
+    facts.verified_by = sig_result.verified_by.clone();
+
+    // ---- required-assurance gate (#10470) ----
+    //
+    // Before GLIBC (which inspects the candidate) and before the `--version`
+    // query below, so an unverified artifact is refused with nothing of it
+    // executed. Off by default: present-only behaviour is untouched.
+    if policy.require_signature {
+        if let Some(
+            state @ (signature::SignatureState::Skipped | signature::SignatureState::Unavailable),
+        ) = sig_result.state
+        {
+            let mut lines = Vec::new();
+            if !sig_result.message.is_empty() {
+                lines.push(sig_result.message.clone());
+            }
+            lines.extend(required_refusal_lines(state, &bin_name));
+            facts.outcome = if state == signature::SignatureState::Skipped {
+                EvidenceOutcome::RefusedUnsigned
+            } else {
+                EvidenceOutcome::RefusedUnavailable
+            };
+            return FetchOutcome::VerificationFailed { lines };
+        }
+    }
+    // ---- source revision / tag movement gate (#10473), same position ----
+    let asset_sha = if policy.require_signature {
+        crate::release_resolve::host::sha256_file(&bin_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let gate_inputs = source::GateInputs {
+        slug: inputs.repo_slug,
+        tag: inputs.tag,
+        target: inputs.target,
+        asset_sha256: &asset_sha,
+        anchor: &policy.approved_source_anchor,
+        record_path: policy.adoption_record.as_deref(),
+    };
+    let mut source_report = None;
+    if policy.require_signature {
+        let api = |path: &str| source::gh_api(inputs.repo_root, path);
+        match source::gate(&api, &gate_inputs) {
+            Ok(r) => source_report = Some(r),
+            Err(refusal) => {
+                facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+                facts.source = Some(refusal.partial);
+                let mut lines = refusal.lines;
+                lines.push(ABORT_LINE.to_string());
+                return FetchOutcome::VerificationFailed { lines };
+            }
+        }
     }
 
     // ---- GLIBC compatibility: the 2026-09-24 incident's fix (#8837) ----
@@ -424,9 +615,22 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
     // daemon, if any, is left untouched).
     let glibc_result = glibc::check(&bin_path, inputs.target);
     if glibc_result.outcome == glibc::Outcome::Incompatible {
+        facts.outcome = EvidenceOutcome::GlibcIncompatible;
         return FetchOutcome::VerificationFailed {
             lines: vec![glibc_result.message, ABORT_LINE.to_string()],
         };
+    }
+
+    // Persist the adoption pin BEFORE the candidate is executed below: a
+    // failed write refuses the artifact rather than adopting it unpinned.
+    if let Some(report) = source_report.as_ref() {
+        if let Err(refusal) = source::record_adoption(report, &gate_inputs) {
+            facts.outcome = EvidenceOutcome::SourceAssuranceRefused;
+            facts.source = Some(refusal.partial);
+            let mut lines = refusal.lines;
+            lines.push(ABORT_LINE.to_string());
+            return FetchOutcome::VerificationFailed { lines };
+        }
     }
 
     let version_output = read_version_output(&bin_path);
@@ -438,7 +642,12 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
     let signature_state = sig_result
         .state
         .unwrap_or(signature::SignatureState::Unavailable);
+    // The `LOOM_SIGNATURE_EVIDENCE` line (required mode) is appended by
+    // `evidence::fetch_and_verify_with_evidence` from these facts.
     let signature_line = sig_result.message;
+    facts.source = source_report;
+    facts.signature_state = Some(signature_state);
+    facts.outcome = EvidenceOutcome::Verified;
     let glibc_line = glibc_result.message;
     let tmp_dir = scratch.persist();
 
@@ -459,3 +668,6 @@ pub fn fetch_and_verify(inputs: &FetchInputs<'_>) -> FetchOutcome {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod evidence_tests;

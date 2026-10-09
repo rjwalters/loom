@@ -38,8 +38,10 @@ pub struct EtaHealth {
     refresh_repos: BTreeMap<String, u64>,
     /// The last fit check: when it started and its outcome or skip reason.
     fit_check: Option<(DateTime<Utc>, String)>,
-    /// Rows, and rows with alternates, of the last built `eta.snapshot`.
-    snapshot_rows: Option<(u64, u64)>,
+    /// The last built `eta.snapshot`'s size and cuts.
+    snapshot_stats: Option<SnapshotStats>,
+    /// Pending estimates the cap evicted since start; `None` before a pass.
+    pending_over_cap: Option<u64>,
     /// Cached fleet snapshot `as_of`, keyed by file, re-read on an mtime change.
     ages: BTreeMap<PathBuf, (SystemTime, String, DateTime<Utc>)>,
     /// Series keys already exported, so a bucket that empties is zeroed
@@ -48,12 +50,35 @@ pub struct EtaHealth {
     emitted_reasons: BTreeSet<String>,
 }
 
+/// The last built `eta.snapshot`, as the `loom.eta.health.snapshot_*` gauges
+/// report it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// Rows sent.
+    pub rows: u64,
+    /// Of those, rows with alternates.
+    pub alternates_rows: u64,
+    /// Rows dropped by the row cap or the byte budget (#10928).
+    pub rows_truncated: u64,
+    /// Rows sent without their alternates by the byte budget (#10928).
+    pub alternates_truncated: u64,
+    /// The record's compact JSON size in bytes (#10928).
+    pub bytes: u64,
+}
+
 /// `(kind, heuristic, reason)` of one items bucket.
 type ItemKey = (String, String, String);
 
 /// The closed refresh-gate vocabulary: every state is emitted each pass
 /// (one at 1, the rest at 0) so a transition never leaves two states active.
-const GATE_STATES: [&str; 4] = ["captain", "stand_down", "no_captain", "disabled"];
+/// `authority`: this host refreshes as the explicit ETA authority (#10918).
+const GATE_STATES: [&str; 5] = [
+    "captain",
+    "authority",
+    "stand_down",
+    "no_captain",
+    "disabled",
+];
 
 static HEALTH: Mutex<Option<EtaHealth>> = Mutex::new(None);
 
@@ -69,7 +94,7 @@ impl EtaHealth {
     /// counts are kept from the last tick that actually refreshed.
     pub fn tick(&mut self, state: &crate::eta::health::RefreshCycleState) {
         self.tick = Some((state.started_at, state.gate.clone()));
-        if state.gate != "stand_down" {
+        if !matches!(state.gate.as_str(), "stand_down" | "disabled") {
             self.refresh_repos = state.stop_reasons.clone();
         }
     }
@@ -79,9 +104,26 @@ impl EtaHealth {
         self.fit_check = Some((started_at, reason.to_string()));
     }
 
-    /// Record the last built `eta.snapshot`: its rows and those with alternates.
-    pub fn snapshot(&mut self, rows: u64, alternates_rows: u64) {
-        self.snapshot_rows = Some((rows, alternates_rows));
+    /// Record the last built `eta.snapshot`'s size and cuts.
+    pub fn snapshot(&mut self, stats: SnapshotStats) {
+        self.snapshot_stats = Some(stats);
+    }
+}
+
+/// Add `n` cap-evicted pending estimates to the cumulative count, and warn
+/// when any were evicted (#10496). `series` of them were the last estimate
+/// of their series — evicted only when distinct series exceed the cap.
+pub fn note_over_cap(n: usize, series: usize) {
+    with(|h| {
+        let total = h.pending_over_cap.unwrap_or(0);
+        h.pending_over_cap = Some(total.saturating_add(n as u64));
+    });
+    if n > 0 {
+        log::warn!(
+            "eta: evicted {n} pending estimate(s) at the {} cap (redundant refreshes, then \
+             pairs to their earliest); {series} whole series lost: more distinct series than the cap",
+            crate::eta::tracker::MAX_PENDING
+        );
     }
 }
 
@@ -97,8 +139,8 @@ pub fn note_fit_check(started_at: DateTime<Utc>, reason: &str) {
 
 /// Record the last built `eta.snapshot` in the global state
 /// ([`EtaHealth::snapshot`]).
-pub fn note_snapshot(rows: u64, alternates_rows: u64) {
-    with(|h| h.snapshot(rows, alternates_rows));
+pub fn note_snapshot(stats: SnapshotStats) {
+    with(|h| h.snapshot(stats));
 }
 
 /// Live items per `(kind, heuristic, reason)`: the newest estimate per
@@ -136,7 +178,9 @@ pub struct Facts {
     pub gate: Option<String>,
     pub last_tick: Option<DateTime<Utc>>,
     pub refresh_repos: BTreeMap<String, u64>,
-    pub snapshot_rows: Option<(u64, u64)>,
+    pub snapshot_stats: Option<SnapshotStats>,
+    /// Cumulative cap evictions; `None` before the first ETA pass.
+    pub pending_over_cap: Option<u64>,
     /// Items bucket keys exported on earlier passes; zeroed when absent now.
     pub prev_items: BTreeSet<ItemKey>,
     /// Refresh stop reasons exported on earlier passes; zeroed when absent now.
@@ -215,9 +259,20 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
             MetricPoint::int(MetricName::EtaHealthRefreshRepos, count(n)).label("reason", reason),
         );
     }
-    if let Some((rows, alternates)) = facts.snapshot_rows {
-        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotRows, count(rows)));
-        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotAlternatesRows, count(alternates)));
+    if let Some(stats) = facts.snapshot_stats {
+        let gauges = [
+            (MetricName::EtaHealthSnapshotRows, stats.rows),
+            (MetricName::EtaHealthSnapshotAlternatesRows, stats.alternates_rows),
+            (MetricName::EtaHealthSnapshotRowsTruncated, stats.rows_truncated),
+            (MetricName::EtaHealthSnapshotAlternatesTruncated, stats.alternates_truncated),
+            (MetricName::EtaHealthSnapshotBytes, stats.bytes),
+        ];
+        for (name, n) in gauges {
+            out.push(MetricPoint::int(name, count(n)));
+        }
+    }
+    if let Some(n) = facts.pending_over_cap {
+        out.push(MetricPoint::int(MetricName::EtaHealthPendingOverCap, count(n)));
     }
     out
 }
@@ -262,26 +317,21 @@ fn snapshot_ages(
 /// Gather the facts for `root` as of `now` from `health` (whose snapshot
 /// `as_of` cache this pass refreshes). Blocking (file reads).
 fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) -> Facts {
-    let eta = crate::eta::config::read(root);
     let snapshots = snapshot_ages(root, &mut health.ages);
-    let (tick, repos, fit_check, snapshot_rows) = (
+    let (tick, repos, fit_check, snapshot_stats) = (
         health.tick.clone(),
         health.refresh_repos.clone(),
         health.fit_check.clone(),
-        health.snapshot_rows,
+        health.snapshot_stats,
     );
     // Before the first tick the gate is what the read-only resolver says it
     // would be (it never arms the singleton job), or `disabled` when the
     // task does not run at all.
     let gate = match &tick {
         Some((_, gate)) => gate.clone(),
-        None if !super::super::eta_fleet_refresh::should_spawn(&eta) => "disabled".into(),
-        None => match crate::fleet_captain::resolve_gate_for_root(root, host_id) {
-            crate::fleet_captain::CaptainGate::Armed { .. } => "captain",
-            crate::fleet_captain::CaptainGate::Refused { .. } => "stand_down",
-            crate::fleet_captain::CaptainGate::NoCaptainDeclared => "no_captain",
-        }
-        .into(),
+        None => super::super::eta_fleet_refresh::preview_gate(root, host_id)
+            .as_str()
+            .into(),
     };
     Facts {
         now,
@@ -292,7 +342,8 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
         gate: Some(gate),
         last_tick: tick.map(|(at, _)| at),
         refresh_repos: repos,
-        snapshot_rows,
+        snapshot_stats,
+        pending_over_cap: health.pending_over_cap,
         prev_items: health.emitted_items.clone(),
         prev_reasons: health.emitted_reasons.clone(),
     }

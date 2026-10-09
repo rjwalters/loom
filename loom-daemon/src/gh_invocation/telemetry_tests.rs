@@ -255,13 +255,35 @@ fn ambient_parsing_rejects_garbage_and_never_reads_third_party_traceparent() {
 
 #[test]
 fn every_span_attribute_survives_export_bounding() {
-    let inv = read_op();
+    // A write inside a caller scope, so the #10752 keys (`github.caller`,
+    // `github.number`, `github.repo`) are set too.
+    let _scope = super::super::caller_scope::enter("stale_blocked_release");
+    let inv = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Write,
+        GhTarget::repo("acme/widgets").unwrap(),
+        Duration::from_secs(10),
+    )
+    .parent(ParentContext::Missing)
+    .args([
+        "api",
+        "-X",
+        "DELETE",
+        "repos/acme/widgets/issues/42/labels/loom%3Ablocked",
+    ]);
+    let billing = super::super::billing::Billing::not_sent(
+        "graphql",
+        &super::super::accounting::cred_of_with(None, false),
+        "writer",
+    )
+    .with_repo(Some("acme/widgets"));
     let span = InvocationSpan::open(&inv).record(
         &inv,
         GhBinSource::Policy,
         Outcome::ExitNonzero,
         Some(4),
         Utc::now(),
+        &billing,
     );
     let bounded = span.clone().bounded();
     for key in SPAN_ATTRIBUTE_KEYS {
@@ -292,4 +314,70 @@ fn spans_carry_github_api_kind() {
         let (_, spans, _) = run(inv, "echo ok");
         assert_eq!(attr(&spans[0], "github.api"), Some(want));
     }
+}
+
+/// #10343: every span carries the nine billing keys; a `--include` 304 (gh
+/// exits non-zero on it) is billed `not_modified` while `github.outcome`
+/// keeps its process truth.
+#[test]
+fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
+    let inv = read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
+    let body =
+        "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
+    let (_, spans, _) = run(inv, body);
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(attr(span, "github.billing"), Some("not_modified"));
+    assert_eq!(attr(span, "github.http.status"), Some("304"));
+    assert_eq!(attr(span, "github.http.not_modified"), Some("true"));
+    assert_eq!(attr(span, "github.http.source"), Some("headers"));
+    assert_eq!(attr(span, "github.http.requests"), Some("1"));
+    assert_eq!(attr(span, "github.resource"), Some("core"));
+    for key in [
+        "github.http.status",
+        "github.http.not_modified",
+        "github.http.requests",
+        "github.http.source",
+        "github.billing",
+        "github.resource",
+        "github.account",
+        "github.cred_owner",
+        "github.role",
+    ] {
+        assert!(SPAN_ATTRIBUTE_KEYS.contains(&key), "{key} not allowlisted");
+        assert!(span.attributes.contains_key(key), "span lacks {key}");
+    }
+}
+
+#[test]
+fn a_span_without_http_evidence_records_unknown_never_a_guess() {
+    let (_, spans, _) = run(read_op().args(["issue", "list"]), "echo boom >&2; exit 1");
+    let span = &spans[0];
+    assert_eq!(attr(span, "github.http.status"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.not_modified"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.requests"), Some("unknown"));
+    assert_eq!(attr(span, "github.http.source"), Some("none"));
+    assert_eq!(attr(span, "github.billing"), Some("error"));
+    assert_eq!(attr(span, "github.resource"), Some("graphql"));
+
+    let (_, spans, _) = run(
+        read_op().args(["pr", "view", "9"]),
+        "echo 'gh: Not Found (HTTP 404)' >&2; exit 1",
+    );
+    assert_eq!(attr(&spans[0], "github.http.status"), Some("404"));
+    assert_eq!(attr(&spans[0], "github.http.source"), Some("stderr"));
+    assert_eq!(attr(&spans[0], "github.http.not_modified"), Some("false"));
+}
+
+#[test]
+fn a_spawn_failure_span_is_billed_not_sent_with_zero_requests() {
+    let inv = read_op().args(["api", "repos/acme/widgets"]);
+    let (result, captured) =
+        capture(|| inv.execute_with("/nonexistent/gh-10343", GhBinSource::EnvOverride));
+    assert!(result.is_err());
+    let span = &captured.spans[0];
+    assert_eq!(attr(span, "github.outcome"), Some("spawn_failed"));
+    assert_eq!(attr(span, "github.billing"), Some("not_sent"));
+    assert_eq!(attr(span, "github.http.requests"), Some("0"));
+    assert_eq!(attr(span, "github.http.status"), Some("unknown"));
 }

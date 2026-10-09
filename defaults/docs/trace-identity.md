@@ -21,11 +21,13 @@ inside a key use RFC 3339 UTC with nanosecond precision.
 | Trace | Trace ID is derived from |
 |-------|--------------------------|
 | Issue story (`loom.story.trace`) | the repo's GitHub numeric `repo_id` and the issue number: `loom-story/v1:github:<repo_id>:<issue>` (key version D32 v1, #9068) — stable across repo renames and transfers; see [`tracing.md`](tracing.md) |
-| Sweep outside a story (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the checkout's GitHub `owner/repo`, else the workspace basename), sweep id — used for PR-set sweeps and checkouts with no GitHub origin |
-| Role-runner invocation (`loom.execution.trace`) | the same repo key, and the execution id `role-<role>-<start instant>` — carried as `loom.repo` and `loom.sweep_id` on the `loom.role_attempt` root. The role is in the key so two roles starting in the same instant differ; the repo key (not a host id) scopes it, because the span carries the repo but no host attribute, and one repo's role runner ticks each role serially |
+| Sweep outside a story (`loom.execution.trace`) | lowercased repo key (`$LOOM_REPO`, else the checkout's GitHub `owner/repo`, else the workspace basename), sweep id — used for PR-set sweeps and checkouts with no GitHub origin. The span's `loom.repo` is that repo spelled as GitHub spells it (#10637); the key is its ASCII lowercase |
+| Role-runner invocation (`loom.execution.trace`) | the same repo key, and the execution id `role-<role>-<start instant>` — carried as `loom.repo` (the key is its ASCII lowercase) and `loom.sweep_id` on the `loom.role_attempt` root. The role is in the key so two roles starting in the same instant differ; the repo key (not a host id) scopes it, because the span carries the repo but no host attribute, and one repo's role runner ticks each role serially |
 | Dispatch tick (`loom.dispatch.tick`) | tick start instant |
 | Pool hold (`loom.pool.hold`) | pool identity (`loom.pool.hold.pool`, a hash of the pool directory) and hold start instant (`since`) — every hold armed in one work-finder tick shares `since`, so the pool is what tells them apart |
 | Rate-limit trip (`loom.ratelimit.trip`) | the tripping job (`loom.ratelimit.source`) and the trip instant (#10022) |
+| Reader withdrawal (`forge.reader.withdrawn`) | the reader App (`forge.reader.app`), the owner and resource withdrawn (`forge.reader.owner`, `forge.reader.resource`) and the withdrawal instant (W4-A) |
+| Read-pool spill-latch transition (`forge.reader.spill`) | the repo (`forge.spill.owner_repo`), resource, home reader, mode and the transition instant (W4-B) |
 | `gh` invocation with no parent (`loom.github.invoke`, span `invoke github`) | `github.operation`, start instant, and `github.invocation` (`<pid>.<seq>`, so two calls in one clock tick differ); with a parent it is that span's child, keyed by the same facts (#9985) |
 | CI run/job (`loom.ci.*`) | repo, run id, attempt (job: job id) — [`ci-observability.md`](ci-observability.md) |
 
@@ -75,6 +77,8 @@ Consequences:
   host) produces the same IDs, so a backend can deduplicate on them.
 - The sweep span carries its derivation inputs: `loom.repo`, `loom.issue` and
   `loom.story_id` in a story, or `loom.repo` and `loom.sweep_id` outside one.
+  `loom.repo` is GitHub's own `owner/name` spelling, the value
+  `loom.dispatch.*` carries; a repo key is its ASCII lowercase (#10637).
 
 **Attended runs (#10116).** A Loom role run as a subagent of an attended
 Claude Code session has no dispatch and so no sweep id or sweep span. Its

@@ -53,6 +53,7 @@ pub(super) fn record(
         complexity: None,
         tokens_status: None,
         tokens_status_reason: None,
+        no_phase_cause: None,
         attempt_index: None,
         previous_sweep_id: None,
         trigger: None,
@@ -172,6 +173,9 @@ fn merge_wait_history(t: chrono::DateTime<chrono::Utc>) -> StageSamples {
 
 fn one_case(t: chrono::DateTime<chrono::Utc>) -> ReplayCase {
     ReplayCase {
+        queue: Vec::new(),
+        pr_flags: None,
+        priority: None,
         subject: subject(),
         as_of: t,
         stage: Stage::MergeWait,

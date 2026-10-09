@@ -9,11 +9,13 @@
 mod api_parsing;
 mod billing_block;
 mod captain_gate;
+mod compaction;
 mod credential_rejection;
 mod dependency_wait;
 mod feed_capture;
 mod job_logs;
 mod join_keys;
+mod journal_rotation;
 mod journal_view;
 mod owners;
 mod queue_time;
@@ -979,6 +981,7 @@ fn env_overrides_config() {
         log_capture_enabled: Some(false),
         log_capture_max_bytes: Some(1024),
         log_capture_excluded_repos: Some(vec![exclusion.clone()]),
+        ..CiTelemetryConfig::default()
     };
     std::env::set_var(ENABLED_ENV, "1");
     std::env::set_var(ORG_ENV, "from-env");

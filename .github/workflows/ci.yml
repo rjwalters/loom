@@ -9,9 +9,10 @@ on:
   # tree. Dormant until a repository enables a merge queue -- GitHub only
   # emits this event for a queue-enabled branch, and this repository is
   # user-owned, so today it never fires here. Every job a merge group needs
-  # treats `merge_group` exactly like `push`: no path filter (the `changes`
-  # job is PR-only), the full suite. `loom-daemon merge-group-ci audit`
-  # proves that statically; see defaults/docs/merge-queue-ci.md.
+  # runs on `merge_group` with no path filter (the `changes` job is PR-only):
+  # the full suite, a superset of `push`, which path-filters only the image
+  # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
+  # see defaults/docs/merge-queue-ci.md.
   merge_group:
     types: [checks_requested]
 
@@ -36,6 +37,14 @@ on:
 # ci-principles.md rule 2. PR runs are unchanged: keyed on the PR number,
 # cancel-in-progress true. This stanza is the ONLY cancellation mechanism on
 # main (rule 4) -- the `changes` job's cancel step is PR-only.
+#
+# #10670: so a high main `cancelled` rate during a merge burst is this bound
+# working, not runs being killed. Measured over the last 100 main push runs
+# (2026-10-06 10:40-22:53Z, Actions API): 54 cancelled, every one with ZERO
+# jobs (superseded while pending); no started run was cancelled. ci-queries.sql section 18 splits main
+# cancellations into superseded-before-start vs cancelled-after-start (the
+# latter is a rule-2 violation and must stay 0), and loom-daemon's
+# `main_cancel` lint fails if any workflow change could produce one.
 #
 # #10257: a merge-group run is keyed on its own head SHA, so it can never
 # share a group with a PR run, with `main`, or with another merge group: a
@@ -90,7 +99,7 @@ jobs:
   # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
   # hiccup from failing the path filter every filtered job `needs`.
   changes:
-    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; push and merge_group run every filtered job unconditionally
+    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; merge_group runs every filtered job unconditionally, and push does too except the image jobs (changes-push, #10825)
     name: Detect Changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -102,7 +111,7 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -113,25 +122,42 @@ jobs:
       # every other job reads.
       # PR events only (#7779). The rationale above is entirely about a
       # superseded PR push -- "a force-pushed rebase created a new run". On a
-      # push to main there is nothing to supersede: `github.head_ref` is empty,
-      # so REF fell back to `github.ref_name` = `main`, and this job cancelled
-      # every other queued/in_progress main run. That is the dominant cause of
-      # the 22/30 cancellation rate, not the `concurrency:` stanza alone --
-      # each main commit is distinct work that deserves its own verification.
+      # push to main there is nothing to supersede. HISTORY, fixed by #7779:
+      # before that fix `github.head_ref` was empty on a push, so REF fell back
+      # to `github.ref_name` = `main`, and this step cancelled every other
+      # queued/in_progress main run -- then the dominant cause of the 22/30
+      # cancellation rate. Since #10670 the step itself also refuses to reach
+      # a main run (no `ref_name` fallback, `pull_request` runs only), and
+      # `main_cancel.rs` (`cargo test -p loom-daemon --lib main_cancel`) fails
+      # if any cancel path a push or merge_group run can reach could cancel a
+      # started run. main's remaining `cancelled` runs are pending runs the
+      # concurrency stanza superseded before they started (zero jobs), by
+      # design: one running (oldest) + the newest pending.
       - name: Cancel older queued/in_progress runs for this ref
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW: ${{ github.workflow }}
-          REF: ${{ github.head_ref || github.ref_name }}
+          REF: ${{ github.head_ref }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          echo "Checking for superseded '$WORKFLOW' runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
+          # PR runs only, by construction (#10670), not just by the job's
+          # `if:`: REF is the PR head branch with no `ref_name` fallback, so
+          # it can never resolve to `main`, and the jq filter selects only
+          # `pull_request` runs, so even a fork PR whose head branch is named
+          # `main` cannot reach a push run. A started main run is never
+          # cancelled (ci-principles.md rule 2); the concurrency stanza's
+          # pending-run supersession is the only bound on main.
+          if [[ -z "$REF" ]]; then
+            echo "No PR head ref; nothing to supersede."
+            exit 0
+          fi
+          echo "Checking for superseded '$WORKFLOW' PR runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
           gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$REF" \
-            --json databaseId,status --jq \
-            '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' \
+            --json databaseId,status,event --jq \
+            '.[] | select(.event == "pull_request") | select(.status == "queued" or .status == "in_progress") | .databaseId' \
             | while read -r run_id; do
                 if [[ "$run_id" != "$CURRENT_RUN_ID" ]]; then
                   echo "Cancelling superseded run $run_id (workflow=$WORKFLOW ref=$REF)"
@@ -167,18 +193,6 @@ jobs:
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
-            docker:
-              - 'docker/**'
-              - '.dockerignore'
-              # The run-job seam (#7853) is the one thing outside docker/ that
-              # this filter's jobs prove: docker/worker/test-run-job.sh drives
-              # these two scripts inside a real worker container to show the
-              # container needs no docker socket. A seam-only PR must re-run
-              # that leg, or the only test that can catch a regression in the
-              # containment story is skipped on exactly the PRs that cause one.
-              - 'defaults/scripts/run-job.sh'
-              - 'defaults/scripts/lib/run-job-exec.sh'
-              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'defaults/**'
@@ -205,7 +219,16 @@ jobs:
               # main red after the merge.
               - '.github/dependabot.yml'
               - '**/package.json'
+              # Same for the Renovate side (#9418): `loom-daemon
+              # check-renovate-labels` runs next to it in installer-tests.
+              - 'renovate.json5'
               - '.github/workflows/ci.yml'
+            # Every workflow file, for the Workflow Cancellation Lint job
+            # (#10670). The `backend` group lists only ci.yml, so without this
+            # a security.yml-only (or new-workflow) PR would merge with the
+            # main_cancel lint never having run.
+            workflows:
+              - '.github/workflows/**'
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
@@ -219,6 +242,87 @@ jobs:
           set -euo pipefail
           echo "daemon needed=true"
           echo "needed=true" >> "$GITHUB_OUTPUT"
+
+  # Detect Image Inputs (PR): do the image jobs run on this pull request?
+  # (#10825) The same script `changes-push` runs on main, so PR and push agree
+  # on what an image input is: docker/**, the .dockerignore-allowlisted
+  # private-control files under defaults/ (which the former `docker` paths
+  # group missed), the run-job seam (#7853) and ci.yml. A failed listing fails
+  # CLOSED (docker=true).
+  #
+  # A job of its own, deliberately NOT a step of `changes`: on a PR the
+  # checkout below is the merge ref, so scripts/ci-image-inputs.sh is
+  # UNMERGED PR CODE, and `changes` holds `actions: write` for its
+  # superseded-run cancellation. Running a PR-head script there would hand a
+  # same-repository contributor a write-capable Actions token. This job's token
+  # is read-only (contents + pull-requests); keep it that way, and never run
+  # PR-head code in a job that retains a write permission.
+  changes-images:
+    # merge-group-audit: pr-only -- the image-input decision only trims PR runs; push is decided by changes-push and merge_group runs every image job unconditionally
+    name: Detect Image Inputs (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Decide whether the image jobs run
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-image-inputs.sh pr --repo "$REPO" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  # Detect Image Inputs (push): the ONE path filter on a push to main, and the
+  # operator-approved exception to ci-principles rule 3 (#10825). It decides
+  # only whether `worker-base-image` and the three image smokes run; every
+  # other job still runs unconditionally on push. The base is the head of the
+  # last GREEN `CI` push run on main, never `github.event.before`: main's
+  # concurrency (one running + newest pending) cancels pending runs in a
+  # burst, so `before` can be an unverified commit, and a red smoke run must
+  # not be forgotten by the next clean diff. Fails CLOSED to docker=true, and
+  # if this job itself fails or is cancelled the image jobs run anyway (their
+  # `if:` reads `result != 'success'`) and `CI Result` goes red. Daemon-source
+  # changes are deliberately not image inputs; ci-daily.yml's `docker-smokes`
+  # runs every smoke unfiltered each day (rule 10). Push-only, so it is not a
+  # job the merge-group audit relies on: `merge_group` never path-filters.
+  changes-push:
+    name: Detect Image Inputs (push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push'
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Decide whether the image jobs run (diff since the last green push run)
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: scripts/ci-image-inputs.sh push --repo "$REPO" --sha "$SHA" --branch "$BRANCH" --workflow ci.yml >> "$GITHUB_OUTPUT"
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -263,15 +367,33 @@ jobs:
 
   release-build:
     name: Release Build Check
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    needs: [changes, changes-images]
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes-images.outputs.docker == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
     # (cfg(debug_assertions) code, optimisation-only link failures) before
     # merge. They now use the shared debug build, so without this job such a
-    # break would first surface in the post-merge release workflow. Nothing
-    # waits on it, so it stays off the critical path.
+    # break would first surface in the post-merge release workflow.
+    #
+    # It is ALSO the one release build per CI run (#10824): the binary is
+    # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
+    # stages it into the Docker build context, so the image smokes no longer
+    # build their own. That makes the shipped `--features otlp` binary the one
+    # the smokes exercise (they previously ran a non-shipped default-feature
+    # build). Since then `worker-base-image` waits on it, so on a run that
+    # builds images this job IS on the image smokes' critical path; on any
+    # other run nothing waits on it.
+    #
+    # Its `if:` MUST stay at least as wide as `worker-base-image`'s (and so the
+    # smokes'): if the base image runs while this job skipped, the artifact
+    # download fails and the smokes go red for no reason. Today it is: this job
+    # runs unconditionally on push and merge_group, where #10825 path-filters
+    # the image jobs on push only via `changes-push`, and on a PR it is the
+    # UNION of `backend` and `docker`, so a docker-only PR still produces the
+    # artifact. Narrowing this gate below the image gate is not allowed; if you
+    # change either, keep this note true (scripts/test-ci-image-inputs.sh pins
+    # it).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -283,6 +405,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --package loom-daemon --features otlp
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: target/release/loom-daemon
+          if-no-files-found: error
+          retention-days: 1
 
   node-packages:
     name: Node Packages (MCP server, dashboard)
@@ -326,6 +454,50 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
+      # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
+      # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
+      # these tests never execute there; the full default-feature suite runs
+      # nightly (ci-daily.yml `full-suite`). The names are DERIVED by the
+      # compiler, never hand-listed (ci-principles rules 7 and 9): the lib
+      # tests `cargo nextest list` reports with default features minus those it
+      # reports with `--features otlp` (#10845), so every cfg form (on a `mod`,
+      # `all(test, not(..))`, one-line, `#[rstest]`, ...) is covered. Each is
+      # selected by its exact full name, and the step fails unless nextest's
+      # "N tests run" equals the derived count (catches under- and
+      # over-selection), on an empty derivation, or on an empty selection.
+      # This is an additional run, not a filterset that skips work. Cost: one
+      # extra compile of the loom-daemon lib test binary with `otlp` (~2 min
+      # locally); this trailing `!cancelled()` step is off the critical path.
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run the cfg(not(otlp)) tests (default features)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # The listing below is `--lib` only; integration tests are not in it.
+          if grep -rlF 'cfg(not(feature = "otlp"))' loom-daemon/tests; then
+            echo "::error::cfg(not(feature = \"otlp\")) under loom-daemon/tests/ is not covered: extend this step beyond --lib" >&2
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          # `otlp` first: its build replaces the default one, which the default
+          # listing and the run below then share (two compiles, not three).
+          cargo nextest list -p loom-daemon --lib --features otlp --message-format json > "$tmp/otlp.json"
+          cargo nextest list -p loom-daemon --lib --message-format json > "$tmp/default.json"
+          jq -r '."rust-suites"[].testcases | to_entries[] | select(.value.ignored | not) | .key' "$tmp/default.json" | sort -u > "$tmp/default.txt"
+          jq -r '."rust-suites"[].testcases | keys[]' "$tmp/otlp.json" | sort -u > "$tmp/otlp.txt"
+          comm -23 "$tmp/default.txt" "$tmp/otlp.txt" > "$tmp/derived.txt"
+          derived=$(wc -l < "$tmp/derived.txt" | tr -d ' ')
+          test "$derived" -gt 0 || { echo "::error::derived no cfg(not(otlp)) tests" >&2; exit 1; }
+          echo "derived $derived tests:"; cat "$tmp/derived.txt"
+          filter=$(sed 's/.*/test(=&)/' "$tmp/derived.txt" | paste -sd'|' - | sed 's/|/ | /g')
+          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail --color never -E "$filter" 2>&1 | tee "$tmp/run.log"
+          ran=$(grep -oE '[0-9]+ tests? run' "$tmp/run.log" | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ "${ran:-0}" != "$derived" ]; then
+            echo "::error::nextest ran ${ran:-0} tests but $derived were derived" >&2
+            exit 1
+          fi
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -378,7 +550,7 @@ jobs:
         with:
           tool: nextest
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
         # the only surface that carries per-test durations out of a finished
@@ -395,9 +567,9 @@ jobs:
         # with `ci-test-timings` and pairs on
         # `-<family>-<k>-<N>`, where `<family>` is this job's display name with
         # its `(k/N)` suffix stripped and slugified
-        # (`ci_telemetry::nextest::job_family_slug`; `ci.yml` has TWO
-        # nextest-partition families both sharding 1..3, so the family is what
-        # disambiguates them). Renaming this artifact — or renaming the job
+        # (`ci_telemetry::nextest::job_family_slug`; the family keeps the
+        # pairing key unambiguous against any other job sharding 1..3).
+        # Renaming this artifact — or renaming the job
         # without renaming the artifact — silently stops test spans, which
         # `ci_telemetry::tests::test_spans` asserts against this file. See
         # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
@@ -408,6 +580,37 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
+
+  # Workflow Cancellation Lint (#10670). The `main_cancel` lint, the
+  # every-workflow parse check and the merge-group audit are Rust unit tests in
+  # `merge_group_ci`, so `backend-tests` runs them -- but only when the
+  # `backend` group matches, and of the workflow files that group lists only
+  # ci.yml. This repo has no merge queue, so the PR run is the only check before
+  # merge: a PR touching only security.yml, codeql.yml, release.yml or a new
+  # workflow would otherwise land with the lint unrun, and the first run to
+  # catch a cancel regression would be the main push it can already cancel.
+  # This job runs just that test module on any `.github/workflows/**` change
+  # (a lib-test build of one crate, not the three-leg suite), and on every push
+  # and merge_group like every other filtered job. On a PR that also matches
+  # `backend` the module runs twice (here and in a backend-tests leg); the
+  # price is one more runner doing a cache-restored lib-test build of one
+  # crate, in parallel, so it adds no wall-clock time to the run.
+  workflow-cancel-lint:
+    name: Workflow Cancellation Lint
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.workflows == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint every workflow for cancellation of a started main run
+        run: cargo test -p loom-daemon --lib merge_group_ci
 
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
@@ -432,10 +635,12 @@ jobs:
       # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
       # just its non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      # The feature's full nextest run lives in the partitioned
-      # backend-otlp-tests job below (#9065). It is NOT deduplicated against
-      # Rust Unit Tests: `otlp` is not purely additive -- two tests are
-      # `#[cfg(not(feature = "otlp"))]` -- so neither run subsumes the other.
+      # The feature's full nextest run lives in the partitioned Rust Unit Tests
+      # job (#10823): the whole workspace runs once, with the shipped `otlp`
+      # configuration. `otlp` is not purely additive -- some tests are
+      # `#[cfg(not(feature = "otlp"))]` -- so the default-feature coverage is
+      # the targeted step in backend-lint-and-check plus ci-daily.yml's
+      # `full-suite`.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -470,6 +675,11 @@ jobs:
       # clamps to zero headroom rather than negative.
       - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      # #10343: github-shadow.sql's bill must charge each quota window once --
+      # stale host readings, interleaved buckets and reset jitter must not
+      # re-charge (the PR #10565 review's live 61k-in-2h inflation).
+      - name: Verify the SigNoz GitHub shadow-spend queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_github_shadow_queries -- --ignored --nocapture
       # #8528 / #8856: the same technique for the trial's one saved ALERT RULE
       # (alerts/queue-starvation.json), the last query artifact in this trial
       # with only a vocabulary guard. An alert that returns no rows -- or rows
@@ -482,6 +692,18 @@ jobs:
       # zero rows survive the SQL so SigNoz can see a series recover.
       - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      # #10973: replay of the host-disk, work-finder-stale and ETA Ready-coverage alert rules
+      - name: Verify the SigNoz disk, work-finder and ETA Ready-coverage alert rules against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      # #10916: the fleet singleton-output alert (alerts/fleet-singleton-output.json),
+      # the cross-host detector for a one-host fleet job that stops producing
+      # while every host looks healthy. Only this run shows that the 2026-10-07
+      # replay (28 of 30 repos without eta.estimate) fires one evaluation past
+      # 2 x cadence and not before, that an idle or all-abstaining repo stays
+      # quiet, and that an empty logs table fires every watched row. Its
+      # deadline-vs-registry no-drift check runs in the ordinary test job.
+      - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
       # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
       # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
       # heuristic is promoted on. eta_artifacts.rs already pins every attribute
@@ -502,6 +724,18 @@ jobs:
       # rows inflates the answer rate because refusals are never refreshed.
       - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
+      # #11125: the same technique for the replay reconstruction
+      # (replay-queries.sql queries 1-3). Only this run shows that an issue
+      # removed, re-added and removed again stays deleted, and that a lost
+      # delta, a missing anchor or delta chunk, or a chain whose anchor never
+      # arrived makes that host unknown instead of rebuilding wrong state.
+      - name: Verify the SigNoz replay reconstruction against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
+      # #11127: `telemetry-replay --as-of` runs those same committed queries
+      # with its own parameter binding and reader over the same fixture store;
+      # only this run shows an uncovered host is reported `unknown`, not empty.
+      - name: Verify telemetry-replay against the replay fixture store
+        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows
@@ -535,49 +769,6 @@ jobs:
       # ones that restore 30 days -- unapplied.
       - name: Verify the SigNoz retention statements against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
-
-  backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
-    # The whole loom-daemon suite with `--features otlp`, partitioned three
-    # ways for the same reason and by the same mechanism as Rust Unit Tests
-    # (#9065): 211s of test execution on one runner was the critical path.
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
-        # The denominator is `strategy.job-total`, never a literal: editing
-        # this list alone cannot silently drop a slice (a gap such as [1, 3]
-        # yields an out-of-range k/N, which fails loudly).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
-        with:
-          tool: nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
-      - name: Upload per-test timings (#9456)
-        # Same contract as the `Rust Unit Tests` leg above, with this job's own
-        # family slug: the poller pairs `ci-test-timings-<family>-<k>-<N>` on
-        # the family, because both nextest-partition families shard 1..3 and
-        # `(kind, k, N)` alone would match two jobs. See
-        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ci-test-timings-rust-otlp-feature-tests-${{ matrix.partition }}-${{ strategy.job-total }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-          retention-days: 14
 
   structural-checks:
     name: Structural Checks
@@ -685,6 +876,15 @@ jobs:
       - name: Check every tracked .sh is accounted for
         if: ${{ !cancelled() }}
         run: bash scripts/check-shell-allowlist.sh
+      - name: Test the CI Result aggregate gate (#10444)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-result-gate.sh
+      - name: Test the image-input detection and the image gate wiring (#10825)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-image-inputs.sh
+      - name: Test the release decision and release.yml wiring (#10826)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-release-decision.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -1251,8 +1451,9 @@ jobs:
   install-surface-checks:
     name: Install Surface Checks
     # Agent Skills Sync Check and Fresh Install Link Check on the shared debug
-    # daemon (#9065). NOT required: they were not required as separate jobs
-    # either. The job itself runs on every PR; its two gates are behind
+    # daemon (#9065), plus the Compatibility Contract (#10716). NOT required:
+    # they were not required as separate jobs either; CI Result aggregates
+    # this job. The job itself runs on every PR; its two gates are behind
     # `daemon != 'false'` (#9113), never behind a file-group filter (path
     # filtering is an optimisation, ci-principles.md rule 3). Both read only
     # `defaults/`, which a dashboard-only PR cannot touch.
@@ -1353,6 +1554,29 @@ jobs:
       - name: Check intra-repo links in the freshly installed tree
         if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
         run: cd "$FIXTURE" && bash .loom/scripts/verify-install.sh check-links
+
+      # component: Compatibility Contract
+      # #10716 (tracker #10698 D3/D4): prove the two claims across adjacent
+      # releases. A: the previous release's installed files against this
+      # daemon (skipped when SUPPORTS_INSTALLED declares the break). B: this
+      # tree's installed files against the oldest PUBLISHED release at or
+      # above REQUIRES_DAEMON (releases skip versions, so not always
+      # v$REQUIRES_DAEMON itself), downloaded by --fetch-old-daemon; while
+      # none is published the new daemon stands in. A violated claim exits 1.
+      # All of it, the release lookup included, is
+      # `loom-daemon install-compat check`. fetch-depth: 0 above supplies the
+      # release tags. Not
+      # path-filtered: a change to `defaults/` alone can break claim B. Here,
+      # not in the required Daemon Checks, because its verdict also depends on
+      # release tags and assets, which no stale-check input set can model.
+      - name: Compatibility contract across adjacent releases (#10716)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./target/debug/loom-daemon install-compat check --repo-root . \
+            --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
+            --asset loom-daemon-x86_64-unknown-linux-gnu
 
   repo-hygiene:
     name: Repo Hygiene Checks
@@ -1732,6 +1956,10 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #11075: check-main-clean.sh --quarantine asks `loom-daemon stashes
+      # build-trees` which cargo build trees to exclude from the rescue stash.
+      - name: check-main-clean (#3513, #11075)
+        run: bash defaults/scripts/tests/test-check-main-clean.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
@@ -1740,6 +1968,8 @@ jobs:
         run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
       - name: spawn-codex sealed-registration trust waiver (#10102)
         run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
+      - name: spawn-* session identity is not inherited by the agent (#10830)
+        run: bash defaults/scripts/tests/test-spawn-session-env.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
@@ -1751,6 +1981,8 @@ jobs:
         run: bash defaults/scripts/tests/test-fleet-send.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
+      - name: post-verdict.sh verdict gate + exclusive labels (#10581)
+        run: bash defaults/scripts/tests/test-post-verdict-gate.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
       # #8458: the per-worktree cargo target dir. Its creation half
@@ -1785,6 +2017,8 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
       - name: merge-pr merge-ordering guard (#3747 item 2 / #7982, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh
+      - name: merge-pr workflow token-scope preflight (#10539)
+        run: bash defaults/scripts/tests/test-merge-pr-workflow-scope-preflight.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job downloads. The parent suite stays in
@@ -1810,6 +2044,10 @@ jobs:
       # and degrades to the flat reason without it, so it needs this build.
       - name: loom-daemon-update --fetch refusal classification (#8654)
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
+      # #11044: the fleet floor confirmation runs inside `loom-daemon
+      # daemon-update`, so the suite pins this job's shared build.
+      - name: loom-daemon-update fleet floor confirmation (#11044)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
@@ -1843,11 +2081,22 @@ jobs:
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      # #10413: ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must not
+      # shadow the pool token spawn-claude.sh selects — drives a real
+      # `loom-daemon tokens select`, so it needs the binary this job
+      # downloads. Split from test-spawn-claude.sh (file-size frozen).
+      - name: spawn-claude ambient credential scrub (#10413)
+        run: bash defaults/scripts/tests/test-spawn-claude-ambient-scrub.sh
       # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
       # after `loom-daemon session-exec posture` has verified the container's
       # label AND HostConfig, so this suite needs the binary this job downloads.
       - name: spawn-codex session container boundary (#8518, #9979)
         run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
+      # #10661: the stale-mount suite's last cases drive the real
+      # `loom-daemon session-exec host` (pinned via require-daemon-bin.sh), so
+      # it needs the binary this job downloads, like the step above.
+      - name: spawn-codex stale-mount refusal (#10364, #10661)
+        run: bash defaults/scripts/tests/test-spawn-codex-session-mount-stale.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
@@ -2031,6 +2280,11 @@ jobs:
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # #10203: `sweep-lease-renew.sh start` re-enters through
+      # `loom-daemon lease renewer sanitize-exec` so its detached loop holds no
+      # fd of the caller's; pins the binary like the suite above.
+      - name: lease renewer holds no caller fd (#10203)
+        run: bash defaults/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
       # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
       # contract. #5657 already skips reuse of an origin/feature/issue-N
       # whose tip is a MERGED PR's head; this covers the strictly worse
@@ -2127,6 +2381,13 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
+      # Moved out of shell-suite-tests by #8191's usage slice: merge-pr.sh's
+      # --help text is `loom-daemon merge-pr usage` now, so both suites that
+      # read --help pin this job's binary (--self-only) and FAIL without one.
+      - name: merge-pr --help (#8191)
+        run: bash defaults/scripts/tests/test-merge-pr-help.sh
+      - name: merge-pr --merge-method (#8845, #8191)
+        run: bash defaults/scripts/tests/test-merge-pr-merge-method.sh
       # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
       # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
       # whose decision is now `loom-daemon merge-pr issue-close-gate`, and drives
@@ -2278,12 +2539,23 @@ jobs:
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
         run: bash defaults/scripts/check-labels-drift.sh
+      # #10013 / PR #10053: proves the registry half of the drift check runs
+      # (identical labels.yml copies that both diverge from labels.json fail).
+      - name: Test labels.yml registry drift check (#10013)
+        run: bash defaults/scripts/tests/test-check-labels-drift.sh
       - name: Check label descriptions fit GitHub's 100-char limit (#4335)
         run: bash defaults/scripts/check-label-descriptions.sh
       - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Check every package manifest has a labeled dependabot entry (#7577)
         run: bash defaults/scripts/check-dependabot-labels.sh
+      # #9418: the Renovate-side counterpart — every `labels` array in
+      # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
+      # lockFileMaintenance override, which REPLACE rather than merge) carries
+      # loom:review-requested. A daemon subcommand, not more lines in that
+      # contract-category script (shell-language-policy.md, epic #7810).
+      - name: Check every Renovate labels array carries loom:review-requested (#9418)
+        run: ./target/debug/loom-daemon check-renovate-labels --repo-root .
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
@@ -2379,6 +2651,9 @@ jobs:
           docker pull ubuntu:24.04
           cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
       - name: Verify account-private clones and exclusive jobs with Docker fixtures
+        # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
+        # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
+        timeout-minutes: 10
         # Owner-only synthetic profiles must belong to the session image's UID.
         # Build as runner; execute only this fixture as UID 1000 with Docker access.
         # Stage public inputs outside the runner's owner-only home. Account
@@ -2510,35 +2785,200 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  worker-base-image:
+    name: Build loom-worker base image
+    # The ONE build of docker/worker/Dockerfile per CI run (#10822). The three
+    # image smokes below each used to rebuild it (plus their own release
+    # loom-daemon build); they now `needs:` this job and `docker load` the
+    # tarball it uploads, under the exact tags they used before
+    # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
+    # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
+    # they do: always on merge_group; on push only when `changes-push` found an
+    # image input since the last green push run, or did not succeed (fails
+    # closed); on a PR when `changes-images.docker` is true (#10825). `release-build`'s
+    # gate must stay a superset of this one (see its comment).
+    #
+    # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
+    # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB
+    # on 2026-10-07; the #9065 eviction problem in this file's header), and an
+    # apt layer there would evict rust-cache entries and be evicted in turn.
+    # The registry cache costs no Actions-cache budget, survives 7-day
+    # eviction (which matters once #10825 makes these jobs rare on main), and
+    # the package is public, so every run -- fork PRs included -- reads it
+    # anonymously. This job only READS it (`packages: read`, no GHCR login,
+    # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
+    # or merge_group token holds `packages: write` (#10846). The cache is
+    # WRITTEN only by `worker-buildcache` below, a separate job gated at job
+    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
+    # same-repo PR must not be able to seed the cache main builds from. The
+    # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
+    # release does not, so its apt layers never match.
+    needs: [changes, changes-images, changes-push, release-build]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # --- Binary staging seam (#10824) -------------------------------------
+      # The Linux release binary the Dockerfile COPYs comes from the single
+      # `Release Build Check` build (`--features otlp`, the shipped config),
+      # not a build of our own. download-artifact fails on a missing artifact,
+      # so a failed producer turns this job red rather than skipped.
+      # upload-artifact drops the executable bit, hence the chmod.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: dist
+      - name: Stage dist/loom-daemon-linux-amd64
+        run: |
+          set -euo pipefail
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
+      # --- end binary staging seam ------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the loom-worker base image
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker buildx build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
+            --output type=docker,dest=/tmp/loom-worker-base.tar \
+            -t loom-worker:ci-smoke \
+            -t ghcr.io/rjwalters/loom-worker:ci-smoke \
+            .
+      - name: Upload the base image for the smoke jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base.tar
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
+  worker-buildcache:
+    name: Publish loom-worker build cache
+    # The ONLY job in this workflow with `packages: write` (#10846). It writes
+    # the registry layer cache `worker-base-image` reads
+    # (ghcr.io/rjwalters/loom-worker:buildcache; rationale in that job's
+    # header). Job permissions cannot vary by event, so the write is split out
+    # here and gated at JOB level to a push to main in rjwalters/loom: on
+    # pull_request and merge_group this job is skipped, so no token those
+    # events mint can push to GHCR. Checkout uses `persist-credentials: false`
+    # so the token never lands in .git/config.
+    #
+    # It rebuilds the same Dockerfile with the same build args; its layers are
+    # cache hits from the previous main build, so it is mostly export time.
+    # Nothing `needs:` it except `ci-result` (off the image critical path).
+    # The binary comes from the same staging seam as `worker-base-image`
+    # (#10824; `release-build` runs unconditionally on push). On push it uses
+    # the same `changes-push` filter as `worker-base-image` (#10825): skipped
+    # only when that detector SUCCEEDED with docker=false (no image input
+    # changed, so the cache would be unchanged), run otherwise (fails
+    # closed). `ignore-error=true` keeps a registry hiccup on export from
+    # failing the job.
+    #
+    # Not merge-group relevant: it is skipped on pull_request, so the
+    # merge-group audit does not count it as a relied-on suite (no marker
+    # needed; it is push-only, not pr-only). `ci-result` passes its PR-time
+    # `skipped` because Detect Changes succeeded, and its merge_group skip
+    # because merge_group has no path filter (scripts/ci-result-gate.sh).
+    needs: [changes-push, release-build]
+    if: >-
+      always() && needs.release-build.result == 'success' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
+      (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # --- Binary staging seam (#10824), same as worker-base-image ---------
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: dist
+      - name: Stage dist/loom-daemon-linux-amd64
+        run: |
+          set -euo pipefail
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
+      # --- end binary staging seam ------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR (buildcache writer)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export the loom-worker layer cache
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker buildx build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
+            --cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true" \
+            --output type=cacheonly \
+            .
+
   worker-image-smoke:
     name: loom-worker Image Smoke Test
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    # Consumes the image `worker-base-image` built (#10822). `always()` keeps
+    # this job RUNNING when that producer failed, so the first step turns it
+    # red instead of skipped (ci-principles rule 7). The image gate (#10825,
+    # shared by all four image jobs): `merge_group` FIRST, so the merge-group
+    # audit proves it runs there unconditionally; on push, `changes-push`'s
+    # diff since the last green push run, run anyway unless that job
+    # succeeded with docker=false; on a PR, `changes-images.docker`.
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no image to test."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Native build (the runner IS x86_64-unknown-linux-gnu) — a full
-      # cross-compile matrix has no place in a per-PR smoke test; the release
-      # workflow's own `build-daemon` matrix already covers every published
-      # target, this job only needs the one Linux artifact the Dockerfile
-      # actually consumes.
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker image (no push)
-        run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect loom-worker:ci-smoke >/dev/null
       - name: Run the smoke test
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
       - name: Run the mount-contract worktree-correctness test
@@ -2553,36 +2993,42 @@ jobs:
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test
-    # Mirrors worker-image-smoke exactly (same `changes.docker` gate — this
+    # Mirrors worker-image-smoke exactly (same image gate — this
     # image is FROM loom-worker, so any docker/** change, including a
     # loom-worker-only one, is worth re-validating this layer against): #6899,
-    # Epic #6896 Phase 1. Builds the base loom-worker image locally first
-    # (needed as this Dockerfile's FROM target) rather than pulling
-    # ghcr.io/rjwalters/loom-worker — a PR's Dockerfile changes are not
-    # published anywhere to pull from, and this keeps the check hermetic.
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    # Epic #6896 Phase 1. Its FROM target is the base image this run's
+    # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
+    # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
+    # published image, which a PR's Dockerfile changes are not in.
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no FROM target."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image (local FROM target)
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker base image (no push, local FROM target)
-        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-session image (no push)
+        timeout-minutes: 10
         run: |
           docker build -f docker/session/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
@@ -2593,43 +3039,104 @@ jobs:
   native-image-smoke:
     name: loom-worker-native Image Smoke Test
     # Mirrors session-image-smoke exactly (#8403, Epic #6896 Phase 3): same
-    # `changes.docker` gate, same local base-image rebuild as this
-    # Dockerfile's FROM target (a PR's Dockerfile changes are published
-    # nowhere to pull from), same timeout. A sibling job rather than a matrix
-    # over the two overlay images on purpose — a matrix would couple two
-    # independent deliverables' failure modes, and CI here is deliberately
-    # dumb and reliable.
+    # image gate, same FROM target (the base image this run's
+    # `worker-base-image` built, #10822), same timeout. A sibling job rather
+    # than a matrix over the two overlay images on purpose — a matrix would
+    # couple two independent deliverables' failure modes, and CI here is
+    # deliberately dumb and reliable.
     #
     # This leg is where the pinned-CLI claim is actually made: the version
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require the shared base image
+        env:
+          BASE_RESULT: ${{ needs.worker-base-image.result }}
+        run: |
+          if [[ "$BASE_RESULT" != "success" ]]; then
+            echo "::error::worker-base-image finished '$BASE_RESULT'; this smoke has no FROM target."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Download the loom-worker base image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: release-daemon
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build loom-daemon (release)
-        run: cargo build --release --package loom-daemon
-      - name: Package binary at the path the Dockerfile expects
+          name: loom-worker-base-image
+          path: /tmp/loom-worker-base
+      - name: Load the loom-worker base image (local FROM target)
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/loom-daemon dist/loom-daemon-linux-amd64
-      - name: Build the loom-worker base image (no push, local FROM target)
-        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-smoke .
+          docker load --input /tmp/loom-worker-base/loom-worker-base.tar
+          docker image inspect ghcr.io/rjwalters/loom-worker:ci-smoke >/dev/null
       - name: Build the loom-worker-native image (no push)
+        timeout-minutes: 10
         run: |
           docker build -f docker/native/Dockerfile \
             --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
             -t loom-worker-native:ci-smoke .
       - name: Run the smoke test
         run: ./docker/native/test-image.sh loom-worker-native:ci-smoke
+
+  # Aggregate gate (#10444). A cancelled / never-acquired `Detect Changes`
+  # skips every path-filtered job behind it, and the three always-run required
+  # contexts stay green, so #10403 merged with no Rust lint or tests run.
+  # This job runs `if: always()`, needs EVERY other job, and fails when
+  # `Detect Changes` is not `success` on a PR, when any job failed/cancelled,
+  # or when a job was skipped only because its upstream did not succeed. A
+  # skip the path filter actually decided stays a pass. On push the only
+  # filter is `changes-push` (#10825): the image jobs skip only when it
+  # SUCCEEDED with docker=false; if it fails or is cancelled they run anyway
+  # and its own result fails this gate, so it fails closed. Rule + tests:
+  # scripts/ci-result-gate.sh, scripts/test-ci-result-gate.sh. Making it a
+  # REQUIRED context is a ruleset change applied by an operator AFTER this job
+  # has reported on `main` (setup-branch-protection.sh); a required context
+  # that never reports blocks every merge. The remedy for a red result is
+  # `gh run rerun --failed <run>` -- never cancel a distinct commit's run.
+  ci-result:
+    # No `merge-group-audit: pr-only` marker: `if: always()` runs this on every
+    # event, merge_group included, so the audit must count it as relied-on.
+    name: CI Result
+    if: always()
+    needs:
+      - changes
+      - changes-images
+      - changes-push
+      - build-daemon
+      - release-build
+      - node-packages
+      - backend-lint-and-check
+      - backend-tests
+      - workflow-cancel-lint
+      - backend-otlp-feature
+      - structural-checks
+      - daemon-checks
+      - install-surface-checks
+      - repo-hygiene
+      - shell-syntax
+      - dep-classification-suites
+      - native-port-daemon-lifecycle
+      - installer-tests
+      - codex-adapter-smoke
+      - shell-suite-tests
+      - worker-base-image
+      - worker-buildcache
+      - worker-image-smoke
+      - session-image-smoke
+      - native-image-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Aggregate every job's result
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: scripts/ci-result-gate.sh

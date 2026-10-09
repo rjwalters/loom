@@ -241,6 +241,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::HostWorktreeVolumeTotalBytes,
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
+        MetricName::QueueListingIncompleteRepos,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -264,6 +265,16 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::MergeTimeToLandMax,
         MetricName::DaemonTaskAlive,
         MetricName::DaemonTaskFaults,
+        MetricName::DaemonIpcLatencyMax,
+        MetricName::DaemonIpcLatency,
+        MetricName::DaemonIpcRequests,
+        MetricName::DaemonIpcStatusBuilds,
+        MetricName::GithubRateLimitRemaining,
+        MetricName::GithubRateLimitUsed,
+        MetricName::GithubRateLimitReset,
+        MetricName::GithubRateLimitBreakerSkips,
+        MetricName::ForgeCalls,
+        MetricName::ForgeFacadeEvents,
         MetricName::EtaHealthItems,
         MetricName::EtaHealthFitLoaded,
         MetricName::EtaHealthFitAgeSeconds,
@@ -274,6 +285,16 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::EtaHealthRefreshRepos,
         MetricName::EtaHealthSnapshotRows,
         MetricName::EtaHealthSnapshotAlternatesRows,
+        MetricName::EtaHealthSnapshotRowsTruncated,
+        MetricName::EtaHealthSnapshotAlternatesTruncated,
+        MetricName::EtaHealthSnapshotBytes,
+        MetricName::EtaHealthPendingOverCap,
+        MetricName::CodexSessionState,
+        MetricName::CodexSessionRecord,
+        MetricName::CodexSessionMountDrift,
+        MetricName::CaptainGaugeAgeSeconds,
+        MetricName::CaptainGaugeFallback,
+        MetricName::AgentScopePeakMemoryBytes,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
@@ -335,6 +356,46 @@ fn tick_result_precedence() {
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
+}
+
+/// #10624: the build back-off result keys on an actual deferral, ranks after
+/// `error`, and a repo that is merely held does not mask the tick's outcome.
+#[test]
+fn build_backoff_result_needs_a_deferral_and_yields_to_error() {
+    let held = |f: fn(&mut TickReport)| {
+        let mut report = TickReport {
+            seen: 3,
+            build_backoff_held: true,
+            ..TickReport::default()
+        };
+        f(&mut report);
+        tick_result(&report)
+    };
+    assert_eq!(held(|r| r.deferred_build_backoff = 2), "build_backoff_held");
+    assert_eq!(
+        held(|r| {
+            r.deferred_build_backoff = 2;
+            r.deferred_capacity = 1;
+        }),
+        "build_backoff_held"
+    );
+    // Another repo's dispatch failed: `error` is not masked.
+    assert_eq!(
+        held(|r| {
+            r.deferred_build_backoff = 2;
+            r.errors = 1;
+        }),
+        "error"
+    );
+    // One held repo with no candidates, another repo capacity-full.
+    assert_eq!(held(|r| r.deferred_capacity = 3), "capacity_full");
+    // Held, nothing deferred, nothing else: per-issue skips, not a hold.
+    assert_eq!(held(|r| r.skipped_backoff = 3), "all_skipped");
+    let idle = TickReport {
+        build_backoff_held: true,
+        ..TickReport::default()
+    };
+    assert_eq!(tick_result(&idle), "no_eligible_work");
 }
 
 #[test]
@@ -536,8 +597,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         Qd::OpenPr,
     ]);
     summary.listing_failed = vec!["/r2".into()];
+    summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 1);
+    assert_eq!(points.len(), Qd::ALL.len() + 2);
     let value = |reason: &str| {
         points
             .iter()
@@ -561,6 +623,11 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         .find(|p| p.name == MetricName::QueueListingFailedRepos)
         .unwrap();
     assert_eq!(failed.value, MetricValue::Int(1));
+    let partial = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueListingIncompleteRepos)
+        .unwrap();
+    assert_eq!(partial.value, MetricValue::Int(2));
     for point in &points {
         // Every label survives the export policy unchanged: only allowlisted,
         // bounded keys (state, reason), never an issue number or repo.

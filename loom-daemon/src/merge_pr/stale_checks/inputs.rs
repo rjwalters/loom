@@ -413,10 +413,30 @@ pub fn spec_for(component: &str) -> Option<&'static CheckSpec<'static>> {
 /// [`unknown_check_reason`] then turns into a refusal (fail closed).
 #[must_use]
 pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec<'static>>> {
-    match REQUIRED_CHECKS.iter().find(|r| r.context == context) {
-        Some(req) => req.components.iter().map(|c| spec_for(c)).collect(),
+    match required_check(context) {
+        Some(req) => {
+            // An aggregate (#10444) is its own components plus every component
+            // of each context it aggregates — the OR of the verdicts it folds.
+            let mut specs: Vec<&'static CheckSpec<'static>> = req
+                .components
+                .iter()
+                .map(|c| spec_for(c))
+                .collect::<Option<_>>()?;
+            for agg in req.aggregates {
+                for c in required_check(agg)?.components {
+                    specs.push(spec_for(c)?);
+                }
+            }
+            Some(specs)
+        }
         None => spec_for(context).map(|s| vec![s]),
     }
+}
+
+/// The [`REQUIRED_CHECKS`] entry for `context`, or `None`.
+#[must_use]
+pub fn required_check(context: &str) -> Option<&'static RequiredCheck> {
+    REQUIRED_CHECKS.iter().find(|r| r.context == context)
 }
 
 /// [`stale_reason_scoped`] for a required context made of `components`: the
@@ -461,6 +481,28 @@ const PROMPT_SURFACE: &[&str] = &[
     ".claude/commands/loom/**",
 ];
 
+/// Everything `scripts/check-role-prompt-budget.sh` reads (#9748): the two
+/// shared prefixes (`SHARED_PREFIX`), role discovery (`git ls-files
+/// 'defaults/roles/*.json'`) and the command directory (`CMD_DIR`) whose entry
+/// points and transitively linked bare siblings are summed. It never reads
+/// `defaults/docs`, installed `.loom/docs`, or the installed mirrors. The
+/// command-directory set is conservative (every markdown file there, not a
+/// per-role graph). A test runs the real checker's `--files` and fails if its
+/// read surface outgrows this set (ci-principles rule 9: refine what a result
+/// covers from the checker's own source; the check still runs on every PR).
+///
+/// Role discovery is `defaults/roles/**/*.json`, not `*.json`: a git pathspec
+/// without `:(glob)` magic matches `*` across `/`, so the checker also
+/// discovers a role from a JSON in a subdirectory. A one-segment glob would
+/// silently drop that read — narrowing on a surface the checker does not
+/// actually have, which rule 9 forbids.
+const ROLE_PROMPT_PREFIX_READS: &[&str] = &[
+    "CLAUDE.md",
+    "defaults/.loom/CLAUDE.md",
+    "defaults/roles/**/*.json",
+    "defaults/.claude/commands/loom/*.md",
+];
+
 /// The two mirrored trees the resync-parity gate pairs up.
 const RESYNC_PAIRS: &[&str] = &[
     "defaults/hooks/**",
@@ -480,6 +522,7 @@ pub const REQUIRED_CONTEXTS: &[&str] = &[
     "Structural Checks",
     "Shell Syntax (macos-latest)",
     "Daemon Checks",
+    "CI Result",
 ];
 
 /// One required context and the component checks its job runs as steps.
@@ -502,6 +545,13 @@ pub struct RequiredCheck {
     pub context: &'static str,
     /// The [`CheckSpec::context`] names of the gates this job runs.
     pub components: &'static [&'static str],
+    /// Other required contexts whose jobs this one aggregates through
+    /// `needs:` (#10444's `CI Result`). Their components are judged as part of
+    /// this context too ([`specs_for`]) — the aggregate's verdict is theirs
+    /// OR'd with its own components' — and their jobs' `ci.yml` blocks stay
+    /// attributed to those components rather than to this context's own
+    /// ([`super::workflow_scope`]). Empty for an ordinary job.
+    pub aggregates: &'static [&'static str],
 }
 
 /// Required context → component gates. See [`RequiredCheck`].
@@ -526,10 +576,12 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             "PRs Must Not Hand-Edit Version-Bearing Files",
             "Shell Syntax (ubuntu-latest)",
         ],
+        aggregates: &[],
     },
     RequiredCheck {
         context: "Shell Syntax (macos-latest)",
         components: &["Shell Syntax (macos-latest)"],
+        aggregates: &[],
     },
     RequiredCheck {
         context: "Daemon Checks",
@@ -538,6 +590,20 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             ".gitignore Convergence Check",
             "Secret Scan",
             "MCP Guard Wiring Contract",
+        ],
+        aggregates: &[],
+    },
+    // The always-run aggregate (#10444): it fails when any job it `needs:`
+    // failed or was cancelled. Its own component covers the gate script and
+    // every job no other required context runs; the three required contexts
+    // it also aggregates contribute their components unchanged.
+    RequiredCheck {
+        context: "CI Result",
+        components: &["CI Result"],
+        aggregates: &[
+            "Structural Checks",
+            "Shell Syntax (macos-latest)",
+            "Daemon Checks",
         ],
     },
 ];
@@ -608,6 +674,20 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         global: &[
             "scripts/check-shell-allowlist.sh",
             "scripts/shell-allowlist.txt",
+            // The CI Result gate's tests ride in this component's step group
+            // (#10444); the test drives the gate script, so both are inputs.
+            "scripts/test-ci-result-gate.sh",
+            "scripts/ci-result-gate.sh",
+            // The release-decision tests also ride in this step group
+            // (#10826); they drive the decision script and parse release.yml.
+            "scripts/test-release-decision.sh",
+            "scripts/release-decision.sh",
+            ".github/workflows/release.yml",
+            // The image-input tests ride here too (#10825); they drive the
+            // detection script, which reads .dockerignore, and parse ci.yml.
+            "scripts/test-ci-image-inputs.sh",
+            "scripts/ci-image-inputs.sh",
+            ".dockerignore",
             CI_WORKFLOW,
         ],
         scanned: SHELL,
@@ -628,15 +708,21 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     },
     // An AGGREGATE over each role's whole prompt file set — split a file in two
     // and every per-file number drops while this one rises. Purely coupled.
+    //
+    // `ci.yml` runs `--self-test` first, which executes
+    // `check-markdown-token-budget.sh --list` on the REAL tree and fails the
+    // step when its estimator disagrees with this one — so that script is a
+    // global input too.
     CheckSpec {
         context: "Role Prompt Prefix Ratchet",
         global: &[
             "scripts/check-role-prompt-budget.sh",
             "scripts/role-prompt-budget.txt",
+            "scripts/check-markdown-token-budget.sh",
             CI_WORKFLOW,
         ],
         scanned: &[],
-        coupled: PROMPT_SURFACE,
+        coupled: ROLE_PROMPT_PREFIX_READS,
         removal_sensitive: true,
     },
     // A content scan of every tracked file, strictly per-file.
@@ -765,10 +851,11 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // Rust surface: `update-gitignore`'s handler in `cli/misc_cmds.rs` calls
     // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
     // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
-    // modules its production code reaches (`agent_skills`, `proc_exec`,
-    // `self_update`), and the dispatch chain. MUST grow if the checker
-    // starts using another module — `daemon_surface_tests.rs` fails until it
-    // does. The script also runs `scripts/cargo-target-dir.sh`.
+    // modules its production code reaches (`agent_skills`, `install_compat`,
+    // `proc_exec`, `release_provenance`, `self_update`), and the dispatch chain.
+    // MUST grow if the checker starts using another module —
+    // `daemon_surface_tests.rs` fails until it does. The script also runs
+    // `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
         global: &[
@@ -777,7 +864,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/cli/misc_cmds.rs",
             "loom-daemon/src/init/**",
             "loom-daemon/src/agent_skills.rs",
+            "loom-daemon/src/install_compat.rs",
+            "loom-daemon/src/install_compat/**",
             "loom-daemon/src/proc_exec.rs",
+            "loom-daemon/src/release_provenance.rs",
             "loom-daemon/src/self_update.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
@@ -877,6 +967,88 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         coupled: &[],
         removal_sensitive: false,
     },
+    // `CI Result`'s own component (#10444): the gate script plus the inputs of
+    // every job it `needs:` that no other required context runs — the Rust
+    // build/lint/test jobs, `node-packages`, the installer/codex/dep suites,
+    // `shell-suite-tests`, `install-surface-checks`, `repo-hygiene` and the
+    // image smokes. Global: a Rust or shell suite's verdict can hinge on any
+    // file it compiles or reads, so any interaction refuses.
+    //
+    // `WORK_PLAN.md` is coupled, not global: two CI-wired shell suites
+    // (`test-guide-operator-attention-fold.sh` Test 3, `test-docs-worktree.sh`
+    // Test 6) assert on the committed root file, and `shell-suite-tests` only
+    // reaches a verdict through this aggregate. Coupled puts it in clauses
+    // 1-2's `any` set: a `WORK_PLAN.md` move on `main` refuses a PR that
+    // touches a global input (those suites, `guide.md`), and a PR touching
+    // `WORK_PLAN.md` refuses under a global move on `main`. A Guide docs
+    // refresh on `main` alone still does not refuse an unrelated PR.
+    CheckSpec {
+        context: "CI Result",
+        global: CI_RESULT_GLOBAL,
+        scanned: &[],
+        coupled: &["WORK_PLAN.md"],
+        removal_sensitive: false,
+    },
+];
+
+/// `CI Result`'s own `G`: the union of `ci.yml`'s `changes` path filters
+/// (`backend`, `mcp`, `docker`, `scripts` — the paths those jobs are declared
+/// to read) widened to every tracked code/config tree, plus the root files a
+/// suite reads (`CLAUDE.md` via the premise-false suite, `VERSION`).
+///
+/// Deliberately absent, because no aggregated job reads them: `README.md`,
+/// `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE`, `WORK_LOG.md`, `docs/**`,
+/// `assets/**`, `.vscode/**` and the editor/bot dotfiles. (`WORK_PLAN.md` IS
+/// read — by two `shell-suite-tests` suites — and is in the spec's `coupled`
+/// set rather than here; see the `CI Result` `CheckSpec`.) The
+/// markdown among them is still judged by the `Structural Checks` components
+/// (`Dangling Link Check`, `Conflict Marker Check`, …) this aggregate composes.
+/// So an edit to `README.md` on `main` does not, on its own, refuse every PR.
+const CI_RESULT_GLOBAL: &[&str] = &[
+    "scripts/ci-result-gate.sh",
+    CI_WORKFLOW,
+    ".github/**",
+    // backend
+    "loom-daemon/**",
+    "loom-api/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+    "deny.toml",
+    ".cargo/**",
+    ".config/**",
+    // mcp / node
+    "mcp-loom/**",
+    "package.json",
+    "pnpm-lock.yaml",
+    "**/package.json",
+    // docker
+    "docker/**",
+    ".dockerignore",
+    // scripts, installer, install surface, shell suites
+    "scripts/**",
+    "defaults/**",
+    "tests/**",
+    "install.sh",
+    ".loom/**",
+    ".claude/**",
+    ".agents/**",
+    ".githooks/**",
+    ".repo/**",
+    "quickstarts/**",
+    "examples/**",
+    "**/*.sh",
+    "**/*.rs",
+    "**/*.ts",
+    "VERSION",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    ".gitignore",
+    ".gitattributes",
+    ".shellcheckrc",
+    ".env.example",
 ];
 
 /// Shared by both `Shell Syntax` matrix legs, which run identical steps.
@@ -948,3 +1120,6 @@ mod tests;
 
 #[cfg(test)]
 mod daemon_surface_tests;
+
+#[cfg(test)]
+mod aggregate_tests;

@@ -1,5 +1,6 @@
 //! Delivery: what the ETA hook offers to the OTLP queues.
 
+use super::authority::{drop_pending, gate_delivery, report_coverage, scope_for};
 use super::*;
 use crate::eta::tests::{as_of, history_a, provenance};
 use crate::eta::tracker::{EstimateContext, IssueState};
@@ -70,14 +71,24 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     };
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &rolled, "host-test", false, Some(&sink));
-    // finish-v1, land-v1 (primary) and the land-v2 / land-v3 /
-    // land-2026-10-04-amber-heron / land-2026-10-04-fresh-tide / land-v4
-    // shadows (#9328, #9970, #10207, #10209, #10210) answer; the
-    // land-2026-10-04-twin-otter shadow (#10243) refuses this pre-PR stage;
-    // its -b composition (#10244) answers it from land-v2's path.
-    assert_eq!(delivered.emitted, 8, "finish + land + the six answering land shadows");
-    assert_eq!(delivered.refused, 1, "twin-otter: unknown_stage before a PR");
-    assert_eq!(delivered.outcomes, 9, "finish finished, every land estimate abandoned");
+    // finish-v1, land-v1 (primary) and the land-v2 /
+    // land-2026-10-06-even-lark / land-v4 shadows (#9328, #10489, #10210)
+    // answer (land-v3 and amber-heron retired, #10484; fresh-tide retired,
+    // #10549; land-2026-10-04-twin-otter, which refused this pre-PR stage,
+    // retired, #10528); little-v0 (#10208) refuses it; the twin-otter -b
+    // composition (#10244) answers it from land-v2's path (its IPCW
+    // calibration wrappers quick-tern, swift-tern and bold-lark, #10524, are
+    // retired, #10949), and so do the land-2026-10-06-held-heron hybrid
+    // (#10523), which routes
+    // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
+    // (#10508), land-2026-10-06-loop-kite (#10521), whose pre-PR stages
+    // take the dispatch plan and land-v2's path, the
+    // land-2026-10-06-tandem-wren dependency wrapper (#10510; no edge, so
+    // -b's own answer), and land-2026-10-06-brisk-petrel (#10528),
+    // twin-otter-b plus the regime adjustment.
+    assert_eq!(delivered.emitted, 11, "finish + land + the nine answering land shadows");
+    assert_eq!(delivered.refused, 1, "little-v0: unknown_stage before a PR");
+    assert_eq!(delivered.outcomes, 12, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
     let kinds: Vec<&str> = offered.iter().map(|e| e.record.kind()).collect();
@@ -93,6 +104,12 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
             "eta.estimate",
             "eta.estimate",
             "eta.estimate",
+            "eta.estimate",
+            "eta.estimate",
+            "eta.estimate",
+            "eta.outcome",
+            "eta.outcome",
+            "eta.outcome",
             "eta.outcome",
             "eta.outcome",
             "eta.outcome",
@@ -119,7 +136,7 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
         assert_eq!(envelope.host_id, "host-test");
         assert_eq!(envelope.schema_version, 12);
     }
-    let TelemetryRecord::EtaOutcome(outcome) = &offered[9].record else {
+    let TelemetryRecord::EtaOutcome(outcome) = &offered[15].record else {
         panic!("outcome")
     };
     assert_eq!(outcome.estimate.loom, provenance(), "the estimating build");
@@ -135,7 +152,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (8, 1, 9));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (11, 1, 12));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -149,15 +166,15 @@ fn records_without_valid_provenance_are_never_offered() {
     let (emissions, outcomes) = lifecycle(bad.clone());
     let sink = Capture::default();
     let delivered = deliver(emissions, Vec::new(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9);
+    assert_eq!(delivered.invalid, 12);
     assert!(sink.0.lock().unwrap().is_empty());
     // … and outcomes observed by one, or scoring one.
     let delivered =
         deliver(Vec::new(), outcomes.clone(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9, "the estimating build's provenance is checked too");
+    assert_eq!(delivered.invalid, 12, "the estimating build's provenance is checked too");
     let (_, good_outcomes) = lifecycle(provenance());
     let delivered = deliver(Vec::new(), good_outcomes, &bad, "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9, "the observing build's provenance is checked too");
+    assert_eq!(delivered.invalid, 12, "the observing build's provenance is checked too");
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -174,6 +191,7 @@ fn no_repo_id_means_no_story_context() {
 #[test]
 fn pr_views_key_each_pr_to_the_issue_it_closes() {
     let row = |number: u32, body: &str, pr: bool| RestIssue {
+        comments: 0,
         number,
         title: None,
         labels: vec!["loom:review-requested".to_string()],
@@ -183,6 +201,7 @@ fn pr_views_key_each_pr_to_the_issue_it_closes() {
         state: "open".to_string(),
         body: Some(body.to_string()),
         author: None,
+        author_association: None,
         is_pull_request: pr,
     };
     let listings = vec![
@@ -208,7 +227,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (8, 9, 0),
+        (11, 12, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {
@@ -223,13 +242,14 @@ fn incomplete_provenance_is_emitted_and_marked() {
 
 // ------------------------------------------- the fitted heuristics' file (#10243)
 
-/// What `land-2026-10-04-twin-otter` answers from `registry`: the fit id its
-/// explanation records, or the refusal.
+/// What twin-otter's evaluation answers from `registry` for a PR stage: the
+/// fit id its explanation records, or the refusal. Served by
+/// `land-2026-10-04-twin-otter-b` (twin-otter itself retired, #10528).
 fn twin_otter_answer(registry: &Registry) -> Result<String, crate::eta::NoEstimateReason> {
-    use crate::eta::heuristics::LAND_TWIN_OTTER;
+    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
     let input = crate::eta::tests::land_twin_otter::review_input();
     let e = registry
-        .get(LAND_TWIN_OTTER)
+        .get(LAND_TWIN_OTTER_B)
         .expect("always registered")
         .estimate(&input, &StageSamples::default());
     match (e.twin_otter, e.no_estimate_reason) {
@@ -245,16 +265,19 @@ fn swap_fit_rebuilds_the_registry_only_when_the_fit_id_changes() {
     let b = fixture_fit(fit_as_of() + chrono::Duration::hours(1));
     assert_ne!(a.id, b.id);
     // The same file again: nothing to do.
-    assert!(swap_fit(Some(&a.id), Some(a.clone())).is_none());
-    assert!(swap_fit(None, None).is_none());
+    assert!(swap_fit((Some(&a.id), None, None), (Some(a.clone()), None, None)).is_none());
+    assert!(swap_fit((None, None, None), (None, None, None)).is_none());
     // A new id (the daily refit): rebuilt around it.
-    let swapped = swap_fit(Some(&a.id), Some(b.clone())).expect("a new id swaps");
+    let swapped =
+        swap_fit((Some(&a.id), None, None), (Some(b.clone()), None, None)).expect("a new id swaps");
     assert_eq!(swapped.fit_id(), Some(b.id.as_str()));
     assert_eq!(twin_otter_answer(&swapped), Ok(b.id.clone()));
     // A file appearing, and one disappearing.
-    let appeared = swap_fit(None, Some(a.clone())).expect("a first file swaps");
+    let appeared =
+        swap_fit((None, None, None), (Some(a.clone()), None, None)).expect("a first file swaps");
     assert_eq!(appeared.fit_id(), Some(a.id.as_str()));
-    let gone = swap_fit(Some(&b.id), None).expect("a missing file swaps");
+    let gone =
+        swap_fit((Some(&b.id), None, None), (None, None, None)).expect("a missing file swaps");
     assert_eq!(gone.fit_id(), None, "the unloaded registry");
     assert_eq!(gone.ids(), Registry::builtin().ids());
     assert_eq!(twin_otter_answer(&gone), Err(crate::eta::NoEstimateReason::NoModel));
@@ -270,14 +293,20 @@ fn a_pass_hot_reloads_a_newer_fit_and_ignores_an_unchanged_one() {
     let root = dir.path();
     let now = review_input().as_of;
     let mut registry = Registry::load(root, now);
-    let reload =
-        |registry: &mut Registry| match swap_fit(registry.fit_id(), fit::load_latest(root, now)) {
-            Some(rebuilt) => {
-                *registry = rebuilt;
-                true
-            }
-            None => false,
-        };
+    let reload = |registry: &mut Registry| match swap_fit(
+        (registry.fit_id(), registry.fit_v2_id(), registry.fit_v3_id()),
+        (
+            fit::load_latest(root, now),
+            fit::v2::load_latest_v2(root, now),
+            fit::v3::load_latest_v3(root, now),
+        ),
+    ) {
+        Some(rebuilt) => {
+            *registry = rebuilt;
+            true
+        }
+        None => false,
+    };
     assert_eq!(registry.fit_id(), None, "an empty directory loads nothing");
     assert_eq!(twin_otter_answer(&registry), Err(crate::eta::NoEstimateReason::NoModel));
     assert!(!reload(&mut registry), "still nothing: no swap");
@@ -323,7 +352,9 @@ case "$*" in
   *'&page=2'*)
     if [ -f "$d/fail2" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p2.json" ;;
-  *) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p1.json" ;;
+  *) printf 'HTTP/2.0 200 OK\r\n'
+    [ "$(grep -o '"number"' "$d/p1.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last1" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+    printf '\r\n'; cat "$d/p1.json" ;;
 esac
 "#,
             dir = dir.display()
@@ -355,4 +386,115 @@ fn starred_issues_read_every_page_and_an_incomplete_walk_is_unknown() {
 
     std::fs::write(dir.path().join("fail2"), "").unwrap();
     assert!(read_starred_issues(&gh, dir.path(), &labels).is_err());
+}
+
+// ===== One ETA authority per fleet (#10498) =====
+
+#[test]
+fn a_non_authority_host_emits_nothing() {
+    let (emissions, outcomes) = lifecycle(provenance());
+    assert!(!emissions.is_empty() && !outcomes.is_empty());
+    let sink = Capture::default();
+    let delivered =
+        gate_delivery(false, emissions, outcomes, &provenance(), "host-test", false, Some(&sink));
+    assert_eq!(delivered, Delivered::default());
+    assert!(sink.0.lock().unwrap().is_empty(), "no eta.* record from a non-authority host");
+}
+
+#[test]
+fn the_authority_still_emits() {
+    let (emissions, outcomes) = lifecycle(provenance());
+    let sink = Capture::default();
+    let delivered =
+        gate_delivery(true, emissions, outcomes, &provenance(), "host-test", false, Some(&sink));
+    assert!(delivered.emitted > 0 && delivered.outcomes > 0);
+    assert!(!sink.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn demotion_drops_the_pending_store_once() {
+    let (emissions, _) = lifecycle(provenance());
+    assert!(!emissions.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let path = pending_path(dir.path());
+    let mut tracker = Tracker::new(provenance());
+    let pending = vec![EstimateSummary::of(&emissions[0].explanation)];
+    write_pending(&path, &pending);
+    tracker.restore_pending(pending, &Registry::builtin());
+    assert!(path.exists());
+    assert_eq!(drop_pending(&mut tracker, &path), 1);
+    assert!(tracker.pending().is_empty());
+    assert!(!path.exists(), "the persisted store is deleted");
+    // Idempotent: a second drop finds nothing and does not fail.
+    assert_eq!(drop_pending(&mut tracker, &path), 0);
+    assert!(read_pending(&path).is_empty(), "nothing is restored after a restart either");
+}
+
+// ===== Authority coverage of the fleet roster (#10897) =====
+
+fn roster_of(n: usize) -> Vec<crate::eta::repo_priority::FleetMember> {
+    (1..=n)
+        .map(|i| crate::eta::repo_priority::FleetMember {
+            repo: Some(format!("acme/repo{i}")),
+            priority: 50,
+        })
+        .collect()
+}
+
+fn faults(captured: &crate::observability::ops::capture::Captured) -> usize {
+    use crate::telemetry::ops::MetricName;
+    captured
+        .metrics
+        .iter()
+        .filter(|p| {
+            p.name == MetricName::DaemonTaskFaults
+                && p.labels.get("reason").map(String::as_str) == Some("eta_authority_coverage")
+        })
+        .count()
+}
+
+#[test]
+fn an_authority_managing_two_of_five_raises_the_critical_signal_and_others_keep_emitting() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let c = coverage(&roster, &["acme/repo1", "acme/repo2"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "loom-fleet-captain");
+    });
+    assert_eq!(faults(&captured), 1, "eta.authority.coverage fires");
+    assert_eq!(c.missing, vec!["acme/repo3", "acme/repo4", "acme/repo5"]);
+    // A non-authority host is not suppressed: undeclared, it emits every
+    // roster repo; declared with the authority's two, it emits the other three.
+    let all = scope_for(false, Some(&roster), &Declared::Undeclared).unwrap();
+    assert_eq!(all.len(), 5);
+    let declared = Declared::Repos(["acme/repo1".to_string(), "acme/repo2".to_string()].into());
+    let rest = scope_for(false, Some(&roster), &declared).unwrap();
+    assert_eq!(rest.len(), 3);
+    assert!(!rest.contains("acme/repo1"));
+}
+
+#[test]
+fn a_healthy_authority_raises_no_signal_and_others_stay_silent() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let slugs: Vec<String> = (1..=5).map(|i| format!("acme/repo{i}")).collect();
+    let c = coverage(&roster, &slugs);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, Some(&roster), &Declared::All), None);
+}
+
+#[test]
+fn an_unknown_roster_raises_nothing_and_changes_no_gating() {
+    use crate::eta::coverage::{coverage, Declared};
+    let c = coverage::<&str>(&[], &["acme/repo1"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, None, &Declared::Undeclared), None);
+    // The authority itself never takes a fallback scope.
+    assert_eq!(scope_for(true, Some(&roster_of(3)), &Declared::Undeclared), None);
 }

@@ -33,9 +33,16 @@
 //!
 //! - Features are built by name, in the model's feature order, through the
 //!   shared train/serve transform ([`crate::eta::fit::model_features`] and
-//!   [`crate::eta::fit::clock`]). At step `j` (`t_j = as_of + j·step_h`) the
-//!   age is `age_h + j·step_h` and the clock is read at `t_j`; the counts and
-//!   `since_merge_h` stay as they were at `as_of`.
+//!   [`crate::eta::fit::clock`]). A model whose names are not all `eta-fit/v1`
+//!   names but are all `eta-fit/v2` names (#10508) goes through the v2
+//!   transform ([`crate::eta::fit::features_v2::model_features_v2`]) with
+//!   [`TwinOtterInput::priority`] instead; a model of `eta-fit/v3` names
+//!   (#10521) goes through [`crate::eta::fit::features_v3::model_features_v3`]
+//!   with [`TwinOtterInput::loops`] as well; any other name is
+//!   `InvalidModel`. At step `j` (`t_j = as_of + j·step_h`) the
+//!   age is `age_h + j·step_h` and the clock is read at `t_j`; a v3 model's
+//!   cumulative stage age advances by the same `j·step_h` (unclamped); the
+//!   counts and `since_merge_h` stay as they were at `as_of`.
 //! - `z = (x − mu) / sd` with the stored `sd`, and no epsilon.
 //! - `h_j = sigmoid(intercept + coef·z_j)` and `S_k = Π_{j<k} (1 − h_j)`.
 //! - Later stages draw their dwell with a **step-function** inverse of the
@@ -99,7 +106,9 @@ mod path;
 pub use eval::blend;
 pub use path::{first_exit, km_inverse, nearest_rank};
 
+use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::fit::{AftFit, CoefficientFile, FitStage, HazardFit, PathStats};
+use crate::eta::loop_features::LoopFeatures;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -191,6 +200,16 @@ pub struct TwinOtterInput {
     pub ci_fail: u8,
     /// Carries `loom:blocked` (0/1).
     pub blocked: u8,
+    /// The `eta-fit/v2` priority inputs (#10508), read only by a v2 model
+    /// (one whose feature names are [`crate::eta::fit::features_v2::FEATURES_V2`]);
+    /// `None` = every one unknown. Absent from a v1 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<PriorityInputs>,
+    /// The `eta-fit/v3` friction predictors (#10521) at `as_of`, read only
+    /// by a v3 model; `None` = the default set (no loop, every `*_known`
+    /// indicator 0). Absent from a v1 or v2 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loops: Option<LoopFeatures>,
 }
 
 /// The parts of a coefficient set twin-otter reads, by reference.

@@ -36,11 +36,23 @@
 //!   instead of adding a second forge call path.
 
 pub mod aggressive;
+pub mod branch_holders;
 pub mod cargo_target;
 pub mod claim_file;
 pub mod clean;
+pub(crate) mod clean_owner;
+/// The hygiene read path (W6): issue and PR state, fresh and conditional,
+/// for every reaping and cleaning consumer.
+pub(crate) mod forge_state;
 pub mod gh;
+/// One hygiene pass (W6 PR2): what a pass may hold, and the fresh read
+/// every removal makes first.
+pub(crate) mod hygiene_pass;
+/// The one hygiene answer remembered across passes: a merged PR.
+pub(crate) mod hygiene_terminal;
 pub mod landed;
+/// Leg 0 of both open-linked-PR probes: the cached open-PR listing (#10514).
+pub(crate) mod linked_pr_listing;
 pub(crate) mod liveness;
 pub mod logs;
 /// `pub` rather than `pub(crate)` since #9444: the `record-rework` subcommand

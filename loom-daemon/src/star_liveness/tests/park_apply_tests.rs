@@ -58,8 +58,14 @@ fn a_comment_park_in_no_naming_form_goes_to_curator_not_the_operator() {
 
 #[test]
 fn an_applied_park_lands_blocked_by_and_inherits_the_star() {
-    let body = compose_body(BODY, &[11], Some("builder"), "2026-10-04T03:00:00Z", None)
-        .expect("a record is written");
+    let body = compose_body(
+        BODY,
+        &[crate::park_record::BlockerRef::local(11)],
+        Some("builder"),
+        "2026-10-04T03:00:00Z",
+        None,
+    )
+    .expect("a record is written");
     let world = World::default();
     let slug = "i/applied-park";
     world.add(slug, issue_with_body(10, &[STAR, "loom:blocked"], &body));

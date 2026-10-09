@@ -450,6 +450,7 @@ fn the_gateway_allowlist_admits_no_topology_peer_attribute() {
         gateway_keep_keys("resource"),
         BTreeSet::from([
             "host.id".to_string(),
+            "host.name".to_string(),
             "service.instance.id".to_string(),
             "service.name".to_string(),
             "service.version".to_string(),

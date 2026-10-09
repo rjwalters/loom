@@ -309,6 +309,10 @@ pub struct WorkItem {
     /// Set when this issue blocks a starred issue and inherits its star
     /// (#9244 C): the starred issue's number. See [`crate::star_liveness::inherit`].
     pub operator_priority_inherited_from: Option<u32>,
+    /// Who filed the issue, when the listing supplied it (#10118). Only a
+    /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
+    /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
+    pub author: Option<crate::comment_trust::Author>,
 }
 
 impl WorkItem {
@@ -330,6 +334,7 @@ impl WorkItem {
             updated_at: None,
             operator_priority_at: None,
             operator_priority_inherited_from: None,
+            author: None,
         }
     }
 
@@ -494,6 +499,15 @@ pub trait WorkSource {
     /// Returns an error when the forge query fails. The caller logs it and
     /// retries on the next tick — the error is never fatal.
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>>;
+
+    /// Whether the last [`Self::list_ready_issues`] returned this repo's
+    /// whole queue (#11139). `false` when it returned only the rows it could
+    /// read (a later page failed, the page cap, a mid-walk change): the tick
+    /// records the repo in [`TickReport::listing_incomplete`]. A source that
+    /// cannot fall short keeps the default.
+    fn listing_complete(&self) -> bool {
+        true
+    }
 }
 
 /// Performs the actual sweep dispatches the finder schedules and reports which
@@ -815,6 +829,12 @@ pub trait WorkDispatcher {
         false
     }
 
+    /// The red-main-fix escalation (#10118): `waiting` is this repo's
+    /// marker-bearing candidates on a red `main` (empty when `red` is false).
+    /// The production dispatcher alerts the operator once per fix left
+    /// unclaimed past the threshold. Defaults to a no-op.
+    fn escalate_red_fix(&mut self, _red: bool, _waiting: &[u32]) {}
+
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).
     ///
@@ -839,25 +859,6 @@ pub trait WorkDispatcher {
 // ============================================================================
 // Tick
 // ============================================================================
-
-/// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
-/// for carrying a hard-exclusion label (#7528), naming the rule.
-///
-/// DEBUG rather than INFO on purpose. The candidate listing re-evaluates the
-/// same rows every tick, so an INFO here would reproduce the #6440
-/// 865-refusals-in-an-hour shape for an intake backlog that is doing exactly
-/// what it should (sitting still until a maintainer clears the label). The
-/// operator-visible signal is the per-tick `declined-skip` count on the
-/// `work_finder: tick — …` line, plus the reaper's threshold WARN
-/// (`SweepRegistry::record_decline`) for an issue that actually reached
-/// dispatch and burned a session.
-fn log_hard_exclusion_skip(issue: u32, rule: &str) {
-    log::debug!(
-        "work_finder: skipping issue #{issue} — carries the hard-exclusion label `{rule}`, \
-         which every Loom role declines on; a maintainer must remove it (or close the issue) \
-         before it is dispatchable (#7528)"
-    );
-}
 
 /// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
 /// stayed parked, naming the capability gap (#6893 AC1/AC3).
@@ -1020,9 +1021,8 @@ pub fn tick_with_saturation_brake(
     max_admissions_per_tick: usize,
     saturation_held: bool,
 ) -> Result<TickReport> {
-    let lane = RedMainLane::default();
     let caps = (max_concurrent.into(), max_admissions_per_tick);
-    tick_with_lanes(source, dispatcher, caps, halted, saturation_held, lane)
+    tick_with_lanes(source, dispatcher, caps, halted, saturation_held, RedMainLane::default())
 }
 
 /// Like [`tick_with_saturation_brake`], plus the #9244 lanes: starred and
@@ -1045,6 +1045,8 @@ pub fn tick_with_lanes(
     lane: RedMainLane,
 ) -> Result<TickReport> {
     let mut ready = source.list_ready_issues()?;
+    // #10118: unpromoted red-main fixes stay only while `main` is red.
+    let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
     let mut report = TickReport {
         seen: ready.len(),
         // Record the brake's engagement even on a tick that defers nothing, so a
@@ -1053,7 +1055,7 @@ pub fn tick_with_lanes(
         saturation_held,
         ..TickReport::default()
     };
-    let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
+    report.note_listing(0, source.listing_complete());
     ready_queue::sort_lanes(&mut ready, red);
     let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
@@ -1180,7 +1182,7 @@ pub fn tick_with_lanes(
         //     standing to act on this issue yet".
         if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
             report.skipped_declined += 1;
-            log_hard_exclusion_skip(item.number, rule);
+            labels::log_hard_exclusion_skip(item.number, rule);
             continue;
         }
         // 1b. Self-declared re-check interval (#6685): the issue's own body
@@ -1610,16 +1612,18 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         preferred_slice,
         max_concurrent_per_repo,
         lanes,
-        false,
+        &[],
     )
 }
 
 /// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
-/// back-off** (#9410, [`build_backoff`]): while `build_backoff_held`, pass 2
-/// defers every candidate that is neither starred (`loom:operator-priority`)
-/// nor a verified red-main fix ([`Qd::DeferredBuildBackoff`]). Checked after
-/// the saturation brake and before the overflow / cap gates; in-flight sweeps
-/// are untouched. `false` is [`tick_multi_with_repo_cap`] byte-for-byte.
+/// back-off** (#9410, [`build_backoff`]): `build_backoff_held` is parallel to
+/// `workspaces` (#10624 — a repo's own debt, or the optional host ceiling);
+/// pass 2 defers each candidate of a held workspace that is neither starred
+/// (`loom:operator-priority`) nor a verified red-main fix
+/// ([`Qd::DeferredBuildBackoff`]). Checked after the saturation brake and
+/// before the overflow / cap gates; in-flight sweeps are untouched. An empty
+/// or all-`false` slice is [`tick_multi_with_repo_cap`] byte-for-byte.
 /// `halt_causes` is threaded through unchanged — see
 /// [`tick_multi_with_repo_cap`] for its contract (#9017).
 #[allow(clippy::too_many_arguments)]
@@ -1632,14 +1636,14 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     max_admissions_per_tick: usize,
     saturation_held: bool,
     preferred_slice: Option<&[bool]>,
-    max_concurrent_per_repo: Option<usize>,
+    max_concurrent_per_repo: impl Into<repo_cap::RepoLimits>,
     lanes: &[RedMainLane],
-    build_backoff_held: bool,
+    build_backoff_held: &[bool],
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
-    report.build_backoff_held = build_backoff_held;
+    report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -1651,7 +1655,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // track affinity, so neither reads any state the global seed did not.
     let per_repo_occupancy: Vec<usize> = workspaces.iter().map(|(_, d)| d.occupancy()).collect();
     let mut occupancy: usize = per_repo_occupancy.iter().sum();
-    let mut cap = RepoCap::new(max_concurrent_per_repo, per_repo_occupancy);
+    // #11094: `max_concurrent_per_repo` may carry the tick's per-repo RAM budget.
+    let mut cap = RepoCap::from_limits(max_concurrent_per_repo.into(), per_repo_occupancy);
     // The host's single `loom:operator-priority` overflow slot (#9244), taken
     // up front when any workspace already has a live overflow sweep.
     let (max_concurrent, mut overflow) = OverflowSlot::for_workspaces(workspaces, terms);
@@ -1799,7 +1804,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // decided globally, so dispatch happens in pass 2 after the sort.
     let mut candidates: Vec<PriorityCandidate> = Vec::new();
     for (idx, (source, dispatcher)) in workspaces.iter_mut().enumerate() {
-        let ready = match source.list_ready_issues() {
+        let mut ready = match source.list_ready_issues() {
             Ok(r) => r,
             Err(e) => {
                 // Per-workspace isolation: log, count, and move on — the other
@@ -1814,6 +1819,11 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 continue;
             }
         };
+        // #10118: resolve the lane first — unpromoted red-main fixes are
+        // dropped from `ready` (and from `seen`) unless `main` is red.
+        report.note_listing(idx, source.listing_complete());
+        let lane = lanes.get(idx).copied().unwrap_or_default();
+        let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
@@ -1826,8 +1836,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // caller can log "backlog is N but halted"; its in-flight sweeps stay in
         // the global occupancy seed and are never touched. #9244: a verified-red
         // repo with no other hold still admits its red-main fixes (only those).
-        let lane = lanes.get(idx).copied().unwrap_or_default();
-        let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.
@@ -1910,7 +1918,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
                 report.skipped_declined += 1;
                 skip(Qd::HardExclusion, Some(rule.to_string()), None);
-                log_hard_exclusion_skip(item.number, rule);
+                labels::log_hard_exclusion_skip(item.number, rule);
                 continue;
             }
             // Self-declared re-check interval (#6685): the issue's own body
@@ -2028,9 +2036,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
             continue;
         }
-        // Build back-off (#9410): a WIP policy, so a star (a human's "now")
-        // and a red-main fix (which drains merge debt) both bypass it.
-        if build_backoff_held && !(cand.operator_priority || cand.main_red_fix) {
+        // Build back-off (#9410), per repo since #10624: a WIP policy, so a star
+        // (a human's "now") and a red-main fix (which drains merge debt) both
+        // bypass it.
+        if build_backoff::defers(build_backoff_held, &cand) {
             report.deferred_build_backoff += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);
             continue;
@@ -2055,11 +2064,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredRampCap, None);
             continue;
         }
-        // Per-repo cap (#9090) — checked LAST of the four admission gates, so
-        // its deferral only ever names a repo that the machine-level gates
-        // above would have admitted. Work-conserving by construction: the
-        // `continue` hands this slot to the next candidate, in another repo.
-        if !over && cap.defer(&cand, &mut report) {
+        // Per-repo cap (#9090) and per-repo RAM charge (#11094) — checked LAST
+        // of the admission gates, so a deferral only ever names a repo that the
+        // machine-level gates above would have admitted. Work-conserving by
+        // construction: the `continue` hands this slot to the next candidate,
+        // in another repo. The RAM charge binds an overflow candidate too.
+        if cap.defer_admission(&cand, over, &mut report) {
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
@@ -2888,8 +2898,9 @@ pub fn spawn_multi_work_finder_task(
         let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
         let mut was_halted = false;
         let mut was_pressured = false;
-        // #9410: the build back-off's hysteresis state, held across ticks.
-        let mut build_backoff = build_backoff::BuildBackoff::default();
+        // #9410/#10624: the build back-off's per-repo (and optional host
+        // ceiling) hysteresis states, held across ticks.
+        let mut build_backoff = build_backoff::BuildBackoffs::default();
         // Pre-flight-advisory hold transition state (#5030): log the distinct
         // "held because pre-flight is broken" warning once per transition rather
         // than every tick, mirroring `was_halted`.
@@ -2991,7 +3002,11 @@ pub fn spawn_multi_work_finder_task(
             // RAM headroom (#5270): the second "dumb mode" machine-headroom
             // axis alongside disk, folded into the same `min(...)`. Read
             // BEFORE disk since #7512 — see the single-workspace loop above.
-            let ram = crate::ram_headroom::ram_headroom_limit();
+            // #11094: samples every live agent scope's `memory.peak` (folding
+            // finished scopes into the repo history) and charges admission
+            // with the observed per-repo peak.
+            // The budget charges each candidate its OWN repo's peak (pass 2).
+            let (ram, ram_budget) = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
@@ -3143,10 +3158,10 @@ pub fn spawn_multi_work_finder_task(
                 in_flight_sweeps,
                 crate::role_runner::global_active_run_count(),
             );
-            // #9410: one in-memory read of the role runner's demand ledger —
-            // no forge call; fails open when the ledger is unobserved.
-            let build_backoff_held =
-                build_backoff.step(&fallback_root, crate::role_runner::demand::global());
+            // #9410/#10624: in-memory reads of the role runner's demand ledger,
+            // one per root — no forge call; fails open when unobserved.
+            let ledger = crate::role_runner::demand::global();
+            let build_backoff_held = build_backoff.step(&fallback_root, &roots, ledger);
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
             // accumulated `threshold` consecutive pre-flight deaths (broken
@@ -3188,23 +3203,23 @@ pub fn spawn_multi_work_finder_task(
             // Distinguish a pre-flight-advisory hold from the main-health /
             // gate-in-flight holds (#5030 AC4) so an operator can tell "held
             // because pre-flight is broken" apart from "held because CI is red."
-            // #7708 folded a second cause into this same slice, so this edge
-            // line names both and defers the specifics to whichever hold
-            // logged its own edge line (`pool_preflight` logs the pool one).
+            // The slice folds four holds (#5030, #7708, write scope, #10719),
+            // so this edge line counts the causes in force and defers the
+            // specifics to whichever hold logged its own edge line.
             if preflight_held_count != was_preflight_held_count {
                 if preflight_held_count > 0 {
                     log::warn!(
-                        "work_finder: {preflight_held_count} of {} repo(s) held — \
-                         claude-wrapper pre-flight advisory tripped (broken .mcp.json, #5030) or \
-                         the resolved token pool has zero spawnable accounts (#7708); dispatch is \
-                         suppressed (an advisory hold still allows one probe per cooldown, a pool \
-                         hold allows none)",
-                        roots.len()
+                        "work_finder: {preflight_held_count} of {} repo(s) held before dispatch \
+                         ({}); see each hold's own edge line. A preflight_advisory hold (#5030) \
+                         still allows one probe per cooldown; token_pool (#7708), write_scope and \
+                         the workspace holds (#10719) allow none",
+                        roots.len(),
+                        halt_cause::held_summary(&preflight_causes)
                     );
                 } else {
                     log::info!(
-                        "work_finder: pre-flight + token-pool holds cleared for all repos — \
-                         dispatch resuming (#5030/#7708)"
+                        "work_finder: pre-dispatch holds cleared for all repos — dispatch \
+                         resuming (#5030/#7708/#10719)"
                     );
                 }
                 was_preflight_held_count = preflight_held_count;
@@ -3290,9 +3305,9 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),
-                max_concurrent_per_repo,
+                (max_concurrent_per_repo, ram_budget),
                 &lanes,
-                build_backoff_held,
+                &build_backoff_held.per_workspace,
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -3374,6 +3389,8 @@ pub fn spawn_multi_work_finder_task(
                     report.collisions
                 );
             }
+            // #10624: which repos the build back-off deferred (INFO on change).
+            build_backoff.log_deferred(&report.queue, &roots);
 
             if !report.halted {
                 // #5305: see the single-workspace loop above — `token_bound`

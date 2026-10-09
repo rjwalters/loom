@@ -113,12 +113,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::workspace_registry::WorkspaceRegistry;
-use crate::worktree_activity::{reclaim_skip_reason, removal_veto, resolve_activity_window};
+use crate::worktree_activity::{removal_veto, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
@@ -344,13 +344,7 @@ pub fn reap_worktrees(
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_generic(
-        repo_root,
-        &crate::worktree_ops::naming::issue_from_worktree,
-        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
-        quarantine,
-        remove,
-    )
+    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, remove, &|_| None)
 }
 
 /// Enumerate `pr-<N>` worktrees under `repo_root`'s worktree root, classify
@@ -376,49 +370,19 @@ pub fn reap_pr_worktrees(
     probes: &clean::PrWorktreeProbes<'_>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_generic(
-        repo_root,
-        &crate::worktree_ops::naming::pr_from_worktree,
-        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
-        // `classify_pr_worktree` never returns `RemoveWithQuarantine` (issue
-        // #6653's quarantine-then-reclaim path is scoped to issue-<N>
-        // worktrees only, so far) — this closure is unreachable for the
-        // `pr-<N>` pass.
-        &|_: &Path, _: u32| None,
-        remove,
-    )
+    reap_pr_worktrees_confirmed(repo_root, opts, probes, remove, &|_| None)
 }
 
 // ============================================================================
 // Artifact reclaim pass (AC3 of #5177 — #5187)
 // ============================================================================
 
-/// What one artifact-reclaim pass over one repo did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReclaimReport {
-    /// Worktree directories examined by this pass — `issue-<N>` for
-    /// [`reclaim_kept_worktree_artifacts`], `pr-<N>` for
-    /// [`reclaim_kept_pr_worktree_artifacts`] (#5939).
-    pub scanned: usize,
-    /// Issue number -> reclaimed top-level directory names (e.g. `"target"`,
-    /// `"node_modules"`), for worktrees that had at least one.
-    pub reclaimed: Vec<(u32, Vec<String>)>,
-    /// Worktrees this pass left untouched, keyed by why.
-    pub skipped: Vec<(u32, String)>,
-}
+mod artifact_reclaim;
 
-impl ReclaimReport {
-    /// A compact one-line summary for the daemon log.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        format!(
-            "scanned={} reclaimed={} skipped={}",
-            self.scanned,
-            self.reclaimed.len(),
-            self.skipped.len()
-        )
-    }
-}
+pub use artifact_reclaim::{
+    clean_idle_targets, log_idle_target_report, reclaim_idle_targets_below_floor, ArtifactDir,
+    ReclaimReport, CATEGORY as IDLE_TARGET_CATEGORY,
+};
 
 /// Reclaim `target/`/`node_modules/`/... from every **kept** worktree under
 /// `repo_root`'s worktree root — a worktree the removal pass ([`reap_worktrees`])
@@ -438,9 +402,10 @@ impl ReclaimReport {
 ///   outcome the acceptance criteria say must never be touched.
 /// - Every other skip reason (open issue, open/unmerged/absent PR, grace
 ///   period, uncommitted changes, unmanaged, editable install, unknown PR
-///   status): a **kept, idle** worktree — reclaim its build artifacts via
-///   [`clean::reclaim_worktree_artifacts`] — **unless** #8116's activity gate
-///   says otherwise. `activity_window` is the mtime window
+///   status): a **kept, idle** worktree — reclaim its build artifacts
+///   (largest first, each directory vetted and probed: see
+///   [`artifact_reclaim`], #11071) — **unless** #8116's activity gate says
+///   otherwise. `activity_window` is the mtime window
 ///   [`crate::worktree_activity::reclaim_skip_reason`] treats as "a live
 ///   worker is here, whatever the registry thinks"; [`Duration::ZERO`]
 ///   disables that gate and restores the pre-#8116 behavior.
@@ -451,12 +416,20 @@ pub fn reclaim_kept_worktree_artifacts(
     dry_run: bool,
     activity_window: Duration,
 ) -> ReclaimReport {
-    reclaim_kept_artifacts_generic(
+    let classify = |path: &Path, n: u32| clean::classify_worktree(path, n, opts, probes);
+    let class = artifact_reclaim::WorktreeClass {
+        prefix: "issue",
+        parse_name: &crate::worktree_ops::naming::issue_from_worktree,
+        classify: &classify,
+    };
+    let probes = artifact_reclaim::production_artifact_probes();
+    artifact_reclaim::reclaim_kept(
         repo_root,
+        &class,
         dry_run,
         activity_window,
-        &crate::worktree_ops::naming::issue_from_worktree,
-        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+        &probes,
+        &artifact_reclaim::never_stop,
     )
 }
 
@@ -482,99 +455,32 @@ pub fn reclaim_kept_pr_worktree_artifacts(
     dry_run: bool,
     activity_window: Duration,
 ) -> ReclaimReport {
-    reclaim_kept_artifacts_generic(
+    let classify = |path: &Path, n: u32| clean::classify_pr_worktree(path, n, opts, probes);
+    let class = artifact_reclaim::WorktreeClass {
+        prefix: "pr",
+        parse_name: &crate::worktree_ops::naming::pr_from_worktree,
+        classify: &classify,
+    };
+    let probes = artifact_reclaim::production_artifact_probes();
+    artifact_reclaim::reclaim_kept(
         repo_root,
+        &class,
         dry_run,
         activity_window,
-        &crate::worktree_ops::naming::pr_from_worktree,
-        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+        &probes,
+        &artifact_reclaim::never_stop,
     )
 }
 
-/// The shared artifact-reclaim loop behind [`reclaim_kept_worktree_artifacts`]
-/// and [`reclaim_kept_pr_worktree_artifacts`] (#5939) — the reclaim-side
-/// counterpart of [`reap_worktrees_generic`], and split for the same reason:
-/// the two classes differ only in their naming filter and classifier, so
-/// there is exactly one copy of the "which decisions are reclaimable" rule.
-fn reclaim_kept_artifacts_generic(
-    repo_root: &Path,
-    dry_run: bool,
-    activity_window: Duration,
-    parse_name: &dyn Fn(&str) -> Option<u32>,
-    classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
-) -> ReclaimReport {
-    let mut report = ReclaimReport::default();
-    let now = SystemTime::now();
-
-    for entry in enumerate_worktree_dirs(repo_root) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(num) = parse_name(&name) else {
-            continue;
-        };
-        report.scanned += 1;
-        if name.starts_with("issue-")
-            && crate::tokens_pool::private_workspace::export::has_issue(repo_root, num)
-        {
-            continue;
-        }
-
-        let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        let decision = classify(&worktree_path, num);
-
-        if let Some(reason) = reclaim_skip_reason(&decision, &worktree_path, now, activity_window) {
-            report.skipped.push((num, reason));
-            continue;
-        }
-
-        let reclaimed = clean::reclaim_worktree_artifacts(&worktree_path, dry_run);
-        if reclaimed.is_empty() {
-            continue;
-        }
-        report
-            .reclaimed
-            .push((num, reclaimed.into_iter().map(|a| a.name).collect()));
-    }
-
-    report
-}
-
-/// Log an `issue-<N>` artifact-reclaim pass's outcome, mirroring
-/// [`log_report`]'s shape.
+/// Log an `issue-<N>` artifact-reclaim pass's outcome
+/// ([`artifact_reclaim::log_report`]).
 pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
-    log_reclaim_report_for_class(repo_root, report, "issue");
+    artifact_reclaim::log_report(repo_root, report, "issue");
 }
 
-/// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939) — the PR counterpart
-/// of [`log_reclaim_report`].
+/// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939).
 pub fn log_pr_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
-    log_reclaim_report_for_class(repo_root, report, "pr");
-}
-
-/// Shared body of [`log_reclaim_report`] / [`log_pr_reclaim_report`]. `class`
-/// is the worktree-name prefix without its trailing dash (`"issue"` / `"pr"`),
-/// so a per-worktree log line reads `skipping issue-42` / `skipping pr-5312`
-/// and an operator can tell the two passes apart in one log.
-fn log_reclaim_report_for_class(repo_root: &Path, report: &ReclaimReport, class: &str) {
-    if report.reclaimed.is_empty() {
-        log::debug!(
-            "worktree_reaper: {} {class}-<N> artifact reclaim: nothing to reclaim ({})",
-            repo_root.display(),
-            report.summary()
-        );
-    } else {
-        log::info!(
-            "worktree_reaper: {} {class}-<N> artifact reclaim: {} reclaimed={:?}",
-            repo_root.display(),
-            report.summary(),
-            report.reclaimed
-        );
-    }
-    for (num, reason) in &report.skipped {
-        log::debug!(
-            "worktree_reaper: {} artifact reclaim skipping {class}-{num}: {reason}",
-            repo_root.display()
-        );
-    }
+    artifact_reclaim::log_report(repo_root, report, "pr");
 }
 
 // ============================================================================
@@ -708,24 +614,28 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
-    // Resolved once per pass (one REST call), not once per worktree.
-    let owner = clean::repo_owner_rest(repo_root);
+    // One hygiene pass (W6 PR2, `worktree_ops::hygiene_pass`): the owner is
+    // resolved once (repo-facts record, else one REST call; `NoPr` owner
+    // confirmations memoised, W3a), and each issue / PR / branch answer is
+    // held for this pass only, so the removal pass and the artifact-reclaim
+    // pass below share one read instead of making two. Every removal is
+    // confirmed by one fresh unconditional read first (`confirm_*`).
+    let pass = crate::worktree_ops::hygiene_pass::Pass::begin(repo_root);
     // #6652: likewise, one `git worktree list` per pass — see
     // `clean::registered_worktree_paths` doc comment for the fail-closed
     // contract on a `None` (undeterminable) snapshot.
     let registered = clean::registered_worktree_paths(repo_root);
     let is_registered_fn = clean::is_registered_worktree_probe(&registered);
 
-    let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
+    let issue_state_fn = |n: u32| pass.issue_state(n);
     // #6653: the safety criterion for gating `PrStatus::NoPr`'s grace period
-    // — REST, same quota-isolation rationale as every other probe here.
-    let issue_closed_at_fn = |n: u32| crate::worktree_ops::gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| match owner.as_deref() {
-        Some(owner) => clean::check_pr_merged_rest(repo_root, owner, n),
-        // No owner ⇒ no REST head filter is constructible; fall back to the
-        // GraphQL-backed probe rather than silently reporting Unknown forever.
-        None => clean::check_pr_merged(repo_root, n),
-    };
+    // — REST, same quota-isolation rationale as every other probe here (and
+    // the same body `issue_state_fn` just read: no second call).
+    let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
+    // The owner-confirmed REST listing; with no owner no REST head filter is
+    // constructible, and the GraphQL-backed probe is the fallback rather than
+    // silently reporting Unknown forever.
+    let pr_status_fn = |n: u32| pass.issue_pr_status(n, false);
     // #6418: the safety criterion for removing a `ClosedNoMerge` worktree's
     // directory — every commit on the issue's own branch must be reachable
     // from some remote ref. Local refs are shared across worktrees of the
@@ -771,7 +681,9 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
         )
     };
 
-    let mut report = reap_worktrees(repo_root, &opts, &probes, &quarantine, &remover);
+    let confirm_issue = |n: u32| pass.confirm_issue(n).keep_reason();
+    let mut report =
+        reap_worktrees_confirmed(repo_root, &opts, &probes, &quarantine, &remover, &confirm_issue);
 
     // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
     // never matched the issue-keyed pass above — the one worktree class no
@@ -780,22 +692,14 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // see `check_pr_status_by_number_rest`), so this needs neither `owner`
     // nor a GraphQL fallback the way the issue-keyed `pr_status_fn` above does.
     //
-    // Memoized per `reap_repo` call (#5939 review): the removal pass and the
-    // artifact-reclaim pass below share these probes, and each kept `pr-<N>`
-    // worktree would otherwise cost two identical `gh api .../pulls/<N>` calls
-    // every tick, forever. One cache, one call per PR per tick. The removal
-    // path also needs the PR's head SHA — same payload, same call — to decide
-    // whether force-deleting the local branch can lose anything.
-    let pr_cache: std::cell::RefCell<std::collections::HashMap<u32, clean::PrProbe>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    let probe_pr = |n: u32| -> clean::PrProbe {
-        if let Some(hit) = pr_cache.borrow().get(&n) {
-            return hit.clone();
-        }
-        let probed = clean::check_pr_by_number_rest(repo_root, n);
-        pr_cache.borrow_mut().insert(n, probed.clone());
-        probed
-    };
+    // Held for this pass (#5939 review; now `hygiene_pass::Pass::pull`): the
+    // removal pass and the artifact-reclaim pass below share these probes,
+    // and each kept `pr-<N>` worktree would otherwise cost two identical
+    // `gh api .../pulls/<N>` calls every tick, forever. A PR that merged is
+    // remembered across passes and costs none. The removal path also needs
+    // the PR's head SHA — same payload — to decide whether force-deleting the
+    // local branch can lose anything; by then `confirm_pull` has re-read it.
+    let probe_pr = |n: u32| -> clean::PrProbe { pass.pull(n) };
     let pr_status_by_number_fn = |n: u32| probe_pr(n).status;
     // #6418: the `pr-<N>` counterpart of `branch_reachable_fn` above — the
     // branch is whatever `gh pr checkout` produced, so it is read from the
@@ -824,7 +728,9 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
             )
         })
     };
-    let pr_report = reap_pr_worktrees(repo_root, &opts, &pr_probes, &pr_remover);
+    let confirm_pr = |n: u32| pass.confirm_pull(n).keep_reason();
+    let pr_report =
+        reap_pr_worktrees_confirmed(repo_root, &opts, &pr_probes, &pr_remover, &confirm_pr);
     log_pr_report(repo_root, &pr_report);
 
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
@@ -867,6 +773,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
 pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
     let report = reap_worktrees_only(repo_root, config);
 
+    // #10995: aborted-fetch debris (`.git/objects/pack/tmp_pack_*`,
+    // `objects/??/tmp_obj_*`). Cheap and precise, so it runs before the
+    // pressure-gated deep pass, which then sees the bytes it freed.
+    let _ = crate::git_tmp_reclaim::run_for(repo_root);
+
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
     // free. Fires only under disk pressure, holds the machine build slot, and
@@ -898,6 +809,10 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // process survives to clean up after a session. See
     // `crate::native_state_reclaim`'s module docs.
     let _ = crate::native_state_reclaim::run_for(repo_root);
+
+    // #8370: orphaned cargo target dirs under `.loom/targets/` and the known
+    // improvised prefixes. Own per-repo cooldown, shared with the eager tier.
+    let _ = crate::target_orphan_reclaim::run_for(repo_root);
 
     report
 }
@@ -2316,6 +2231,7 @@ mod tests {
                 scanned: 2,
                 reclaimed: vec![(5312, vec!["target".to_string()])],
                 skipped: vec![(5349, "PR still open".to_string())],
+                ..ReclaimReport::default()
             },
         );
     }
@@ -2489,6 +2405,7 @@ mod tests {
             scanned: 3,
             reclaimed: vec![(1, vec!["target".to_string()])],
             skipped: vec![(2, "in use".to_string())],
+            ..ReclaimReport::default()
         };
         assert_eq!(report.summary(), "scanned=3 reclaimed=1 skipped=1");
     }
@@ -2504,6 +2421,7 @@ mod tests {
                 scanned: 1,
                 reclaimed: vec![(1, vec!["target".to_string(), "node_modules".to_string()])],
                 skipped: vec![(2, "PR still open".to_string())],
+                ..ReclaimReport::default()
             },
         );
     }
@@ -2788,4 +2706,6 @@ mod tests {
 }
 
 mod private_route;
+#[cfg(any(test, doc))]
 use private_route::reap_worktrees_generic;
+use private_route::{reap_pr_worktrees_confirmed, reap_worktrees_confirmed};

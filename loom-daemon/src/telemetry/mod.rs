@@ -59,21 +59,27 @@ pub mod ci;
 pub mod disposition;
 mod envelope;
 pub mod kinds;
+pub mod no_phase_cause;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
+pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
-pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
+pub use disposition::{
+    classify_disposition, DispositionSignals, IssueEndState, SweepDisposition,
+    NO_PHASE_SIGNAL_CLASS,
+};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
     export_coverage, exported_kinds_for, TelemetryKindMeta, TelemetryKindOtlp,
     NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS,
 };
+pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
 pub use queue_snapshot::QueueSnapshotRecord;
 
@@ -937,6 +943,11 @@ pub struct SweepOutcomeRecord {
     /// BY`, which is the whole point of separating the absence cases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_status_reason: Option<String>,
+    /// Why a `failure_class = unclassified:no-phase-signal` sweep ended
+    /// (Issue #10642): exit code (or `none_observed`), last step reached, and
+    /// a bounded reason. Present only on records of that class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_phase_cause: Option<NoPhaseCause>,
     /// 1-based count of terminal sweeps for this repo#issue in this host's
     /// durable outcome journal (Issue #9444) — the attempt this sweep was.
     /// Absent when the journal could not be read.
@@ -1755,6 +1766,32 @@ pub struct ManagedRepoEntry {
     /// workspace (the empty-registry cwd fallback) and on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
+    /// This host's `loom:blocked` release-pass tallies for the repo since the
+    /// daemon started (#10763). Absent before the pass's first tick for the
+    /// repo on this host and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
+}
+
+/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
+/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
+/// diagnosable without host logs: `ticks` counts every per-repo tick by
+/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
+/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleBlockedReleaseCounters {
+    /// Artifacts released (applied writes only).
+    #[serde(default)]
+    pub released: u64,
+    /// Artifacts re-parked (applied writes only).
+    #[serde(default)]
+    pub reparked: u64,
+    /// The most recent tick's outcome key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    /// Ticks per outcome key.
+    #[serde(default)]
+    pub ticks: std::collections::BTreeMap<String, u64>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

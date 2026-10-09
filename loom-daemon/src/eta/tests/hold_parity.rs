@@ -17,7 +17,7 @@ use super::provenance;
 use crate::eta::fit::rows;
 use crate::eta::fit::{FitStage, ModelInputs};
 use crate::eta::fleet::FleetSnapshot;
-use crate::eta::heuristics::LAND_TWIN_OTTER;
+use crate::eta::heuristics::LAND_TWIN_OTTER_B;
 use crate::eta::journal::JournalEntry;
 use crate::eta::tracker::{
     events_from_journal, EstimateContext, ItemKey, ListedPr, PrState, PrView, Tracker,
@@ -73,7 +73,7 @@ impl Spec {
     }
 
     /// The forge's label timeline of this PR.
-    fn history(&self) -> PrHistory {
+    pub(crate) fn history(&self) -> PrHistory {
         let mut events: Vec<PrEvent> = Vec::new();
         let mut before: &[&str] = &[];
         for (x, labels) in self.steps {
@@ -160,7 +160,7 @@ pub(crate) fn snapshots(specs: &[Spec]) -> Vec<FleetSnapshot> {
 }
 
 /// The fleet listings of `specs` at `at`.
-fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
+pub(crate) fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
     [REPO, OTHER]
         .into_iter()
         .map(|repo| {
@@ -177,6 +177,24 @@ fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
                 })
                 .collect();
             (repo.to_string(), prs)
+        })
+        .collect()
+}
+
+/// The tracker's listing rows of `repo`'s PRs at `at`.
+pub(crate) fn views_at(specs: &[Spec], repo: &str, at: f64) -> Vec<PrView> {
+    specs
+        .iter()
+        .filter(|s| s.repo == repo && s.listed_at(at))
+        .map(|s| {
+            let (labels, updated_at) = s.view_at(at);
+            PrView {
+                number: s.pr,
+                issue: s.issue(),
+                labels,
+                created_at: Some(t(0)),
+                updated_at: Some(updated_at),
+            }
         })
         .collect()
 }
@@ -245,11 +263,18 @@ pub(crate) fn serve_with(
 
 /// The registry with the parity fixture's fit, cut off before the scenario.
 pub(crate) fn fitted() -> Registry {
-    Registry::with_fit(Some(Arc::new(fixture_fit(t(0) - Duration::days(1)))))
+    let at = t(0) - Duration::days(1);
+    // Every fit, so `land-2026-10-06-keen-wren` (#10508) and
+    // `land-2026-10-06-loop-kite` (#10521) answer too.
+    Registry::with_all_fits(
+        Some(Arc::new(fixture_fit(at))),
+        Some(Arc::new(super::keen_wren::v2_fixture(at, 0.0, 0.0))),
+        Some(Arc::new(super::loop_kite::v3_fixture(at, 0.0, 0.0))),
+    )
 }
 
 /// The twin-otter record of `spec`'s first `land` estimate at [`AT`].
-fn served(
+pub(crate) fn served(
     tracker: &mut Tracker,
     registry: &Registry,
     spec: &Spec,
@@ -270,8 +295,8 @@ fn served(
     let emissions = tracker.estimate(Some(&[spec.key()]), &ctx, h(AT));
     let twin = emissions
         .iter()
-        .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == LAND_TWIN_OTTER)
-        .expect("a twin-otter estimate");
+        .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == LAND_TWIN_OTTER_B)
+        .expect("a twin-otter-b estimate (twin-otter's PR-stage evaluation, #10528)");
     let record = twin.explanation.twin_otter.as_ref().unwrap_or_else(|| {
         panic!("PR {} not answered: {:?}", spec.pr, twin.explanation.no_estimate_reason)
     });

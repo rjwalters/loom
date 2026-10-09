@@ -81,11 +81,11 @@
 use super::config::HistoryScopeMode;
 use super::episodes::{derive, input_from_pr_history, StageEpisode};
 use super::explanation::HistoryScope;
-use super::flag_timeline::{self, flag_changes_from_input, FlagChange};
+use super::flag_timeline::{self, flag_changes_from_input, FlagChange, RepoFlagChange};
 use super::history::{SampleSource, StageSample, StageSamples, VerdictSample};
 use super::journal::{censored_from_pr_history, entries_from_pr_history, JournalEntry};
 use super::{Provenance, Stage, WINDOW_DAYS};
-use crate::pr_latency::PrHistory;
+use crate::pr_latency::{PrHistory, PrState};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -252,6 +252,29 @@ pub struct FleetSnapshot {
     /// empty list is not written, so such a file keeps its id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flag_changes: Vec<FlagChange>,
+    /// Every merge of a PR the snapshot read (#10500), **labelled or not**:
+    /// a PR that never carried a loom review label has no episode, so
+    /// without this its merge would reach no merge count. Sorted by
+    /// `(pr_number, at)`. Same compatibility rules as `episodes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merges: Vec<ForgeMerge>,
+}
+
+/// One forge merge (#10500): the PR and its `merged_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ForgeMerge {
+    /// The merged PR.
+    pub pr_number: u32,
+    /// When it merged.
+    pub at: DateTime<Utc>,
+}
+
+impl ForgeMerge {
+    /// The merge's snapshot-id digest line (starts `merge|`, so it cannot
+    /// read as a sample, episode or flag line).
+    fn digest_line(&self) -> String {
+        format!("merge|{}|{}", self.pr_number, crate::telemetry::trace::instant(self.at))
+    }
 }
 
 impl FleetSnapshot {
@@ -268,6 +291,7 @@ impl FleetSnapshot {
             samples: Vec::new(),
             episodes: Vec::new(),
             flag_changes: Vec::new(),
+            merges: Vec::new(),
         };
         snapshot.seal();
         snapshot
@@ -300,7 +324,15 @@ impl FleetSnapshot {
         self.episodes.retain(|e| !replaced.contains(&e.pr_number));
         self.flag_changes
             .retain(|c| !replaced.contains(&c.pr_number));
+        self.merges.retain(|m| !replaced.contains(&m.pr_number));
         for h in &usable {
+            // #10500: every merged PR, whether or not it has an episode.
+            if let (PrState::Merged, Some(at)) = (h.state, h.merged_at) {
+                self.merges.push(ForgeMerge {
+                    pr_number: h.number,
+                    at,
+                });
+            }
             self.samples
                 .extend(samples_from_pr_history(h, &self.repo, as_of));
             let input = input_from_pr_history(h, &self.repo);
@@ -319,6 +351,7 @@ impl FleetSnapshot {
         {
             self.samples.retain(|s| s.observed_at >= floor);
             self.episodes.retain(|e| e.last_at() >= floor);
+            self.merges.retain(|m| m.at >= floor);
             self.flag_changes = flag_timeline::prune(std::mem::take(&mut self.flag_changes), floor);
         }
         let mut prs: BTreeSet<u32> = self.prs.iter().copied().collect();
@@ -352,6 +385,8 @@ impl FleetSnapshot {
         self.episodes.dedup();
         self.flag_changes.sort();
         self.flag_changes.dedup();
+        self.merges.sort();
+        self.merges.dedup();
         self.cursor = self.samples.iter().map(|s| s.observed_at).max();
         let mut lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
         // #10218: episode lines only when there are episodes (each starts
@@ -360,6 +395,8 @@ impl FleetSnapshot {
         lines.extend(self.episodes.iter().map(StageEpisode::digest_line));
         // #10245: the same rule for flag lines (each starts `flags|`).
         lines.extend(self.flag_changes.iter().map(FlagChange::digest_line));
+        // #10500: and for merge lines (each starts `merge|`).
+        lines.extend(self.merges.iter().map(ForgeMerge::digest_line));
         let mut parts: Vec<&str> = vec!["loom.eta.fleet.snapshot"];
         let repo = self.repo.to_ascii_lowercase();
         let at = crate::telemetry::trace::instant(self.as_of);
@@ -386,7 +423,9 @@ impl FleetSnapshot {
     /// when it left for a stage or a merge, censored otherwise) so
     /// `select(repo, MergeHold, …)` answers. The split `merge_wait` episodes
     /// are deliberately **not** samples: `merge_wait` samples keep the pooled
-    /// definition every shipped heuristic reads.
+    /// definition every shipped heuristic reads. The flag timeline (#10245)
+    /// is copied into [`StageSamples::flag_changes`] with this snapshot's
+    /// repo (#10523).
     #[must_use]
     pub fn stage_samples(&self) -> StageSamples {
         let mut history = StageSamples {
@@ -420,6 +459,15 @@ impl FleetSnapshot {
             }
         }
         history.episodes = self.episodes.clone();
+        // #10523: the flag timeline, tagged with this snapshot's repo.
+        history.flag_changes = self
+            .flag_changes
+            .iter()
+            .map(|change| RepoFlagChange {
+                repo: self.repo.clone(),
+                change: *change,
+            })
+            .collect();
         history
     }
 

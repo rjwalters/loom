@@ -20,13 +20,34 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::doctor::{
-    ConfigFacts, DataFacts, FitFacts, Gate, HeuristicTally, OutcomeFacts, PairFacts, RepoFacts,
-    ServingFacts,
+    AuthorityFacts, BacktestFacts, ConfigFacts, DataFacts, DriftFacts, FitFacts, Gate,
+    HeuristicTally, OutcomeFacts, PairFacts, RepoFacts, ServingFacts,
 };
-use super::{calibration_log, config, fit, fleet, fleet_refresh, health, shadow, Kind, Registry};
+use super::heuristics::{
+    CALIBRATION_BASE, CALIBRATION_BASES, LAND_BRISK_PETREL, LAND_TWIN_OTTER_B,
+};
+use super::{
+    calibration_log, config, fit, fleet, fleet_refresh, health, nightly_folds, regime, shadow,
+    Kind, Registry, Stage,
+};
 use crate::eta::doctor::Facts;
 use crate::eta::score::EstimateSummary;
 use crate::observability::{self, ExporterKind};
+
+/// The last recorded authority pass against the cached roster as of `now`
+/// (#10897); unknown with no recorded pass or no roster.
+fn last_pass_coverage(root: &Path, now: DateTime<Utc>) -> crate::eta::coverage::Coverage {
+    let Some(pass) = crate::eta::coverage::read_last_pass(root) else {
+        return crate::eta::coverage::Coverage::default();
+    };
+    let Some(history) = crate::eta::roster_history::load_for(root, now).0 else {
+        return crate::eta::coverage::Coverage::default();
+    };
+    crate::eta::repo_priority::revision_at(&history, now)
+        .map_or_else(crate::eta::coverage::Coverage::default, |r| {
+            crate::eta::coverage::coverage(&r.members, &pass.covered)
+        })
+}
 
 /// Gather every fact for the checks, as of `now`, for the host `host_id`.
 #[must_use]
@@ -45,13 +66,34 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         interval_secs: eta.fleet_refresh.interval_secs,
         otlp_exporter: exporters.iter().any(|e| e.kind == ExporterKind::Otlp),
         native_exporter: exporters.iter().any(|e| e.kind == ExporterKind::Https),
+        authority: {
+            let r = crate::eta::authority::resolve_with(root, host_id, |k| std::env::var(k).ok());
+            AuthorityFacts {
+                host: r.authority.host.clone(),
+                reason: r.authority.reason.as_str().to_string(),
+                is_local: r.is_authority(),
+                others: r.authority.others.clone(),
+                detail: r.describe(),
+                coverage: last_pass_coverage(root, now),
+                coverage_host: crate::eta::coverage::read_last_pass(root).map(|p| p.host),
+            }
+        },
     };
 
     // The read-only gate resolver: it must never arm the singleton job.
-    let gate = match crate::fleet_captain::resolve_gate_for_root(root, host_id) {
-        crate::fleet_captain::CaptainGate::Armed { .. } => Gate::Captain,
-        crate::fleet_captain::CaptainGate::Refused { captain, .. } => Gate::StandDown { captain },
-        crate::fleet_captain::CaptainGate::NoCaptainDeclared => Gate::NoCaptain,
+    // #10918: the explicit ETA authority, else the fleet captain.
+    let gate = match crate::eta::job_owner::resolve_for_root(root, host_id) {
+        crate::eta::job_owner::Owner::Authority => Gate::Authority,
+        crate::eta::job_owner::Owner::AuthorityElsewhere { authority } => {
+            Gate::AuthorityElsewhere { authority }
+        }
+        crate::eta::job_owner::Owner::Captain(g) => match g {
+            crate::fleet_captain::CaptainGate::Armed { .. } => Gate::Captain,
+            crate::fleet_captain::CaptainGate::Refused { captain, .. } => {
+                Gate::StandDown { captain }
+            }
+            crate::fleet_captain::CaptainGate::NoCaptainDeclared => Gate::NoCaptain,
+        },
     };
     let targets = crate::observability::eta_fleet_refresh::repo_targets(
         root,
@@ -73,6 +115,9 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
                 .and_then(|s| s.pass)
                 .filter(|p| p.kind == fleet_refresh::PassKind::Backfill)
                 .map(|p| p.listed_at),
+            // #10520: persisted by the refresh cycle; never re-derived here.
+            history: fleet_refresh::read_state(&fleet_refresh::state_path(root, &t.repo))
+                .and_then(|s| s.history),
         })
         .collect();
     let data = DataFacts {
@@ -95,6 +140,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         .is_some(),
         last_check: health::read_fit_check(root),
         published: fit::publish::read_status(root),
+        published_v2: fit::publish_v2::read_status_v2(root),
     };
 
     let pending = read_pending(root);
@@ -143,11 +189,43 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     };
 
     let ledger = shadow::read_ledger(&shadow::ledger_path(root)).unwrap_or_default();
-    let outcomes = OutcomeFacts {
-        calibration_newest: calibration_log::read(&calibration_log::path(root))
+    let calibration = calibration_log::read(&calibration_log::path(root));
+    // Drift is checked on one heuristic's track only (#10563 review): pooling
+    // every logged heuristic would let a change in the *mix* of heuristics
+    // trip the CUSUM with no real regime change. That track is the serving
+    // `land` heuristic's when the log records it, else the calibration base.
+    // brisk-petrel (#10528) adjusts on twin-otter-b's track, so that is the
+    // track its drift is checked on.
+    let serving_land = registry.current(Kind::Land, eta.current(Kind::Land)).id();
+    let adjusted = serving_land == LAND_BRISK_PETREL;
+    let drift_heuristic = if adjusted {
+        LAND_TWIN_OTTER_B
+    } else if CALIBRATION_BASES.contains(&serving_land) {
+        serving_land
+    } else {
+        CALIBRATION_BASE
+    };
+    let scored = regime::residuals(
+        &calibration
             .iter()
-            .map(|o| o.as_of)
-            .max(),
+            .filter(|o| o.heuristic == drift_heuristic)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let drift = Stage::EVERY
+        .iter()
+        .map(|&stage| regime::drift(&scored, stage, now))
+        .filter(|d| d.n_recent > 0)
+        .map(|d| DriftFacts {
+            stage: d.stage.as_str().to_string(),
+            heuristic: drift_heuristic.to_string(),
+            n_recent: u64::try_from(d.n_recent).unwrap_or(u64::MAX),
+            state: d.state(),
+            adjusted,
+        })
+        .collect();
+    let outcomes = OutcomeFacts {
+        calibration_newest: calibration.iter().map(|o| o.as_of).max(),
         pairs: ledger
             .pairs
             .iter()
@@ -158,10 +236,17 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
             .collect(),
         oldest_pending: pending.iter().map(|p| p.as_of).min(),
         pending: u64::try_from(pending.len()).unwrap_or(u64::MAX),
+        drift,
+    };
+
+    let backtest = BacktestFacts {
+        enabled: eta.enabled && eta.nightly_folds_enabled,
+        state: nightly_folds::read_state(root),
     };
 
     Facts {
         now,
+        backtest,
         config: config_facts,
         data,
         fit: fit_facts,

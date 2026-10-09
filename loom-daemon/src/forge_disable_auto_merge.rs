@@ -330,6 +330,19 @@ pub fn handle_disable_auto_merge(pr: u32, audit_comment: bool, hold: Option<&str
     // argument assembly (see verdict-staleness-guard.sh).
     let hold = hold.filter(|label| !label.trim().is_empty());
     let gh = crate::forge_cmd::gh_bin();
+    // #10256: in merge-queue mode, revoke the queue authorization and dequeue
+    // BEFORE the caller's stale-verdict transition. Direct mode: no forge call.
+    let root = crate::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    if let Some(line) = crate::forge_merge_queue::gh_lifecycle::revoke_for_root(
+        Path::new(&gh),
+        &root,
+        pr,
+        "stale-verdict",
+    ) {
+        eprintln!("{line}");
+    }
     let outcome = disarm_auto_merge(Path::new(&gh), None, pr);
     if audit_comment {
         post_audit_comment(Path::new(&gh), pr, &outcome, hold);

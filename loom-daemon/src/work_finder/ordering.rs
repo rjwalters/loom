@@ -226,6 +226,19 @@ pub const ETA_POSITION_KEYS: [&str; 5] = [
 /// counts same-repo items only).
 pub const ETA_IGNORED_KEYS: [&str; 2] = ["main_red_fix", "workspace_priority"];
 
+/// The [`candidate_keys`] the ETA's **fleet-wide** dispatch position uses
+/// (`eta-fit/v2`, #10508): every key but `main_red_fix` (no point-in-time
+/// record). Unlike [`ETA_POSITION_KEYS`] it keeps `workspace_priority`,
+/// because it counts PRs across repos, as cross-repo dispatch does.
+pub const ETA_FLEET_POSITION_KEYS: [&str; 6] = [
+    "operator_priority_level",
+    "operator_priority",
+    "operator_priority_at",
+    "workspace_priority",
+    "created_at",
+    "number",
+];
+
 /// Lexicographic compare of `a` and `b` over only the [`candidate_keys`]
 /// named in `names`, in comparator order. [`candidate_cmp`] is this with every
 /// key; the ETA's queue position is this with [`ETA_POSITION_KEYS`], so

@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod captain_tests;
 mod edges_tests;
 /// `pub(crate)` so `safehouse::tests` can compose the **real** publisher with
 /// the **real** Safehouse relay in one end-to-end test (#9321) instead of
@@ -13,9 +14,12 @@ pub(crate) mod fake;
 mod inherited_star_tests;
 mod intents_tests;
 mod landing_tests;
+mod level_inherit_tests;
 mod level_tests;
+mod materialize_tests;
 mod named_blocker_tests;
 mod notice_tests;
+mod parent_link_tests;
 mod park_apply_tests;
 mod pass_tests;
 mod propagation_tests;

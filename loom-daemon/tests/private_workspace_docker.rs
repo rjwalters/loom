@@ -266,7 +266,10 @@ impl Fixture {
         // production guard scripts and the libraries they source, outside any
         // clone, root-owned and unwritable (issue #8839).
         control::stage(&context.join("control"));
+        // Same apt retry/timeout config as docker/worker/Dockerfile (#10822):
+        // a stalled archive.ubuntu.com otherwise hangs this build unbounded.
         std::fs::write(context.join("Dockerfile"), r#"FROM ubuntu:24.04
+RUN printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-loom-retries
 RUN apt-get update -qq && apt-get install -y --no-install-recommends git tini python3 openssl ca-certificates jq coreutils && rm -rf /var/lib/apt/lists/*
 COPY loom-daemon /usr/local/bin/loom-daemon
 COPY codex gh /usr/local/bin/

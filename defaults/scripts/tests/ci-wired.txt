@@ -45,8 +45,11 @@ test-champion-epic-phase-marker-normalization.sh
 test-champion-epic-verdict-marker-scope.sh
 test-champion-held-pr-health-pass.sh
 test-champion-issue-promo-escalation-respects-human-hold.sh
+test-champion-merge-queue-step-no-fallthrough.sh
+test-champion-needs-revision-routing.sh
 test-champion-pr-merge-negation-guard.sh
 test-champion-premise-false-close.sh
+test-champion-promotion-throughput.sh
 test-champion-standing-authorization.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
@@ -59,7 +62,6 @@ test-check-merge-config.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
-test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh
@@ -75,11 +77,13 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-pr-priority-labels.sh
 test-create-pr-provenance.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
+test-critical-file-hold-tick.sh
 test-curator-rightsizing.sh
 test-default-branch.sh
 test-dependency-parse.sh
@@ -104,10 +108,12 @@ test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
+test-guide-blocked-unblock-limit.sh
 test-guide-operator-only-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
 test-guide-superseding-block-merge-state.sh
+test-guide-unblock-merged-blocker.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -147,12 +153,13 @@ test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-queued-stacked-children.sh
+test-merge-pr-chain-lock.sh
 test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh
-test-merge-pr-help.sh
-test-merge-pr-merge-method.sh
 test-merge-pr-rate-limit-fallback.sh
+test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
+test-merge-pr-ci-result.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
@@ -167,10 +174,12 @@ test-recover-orphaned-shepherds-diagnostics.sh
 test-repo-mismatch-fallback.sh
 test-require-complexity-marker.sh
 test-require-daemon-bin.sh
+test-require-daemon-bin-provenance.sh
 test-resolve-tier-model.sh
 test-resync-installed-agent-skills-guard.sh
 test-resync-installed-gh-config-guard.sh
 test-resync-installed-guard-check.sh
+test-resync-installed-host-optout.sh
 test-resync-installed-local-fix-guard.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-dogfood-symlink.sh
@@ -191,6 +200,7 @@ test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
 test-spawn-codex-sandbox-noop.sh
+test-spawn-codex-session-down.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh
@@ -252,6 +262,8 @@ tests/hooks/test-pre-commit-missing-formatter.sh
 
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh
+defaults/hooks/tests/test-roll-pause.sh
+defaults/hooks/tests/test-guard-forge-egress.sh
 defaults/hooks/tests/test-guard-installed-file-writes.sh
 defaults/hooks/tests/test-guard-loom-workspace.sh
 defaults/hooks/tests/test-guard-secret-scan.sh
@@ -291,3 +303,11 @@ tests/hermit/test-stateless-ceremony.sh
 # scripts/ — repo-root tooling suites. Hermetic: builds a disposable git
 # repo under mktemp -d with its own identity, no network, no gh.
 scripts/test-changelog.sh
+
+# #9987: spawn-claude.sh managed-gh container admission. Hermetic: a fake daemon
+# and docker stub under mktemp -d; no network, forge or real daemon binary.
+test-spawn-claude-managed-gh.sh
+
+# #11076: spawn-claude.sh's systemd scope carries OOMPolicy=continue. Hermetic:
+# systemd-run/systemctl/claude stubs under mktemp -d, no daemon, forge or network.
+test-spawn-claude-oom-policy.sh

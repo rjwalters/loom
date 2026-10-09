@@ -37,6 +37,7 @@ fn gather_resolves_a_fresh_reader_under_the_doctors_own_root() {
         slug: Some("r1".into()),
         installation_id: "9".into(),
         expires_at: (Utc::now() + chrono::Duration::minutes(50)).to_rfc3339(),
+        ..Default::default()
     };
     std::fs::write(dir.join("identity.json"), serde_json::to_vec(&side).unwrap()).unwrap();
 
@@ -129,4 +130,34 @@ fn gather_selects_the_old_eligible_fit_over_a_future_one() {
 fn a_non_github_host_resolves_no_reader() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(reader_in(tmp.path(), "acme/alpha", Some("gitea.example.com")).is_none());
+}
+
+/// #10520: the gap-fill count comes from the persisted refresh state, read
+/// only; a repo whose state carries no note reports none.
+#[test]
+fn gather_reads_the_persisted_gap_fill_count() {
+    use crate::eta::fleet_signoz_history::{HistoryNote, HistorySource};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let now = Utc::now();
+    snapshot(root, "acme/alpha", now);
+    snapshot(root, "acme/beta", now);
+    let note = HistoryNote {
+        at: now,
+        source: HistorySource::Signoz,
+        gap_fill_calls: 0,
+    };
+    let mut state = fleet_refresh::RefreshState::new("acme/alpha");
+    state.history = Some(note);
+    fleet_refresh::write_state(&fleet_refresh::state_path(root, "acme/alpha"), &state).unwrap();
+
+    let facts = gather(root, "host-a", now);
+    let by_repo: BTreeMap<&str, Option<HistoryNote>> = facts
+        .data
+        .repos
+        .iter()
+        .map(|r| (r.repo.as_str(), r.history))
+        .collect();
+    assert_eq!(by_repo.get("acme/alpha"), Some(&Some(note)));
+    assert_eq!(by_repo.get("acme/beta"), Some(&None));
 }

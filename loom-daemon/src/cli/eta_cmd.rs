@@ -32,6 +32,8 @@ use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
 use loom_daemon::eta::shadow;
+use loom_daemon::eta::shadow_lifecycle as lifecycle;
+use loom_daemon::eta::walk_forward::DatedFits;
 use loom_daemon::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
     Registry, Stage, Subject,
@@ -88,6 +90,17 @@ pub(crate) enum EtaCommand {
     /// (#10391), with the remedy for each failure:
     /// `loom-daemon eta doctor [--repo-root PATH] [--json]`.
     Doctor(super::eta_doctor_cmd::EtaDoctorArgs),
+    /// Retirement proposals from the nightly folds (#10525); `--file` files
+    /// each new one as an issue. Never unregisters anything.
+    Retire(super::eta_retire_cmd::EtaRetireArgs),
+    /// Preview a proposed planner config's effect on the live ready roster's
+    /// `start` / `land` ETAs (#10528): `loom-daemon eta simulate --planner PATH`.
+    Simulate(super::eta_simulate_cmd::EtaSimulateArgs),
+    /// Replay a logged estimate from its explanation export, check parity,
+    /// and explain it: per-stage breakdown, each input's marginal
+    /// contribution, and with `--diff` the inputs that moved the p50
+    /// (#10930): `loom-daemon eta explain --file F [--diff F2] [--json]`.
+    Explain(super::eta_explain_cmd::EtaExplainArgs),
 }
 
 impl EtaCommand {
@@ -102,6 +115,9 @@ impl EtaCommand {
             EtaCommand::Offline(args) => args.run(),
             EtaCommand::Fit(args) => args.run(),
             EtaCommand::Doctor(args) => args.run(),
+            EtaCommand::Retire(args) => args.run(),
+            EtaCommand::Simulate(args) => args.run(),
+            EtaCommand::Explain(args) => args.run(),
         }
     }
 }
@@ -113,7 +129,9 @@ impl EtaCommand {
 /// been accumulating (gate 2). The gates themselves live in
 /// [`shadow::evaluate`] / [`shadow::promote_if_ready`] — this command cannot
 /// relax them, and `--apply` on a failing candidate is a refusal, not an
-/// override.
+/// override. It also requires the live non-refusal check (#10949,
+/// [`loom_daemon::eta::shadow_non_refusal`]): the candidate answered at least
+/// 95% of the passes `current` answered in the last 24 h.
 #[derive(clap::Args)]
 pub(crate) struct EtaPromoteArgs {
     /// Candidate heuristic id to promote (e.g. `land-v2`).
@@ -138,6 +156,11 @@ pub(crate) struct EtaPromoteArgs {
     #[arg(long)]
     pub apply: bool,
 
+    /// Where the evidence behind this promotion is published (an issue
+    /// comment or write-up URL). Recorded in the decision log (#10949).
+    #[arg(long, value_name = "URL")]
+    pub evidence: Option<String>,
+
     /// Emit the decision record as JSON instead of the human report.
     #[arg(long)]
     pub json: bool,
@@ -145,11 +168,7 @@ pub(crate) struct EtaPromoteArgs {
 
 impl EtaPromoteArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let registry = Registry::builtin();
         let Some(candidate) = registry.get(&self.candidate) else {
             bail!(
@@ -160,6 +179,8 @@ impl EtaPromoteArgs {
         };
         let kind = candidate.kind();
         let config = loom_daemon::eta::config::read(&root);
+        // #10525: a config the tracker refuses to run is not one to promote under.
+        registry.check_budget(config.shadow_max_active)?;
         let current = registry.current(kind, config.current(kind));
         if current.id() == candidate.id() {
             bail!("{} is already current for {kind}", candidate.id());
@@ -186,7 +207,8 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
+        let unfitted = DatedFits::new(Vec::new());
+        backtest::with_replay_calibration(|id| unfitted.heuristic(id), &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -194,7 +216,16 @@ impl EtaPromoteArgs {
         let mut ledger = shadow::read_ledger(&ledger_path)?;
         let now = Utc::now();
         let config_path = loom_daemon::eta::config::promotion_config_path(&root);
-        let decision = if self.apply {
+        // #10525: only the top candidates by nightly-fold pinball reach the
+        // live gate; missing or stale fold evidence refuses (fails closed).
+        let shortlist =
+            lifecycle::shortlist_for(&root, &registry, current.id(), candidate.id(), now);
+        let admitted = shortlist.admits(candidate.id());
+        // #10949: a candidate that refuses where `current` answers must not
+        // be flipped in, whatever its pinball; read before `--apply` writes.
+        let non_refusal = ledger.non_refusal(kind, current.id(), candidate.id(), now);
+        let serves = non_refusal.status == shadow::GateStatus::Passed;
+        let mut decision = if admitted.is_ok() && serves && self.apply {
             let decision = shadow::promote_if_ready(
                 &mut ledger,
                 kind,
@@ -212,6 +243,13 @@ impl EtaPromoteArgs {
             let stats = ledger.stats(kind, current.id(), candidate.id());
             shadow::evaluate(kind, current.id(), candidate.id(), comparison.as_ref(), &stats, now)
         };
+        loom_daemon::eta::shadow_non_refusal::apply(&mut decision, non_refusal);
+        if let Err(why) = admitted {
+            decision.promote = false;
+            decision.reason = why;
+        }
+        decision.shortlist = Some(shortlist);
+        decision.evidence = self.evidence;
 
         // Every evaluation is recorded, promoting or not: "why has this not
         // flipped yet?" is the question an operator actually asks.
@@ -233,9 +271,24 @@ fn render_decision(d: &shadow::PromotionDecision, applied: bool) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "eta promote {} → {} ({})", d.current, d.candidate, d.kind);
+    if let Some(tier) = d.candidate_tier {
+        let _ = writeln!(out, "  candidate tier:  {tier}");
+    }
+    if let Some(list) = &d.shortlist {
+        let _ = writeln!(out, "  short-list:      {:?}", list.selected);
+    }
     let _ =
         writeln!(out, "  gate 1 backtest: {} — {}", d.backtest.status.as_str(), d.backtest.detail);
     let _ = writeln!(out, "  gate 2 live:     {} — {}", d.live.status.as_str(), d.live.detail);
+    if let Some(a) = &d.adaptation {
+        let _ = writeln!(out, "  adaptation:      {:?} — {}", a.status, a.detail);
+    }
+    if let Some(n) = &d.non_refusal {
+        let _ = writeln!(out, "  non-refusal:     {} — {}", n.status.as_str(), n.detail);
+    }
+    if let Some(evidence) = &d.evidence {
+        let _ = writeln!(out, "  evidence:        {evidence}");
+    }
     let _ = writeln!(out, "  decision: {}", d.reason);
     match (&d.config_path, d.promote, applied) {
         (Some(path), _, _) => {
@@ -279,11 +332,7 @@ pub(crate) struct EtaBackfillArgs {
 
 impl EtaBackfillArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let repo = match &self.repo {
             Some(r) => r.clone(),
             None => resolve_repo(&root)
@@ -385,6 +434,26 @@ pub(crate) struct EtaBacktestArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Directory of `eta-fit/v1` coefficient files (`eta fit --out`, or a
+    /// copy of `.loom/state/eta/fit/`) to replay fitted heuristics with
+    /// (#10524). Each case is estimated with the newest file whose cutoff is
+    /// strictly before its `as_of`, as live serving would; without it every
+    /// fitted heuristic refuses `no_model`. Its `v2/` and `v3/`
+    /// subdirectories (`eta-fit/v2`, `eta-fit/v3`) are dated the same way,
+    /// per schema (#10521).
+    #[arg(long, value_name = "PATH")]
+    pub fit_dir: Option<PathBuf>,
+
+    /// Also report the regime layer's adaptation times (`t_p50`, `t_cov`,
+    /// `t_alarm`) on this heuristic's residuals under an injected x2 shift
+    /// (#10528). Diagnostic; not with `--compare`.
+    #[arg(long, conflicts_with = "compare")]
+    pub adaptation: bool,
+    /// Score `--heuristic` IPCW-wrapped (`ipcw` or `ipcw-drift`) as
+    /// `ID+NAME`; `--compare` stays unwrapped (#10524).
+    #[arg(long, value_name = "NAME")]
+    pub wrap: Option<String>,
+
     /// Opt-in `land` cases from merged PRs' label timelines (#9579).
     #[command(flatten)]
     pub pr_cases: PrCaseArgs,
@@ -392,27 +461,17 @@ pub(crate) struct EtaBacktestArgs {
 
 impl EtaBacktestArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let registry = Registry::builtin();
-        let Some(heuristic) = registry.get(&self.heuristic) else {
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
+        let fits = super::eta_replay_cmd::load_fits(self.fit_dir.as_deref())?;
+        let registry = fits.registry();
+        let Some(heuristic) = fits.heuristic(&self.heuristic) else {
             bail!(
                 "unknown heuristic id {:?} (known: {})",
                 self.heuristic,
                 registry.ids().join(", ")
             );
         };
-        let since = match &self.since {
-            Some(raw) => Some(
-                DateTime::parse_from_rfc3339(raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| anyhow::anyhow!("invalid --since {raw:?}: {e}"))?,
-            ),
-            None => None,
-        };
+        let since = super::eta_replay_cmd::parse_since(self.since.as_deref())?;
         let filter = Filter {
             since,
             repo: self.repo.as_deref(),
@@ -423,13 +482,21 @@ impl EtaBacktestArgs {
             eprintln!("{note}");
         }
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
+        backtest::with_replay_calibration(|id| fits.heuristic(id), &mut history, &cases, &loom);
+        let heuristic = super::eta_replay_cmd::wrap_for_backtest(
+            heuristic,
+            self.wrap.as_deref(),
+            &mut history,
+            &cases,
+            &loom,
+        )?;
+        let heuristic = heuristic.as_ref();
 
         if let Some(other_id) = &self.compare {
-            let Some(other) = registry.get(other_id) else {
+            let Some(other) = fits.heuristic(other_id) else {
                 bail!("unknown heuristic id {:?} (known: {})", other_id, registry.ids().join(", "));
             };
-            let comparison = backtest::compare(heuristic, other, &history, &cases, filter, &loom)?;
+            let comparison = backtest::compare(heuristic, &other, &history, &cases, filter, &loom)?;
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
@@ -438,7 +505,8 @@ impl EtaBacktestArgs {
             return Ok(());
         }
 
-        let report = backtest::run(heuristic, &history, &cases, filter, &loom);
+        let run = backtest::runner(self.adaptation);
+        let report = run(heuristic, &history, &cases, filter, &loom);
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -475,22 +543,23 @@ pub(crate) fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
 /// `scope` reads the cached fleet snapshot only — it makes no forge call, so
 /// `eta view` costs the same whichever scope it runs at. Building that cache
 /// is `eta fleet backfill`'s job.
-fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
+pub(super) fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     let envelopes = load_outcome_envelopes(root);
     let mut history = StageSamples::default();
     history.push_envelopes(&envelopes);
     let journal_entries = journal::read(&journal::journal_path(root));
     history.push_journal(&journal_entries, "local");
     let mut history = fleet::apply_scope(scope, root, history);
-    // #10207: the daemon's calibration log and pending store, so `eta view`
-    // shows the recalibrated interval the daemon would.
+    // The daemon's calibration log and pending store, so `eta view` shows the
+    // calibrated intervals the registered calibrators (`land-2026-10-06-even-lark`,
+    // #10489, and the #10524 IPCW wrappers) would; they read `history.calibration`.
     history.calibration = loom_daemon::eta::calibration_log::load(root);
     history
 }
 
 /// The scope a `--scope` flag asks for: the flag when given, else the
 /// configured `autonomous.eta.historyScope`.
-fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistoryScopeMode> {
+pub(super) fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistoryScopeMode> {
     match flag {
         Some(raw) => HistoryScopeMode::parse(raw)
             .ok_or_else(|| anyhow::anyhow!("invalid --scope {raw:?} (local | augment | fleet)")),
@@ -740,6 +809,8 @@ fn build_input(
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
+        dependencies: None,
     }
 }
 
@@ -838,11 +909,7 @@ pub(crate) struct EtaViewArgs {
 
 impl EtaViewArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let (repo, issue) = parse_story(&self.story)?;
         let now = Utc::now();
 
@@ -940,11 +1007,7 @@ struct ListRow {
 
 impl EtaListArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let root = self
-            .repo_root
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let repo = match &self.repo {
             Some(r) => r.clone(),
             None => resolve_repo(&root)

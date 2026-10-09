@@ -1,13 +1,16 @@
 //! The agent `gh` front: plain `gh` reads ETag-revalidated by default (#10331).
 //!
 //! Dispatched workers get `gh` → `loom-daemon` first on `PATH`
-//! ([`worker_path`], applied by `worker_spawn`); `loom-daemon` started under
+//! ([`session_path`], applied by `worker_spawn`); interactive sessions get the
+//! same order through a SessionStart hook ([`session_env`], #10516). `loom-daemon` started under
 //! the name `gh` — or explicitly as `loom-daemon gh <gh argv…>` — lands in
 //! [`run`]. Per call:
 //!
 //! - [`classify::classify`] picks [`classify::Route::EtagView`] /
 //!   [`classify::Route::EtagList`] for the `issue|pr view|list --json …`
-//!   shapes the in-repo ETag modules reproduce exactly, and
+//!   shapes the in-repo ETag modules reproduce exactly,
+//!   [`classify::Route::EtagChecks`] for the `pr checks <N>` shapes
+//!   [`pr_checks`] reproduces from REST (#10516), and
 //!   [`classify::Route::Passthrough`] for everything else.
 //! - An ETag route is served in-process by [`crate::forge_cached_view`] /
 //!   [`crate::forge_cached_list`]: a conditional `gh api` request whose `304`
@@ -28,11 +31,20 @@
 //!
 //! Reads served here are recorded against caller [`STATS_CALLER`] in
 //! `forge_call_stats` (`loom-daemon status` forge-calls row), so the `304`
-//! share is measurable. `forge_etag_store::fetch_conditional` already routes
-//! them to a repo's reader App when one is configured (#9537).
+//! share is measurable. Every passthrough is one row too ([`ledger`], W5):
+//! `agent.gh.<command>`, with the session's role and credential, so agent
+//! spend lands in the same per-bucket rollup (`loom-daemon forge calls`).
+//! Both kinds of row are stamped with the agent role and `served` /
+//! `passthrough` ([`crate::forge_call_stats::agent`], #10607).
+//! `forge_etag_store::fetch_conditional` already routes served reads to a
+//! repo's reader App when one is configured (#9537).
 
 pub mod classify;
+pub mod go_sort;
+pub mod ledger;
 pub mod next_gh;
+pub mod pr_checks;
+pub mod session_env;
 
 #[cfg(test)]
 mod tests;
@@ -73,23 +85,35 @@ pub fn dispatch_if_front() {
     std::process::exit(code);
 }
 
-/// `loom-daemon gh-shim path`: create the shim directory and print it.
+/// `loom-daemon gh-shim path|session-env|status`.
+///
+/// - `path`: create the shim directory and print it.
+/// - `session-env`: the SessionStart hook's half (#10516) — see [`session_env`].
+/// - `status`: which `gh` this shell actually resolves — see [`session_env`].
 fn shim_command(args: &[OsString]) -> i32 {
-    if args.len() != 1 || args[0] != "path" {
-        eprintln!(
-            "usage: loom-daemon gh-shim path\n  print a directory holding `gh` -> loom-daemon; \
-             put it first on PATH to route plain `gh` reads through the ETag cache (#10331)"
-        );
-        return 2;
-    }
-    match ensure_shim_dir() {
-        Ok(dir) => {
-            println!("{}", dir.display());
-            0
-        }
-        Err(e) => {
-            eprintln!("loom-daemon gh-shim path: {e}");
-            1
+    match args.first().and_then(|a| a.to_str()) {
+        Some("path") if args.len() == 1 => match ensure_shim_dir() {
+            Ok(dir) => {
+                println!("{}", dir.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("loom-daemon gh-shim path: {e}");
+                1
+            }
+        },
+        Some("session-env") if args.len() == 1 => session_env::run(),
+        Some("status") if args.len() == 1 => session_env::status(),
+        _ => {
+            eprintln!(
+                "usage: loom-daemon gh-shim path|session-env|status\n  \
+                 path         print a directory holding `gh` -> loom-daemon; put it first on PATH to \
+                 route plain `gh` reads through the ETag cache (#10331)\n  \
+                 session-env  (SessionStart hook) put that directory first on PATH via \
+                 $CLAUDE_ENV_FILE (#10516)\n  \
+                 status       print `front|launcher|bypassed: <gh>` for this shell's PATH"
+            );
+            2
         }
     }
 }
@@ -116,6 +140,24 @@ fn no_cache() -> bool {
     .any(|k| env_on(k))
 }
 
+/// A served call: what `gh` would have written and its exit status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+}
+
+impl Served {
+    fn ok(stdout: String) -> Self {
+        Self {
+            stdout,
+            stderr: String::new(),
+            code: 0,
+        }
+    }
+}
+
 /// The front proper. Returns the exit code to exit with (a passthrough
 /// replaces this process and never returns).
 #[must_use]
@@ -132,15 +174,27 @@ pub fn run(raw: &[OsString]) -> i32 {
         return 127;
     };
     if depth == 0 {
+        // #10432: a role tick's forge writes (claims, verdict labels, merges),
+        // journaled for its `pick.decision`. Parses argv only; a no-op outside
+        // a role tick.
+        crate::observability::pick_journal::record_gh_actions(raw);
+        // #10607: every row this process writes — served (the facade's) or
+        // passthrough (`ledger`) — carries the agent role and `served` /
+        // `passthrough` (`ag` / `vi`).
+        crate::forge_call_stats::agent::set_agent_role(std::env::var("LOOM_ROLE").ok().as_deref());
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();
             // A closed pipe (`gh … | head -1`) is the reader's choice.
-            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.write_all(out.stdout.as_bytes());
             let _ = stdout.flush();
-            return 0;
+            let _ = std::io::stderr().lock().write_all(out.stderr.as_bytes());
+            return out.code;
         }
         record("bypass", raw);
+        // W5: one ledger row per passthrough, written before the exec that
+        // replaces this process. It can never fail or delay the call.
+        ledger::book(raw, std::env::current_dir().ok().as_deref());
     }
     let err = crate::gh_invocation::transparent::exec(
         &next,
@@ -153,7 +207,7 @@ pub fn run(raw: &[OsString]) -> i32 {
 
 /// The ETag-served output, or `None` to pass through. Every failure of the
 /// cache layer lands here as `None`: caching is never a correctness mechanism.
-fn serve(raw: &[OsString], next: &Path) -> Option<String> {
+fn serve(raw: &[OsString], next: &Path) -> Option<Served> {
     if no_cache() || std::io::stdout().is_terminal() {
         return None; // A TTY gets gh's human/colour output, which we do not reproduce.
     }
@@ -173,27 +227,51 @@ fn serve(raw: &[OsString], next: &Path) -> Option<String> {
         Route::EtagView(entity) => {
             let served = pin_repo(args[1..].to_vec(), cwd.as_deref())?;
             crate::forge_cached_view::build_output_via(STATS_CALLER, entity.as_str(), &served, next)
+                .map(Served::ok)
+        }
+        Route::EtagChecks => {
+            if gh_output_altered() {
+                return None;
+            }
+            let served = pin_repo(args[2..].to_vec(), cwd.as_deref())?;
+            pr_checks::serve(&served, next, cwd.as_deref())
         }
         Route::EtagList(entity, served) => {
             let jq = served
                 .iter()
                 .any(|a| a == "--jq" || a == "-q" || a.starts_with("--jq="));
             let served = pin_repo(served, cwd.as_deref())?;
-            let out = crate::forge_cached_list::build_output_via(
+            let listing = crate::forge_cached_list::build_served_via(
                 STATS_CALLER,
                 entity.as_str(),
                 &served,
                 next,
             )?;
+            // #10432: a role tick's candidate listing, journaled for its
+            // `pick.decision` (a no-op outside a role tick).
+            crate::observability::pick_journal::record_listing(&listing);
+            let out = listing.render()?;
             if jq {
-                return Some(out);
+                return Some(Served::ok(out));
             }
             // The listing module pretty-prints; `gh --json` off a TTY is compact.
             let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-            serde_json::to_string(&v).ok().map(|s| format!("{s}\n"))
+            serde_json::to_string(&v)
+                .ok()
+                .map(|s| Served::ok(format!("{s}\n")))
         }
         Route::Passthrough => None,
     }
+}
+
+/// Environment that makes `gh` print something else off a TTY: a forced
+/// TTY, forced colour (colourised `--json`), or debug output on stderr.
+fn gh_output_altered() -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty());
+    set("GH_FORCE_TTY")
+        || set("GH_DEBUG")
+        || set("DEBUG")
+        || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Name the repo `gh` itself would use, as an explicit `--repo`, so the ETag
@@ -315,11 +393,10 @@ pub fn ensure_shim_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The `PATH` a dispatched worker gets: the shim dir first, then `current`.
-/// `None` leaves `PATH` alone — opted out (`LOOM_GH_SHIM=0`), not running as
-/// `loom-daemon` (a test harness), or the shim dir could not be made.
+/// The front's shim dir, or `None`: opted out (`LOOM_GH_SHIM=0`), not
+/// running as `loom-daemon` (a test harness), or the dir could not be made.
 #[must_use]
-pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
+pub fn front_dir() -> Option<PathBuf> {
     if std::env::var(OPT_OUT_ENV).is_ok_and(|v| v == "0") {
         return None;
     }
@@ -327,7 +404,48 @@ pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
     if exe.file_name() != Some(OsStr::new("loom-daemon")) {
         return None;
     }
-    prepend_path(&ensure_shim_dir().ok()?, current)
+    ensure_shim_dir().ok()
+}
+
+/// The `PATH` a dispatched worker gets: the shim dir first, then `current`.
+/// `None` leaves `PATH` alone (see [`front_dir`]).
+#[must_use]
+pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
+    prepend_path(&front_dir()?, current)
+}
+
+/// The one `gh` ordering shared by a dispatched worker and an interactive
+/// session (#10516): the managed launcher (#9987) first when a policy resolves
+/// one, then the front, then `current` — so with no policy the front's own
+/// reads still reach whatever `gh` came first before (e.g. the 2am telemetry
+/// shim) as their `next_gh`. `None` leaves `PATH` alone.
+#[must_use]
+pub fn session_path(
+    current: Option<&OsStr>,
+    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
+) -> Option<OsString> {
+    compose_path(
+        front_dir().as_deref(),
+        egress.and_then(crate::forge_egress::worker_env::WorkerEgress::launcher_dir),
+        current,
+    )
+}
+
+/// [`session_path`] with its inputs injected: `front` prepended to `current`,
+/// then `launcher` on top. `None` when neither applies.
+#[must_use]
+pub fn compose_path(
+    front: Option<&Path>,
+    launcher: Option<&Path>,
+    current: Option<&OsStr>,
+) -> Option<OsString> {
+    let mut path: Option<OsString> = None;
+    for dir in [front, launcher].into_iter().flatten() {
+        if let Some(next) = prepend_path(dir, path.as_deref().or(current)) {
+            path = Some(next);
+        }
+    }
+    path
 }
 
 /// `dir` first, then `current` minus any earlier copy of `dir`.

@@ -309,7 +309,11 @@ fn fetch_required(
 /// `--jq` runs once per page, so a multi-page read arrives as a stream of
 /// concatenated per-page objects that must be folded here. `total_count` repeats
 /// identically on every page; `max` is the conservative pick for the comparison.
-fn fetch_check_runs(gh: &str, nwo: &str, head_sha: &str) -> Result<Vec<CheckRun>, String> {
+pub(crate) fn fetch_check_runs(
+    gh: &str,
+    nwo: &str,
+    head_sha: &str,
+) -> Result<Vec<CheckRun>, String> {
     let out = gh_api(gh, &[
         &format!("repos/{nwo}/commits/{head_sha}/check-runs?per_page=100"),
         "--paginate",

@@ -15,7 +15,7 @@ pub use state::{outside_every_repository, private_directory};
 /// `.github/workflows/harness-pins.yml` bumps both together.
 macro_rules! opencode_plugin_version {
     () => {
-        "1.18.34"
+        "1.18.35"
     };
 }
 

@@ -111,16 +111,31 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
     use crate::gh_invocation::ParentContext;
     use crate::gh_invocation::{AccessIntent, GhBinSource, GhInvocation, GhTarget, Operation};
     let parent = TraceContext::derived("sweep", &["acme/widgets", "sweep-issue-9-1"]);
+    // #10752: `github.caller` is only stamped inside a caller scope and
+    // `github.number` only on a write whose argv names an issue/PR.
+    let _scope = crate::gh_invocation::caller_scope::enter("stale_blocked_release");
     let inv = GhInvocation::new(
         Operation::new("api.graphql"),
         AccessIntent::Write,
         GhTarget::repo("acme/widgets").unwrap(),
         std::time::Duration::from_secs(5),
     )
+    .args(["api", "repos/acme/widgets/issues/9/labels"])
     .parent(ParentContext::Parent(parent.clone()));
     let at = Utc::now();
     let open = InvocationSpan::open_at(&inv, at, "42.0".into());
-    let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at);
+    let cred = crate::gh_invocation::accounting::cred_of_with(None, false);
+    let billing = crate::gh_invocation::billing::Billing::sent(
+        Some(200),
+        "",
+        Some(1),
+        crate::gh_invocation::billing::BillingClass::Ok,
+        "graphql",
+        &cred,
+        "writer",
+    )
+    .with_repo(Some("acme/widgets"));
+    let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at, &billing);
     let again = InvocationSpan::open_at(&inv, at, "42.0".into());
     assert_eq!(open.context, again.context, "IDs recompute from the span's facts");
 
@@ -150,4 +165,42 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
     for key in SPAN_ATTRIBUTE_KEYS {
         assert!(keys.iter().any(|k| k == key), "exported span lacks {key}");
     }
+}
+
+/// #10640: a failed span's one-line reason is the OTLP status message, not
+/// an exported attribute; an `Ok`/`Unset` span exports no message even when
+/// the attribute is present.
+#[test]
+fn the_status_message_attribute_becomes_the_error_status_message() {
+    let mut failed = span(TraceContext::root(true));
+    failed.status = SpanStatus::Error;
+    failed
+        .attributes
+        .insert("loom.failure_class".into(), "exit-1".into());
+    failed
+        .attributes
+        .insert(STATUS_MESSAGE.into(), "role child exited with code 1".into());
+    let mut ok = failed.clone();
+    ok.context = TraceContext::root(true);
+    ok.status = SpanStatus::Ok;
+    let request = build_traces_request(&[
+        TelemetryEnvelope::new("host", TelemetryRecord::Span(failed)),
+        TelemetryEnvelope::new("host", TelemetryRecord::Span(ok)),
+    ])
+    .unwrap();
+    let spans = &request.resource_spans[0].scope_spans[0].spans;
+    let status = spans[0].status.as_ref().unwrap();
+    assert_eq!(status.code, 2);
+    assert_eq!(status.message, "role child exited with code 1");
+    assert!(spans[0]
+        .attributes
+        .iter()
+        .any(|kv| kv.key == "loom.failure_class"));
+    for span in spans {
+        assert!(
+            span.attributes.iter().all(|kv| kv.key != STATUS_MESSAGE),
+            "the description is not also exported as an attribute"
+        );
+    }
+    assert_eq!(spans[1].status.as_ref().unwrap().message, "", "no description off Error");
 }

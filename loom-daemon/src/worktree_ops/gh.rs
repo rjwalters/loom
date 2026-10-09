@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::cmd_out::{CmdOutcome, Unavailable};
-use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation, ReadClass};
 
 /// Deadline for the unbounded-by-history `gh` calls this module made through a
 /// bare `Command::output()` (#10089: the facade always bounds its child).
@@ -95,22 +95,27 @@ pub(crate) fn bounded_via(inv: GhInvocation) -> Option<Output> {
     }
 }
 
-/// A bounded counted read probe: the `None`-on-no-answer contract of
-/// [`bounded_via`] for a `gh <args>` call run from `repo_root`, booked under
-/// `op`.
-pub(crate) fn bounded_counted(
+/// A bounded counted read probe ([`bounded_via`]) for a deferrable hygiene
+/// probe (W4-C, [`ReadClass::Hygiene`]): when every reader for the repo's owner is
+/// withdrawn the probe is shed instead of spending the writer's bucket, and
+/// the shed is "no answer" (`None`) exactly like a timeout — so each caller
+/// keeps its fail-closed `UNKNOWN` / `PrStatus::Unknown` path.
+pub(crate) fn bounded_hygiene(
     op: &'static str,
     repo_root: &Path,
     args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
 ) -> Option<Output> {
-    bounded_via(invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args))
+    bounded_via(
+        invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args)
+            .read_class(ReadClass::Hygiene),
+    )
 }
 
 /// `gh issue view <N> --json state --jq .state`. Returns `"UNKNOWN"` on any
 /// failure (matches `clean.py`'s `except Exception: issue_state = "UNKNOWN"`).
 #[must_use]
 pub fn issue_state(repo_root: &Path, issue: u32) -> String {
-    let out = bounded_counted(
+    let out = bounded_hygiene(
         "worktree.issue_state",
         repo_root,
         [
@@ -136,8 +141,8 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
     }
 }
 
-/// `gh api repos/{owner}/{repo}/issues/<N> --jq .state`, normalized to
-/// `"OPEN"` / `"CLOSED"` / `"UNKNOWN"`.
+/// The issue's REST `.state`, normalized to `"OPEN"` / `"CLOSED"` /
+/// `"UNKNOWN"` (any failure, `404`, mismatch or other value).
 ///
 /// Deliberately the REST endpoint rather than [`issue_state`]'s `gh issue
 /// view` (which goes through GraphQL): GraphQL quota exhaustion under
@@ -145,61 +150,35 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
 /// this probe are bulk hygiene passes that can issue one call per stale file
 /// (#4450). REST returns lowercase states, so they are upper-cased here to
 /// match [`issue_state`]'s contract.
+///
+/// A fresh, conditional read of the checkout's OWN repo (W6,
+/// [`super::forge_state::issue_facts`]): never `LOOM_REPO`, and every call
+/// reaches the forge (an unchanged issue answers a free `304`).
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let out = bounded_counted(
-        "worktree.issue_state_rest",
-        repo_root,
-        [
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".state",
-        ],
-    );
-    match out {
-        Some(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
-            match s.as_str() {
-                "OPEN" | "CLOSED" => s,
-                _ => "UNKNOWN".to_string(),
-            }
-        }
-        _ => "UNKNOWN".to_string(),
+    let facts = super::forge_state::issue_facts(repo_root, issue, "worktree.issue_state_rest");
+    match facts.ok().map(|f| f.state) {
+        Some(super::forge_state::IssueState::Open) => "OPEN".to_string(),
+        Some(super::forge_state::IssueState::Closed) => "CLOSED".to_string(),
+        None => "UNKNOWN".to_string(),
     }
 }
 
-/// `gh api repos/{owner}/{repo}/issues/<N> --jq .closed_at`: the issue's own
-/// close timestamp (issue #6653), REST rather than GraphQL for the same
-/// quota-isolation reason as [`issue_state_rest`].
+/// The issue's REST `.closed_at`: its own close timestamp (issue #6653), REST
+/// rather than GraphQL for the same quota-isolation reason as
+/// [`issue_state_rest`], and the same fresh conditional read.
 ///
 /// Used to gate the grace period for a closed issue whose worktree never had
 /// a PR opened at all (`clean::PrStatus::NoPr`) — there is no PR
 /// `closedAt`/`mergedAt` to read in that case, so the issue's own close time
 /// is the only timestamp available. `None` on any failure, an empty/`null`
-/// response, or an issue that is not (yet) closed — a probe failure must
+/// value, or an issue that is not (yet) closed — a probe failure must
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let out = bounded_counted(
-        "worktree.issue_closed_at",
-        repo_root,
-        [
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".closed_at",
-        ],
-    )?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s == "null" {
-        None
-    } else {
-        Some(s)
-    }
+    super::forge_state::issue_facts(repo_root, issue, "worktree.issue_closed_at")
+        .ok()?
+        .closed_at
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,13 +192,17 @@ struct PrRow {
 /// lookup must not be silently treated as "no open PR".
 #[must_use]
 pub fn has_open_pr(repo_root: &Path, branch: &str) -> (bool, bool) {
-    let out = run_read(
+    let out = invocation(
         "worktree.has_open_pr",
+        AccessIntent::Read,
         repo_root,
+        GH_CALL_TIMEOUT,
         [
             "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1",
         ],
-    );
+    )
+    .read_class(ReadClass::Hygiene)
+    .run();
     match out {
         CmdOutcome::Ran(o) if o.status.success() => {
             let rows: Result<Vec<PrRow>, _> = serde_json::from_slice(&o.stdout);
@@ -365,7 +348,7 @@ pub fn open_linked_pr_timeline_args(owner: &str, repo: &str, issue: u32) -> Vec<
 ///
 /// Returns `None` only if the regex itself fails to compile, which callers must
 /// treat as a probe failure rather than an absence.
-fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
+pub(crate) fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
     regex::Regex::new(&format!(
         r"(?i)(?:^|[^0-9A-Za-z]){LINKAGE_PHRASE}[*_:\s]*#{issue}(?:[^0-9]|$)"
     ))
@@ -588,8 +571,22 @@ pub fn parse_open_linked_pr_timeline_trusted(stdout: &str, issue: u32, root: &Pa
 /// the wrong closes-graph — which, for orphan recovery, is a false
 /// `NoneOpen` that greenlights resetting a live claim (#5511). `None` on any
 /// failure, which callers must treat as a probe failure.
+///
+/// Answered from the repo-facts record (`gh repo view` semantics: `GH_REPO`
+/// ignored, post-redirect) when facts are on; the `gh repo view` call below
+/// when they are off or the root is pinned to legacy (W3a).
 #[must_use]
 pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
+    match crate::forge_repo_facts::canonical(repo_root, crate::forge_repo_facts::GhRepoEnv::Ignore)
+    {
+        crate::forge_repo_facts::Lookup::Fact(f) => Some((f.owner, f.name)),
+        crate::forge_repo_facts::Lookup::Unavailable => None,
+        crate::forge_repo_facts::Lookup::Legacy => resolve_owner_repo_legacy(repo_root),
+    }
+}
+
+/// The pre-facts `gh repo view` resolve behind [`resolve_owner_repo`].
+fn resolve_owner_repo_legacy(repo_root: &Path) -> Option<(String, String)> {
     let out = run_read(
         "worktree.resolve_repo",
         repo_root,
@@ -623,8 +620,12 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
 /// The `worktree_ops` counterpart of
 /// `sweep_registry::guards::SweepRegistry::probe_open_linked_pr`, resolved
 /// against `repo_root` instead of a registry workspace, and — since #8116 —
-/// sharing that probe's two-transport union rather than only its first leg:
+/// sharing that probe's transports rather than only its first leg:
 ///
+/// 0. **Cached open-PR listing** ([`super::linked_pr_listing`], #10514). When
+///    the ETag'd REST listing reads, its verdict is final and legs 1-2 never
+///    run: the normal path spends no GraphQL and no timeline walk. Legs 1-2
+///    below are its fallback for a listing that could not be read.
 /// 1. **GraphQL closes-graph** ([`open_linked_pr_args`] /
 ///    [`parse_open_linked_pr`]). Decisive when it finds an OPEN PR.
 /// 2. **REST timeline** ([`open_linked_pr_timeline_args`] /
@@ -651,15 +652,68 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
 /// comment thread refused dispatch of `#N` for as long as that PR stayed open.
 #[must_use]
 pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
+    use crate::forge_repo_facts::{self as facts, GhRepoEnv, Lookup};
     // Repo resolution failure is a PROBE FAILURE, not a verified absence.
-    let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
-        return OpenPrProbe::ProbeFailed;
+    let (owner, repo, fact) = match facts::canonical(repo_root, GhRepoEnv::Ignore) {
+        Lookup::Fact(f) => (f.owner.clone(), f.name.clone(), Some(f)),
+        Lookup::Unavailable => return OpenPrProbe::ProbeFailed,
+        Lookup::Legacy => match resolve_owner_repo_legacy(repo_root) {
+            Some((o, r)) => (o, r, None),
+            None => return OpenPrProbe::ProbeFailed,
+        },
     };
+    // Leg 0 (#10514): the cached open-PR listing, pinned to the repo just
+    // resolved (never `LOOM_REPO`, #5511). A read listing is decisive.
+    let nwo = format!("{owner}/{repo}");
+    let gh = gh_bin();
+    let listed = super::linked_pr_listing::probe(
+        "worktree.linked_pr_listing",
+        Path::new(&gh),
+        repo_root,
+        (&nwo, issue),
+        None,
+    );
+    let gone = std::cell::Cell::new(false);
+    let verdict = match listed {
+        Some(verdict) => verdict,
+        None => legacy_union(repo_root, &owner, &repo, issue, &gone),
+    };
+    let Some(fact) = fact else {
+        return verdict;
+    };
+    // W3a: a repo the forge could not resolve under the remembered name is
+    // suspect, and nothing computed from it is a verdict.
+    if gone.get() {
+        facts::invalidate(repo_root, "linked-PR probe could not resolve the repository");
+        return OpenPrProbe::ProbeFailed;
+    }
+    // A NoneOpen greenlights claim resets (orphan recovery, check-claim): it
+    // is a verdict only when the owner it was asked under is confirmed now.
+    if verdict == OpenPrProbe::NoneOpen
+        && !fact.fresh
+        && !facts::confirmed_in_pass(&fact)
+        && !facts::confirm_owner(repo_root, GhRepoEnv::Ignore, &fact.owner)
+    {
+        return OpenPrProbe::ProbeFailed;
+    }
+    verdict
+}
+
+/// The pre-#10514 GraphQL-then-timeline union of [`probe_open_linked_pr`], now
+/// only its fallback when the open-PR listing could not be read.
+fn legacy_union(
+    repo_root: &Path,
+    owner: &str,
+    repo: &str,
+    issue: u32,
+    gone: &std::cell::Cell<bool>,
+) -> OpenPrProbe {
     let graphql = run_probe(
         "worktree.linked_pr_graphql",
         repo_root,
-        open_linked_pr_args(&owner, &repo, issue),
+        open_linked_pr_args(owner, repo, issue),
         &|s| parse_open_linked_pr_trusted(s, repo_root),
+        gone,
     );
     if matches!(graphql, OpenPrProbe::Open(_)) {
         return graphql;
@@ -667,32 +721,53 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
     let timeline = run_probe(
         "worktree.linked_pr_timeline",
         repo_root,
-        open_linked_pr_timeline_args(&owner, &repo, issue),
+        open_linked_pr_timeline_args(owner, repo, issue),
         &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
+        gone,
     );
-    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
-    // superset *when it answers*, and an unanswered superset is no evidence.
+    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2
+    // is a superset *when it answers*, and an unanswered superset is no
+    // evidence.
     if matches!(timeline, OpenPrProbe::ProbeFailed) {
-        return graphql;
+        graphql
+    } else {
+        timeline
     }
-    timeline
 }
 
 /// Run one `gh` transport for [`probe_open_linked_pr`] and classify it.
 ///
 /// A spawn error or non-zero exit (rate limit, auth failure, transient forge
-/// error) is a PROBE FAILURE, never a verified "no open PR".
+/// error) is a PROBE FAILURE, never a verified "no open PR". An answer saying
+/// the repository itself does not resolve sets `gone`.
 fn run_probe(
     op: &'static str,
     repo_root: &Path,
     args: Vec<String>,
     classify: &dyn Fn(&str) -> OpenPrProbe,
+    gone: &std::cell::Cell<bool>,
 ) -> OpenPrProbe {
     match run_read(op, repo_root, args) {
-        CmdOutcome::Ran(o) if o.status.success() => classify(&String::from_utf8_lossy(&o.stdout)),
-        _ => OpenPrProbe::ProbeFailed,
+        CmdOutcome::Ran(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if stdout.contains(REPO_UNRESOLVED) {
+                gone.set(true);
+            }
+            classify(&stdout)
+        }
+        CmdOutcome::Ran(o) => {
+            let said = |b: &[u8]| String::from_utf8_lossy(b).contains(REPO_UNRESOLVED);
+            if said(&o.stdout) || said(&o.stderr) {
+                gone.set(true);
+            }
+            OpenPrProbe::ProbeFailed
+        }
+        CmdOutcome::Unavailable(_) => OpenPrProbe::ProbeFailed,
     }
 }
+
+/// GitHub's GraphQL error for a repository that does not resolve.
+const REPO_UNRESOLVED: &str = "Could not resolve to a Repository";
 
 /// #9548: both writers below resolve the repo from `repo_root`'s remotes;
 /// refuse unless this installation may write there.

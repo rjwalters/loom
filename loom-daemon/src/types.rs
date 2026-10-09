@@ -406,6 +406,26 @@ pub enum Request {
     /// the IPC handler, so the `loom-daemon status` CLI shells out to
     /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
     DaemonStatus,
+    /// `DaemonStatus` for only the named top-level sections of
+    /// `status --json` (Issue #10787, `loom-daemon status --json --section`).
+    /// The daemon runs only the build phases those sections need — notably
+    /// it skips the `O(roots)` per-root walk unless a section reads it (see
+    /// [`crate::status_section::SectionSet`]). The reply is the same
+    /// `Response::DaemonStatus`; fields of unrequested sections are
+    /// unspecified (typically their defaults) and the CLI emits only the
+    /// requested keys.
+    ///
+    /// A separate variant rather than a field on `DaemonStatus`, so the
+    /// existing `{"type":"DaemonStatus"}` frame and every client sending it
+    /// are untouched, an older daemon rejects this frame with a parse error
+    /// the CLI can name ("daemon too old for --section") instead of silently
+    /// answering with a full build, and the IPC latency metrics
+    /// (`loom.daemon.ipc.*`) label it with its own `kind`,
+    /// `DaemonStatusSections`, so cheap sectioned calls do not dilute the
+    /// full build's latency series.
+    DaemonStatusSections {
+        sections: Vec<crate::status_section::StatusSection>,
+    },
     // ========================================================================
     // Workspace Registry Requests (Issue #3926 — phase 1 of #3835)
     // ========================================================================
@@ -1346,13 +1366,20 @@ pub struct DaemonStatusReport {
     /// transition) these are always queryable, so a host idling behind a roll
     /// is visible to a single `loom-daemon status --json`.
     #[serde(default)]
-    pub drain_roll: Option<crate::ipc::drain_roll::DrainRollStatus>,
+    pub drain_roll: Option<crate::ipc::drain_status::DrainRollStatus>,
     /// Cumulative dispatch-paused seconds attributable to drain-and-restart
     /// rolls, per UTC day (Issue #8652), from a ledger persisted across the
     /// restart a successful roll performs. Includes the elapsed portion of an
     /// in-progress pause. Empty from a pre-#8652 daemon (`#[serde(default)]`).
     #[serde(default)]
     pub drain_paused_by_day: std::collections::BTreeMap<chrono::NaiveDate, u64>,
+    /// The pause-and-roll resume state (#10832): the pause manifest this
+    /// process found at startup, the H5 step it is on (or how it ended), and
+    /// what became of each paused agent, with per-reason requeue counters and
+    /// observed durations. `None` when the process started without a manifest
+    /// (and from a pre-#10832 daemon). Rendered as `drain.resume`.
+    #[serde(default)]
+    pub pause_resume: Option<crate::auto_update::pause_resume::PauseResumeStatus>,
     /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
     /// daemon process. `false` in the common opt-out case (the loop is
     /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older
@@ -1360,6 +1387,11 @@ pub struct DaemonStatusReport {
     /// mirroring the `draining` forward-compat convention.
     #[serde(default)]
     pub auto_update_enabled: bool,
+    /// Why the self-update loop runs, and in which mode (#10954), e.g. `fleet
+    /// floor only (autoUpdate.enabled=false)`. `None` before the spawn decision
+    /// and from an older daemon, which then renders as plain `enabled`.
+    #[serde(default)]
+    pub auto_update_mode: Option<String>,
     /// Wall-clock time of the auto-update loop's most recent staleness check
     /// (Issue #4055), or `None` when the loop has not ticked yet (or is
     /// disabled). `#[serde(default)]` keeps pre-#4055 wire data compatible.
@@ -1422,15 +1454,17 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
-    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
-    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
-    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
-    #[serde(default)]
-    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
     pub task_liveness: Vec<crate::task_liveness::TaskLivenessEntry>,
+    /// Codex session containers, per session-managed account (Issue
+    /// #10600): state, mounts, posture, hold, removal record and the
+    /// reconciler's last action, read from the published snapshot (no docker
+    /// call). `None` on a host without a session-managed account, and from a
+    /// pre-#10600 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_containers: Option<crate::session_status::SessionContainersReport>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
@@ -1867,7 +1901,7 @@ pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, H
 pub(crate) mod work_finder_tick;
 pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
-mod star_liveness;
+pub mod star_liveness;
 pub use star_liveness::{
     AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
 };
@@ -2307,6 +2341,71 @@ pub struct ForgeCallsStatus {
     /// `None` when the sink is disabled, or from an older daemon.
     #[serde(default)]
     pub identity_roles: Option<Vec<ForgeIdentityRoleCounts>>,
+    /// Host-wide counts over the window per billed bucket (W1), beside the
+    /// bucket book's newest reading. `None` when the sink is disabled, or
+    /// from an older daemon.
+    #[serde(default)]
+    pub buckets: Option<Vec<ForgeBucketStatus>>,
+    /// Reader Apps withdrawn from one `(owner, resource)` bucket right now
+    /// (W4-A), from this daemon's routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reader_withdrawals: Vec<ReaderWithdrawalStatus>,
+    /// Read-pool spill latches engaged right now (W4-B), from this daemon's
+    /// routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_spills: Vec<ReadSpillStatus>,
+}
+
+/// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadSpillStatus {
+    /// The repo, `owner/repo` lowercased.
+    pub owner_repo: String,
+    /// `core`, `graphql` or `search`.
+    pub resource: String,
+    /// The home reader, `app-<id>`.
+    pub from: String,
+    /// `partial` or `full`.
+    pub mode: String,
+    /// When the latch releases.
+    pub until: DateTime<Utc>,
+}
+
+/// One live scoped reader withdrawal of [`ForgeCallsStatus`] (W4-A).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderWithdrawalStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The owner, lowercased.
+    pub owner: String,
+    /// `core`, `graphql`, `search` or `all`.
+    pub resource: String,
+    pub until: DateTime<Utc>,
+}
+
+/// One billed GitHub rate-limit bucket of [`ForgeCallsStatus`] (W1):
+/// `(account, cred_owner, resource)`, what this host charged it over the
+/// window, and the bucket book's reading when one is believed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeBucketStatus {
+    /// `app-<id>`, `app-unknown`, `env-token`, `ambient` or `unknown`.
+    pub account: String,
+    /// The installation's owner, or `-` when the credential has none.
+    pub cred_owner: String,
+    /// The App installation the bucket was read under (#10571), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<String>,
+    pub resource: String,
+    /// Requests charged (`ok` rows × pages).
+    pub charged: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    #[serde(default)]
+    pub used: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
 }
 
 /// One identity-role row of [`ForgeCallsStatus`] (#9872).
@@ -2318,6 +2417,9 @@ pub struct ForgeIdentityRoleCounts {
     pub not_modified: u64,
     pub rate_limited: u64,
     pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
@@ -2343,6 +2445,9 @@ pub struct ForgeOperationCounts {
     pub not_modified: u64,
     pub rate_limited: u64,
     pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].
@@ -2360,6 +2465,10 @@ pub struct ForgeCallCounts {
     pub rate_limited: u64,
     /// Any other failure.
     pub error: u64,
+    /// Reads a reader route deferred without a request (W4-C): charged
+    /// nothing.
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// A remaining-budget reading for one pool.

@@ -277,7 +277,7 @@ impl SweepRegistry {
         );
         let args = ["api", path.as_str(), "--paginate", "--jq", jq.as_str()];
         let output = self
-            .gh_read("outcome.writeback_probe", args)
+            .gh_read_own_write("outcome.writeback_probe", args)
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -393,6 +393,7 @@ mod tests {
             complexity: Some("complex".to_string()),
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             attempt_index: None,
             previous_sweep_id: None,
             trigger: None,

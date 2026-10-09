@@ -265,6 +265,11 @@ pub struct StageSamples {
     /// through [`Self::select_episodes`]; no shipped heuristic reads it, so
     /// adding it changes no shipped estimate.
     pub episodes: Vec<super::episodes::StageEpisode>,
+    /// Every PR's label-flag timeline (#10245), with its repo (#10523): how
+    /// `land-2026-10-06-held-heron` finds sequenced spells. Copied from the
+    /// fleet snapshot beside [`Self::episodes`]; no other heuristic reads it,
+    /// so adding it changes no other estimate.
+    pub flag_changes: Vec<super::flag_timeline::RepoFlagChange>,
     /// Whose history this is (#9343): `Local` when every sample came from
     /// this host's own journals, `Fleet` as soon as one host-independent
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
@@ -296,6 +301,17 @@ impl Level {
             Level::Host => "host",
         }
     }
+}
+
+/// A recency-weighted mean duration ([`StageSamples::weighted_mean`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightedMean {
+    /// Level the samples came from.
+    pub level: Level,
+    /// Samples read.
+    pub n: usize,
+    /// Weighted mean, seconds.
+    pub mean_sec: f64,
 }
 
 /// A stage's samples, ready to summarise.
@@ -354,7 +370,7 @@ pub(super) fn selection_of(
     }
 }
 
-fn same_repo(a: &str, b: &str) -> bool {
+pub(crate) fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
@@ -408,6 +424,7 @@ impl StageSamples {
         self.paths.extend(other.paths);
         self.calibration.extend(other.calibration);
         self.episodes.extend(other.episodes);
+        self.flag_changes.extend(other.flag_changes);
         self.outcome_keys.extend(other.outcome_keys);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;
@@ -544,6 +561,51 @@ impl StageSamples {
         sources: &[SampleSource],
     ) -> Option<Selection> {
         self.select_at(repo, stage, as_of, sources, MIN_SAMPLES)
+    }
+
+    /// The recency-weighted mean duration of `stage` (#10208): the samples
+    /// [`Self::select`] would read (same level, window, worked-only filter and
+    /// [`MAX_SAMPLES`] most recent), each weighted `2^(-age / half_life_sec)`
+    /// where `age` is `as_of` minus its `observed_at`.
+    #[must_use]
+    pub fn weighted_mean(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        half_life_sec: i64,
+    ) -> Option<WeightedMean> {
+        let level = self.select(repo, stage, as_of, sources)?.level;
+        let mut picked: Vec<&StageSample> = self
+            .stages
+            .iter()
+            .filter(|s| {
+                s.stage == stage
+                    && admitted(sources, s.source)
+                    && in_window(s.observed_at, as_of)
+                    && (level == Level::Host || same_repo(&s.repo, repo))
+                    && s.worked_admitted()
+            })
+            .collect();
+        picked.sort_by(|a, b| {
+            b.observed_at
+                .cmp(&a.observed_at)
+                .then(a.duration_sec.cmp(&b.duration_sec))
+        });
+        picked.truncate(MAX_SAMPLES);
+        let (mut num, mut den) = (0.0_f64, 0.0_f64);
+        for s in &picked {
+            let age = (as_of - s.observed_at).num_seconds().max(0) as f64;
+            let w = (-age / half_life_sec as f64 * std::f64::consts::LN_2).exp();
+            num += w * s.duration_sec as f64;
+            den += w;
+        }
+        (den > 0.0).then(|| WeightedMean {
+            level,
+            n: picked.len(),
+            mean_sec: num / den,
+        })
     }
 
     /// [`Self::select`] with an explicit floor.

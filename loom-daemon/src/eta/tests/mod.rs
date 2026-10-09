@@ -1,47 +1,88 @@
 //! ETA core tests (#9289). Pure: no daemon, no network, no clock.
 
 mod backtest;
+mod backtest_adaptation;
+mod backtest_censored;
 mod backtest_pr;
+mod backtest_priority;
+mod backtest_subsets;
 mod backtest_union;
 mod censoring;
 mod conditioning;
 mod config;
+mod conformal;
+mod conformal_ipcw;
+mod conformal_ipcw_drift;
+mod conformal_seconds;
+mod conformal_wrap;
+mod dependency;
 mod emit;
 mod episodes;
 mod estimate;
+mod explain;
 mod explanation;
+mod features_v3;
 mod fit;
 mod fit_leak;
+mod fit_newton;
 mod fit_parity;
 mod fit_publish;
+mod fit_publish_v2;
 mod fit_rows;
 mod flag_timeline;
 mod fleet;
 mod fleet_refresh;
 mod fleet_signoz;
+mod fleet_signoz_history;
+mod fleet_signoz_timeline;
+mod fleet_signoz_timeline_sql;
 mod friction;
+mod held_heron;
+mod hold_kind;
+mod hold_marker_log;
 mod hold_parity;
 mod hold_serving;
 mod item_features;
 mod journal;
+mod keen_wren;
 pub(crate) mod land_twin_otter;
 mod land_v3;
+mod little_v0;
+mod loop_features;
+mod loop_kite;
 mod merge_hold;
 mod offline;
+mod planner_sim;
+mod planner_version;
+mod point_in_time;
+mod pr_file_log;
 mod primitives;
 mod priority_features;
+mod priority_inputs;
 mod queue_features;
 mod ready;
+mod ready_order;
 mod recalibrate;
 mod recency;
+mod regime;
+mod regime_serving;
+mod roster_history;
+mod scope_features;
 mod score;
+mod serve_parity;
 mod shadow;
+mod shadow_fleet;
 mod shadow_gate;
+mod shadow_lifecycle;
+mod shadow_non_refusal;
+mod shadow_stats;
+mod stage_forecast;
 mod stall;
 mod star_parity;
 mod tracker;
 mod tracker_hold;
 mod twin_otter_parity;
+mod walk_forward;
 
 use super::explanation::Features;
 use super::history::StageSamples;
@@ -143,5 +184,7 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
+        dependencies: None,
     }
 }

@@ -110,6 +110,21 @@ pub struct CalibrationObservation {
     /// When the landing became known (a forge read can lag the merge).
     /// Never earlier than `actual_at`; `None` while still open.
     pub resolved_at: Option<DateTime<Utc>>,
+    /// The item's age in its stage at the estimate (#10489): the conformal
+    /// calibrator's age bucket. Absent on a row persisted before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_sec: Option<i64>,
+    /// The base estimate's own 25th percentile (#10489), so a quantile
+    /// calibrator can score the quantile it was asked about, not just the
+    /// median. Absent on a row persisted before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p25_sec: Option<i64>,
+    /// The base estimate's 75th percentile (#10489). See [`Self::p25_sec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p75_sec: Option<i64>,
+    /// The base estimate's 90th percentile (#10489). See [`Self::p25_sec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_sec: Option<i64>,
 }
 
 impl CalibrationObservation {
@@ -128,6 +143,10 @@ impl CalibrationObservation {
             p50_sec: summary.p50_sec?,
             actual_at: None,
             resolved_at: None,
+            age_sec: summary.age_sec,
+            p25_sec: summary.p25_sec,
+            p75_sec: summary.p75_sec,
+            p90_sec: summary.p90_sec,
         })
     }
 

@@ -30,14 +30,12 @@
 //!
 //! - **Queue features**: `queue_features(subject, roster, log, scope, t)`.
 //!   The subject's entry is the **split** episode's. The roster is every PR
-//!   open in an episode at `t − LAG`, known at `entered_at + LAG`. The log has
-//!   one event per episode end before `H`, known at `at + LAG`: a merge is one
-//!   `merge` event (never an exit plus a merge, which would double-count the
-//!   departure), every other end (`left` for a stage or a close, `unstaged`)
-//!   an `exit`, both with the episode's stage. So `merge_wait → merge_hold` is
-//!   a `merge_wait` exit, as serving journals it. `log.from` is the latest of
-//!   the snapshots' earliest episode entries, the instant from which every
-//!   repo's log is complete. The scope is every loaded snapshot's repo.
+//!   open in an episode at `t − LAG`, known at `entered_at + LAG`. The log is
+//!   [`SnapshotLog`] (#10500), the one definition serving reads too: one
+//!   event per episode end before `H` (a merge one `merge`, never an exit
+//!   plus a merge), plus every other forge merge of the repo (a PR with no
+//!   loom review label has no episode), each known at `at + LAG`. The scope
+//!   is every loaded snapshot's repo.
 //! - **`age_h`**: hours since the split episode's entry.
 //! - **`rework`**: the PR's `doctor` episodes entered before `t − LAG`, the
 //!   current one included: the Judge rejections knowable at `t`, which is
@@ -51,6 +49,19 @@
 //!   timeline read from its flag changes before `t − LAG`
 //!   ([`PriorityState::from_flags`]), plus the linked-issue star run
 //!   (#10372) when star inputs are given.
+//! - **v2 priority inputs** (#10508, [`Assembled::priority_inputs`], not
+//!   read by the v1 fit): [`crate::eta::priority_inputs::priority_inputs`],
+//!   the one builder serving calls too, over the same roster, with the
+//!   subject's own flag timeline, its linked-issue star at `t − LAG` (`None`
+//!   when the cache does not cover it) and the fleet roster history given to
+//!   [`build_with_context`] (`None` = every roster-derived input unknown).
+//! - **Friction predictors** (#10521, [`Assembled::loops`], not model
+//!   inputs): `loop_features` at `t − LAG` over the repo's episodes, the same
+//!   builder serving calls. Files and CI are not logged, so those are `None`.
+//! - **Size and scope predictors** (#10960, [`Assembled::scope`], not model
+//!   inputs): `scope_features` at `t − LAG` over the logged file lists and
+//!   the repo's merges in the trailing 7 days, the same builder serving
+//!   calls. All unknown when no file log is given.
 //! - A row whose needed queue feature is `None` is dropped and counted in
 //!   [`RowStats::rows_dropped_missing`].
 //! - **Exit label**: `Some` iff `t + `[`EXIT_HORIZON_SEC`]` < H`; then whether
@@ -80,6 +91,7 @@
 //! Rows are sorted by `(t, repo, pr, stage)` and dwells by `(stage, repo, pr,
 //! entered_at)`, repos lowercased: total keys, never input order.
 
+use super::features_v2::PriorityInputs;
 use super::{
     clock, DwellEnd, DwellRow, FitStage, MergeLabel, ModelInputs, TrainingRow, EXIT_HORIZON_SEC,
     KNOWABLE_LAG_SEC, ROW_STEP_SEC, WINDOW_DAYS,
@@ -87,15 +99,20 @@ use super::{
 use crate::eta::episodes::{EpisodeEnd, EpisodeNext, StageEpisode};
 use crate::eta::flag_timeline::{flags_before, FlagChange};
 use crate::eta::fleet::FleetSnapshot;
+use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
 use crate::eta::labels::{
     FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
+};
+use crate::eta::loop_features::{
+    loop_features, repo_context, FileSnapshot, LoopFeatures, LoopInputs,
 };
 use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
-use crate::eta::queue_features::{
-    queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
-};
+use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
+use crate::eta::queue_features::{queue_features, QueueFeatures, QueueSubject, RosterEntry};
+use crate::eta::repo_priority::RosterRevision;
+use crate::eta::scope_features::{churn_context, scope_features, ScopeFeatures, ScopeInputs};
 use crate::eta::star::{LinkedStar, StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
@@ -147,6 +164,20 @@ pub struct Assembled {
     /// candidate inputs for the next model version, not read by the current
     /// fit, so the coefficient file is unchanged.
     pub priority: Vec<PriorityFeatures>,
+    /// `priority_inputs[i]` is the `eta-fit/v2` priority input set of
+    /// `rows[i]` (#10508), from the builder serving shares. Not read by the
+    /// v1 fit, so the coefficient file is unchanged.
+    pub priority_inputs: Vec<PriorityInputs>,
+    /// `loops[i]` is the friction-predictor set of `rows[i]` (#10521): the
+    /// review-loop history, repo Judge rejection rate and cumulative stage
+    /// age, from the one builder serving also calls. File overlap and own-CI
+    /// are `None` (not logged yet). Not read by the current fit.
+    pub loops: Vec<LoopFeatures>,
+    /// `scope[i]` is the size and scope predictor set of `rows[i]` (#10960),
+    /// from the one builder serving also calls, over the file lists logged
+    /// before the row's cutoff. All unknown without a file log. Not read by
+    /// any fit yet.
+    pub scope: Vec<ScopeFeatures>,
     /// What was dropped.
     pub stats: RowStats,
     /// The data horizon `H` (see the module docs).
@@ -173,6 +204,21 @@ pub fn is_open_at(episode: &StageEpisode, cutoff: DateTime<Utc>) -> bool {
     episode.entered_at < cutoff && episode.ended_at().is_none_or(|at| at >= cutoff)
 }
 
+/// The rows (and their keys) observed under `planner_version`, in their
+/// given canonical order; rows with no stamp are dropped (#10528). Pure: for
+/// a fit that must learn only the current planner regime.
+#[must_use]
+pub fn restrict_to_regime(
+    rows: Vec<TrainingRow>,
+    row_keys: Vec<RowKey>,
+    planner_version: &str,
+) -> (Vec<TrainingRow>, Vec<RowKey>) {
+    rows.into_iter()
+        .zip(row_keys)
+        .filter(|(row, _)| row.planner_version.as_deref() == Some(planner_version))
+        .unzip()
+}
+
 /// One PR, gathered from its snapshot.
 struct Pr<'a> {
     repo: String,
@@ -190,22 +236,6 @@ impl<'a> Pr<'a> {
             .copied()
             .find(|e| is_open_at(e, cutoff))
     }
-}
-
-/// One snapshot per repo: two files for one repo (a case variant) would
-/// otherwise double every PR. The later `(as_of, snapshot_id)` wins, which is
-/// independent of load order.
-fn one_per_repo(snapshots: &[FleetSnapshot]) -> Vec<&FleetSnapshot> {
-    let mut by_repo: BTreeMap<String, &FleetSnapshot> = BTreeMap::new();
-    for snapshot in snapshots {
-        let slot = by_repo
-            .entry(snapshot.repo.to_ascii_lowercase())
-            .or_insert(snapshot);
-        if (snapshot.as_of, &snapshot.snapshot_id) > (slot.as_of, &slot.snapshot_id) {
-            *slot = snapshot;
-        }
-    }
-    by_repo.into_values().collect()
 }
 
 /// Every PR with an episode, in `(repo, pr)` order, its episodes by entry and
@@ -255,77 +285,6 @@ fn gather<'a>(snapshots: &[&'a FleetSnapshot]) -> Vec<Pr<'a>> {
         }
     }
     prs.into_values().collect()
-}
-
-/// The stage events: one per episode end before `horizon`, sorted by instant,
-/// plus each repo's merges for the since-merge lookup.
-struct Events {
-    sorted: Vec<StageEvent>,
-    merges_by_repo: BTreeMap<String, Vec<StageEvent>>,
-    from: Option<DateTime<Utc>>,
-}
-
-impl Events {
-    fn new(prs: &[Pr<'_>], horizon: DateTime<Utc>, from: Option<DateTime<Utc>>) -> Self {
-        let lag = Duration::seconds(KNOWABLE_LAG_SEC);
-        let mut sorted: Vec<StageEvent> = Vec::new();
-        for pr in prs {
-            for episode in &pr.episodes {
-                let Some(at) = episode.ended_at().filter(|at| *at < horizon) else {
-                    continue;
-                };
-                let kind = match episode.end {
-                    EpisodeEnd::Left {
-                        next: EpisodeNext::Merged,
-                        ..
-                    } => EventKind::Merge,
-                    _ => EventKind::Exit,
-                };
-                sorted.push(StageEvent {
-                    repo: pr.repo.clone(),
-                    pr: Some(pr.number),
-                    stage: Some(episode.stage),
-                    kind,
-                    at,
-                    known_at: at + lag,
-                });
-            }
-        }
-        sorted.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.cmp(b)));
-        let mut merges_by_repo: BTreeMap<String, Vec<StageEvent>> = BTreeMap::new();
-        for event in sorted.iter().filter(|e| e.kind == EventKind::Merge) {
-            merges_by_repo
-                .entry(event.repo.clone())
-                .or_default()
-                .push(event.clone());
-        }
-        Events {
-            sorted,
-            merges_by_repo,
-            from,
-        }
-    }
-
-    /// The log [`queue_features`] reads at `t`. Equal in effect to the whole
-    /// log: every window it counts over is at most 24 h, and `since_merge`
-    /// reads only each repo's last merge, so the events in `[t − 24 h, t)`
-    /// plus each repo's last merge before that give the same features.
-    fn at(&self, t: DateTime<Utc>) -> EventLog {
-        let window_start = t - Duration::hours(24);
-        let lo = self.sorted.partition_point(|e| e.at < window_start);
-        let hi = self.sorted.partition_point(|e| e.at < t);
-        let mut events: Vec<StageEvent> = self.sorted[lo..hi].to_vec();
-        for merges in self.merges_by_repo.values() {
-            let before = merges.partition_point(|e| e.at < window_start);
-            if let Some(last) = before.checked_sub(1).and_then(|i| merges.get(i)) {
-                events.push(last.clone());
-            }
-        }
-        EventLog {
-            from: self.from,
-            events,
-        }
-    }
 }
 
 fn hours(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
@@ -422,6 +381,34 @@ pub fn build_with_star(
     as_of: DateTime<Utc>,
     star: Option<&StarInputs>,
 ) -> Assembled {
+    build_with_context(snapshots, as_of, star, None)
+}
+
+/// [`build_with_star`], also reading the fleet roster's history (oldest
+/// first) for the v2 priority inputs (#10508). `None` leaves every
+/// roster-derived input unknown.
+#[must_use]
+pub fn build_with_context(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+) -> Assembled {
+    build_with_files(snapshots, as_of, star, fleet_history, None)
+}
+
+/// [`build_with_context`], also reading each open PR's changed-file list as
+/// logged before each row's cutoff (#10550) for the file-overlap predictor.
+/// `None` leaves it unknown; `Some` reads only snapshots whose `known_at` is
+/// before `t - lag`, never the PR's final diff.
+#[must_use]
+pub fn build_with_files(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+    files: Option<&[FileSnapshot]>,
+) -> Assembled {
     let lag = Duration::seconds(KNOWABLE_LAG_SEC);
     let step = Duration::seconds(ROW_STEP_SEC);
     let exit_horizon = Duration::seconds(EXIT_HORIZON_SEC);
@@ -436,21 +423,18 @@ pub fn build_with_star(
         .collect();
     scope.sort();
     scope.dedup();
-    // Only entries before the horizon, so a post-cutoff PR cannot move it.
-    let from = chosen
-        .iter()
-        .filter_map(|s| {
-            s.episodes
-                .iter()
-                .map(|e| e.entered_at)
-                .filter(|at| *at < horizon)
-                .min()
-        })
-        .max();
-    let events = Events::new(&prs, horizon, from);
+    // #10500: the one event-log definition, shared with serving.
+    let events = SnapshotLog::new(&chosen, horizon);
+    let mut repo_episodes: BTreeMap<&str, Vec<&StageEpisode>> = BTreeMap::new();
+    for pr in &prs {
+        repo_episodes
+            .entry(pr.repo.as_str())
+            .or_default()
+            .extend(pr.episodes.iter().copied());
+    }
 
     let mut stats = RowStats::default();
-    let mut keyed: Vec<((RowKey, FitStage), (TrainingRow, PriorityFeatures))> = Vec::new();
+    let mut keyed: Vec<KeyedRow> = Vec::new();
     let mut t = window_start;
     while t < horizon {
         let cutoff = t - lag;
@@ -483,6 +467,20 @@ pub fn build_with_star(
                 })
                 .collect();
             let log = events.at(t);
+            // The repo-level slice of the friction predictors, once per tick.
+            let context: BTreeMap<&str, Vec<&StageEpisode>> = repo_episodes
+                .iter()
+                .map(|(repo, eps)| (*repo, repo_context(eps, cutoff)))
+                .collect();
+            // The repo's merges in the churn window, once per tick (#10960).
+            let merged: BTreeMap<&str, Vec<&StageEpisode>> = if files.is_some() {
+                repo_episodes
+                    .iter()
+                    .map(|(repo, eps)| (*repo, churn_context(eps, cutoff)))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
             for (pr, episode) in &open {
                 let Some(stage) = FitStage::from_stage(episode.stage) else {
                     continue;
@@ -522,6 +520,36 @@ pub fn build_with_star(
                     .map(|e| e.star.clone())
                     .unwrap_or_default();
                 let prio = priority_features(&subject, &own, &priority_roster, &scope, t);
+                let ctx = PriorityContext {
+                    roster: &priority_roster,
+                    scope: &scope,
+                    fleet_history,
+                };
+                let linked = star
+                    .and_then(|s| s.repos.get(&pr.repo))
+                    .and_then(|r| r.linked_at(pr.number, cutoff));
+                let own_flags = PriorityState::from_flags(&pr.flags, cutoff).unwrap_or_default();
+                let prio_v2 = priority_inputs(&subject, &own_flags, linked.as_ref(), &ctx, t);
+                let loops = loop_features(
+                    &LoopInputs {
+                        repo: &pr.repo,
+                        pr: pr.number,
+                        own: &pr.episodes,
+                        repo_episodes: context.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
+                        files,
+                        ci: None,
+                    },
+                    cutoff,
+                );
+                let scope = scope_features(
+                    &ScopeInputs {
+                        repo: &pr.repo,
+                        pr: pr.number,
+                        repo_episodes: merged.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
+                        files,
+                    },
+                    cutoff,
+                );
                 let rework = pr
                     .episodes
                     .iter()
@@ -549,10 +577,14 @@ pub fn build_with_star(
                             inputs,
                             starred_any,
                             star_source,
+                            planner_version: None,
                             exit,
                             merge: merge_label(pr, t, horizon),
                         },
                         prio,
+                        prio_v2,
+                        loops,
+                        scope,
                     ),
                 ));
             }
@@ -563,10 +595,16 @@ pub fn build_with_star(
     let mut row_keys = Vec::with_capacity(keyed.len());
     let mut rows = Vec::with_capacity(keyed.len());
     let mut priority = Vec::with_capacity(keyed.len());
-    for ((key, _), (row, prio)) in keyed {
+    let mut priority_inputs = Vec::with_capacity(keyed.len());
+    let mut loops = Vec::with_capacity(keyed.len());
+    let mut scope = Vec::with_capacity(keyed.len());
+    for ((key, _), (row, prio, prio_v2, lp, sc)) in keyed {
         row_keys.push(key);
         rows.push(row);
         priority.push(prio);
+        priority_inputs.push(prio_v2);
+        loops.push(lp);
+        scope.push(sc);
     }
 
     Assembled {
@@ -574,6 +612,9 @@ pub fn build_with_star(
         row_keys,
         dwells: dwells(&prs, window_start, horizon),
         priority,
+        priority_inputs,
+        loops,
+        scope,
         stats,
         data_through: horizon,
     }
@@ -581,6 +622,13 @@ pub fn build_with_star(
 
 /// A dwell's canonical sort key: `(stage, repo, pr, entered_at)`.
 type DwellKey<'a> = (FitStage, &'a str, u32, DateTime<Utc>);
+
+/// One assembled row with its sort key, v1 priority candidates, v2 inputs,
+/// friction predictors (#10521) and size and scope predictors (#10960).
+type KeyedRow = (
+    (RowKey, FitStage),
+    (TrainingRow, PriorityFeatures, PriorityInputs, LoopFeatures, ScopeFeatures),
+);
 
 /// The dwells, in canonical order (see the module docs).
 fn dwells(prs: &[Pr<'_>], window_start: DateTime<Utc>, horizon: DateTime<Utc>) -> Vec<DwellRow> {

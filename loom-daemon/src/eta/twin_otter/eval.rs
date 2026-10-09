@@ -2,6 +2,8 @@
 //! current-stage survival curve, the direct (AFT) quantiles and the blend.
 
 use super::{EvalConfig, EvalError, TwinOtterInput, PROBIT_TAUS};
+use crate::eta::fit::features_v2::{model_features_v2, ModelInputsV2, FEATURES_V2};
+use crate::eta::fit::features_v3::{model_features_v3, ModelInputsV3, FEATURES_V3};
 use crate::eta::fit::math::sigmoid;
 use crate::eta::fit::{clock, model_features, AftFit, HazardFit, ModelInputs, FEATURES};
 use chrono::{DateTime, Duration, Utc};
@@ -19,10 +21,51 @@ const NULLABLE: [(&str, &str); 9] = [
     ("n_stage_fleet", "log_n_stage_fleet"),
 ];
 
+/// Which shared transform a model's feature names select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transform {
+    /// `eta-fit/v1`: [`model_features`], positions in [`FEATURES`].
+    V1,
+    /// `eta-fit/v2` (#10508): [`model_features_v2`], positions in
+    /// [`FEATURES_V2`].
+    V2,
+    /// `eta-fit/v3` (#10521): [`model_features_v3`], positions in
+    /// [`FEATURES_V3`].
+    V3,
+}
+
+impl Transform {
+    /// The transform whose names cover every one of `names`: v1 first, so
+    /// a v1 model is read exactly as before, then v2 (so a v2 model is too),
+    /// then v3; `None` when none does.
+    fn of(names: &[String]) -> Option<Self> {
+        let covers = |set: &[&str]| names.iter().all(|n| set.contains(&n.as_str()));
+        if covers(&FEATURES) {
+            Some(Transform::V1)
+        } else if covers(&FEATURES_V2) {
+            Some(Transform::V2)
+        } else if covers(&FEATURES_V3) {
+            Some(Transform::V3)
+        } else {
+            None
+        }
+    }
+
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Transform::V1 => &FEATURES,
+            Transform::V2 => &FEATURES_V2,
+            Transform::V3 => &FEATURES_V3,
+        }
+    }
+}
+
 /// One item's features, laid out in the model's feature order.
 pub(super) struct Features<'a> {
     input: &'a TwinOtterInput,
-    /// For each model feature, its position in [`FEATURES`].
+    /// The shared transform the model's names select.
+    transform: Transform,
+    /// For each model feature, its position in the transform's output.
     index: Vec<usize>,
     /// For each model feature, whether it is imputed at standardized 0.
     imputed_at: Vec<bool>,
@@ -35,12 +78,17 @@ impl<'a> Features<'a> {
     /// to impute.
     pub(super) fn new(names: &[String], input: &'a TwinOtterInput) -> Result<Self, EvalError> {
         check_input(input)?;
+        let transform = Transform::of(names).unwrap_or(Transform::V1);
         let index = names
             .iter()
             .map(|name| {
-                FEATURES.iter().position(|f| f == name).ok_or_else(|| {
-                    EvalError::InvalidModel(format!("unknown feature name `{name}`"))
-                })
+                transform
+                    .names()
+                    .iter()
+                    .position(|f| f == name)
+                    .ok_or_else(|| {
+                        EvalError::InvalidModel(format!("unknown feature name `{name}`"))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let missing = [
@@ -71,6 +119,7 @@ impl<'a> Features<'a> {
             .collect();
         Ok(Features {
             input,
+            transform,
             index,
             imputed_at,
             imputed,
@@ -91,7 +140,31 @@ impl<'a> Features<'a> {
     /// other input frozen. An imputed feature is 0.
     fn standardized(&self, age_h: f64, at: DateTime<Utc>, mu: &[f64], sd: &[f64]) -> Vec<f64> {
         let (hour_utc, weekend) = clock(at);
-        let x = model_features(&self.raw(age_h, hour_utc, weekend));
+        let base = self.raw(age_h, hour_utc, weekend);
+        let x: Vec<f64> = match self.transform {
+            Transform::V1 => model_features(&base).to_vec(),
+            Transform::V2 => model_features_v2(&ModelInputsV2 {
+                base,
+                priority: self.input.priority.unwrap_or_default(),
+            })
+            .to_vec(),
+            Transform::V3 => {
+                let mut loops = self.input.loops.clone().unwrap_or_default();
+                // The cumulative stage age advances with the clock, as the
+                // age does; every other friction input stays frozen.
+                let offset_h =
+                    ((at - self.input.as_of).num_milliseconds().max(0) as f64) / 3_600_000.0;
+                loops.cum_stage_h = loops.cum_stage_h.map(|h| h + offset_h);
+                model_features_v3(&ModelInputsV3 {
+                    v2: ModelInputsV2 {
+                        base,
+                        priority: self.input.priority.unwrap_or_default(),
+                    },
+                    loops,
+                })
+                .to_vec()
+            }
+        };
         self.index
             .iter()
             .zip(&self.imputed_at)
@@ -229,6 +302,24 @@ fn check_input(input: &TwinOtterInput) -> Result<(), EvalError> {
         return Err(EvalError::InvalidInput(
             "since_merge_h must be non-negative and finite".to_string(),
         ));
+    }
+    if let Some(loops) = &input.loops {
+        if loops
+            .cum_stage_h
+            .is_some_and(|h| !(h.is_finite() && h >= 0.0))
+        {
+            return Err(EvalError::InvalidInput(
+                "loops.cum_stage_h must be non-negative and finite".to_string(),
+            ));
+        }
+        if loops
+            .judge_reject_rate_7d
+            .is_some_and(|r| !(0.0..=1.0).contains(&r))
+        {
+            return Err(EvalError::InvalidInput(
+                "loops.judge_reject_rate_7d must be in [0, 1]".to_string(),
+            ));
+        }
     }
     Ok(())
 }

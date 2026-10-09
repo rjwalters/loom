@@ -1483,7 +1483,7 @@ fn daemon_unit_pins_workingdirectory_with_4292_marker() {
         .apply
         .contains("WorkingDirectory=%h/loom-workspaces/anvil"));
     assert!(step.apply.contains("#4292"), "workaround must be marked with #4292");
-    assert!(step.apply.contains("Restart=on-success"));
+    assert!(step.apply.contains("\nRestart=always\n"));
     assert!(step.apply.contains("enable-linger"));
 }
 
@@ -1491,12 +1491,9 @@ fn daemon_unit_pins_workingdirectory_with_4292_marker() {
 fn daemon_unit_sets_supervisor_env_and_correct_restart_policy() {
     // #4640: without LOOM_DAEMON_SUPERVISOR=systemd, detect_supervisor()
     // (ipc.rs) can't tell the fleet daemon is systemd-supervised, so
-    // `restart --drain` refuses on every fleet worker. Restart=on-failure
-    // additionally inverts the exit-code contract: it never relaunches on
-    // the restart primitive's clean exit 0, and (had it been changed to
-    // `always` instead) would incorrectly relaunch on EXIT_SHUTDOWN (143).
-    // Restart=on-success mirrors the canonical `render_systemd_unit()` in
-    // loom-daemon-start.sh (#4268) and gets both right.
+    // `restart --drain` refuses on every fleet worker. #11058: the policy
+    // (Restart=always + RestartPreventExitStatus=, OOMPolicy=continue) is the
+    // canonical block, whose contract render.rs's tests pin.
     let config = base_config();
     let plan = build_plan(&config, &Secrets::default());
     let step = plan
@@ -1513,17 +1510,14 @@ fn daemon_unit_sets_supervisor_env_and_correct_restart_policy() {
         "rendered unit must set LOOM_DAEMON_SUPERVISOR=systemd so detect_supervisor() \
              recognizes the fleet daemon as supervised"
     );
+    let render = |s: &str| step.apply.contains(s);
+    assert!(render(&crate::daemon_start::render::systemd_supervision_block()));
+    assert!(!render("Restart=on-success") && !render("Restart=on-failure"));
+    // StartLimit* only take effect in [Unit].
+    let unit = step.apply.split("[Service]").next().unwrap_or_default();
+    assert!(unit.contains(crate::daemon_start::render::SYSTEMD_START_LIMIT));
     assert!(
-        step.apply.contains("Restart=on-success"),
-        "rendered unit must use Restart=on-success (the EXIT_RESTART/EXIT_SIGINT/\
-             EXIT_SHUTDOWN contract), not Restart=on-failure or Restart=always"
-    );
-    assert!(
-        !step.apply.contains("Restart=on-failure"),
-        "the old Restart=on-failure policy must be fully replaced"
-    );
-    assert!(
-        step.summary.contains("Restart=on-success"),
+        step.summary.contains("Restart=always") && step.summary.contains("OOMPolicy=continue"),
         "step summary must match the rendered policy"
     );
 }
@@ -1552,8 +1546,8 @@ fn daemon_unit_carries_the_killmode_and_stop_timeout_fixes() {
         .unwrap();
     assert!(
         step.apply.contains("KillMode=mixed"),
-        "fleet worker unit must carry #4862's KillMode=mixed, or Restart=on-success \
-             never fires when the cgroup still holds sweep/role-run children"
+        "fleet worker unit must carry #4862's KillMode=mixed, or a clean exit with \
+             sweep/role-run children still in the cgroup is reclassified Result=timeout"
     );
     assert!(
         step.apply.contains("TimeoutStopSec=20"),

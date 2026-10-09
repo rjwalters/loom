@@ -179,8 +179,12 @@ fn with_events(h: &PrHistory, extra: &[PrEvent]) -> PrHistory {
 }
 
 /// The file's bytes for `snapshots` at the cutoff.
+/// The v1 file's bytes followed by the `eta-fit/v2` file's (#10508): every
+/// perturbation below must leave both byte-identical.
 fn bytes(snapshots: &[FleetSnapshot]) -> String {
-    coeffs::to_json(&run::fit_snapshots(snapshots, end(), &fitter()).0)
+    let (file, assembled) = run::fit_snapshots(snapshots, end(), &fitter());
+    let v2 = run::fit_v2_of(&assembled, end(), &fitter());
+    format!("{}{}", coeffs::to_json(&file), coeffs::to_json(&v2))
 }
 
 fn baseline_bytes() -> String {
@@ -203,7 +207,8 @@ fn the_baseline_fits_and_the_positive_control_moves_the_file() {
     assert!(inputs.iter().any(|i| i.conflict));
     assert!(inputs.iter().any(|i| i.rework >= 1));
     assert!(assembled.rows.iter().any(|r| r.exit.is_none()), "rows near the horizon");
-    let baseline = coeffs::to_json(&file);
+    let baseline = bytes(&snapshots);
+    assert!(baseline.starts_with(&coeffs::to_json(&file)), "the v1 file leads");
     assert_eq!(bytes(&snapshots), baseline, "deterministic");
 
     // Positive control: the same merge an hour later, still before T − 120 s.
@@ -427,6 +432,12 @@ fn writing_a_fifteenth_file_keeps_the_newest_fourteen() {
     let report = run::fit_and_write(root.path(), end(), Some(&out), false, &fitter()).unwrap();
     assert_eq!(report.pruned, 0);
     assert!(out.exists());
+    // The v2 file (#10508) goes beside an explicit --out.
+    assert_eq!(report.v2_path, root.path().join("elsewhere.v2.json"));
+    assert!(report.v2_path.exists());
+    // So does the v3 file (#10521).
+    assert_eq!(report.v3_path, root.path().join("elsewhere.v3.json"));
+    assert!(report.v3_path.exists());
     assert_eq!(names(&dir).len(), 16);
 
     let report = run::fit_and_write(root.path(), end(), None, false, &fitter()).unwrap();
@@ -434,8 +445,15 @@ fn writing_a_fifteenth_file_keeps_the_newest_fourteen() {
     old.drain(..2);
     old.push(path_for(end()));
     old.push("notes.txt".to_string());
+    // The v2 files' own directory, which v1 retention never touches.
+    old.push("v2".to_string());
+    old.push("v3".to_string());
     old.sort();
     assert_eq!(names(&dir), old);
+    assert_eq!(names(&dir.join("v2")), [path_for(end())]);
+    assert_eq!(report.v2_path, dir.join("v2").join(path_for(end())));
+    assert_eq!(names(&dir.join("v3")), [path_for(end())]);
+    assert_eq!(report.v3_path, dir.join("v3").join(path_for(end())));
 }
 
 #[test]
@@ -533,7 +551,7 @@ fn the_star_baseline_is_not_vacuous_and_the_file_is_unchanged() {
         .repos
         .insert(REPO.to_string(), RepoStar::from_events(&star_events(&[])));
     let with = run::fit_snapshots_with_star(&snapshots, end(), &fitter(), Some(&inputs)).0;
-    assert_eq!(coeffs::to_json(&with), bytes(&snapshots));
+    assert!(bytes(&snapshots).starts_with(&coeffs::to_json(&with)));
 }
 
 #[test]

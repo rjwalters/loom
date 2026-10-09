@@ -64,6 +64,15 @@ reference) — the one-line-per-blocker rule binds the *writer*, not the parser.
 
 ## Who writes one, and when — `park-record apply` (#10152)
 
+**Cross-repo blockers (#10443).** A blocker in another repository is written
+`OWNER/REPO#N` (`Blocked by: example-org/tool-repo#202`). `--blocked-by` accepts `N`,
+`#N` (this repo) and `OWNER/REPO#N`, mixed and comma-separated; still one record
+per blocker. A qualified reference is **never** resolved against the local repo:
+`check-stale-blocked` reads its state in its own repo, `apply` refuses a closed
+one by looking it up there, and it is a self-block only when it names this very
+repo and number. `#9` and `o/r#9` are two distinct blockers. Records written
+with a bare number parse exactly as before (`repo` is `None`).
+
 **Every** role applying `loom:blocked` writes one, through one command — never
 a bare label edit:
 
@@ -102,6 +111,35 @@ loom-daemon park-record render --blocked-by 8322 --by doctor \
 # <!-- loom:park Blocked by: #8322 by=doctor at=2026-09-19T18:04:11Z reason="needs an architecture ruling" -->
 ```
 
+### The daemon's own holds (#10161)
+
+Two `loom:blocked` writers live inside `loom-daemon`, not in a role prompt: the
+insta-crash quarantine (#3939) and the PR-less retry hold (#7972/#9239). Each
+writes a reason-only record **before** its label edit:
+
+```text
+<!-- loom:park Blocked by: (unstated) by=daemon at=2026-10-06T12:00:00Z reason="insta-crash quarantine" -->
+<!-- loom:park Blocked by: (unstated) by=daemon at=2026-10-06T12:00:00Z reason="pr-less hold" -->
+```
+
+`loom_daemon::sweep_registry::park_hold` owns the format: `DAEMON_HOLD_BY`,
+`QUARANTINE_HOLD_REASON`, `PRLESS_HOLD_REASON`, and `is_daemon_hold(&record)`.
+A reader that needs to tell a deliberate daemon hold from an undocumented park
+should key on `is_daemon_hold`, not on comment prose.
+
+These writers differ from `apply` in two documented ways:
+
+- **A refused body write still applies the label.** For the PR-less hold, the
+  label is the deliverable (#9239), and an unparked re-claim loop costs more
+  than a park without a name. The fallback is logged at `warn`. A body read or
+  write that **times out** stops the writer before its label edit, so a wedged
+  `gh` costs one timeout on the `reap_once` read path (#3973).
+- **Re-applying a hold replaces that hold's earlier record**, so `at=` dates
+  the current park. Releases (`quarantine clear`, the TTL, reconciliation, a
+  hand flip back to `loom:issue`) change only labels and leave the record in
+  the body. Readers key on `loom:blocked` first, so a leftover record on an
+  unblocked issue declares nothing.
+
 ## Who reads one
 
 - `loom-daemon check-stale-blocked` (`defaults/scripts/check-stale-blocked.sh`,
@@ -109,7 +147,23 @@ loom-daemon park-record render --blocked-by 8322 --by doctor \
   artifact's body to populate `Evidence::declared`; an artifact whose only
   blocker reference is NOT inside a park record is reported as **PROSE-ONLY**
   (`stale_blocked::undeclared`), separate from **UNDOCUMENTED** (no blocker
-  reference anywhere).
+  reference anywhere). Its forge reads are batched (#10480: one REST + ETag
+  listing, REST blocker reads, one GraphQL query per 100 issues) and run under
+  a **budget floor**: after the listing it reads the free `/rate_limit` probe,
+  and if the run's projected cost would leave fewer than
+  `--min-graphql-remaining` GraphQL points or `--min-core-remaining` core
+  requests (default 1000 each; `0` disables) it gathers nothing and reports
+  every artifact **NOT EVALUATED**, still exit 0. The same floors are
+  re-checked between reads from the forge's own rate-limit answers, so a run
+  stops part-way rather than draining the bucket. `--json` adds a
+  `forge_cost` object (`graphql_queries`, `graphql_points` from
+  `rateLimit.cost`, `rest_requests`, `rest_not_modified`, `budget_before`,
+  `projected`, `floor`, `budget_refused`, `budget_stopped`). It first reads
+  the repository's `archived` flag (#10562, one REST + ETag read shared with
+  `release-stale-blocked` and the role runner): an archived repository is
+  read-only, so nothing is listed, `--json` reports `archived: true` and the
+  human report is one line. A probe that fails is NOT EVALUATED, never
+  archived and never clear (`archived: null`).
 - `guide.md`'s `check_and_unblock` / `check_and_unblock_prs` — the active
   unblock sweep. A rendered park record's `Blocked by: #N` line already
   matches `parse_dependencies`'s existing pattern, so no separate parser is
@@ -167,15 +221,16 @@ check_and_unblock_prs() {
 
     for dep in $deps; do
       # A declared blocker can itself be an issue or a PR — try both reads.
+      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
       local state
-      state=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null) \
-        || state=$(gh pr view "$dep" --json state --jq '.state' 2>/dev/null) \
+      state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
+        || state=$(gh pr view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
         || state="UNKNOWN"
       if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
         all_resolved=false
         break
       fi
-      resolved_deps="$resolved_deps #$dep"
+      resolved_deps="$resolved_deps $dr#$dn"
     done
 
     if [ "$all_resolved" = true ]; then

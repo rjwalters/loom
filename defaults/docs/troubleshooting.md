@@ -8,9 +8,20 @@
 - [Stuck Agent Detection](#stuck-agent-detection)
 - [Sweep Dispatch Troubleshooting](#sweep-dispatch-troubleshooting)
 - [Overnight / long-running orchestration](#overnight--long-running-orchestration)
+- [Worker disk full: dispatch halted `disk_full` (#10973)](#worker-disk-full-dispatch-halted-disk_full-10973)
 <!-- toc:end -->
 
 ## Common Issues
+
+### A stopped daemon keeps coming back (#10179)
+
+`loom-daemon-stop.sh` is "stopped for now"; the watchdog, a supervised relaunch, the
+auto-update roll or `loom update` can bring a daemon back. For a durable opt-out run
+`loom-daemon host disable --reason "<why>"` (writes `~/.loom/autonomy-disabled`, stops
+the daemon and removes its jobs). Every start/re-provision path then refuses with the
+reason, who and when; `loom-daemon status` shows `disabled by operator: <reason>
+(<when>)`. Undo with `loom-daemon host enable` (it does not start anything). Agents must
+not start or repair a daemon on such a host. See `daemon-reference.md`.
 
 ### Hooks not firing (`guard-destructive.sh` not blocking commands)
 
@@ -549,6 +560,58 @@ Directories orphaned *before* this landed have no worktree left to resolve
 from, so they must be removed by hand — check them against `git worktree list`
 first, and stop anything still building into them.
 
+### `StorageFull` in an unrelated test means: check `df` first (#8370)
+
+**Symptom**: a test that has nothing to do with your change fails with
+`Error code 13: database or disk is full`, `StorageFull`, `No space left on
+device` or `ENOSPC`, often on a `tempfile` path, sometimes alongside your own
+tool calls failing with "the temp filesystem ... is full". It is easy to read
+as "main is broken" and misdiagnose a valid change.
+
+**Check the disk before believing the suite:**
+
+```bash
+df -h . /tmp "${TMPDIR:-/tmp}"
+```
+
+If a volume is at or near 100%, the failure says nothing about the code. The
+usual cause is leaked cargo target dirs, 3-22 GB each. Look under the
+prefixes the orphan sweep knows:
+
+```bash
+du -sh <repo>/.loom/targets/* <repo>/.loom/target-* /tmp/loom-target-* \
+  /tmp/cargo-target-* "${TMPDIR:-/tmp}"/cargo-target-* ~/.cache/cargo-target-* 2>/dev/null
+```
+
+**Fix**: `loom-daemon clean --dry-run` lists the orphans and the bytes they
+hold, and `loom-daemon clean -y` removes them. A dir is an orphan only when its
+newest file is older than 3 hours (`LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS`),
+no process holds it open, no live claim names its issue, and it is not your
+configured `CARGO_TARGET_DIR` / `build.target-dir`. The daemon runs the same
+sweep every 15 minutes and whenever free disk drops below the floor
+(`category=cargo_target_orphan` in its log). Then re-run the test.
+
+**What the sweep will not touch.** Under `/tmp`, `$TMPDIR` and `~/.cache` it
+matches agent-shaped names only (`cargo-target-issue-<N>`,
+`cargo-target-review-<N>`, `loom-target-<N>-doctor`: role or `issue` /
+`review` / `pr` words plus a number) and only dirs owned by the daemon's own
+user. Your own `~/.cache/cargo-target-shared` is never a candidate, whether or
+not the daemon can see your `CARGO_TARGET_DIR`. Under `<repo>/.loom/targets/`
+it removes only dirs carrying Loom's `.loom-run-owner` marker. If `.loom` or
+`.loom/targets` is a symlink (say, to a bigger volume) the sweep refuses that
+root and logs `not scanning … is a symlink`; set `CARGO_TARGET_DIR` or
+`build.target-dir` to relocate builds instead. To turn the sweep off entirely:
+`LOOM_TARGET_ORPHAN_RECLAIM=0`.
+
+**Prevention**: every role run now gets a Loom-owned `CARGO_TARGET_DIR` under
+`<repo>/.loom/targets/`. A role-runner tick's dir is removed when the run
+ends; a daemon sweep's or manual spawn's is collected by the orphan sweep
+after its owner exits. Agents must use it (or
+their worktree's `target/`) and never create one under `/tmp`, `~`, `~/.cache`
+or `.loom/target-*`; see `cargo-target-isolation.md`. The disk-headroom
+estimate per worktree (`LOOM_PER_WORKTREE_GB`) defaults to 8 GB, measured
+from full builds of this workspace.
+
 ### Building into a private target dir you can actually delete afterwards (#8460)
 
 **Symptom**: you build into a private `CARGO_TARGET_DIR` to get a hermetic test
@@ -557,6 +620,11 @@ binary, #8453), and then `rm -rf` on it is denied —
 `BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo)`. The directory is
 outside the repo by construction, so `rmScope=repo` refuses it. Three agents in
 one day each gave up at this point and abandoned 3.5–11 GB apiece.
+
+A role run no longer needs this: it is handed a Loom-owned `CARGO_TARGET_DIR`
+that Loom removes itself, and can otherwise build into its worktree's
+`target/` (#8370, `cargo-target-isolation.md`). This section is for an
+interactive session that has neither.
 
 **Fix**: put the private target dir at the one out-of-repo path the guard can
 prove you own — `<scratch-root>/<your session id>`, marked with a
@@ -3288,3 +3356,46 @@ from `land-resync-commit.sh`; track down what did. If a commit's SHA
 legitimately changed for some other reason, `git diff <old-sha> <new-sha>`
 being empty confirms the content is identical (the #6646 incident's actual
 outcome) even though the identity changed.
+
+## Worker disk full: dispatch halted `disk_full` (#10973)
+
+**Symptom.** `host.health` shows `dispatch_halted: true` with a `halt_reason`
+starting `disk_full: <n> GB free`, `loom-daemon status` reports the host
+breaker `open` with the same reason, and `dispatch_sweep` is refused. On the
+2026-10-08 incident a worker's worktree volume reached 0 GB and, because that
+host was the ETA authority, fleet ETAs went `stale_inputs` for hours.
+
+**What the daemon does by itself.** Each work-finder tick samples free GB on
+the worktree-root volume. Two consecutive readings below the floor
+(`LOOM_DISK_FULL_HALT_GB`, default 3; `0` disables) halt new dispatch. The
+eager reclaim pass (#7512) gets the first low tick to free space, so a pass
+that frees space never halts. The halt clears only at `LOOM_DISK_FULL_RESUME_GB`
+(default twice the floor). An unmeasurable probe (`df` failure) never halts and
+clears an existing halt. Running sweeps drain; nothing is killed. Grep the
+daemon log for `disk_full_halt:` (edges) and `eager_reclaim:` (what each
+reclaim step freed).
+
+**Alerts.** SigNoz pages before this point (`signoz/alerts/`): `host-disk-low`
+(warning: under 30 GB or 10%, or full within 6 h at the last hour's rate) and
+`host-disk-critical` (under 5 GB or 3%, or full within 1 h), keyed on
+`loom.host.worktree_root_free_gb`; `work-finder-stale` when a host still
+heartbeats but its work finder has not ticked for 2x its own interval.
+
+**Free disk on the worker.**
+
+1. `df -h` the worktree volume; find the consumer (`du -xh --max-depth=2`).
+2. `loom-clean --force` removes stale loom-managed worktrees and branches.
+3. `loom-daemon clean --deep --safe` strips build artifacts (`target/`,
+   `node_modules/`) from the primary checkout; it has its own cooldown, so a
+   manual run is the way past it.
+4. Reclaim only touches Loom-managed paths. Space held by anything else (logs,
+   caches, another tenant) must be freed by hand.
+5. The halt lifts within a tick or two of free space reaching the resume level.
+
+**Move the ETA authority off a sick host.** Set `fleet.etaAuthority` in the
+committed config to a healthy host id (or `LOOM_ETA_AUTHORITY=<host id>` on
+that host), per "One ETA authority per fleet" above, and confirm with
+`loom-daemon eta doctor`. Caveat (#10933): estimates issued before the move
+may never receive an `eta.outcome` (no outcome-coverage accounting or backfill
+yet), so headline ETA scores can look optimistic until that lands; do not
+read the gap as a regression.

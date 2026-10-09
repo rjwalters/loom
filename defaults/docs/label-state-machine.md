@@ -64,7 +64,7 @@ each definition, for the terse version of this same table):
 
 | Label | Question it answers | Does sweep/shepherd skip it? |
 |---|---|---|
-| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | **Yes**, for a *fresh* work-finder candidate — `loom:blocked` is in [`PARK_LABELS`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder/labels.rs), the daemon's own authoritative park set. "Still automatable once that clears" describes what happens *after* the label is removed, not while it is present — see #8925, which found this exact row previously read "No" while the code already skipped it. The unblock sweep (`guide.md`'s `check_and_unblock`/`check_and_unblock_prs`) and `loom-daemon check-stale-blocked` (plus, at merge time, `merge-pr.sh`'s `notify-cleared-blockers` comment on each citer, #9102) are what re-evaluate it and clear it once its declared blocker resolves (`defaults/docs/park-record.md`) |
+| `loom:blocked` | Waiting on a dependency, but still automatable once that clears | **Yes**, for a *fresh* work-finder candidate — `loom:blocked` is in [`PARK_LABELS`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder/labels.rs), the daemon's own authoritative park set. "Still automatable once that clears" describes what happens *after* the label is removed, not while it is present — see #8925, which found this exact row previously read "No" while the code already skipped it. The unblock sweep (`guide.md`'s `check_and_unblock`/`check_and_unblock_prs`) and `loom-daemon check-stale-blocked` (plus, at merge time, `merge-pr.sh`'s `notify-cleared-blockers` comment on each citer, #9102) are what re-evaluate it and clear it once its declared blocker resolves (`defaults/docs/park-record.md`). The daemon also runs, from its own task on every host that runs the work finder or the role runner for the repo (shard owner only; default on; `LOOM_RELEASE_STALE_BLOCKED=0` disables, `dry-run` logs the plan only; per-repo outcomes and release/re-park counts on `host.health`'s `managed_repos[].stale_blocked_release`, #10763), `loom-daemon release-stale-blocked` (#10556): deterministic, no LLM, park-record blockers only — it removes the label (restoring `loom:issue` only if the issue was approved before, or a PR's prior review label) once every declared blocker is a closed issue or merged PR, and re-parks to the still-open records when only some are, skipping operator holds, `<!-- loom:permanent-block` (#8742), daemon holds and any other still-open reference |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
@@ -95,9 +95,17 @@ act" but "a human wants this landed ASAP, act now". It is the one "land this
 ASAP" signal; the older urgent label is retired (its `labels.yml` description
 says so, and no role applies it).
 
-- **Human-only.** No role decides to apply or remove it. The daemon only relays
-  a loom-ui star intent, and Builder copies it from a starred issue onto the PR
-  it opens.
+- **Operator-derived only (#10012).** No role stars on its own judgment. The
+  daemon relays a loom-ui star intent; Builder copies it onto the PR it opens;
+  `create-issue.sh --parent N` stars a new child of a starred N (audit comment
+  `inherited_from=#N`), and, when `autonomous.operatorPriority.materializeLabels`
+  is on (the default), the star-liveness pass writes it on every open
+  child a starred issue's text links, removing it once that root loses its
+  star (never an operator's own star, never because the root closed).
+  Never propagated: holds, claim/lifecycle labels, `loom:heavy`, `points:*`.
+  Only the star, `external` and (as a default) `tier:*` travel to children;
+  the table is each label's registry `propagate` field; full never-list:
+  `daemon-reference.md` → "What travels to children".
 - **Starred first, every stage.** Curator curates starred issues first (a
   starred issue with no workflow label counts as `loom:triage`) and promotes
   them straight to `loom:issue`, because the star is the Tier-3 approval. A
@@ -119,7 +127,9 @@ says so, and no role applies it).
 - **Red-main fixes** are a body marker, not a label: an issue that fixes a red
   `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
   pre-existing failure confirmed on `origin/main`). Curator takes these next,
-  after starred work, with no promotion bypass.
+  after starred work, and never promotes them: while that repo's `main` is
+  verified red the work finder admits them from `loom:triage`/`loom:curated`
+  itself (only when a trusted identity filed them, #9548), and alerts the operator if one stays unclaimed (#10118).
 
 ## Entry points
 
@@ -658,7 +668,8 @@ with `loom:operator-objective` available to all of them as a fourth choice
 
 | Role | Site | Sub-kind it applies |
 |---|---|---|
-| Champion | Unrevised-proposal N=2 escalation (`champion-issue-promo.md`), epic-complete-unpromoted escalation (`champion-common.md`) | `loom:operator-blocked` when the recurring finding is itself a live, open dependency; `loom:operator-decision` otherwise. **Exception, no label applied (#7657)**: when every recurring finding is `premise-false` (a cited path/line-range/repo-state claim, re-verified false on current `main`), Champion closes the proposal (`<!-- champion:premise-false-closed:<main-sha> -->`, `gh issue close --reason "not planned"`) instead of escalating — no `loom:operator-only` and no sub-kind, since nothing is routed to a human. Any mixed premise-false + ordinary finding set still escalates via the row above, unchanged. |
+| Champion | Unrevised-proposal bound (`champion-issue-promo.md` Step 4), reached only after the Curator revision loop (#10753) | `loom:operator-decision`, filed by `loom-daemon operator-decision apply` with ranked options; never a bare hold (#10753). **Exception, no label applied (#7657)**: when every recurring finding is `premise-false` (a cited path/line-range/repo-state claim, re-verified false on current `main`), Champion closes the proposal (`<!-- champion:premise-false-closed:<main-sha> -->`, `gh issue close --reason "not planned"`) instead of escalating — no `loom:operator-only` and no sub-kind, since nothing is routed to a human. Any mixed premise-false + ordinary finding set still escalates via the row above, unchanged. |
+| Champion | Epic-complete-unpromoted escalation (`champion-common.md`) | `loom:operator-blocked` when the recurring finding is itself a live, open dependency; `loom:operator-decision` otherwise |
 | Champion | Dependency-cycle detector (`detect-dependency-cycle.sh`, invoked from `champion-issue-promo.md` and `champion-pr-merge.md`), capped-PR close recommendation (`champion-pr-merge.md`) | `loom:operator-decision` — matching their own rationale ("breaking a cycle is a human decision" / "the approach itself is not viable") |
 | Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice among all four sub-kinds |
 | Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice among all four sub-kinds |
@@ -720,6 +731,15 @@ rationale: [`premise-gate.md`](premise-gate.md).
 `loom:operator-decision` issue without a valid `decision` block into this label.
 Curator repairs it (back to `loom:operator-decision`) or, if no operator call
 exists, removes it and re-routes; a repeat bounce is left alone.
+
+**`loom:needs-revision` (#10753)**: Champion adds it with a `NEEDS REVISION`
+verdict, routing the issue to Curator instead of waiting for someone to edit
+it. Champion's discovery skips it. Curator revises the body (a dated
+`## Revision` section) and removes it, and the new body hash brings Champion
+back. After at most two rounds plus one final round, Champion files a ranked
+decision with `operator-decision apply` when a preference or authority
+question is named (never a bare `loom:operator-only` hold); factual findings
+get one Curator disposition round instead. Contract and bound: [`promotion-throughput.md`](promotion-throughput.md).
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
@@ -979,15 +999,20 @@ above. Nothing about the guard changes for any other blocking label.
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the
 boolean properties the daemon's label tables encode (`park`, `skip`,
 `hold`, `operator_gate`, `blocked_colabel`, `hard_exclusion`, `champion_path`,
-`human_gated`, `contradicts_approval`). It is embedded in `loom-daemon`; query
+`human_gated`, `merge_hold`, `operator_hold`, `contradicts_approval`). It is embedded in `loom-daemon`; query
 it with `loom-daemon labels list --property park` / `labels get <name>`
 (non-zero exit on an unknown label or property).
 
 The Loom block of `.github/labels.yml` and `defaults/.github/labels.yml` is
 generated from it: edit the registry, then run `loom-daemon labels generate
 --write`. The `label_registry` tests fail on registry drift;
-`check-labels-drift.sh` only keeps the two copies byte-identical.
-The park, skip, hard-exclusion and champion-path sets are derived from the
-registry; the other daemon tables are still hand-listed, held equal to it by
-lockstep tests. Either way a change to a table's meaning goes in the registry.
-`stale_after_minutes`, `lifecycle` and `propagate` are inert.
+`check-labels-drift.sh` only keeps the two copies byte-identical. The
+`quickstarts/*/.github/labels.yml` subsets are deliberately NOT generated:
+they are standalone starter templates with no marker block, not held to the
+registry.
+Every daemon table named by a boolean property above is derived from the
+registry; dep_classify's operator-only names stay consts, lockstep-tested
+against `requires_base`/`remove_with` (#5671). Changes go in the registry.
+`propagate` holds #10012's propagation table (`null` = never propagates);
+`star_liveness::propagation_rules` derives its rules from it.
+`stale_after_minutes` and `lifecycle` are inert.

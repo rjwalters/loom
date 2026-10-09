@@ -24,6 +24,20 @@ fn healthy() -> Facts {
             interval_secs: 3600,
             otlp_exporter: true,
             native_exporter: true,
+            authority: AuthorityFacts {
+                host: Some("robb-studio".into()),
+                reason: "fleet_refresh".into(),
+                is_local: true,
+                others: Vec::new(),
+                detail: "robb-studio (fleet_refresh); this host is the authority".into(),
+                coverage: crate::eta::coverage::Coverage {
+                    state: crate::eta::coverage::State::Full,
+                    roster: 2,
+                    covered: 2,
+                    missing: Vec::new(),
+                },
+                coverage_host: Some("robb-studio".into()),
+            },
         },
         data: DataFacts {
             gate: Gate::Captain,
@@ -33,6 +47,7 @@ fn healthy() -> Facts {
                 unsupported_forge: false,
                 snapshot_as_of: Some(now() - Duration::minutes(20)),
                 backfill_since: None,
+                history: None,
             }],
             refresh_cycle: Some(RefreshCycleState {
                 started_at: now() - Duration::minutes(20),
@@ -48,6 +63,7 @@ fn healthy() -> Facts {
             today_exists: true,
             last_check: Some(fit_record("skipped", Some("today_exists"), 1)),
             published: PubStatus::default(),
+            published_v2: PubStatus::default(),
         },
         serving: ServingFacts {
             fit_loaded: true,
@@ -68,7 +84,9 @@ fn healthy() -> Facts {
             }],
             oldest_pending: Some(hours_ago(30)),
             pending: 4,
+            drift: Vec::new(),
         },
+        backtest: BacktestFacts::default(),
     }
 }
 
@@ -120,7 +138,8 @@ fn a_healthy_host_has_no_fail_or_warn_and_every_bad_status_has_a_remedy() {
             "fit",
             "serving",
             "snapshot_feed",
-            "outcomes"
+            "outcomes",
+            "backtest"
         ]
     );
 }
@@ -360,4 +379,308 @@ fn published_fit_states_map_to_status() {
     let c = find(&c, "fit", "published_fit");
     assert_eq!(c.status, Status::Warn);
     assert!(c.detail.contains("403"), "{}", c.render());
+}
+
+#[test]
+fn published_fit_v2_is_its_own_check_independent_of_v1() {
+    let mut f = healthy();
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // A failing v2 lane warns on its own check and leaves v1's untouched.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Refused),
+        reason: Some("bad_fit".into()),
+        fit_id: Some("fitV2".into()),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("bad_fit"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+
+    // A healthy v2 lane is ok while v1 is absent.
+    f.fit.published_v2.kind = Some(FetchKind::Installed);
+    f.fit.published_v2.reason = None;
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Ok);
+    assert!(v2.detail.contains("fitV2"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
+fn v2_publish_error_after_an_absent_fetch_warns() {
+    let mut f = healthy();
+    // Absent without an error stays a skip.
+    f.fit.published_v2 = PubStatus {
+        kind: Some(FetchKind::Absent),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    assert_eq!(find(&c, "fit", "published_fit_v2").status, Status::Skip);
+
+    // Absent store followed by a failed captain upload is a warning.
+    f.fit.published_v2.publish_error = Some("403".into());
+    let c = evaluate(&f);
+    let v2 = find(&c, "fit", "published_fit_v2");
+    assert_eq!(v2.status, Status::Warn);
+    assert!(v2.detail.contains("403"), "{}", v2.render());
+    assert_eq!(find(&c, "fit", "published_fit").status, Status::Skip);
+}
+
+#[test]
+fn the_authority_is_printed_and_a_missing_one_warns() {
+    let ok = authority(&healthy().config.authority);
+    assert_eq!(ok.status, Status::Ok);
+    assert!(ok.detail.contains("robb-studio"), "{}", ok.detail);
+    let none = AuthorityFacts {
+        host: None,
+        reason: "no_candidate".into(),
+        is_local: false,
+        others: Vec::new(),
+        detail: "none (no_candidate)".into(),
+        coverage: crate::eta::coverage::Coverage::default(),
+        coverage_host: None,
+    };
+    let warn = authority(&none);
+    assert_eq!(warn.status, Status::Warn);
+    assert!(warn.remedy.unwrap().contains("fleet.etaAuthority"));
+}
+
+#[test]
+fn authority_coverage_reports_full_short_and_unknown() {
+    use crate::eta::coverage::{Coverage, State};
+    let mut a = healthy().config.authority;
+    let full = authority_coverage(&a);
+    assert_eq!(full.status, Status::Ok);
+    assert!(full.detail.contains("2 of 2 roster repos"), "{}", full.detail);
+    assert!(full.detail.contains("robb-studio"), "{}", full.detail);
+    a.coverage = Coverage {
+        state: State::Short,
+        roster: 5,
+        covered: 2,
+        missing: vec!["a/x".into(), "a/y".into(), "a/z".into()],
+    };
+    let short = authority_coverage(&a);
+    assert_eq!(short.status, Status::Warn);
+    assert!(short.detail.contains("2 of 5") && short.detail.contains("a/x, a/y, a/z"));
+    assert!(short.remedy.unwrap().contains("fleet.etaAuthority"));
+    a.coverage = Coverage::default();
+    let unknown = authority_coverage(&a);
+    assert_eq!(unknown.status, Status::Skip);
+}
+
+#[test]
+fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
+    use crate::eta::regime::DriftState;
+    let mut f = healthy();
+    let row = |stage: &str, n_recent: u64, state: DriftState| DriftFacts {
+        stage: stage.into(),
+        heuristic: "land-v2".into(),
+        n_recent,
+        state,
+        adjusted: false,
+    };
+    f.outcomes.drift = vec![
+        row("building", 2, DriftState::Unknown),
+        row("judging", 9, DriftState::Stable),
+        row("doctoring", 9, DriftState::Drifted),
+    ];
+    let checks = evaluate(&f);
+
+    let unknown = find(&checks, "outcomes", "drift building");
+    assert_eq!(unknown.status, Status::Ok);
+    assert!(unknown.detail.contains("drift unknown"), "{}", unknown.detail);
+    assert!(!unknown.detail.contains("no drift"), "{}", unknown.detail);
+
+    let stable = find(&checks, "outcomes", "drift judging");
+    assert_eq!(stable.status, Status::Ok);
+    assert!(stable.detail.contains("no drift"), "{}", stable.detail);
+    assert!(stable.detail.contains("land-v2"), "{}", stable.detail);
+
+    let drifted = find(&checks, "outcomes", "drift doctoring");
+    assert_eq!(drifted.status, Status::Warn);
+    assert!(drifted.remedy.is_some());
+    // Not serving brisk-petrel: the factor is not applied (#10563 review),
+    // and the doctor names the candidate that would apply it.
+    assert!(drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
+    assert!(!drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(drifted.detail.contains("brisk-petrel"), "{}", drifted.detail);
+}
+
+#[test]
+fn drift_says_served_etas_are_scaled_only_when_brisk_petrel_serves() {
+    use crate::eta::regime::DriftState;
+    let mut f = healthy();
+    f.outcomes.drift = vec![DriftFacts {
+        stage: "judging".into(),
+        heuristic: "land-2026-10-04-twin-otter-b".into(),
+        n_recent: 9,
+        state: DriftState::Drifted,
+        adjusted: true,
+    }];
+    let checks = evaluate(&f);
+    let drifted = find(&checks, "outcomes", "drift judging");
+    assert_eq!(drifted.status, Status::Warn);
+    assert!(drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(!drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
+}
+
+fn summary(ready: bool) -> crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+    crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+        summary_id: "s".into(),
+        heuristic: "land-v4".into(),
+        kind: "land".into(),
+        compared_to: "land-v1".into(),
+        as_of_day: "2026-10-04".into(),
+        cutoff: now(),
+        cases: 40,
+        days: 8,
+        wins: 7,
+        ties: 0,
+        win_rate: Some(0.875),
+        ci_low: Some(0.529),
+        ci_high: Some(0.978),
+        min_folds: 7,
+        gate_ready: ready,
+        gate_detail: "land-v4 wins".into(),
+        fitted_from: None,
+        cases_before_fit: 0,
+        fit_id: None,
+        loom: crate::eta::Provenance {
+            version: "0.0.0".into(),
+            revision: "0".repeat(40),
+            tree_state: "clean".into(),
+            complete: true,
+        },
+    }
+}
+
+#[test]
+fn the_backtest_scoreboard_lists_each_challenger_and_warns_when_stale() {
+    let mut f = healthy();
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: Some(crate::eta::nightly_folds::State {
+            written_at: hours_ago(5),
+            day: "2026-10-04".into(),
+            summaries: vec![summary(true)],
+        }),
+    };
+    let checks = evaluate(&f);
+    assert_eq!(find(&checks, "backtest", "nightly_folds").status, Status::Ok);
+    let row = find(&checks, "backtest", "scoreboard land-v4");
+    assert_eq!(row.status, Status::Ok);
+    assert!(
+        row.detail.contains("won 7/8") && row.detail.contains("READY"),
+        "{}",
+        row.render()
+    );
+
+    f.backtest.state.as_mut().unwrap().written_at = hours_ago(24 * 5);
+    let checks = evaluate(&f);
+    let c = find(&checks, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.remedy.as_deref().unwrap().contains("fleet.captain"), "{}", c.render());
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    f.data.gate = Gate::StandDown {
+        captain: "cap".into(),
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("cap"), "{}", c.render());
+
+    // Fail-closed with no captain: the doctor says how to turn it on.
+    f.data.gate = Gate::NoCaptain;
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("fleet.captain"), "{}", c.render());
+}
+
+/// #10520: the repo check reports the last SigNoz-primary pass's gap-fill
+/// request count, `0` when SigNoz covered it, and nothing when it never ran.
+#[test]
+fn the_repo_check_reports_the_gap_fill_request_count() {
+    use crate::eta::fleet_signoz_history::{HistoryNote, HistorySource};
+    let detail = |f: &Facts| {
+        evaluate(f)
+            .into_iter()
+            .find(|c| c.link == "data" && c.check == "repo acme/alpha")
+            .unwrap()
+    };
+    let f = healthy();
+    assert!(!detail(&f).detail.contains("gap-fill"), "SigNoz history off: nothing");
+
+    let mut f = healthy();
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::Signoz,
+        gap_fill_calls: 0,
+    });
+    let c = detail(&f);
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.detail.contains("history signoz, 0 gap-fill request(s)"), "{}", c.detail);
+
+    f.data.repos[0].history = Some(HistoryNote {
+        at: now() - Duration::minutes(20),
+        source: HistorySource::SignozGapFill,
+        gap_fill_calls: 12,
+    });
+    let c = detail(&f);
+    assert!(
+        c.detail
+            .contains("history signoz_gap_fill, 12 gap-fill request(s)"),
+        "{}",
+        c.detail
+    );
+}
+
+/// #10918: on the explicit ETA authority the refresh gate reads "authority",
+/// even with its own `fleetRefresh.enabled` off; any other host stands down
+/// for the authority, and the backtest skip names it.
+#[test]
+fn the_explicit_authority_refreshes_and_the_others_stand_down_for_it() {
+    let mut f = healthy();
+    f.config.fleet_refresh_enabled = false;
+    f.data.gate = Gate::Authority;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("ETA authority"), "{}", gate.render());
+    let refresh = find(&checks, "data", "refresh_loop");
+    assert_eq!(refresh.status, Status::Ok, "not skipped as 'fleet refresh is off'");
+    let switch = find(&checks, "config", "fleet_refresh");
+    assert_eq!(switch.status, Status::Ok, "no remedy to turn on what is overridden");
+
+    f.config.fleet_refresh_enabled = true;
+    f.data.gate = Gate::AuthorityElsewhere {
+        authority: "loom-worker-1".into(),
+    };
+    f.data.repos[0].has_reader = false;
+    let checks = evaluate(&f);
+    let gate = find(&checks, "data", "captain_gate");
+    assert_eq!(gate.status, Status::Ok);
+    assert!(gate.detail.contains("loom-worker-1"), "{}", gate.render());
+    assert_eq!(
+        find(&checks, "data", "repo acme/alpha").status,
+        Status::Ok,
+        "a stand-down host does not demand a reader"
+    );
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("ETA authority (loom-worker-1"), "{}", c.render());
 }

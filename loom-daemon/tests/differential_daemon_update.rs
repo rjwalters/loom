@@ -818,28 +818,466 @@ fn port_bin() -> PathBuf {
 // Divergence classes — recognised by MECHANISM
 // ---------------------------------------------------------------------------
 
-/// No divergence class is recorded today: every frozen answer matches the
-/// port byte for byte.
-///
-/// The enum exists rather than being elided because the *shape* is the
-/// contract — a future divergence gets a variant whose doc comment states its
-/// MECHANISM and the direction of its risk, and [`classify`] must compute what
-/// that mechanism can produce and require the observed difference to be
-/// exactly that. A class recognised by a property of the input ("this case has
-/// a newline in it") is a hole shaped like a class.
+/// The `Environment:` block #10470 (the first two entries, 12 lines) and
+/// #10473 (`LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR`, 14 lines, directly
+/// after them) added to `--help` for the opt-in required-signature mode. It is
+/// spelled out here, independently of `help.txt`, so the class below verifies
+/// the EXACT intended text rather than "whatever the port prints".
+const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
+    "  LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE  1/true/yes/on switches signature
+                         handling from the default \"present-only\" mode
+                         (#5054: an unsigned release or an unverifiable
+                         signature is a loud skip) to \"required\" mode
+                         (#10470): an unsigned release, or one whose
+                         signature cannot be checked on this host, is
+                         REFUSED before provisioning, with distinct
+                         messages. Default: off.
+  LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW  Required-mode companion: pin the
+                         derived keyless identity to this workflow file
+                         (e.g. release.yml) instead of `[^@]+`. Default:
+                         unset.
+  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR  Required-mode companion
+                         (#10473): a full 40-hex commit SHA. The release tag
+                         must resolve to it or a descendant (gh api compare:
+                         identical/ahead), else REFUSED before the candidate
+                         runs. Distinct refusals: configuration error (short
+                         or non-hex anchor), source assurance unavailable
+                         (gh/API failure -- not tampering), not a descendant
+                         of approved source, tag movement, asset replacement.
+                         The last two compare against a local adoption record
+                         (~/.loom/daemon-update/release-adoption.json) written
+                         on each required-mode success; it lives on this
+                         host, so it catches drift, not a host compromise.
+                         Default: unset (evidence reports
+                         source_check=not_configured).
+";
+
+/// The line the added block sits directly in front of in the help text.
+const HELP_BLOCK_ANCHOR: &str = "  LOOM_PID_FILE ";
+
+/// The usage line #10709 added to `--help` for the `--fetch --tag <TAG>` pin.
+/// Spelled out here, independently of `help.txt`, so the class below verifies
+/// the EXACT intended text rather than "whatever the port prints".
+const TAG_PIN_HELP_LINE: &str =
+    "  ./.loom/scripts/cli/loom-daemon-update.sh --fetch --tag v0.19.831  Pin the artifact fetch to EXACTLY this release tag (Issue #10709) instead of resolving the newest one, so the version installed is the one a roll targeted. A tag that does not exist, or a release with no artifact for this host's platform, hard-fails (exit 1) and never falls back to a source build or to another release. Without --tag, resolution is the newest release, unchanged. Cannot be combined with --no-fetch or --resolve-json. The daemon's auto-update tick passes the tag its own verdict resolved.\n";
+
+/// The usage line the tag-pin line sits directly in front of (the `--no-fetch`
+/// entry, which follows the `--fetch` entry in the help text).
+const TAG_PIN_ANCHOR: &str = "  ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch ";
+
+/// The 4 lines #10789 added under `LOOM_DAEMON_BIN` in `--help`, warning
+/// that a symlinked dest is replaced by a regular file. Spelled out here,
+/// independently of `help.txt`, so the class below verifies the EXACT intended
+/// text rather than "whatever the port prints".
+const SYMLINKED_DEST_HELP_BLOCK: &str =
+    "                         A symlinked dest is replaced by a regular file (like
+                         GNU install), so pin the real path (e.g.
+                         ~/.local/bin/loom-daemon), not a symlink such as
+                         /usr/local/bin/loom-daemon.
+";
+
+/// The line the symlinked-dest block sits directly in front of: the
+/// `LOOM_DAEMON_BIN_DIR` entry, which follows the `LOOM_DAEMON_BIN` entry.
+const SYMLINKED_DEST_ANCHOR: &str = "  LOOM_DAEMON_BIN_DIR ";
+
+/// Divergence classes, each recognised by MECHANISM.
+// Every class so far is a documented `--help` addition, so the shared
+// `HelpDocuments` prefix names the mechanism rather than repeating the type.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-enum Divergence {}
+enum Divergence {
+    /// MECHANISM: #10470 (and its #10473 source-anchor companion) added
+    /// documentation for the opt-in required-signature mode to `--help`,
+    /// which the frozen pre-port shell cannot contain. The
+    /// port's stdout must equal the shell's stdout with exactly
+    /// [`REQUIRE_SIGNATURE_HELP_BLOCK`] inserted immediately before the single
+    /// `LOOM_PID_FILE` entry. Exit code and stderr must be identical. Risk
+    /// direction: documentation only — the new variables default to off, so
+    /// no behaviour the shell had changes. Any other stdout/stderr/rc
+    /// difference (including a different or misplaced block) stays
+    /// unexplained.
+    HelpDocumentsRequireSignature,
+    /// MECHANISM: #10709 added the `--fetch --tag <TAG>` usage line to
+    /// `--help`, which the frozen pre-port shell cannot contain. The port's
+    /// stdout must equal the shell's stdout with exactly [`TAG_PIN_HELP_LINE`]
+    /// inserted immediately before the single `--no-fetch` usage entry (that
+    /// is, directly after the `--fetch` entry). Exit code and stderr must be
+    /// identical. Risk direction: documentation only — the flag is opt-in, and
+    /// without it resolution is the newest release as before. Any other
+    /// difference (an extra, misplaced, or tampered line) stays unexplained.
+    HelpDocumentsTagPin,
+    /// MECHANISM: #10789 added a warning to the `LOOM_DAEMON_BIN` entry in
+    /// `--help` that a symlinked dest is replaced by a regular file, which the
+    /// frozen pre-port shell cannot contain. The port's stdout must equal the
+    /// shell's stdout with exactly [`SYMLINKED_DEST_HELP_BLOCK`] inserted
+    /// immediately before the single `LOOM_DAEMON_BIN_DIR` entry (that is, at
+    /// the end of the `LOOM_DAEMON_BIN` entry). Exit code and stderr must be
+    /// identical. Risk direction: documentation only. Any other difference (an
+    /// extra, misplaced, or tampered block) stays unexplained.
+    HelpDocumentsSymlinkedDest,
+    /// MECHANISM: #11044 documented the fleet floor confirmation in `--help`
+    /// (a section, the `--yes` / `--to-floor` usage lines, two environment
+    /// entries and the exit-code-1 case), which the frozen pre-port shell
+    /// cannot contain. The port's stdout must equal the shell's stdout with
+    /// exactly the four [`FLOOR_CHECK_INSERTS`] blocks, all of them, each
+    /// inserted immediately before its single anchor line. Exit code and
+    /// stderr must be identical. Risk direction: documentation only for every
+    /// case in this corpus — the check speaks only on a fleet host, and the
+    /// corpus pins `$HOME` and the config tiers to a fixture with no fleet
+    /// store. Any other difference stays unexplained.
+    HelpDocumentsFleetFloorCheck,
+    /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
+    /// the operator to `rm` entries `--prune-stale-entry-points` would not
+    /// remove (it had told them to delete provisioning's rollback copy). For
+    /// an advisory listing only non-Python, non-shim entries, the port's
+    /// stderr must equal the shell's stderr with exactly
+    /// `stale_remediation::STALE_REMEDIATION_SHELL` replaced, once, by
+    /// `stale_remediation::STALE_REMEDIATION_UNRELATED`. The header, every per-entry line and
+    /// the suppression line are unchanged. Risk direction: advisory text only
+    /// — the scan, the exit code and the prune are untouched. Any other stderr
+    /// difference stays unexplained.
+    StaleAdvisoryNoRmForUnprunableEntries,
+}
 
 /// Classify one difference, or return `Err` for "unexplained".
 ///
 /// stdout and stderr are classified independently — a half that no class
 /// explains is a finding whatever the other half did.
-#[allow(clippy::unnecessary_wraps)]
 fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
-    if shell.rc != port.rc || shell.stdout != port.stdout || shell.stderr != port.stderr {
+    if shell.rc != port.rc {
         return Err(());
     }
-    Ok(Vec::new())
+    let mut found = Vec::new();
+    if shell.stderr != port.stderr {
+        if !stale_remediation::explains(&shell.stderr, &port.stderr) {
+            return Err(());
+        }
+        found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
+    }
+    if shell.stdout == port.stdout {
+        return Ok(found);
+    }
+    // `--help` now carries several documented additions, so accept any
+    // combination of them — never anything else.
+    // Each class is one or more (anchor, block) insertions, applied together.
+    let additions: [(Divergence, &[(&str, &str)]); 4] = [
+        (Divergence::HelpDocumentsTagPin, &[(TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE)]),
+        (
+            Divergence::HelpDocumentsSymlinkedDest,
+            &[(SYMLINKED_DEST_ANCHOR, SYMLINKED_DEST_HELP_BLOCK)],
+        ),
+        (
+            Divergence::HelpDocumentsRequireSignature,
+            &[(HELP_BLOCK_ANCHOR, REQUIRE_SIGNATURE_HELP_BLOCK)],
+        ),
+        (Divergence::HelpDocumentsFleetFloorCheck, &FLOOR_CHECK_INSERTS),
+    ];
+    for mask in 1u8..(1 << additions.len()) {
+        let mut expected = shell.stdout.clone();
+        let mut classes = Vec::new();
+        let mut applicable = true;
+        for (i, (class, inserts)) in additions.iter().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            for (anchor, block) in *inserts {
+                match insert_before_unique(&expected, anchor, block) {
+                    Some(next) => expected = next,
+                    None => {
+                        applicable = false;
+                        break;
+                    }
+                }
+            }
+            if !applicable {
+                break;
+            }
+            classes.push(*class);
+        }
+        if applicable && expected == port.stdout {
+            found.extend(classes);
+            return Ok(found);
+        }
+    }
+    Err(())
+}
+
+/// `text` with `block` inserted at the start of the single line beginning with
+/// `anchor`; `None` when that line is absent or not unique.
+fn insert_before_unique(text: &str, anchor: &str, block: &str) -> Option<String> {
+    let needle = format!("\n{anchor}");
+    if text.matches(&needle).count() != 1 {
+        return None;
+    }
+    let at = text.find(&needle)? + 1;
+    let mut out = String::with_capacity(text.len() + block.len());
+    out.push_str(&text[..at]);
+    out.push_str(block);
+    out.push_str(&text[at..]);
+    Some(out)
+}
+
+/// The class admits exactly the intended addition and nothing else.
+#[test]
+fn the_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!("Environment:\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"),
+        stderr: String::new(),
+    };
+    let with_block = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let good = with_block(base.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &good), Ok(vec![Divergence::HelpDocumentsRequireSignature]));
+    assert_eq!(classify(&base, &base), Ok(Vec::new()));
+
+    // An extra unrelated change alongside the block.
+    let extra = with_block(format!("{}extra\n", good.stdout));
+    assert_eq!(classify(&base, &extra), Err(()));
+    // The block in the wrong place.
+    let misplaced = with_block(format!("{REQUIRE_SIGNATURE_HELP_BLOCK}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // A tampered block.
+    let tampered = with_block(good.stdout.replace("Default: off.", "Default: on."));
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered #10473 entry, and the block missing it (the #10470-only
+    // text): the class pins the whole addition, not just its first part.
+    let tampered_anchor = with_block(good.stdout.replace("identical/ahead", "behind"));
+    assert_eq!(classify(&base, &tampered_anchor), Err(()));
+    let without_anchor = REQUIRE_SIGNATURE_HELP_BLOCK
+        .split("  LOOM_DAEMON_UPDATE_APPROVED_SOURCE_ANCHOR")
+        .next()
+        .unwrap();
+    let partial = with_block(base.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{without_anchor}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &partial), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..good.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..good.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no env block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(
+            &anchorless,
+            &with_block(format!("{REQUIRE_SIGNATURE_HELP_BLOCK}no env block\n"))
+        ),
+        Err(())
+    );
+}
+
+/// The tag-pin class admits exactly the intended line, alone or together with
+/// the required-signature block, and nothing else.
+#[test]
+fn the_tag_pin_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!(
+            "Usage:\n  ./.loom/scripts/cli/loom-daemon-update.sh --fetch  f\n{TAG_PIN_ANCHOR} d\n\
+             Environment:\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"
+        ),
+        stderr: String::new(),
+    };
+    let with_stdout = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let tag_only = with_stdout(base.stdout.replace(
+        &format!("\n{TAG_PIN_ANCHOR}"),
+        &format!("\n{TAG_PIN_HELP_LINE}{TAG_PIN_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &tag_only), Ok(vec![Divergence::HelpDocumentsTagPin]));
+
+    // Both additions together, as the real `--help` output now has.
+    let both = with_stdout(tag_only.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(
+        classify(&base, &both),
+        Ok(vec![
+            Divergence::HelpDocumentsTagPin,
+            Divergence::HelpDocumentsRequireSignature
+        ])
+    );
+
+    // An extra unrelated change alongside the line.
+    assert_eq!(classify(&base, &with_stdout(format!("{}extra\n", tag_only.stdout))), Err(()));
+    // The line in the wrong place.
+    let misplaced = with_stdout(format!("{TAG_PIN_HELP_LINE}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // The line twice.
+    let doubled = with_stdout(
+        tag_only
+            .stdout
+            .replace(TAG_PIN_HELP_LINE, &format!("{TAG_PIN_HELP_LINE}{TAG_PIN_HELP_LINE}")),
+    );
+    assert_eq!(classify(&base, &doubled), Err(()));
+    // A tampered line.
+    let tampered = with_stdout(
+        tag_only
+            .stdout
+            .replace("EXACTLY this release tag", "any release tag"),
+    );
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered line next to a good signature block.
+    let both_tampered = with_stdout(both.stdout.replace("never falls back", "may fall back"));
+    assert_eq!(classify(&base, &both_tampered), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..tag_only.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..tag_only.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no usage block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(&anchorless, &with_stdout(format!("{TAG_PIN_HELP_LINE}no usage block\n"))),
+        Err(())
+    );
+}
+
+/// The symlinked-dest class admits exactly the intended block, alone or
+/// together with the other additions, and nothing else.
+#[test]
+fn the_symlinked_dest_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!(
+            "Usage:\n  ./.loom/scripts/cli/loom-daemon-update.sh --fetch  f\n{TAG_PIN_ANCHOR} d\n\
+             Environment:\n  LOOM_DAEMON_BIN       Path to the binary\n\
+             {SYMLINKED_DEST_ANCHOR}  dir\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"
+        ),
+        stderr: String::new(),
+    };
+    let with_stdout = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let link_only = with_stdout(base.stdout.replace(
+        &format!("\n{SYMLINKED_DEST_ANCHOR}"),
+        &format!("\n{SYMLINKED_DEST_HELP_BLOCK}{SYMLINKED_DEST_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &link_only), Ok(vec![Divergence::HelpDocumentsSymlinkedDest]));
+
+    // All three additions together, as the real `--help` output now has.
+    let all = with_stdout(
+        link_only
+            .stdout
+            .replace(
+                &format!("\n{TAG_PIN_ANCHOR}"),
+                &format!("\n{TAG_PIN_HELP_LINE}{TAG_PIN_ANCHOR}"),
+            )
+            .replace(
+                &format!("\n{HELP_BLOCK_ANCHOR}"),
+                &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+            ),
+    );
+    assert_eq!(
+        classify(&base, &all),
+        Ok(vec![
+            Divergence::HelpDocumentsTagPin,
+            Divergence::HelpDocumentsSymlinkedDest,
+            Divergence::HelpDocumentsRequireSignature
+        ])
+    );
+
+    // An extra unrelated change alongside the block.
+    assert_eq!(classify(&base, &with_stdout(format!("{}extra\n", link_only.stdout))), Err(()));
+    // The block in the wrong place.
+    let misplaced = with_stdout(format!("{SYMLINKED_DEST_HELP_BLOCK}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // The block twice.
+    let doubled = with_stdout(link_only.stdout.replace(
+        SYMLINKED_DEST_HELP_BLOCK,
+        &format!("{SYMLINKED_DEST_HELP_BLOCK}{SYMLINKED_DEST_HELP_BLOCK}"),
+    ));
+    assert_eq!(classify(&base, &doubled), Err(()));
+    // A tampered block.
+    let tampered = with_stdout(
+        link_only
+            .stdout
+            .replace("replaced by a regular file", "followed"),
+    );
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered block next to the other good additions.
+    let all_tampered = with_stdout(all.stdout.replace("pin the real path", "pin any path"));
+    assert_eq!(classify(&base, &all_tampered), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..link_only.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..link_only.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no env block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(&anchorless, &with_stdout(format!("{SYMLINKED_DEST_HELP_BLOCK}no env block\n"))),
+        Err(())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,3 +1564,10 @@ fn the_oracle_is_host_portable() {
 // invisible to that discovery (Cargo only globs `tests/*.rs`, not `tests/*/*.rs`).
 #[path = "differential_daemon_update/corpus.rs"]
 mod corpus;
+
+#[path = "differential_daemon_update/floor_check_help.rs"]
+mod floor_check_help;
+use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/stale_remediation.rs"]
+mod stale_remediation;

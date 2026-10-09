@@ -8,7 +8,10 @@
 
 use chrono::{DateTime, Utc};
 use loom_daemon::health::format_window;
-use loom_daemon::types::{DaemonStatusReport, ForgeBudgetReading, ForgeCallCounts};
+use loom_daemon::types::{
+    DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts, ReadSpillStatus,
+    ReaderWithdrawalStatus,
+};
 
 /// Every line of the section; empty for a pre-#9251 daemon (no field).
 pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>) -> Vec<String> {
@@ -60,6 +63,89 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
             .map(|b| render_budget(b, own(&b.pool), now))
             .collect();
         lines.push(format!("  budget: {}", readings.join(" · ")));
+    }
+    lines.extend(render_bucket_block(fc.buckets.as_deref().unwrap_or_default(), now));
+    lines.extend(render_withdrawals(&fc.reader_withdrawals, now));
+    lines.extend(render_spills(&fc.read_spills, now));
+    lines
+}
+
+/// W4-B: each repo whose reads are spilling off a home reader that is
+/// running dry, and when the latch releases.
+fn render_spills(rows: &[ReadSpillStatus], now: DateTime<Utc>) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  read spills:".to_string()];
+    lines.extend(rows.iter().map(|s| {
+        format!(
+            "    {} {} off {} ({}): releases in {}",
+            s.owner_repo,
+            s.resource,
+            s.from,
+            s.mode,
+            ago((s.until - now).num_seconds())
+        )
+    }));
+    lines
+}
+
+/// W4-A: each reader currently withdrawn from one `(owner, resource)`
+/// bucket — the rest of its owners and resources keep serving.
+fn render_withdrawals(rows: &[ReaderWithdrawalStatus], now: DateTime<Utc>) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  reader withdrawals (scoped):".to_string()];
+    lines.extend(rows.iter().map(|w| {
+        format!(
+            "    {} {} {}: back in {}",
+            w.account,
+            w.owner,
+            w.resource,
+            ago((w.until - now).num_seconds())
+        )
+    }));
+    lines
+}
+
+/// Most bucket rows the compact block shows; the rest are summarised.
+const MAX_BUCKET_ROWS: usize = 12;
+
+/// The W1 per-bucket block: one line per billed bucket, busiest first —
+/// what this host charged it over the window and its newest reading.
+/// `loom-daemon forge calls --by bucket` has the full table.
+fn render_bucket_block(buckets: &[ForgeBucketStatus], now: DateTime<Utc>) -> Vec<String> {
+    if buckets.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&ForgeBucketStatus> = buckets.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.charged
+            .cmp(&a.charged)
+            .then_with(|| a.account.cmp(&b.account))
+    });
+    let mut lines = vec!["  buckets (charged · 304 · limited · used/limit):".to_string()];
+    for b in sorted.iter().take(MAX_BUCKET_ROWS) {
+        let reading = match (b.used, b.limit) {
+            (Some(used), Some(limit)) => format!("{used}/{limit}"),
+            (Some(used), None) => format!("{used}/?"),
+            _ => "-".to_string(),
+        };
+        let resets = b
+            .reset_at
+            .map(|r| format!(", resets in {}", ago((r - now).num_seconds())))
+            .unwrap_or_default();
+        lines.push(format!(
+            "    {} {} {}: {} · {} · {} · {reading}{resets}",
+            b.account, b.cred_owner, b.resource, b.charged, b.not_modified, b.rate_limited
+        ));
+    }
+    if sorted.len() > MAX_BUCKET_ROWS {
+        lines.push(format!(
+            "    … {} more — loom-daemon forge calls --by bucket",
+            sorted.len() - MAX_BUCKET_ROWS
+        ));
     }
     lines
 }
@@ -159,6 +245,9 @@ mod tests {
             // this renderer must keep rendering unchanged.
             operations: None,
             identity_roles: None,
+            buckets: None,
+            reader_withdrawals: Vec::new(),
+            read_spills: Vec::new(),
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
@@ -218,6 +307,76 @@ mod tests {
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let budget = lines.iter().find(|l| l.contains("budget:")).unwrap();
         assert!(budget.contains("used 4960 (own n/a — sink off)"), "{budget}");
+    }
+
+    #[test]
+    fn the_bucket_block_lists_each_bucket_busiest_first() {
+        let now = Utc::now();
+        let bucket = |account: &str, charged, used| ForgeBucketStatus {
+            account: account.into(),
+            cred_owner: "acme".into(),
+            resource: "core".into(),
+            charged,
+            used,
+            limit: used.map(|_| 5000),
+            reset_at: Some(now + chrono::Duration::minutes(20)),
+            ..Default::default()
+        };
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            buckets: Some(vec![bucket("app-7", 3, None), bucket("app-42", 120, Some(900))]),
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines.iter().position(|l| l.contains("buckets (")).unwrap();
+        assert!(lines[at + 1].contains("app-42 acme core: 120 · 0 · 0 · 900/5000, resets in 20m"));
+        assert!(lines[at + 2].contains("app-7 acme core: 3 · 0 · 0 · -"), "{lines:?}");
+    }
+
+    #[test]
+    fn live_scoped_reader_withdrawals_are_listed() {
+        let now = Utc::now();
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            reader_withdrawals: vec![ReaderWithdrawalStatus {
+                account: "app-7".into(),
+                owner: "acme".into(),
+                resource: "core".into(),
+                until: now + chrono::Duration::minutes(12),
+            }],
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines
+            .iter()
+            .position(|l| l.contains("reader withdrawals"))
+            .unwrap();
+        assert!(lines[at + 1].contains("app-7 acme core: back in 1"), "{lines:?}");
+    }
+
+    #[test]
+    fn engaged_read_spills_are_listed() {
+        let now = Utc::now();
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            read_spills: vec![ReadSpillStatus {
+                owner_repo: "acme/hot".into(),
+                resource: "core".into(),
+                from: "app-7".into(),
+                mode: "partial".into(),
+                until: now + chrono::Duration::minutes(40),
+            }],
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines
+            .iter()
+            .position(|l| l.contains("read spills"))
+            .unwrap();
+        assert!(
+            lines[at + 1].contains("acme/hot core off app-7 (partial): releases in"),
+            "{lines:?}"
+        );
     }
 
     #[test]

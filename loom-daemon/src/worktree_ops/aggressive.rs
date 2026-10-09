@@ -331,6 +331,7 @@ fn decide_for_worktree(
     min_age_seconds: u64,
     force: bool,
     safe: bool,
+    pass: &super::hygiene_pass::Pass<'_>,
 ) -> (Decision, Reason) {
     let resolved_repo = repo_root
         .canonicalize()
@@ -364,7 +365,9 @@ fn decide_for_worktree(
     // forge rung and `worktree_reaper`'s probe: GraphQL exhaustion is a live failure
     // mode here, and `--aggressive` is a bulk pass over every worktree.
     // `None` for a worktree with no `issue-N` branch — nothing to ask about.
-    let issue_state_probe = issue_num.map(|n| move || gh::issue_state_rest(repo_root, n));
+    // Through the pass (W6 PR2) so the answer the decision used is held for
+    // the pre-removal confirm in `clean_aggressive`.
+    let issue_state_probe = issue_num.map(|n| move || pass.issue_state(n));
     let issue_state: Option<&dyn Fn() -> String> =
         issue_state_probe.as_ref().map(|f| f as &dyn Fn() -> String);
 
@@ -416,6 +419,10 @@ pub struct AggressiveStats {
     /// "could not determine" and "confirmed unreachable" are different
     /// answers, not the same skip for two reasons.
     pub skipped_landed_unknown: usize,
+    /// W6 PR2: worktrees the decision tree would have removed, kept because
+    /// the fresh pre-removal read of the issue did not confirm the state the
+    /// decision used (`hygiene.confirm_downgrade`).
+    pub skipped_unconfirmed: usize,
     pub skipped_locked: usize,
     /// #5735: worktrees actually removed via the `ForceOverrideUnreachable`
     /// fallback — i.e. `--force` overrode the "HEAD not on origin/main —
@@ -480,7 +487,10 @@ fn remove_aggressive_worktree(
         wt.branch_short().as_deref(),
         reason.as_str(),
     );
-    if let Some(b) = wt.branch_short() {
+    if let Some(b) = wt
+        .branch_short()
+        .filter(|b| !super::branch_holders::skip_if_held(repo_root, b))
+    {
         let _ = Command::new("git")
             .args(["branch", "-D", &b])
             .current_dir(repo_root)
@@ -499,6 +509,7 @@ pub fn clean_aggressive(
 ) -> AggressiveStats {
     let mut stats = AggressiveStats::default();
     let active_shepherds = super::liveness::active_spawn_loop_issues(repo_root);
+    let pass = super::hygiene_pass::Pass::begin(repo_root);
 
     let worktrees = enumerate_git_worktrees(repo_root);
     if worktrees.is_empty() {
@@ -513,8 +524,15 @@ pub fn clean_aggressive(
             None => wt.path.display().to_string(),
         };
 
-        let (decision, reason) =
-            decide_for_worktree(wt, repo_root, &active_shepherds, min_age_seconds, force, safe);
+        let (decision, reason) = decide_for_worktree(
+            wt,
+            repo_root,
+            &active_shepherds,
+            min_age_seconds,
+            force,
+            safe,
+            &pass,
+        );
 
         match decision {
             Decision::Keep => {
@@ -584,6 +602,19 @@ pub fn clean_aggressive(
                 continue;
             }
             Decision::Remove => {
+                // W6 PR2: when the decision read the issue's state, one fresh
+                // unconditional read must still agree before anything is
+                // removed. A dry run removes nothing and confirms nothing.
+                let unconfirmed = wt
+                    .branch_short()
+                    .and_then(|b| naming::issue_from_branch(&b))
+                    .filter(|_| !dry_run)
+                    .and_then(|n| pass.confirm_issue(n).keep_reason());
+                if let Some(why) = unconfirmed {
+                    stats.skipped_unconfirmed += 1;
+                    println!("  Skip ({why}): {label}");
+                    continue;
+                }
                 let is_forced_override = reason == Reason::ForceOverrideUnreachable;
                 if is_forced_override {
                     // #5735: preserve the same classification text and
@@ -677,6 +708,12 @@ pub fn print_aggressive_summary(stats: &AggressiveStats, dry_run: bool) {
         println!(
             "  Skipped (could not determine whether the work landed): {}",
             stats.skipped_landed_unknown
+        );
+    }
+    if stats.skipped_unconfirmed > 0 {
+        println!(
+            "  Skipped (fresh forge read did not confirm the issue state): {}",
+            stats.skipped_unconfirmed
         );
     }
     if stats.skipped_locked > 0 {

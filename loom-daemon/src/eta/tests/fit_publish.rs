@@ -16,13 +16,13 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const CAPTAIN: &str = "loom-worker-1";
+pub(super) const CAPTAIN: &str = "loom-worker-1";
 
-fn at(day: u32) -> DateTime<Utc> {
+pub(super) fn at(day: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, day, 0, 0, 0).unwrap()
 }
 
-fn fit_at(as_of: DateTime<Utc>) -> CoefficientFile {
+pub(super) fn fit_at(as_of: DateTime<Utc>) -> CoefficientFile {
     let meta = FitMeta {
         as_of,
         window: FitWindow::standard(as_of),
@@ -34,7 +34,7 @@ fn fit_at(as_of: DateTime<Utc>) -> CoefficientFile {
     coeffs::fit(&meta, &[], &[])
 }
 
-fn loc() -> StoreLocation {
+pub(super) fn loc() -> StoreLocation {
     StoreLocation {
         repo: "o/store".to_string(),
         reference: "eta-fit".to_string(),
@@ -61,11 +61,11 @@ fn split_repo(api_path: &str) -> (String, &str) {
 
 /// An in-memory contents API: [`store_key`] -> bytes, per repo and branch.
 #[derive(Default)]
-struct Store {
-    files: RefCell<BTreeMap<String, Vec<u8>>>,
-    branch: RefCell<bool>,
-    writes: RefCell<Vec<String>>,
-    fail_gets: RefCell<bool>,
+pub(super) struct Store {
+    pub(super) files: RefCell<BTreeMap<String, Vec<u8>>>,
+    pub(super) branch: RefCell<bool>,
+    pub(super) writes: RefCell<Vec<String>>,
+    pub(super) fail_gets: RefCell<bool>,
 }
 
 impl Store {

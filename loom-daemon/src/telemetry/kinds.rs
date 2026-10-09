@@ -161,8 +161,14 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `host.export` (#11124).
+pub mod host_export;
+
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
+
+/// `eta.backtest.fold` / `eta.backtest.summary` (#10492).
+pub mod eta_backtest;
 
 /// `eta.fit` (#10391).
 pub mod eta_fit;
@@ -172,11 +178,25 @@ pub mod eta_fleet_refresh;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
+pub mod eta_stage_outcome;
+
+/// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
+pub mod pass;
+
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
+/// `pr.resolved` (#10519) — a PR's merge or close instant, from the ETA pass.
+pub mod pr_resolved;
+
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
+
+/// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
+pub mod fleet_state;
+/// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
+pub mod token_ranking_refresh;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -396,6 +416,14 @@ macro_rules! telemetry_kind_table {
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
+            /// One host's in-flight items (stage, entered-at, PR, host, slot)
+            /// and per-repo open-PR census (Issue #10196). OTLP-only: the
+            /// replay contract's state record. A full anchor goes out hourly,
+            /// with deltas in between only when something changed. See
+            /// [`fleet_state`].
+            FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One daily-fit check, whether it fitted or skipped (Issue
             /// #10391). OTLP-only, like the other `eta.*` log kinds. See
             /// [`eta_fit`].
@@ -406,6 +434,55 @@ macro_rules! telemetry_kind_table {
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A PR the ETA pass saw leave the review listings, with its merge
+            /// or close instant (Issue #10519). Built from rows the pass
+            /// already journals, so no new forge read. OTLP-only. See
+            /// [`pr_resolved`].
+            PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One stage an item left, with its entry and exit instants and the
+            /// estimates open for the item then (Issue #10929). Built from rows
+            /// the ETA tracker already journals, so no new forge read.
+            /// OTLP-only. See [`eta_stage_outcome`].
+            EtaStageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::eta_stage_outcome::EtaStageOutcomeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One heuristic's nightly walk-forward fold for one UTC day (Issue
+            /// #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestFold = "eta.backtest.fold" => $crate::telemetry::kinds::eta_backtest::EtaBacktestFoldRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One challenger's rolling backtest standing against `current`
+            /// (Issue #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestSummary = "eta.backtest.summary" => $crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One pass over a workspace's artifacts (Issue #10752): mechanism,
+            /// mode, outcome, counts by verdict and skip reason, write cap,
+            /// duration and GitHub calls. OTLP-only. See [`pass`].
+            PassSummary = "pass.summary" => $crate::telemetry::kinds::pass::PassSummaryRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One artifact's verdict in a pass (Issue #10752): repo#n, verdict,
+            /// reason, blockers with their states, labels changed. OTLP-only.
+            /// See [`pass`].
+            PassVerdict = "pass.verdict" => $crate::telemetry::kinds::pass::PassVerdictRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One workspace's token-ranking refresh round (Issue #10744):
+            /// accounts probed, per-account outcome and credential kind, and
+            /// how many probes used a metered API key. OTLP-only. See
+            /// [`token_ranking_refresh`].
+            TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// This host's export view (Issue #11124, R2 of #10196): active
+            /// exporters, queue depth, cumulative `dropped_total` per exporter
+            /// and the last successful flush. OTLP-only. See [`host_export`].
+            HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

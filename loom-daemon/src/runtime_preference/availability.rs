@@ -206,6 +206,13 @@ fn claude(root: &Path) -> Availability {
 /// ["codex","claude"]` fall through to Claude when Codex can run nothing.
 /// The hold is self-healing (`PoolHold::SelfHealing`): it ages out and the next
 /// tick re-tests the sandbox.
+///
+/// **Session down (#10454).** A session-managed account whose container is not
+/// running is not spawnable (spawn-codex.sh refuses it), so a pool of only
+/// such accounts is Exhausted with a detail naming `SessionDown`. The read is
+/// the session watch's published snapshot (#10660), never a `docker` process;
+/// with no fresh snapshot, or Docker unqueryable, the count stays at zero —
+/// cannot observe, not down.
 fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     let source = CredentialSource::CodexAccounts;
     if let Some(hold) = super::sandbox_hold::active("codex", now) {
@@ -268,9 +275,9 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             "0/{} spawnable ({}) — #8408",
             state.enabled,
             if state.enabled == 0 {
-                "no enabled codex account is provisioned"
+                "no enabled codex account is provisioned".to_string()
             } else {
-                "every enabled account is cooling down or needs re-auth"
+                crate::role_runner::runtime_preflight::codex_exhausted_reason(&state)
             }
         ),
     }
@@ -302,6 +309,12 @@ fn native(root: &Path, tap: &Tap, runtime: &str) -> Availability {
     let Ok(selection) = crate::worker_spawn::profiles::resolve(runtime, &name, &profile) else {
         return ungated(CredentialSource::Unobservable);
     };
+    // #9473: a profile routed through the LLM gateway never consults the pool
+    // (the gateway's virtual key replaces it), so the pool is not its wall. A
+    // routed profile that cannot launch fails loudly at launch, as above.
+    if !matches!(crate::worker_spawn::llm_gateway::plan(runtime, &selection, &config), Ok(None)) {
+        return ungated(CredentialSource::Unobservable);
+    }
     // Step 1/2 of the ladder: which single source variable is unset?
     let unset: Vec<&str> = selection
         .credentials

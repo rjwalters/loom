@@ -106,18 +106,23 @@ impl WorkItem {
 #[must_use]
 pub fn merge_starred(mut ready: Vec<WorkItem>, starred: Vec<WorkItem>) -> Vec<WorkItem> {
     let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();
-    ready.extend(starred.into_iter().filter(|i| {
-        !listed.contains(&i.number)
-            && !i
-                .labels
-                .iter()
-                .any(|l| l == BUILDING_LABEL || l == CURATING_LABEL)
-            && !i
-                .labels
-                .iter()
-                .any(|l| CHAMPION_PATH_LABELS.contains(&l.as_str()))
-    }));
+    ready.extend(
+        starred
+            .into_iter()
+            .filter(|i| !listed.contains(&i.number) && !excluded_from_side_listing(i)),
+    );
     ready
+}
+
+/// Whether a row from a listing other than `loom:issue` (the starred one, or
+/// the unpromoted red-main-fix ones, #10118) is left out of the candidates:
+/// already claimed ([`BUILDING_LABEL`]), being curated ([`CURATING_LABEL`]),
+/// or on the Champion path ([`CHAMPION_PATH_LABELS`]).
+#[must_use]
+pub fn excluded_from_side_listing(item: &WorkItem) -> bool {
+    item.labels.iter().any(|l| {
+        l == BUILDING_LABEL || l == CURATING_LABEL || CHAMPION_PATH_LABELS.contains(&l.as_str())
+    })
 }
 
 /// Where a starred issue's starred-at comes from.

@@ -12,9 +12,17 @@
 //! next listing, and an already-lifecycle-labeled issue is never selected. Uses
 //! REST (`gh api`) only, batch-capped per pass, and never fails the tick.
 //!
-//! Config (env only; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
+//! Config (env; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
 //! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (default 300),
 //! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50).
+//!
+//! # One pass per fleet (W7)
+//!
+//! With `fleet.intakeReconcile.singleton` set and a `fleet.captain` declared,
+//! the inline pass here stands down on every host and the captain alone runs
+//! intake from its own task, on reader-pool conditional listings with a
+//! re-read before every label: see [`singleton`]. Unconfigured, or with no
+//! captain declared, this module behaves exactly as described above.
 
 use crate::claim_reconciliation::gh_call;
 use chrono::{DateTime, Duration, Utc};
@@ -22,6 +30,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+
+pub mod singleton;
 
 /// The intake label applied.
 pub const TRIAGE_LABEL: &str = "loom:triage";
@@ -120,13 +130,27 @@ fn due(root: &Path, interval_secs: u64) -> bool {
     true
 }
 
+/// Whether the inline pass runs now: enabled, not stood down by the W7
+/// singleton, and due, asked in that order. A stood-down host never consults
+/// (or records) the cadence, so taking intake back runs a pass at once.
+fn inline_pass_due(
+    enabled: bool,
+    stands_down: impl FnOnce() -> bool,
+    due: impl FnOnce() -> bool,
+) -> bool {
+    enabled && !stands_down() && due()
+}
+
 /// Run the pass for `root` if enabled and due. Returns issues labeled.
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // Unit tests of other modules drive GhWorkSource with real/fake `gh`; the
     // pass is exercised directly via `run_once` instead.
+    // W7: with the singleton configured and a captain declared, the captain's
+    // own task runs intake; no host runs it inline. Checked before `due` so a
+    // host that takes intake back runs its first pass at once.
+    let interval = env_num("LOOM_INTAKE_RECONCILE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS);
     if cfg!(test)
-        || !enabled()
-        || !due(root, env_num("LOOM_INTAKE_RECONCILE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS))
+        || !inline_pass_due(enabled(), singleton::legacy_stands_down, || due(root, interval))
     {
         return 0;
     }
@@ -146,16 +170,33 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
 /// One ungated pass (tests call this directly).
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
     const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(","))] | @tsv"#;
-    let listing = gh_call::ok_stdout(gh_call::read("intake.list_open", gh_bin, root).args([
-        "api",
-        "--paginate",
-        "repos/{owner}/{repo}/issues?state=open&per_page=100",
-        "--jq",
-        JQ,
-    ]));
-    let Some(stdout) = listing else {
-        log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
-        return 0;
+    // W4-C: Hygiene — a shed listing is a skipped pass, retried on the next
+    // tick. The shed itself is logged (rate-limited) by the facade, so it is
+    // not reported here as a failure every tick.
+    let outcome = gh_call::read("intake.list_open", gh_bin, root)
+        .read_class(crate::gh_invocation::ReadClass::Hygiene)
+        .args([
+            "api",
+            "--paginate",
+            "repos/{owner}/{repo}/issues?state=open&per_page=100",
+            "--jq",
+            JQ,
+        ])
+        .run();
+    let stdout = match outcome {
+        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => out.stdout,
+        crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed { until }) => {
+            log::debug!(
+                "intake_reconcile: open-issue listing deferred in {} (reader budget low until \
+                 {until:?}); skipped this pass",
+                root.display()
+            );
+            return 0;
+        }
+        _ => {
+            log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
+            return 0;
+        }
     };
     let rows = parse_rows(&String::from_utf8_lossy(&stdout));
     let mut labeled = 0;

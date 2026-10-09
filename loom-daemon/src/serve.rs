@@ -284,6 +284,8 @@ pub fn build_snapshot(report: DaemonStatusReport) -> StatusSnapshot {
     }
 }
 
+#[cfg(test)]
+mod dashboard_queue_tests;
 /// The `DaemonStatus` round-trip and its root-scaled budget (Issue #8224),
 /// extracted to a sibling module because this file is frozen by the file-size
 /// ratchet (`scripts/check-file-size-budget.sh`; see
@@ -706,6 +708,7 @@ async fn handle_health(
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        inbox_mail: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

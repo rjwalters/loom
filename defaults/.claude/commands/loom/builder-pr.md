@@ -8,6 +8,7 @@ This document covers PR creation, test output handling, and quality requirements
 - [Pre-Implementation Review: Check Recent Main Changes](#pre-implementation-review-check-recent-main-changes)
 - [Test Output: Truncate for Token Efficiency](#test-output-truncate-for-token-efficiency)
 - [Acceptance Criteria Verification: REQUIRED Before PR Creation](#acceptance-criteria-verification-required-before-pr-creation)
+- [Rollout check (host-move PRs)](#rollout-check-host-move-prs)
 - [Test-First Discipline (TDD line, required in PR body)](#test-first-discipline-tdd-line-required-in-pr-body)
 - [PR Titles: Conventional Commit Style Required](#pr-titles-conventional-commit-style-required)
 - [Commit Messages: Same Rules as PR Titles](#commit-messages-same-rules-as-pr-titles)
@@ -383,6 +384,8 @@ Local verification:
 - [ ] Linter run on changed files (0 errors)
 ```
 
+**Pre-PR gate (pre-flight, #10476).** With `buildGate` set, run `loom-daemon preflight --issue N` before `create-pr.sh`. Exit 1 = failed: fix the tail, commit, re-run (max `preflightMaxAttempts`). Exit 4 (`preflight_unresolved`) = stop, NO PR (claim released). Exit 5 = timeout, exit 6 = deferred for host load (both keep the claim): re-run later; at the timeout cap, NO PR. Name any `PASS (flaky…)` test in the PR. `create-pr.sh` refuses (exit 7) an ungated HEAD.
+
 ### Language-Specific Verification
 
 **Rust Code Changes**
@@ -390,48 +393,32 @@ Local verification:
 If you modified any `.rs` files, run these checks **before committing**:
 
 ```bash
-# Compile check - catches type errors, borrow issues, async Send violations
+# Compile check
 cargo check
 
-# Lint - catches common mistakes, anti-patterns, correctness issues
+# Lint
 cargo clippy
 
-# Format all Rust files (applies formatting)
+# Format (applies)
 cargo fmt
 
-# Verify formatting (check only, no changes - returns non-zero if unformatted)
+# Verify formatting (check only)
 cargo fmt --all -- --check
 ```
 
-**Why check compilation before commit (not just rely on CI)?**
+**Why check before commit?** Pre-commit hooks can fail silently in worktrees, and a Doctor cycle costs far more than a local check.
 
-1. **Defense in depth** - Pre-commit hooks can fail silently in worktrees or with PATH issues
-2. **Early feedback** - Catch errors immediately instead of after CI failure
-3. **Save a Doctor cycle** - the project's check command (`buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`) includes compilation; catching it early avoids a fix cycle
-4. **Async pitfalls** - Common Rust async errors (e.g., holding `MutexGuard` across `.await`) are only caught by the compiler, not by reading code
-
-**Add to your pre-PR checklist when modifying Rust:**
-
-```markdown
-Local verification:
-- [ ] The project's check command passes (`buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`)
-- [ ] `cargo check` returns 0 (Rust files only)
-- [ ] `cargo clippy` returns 0 (Rust files only)
-- [ ] `cargo fmt --all -- --check` returns 0 (Rust files only)
-```
+**When modifying Rust**, tick off before the PR: the project check command (`buildGate.command` in `.loom/config.json`), `cargo check`, `cargo clippy`, and `cargo fmt --all -- --check` all return 0.
 
 ### Red Flags: Don't Create PR Yet
 
-**STOP and verify if:**
-- You haven't explicitly checked each criterion from the issue
-- You're unsure if a criterion is met ("it should work")
-- The issue mentions files you haven't touched
-- CI might fail on something you didn't test locally
+**STOP and verify if** you have not checked each issue criterion, are unsure one is met ("it should work"), the issue mentions files you have not touched, or CI might fail on something untested locally. Then re-extract criteria (Step 1), verify each explicitly, and only then create the PR.
 
-**Instead:**
-1. Go back to Step 1 and re-extract criteria
-2. Verify each one explicitly
-3. Only then create the PR
+---
+
+## Rollout check (host-move PRs)
+
+A PR that moves work between hosts or changes who emits a fleet signal (authority, captain, singleton jobs, gating, capability routing) needs a `## Rollout check` section: the production signal (e.g. a SigNoz query) and its expected value after the fleet rolls. Others omit it. See `.loom/docs/rollout-check.md`.
 
 ---
 
@@ -649,10 +636,8 @@ body. `--signoff` is harmless when not required. See
 ### PR Label Rules
 
 **When creating a NEW PR:**
-- Add `loom:review-requested` during creation, plus each priority label the issue
-  carries (`loom:operator-priority`, `loom:operator-high-priority`,
-  `loom:high-priority-inherited`; #9244/#10307: the one set a role copies, never invents;
-  level list: keep in sync with operator_levels.rs LEVELS until #10311)
+- Pass only `loom:review-requested`: `create-pr.sh` copies the closing issue's
+  priority labels (the star and its levels) itself (#10518); a role never invents one
 - This is the ONLY time you add labels to a PR
 
 **After PR creation:**
@@ -817,7 +802,8 @@ When creating a PR, verify:
 8. Tests added/updated as needed
 9. Commits carry a `Signed-off-by:` trailer if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` check — see "DCO sign-off")
 10. `## Test Plan` includes a `TDD:` line for any diff touching executing code (see "Test-First Discipline" above) — omit only for docs/config/ADR-only changes
-11. **Rebased onto latest `origin/main` immediately before push** — see "Pre-Push Rebase: Sync with `origin/main`" below
+11. `## Rollout check` section present if the PR is a host-move PR (see "Rollout check" above)
+12. **Rebased onto latest `origin/main` immediately before push** — see "Pre-Push Rebase: Sync with `origin/main`" below
 
 ### Pre-Push Rebase: Sync with `origin/main` (#7668)
 
@@ -970,6 +956,7 @@ still a transient credential window, never a signal to redo the work.
 ```bash
 # CORRECT way to create PR
 # Title MUST use conventional commit format: "fix:", "feat:", "refactor:", etc.
+# create-pr.sh adds the closing issue's priority labels (the star) itself (#10518)
 ./.loom/scripts/create-pr.sh --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
 ## Summary
 Brief description of what this PR does and why.

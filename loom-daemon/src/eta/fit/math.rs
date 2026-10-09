@@ -11,7 +11,7 @@
 
 use std::f64::consts::{FRAC_1_SQRT_2, TAU};
 
-use super::{MAX_NEWTON_ITERATIONS, N_FEATURES, STD_EPS};
+use super::{MAX_NEWTON_ITERATIONS, STD_EPS};
 
 /// The rational-approximation coefficients, in one scope so the precision
 /// allow covers these tables only.
@@ -382,9 +382,9 @@ pub fn cholesky_solve(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
 /// Per-feature mean and population standard deviation plus [`STD_EPS`],
 /// two-pass. An empty input gives means of 0 and deviations of `STD_EPS`.
 #[must_use]
-pub fn standardization(xs: &[[f64; N_FEATURES]]) -> (Vec<f64>, Vec<f64>) {
-    let mut mu = vec![0.0; N_FEATURES];
-    let mut sd = vec![STD_EPS; N_FEATURES];
+pub fn standardization<const N: usize>(xs: &[[f64; N]]) -> (Vec<f64>, Vec<f64>) {
+    let mut mu = vec![0.0; N];
+    let mut sd = vec![STD_EPS; N];
     if xs.is_empty() {
         return (mu, sd);
     }
@@ -401,8 +401,8 @@ pub fn standardization(xs: &[[f64; N_FEATURES]]) -> (Vec<f64>, Vec<f64>) {
 
 /// `(x − mu) / sd`, elementwise.
 #[must_use]
-pub fn standardize(x: &[f64; N_FEATURES], mu: &[f64], sd: &[f64]) -> [f64; N_FEATURES] {
-    let mut z = [0.0; N_FEATURES];
+pub fn standardize<const N: usize>(x: &[f64; N], mu: &[f64], sd: &[f64]) -> [f64; N] {
+    let mut z = [0.0; N];
     for (j, v) in z.iter_mut().enumerate() {
         *v = (x[j] - mu[j]) / sd[j];
     }
@@ -423,6 +423,20 @@ fn inf_norm(v: &[f64]) -> f64 {
     v.iter().fold(0.0, |m, x| m.max(x.abs()))
 }
 
+/// [`Stop::decrease_rtol`] for both fits (#10501): a predicted decrease this
+/// far below `|f|` is under the rounding noise of a sum over thousands of
+/// rows (about `√n·ε·|f|`), so no line search can confirm it. Real fits
+/// that stalled sat at `1e-18`..`1e-15` of `|f|`; the last genuine step
+/// before each, `1e-9` or more.
+pub(crate) const DECREASE_RTOL: f64 = 1e-13;
+
+/// [`Stop::step_rtol`] for both fits (#10501). Keeps a run whose
+/// coefficients still move — no finite optimum, `f → 0`, steps of `1/k` of
+/// `‖x‖` — from passing on the decrement alone. Real noise-floor steps
+/// measured `≤ 5e-7` relative, and the full step taken there leaves an error
+/// of about its square.
+pub(crate) const STEP_RTOL: f64 = 1e-5;
+
 /// When [`newton`] stops.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stop {
@@ -430,6 +444,13 @@ pub(crate) struct Stop {
     pub grad_tol: f64,
     /// Converged once the full Newton step's `‖·‖∞` is below this.
     pub step_tol: f64,
+    /// Noise-floor stop (#10501), with [`Stop::step_rtol`]: converged once an
+    /// undamped Newton step's predicted decrease `λ²/2 = −g·d/2` is at most
+    /// this times `max(|f|, 1)` (0 disables). Scale-aware: the same rule
+    /// fits a sum objective, which grows with the rows, and a mean one.
+    pub decrease_rtol: f64,
+    /// The noise-floor stop also needs `‖d‖∞ ≤ step_rtol · max(‖x‖∞, 1)`.
+    pub step_rtol: f64,
 }
 
 /// A minimizer [`newton`] found.
@@ -445,10 +466,11 @@ pub(crate) struct Minimum {
 pub(crate) type Derivatives = (f64, Vec<f64>, Vec<f64>);
 
 /// Solve `h·d = rhs`, adding Levenberg damping `λI` (growing tenfold) when
-/// `h` is not positive definite.
-fn damped_solve(h: &[f64], rhs: &[f64]) -> Option<Vec<f64>> {
+/// `h` is not positive definite. The flag is `true` for an undamped step —
+/// `h` itself positive definite, so `d` is a true Newton step.
+fn damped_solve(h: &[f64], rhs: &[f64]) -> Option<(Vec<f64>, bool)> {
     if let Some(d) = cholesky_solve(h, rhs) {
-        return Some(d);
+        return Some((d, true));
     }
     let n = rhs.len();
     let scale = (0..n).fold(1.0_f64, |m, i| m.max(h[i * n + i].abs()));
@@ -459,7 +481,7 @@ fn damped_solve(h: &[f64], rhs: &[f64]) -> Option<Vec<f64>> {
             damped[i * n + i] += lambda;
         }
         if let Some(d) = cholesky_solve(&damped, rhs) {
-            return Some(d);
+            return Some((d, false));
         }
         lambda *= 10.0;
     }
@@ -473,6 +495,15 @@ fn damped_solve(h: &[f64], rhs: &[f64]) -> Option<Vec<f64>> {
 /// alone (the line search). A full step whose `‖·‖∞` is below
 /// `stop.step_tol` is taken and ends the run as converged, so a line search
 /// that only shrinks the step can never fake convergence.
+///
+/// So is an undamped step at the noise floor (#10501): its predicted
+/// decrease under `stop.decrease_rtol · max(|f|, 1)` and its size under
+/// `stop.step_rtol · max(‖x‖∞, 1)`. There the decrease is below the
+/// objective's own rounding, the line search can only accept noise-sized
+/// fractions of an accurate step, and the absolute tolerances are out of
+/// reach; from inside Newton's quadratic region the full step leaves an
+/// error of about `‖d‖²`. Hitting the iteration cap, or a failed solve or
+/// line search, still reports `converged: false`.
 pub(crate) fn newton(
     x0: Vec<f64>,
     stop: Stop,
@@ -491,11 +522,17 @@ pub(crate) fn newton(
             break;
         }
         let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
-        let Some(step) = damped_solve(&h, &rhs) else {
+        let Some((step, newton_step)) = damped_solve(&h, &rhs) else {
             break;
         };
         iterations += 1;
-        if inf_norm(&step) < stop.step_tol {
+        let slope: f64 = g.iter().zip(&step).map(|(a, b)| a * b).sum();
+        let step_norm = inf_norm(&step);
+        let noise_floor = newton_step
+            && stop.decrease_rtol > 0.0
+            && -0.5 * slope <= stop.decrease_rtol * f.abs().max(1.0)
+            && step_norm <= stop.step_rtol * inf_norm(&x).max(1.0);
+        if step_norm < stop.step_tol || noise_floor {
             for (xi, di) in x.iter_mut().zip(&step) {
                 *xi += di;
             }
@@ -503,7 +540,6 @@ pub(crate) fn newton(
             converged = true;
             break;
         }
-        let slope: f64 = g.iter().zip(&step).map(|(a, b)| a * b).sum();
         // Rounding slack, so a step that is exact to the last bit is not
         // refused for an objective equal to f within its own ulp.
         let slack = 4.0 * f64::EPSILON * f.abs().max(1.0);

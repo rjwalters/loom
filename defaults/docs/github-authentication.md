@@ -14,6 +14,7 @@ separate question. See [`forge-egress.md`](forge-egress.md)
 - [Required Token Permissions](#required-token-permissions)
 - [Creating a Fine-Grained PAT](#creating-a-fine-grained-pat)
 - [Using the Token](#using-the-token)
+- [Merging workflow-file PRs needs the `workflow` scope (#10539)](#merging-workflow-file-prs-needs-the-workflow-scope-10539)
 - [Verifying Authentication](#verifying-authentication)
 - [Headless and SSH-only daemon operation (#4005)](#headless-and-ssh-only-daemon-operation-4005)
 - [Rate-limit pools: what actually splits the bucket (#9872)](#rate-limit-pools-what-actually-splits-the-bucket-9872)
@@ -125,6 +126,26 @@ all of them share your one personal rate-limit pool (see
 [Rate-limit pools](#rate-limit-pools-what-actually-splits-the-bucket-9872)).
 
 When using Daemon Mode, set the variable before launching the daemon so all spawned terminals inherit it.
+
+## Merging workflow-file PRs needs the `workflow` scope (#10539)
+
+GitHub refuses (403, "refusing to allow an OAuth App to create or update
+workflow ... without `workflow` scope") to merge a PR that changes
+`.github/workflows/*` when the OAuth token in use lacks the classic `workflow`
+scope. Champion's critical-file hold sends exactly these PRs to a human merge,
+so the operator's `gh` login needs it:
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
+
+`merge-pr.sh` checks this up front (`loom-daemon merge-pr workflow-scope`) and
+refuses with that command instead of surfacing the raw 403. It blocks only when
+the PR touches `.github/workflows/` AND the token's `X-OAuth-Scopes` header is
+present and lacks `workflow`. App installation and fine-grained tokens send no
+such header, so they are never blocked here; any lookup error also proceeds.
+Bypass: `LOOM_SKIP_WORKFLOW_SCOPE_CHECK=1`. Refreshing the credential is an
+operator action; automation never runs `gh auth refresh`.
 
 ## Verifying Authentication
 
@@ -273,6 +294,44 @@ exploration) starves the daemon.
   counts calls per identity role: `reader` (a reader App's pool), `writer`,
   `writer-fallback` (a read a reader failed on, re-run on the writer) and
   `unknown` (a call recorded outside the `gh` facade, or by an older binary).
+- Calls by billed bucket (W1): `loom-daemon forge calls --by bucket` (or
+  `--by caller|role|repo`, `--since 90m|3h`) rolls up this host's forge-call
+  sink per `(account, cred_owner, resource, reset)`. Each row shows what this
+  host was charged (`ok` rows × pages; the free `rate_limit` probe is counted
+  as `free`, never charged), its `304`s and its rate-limited calls,
+  and the table is followed by the bucket book's newest `used`/`limit`/reset
+  per App installation. The credential is classified by its `GH_CONFIG_DIR`
+  shape alone (`gh-config` / `gh-config-by-owner/<owner>` = the writer,
+  `gh-config-by-owner/<owner>/<app-id>` = a reader); an env token is booked
+  `env-token` and anything else `ambient`. It reads local files only, so it
+  is safe to run on a rate-limited host.
+- Pages (W5, **off by default**): GitHub charges a `gh api --paginate` read
+  one request per page, but the call is one ledger row flagged "pages
+  unknown" (`pu`); the report's `unattributed` line counts those. Setting
+  `LOOM_GH_PAGE_WALK=1` (exactly `1`; anything else is off) makes the `gh`
+  facade walk a REST `--paginate` read itself: one `gh api --include`
+  execution and one ledger row per page, page 1 asking for `per_page=100`
+  as `gh --paginate` does. GraphQL cursor pagination is never walked and
+  stays `pu`. The walk changes how reads that gate decisions are fetched,
+  so validate it on one host before enabling it more widely: with the
+  switch on, compare each site's `gh` spawn count (the `invoke github`
+  spans per operation) and each bucket's `x-ratelimit-used` delta over the
+  same window against what `forge calls --by caller|bucket` charged. With
+  the walk on, every page's `x-ratelimit-*` reading also feeds the bucket
+  book (`forge_bucket_book::observe`). A walk never passes a partial
+  listing off as complete: a page without a header block, a next link that
+  is not `https://`, or more than 1000 pages is an error, and a deadline
+  mid-walk is a timeout whose output is not a well-formed array.
+- Agent sessions (W5): an agent session's own `gh` calls are rows too. The
+  `gh` front books each passthrough before it execs the real `gh`, as
+  caller `agent.gh.<command>` (never the argv), under the session's
+  credential bucket, with the role `agent-<LOOM_ROLE>` (`agent-session`
+  outside a role) — so `forge calls --by role` lists agent spend beside
+  `reader` / `writer`. Those rows are booked on intent (the exec replaces
+  the process), so they always count as charged, and a paginated agent
+  call is `pu`. A session's `TMPDIR` is private, so the spawner exports the
+  host's sink directory to it as `LOOM_FORGE_CALL_STATS_DIR`; without that
+  the rows would land where no host rollup reads.
 
 ## GitHub App identity (#4430)
 
@@ -303,9 +362,15 @@ hard-failing.
 1. Create a GitHub App (under whichever account/org owns the target repos)
    with **Contents: Read & write**, **Issues: Read & write**, **Pull
    requests: Read & write**, **Metadata: Read** permissions, plus
-   **Actions: Read** (optional: lets the #8248/#8919 freshness guard read the
-   base each required check actually tested, instead of falling back to the
-   timestamp rule). GitHub has no API for changing an App's
+   **Checks: Read** and **Commit statuses: Read** (CI verdicts:
+   `forge wait-checks` reads `commits/{sha}/check-runs` and
+   `commits/{sha}/status`; without Commit statuses the wait degrades to
+   check-runs only, #10633), and **Actions: Read & write** (Read lets the
+   #8248/#8919 freshness guard read the base each required check actually
+   tested, instead of falling back to the timestamp rule; write lets
+   `forge rerun` re-run a cancelled or flaky job in place, #10633). Reader
+   Apps in a read pool need the same read permissions: a reader refused for
+   one falls back to the writer, an extra call per read. GitHub has no API for changing an App's
    permissions: add it in the App's settings, then accept the updated
    permission request on each installation.
 2. Generate a private key for the app (downloads a `.pem` file) and copy it to
@@ -435,10 +500,39 @@ Every host is configured the same way. There is no per-host pinning:
   history is not recognised until the host moves to `forge.identities`.
   With no readers configured at all, reads share the writer, as before.
 - **Read routing**: each repo's reads go to `hash(owner/repo) mod N`, the same
-  reader on every host. A reader that hits a rate limit or an auth/coverage
-  error is withdrawn (until the reported reset, where GitHub gives one) and
-  the read is retried once on the writer. Reads fall back to the writer when
-  no reader is usable.
+  reader on every host. A reader entry may carry `"owners": ["acme"]` to
+  serve only those owners; `N` then counts only the readers serving the
+  repo's owner. A hot repo listed in `forge.readPool.routing.splitRepos` is
+  split per request (one URL, one reader), and a reader whose bucket is
+  projected to run dry spills part or all of its repo's reads to a reader
+  with headroom until its reset (W4-B) — see
+  [daemon-reference](daemon-reference.md#read-pool-routing-forgereadpoolrouting).
+  A failed read is retried once on the writer, and the
+  reader is withdrawn only from what failed (W4-A), because GitHub meters each
+  App installation per owner and per resource:
+  - a **rate limit** withdraws the reader from that owner's refused pool
+    (`core`, `graphql` or `search`) until the pool's reset — the refusal's own
+    `x-ratelimit-reset`, else a free on-demand `gh api rate_limit` probe of
+    that reader (at most one per App and owner per minute), else 5 minutes —
+    clamped to between 30 s and 61 minutes. Its other owners and that owner's
+    other pools keep serving;
+  - a **secondary limit** (the message, or a `403`/`429` carrying
+    `Retry-After`) withdraws that owner's every pool for `Retry-After`, else
+    60 s, never until the hourly reset;
+  - **bad credentials** (`401`) withdraw that owner's every pool for 5 minutes;
+  - a **coverage** error (`403`/`404` the writer can read) withdraws the
+    reader for that one repo for an hour;
+  - only a **mint or key** failure withdraws the reader App-wide.
+
+  Each withdrawal is exported as a `forge.reader.withdrawn` span
+  ([`telemetry-schema.md`](telemetry-schema.md)), and `loom-daemon status`
+  lists the live scoped ones under `reader withdrawals (scoped)`. Reads fall
+  back to the writer when no reader is usable.
+  `LOOM_READ_ROUTING=legacy` restores the earlier behaviour (every rate limit
+  or credential failure withdraws the App everywhere, for 5 minutes or until
+  the reported reset). It is read on every call with no cache, so it needs no
+  new release; the daemon sees it from its next start
+  ([`daemon-reference.md`](daemon-reference.md#reader-withdrawal-kill-switch-loom_read_routing)).
 - **CI telemetry** reads its repos' runs, jobs, logs and artifacts on each
   repo's reader. GitHub's `Link` header spells page 2+ of a repo listing as
   `repositories/<id>/…`, which names no repo, so the poller reads every page

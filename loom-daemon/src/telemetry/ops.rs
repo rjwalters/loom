@@ -40,9 +40,25 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "state",
     "resource",
     "task",
+    // W1: per-bucket rate-limit gauges and `loom.forge.calls`.
+    "owner",
+    "caller",
+    "op",
+    "role",
+    "cred_owner",
+    "target_owner",
+    // #10571: the App installation a bucket was minted under (one per
+    // `(account, owner)`, so it adds no series).
+    "installation",
+    "outcome",
     "heuristic",
     "kind",
     "repo",
+    // #10455: `loom.codex_session.state` (the session container's name).
+    "container",
+    // #10607: `loom.forge.calls` ingested from agent `gh` fronts — the agent
+    // role (closed vocabulary), `-` on the daemon's own rows.
+    "agent",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -110,12 +126,36 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.ratelimit.graphql.used",
     "github.ratelimit.graphql.own",
     "github.ratelimit.graphql.external",
+    // `forge.reader.withdrawn` spans (W4-A): which reader App left which
+    // (owner, resource) bucket, until when, and where that end came from.
+    "forge.reader.app",
+    "forge.reader.owner",
+    "forge.reader.resource",
+    "forge.reader.until",
+    "forge.reader.source",
+    "forge.reader.secondary",
+    // `forge.reader.spill` spans (W4-B): one read-pool spill-latch
+    // transition — repo, resource, home and target reader, mode, release.
+    "forge.spill.owner_repo",
+    "forge.spill.resource",
+    "forge.spill.from",
+    "forge.spill.to",
+    "forge.spill.mode",
+    "forge.spill.until",
+    // `forge.read.shed` spans (W4-C): which deferred read, of which class,
+    // for which (owner, resource) bucket, until when.
+    "forge.read.op",
+    "forge.read.class",
+    "forge.read.app",
+    "forge.read.owner",
+    "forge.read.resource",
+    "forge.read.until",
 ];
 
 /// Longest label value kept, in bytes.
 pub const MAX_LABEL_VALUE_BYTES: usize = 128;
-/// Most labels kept on one point.
-pub const MAX_LABELS_PER_POINT: usize = 8;
+/// Most labels kept on one point (`loom.forge.calls` carries ten, #10607).
+pub const MAX_LABELS_PER_POINT: usize = 10;
 /// Most points kept in one record.
 pub const MAX_POINTS_PER_RECORD: usize = 256;
 
@@ -184,6 +224,12 @@ pub enum MetricName {
     /// value means `loom.queue.issues` is missing their backlog.
     #[serde(rename = "loom.queue.listing_failed_repos")]
     QueueListingFailedRepos,
+    /// Repos whose ready-issue listing came back partial on the last tick
+    /// (#11139: a later page failed, the page cap, a mid-walk change): a
+    /// non-zero value means `loom.queue.issues` holds only part of their
+    /// backlog.
+    #[serde(rename = "loom.queue.listing_incomplete_repos")]
+    QueueListingIncompleteRepos,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -261,6 +307,18 @@ pub enum MetricName {
     /// `observability::ops::ratelimit::Job`).
     #[serde(rename = "github.ratelimit.breaker_skips")]
     GithubRateLimitBreakerSkips,
+    /// Requests the `gh` facade spent since the previous point (W1),
+    /// labelled `caller`, `op`, `role`, `account`, `cred_owner`,
+    /// `target_owner`, `resource` and `outcome`; a paginated call counts its
+    /// pages when known.
+    #[serde(rename = "loom.forge.calls")]
+    ForgeCalls,
+    /// The `gh` facade's named event counters since the previous point
+    /// (`crate::forge_call_stats::counters`), labelled `reason` = the
+    /// counter (`facade.cwd_route.disagree`, `repo_facts.redirected`,
+    /// `repo_facts.resolver_disagree`): signals that are not forge calls.
+    #[serde(rename = "loom.forge.facade.events")]
+    ForgeFacadeEvents,
     // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
     /// PRs with at least one #8508 re-date commit in the trailing window,
     /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
@@ -285,6 +343,24 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- IPC request latency (Issue #10765) -------------------------------
+    /// Slowest IPC request answered in the interval, seconds from the request
+    /// line being read to the response written, labelled `kind` (the
+    /// request's wire `type` tag, or `invalid`).
+    #[serde(rename = "loom.daemon.ipc.latency_max")]
+    DaemonIpcLatencyMax,
+    /// Summed IPC request latency since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.latency")]
+    DaemonIpcLatency,
+    /// IPC requests answered since the previous point, by `kind`.
+    #[serde(rename = "loom.daemon.ipc.requests")]
+    DaemonIpcRequests,
+    /// `DaemonStatus` builds finished since the previous point, by `outcome`
+    /// (`ok` / `panic` / `join_error`). Concurrent status requests share one
+    /// build (Issue #10861), so `requests / status_builds` is the coalescing
+    /// ratio.
+    #[serde(rename = "loom.daemon.ipc.status_builds")]
+    DaemonIpcStatusBuilds,
     // ---- ETA pipeline health (Issue #10391) ------------------------------
     /// Live ETA items on this host, by kind, heuristic and answered/refusal reason.
     #[serde(rename = "loom.eta.health.items")]
@@ -316,6 +392,50 @@ pub enum MetricName {
     /// Rows with non-empty alternates in the last built eta.snapshot.
     #[serde(rename = "loom.eta.health.snapshot_alternates_rows")]
     EtaHealthSnapshotAlternatesRows,
+    /// Rows the last built eta.snapshot dropped at its cap (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_rows_truncated")]
+    EtaHealthSnapshotRowsTruncated,
+    /// Rows the last built eta.snapshot sent without their alternates (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_alternates_truncated")]
+    EtaHealthSnapshotAlternatesTruncated,
+    /// Compact JSON size of the last built eta.snapshot (#10928).
+    #[serde(rename = "loom.eta.health.snapshot_bytes")]
+    EtaHealthSnapshotBytes,
+    /// Pending estimates evicted by the MAX_PENDING cap since process start.
+    #[serde(rename = "loom.eta.health.pending_over_cap")]
+    EtaHealthPendingOverCap,
+    // ---- Codex session containers (Issue #10455) ---------------------------
+    /// Per session-managed Codex account, one point per `state` ∈ `running`,
+    /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
+    /// state, 0 for the rest. Labelled `account` and `container`.
+    #[serde(rename = "loom.codex_session.state")]
+    CodexSessionState,
+    /// Per session-managed Codex account, one point per `kind` ∈ `hold`,
+    /// `drift_removal`: 1 while that on-disk record stands (an operator
+    /// `stop`; the reconciler's fail-closed removal for a denied mount),
+    /// else 0. Labelled `account` and `container` (#10600).
+    #[serde(rename = "loom.codex_session.record")]
+    CodexSessionRecord,
+    /// Per session-managed Codex account with a drift verdict, one point per
+    /// `kind` ∈ `missing`, `extra`, `denied`: how many workspace paths drift
+    /// that way (`extra` excludes `denied`). Labelled `account` and
+    /// `container` (#10600).
+    #[serde(rename = "loom.codex_session.mount_drift")]
+    CodexSessionMountDrift,
+    // ---- Fleet gauges produced by the captain (W12) ----------------------
+    /// Age of the captain's last production of a fleet gauge job, labelled
+    /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
+    /// on a dispatcher the published `as_of` it last read.
+    #[serde(rename = "loom.captain.gauge_age_seconds")]
+    CaptainGaugeAgeSeconds,
+    /// 1 while a dispatcher produces a fleet gauge job locally because the
+    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
+    #[serde(rename = "loom.captain.gauge_fallback")]
+    CaptainGaugeFallback,
+    /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
+    /// (#11094).
+    #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
+    AgentScopePeakMemoryBytes,
 }
 
 impl MetricName {
@@ -339,6 +459,7 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
+            Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -361,11 +482,17 @@ impl MetricName {
             Self::GithubRateLimitUsed => "github.ratelimit.used",
             Self::GithubRateLimitReset => "github.ratelimit.reset",
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
+            Self::ForgeCalls => "loom.forge.calls",
+            Self::ForgeFacadeEvents => "loom.forge.facade.events",
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
+            Self::DaemonIpcLatency => "loom.daemon.ipc.latency",
+            Self::DaemonIpcRequests => "loom.daemon.ipc.requests",
+            Self::DaemonIpcStatusBuilds => "loom.daemon.ipc.status_builds",
             Self::EtaHealthItems => "loom.eta.health.items",
             Self::EtaHealthFitLoaded => "loom.eta.health.fit_loaded",
             Self::EtaHealthFitAgeSeconds => "loom.eta.health.fit_age_seconds",
@@ -378,6 +505,18 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "loom.eta.health.refresh_repos",
             Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
+            Self::EtaHealthSnapshotRowsTruncated => "loom.eta.health.snapshot_rows_truncated",
+            Self::EtaHealthSnapshotAlternatesTruncated => {
+                "loom.eta.health.snapshot_alternates_truncated"
+            }
+            Self::EtaHealthSnapshotBytes => "loom.eta.health.snapshot_bytes",
+            Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
+            Self::CodexSessionState => "loom.codex_session.state",
+            Self::CodexSessionRecord => "loom.codex_session.record",
+            Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
+            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
+            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
+            Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
         }
     }
 
@@ -403,7 +542,12 @@ impl MetricName {
             | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
-            | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
+            | Self::ForgeCalls
+            | Self::ForgeFacadeEvents
+            | Self::DaemonTaskFaults
+            | Self::DaemonIpcLatency
+            | Self::DaemonIpcRequests
+            | Self::DaemonIpcStatusBuilds => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -419,7 +563,7 @@ impl MetricName {
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent => "{sweep}",
             Self::QueueIssues => "{issue}",
-            Self::QueueListingFailedRepos => "{repository}",
+            Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -438,11 +582,16 @@ impl MetricName {
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
+            Self::ForgeCalls => "{request}",
+            Self::ForgeFacadeEvents => "{event}",
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
+            Self::DaemonIpcRequests => "{request}",
+            Self::DaemonIpcStatusBuilds => "{build}",
             Self::EtaHealthItems => "{item}",
             Self::EtaHealthFitLoaded => "1",
             Self::EtaHealthFitAgeSeconds => "s",
@@ -453,6 +602,15 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "{repository}",
             Self::EtaHealthSnapshotRows => "{row}",
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
+            Self::EtaHealthSnapshotRowsTruncated => "{row}",
+            Self::EtaHealthSnapshotAlternatesTruncated => "{row}",
+            Self::EtaHealthSnapshotBytes => "By",
+            Self::EtaHealthPendingOverCap => "{estimate}",
+            Self::CodexSessionState => "1",
+            Self::CodexSessionRecord => "1",
+            Self::CodexSessionMountDrift => "{path}",
+            Self::CaptainGaugeAgeSeconds => "s",
+            Self::CaptainGaugeFallback => "1",
             _ => "By",
         }
     }
@@ -477,6 +635,9 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueListingIncompleteRepos => {
+                "Repos whose ready-issue listing came back partial last tick."
+            }
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
@@ -503,11 +664,17 @@ impl MetricName {
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
-            Self::GithubRateLimitRemaining => "GitHub API requests left, by resource and account.",
-            Self::GithubRateLimitUsed => "GitHub API requests spent this window, by resource.",
+            Self::GithubRateLimitRemaining => "GitHub API requests left, per bucket.",
+            Self::GithubRateLimitUsed => "GitHub API requests spent this window, per bucket.",
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."
+            }
+            Self::ForgeCalls => {
+                "GitHub requests sent by the gh facade, by caller, bucket and outcome."
+            }
+            Self::ForgeFacadeEvents => {
+                "Named gh-facade events that are not forge calls, by reason (counter name)."
             }
             Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
             Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
@@ -516,6 +683,10 @@ impl MetricName {
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
+            Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
+            Self::DaemonIpcRequests => "IPC requests answered, by request kind.",
+            Self::DaemonIpcStatusBuilds => "DaemonStatus builds finished, by outcome.",
             Self::EtaHealthItems => {
                 "Live ETA items on this host, by kind, heuristic and answered/refusal reason."
             }
@@ -531,6 +702,39 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "Rows in the last built eta.snapshot.",
             Self::EtaHealthSnapshotAlternatesRows => {
                 "Rows with non-empty alternates in the last built eta.snapshot."
+            }
+            Self::EtaHealthSnapshotRowsTruncated => {
+                "Rows the last built eta.snapshot dropped at its row cap or byte budget; \
+                 above 0, the dashboard has no fresh ETA for them."
+            }
+            Self::EtaHealthSnapshotAlternatesTruncated => {
+                "Rows the last built eta.snapshot sent without their alternates (byte budget)."
+            }
+            Self::EtaHealthSnapshotBytes => "Compact JSON size of the last built eta.snapshot.",
+            Self::EtaHealthPendingOverCap => {
+                "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
+                 whole series only when distinct series exceed the cap."
+            }
+            Self::CodexSessionState => {
+                "Codex session container state per account: 1 for the current state \
+                 (running, stopped, restarting, missing, stale_mounts), 0 for the others."
+            }
+            Self::CodexSessionRecord => {
+                "1 while an operator hold or a drift-removal record stands for a Codex \
+                 session account, by kind."
+            }
+            Self::CodexSessionMountDrift => {
+                "Workspace paths a Codex session container is missing, mounts extra, or \
+                 mounts though denied, by kind."
+            }
+            Self::CaptainGaugeAgeSeconds => {
+                "Age of the fleet captain's last run of a fleet gauge job, by task."
+            }
+            Self::CaptainGaugeFallback => {
+                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
+            }
+            Self::AgentScopePeakMemoryBytes => {
+                "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
             }
         }
     }

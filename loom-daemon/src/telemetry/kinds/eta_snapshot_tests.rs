@@ -22,6 +22,7 @@ fn row() -> EtaSnapshotRow {
         stage: Some(Stage::ReviewWait),
         no_estimate_reason: None,
         alternates: Vec::new(),
+        stages: BTreeMap::new(),
     }
 }
 
@@ -31,6 +32,7 @@ fn record() -> EtaSnapshotRecord {
         as_of: row.as_of,
         rows: vec![row],
         rows_truncated: 0,
+        alternates_truncated: 0,
         rows_truncated_by_kind: Default::default(),
     }
 }
@@ -133,7 +135,8 @@ fn a_refusals_quantiles_are_absent_and_its_reason_is_present() {
     assert_eq!(back, refusal);
 }
 
-/// An older reader's record (no `rows_truncated`) still decodes, and an
+/// An older daemon's record (no `rows_truncated`, no `alternates_truncated`)
+/// still decodes, and an
 /// untagged row is private — the default every per-repo record shares.
 #[test]
 fn missing_optional_fields_decode_to_the_safe_default() {
@@ -150,6 +153,7 @@ fn missing_optional_fields_decode_to_the_safe_default() {
     }))
     .unwrap();
     assert_eq!(decoded.rows_truncated, 0);
+    assert_eq!(decoded.alternates_truncated, 0, "absent from older daemons (#10928)");
     assert_eq!(decoded.rows[0].visibility, RepoVisibility::Private);
     assert_eq!(decoded.rows[0].kind, Kind::Start);
     assert_eq!(decoded.rows[0].stage, None);
@@ -158,6 +162,7 @@ fn missing_optional_fields_decode_to_the_safe_default() {
 fn alt_estimating() -> EtaSnapshotAlternate {
     EtaSnapshotAlternate {
         heuristic: "land-2026-10-04-twin-otter".to_string(),
+        tier: Some(Tier::Candidate),
         estimate_id: "0a1b2c3d4e5f6071".to_string(),
         as_of: Utc.with_ymd_and_hms(2026, 9, 30, 12, 5, 0).unwrap(),
         p25: Some(100),
@@ -204,12 +209,23 @@ fn an_alternate_carries_exactly_the_agreed_fields() {
             "p25",
             "p50",
             "p75",
-            "p90"
+            "p90",
+            "tier"
         ]
     );
     let refusal = serde_json::to_value(alt_refusing()).unwrap();
-    assert_eq!(keys(&refusal), ["as_of", "estimate_id", "heuristic", "no_estimate_reason"]);
+    assert_eq!(
+        keys(&refusal),
+        [
+            "as_of",
+            "estimate_id",
+            "heuristic",
+            "no_estimate_reason",
+            "tier"
+        ]
+    );
     assert_eq!(refusal["no_estimate_reason"], "no_model");
+    assert_eq!(est["tier"], "candidate");
 }
 
 /// Shape pinned against loom-ui `test/etaState.test.ts`
@@ -237,3 +253,6 @@ fn alternates_round_trip_and_match_the_loom_ui_fixture_shape() {
     let back: EtaSnapshotRow = serde_json::from_value(old).unwrap();
     assert!(back.alternates.is_empty());
 }
+
+#[path = "eta_snapshot_contract_tests.rs"]
+mod contract;

@@ -36,8 +36,14 @@
 
 pub mod checksum;
 pub mod cosign;
+pub mod evidence;
 pub mod fetch;
 pub mod glibc;
 pub mod signature;
+pub mod source;
 
-pub use fetch::{fetch_and_verify, FetchInputs, FetchOutcome, VerifiedArtifact};
+pub use evidence::{fetch_and_verify_with_evidence, SignatureEvidence};
+pub use fetch::{
+    fetch_and_verify, fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,
+    VerifiedArtifact,
+};

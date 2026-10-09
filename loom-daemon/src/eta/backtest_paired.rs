@@ -26,8 +26,10 @@
 //! per-day win rate carries the same deterministic 95% Wilson interval as the
 //! live gate ([`DayWins`]).
 
+use super::super::offline::evaluate::{bootstrap, Estimate, IssueSums, BOOTSTRAP_SEED};
 use super::super::score::{bucket, EstimateSummary, Score};
 use super::super::shadow::{DaySums, DayWins, ANSWER_RATE_SLACK, LATE_SURPRISE_SLACK};
+use super::censored::late_flag;
 use super::ReplayCase;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -191,12 +193,31 @@ pub struct Paired {
     pub a_mean_pinball4_loss_sec: Option<f64>,
     /// `b`'s.
     pub b_mean_pinball4_loss_sec: Option<f64>,
-    /// Cases whose late surprise (`actual > p90`) is decided on both sides.
+    /// Cases both sides answered with a p90, in-flight cases included
+    /// (#9970 Slice 2) — the same population as [`Self::delta_late_rate`].
     pub late_pairs: usize,
-    /// `a`'s late-surprise rate over them.
+    /// `a`'s late-surprise (`actual > p90`) rate over them. An in-flight case
+    /// still inside its p90 counts as not late, so this is a lower bound,
+    /// never an overstatement; with no in-flight cases it is the resolved rate.
     pub a_late_rate: Option<f64>,
     /// `b`'s.
     pub b_late_rate: Option<f64>,
+    /// `b − a` mean three-quantile pinball loss over `common`, with its 95%
+    /// issue-bootstrap interval (#10489): whole issues are resampled, so the
+    /// many stage entries of one issue never inflate `n`. Negative favours
+    /// `b`. `None` when nothing was common.
+    pub delta_pinball_loss_sec: Option<Estimate>,
+    /// `b − a` mean `pinball4_loss_sec` over `loss4_pairs`, likewise.
+    pub delta_pinball4_loss_sec: Option<Estimate>,
+    /// Distinct issues behind [`Self::delta_pinball4_loss_sec`]: the
+    /// promotion gate's independence count (#10525).
+    pub delta4_items: usize,
+    /// `b − a` late-surprise rate over every case both sides answered with a
+    /// p90, **in-flight cases included** (#9970 Slice 2), with its 95%
+    /// issue-bootstrap interval. An in-flight case still inside the p90
+    /// counts as not late, so each rate is a lower bound. Negative favours
+    /// `b`. `None` when no case was decidable.
+    pub delta_late_rate: Option<Estimate>,
     /// The walk-forward daily folds, oldest first.
     pub folds: Vec<Fold>,
     /// `b`'s per-day win rate over `a` on the deciding loss, with its 95%
@@ -205,6 +226,10 @@ pub struct Paired {
     /// `B` as the challenger.
     pub day_wins: DayWins,
 }
+
+/// Issue-bootstrap draws behind [`Paired::delta_pinball_loss_sec`] and
+/// [`Paired::delta_pinball4_loss_sec`].
+pub const PAIRED_BOOTSTRAP_RESAMPLES: usize = 1_000;
 
 /// Pair `a` and `b`, replayed over the same cases in the same order.
 pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
@@ -218,10 +243,19 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     let (mut a_loss, mut b_loss, mut a_loss4, mut b_loss4) = (0.0, 0.0, 0.0, 0.0);
     let (mut a_late, mut b_late) = (0_usize, 0_usize);
     let mut days: BTreeMap<String, (usize, DaySums)> = BTreeMap::new();
+    let (mut delta, mut delta4) = (IssueSums::new(), IssueSums::new());
+    let mut delta_late = IssueSums::new();
+    let add = |sums: &mut IssueSums, key: &str, d: f64| {
+        let e = sums.entry(key.to_string()).or_insert((0.0, 0));
+        e.0 += d;
+        e.1 += 1;
+    };
     for (ra, rb) in a.iter().zip(b) {
+        let issue = format!("{}#{}", ra.case.subject.repo, ra.case.subject.issue);
         let (sa, sb) = (&ra.score, &rb.score);
-        out.a_answered += usize::from(sa.pinball_loss_sec.is_some());
-        out.b_answered += usize::from(sb.pinball_loss_sec.is_some());
+        // Answered, not merely loss-scored: an in-flight case carries no loss.
+        out.a_answered += usize::from(ra.summary.quantiles().is_some());
+        out.b_answered += usize::from(rb.summary.quantiles().is_some());
         let day = days
             .entry(ra.case.as_of.format("%Y-%m-%d").to_string())
             .or_default();
@@ -230,16 +264,22 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
             out.common += 1;
             a_loss += la;
             b_loss += lb;
+            add(&mut delta, &issue, lb - la);
         }
         if let (Some(la), Some(lb)) = (sa.pinball4_loss_sec, sb.pinball4_loss_sec) {
             out.loss4_pairs += 1;
             a_loss4 += la;
             b_loss4 += lb;
+            add(&mut delta4, &issue, lb - la);
             day.1.pairs += 1;
             day.1.current_loss4_sec += la;
             day.1.candidate_loss4_sec += lb;
         }
-        if let (Some(la), Some(lb)) = (sa.above_p90, sb.above_p90) {
+        // One lower-bound late flag feeds both the gate's rates and
+        // `delta_late_rate`: keying on raw `above_p90` would admit only the
+        // in-flight cases already past p90 and overstate lateness (#9970).
+        if let (Some(la), Some(lb)) = (late_flag(ra), late_flag(rb)) {
+            add(&mut delta_late, &issue, f64::from(u8::from(lb)) - f64::from(u8::from(la)));
             out.late_pairs += 1;
             a_late += usize::from(la);
             b_late += usize::from(lb);
@@ -253,6 +293,13 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     out.b_mean_pinball4_loss_sec = mean(b_loss4, out.loss4_pairs);
     out.a_late_rate = share(a_late, out.late_pairs);
     out.b_late_rate = share(b_late, out.late_pairs);
+    let ci = |sums: &IssueSums| {
+        (!sums.is_empty()).then(|| bootstrap(sums, PAIRED_BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED))
+    };
+    out.delta_pinball_loss_sec = ci(&delta);
+    out.delta_pinball4_loss_sec = ci(&delta4);
+    out.delta4_items = delta4.len();
+    out.delta_late_rate = ci(&delta_late);
     let sums: BTreeMap<String, DaySums> = days.iter().map(|(d, (_, s))| (d.clone(), *s)).collect();
     out.day_wins = DayWins::of(&sums);
     out.folds = days

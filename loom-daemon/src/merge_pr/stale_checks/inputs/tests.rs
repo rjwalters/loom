@@ -89,8 +89,8 @@ fn a_coupled_aggregate_check_is_stale_when_both_sides_touch_the_set() {
     // Role Prompt Prefix Ratchet sums a role's WHOLE file set, so two disjoint
     // per-file edits still move the aggregate.
     let s = spec("Role Prompt Prefix Ratchet");
-    let d = set(&["defaults/roles/builder.md"]);
-    let p = set(&["defaults/roles/judge.md"]);
+    let d = set(&["defaults/.claude/commands/loom/builder.md"]);
+    let p = set(&["defaults/.claude/commands/loom/judge.md"]);
     let reason = stale_reason(s, &d, &p).expect("disjoint files still move one SUM");
     assert!(reason.clause.contains("coupled"), "{reason:?}");
 
@@ -579,4 +579,382 @@ fn the_pr_side_narrowing_is_confined_to_clauses_1_and_2() {
     let d = set(&["docs/some-page.md"]);
     let p = set_with_removal(&[], &["scripts/gone.sh"]);
     assert!(stale_reason_scoped(spec("Dangling Link Check"), &d, &p, &none).is_some());
+}
+
+// --- Role Prompt Prefix Ratchet: dedicated read surface (#9748) ---------------
+//
+// `scripts/check-role-prompt-budget.sh` reads exactly: the two shared prefixes,
+// `defaults/roles/*.json` (role discovery), and the command-directory markdown
+// (entry points + transitively linked bare siblings). It never reads
+// `defaults/docs`, installed `.loom/docs`, or the installed mirrors.
+
+const ROLE_PREFIX: &str = "Role Prompt Prefix Ratchet";
+
+/// Both orientations of an ordinary-modification pair: no `StaleReason`.
+fn assert_role_prefix_fresh_both_ways(a: &[&str], b: &[&str]) {
+    let s = spec(ROLE_PREFIX);
+    assert_eq!(stale_reason(s, &set(a), &set(b)), None, "base={a:?} pr={b:?}");
+    assert_eq!(stale_reason(s, &set(b), &set(a)), None, "base={b:?} pr={a:?}");
+}
+
+/// Both orientations of an interacting pair: a `StaleReason` each way.
+fn assert_role_prefix_stale_both_ways(a: &[&str], b: &[&str]) {
+    let s = spec(ROLE_PREFIX);
+    assert!(stale_reason(s, &set(a), &set(b)).is_some(), "base={a:?} pr={b:?}");
+    assert!(stale_reason(s, &set(b), &set(a)).is_some(), "base={b:?} pr={a:?}");
+}
+
+const JUDGE_CMD: &str = "defaults/.claude/commands/loom/judge.md";
+const BUILDER_CMD: &str = "defaults/.claude/commands/loom/builder.md";
+
+#[test]
+fn role_prefix_ignores_documentation_edits_on_both_sides() {
+    // The measured #10423/#10497 tuple.
+    assert_role_prefix_fresh_both_ways(
+        &["defaults/docs/daemon-reference.md"],
+        &["defaults/docs/eta.md"],
+    );
+    // Same doc on both sides is still not this check's input.
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["defaults/docs/eta.md"]);
+}
+
+#[test]
+fn role_prefix_ignores_eta_docs_against_the_judge_prompt() {
+    // PR #10486's recorded refusal: base ETA docs vs the PR's Judge prompt.
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &[JUDGE_CMD]);
+}
+
+#[test]
+fn role_prefix_ignores_docs_against_the_shared_claude_md() {
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["CLAUDE.md"]);
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["defaults/.loom/CLAUDE.md"]);
+}
+
+#[test]
+fn role_prefix_ignores_installed_mirrors_and_unread_prompt_files() {
+    // Installed `.loom/docs`, `.loom/roles`, `.claude/commands` mirrors, the
+    // role markdown, AGENTS.md and the installed CLAUDE.md are not read.
+    for unread in [
+        ".loom/docs/eta.md",
+        ".loom/docs/daemon-reference.md",
+        ".loom/roles/judge.md",
+        ".claude/commands/loom/judge.md",
+        ".loom/CLAUDE.md",
+        "AGENTS.md",
+        "defaults/.loom/AGENTS.md",
+        "defaults/roles/judge.md",
+        "defaults/roles/README.md",
+        "defaults/docs/ci-principles.md",
+    ] {
+        assert_role_prefix_fresh_both_ways(&[unread], &[JUDGE_CMD]);
+        assert_role_prefix_fresh_both_ways(&[unread], &["CLAUDE.md"]);
+        assert_role_prefix_fresh_both_ways(&[".loom/docs/eta.md"], &[unread]);
+    }
+}
+
+#[test]
+fn role_prefix_still_couples_every_declared_read() {
+    // Positive controls: two interacting reads on opposite sides stay stale.
+    assert_role_prefix_stale_both_ways(&[JUDGE_CMD], &[BUILDER_CMD]);
+    assert_role_prefix_stale_both_ways(&["CLAUDE.md"], &[JUDGE_CMD]);
+    assert_role_prefix_stale_both_ways(&["CLAUDE.md"], &["defaults/.loom/CLAUDE.md"]);
+    // A transitively reached sibling (not a role entry point) is a command-dir
+    // markdown file and is covered.
+    assert_role_prefix_stale_both_ways(
+        &["defaults/.claude/commands/loom/probe-protocol.md"],
+        &["CLAUDE.md"],
+    );
+    // Role discovery (`defaults/roles/*.json`) against a command input.
+    assert_role_prefix_stale_both_ways(&["defaults/roles/judge.json"], &[JUDGE_CMD]);
+    assert_role_prefix_stale_both_ways(&["defaults/roles/newrole.json"], &["CLAUDE.md"]);
+}
+
+#[test]
+fn role_prefix_keeps_its_global_inputs() {
+    let s = spec(ROLE_PREFIX);
+    for global in [
+        "scripts/check-role-prompt-budget.sh",
+        "scripts/role-prompt-budget.txt",
+        CI_WORKFLOW,
+    ] {
+        assert!(s.global.contains(&global), "{global} must stay global");
+        // Budget/checker/workflow change against a measured input, both ways.
+        assert_role_prefix_stale_both_ways(&[global], &[JUDGE_CMD]);
+        assert_role_prefix_stale_both_ways(&[global], &["CLAUDE.md"]);
+        assert_role_prefix_stale_both_ways(&[global], &["defaults/roles/judge.json"]);
+    }
+    // A global move against a PR that touches only docs has nothing to re-judge.
+    let d = set(&["scripts/role-prompt-budget.txt"]);
+    assert_eq!(stale_reason(s, &d, &set(&["defaults/docs/eta.md"])), None);
+}
+
+#[test]
+fn role_prefix_keeps_conservative_removal_handling() {
+    let s = spec(ROLE_PREFIX);
+    assert!(s.removal_sensitive);
+    // Deleting/renaming a relevant input while the other side touches a read.
+    let d = set_with_removal(&[], &[JUDGE_CMD]);
+    assert!(stale_reason(s, &d, &set(&["CLAUDE.md"])).is_some());
+    assert!(stale_reason(s, &set(&["CLAUDE.md"]), &d).is_some());
+    let d = set_with_removal(&[], &["defaults/roles/judge.json"]);
+    assert!(stale_reason(s, &d, &set(&[BUILDER_CMD])).is_some());
+    assert!(stale_reason(s, &set(&[BUILDER_CMD]), &d).is_some());
+    // The removal clause does not couple to unread docs on the other side.
+    let d = set_with_removal(&[], &[JUDGE_CMD]);
+    assert_eq!(stale_reason(s, &d, &set(&["defaults/docs/eta.md"])), None);
+}
+
+#[test]
+fn only_role_prefix_got_a_dedicated_surface() {
+    // Neighbouring prompt ratchets keep the broad shared set.
+    let md = spec("Markdown Token Ratchet");
+    assert_eq!(md.scanned, PROMPT_SURFACE);
+    assert!(md.scanned.contains(&"defaults/docs/**"));
+    assert!(!spec(ROLE_PREFIX).coupled.contains(&"defaults/docs/**"));
+    assert!(PROMPT_SURFACE.contains(&"defaults/docs/**"));
+    assert!(PROMPT_SURFACE.contains(&".loom/docs/**"));
+}
+
+/// Source contract (#9748): the declared coupled set must cover everything the
+/// REAL checker's `--files` resolution reads, and nothing it names may fall
+/// outside the declared inputs. A fixture that grows the checker's read
+/// surface (a new shared prefix, a second command dir) fails here.
+#[test]
+fn role_prefix_inputs_cover_the_real_checkers_read_surface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = std::process::Command::new("bash")
+        .arg(root.join("scripts/check-role-prompt-budget.sh"))
+        .arg("--files")
+        .current_dir(&root)
+        .output()
+        .expect("the role-prompt checker must be runnable");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let s = spec(ROLE_PREFIX);
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    for line in stdout.lines() {
+        // Per-file rows are "<tokens>  <path>"; role headers start with "==".
+        let mut cols = line.split_whitespace();
+        if let (Some(n), Some(path), None) = (cols.next(), cols.next(), cols.next()) {
+            if n.chars().all(|c| c.is_ascii_digit()) {
+                read.insert(path.to_string());
+            }
+        }
+    }
+    assert!(
+        read.contains("CLAUDE.md") && read.contains("defaults/.loom/CLAUDE.md"),
+        "{read:?}"
+    );
+    assert!(
+        read.iter().any(|p| p.ends_with("/probe-protocol.md")),
+        "the fixture must include a transitively reached sibling: {read:?}"
+    );
+    for path in &read {
+        assert!(
+            s.coupled.iter().any(|pat| glob_match(pat, path)),
+            "the checker reads `{path}` but the Role Prompt Prefix spec does not couple it"
+        );
+    }
+    // Role discovery: every tracked role JSON is declared, and the checker
+    // reads no documentation tree.
+    assert!(s
+        .coupled
+        .iter()
+        .any(|pat| glob_match(pat, "defaults/roles/judge.json")));
+    assert!(read.iter().all(|p| !p.contains("/docs/")), "{read:?}");
+    // And the declared command-dir surface is not wider than one directory
+    // level of markdown (the checker only follows bare sibling links). Role
+    // discovery is the one recursive entry: see the nested-JSON test below.
+    for pat in s.coupled {
+        assert!(
+            !pat.contains("**") || *pat == ROLE_DISCOVERY_GLOB,
+            "unexpectedly broad coupled glob `{pat}`"
+        );
+    }
+}
+
+/// The checker's role-discovery pathspec, as the spec must declare it.
+const ROLE_DISCOVERY_GLOB: &str = "defaults/roles/**/*.json";
+
+/// The real checker, verbatim — the authority every assertion below is
+/// grounded in, not a copy of the declared list.
+const ROLE_PREFIX_CHECKER: &str =
+    include_str!("../../../../../scripts/check-role-prompt-budget.sh");
+
+/// Role discovery is `git ls-files -- 'defaults/roles/*.json'`. A git
+/// pathspec without `:(glob)` magic matches `*` ACROSS `/`, so a JSON file in a
+/// subdirectory of `defaults/roles/` is a discovered role too (its basename is
+/// the role name). A one-segment `defaults/roles/*.json` glob silently misses
+/// that read — the fail-open narrowing ci-principles rule 9 forbids. This runs
+/// the REAL checker on a hermetic fixture to prove the discovery, then asserts
+/// the spec couples it.
+#[test]
+fn role_prefix_couples_a_nested_role_json_the_checker_discovers() {
+    // Grounding: the discovery line is still the bare (non-:(glob)) pathspec.
+    assert!(
+        ROLE_PREFIX_CHECKER.contains("git ls-files -- 'defaults/roles/*.json'"),
+        "role discovery changed shape — re-derive the Role Prompt Prefix inputs from it"
+    );
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let t = tmp.path();
+    let cmd_dir = t.join("defaults/.claude/commands/loom");
+    for dir in [
+        t.join("scripts"),
+        cmd_dir.clone(),
+        t.join("defaults/roles/extra"),
+        t.join("defaults/.loom"),
+    ] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    std::fs::copy(
+        root.join("scripts/check-role-prompt-budget.sh"),
+        t.join("scripts/check-role-prompt-budget.sh"),
+    )
+    .expect("copy checker");
+    std::fs::write(t.join("CLAUDE.md"), "x").unwrap();
+    std::fs::write(t.join("defaults/.loom/CLAUDE.md"), "x").unwrap();
+    std::fs::write(cmd_dir.join("nested.md"), "nested role prompt\n").unwrap();
+    std::fs::write(t.join("defaults/roles/extra/nested.json"), "{}\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(t)
+            .output()
+            .expect("git must be runnable");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    let out = std::process::Command::new("bash")
+        .arg(t.join("scripts/check-role-prompt-budget.sh"))
+        .arg("--files")
+        .current_dir(t)
+        .output()
+        .expect("the role-prompt checker must be runnable");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|l| l.trim() == "== nested"),
+        "precondition: the real checker discovers a role from a nested JSON:\n{stdout}"
+    );
+
+    let s = spec(ROLE_PREFIX);
+    assert!(s.coupled.contains(&ROLE_DISCOVERY_GLOB), "{:?}", s.coupled);
+    let nested = "defaults/roles/extra/nested.json";
+    assert!(
+        s.coupled.iter().any(|pat| glob_match(pat, nested)),
+        "the checker discovers `{nested}` but the spec does not couple it"
+    );
+    // Behaviour, not just the list: a new nested role on one side against a
+    // shared-prefix or command edit on the other is stale both ways.
+    assert_role_prefix_stale_both_ways(&[nested], &["CLAUDE.md"]);
+    assert_role_prefix_stale_both_ways(&[nested], &["defaults/.claude/commands/loom/nested.md"]);
+    // And the recursion admits only JSON: role markdown symlinks stay unread.
+    assert_role_prefix_fresh_both_ways(&["defaults/roles/extra/notes.md"], &["CLAUDE.md"]);
+}
+
+/// Every repo path the checker names outside its throwaway fixtures, with the
+/// `$ROOT/` prefix stripped. Lines that only run inside the self-test's
+/// sandbox (`cd "$tmp"`, `git -C "$tmp"`) and `echo` lines (operator-facing
+/// prose and the budget file's generated header) are not reads of this repo.
+fn checker_repo_paths(src: &str) -> BTreeSet<String> {
+    const ROOTS: &[&str] = &[
+        "scripts/",
+        "defaults/",
+        "docs/",
+        ".loom/",
+        ".claude/",
+        ".github/",
+        "CLAUDE.md",
+        "AGENTS.md",
+    ];
+    let mut out = BTreeSet::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#')
+            || trimmed.starts_with("echo ")
+            || line.contains("cd \"$tmp\"")
+            || line.contains("git -C \"$tmp\"")
+        {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let Some(root) = ROOTS.iter().find(|r| bytes[i..].starts_with(r.as_bytes())) else {
+                i += 1;
+                continue;
+            };
+            // Byte-wise: the checker's prose carries multi-byte characters.
+            let before = &bytes[..i];
+            let anchored_at_root = before.ends_with(b"$ROOT/") || before.ends_with(b"\"$ROOT\"/");
+            let free_standing = i == 0 || !(is_path_byte(bytes[i - 1]) || bytes[i - 1] == b'$');
+            if !(anchored_at_root || free_standing) {
+                i += root.len();
+                continue;
+            }
+            let mut end = i + root.len();
+            while end < bytes.len() && (is_path_byte(bytes[end]) || bytes[end] == b'*') {
+                end += 1;
+            }
+            out.insert(line[i..end].trim_end_matches('.').to_string());
+            i = end;
+        }
+    }
+    out
+}
+
+/// Source contract (#9748): every repo path the checker names — in its check
+/// path AND in the `--self-test` CI runs first (`ci.yml`'s "Self-test the
+/// ratchet" step) — is a declared input of the spec. The self-test executes
+/// `scripts/check-markdown-token-budget.sh --list` on the REAL tree and fails
+/// the step when the two estimators disagree, so that script is a global input
+/// even though the main check never runs it. A new path literal in the checker
+/// fails here until the spec grows to cover it.
+#[test]
+fn role_prefix_inputs_cover_every_repo_path_the_checker_names() {
+    let s = spec(ROLE_PREFIX);
+    let named = checker_repo_paths(ROLE_PREFIX_CHECKER);
+    for must in [
+        "CLAUDE.md",
+        "defaults/.loom/CLAUDE.md",
+        "defaults/.claude/commands/loom",
+        "defaults/roles/*.json",
+        "scripts/role-prompt-budget.txt",
+        "scripts/check-markdown-token-budget.sh",
+    ] {
+        assert!(named.contains(must), "the scan lost `{must}` — the parser broke: {named:?}");
+    }
+    // A bare directory (`CMD_DIR`) is covered when a markdown entry point in it is.
+    let covered = |path: &str| {
+        let is_dir = !path.rsplit('/').next().unwrap_or(path).contains('.');
+        s.global.iter().chain(s.coupled.iter()).any(|pat| {
+            glob_match(pat, path) || (is_dir && glob_match(pat, &format!("{path}/entry.md")))
+        })
+    };
+    for path in &named {
+        assert!(
+            covered(path),
+            "scripts/check-role-prompt-budget.sh names `{path}` but the Role Prompt Prefix spec \
+             declares no input covering it (inputs.rs)"
+        );
+    }
+    // The self-test's estimator peer is a GLOBAL input: a change to it can flip
+    // the parity assertion against any measured file.
+    assert!(s.global.contains(&"scripts/check-markdown-token-budget.sh"));
+    assert_role_prefix_stale_both_ways(
+        &["scripts/check-markdown-token-budget.sh"],
+        &["defaults/.claude/commands/loom/probe-protocol.md"],
+    );
+    // …and it does not couple unread documentation.
+    assert_eq!(
+        stale_reason(
+            s,
+            &set(&["scripts/check-markdown-token-budget.sh"]),
+            &set(&["defaults/docs/eta.md"])
+        ),
+        None
+    );
 }

@@ -159,6 +159,15 @@
 //! irreversible steps (`git worktree remove --force`, `git branch -D`). The
 //! `git` invocation itself stays in the shell; only the parse moved.
 //!
+//! [`worktree_teardown`] is the step every cleanup guard here exists to
+//! protect: the `git worktree remove --force` itself, with #6372's single
+//! prune-and-retry and its failure diagnosis. It fails toward removing
+//! nothing, like every guard in front of it.
+//!
+//! [`usage`] is `merge-pr.sh --help`'s text — the option list and the
+//! exit-code table role prompts branch on — byte-frozen against the retired
+//! `show_help` heredoc. Pure data; it fails open to a one-line usage.
+//!
 //! [`issue_close_gate`] is [`worktrees`]'s neighbour at the same post-merge
 //! choke point, one level up: whether the issue a worktree/branch belongs to
 //! is actually finished, so the async-close-race guard (#4186) does not
@@ -235,14 +244,23 @@
 //! `branch_has_landed`'s verdict (#7812) are both already answered by the
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
+//!
+//! [`retarget_children`] is not a port — it is #9372's gate in front of the
+//! post-merge remote-branch delete: a bare ref delete makes GitHub CLOSE every
+//! open PR based on that branch (unrecoverably), so each open child is
+//! retargeted onto the parent's base first, and the branch is kept whenever
+//! that cannot be confirmed.
 
+pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
+pub mod ci_result;
 pub mod cleanup_paths;
 pub mod closed_building;
 pub mod consolidate;
 pub mod dirty_guard;
+pub mod discovered_worktree;
 pub mod head_sync;
 pub mod hold_state;
 pub mod issue_close_gate;
@@ -252,16 +270,23 @@ pub mod mergeable_recheck;
 pub mod partial_comment;
 pub mod partial_conflict;
 pub mod partial_reset;
+pub mod poll_wait;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
 pub mod remove_gate;
 pub mod response;
+pub mod retarget_children;
+pub mod retries_used;
+pub mod revalidate_head;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
 pub mod tree_checks;
+pub mod usage;
 pub mod version_policy;
+pub mod workflow_scope;
 pub mod worktree_preserve;
+pub mod worktree_teardown;
 pub mod worktrees;
 pub mod zero_checks;

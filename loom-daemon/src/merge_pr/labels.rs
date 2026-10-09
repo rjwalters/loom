@@ -76,13 +76,11 @@ pub const CLEAN: &str = "LOOM-VERDICT-CLEAN";
 /// Labels that contradict `loom:pr`, in the order they are reported.
 ///
 /// Fixed and ordered so the verdict is a function of the label SET alone.
-pub const BLOCKING: &[&str] = &[
-    "loom:changes-requested",
-    "loom:blocked",
-    "loom:operator",
-    "loom:sequenced",
-    "loom:review-requested",
-];
+/// Derived (#10013): the registry's `contradicts_approval` labels, in their
+/// registry-declared report order.
+pub static BLOCKING: crate::label_registry::LabelSet = crate::label_registry::LabelSet::new(|| {
+    crate::label_registry::embedded_set("contradicts_approval")
+});
 
 /// The blocking label contradicting `loom:pr`, if the set is contradictory.
 ///

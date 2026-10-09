@@ -12,6 +12,7 @@
 //! |------|------|---------|
 //! | [`assert_for`] (`forge egress assert`) | policy + effective `gh` build + effective profiles | none |
 //! | [`doctor_for`] (`forge egress doctor`) | + git, runtime canary, telemetry sections | canary only |
+//! | [`guard::check_process`] (`forge egress guard`) | classify one typed command for the `PreToolUse` hook | none |
 //!
 //! **Exit taxonomy**: `0` aligned, `1` findings, `2` verification incomplete
 //! (both 1 and 2 fail admission). The process exit code is the **routing**
@@ -31,10 +32,12 @@
 
 pub mod checks;
 pub mod gate;
+pub mod guard;
 pub mod policy;
 pub mod probe;
 pub mod publication;
 pub mod report;
+pub mod worker_env;
 
 use std::path::Path;
 

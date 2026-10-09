@@ -1,6 +1,10 @@
 //! `repos.yml` → the desired workspace set, and its diff against the daemon's
 //! workspace registry.
 //!
+//! When the store has the compiled `fleet.json` (#10705), the roster is that
+//! document's top-level `root` and `repos`, with the same contract and the same
+//! validation ([`from_snapshot`]); `repos.yml` is read only when it is absent.
+//!
 //! # Contract
 //!
 //! ```yaml
@@ -37,6 +41,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::fetch::Snapshot;
 use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
 /// One `repos[]` record.
@@ -99,15 +104,52 @@ pub fn parse(text: &str, home: &Path) -> Result<Roster> {
     let top = doc
         .as_object()
         .ok_or_else(|| anyhow!("repos.yml: top level must be a mapping"))?;
+    from_map(top, home, super::ROSTER_PATH)
+}
+
+/// The roster from a store snapshot: `fleet.json`'s top level when the store
+/// has it, else `repos.yml`. `Ok(None)` when it has neither. A present but
+/// invalid `fleet.json` is an error and never falls back to `repos.yml`.
+pub fn from_snapshot(snapshot: &Snapshot, home: &Path) -> Result<Option<Roster>> {
+    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
+        return from_map(doc.roster(), home, super::FLEET_JSON_PATH).map(Some);
+    }
+    let Some(text) = snapshot.text(super::ROSTER_PATH)? else {
+        return Ok(None);
+    };
+    parse(&text, home).map(Some)
+}
+
+/// The roster from a compiled `fleet.json`'s top-level `root` and `repos`,
+/// already parsed (the ETA roster history caches just that section, #10905).
+pub fn from_compiled(top: &serde_json::Map<String, Value>, home: &Path) -> Result<Roster> {
+    from_map(top, home, super::FLEET_JSON_PATH)
+}
+
+/// The message for a snapshot with no roster at all ([`from_snapshot`]
+/// returned `Ok(None)`).
+#[must_use]
+pub fn missing_message(snapshot: &Snapshot) -> String {
+    format!(
+        "the store has neither {} nor {} (commit {})",
+        super::FLEET_JSON_PATH,
+        super::ROSTER_PATH,
+        snapshot.short_commit()
+    )
+}
+
+/// Validate a roster held as a parsed mapping (`repos.yml`'s top level, or
+/// `fleet.json`'s). `source` names the file in messages.
+fn from_map(top: &serde_json::Map<String, Value>, home: &Path, source: &str) -> Result<Roster> {
     let root = top
         .get("root")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("repos.yml: `root` must be a string"))?;
-    let root = expand_root(root, home)?;
+        .ok_or_else(|| anyhow!("{source}: `root` must be a string"))?;
+    let root = expand_root(root, home, source)?;
     let repos = top
         .get("repos")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("repos.yml: `repos` must be a list"))?;
+        .ok_or_else(|| anyhow!("{source}: `repos` must be a list"))?;
 
     let mut records = Vec::with_capacity(repos.len());
     let mut errors = Vec::new();
@@ -135,12 +177,12 @@ pub fn parse(text: &str, home: &Path) -> Result<Roster> {
         }
     }
     if !errors.is_empty() {
-        bail!("repos.yml is not a valid roster:\n  {}", errors.join("\n  "));
+        bail!("{source} is not a valid roster:\n  {}", errors.join("\n  "));
     }
     Ok(Roster { root, records })
 }
 
-fn expand_root(root: &str, home: &Path) -> Result<PathBuf> {
+fn expand_root(root: &str, home: &Path, source: &str) -> Result<PathBuf> {
     let p = if root == "~" {
         home.to_path_buf()
     } else if let Some(rest) = root.strip_prefix("~/") {
@@ -149,7 +191,7 @@ fn expand_root(root: &str, home: &Path) -> Result<PathBuf> {
         PathBuf::from(root)
     };
     if !p.is_absolute() {
-        bail!("repos.yml: `root` must be absolute or start with `~/` (got `{root}`)");
+        bail!("{source}: `root` must be absolute or start with `~/` (got `{root}`)");
     }
     Ok(p)
 }

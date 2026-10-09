@@ -260,6 +260,8 @@ fn pre_timeline_snapshot() -> FleetSnapshot {
     let mut s = snapshot(REPO, &prs, cutoff() + Duration::hours(1));
     assert!(!s.flag_changes.is_empty(), "a fresh snapshot has a timeline");
     s.flag_changes.clear();
+    // A pre-#10245 file has no #10500 merges either.
+    s.merges.clear();
     s.merge(&[], s.as_of);
     s
 }
@@ -270,6 +272,7 @@ fn a_snapshot_without_flag_changes_keeps_its_id_and_round_trips_byte_identically
     assert_eq!(old.snapshot_id, id_without_flags(&old));
     let text = serde_json::to_string_pretty(&old).unwrap();
     assert!(!text.contains("flag_changes"), "{text}");
+    assert!(!text.contains("\"merges\""), "{text}");
     let parsed: FleetSnapshot = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed, old);
     assert_eq!(serde_json::to_string_pretty(&parsed).unwrap(), text);

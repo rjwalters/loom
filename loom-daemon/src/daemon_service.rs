@@ -107,11 +107,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         return match command {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
-            Commands::Status {
-                json,
-                pipeline,
-                timeout_secs,
-            } => handle_status_command(json, pipeline, timeout_secs).await,
+            Commands::Status(args) => handle_status_command(args).await,
             // `health` (#4761) needs the async runtime for the same reason
             // `status` does — one IPC round-trip — plus a bounded forge fan-out
             // for the queue-depth/throughput sections.
@@ -411,6 +407,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
 
+    // #10832: a live pause manifest must hold restart recovery off its paused
+    // agents BEFORE the first registry is reconstructed (design §7 H5).
+    let h5 = auto_update::pause_resume::arm_at_startup();
     let mut sweep = SweepRegistry::with_event_bus(sweep_config, event_bus.clone());
     match sweep.reconstruct() {
         Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
@@ -473,11 +472,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // exactly the pre-#4430 path, with zero extra subprocess overhead.
         None => credential_preflight::GithubAppPreflight {
             report: credential_preflight::run(&credential_preflight_probe),
-            minted_gh_token: None,
+            minted: None,
         },
     };
     // #4458: deliver the minted installation token via a daemon-owned
-    // `GH_CONFIG_DIR` (`credential_preflight::publish_github_app_token`)
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_minted`, #10571 sidecar)
     // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
     // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
     // call sites — see the issue body's census) re-reads
@@ -508,8 +507,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // publication branch below never runs there.
     let mut github_app_gh_config_dir_active =
         github_credential_forbidden && egress::activate_tokenless_profile(&github_app_config_dir);
-    if let Some(token) = &github_app_preflight.minted_gh_token {
-        match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
+    if let Some(minted) = &github_app_preflight.minted {
+        match credential_preflight::publish_minted(&github_app_config_dir, minted) {
             Ok(()) => {
                 std::env::remove_var("GH_TOKEN");
                 std::env::remove_var("GITHUB_TOKEN");
@@ -552,7 +551,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // never called per owner before now.
     //
     // Only runs when the App mechanism is actually the active credential this
-    // run (`minted_gh_token.is_some()`) — an ambient `gh` auth / PAT host is
+    // run (`minted.is_some()`) — an ambient `gh` auth / PAT host is
     // not subject to the single-installation limit. A single-owner fleet
     // yields no plans, registers nothing, and is byte-identical to pre-#5401.
     // Each established plan is registered into
@@ -565,7 +564,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
-        github_app_preflight.minted_gh_token.is_some(),
+        github_app_preflight.minted.is_some(),
     ) {
         let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
         let cross_owner_registry =
@@ -588,16 +587,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     &sweep_workspace,
                     &plan.owner,
                 );
-                match credential_preflight::GithubAppMinter::mint(
-                    &minter,
-                    &plan.representative_owner_repo,
-                ) {
-                    credential_preflight::GithubAppOutcome::Minted {
-                        token,
-                        installation_id,
-                        app_id,
+                let repo = &plan.representative_owner_repo;
+                match credential_preflight::GithubAppMinter::mint(&minter, repo) {
+                    ref outcome @ credential_preflight::GithubAppOutcome::Minted {
+                        ref installation_id,
+                        ref app_id,
                         ..
-                    } => match credential_preflight::publish_github_app_token(&owner_dir, &token) {
+                    } => match credential_preflight::publish_outcome(&owner_dir, outcome, repo) {
                         Ok(()) => {
                             for root in &plan.roots {
                                 credential_preflight::register_root_gh_config_dir(root, &owner_dir);
@@ -652,7 +648,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         );
                     }
                     credential_preflight::GithubAppOutcome::NotConfigured => {
-                        // Unreachable in practice: `minted_gh_token.is_some()`
+                        // Unreachable in practice: `minted.is_some()`
                         // above already proved the app is configured. Treat as
                         // a no-op rather than a failure.
                     }
@@ -712,26 +708,28 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let cwd = sweep_workspace.clone();
         let owner_repo = owner_repo.clone();
         let config_dir = github_app_config_dir.clone();
-        let mut current_token = github_app_preflight.minted_gh_token.clone();
+        let mut current_token = github_app_preflight.minted.map(|m| m.token);
         let mut config_dir_active = github_app_gh_config_dir_active;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
                 let script_path = script_path.clone();
                 let cwd = cwd.clone();
-                let owner_repo = owner_repo.clone();
+                let repo = owner_repo.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
-                    credential_preflight::GithubAppMinter::mint(&minter, &owner_repo)
+                    credential_preflight::GithubAppMinter::mint(&minter, &repo)
                 })
                 .await;
                 match outcome {
-                    Ok(credential_preflight::GithubAppOutcome::Minted {
-                        token,
-                        installation_id,
-                        app_id,
-                        ..
-                    }) => {
+                    Ok(
+                        ref minted @ credential_preflight::GithubAppOutcome::Minted {
+                            ref token,
+                            ref installation_id,
+                            ref app_id,
+                            ..
+                        },
+                    ) => {
                         // #5630: a successful mint (fresh or cache hit) ends this
                         // source's credential-failure streak, so the main-health
                         // gate goes back to trusting its forge answers on the very
@@ -745,7 +743,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         // `std::env::set_var` anywhere in this arm once
                         // `config_dir_active` is already true (the common
                         // case: activation happened at startup above).
-                        if gh_token_needs_update(current_token.as_deref(), &token) {
+                        if gh_token_needs_update(current_token.as_deref(), token) {
                             // Rare edge case: the app becomes configured
                             // *after* startup (e.g. the shell helper's own
                             // config appears mid-run) without the daemon
@@ -763,12 +761,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                                 std::env::set_var("GH_CONFIG_DIR", &config_dir);
                                 config_dir_active = true;
                             }
-                            match credential_preflight::publish_github_app_token(
+                            match credential_preflight::publish_outcome(
                                 &config_dir,
-                                &token,
+                                minted,
+                                &owner_repo,
                             ) {
                                 Ok(()) => {
-                                    current_token = Some(token);
+                                    current_token = Some(token.clone());
                                     log::debug!(
                                         "credential_preflight: github-app refresh tick rotated \
                                          GH_TOKEN (app {app_id} installation {installation_id}) \
@@ -878,10 +877,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     // failing owner's streak.
                     let source = credential_preflight::credential_source_for_owner(owner_repo);
                     match outcome {
-                        Ok(credential_preflight::GithubAppOutcome::Minted { token, .. }) => {
-                            if let Err(e) =
-                                credential_preflight::publish_github_app_token(config_dir, &token)
-                            {
+                        Ok(ref minted @ credential_preflight::GithubAppOutcome::Minted { .. }) => {
+                            if let Err(e) = credential_preflight::publish_outcome(
+                                config_dir, minted, owner_repo,
+                            ) {
                                 credential_preflight::record_forge_credential_failure(
                                     &source,
                                     &format!("could not publish the minted token: {e}"),
@@ -1332,7 +1331,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // that repo's dispatch — never the siblings'. With an empty registry (the
     // common single-workspace case) exactly one root is keyed, reducing to the
     // pre-#3930 single-flag behavior byte-for-byte.
-    let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
+    // #10869: made through `checkout_ff`, which registers them so the timer's
+    // checkout fast-forward asks whether a gate run is building in a checkout
+    // before it moves it.
+    let workspace_health_states = loom_daemon::fleet_sync::checkout_ff::health_states();
 
     // Shared drain-and-restart state (Issue #4090). Constructed here — before the
     // epic supervisor, work-finder, and role runner — so its flag can be threaded
@@ -1365,6 +1367,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `0` rather than "unknown" — and so it is registered exactly once, at the
     // single construction site, rather than from whichever loop happens to spawn.
     role_runner::register_global_in_progress(role_in_progress.clone());
+    // #10832: hold dispatch and run H5 (health probation, then resume the
+    // paused agents) before any dispatch producer below is spawned.
+    h5.spawn(&drain_state, &workspace_pool, &sweep_workspace, &event_bus, &role_in_progress);
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
@@ -1483,9 +1488,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // sole sampler — a daemon with no work-finder never trips it (and its
         // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
         let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
-        host_breaker::register_global(std::sync::Arc::new(host_breaker::SharedHostBreaker::new(
-            host_breaker_config,
-        )));
+        host_breaker::register_global(std::sync::Arc::new(
+            host_breaker::SharedHostBreaker::new(host_breaker_config)
+                .with_disk_guard(&sweep_workspace),
+        ));
         log::info!(
             "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
             host_breaker_config.enabled,
@@ -1668,10 +1674,22 @@ pub(crate) async fn run_daemon() -> Result<()> {
             None
         };
 
-    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
-    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
-    // Feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns` is on.
-    let _ci_poller = loom_daemon::ci_telemetry::spawn_task_on(sweep_workspace.clone(), &event_bus);
+    // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
+    // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
+    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
+    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
+    // and the shard-owned `loom:blocked` release task (#10763).
+    // The release task serves only through a loop that actually started (#10763
+    // P2), so the role-runner decision is resolved here, once, and reused below.
+    let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
+    let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
+    let loops = (_work_finder_handle.is_some(), role_runner_on).into(); // (work finder, role runner)
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus, loops);
+
+    // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
+    let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
 
     // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
     // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
@@ -1748,10 +1766,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // or dispatch side effect.
     let _stash_summary_refresh_handle = {
         let interval = quarantine_stash_status::DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL;
-        log::info!(
-            "quarantine_stash_status: enabled (multi-workspace, interval={}s)",
-            interval.as_secs()
-        );
+        // Duration's Debug renders whole seconds as `<n>s`, same text as before.
+        log::info!("quarantine_stash_status: enabled (multi-workspace, interval={interval:?})");
         quarantine_stash_status::spawn_multi_stash_summary_refresh_task(
             sweep_workspace.clone(),
             interval,
@@ -1811,6 +1827,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
     autonomy_marker::log_heal_outcome(autonomy_marker::heal_on_startup(
         heartbeat_interval.as_secs(),
     ));
+
+    // Startup supervision drop-in (#11111): a floor roll relaunches onto a new
+    // binary without re-rendering the unit, so write #11058's supervision
+    // settings as a drop-in and `daemon-reload`; systemd applies them at this
+    // daemon's next exit. systemd on Linux only; failures log at WARN. On its
+    // own thread so a wedged user manager cannot delay startup.
+    if let Err(e) = std::thread::Builder::new()
+        .name("supervision-dropin".to_string())
+        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup)
+    {
+        log::warn!(
+            "supervision drop-in: could not spawn its startup thread ({e}); the unit keeps \
+             its current supervision settings until the next startup"
+        );
+    }
 
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of
@@ -1883,8 +1914,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `roleRunner.roles` now only affects the home workspace's own
     // participation (via the existing per-root check), never any other
     // repo's.
-    let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
-    let _role_runner_handles = if role_runner::resolve_enabled(&role_runner_config) {
+    let _role_runner_handles = if role_runner_on {
         // Purely informational (#5654): the home workspace's own resolved
         // list no longer gates which loops are spawned below, but logging it
         // alongside the full `DEFAULT_ROLES` set makes a divergence between
@@ -2007,12 +2037,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
         None
     };
 
-    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Opt-in via
-    // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
+    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Without a fleet
+    // store, opt-in via `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
     // source checkout advances past the commit this binary was built from, the
     // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
-    // and rolls onto the fresh binary via #4090's drain path — in-flight sweeps
-    // finish first and survive in the registry. Gated on a clean tree, a settle
+    // and rolls onto the fresh binary via pause-and-roll (#10831) — every
+    // in-flight agent is paused at a safe point or requeued, then the daemon
+    // restarts. Gated on a clean tree, a settle
     // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
     // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
     //
@@ -2020,31 +2051,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // whole daemon (its subject is the daemon process itself — one binary, one
     // source checkout, one restart), NOT a `spawn_multi_*` per-workspace fan-out.
     // Config is read from the daemon's default workspace, like the sibling readers.
-    // Default OFF (side effects on the running process). Cloned handles here because
-    // `event_bus` is moved into `IpcServer::new` below.
-    let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
-    let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
-        let tuning = auto_update::TickTuning::resolve(&auto_update_config);
-        log::info!("auto_update: enabled ({})", tuning.describe());
-        let probe = auto_update::ScriptAutoUpdateProbe::new(
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-        );
-        let trigger = auto_update::IpcDrainTrigger::new(
-            drain_state.clone(),
-            workspace_pool.clone(),
-            sweep_workspace.clone(),
-            event_bus.clone(),
-            tokio::runtime::Handle::current(),
-        );
-        let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
-        Some(auto_update::spawn_auto_update_task(probe, trigger, status, tuning))
-    } else {
-        log::debug!(
-            "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
-        );
-        None
-    };
+    // #10954: spawned on every fleet host (fleet_sync::start ran above), and on a
+    // host with no fleet store only when autoUpdate is enabled — see `loop_mode`.
+    let _auto_update_handle =
+        auto_update::loop_mode::start(&sweep_workspace, &workspace_pool, &drain_state, &event_bus);
 
     // Independent, opt-in idle exit (#4467). The daemon only exits; the host
     // guard retains sole authority to power off.

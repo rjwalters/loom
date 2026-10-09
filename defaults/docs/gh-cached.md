@@ -225,21 +225,66 @@ prepends a private shim dir; `loom-daemon gh-shim path` prints it). Plain
 current and costs no primary quota, so it is **never stale** and the
 gating carve-outs above stay correct. There is deliberately no identical-call
 TTL in the front; the TTL stays opt-in via `gh-cached`. Everything else
-(mutations, `api`, `run`, `pr diff|checks`, `repo view`, unknown or
+(mutations, `api`, `run`, `pr diff`, `repo view`, unknown or
 ambiguous argv, a TTY on stdout, hosts other than GitHub) execs the next `gh`
 with argv, streams and exit status untouched. The next `gh` is `LOOM_GH_BIN`,
 else the next `gh` on `PATH` (the managed launcher, #9987, when installed), so
 its policy and telemetry are composed with, not replaced. Any cache error
 degrades to that real `gh`.
 
+- **`gh pr checks <N>` (#10516)**: non-TTY text and `--json` over
+  `name,state,bucket,link,startedAt,completedAt,description` are rebuilt from
+  the ETag'd REST reads `forge wait-checks` makes (PR, check-runs, combined
+  status), with `gh`'s exit codes (`1` fail, `8` pending; `--json` exits `0`)
+  and its zero-checks stderr line. Exactness is the contract, so the front
+  only answers when the output is provable. `gh` orders rows by GraphQL order,
+  which REST does not expose, through Go's unstable `sort.Slice` and a
+  comparator that is not a strict weak order. The front therefore ports Go's
+  sort and tries every order of rows sharing a `startedAt`. Text is served
+  only when all of those orders print the same thing, and JSON only when
+  tied rows project identically. Calls pass through on a duplicated check
+  name, more than 8! orders, `--watch`, `--required`, `--jq`/`--template`,
+  `event`/`workflow`, a branch/URL selector, `GH_FORCE_TTY`, `CLICOLOR_FORCE`
+  or `GH_DEBUG`/`DEBUG`. Golden fixtures from `gh` 2.100.0 pin the output
+  (`loom-daemon/src/agent_gh/fixtures/pr_checks/`). `gh pr view --json
+  statusCheckRollup` still **passes through**: `gh` prints GraphQL's
+  `contexts` order, which no REST read exposes (#10629).
 - **Escape hatch**: `LOOM_GH_NO_CACHE=1` (also `GH_CACHE_DISABLE=1`) forces a
   real call. Env-only: there is no `--fresh` flag, since plain `gh` rejects it (#3547).
-- **Opt out of the shim**: `LOOM_GH_SHIM=0` at worker spawn.
+- **Opt out of the shim**: `LOOM_GH_SHIM=0` at worker spawn or session start.
+- **Interactive sessions (#10516)**: a `SessionStart` hook
+  (`defaults/hooks/gh-front-env.sh`, wired user-scope by
+  `scripts/install/provision-hooks.sh` with matcher `""`) runs
+  `loom-daemon gh-shim session-env`. That appends one guarded `PATH` line to
+  `$CLAUDE_ENV_FILE`, in the worker's order (`agent_gh::session_path`):
+  - the managed launcher first when a policy names one;
+  - then the front;
+  - then the session's existing `PATH`, so the 2am telemetry shim stays the front's next `gh`.
+
+  Claude Code sources that file before every Bash call, and Task subagents
+  inherit it. This was verified on Claude Code 2.1.291. A `SubagentStart` hook
+  gets no `CLAUDE_ENV_FILE`, so it is not used.
+
+  The hook only runs in a Loom workspace on GitHub. It is fail-open and prints
+  nothing on stdout. It never appends twice, and the line skips the prepend
+  when `PATH` already starts with the prefix, as it does for a dispatched
+  worker.
+- **Under a policy**: the launcher execs its pinned upstream `gh`, so the
+  front is bypassed. Workers behave the same way.
+- **Self-check**: inside a session, `loom-daemon gh-shim status` prints
+  `front|launcher|bypassed: <gh>` and exits 1 only for `bypassed`. The
+  `gh-front-wired` install self-check invariant flags a host whose user-scope
+  hooks predate the entry; `loom update` re-provisions it.
 - **Reader App**: reads route to a configured reader App through
   `forge_etag_store::fetch_conditional` (#9537); with none configured nothing
   changes. Passthrough reads are tracked as follow-up work.
-- **Telemetry**: served reads are recorded under caller `agent_gh_front` in
-  `forge_call_stats`; set `GH_CACHE_OUTCOME_LOG` for `x-loom-cache`
+- **Telemetry**: served reads (caller `agent_gh_front`) and passthroughs (one
+  W5 row, `agent.gh.<cmd>`) land in `forge_call_stats` with `ag`=role,
+  `vi`=served|passthrough (#10607). Every spawn path exports the host sink as
+  `LOOM_FORGE_CALL_STATS_DIR`; containers get only its `contained/` subdirectory,
+  mounted rw at that path, and only if it is a sink (rows drop silently unless
+  the container uid owns it). The daemon ingests these rows into
+  `loom.forge.calls{agent=<role>}` on its export tick, as untrusted input. `GH_CACHE_OUTCOME_LOG` adds `x-loom-cache`
   `revalidated`/`bypass` records. Measure the 304 share, not process counts.
 
 ## Per-skill call-site inventory

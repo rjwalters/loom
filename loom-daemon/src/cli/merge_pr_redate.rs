@@ -18,6 +18,8 @@
 //! | inside the backoff window; nothing written | `LOOM-REDATE-DEFERRED …` | 0 |
 //! | could not read/write the forge state needed | the reason | 1 |
 //! | branch already moved past `--expected-head-sha` | the reason | 3 |
+//! | budget spent; base merged via update-branch (#10388) | `LOOM-REDATE-SYNCED …` | 0 |
+//! | budget spent; base sync conflicts, `loom:merge-conflict` applied | `LOOM-REDATE-SYNC-CONFLICT …` | 0 |
 //! | bound reached; escalated to `loom:operator` | `LOOM-REDATE-ESCALATED …` | 4 |
 //!
 //! # Why the in-place re-run is gone (#8919)
@@ -128,6 +130,7 @@ the checks without re-testing the current base; only a new push does that. Going
         }
         match remedy(&self.repo, &self.branch, &self.expected_head_sha, &self.pr) {
             RemedyOutcome::Pushed { new_sha } => {
+                record_chain_lock(&self.repo, &self.pr, &new_sha);
                 println!("LOOM-REDATE-PUSHED sha={new_sha}");
                 std::process::exit(0);
             }
@@ -171,6 +174,32 @@ commit against the current base, re-runs every required check, and starts a fres
                 );
                 std::process::exit(4);
             }
+            RemedyOutcome::SyncedBase { head, n, max } => {
+                println!(
+                    "LOOM-REDATE-SYNCED pr={} head={head} n={n} max={max}\n\
+PR #{}'s re-date budget is exhausted (#9590); merged the base branch into it via \
+update-branch (sync {n} of {max}, #10388) instead of holding it. The new head starts a fresh \
+re-date chain. Not merged this pass; retry on a later pass.",
+                    self.pr, self.pr
+                );
+                std::process::exit(0);
+            }
+            RemedyOutcome::SyncConflict { notice_posted } => {
+                println!(
+                    "LOOM-REDATE-SYNC-CONFLICT pr={} head={} label=loom:merge-conflict notice={}\n\
+PR #{}'s re-date budget is exhausted and merging the base branch conflicts (#10388): applied \
+loom:merge-conflict so Doctor rebases it. No operator hold. Not merged this pass.",
+                    self.pr,
+                    self.expected_head_sha,
+                    if notice_posted {
+                        "posted"
+                    } else {
+                        "already-present"
+                    },
+                    self.pr
+                );
+                std::process::exit(0);
+            }
             RemedyOutcome::HeadMoved { current } => {
                 println!(
                     "PR #{}'s branch '{}' already moved to {current} — expected {} \
@@ -188,6 +217,26 @@ PR fresh next pass.",
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// #10167: a fresh-verdict re-date just landed, so take the chain-head merge
+/// lock — one trusted comment holding every other merge onto this PR's base
+/// until it lands or a required check fails (bounded by the cap, #10448). A separate comment
+/// from the #9590 attempt record, so the budget is untouched. Best-effort: a
+/// failure leaves today's behaviour (no lock) and is named on stderr; the
+/// re-date itself already succeeded and is still reported as such.
+fn record_chain_lock(repo: &str, pr: &str, new_sha: &str) {
+    use loom_daemon::merge_pr::chain_lock;
+    let root = loom_daemon::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let gh = loom_daemon::gh_invocation::gh_bin();
+    let cap = chain_lock::cap_for_root(&root);
+    if let Err(why) =
+        chain_lock::record_lock(&gh, &root, repo, pr, new_sha, cap, chrono::Utc::now())
+    {
+        eprintln!("Note: PR #{pr} was re-dated but took no chain-head merge lock (#10167): {why}");
     }
 }
 

@@ -26,7 +26,11 @@ use serde::{Deserialize, Serialize};
 /// (`defaults/observability/collector/config.yaml`, contract-tested).
 pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.story",
+    // #11125: cross-host outcome fact id (`pr.resolved`, `eta.stage_outcome`).
+    "loom.fact_id",
     "loom.eta.estimate_id",
+    // `eta.estimate` / `eta.outcome` (#10498): the authority host id.
+    "loom.eta.authority",
     "loom.eta.kind",
     "loom.eta.heuristic",
     "loom.eta.primary",
@@ -43,6 +47,14 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.samples_min",
     "loom.eta.horizon_bucket",
     "loom.eta.no_estimate_reason",
+    // #10903: why this host's planner did not dispatch a placed ready row.
+    "loom.eta.not_here",
+    // #10930: the fit and the queue / capacity inputs an estimate used.
+    "loom.eta.fit_id",
+    "loom.eta.queue_rank",
+    "loom.eta.queue_ready",
+    "loom.eta.queue_running",
+    "loom.eta.max_concurrent",
     "loom.eta.outcome",
     "loom.eta.outcome_source",
     "loom.eta.lead_sec",
@@ -103,6 +115,60 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.fit.coeff_bytes",
     "loom.eta.fit.coeff_sha256",
     "loom.eta.fit.duration_ms",
+    // `pr.resolved` (#10519).
+    "loom.eta.pr.state",
+    "loom.eta.pr.resolved_at",
+    "loom.eta.pr.observed_at",
+    "loom.eta.pr.resolution_sec",
+    // `eta.outcome` stage attribution (#10929).
+    "loom.eta.attribution.unattributed_sec",
+    "loom.eta.attribution.dominant_stage",
+    // `eta.stage_outcome` (#10929).
+    "loom.eta.stage_outcome.stage",
+    "loom.eta.stage_outcome.exit",
+    "loom.eta.stage_outcome.next_stage",
+    "loom.eta.stage_outcome.entered_at",
+    "loom.eta.stage_outcome.left_at",
+    "loom.eta.stage_outcome.dwell_sec",
+    "loom.eta.stage_outcome.open_estimates",
+    // `eta.backtest.fold` (#10492).
+    "loom.eta.backtest.fold.fold_id",
+    "loom.eta.backtest.fold.heuristic",
+    "loom.eta.backtest.fold.kind",
+    "loom.eta.backtest.fold.day",
+    "loom.eta.backtest.fold.compared_to",
+    "loom.eta.backtest.fold.is_current",
+    "loom.eta.backtest.fold.n_cases",
+    "loom.eta.backtest.fold.n_answered",
+    "loom.eta.backtest.fold.answer_rate",
+    "loom.eta.backtest.fold.pinball4_loss_sec",
+    "loom.eta.backtest.fold.cov_25_75",
+    "loom.eta.backtest.fold.late_surprise",
+    "loom.eta.backtest.fold.paired_pairs",
+    "loom.eta.backtest.fold.delta_pinball4_loss_sec",
+    "loom.eta.backtest.fold.delta_answer_rate",
+    "loom.eta.backtest.fold.delta_late_surprise",
+    "loom.eta.backtest.fold.win",
+    "loom.eta.backtest.fold.fit_id",
+    // `eta.backtest.summary` (#10492).
+    "loom.eta.backtest.summary.summary_id",
+    "loom.eta.backtest.summary.heuristic",
+    "loom.eta.backtest.summary.kind",
+    "loom.eta.backtest.summary.compared_to",
+    "loom.eta.backtest.summary.as_of_day",
+    "loom.eta.backtest.summary.cases",
+    "loom.eta.backtest.summary.days",
+    "loom.eta.backtest.summary.wins",
+    "loom.eta.backtest.summary.ties",
+    "loom.eta.backtest.summary.win_rate",
+    "loom.eta.backtest.summary.ci_low",
+    "loom.eta.backtest.summary.ci_high",
+    "loom.eta.backtest.summary.min_folds",
+    "loom.eta.backtest.summary.gate_ready",
+    "loom.eta.backtest.summary.gate_detail",
+    "loom.eta.backtest.summary.fitted_from",
+    "loom.eta.backtest.summary.cases_before_fit",
+    "loom.eta.backtest.summary.fit_id",
 ];
 
 /// One estimate, with its full `eta-explanation/v1` record.
@@ -147,6 +213,12 @@ pub struct EtaOutcomeRecord {
     pub outcome_resolution_sec: Option<i64>,
     /// `finish`: the sweep's terminal class (`exited`, `crashed`).
     pub result: Option<String>,
+    /// The error split by stage (#10929): each forecast stage's predicted
+    /// and actual entry and dwell after `as_of`, and its contribution, with
+    /// `Σ contribution_sec + unattributed_sec == score.error_sec`. Absent when
+    /// the estimate forecast no stage or the outcome has no error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<crate::eta::stage_forecast::Attribution>,
 }
 
 impl EtaEstimateRecord {

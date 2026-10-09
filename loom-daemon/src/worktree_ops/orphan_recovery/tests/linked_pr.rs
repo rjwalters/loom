@@ -251,6 +251,52 @@ fn merged_linked_pr_does_not_block_recovery_body() {
         .any(|r| r.action == "reset_issue_label"));
 }
 
+/// [`install_fake_gh`] whose fake also serves the open-PR listing `rows`
+/// (#10514 leg 0), and whose closes-graph arm refuses (exit 97).
+#[cfg(unix)]
+fn install_fake_gh_with_listing(
+    dir: &Path,
+    rows: &[crate::claim_reconciliation::open_pr_listing::test_support::Row],
+) -> FakeGh {
+    let gh = install_fake_gh(dir, "FORBIDDEN", 97);
+    let fake = dir.join("bin").join("gh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    let (head, rest) = script.split_once('\n').unwrap();
+    let (log_line, rest) = rest.split_once('\n').unwrap();
+    let arm = crate::claim_reconciliation::open_pr_listing::test_support::pulls_arm(rows);
+    std::fs::write(&fake, format!("{head}\n{log_line}\n{arm}{rest}")).unwrap();
+    gh
+}
+
+/// (e) #10514: orphan recovery's probe answers from the open-PR listing
+/// alone — a `Closes #5501` PR blocks the reset, an empty listing allows it,
+/// and neither spawns the closes-graph nor walks the timeline.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn the_open_pr_listing_answers_without_graphql() {
+    the_open_pr_listing_answers_without_graphql_body();
+}
+
+#[serial]
+fn the_open_pr_listing_answers_without_graphql_body() {
+    use crate::claim_reconciliation::open_pr_listing::test_support::row;
+    let linked = [row(5507, &[])
+        .head("topic")
+        .repo("rjwalters/loom")
+        .body("Closes #5501")];
+    for (rows, resets) in [(&linked[..], false), (&[][..], true)] {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh_with_listing(dir.path(), rows);
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+        let calls = gh.calls();
+        assert_eq!(calls.contains("issue edit"), resets, "{calls}");
+        assert!(calls.contains("pulls?state=open"), "{calls}");
+        assert!(!calls.contains("graphql") && !calls.contains("timeline"), "{calls}");
+    }
+}
+
 /// #9548 negative control: the (b) fixture, but the credential only has
 /// `pull`. The real write-scope check refuses the label writer, so the
 /// reset never reaches `gh issue edit`.
@@ -404,6 +450,93 @@ fn expired_lease_does_not_block_recovery_body() {
     let mut recovery = OrphanRecoveryResult::default();
     recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
     assert!(gh.calls().contains("issue edit"));
+}
+
+/// #10570: the #10161 shape seen from the RECOVERING host. An attended claim
+/// made elsewhere leaves nothing on this host's disk (no claim file, no
+/// journal, no spawn-loop entry) and has no PR yet; its only liveness signal
+/// is the lease its deferred publisher put on the forge once a released
+/// sweep's leftover lease aged out. While that lease is renewed the claim
+/// survives every pass; once the session ends and the lease goes stale, the
+/// same pass reclaims it under the unchanged gates.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn a_remote_attended_lease_holds_the_claim_until_it_goes_stale() {
+    a_remote_attended_lease_holds_the_claim_until_it_goes_stale_body();
+}
+
+#[serial]
+fn a_remote_attended_lease_holds_the_claim_until_it_goes_stale_body() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A second repository root: nothing local vouches for the claim.
+    let dir = tempdir().unwrap();
+    assert!(!has_valid_claim(dir.path(), 5501));
+    // The forge's view of the lease comment's `updated_at`, mutable per pass.
+    let forge_lease = dir.path().join("forge-lease-updated-at");
+    let set_lease_age = |minutes: i64| {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        std::fs::write(&forge_lease, ts).unwrap();
+    };
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.path().join("gh-invocations.log");
+    let lease_stdout = with_fleet_author(&format!(
+        r#"printf '{{"updated_at":"%s"}}' "$(cat '{}')""#,
+        forge_lease.display()
+    ));
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" >> '{log}'\n\
+         if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then\n\
+         printf '%s' '[{{\"number\":5501,\"title\":\"attended work\"}}]'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"repo\" ]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n\
+         printf '%s' '{payload}'\n\
+         exit 0\n\
+         fi\n\
+         case \"$*\" in */comments*) {lease_stdout}; exit 0;; esac\n\
+         if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+         exit 0\n",
+        log = log.display(),
+        payload = closes_graph(""),
+    );
+    let fake_gh = bin.join("gh");
+    std::fs::write(&fake_gh, script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ws = WritableRoot::register_with_gh(dir.path(), &fake_gh);
+    std::env::set_var("LOOM_GH_BIN", &ws.gh);
+    let gh = FakeGh { log, _ws: ws };
+
+    // Published, then renewed every few minutes while the session lives.
+    for age in [1, 4] {
+        set_lease_age(age);
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+        assert!(result.orphaned.is_empty(), "lease {age}m old: {:?}", result.orphaned);
+        assert_eq!(result.watched.len(), 1, "{:?}", result.watched);
+        assert_eq!(result.watched[0].reason, "lease_fresh");
+    }
+    assert!(!gh.calls().contains("issue edit"), "{}", gh.calls());
+
+    // The session ended; renewal stopped and the lease aged past its TTL.
+    set_lease_age(30);
+    let mut result = OrphanRecoveryResult::default();
+    check_untracked_building(&evidence_without_the_issue(), &mut result, dir.path(), 600, false);
+    assert_eq!(result.orphaned.len(), 1, "{:?}", result.orphaned);
+    assert_eq!(result.orphaned[0].reason, "no_spawn_loop_entry");
+    let mut recovery = OrphanRecoveryResult::default();
+    recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+    assert!(gh.calls().contains("issue edit"), "{}", gh.calls());
 }
 
 /// Same shape as [`install_fake_gh_with_lease`], but the `.../comments`

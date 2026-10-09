@@ -228,12 +228,15 @@ fn registry_resolves_current_per_kind() {
             "finish-v1",
             "land-v1",
             "land-v2",
-            "land-v3",
-            "land-2026-10-04-amber-heron",
-            "land-2026-10-04-fresh-tide",
+            "land-2026-10-06-even-lark",
             "land-v4",
-            "land-2026-10-04-twin-otter",
-            "land-2026-10-04-twin-otter-b"
+            "little-v0",
+            "land-2026-10-06-brisk-petrel",
+            "land-2026-10-06-held-heron",
+            "land-2026-10-06-keen-wren",
+            "land-2026-10-06-loop-kite",
+            "land-2026-10-04-twin-otter-b",
+            "land-2026-10-06-tandem-wren"
         ]
     );
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
@@ -244,30 +247,71 @@ fn registry_resolves_current_per_kind() {
     // A registered candidate IS selectable as current — that is what the
     // promotion switch flips (#9328).
     assert_eq!(registry.current(Kind::Land, Some("land-v2")).id(), "land-v2");
-    // `land-v3` (#9970) ships registered, not current: the default is
-    // unchanged, and only an explicit config selects it.
-    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v3");
-    // `land-2026-10-04-amber-heron` (#10207) likewise: registered, not current.
+    // `land-v3` (#9970) and `land-2026-10-04-amber-heron` (#10207) were
+    // retired from the registry 2026-10-06 (#10484): selecting either falls
+    // back to the default.
+    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v1");
     assert_eq!(
         registry
             .current(Kind::Land, Some("land-2026-10-04-amber-heron"))
             .id(),
-        "land-2026-10-04-amber-heron"
+        "land-v1"
     );
-    // `land-2026-10-04-fresh-tide` (#10209) likewise: registered, not current.
+    // `land-2026-10-06-calm-plover` was retired 2026-10-06 (#10489):
+    // selecting it falls back to the default.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-06-calm-plover"))
+            .id(),
+        "land-v1"
+    );
+    // `land-2026-10-06-even-lark` (#10489), which replaced it: registered,
+    // not current.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-06-even-lark"))
+            .id(),
+        "land-2026-10-06-even-lark"
+    );
+    // The IPCW-wrapped shadows (#10524) were retired 2026-10-08 (#10949):
+    // selecting any of them falls back to the default.
+    for retired in [
+        "land-2026-10-06-quick-tern",
+        "land-2026-10-06-swift-tern",
+        "land-2026-10-06-bold-lark",
+    ] {
+        assert_eq!(registry.current(Kind::Land, Some(retired)).id(), "land-v1");
+    }
+    // `land-2026-10-06-held-heron` (#10523) likewise: registered, not current.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-06-held-heron"))
+            .id(),
+        "land-2026-10-06-held-heron"
+    );
+    // `land-2026-10-04-fresh-tide` (#10209) was retired 2026-10-06 (#10549):
+    // selecting it falls back to the default.
     assert_eq!(
         registry
             .current(Kind::Land, Some("land-2026-10-04-fresh-tide"))
             .id(),
-        "land-2026-10-04-fresh-tide"
+        "land-v1"
     );
-    // `land-2026-10-04-twin-otter` (#10243) likewise: registered last, as a
-    // shadow, and refusing `no_model` in `builtin()`, which loads no fit.
+    // `land-2026-10-04-twin-otter` (#10243) was retired too (#10528): `-b`
+    // carries its evaluation, so selecting it falls back to the default.
     assert_eq!(
         registry
             .current(Kind::Land, Some("land-2026-10-04-twin-otter"))
             .id(),
-        "land-2026-10-04-twin-otter"
+        "land-v1"
+    );
+    // `land-2026-10-04-twin-otter-b` (#10244): registered, as a shadow, and
+    // refusing `no_model` for PR stages in `builtin()`, which loads no fit.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-04-twin-otter-b"))
+            .id(),
+        "land-2026-10-04-twin-otter-b"
     );
     // `land-v4` (#10210) likewise.
     assert_eq!(registry.current(Kind::Land, Some("land-v4")).id(), "land-v4");
@@ -284,12 +328,15 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
         vec![
             "land-v1",
             "land-v2",
-            "land-v3",
-            "land-2026-10-04-amber-heron",
-            "land-2026-10-04-fresh-tide",
+            "land-2026-10-06-even-lark",
             "land-v4",
-            "land-2026-10-04-twin-otter",
-            "land-2026-10-04-twin-otter-b"
+            "little-v0",
+            "land-2026-10-06-brisk-petrel",
+            "land-2026-10-06-held-heron",
+            "land-2026-10-06-keen-wren",
+            "land-2026-10-06-loop-kite",
+            "land-2026-10-04-twin-otter-b",
+            "land-2026-10-06-tandem-wren"
         ]
     );
     assert_eq!(

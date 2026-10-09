@@ -16,9 +16,12 @@
 //!   *ordering* excludes them).
 //! - **Plan.** Eligible open PRs (not draft, no hold label, no agent
 //!   mid-flight, pinnable head) are grouped into connected components of the
-//!   shared-changed-file graph. Shared filenames are evidence of possible
-//!   overlap, never proof of semantic compatibility — the pass only orders,
-//!   it never merges, vouches, or combines. Within a component, existing
+//!   REAL-conflict graph (#10350, [`conflict`]): a shared changed filename is
+//!   only the prefilter, and a pair is an edge only when `git merge-tree` of
+//!   the two heads conflicts (any unknown counts as a conflict — fail
+//!   closed); stacked bases are edges unconditionally. A clean merge is not
+//!   proof of semantic compatibility either — the pass only orders, it never
+//!   merges, vouches, or combines. Within a component, existing
 //!   trusted `loom:sequence` markers and base-branch stacking are
 //!   authoritative constraints; everything else orders ready-first (#10371,
 //!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
@@ -28,8 +31,8 @@
 //!   cycle skips the whole component for that tick — a half-rewritten order
 //!   is worse than a deferred one.
 //! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
-//!   waits only for its nearest earlier member that shares a changed file
-//!   with it (or that it is stacked on), never for a PR it reaches only
+//!   waits only for its nearest earlier member it really conflicts with
+//!   (or that it is stacked on), never for a PR it reaches only
 //!   through a third PR — so the marker's "changes files #N also changes" is
 //!   always true. No edge is written behind a predecessor that is not ready
 //!   to land (#10371). The follower gets `loom:sequenced` (#9378's durable gate)
@@ -60,7 +63,8 @@
 //!   `loom:blocked`, is released on the next tick; hard holds never are.
 //! - **No-overlap release (#10077, [`overlap`]).** A soft in-flight hold
 //!   whose two PRs share no changed file (a transitive-only edge recorded
-//!   before #10060) is released; any failed read or unknown keeps it.
+//!   before #10060) or do not really conflict (#10350) is released; any
+//!   failed read or unknown keeps it.
 //! - **Defer repairs.** The review-conflict pass
 //!   (`super::review_conflict`) consults this module's `defer_base_repair`:
 //!   a base-conflicting review-queue PR whose sequencing predecessor is
@@ -77,19 +81,20 @@
 //! carried forward (#9416 owns proven equivalence), no substantive Judge
 //! rejection is suppressed (only THIS pass's base-conflict auto-flag
 //! consults the sequence state), and independent PRs are untouched. Every
-//! write is idempotent: an identical marker already on the PR suppresses the
-//! repeat comment, so competing daemons converge instead of spamming.
+//! write is idempotent: the landing comment is upserted by its order key
+//! (after PR, both heads — not the churning plan id), duplicates of it are
+//! deleted, and one host per workspace runs the pass ([`landing`], #10634),
+//! so competing daemons converge instead of spamming.
 //!
 //! Kill switch: [`MERGE_SEQUENCE_ENABLED_ENV`] (default ON), nested inside
 //! the master `LOOM_STALE_CLAIM_RECONCILE` switch like the review-conflict
 //! pass. Read-only inspection: `loom-daemon merge-pr sequence-plan`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::gh_call;
@@ -127,6 +132,15 @@ pub mod ready;
 // Tree-identical re-dates keep a hold; operator releases stick (#10398).
 #[path = "merge_sequence_sticky.rs"]
 pub mod sticky;
+
+// One landing-order comment per follower, upserted by key (#10634).
+#[path = "merge_sequence_landing.rs"]
+pub mod landing;
+// The real-merge-conflict pair predicate edges require (#10350).
+#[path = "merge_sequence_conflict.rs"]
+pub mod conflict;
+pub use conflict::overlap_components_with;
+use conflict::Conflicts;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -292,40 +306,7 @@ pub fn overlap_components(
     eligible: &[&SequencePr],
     files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> Vec<Vec<u32>> {
-    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
-    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (i, a) in eligible.iter().enumerate() {
-        for b in &eligible[i + 1..] {
-            let shared = files
-                .get(&a.number)
-                .zip(files.get(&b.number))
-                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
-            if shared {
-                adj.entry(a.number).or_default().push(b.number);
-                adj.entry(b.number).or_default().push(a.number);
-            }
-        }
-    }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut out = Vec::new();
-    for start in &nums {
-        if seen.contains(start) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut queue = VecDeque::from([*start]);
-        seen.insert(*start);
-        while let Some(n) = queue.pop_front() {
-            component.push(n);
-            for next in adj.get(&n).into_iter().flatten() {
-                if seen.insert(*next) {
-                    queue.push_back(*next);
-                }
-            }
-        }
-        out.push(component);
-    }
-    out
+    overlap_components_with(eligible, files, &conflict::assume_conflict)
 }
 
 /// Order one component's members: constraint edges first (trusted markers
@@ -405,6 +386,19 @@ pub fn plan_group(
     by_number: &BTreeMap<u32, SequencePr>,
     files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> SequenceGroup {
+    plan_group_with(plan, order, by_number, files, &conflict::assume_conflict)
+}
+
+/// [`plan_group`] where a shared file yields an edge only when `conflicts`
+/// says the pair really conflicts (#10350); stacking is unconditional.
+#[must_use]
+pub fn plan_group_with(
+    plan: &str,
+    order: &[u32],
+    by_number: &BTreeMap<u32, SequencePr>,
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    conflicts: Conflicts<'_>,
+) -> SequenceGroup {
     let shares = |a: u32, b: u32| {
         files
             .get(&a)
@@ -417,10 +411,9 @@ pub fn plan_group(
             continue;
         };
         let Some(&after) = order[..i].iter().rev().find(|&&a| {
-            shares(a, follower)
-                || by_number
-                    .get(&a)
-                    .is_some_and(|p| fol.base_ref == p.head_ref)
+            by_number.get(&a).is_some_and(|p| {
+                fol.base_ref == p.head_ref || (shares(a, follower) && conflicts(p, fol))
+            })
         }) else {
             continue;
         };
@@ -463,8 +456,19 @@ pub fn plan_repo(
     files: &BTreeMap<u32, BTreeSet<String>>,
     markers: &BTreeMap<u32, SequenceMarker>,
 ) -> Vec<SequenceGroup> {
+    plan_repo_checked(open_prs, files, markers, &conflict::assume_conflict)
+}
+
+/// [`plan_repo`] with the real-conflict predicate (#10350) — the live pass.
+#[must_use]
+pub fn plan_repo_checked(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+    conflicts: Conflicts<'_>,
+) -> Vec<SequenceGroup> {
     let stalled = stall::stalled_for_ordering(open_prs, Utc::now(), stall_hours());
-    plan_repo_with(open_prs, files, markers, &stalled)
+    plan_repo_conflicts(open_prs, files, markers, &stalled, conflicts)
 }
 
 /// [`plan_repo`] with an explicit stalled set (deterministic for tests).
@@ -475,9 +479,24 @@ pub fn plan_repo_with(
     markers: &BTreeMap<u32, SequenceMarker>,
     stalled: &BTreeSet<u32>,
 ) -> Vec<SequenceGroup> {
+    plan_repo_conflicts(open_prs, files, markers, stalled, &conflict::assume_conflict)
+}
+
+/// [`plan_repo_with`] with an explicit pair-conflict predicate (#10350).
+#[must_use]
+pub fn plan_repo_conflicts(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+    stalled: &BTreeSet<u32>,
+    conflicts: Conflicts<'_>,
+) -> Vec<SequenceGroup> {
     if open_prs.len() <= TRIGGER_OPEN_PRS {
         return Vec::new();
     }
+    // #10465: readiness is transitive across the recorded holds.
+    let demoted = ready::demote_unlandable(open_prs, markers);
+    let open_prs = demoted.as_slice();
     let eligible: Vec<&SequencePr> = open_prs
         .iter()
         .filter(|p| p.eligible_for_ordering() && p.pinnable())
@@ -485,7 +504,7 @@ pub fn plan_repo_with(
     let by_number: BTreeMap<u32, SequencePr> =
         open_prs.iter().map(|p| (p.number, p.clone())).collect();
     let mut groups = Vec::new();
-    for component in overlap_components(&eligible, files) {
+    for component in overlap_components_with(&eligible, files, conflicts) {
         if component.len() < 2 {
             continue;
         }
@@ -523,7 +542,7 @@ pub fn plan_repo_with(
             })
             .collect();
         let id = plan_id(&member_pins);
-        let mut group = plan_group(&id, &order, &by_number, files);
+        let mut group = plan_group_with(&id, &order, &by_number, files, conflicts);
         ready::drop_edges_behind_unready(&mut group, &by_number);
         groups.push(group);
     }
@@ -827,11 +846,12 @@ pub struct MergeSequenceStats {
 
 // --- Forge reads --------------------------------------------------------
 
-/// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
-/// applied — the same invocation shape as the review-conflict pass.
+/// Run a `gh pr <comment|edit…>` write in `root` with the per-root credential
+/// and `LOOM_REPO` applied — the same invocation shape as the review-conflict
+/// pass. There is no read arm: the label side of [`apply_edge`] comes from the
+/// tick-start REST listing (#10507), so this pass spends no GraphQL read here.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("view") => gh_call::read("sequence.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("sequence.pr_comment", gh_bin, root),
         _ => gh_call::write("sequence.pr_edit", gh_bin, root),
     };
@@ -860,19 +880,11 @@ fn changed_files(gh_bin: &Path, root: &Path, pr: &SequencePr) -> Option<BTreeSet
     super::read_cache::CHANGED_FILES.get_or(key, || fetch_changed_files(gh_bin, root, pr.number))
 }
 
+/// #10382: ETag'd REST `pulls/{n}/files` (was GraphQL `gh pr view --json
+/// files`), so a re-read after `CHANGED_FILES` expires is a free `304`.
 fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
-    #[derive(Debug, Deserialize)]
-    struct Row {
-        path: String,
-    }
-    #[derive(Debug, Deserialize)]
-    struct Files {
-        #[serde(default)]
-        files: Vec<Row>,
-    }
-    let stdout = gh_pr(gh_bin, root, &["view", &number.to_string(), "--json", "files"]).ok()?;
-    let parsed: Files = serde_json::from_slice(&stdout).ok()?;
-    Some(parsed.files.into_iter().map(|Row { path }| path).collect())
+    let caller = "claim_reconciliation.pr_files";
+    crate::forge_pull_listing::pull_files_cached_as(caller, gh_bin, Some(root), None, number).ok()
 }
 
 /// A holder's newest trusted marker (`Some(None)`: a manual hold), `None`
@@ -975,13 +987,16 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         .collect();
     report.holders = holder_numbers.len();
     let mut cache = overlap::TickFiles::default();
-    report.would_release_no_overlap = overlap::would_release(gh_bin, root, &open, &mut cache);
+    let pairs = conflict::live(root);
+    let conflicts = |a: &SequencePr, b: &SequencePr| pairs.conflicts(a, b);
+    report.would_release_no_overlap =
+        overlap::would_release(gh_bin, root, &open, &mut cache, &conflicts);
     for pr in &eligible {
         cache.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
     let files = cache.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
-    report.groups = plan_repo(&open, &files, &markers);
+    report.groups = plan_repo_checked(&open, &files, &markers, &conflicts);
     let bin = gh_bin.to_string_lossy().to_string();
     for g in &mut report.groups {
         g.edges.retain(|e| {
@@ -1002,10 +1017,11 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     }
     for g in &report.groups {
         for e in &g.edges {
-            if markers
-                .get(&e.follower)
-                .is_some_and(|m| marker_text(m) == marker_text(&edge_marker(e)))
-            {
+            // #10634: the order key, not the plan id — the live pass keeps a
+            // comment whose key matches, whatever plan id it carries.
+            if markers.get(&e.follower).is_some_and(|m| {
+                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
+            }) {
                 report.already_planned += 1;
             }
         }
@@ -1025,27 +1041,7 @@ fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<(
     Ok(())
 }
 
-/// Does the PR carry the sequencing label right now? Live read — the label
-/// and the marker are checked independently so a partial write is healed
-/// per-side on the next tick.
-fn has_sequence_label(gh_bin: &Path, root: &Path, number: u32) -> Result<bool> {
-    let stdout = gh_pr(
-        gh_bin,
-        root,
-        &[
-            "view",
-            &number.to_string(),
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-    )?;
-    let text = String::from_utf8_lossy(&stdout);
-    Ok(text.lines().any(|l| l.trim() == SEQUENCE_LABEL))
-}
-
-/// Apply one planned edge: marker comment + label, idempotent PER SIDE.
+/// Apply one planned edge: landing comment + label, idempotent PER SIDE.
 /// Returns `Ok(false)` only when both sides already agree — the convergence
 /// guard that makes competing daemons settle without duplicate comments.
 ///
@@ -1057,27 +1053,33 @@ fn has_sequence_label(gh_bin: &Path, root: &Path, number: u32) -> Result<bool> {
 /// un-gated for at most one tick and is healed here on the next run: each
 /// side is checked independently, so the follow-up adds the missing label
 /// without re-posting the comment.
+///
+/// The comment side is [`landing::plan`] over this follower's fresh trusted
+/// comments (#10634): keep, patch in place, or post once, keyed by the order
+/// rather than the plan id. The label side comes from the tick-start REST
+/// listing (`label_present`, #10507), not a per-follower `gh pr view`: the
+/// caller only reaches here for followers that were NOT holders in that
+/// listing. The one race — another daemon adds the label between the listing
+/// and this write — costs one redundant `--add-label`, which the forge no-ops.
 fn apply_edge(
     gh_bin: &Path,
     root: &Path,
     edge: &SequenceEdge,
-    marker: &SequenceMarker,
-    bodies: &[String],
+    plan: &landing::LandingPlan,
+    label_present: bool,
 ) -> Result<bool> {
-    let marker_present = bodies.iter().any(|b| b.contains(&marker_text(marker)));
-    let label_present = has_sequence_label(gh_bin, root, edge.follower)?;
-    if marker_present && label_present {
-        return Ok(false);
-    }
-    let n = edge.follower.to_string();
-    if !marker_present {
-        let body = apply_comment_body(marker, edge.reason);
-        gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    }
-    if !label_present {
-        gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
-    }
-    Ok(true)
+    let wrote = if plan.write == landing::LandingWrite::Keep && label_present {
+        false
+    } else {
+        landing::write(gh_bin, root, edge.follower, edge.reason, plan)?;
+        if !label_present {
+            let n = edge.follower.to_string();
+            gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
+        }
+        true
+    };
+    landing::delete_duplicates(gh_bin, root, edge.follower, plan);
+    Ok(wrote)
 }
 
 // --- The pass ------------------------------------------------------------
@@ -1098,6 +1100,29 @@ pub(super) fn reconcile_merge_sequences_with(
     gh_bin: &Path,
     root: &Path,
     prefetched: Option<&[super::open_pr_listing::RestPull]>,
+) -> MergeSequenceStats {
+    // #10634: one host per workspace plans and posts — the role-runner shard
+    // (#6374/#6704) that already makes one host of a sharded fleet own a
+    // workspace's other forge-writing passes (`stale_blocked`). Unsharded
+    // hosts own everything, so a lone daemon is unaffected. Releasing an
+    // existing hold is not gated (see `reconcile_merge_sequences_gated`).
+    let owned = cfg!(test) || crate::role_shard::decide(root).admits_role_tick();
+    reconcile_merge_sequences_gated(gh_bin, root, prefetched, owned)
+}
+
+/// [`reconcile_merge_sequences_with`] with the shard verdict supplied
+/// (#10634). A host that does not own `root` still runs Phase 1's releases —
+/// they are idempotent, and a slice with no live owner (its static-shard host
+/// down, a roster yielding everywhere, the owner skipped by write scope) must
+/// not keep `loom:sequenced` on PRs that `merge-pr.sh` then refuses (Judge,
+/// PR #10651). It does not plan or post: no new landing-order comment, no
+/// re-anchor record, no stall escalation. With no hold in the listing it
+/// makes no forge call beyond the listing.
+pub(super) fn reconcile_merge_sequences_gated(
+    gh_bin: &Path,
+    root: &Path,
+    prefetched: Option<&[super::open_pr_listing::RestPull]>,
+    owned: bool,
 ) -> MergeSequenceStats {
     let mut stats = MergeSequenceStats::default();
     if !merge_sequence_enabled() {
@@ -1127,6 +1152,9 @@ pub(super) fn reconcile_merge_sequences_with(
     let mut stalls = stall::StallLedger::default();
     // One changed-files read per PR per tick, shared by both phases (#10077).
     let mut files = overlap::TickFiles::default();
+    // One real-conflict predicate per tick, shared by both phases (#10350).
+    let pairs = conflict::live(root);
+    let conflicts = |a: &SequencePr, b: &SequencePr| pairs.conflicts(a, b);
 
     // Phase 1: evaluate every existing hold, oldest first for a stable
     // transcript.
@@ -1138,8 +1166,19 @@ pub(super) fn reconcile_merge_sequences_with(
     let bin = gh_bin.to_string_lossy().to_string();
     // Each holder's completed marker read, reused by Phase 2 (#10089).
     let mut read_markers: BTreeMap<u32, Option<SequenceMarker>> = BTreeMap::new();
+    // #10465: readiness is transitive across the recorded holds, so every
+    // holder's marker is read up front (once; the loop below reuses it).
+    let holder_reads: BTreeMap<u32, Option<Option<SequenceMarker>>> = holders
+        .iter()
+        .map(|p| (p.number, holder_marker(&bin, root, p)))
+        .collect();
+    let held_markers: BTreeMap<u32, SequenceMarker> = holder_reads
+        .iter()
+        .filter_map(|(n, m)| Some((*n, m.clone()??)))
+        .collect();
+    let open_ready = ready::demote_unlandable(&open, &held_markers);
     for pr in &holders {
-        let parsed = match holder_marker(&bin, root, pr) {
+        let parsed = match holder_reads.get(&pr.number).cloned().flatten() {
             Some(m) => m,
             None => {
                 // The label gates merges regardless (#9378); a failed read
@@ -1174,6 +1213,12 @@ pub(super) fn reconcile_merge_sequences_with(
         });
         let pr: &SequencePr = &held;
         let pred = predecessor(&bin, root, &open, marker.after);
+        // #10465: a predecessor head that moved by a tree-identical commit is
+        // re-anchored, not voided; the hold is evaluated at the new head.
+        let reanchored = sticky::reanchor_predecessor(&marker, pred.as_ref(), |pinned, live| {
+            sticky::forge_same_tree(gh_bin, root, pinned, live)
+        });
+        let marker = reanchored.clone().unwrap_or(marker);
         // The head's labels and freshness come from this tick's listing; a
         // predecessor outside it is never treated as stalled (fail closed).
         let head = open.iter().find(|p| p.number == marker.after);
@@ -1195,11 +1240,13 @@ pub(super) fn reconcile_merge_sequences_with(
         }
         // #10371: a soft hold behind a predecessor that is not ready to land
         // (as this tick's listing shows it) is released.
-        let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, head);
+        let ready_head = open_ready.iter().find(|p| p.number == marker.after);
+        let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, ready_head);
         // #10077: a soft hold between PRs sharing no file is released.
         let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
+        let (p, open) = (pred.as_ref(), open.as_slice());
         let action =
-            overlap::with_no_overlap(action, &marker, pred.as_ref(), pr, &open, &mut files, fetch);
+            overlap::with_no_overlap(action, &marker, p, pr, open, &mut files, fetch, &conflicts);
         let result = match action {
             HoldAction::Release
             | HoldAction::ReleaseDissolved
@@ -1213,7 +1260,13 @@ pub(super) fn reconcile_merge_sequences_with(
             HoldAction::VoidAndReplan => {
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)
             }
-            HoldAction::HoldSoft | HoldAction::HoldHard => Ok(action),
+            HoldAction::HoldSoft | HoldAction::HoldHard => match reanchored.as_ref() {
+                // Re-anchor records are posting: the owner writes them.
+                Some(m) if owned => {
+                    sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action)
+                }
+                _ => Ok(action),
+            },
         };
         match result {
             Ok(HoldAction::Release) => stats.released += 1,
@@ -1233,6 +1286,16 @@ pub(super) fn reconcile_merge_sequences_with(
                 );
             }
         }
+    }
+
+    // #10634: everything below plans or posts — the workspace's owner only.
+    if !owned {
+        log::debug!(
+            "claim_reconciliation (merge sequence): {} is owned by another host's shard — \
+             holds evaluated, planning skipped (#10634)",
+            root.display()
+        );
+        return stats;
     }
 
     // Phase 1b: one escalation per stalled chain (#10060), deduped on the
@@ -1270,7 +1333,8 @@ pub(super) fn reconcile_merge_sequences_with(
     }
     let files = files.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &read_markers);
-    for group in plan_repo(&open, &files, &markers) {
+    let fleet = crate::forge_identity::FleetLogins::for_root(root);
+    for group in plan_repo_checked(&open, &files, &markers, &conflicts) {
         stats.groups += 1;
         for edge in group.edges {
             // Never re-plan a follower that already carries an ordering
@@ -1280,8 +1344,19 @@ pub(super) fn reconcile_merge_sequences_with(
             if markers.contains_key(&edge.follower) || holder_numbers.contains(&edge.follower) {
                 continue;
             }
-            let bodies = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower)
-                .unwrap_or_default();
+            // #10634: one read gives the sticky check its bodies and the
+            // landing upsert its comment ids. A failed read skips the edge —
+            // "no comment" read from a read that did not happen is a repost.
+            let Some(thread) = landing::fetch_thread(gh_bin, root, edge.follower) else {
+                log::warn!(
+                    "claim_reconciliation (merge sequence): PR #{} in {}: could not read \
+                     trusted comments — edge skipped this tick",
+                    edge.follower,
+                    root.display()
+                );
+                continue;
+            };
+            let bodies = landing::bodies(&thread);
             // #10398: an operator's release of this pair sticks while the tree holds.
             match sticky::check(gh_bin, root, &edge, &open, &bodies) {
                 sticky::OperatorRelease::None => {}
@@ -1298,8 +1373,12 @@ pub(super) fn reconcile_merge_sequences_with(
                     continue;
                 }
             }
-            let marker = edge_marker(&edge);
-            match apply_edge(gh_bin, root, &edge, &marker, &bodies) {
+            let plan = landing::plan(&thread, &edge_marker(&edge), |l| fleet.contains(l));
+            // Label side from the tick-start listing (#10507); see `apply_edge`.
+            let label_present = open
+                .iter()
+                .any(|p| p.number == edge.follower && p.has(SEQUENCE_LABEL));
+            match apply_edge(gh_bin, root, &edge, &plan, label_present) {
                 Ok(true) => {
                     stats.applied += 1;
                     log::info!(

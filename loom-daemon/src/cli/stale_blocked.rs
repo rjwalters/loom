@@ -10,9 +10,22 @@
 //! Brand-new logic, so it is native from the start per
 //! `.loom/docs/shell-language-policy.md` — the `generate-agent-skills.sh`
 //! precedent — rather than a script to be ported later. The classification
-//! itself lives in [`loom_daemon::stale_blocked`]; this module is the
-//! enumeration, the live reads (all delegated to
-//! [`loom_daemon::dep_recheck::forge`]) and the rendering.
+//! itself lives in [`loom_daemon::stale_blocked`], and the forge reads in
+//! [`loom_daemon::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
+//! comment and blocker-state reads, one GraphQL query per 100 issues); this
+//! module is the rendering. `notify-cleared-blockers` reads through the same
+//! gatherer (#10515).
+//!
+//! # Budget floor (#10480)
+//!
+//! After the candidate listing the run reads the free budget probe and
+//! projects its own cost; if it would take the GraphQL or core bucket below
+//! `--min-graphql-remaining` / `--min-core-remaining` (default 1,000 each, `0`
+//! disables) it gathers nothing and reports every artifact *not evaluated*.
+//! The same floors are re-checked between reads, from the forge's own
+//! answers. `--json` carries what the run spent as `forge_cost`; the human
+//! report prints the same numbers as one stderr line unless `--quiet`.
+//! The logic is [`loom_daemon::stale_blocked::budget`].
 //!
 //! # Why every failure is still exit 0
 //!
@@ -23,28 +36,30 @@
 //! posture is that a conclusion drawn from a failed read is worse than no
 //! conclusion. The one thing this command will not do is guess.
 //!
-//! # Both populations, two enumerations (#8925)
+//! # Archived repositories (#10562)
+//!
+//! The run first reads the repository's `archived` flag (one REST + ETag
+//! `repos/{owner}/{repo}` read, the probe the release pass shares). An
+//! archived repository is read-only, so no role can act on its rows: nothing
+//! is listed or gathered, `--json` reports `archived: true`, and the human
+//! report is one line. A probe that did not answer is an enumeration failure
+//! — unknown, never archived and never clear.
+//!
+//! # Both populations (#8925)
 //!
 //! `gh issue list` never returns a pull request, so the original single
-//! enumeration could not see a parked PR at all. This command now runs
-//! `gh pr list --label loom:blocked --state open` as well, and reads a PR's body
-//! and comments through [`forge::fetch_pr_body_and_comments`] (`gh issue view`
-//! exits non-zero on a PR number). `--no-prs` restores the issues-only
-//! behaviour for a caller that wants it; nothing in the fleet passes it.
+//! enumeration could not see a parked PR at all. The REST listing the batch
+//! gatherer reads returns both, split by `pull_request`. `--no-prs` restores
+//! the issues-only behaviour for a caller that wants it; nothing in the fleet
+//! passes it.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
-use serde::Deserialize;
 
-use loom_daemon::cmd_out::Query;
-use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::park_record;
-use loom_daemon::script_helpers::gh_query;
-use loom_daemon::stale_blocked::{
-    classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
-};
+use loom_daemon::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdict};
 
 /// How many open `loom:blocked` issues to examine by default.
 ///
@@ -84,20 +99,19 @@ pub(crate) struct StaleBlockedArgs {
     /// restoring the issues-only behaviour this check shipped with.
     #[arg(long)]
     pub no_prs: bool,
-}
 
-/// One row of the enumeration query. Shared by both populations — `gh pr list`
-/// and `gh issue list` return the same `number,title` shape.
-///
-/// `pub(super)` (rather than private): reused by `notify_cleared_blockers`
-/// (issue #9102), the close-triggered sibling of this fleet-wide advisory,
-/// which enumerates the same `loom:blocked` population via [`list_blocked`]
-/// rather than re-deriving it.
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct IssueRow {
-    pub(super) number: i64,
-    #[serde(default)]
-    pub(super) title: String,
+    /// GraphQL points that must remain after this run (#10480). If the free
+    /// budget probe says the run would go below it, nothing is gathered and
+    /// every artifact is reported not evaluated (still exit 0); it is also
+    /// re-checked between GraphQL batches. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_GRAPHQL_REMAINING)]
+    pub min_graphql_remaining: u64,
+
+    /// Core (REST) requests that must remain after this run (#10480). Same
+    /// semantics as `--min-graphql-remaining`, re-checked before each REST
+    /// read. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_CORE_REMAINING)]
+    pub min_core_remaining: u64,
 }
 
 /// One classified artifact, ready to render. `Clone` because a prose-only park is
@@ -127,72 +141,71 @@ impl StaleBlockedArgs {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let repo = self.repo.as_deref();
-
-        let mut populations: Vec<(Artifact, Vec<IssueRow>)> = Vec::new();
-        let mut enumerate_errors: Vec<String> = Vec::new();
-
-        let (rows, err) = list_blocked(Artifact::Issue, &root, repo, self.limit);
-        populations.push((Artifact::Issue, rows));
-        enumerate_errors.extend(err);
-
-        if !self.no_prs {
-            let (rows, err) = list_blocked(Artifact::Pr, &root, repo, self.limit);
-            populations.push((Artifact::Pr, rows));
-            enumerate_errors.extend(err);
-        }
+        let mut forge = batch::GhStaleBlockedForge::new(&root, self.repo.as_deref());
+        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let opts = batch::Options {
+            limit: self.limit,
+            no_prs: self.no_prs,
+            floor: budget::Floor {
+                graphql: self.min_graphql_remaining,
+                core: self.min_core_remaining,
+            },
+        };
+        let batch::Gathering {
+            items: gathered,
+            enumerate_error,
+            cost,
+            archived,
+        } = batch::gather_checked(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
+        let mut unticked: Vec<Finding> = Vec::new();
         let mut undocumented: Vec<Finding> = Vec::new();
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
 
-        for (kind, rows) in populations {
-            for row in rows {
-                let evidence = match gather(kind, row.number, repo, &root) {
-                    Ok(e) => e,
-                    Err(why) => {
-                        unevaluated.push((format!("{} #{}", kind.label(), row.number), why));
-                        continue;
-                    }
-                };
-                let finding = Finding {
-                    kind,
-                    number: row.number,
-                    title: row.title.clone(),
-                    verdict: classify(&evidence),
-                    undeclared: undeclared(&evidence),
-                };
-                // A prose-only park is reported REGARDLESS of its verdict: a
-                // still-blocked park whose blocker is unreadable is the defect
-                // in waiting, and waiting for it to go stale is what let #8852
-                // sit through its blocker closing (#8925).
-                if finding.undeclared {
-                    prose_only.push(finding.clone());
+        for g in gathered {
+            let evidence = match g.evidence {
+                Ok(e) => e,
+                Err(why) => {
+                    unevaluated.push((format!("{} #{}", g.kind.label(), g.number), why));
+                    continue;
                 }
-                match finding.verdict {
-                    Verdict::Stale(_) => stale.push(finding),
-                    Verdict::Superseded { .. } => superseded.push(finding),
-                    Verdict::Undocumented => undocumented.push(finding),
-                    Verdict::StillBlocked => {}
-                }
+            };
+            let finding = Finding {
+                kind: g.kind,
+                number: g.number,
+                title: g.title,
+                verdict: classify(&evidence),
+                undeclared: undeclared(&evidence),
+            };
+            // A prose-only park is reported REGARDLESS of its verdict: a
+            // still-blocked park whose blocker is unreadable is the defect
+            // in waiting, and waiting for it to go stale is what let #8852
+            // sit through its blocker closing (#8925).
+            if finding.undeclared {
+                prose_only.push(finding.clone());
+            }
+            match finding.verdict {
+                Verdict::Stale(_) => stale.push(finding),
+                Verdict::Superseded { .. } => superseded.push(finding),
+                Verdict::Unticked { .. } => unticked.push(finding),
+                Verdict::Undocumented => undocumented.push(finding),
+                Verdict::StillBlocked => {}
             }
         }
-
-        let enumerate_error = if enumerate_errors.is_empty() {
-            None
-        } else {
-            Some(enumerate_errors.join("; "))
-        };
 
         let sections = Sections {
             stale: &stale,
             superseded: &superseded,
+            unticked: &unticked,
             undocumented: &undocumented,
             prose_only: &prose_only,
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
+            cost: &cost,
+            archived,
         };
 
         if self.json {
@@ -210,10 +223,14 @@ impl StaleBlockedArgs {
 struct Sections<'a> {
     stale: &'a [Finding],
     superseded: &'a [Finding],
+    unticked: &'a [Finding],
     undocumented: &'a [Finding],
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
+    cost: &'a budget::ForgeCost,
+    /// The archived probe's answer (#10562); `None` when it did not answer.
+    archived: Option<bool>,
 }
 
 impl Sections<'_> {
@@ -221,119 +238,10 @@ impl Sections<'_> {
     fn any(&self) -> bool {
         !self.stale.is_empty()
             || !self.superseded.is_empty()
+            || !self.unticked.is_empty()
             || !self.undocumented.is_empty()
             || !self.prose_only.is_empty()
     }
-}
-
-/// Every open `loom:blocked` artifact of one kind, plus a reason string when the
-/// enumeration itself did not answer.
-///
-/// `gh issue list --label="loom:blocked" --state=open` is `curator.md`'s own
-/// Priority-2 query shape, reused rather than re-derived; the PR arm is the same
-/// query against `gh pr list`, which is the enumeration #8925 found missing. An
-/// empty result is a fact (`Query::Empty`), not a failure — that is the healthy
-/// repo.
-pub(super) fn list_blocked(
-    kind: Artifact,
-    root: &Path,
-    repo: Option<&str>,
-    limit: u32,
-) -> (Vec<IssueRow>, Option<String>) {
-    let limit = limit.to_string();
-    let entity = match kind {
-        Artifact::Issue => "issue",
-        Artifact::Pr => "pr",
-    };
-    let mut args = vec![entity, "list", "--label", "loom:blocked", "--state", "open"];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    args.extend(["--json", "number,title", "--limit", &limit]);
-
-    let q: Query<Vec<IssueRow>> = gh_query(&args, root, false, |v: &Vec<IssueRow>| v.is_empty());
-    match q {
-        Query::Populated(rows) => (rows, None),
-        Query::Empty => (Vec::new(), None),
-        Query::Malformed { error, .. } => {
-            (Vec::new(), Some(format!("gh {entity} list returned unreadable JSON: {error}")))
-        }
-        Query::Failed { status, .. } => {
-            (Vec::new(), Some(format!("gh {entity} list exited {status}")))
-        }
-        Query::Unavailable(u) => {
-            (Vec::new(), Some(format!("gh {entity} list could not be run: {u:?}")))
-        }
-    }
-}
-
-/// Read one artifact's blocker references in every shape that applies to it.
-///
-/// Every forge read here is a `dep_recheck::forge` call, and the only text this
-/// function parses itself is the park record ([`park_record::blockers`], which
-/// reads the *same* `Blocked by: #N` vocabulary rather than adding a second one).
-/// `fetch_named_deps` runs the `## Dependencies` checklist matcher,
-/// `extract::extract` runs the prose dependency-phrase matcher over the body plus
-/// every non-bot comment, and `fetch_prs` reads the linked closing PRs. That is
-/// the whole point — #8927 asks for a trigger for the existing check, not a
-/// second copy of it.
-///
-/// # What differs for a PR (#8925)
-///
-/// - The body/comments read goes through `gh pr view`, not `gh issue view`.
-/// - There is no `## Dependencies` checklist arm and no linked-closing-PR arm: a
-///   PR body carries `Closes #N`, which is the *opposite* relation, and a PR has
-///   no closing PR of its own. Reading either would answer a question nobody
-///   asked.
-/// - The PR's own state supplies [`Evidence::self_block`], the superseding-block
-///   gate the issue arm gets from `closing` instead.
-pub(super) fn gather(
-    kind: Artifact,
-    number: i64,
-    repo: Option<&str>,
-    root: &Path,
-) -> Result<Evidence, String> {
-    let input = match kind {
-        Artifact::Issue => forge::fetch_body_and_comments(number, repo, root),
-        Artifact::Pr => forge::fetch_pr_body_and_comments(number, repo, root),
-    }
-    .map_err(|e| e.to_string())?;
-
-    let numbers: Vec<i64> =
-        extract::extract_with(&input, &loom_daemon::forge_identity::FleetLogins::for_root(root))
-            .split_whitespace()
-            .filter_map(|t| t.parse().ok())
-            .collect();
-    let prose = if numbers.is_empty() {
-        Vec::new()
-    } else {
-        forge::fetch_refs(&numbers, repo, root).map_err(|e| e.to_string())?
-    };
-
-    // The park record is read from the BODY only. A record in a comment would be
-    // the very thing #8925 is closing: a park nobody can attribute to the
-    // artifact's own declared state.
-    let declared = park_record::blockers(&input.body);
-
-    let (named, closing, self_block) = match kind {
-        Artifact::Issue => (
-            forge::fetch_named_deps(number, repo, root).map_err(|e| e.to_string())?,
-            forge::fetch_prs(number, repo, root).map_err(|e| e.to_string())?,
-            None,
-        ),
-        Artifact::Pr => {
-            let this = forge::fetch_pr(number, repo, root).map_err(|e| e.to_string())?;
-            (Vec::new(), Vec::new(), park_self_block(&this))
-        }
-    };
-
-    Ok(Evidence {
-        named,
-        prose,
-        closing,
-        declared,
-        self_block,
-    })
 }
 
 /// The human report: a bordered stderr warning when anything was found, plus
@@ -343,8 +251,23 @@ pub(super) fn gather(
 /// caller of this on the sweep path captures stderr to a log file, which is the
 /// same reasoning `script_helpers::emit` records for its own diagnostics.
 fn report(s: &Sections<'_>, quiet: bool) {
-    let mut w = std::io::stderr();
+    render(&mut std::io::stderr(), &mut std::io::stdout(), s, quiet);
+}
 
+/// [`report`] over arbitrary writers, so a test can assert section placement.
+fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: bool) {
+    // Nothing was listed, so the count is unknown and the line says so. It
+    // goes to stdout like the clear-confirmation, so `--quiet` suppresses it.
+    if s.archived == Some(true) {
+        if !quiet {
+            let _ = writeln!(
+                out,
+                "[stale-blocked] repository is archived; its open loom:blocked artifacts were \
+                 not evaluated (read-only: no role can act on them)."
+            );
+        }
+        return;
+    }
     if let Some(why) = s.enumerate_error {
         let _ =
             writeln!(w, "[stale-blocked] could not enumerate open loom:blocked artifacts: {why}");
@@ -356,7 +279,11 @@ fn report(s: &Sections<'_>, quiet: bool) {
     }
 
     if s.any() {
-        let n = s.stale.len() + s.superseded.len() + s.undocumented.len() + s.prose_only.len();
+        let n = s.stale.len()
+            + s.superseded.len()
+            + s.unticked.len()
+            + s.undocumented.len()
+            + s.prose_only.len();
         let _ = writeln!(w);
         let _ = writeln!(w, "{}", "=".repeat(72));
         let _ = writeln!(
@@ -407,6 +334,36 @@ fn report(s: &Sections<'_>, quiet: bool) {
         }
         let _ =
             writeln!(w, "  Do NOT unpark these on the cleared dependency alone (#4634, #7267).");
+    }
+
+    if !s.unticked.is_empty() {
+        let _ = writeln!(w);
+        let _ = writeln!(
+            w,
+            "CHECKLIST REFS RESOLVED, BOXES UNTICKED: confirm each condition, tick it, or \
+             unpark ({}):",
+            s.unticked.len()
+        );
+        for f in s.unticked {
+            let _ = writeln!(w, "  {} {}", f.reference(), f.title);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                if !resolved_refs.is_empty() {
+                    let _ = writeln!(w, "      - refs resolved: {}", resolved_refs.join(", "));
+                }
+                if *unparsed > 0 {
+                    let _ =
+                        writeln!(w, "      - {unparsed} unchecked line(s) carry no readable ref");
+                }
+            }
+        }
+        let _ = writeln!(
+            w,
+            "  An unticked box is unmet: a merge or close does not prove its whole condition."
+        );
     }
 
     if !s.undocumented.is_empty() {
@@ -493,19 +450,37 @@ fn report(s: &Sections<'_>, quiet: bool) {
         return;
     }
 
+    // Only when something was examined: an empty population stays silent.
+    if s.cost.projected != budget::Projection::default() {
+        let _ = writeln!(w, "{}", s.cost.summary());
+        if let Some(why) = s
+            .cost
+            .budget_refused
+            .as_deref()
+            .or(s.cost.budget_stopped.as_deref())
+        {
+            let _ = writeln!(w, "[stale-blocked] {why}");
+        }
+    }
+
     if s.any() {
-        println!(
-            "[stale-blocked] WARNING: {} stale, {} superseded, {} undocumented, {} prose-only \
-             loom:blocked artifact(s). See stderr for details.",
+        let _ = writeln!(
+            out,
+            "[stale-blocked] WARNING: {} stale, {} superseded, {} unticked, {} undocumented, \
+             {} prose-only loom:blocked artifact(s). See stderr for details.",
             s.stale.len(),
             s.superseded.len(),
+            s.unticked.len(),
             s.undocumented.len(),
             s.prose_only.len()
         );
     } else if s.enumerate_error.is_some() {
-        println!("[stale-blocked] could not enumerate loom:blocked artifacts; see stderr.");
+        let _ = writeln!(
+            out,
+            "[stale-blocked] could not enumerate loom:blocked artifacts; see stderr."
+        );
     } else {
-        println!("[stale-blocked] no stale, superseded, undocumented or prose-only loom:blocked artifacts.");
+        let _ = writeln!(out, "[stale-blocked] no stale, superseded, undocumented or prose-only loom:blocked artifacts.");
     }
 }
 
@@ -550,6 +525,22 @@ fn print_json(s: &Sections<'_>) {
             v
         })
         .collect();
+    let unticked_json: Vec<_> = s
+        .unticked
+        .iter()
+        .map(|f| {
+            let mut v = row(f);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                v["resolved_refs"] = serde_json::json!(resolved_refs);
+                v["unparsed"] = serde_json::json!(unparsed);
+            }
+            v
+        })
+        .collect();
     let undoc_json: Vec<_> = s.undocumented.iter().map(row).collect();
     let prose_only_json: Vec<_> = s.prose_only.iter().map(row).collect();
     let uneval_json: Vec<_> = s
@@ -562,10 +553,99 @@ fn print_json(s: &Sections<'_>) {
         serde_json::json!({
             "stale": stale_json,
             "superseded": superseded_json,
+            "unticked": unticked_json,
             "undocumented": undoc_json,
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
+            "forge_cost": s.cost,
+            "archived": s.archived,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unticked() -> Finding {
+        Finding {
+            kind: Artifact::Issue,
+            number: 42,
+            title: "parked".into(),
+            verdict: Verdict::Unticked {
+                resolved_refs: vec!["#187".into()],
+                unparsed: 0,
+            },
+            undeclared: false,
+        }
+    }
+
+    fn rendered(quiet: bool) -> String {
+        let f = [unticked()];
+        let uneval = [("issue #7".to_string(), "timeout".to_string())];
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &f,
+            undocumented: &[],
+            prose_only: &[],
+            unevaluated: &uneval,
+            enumerate_error: None,
+            cost: &cost,
+            archived: Some(false),
+        };
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, quiet);
+        String::from_utf8(err).unwrap()
+    }
+
+    /// An archived repository is one stdout line and nothing on stderr
+    /// (#10562); `--quiet` silences it.
+    #[test]
+    fn archived_repo_is_one_line() {
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &[],
+            undocumented: &[],
+            prose_only: &[],
+            unevaluated: &[],
+            enumerate_error: None,
+            cost: &cost,
+            archived: Some(true),
+        };
+        for quiet in [false, true] {
+            let (mut err, mut out) = (Vec::new(), Vec::new());
+            render(&mut err, &mut out, &s, quiet);
+            assert!(err.is_empty());
+            let out = String::from_utf8(out).unwrap();
+            if quiet {
+                assert!(out.is_empty(), "{out}");
+            } else {
+                assert_eq!(out.lines().count(), 1, "{out}");
+                assert!(out.contains("repository is archived"), "{out}");
+                assert!(!out.contains("no stale"), "never reported clear: {out}");
+            }
+        }
+    }
+
+    /// The unticked section sits inside the bordered report body (#9274): listed
+    /// under `--quiet`, and before the closing remedy footer.
+    #[test]
+    fn unticked_section_is_inside_report_body_even_when_quiet() {
+        for quiet in [false, true] {
+            let err = rendered(quiet);
+            let section = err
+                .find("CHECKLIST REFS RESOLVED, BOXES UNTICKED")
+                .unwrap_or_else(|| panic!("unticked section missing (quiet={quiet}):\n{err}"));
+            let uneval = err.find("NOT EVALUATED").expect("unevaluated section");
+            let footer = err.find("To re-check one issue").expect("footer");
+            assert!(section < uneval, "unticked must precede NOT EVALUATED:\n{err}");
+            assert!(section < footer, "unticked must precede the footer:\n{err}");
+            assert!(err.contains("issue #42 parked"));
+        }
+    }
 }

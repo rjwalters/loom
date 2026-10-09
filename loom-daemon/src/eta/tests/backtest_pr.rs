@@ -272,11 +272,11 @@ fn sweep_record(issue: u32, phases: &[(&str, i64)]) -> SweepOutcomeRecord {
     super::backtest::record(issue, REPO, phases, SweepResult::Success)
 }
 
-#[test]
-fn a_case_both_sources_answer_is_counted_once() {
-    // An in-sweep merge: the sweep record and the forge timeline describe
-    // the same review → rejection → review → approval path.
-    let record = sweep_record(
+/// The in-sweep merge both sources answer: issue 11's sweep record, whose PR
+/// is 9011 (`9000 + issue`, the `record` helper's), through review →
+/// rejection → review → approval.
+fn in_sweep_land_cases(pr_number: Option<u32>) -> Vec<ReplayCase> {
+    let mut record = sweep_record(
         11,
         &[
             ("builder", 600),
@@ -286,16 +286,40 @@ fn a_case_both_sources_answer_is_counted_once() {
             ("merge", 4000),
         ],
     );
-    let sweep_cases: Vec<ReplayCase> = cases_from_record(&record, t(5000))
+    assert_eq!(record.pr_number, Some(9011));
+    record.pr_number = pr_number;
+    cases_from_record(&record, t(5000))
         .into_iter()
         .filter(|c| c.kind == Kind::Land)
-        .collect();
-    let forge = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+        .collect()
+}
+
+#[test]
+fn a_case_both_sources_answer_is_counted_once() {
+    // An in-sweep merge: the sweep record and the forge timeline describe
+    // the same review → rejection → review → approval path of PR 9011.
+    // (Until #10781 the forge side was PR 111 while the sweep record named
+    // PR 9011, and the two were treated as one case only because identity
+    // ignored the PR. They are two PRs on one issue, so the forge side now
+    // names the sweep record's own PR.)
+    let sweep_cases = in_sweep_land_cases(Some(9011));
+    let forge = cases_from_pr_history(REPO, &two_lap_pr(9011, Vec::new()), Some(&[11])).unwrap();
     assert_eq!(forge.len(), 4);
 
     let (merged_set, dropped) = merge_case_sets(sweep_cases.clone(), forge.clone());
     assert_eq!(dropped, 4, "every forge case was already answered by the sweep");
     assert_eq!(merged_set, sweep_cases);
+
+    // A sweep record that does not know its PR (before #9441, or a
+    // checkpoint that missed it) still dedups against the forge, by the
+    // issue-level lap, exactly as before #10781.
+    let unknown_pr = in_sweep_land_cases(None);
+    for pr in [9011, 111] {
+        let forge = cases_from_pr_history(REPO, &two_lap_pr(pr, Vec::new()), Some(&[11])).unwrap();
+        let (merged_set, dropped) = merge_case_sets(unknown_pr.clone(), forge);
+        assert_eq!(dropped, 4, "PR {pr}: the issue-level fallback");
+        assert_eq!(merged_set, unknown_pr);
+    }
 
     // Reading the same PR twice (offline file + forge) is one set, not two;
     // its two genuine review laps stay distinct.
@@ -311,10 +335,66 @@ fn a_case_both_sources_answer_is_counted_once() {
         2
     );
 
-    // A different issue is not collapsed into it.
+    // A different issue is not collapsed into it…
     let other = cases_from_pr_history(REPO, &two_lap_pr(112, Vec::new()), Some(&[12])).unwrap();
     let (kept, dropped) = merge_case_sets(sweep_cases.clone(), other);
     assert_eq!((kept.len(), dropped), (sweep_cases.len() + 4, 0));
+    // …nor is a different, known PR on the same issue.
+    let sibling = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+    let (kept, dropped) = merge_case_sets(sweep_cases.clone(), sibling);
+    assert_eq!((kept.len(), dropped), (sweep_cases.len() + 4, 0));
+}
+
+/// #10781: issue 11 has two PRs. B (9011) merged inside a sweep, so both
+/// sources answer it; A (111) was merged by Champion, so only the forge
+/// does, and each of A's stage entries is earlier than B's. Ranked by issue
+/// alone, A's forge case took lap 0, matched B's sweep case and was dropped,
+/// while B's own forge case took lap 1 and was kept: B scored twice, A
+/// never. Each is kept once.
+#[test]
+fn a_same_issue_pr_merged_outside_the_sweep_is_kept_and_the_swept_one_not_doubled() {
+    let sweep_cases = in_sweep_land_cases(Some(9011));
+    let b = cases_from_pr_history(REPO, &two_lap_pr(9011, Vec::new()), Some(&[11])).unwrap();
+    let a = cases_from_pr_history(
+        REPO,
+        &merged(
+            111,
+            3000,
+            vec![
+                labeled(REVIEW_REQUESTED, 50),
+                unlabeled(REVIEW_REQUESTED, 90),
+                labeled(APPROVED, 90),
+            ],
+        ),
+        Some(&[11]),
+    )
+    .unwrap();
+    assert_eq!(a.len(), 2);
+    for case in &a {
+        let rivals: Vec<&ReplayCase> = sweep_cases
+            .iter()
+            .chain(&b)
+            .filter(|c| c.stage == case.stage)
+            .collect();
+        assert!(!rivals.is_empty(), "{:?} has a B case to be confused with", case.stage);
+        assert!(rivals.iter().all(|c| case.as_of < c.as_of), "A enters {:?} first", case.stage);
+    }
+
+    let mut forge = a.clone();
+    forge.extend(b.clone());
+    let (merged_set, dropped) = merge_case_sets(sweep_cases.clone(), forge);
+    assert_eq!(dropped, b.len(), "B's forge cases, and only those, are dropped");
+    let mut want = sweep_cases.clone();
+    want.extend(a);
+    assert_eq!(merged_set, want);
+
+    // Without its PR the sweep record falls back to the issue-level lap, as
+    // before #10781: one sweep case still answers at most one forge case.
+    let unknown_pr = in_sweep_land_cases(None);
+    let mut forge = cases_from_pr_history(REPO, &two_lap_pr(111, Vec::new()), Some(&[11])).unwrap();
+    forge.extend(b);
+    let (merged_set, dropped) = merge_case_sets(unknown_pr.clone(), forge);
+    assert_eq!((merged_set.len(), dropped), (unknown_pr.len() + 4, 4));
 }
 
 /// `land-v1` with every quantile replaced by an absurdly early triple.
@@ -420,7 +500,10 @@ fn labels_at(h: &PrHistory, as_of: chrono::DateTime<chrono::Utc>) -> Vec<String>
             PrEvent::Unlabeled { label, .. } => {
                 labels.remove(label);
             }
-            PrEvent::Pushed { .. } | PrEvent::Merged { .. } => {}
+            PrEvent::Pushed { .. }
+            | PrEvent::Merged { .. }
+            | PrEvent::Closed { .. }
+            | PrEvent::Reopened { .. } => {}
         }
     }
     labels.into_iter().collect()
@@ -769,4 +852,187 @@ fn later_events_never_move_an_earlier_hold_cases_inputs() {
     let last = perturbed.cases.last().unwrap();
     assert_eq!((last.stage, last.rework_rounds), (Stage::Doctor, 1));
     assert!(perturbed.cases.iter().all(|c| c.as_of < c.actual_at));
+}
+
+#[test]
+fn the_pr_case_producer_reconstructs_each_cases_point_in_time_queue() {
+    use crate::eta::heuristics::LittleV0;
+
+    let records = records();
+    let (cases, _) = cases_from_pr_records(&records);
+    for case in &cases {
+        let [queue] = case.queue.as_slice() else {
+            panic!("expected one queue entry, got {:?}", case.queue);
+        };
+        assert_eq!(queue.stage, case.stage);
+    }
+
+    // Four overlapping PRs, each reviewed then approved (`loom:pr`) then merged.
+    let pr = |n: u32, review: &str, approve: &str, merge: &str| {
+        let ev = |kind: &str, label: Option<&str>, at: &str| match label {
+            Some(l) => format!(r#"{{"event":"{kind}","label":"{l}","at":"2026-09-01T{at}:00Z"}}"#),
+            None => format!(r#"{{"event":"{kind}","at":"2026-09-01T{at}:00Z"}}"#),
+        };
+        let events = [
+            ev("labeled", Some("loom:review-requested"), review),
+            ev("unlabeled", Some("loom:review-requested"), approve),
+            ev("labeled", Some("loom:pr"), approve),
+            ev("merged", None, merge),
+        ]
+        .join(",");
+        format!(
+            r#"{{"schema":"eta-pr-case/v1","repo":"{REPO}","number":{n},"created_at":"2026-08-31T23:00:00Z","state":"merged","merged_at":"2026-09-01T{merge}:00Z","closing_issues":[{}],"timeline_complete":true,"events":[{events}]}}"#,
+            n - 100
+        )
+    };
+    let jsonl = [
+        pr(200, "00:00", "00:20", "00:35"),
+        pr(201, "00:05", "00:30", "00:40"),
+        pr(202, "00:10", "00:40", "00:50"),
+        pr(203, "00:25", "00:45", "01:00"),
+    ]
+    .join("\n");
+    let (overlap, _) = cases_from_pr_records(&parse_pr_records(&jsonl).unwrap());
+    let queue_of = |pr: u32, stage: Stage| {
+        let case = overlap
+            .iter()
+            .find(|c| c.subject.pr_number == Some(pr) && c.stage == stage)
+            .unwrap_or_else(|| panic!("no {stage:?} case for PR {pr}"));
+        (case.queue[0].items_ahead, case.queue[0].exits)
+    };
+    // The first in line has nobody ahead and nothing has drained yet.
+    assert_eq!(queue_of(200, Stage::ReviewWait), (0, 0));
+    // 202 enters behind 200 and 201, both still in review.
+    assert_eq!(queue_of(202, Stage::ReviewWait), (2, 0));
+    // 203 enters behind 201 and 202; 200 has left review by then.
+    assert_eq!(queue_of(203, Stage::ReviewWait), (2, 1));
+    // 201 is approved while 200, approved earlier, still awaits its merge.
+    assert_eq!(queue_of(201, Stage::MergeWait), (1, 0));
+
+    // `little-v0` scores on the producer's own cases, no hand-fed queue.
+    let report = backtest::run(
+        &LittleV0,
+        &history_of(&backfill(&records)),
+        &cases,
+        Filter::default(),
+        &provenance(),
+    );
+    assert!(report.overall.scored > 0, "{report:?}");
+}
+
+/// One PR record on 2026-09-01 for the queue-reconstruction tests: `labels`
+/// are `(added, label, "HH:MM")` events; `end` is the state and its instant.
+fn queue_pr(
+    n: u32,
+    closing: &str,
+    end: (&str, Option<&str>),
+    labels: &[(bool, &str, &str)],
+) -> String {
+    let mut events: Vec<String> = labels
+        .iter()
+        .map(|(added, label, at)| {
+            let kind = if *added { "labeled" } else { "unlabeled" };
+            format!(r#"{{"event":"{kind}","label":"{label}","at":"2026-09-01T{at}:00Z"}}"#)
+        })
+        .collect();
+    let (state, at) = end;
+    let mut terminal = String::new();
+    if let Some(at) = at {
+        let key = if state == "merged" {
+            "merged_at"
+        } else {
+            "closed_at"
+        };
+        terminal = format!(r#","{key}":"2026-09-01T{at}:00Z""#);
+        if state == "merged" {
+            events.push(format!(r#"{{"event":"merged","at":"2026-09-01T{at}:00Z"}}"#));
+        }
+    }
+    format!(
+        r#"{{"schema":"eta-pr-case/v1","repo":"{REPO}","number":{n},"created_at":"2026-08-31T23:00:00Z","state":"{state}"{terminal},"closing_issues":{closing},"timeline_complete":true,"events":[{}]}}"#,
+        events.join(",")
+    )
+}
+
+fn queue_of_case(jsonl: &[String], pr: u32, stage: Stage) -> (u32, u32) {
+    let (cases, _) = cases_from_pr_records(&parse_pr_records(&jsonl.join("\n")).unwrap());
+    let case = cases
+        .iter()
+        .find(|c| c.subject.pr_number == Some(pr) && c.stage == stage)
+        .unwrap_or_else(|| panic!("no {stage:?} case for PR {pr}"));
+    (case.queue[0].items_ahead, case.queue[0].exits)
+}
+
+#[test]
+fn a_neighbour_that_is_not_a_scored_case_still_holds_its_queue_position() {
+    let review = [(true, "loom:review-requested", "00:00")];
+    let target = queue_pr(
+        301,
+        "[31]",
+        ("merged", Some("01:00")),
+        &[(true, "loom:review-requested", "00:10")],
+    );
+    let baseline = queue_of_case(
+        &[
+            queue_pr(300, "[30]", ("merged", Some("00:50")), &review),
+            target.clone(),
+        ],
+        301,
+        Stage::ReviewWait,
+    );
+    assert_eq!(baseline, (1, 0));
+
+    // The earlier neighbour stays open, closes unmerged after the target
+    // entered, or has no closing issue: none is a scored case, and none may
+    // change what the target saw ahead of it.
+    for neighbour in [
+        queue_pr(300, "[30]", ("open", None), &review),
+        queue_pr(300, "[30]", ("closed", Some("00:40")), &review),
+        queue_pr(300, "[]", ("merged", Some("00:50")), &review),
+        queue_pr(300, "null", ("merged", Some("00:50")), &review),
+    ] {
+        assert_eq!(
+            queue_of_case(&[neighbour.clone(), target.clone()], 301, Stage::ReviewWait),
+            baseline,
+            "{neighbour}"
+        );
+    }
+
+    // A neighbour that closed unmerged *before* the target entered has
+    // already drained: one exit, nobody ahead.
+    let drained = queue_pr(300, "[30]", ("closed", Some("00:05")), &review);
+    assert_eq!(queue_of_case(&[drained, target], 301, Stage::ReviewWait), (0, 1));
+}
+
+#[test]
+fn removing_the_last_review_label_ends_the_occupancy() {
+    // A: review 00:00, label removed 00:10, merge-wait 00:30. B enters
+    // review at 00:20, after A left review and before A re-entered a stage.
+    let a = queue_pr(
+        310,
+        "[31]",
+        ("merged", Some("00:50")),
+        &[
+            (true, "loom:review-requested", "00:00"),
+            (false, "loom:review-requested", "00:10"),
+            (true, "loom:pr", "00:30"),
+        ],
+    );
+    let b = queue_pr(
+        311,
+        "[32]",
+        ("merged", Some("01:00")),
+        &[(true, "loom:review-requested", "00:20")],
+    );
+    let jsonl = [a, b];
+    assert_eq!(queue_of_case(&jsonl, 311, Stage::ReviewWait), (0, 1));
+    // The gap is no scored case of A's own: its entries are review and
+    // merge-wait only.
+    let (cases, _) = cases_from_pr_records(&parse_pr_records(&jsonl.join("\n")).unwrap());
+    let a_stages: Vec<Stage> = cases
+        .iter()
+        .filter(|c| c.subject.pr_number == Some(310))
+        .map(|c| c.stage)
+        .collect();
+    assert_eq!(a_stages, [Stage::ReviewWait, Stage::MergeWait]);
 }

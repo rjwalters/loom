@@ -45,6 +45,9 @@
 //!   OTel environment a *spawned worker's own* Claude Code session needs in
 //!   order to emit `claude_code.llm_request` / `claude_code.tool` sub-spans
 //!   into the trace [`tracing::prepare_child`] already propagates.
+//! - [`agent_relay`] (Issue #10964) — opt-in, default-off: a loopback OTLP
+//!   receiver (`otlp::relay`) for the agent sessions this daemon launches,
+//!   which binds their identity, scrubs them, and forwards to the `otlp` sink.
 //! - [`daemon_event`] (Issue #8760, G4 of #8714) — a second, narrower
 //!   [`crate::event_bus::EventBus`] subscriber alongside [`collector`],
 //!   covering the four named topics that carried no telemetry record kind
@@ -100,29 +103,37 @@
 //! than requiring — or risking — a value copied verbatim from a different
 //! host (#5336).
 
+pub mod agent_relay;
 pub mod backfill;
+pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+mod eta_dependency;
 pub mod eta_fit;
 pub mod eta_fleet_refresh;
 mod eta_friction;
+pub mod eta_nightly_folds;
 pub mod eta_snapshot;
 pub mod exporter;
+pub mod fleet_state;
 pub mod lifecycle;
+pub mod llm_billing;
 pub mod ops;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
+pub mod pick_journal;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
 pub mod repo_ref;
+pub mod request_headers;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
@@ -203,6 +214,11 @@ pub struct RawExporterEntry {
     /// Per-exporter endpoint; `None` ⇒ this entry uses the shared
     /// `observability.endpoint`.
     pub endpoint: Option<String>,
+    /// `headers_file` (Issue #10961): a path to extra request headers, see
+    /// [`request_headers`]. `Some("")` records a key that was present but not
+    /// a usable string, so the policy pass refuses it instead of exporting
+    /// without the headers the operator asked for.
+    pub headers_file: Option<String>,
 }
 
 /// One resolved entry of the exporter list (Issue #8756): kind classified,
@@ -213,6 +229,10 @@ pub struct ExporterEntry {
     /// Per-exporter endpoint override; `None` ⇒ use the shared
     /// `observability.endpoint`.
     pub endpoint: Option<String>,
+    /// Path to this entry's extra request headers (Issue #10961,
+    /// [`request_headers`]). Only ever the *path*: the file is read when the
+    /// exporter is built, and its contents never reach this struct.
+    pub headers_file: Option<String>,
 }
 
 /// Which [`exporter::Exporter`] implementation [`spawn_task`] selects.
@@ -302,7 +322,8 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
 
 /// Parse the `observability.exporters` array (Issue #8756). Each element is
 /// either a bare kind string (`"https"`) or an object `{"kind": "otlp",
-/// "endpoint": "…"}`; anything else (or an object without a string `kind`) is
+/// "endpoint": "…", "headers_file": "…"}` (`headersFile` is accepted as an
+/// alias, #10961); anything else (or an object without a string `kind`) is
 /// dropped here — malformed *shapes* cannot be named in a warn line, while a
 /// well-formed-but-unknown kind string survives to [`resolve_exporters`],
 /// which logs it.
@@ -314,6 +335,7 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
             serde_json::Value::String(kind) => Some(RawExporterEntry {
                 kind: kind.clone(),
                 endpoint: None,
+                headers_file: None,
             }),
             serde_json::Value::Object(fields) => {
                 let kind = fields.get("kind")?.as_str()?.to_string();
@@ -322,7 +344,17 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
                     .and_then(serde_json::Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
-                Some(RawExporterEntry { kind, endpoint })
+                // Present-but-unusable (not a string) becomes `Some("")`,
+                // which `request_headers::entry_policy` refuses.
+                let headers_file = ["headers_file", "headersFile"]
+                    .iter()
+                    .find_map(|key| fields.get(*key))
+                    .map(|value| value.as_str().unwrap_or_default().to_string());
+                Some(RawExporterEntry {
+                    kind,
+                    endpoint,
+                    headers_file,
+                })
             }
             _ => None,
         })
@@ -651,6 +683,48 @@ pub fn global_export_statuses(
         .collect()
 }
 
+/// Process-global per-exporter queues (Issue #11124), keyed like
+/// [`GLOBAL_EXPORT_STATUSES`], so the `host.export` record can read each
+/// exporter's depth and lifetime drop count. Last-wins, for the same reason.
+static GLOBAL_EXPORT_QUEUES: std::sync::Mutex<
+    Option<std::collections::BTreeMap<String, Arc<DurableQueue>>>,
+> = std::sync::Mutex::new(None);
+
+/// Publish the per-exporter queues as the process-global (Issue #11124).
+pub fn register_global_export_queues(
+    queues: std::collections::BTreeMap<String, Arc<DurableQueue>>,
+) {
+    *GLOBAL_EXPORT_QUEUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(queues);
+}
+
+/// Every running exporter's queue depth and lifetime drop count, keyed by
+/// exporter name. Empty when no exporter started.
+#[must_use]
+pub fn global_export_queue_stats(
+) -> std::collections::BTreeMap<String, crate::telemetry::kinds::host_export::QueueStats> {
+    let guard = GLOBAL_EXPORT_QUEUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .map(|(name, queue)| {
+                    (
+                        name.clone(),
+                        crate::telemetry::kinds::host_export::QueueStats {
+                            depth: u64::try_from(queue.len()).unwrap_or(u64::MAX),
+                            dropped_total: queue.dropped_total(),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// **env(singular) > config list > config singular > default (`[https]`)**
 /// (Issue #8756). Resolves the full exporter list [`spawn_task`] fans out to:
 ///
@@ -674,6 +748,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         vec![RawExporterEntry {
             kind: env,
             endpoint: None,
+            headers_file: None,
         }]
     } else if let Some(list) = config.exporters.as_ref().filter(|list| !list.is_empty()) {
         list.clone()
@@ -685,6 +760,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         vec![RawExporterEntry {
             kind: singular,
             endpoint: None,
+            headers_file: None,
         }]
     };
     let mut resolved: Vec<ExporterEntry> = Vec::with_capacity(raw.len());
@@ -701,6 +777,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
                     resolved.push(ExporterEntry {
                         kind,
                         endpoint: entry.endpoint,
+                        headers_file: entry.headers_file,
                     });
                 }
             }
@@ -716,6 +793,7 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
         resolved.push(ExporterEntry {
             kind: ExporterKind::Https,
             endpoint: None,
+            headers_file: None,
         });
     }
     resolved
@@ -857,6 +935,15 @@ fn entry_endpoint(
                 .to_string(),
         ));
     }
+    // `headers_file` (Issue #10961): refused here, before the ingest key or
+    // the headers file itself is read. A no-op for an entry without one.
+    if let Err(detail) = request_headers::entry_policy(
+        entry.kind == ExporterKind::Otlp,
+        &endpoint,
+        entry.headers_file.as_deref(),
+    ) {
+        return Err((Some(endpoint), detail));
+    }
     Ok(endpoint)
 }
 
@@ -866,6 +953,18 @@ fn entry_endpoint(
 /// nothing (#10116: the attended live-output tailer's gate).
 #[must_use]
 pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
+    planned_otlp_exporters(config)
+        .into_iter()
+        .map(|(endpoint, _)| endpoint)
+        .collect()
+}
+
+/// [`planned_otlp_endpoints`], each paired with its entry's `headers_file`
+/// path (Issue #10961) — so a second process that builds its own exporter
+/// for the same destination sends the same headers. Paths only; nothing is
+/// read.
+#[must_use]
+pub fn planned_otlp_exporters(config: &ObservabilityConfig) -> Vec<(String, Option<String>)> {
     if !resolve_enabled(config) {
         return Vec::new();
     }
@@ -873,7 +972,10 @@ pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
     resolve_exporters(config)
         .iter()
         .filter(|entry| entry.kind == ExporterKind::Otlp)
-        .filter_map(|entry| entry_endpoint(entry, shared_endpoint.as_ref()).ok())
+        .filter_map(|entry| {
+            let endpoint = entry_endpoint(entry, shared_endpoint.as_ref()).ok()?;
+            Some((endpoint, entry.headers_file.clone()))
+        })
         .collect()
 }
 
@@ -1019,10 +1121,15 @@ pub fn spawn_task(
     // `async-trait`).
     let mut sender_handles = Vec::with_capacity(planned.len());
     let mut queues: Vec<Arc<DurableQueue>> = Vec::with_capacity(planned.len());
+    let mut export_queues: std::collections::BTreeMap<String, Arc<DurableQueue>> =
+        std::collections::BTreeMap::new();
     // The OTLP-only subset, for the `ops` sink (Issue #8860).
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
+    // The OTLP sinks whose senders started, for the agent relay (#10964).
+    #[cfg(feature = "otlp")]
+    let mut relay_sinks: Vec<otlp::relay::Sink> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
         let queue_path = queue_path_for(&workspace_root, name, sole);
@@ -1103,7 +1210,14 @@ pub fn spawn_task(
                 // check against.
                 #[cfg(feature = "otlp")]
                 {
-                    match otlp::OtlpExporter::new(endpoint.clone(), ingest_key.clone()) {
+                    // `headers_file` (#10961) is read here, at construction —
+                    // a refused file lands in the `Err` arm below as this
+                    // sink's own `misconfigured` detail (path and line only).
+                    match otlp::OtlpExporter::with_headers_file(
+                        endpoint.clone(),
+                        ingest_key.clone(),
+                        entry.headers_file.as_deref(),
+                    ) {
                         Ok(exporter) => sender::spawn_task(
                             queue.clone(),
                             exporter,
@@ -1137,10 +1251,16 @@ pub fn spawn_task(
         };
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
+            #[cfg(feature = "otlp")]
+            relay_sinks.push(otlp::relay::Sink {
+                endpoint: endpoint.clone(),
+                headers_file: entry.headers_file.clone(),
+            });
             otlp_queues.push(queue.clone());
         } else {
             native_queues.push(queue.clone());
         }
+        export_queues.insert(name.to_string(), queue.clone());
         queues.push(queue);
         sender_handles.push(sender_handle);
     }
@@ -1149,6 +1269,7 @@ pub fn spawn_task(
         register_global_export_status(primary_status_for(&entries, &statuses));
         return None;
     }
+    register_global_export_queues(export_queues);
     let fanout = Arc::new(queue::FanoutQueue::new(queues));
     // `session.summary` emission (Issue #8757, fanned out by #8756): hand the
     // transcript-ingest thread the same fan-out sink every other producer
@@ -1170,9 +1291,16 @@ pub fn spawn_task(
     // both kinds are OTLP-only, so an HTTPS queue would just carry and drop
     // them. No OTLP exporter ⇒ nothing registered ⇒ every emit is a no-op.
     let mut ops_handles = Vec::new();
+    // The agent telemetry relay (#10964): opt-in, and only over OTLP sinks
+    // that just started — it cannot add or start an exporter either.
+    #[cfg(feature = "otlp")]
+    ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
+    // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
+    // built on the collector's snapshot pass whether or not ETA is enabled.
+    fleet_state::register_sink(otlp_queues.clone(), &host_id);
     let eta_handle =
         eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
     // #10414: the ETA pass runs inside the collector's 5-minute pass, which
@@ -1204,6 +1332,13 @@ pub fn spawn_task(
             host_id.clone(),
         ));
     }
+    // The captain's nightly walk-forward backtest folds (#10492): independent
+    // of the refit/refresh either/or above; `fleet.captain`-gated per check.
+    ops_handles.extend(eta_nightly_folds::spawn_task(
+        workspace_root.clone(),
+        otlp_queues.clone(),
+        host_id.clone(),
+    ));
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the
@@ -1218,6 +1353,8 @@ pub fn spawn_task(
         // Long-running task liveness gauges (#10414), on their own ticker so
         // a stuck collector pass cannot hide another loop's death.
         ops_handles.push(ops::liveness::spawn_task());
+        // IPC request latency by kind (#10765), on its own ticker too.
+        ops_handles.push(ops::ipc_latency::spawn_task());
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.

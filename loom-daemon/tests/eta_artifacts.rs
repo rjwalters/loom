@@ -320,6 +320,7 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         alternates: vec![
             loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotAlternate {
                 heuristic: "land-2026-10-04-twin-otter".to_string(),
+                tier: Some(loom_daemon::eta::Tier::Candidate),
                 estimate_id: "0a1b2c3d4e5f6071".to_string(),
                 as_of: chrono::Utc::now(),
                 p25: Some(1),
@@ -329,11 +330,22 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
                 no_estimate_reason: Some(loom_daemon::eta::NoEstimateReason::NoModel),
             },
         ],
+        stages: std::collections::BTreeMap::from([(
+            loom_daemon::eta::Stage::ReviewWait,
+            loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotStage {
+                entry_p50: 0,
+                entry_p90: 0,
+                dwell_p50: 2_400,
+                dwell_p90: 10_800,
+                reach_pct: 100,
+            },
+        )]),
     };
     let record = EtaSnapshotRecord {
         as_of: row.as_of,
         rows: vec![row.clone()],
         rows_truncated: 0,
+        alternates_truncated: 0,
         rows_truncated_by_kind: Default::default(),
     };
     let section = SCHEMA_DOC
@@ -382,6 +394,18 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
             "the eta.snapshot alternate's `{field}` is not documented in telemetry-schema.md"
         );
     }
+    // #10929: each per-stage forecast field, too.
+    for field in serde_json::to_value(row.stages.values().next().unwrap())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        assert!(
+            documented(field),
+            "the eta.snapshot stage forecast's `{field}` is not documented in telemetry-schema.md"
+        );
+    }
     // The routing decision, which is the one thing a dashboard cannot infer
     // from the field list.
     assert!(
@@ -411,8 +435,15 @@ fn the_doc_no_longer_defers_the_live_list_to_a_later_phase() {
         ETA_DOC.contains("### Adding a v2, and comparing it"),
         "eta.md must document how a candidate heuristic is compared and promoted"
     );
-    // Both halves of the promotion gate, since either alone is not the rule.
-    assert!(ETA_DOC.contains("50 paired observations") && ETA_DOC.contains("[40%, 60%]"));
+    // The whole promotion gate, since any one clause alone is not the rule: the
+    // item-clustered primary test (#10525), the coverage band, and the day
+    // consistency check.
+    assert!(
+        ETA_DOC.contains("100 distinct items")
+            && ETA_DOC.contains("[40%, 60%]")
+            && ETA_DOC.contains("day consistency check"),
+        "eta.md must keep the whole promotion gate: primary test, coverage band, day consistency"
+    );
 }
 
 /// The four #10233 views each guard one specific misreading; the clause that

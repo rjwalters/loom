@@ -15,6 +15,7 @@ fn root(n: u8) -> PathBuf {
 
 fn row(number: u32, is_pull_request: bool) -> RestIssue {
     RestIssue {
+        comments: 0,
         number,
         title: None,
         labels: Vec::new(),
@@ -24,6 +25,7 @@ fn row(number: u32, is_pull_request: bool) -> RestIssue {
         state: "open".to_string(),
         body: None,
         author: None,
+        author_association: None,
         is_pull_request,
     }
 }
@@ -216,6 +218,7 @@ fn operator_held_prs_are_not_merge_debt() {
     // reads. Review debt is unaffected by the same labels (changes debt has
     // its own, narrower park set — see `parked_prs_are_not_changes_debt`).
     let labelled = |n: u32, label: &str| RestIssue {
+        comments: 0,
         labels: vec!["loom:pr".to_string(), label.to_string()],
         ..row(n, true)
     };
@@ -249,6 +252,7 @@ fn parked_prs_are_not_changes_debt() {
     // must not hold the build back-off engaged. `loom:operator` is still
     // Doctor work (#7660) and `loom:treating` is a live claim: both count.
     let labelled = |n: u32, label: &str| RestIssue {
+        comments: 0,
         labels: vec!["loom:changes-requested".to_string(), label.to_string()],
         ..row(n, true)
     };
@@ -284,6 +288,7 @@ fn review_debt_counts_held_and_parked_prs() {
     // #9421: Judge's queue has no label exclusions, so every open
     // `loom:review-requested` PR is review debt whatever else it carries.
     let labelled = |n: u32, label: &str| RestIssue {
+        comments: 0,
         labels: vec!["loom:review-requested".to_string(), label.to_string()],
         ..row(n, true)
     };
@@ -377,7 +382,8 @@ fn demand_config_defaults_and_per_key_fallback() {
             max: 6,
             reserve: false,
             non_pr_floor: 2,
-            stale_secs: 90
+            stale_secs: 90,
+            doctor_max_per_repo: 3
         }
     );
     let ws = workspace(r#"{"autonomous":{"roleRunner":{"demandWidth":{"perRun":7}}}}"#);
