@@ -1782,8 +1782,12 @@ workspace's default branch (never the working tree) and classifies it:
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
   `paused` reaches it), no pause roll is armed, committed or in progress
   (#10831; reported as `roll pending`, and never set by a fleet hold or an
-  operator drain), the binary on disk is still the one running, self-update is not in backoff or terminal, and the running version
-  is not below `loom_min_version`. The gate is read at the start of the pass,
+  operator drain), no pause manifest found at startup is still waiting for H5
+  to finish with it (#11016; reported as `resume-pending`, so a daemon a pause
+  roll just restarted claims and pushes nothing, in its startup pass or on the
+  timer, until health probation has passed), the binary on disk is still the
+  one running, self-update is not in backoff or terminal, and the running
+  version is not below `loom_min_version`. The gate is read at the start of the pass,
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
@@ -1892,8 +1896,8 @@ are in memory and reset on restart. Each workspace's state and reason appear on
 the `Fleet store:` status block and under `workspaces` in
 `fleet-sync-status.json`.
 
-The resync does not fast-forward a host's own checkout (#10869), so a host keeps
-running its old installed scripts until that checkout is updated.
+A resync never touches a host's own checkout: the checkout fast-forward below
+does that.
 
 #### What a resync refreshes (#10895)
 
@@ -1954,6 +1958,192 @@ Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
 
 Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
 a release with these surfaces is the fleet floor.
+
+### Checkout fast-forward (#10869)
+
+A resync lands on a repo's default branch **on the forge**. Each host
+dispatches from its **own main checkout**: the spawn script and the role
+prompts are read from that working tree. So the same timer also fast-forwards
+each registered workspace's main checkout to its default branch.
+
+- **When.** Inside the startup pass, before any dispatch producer exists, so a
+  daemon that just rolled dispatches (and later resumes paused agents) from the
+  installed files that match it. Then on every tick, as the last step of the
+  workspace resync's pass: on that pass's own thread, inside the same
+  supervised closure, so the fleet-sync timer never waits for it, the single
+  flight and the stuck-pass watchdog cover it, it follows any resync that pass
+  pushed, and it never overlaps the next pass. Nothing else schedules it, and
+  it does not wait for a roll window.
+- **Bounded.** It stops starting workspaces after 30 s at startup, and on the
+  timer after 45 s or at the workspace pass's 120 s deadline, whichever comes
+  first; the next pass starts with the ones it did not reach, and they keep
+  their last report. Every git child has a timeout (15 s for a read and for
+  `ls-remote`, 30 s for a fetch). At startup it runs inside the startup pass's
+  own cap (`LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS`), so it never delays boot
+  past it.
+- **Writes need `fleet.autoApply`.** With it off, nothing is modified and a
+  clean checkout that is behind is reported as `behind`, with the count.
+- **A paused host writes nothing.** "Paused" means everything on the host is
+  left as it is, in a state a resume can pick up, so the fast-forward follows
+  the pause just as the network does, though it is only a local write. With
+  `fleet.autoApply` on, no checkout is moved while dispatch is paused (a
+  drain, a roll's pause or a fleet hold), while a pause roll is armed,
+  committed or in progress, or while a pause manifest found at startup is not
+  yet finished by H5 (`resume-pending`). The last covers the startup pass,
+  which runs before H5 is spawned, and every timer pass until H5 ends. The
+  question is asked again right before each merge. A clean checkout that is
+  behind is reported as `behind` with the reason, and the first pass after
+  the pause ends fast-forwards it. A host that is merely offline, or not in
+  H0 for another reason, is not held this way.
+- **The local merge is not tied to provenance; the network is.** The merge is
+  a write to the host's own clean checkout, so any build with
+  `fleet.autoApply` on may fast-forward to the `origin/<default>` its clone
+  already has. Asking a remote or fetching is another matter: this step does
+  that only on a host the workspace resync would itself use the network on
+  (see below), so a build that is not an official release asks nothing.
+- **One git write.** `git merge --ff-only origin/<default>`, with hooks
+  disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
+  `submodule.recurse` and the silent overwrite of ignored files turned off.
+  Never `reset`, `rebase`, `stash`, `checkout`, `clean`, a merge commit, or a
+  removed lock file. Submodules are not updated.
+
+What a pass costs on the network:
+
+- **None at all on a host the workspace resync keeps off the network**: no
+  `ls-remote` and no fetch. The checkout is compared with the clone's own
+  `origin/<default>` as it stands, so the reported count is as of the last
+  fetch anything made in that clone. That is a host:
+  - with `fleet.autoApply` off;
+  - with dispatch paused (a drain, a roll's pause or a fleet hold);
+  - with a resume pending: a pause manifest found at startup that H5 has not
+    finished with;
+  - running a build that is not an official release, or whose release tag is
+    not verified yet;
+  - with a roll pending, or a different binary staged on disk;
+  - running a version below the fleet floor (`loom_min_version`);
+  - whose self-update is backing off or has given up;
+  - in an outage hold (no remote answered in a recent pass).
+
+  On the timer the step does not work this out for itself: it takes the
+  workspace pass's own decision, so the two halves cannot disagree. At startup
+  it applies the same host gate to what is knowable at boot; a fresh daemon is
+  exempt only from "startup pass not complete", since that pass is the one
+  that verifies.
+- **None for a repo the resync is backing off** because its remote did not
+  answer or refused, until that backoff ends.
+- **None for a repo the workspace resync asked about in the same pass.** That
+  pass already learned the head (one batched query per owner) and fetched it
+  if it moved; this step trusts it, and fetches only if the clone's
+  `origin/<default>` is somehow not that head.
+- **One `git ls-remote` per pass for any other root**: the Loom source repo
+  and a non-GitHub origin (which the resync skips), a repo the resync did not
+  reach, and every root at startup. Then a `git fetch` only
+  when the head moved, with `--no-write-fetch-head`. The rate-limit breaker is
+  read immediately before each `ls-remote`; while it is open nothing more is
+  asked and the checkout is compared with the clone as it stands.
+- Three remotes in a row that do not answer end the pass's network use.
+- **No fetch below the free-space floor** (`diskWarnFreeGb`, #10995). A fetch
+  that is due there is not run, at startup or on the timer, and the checkout
+  reports `low-disk`, never `fetch-failed`: it is not a failure, sets no
+  backoff and does not count toward the three-in-a-row stop.
+
+So on a host that may use the network, any commit on the default branch
+reaches every clean checkout on the next tick, and the host that pushed a
+resync fast-forwards to it in the same pass.
+
+The step never waits for its own state: if an earlier step that never ended
+(for example one stuck in a git child) still holds it, the tick's step is
+skipped, the workspace pass it follows still records its result, and the
+`Fleet store:` block says `checkouts: an earlier checkout step has not ended;
+nothing was checked this tick`.
+
+For each workspace the first rule that matches ends the attempt:
+
+| # | Check | State when it fails |
+|---|---|---|
+| 1 | the clone's `origin/HEAD` names the default branch (no remote is asked, `main` is never guessed) | `no-default-branch` |
+| 2 | HEAD is on it, not on another branch and not detached | `wrong-branch` |
+| 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
+| 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
+| 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
+| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed`; `low-disk` when the fetch was not run below the free-space floor and nothing else is to report |
+| 6 | nothing behind and nothing ahead | `current` |
+| 7 | ahead only: unpushed local commits | `ahead` |
+| 8 | ahead and behind | `diverged` |
+| 9 | no staged or unstaged change to any tracked file | `dirty` |
+| 10 | the merge succeeds | `would-overwrite` when a local file is in the way, else `git-failure` |
+| | | `fast-forwarded` |
+
+- **Local work is never touched.** A checkout in any skip state is left exactly
+  as it is: HEAD, index and working tree. Untracked files do not make a
+  checkout dirty; one that sits where an incoming commit adds a file is
+  `would-overwrite`, and nothing is changed.
+- **Stricter than the gate's sync, on purpose.** The main-health gate also
+  brings a checkout to `origin/main` before a gate build
+  (`prepare_workspace_to_origin_main`), with `git reset --hard`, and so may
+  ignore some tracked dirt (lockfiles, a re-stamped
+  `.loom/install-metadata.json`). That sync is unchanged, and it runs only for
+  a repo with a build gate when a gate run is due. This step discards nothing,
+  so any tracked change is `dirty`. The two compose: after a fast-forward the
+  gate's reset is a no-op. They are not mutually excluded: this step checks
+  for a gate run before an attempt and again right before the merge, which
+  narrows the race but does not close it. Both writers are the daemon's own and
+  both only bring the checkout to `origin/<default>`, so a race converges. A
+  checkout left dirty by the retired shell resync shows up once and needs a
+  one-time clean-up.
+- **Not the fleet-refresh task.** `eta-fleet-refresh` (#10263) refreshes ETA
+  snapshots through the forge API on the fleet captain. It runs no git command
+  in any checkout and is unrelated to this step.
+- **A host behind a repo still fast-forwards.** The checkout moves to whatever
+  is on the default branch, even when those installed files are newer than this
+  daemon. Whether that pair may dispatch is the host roll's decision (#10719).
+- **Running agents are unaffected.** Sweeps work in their own worktrees, and a
+  script that is already executing keeps the file it opened.
+
+**The Loom source checkout is included.** The self-update loop still never
+pulls it, and its clean-tree gate is unchanged. What changes is that on a host
+with `fleet.autoApply` on, the checkout the loop compares the running binary
+against now advances on its own:
+
+- A host that installs release artifacts is unaffected: that path never reads
+  the checkout. Between a merge and its release the checkout is ahead of the
+  installed binary, which is the case #9711 describes for a hand-run
+  `loom-daemon-update.sh`; that script's behaviour is not changed here.
+- A fleet host moves only when the floor moves (`loom_min_version`; fleet
+  hosts no longer chase the latest release, #10885). So a newer commit in the
+  checkout is not by itself a reason to roll, and a source-building fleet host
+  does not rebuild as `main` moves. When a roll does build from source, it
+  builds the commit `loom-daemon-update.sh` would itself have fast-forwarded
+  to. Both only move forward along the default branch.
+- The checkout never moves under a running update. The script verifies that
+  the binary it built is a build of the checkout's HEAD and treats a mismatch
+  as terminal, so the daemon holds the checkout for the whole run of the
+  script: this step skips it (`self-update-in-flight`), and an update that
+  starts during an attempt waits for that one attempt. A `loom-daemon-update.sh`
+  run by hand is outside the daemon and is not covered. A fast-forward that
+  lands before its build stamps the commit fails its verification (exit 4),
+  and it is run again. There is a narrow window after the stamp, while the
+  compiler is still reading sources, in which a fast-forward gives a binary
+  stamped with the old commit but built partly from new sources, and the
+  verification passes. It needs a new commit on the default branch to land in
+  that window, after the script's own fast-forward.
+
+Reporting:
+
+- `fleet-sync-status.json` gains `checkouts`, one entry per workspace: `root`,
+  `state`, `branch`, `behind`, `ahead`, `head`, `detail`, `since` and
+  `installedFilesBehind`. The `Fleet store:` status block shows every workspace
+  that is not `current`.
+- `installedFilesBehind` is true when the commits the checkout is missing
+  change `.loom/` or `.claude/commands/loom/`: the host is running stale Loom
+  scripts, not merely stale product code.
+- A state is logged, and published on the event bus as `fleet_sync.checkout`,
+  when it is entered and when it clears, not once per pass. A skip state is a
+  `warn`, or an `error` when `installedFilesBehind` is true. A fast-forward is
+  an `info` naming the old and new commit. `fetch-failed`, `git-failure` and
+  the two in-flight states are reported only after three passes in a row. The
+  memory behind this is per process: a restarted daemon reports each standing
+  skip state once more.
 
 ### ETA fit publication branch (#10395)
 

@@ -403,8 +403,9 @@ fn h0() -> HostGateInputs {
 fn the_host_gate_names_each_reason() {
     assert_eq!(host_gate(&h0()), Ok(()));
     type Set = fn(&mut HostGateInputs);
-    let table: [(Set, NotCurrent); 8] = [
+    let table: [(Set, NotCurrent); 9] = [
         (|i| i.draining = true, NotCurrent::Draining),
+        (|i| i.resume_pending = true, NotCurrent::ResumePending),
         (|i| i.staged = true, NotCurrent::Staged),
         (|i| i.roll_pending = true, NotCurrent::RollPending),
         (|i| i.stalled = true, NotCurrent::Stalled),
@@ -1166,5 +1167,7 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 mod bounds;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
+#[path = "workspace_resync_online.rs"]
+mod online;
 #[path = "workspace_resync_surfaces.rs"]
 mod surfaces;
