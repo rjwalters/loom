@@ -126,6 +126,9 @@ pub const MAX_PAGES: u32 = 10;
 /// rather than a set that may have lost an item across a page boundary. The
 /// last (short) page is not revalidated: a removal on an earlier page shifts
 /// page `n-1`, which is caught. A single-page walk makes no extra request.
+/// One full page then an empty page 2 is not revalidated either, since no
+/// item can shift across that boundary unseen: exactly 100 rows cost two
+/// requests, and any longer walk of `p` pages costs `2p - 1`.
 /// The walk is not retried internally; the next call is the retry.
 ///
 /// # Errors
@@ -321,8 +324,18 @@ fn walk_pages_partial(
             Err(e) => return Ok(partial(pages, e)),
         };
         let full = rows.len() >= PER_PAGE;
+        let empty_second_page = page == 2 && rows.is_empty();
         pages.push(rows);
         if !full {
+            // Exactly one full page: an item that left page 1 meanwhile
+            // shifts nothing onto page 2, and one that arrived would have
+            // made page 2 non-empty. No re-read can find a missed item.
+            if empty_second_page {
+                return Ok(PagedListing {
+                    rows: pages.into_iter().flatten().collect(),
+                    incomplete: None,
+                });
+            }
             // Revalidate every earlier page (conditional reads: free `304`s
             // when nothing moved). Nothing to do for a single-page walk.
             let last = pages.len() - 1;

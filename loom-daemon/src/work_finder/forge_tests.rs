@@ -241,6 +241,23 @@ fn a_single_page_ready_queue_makes_exactly_one_request() {
     assert_eq!(ready_requests(dir.path()), 1);
 }
 
+/// Exactly one full page (100 raw rows) cannot be told from a page with a
+/// successor without reading page 2. That empty page ends the walk: no
+/// re-read of page 1, so two requests, and the queue is complete.
+#[test]
+fn exactly_one_full_page_costs_one_extra_request() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ready-p1.json"), ready_page(100, 100)).unwrap();
+    std::fs::write(dir.path().join("ready-p2.json"), "[]").unwrap();
+    let repo = format!("acme/paged-100-{}", std::process::id());
+    let mut src = paged_source(dir.path(), &repo);
+    let items = src.list_ready_issues().unwrap();
+    let numbers: Vec<u32> = items.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, (1..=100).rev().collect::<Vec<_>>());
+    assert!(src.listing_complete());
+    assert_eq!(ready_requests(dir.path()), 2);
+}
+
 /// A later page failing keeps the rows read and marks the queue incomplete;
 /// it is never a silent partial list. The next whole read clears the mark.
 #[test]

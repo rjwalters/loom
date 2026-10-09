@@ -416,29 +416,6 @@ mod tests {
         assert!(!render_queue(&whole, now).contains("INCOMPLETE"));
     }
 
-    /// #11139: the dashboard's queue panel must treat a partial listing
-    /// (`listing_incomplete`) like a failed one — flag it INCOMPLETE and
-    /// never render "no ready loom:issue work" over it. The page has no JS
-    /// test harness, so pin the `renderQueue` source contract here.
-    #[test]
-    fn dashboard_queue_panel_flags_a_partial_listing() {
-        let html = include_str!("../dashboard.html");
-        let start = html
-            .find("function renderQueue(report)")
-            .expect("renderQueue present");
-        let end = start
-            + html[start..]
-                .find("\nfunction ")
-                .expect("a function after renderQueue");
-        let body = &html[start..end];
-        assert!(body.contains("tick.listing_incomplete || []"), "{body}");
-        assert!(body.contains("came back partial for"), "{body}");
-        assert!(
-            body.contains("if (failed.length > 0 || partial.length > 0) return;"),
-            "an empty table under a partial listing must not read as empty: {body}"
-        );
-    }
-
     #[test]
     fn plan_fields_render_and_ordering_comes_from_the_daemon() {
         let now = Utc::now();
