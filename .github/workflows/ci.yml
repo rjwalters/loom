@@ -219,6 +219,9 @@ jobs:
               # main red after the merge.
               - '.github/dependabot.yml'
               - '**/package.json'
+              # Same for the Renovate side (#9418): `loom-daemon
+              # check-renovate-labels` runs next to it in installer-tests.
+              - 'renovate.json5'
               - '.github/workflows/ci.yml'
             # Every workflow file, for the Workflow Cancellation Lint job
             # (#10670). The `backend` group lists only ci.yml, so without this
@@ -2514,6 +2517,13 @@ jobs:
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Check every package manifest has a labeled dependabot entry (#7577)
         run: bash defaults/scripts/check-dependabot-labels.sh
+      # #9418: the Renovate-side counterpart — every `labels` array in
+      # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
+      # lockFileMaintenance override, which REPLACE rather than merge) carries
+      # loom:review-requested. A daemon subcommand, not more lines in that
+      # contract-category script (shell-language-policy.md, epic #7810).
+      - name: Check every Renovate labels array carries loom:review-requested (#9418)
+        run: ./target/debug/loom-daemon check-renovate-labels --repo-root .
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)

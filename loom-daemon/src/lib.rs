@@ -300,6 +300,7 @@ pub mod refname;
 pub mod release_fetch;
 pub mod release_provenance;
 pub mod release_resolve;
+pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
 pub mod retry_classify;

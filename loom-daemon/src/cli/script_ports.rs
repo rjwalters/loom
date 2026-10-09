@@ -459,6 +459,13 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// The Renovate-side routing contract (#9418): every `labels` array in the
+    /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
+    /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
+    /// any violation; no Renovate config is a clean no-op. Counterpart of
+    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
+
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
@@ -633,6 +640,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
