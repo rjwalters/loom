@@ -426,6 +426,10 @@ pub enum MetricName {
     /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
     #[serde(rename = "loom.captain.gauge_fallback")]
     CaptainGaugeFallback,
+    /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
+    /// (#11094).
+    #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
+    AgentScopePeakMemoryBytes,
 }
 
 impl MetricName {
@@ -505,6 +509,7 @@ impl MetricName {
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
+            Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
         }
     }
 
@@ -717,6 +722,9 @@ impl MetricName {
             }
             Self::CaptainGaugeFallback => {
                 "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
+            }
+            Self::AgentScopePeakMemoryBytes => {
+                "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
             }
         }
     }

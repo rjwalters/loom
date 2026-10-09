@@ -73,6 +73,16 @@ pub fn per_worktree_ram_gb() -> u64 {
         .unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB)
 }
 
+/// The operator's explicit [`PER_WORKTREE_RAM_GB_ENV`] value, if set and valid
+/// (unlike [`per_worktree_ram_gb`], does not fall back to the default).
+#[must_use]
+pub fn env_per_worktree_ram_gb() -> Option<u64> {
+    std::env::var(PER_WORKTREE_RAM_GB_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+}
+
 /// Parse `MemAvailable` (in kB) from Linux `/proc/meminfo` contents.
 ///
 /// `/proc/meminfo` lines are `"<Key>:<spaces><value> kB\n"`. `MemAvailable` is
@@ -162,6 +172,58 @@ pub fn available_ram_gb() -> Option<u64> {
 pub fn ram_headroom(available_gb: u64, per_gb: u64) -> usize {
     let per = per_gb.max(1);
     usize::try_from(available_gb / per).unwrap_or(usize::MAX)
+}
+
+/// RAM headroom net of the in-flight sweeps' unrealised peaks (#11094):
+/// `floor((available - reserved) / charge)`, saturating at 0. Pure.
+#[must_use]
+pub fn ram_headroom_reserved(available_gb: u64, reserved_gb: u64, charge_gb: u64) -> usize {
+    ram_headroom(available_gb.saturating_sub(reserved_gb), charge_gb)
+}
+
+/// Observed-history-aware RAM headroom for the given workspace roots (#11094).
+///
+/// The per-sweep charge is the env override, else the largest observed
+/// per-repo high-water mark among `roots` (see [`crate::ram_peaks`]), else the
+/// flat default; the in-flight sweeps' not-yet-realised peaks are subtracted
+/// from the available memory first. With no history anywhere this is exactly
+/// [`ram_headroom_limit`]. The charge, its source and the reservation are
+/// logged (INFO on change, DEBUG otherwise).
+#[must_use]
+pub fn ram_headroom_limit_for(roots: &[std::path::PathBuf]) -> usize {
+    use crate::ram_peaks;
+    let Some(available) = available_ram_gb() else {
+        return ram_headroom_limit();
+    };
+    let store = ram_peaks::store_path()
+        .map(|p| ram_peaks::load(&p))
+        .unwrap_or_default();
+    let observed = roots
+        .iter()
+        .filter_map(|r| store.repos.get(&ram_peaks::repo_key(r)))
+        .filter_map(|h| ram_peaks::high_water_bytes(h))
+        .max();
+    let (charge, source) =
+        ram_peaks::charge_gb(env_per_worktree_ram_gb(), observed, DEFAULT_PER_WORKTREE_RAM_GB);
+    let reserved_gb = ram_peaks::reserved_bytes(&store).div_ceil(1024 * 1024 * 1024);
+    let headroom = ram_headroom_reserved(available, reserved_gb, charge);
+    let line = format!(
+        "ram_headroom: charge={charge}GB source={} in_flight_reservation={reserved_gb}GB \
+         available={available}GB headroom={headroom}",
+        source.as_str()
+    );
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let key = format!("{charge}/{}/{reserved_gb}/{headroom}", source.as_str());
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.as_deref() == Some(key.as_str()) {
+        log::debug!("{line}");
+    } else {
+        log::info!("{line}");
+        *last = Some(key);
+    }
+    headroom
 }
 
 /// Resolve the RAM-headroom concurrency bound for the current host: the
@@ -256,6 +318,29 @@ mod tests {
     #[test]
     fn test_ram_headroom_per_gb_zero_treated_as_one() {
         assert_eq!(ram_headroom(5, 0), 5);
+    }
+
+    // ===================================================================
+    // ram_headroom_reserved — #11094 in-flight reservation
+    // ===================================================================
+
+    #[test]
+    fn test_ram_headroom_reserved_blocks_second_admission() {
+        // 13 GB repo peak (charge 15 with margin), 30 GB host, one sweep
+        // running at 4 GB so far: available 26, reservation 9 -> 17 / 15 = 1,
+        // and with 11 GB already realised elsewhere (available 19): 10/15 = 0.
+        assert_eq!(ram_headroom_reserved(26, 9, 15), 1);
+        assert_eq!(ram_headroom_reserved(19, 9, 15), 0);
+    }
+
+    #[test]
+    fn test_ram_headroom_reserved_no_history_equals_flat() {
+        assert_eq!(ram_headroom_reserved(21, 0, 2), ram_headroom(21, 2));
+    }
+
+    #[test]
+    fn test_ram_headroom_reserved_saturates_at_zero() {
+        assert_eq!(ram_headroom_reserved(5, 50, 2), 0);
     }
 
     // ===================================================================

@@ -1533,6 +1533,7 @@ Every other name is a **`Gauge`**:
 | `loom.queue.starved.by_reason` (`reason` = queue disposition) | count | every multi-workspace tick, non-zero reasons only |
 | `loom.host.memory.available_bytes`, `loom.host.memory.total_bytes` | bytes | `host.health` interval |
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
+| `loom.agent_scope.peak_memory_bytes` (`repo`) | bytes | once per finished agent scope (cgroup `memory.peak`, #11094); absent without cgroup v2 |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
