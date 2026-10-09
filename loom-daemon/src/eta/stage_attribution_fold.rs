@@ -10,9 +10,11 @@
 //! - **Exactly once.** A row is one estimate, but the unit counted is the
 //!   resolved case, as in the nightly cohort rule: one outcome resolves every
 //!   pending estimate of its series (each refresh), so the rows of one
-//!   heuristic sharing `(repo, issue, pr_number, actual_at)` are one case and
-//!   count once, the earliest-predicted (`as_of`) winning. Distinct PRs, or
-//!   laps (a different `actual_at`), on one issue stay distinct cases.
+//!   heuristic sharing `(repo, issue, actual_at)` are one case and count
+//!   once, the earliest-predicted (`as_of`) winning. A row with no
+//!   `pr_number` (estimated before PR discovery) joins the case of a row
+//!   that has one. Distinct known PRs, or laps (a different `actual_at`), on
+//!   one issue stay distinct cases.
 //!   Duplicates in the log (a retried append) collapse the same way.
 //!   Each day's records are persisted once (`nightly_folds::day_path`), so a
 //!   restart does not re-fold or duplicate them.
@@ -48,33 +50,58 @@ pub fn cutoff(day: NaiveDate) -> DateTime<Utc> {
     Utc.from_utc_datetime(&day.and_time(NaiveTime::MIN)) + Duration::days(1)
 }
 
-/// A resolved case of one heuristic: repo (lowercased), issue, PR and the
-/// outcome instant.
-type CaseKey<'a> = (String, u32, Option<u32>, &'a str, DateTime<Utc>);
+/// A resolved case of one heuristic, before its PR: repo (lowercased), issue
+/// and the outcome instant.
+type CaseKey<'a> = (String, u32, &'a str, DateTime<Utc>);
+
+/// Which of two rows of one case predicted first.
+fn rank(r: &AttributionRow) -> (DateTime<Utc>, DateTime<Utc>, &str) {
+    (r.as_of, r.observed_at, r.estimate_id.as_str())
+}
 
 /// The rows that count for `day`: inside the window, known before the
 /// cutoff, one per resolved case and heuristic.
+///
+/// An estimate made before its PR was discovered has no `pr_number`; a
+/// refresh resolved by the same outcome has one. They are one case, so a row
+/// without a PR joins a case with one (the lowest-numbered, if several) and
+/// stands alone only where no row names a PR. Two known, different PRs stay
+/// two cases.
 fn window(rows: &[AttributionRow], day: NaiveDate) -> Vec<&AttributionRow> {
     let end = cutoff(day);
     let start = end - Duration::days(i64::from(WINDOW_DAYS));
-    let mut by_case: BTreeMap<CaseKey, &AttributionRow> = BTreeMap::new();
+    let mut by_case: BTreeMap<CaseKey, BTreeMap<Option<u32>, &AttributionRow>> = BTreeMap::new();
     for row in rows.iter().filter(|r| {
         r.kind == Kind::Land && r.actual_at >= start && r.actual_at < end && r.observed_at < end
     }) {
-        let key = (
-            row.repo.to_ascii_lowercase(),
-            row.issue,
-            row.pr_number,
-            row.heuristic.as_str(),
-            row.actual_at,
-        );
-        let slot = by_case.entry(key).or_insert(row);
-        let rank = |r: &AttributionRow| (r.as_of, r.observed_at, r.estimate_id.clone());
+        let key = (row.repo.to_ascii_lowercase(), row.issue, row.heuristic.as_str(), row.actual_at);
+        let slot = by_case
+            .entry(key)
+            .or_default()
+            .entry(row.pr_number)
+            .or_insert(row);
         if rank(row) < rank(slot) {
             *slot = row;
         }
     }
-    by_case.into_values().collect()
+    let mut out = Vec::new();
+    for mut prs in by_case.into_values() {
+        if let Some(unknown) = prs.remove(&None) {
+            match prs.values_mut().next() {
+                Some(first) => {
+                    if rank(unknown) < rank(first) {
+                        *first = unknown;
+                    }
+                }
+                None => {
+                    out.push(unknown);
+                    continue;
+                }
+            }
+        }
+        out.extend(prs.into_values());
+    }
+    out
 }
 
 /// `(n, bias, mean abs)` of `errors`.

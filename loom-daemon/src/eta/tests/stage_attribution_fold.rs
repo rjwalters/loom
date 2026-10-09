@@ -219,6 +219,40 @@ fn a_resolved_case_counts_once_per_heuristic_however_many_estimates_it_resolved(
 }
 
 #[test]
+fn an_estimate_before_pr_discovery_and_its_refresh_are_one_case() {
+    // An early estimate has no PR; the refresh after discovery names PR 7.
+    // One outcome resolved both at the same instant: one case, the earlier
+    // prediction (30) winning, whatever the log order.
+    let mut early = row("early", "h1", 100, 30, -10, 5);
+    early.as_of = early.actual_at - Duration::hours(3);
+    let mut refresh = row("refresh", "h1", 100, 900, -10, 5);
+    refresh.pr_number = Some(7);
+    refresh.as_of = refresh.actual_at - Duration::hours(1);
+    // Another known PR at the same instant stays its own case.
+    let mut other = refresh.clone();
+    other.estimate_id = "other".into();
+    other.pr_number = Some(8);
+    other
+        .attribution
+        .stages
+        .get_mut(&Stage::SweepBuilder)
+        .unwrap()
+        .contribution_sec = 10;
+
+    let mut rows = vec![early, refresh];
+    let out = records(&rows);
+    let builder = find(&out, "h1", "sweep.builder");
+    assert_eq!((builder.n, builder.bias_sec), (1, Some(30.0)));
+    rows.reverse();
+    assert_eq!(records(&rows), out);
+
+    rows.push(other);
+    let builder_pair = records(&rows);
+    let builder = find(&builder_pair, "h1", "sweep.builder");
+    assert_eq!(builder.n, 2);
+}
+
+#[test]
 fn the_sum_identity_survives_the_log_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = attribution_log::path(dir.path());

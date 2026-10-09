@@ -3315,8 +3315,11 @@ day, catches up at most 7 missed days oldest first).
   per scored `land` outcome with an attribution, appended where the tracker
   scores it (no forge call; compacted like `calibration.jsonl`). The fold
   counts a row only when it was both resolved (`actual_at`) and scored by this
-  daemon (`observed_at`) before the day's cutoff, and once per `estimate_id`,
-  so a later outcome leaves the day's rows bit-identical. There is no
+  daemon (`observed_at`) before the day's cutoff, and once per resolved case
+  (heuristic, repo, issue, `actual_at`; the earliest-predicted estimate wins,
+  and an estimate with no PR yet joins the case of one that has it; distinct
+  known PRs and laps stay distinct), so a later outcome leaves the day's rows
+  bit-identical. There is no
   backfill: attribution exists only from the release that added the log, so
   the first window is partial. `eta-queries.sql` QA (one estimate, forecast
   vs actual per stage) and QB (per-heuristic, per-stage bias) read them.
