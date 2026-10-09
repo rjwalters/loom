@@ -794,10 +794,9 @@ impl Tracker {
                 // First sight mid-stage: dated from the label timeline, else
                 // at most `updated_at` ago (#10500, `tracker_timeline.rs`).
                 let item = self.first_sight(&key, pr, stage, now);
-                let mut row = self.row("label.first_seen", &item, now);
-                row.next_stage = Some(stage);
-                row.raw = serde_json::json!({"labels": pr.labels, "updated_at": pr.updated_at});
-                effects.journal.push(row);
+                effects
+                    .journal
+                    .push(self.first_seen_row(&item, pr, stage, now));
                 effects.dirty.push(key);
                 continue;
             }
@@ -909,6 +908,7 @@ impl Tracker {
                 let mut row =
                     self.transition(key, None, at, AgeSource::LabelEvent, "pr.resolved", false, 0);
                 row.raw = serde_json::json!({"pr": pr, "state": "merged"});
+                row.forge_at = Some(at);
                 effects.journal.push(row);
                 let late = (now - at).num_seconds().max(0);
                 effects.outcomes.extend(self.resolve(

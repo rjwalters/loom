@@ -129,6 +129,10 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.stage_outcome.left_at",
     "loom.eta.stage_outcome.dwell_sec",
     "loom.eta.stage_outcome.open_estimates",
+    // `eta.stage_sample` (#10756).
+    "loom.eta.stage_sample.event",
+    "loom.eta.stage_sample.observed_at",
+    "loom.eta.stage_sample.forge_at",
     // `eta.backtest.fold` (#10492).
     "loom.eta.backtest.fold.fold_id",
     "loom.eta.backtest.fold.heuristic",

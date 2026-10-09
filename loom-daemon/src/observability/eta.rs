@@ -251,10 +251,13 @@ pub fn deliver(
     delivered
 }
 
-fn append_journal(workspace_root: &Path, rows: &[JournalEntry]) {
+/// Append `rows` to the stage journal and offer each as an `eta.stage_sample`
+/// (#10756). Every host does both, the ETA authority or not.
+fn append_journal(workspace_root: &Path, rows: &[JournalEntry], host_id: &str, dry_run: bool) {
     if let Err(error) = journal::append(&journal::journal_path(workspace_root), rows) {
         log::warn!("eta: stage journal append failed: {error}");
     }
+    stage_sample::emit(rows, host_id, dry_run);
 }
 
 fn read_pending(path: &Path) -> Vec<EstimateSummary> {
@@ -420,14 +423,14 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
         };
         (state.config.dry_run, state.workspace_root.clone(), state.host_id.clone())
     };
-    if authority::journal_only(&root, &effects.journal) {
+    if authority::journal_only(&root, &effects.journal, &host_id, dry_run) {
         return;
     }
     let mut dirty = effects.dirty;
     dirty.sort();
     dirty.dedup();
     let emissions = estimate_isolated(Some(dirty), now).await;
-    append_journal(&root, &effects.journal);
+    append_journal(&root, &effects.journal, &host_id, dry_run);
     let stages = match lock().as_mut() {
         Some(state) => {
             note_outcomes(state, &effects.outcomes, now);
@@ -1136,7 +1139,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.tracker.pending().to_vec())
         .unwrap_or_default();
-    append_journal(workspace_root, &rows);
+    append_journal(workspace_root, &rows, &host_id, dry_run);
     pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
     let stages = stage_outcome::build(&rows, &pending, &outcomes, now);
     stage_outcome::emit(stages, &host_id, dry_run);
@@ -1223,6 +1226,7 @@ mod feature_pass;
 mod fit_swap;
 mod pr_resolved;
 mod stage_outcome;
+mod stage_sample;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]

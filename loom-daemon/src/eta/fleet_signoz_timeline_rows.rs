@@ -14,6 +14,7 @@
 //! | `record_id` | `loom.record_id`, else a content hash: the per-row keyset cursor |
 //! | `identity` | the delivery identity rule 1 dedupes on ([`Row::record_id`]): see below |
 //! | `kind` | `loom.kind`, else the body's `kind` on a webhook export row, else the body (the OTLP event name) |
+//! | `journal_event` | the body's `event` on an `eta.stage_sample` row (the journal event), else empty |
 //! | `service` / `scope` | resource `service.name` and the OTLP scope name: the producer ([`Source`]) |
 //! | `repo` | the queried repo on a `queue.snapshot` row (host-level, no repo); else `loom.repo`, else the body's `repo` on a webhook export row |
 //! | `attrs` / `nums` / `bools` | the string / number / bool attribute maps, as JSON |
@@ -37,10 +38,11 @@
 //!   rows), `merged` / `noop` are in the bool map. Webhook-class: it is the
 //!   only copy of 09-14..09-28, and elsewhere it duplicates the export.
 //! - **The daemon** (`service.name = loom` too, no d1sync scope): `ci.*` with
-//!   `loom.ci.*` keys, `pr.resolved`. Daemon-class. No daemon `label.*` row
-//!   reaches SigNoz today (the stage journal has no OTLP mapping, #10756), so
-//!   [`RowBody::LabelSet`] is accepted from a daemon-class row only and has no
-//!   live producer yet.
+//!   `loom.ci.*` keys, `pr.resolved`, and `eta.stage_sample` (#10756): one
+//!   stage-journal row, verbatim, as a JSON body. Daemon-class. Only its
+//!   `label.transition` / `label.first_seen` rows are read: each carries the
+//!   PR's whole label set (`raw.labels`), a [`RowBody::LabelSet`], accepted
+//!   from a daemon-class row only.
 //!
 //! **Identity.** One D1 record reaches SigNoz up to once per exporter (and
 //! the export re-exports). `identity` is the GitHub delivery id on a
@@ -88,10 +90,10 @@ pub const D1SYNC_RECORD_ATTR: &str = "d1sync.record";
 
 /// The record kinds the timeline reads.
 pub mod kind {
-    /// A label change: a webhook transition, or a daemon label-set row.
+    /// A webhook label change.
     pub const LABEL_TRANSITION: &str = "label.transition";
-    /// The daemon's first sight of an item's labels: a baseline set.
-    pub const LABEL_FIRST_SEEN: &str = "label.first_seen";
+    /// One daemon stage-journal row (#10756). Only its label events are read.
+    pub const STAGE_SAMPLE: &str = "eta.stage_sample";
     /// A PR's merge or close instant, from the daemon (#10519).
     pub const PR_RESOLVED: &str = "pr.resolved";
     /// A completed CI run.
@@ -105,7 +107,7 @@ pub mod kind {
     /// Every kind above.
     pub const ALL: [&str; 7] = [
         LABEL_TRANSITION,
-        LABEL_FIRST_SEEN,
+        STAGE_SAMPLE,
         PR_RESOLVED,
         CI_RUN,
         CI_JOB,
@@ -162,6 +164,7 @@ SELECT
             concat('d1:', replaceOne(splitByChar('/', attributes_string['d1sync.record'])[-1], '#', ':')),
             attributes_string['loom.export.id'] != '', concat('d1:', attributes_string['loom.export.id']),
             record_id) AS identity,
+    if(kind = 'eta.stage_sample', JSONExtractString(body, 'event'), '') AS journal_event,
     toJSONString(attributes_string) AS attrs,
     toJSONString(attributes_number) AS nums,
     toJSONString(attributes_bool) AS bools,
@@ -169,8 +172,9 @@ SELECT
     toString(timestamp) AS event_time_ns,
     toString(observed_timestamp) AS knowable_time_ns
 FROM signoz_logs.distributed_logs_v2
-WHERE kind IN ('label.transition', 'label.first_seen', 'pr.resolved', 'ci.run', 'ci.job',
+WHERE kind IN ('label.transition', 'eta.stage_sample', 'pr.resolved', 'ci.run', 'ci.job',
                'ci.duration', 'queue.snapshot')
+  AND (kind != 'eta.stage_sample' OR journal_event IN ('label.transition', 'label.first_seen'))
   AND lower(repo) = lower({repo:String})
   AND observed_timestamp >= {since_ns:UInt64}
   AND observed_timestamp <= {until_ns:UInt64}
@@ -525,10 +529,10 @@ fn admit(fields: &Fields<'_>, record_id: String, repo: &str) -> ParsedRow {
     let source = source(fields);
     let event_at = fields.column_time("event_time_ns");
     let knowable_column = fields.column_time("knowable_time_ns");
-    let noop = matches!(kind.as_str(), kind::LABEL_TRANSITION | kind::LABEL_FIRST_SEEN)
-        && flag(fields, &["noop", "loom.noop"]);
+    let noop = kind == kind::LABEL_TRANSITION && flag(fields, &["noop", "loom.noop"]);
     let body = match kind.as_str() {
-        kind::LABEL_TRANSITION | kind::LABEL_FIRST_SEEN => label_body(fields, repo, source),
+        kind::LABEL_TRANSITION => label_body(fields, repo),
+        kind::STAGE_SAMPLE => label_set_body(fields, repo, source),
         kind::PR_RESOLVED => resolved_body(fields, repo),
         kind::QUEUE_SNAPSHOT => queue_body(fields, repo, event_at),
         _ => ci_body(fields, &kind),
@@ -589,7 +593,41 @@ fn flag(fields: &Fields<'_>, names: &[&str]) -> bool {
 
 type Body = Result<Option<RowBody>, &'static str>;
 
-fn label_body(fields: &Fields<'_>, repo: &str, source: Source) -> Body {
+/// The journal events of an `eta.stage_sample` row that carry a label set.
+const LABEL_SET_EVENTS: [&str; 2] = ["label.transition", "label.first_seen"];
+
+/// An `eta.stage_sample` row (#10756): a daemon stage-journal label event is
+/// the item's whole label set at its `observed_at`; any other journal event
+/// says nothing the timeline uses.
+fn label_set_body(fields: &Fields<'_>, repo: &str, source: Source) -> Body {
+    // Only the daemon exports the stage journal.
+    if source != Source::Daemon {
+        return Err(reject::UNKNOWN_KIND);
+    }
+    let event = fields
+        .column("journal_event")
+        .map(str::to_string)
+        .or_else(|| fields.text(&["event", "loom.eta.stage_sample.event"]));
+    if !event.is_some_and(|e| LABEL_SET_EVENTS.contains(&e.as_str())) {
+        return Ok(None);
+    }
+    let item = match (fields.uint::<u32>(PR_NUMBER), fields.uint::<u32>(ISSUE)) {
+        (Some(pr), _) if pr > 0 => ItemKey::new(repo, Target::Pr, pr),
+        (_, Some(issue)) if issue > 0 => ItemKey::new(repo, Target::Issue, issue),
+        _ => return Err(reject::MISSING_NUMBER),
+    };
+    let labels = match fields.get(&["labels"]) {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => return Err(reject::MISSING_LABELS),
+    };
+    Ok(Some(RowBody::LabelSet { item, labels }))
+}
+
+fn label_body(fields: &Fields<'_>, repo: &str) -> Body {
     let action = fields.text(&["action", "loom.action"]);
     let label = fields.text(&["label", "loom.label"]);
     let target = match fields.text(&["target", "loom.target"]).as_deref() {
@@ -598,32 +636,10 @@ fn label_body(fields: &Fields<'_>, repo: &str, source: Source) -> Body {
         Some(_) => return Err(reject::MISSING_TARGET),
         None => None,
     };
+    // A label change always names its action; a label set is an
+    // `eta.stage_sample` row ([`label_set_body`]).
     if action.is_none() {
-        // A webhook record always names its action.
-        if source == Source::Webhook {
-            return Err(reject::UNKNOWN_ACTION);
-        }
-        // A daemon stage-journal row: the whole label set after the change.
-        // No producer exports these to SigNoz yet (#10756); the path is
-        // pinned by synthetic rows only.
-        let item = match (fields.uint::<u32>(PR_NUMBER), fields.uint::<u32>(ISSUE)) {
-            (Some(pr), _) if pr > 0 => ItemKey::new(repo, Target::Pr, pr),
-            (_, Some(issue)) if issue > 0 => ItemKey::new(repo, Target::Issue, issue),
-            _ => return Err(reject::MISSING_NUMBER),
-        };
-        let labels = match fields.get(&["labels", "labels_after"]) {
-            Some(Value::Array(list)) => list
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            Some(Value::String(text)) => match serde_json::from_str::<Vec<String>>(text) {
-                Ok(list) => list.into_iter().collect(),
-                Err(_) => return Err(reject::MISSING_LABELS),
-            },
-            _ => return Err(reject::MISSING_LABELS),
-        };
-        return Ok(Some(RowBody::LabelSet { item, labels }));
+        return Err(reject::UNKNOWN_ACTION);
     }
     let Some(target) = target else {
         return Err(reject::MISSING_TARGET);

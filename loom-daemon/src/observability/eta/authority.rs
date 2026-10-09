@@ -210,13 +210,18 @@ pub(super) fn refresh(workspace_root: &Path) -> bool {
 }
 
 /// A non-authority host's bus event: the stage journal still records what this
-/// host saw, but nothing is estimated, scored or emitted. `true` when it
-/// applied (the caller returns).
-pub(super) fn journal_only(root: &Path, rows: &[JournalEntry]) -> bool {
+/// host saw, and exports it as `eta.stage_sample` (#10756), but nothing is
+/// estimated, scored or emitted. `true` when it applied (the caller returns).
+pub(super) fn journal_only(
+    root: &Path,
+    rows: &[JournalEntry],
+    host_id: &str,
+    dry_run: bool,
+) -> bool {
     if active() {
         return false;
     }
-    append_journal(root, rows);
+    append_journal(root, rows, host_id, dry_run);
     true
 }
 

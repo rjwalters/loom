@@ -178,6 +178,9 @@ pub mod eta_snapshot;
 /// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
 pub mod eta_stage_outcome;
 
+/// `eta.stage_sample` (#10756) — one stage-journal row, verbatim, from every host.
+pub mod eta_stage_sample;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -464,6 +467,12 @@ macro_rules! telemetry_kind_table {
             /// how many probes used a metered API key. OTLP-only. See
             /// [`token_ranking_refresh`].
             TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One ETA stage-journal row, verbatim (Issue #10756): label sets,
+            /// first sightings, hold overlays and sweep boundaries, from every
+            /// host. OTLP-only. See [`eta_stage_sample`].
+            EtaStageSample = "eta.stage_sample" => $crate::telemetry::kinds::eta_stage_sample::EtaStageSampleRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

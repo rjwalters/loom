@@ -36,6 +36,13 @@ pub struct JournalEntry {
     pub schema: String,
     /// When the tracker observed it.
     pub observed_at: DateTime<Utc>,
+    /// The forge's own instant for what this row records, when the daemon
+    /// knows it (#10756): a merge's `merged_at`, or the label application a
+    /// first-sighted stage was dated from. A listing diff knows only the poll,
+    /// so it has none (`resolution_sec` bounds that lag). `#[serde(default)]`:
+    /// older rows have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_at: Option<DateTime<Utc>>,
     /// What was observed: `sweep.dispatch`, `sweep.phase`, `sweep.terminal`,
     /// `label.transition`, `label.first_seen`, `pr.resolved`, `verdict`.
     pub event: String,
@@ -91,6 +98,7 @@ impl JournalEntry {
         JournalEntry {
             schema: JOURNAL_SCHEMA.to_string(),
             observed_at,
+            forge_at: None,
             event: event.to_string(),
             repo: repo.to_string(),
             issue: None,

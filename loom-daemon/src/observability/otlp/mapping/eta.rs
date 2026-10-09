@@ -1,6 +1,6 @@
 //! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289),
 //! `eta.fleet_refresh` (#10263), `eta.fit` (#10391), `pr.resolved`
-//! (#10519) and `eta.stage_outcome` (#10929).
+//! (#10519), `eta.stage_outcome` (#10929) and `eta.stage_sample` (#10756).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -318,6 +318,38 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
         }
+        TelemetryRecord::EtaStageSample(r) => {
+            // #10756: one stage-journal row, stamped at its forge instant when
+            // known, else its observation; observed at the export (the
+            // default). The body is the row, so the timeline reader finds its
+            // label set (`raw.labels`) and `observed_at` there.
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.eta.stage_sample.event", r.event.clone()),
+                kv_string("loom.eta.stage_sample.observed_at", instant(r.observed_at)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(&mut attributes, "loom.issue", r.issue.map(i64::from));
+            opt_int(&mut attributes, "loom.pr_number", r.pr_number.map(i64::from));
+            if let Some(sweep_id) = &r.sweep_id {
+                attributes.push(kv_string("loom.sweep_id", sweep_id.clone()));
+            }
+            if let Some(stage) = r.stage {
+                attributes.push(kv_string("loom.eta.stage", stage.as_str()));
+            }
+            if let Some(forge_at) = r.forge_at {
+                attributes.push(kv_string("loom.eta.stage_sample.forge_at", instant(forge_at)));
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some((
+                "eta.stage_sample",
+                SeverityNumber::Info,
+                nanos(r.record_time()),
+                attributes,
+                body,
+            ))
+        }
         TelemetryRecord::EtaStageOutcome(r) => {
             // #10929: stamped at `left_at`; the caller sets the observed
             // timestamp to `observed_at` (the knowable-at time).
@@ -432,6 +464,11 @@ pub(super) fn log_parts(
 #[allow(clippy::unwrap_used)]
 #[path = "eta_stage_outcome_tests.rs"]
 mod stage_outcome_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "eta_stage_sample_tests.rs"]
+mod stage_sample_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

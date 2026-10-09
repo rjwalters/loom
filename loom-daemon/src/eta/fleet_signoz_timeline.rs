@@ -22,8 +22,8 @@
 //! exporter (the export and d1sync, both [`Source::Webhook`]); its copies
 //! share one identity, so they are one row, never a corroboration. The daemon
 //! (a polling time, up to one listing interval late) contributes `pr.resolved`
-//! for a merge or close, and, once its stage journal is exported (no producer
-//! yet, #10756), whole label sets.
+//! for a merge or close, and its stage journal's label rows
+//! (`eta.stage_sample`, #10756), whole label sets.
 //!
 //! **Rules** (one unit test each):
 //!
@@ -42,7 +42,7 @@
 //!    instant are one event, so a redelivered or re-exported row never
 //!    counts twice.
 //!
-//! The daemon's label rows (stage journal rows, not yet exported) carry the
+//! The daemon's label rows (stage journal rows, `eta.stage_sample`) carry the
 //! whole label set, not a single change. Consecutive sets of one item are diffed into
 //! changes, dated at the later set's observation. An item's first set is a
 //! baseline and dates nothing: the daemon cannot know when those labels were

@@ -36,6 +36,7 @@ use crate::eta::fit::rows::{data_horizon, is_open_at};
 use crate::eta::fit::KNOWABLE_LAG_SEC;
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
+use crate::eta::journal::JournalEntry;
 use crate::eta::loop_features::{
     loop_features, repo_context, FileSnapshot, LoopFeatures, LoopInputs,
 };
@@ -46,6 +47,28 @@ use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
 impl Tracker {
+    /// The `label.first_seen` row for `item`, first sighted mid-`stage` at
+    /// `now` ([`Self::first_sight`]). Its `forge_at` (#10756) is the label
+    /// application the timeline dated the entry from; an `updated_at` lower
+    /// bound is no forge instant, so it has none.
+    pub(super) fn first_seen_row(
+        &self,
+        item: &Item,
+        pr: &PrView,
+        stage: Stage,
+        now: DateTime<Utc>,
+    ) -> JournalEntry {
+        let mut row = self.row("label.first_seen", item, now);
+        row.next_stage = Some(stage);
+        row.forge_at = item
+            .stage
+            .as_ref()
+            .filter(|track| track.source == AgeSource::LabelEvent)
+            .map(|track| track.entered_at);
+        row.raw = serde_json::json!({"labels": pr.labels, "updated_at": pr.updated_at});
+        row
+    }
+
     /// The friction predictors of `pr` of `repo` at `now` (#10521), from the
     /// fleet snapshots' timeline at `now − LAG`, as a training row at `t`
     /// reads them at `t − LAG` ([`Timeline::loop_features`]).

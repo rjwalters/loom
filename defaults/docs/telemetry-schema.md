@@ -2405,6 +2405,42 @@ required and exports as `loom.eta.version` / `revision` / `tree_state` /
 | `estimate_ids[]` | array | the newest such estimate per `(kind, heuristic)` series. Bounded by the registry, not by refreshes. Any other estimate joins on `(repo, issue)` with `as_of < left_at` |
 | `loom` | object | the observing daemon's provenance (required) |
 
+### `eta.stage_sample`
+
+One row of the ETA stage journal (`.loom/logs/eta-stage-samples.jsonl`,
+schema `eta-stage-sample/v1`), exported **verbatim** (Issue #10756).
+Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`).
+Every row is offered as it is appended, on **every host**, the ETA authority
+or not: a non-authority host's journal (its own sweeps' bus events) reaches
+SigNoz too. It needs **no new forge read**. It carries what
+`eta.stage_outcome` does not: each PR's whole label set at every label
+transition (`label.transition`) and at first sight (`label.first_seen`, which
+closes no stage), the `merge_hold` overlay, and rows that close no stage. The
+SigNoz timeline reader (`eta::fleet_signoz_timeline_rows`) reads its
+`label.transition` / `label.first_seen` rows as daemon label sets.
+
+The log record's **time is `forge_at`** when present, else `observed_at`; its
+**observed timestamp is the export** (knowable-at). The body is the row's
+JSON. The scalars ride as `loom.repo`, `loom.issue`, `loom.pr_number`,
+`loom.sweep_id`, `loom.eta.stage` and `loom.eta.stage_sample.*` (`event`,
+`observed_at`, `forge_at`). Provenance is required and exports as
+`loom.eta.version` / `revision` / `tree_state` / `provenance_complete`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | string | `eta-stage-sample/v1` |
+| `observed_at` | RFC3339 | when the tracker observed it; for a listing diff, the poll |
+| `forge_at` | RFC3339? | the forge's own instant, when known: a merge's `merged_at`, or the label application the label timeline dated a first sighting from. A listing diff knows only the poll, so it has none (`resolution_sec` bounds the lag) |
+| `event` | string | `sweep.dispatch`, `sweep.phase`, `sweep.terminal`, `label.transition`, `label.first_seen`, `pr.resolved`, `verdict`, … |
+| `repo` | string | `owner/repo` |
+| `issue`, `pr_number`, `sweep_id` | integer? / integer? / string? | when known |
+| `stage`, `entered_at`, `left_at`, `duration_sec`, `censored_sec`, `next_stage` | | the stage this row completes, as the journal records it |
+| `verdict`, `attempt` | string? / integer? | a Judge verdict this row records |
+| `in_sweep` | bool | the `sweep.outcome` journal also has this duration |
+| `resolution_sec` | integer? | how late `observed_at` can be: a listing interval, `0` for a bus event |
+| `raw` | object | the raw fields observed; `raw.labels` is the PR's whole label set on a label row |
+| `loom` | object | the observing daemon's provenance (required) |
+
 ### `eta.backtest.fold` and `eta.backtest.summary`
 
 The fleet captain's nightly walk-forward backtest (Issue #10492; see

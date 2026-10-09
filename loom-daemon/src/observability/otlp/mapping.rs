@@ -613,7 +613,8 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaBacktestFold(_)
         | TelemetryRecord::EtaBacktestSummary(_)
         | TelemetryRecord::PrResolved(_)
-        | TelemetryRecord::EtaStageOutcome(_) => {
+        | TelemetryRecord::EtaStageOutcome(_)
+        | TelemetryRecord::EtaStageSample(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes. Issues
             // #10519 / #10929: `pr.resolved` and `eta.stage_outcome` are

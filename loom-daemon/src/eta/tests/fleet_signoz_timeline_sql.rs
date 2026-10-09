@@ -47,6 +47,14 @@ multiIf(kind = 'queue.snapshot', {repo:String},
 /// The repo predicate, verbatim.
 const REPO_WHERE: &str = "AND lower(repo) = lower({repo:String})";
 
+/// The `journal_event` column (#10756), verbatim.
+const JOURNAL_EVENT_EXPR: &str =
+    "if(kind = 'eta.stage_sample', JSONExtractString(body, 'event'), '') AS journal_event,";
+
+/// The stage-journal event predicate (#10756), verbatim: only label events.
+const JOURNAL_EVENT_WHERE: &str =
+    "AND (kind != 'eta.stage_sample' OR journal_event IN ('label.transition', 'label.first_seen'))";
+
 /// The `identity` column, verbatim.
 const IDENTITY_EXPR: &str = "\
 multiIf(attributes_string['loom.record_id'] != '', record_id,
@@ -104,8 +112,9 @@ fn attr(raw: &Raw, key: &str) -> String {
         .to_string()
 }
 
-/// [`KIND_EXPR`], [`REPO_EXPR`], the kind list and [`REPO_WHERE`] over `raw`:
-/// `Some((kind, repo))` when the query would select it.
+/// [`KIND_EXPR`], [`REPO_EXPR`], the kind list, [`REPO_WHERE`] and
+/// [`JOURNAL_EVENT_WHERE`] over `raw`: `Some((kind, repo))` when the query
+/// would select it.
 fn select(raw: &Raw, repo: &str) -> Option<(String, String)> {
     let kind = if !attr(raw, "loom.kind").is_empty() {
         attr(raw, "loom.kind")
@@ -124,8 +133,19 @@ fn select(raw: &Raw, repo: &str) -> Option<(String, String)> {
         String::new()
     };
     let kind_ok = crate::eta::fleet_signoz_timeline_rows::kind::ALL.contains(&kind.as_str());
-    (kind_ok && resolved_repo.to_lowercase() == repo.to_lowercase())
+    let event_ok = kind != "eta.stage_sample"
+        || ["label.transition", "label.first_seen"].contains(&journal_event(raw, &kind).as_str());
+    (kind_ok && event_ok && resolved_repo.to_lowercase() == repo.to_lowercase())
         .then_some((kind, resolved_repo))
+}
+
+/// [`JOURNAL_EVENT_EXPR`] over `raw` of the resolved `kind`.
+fn journal_event(raw: &Raw, kind: &str) -> String {
+    if kind == "eta.stage_sample" {
+        json_extract_string(&raw.body, "event")
+    } else {
+        String::new()
+    }
 }
 
 /// The `JSONEachRow` line the query emits for a selected `raw`.
@@ -135,6 +155,7 @@ fn emitted(raw: &Raw, kind: &str, repo: &str) -> String {
         "kind": kind,
         "service": raw.service,
         "repo": repo,
+        "journal_event": journal_event(raw, kind),
         "attrs": Value::Object(raw.attributes_string.clone()).to_string(),
         "nums": "{}",
         "body": raw.body,
@@ -165,6 +186,8 @@ fn the_query_pins_the_resolution_the_model_mirrors() {
         ("repo", REPO_EXPR),
         ("where", REPO_WHERE),
         ("identity", IDENTITY_EXPR),
+        ("journal_event", JOURNAL_EVENT_EXPR),
+        ("journal_event where", JOURNAL_EVENT_WHERE),
         ("scope", "scope_name AS scope,"),
         ("bools", "toJSONString(attributes_bool) AS bools,"),
     ] {
@@ -299,4 +322,44 @@ fn both_exporters_copies_of_one_record_resolve_to_one_identity() {
         body: "ci.run".to_string(),
     };
     assert_eq!(identity(&daemon, "ci.run", "h:6"), "h:6");
+}
+
+/// A daemon `eta.stage_sample` row (#10756) as the exporter writes it: the
+/// stage-journal row as a JSON body, `loom.kind` / `loom.repo` attributes.
+fn stage_sample_row(event: &str) -> Raw {
+    Raw {
+        attributes_string: strings(&[
+            ("loom.kind", "eta.stage_sample"),
+            ("loom.repo", REPO),
+            ("loom.record_id", "0123456789abcdef"),
+        ]),
+        service: "loom",
+        body: json!({"schema": "eta-stage-sample/v1", "observed_at": "2026-10-08T12:00:00Z",
+                     "event": event, "repo": REPO, "issue": 10756, "pr_number": 11020,
+                     "raw": {"labels": ["loom:review-requested"]}})
+        .to_string(),
+    }
+}
+
+#[test]
+fn only_the_stage_journals_label_events_are_selected_and_they_parse_as_label_sets() {
+    for event in ["label.first_seen", "label.transition"] {
+        let raw = stage_sample_row(event);
+        let (kind, repo) = select(&raw, REPO).expect("a stage-journal label row is selected");
+        assert_eq!(kind, "eta.stage_sample");
+        let (_, parsed) = parse_row(&emitted(&raw, &kind, &repo), REPO).unwrap();
+        let ParsedRow::Admitted(row) = parsed else {
+            panic!("{event} not admitted: {parsed:?}");
+        };
+        assert_eq!(row.source, Source::Daemon);
+        assert!(matches!(
+            row.body,
+            RowBody::LabelSet { ref item, ref labels }
+                if item.target == Target::Pr && item.number == 11020
+                    && labels.contains("loom:review-requested")
+        ));
+    }
+    for event in ["sweep.phase", "pr.resolved", "verdict"] {
+        assert_eq!(select(&stage_sample_row(event), REPO), None, "{event} is not read");
+    }
 }

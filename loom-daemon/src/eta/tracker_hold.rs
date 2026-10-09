@@ -284,6 +284,8 @@ impl Tracker {
         };
         let mut row = self.close_hold(key, None, completed, at, "pr.resolved", 0)?;
         row.raw = serde_json::json!({"pr": row.pr_number, "state": name});
+        // #10756: a merge's instant is the forge's own `merged_at`.
+        row.forge_at = completed.then_some(at);
         Some(row)
     }
 
@@ -374,6 +376,8 @@ impl Tracker {
             let item = item.clone();
             let mut row = self.row("label.first_seen", &item, now);
             row.next_stage = Some(Stage::MergeHold);
+            // #10756: the hold label's forge instant, when the timeline has it.
+            row.forge_at = held.map(|(_, hold_at)| hold_at.min(now));
             row.raw = serde_json::json!({"labels": pr.labels, "updated_at": pr.updated_at});
             effects.journal.push(row);
             effects.dirty.push(key.clone());

@@ -6,9 +6,10 @@
 //! shape (verified against SigNoz, #10671): the loom-ui export (the D1
 //! record as a flat body), d1sync (the same records as `loom.*` attributes
 //! and bools, plus a d1sync-only PR), and the daemon (`ci.*` with `loom.ci.*`
-//! keys, `pr.resolved`). The daemon's stage-journal label sets have no live
-//! producer, so they appear only as synthetic rows built here
-//! ([`label_set`]).
+//! keys, `pr.resolved`). The daemon's stage-journal label sets
+//! (`eta.stage_sample`, #10756) are built here as admitted rows
+//! ([`label_set`]); the exporter-to-reader contract that produces them is
+//! `observability/otlp/mapping/eta_stage_sample_tests.rs`.
 
 use crate::eta::fleet_signoz_refresh::{
     FileRows, Limits, PageQuery, ReadError, SignozRead, SignozStop,
@@ -69,8 +70,7 @@ fn label(source: Source, id: &str, item: &ItemKey, name: &str, tr: Transition, a
     }
 }
 
-/// A daemon stage-journal label set. Synthetic: no producer exports these to
-/// SigNoz yet (#10756), so they pin the gated `LabelSet` path only.
+/// A daemon stage-journal label set (`eta.stage_sample`, #10756), as admitted.
 fn label_set(id: &str, item: &ItemKey, labels: &[&str], observed: Option<i64>) -> Row {
     Row {
         record_id: id.to_string(),
@@ -241,6 +241,7 @@ fn the_query_selects_every_column_the_parser_reads() {
         "AS record_id",
         "AS identity",
         "AS kind",
+        "AS journal_event",
         "AS service",
         "AS scope",
         "AS repo",
@@ -546,12 +547,14 @@ fn a_webhook_row_is_knowable_at_its_receipt_and_a_daemon_row_at_its_observation(
 
     let daemon = |body: serde_json::Value, knowable: i64| {
         admitted(json!({
-            "record_id": "d:1", "kind": "label.transition", "service": "loom",
+            "record_id": "d:1", "kind": "eta.stage_sample", "journal_event": "label.transition",
+            "service": "loom",
             "repo": REPO, "attrs": "{}", "nums": "{}", "body": body.to_string(),
             "event_time_ns": ns(t(0)), "knowable_time_ns": knowable.to_string(),
         }))
     };
-    let journal = json!({"observed_at": "2026-10-01T10:05:00Z", "pr_number": 7,
+    let journal = json!({"event": "label.transition", "observed_at": "2026-10-01T10:05:00Z",
+                         "pr_number": 7,
                          "raw": {"labels": [RR]}});
     assert_eq!(daemon(journal.clone(), 0).observed_at, Some(t(300)), "its own field");
     let mut bare = journal;

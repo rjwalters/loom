@@ -162,9 +162,9 @@ fn webhook(
     .to_string()
 }
 
-/// One daemon stage-journal row (`label.first_seen`, as `TIMELINE_SQL`
-/// returns it): PR `number`'s whole label set, observed at `seen`.
-/// Synthetic: no producer exports these to SigNoz yet (#10756).
+/// One daemon `eta.stage_sample` row (#10756) of event `label.first_seen`,
+/// as `TIMELINE_SQL` returns it: PR `number`'s whole label set, observed at
+/// `seen`.
 fn label_set_row(id: &str, number: u32, labels: &[&str], seen: DateTime<Utc>) -> String {
     let body = json!({
         "schema": "eta-stage-sample/v1",
@@ -180,10 +180,11 @@ fn label_set_row(id: &str, number: u32, labels: &[&str], seen: DateTime<Utc>) ->
     });
     json!({
         "record_id": id,
-        "kind": "label.first_seen",
+        "kind": "eta.stage_sample",
+        "journal_event": "label.first_seen",
         "service": "loom",
         "repo": A,
-        "attrs": json!({"loom.repo": A}).to_string(),
+        "attrs": json!({"loom.kind": "eta.stage_sample", "loom.repo": A}).to_string(),
         "nums": "{}",
         "body": body.to_string(),
         "event_time_ns": ns(seen),

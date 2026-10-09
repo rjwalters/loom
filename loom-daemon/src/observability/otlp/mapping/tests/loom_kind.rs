@@ -251,6 +251,9 @@ fn samples() -> Vec<TelemetryRecord> {
                     "workspace": "loom", "outcome": "success", "source": "probe",
                     "probed_count": 0, "api_key_probe_count": 0, "accounts": [],
                     "duration_ms": 0, "loom": p})),
+        wire(json!({"kind": "eta.stage_sample", "schema": "eta-stage-sample/v1",
+                    "observed_at": AT, "event": "label.transition", "repo": "rjwalters/loom",
+                    "in_sweep": false, "raw": {"labels": []}, "loom": p})),
     ]
 }
 

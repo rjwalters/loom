@@ -2569,7 +2569,10 @@ observed time, an applied stall, and a calibration or regime shift. The parts
 always sum to `error_sec`. `dominant_stage` names the largest contribution.
 Each stage boundary is also its own record, `eta.stage_outcome` (entry, exit,
 dwell and exit kind, plus the newest open estimate per series), so a
-predicted-vs-actual stage timeline can be drawn per item. The nightly
+predicted-vs-actual stage timeline can be drawn per item. Every stage-journal
+row, label sets and first sightings included, is also exported verbatim from
+every host as `eta.stage_sample` (#10756), with the forge's own instant
+(`forge_at`) beside the poll (`observed_at`) where the daemon knows it. The nightly
 per-heuristic, per-stage bias rollup is a follow-up.
 
 **Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
@@ -3058,7 +3061,8 @@ not one per host.
   `eta.estimate`, `eta.outcome`, `eta.snapshot` or `eta.fit`, and **drops its
   pending-estimate store** (`.loom/state/eta/pending.jsonl`) on start and on
   demotion, so it never scores a stale outcome. Its stage journal still
-  records what it saw, and the `eta` CLI keeps working read-only.
+  records what it saw, exported as `eta.stage_sample` like every host's
+  (#10756), and the `eta` CLI keeps working read-only.
 - **Observability.** `eta doctor` prints the authority host and why
   (`config.authority`). A non-authority host that reaches the ETA sink anyway
   drops the records and counts
@@ -3366,7 +3370,10 @@ the primary history source, with forge reads only filling gaps.
 - **Two sources.** The loom-ui webhook export (`service.name =
   loom-ui-d1-export`) carries exact receipt times. The daemon's rows are
   polling-time: stage-journal label sets (diffed into changes; an item's first
-  set is a baseline), `pr.resolved`, `ci.*` and `queue.snapshot`. When both
+  set is a baseline), `pr.resolved`, `ci.*` and `queue.snapshot`. The label
+  sets are the `label.transition` / `label.first_seen` rows of the
+  `eta.stage_sample` export (#10756): `TIMELINE_SQL` selects that kind only
+  for those two journal events, and reads each row's `raw.labels`. When both
   saw one change of one `(repo, number, label, transition)`, it is one event
   dated by the webhook. A daemon change with no webhook partner keeps the
   daemon time. Repeats within a source collapse.
