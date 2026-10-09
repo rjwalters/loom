@@ -457,11 +457,17 @@ jobs:
       # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
       # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
       # these tests never execute there; the full default-feature suite runs
-      # nightly (ci-daily.yml `full-suite`). The names are DERIVED from source
-      # (a test attribute between the cfg and the fn), never hand-listed
-      # (ci-principles rules 7 and 9); an empty derivation or an empty
-      # selection fails. This is an additional run, not a filterset that skips
-      # work.
+      # nightly (ci-daily.yml `full-suite`). The names are DERIVED by the
+      # compiler, never hand-listed (ci-principles rules 7 and 9): the lib
+      # tests `cargo nextest list` reports with default features minus those it
+      # reports with `--features otlp` (#10845), so every cfg form (on a `mod`,
+      # `all(test, not(..))`, one-line, `#[rstest]`, ...) is covered. Each is
+      # selected by its exact full name, and the step fails unless nextest's
+      # "N tests run" equals the derived count (catches under- and
+      # over-selection), on an empty derivation, or on an empty selection.
+      # This is an additional run, not a filterset that skips work. Cost: one
+      # extra compile of the loom-daemon lib test binary with `otlp` (~2 min
+      # locally); this trailing `!cancelled()` step is off the critical path.
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
@@ -469,19 +475,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          names=$(grep -rl 'cfg(not(feature = "otlp"))' loom-daemon/src | sort | xargs awk '
-            /#\[cfg\(not\(feature = "otlp"\)\)\]/ { pend=1; ist=0; next }
-            pend && /#\[(tokio::)?test/ { ist=1; next }
-            pend && /^[ \t]*(pub )?(async )?fn / {
-              if (ist) { l=$0; sub(/.*fn /, "", l); sub(/\(.*/, "", l); print l }
-              pend=0; next }
-            pend && /^[ \t]*(#\[|\/\/|$)/ { next }
-            { pend=0 }
-          ' | sort -u)
-          test -n "$names" || { echo "derived no cfg(not(otlp)) tests" >&2; exit 1; }
-          echo "derived tests:"; echo "$names"
-          filter=$(echo "$names" | sed 's|.*|test(/::&$/)|' | paste -sd'|' - | sed 's/|/ | /g')
-          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail -E "$filter"
+          # The listing below is `--lib` only; integration tests are not in it.
+          if grep -rlF 'cfg(not(feature = "otlp"))' loom-daemon/tests; then
+            echo "::error::cfg(not(feature = \"otlp\")) under loom-daemon/tests/ is not covered: extend this step beyond --lib" >&2
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          # `otlp` first: its build replaces the default one, which the default
+          # listing and the run below then share (two compiles, not three).
+          cargo nextest list -p loom-daemon --lib --features otlp --message-format json > "$tmp/otlp.json"
+          cargo nextest list -p loom-daemon --lib --message-format json > "$tmp/default.json"
+          jq -r '."rust-suites"[].testcases | to_entries[] | select(.value.ignored | not) | .key' "$tmp/default.json" | sort -u > "$tmp/default.txt"
+          jq -r '."rust-suites"[].testcases | keys[]' "$tmp/otlp.json" | sort -u > "$tmp/otlp.txt"
+          comm -23 "$tmp/default.txt" "$tmp/otlp.txt" > "$tmp/derived.txt"
+          derived=$(wc -l < "$tmp/derived.txt" | tr -d ' ')
+          test "$derived" -gt 0 || { echo "::error::derived no cfg(not(otlp)) tests" >&2; exit 1; }
+          echo "derived $derived tests:"; cat "$tmp/derived.txt"
+          filter=$(sed 's/.*/test(=&)/' "$tmp/derived.txt" | paste -sd'|' - | sed 's/|/ | /g')
+          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail --color never -E "$filter" 2>&1 | tee "$tmp/run.log"
+          ran=$(grep -oE '[0-9]+ tests? run' "$tmp/run.log" | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ "${ran:-0}" != "$derived" ]; then
+            echo "::error::nextest ran ${ran:-0} tests but $derived were derived" >&2
+            exit 1
+          fi
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
