@@ -3,6 +3,10 @@
 //! This is the narrow remediation path (#4232 launchd / #4862 systemd), reached
 //! only when the job is LOADED, has no live process, and its last exit was
 //! clean. See [`super::remediation`] for why that gate is exactly that narrow.
+//!
+//! The opt-in LIVE-hang restart (#7855, [`super::hang_recover`]) has its own
+//! argv builders here, deliberately separate so neither path's gate or command
+//! can silently become the other's.
 
 use std::path::Path;
 use std::process::Command;
@@ -53,6 +57,42 @@ pub fn systemd_restart_argvs(unit: &str) -> Vec<Vec<String>> {
     ]
 }
 
+/// The opt-in LIVE-HANG restart command (#7855), for a launchd job whose
+/// process is ALIVE but wedged.
+///
+/// Deliberately a different builder from [`launchd_kickstart_argv`], not a flag
+/// on it. The dead-daemon path must stay plain `kickstart` (its whole safety
+/// argument is that `-k` could kill a daemon the supervisor had just
+/// relaunched). The live-hang path is the opposite case: the job is loaded and
+/// its process is running but refuses IPC, so it needs restart semantics —
+/// `kickstart -k` asks launchd itself to stop and relaunch the job it owns.
+/// That is the ONLY way this path ends a process: no bare `kill`, and nothing
+/// travels over the wedged socket.
+#[must_use]
+pub fn launchd_hang_restart_argv(service: &str) -> Vec<String> {
+    vec![
+        "launchctl".to_string(),
+        "kickstart".to_string(),
+        "-k".to_string(),
+        service.to_string(),
+    ]
+}
+
+/// The opt-in LIVE-HANG restart command (#7855) for a `systemd --user` unit.
+///
+/// `restart`, not the dead-daemon path's `reset-failed` + `start`: a unit whose
+/// process is running is not `failed`, and `start` on an active unit is a
+/// no-op that would leave the wedged process in place.
+#[must_use]
+pub fn systemd_hang_restart_argv(unit: &str) -> Vec<String> {
+    vec![
+        "systemctl".to_string(),
+        "--user".to_string(),
+        "restart".to_string(),
+        unit.to_string(),
+    ]
+}
+
 /// Run one argv, bounded. Returns the exit code, or `None` if it could not be
 /// run or exceeded the budget.
 ///
@@ -61,10 +101,28 @@ pub fn systemd_restart_argvs(unit: &str) -> Vec<Vec<String>> {
 /// stopped watching.
 #[must_use]
 pub fn run_bounded(argv: &[String]) -> Option<i32> {
+    run_bounded_for(argv, SUPERVISOR_CMD_TIMEOUT)
+}
+
+/// How long the live-hang restart (#7855) may take. Longer than
+/// [`SUPERVISOR_CMD_TIMEOUT`] because both `kickstart -k` and `systemctl
+/// restart` wait for the wedged process to stop — and a wedged process may
+/// only go once the supervisor escalates past its own stop timeout (launchd's
+/// `ExitTimeOut` defaults to 20s, systemd's `TimeoutStopSec` to 90s). Still a
+/// hard bound, so a hung supervisor cannot hang the tick.
+pub const HANG_RESTART_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// [`run_bounded`] with the #7855 live-hang budget.
+#[must_use]
+pub fn run_hang_restart(argv: &[String]) -> Option<i32> {
+    run_bounded_for(argv, HANG_RESTART_TIMEOUT)
+}
+
+fn run_bounded_for(argv: &[String], timeout: Duration) -> Option<i32> {
     let (program, args) = argv.split_first()?;
     let mut cmd = Command::new(program);
     cmd.args(args);
-    crate::sweep_registry::output_with_timeout(cmd, SUPERVISOR_CMD_TIMEOUT)
+    crate::sweep_registry::output_with_timeout(cmd, timeout)
         .ok()
         .flatten()
         .and_then(|o| o.status.code())
@@ -164,6 +222,21 @@ mod tests {
         );
         assert!(!argv.iter().any(|a| a == "-k"), "{argv:?}");
         assert!(!argv.iter().any(|a| a.starts_with("-k")), "{argv:?}");
+    }
+
+    #[test]
+    fn the_hang_restart_argvs_are_distinct_from_the_dead_daemon_ones() {
+        // #7855: the live-hang path needs restart semantics; the dead-daemon
+        // path must keep its plain kickstart / reset-failed+start. Neither may
+        // silently become the other.
+        let svc = "gui/501/com.rjwalters.loom-daemon";
+        assert_eq!(launchd_hang_restart_argv(svc), ["launchctl", "kickstart", "-k", svc]);
+        assert_ne!(launchd_hang_restart_argv(svc), launchd_kickstart_argv(svc));
+        assert!(!launchd_kickstart_argv(svc).iter().any(|a| a == "-k"));
+
+        let unit = "loom-daemon.service";
+        assert_eq!(systemd_hang_restart_argv(unit), ["systemctl", "--user", "restart", unit]);
+        assert!(!systemd_restart_argvs(unit).contains(&systemd_hang_restart_argv(unit)));
     }
 
     #[test]
