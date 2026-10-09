@@ -24,14 +24,20 @@
 //! prose `gh pr comment --body "use ssh"` is not a command), `;`/`&&`/`|`/
 //! newlines/`(`/`)` separate commands, `$(…)`, backticks and `<(…)` bodies are
 //! analyzed as commands of their own, and the common wrappers (`sudo`, `env`,
-//! `timeout`, `xargs`, `nohup`, `find -exec`, `eval`, `bash -c`, a here-string
-//! fed to a shell, …) are looked through.
+//! `timeout`, `xargs`, `nohup`, `find -exec`, `eval`, `bash -c`, `su -c`,
+//! `script -c`, `busybox`, `tmux`/`screen`, a here-string fed to a shell, …)
+//! are looked through. `rsync -e`/`host:path`, `git -c core.sshCommand=…`
+//! and `GIT_SSH_COMMAND=…` are `remote-shell` too. A path word is lexically
+//! normalized (`..`, `.`, `//`, `/proc/<pid>/root`) before the home test.
 //!
 //! # What is deliberately NOT matched
 //!
 //! This is a backstop, not a sandbox. A command assembled at run time
-//! (`p=ss; ${p}h host`), a script file the session wrote and then ran, or text
-//! piped into a shell's stdin is not visible to any static matcher; neither is
+//! (`p=ss; ${p}h host`), a script file the session wrote and then ran, an
+//! inline interpreter program (`python3 -c`, `perl -e`, `node -e`) that shells
+//! out, or text piped into a shell's stdin is not visible to any static
+//! matcher, nor is a symlink into a credential directory that already exists
+//! on disk (normalization is lexical); neither is
 //! the SSH transport `git fetch` uses under the hood (forge transport is not a
 //! remote shell). The credential-store matcher anchors on a home directory
 //! (`~`, `$HOME`, the hook's own `$HOME`, `/root`, `/home/<u>`, `/Users/<u>`)
@@ -64,23 +70,13 @@ pub const CLOUD_CLI_PROGRAMS: [&str; 10] = [
     "aws", "gcloud", "az", "doctl", "flyctl", "fly", "wrangler", "heroku", "kubectl", "eksctl",
 ];
 
-/// Home-relative credential locations (`credential-store`), as component
-/// lists. A path is inside one when its home-relative components start with
-/// the entry's components.
-pub const CREDENTIAL_DIRS: [&[&str]; 12] = [
-    &[".ssh"],
-    &[".aws"],
-    &[".gnupg"],
-    &[".netrc"],
-    &[".git-credentials"],
-    &[".kube"],
-    &[".azure"],
-    &[".config", "gh"],
-    &[".config", "gcloud"],
-    &[".docker", "config.json"],
-    &[".loom", "tokens"],
-    &[".claude", ".credentials.json"],
-];
+#[cfg(test)]
+use paths::glob_match;
+use paths::is_credential_path;
+pub use paths::CREDENTIAL_DIRS;
+
+#[path = "command_match_paths.rs"]
+mod paths;
 
 /// Shells whose `-c` argument (or here-string) is itself a command line.
 const SHELLS: [&str; 7] = ["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"];
@@ -429,6 +425,14 @@ fn analyze_str(command: &str, home: Option<&str>, depth: usize, hits: &mut Vec<H
     let lexed = lex(command);
     for seg in &lexed.segments {
         for w in seg {
+            // `GIT_SSH_COMMAND=…` (prefix, `env`, `export`) makes the next
+            // git transport an arbitrary remote-shell command.
+            if w.kind == WordKind::Plain && is_assignment(&w.text) {
+                let name = w.text.split_once('=').map_or("", |(n, _)| n);
+                if matches!(name, "GIT_SSH_COMMAND" | "GIT_SSH" | "RSYNC_RSH") {
+                    hits.push(Hit::new("remote-shell", name));
+                }
+            }
             // Every word, wherever it sits, can name a credential store —
             // including `--key=~/.ssh/id` and `host:~/.ssh/x`.
             for piece in w.text.split(['=', ':']) {
@@ -638,6 +642,58 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
                 hits.push(Hit::new("forge-secrets", evidence));
             }
         }
+        // Multi-call binaries: the first operand is the applet.
+        "busybox" | "toybox" => recurse(skip_options(rest, &[]), hits),
+        // `su -c '<cmd>'`, `su - u -c …`, `script -qc '<cmd>' log`.
+        "su" | "runuser" | "script" => {
+            for (j, w) in rest.iter().enumerate() {
+                let body = if let Some(v) = w.strip_prefix("--command=") {
+                    Some(v)
+                } else if w == "--command"
+                    || w == "--session-command"
+                    || (w.starts_with('-') && !w.starts_with("--") && w.ends_with('c'))
+                {
+                    rest.get(j + 1).map(String::as_str)
+                } else {
+                    None
+                };
+                if let Some(body) = body {
+                    analyze_str(body, home, depth + 1, hits);
+                }
+            }
+            // `runuser -u <user> -- <cmd> …` runs its operands directly.
+            if prog == "runuser" {
+                if let Some(p) = rest.iter().position(|w| w == "--") {
+                    recurse(p + 1, hits);
+                }
+            }
+        }
+        // A tmux/screen operand is a shell command (`tmux new 'ssh h'`,
+        // `screen ssh h`, `tmux send-keys 'ssh h' Enter`): analyze each one.
+        // Over-denies only a session literally named after a capability.
+        "tmux" | "screen" => {
+            for w in rest {
+                analyze_str(w, home, depth + 1, hits);
+            }
+        }
+        // rsync runs ssh itself for `-e`/`--rsh` and for a `host:path` operand.
+        "rsync" => {
+            let rsh = rest.iter().any(|w| {
+                w == "--rsh"
+                    || w.starts_with("--rsh=")
+                    || (w.starts_with('-') && !w.starts_with("--") && w.contains('e'))
+            });
+            let remote = rest.iter().any(|w| {
+                !w.starts_with('-')
+                    && (w.starts_with("rsync://")
+                        || w.split_once(':')
+                            .is_some_and(|(h, _)| !h.is_empty() && !h.contains('/')))
+            });
+            if rsh || remote {
+                hits.push(Hit::new("remote-shell", "rsync"));
+            }
+        }
+        "git" => git_hits(rest, home, depth, hits),
         p if SHELLS.contains(&p) => {
             // `bash -c '<cmd>'`, `sh -ec '<cmd>'`, `bash -o pipefail -c …`.
             let mut j = 0;
@@ -665,17 +721,36 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
     }
 }
 
+/// `git` words that run a command of the caller's choosing: a
+/// `core.sshCommand` override (`git -c core.sshCommand=…`, `git config
+/// core.sshCommand …`) is a remote shell outright; a `!`-alias body and an
+/// `ext::` remote are command lines of their own. Plain `git fetch` over SSH
+/// is forge transport and stays allowed.
+fn git_hits(rest: &[String], home: Option<&str>, depth: usize, hits: &mut Vec<Hit>) {
+    for w in rest {
+        if w.to_ascii_lowercase().contains("core.sshcommand") {
+            hits.push(Hit::new("remote-shell", "git core.sshCommand"));
+        }
+        let body = w
+            .split_once("=!")
+            .map(|(_, b)| b)
+            .or_else(|| w.strip_prefix('!'))
+            .or_else(|| w.strip_prefix("ext::"));
+        if let Some(body) = body {
+            analyze_str(body, home, depth + 1, hits);
+        }
+    }
+}
+
 /// The `forge-secrets` evidence for `gh <rest…>`, if it is one.
 fn gh_forge_secret(rest: &[String]) -> Option<String> {
-    let mut words = rest
-        .iter()
-        .map(String::as_str)
-        .filter(|w| !w.starts_with('-'));
-    let sub = words.next()?;
+    const SENSITIVE: [&str; 4] = ["secret", "variable", "auth", "api"];
+    let (k, sub) = gh_operand(rest, &SENSITIVE)?;
     match sub {
         "secret" | "variable" => Some(format!("gh {sub}")),
         "auth" => {
-            let verb = words.next().unwrap_or("");
+            const VERBS: [&str; 6] = ["token", "login", "refresh", "logout", "setup-git", "status"];
+            let verb = gh_operand(&rest[k + 1..], &VERBS).map_or("", |(_, v)| v);
             let shows_token = rest
                 .iter()
                 .any(|w| w == "-t" || w == "--show-token" || w == "--show-token=true");
@@ -698,124 +773,36 @@ fn gh_forge_secret(rest: &[String]) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Credential paths
-// ---------------------------------------------------------------------------
-
-/// `true` when `word` names a path inside a home credential store.
-fn is_credential_path(word: &str, home: Option<&str>) -> bool {
-    let Some((rel, anchored)) = home_relative(word, home) else {
-        return false;
-    };
-    let comps = normalize(rel);
-    CREDENTIAL_DIRS.iter().any(|dir| {
-        dir.len() <= comps.len()
-            && dir.iter().zip(&comps).all(|(want, got)| {
-                // Glob widening only below an explicit home anchor: a bare
-                // relative `*` or `.*` is far more often a repo glob than a
-                // reach into `$HOME`.
-                if anchored {
-                    glob_match(got, want)
-                } else {
-                    got == want
-                }
-            })
-    })
-}
-
-/// The part of `word` below a home directory plus `true`, or the whole word
-/// plus `false` when it is a relative path (resolved against an unknown cwd,
-/// which is `$HOME` often enough — `cd && cat .ssh/id_rsa` — to count).
-fn home_relative<'a>(word: &'a str, home: Option<&str>) -> Option<(&'a str, bool)> {
-    if word.is_empty() {
-        return None;
-    }
-    for prefix in ["~/", "$HOME/", "${HOME}/"] {
-        if let Some(rest) = word.strip_prefix(prefix) {
-            return Some((rest, true));
+/// The first `gh` operand among `wanted` and its index, past options and
+/// their values. `-R`/`--repo`/`--hostname` always consume the next word. A
+/// word right after any other bare option MAY be that option's value, so
+/// when it is not in `wanted` the scan goes on instead of taking it as the
+/// subcommand (`gh -R o/r secret list`, `gh --foo x api …`). The first
+/// operand that cannot be a value and is not wanted ends the scan, so
+/// `gh pr comment --body secret` stays a `pr` command.
+fn gh_operand<'a>(words: &'a [String], wanted: &[&str]) -> Option<(usize, &'a str)> {
+    let mut takes_value = false;
+    let mut maybe_value = false;
+    for (k, w) in words.iter().enumerate() {
+        let w = w.as_str();
+        if takes_value {
+            takes_value = false;
+            continue;
         }
-    }
-    if let Some(rest) = word.strip_prefix('~') {
-        // `~user/…`
-        return rest.split_once('/').map(|(_, r)| (r, true));
-    }
-    if let Some(h) = home
-        .map(|h| h.trim_end_matches('/'))
-        .filter(|h| !h.is_empty())
-    {
-        if let Some(rest) = word.strip_prefix(h).and_then(|r| r.strip_prefix('/')) {
-            return Some((rest, true));
+        if w.starts_with('-') && w != "-" && w != "--" {
+            takes_value = matches!(w, "-R" | "--repo" | "--hostname");
+            maybe_value = !w.contains('=');
+            continue;
         }
-    }
-    if let Some(rest) = word.strip_prefix("/root/") {
-        return Some((rest, true));
-    }
-    for base in ["/home/", "/Users/"] {
-        if let Some(rest) = word.strip_prefix(base) {
-            return rest.split_once('/').map(|(_, r)| (r, true));
+        if wanted.contains(&w) {
+            return Some((k, w));
         }
-    }
-    if word.starts_with('/') || word.starts_with('$') {
-        return None;
-    }
-    Some((word, false))
-}
-
-/// Lexically normalize a relative path into components (`.`/empty dropped,
-/// `..` pops).
-fn normalize(rel: &str) -> Vec<&str> {
-    let mut out: Vec<&str> = Vec::new();
-    for comp in rel.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            c => out.push(c),
+        if !maybe_value {
+            return None;
         }
+        maybe_value = false;
     }
-    out
-}
-
-/// Shell-glob match of one path component: `*`, `?`, and `[…]` as one char.
-/// A literal component compares exactly, so this only widens what a glob can
-/// reach (`~/.s*h`, `~/.*/id_rsa`), never what a plain name does.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    // As in the shell, a wildcard never matches a leading dot.
-    if name.starts_with('.') && !pattern.starts_with('.') {
-        return false;
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let (mut star, mut mark) = (None::<usize>, 0usize);
-    while ni < n.len() {
-        if pi < p.len() && p[pi] == '[' {
-            if let Some(close) = p[pi..].iter().position(|&c| c == ']') {
-                pi += close + 1;
-                ni += 1;
-                continue;
-            }
-        }
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ni;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+    None
 }
 
 #[cfg(test)]

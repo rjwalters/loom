@@ -166,6 +166,52 @@ fn every_read_only_role_is_denied_each_surface_by_the_bash_hook() {
     }
 }
 
+/// Judge round 1 on PR #11152: shapes the real hook ALLOWED before — a
+/// non-normalized absolute path, option-prefixed `gh` secret calls, and the
+/// remote-shell transports/wrappers. `{home}` is the hook's `$HOME`.
+const ROUND_1_BYPASSES: &[(&str, &str)] = &[
+    ("echo x >> /tmp/..{home}/.ssh/authorized_keys", "credential-store"),
+    ("cat /tmp/..{home}/.ssh/id_rsa", "credential-store"),
+    ("cat /proc/self/root{home}/.ssh/id_rsa", "credential-store"),
+    ("cat /{home}/.ssh/id_rsa", "credential-store"),
+    ("cat /.{home}/.ssh/id_rsa", "credential-store"),
+    ("gh -R o/r secret list", "forge-secrets"),
+    ("gh --repo o/r variable list", "forge-secrets"),
+    ("rsync -e ssh a b:c", "remote-shell"),
+    ("rsync a host:b", "remote-shell"),
+    ("script -c 'ssh h'", "remote-shell"),
+    ("su -c 'ssh h'", "remote-shell"),
+    ("busybox ssh h", "remote-shell"),
+    ("tmux new 'ssh h'", "remote-shell"),
+    ("screen ssh h", "remote-shell"),
+    ("git -c core.sshCommand='ssh -i k' fetch", "remote-shell"),
+    ("GIT_SSH_COMMAND='ssh -i k' git fetch", "remote-shell"),
+];
+
+#[test]
+fn round_1_bypasses_are_denied_by_the_real_hooks() {
+    let f = Fixture::new();
+    let home = f.home().to_string_lossy().into_owned();
+    for (shape, cap) in ROUND_1_BYPASSES {
+        let cmd = shape.replace("{home}", &home);
+        let (d, reason) = f.bash(&cmd, Some("judge"), BIN);
+        assert_eq!(d, "deny", "judge: {cmd} -> {reason}");
+        assert!(reason.contains(cap), "{cmd}: {reason}");
+        let (d, reason) = f.codex_shell(&cmd, Some("judge"));
+        assert_eq!(d, "deny", "codex: {cmd} -> {reason}");
+        let (_, reason) = f.bash(&cmd, Some("builder"), BIN);
+        assert!(!reason.contains("role-tool-policy"), "builder: {cmd} -> {reason}");
+    }
+    for cmd in [
+        "gh -R o/r pr view 12",
+        "gh --repo o/r issue list",
+        "rsync -a src/ dst/",
+    ] {
+        let (d, reason) = f.bash(cmd, Some("judge"), BIN);
+        assert_eq!(d, "allow", "judge: {cmd} -> {reason}");
+    }
+}
+
 #[test]
 fn read_only_roles_keep_their_everyday_commands() {
     let f = Fixture::new();

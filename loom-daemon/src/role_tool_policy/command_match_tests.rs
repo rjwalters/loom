@@ -98,6 +98,63 @@ fn remote_shell_through_wrappers_compounds_and_substitutions() {
 }
 
 #[test]
+fn remote_shell_through_transports_and_session_wrappers() {
+    // Judge round 1 on PR #11152: each was ALLOWED before.
+    for cmd in [
+        "rsync -e ssh a b:c",
+        "rsync -avze 'ssh -p 2222' a b:c",
+        "rsync --rsh=ssh a b",
+        "rsync a host:b",
+        "rsync -a host:/etc/x .",
+        "rsync rsync://host/mod/x .",
+        "script -c 'ssh h'",
+        "script -qc 'ssh h' /dev/null",
+        "script --command='ssh h' log",
+        "su -c 'ssh h'",
+        "su - root -c 'ssh h'",
+        "su root --command 'ssh h'",
+        "runuser -u x -- ssh h",
+        "busybox ssh h",
+        "toybox ssh h",
+        "tmux new 'ssh h'",
+        "tmux new-session -d ssh h",
+        "tmux send-keys 'ssh h' Enter",
+        "screen ssh h",
+        "screen -dmS s ssh h",
+        "git -c core.sshCommand='ssh -i k' fetch",
+        "git -c core.sshcommand=x fetch",
+        "git config core.sshCommand 'ssh -i k'",
+        "git -c alias.x='!ssh h' x",
+        "git clone 'ext::ssh h %S foo'",
+        "GIT_SSH_COMMAND='ssh -i k' git fetch",
+        "env GIT_SSH_COMMAND=x git fetch",
+        "export GIT_SSH=/tmp/s",
+        "RSYNC_RSH=ssh rsync a b",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "not caught: {cmd:?}");
+    }
+}
+
+#[test]
+fn local_rsync_git_and_tmux_stay_clean() {
+    for cmd in [
+        "rsync -a src/ dst/",
+        "rsync -av ./a:b dst/",
+        "rsync --exclude target -a a/ b/",
+        "git fetch origin && git rebase origin/main",
+        "git -c user.name=x commit -m 'ssh fix'",
+        "git config --get core.editor",
+        "tmux ls",
+        "screen -ls",
+        "script -q /dev/null",
+        "busybox ls",
+        "su -c 'ls -la'",
+    ] {
+        assert!(!hits_cap(cmd, "remote-shell"), "false positive: {cmd:?}");
+    }
+}
+
+#[test]
 fn remote_shell_mentions_are_not_invocations() {
     for cmd in [
         "grep -rn ssh docs/",
@@ -172,6 +229,36 @@ fn forge_secrets_gh_forms() {
 }
 
 #[test]
+fn forge_secrets_behind_leading_gh_options() {
+    // Judge round 1 on PR #11152: option values hid the subcommand.
+    for cmd in [
+        "gh -R o/r secret list",
+        "gh --repo o/r secret list",
+        "gh --repo=o/r secret list",
+        "gh --repo o/r variable list",
+        "gh -R o/r variable get X",
+        "gh --hostname ghe.example api repos/o/r/actions/secrets",
+        "gh --unknown val api repos/o/r/actions/variables",
+        "gh auth --hostname ghe.example token",
+        "gh -R o/r auth status --show-token",
+        "bash -c 'gh -R o/r secret list'",
+    ] {
+        assert!(hits_cap(cmd, "forge-secrets"), "not caught: {cmd:?}");
+    }
+    for cmd in [
+        "gh -R o/r pr view 12",
+        "gh --repo o/r issue list --label loom:issue",
+        "gh --repo=o/r pr comment 3 --body secret",
+        "gh -R o/r pr comment 3 --body 'see gh secret list'",
+        "gh --hostname ghe.example api repos/o/r/pulls/3",
+        "gh -R o/r auth status",
+        "gh pr comment 3 --body secret",
+    ] {
+        assert_clean(cmd);
+    }
+}
+
+#[test]
 fn forge_secrets_everyday_gh_stays_clean() {
     for cmd in [
         "gh auth status",
@@ -224,6 +311,56 @@ fn credential_store_reads_and_writes() {
     ] {
         assert!(hits_cap(cmd, "credential-store"), "not caught: {cmd:?}");
     }
+}
+
+#[test]
+fn credential_store_paths_are_normalized_before_the_home_test() {
+    // Judge round 1 on PR #11152: every one of these was ALLOWED.
+    for cmd in [
+        "echo x >> /tmp/../home/agent/.ssh/authorized_keys",
+        "cat /tmp/../home/agent/.ssh/id_rsa",
+        "cat /proc/self/root/home/agent/.ssh/id_rsa",
+        "cat /proc/thread-self/root/home/agent/.ssh/id_rsa",
+        "cat /proc/1234/root/home/agent/.ssh/id_rsa",
+        "cat /proc/1/task/1/root/root/.aws/credentials",
+        "cat /proc/self/root/proc/self/root/home/agent/.ssh/id_rsa",
+        "cat /proc/self/root/../home/agent/.ssh/id_rsa",
+        "cat /proc/*/root/home/agent/.ssh/id_rsa",
+        "cat /proc/self/cwd/.ssh/id_rsa",
+        "cat //home/agent/.ssh/id_rsa",
+        "cat /./home/agent/.ssh/id_rsa",
+        "cat /home//agent//.ssh//id_rsa",
+        "cat /home/agent/./.ssh/id_rsa",
+        "cat /../../home/agent/.ssh/id_rsa",
+        "cat /home/agent/x/../.ssh/id_rsa",
+        "cat /usr/../root/.ssh/id_rsa",
+        "cat ~/../other/.ssh/id_rsa",
+        "cat $HOME/../other/.aws/credentials",
+        "cat ../../home/agent/.ssh/id_rsa",
+        "cat a/../../../../root/.ssh/id_rsa",
+        "cp k /tmp/../home/agent/.ssh/authorized_keys",
+    ] {
+        assert!(hits_cap(cmd, "credential-store"), "not caught: {cmd:?}");
+    }
+    for cmd in [
+        "cat /proc/self/status",
+        "cat /proc/self/root/etc/hostname",
+        "cat /tmp/../etc/ssh/sshd_config",
+        "cat /home/agent/repo/../repo/src/main.rs",
+        "cat ../README.md",
+    ] {
+        assert!(!hits_cap(cmd, "credential-store"), "false positive: {cmd:?}");
+    }
+    // The same normalization serves the Edit/Write path mode.
+    for p in [
+        "/tmp/../home/agent/.ssh/authorized_keys",
+        "/proc/self/root/home/agent/.ssh/authorized_keys",
+        "//home/agent/.aws/config",
+    ] {
+        assert!(path_hit(p, HOME).is_some(), "{p}");
+    }
+    // With no known $HOME, `~` still anchors under /home.
+    assert!(!command_hits("cat ~/../x/.ssh/id_rsa", None).is_empty());
 }
 
 #[test]

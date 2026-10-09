@@ -502,9 +502,9 @@ doctor). Exit 0 allows. Exit 1 denies, with a reason on stdout that starts
 
 | Capability | Denied when |
 |---|---|
-| `remote-shell` | `ssh`, `scp`, `sftp`, `ssh-*`, `autossh` is a **command word** |
+| `remote-shell` | `ssh`, `scp`, `sftp`, `ssh-*`, `autossh` is a **command word**; `rsync -e`/`--rsh` or a `host:path` operand; `git -c core.sshCommand=…`, `git config core.sshCommand`; a `GIT_SSH_COMMAND`/`GIT_SSH`/`RSYNC_RSH` assignment |
 | `cloud-cli` | `aws`, `gcloud`, `az`, `doctl`, `fly(ctl)`, `wrangler`, `heroku`, `kubectl`, `eksctl` is a command word |
-| `forge-secrets` | `gh secret`, `gh variable`, `gh auth token/login/refresh/logout/setup-git`, `gh auth status --show-token`, `gh api …/secrets` or `…/variables` |
+| `forge-secrets` | `gh secret`, `gh variable`, `gh auth token/login/refresh/logout/setup-git`, `gh auth status --show-token`, `gh api …/secrets` or `…/variables`, also behind leading options (`gh -R o/r secret list`) |
 | `credential-store` | any word, redirect target or Edit/Write path is under `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.git-credentials`, `~/.kube`, `~/.azure`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json`, `~/.loom/tokens` or `~/.claude/.credentials.json` |
 
 A command word is found the way the shell would find it. Quotes and backslashes
@@ -512,8 +512,12 @@ are honoured, so `"s"sh` is `ssh` and `gh pr comment --body "use ssh"` is not a
 command. `;`, `&&`, `|` and newlines separate commands. `$(…)`, backticks and
 `<(…)` are analyzed as commands. The common wrappers are looked through:
 `sudo`, `env` (including `-S`), `timeout`, `nice`, `nohup`, `xargs`,
-`find -exec`, `watch`, `flock`, `eval`, `bash -c` and a here-string fed to a
-shell.
+`find -exec`, `watch`, `flock`, `eval`, `bash -c`, `su -c`/`runuser`,
+`script -c`, `busybox`/`toybox`, every `tmux`/`screen` operand, a git
+`!`-alias or `ext::` remote, and a here-string fed to a shell. A path word is
+normalized lexically before the home test: `.`, `..` and `//` are collapsed
+and `/proc/<pid>/root` resets to `/`, so `/tmp/../home/u/.ssh/x` and
+`/proc/self/root/home/u/.ssh/x` match like `/home/u/.ssh/x`.
 
 **Enforcement points.** Every hook reads the declaration from its **own**
 install (`<hooks>/../roles`), never from the session's cwd, so a PR checked out
@@ -549,9 +553,14 @@ restricted.
 **Known limits.** This is a backstop, not a sandbox. It cannot see a command
 assembled at run time (`p=ss; ${p}h host`), a script the session wrote and
 then ran, text piped into a shell's stdin, or the SSH transport `git fetch`
-uses. The credential-store match anchors on a home directory or a relative
-path that starts with a credential directory, so a path built from variables
-is not seen. Where the matcher cannot tell a pattern from a path (an unquoted
+uses. **Inline interpreter programs** are the same class as a script file:
+`python3 -c`, `perl -e`, `node -e` (and `ruby -e`, `awk 'BEGIN{system(…)}'`)
+that shell out or open a path are not parsed. The credential-store match
+anchors on a home directory or a relative path that starts with a credential
+directory, so a path built from variables is not seen. Path normalization is
+lexical: a **symlink that already exists on disk** and points into a
+credential directory is not resolved (one created in the same command names
+the credential path and is caught). Where the matcher cannot tell a pattern from a path (an unquoted
 `grep .ssh`), it over-denies.
 
 ## `loom-daemon guards status` and toggle messages (#10434)
