@@ -32,12 +32,15 @@ use crate::types::DaemonStatusReport;
 
 pub mod capacity;
 pub mod causes;
+pub mod output_feed;
 pub mod outputs;
 pub mod state;
 pub mod task;
 
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(test)]
+mod output_feed_tests;
 #[cfg(test)]
 mod tests;
 

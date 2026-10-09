@@ -476,6 +476,15 @@ impl ClickhouseHttp {
     ///
     /// The endpoint is not an `http(s)` URL.
     pub fn url(&self, query: &PageQuery) -> Result<reqwest::Url, ReadError> {
+        self.url_with(&query.params())
+    }
+
+    /// The endpoint plus `params`, each bound as `param_<name>`.
+    ///
+    /// # Errors
+    ///
+    /// The endpoint is not an `http(s)` URL.
+    pub fn url_with(&self, params: &[(&str, String)]) -> Result<reqwest::Url, ReadError> {
         let mut url = reqwest::Url::parse(&self.endpoint)
             .map_err(|e| ReadError::Unavailable(format!("invalid endpoint: {e}")))?;
         if !matches!(url.scheme(), "http" | "https") {
@@ -483,8 +492,8 @@ impl ClickhouseHttp {
         }
         {
             let mut pairs = url.query_pairs_mut();
-            for (name, value) in query.params() {
-                pairs.append_pair(&format!("param_{name}"), &value);
+            for (name, value) in params {
+                pairs.append_pair(&format!("param_{name}"), value);
             }
         }
         Ok(url)
@@ -506,7 +515,21 @@ impl ClickhouseHttp {
     ///
     /// The backend is unreachable or answered with an error status.
     pub fn post(&self, sql: &'static str, query: &PageQuery) -> Result<String, ReadError> {
-        let url = self.url(query)?;
+        self.post_with(sql, &query.params())
+    }
+
+    /// `POST` `sql` with `params` bound (the fleet output watchdog's
+    /// aggregate read, #10916, which pages nothing).
+    ///
+    /// # Errors
+    ///
+    /// The backend is unreachable or answered with an error status.
+    pub fn post_with(
+        &self,
+        sql: &'static str,
+        params: &[(&str, String)],
+    ) -> Result<String, ReadError> {
+        let url = self.url_with(params)?;
         let password = self.password()?;
         let user = self.user.clone();
         let timeout = self.timeout;

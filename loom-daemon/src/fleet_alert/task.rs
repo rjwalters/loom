@@ -257,20 +257,28 @@ pub fn spawn(
                 AlertState::load(&state_path, settings.debounce_ticks, settings.reminder);
             let host = crate::sweep_registry::host_identity();
             let window = Duration::from_secs(crate::health::DEFAULT_WINDOW_SECS);
+            // #10916: the output watchdog's reader runs on its own thread; this
+            // one only judges its latest reading (captain only).
+            let mut feed = super::output_feed::Feed::start(workspace_root, host.clone());
             // Let the daemon finish starting before the first evaluation.
             std::thread::sleep(Duration::from_secs(30));
             loop {
                 let status = fetch_status(&socket_path);
                 let pool_dir = status.as_ref().and_then(|s| s.token_pool_dir.clone());
+                let now = Utc::now();
+                let source = feed.observed_guarded(&host, now);
+                let watch = source.as_ref().map(|s| super::outputs::OutputWatch {
+                    source: s,
+                    roster: &s.roster,
+                });
                 let ctx = TickContext {
                     status: status.as_ref(),
                     window,
                     host: &host,
                     pool_dir: pool_dir.as_deref(),
-                    // The real fleet-store/SigNoz OutputSource is a follow-up.
-                    outputs: None,
+                    outputs: watch.as_ref(),
                 };
-                let transitions = run_tick(&mut state, &sinks, &ctx, Utc::now());
+                let transitions = run_tick(&mut state, &sinks, &ctx, now);
                 if !transitions.is_empty() {
                     state.save(&state_path);
                 }
