@@ -1833,9 +1833,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // settings as a drop-in and `daemon-reload`; systemd applies them at this
     // daemon's next exit. systemd on Linux only; failures log at WARN. On its
     // own thread so a wedged user manager cannot delay startup.
-    let _ = std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("supervision-dropin".to_string())
-        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup);
+        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup)
+    {
+        log::warn!(
+            "supervision drop-in: could not spawn its startup thread ({e}); the unit keeps \
+             its current supervision settings until the next startup"
+        );
+    }
 
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of

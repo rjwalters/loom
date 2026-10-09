@@ -66,3 +66,19 @@ fn a_test_daemon_writes_its_fallback_root_record_only_inside_its_fixture() {
     let value: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(value["root"].as_str(), Some(workspace.to_str().unwrap()), "{body}");
 }
+
+/// #11111: `isolate_daemon_state` strips the inherited supervisor marker, so a
+/// test daemon started inside a sweep never takes the supervised startup path
+/// (the supervision drop-in write and `daemon-reload`).
+#[test]
+fn isolate_daemon_state_strips_the_inherited_supervisor() {
+    let fixture = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(daemon_bin());
+    cmd.env("LOOM_DAEMON_SUPERVISOR", "systemd");
+    isolate_daemon_state(&mut cmd, fixture.path());
+    let supervisor = cmd
+        .get_envs()
+        .find(|(k, _)| *k == "LOOM_DAEMON_SUPERVISOR")
+        .map(|(_, v)| v);
+    assert_eq!(supervisor, Some(None), "LOOM_DAEMON_SUPERVISOR must be removed");
+}

@@ -12183,16 +12183,27 @@ The daemon encodes WHY it exits in its exit code (`ipc.rs`,
   `systemctl --user daemon-reload`. The file holds the `[Unit]` start limit and
   the `[Service]` directives of the same `systemd_supervision_block()`, with an
   empty `RestartPreventExitStatus=` / `SuccessExitStatus=` before each value,
-  because those keys add to the base unit's lists. It is rewritten only when its
-  content differs. systemd reads the settings when the daemon exits, so the next
-  exit is supervised by them; a floor roll is enough to deliver them fleet-wide.
+  because those keys add to the base unit's lists. The shared block also
+  carries `KillMode=mixed` and `TimeoutStopSec=20`. Recent units already set
+  both, but a pre-#5119 `fleet add-worker` unit lacks them and a pre-#4862
+  canonical unit runs the default `KillMode=control-group`; on those hosts the drop-in sets
+  them as intended. It is rewritten only when its content differs. systemd
+  reads the settings when the daemon exits, so the next exit is supervised by
+  them; a floor roll is enough to deliver them fleet-wide.
   It covers the canonical unit and the `fleet add-worker` unit alike. A failure
   is logged at WARN and the daemon carries on. Nothing is written under launchd
-  or when unsupervised. systemd applies drop-ins in file-name order and the
+  or when unsupervised. Only the unit's own main process writes: the daemon
+  checks that `systemctl --user show -p MainPID --value <unit>` is its own pid,
+  and skips (at DEBUG) on a mismatch, an empty value, `0`, or a failed query. A
+  sweep child or test daemon that inherited `LOOM_DAEMON_SUPERVISOR=systemd`
+  therefore never writes the live unit's drop-in or reloads the user manager
+  (#8077). systemd applies drop-ins in file-name order and the
   last one wins, so the `zz-` name sorts after any operator drop-in, including
   the pre-#11111 retrofit's `supervisor.conf` with `Restart=on-success` and
   `systemctl edit`'s `override.conf`. A drop-in that still sorts after it and
-  sets the same keys would win; startup names such a file at WARN. Writing the
+  sets the same keys would win (or, for the two list keys, append to its
+  lists); startup names such a file at WARN. Only the unit's own `.d`
+  directory is scanned for such files. Writing the
   drop-in also removes a `50-supervision.conf`, the name an unreleased build
   used, so two copies never coexist.
 - **The unit file itself is re-rendered** only by `loom-daemon-update.sh

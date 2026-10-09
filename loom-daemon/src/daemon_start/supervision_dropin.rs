@@ -30,6 +30,16 @@
 //! at WARN. A copy under the pre-release name [`LEGACY_DROPIN_NAME`] is removed
 //! when the drop-in is written, so two copies never coexist.
 //!
+//! Only the unit's own main process writes (#11111 review). `LOOM_DAEMON_SUPERVISOR`
+//! is inherited by every sweep child and every test daemon a sweep's
+//! `cargo test` starts, so the env var alone would let a branch-under-test
+//! binary write its supervision block into the live unit's drop-in and
+//! `daemon-reload` the production user manager (the #8077 hazard). So before
+//! writing, the daemon asks `systemctl --user show -p MainPID --value <unit>`
+//! and acts only when the answer is its own pid. Any error, an empty value or
+//! `0` means "not us": it skips, logging at DEBUG. This also covers a duplicate
+//! daemon that runs before the singleton guard refuses it.
+//!
 //! Every failure is logged at WARN and swallowed: a daemon that cannot write
 //! its own drop-in is still a working daemon.
 
@@ -80,16 +90,21 @@ pub fn render_dropin() -> String {
     s
 }
 
-/// The drop-in directory for `unit`. A bare unit name is a `.service` to
-/// systemd (see [`super::platform::systemd_unit`]), so the suffix is added here.
+/// `unit` with the `.service` suffix systemd implies for a bare name (see
+/// [`super::platform::systemd_unit`]).
 #[must_use]
-pub fn dropin_dir(unit_dir: &Path, unit: &str) -> PathBuf {
-    let unit = if unit.ends_with(".service") {
+pub fn service_name(unit: &str) -> String {
+    if unit.ends_with(".service") {
         unit.to_string()
     } else {
         format!("{unit}.service")
-    };
-    unit_dir.join(format!("{unit}.d"))
+    }
+}
+
+/// The drop-in directory for `unit`.
+#[must_use]
+pub fn dropin_dir(unit_dir: &Path, unit: &str) -> PathBuf {
+    unit_dir.join(format!("{}.d", service_name(unit)))
 }
 
 /// The filesystem and `systemctl` this module touches, behind a seam so tests
@@ -115,6 +130,12 @@ pub trait DropinHost {
     /// # Errors
     /// Any read failure other than not-found.
     fn list(&self, dir: &Path) -> io::Result<Vec<String>>;
+    /// `systemctl --user show -p MainPID --value <unit>`, trimmed. A read-only
+    /// query.
+    ///
+    /// # Errors
+    /// When `systemctl` cannot run or exits non-zero.
+    fn main_pid(&self, unit: &str) -> io::Result<String>;
     /// `systemctl --user daemon-reload`.
     ///
     /// # Errors
@@ -156,6 +177,22 @@ impl DropinHost for RealHost {
         }
     }
 
+    fn main_pid(&self, unit: &str) -> io::Result<String> {
+        let out = Command::new("systemctl")
+            .args(["--user", "show", "-p", "MainPID", "--value", unit])
+            .stdin(Stdio::null())
+            .output()?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(io::Error::other(format!(
+                "systemctl --user show -p MainPID exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+
     fn daemon_reload(&self) -> io::Result<()> {
         let out = Command::new("systemctl")
             .args(["--user", "daemon-reload"])
@@ -178,6 +215,9 @@ impl DropinHost for RealHost {
 pub enum Outcome {
     /// Not supervised by systemd on Linux (launchd, macOS, unsupervised): nothing written.
     NotSystemd,
+    /// systemd's `MainPID` for the unit is not this process (a sweep child, a
+    /// test daemon, a duplicate daemon), or the query failed: nothing written.
+    NotMainProcess(String),
     /// The drop-in already has this content and no legacy copy exists: no
     /// write, no reload.
     Unchanged(PathBuf),
@@ -191,17 +231,28 @@ pub enum Outcome {
 }
 
 /// Write the drop-in when `supervisor` is systemd on Linux and its content
-/// differs, remove a [`LEGACY_DROPIN_NAME`] copy, then reload. Never fails; see
-/// [`Outcome`].
+/// differs, remove a [`LEGACY_DROPIN_NAME`] copy, then reload. Acts only when
+/// the unit's `MainPID` is `own_pid`. Never fails; see [`Outcome`].
 pub fn ensure_with(
     supervisor: Option<&str>,
     is_linux: bool,
+    own_pid: u32,
     unit_dir: &Path,
     unit: &str,
     host: &dyn DropinHost,
 ) -> Outcome {
     if !is_linux || supervisor != Some("systemd") {
         return Outcome::NotSystemd;
+    }
+    match host.main_pid(&service_name(unit)) {
+        Ok(v) if own_pid != 0 && v.parse::<u32>().ok() == Some(own_pid) => {}
+        Ok(v) => {
+            return Outcome::NotMainProcess(format!(
+                "the unit's MainPID is {:?}, this process is {own_pid}",
+                v
+            ))
+        }
+        Err(e) => return Outcome::NotMainProcess(e.to_string()),
     }
     let dir = dropin_dir(unit_dir, unit);
     let path = dir.join(DROPIN_NAME);
@@ -271,6 +322,9 @@ pub fn log_outcome(outcome: &Outcome) {
         Outcome::NotSystemd => {
             log::debug!("supervision drop-in: not supervised by systemd on Linux; skipped");
         }
+        Outcome::NotMainProcess(why) => {
+            log::debug!("supervision drop-in: not the unit's main process ({why}); skipped");
+        }
         Outcome::Unchanged(p) => {
             log::debug!("supervision drop-in: {} is current", p.display());
         }
@@ -299,6 +353,7 @@ pub fn ensure_on_startup() {
     let outcome = ensure_with(
         supervisor.as_deref(),
         cfg!(target_os = "linux"),
+        std::process::id(),
         &super::platform::systemd_unit_dir(),
         &super::platform::systemd_unit(),
         &RealHost,
@@ -309,8 +364,10 @@ pub fn ensure_on_startup() {
         let shadows = shadowing_dropins(dir, &RealHost);
         if !shadows.is_empty() {
             log::warn!(
-                "supervision drop-in: {} in {} sort(s) after {DROPIN_NAME} and override its \
-                 settings; remove those lines so the #11058 supervision applies",
+                "supervision drop-in: {} in {} sort(s) after {DROPIN_NAME} and set(s) the same \
+                 keys, so systemd applies those values instead of ours (for \
+                 RestartPreventExitStatus= and SuccessExitStatus=, appends to our lists); \
+                 remove those lines so the #11058 supervision applies",
                 shadows.join(", "),
                 dir.display()
             );
@@ -324,8 +381,8 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    /// An in-memory host recording every write and reload.
-    #[derive(Default)]
+    /// An in-memory host recording every write and reload. By default this
+    /// process is the unit's main process.
     struct FakeHost {
         files: RefCell<HashMap<PathBuf, String>>,
         writes: RefCell<usize>,
@@ -333,6 +390,25 @@ mod tests {
         fail_write: bool,
         fail_reload: bool,
         fail_remove: bool,
+        /// What `main_pid` answers; `None` is a systemctl failure.
+        main_pid: Option<String>,
+    }
+
+    /// The pid the tests' `ensure` calls itself.
+    const OWN_PID: u32 = 4242;
+
+    impl Default for FakeHost {
+        fn default() -> Self {
+            Self {
+                files: RefCell::default(),
+                writes: RefCell::default(),
+                reloads: RefCell::default(),
+                fail_write: false,
+                fail_reload: false,
+                fail_remove: false,
+                main_pid: Some(OWN_PID.to_string()),
+            }
+        }
     }
 
     impl DropinHost for FakeHost {
@@ -365,6 +441,12 @@ mod tests {
                 .filter_map(|p| p.file_name()?.to_str().map(ToString::to_string))
                 .collect())
         }
+        fn main_pid(&self, unit: &str) -> io::Result<String> {
+            assert_eq!(unit, "loom-daemon.service", "queries the suffixed unit");
+            self.main_pid
+                .clone()
+                .ok_or_else(|| io::Error::other("Failed to connect to bus"))
+        }
         fn daemon_reload(&self) -> io::Result<()> {
             *self.reloads.borrow_mut() += 1;
             if self.fail_reload {
@@ -385,7 +467,7 @@ mod tests {
     }
 
     fn ensure(host: &FakeHost, sup: Option<&str>, linux: bool) -> Outcome {
-        ensure_with(sup, linux, Path::new(UNIT_DIR), "loom-daemon.service", host)
+        ensure_with(sup, linux, OWN_PID, Path::new(UNIT_DIR), "loom-daemon", host)
     }
 
     /// `key=` values in order, across the whole text.
@@ -482,6 +564,56 @@ mod tests {
             assert_eq!(ensure(&host, sup, linux), Outcome::NotSystemd, "{sup:?} linux={linux}");
             assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (0, 0));
         }
+    }
+
+    #[test]
+    fn writes_when_this_process_is_the_units_main_pid() {
+        let host = FakeHost::default();
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Written(dropin_path()));
+        assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (1, 1));
+    }
+
+    #[test]
+    fn a_main_pid_mismatch_writes_nothing_and_does_not_reload() {
+        // A sweep child or a test daemon that inherited
+        // LOOM_DAEMON_SUPERVISOR=systemd (#8077): the unit's MainPID is the
+        // production daemon, not this process. Also an inactive unit (`0`) and
+        // an empty answer.
+        for answer in ["999", "0", "", "not-a-pid"] {
+            let host = FakeHost {
+                main_pid: Some(answer.to_string()),
+                ..FakeHost::default()
+            };
+            host.files
+                .borrow_mut()
+                .insert(legacy_path(), "[Service]\nRestart=always\n".to_string());
+            let out = ensure(&host, Some("systemd"), true);
+            assert!(matches!(out, Outcome::NotMainProcess(_)), "{answer:?}: {out:?}");
+            assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (0, 0), "{answer:?}");
+            assert!(!host.files.borrow().contains_key(&dropin_path()));
+            // Not even the legacy removal.
+            assert!(host.files.borrow().contains_key(&legacy_path()));
+            log_outcome(&out);
+        }
+        // A pid of 0 for this process never matches an inactive unit's `0`.
+        let host = FakeHost {
+            main_pid: Some("0".to_string()),
+            ..FakeHost::default()
+        };
+        let out = ensure_with(Some("systemd"), true, 0, Path::new(UNIT_DIR), "loom-daemon", &host);
+        assert!(matches!(out, Outcome::NotMainProcess(_)), "{out:?}");
+    }
+
+    #[test]
+    fn a_systemctl_failure_writes_nothing() {
+        let host = FakeHost {
+            main_pid: None,
+            ..FakeHost::default()
+        };
+        let out = ensure(&host, Some("systemd"), true);
+        assert!(matches!(out, Outcome::NotMainProcess(_)), "{out:?}");
+        assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (0, 0));
+        assert!(host.files.borrow().is_empty());
     }
 
     #[test]
