@@ -19,8 +19,11 @@
 //! ([`super::pr_file_log`], read only): the latest snapshot strictly before
 //! the cutoff. No snapshot, or a latest snapshot that could not name exactly
 //! one head, is an unknown head and the feature stays unknown; runs of any
-//! other head (stale heads, branch runs, another repo's same-numbered PR) are
-//! never the subject's. Only runs with `known_at` and `completed_at` before
+//! other head (stale heads, another repo's same-numbered PR) are never the
+//! subject's. A run at the right head also needs its own ref to name the
+//! subject ([`pr_of_ref`]: `refs/pull/N/merge|head`): a branch run, another
+//! PR's run at the same SHA, a malformed ref or a line logged before the ref
+//! was kept is not attributable and is never counted. Only runs with `known_at` and `completed_at` before
 //! the cutoff count.
 //!
 //! # Meaning of "last CI run"
@@ -82,6 +85,34 @@ pub struct CiRecord {
     /// The run's conclusion, when it carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
+    /// The run's git ref as logged (`refs/pull/N/merge`, a branch, ...).
+    /// Absent on lines written before the ref was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// The one PR the ref names (`refs/pull/N/{merge,head}`). `None` is
+    /// unknown or not a PR ref (a branch, a malformed ref, an old line): the
+    /// run is attributable to no PR and never counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+}
+
+/// The PR a run's ref names, when it names exactly one: `refs/pull/N/merge`
+/// or `refs/pull/N/head` (also without the `refs/` prefix), `N` a positive
+/// integer. Anything else, including a branch name, is `None`.
+#[must_use]
+pub fn pr_of_ref(git_ref: &str) -> Option<u32> {
+    let rest = git_ref.trim();
+    let rest = rest.strip_prefix("refs/").unwrap_or(rest);
+    let mut parts = rest.strip_prefix("pull/")?.split('/');
+    let n = parts.next()?;
+    let kind = parts.next()?;
+    if parts.next().is_some() || !matches!(kind, "merge" | "head") {
+        return None;
+    }
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok().filter(|&n| n > 0)
 }
 
 impl CiRecord {
@@ -107,6 +138,8 @@ impl CiRecord {
             completed_at: run.completed_at,
             known_at: state.observed_at,
             conclusion: run.conclusion.clone(),
+            git_ref: run.git_ref.clone().filter(|r| !r.is_empty()),
+            pr: run.git_ref.as_deref().and_then(pr_of_ref),
         })
     }
 
@@ -260,7 +293,8 @@ impl CiLog {
     /// run order, for [`super::loop_features::LoopInputs::ci`]; `None` when
     /// the PR's head is unknown then. Only runs of that head, finished and
     /// known before `as_of`, whose conclusion is an outcome
-    /// ([`CiRecord::failed`]), are returned.
+    /// ([`CiRecord::failed`]), are returned. A run counts only when its own
+    /// ref names this PR ([`CiRecord::pr`]).
     #[must_use]
     pub fn observations(
         &self,
@@ -274,6 +308,7 @@ impl CiLog {
             .get(&(repo.to_ascii_lowercase(), head.to_string()))
             .into_iter()
             .flatten()
+            .filter(|r| r.pr == Some(pr))
             .filter(|r| r.known_at < as_of && r.completed_at < as_of)
             .filter_map(|r| r.failed().map(|f| (r, f)))
             .collect();

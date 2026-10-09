@@ -156,6 +156,8 @@ fn logged_ci_reaches_fit_and_serving_alike_and_never_leaks() {
     use crate::eta::ci_log::{CiLog, CiRecord};
     let snaps = fleet();
     let mk = |sha: &str, id: u64, done: f64, known: f64, c: &str| CiRecord {
+        git_ref: Some(format!("refs/pull/{}/merge", id % 2 + 1)),
+        pr: Some(u32::try_from(id % 2).unwrap() + 1),
         repo: REPO.into(),
         head_sha: sha.into(),
         run_id: id,

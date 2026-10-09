@@ -1,7 +1,7 @@
 //! The CI-run log (#10737): head resolution at the cutoff, the meaning of
 //! "last completed run", observation-time leaks and persistence.
 
-use crate::eta::ci_log::{append, compact, fresh, load, log_path, CiLog, CiRecord};
+use crate::eta::ci_log::{append, compact, fresh, load, log_path, pr_of_ref, CiLog, CiRecord};
 use crate::eta::loop_features::FileSnapshot;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
@@ -33,6 +33,8 @@ fn run(sha: &str, id: u64, attempt: u32, done: i64, known: i64, c: Option<&str>)
         completed_at: t(done),
         known_at: t(known),
         conclusion: c.map(str::to_string),
+        git_ref: Some("refs/pull/7/merge".into()),
+        pr: Some(7),
     }
 }
 
@@ -186,6 +188,8 @@ fn from_state_needs_a_head_and_a_finished_run() {
     let r = CiRecord::from_state("O/R", &state(Some("AbC"), Some("completed"))).unwrap();
     assert_eq!((r.repo.as_str(), r.head_sha.as_str()), ("o/r", "abc"));
     assert_eq!((r.completed_at, r.known_at, r.run_attempt), (t(1), t(3), 2));
+    // A branch ref names no PR.
+    assert_eq!((r.git_ref.as_deref(), r.pr), (Some("refs/heads/x"), None));
     assert!(CiRecord::from_state("o/r", &state(None, None)).is_none());
     assert!(CiRecord::from_state("o/r", &state(Some("a"), Some("in_progress"))).is_none());
 }
@@ -212,4 +216,60 @@ fn the_log_round_trips_both_timestamps_and_dedupes() {
     // Small logs are not compacted.
     compact(dir.path(), t(100_000)).unwrap();
     assert_eq!(load(dir.path()).len(), 1);
+}
+
+#[test]
+fn pr_refs_parse_strictly() {
+    assert_eq!(pr_of_ref("refs/pull/12/merge"), Some(12));
+    assert_eq!(pr_of_ref("refs/pull/12/head"), Some(12));
+    assert_eq!(pr_of_ref("pull/12/merge"), Some(12));
+    for bad in [
+        "",
+        "main",
+        "refs/heads/main",
+        "refs/pull/0/merge",
+        "refs/pull/x/merge",
+        "refs/pull/12",
+        "refs/pull/12/other",
+        "refs/pull/12/merge/x",
+        "refs/pull//merge",
+        "refs/pull/-1/merge",
+    ] {
+        assert_eq!(pr_of_ref(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn a_run_must_name_the_subject_pr_not_just_its_head() {
+    let heads = [head("o/r", 7, 0, Some("a")), head("o/r", 8, 0, Some("a"))];
+    let subject = run("a", 1, 1, 1, 1, Some("success"));
+    let base = CiLog::new(std::slice::from_ref(&subject), &heads);
+    assert_eq!(seen(&base, "o/r", 7, 20), Some(vec![(1, false)]));
+    // Newer failing runs at the same SHA from a branch, another PR, a
+    // missing ref and a malformed ref change nothing for PR 7.
+    let mut branch = run("a", 2, 1, 5, 5, Some("failure"));
+    (branch.git_ref, branch.pr) = (Some("refs/heads/feature/x".into()), None);
+    let mut other = run("a", 3, 1, 6, 6, Some("failure"));
+    (other.git_ref, other.pr) = (Some("refs/pull/8/merge".into()), Some(8));
+    let mut missing = run("a", 4, 1, 7, 7, Some("failure"));
+    (missing.git_ref, missing.pr) = (None, None);
+    let mut garbled = run("a", 5, 1, 8, 8, Some("failure"));
+    (garbled.git_ref, garbled.pr) = (Some("refs/pull/7/merge/x".into()), None);
+    let log = CiLog::new(&[subject, branch, other.clone(), missing, garbled], &heads);
+    assert_eq!(seen(&log, "o/r", 7, 20), Some(vec![(1, false)]));
+    // The other PR still sees its own run.
+    assert_eq!(seen(&log, "o/r", 8, 20), Some(vec![(6, true)]));
+}
+
+#[test]
+fn old_lines_without_identity_load_but_never_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = r#"{"repo":"o/r","head_sha":"a","run_id":1,"run_attempt":1,"workflow":"ci","completed_at":"2026-10-01T01:00:00Z","known_at":"2026-10-01T01:00:00Z","conclusion":"failure"}"#;
+    std::fs::create_dir_all(log_path(dir.path()).parent().unwrap()).unwrap();
+    std::fs::write(log_path(dir.path()), format!("{old}\n")).unwrap();
+    let loaded = load(dir.path());
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].pr, None);
+    let log = CiLog::new(&loaded, &[head("o/r", 7, 0, Some("a"))]);
+    assert_eq!(seen(&log, "o/r", 7, 20), Some(vec![]));
 }
