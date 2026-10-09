@@ -12,8 +12,8 @@
 //! hosts are expected, and `loom.fact_id` collapses them. The fact id is
 //! keyed on forge instants only: a PR's `merged_at` / `closed_at`, and for a
 //! review-label move the new label's `labeled` event (one events read per
-//! move, at most [`LABEL_READ_BUDGET`] per pass). A move with no forge
-//! instant (a sweep stage, an exhausted budget, a failed read) is still
+//! actual move, never per pass, every page of the history; no per-pass
+//! limit). A move with no forge instant (a sweep stage, a failed read) is still
 //! emitted, without a fact id, at the observing pass with `resolution_sec`
 //! set to the pass interval.
 //!
@@ -34,8 +34,8 @@ use crate::telemetry::kinds::stage_outcome::{StageExit, StageOutcomeRecord, FLEE
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
-/// Events reads for label-move instants, per pass.
-pub const LABEL_READ_BUDGET: usize = 30;
+/// The page size of an issue-events read; a shorter page is the last one.
+pub const EVENTS_PAGE_SIZE: usize = 100;
 
 /// A PR's state from one `pulls/{n}` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +130,6 @@ struct Diff<'a, F> {
     loom: &'a Provenance,
     now: DateTime<Utc>,
     prev_at: DateTime<Utc>,
-    budget: usize,
 }
 
 impl<F: ForgeReads> Diff<'_, F> {
@@ -144,10 +143,9 @@ impl<F: ForgeReads> Diff<'_, F> {
     /// to the stage, even one inside the preceding interval) is not this move.
     fn label_instant(&mut self, repo: &str, pr: u32, stage: FleetStage) -> Option<DateTime<Utc>> {
         let labels = stage_labels(stage);
-        if labels.is_empty() || self.budget == 0 {
+        if labels.is_empty() {
             return None;
         }
-        self.budget -= 1;
         let times = self.forge.label_times(repo, pr)?;
         let at = labels.iter().filter_map(|l| times.get(*l)).max().copied()?;
         (at > self.prev_at && at <= self.now).then_some(at)
@@ -217,7 +215,6 @@ pub fn diff(
         loom,
         now: pass.now,
         prev_at,
-        budget: LABEL_READ_BUDGET,
     };
     let mut out = Vec::new();
 
@@ -428,12 +425,38 @@ impl ForgeReads for GhForgeReads {
     }
 
     fn label_times(&mut self, repo: &str, number: u32) -> Option<BTreeMap<String, DateTime<Utc>>> {
-        let events = crate::observability::ops::stage_dwell::gh_json(
-            self.root(repo)?,
-            &format!("repos/{repo}/issues/{number}/events?per_page=100"),
-        )?;
-        Some(crate::observability::ops::stage_dwell::parse_label_times(&events))
+        let root = self.root(repo)?.to_path_buf();
+        paged_label_times(|page| {
+            crate::observability::ops::stage_dwell::gh_json(
+                &root,
+                &format!(
+                    "repos/{repo}/issues/{number}/events?per_page={EVENTS_PAGE_SIZE}&page={page}"
+                ),
+            )
+        })
     }
+}
+
+/// The latest `labeled` instant per label over an issue's whole event
+/// history, read page by page (`read_page(1)`, `read_page(2)`, …) until a
+/// short page. The API lists events oldest first, so the newest move is on
+/// the last page. `None` when any page fails or is not an array.
+pub fn paged_label_times(
+    mut read_page: impl FnMut(usize) -> Option<serde_json::Value>,
+) -> Option<BTreeMap<String, DateTime<Utc>>> {
+    let mut times: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+    for page in 1.. {
+        let events = read_page(page)?;
+        let len = events.as_array()?.len();
+        for (label, at) in crate::observability::ops::stage_dwell::parse_label_times(&events) {
+            let slot = times.entry(label).or_insert(at);
+            *slot = (*slot).max(at);
+        }
+        if len < EVENTS_PAGE_SIZE {
+            break;
+        }
+    }
+    Some(times)
 }
 
 #[cfg(test)]

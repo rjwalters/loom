@@ -592,3 +592,82 @@ fn a_hold_release_is_not_dated_by_the_old_approval_label() {
     }
     assert_eq!(forge.reads, 1, "only the re-hold reads events, never a release");
 }
+
+/// No per-pass limit: every one of 40 review-label moves in one pass is
+/// dated by its own label event, with one events read per move.
+#[test]
+fn more_than_thirty_stage_outcome_moves_in_one_pass_all_get_their_forge_instant() {
+    let approved_at = t0() + Duration::minutes(3);
+    let mut forge = Forge::default();
+    let numbers: Vec<u32> = (0..40).map(|i| 100 + 2 * i).collect();
+    for n in &numbers {
+        forge
+            .labels
+            .insert(*n, [("loom:pr".to_string(), approved_at)].into());
+    }
+    let listing = |label: &'static str| -> Vec<(u32, &'static str, u32)> {
+        numbers.iter().map(|n| (*n, label, n - 1)).collect()
+    };
+    let out = run(
+        &[
+            input(&listing("loom:review-requested"), Vec::new()),
+            input(&listing("loom:pr"), Vec::new()),
+        ],
+        Duration::minutes(5),
+        &mut forge,
+    );
+    let records = stages(&out[1]);
+    assert_eq!(records.len(), 40);
+    assert!(
+        records
+            .iter()
+            .all(|r| r.forge_transition_at == Some(approved_at)),
+        "every move is forge-dated"
+    );
+    assert_eq!(forge.reads, 40, "one events read per actual move");
+}
+
+fn labeled(label: &str, at: DateTime<Utc>) -> serde_json::Value {
+    serde_json::json!({
+        "event": "labeled",
+        "label": {"name": label},
+        "created_at": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
+}
+
+/// The events API lists oldest first, so the move this pass saw is on the
+/// last page: every page is read, and the newest `labeled` event wins.
+#[test]
+fn a_label_event_beyond_page_one_dates_the_stage_outcome() {
+    let old = t0() - Duration::days(30);
+    let new = t0() + Duration::minutes(3);
+    let mut first: Vec<serde_json::Value> = (0..EVENTS_PAGE_SIZE - 1)
+        .map(|_| serde_json::json!({"event": "commented"}))
+        .collect();
+    first.push(labeled("loom:pr", old));
+    let pages = [
+        serde_json::Value::Array(first),
+        serde_json::Value::Array(vec![
+            labeled("loom:review-requested", old),
+            labeled("loom:pr", new),
+        ]),
+    ];
+    let mut read = Vec::new();
+    let times = paged_label_times(|page| {
+        read.push(page);
+        pages.get(page - 1).cloned()
+    })
+    .unwrap();
+    assert_eq!(times["loom:pr"], new, "the page-two event, not page one's");
+    assert_eq!(read, [1, 2], "stops at the short page");
+}
+
+#[test]
+fn a_failed_events_page_is_a_failed_read() {
+    let full = serde_json::Value::Array(
+        (0..EVENTS_PAGE_SIZE)
+            .map(|_| serde_json::json!({"event": "commented"}))
+            .collect(),
+    );
+    assert!(paged_label_times(|page| (page == 1).then(|| full.clone())).is_none());
+}

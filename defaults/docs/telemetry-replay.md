@@ -121,8 +121,8 @@ polling time. A host's own polling time (`left_at` for a polled move,
 different times would otherwise emit two ids for it.
 
 **No forge instant, no fact id.** A stage exit the producer has no forge
-instant for (a sweep stage, a failed or over-budget read, a label event not
-on the first events page) is emitted **without** `loom.fact_id`. So is a
+instant for (a sweep stage, a failed read, a label event outside the pass
+window) is emitted **without** `loom.fact_id`. So is a
 `pr.resolved` from a build before #11126 (no `closed_at`). Readers dedupe
 these by `(repo, issue, next_stage)` for `eta.stage_outcome` (`(repo,
 pr_number, state)` for `pr.resolved`) within a short window: two hosts'

@@ -2503,11 +2503,12 @@ record carries `loom.fact_id = derived_hex(["loom.fact", "eta.stage_outcome",
 repo, issue, stage, next_stage, forge_transition_at], 16)` (`next_stage` empty
 when the item left the view; `forge_transition_at` as RFC 3339 UTC,
 nanoseconds). `forge_transition_at` is the forge's own instant: the new review
-label's `labeled` event (one issue-events read per move, at most 30 per pass,
-first page only, and only when it falls inside the pass window), or the PR's
+label's `labeled` event (one paginated issue-events read per actual move,
+with no per-pass limit, every page of the history, and only when it falls
+inside the pass window), or the PR's
 `merged_at` / `closed_at`. Every part is the same on every host, whatever its
 polling time. **A transition with no forge instant** (a sweep stage, a ready
-row, an exhausted read budget, a failed read) **is emitted without
+row, a failed read) **is emitted without
 `loom.fact_id`**; readers dedupe it by `(repo, issue, next_stage)` within a
 short window (see [`telemetry-replay.md`](telemetry-replay.md)).
 
