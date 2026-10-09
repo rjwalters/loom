@@ -1017,3 +1017,62 @@ fn a_single_page_walk_makes_no_extra_request() {
     assert_eq!(all.len(), 3);
     assert_eq!(calls(dir.path()).len(), 1);
 }
+
+// ===== list_issues_cached_paged_as (#11139) =====
+
+/// The partial walk: a mid-walk change hands back the fresher rows, each item
+/// once, marked incomplete, where the all-or-nothing walk errors.
+#[test]
+fn a_paged_walk_that_moves_mid_walk_returns_the_fresher_rows_marked_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-partial-shift-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("p1b.json"), page_json(2..102)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    std::fs::write(dir.path().join("shift"), "").unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open")
+        .expect("page 1 was read");
+    assert!(!walk.complete());
+    let reason = format!("{:#}", walk.incomplete.as_ref().unwrap());
+    assert!(reason.contains("changed mid-walk"), "{reason}");
+    let numbers: Vec<u32> = walk.rows.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, (2..106).collect::<Vec<_>>(), "#1 left; #101 listed once");
+}
+
+/// The partial walk: a later page failing or the page cap keeps what was
+/// read, marked incomplete; page 1 failing is still an error; a whole walk
+/// is complete and costs what [`list_issues_cached_all_as`]'s does.
+#[test]
+fn a_paged_walk_falls_short_with_its_rows_and_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-partial-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..201)).unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = || list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open");
+
+    std::fs::write(dir.path().join("fail3"), "").unwrap();
+    let partial = walk().unwrap();
+    assert_eq!(partial.rows.len(), 200);
+    assert!(format!("{:#}", partial.incomplete.unwrap()).contains("HTTP 502"));
+
+    std::fs::remove_file(dir.path().join("fail3")).unwrap();
+    let capped = walk().unwrap();
+    // Pages 2..=MAX_PAGES all serve the same rows: each item listed once.
+    assert_eq!(capped.rows.len(), 200);
+    assert!(format!("{:#}", capped.incomplete.unwrap()).contains("incomplete"));
+
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    let before = calls(dir.path()).len();
+    let whole = walk().unwrap();
+    assert!(whole.complete());
+    assert_eq!(whole.rows.len(), 105);
+    assert_eq!(calls(dir.path()).len() - before, 3, "page 1, page 2, page 1 again");
+
+    let other = format!("{repo}-p1-fails");
+    std::fs::write(dir.path().join("p1.json"), "not json").unwrap();
+    assert!(
+        list_issues_cached_paged_as("t", &gh, Some(dir.path()), Some(&other), "x", "open").is_err()
+    );
+}

@@ -223,8 +223,76 @@ impl Snapshot {
     }
 }
 
-/// The page walk behind [`list_issues_cached_all_as`], bounded by `max_pages`.
+/// The page walk behind [`list_issues_cached_all_as`], bounded by `max_pages`:
+/// [`walk_pages_partial`], with any incompleteness turned into the error.
 fn walk_pages(
+    site: store::ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    query: (&str, &str),
+    max_pages: u32,
+    snapshot: Snapshot,
+) -> Result<Vec<RestIssue>> {
+    let walk = walk_pages_partial(site, gh_bin, cwd, repo_override, query, max_pages, snapshot)?;
+    match walk.incomplete {
+        None => Ok(walk.rows),
+        Some(reason) => Err(reason),
+    }
+}
+
+/// A page walk's rows, and why they may not be the whole listing (#11139).
+#[derive(Debug)]
+pub struct PagedListing {
+    /// Every row read, in listing order, each item once.
+    pub rows: Vec<RestIssue>,
+    /// `None` when `rows` is the whole listing. `Some` when it may not be: a
+    /// later page failed, [`MAX_PAGES`] full pages were read, or the listing
+    /// changed mid-walk. A caller must not read a missing item as absent.
+    pub incomplete: Option<anyhow::Error>,
+}
+
+impl PagedListing {
+    /// Whether [`Self::rows`] is the whole listing.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_none()
+    }
+}
+
+/// [`list_issues_cached_all_as`]'s walk, but an incomplete walk hands back
+/// what it read, marked incomplete, instead of failing (#11139): a ready
+/// queue past [`MAX_PAGES`] pages, or one that moved mid-walk, still yields
+/// the rows it could read, and the caller says the queue is partial.
+///
+/// On a mid-walk change the revalidated (fresher) page replaces the earlier
+/// read, and an item a shift carried across a page boundary is listed once.
+///
+/// # Errors
+///
+/// Page 1 failed: there are no rows to hand back.
+pub fn list_issues_cached_paged_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<PagedListing> {
+    walk_pages_partial(
+        issue_list(caller),
+        gh_bin,
+        cwd,
+        repo_override,
+        (label, state),
+        MAX_PAGES,
+        Snapshot::Rows,
+    )
+}
+
+/// The page walk itself. Page 1 failing is the only error; every other way
+/// the walk falls short returns the rows read plus the reason.
+fn walk_pages_partial(
     site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
@@ -232,7 +300,7 @@ fn walk_pages(
     (label, state): (&str, &str),
     max_pages: u32,
     snapshot: Snapshot,
-) -> Result<Vec<RestIssue>> {
+) -> Result<PagedListing> {
     let what = if label.is_empty() {
         "unfiltered"
     } else {
@@ -241,34 +309,64 @@ fn walk_pages(
     let read = |page: u32| {
         list_issues_cached_retrying(site, gh_bin, cwd, repo_override, label, state, Some(page))
     };
+    let partial = |pages: Vec<Vec<RestIssue>>, reason: anyhow::Error| PagedListing {
+        rows: dedup_rows(pages),
+        incomplete: Some(reason),
+    };
     let mut pages: Vec<Vec<RestIssue>> = Vec::new();
     for page in 1..=max_pages {
-        let rows = read(page)?;
+        let rows = match read(page) {
+            Ok(rows) => rows,
+            Err(e) if page == 1 => return Err(e),
+            Err(e) => return Ok(partial(pages, e)),
+        };
         let full = rows.len() >= PER_PAGE;
         pages.push(rows);
         if !full {
             // Revalidate every earlier page (conditional reads: free `304`s
             // when nothing moved). Nothing to do for a single-page walk.
             let last = pages.len() - 1;
-            for (i, earlier) in pages[..last].iter_mut().enumerate() {
-                let now = read(i as u32 + 1)?;
-                if snapshot.same(earlier, &now) {
-                    *earlier = now;
-                } else {
-                    return Err(anyhow!(
+            for i in 0..last {
+                let now = match read(i as u32 + 1) {
+                    Ok(now) => now,
+                    Err(e) => return Ok(partial(pages, e)),
+                };
+                let same = snapshot.same(&pages[i], &now);
+                pages[i] = now;
+                if !same {
+                    // Stop here, as before #11139: the walk is already not a
+                    // snapshot, and another read would not make it one.
+                    let reason = anyhow!(
                         "forge_listing: the {what} listing changed mid-walk (page {} moved); \
                          the set is not a consistent snapshot",
                         i + 1
-                    ));
+                    );
+                    return Ok(partial(pages, reason));
                 }
             }
-            return Ok(pages.into_iter().flatten().collect());
+            return Ok(PagedListing {
+                rows: pages.into_iter().flatten().collect(),
+                incomplete: None,
+            });
         }
     }
-    Err(anyhow!(
-        "forge_listing: more than {} {what} items; the listing is incomplete",
-        max_pages as usize * PER_PAGE
+    Ok(partial(
+        pages,
+        anyhow!(
+            "forge_listing: more than {} {what} items; the listing is incomplete",
+            max_pages as usize * PER_PAGE
+        ),
     ))
+}
+
+/// `pages` flattened in order, each item number kept at its first sighting.
+fn dedup_rows(pages: Vec<Vec<RestIssue>>) -> Vec<RestIssue> {
+    let mut seen = std::collections::HashSet::new();
+    pages
+        .into_iter()
+        .flatten()
+        .filter(|r| seen.insert(r.number))
+        .collect()
 }
 
 /// [`list_issues_cached_once`], retried exactly once after a forced

@@ -2083,7 +2083,7 @@ describe a different order from the one the tick ran. The `plan` block:
 | `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
 | `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |
 | `ordering` | array | comparator key names, in order |
-| `complete` | bool | `false` when some repo's listing failed (like `listing_failed`) |
+| `complete` | bool | `false` when some repo's listing failed (like `listing_failed`) or came back partial (a later page failed, the page cap, a mid-walk change; #11139): the rows are not the whole queue |
 
 **Pre-ready tiers are unordered.** `loom:curated` and `loom:triage` issues have
 no dispatcher order and never appear in the plan; Champion's promotion order is

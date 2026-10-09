@@ -1189,8 +1189,10 @@ async fn ready_rows(
             },
         });
     }
+    // #11139: a repo whose listing came back partial is as unlisted as a
+    // failed one: its rows are not its whole queue.
     let mut listing_failed = Vec::with_capacity(summary.listing_failed.len());
-    for root in &summary.listing_failed {
+    for root in summary.listing_not_whole() {
         if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
             listing_failed.push(slug);
         }
