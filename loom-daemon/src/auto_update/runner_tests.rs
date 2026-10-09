@@ -495,7 +495,8 @@ fn a_fleet_host_with_autoupdate_off_below_the_floor_rolls_on_that_tick() {
 #[test]
 fn a_fleet_host_with_autoupdate_off_at_the_floor_ignores_a_newer_release() {
     let running = env!("CARGO_PKG_VERSION");
-    // At the floor, and above it.
+    // Running at the floor, and running above it (the "0.1.0" floor is below
+    // the running version).
     for floor in [running, "0.1.0"] {
         let (summary, arms, _) =
             floor_only_tick(&set_floor(floor), newer(&running_plus(3), running));

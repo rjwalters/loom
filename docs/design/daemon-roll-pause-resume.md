@@ -887,6 +887,10 @@ Consequences:
   (`repo_ahead`) rolls a fleet host with autoUpdate off too. Should a loop
   spawned for the floor alone see `NoStore` on a later tick, that tick checks
   nothing rather than chase the newest release.
-- **Opting a fleet host out** is the fleet store's `paused` run state, not
-  `autoUpdate.enabled`. A fleet-paused host's roll is held; #10979 owns how
-  a paused host should roll, and #10954 does not change it.
+- **No per-host opt-out.** Neither `autoUpdate.enabled=false` nor the fleet
+  store's `paused` run state keeps a fleet host from a floor roll. A
+  fleet-paused host below the floor still rolls: the roll replaces the pause's
+  hold with a supervised drain, restarts once nothing is in flight, and the
+  daemon comes back still paused (#10979). An operator stop on record
+  (`restart --abort-drain`, or an operator stop) holds a roll, and that tick
+  is skipped. A `stopped` host exits at boot, before the loop exists.

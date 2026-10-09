@@ -6313,11 +6313,14 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   newest release; on a host with no fleet store it still switches the opt-in
   loop on and off. Should a floor-only loop's host stop reading a fleet store
   while running, its ticks check nothing rather than start chasing.
-- **To keep a fleet host from rolling**, use the fleet store's `paused` run
-  state ([Run-state enforcement](#run-state-enforcement-9598)), not
-  `autoUpdate.enabled=false`, which does not stop a floor roll. A fleet-paused
-  host's roll is held; how a paused host should roll is #10979's, and this
-  rule does not change it.
+- **There is no per-host opt-out from a floor roll.** `autoUpdate.enabled=false`
+  does not stop one, and neither does the fleet store's `paused` run state
+  ([Run-state enforcement](#run-state-enforcement-9598)): a fleet-paused host
+  below the floor still rolls. The roll replaces the pause's hold with a
+  supervised drain, restarts once nothing is in flight, and the daemon comes
+  back still paused (#10979). An operator stop on record (`restart
+  --abort-drain`, or an operator stop) does hold a roll: that tick is skipped.
+  A `stopped` host exits at boot, before the loop starts.
 
 ### Sweep-outcome issue write-back (#9056)
 
