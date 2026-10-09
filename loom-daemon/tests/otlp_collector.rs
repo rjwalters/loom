@@ -1,6 +1,9 @@
 //! Explicit integration test: requires Docker, never converts missing Docker to a pass.
 #![cfg(feature = "otlp")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::{
     path::Path,
     process::Command,
@@ -74,7 +77,7 @@ fn real_collector_decodes_installed_binary_logs_metrics_and_correlated_traces() 
             ))
             .arg("--volume")
             .arg(format!("{}:/evidence", evidence.path().display()))
-            .arg(IMAGE),
+            .arg(hub_image::resolve(IMAGE)),
     );
     let port = command_ok(Command::new("docker").args(["port", &collector.0, "4318/tcp"]));
     let address = port.trim();

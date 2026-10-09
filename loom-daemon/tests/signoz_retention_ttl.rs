@@ -53,6 +53,9 @@
 //! breaks it run as a counterfactual rather than described.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/hub_image.rs"]
+mod hub_image;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -420,7 +423,7 @@ fn local(script: &str, format: &str) -> String {
             "none",
             "--entrypoint",
             "clickhouse",
-            CLICKHOUSE_IMAGE,
+            &hub_image::resolve(CLICKHOUSE_IMAGE),
             "local",
             "--multiquery",
             &format!("--format={format}"),
@@ -508,7 +511,7 @@ impl Server {
                     "{}:/etc/clickhouse-server/config.d/trial.yaml:ro",
                     scratch.join("trial.yaml").display()
                 ),
-                CLICKHOUSE_IMAGE,
+                &hub_image::resolve(CLICKHOUSE_IMAGE),
             ])
             .output()
             .expect("docker is required for this test");

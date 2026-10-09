@@ -2753,11 +2753,13 @@ jobs:
       - name: Run the mocked Codex adapter test suite
         run: bash defaults/scripts/tests/test-spawn-codex.sh
       - name: Verify persistent-session cancellation with fake workers
+        # #11232: no `docker pull` here. The test pulls ubuntu:24.04 through
+        # tests/common/hub_image.rs (mirror first, Docker Hub with bounded
+        # retry as the fallback) and tags it `ubuntu:24.04`, which the fixture
+        # build in the next step also consumes.
         env:
           LOOM_TEST_SESSION_IMAGE: ubuntu:24.04
-        run: |
-          docker pull ubuntu:24.04
-          cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
+        run: cargo test -p loom-daemon --test session_exec_docker -- --ignored --nocapture
       - name: Verify account-private clones and exclusive jobs with Docker fixtures
         # Builds a small ubuntu:24.04 fixture image (apt from archive.ubuntu.com);
         # capped so a mirror stall fails here, not at the 30-min job limit (#10822).
