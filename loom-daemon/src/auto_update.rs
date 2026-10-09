@@ -323,7 +323,8 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
 
 /// Resolve whether the loop is enabled with precedence **env > config >
 /// default(false)**. This loop is opt-in (side effects on the running process),
-/// so an absent config leaves it **off**.
+/// so an absent config leaves it **off**. #10954: on a fleet host the loop runs
+/// whatever this says; it governs only a host with no fleet store ([`loop_mode`]).
 #[must_use]
 pub fn resolve_enabled(config: &AutoUpdateConfig) -> bool {
     if let Ok(v) = std::env::var(AUTO_UPDATE_ENABLE_ENV) {
@@ -598,6 +599,8 @@ pub mod removed_settings;
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
 pub use tuning::TickTuning;
+/// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
+pub mod loop_mode;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -1236,6 +1239,8 @@ pub struct AutoUpdateState {
     /// #10712: the fleet floor's basis and last verdict (inert on a host with
     /// no fleet store).
     floor: floor_roll::FloorState,
+    /// #10719: the repo-ahead demand's basis and last verdict (inert while unset).
+    repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
 }
@@ -1294,6 +1299,7 @@ impl AutoUpdateState {
                 // streak from a previous tick no longer applies (#8513).
                 self.stale_repo.reset();
                 self.floor.observe(None);
+                self.repo_ahead.observe(None);
                 // #10885: a fleet host never rebuilds itself from source. With
                 // no release resolved it has nothing to roll to this tick.
                 if self.floor.fleet_host() {
@@ -1340,6 +1346,10 @@ impl AutoUpdateState {
         let verdict = classify_artifact(info);
         // #10712: below a satisfiable fleet floor, this release is the floor target.
         let floor_target = self.floor.observe(Some(&floor_roll::Release::of(info)));
+        // #10719: so is it for a workspace that needs a newer daemon.
+        let ahead_target = self
+            .repo_ahead
+            .observe(Some(&floor_roll::Release::of(info)));
         // Issue #8513: the streak counts only genuinely CONSECUTIVE
         // stale-repo ticks, so anything else this tick resolved drops it —
         // but the reset must not run before the `StaleRepo` arm increments,
@@ -1413,14 +1423,12 @@ impl AutoUpdateState {
             }
         };
 
-        // #10885: a fleet host rolls only for the floor. With no floor target
-        // this tick (floor met, unknown, or unsatisfiable) the newer release or
-        // re-published artifact above is not chased, and nothing is tracked,
-        // so no settle clock accumulates behind the floor.
-        //
-        // Seam for #10719: a repo-ahead target is a second demand that would
-        // join `floor_target` here (and in `floor_roll::select_target`).
-        if self.floor.fleet_host() && floor_target.is_none() {
+        // #10885: a fleet host rolls only for the floor, and (#10719) for a
+        // registered workspace that needs a newer daemon. With neither target
+        // this tick (floor met, unknown, or unsatisfiable; no workspace needs
+        // a newer daemon) the newer release or re-published artifact above is
+        // not chased, and nothing is tracked, so no settle clock accumulates.
+        if self.floor.fleet_host() && floor_target.is_none() && ahead_target.is_none() {
             self.clear_tracking();
             let seen = why.trim_end_matches(" → fetching");
             let unchased = format!("release {} ({seen})", info.tag);
@@ -1439,9 +1447,12 @@ impl AutoUpdateState {
             return skip;
         }
         // #10712: a floor-driven roll skips settle (and so does its supersede,
-        // which re-decides here still floor-driven). Only a host with no fleet
-        // store reaches the settle gate (#10885).
-        let selected = self.floor.select(floor_target.as_ref(), info);
+        // which re-decides here still floor-driven); autoUpdate rolls do not.
+        // A repo-ahead demand (#10719) skips settle the same way. Only a host
+        // with no fleet store reaches the settle gate (#10885).
+        let selected = self
+            .floor
+            .select(floor_target.as_ref(), ahead_target.as_ref(), info);
         if selected.source == floor_roll::TargetSource::AutoUpdate {
             if let Some(skip) = self.settle_gate(now, settle) {
                 return skip;
@@ -1452,7 +1463,11 @@ impl AutoUpdateState {
         // the host is busy, exactly as the post-deadline path used to do,
         // minus the wait. `defer_deadline` is consumed by `decide_source` only.
         TickDecision::FetchArtifact {
-            why: format!("{why}{}", self.floor.why_suffix(&selected)),
+            why: format!(
+                "{why}{}{}",
+                self.floor.why_suffix(&selected),
+                self.repo_ahead.why_suffix(&selected)
+            ),
             version: selected.version,
             tag: selected.tag,
             low_priority: in_flight > 0,

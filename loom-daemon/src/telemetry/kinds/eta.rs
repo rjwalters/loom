@@ -47,6 +47,12 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.no_estimate_reason",
     // #10903: why this host's planner did not dispatch a placed ready row.
     "loom.eta.not_here",
+    // #10930: the fit and the queue / capacity inputs an estimate used.
+    "loom.eta.fit_id",
+    "loom.eta.queue_rank",
+    "loom.eta.queue_ready",
+    "loom.eta.queue_running",
+    "loom.eta.max_concurrent",
     "loom.eta.outcome",
     "loom.eta.outcome_source",
     "loom.eta.lead_sec",

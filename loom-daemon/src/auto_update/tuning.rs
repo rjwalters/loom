@@ -32,6 +32,10 @@ pub struct TickTuning {
     pub settle: Duration,
     /// Gate 4's bound on deferring a rebuild for in-flight sweeps (#4929).
     pub defer_deadline: Duration,
+    /// `autonomous.autoUpdate.enabled`: whether a tick on a host with no fleet
+    /// store may chase the newest release. #10954: the loop also runs on a
+    /// fleet host with it off, for the floor alone; see [`super::loop_mode`].
+    pub chase_enabled: bool,
 }
 
 impl TickTuning {
@@ -42,6 +46,7 @@ impl TickTuning {
             interval: super::resolve_interval(config),
             settle: super::resolve_settle(config),
             defer_deadline: super::resolve_defer_deadline(config),
+            chase_enabled: super::resolve_enabled(config),
         }
     }
 
@@ -71,7 +76,8 @@ mod tests {
 
     /// Every env override the resolvers read, cleared so a tier test measures the
     /// tier it means to.
-    const ENV_VARS: [&str; 3] = [
+    const ENV_VARS: [&str; 4] = [
+        crate::auto_update::AUTO_UPDATE_ENABLE_ENV,
         crate::auto_update::AUTO_UPDATE_INTERVAL_ENV,
         crate::auto_update::AUTO_UPDATE_SETTLE_ENV,
         crate::auto_update::AUTO_UPDATE_DEFER_DEADLINE_ENV,
@@ -111,6 +117,7 @@ mod tests {
                 interval: Duration::from_secs(120),
                 settle: Duration::from_secs(30),
                 defer_deadline: Duration::from_secs(7200),
+                chase_enabled: true,
             }
         );
         // The description is what both startup log lines render, so pin it.

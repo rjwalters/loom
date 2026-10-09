@@ -263,6 +263,29 @@ query ships `disabled`). What it does **not** establish: no rule evaluator ran
 and no notification was delivered — the live fire-and-resolve check is
 [#9006](https://github.com/rjwalters/loom/issues/9006).
 
+`alerts/fleet-singleton-output.json` (#10916) is imported the same way. It
+watches the outputs of one-host fleet jobs on the logs table by `loom.kind`
+(and `loom.repo` for per-repo rows), one deadline per
+`fleet_outputs::SINGLETON_OUTPUTS` row, embedded as the query's `arrayJoin`
+registry literal. Each series' value is seconds past its deadline, so it fires
+above 0. Every watched kind always has a fleet-level series (`repo` empty) that
+fires when the kind has no record in the 72 h window, and `alertOnAbsent`
+covers a query that returns nothing. A `per_repo` row's expected repos come
+from an independent roster, every repo with a `pass.summary`,
+`role_tick.outcome` or `sweep.started` record in the window, left-joined to the
+output, so a repo that never emitted it (or whose outage is older than the
+window) still has a firing series while another repo stays healthy. A repo
+with no such activity in the window is not on the roster, and the
+`per_active_repo` row (`eta.estimate`) is not roster-expanded. `loom-daemon/tests/signoz_fleet_singleton_output_alert.rs`
+asserts in ordinary CI that each embedded deadline equals the registry's and
+that the collector forwards every attribute the query reads. Its Docker half
+replays the 2026-10-07 incident (28 of 30 repos silenced, which fires one
+evaluation past 2 x cadence and not one before), shows that a healthy fleet
+with an idle and an all-abstaining repo does not fire, fires a roster repo with
+no output history and a 100 h-old outage beside a healthy repo, and runs each
+quiet-repo predicate's and the roster's breaking mutation. The same caveat applies: no rule
+evaluator or notification has run.
+
 All five queries are additionally **executed verbatim** against the pinned
 ClickHouse the telemetry store runs, by
 `loom-daemon/tests/signoz_queue_quota_queries.rs`. That run is what establishes
@@ -530,6 +553,7 @@ data.
 | Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Host disk alerts | Alerts → Import `alerts/host-disk-low.json` (warning) and `alerts/host-disk-critical.json` (critical). Both read `host.health` rows that reach SigNoz through the loom-ui d1-export (`service.name = loom-ui-d1-export`, body `kind = host.health`), per host, over a 10-minute window where every record must breach (each minute bucket takes the `min` of the breach predicate, so one healthy reading clears that minute). Warning: `worktree_root_free_gb` < 30 or < 10% of `worktree_root_total_gb`; critical: < 5 (so 0 included) or < 3%. The percent arm needs `worktree_root_total_gb`; a host that does not report it is judged on the absolute GB arm alone, and a record without `worktree_root_free_gb` is unknown, never 0 GB. Once #10934 rolls out these can key on the direct OTLP `loom.host.worktree_root_free_gb` instead. Executed against the pinned ClickHouse over a replay of free GB falling to 0, and of a host alternating 0 GB and recovered readings within each minute (must not page), by `signoz_ops_alerts.rs`; no rule evaluator or notification has run (#10973) |
 | ETA Ready-coverage alert | Alerts → Import `alerts/eta-ready-coverage.json`. Over a 30-minute window, fires when any 10-minute bucket of a host's `ready_wait` `eta.estimate` rows (`loom.eta.stage`) has zero answered and at least half `stale_inputs` refusals. Each ready item produces a record, so rows existing means ready items exist; total silence is the separate no-ETAs-emitted alert (#10898). Because refusals are currently emitted once (item 4 of #10973 will re-emit them), this fires for the window after the refusals begin and then clears. Replay-tested by `signoz_ops_alerts.rs` (#10973) |
+| Fleet singleton output alert | Alerts → Import `alerts/fleet-singleton-output.json`. Fires when a watched fleet-singleton output (`loom.kind`, per `loom.repo` for per-repo rows) is older than its `SINGLETON_OUTPUTS` deadline or absent from the 72 h window (per-repo rows: for every repo on the fleet-activity roster); the deadlines are asserted equal to the registry and the 2026-10-07 replay is executed against the pinned ClickHouse by `signoz_fleet_singleton_output_alert.rs` (see above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
 | Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
 | Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |

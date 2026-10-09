@@ -20,6 +20,7 @@ mod dependency;
 mod emit;
 mod episodes;
 mod estimate;
+mod explain;
 mod explanation;
 mod features_v3;
 mod fit;

@@ -325,8 +325,18 @@ pub enum ResyncRefusal {
 }
 
 impl ResyncRefusal {
-    /// True for the "repo ahead of daemon" refusals: the inputs to the
-    /// host's `repo_ahead_target` and the `daemon-too-old` dispatch hold.
+    /// True for the "repo ahead of daemon" refusals: a resync from this
+    /// payload would downgrade the workspace, so none is attempted.
+    ///
+    /// This is not the dispatch hold's test, and not the roll demand's
+    /// ([`crate::workspace_hold::decide_hold`], #10719). Of the three, only
+    /// [`Self::NeedsNewerDaemon`] holds dispatch as `daemon-too-old` and asks
+    /// for a roll. [`Self::RepoAheadOfDaemon`] is compatible: no hold, no
+    /// roll. [`Self::PendingAheadOfDaemon`] holds dispatch and asks for no
+    /// roll. [`Self::UnrecognizedVersion`] is not in this set, yet holds,
+    /// because it may need a newer daemon; it asks for a roll only when its
+    /// `requires_daemon` is above this daemon, or names nothing that parses
+    /// ([`crate::workspace_hold::demanded`]).
     #[must_use]
     pub fn repo_ahead_of_daemon(&self) -> bool {
         matches!(

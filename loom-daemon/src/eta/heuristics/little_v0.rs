@@ -82,6 +82,65 @@ pub fn wait_sec(items_ahead: u32, drain_rate_per_hr: f64) -> i64 {
     (f64::from(items_ahead) / drain_rate_per_hr * 3600.0).round() as i64
 }
 
+/// `(p25, p50, p75, p90)`: the wait plus the service total, with the
+/// interval from `draws` Gamma(`shape`) posterior draws on the rate seeded by
+/// `seed`. The one computation the estimate and [`recompute`] share.
+fn queue_quantiles(
+    items_ahead: u32,
+    rate: f64,
+    shape: u32,
+    service_total: i64,
+    draws: usize,
+    seed: u64,
+) -> (i64, i64, i64, i64) {
+    let wait = if items_ahead == 0 {
+        0
+    } else {
+        wait_sec(items_ahead, rate)
+    };
+    let p50 = wait + service_total;
+    // Interval: Gamma(α = exits) posterior on the rate, mean = observed.
+    let (mut p25, mut p75, mut p90) = (p50, p50, p50);
+    if items_ahead > 0 && draws > 0 {
+        let shape = shape.max(1);
+        let mut rng = SplitMix64::new(seed);
+        let mut totals: Vec<i64> = (0..draws)
+            .map(|_| {
+                let g: f64 = (0..shape).map(|_| -(1.0 - rng.next_f64()).ln()).sum();
+                let draw_rate = rate * g / f64::from(shape);
+                (f64::from(items_ahead) / draw_rate * 3600.0).round() as i64 + service_total
+            })
+            .collect();
+        totals.sort_unstable();
+        let at = |pct: usize| totals[(pct * draws).div_ceil(100).clamp(1, draws) - 1];
+        p25 = at(25).min(p50);
+        p75 = at(75).max(p50);
+        p90 = at(90).max(p75);
+    }
+    (p25, p50, p75, p90)
+}
+
+/// Recompute a `little-v0` answer from its [`QueueRecord`] alone (#10930):
+/// `items_ahead`, `drain_rate_per_hr`, `gamma_shape`, `service_total_sec`,
+/// `draws` and `seed`. `None` for a record no estimate could have produced
+/// (a non-positive rate with items ahead, an unparseable seed).
+#[must_use]
+pub fn recompute(record: &QueueRecord) -> Option<(i64, i64, i64, i64)> {
+    let rate = record.drain_rate_per_hr;
+    if record.items_ahead > 0 && !(rate.is_finite() && rate > 0.0) {
+        return None;
+    }
+    let seed = crate::eta::simulate::parse_seed(&record.seed)?;
+    Some(queue_quantiles(
+        record.items_ahead,
+        rate,
+        record.gamma_shape.min(MAX_SHAPE),
+        record.service_total_sec,
+        record.draws,
+        seed,
+    ))
+}
+
 impl Heuristic for LittleV0 {
     fn id(&self) -> &'static str {
         LITTLE_V0
@@ -126,6 +185,8 @@ impl Heuristic for LittleV0 {
             // never applies a stall term, so it stays `applied: false`.
             stalled: stall::binding(&input.stalls, as_of),
             truncated: Vec::new(),
+            replayable: None,
+            replayable_reason: None,
             recalibration: None,
             calibration: None,
             twin_otter: None,
@@ -195,28 +256,10 @@ impl Heuristic for LittleV0 {
         } else {
             wait_sec(queue.items_ahead, rate)
         };
-        let p50 = wait + service_total;
-
-        // Interval: Gamma(α = exits) posterior on the rate, mean = observed.
         let seed = seed_for(&explanation.estimate_id);
         let shape = queue.exits.clamp(1, MAX_SHAPE);
-        let (mut p25, mut p75, mut p90) = (p50, p50, p50);
-        if queue.items_ahead > 0 {
-            let mut rng = SplitMix64::new(seed);
-            let mut totals: Vec<i64> = (0..DRAWS)
-                .map(|_| {
-                    let g: f64 = (0..shape).map(|_| -(1.0 - rng.next_f64()).ln()).sum();
-                    let draw_rate = rate * g / f64::from(shape);
-                    (f64::from(queue.items_ahead) / draw_rate * 3600.0).round() as i64
-                        + service_total
-                })
-                .collect();
-            totals.sort_unstable();
-            let at = |pct: usize| totals[(pct * DRAWS).div_ceil(100).clamp(1, DRAWS) - 1];
-            p25 = at(25).min(p50);
-            p75 = at(75).max(p50);
-            p90 = at(90).max(p75);
-        }
+        let (p25, p50, p75, p90) =
+            queue_quantiles(queue.items_ahead, rate, shape, service_total, DRAWS, seed);
 
         explanation.queue = Some(QueueRecord {
             stage: current.stage,
