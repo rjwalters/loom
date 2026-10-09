@@ -104,6 +104,34 @@ fn opts(worktree: &Path, target_ref: &str, label: &str) -> Options {
     }
 }
 
+/// [`super::run`] for a case that expects `0`, which on a nonzero return
+/// panics naming whatever has its cwd inside the worktree (#9973).
+///
+/// **Best-effort re-scan, not the refusing probe's own result.** `run` keeps
+/// its matched PIDs to itself, so this runs a *second*
+/// `find_processes_with_cwd_in_directory` immediately after the refusal. A
+/// holder that exited in between is missed (reported as an empty scan), so an
+/// empty list here does not prove there was no holder. The production probe and
+/// refusal text are untouched; the differential suite pins the latter.
+fn run_expecting_ok(o: &Options) {
+    let code = run(o);
+    if code == 0 {
+        return;
+    }
+    let rescan = match safety::find_processes_with_cwd_in_directory(&o.worktree) {
+        CwdProbe::Pids(pids) if pids.is_empty() => {
+            "re-scan found nothing (holder, if any, already gone)".to_string()
+        }
+        CwdProbe::Pids(pids) => describe_pids(&pids),
+        CwdProbe::Unprobable => "re-scan unavailable (no /proc, no lsof)".to_string(),
+    };
+    panic!(
+        "run({}) returned {code}, expected 0; best-effort re-scan of processes \
+         with cwd inside the worktree right after the return: {rescan}",
+        o.worktree.display()
+    );
+}
+
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     let mut perms = fs::metadata(path).unwrap().permissions();
@@ -193,7 +221,7 @@ fn a_clean_worktree_resets_and_writes_no_rescue_patch() {
     let second = commit(&repo, "second\n", "second");
     git(&repo, &["reset", "-q", "--hard", &base]);
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(head(&repo), second, "the reset must land on the target ref");
     assert!(patches(&repo).is_empty(), "a clean worktree has nothing to rescue");
 }
@@ -210,7 +238,7 @@ fn an_untracked_file_needs_no_rescue_and_survives_the_reset() {
     git(&repo, &["reset", "-q", "--hard", &base]);
     fs::write(repo.join("scratch.txt"), "untracked scratch\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(fs::read_to_string(repo.join("scratch.txt")).unwrap(), "untracked scratch\n");
     assert!(patches(&repo).is_empty());
 }
@@ -226,7 +254,7 @@ fn foreign_tracked_changes_are_rescued_to_a_replayable_patch_before_the_reset() 
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &base, "test-rescue"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected exactly one rescue patch: {found:?}");
@@ -253,7 +281,7 @@ fn the_rescue_patch_is_named_from_the_label_and_a_utc_stamp() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "issue-42-stale-worktree-reset")), 0);
+    run_expecting_ok(&opts(&repo, &base, "issue-42-stale-worktree-reset"));
 
     let found = patches(&repo);
     let name = found[0].file_name().unwrap().to_string_lossy().to_string();
@@ -504,7 +532,7 @@ fn a_worktree_path_containing_spaces_is_rescued_and_reset_whole() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "label with spaces")), 0);
+    run_expecting_ok(&opts(&repo, &base, "label with spaces"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected one patch: {found:?}");
@@ -562,8 +590,9 @@ fn a_live_holder_under_a_space_bearing_path_is_still_detected() {
 
 /// `pid=… ppid=… exe=… cmdline=…` for each PID, read straight from `/proc`
 /// (best effort — a holder that has already exited reads as `<gone>`). Used
-/// only in failure messages, fed the PIDs from the *same* probe call that
-/// matched them, because a later independent scan misses a short-lived child.
+/// only in failure messages. The probe guard below feeds it the PIDs from the
+/// same probe call that matched them; [`run_expecting_ok`] can only feed it a
+/// later re-scan, which misses a holder that has already exited.
 fn describe_pids(pids: &[u32]) -> String {
     let read = |pid: u32, f: &str| {
         fs::read(format!("/proc/{pid}/{f}"))
@@ -593,10 +622,11 @@ fn describe_pids(pids: &[u32]) -> String {
 
 #[test]
 fn fixture_repos_disable_gits_detached_background_maintenance() {
-    // The deterministic half of the #9973 regression: the prior fixture left
-    // both keys unset, so on git >= 2.47 every fixture commit could leave a
-    // daemonized `git maintenance run --auto --detach` inside the repo for the
-    // fast-path cases' liveness probe to find.
+    // A fixture pin (#9973), not a regression test: it asserts the keys are
+    // set, and cannot tell the old behaviour from the new. The prior fixture
+    // left both unset, so — per the unreproduced hypothesis on `repo()` — on
+    // git >= 2.47 a fixture commit could leave a daemonized
+    // `git maintenance run --auto --detach` inside the repo.
     let dir = tmpdir("fixture-maintenance");
     let repo = repo(&dir, "repo");
     let get = |key: &str| {
@@ -610,13 +640,13 @@ fn fixture_repos_disable_gits_detached_background_maintenance() {
 
 #[test]
 fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
-    // The behavioural half: probe immediately after each fixture commit, which
-    // is the moment the detached maintenance child (if any) is alive. With the
-    // prior fixture under git >= 2.47 this trips intermittently — it cannot be
-    // made deterministic without depending on git-internal timing (0/40 trips
-    // on git 2.54 when measured, so it is a guard, not proof) — and with
-    // maintenance off it has nothing to find on any git, so it never fails
-    // spuriously. On older git (no `--detach`) it passes either way.
+    // A guard, not proof: probe immediately after each fixture commit, which
+    // is when a detached maintenance child (if any) would be alive.
+    // Hypothesis (#9973, unreproduced; 0/40 trips on git 2.54 with the prior
+    // fixture): a detached maintenance child could be visible here. With
+    // maintenance off it has nothing to find on any git, so it should not fail
+    // spuriously; if it ever does, the message names the holder from this same
+    // probe call.
     let dir = tmpdir("fixture-no-holder");
     let repo = repo(&dir, "repo");
     if !probe_available(&repo) {
