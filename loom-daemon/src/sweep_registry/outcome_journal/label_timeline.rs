@@ -29,6 +29,21 @@
 //! checkpoint marker stood for. A terminal rejection (the sweep hit the
 //! Doctor-cycle cap, or died) is therefore NOT counted as a cycle.
 //!
+//! # Daemon base-conflict flags are not Judge verdicts (#9062)
+//!
+//! The daemon's review-queue conflict pass
+//! ([`crate::claim_reconciliation::review_conflict`], #8922) moves a
+//! base-conflicting PR with the same `loom:review-requested` →
+//! `loom:changes-requested` transition a Judge's DIRTY fallback uses, but no
+//! Judge looked at the code. It writes a comment opening with
+//! [`BASE_CONFLICT_MARKER`] *first*, then relabels, so the projection also
+//! carries each such comment (author kept), and a **trusted** flag comment
+//! followed by `loom:changes-requested` within [`BASE_CONFLICT_FLAG_WINDOW`]
+//! is not a verdict. The re-queue that follows it (a Doctor rebase, or the
+//! pass clearing its own flag) resumes the same attempt rather than opening a
+//! new one or counting a Doctor cycle. A Judge DIRTY verdict applies the same
+//! label pair WITHOUT that comment and still counts as a rejection.
+//!
 //! # Which PR
 //!
 //! The record covers exactly the PR named by the same record's `pr_number` —
@@ -56,6 +71,8 @@
 //! never a blocked or failed journal append.
 
 use super::*;
+use crate::claim_reconciliation::review_conflict::BASE_CONFLICT_MARKER;
+use crate::comment_trust::{records, TrustPolicy};
 
 /// The label a Builder (or a Doctor handing back a fixed PR) applies to open a
 /// Judge attempt.
@@ -79,6 +96,15 @@ pub(crate) const VERDICT_FAIL: &str = "fail";
 /// truncates a pathological label-flapping timeline, never a real lifecycle.
 pub(crate) const MAX_JUDGE_VERDICTS: usize = 32;
 
+/// How long after a base-conflict flag comment its `loom:changes-requested`
+/// can land and still be read as the flag's (#9062). The pass writes the
+/// comment and the labels back to back (seconds); the bound keeps a flag whose
+/// relabel failed from swallowing a later, genuine Judge rejection.
+pub(crate) const BASE_CONFLICT_FLAG_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The [`timeline_jq`] kind column of a base-conflict flag comment row.
+pub(crate) const FLAG_ROW_KIND: &str = "base-conflict-flag";
+
 /// One `labeled` event from a PR's forge timeline, trimmed to what the verdict
 /// reconstruction needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +113,11 @@ pub(crate) struct LabelEvent {
     /// events from separate `--paginate` pages can be merged in true
     /// chronological order rather than in page order.
     pub(crate) at: DateTime<Utc>,
-    /// The label name (`loom:review-requested`, `loom:pr`, …).
+    /// The label name (`loom:review-requested`, `loom:pr`, …). Empty for a
+    /// base-conflict flag comment.
     pub(crate) label: String,
+    /// A trusted daemon base-conflict flag comment, not a label (#9062).
+    pub(crate) base_conflict_flag: bool,
 }
 
 /// What one PR's label timeline says about its Judge/Doctor history.
@@ -103,13 +132,22 @@ pub(crate) struct TimelineSignals {
 }
 
 /// The `--jq` program handed to `gh api`: one `<rfc3339>\t<label>` line per
-/// `labeled` event. Projecting on the wire keeps the piped payload small on a
-/// long timeline, and the tab-separated shape is unambiguous (a label name can
-/// contain neither a tab nor a newline).
-pub(crate) const TIMELINE_JQ: &str =
-    r#".[] | select(.event == "labeled") | "\(.created_at)\t\(.label.name)""#;
+/// `labeled` event, plus one `<rfc3339>\t<FLAG_ROW_KIND>\t<author json>` line
+/// per comment opening with [`BASE_CONFLICT_MARKER`] (#9062). Projecting on
+/// the wire keeps the piped payload small on a long timeline, and the
+/// tab-separated shape is unambiguous (a label name can contain neither a tab
+/// nor a newline, and `tojson` escapes both).
+#[must_use]
+pub(crate) fn timeline_jq() -> String {
+    format!(
+        r#".[] | if .event == "labeled" then "\(.created_at)\t\(.label.name)" elif .event == "commented" and ((.body // "") | ltrimstr("\n") | startswith("{BASE_CONFLICT_MARKER}")) then "\(.created_at)\t{FLAG_ROW_KIND}\t\({{{author}}} | tojson)" else empty end"#,
+        author = records::AUTHOR_JQ,
+    )
+}
 
-/// Parse [`TIMELINE_JQ`]'s stdout into chronologically-ordered events.
+/// Parse [`timeline_jq`]'s stdout into chronologically-ordered events. A flag
+/// comment row survives only when `policy` trusts its author: an outsider's
+/// copy of the marker is prose and must not erase a real rejection (#9548).
 ///
 /// `--paginate` re-runs the `--jq` program per page and concatenates the
 /// results (#4637), so multi-page output is several independently-ordered
@@ -121,19 +159,30 @@ pub(crate) const TIMELINE_JQ: &str =
 /// "this PR has no `labeled` events" is a legitimate observation, and the
 /// caller's "the read failed" signal is its own `None`, never this one.
 #[must_use]
-pub(crate) fn parse_label_events(stdout: &[u8]) -> Vec<LabelEvent> {
+pub(crate) fn parse_label_events(stdout: &[u8], policy: &TrustPolicy) -> Vec<LabelEvent> {
     let raw = String::from_utf8_lossy(stdout);
     let mut events: Vec<LabelEvent> = raw
         .lines()
         .filter_map(|line| {
-            let (at, label) = line.trim_end_matches('\r').split_once('\t')?;
+            let (at, rest) = line.trim_end_matches('\r').split_once('\t')?;
             let at = DateTime::parse_from_rfc3339(at.trim().trim_matches('"'))
                 .ok()?
                 .with_timezone(&Utc);
-            let label = label.trim();
+            if let Some((kind, author)) = rest.split_once('\t') {
+                let author = serde_json::from_str::<serde_json::Value>(author.trim()).ok()?;
+                return (kind.trim() == FLAG_ROW_KIND && policy.trusts_json(&author)).then(|| {
+                    LabelEvent {
+                        at,
+                        label: String::new(),
+                        base_conflict_flag: true,
+                    }
+                });
+            }
+            let label = rest.trim();
             (!label.is_empty()).then(|| LabelEvent {
                 at,
                 label: label.to_string(),
+                base_conflict_flag: false,
             })
         })
         .collect();
@@ -157,6 +206,10 @@ pub(crate) fn parse_label_events(stdout: &[u8]) -> Vec<LabelEvent> {
 /// A verdict identical to the previous one *within the same attempt* is
 /// ignored: a Judge that removes and re-applies its own label, or a Champion
 /// pass that re-adds `loom:pr`, is one verdict, not two.
+///
+/// A `loom:changes-requested` within [`BASE_CONFLICT_FLAG_WINDOW`] after a
+/// base-conflict flag comment is the daemon's flag, not a verdict, and the
+/// next `loom:review-requested` resumes the flagged attempt (#9062).
 #[must_use]
 pub(crate) fn signals_from_events(events: &[LabelEvent]) -> TimelineSignals {
     let mut out = TimelineSignals::default();
@@ -165,10 +218,28 @@ pub(crate) fn signals_from_events(events: &[LabelEvent]) -> TimelineSignals {
     // `loom:review-requested` arrival after it can settle it as a COMPLETED
     // Doctor cycle.
     let mut open_rejection = false;
+    // A flag comment awaiting its `loom:changes-requested`, and whether a
+    // flagged (not judged) PR is awaiting its re-queue.
+    let mut pending_flag: Option<DateTime<Utc>> = None;
+    let mut flagged = false;
     for event in events {
+        if event.base_conflict_flag {
+            pending_flag = Some(event.at);
+            continue;
+        }
         match event.label.as_str() {
+            CHANGES_REQUESTED_LABEL
+                if pending_flag
+                    .take()
+                    .is_some_and(|f| event.at - f <= BASE_CONFLICT_FLAG_WINDOW) =>
+            {
+                flagged = true;
+            }
             REVIEW_REQUESTED_LABEL => {
-                attempt = attempt.saturating_add(1);
+                pending_flag = None;
+                if !std::mem::take(&mut flagged) || attempt == 0 {
+                    attempt = attempt.saturating_add(1);
+                }
                 if open_rejection {
                     // The rejection that preceded this hand-back was actually
                     // worked: one completed Doctor cycle.
@@ -177,6 +248,7 @@ pub(crate) fn signals_from_events(events: &[LabelEvent]) -> TimelineSignals {
                 }
             }
             APPROVED_LABEL => {
+                pending_flag = None;
                 push_verdict(&mut out, attempt, VERDICT_PASS);
             }
             CHANGES_REQUESTED_LABEL => {
@@ -241,7 +313,8 @@ impl SweepRegistry {
         // `--repo` flag, which `gh api` rejects (#8263). The facade applies
         // all three and counts the call as `outcome.label_timeline` (#10089).
         let path = format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline");
-        let args = ["api", path.as_str(), "--paginate", "--jq", TIMELINE_JQ];
+        let jq = timeline_jq();
+        let args = ["api", path.as_str(), "--paginate", "--jq", jq.as_str()];
         let output = match self.gh_read("outcome.label_timeline", args) {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
@@ -280,7 +353,10 @@ impl SweepRegistry {
                 return None;
             }
         };
-        Some(signals_from_events(&parse_label_events(&output.stdout)))
+        // #9548/#9062: only a trusted author's base-conflict flag excludes a
+        // rejection from the verdict list.
+        let policy = TrustPolicy::for_root(&self.config.workspace_root);
+        Some(signals_from_events(&parse_label_events(&output.stdout, &policy)))
     }
 }
 
@@ -288,13 +364,19 @@ impl SweepRegistry {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::forge_identity::{FleetLogins, Roster};
+
+    /// The default fleet family is trusted; nobody else is.
+    fn policy() -> TrustPolicy {
+        TrustPolicy::new(FleetLogins::of(&Roster::default()), None, vec![])
+    }
 
     fn events(rows: &[(&str, &str)]) -> Vec<LabelEvent> {
         let joined: String = rows
             .iter()
             .map(|(at, label)| format!("{at}\t{label}\n"))
             .collect();
-        parse_label_events(joined.as_bytes())
+        parse_label_events(joined.as_bytes(), &policy())
     }
 
     /// The `--jq` projection parses into chronological events, and rows from
@@ -304,7 +386,7 @@ mod tests {
     fn parses_and_chronologically_merges_paginated_rows() {
         let stdout = "2026-09-18T12:05:00Z\tloom:pr\n\
                       2026-09-18T12:00:00Z\tloom:review-requested\n";
-        let parsed = parse_label_events(stdout.as_bytes());
+        let parsed = parse_label_events(stdout.as_bytes(), &policy());
         assert_eq!(
             parsed.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
             vec![REVIEW_REQUESTED_LABEL, APPROVED_LABEL],
@@ -319,7 +401,7 @@ mod tests {
                       \n\
                       2026-09-18T12:00:00Z\tloom:review-requested\n\
                       2026-09-18T12:01:00Z\t\n";
-        let parsed = parse_label_events(stdout.as_bytes());
+        let parsed = parse_label_events(stdout.as_bytes(), &policy());
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].label, REVIEW_REQUESTED_LABEL);
     }
@@ -439,13 +521,123 @@ mod tests {
             flapping.push(LabelEvent {
                 at: base + chrono::Duration::minutes(i * 2),
                 label: REVIEW_REQUESTED_LABEL.to_string(),
+                base_conflict_flag: false,
             });
             flapping.push(LabelEvent {
                 at: base + chrono::Duration::minutes(i * 2 + 1),
                 label: APPROVED_LABEL.to_string(),
+                base_conflict_flag: false,
             });
         }
         let signals = signals_from_events(&flapping);
         assert_eq!(signals.judge_verdicts.len(), MAX_JUDGE_VERDICTS);
+    }
+
+    /// A flag-comment row as [`timeline_jq`] projects it.
+    fn flag_row(at: &str, login: &str, association: &str) -> String {
+        format!(
+            "{at}\t{FLAG_ROW_KIND}\t{{\"user\":{{\"login\":\"{login}\",\"type\":\"Bot\"}},\
+             \"author_association\":\"{association}\"}}\n"
+        )
+    }
+
+    /// #9062: the daemon's base-conflict flag (comment, then the same label
+    /// pair Judge's DIRTY fallback applies) is not a Judge rejection, and the
+    /// Doctor rebase that re-queues it resumes attempt 1 without counting a
+    /// Doctor cycle — so a pass after it is still a FIRST-pass approval.
+    #[test]
+    fn a_daemon_base_conflict_flag_is_not_a_judge_verdict() {
+        let stdout = format!(
+            "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
+             2026-09-18T12:10:02Z\t{CHANGES_REQUESTED_LABEL}\n\
+             2026-09-18T12:10:02Z\tloom:merge-conflict\n\
+             2026-09-18T12:40:00Z\t{REVIEW_REQUESTED_LABEL}\n\
+             2026-09-18T13:00:00Z\t{APPROVED_LABEL}\n",
+            flag_row("2026-09-18T12:10:00Z", "loom-fleet-dispatch[bot]", "NONE"),
+        );
+        let signals = signals_from_events(&parse_label_events(stdout.as_bytes(), &policy()));
+        assert_eq!(
+            signals.judge_verdicts,
+            vec![telemetry::JudgeVerdict {
+                attempt: 1,
+                verdict: VERDICT_PASS.to_string(),
+            }]
+        );
+        assert_eq!(signals.doctor_cycles, 0);
+    }
+
+    /// A Judge rejection on the re-queued tree after a flag still counts, on
+    /// the same attempt the flag interrupted, and its hand-back is a cycle.
+    #[test]
+    fn a_judge_rejection_after_a_flag_still_counts() {
+        let stdout = format!(
+            "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
+             2026-09-18T12:10:01Z\t{CHANGES_REQUESTED_LABEL}\n\
+             2026-09-18T12:40:00Z\t{REVIEW_REQUESTED_LABEL}\n\
+             2026-09-18T13:00:00Z\t{CHANGES_REQUESTED_LABEL}\n\
+             2026-09-18T13:30:00Z\t{REVIEW_REQUESTED_LABEL}\n",
+            flag_row("2026-09-18T12:10:00Z", "loom-fleet-dispatch[bot]", "NONE"),
+        );
+        let signals = signals_from_events(&parse_label_events(stdout.as_bytes(), &policy()));
+        assert_eq!(
+            signals.judge_verdicts,
+            vec![telemetry::JudgeVerdict {
+                attempt: 1,
+                verdict: VERDICT_FAIL.to_string(),
+            }]
+        );
+        assert_eq!(signals.doctor_cycles, 1);
+    }
+
+    /// Edge case from the issue: Judge's DIRTY fallback applies the same
+    /// `loom:changes-requested` + `loom:merge-conflict` pair WITHOUT the flag
+    /// comment, and is a real rejection — no over-exclusion on the label pair.
+    #[test]
+    fn a_judge_dirty_fallback_without_the_marker_is_still_a_rejection() {
+        let signals = signals_from_events(&events(&[
+            ("2026-09-18T12:00:00Z", REVIEW_REQUESTED_LABEL),
+            ("2026-09-18T12:30:00Z", CHANGES_REQUESTED_LABEL),
+            ("2026-09-18T12:30:00Z", "loom:merge-conflict"),
+            ("2026-09-18T13:00:00Z", REVIEW_REQUESTED_LABEL),
+        ]));
+        assert_eq!(signals.judge_verdicts.len(), 1);
+        assert_eq!(signals.judge_verdicts[0].verdict, VERDICT_FAIL);
+        assert_eq!(signals.doctor_cycles, 1);
+    }
+
+    /// #9548: an untrusted author's copy of the marker is prose — the
+    /// rejection after it still counts.
+    #[test]
+    fn an_untrusted_flag_comment_does_not_hide_a_rejection() {
+        let stdout = format!(
+            "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
+             2026-09-18T12:10:05Z\t{CHANGES_REQUESTED_LABEL}\n",
+            flag_row("2026-09-18T12:10:00Z", "someone-else[bot]", "NONE"),
+        );
+        let parsed = parse_label_events(stdout.as_bytes(), &policy());
+        assert!(parsed.iter().all(|e| !e.base_conflict_flag));
+        assert_eq!(signals_from_events(&parsed).judge_verdicts.len(), 1);
+    }
+
+    /// A flag whose relabel never landed must not swallow a genuine Judge
+    /// rejection long after it.
+    #[test]
+    fn a_stale_flag_outside_the_window_does_not_hide_a_later_rejection() {
+        let stdout = format!(
+            "2026-09-18T12:00:00Z\t{REVIEW_REQUESTED_LABEL}\n{}\
+             2026-09-18T14:00:00Z\t{CHANGES_REQUESTED_LABEL}\n",
+            flag_row("2026-09-18T12:10:00Z", "loom-fleet-dispatch[bot]", "NONE"),
+        );
+        let signals = signals_from_events(&parse_label_events(stdout.as_bytes(), &policy()));
+        assert_eq!(signals.judge_verdicts.len(), 1);
+        assert_eq!(signals.judge_verdicts[0].verdict, VERDICT_FAIL);
+    }
+
+    /// The jq projection names the marker and keeps the comment's author.
+    #[test]
+    fn the_projection_carries_flag_comments_with_their_author() {
+        let jq = timeline_jq();
+        assert!(jq.contains(BASE_CONFLICT_MARKER));
+        assert!(jq.contains(".user.login") && jq.contains("tojson"));
     }
 }

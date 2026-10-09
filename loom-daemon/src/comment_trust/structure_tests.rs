@@ -77,6 +77,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
     ("sweep_registry/quarantine.rs", "writer"),
+    (
+        "sweep_registry/outcome_journal/label_timeline.rs",
+        "#9062 timeline flag rows, trusted via policy.trusts_json in parse_label_events",
+    ),
     ("worktree_ops/gh.rs", "linked-PR probe (FETCH_SITES)"),
 ];
 
@@ -100,6 +104,17 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    // #9062: the PR timeline read carries base-conflict flag comments.
+    (
+        "sweep_registry/outcome_journal/label_timeline.rs",
+        "fetch_timeline_signals",
+        "TrustPolicy::for_root(",
+    ),
+    (
+        "sweep_registry/outcome_journal/label_timeline.rs",
+        "parse_label_events",
+        "policy.trusts_json(",
+    ),
     ("cli/lease_co_occupancy.rs", "read_rows", "policy.trusted_ndjson("),
     ("forge_check_claim.rs", "read_freshest_live_lease", "policy.trusted_ndjson("),
     ("sweep_registry/guards.rs", "issue_body_via_rest", "records::trusted_body("),
