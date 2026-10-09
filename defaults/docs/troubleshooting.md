@@ -584,10 +584,12 @@ du -sh <repo>/.loom/targets/* <repo>/.loom/target-* /tmp/loom-target-* \
 ```
 
 **Fix**: `loom-daemon clean --dry-run` lists the orphans and the bytes they
-hold, and `loom-daemon clean -y` removes them. A dir is an orphan only when its
-newest file is older than 3 hours (`LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS`),
-no process holds it open, no live claim names its issue, and it is not your
-configured `CARGO_TARGET_DIR` / `build.target-dir`. The daemon runs the same
+hold, and `loom-daemon clean -y` removes them. A dir is an orphan only when no
+process holds it open, no live claim names its issue, it is not your
+configured `CARGO_TARGET_DIR` / `build.target-dir`, and its newest file is old
+enough: 10 minutes for a `.loom/targets` run dir whose recorded owner has
+exited (`LOOM_TARGET_ORPHAN_RECLAIM_DEAD_OWNER_GRACE_MINUTES`), 3 hours for
+everything else (`LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS`). The daemon runs the same
 sweep every 15 minutes and whenever free disk drops below the floor
 (`category=cargo_target_orphan` in its log). Then re-run the test.
 
@@ -605,8 +607,10 @@ root and logs `not scanning … is a symlink`; set `CARGO_TARGET_DIR` or
 
 **Prevention**: every role run now gets a Loom-owned `CARGO_TARGET_DIR` under
 `<repo>/.loom/targets/`. A role-runner tick's dir is removed when the run
-ends; a daemon sweep's or manual spawn's is collected by the orphan sweep
-after its owner exits. Agents must use it (or
+ends, and a daemon sweep's when the daemon sees the sweep end (completed,
+failed, cancelled or watchdog-cancelled); a manual spawn's, or one kept at run
+end, is collected by the orphan sweep about 10 minutes after its owner
+exits. Agents must use it (or
 their worktree's `target/`) and never create one under `/tmp`, `~`, `~/.cache`
 or `.loom/target-*`; see `cargo-target-isolation.md`. The disk-headroom
 estimate per worktree (`LOOM_PER_WORKTREE_GB`) defaults to 8 GB, measured

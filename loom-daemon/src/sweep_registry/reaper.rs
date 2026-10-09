@@ -8,6 +8,7 @@ mod liveness;
 pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
 pub(crate) mod pr_park;
+mod run_dir_end;
 
 // ============================================================================
 // Constants
@@ -907,6 +908,8 @@ impl SweepRegistry {
         // the exit was already reaped in the poll loop above, or when no
         // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
+        let pgid = self.entries.get(sweep_id).and_then(|info| info.pgid);
+        self.on_sweep_process_end(sweep_id, kind, pid, pgid, false); // #11031
 
         // Read `pr_number` BEFORE mutating terminal state so the
         // orphaned-claim gate below sees the pre-cancel value (the state
@@ -1144,13 +1147,8 @@ impl SweepRegistry {
                 // Signal the group before the entry transitions terminal (after
                 // which nothing tracks the pgid at all). No-op when the group is
                 // already empty, which is the ordinary case.
-                if let Some(pgid) = pgid {
-                    let issue = match &kind {
-                        SweepKind::Issue(n) => Some(*n),
-                        SweepKind::PrSet(_) => None,
-                    };
-                    self.reap_orphaned_group(&sweep_id, issue, pgid);
-                }
+                // #11031: the sweep's run target dir goes too, off this thread.
+                self.on_sweep_process_end(&sweep_id, &kind, pid, pgid, true);
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
