@@ -1965,7 +1965,7 @@ assert_contains "# LOOM_DISPATCH_MODE mode=bare-metal" "$output" "containment di
 echo '{"runtimes": {"containment": {"enabled": true}}}' > "$CONTAIN_WS/.loom/config.json"
 : > "$DOCKER_LOG"
 output=$(LOOM_WORKSPACE="$CONTAIN_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CONTAIN_STUB_DIR:$PATH" \
-    LOOM_SWEEP_CPU_QUOTA=0 CARGO_PROFILE_DEV_DEBUG=full CARGO_PROFILE_TEST_DEBUG= \
+    LOOM_SWEEP_CPU_QUOTA=0 CARGO_PROFILE_DEV_DEBUG=full CARGO_PROFILE_TEST_DEBUG='' \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "containerized dispatch ENABLED" "$output" \
     "runtimes.containment.enabled=true: spawn-claude logs the containment decision (#7429)"
