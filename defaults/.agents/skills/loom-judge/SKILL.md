@@ -884,17 +884,15 @@ verdict is posted through `post-verdict.sh`, that specific failure mode is
 gone — the marker is an argument, not prose, so there is no "forgot to append
 it" outcome for that call. What remains possible is a model deviating from
 this document and calling raw `gh pr comment` instead; the pre-approval
-checklist above exists to catch that. Two mechanical backstops also cover
-whatever gets through anyway: the stale-verdict sweep below runs the guard
-with `--anchor`, and `loom-daemon`'s `reconcile_pr_verdicts` anchors on its
-periodic tick. Both post the missing marker at whatever the head is *when they
-run*.
+checklist above exists to catch that. Two mechanical backstops catch what
+gets through: the stale-verdict sweep below (guard `--clear --anchor`) and
+`loom-daemon`'s `reconcile_pr_verdicts` tick. A markerless **approval** is
+re-queued (`loom:pr` → `loom:review-requested`), **never anchored** (#9258);
+only a markerless rejection is anchored at the head *as of that run*.
 
-**That is a bound on future exposure, not a repair.** Neither backstop knows
-which tree you actually reviewed — if the head moved between your verdict and
-the anchor, they anchor an approval to a tree nobody read, and it will then
-read as `FRESH`. Only the marker `post-verdict.sh` writes at verdict time
-records the truth. Use it.
+**Neither backstop knows which tree you reviewed**, so a markerless approval
+is lost work, never a merge. Only the marker `post-verdict.sh` writes at
+verdict time records the truth. Use it.
 
 **Only stamp genuine verdicts.** Stand-down notes, progress comments,
 fallback-queue notes, and the stale-verdict notice itself are not verdicts and
@@ -922,8 +920,8 @@ nothing would ever look at it again. Sweep those two queues first:
 # Report-and-act gate; one call per candidate PR. Exit codes:
 #   0 = FRESH (verdict matches current head), 10 = no verdict label,
 #   11 = UNVERIFIABLE (no marker AND could not anchor — fail safe, kept),
-#   12 = STALE (cleared + re-queued when --clear is passed),
-#   13 = ANCHORED (no marker; --anchor stamped one at the current head, #6319),
+#   12 = STALE (head moved, or an unmarked approval, #9258; re-queued on --clear),
+#   13 = ANCHORED (unmarked changes-requested only; stamped at current head, #6319),
 #   1 = gh/env error.
 UNANCHORED=""; ANCHORED=""
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
