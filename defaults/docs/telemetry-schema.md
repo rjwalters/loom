@@ -2450,8 +2450,9 @@ the number of outcomes. There is never a per-item row. Fields: `row_id`
 `window_days` (7, the trailing window ending at `cutoff`), `heuristic`, `kind`,
 `stage`, `n` (outcomes in the window that visited or forecast the stage),
 `bias_sec?` (mean signed contribution; positive is slower than forecast),
-`mean_abs_sec?`, `dominant_share?` (share of those outcomes whose largest miss
-was this stage; absent for `unattributed`), `cutoff`, `loom`. With `n = 0` the
+`mean_abs_sec?`, `dominant_share?` (share of *all* the heuristic's outcomes in
+the window, not only the `n` that visited the stage, whose largest miss was this
+stage; absent for `unattributed`), `cutoff`, `loom`. With `n = 0` the
 statistics are omitted.
 
 ### `eta.snapshot`

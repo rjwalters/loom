@@ -163,11 +163,12 @@ fn real(row: &Row, key: &str) -> Option<f64> {
     )
 }
 
-fn stage<'a>(rows: &'a [Row]) -> Vec<&'a str> {
+fn stage(rows: &[Row]) -> Vec<&str> {
     rows.iter().map(|r| r["stage"].as_str().unwrap()).collect()
 }
 
 #[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn qa_lays_each_stage_forecast_beside_what_happened() {
     let rows = run(8, "e-1");
     assert_eq!(
@@ -196,12 +197,14 @@ fn qa_lays_each_stage_forecast_beside_what_happened() {
 }
 
 #[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn qa_answers_nothing_for_an_unknown_estimate() {
     assert!(run(8, "no-such").is_empty());
     assert!(run(8, "").is_empty());
 }
 
 #[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn qb_reads_the_rollup_once_newest_day_first_with_null_for_no_data() {
     let rows = run(9, "");
     assert_eq!(rows.len(), 3, "the re-offered row r1 counts once: {rows:?}");

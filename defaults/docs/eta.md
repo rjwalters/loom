@@ -3309,7 +3309,9 @@ day, catches up at most 7 missed days oldest first).
   registered `land` heuristic, one per stage of the fixed enum plus
   `unattributed` (`heuristics x 8` a day, never a per-item row), each with
   `n`, `bias_sec`, `mean_abs_sec` and `dominant_share` over the trailing 7
-  days. The source is a local log, `.loom/state/eta/attribution.jsonl`, one row
+  days. `dominant_share` is over *all* the heuristic's outcomes in the window
+  (not only the `n` that visited the stage), so a heuristic's shares sum to at
+  most 1. The source is a local log, `.loom/state/eta/attribution.jsonl`, one row
   per scored `land` outcome with an attribution, appended where the tracker
   scores it (no forge call; compacted like `calibration.jsonl`). The fold
   counts a row only when it was both resolved (`actual_at`) and scored by this

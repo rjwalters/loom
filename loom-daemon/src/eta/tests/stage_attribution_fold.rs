@@ -101,6 +101,26 @@ fn rows_carry_bias_mean_abs_and_dominant_share_per_heuristic_and_stage() {
 }
 
 #[test]
+fn dominant_share_is_over_all_the_heuristics_outcomes_not_only_the_visitors() {
+    // `d` never visited review_wait, so review_wait has n = 2 (a, b) while h1
+    // has 3 outcomes in the window; only `b` is review-dominant.
+    let mut d = row("d", "h1", 300, 40, 0, 0);
+    d.attribution.stages.remove(&Stage::ReviewWait);
+    d.error_sec = 40;
+    let rows = [
+        row("a", "h1", 100, 30, -10, 5),
+        row("b", "h1", 200, -10, 50, -5),
+        d,
+    ];
+    let out = records(&rows);
+    let review = find(&out, "h1", "review_wait");
+    assert_eq!(review.n, 2);
+    assert_eq!(review.dominant_share, Some(0.3333), "1 of 3, not 1 of 2");
+    let builder = find(&out, "h1", "sweep.builder");
+    assert_eq!((builder.n, builder.dominant_share), (3, Some(0.6667)));
+}
+
+#[test]
 fn an_outcome_after_the_cutoff_leaves_the_rows_bit_identical() {
     let base = vec![row("a", "h1", 100, 30, -10, 5)];
     let before = records(&base);
@@ -128,7 +148,7 @@ fn a_row_is_counted_once_however_often_it_is_logged() {
     let mut again = a.clone();
     again.observed_at += Duration::seconds(5);
     assert_eq!(records(&[a.clone(), again, a.clone()]), once);
-    assert_eq!(records(&[a.clone()]), once, "a re-run is the same records");
+    assert_eq!(records(std::slice::from_ref(&a)), once, "a re-run is the same records");
 }
 
 #[test]

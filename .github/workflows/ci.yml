@@ -705,6 +705,11 @@ jobs:
       # rows inflates the answer rate because refusals are never refreshed.
       - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
+      # #10957: the same technique for the stage-error views (eta-queries.sql
+      # QA/QB): per-stage forecast vs actual for one estimate, and the nightly
+      # eta.stage_attribution rollup read once per row_id, newest day first.
+      - name: Verify the SigNoz ETA stage-attribution queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_eta_stage_attribution -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows

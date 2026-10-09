@@ -14,6 +14,11 @@
 //! - **Row budget.** One record per registered heuristic per [`Stage`] plus
 //!   one `unattributed`, with `n = 0` and no statistics where nothing
 //!   landed: `heuristics × 8`, independent of the number of outcomes.
+//! - **Dominant share.** A stage's `dominant_share` is the share of *all*
+//!   the heuristic's counted outcomes in the window whose dominant stage it
+//!   was, not of only the outcomes that visited the stage (`n`), so a
+//!   heuristic's shares across stages sum to at most 1. `None` when `n = 0`
+//!   and for `unattributed`.
 //! - **Sum property.** Each row's `Σ contribution_sec + unattributed_sec ==
 //!   error_sec` (`stage_forecast::attribute`) and the log round-trip keeps
 //!   integer seconds, so the per-stage biases and the unattributed bias are
@@ -40,7 +45,7 @@ pub fn cutoff(day: NaiveDate) -> DateTime<Utc> {
 
 /// The rows that count for `day`: inside the window, known before the
 /// cutoff, one per estimate.
-fn window<'a>(rows: &'a [AttributionRow], day: NaiveDate) -> Vec<&'a AttributionRow> {
+fn window(rows: &[AttributionRow], day: NaiveDate) -> Vec<&AttributionRow> {
     let end = cutoff(day);
     let start = end - Duration::days(i64::from(WINDOW_DAYS));
     let mut by_id: BTreeMap<&str, &AttributionRow> = BTreeMap::new();
@@ -89,6 +94,9 @@ pub fn rollup(
             .copied()
             .filter(|r| r.heuristic == id)
             .collect();
+        // The dominant-share denominator: every counted outcome of this
+        // heuristic in the window, whether or not it visited the stage.
+        let total = mine.len();
         let mut push = |stage: &str, errors: &[i64], dominant: Option<usize>| {
             let (n, bias_sec, mean_abs_sec) = stats(errors);
             out.push(EtaStageAttributionRecord {
@@ -105,8 +113,8 @@ pub fn rollup(
                 bias_sec,
                 mean_abs_sec,
                 dominant_share: dominant
-                    .filter(|_| n > 0)
-                    .map(|d| round4(d as f64 / errors.len() as f64)),
+                    .filter(|_| n > 0 && total > 0)
+                    .map(|d| round4(d as f64 / total as f64)),
                 cutoff: end,
                 loom: loom.clone(),
             });

@@ -50,8 +50,9 @@ pub struct EtaStageAttributionRecord {
     /// Mean absolute error attributed here, seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_abs_sec: Option<f64>,
-    /// Share of those outcomes whose dominant stage this was. Absent for
-    /// `unattributed`.
+    /// Share of all the heuristic's outcomes in the window (not only the `n`
+    /// that visited this stage) whose dominant stage this was. Absent for
+    /// `unattributed` and when `n = 0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dominant_share: Option<f64>,
     /// The end of `day`: nothing observed at or after it was read, and the

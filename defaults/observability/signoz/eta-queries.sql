@@ -470,8 +470,9 @@ ORDER BY indexOf(['ready_wait', 'sweep.curator', 'sweep.builder', 'review_wait',
 --     `window_days` days; chosen over recomputing from `eta.outcome` bodies so
 --     the figure is the exact one the authority host folded, point-in-time).
 --     `bias_sec` > 0 means the stage ran longer than forecast; `mean_abs_sec`
---     is the typical miss; `dominant_share` the share of that window's
---     outcomes whose largest miss was this stage. NULL (not 0) when `n` = 0.
+--     is the typical miss; `dominant_share` the share of all the
+--     heuristic's outcomes in that window (not only the `n` that visited the
+--     stage) whose largest miss was this stage. NULL (not 0) when `n` = 0.
 --     Each day's window overlaps the previous six, so read the newest `day`
 --     per heuristic, or plot one stage over `day`; do not sum days.
 --     De-duplicated on the stable `row_id` (delivery is at least once). Not
