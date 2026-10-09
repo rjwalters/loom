@@ -134,6 +134,8 @@ pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
+pub mod hold_kind;
+pub mod hold_marker_log;
 pub mod job_owner;
 pub mod journal;
 pub mod labels;

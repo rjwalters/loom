@@ -1215,6 +1215,8 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
 mod authority;
 mod estimate_pass;
 use estimate_pass::estimate_locked;
+#[path = "eta_marker_pass.rs"]
+mod eta_marker_pass;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
