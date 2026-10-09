@@ -1,6 +1,6 @@
 {
   "name": "@loom/mcp",
-  "version": "0.19.954",
+  "version": "0.19.955",
   "description": "Unified MCP server for Loom - combines logs, UI, and terminal tools",
   "type": "module",
   "engines": {
