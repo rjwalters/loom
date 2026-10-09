@@ -56,12 +56,24 @@ fn git(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A one-commit repo at `<dir>/<name>`. `name` may contain spaces.
+///
+/// **Background maintenance is off (#9973).** Hypothesis (NOT reproduced; see
+/// the PR): `git commit` ends by spawning `git maintenance run --auto
+/// --detach`, which daemonizes without leaving the `git -C` cwd, so for a
+/// short window a reparented `git` could sit inside the repo and the #7463
+/// liveness probe [`super::run`] opens with would refuse. The production
+/// fetches that precede a reset already pass `-c maintenance.auto=false`
+/// (#9620) and `tests/worktree_reset_differential.rs` sets these keys too.
+/// Only the fixture changes; the probe and its veto are untouched, so every
+/// liveness case below still proves a *real* holder refuses.
 fn repo(dir: &Path, name: &str) -> PathBuf {
     let repo = dir.join(name);
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "maintenance.auto", "false"]);
+    git(&repo, &["config", "gc.auto", "0"]);
     fs::write(repo.join("tracked.txt"), "base content\n").unwrap();
     git(&repo, &["add", "tracked.txt"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -545,7 +557,87 @@ fn a_live_holder_under_a_space_bearing_path_is_still_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Helpers
+// 6. Fixture hermeticity (#9973)
+// ---------------------------------------------------------------------------
+
+/// `pid=… ppid=… exe=… cmdline=…` for each PID, read straight from `/proc`
+/// (best effort — a holder that has already exited reads as `<gone>`). Used
+/// only in failure messages, fed the PIDs from the *same* probe call that
+/// matched them, because a later independent scan misses a short-lived child.
+fn describe_pids(pids: &[u32]) -> String {
+    let read = |pid: u32, f: &str| {
+        fs::read(format!("/proc/{pid}/{f}"))
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|_| "<gone>".to_string())
+    };
+    pids.iter()
+        .map(|&pid| {
+            let cmdline = read(pid, "cmdline");
+            let ppid = read(pid, "status")
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().to_string()))
+                .unwrap_or_else(|| "<gone>".to_string());
+            let exe = fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<gone>".to_string());
+            format!("pid={pid} ppid={ppid} exe={exe} cmdline={cmdline}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[test]
+fn fixture_repos_disable_gits_detached_background_maintenance() {
+    // The deterministic half of the #9973 regression: the prior fixture left
+    // both keys unset, so on git >= 2.47 every fixture commit could leave a
+    // daemonized `git maintenance run --auto --detach` inside the repo for the
+    // fast-path cases' liveness probe to find.
+    let dir = tmpdir("fixture-maintenance");
+    let repo = repo(&dir, "repo");
+    let get = |key: &str| {
+        String::from_utf8_lossy(&git(&repo, &["config", "--local", "--get", key]).stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(get("maintenance.auto"), "false");
+    assert_eq!(get("gc.auto"), "0");
+}
+
+#[test]
+fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
+    // The behavioural half: probe immediately after each fixture commit, which
+    // is the moment the detached maintenance child (if any) is alive. With the
+    // prior fixture under git >= 2.47 this trips intermittently — it cannot be
+    // made deterministic without depending on git-internal timing (0/40 trips
+    // on git 2.54 when measured, so it is a guard, not proof) — and with
+    // maintenance off it has nothing to find on any git, so it never fails
+    // spuriously. On older git (no `--detach`) it passes either way.
+    let dir = tmpdir("fixture-no-holder");
+    let repo = repo(&dir, "repo");
+    if !probe_available(&repo) {
+        eprintln!("SKIP: no /proc and no lsof on this host");
+        return;
+    }
+    for n in 0..25 {
+        commit(&repo, &format!("commit {n}\n"), &format!("c{n}"));
+        if let CwdProbe::Pids(pids) = safety::find_processes_with_cwd_in_directory(&repo) {
+            assert!(
+                pids.is_empty(),
+                "a fixture commit left a live process inside the worktree, which \
+                 the reset's liveness probe would count as a foreign holder: {}",
+                describe_pids(&pids)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Helpers
 // ---------------------------------------------------------------------------
 
 #[test]
