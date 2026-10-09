@@ -25,7 +25,7 @@
 //! time.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -42,6 +42,8 @@ const HUB_BACKOFF: [Duration; 3] = [
 /// Deadline for one `docker pull`. Six attempts plus backoff stay under the
 /// 30-minute job limit, so exhaustion is reported rather than cancelled.
 const PULL_DEADLINE: Duration = Duration::from_secs(180);
+/// How much of a failed `docker` call's stderr is kept for the report.
+const STDERR_TAIL_BYTES: u64 = 4096;
 /// Deadline for a local `docker image inspect` / `docker tag`.
 const LOCAL_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -98,36 +100,32 @@ impl Puller {
     }
 
     /// Runs `docker <args>`, killing and reaping it at `deadline`.
+    ///
+    /// stderr goes to an unlinked temp file, not a pipe: a pipe would block a
+    /// chatty child once full, and reading one to its end waits on any
+    /// descendant still holding it. A file does neither, so collecting the
+    /// diagnostic cannot outlive the deadline.
     fn docker(&self, args: &[&str], deadline: Duration) -> Result<(), String> {
+        let mut stderr = tempfile::tempfile().expect("temp file for docker stderr");
         let mut child = Command::new(&self.docker)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(stderr.try_clone().expect("clone stderr file"))
             .spawn()
             .expect("docker is required for this test");
         let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("wait for docker") {
-                break Some(status);
-            }
-            if started.elapsed() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        match status {
-            Some(status) if status.success() => Ok(()),
-            Some(_) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
+        loop {
+            match child.try_wait().expect("wait for docker") {
+                Some(status) if status.success() => return Ok(()),
+                Some(_) => return Err(tail(&mut stderr)),
+                None if started.elapsed() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timed out after {}s", deadline.as_secs_f32()));
                 }
-                Err(stderr.trim().to_string())
+                None => std::thread::sleep(Duration::from_millis(50)),
             }
-            None => Err(format!("timed out after {}s", deadline.as_secs_f32())),
         }
     }
 
@@ -185,6 +183,19 @@ impl Puller {
         }
         Err(failures)
     }
+}
+
+/// The last [`STDERR_TAIL_BYTES`] of a finished child's stderr, trimmed.
+fn tail(stderr: &mut std::fs::File) -> String {
+    let len = stderr.metadata().map_or(0, |meta| meta.len());
+    let mut bytes = Vec::new();
+    if stderr
+        .seek(SeekFrom::Start(len.saturating_sub(STDERR_TAIL_BYTES)))
+        .is_ok()
+    {
+        let _ = stderr.take(STDERR_TAIL_BYTES).read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 /// Returns the reference to pass to `docker` for the Docker Hub image `image`,

@@ -46,8 +46,12 @@ mod fake_docker {
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
-    /// A `docker` that has no local images, hangs on any pull from
-    /// `stall.test`, refuses any pull from `down.test`, and serves the rest.
+    /// A `docker` that has no local images and serves any pull, except from:
+    /// - `stall.test`: hangs;
+    /// - `down.test`: refuses;
+    /// - `loud.test`: succeeds after writing more stderr than a pipe holds;
+    /// - `linger.test`: refuses, leaving a background child holding stderr.
+    ///
     /// Every invocation is appended to `calls` beside it.
     const SCRIPT: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/calls"
@@ -55,6 +59,8 @@ case "$1 $*" in
   image*) exit 1 ;;
   pull*stall.test/*) exec sleep 30 ;;
   pull*down.test/*) echo "toomanyrequests: fake rate limit" >&2; exit 1 ;;
+  pull*loud.test/*) head -c 1048576 /dev/zero >&2 ;;
+  pull*linger.test/*) sleep 20 & echo "denied: fake refusal" >&2; exit 1 ;;
 esac
 exit 0
 "#;
@@ -102,6 +108,32 @@ exit 0
         assert_eq!(reference, Ok(format!("up.test/clickhouse/clickhouse-server@{DIGEST}")));
         assert_eq!(calls(dir.path(), "pull --quiet stall.test/"), 2);
         assert_eq!(calls(dir.path(), "pull --quiet up.test/"), 1);
+    }
+
+    #[test]
+    fn stderr_larger_than_a_pipe_is_not_mistaken_for_a_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = format!("clickhouse/clickhouse-server:25.12.5@{DIGEST}");
+        let reference = puller(dir.path(), "loud.test", "down.test").pull(&image);
+        assert_eq!(reference, Ok(format!("loud.test/clickhouse/clickhouse-server@{DIGEST}")));
+        assert_eq!(calls(dir.path(), "pull --quiet loud.test/"), 1);
+    }
+
+    #[test]
+    fn failed_pull_does_not_wait_on_a_descendant_holding_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let failures = puller(dir.path(), "linger.test", "down.test")
+            .pull("ubuntu:24.04")
+            .unwrap_err();
+        // Two refused attempts, not two 20s waits on the lingering `sleep`.
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(
+            failures[..2]
+                .iter()
+                .all(|f| f.ends_with("denied: fake refusal")),
+            "{failures:?}"
+        );
     }
 
     #[test]
