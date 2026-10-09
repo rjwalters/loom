@@ -486,6 +486,10 @@ WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
 # Read stdin (needed by both mechanisms below)
 INPUT=$(cat 2>/dev/null) || INPUT=""
 
+# Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
+# requires-daemon: guard-hook optional   exit 0 means opted out; a missing or older daemon (127/2) never exits 0, so the guard stays ON (#10335)
+"${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$MAIN_ROOT" </dev/null >/dev/null 2>&1 && exit 0
+
 # Verify jq is available
 if ! command -v jq &>/dev/null; then
     log_hook_error "jq not found in PATH — allowing (cannot parse input)"

@@ -2004,6 +2004,13 @@ jobs:
       - name: fleet-send safehouse envelope (#9517)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-fleet-send.sh
+      # #10335: the guards.enabled opt-out and the gh-body heredoc mask are
+      # `loom-daemon guard-hook` subcommands; both suites drive the real hook
+      # files against this job's shared build (moved out of ci-wired.txt).
+      - name: guard hooks guards.enabled master opt-out (#10335)
+        run: bash tests/hooks/test-guard-master-optout.sh
+      - name: guard-loom-workflow gh-body heredoc mask (#10335)
+        run: bash tests/hooks/test-guard-gh-body-heredoc.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh

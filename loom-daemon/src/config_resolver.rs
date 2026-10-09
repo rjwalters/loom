@@ -302,6 +302,23 @@ pub fn get_path<'a>(config: &'a Value, dotted: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// Master opt-out for Loom's `PreToolUse` guard hooks (issue #10335).
+///
+/// `true` only on an EXPLICIT opt-out: `LOOM_GUARDS_ENABLED=0|false|no`, or a
+/// boolean `guards.enabled: false` in the effective config. An absent key, a
+/// non-boolean value, or malformed config all mean guards stay ON. The hooks
+/// reach it through `loom-daemon guard-hook opted-out` (`guard_hook.rs`).
+#[must_use]
+pub fn guards_master_disabled(repo_root: &Path) -> bool {
+    match std::env::var("LOOM_GUARDS_ENABLED").as_deref() {
+        Ok("0" | "false" | "no") => return true,
+        Ok("1" | "true" | "yes") => return false,
+        _ => {}
+    }
+    let cfg = resolve_effective_config(repo_root);
+    get_path(&cfg, "guards.enabled").and_then(Value::as_bool) == Some(false)
+}
+
 /// Dotted key read by [`daemon_delegated_to`].
 const DAEMON_DELEGATED_TO_KEY: &str = "daemon.delegatedTo";
 
@@ -1090,5 +1107,23 @@ mod tests {
             effective, expected,
             "Rust resolver diverged from the cross-language conformance fixture's expected.json"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn guards_master_disabled_only_on_explicit_false() {
+        std::env::remove_var("LOOM_GUARDS_ENABLED");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(".loom/config.json"), "{}");
+        assert!(!guards_master_disabled(dir.path()));
+        write(&dir.path().join(".loom/config.json"), r#"{"guards":{"enabled":true}}"#);
+        assert!(!guards_master_disabled(dir.path()));
+        write(&dir.path().join(".loom/config.json"), r#"{"guards":{"enabled":"false"}}"#);
+        assert!(!guards_master_disabled(dir.path()));
+        write(&dir.path().join(".loom/config.json"), r#"{"guards":{"enabled":false}}"#);
+        assert!(guards_master_disabled(dir.path()));
+        std::env::set_var("LOOM_GUARDS_ENABLED", "1");
+        assert!(!guards_master_disabled(dir.path()));
+        std::env::remove_var("LOOM_GUARDS_ENABLED");
     }
 }

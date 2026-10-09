@@ -1662,6 +1662,10 @@ elif [[ -n "$CWD" ]]; then
     log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
 fi
 
+# Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
+# requires-daemon: guard-hook optional   exit 0 means opted out; a missing or older daemon (127/2) never exits 0, so the guard stays ON (#10335)
+"${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$REPO_ROOT" </dev/null >/dev/null 2>&1 && exit 0
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771 / #3898) recorded
@@ -1703,6 +1707,16 @@ emit_decision() {
     exit 0
 }
 
+# Issue #10335: blank the BODY of a quoted-delimiter heredoc fed to
+# `gh issue|pr create|comment|edit` (inert data -- gh reads it from stdin and the
+# quoted delimiter disables expansion). The fail-safe matcher lives in
+# `loom-daemon guard-hook mask-gh-body-heredocs` (loom-daemon/src/guard_hook.rs).
+# No `<<` means nothing to mask; a missing/older daemon masks nothing, so the
+# scan below sees the raw command and denies exactly as before.
+mask_gh_body_heredocs() {
+    [[ "$1" == *"<<"* ]] && "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook mask-gh-body-heredocs <<<"$1" 2>/dev/null || printf '%s' "$1"
+}
+
 # =============================================================================
 # LOOM: Prefer merge-pr.sh over gh pr merge
 # =============================================================================
@@ -1725,7 +1739,7 @@ emit_decision() {
 # DEFINITION-site masks, before the REFERENCE-site masks) keeps this pipeline
 # consistent: definition-site literals are neutralized first, so a later
 # reference-site pass can never be confused by a still-live definition.
-GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_for_loop_list_items "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")")")
+GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_for_loop_list_items "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$(mask_gh_body_heredocs "$COMMAND")")")")")")
 if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the

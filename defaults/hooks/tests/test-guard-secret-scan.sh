@@ -34,6 +34,9 @@ git init -q "$REPO"
 STUB="$TMP/loom-daemon"
 cat > "$STUB" <<'STUB'
 #!/usr/bin/env bash
+# Only the scanner is stubbed; any other subcommand (the hook's #10335
+# `guard-hook opted-out` probe) answers like a daemon that lacks it.
+[ "$1" = secret-scan ] || exit 2
 printf '%s\n' "$*" >> "$STUB_CALLS"
 case "$STUB_MODE" in
     found)

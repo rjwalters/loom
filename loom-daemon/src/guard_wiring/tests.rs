@@ -193,3 +193,32 @@ fn this_repository_satisfies_the_wiring_contract() {
             .join("\n\n")
     );
 }
+
+/// Write a `guards.enabled:false` opt-out config into `root` (#10335).
+fn opt_out_of_guards(root: &Path) {
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(root.join(".loom/config.json"), r#"{"guards":{"enabled":false}}"#).unwrap();
+}
+
+/// Issue #10335 review: `guards.enabled:false` opts out of the Bash/Write
+/// guards only. The MCP guard is out of scope for it, so an opted-out repo
+/// with missing MCP wiring must still fail this contract.
+#[test]
+fn opted_out_repo_with_missing_mcp_wiring_still_fails() {
+    let f = Fixture::build(Variant::NoMatcher);
+    opt_out_of_guards(f.dir.path());
+    assert!(headlines(&f.check()).contains(&"MISSING MCP MATCHER"));
+
+    let dir = tempfile::tempdir().unwrap();
+    opt_out_of_guards(dir.path());
+    assert_eq!(headlines(&super::check(dir.path())), vec!["MISSING SETTINGS FILE"]);
+}
+
+/// The other half: valid MCP wiring passes without the three opted-out hooks.
+#[test]
+fn opted_out_repo_with_valid_mcp_wiring_passes() {
+    let f = Fixture::build(Variant::Compliant);
+    opt_out_of_guards(f.dir.path());
+    let v = f.check();
+    assert!(v.is_empty(), "opted-out compliant fixture was rejected: {:?}", headlines(&v));
+}

@@ -117,6 +117,23 @@ read-only fast-path toggles both consult `.loom-project/project.json` first, the
 legacy file — the fast path stays a bounded, direct-`jq` read (never the full resolver
 merge) to preserve the #3687 fork budget on the hottest guard invocation.
 
+### Master opt-out: `guards.enabled` / `LOOM_GUARDS_ENABLED` (#10335)
+
+`{ "guards": { "enabled": false } }` in the tracked `.loom/config.json` (or
+`.loom-project/project.json`), or `LOOM_GUARDS_ENABLED=0`, turns the three PreToolUse
+guards (`guard-destructive.sh`, `guard-loom-workflow.sh`, `guard-worktree-paths.sh`)
+off wholesale for that repo. **This includes the ungated denial floor below** - it is
+an explicit operator decision, unlike the per-category toggles, which never reach the
+floor. Absent, `true`, or non-boolean means guards stay on. Effects: the hooks
+early-exit allow (each asks `loom-daemon guard-hook opted-out`; with no daemon on
+`PATH`, or one predating this subcommand, the guards stay on); `loom-daemon init`/`loom update` and `ensure_project_hook_wiring`
+neither add nor keep these entries in the repo's `.claude/settings.json` (foreign and
+non-guard Loom hooks are preserved); the user-scope `~/.claude/settings.json` fallback
+wrappers need no change because they exec the hook, which self-gates per repo
+(`LOOM_GUARDS_ENABLED=0` at install time additionally skips writing those entries);
+`check-guard-wiring` still audits an opted-out repo's MCP wiring (the MCP guard is not covered by the opt-out). `guard-mcp-tools.sh`,
+`guard-background-subagents.sh`, and `guard-codex-bridge.sh` are out of scope.
+
 ## The Ungated Denial Floor
 
 **Guarantee (#4791): a fixed set of catastrophic commands is denied by
