@@ -417,7 +417,9 @@ pub fn discover_scopes(
         .collect()
 }
 
-/// Emit the per-scope peak as telemetry (metric + log line).
+/// Emit the per-scope peak as telemetry (metric + log line). Only
+/// [`record_tick`]'s Linux branch calls it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn emit_ended(e: &EndedScope) {
     let who = e
         .issue
