@@ -676,6 +676,15 @@ jobs:
       # #10973: replay of the host-disk and ETA Ready-coverage alert rules
       - name: Verify the SigNoz disk and ETA Ready-coverage alert rules against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      # #10916: the fleet singleton-output alert (alerts/fleet-singleton-output.json),
+      # the cross-host detector for a one-host fleet job that stops producing
+      # while every host looks healthy. Only this run shows that the 2026-10-07
+      # replay (28 of 30 repos without eta.estimate) fires one evaluation past
+      # 2 x cadence and not before, that an idle or all-abstaining repo stays
+      # quiet, and that an empty logs table fires every watched row. Its
+      # deadline-vs-registry no-drift check runs in the ordinary test job.
+      - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
       # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
       # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
       # heuristic is promoted on. eta_artifacts.rs already pins every attribute
