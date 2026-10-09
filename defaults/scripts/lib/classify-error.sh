@@ -36,7 +36,7 @@
 #                         has to learn a new enum value. Issue #11205 adds
 #                         "You've hit your team's shared budget", "Your org is
 #                         out of usage", the legacy "Claude AI usage limit
-#                         reached|<epoch>" and Claude Code's "API Error: 429".
+#                         reached|<epoch>".
 #       MODEL_CREDITS_EXHAUSTED
 #                       — per-model-TIER usage credits ran out (issue #5687):
 #                         "You're out of usage credits". Distinct from
@@ -354,15 +354,17 @@ _classify_error_claude() {
     #     class-scoped mark would keep a dead account in rotation.
     #   * "Claude AI usage limit reached|<epoch>" — the older CLI's machine-
     #     readable limit line (the epoch is the reset time).
-    #   * "API Error: 429 …" — Claude Code's own prefix on an HTTP 429. Its API
-    #     client retries a 429 itself before it gives up, so a 429 that reaches
-    #     the exit is not a short throttle; for a subscription account it is
-    #     the usage limit arriving without the headers the CLI uses to print
-    #     its "hit your limit" text. Only this prefixed form is matched: a bare
-    #     "429 Too Many Requests" from any other tool stays RECOVERABLE through
-    #     the generic table, and a concurrent-session 429 is SESSION_LIMIT,
-    #     which is checked first.
-    if echo "$output" | grep -qiE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit|hit your ([^[:space:]]+[[:space:]]+){0,3}budget|your org is out of usage|claude ai usage limit reached|api error: 429"; then
+    #
+    # Deliberately NOT matched: Claude Code's "API Error: 429 …" prefix. It names
+    # the reporting client, not the cause: a temporary request/token throttle
+    # ("Too many requests. Please retry after 60 seconds.") looks the same as a
+    # spent allocation, and the CLI's own bounded retries can finish before a
+    # throttle resets. Treating it as TOKEN_EXHAUSTED would mark the account
+    # `exhausted` (6h cooldown) and concurrent throttles could pull healthy
+    # accounts out of rotation. Without positive usage-exhaustion evidence a
+    # 429 stays RECOVERABLE through the generic table; a concurrent-session 429
+    # is SESSION_LIMIT, checked first.
+    if echo "$output" | grep -qiE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit|hit your ([^[:space:]]+[[:space:]]+){0,3}budget|your org is out of usage|claude ai usage limit reached"; then
         echo "TOKEN_EXHAUSTED"
         return
     fi

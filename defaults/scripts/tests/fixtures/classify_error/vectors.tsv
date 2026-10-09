@@ -26,9 +26,10 @@ RECOVERABLE	1	claude	negative: a budget mention that is not exhaustion	The team'
 TOKEN_EXHAUSTED	1	claude	org out of usage, verbatim (add funds)	Your org is out of usage · add funds to continue
 TOKEN_EXHAUSTED	1	claude	org out of usage, verbatim (contact admin)	Your org is out of usage · contact your admin
 TOKEN_EXHAUSTED	1	claude	legacy machine-readable limit line with reset epoch	Claude AI usage limit reached|1760000000
-TOKEN_EXHAUSTED	1	claude	bare API Error: 429	API Error: 429
-TOKEN_EXHAUSTED	1	claude	API Error: 429 with the API's JSON body	API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Error"}}
+RECOVERABLE	1	claude	negative: bare API Error: 429 has no usage-exhaustion evidence, stays transient	API Error: 429
+RECOVERABLE	1	claude	negative: API Error: 429 with the API's JSON body stays transient	API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Error"}}
+RECOVERABLE	1	claude	negative: prefixed temporary 429 throttle ("retry after 60 seconds") stays transient	API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Too many requests. Please retry after 60 seconds."}}
 SESSION_LIMIT	1	claude	a concurrent-session 429 stays SESSION_LIMIT (#3947 order)	API Error: 429 too many concurrent requests for this account
 RECOVERABLE	1	claude	negative: a 429 without the CLI's prefix stays transient	429 Too Many Requests
-RECOVERABLE	1	codex	negative: the 429 anchor is claude-only; codex keeps bare 429 transient	API Error: 429
+RECOVERABLE	1	codex	negative: codex keeps a prefixed bare 429 transient too	API Error: 429
 SUCCESS	0	claude	exit-code-first: a clean exit quoting a 429 stays SUCCESS (#3233)	API Error: 429
