@@ -58,6 +58,7 @@ pub mod config;
 pub mod consts;
 pub mod env;
 pub mod escalate;
+pub mod hang_recover;
 pub mod heartbeat;
 pub mod liveness;
 pub mod load_avg;
@@ -894,6 +895,10 @@ fn ipc_probe(
     match verdict {
         probe::IpcVerdict::Healthy => {
             probe_state::clear_fail_streak(&state.probe_fail_count);
+            // #7855: a clean round-trip ends the dual-signal streak and
+            // re-arms the hang-recovery breaker (never its cooldown).
+            hang_recover::reset_streak(&state.hang_streak);
+            hang_recover::on_healthy(&state.hang_state);
             let w = probe_state::record(&state.probe_window, pid, false, window_ticks);
 
             if w.fails >= window_threshold {
@@ -936,6 +941,8 @@ fn ipc_probe(
             let load = load_avg::sample();
 
             if streak >= fail_threshold {
+                let hang =
+                    hang_recovery(paths, state, snap, pid, &detail, streak, fail_threshold, &load);
                 reporter.report(
                     report::Level::Divergence,
                     &format!(
@@ -945,9 +952,8 @@ fn ipc_probe(
                          {fail_threshold}). {detail}. Host load average at probe time: {load}. \
                          The heartbeat writer and the IPC accept loop are independent tokio \
                          tasks, so a fresh heartbeat does NOT prove the daemon can still serve \
-                         work: autonomous dispatch is effectively DEAD while this holds. No \
-                         automatic kill/restart is attempted (#4398 — there is no provably-safe \
-                         unattended remediation for a wedged-but-alive process). RECOVER: \
+                         work: autonomous dispatch is effectively DEAD while this holds. {} \
+                         RECOVER: \
                          'loom-daemon restart' (note: the restart primitive travels over this \
                          same wedged socket and may itself hang), else \
                          ./.loom/scripts/cli/loom-daemon-stop.sh && \
@@ -956,16 +962,22 @@ fn ipc_probe(
                          process with 'sample {pid}' (macOS) or 'gdb -p {pid}' to capture the \
                          wedge before killing it.",
                         snap.detail,
+                        hang.note,
                         paths.socket_path.display(),
                         probe::probe_timeout_secs()
                     ),
                 );
+                if let Some(line) = hang.restart_line {
+                    reporter.report(report::Level::Divergence, &line);
+                }
                 return ProbeOutcome {
                     exit: Some(1),
                     healthy: false,
                 };
             }
 
+            // #7855: a not-yet-CONFIRMED tick interrupts the dual-signal streak.
+            hang_recover::reset_streak(&state.hang_streak);
             reporter.report(
                 report::Level::Divergence,
                 &format!(
@@ -988,6 +1000,9 @@ fn ipc_probe(
         // is NOT recorded — an unobserved tick is not a healthy one, and
         // recording it as either would bias the rate signal.
         probe::IpcVerdict::Skipped => {
+            // An unobserved tick (startup grace included) is not a CONFIRMED
+            // one, so it interrupts the #7855 dual-signal streak.
+            hang_recover::reset_streak(&state.hang_streak);
             reporter.report(report::Level::Ok, &format!("IPC probe skipped: {detail}."));
             ProbeOutcome {
                 exit: None,
@@ -995,6 +1010,57 @@ fn ipc_probe(
             }
         }
     }
+}
+
+/// #7855: the opt-in supervised hang recovery for this CONFIRMED tick. Default
+/// OFF, in which case this touches no state and only words the report-only note.
+#[allow(clippy::too_many_arguments)]
+fn hang_recovery(
+    paths: &config::Paths,
+    state: &consts::StateFiles,
+    snap: &liveness::Snapshot,
+    pid: u32,
+    detail: &str,
+    streak: u64,
+    fail_threshold: u64,
+    load: &str,
+) -> hang_recover::Outcome {
+    let settings = hang_recover::Settings::from_env_and_marker(&paths.marker);
+    let signal = hang_recover::classify_heartbeat(
+        snap.heartbeat,
+        snap.heartbeat_age_secs,
+        snap.heartbeat_stale_threshold_secs,
+        snap.process_age_secs,
+    );
+    let ev = hang_recover::Evidence {
+        pid,
+        ipc_detail: detail,
+        ipc_streak: streak,
+        ipc_threshold: fail_threshold,
+        load,
+    };
+    // Re-asked under the lock, immediately before acting: a deliberate stop,
+    // drain (#9588) or host opt-out recorded since this tick began must win.
+    let guard = || {
+        hang_recover::intent_guard(&paths.marker)?;
+        crate::host_optout::check_or_refuse("daemon-watchdog").map_err(|r| r.to_string())
+    };
+    hang_recover::on_confirmed(
+        &settings,
+        &state.hang_streak,
+        &state.hang_state,
+        &signal,
+        hang_recover::restart_argv(
+            snap.source,
+            snap.supervisor_service.as_deref(),
+            &snap.detail,
+            pid,
+        ),
+        &ev,
+        now_secs(),
+        guard,
+        supervisor_cmd::run_hang_restart,
+    )
 }
 
 /// The 50-series: peer-claim coordination health (#6222/#7258/#7664).

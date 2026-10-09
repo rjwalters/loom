@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
-use crate::telemetry::kinds::fleet_state::{FleetSlots, PlannerStamps};
+use crate::sweep_registry::SweepRegistry;
+use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
 use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
@@ -75,6 +76,27 @@ fn checkpoint(
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok()),
     )
+}
+
+/// Non-terminal sweeps of every provisioned registry, of any kind (`Issue` or
+/// `PrSet`). Deliberately independent of [`held_sweeps`]' issue-row projection
+/// and of repo-slug resolution: `capacity.live_workers` counts workers this
+/// host runs, not rows that can be attributed to a repo.
+fn live_sweep_count(registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>>]) -> usize {
+    registries
+        .iter()
+        .map(|registry| {
+            let snapshot = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot();
+            snapshot
+                .list(None)
+                .iter()
+                .filter(|info| !info.state.is_terminal())
+                .count()
+        })
+        .sum()
 }
 
 /// The live issue sweeps of every provisioned registry. Each registry lock is
@@ -285,8 +307,69 @@ fn ready_from_tick(
     }
 }
 
+/// Available and exhausted token accounts in the rotation ranking at
+/// `workspace_root`; `None` when the ranking is missing or empty.
+fn account_counts(workspace_root: &Path) -> Option<(u32, u32)> {
+    let ranking = crate::tokens_pool::paths::resolve_tokens_dir(workspace_root).join(".ranking");
+    parse_account_counts(&std::fs::read_to_string(ranking).ok()?)
+}
+
+/// `(available, exhausted)` over the ranking `contents`. Only
+/// `AccountHealth::Available` is usable and only `AccountHealth::Exhausted`
+/// is exhausted; `rate_limited`, `blocked` and unknown words are neither.
+/// `None` when no account is listed.
+pub(super) fn parse_account_counts(contents: &str) -> Option<(u32, u32)> {
+    use crate::capacity::AccountHealth;
+    let (mut listed, mut usable, mut exhausted) = (0_u32, 0_u32, 0_u32);
+    for line in contents.lines().filter(|l| l.contains('|')) {
+        let Some(row) = crate::tokens_pool::select::parse_ranking_line(line) else {
+            continue;
+        };
+        listed += 1;
+        match AccountHealth::parse(&row.status) {
+            AccountHealth::Available => usable += 1,
+            AccountHealth::Exhausted => exhausted += 1,
+            AccountHealth::RateLimited | AccountHealth::Blocked | AccountHealth::Unknown => {}
+        }
+    }
+    (listed > 0).then_some((usable, exhausted))
+}
+
+/// This host's capacity facts. Only discrete values: no utilisation fraction.
+fn capacity(workspace_root: &Path, live_workers: usize) -> FleetCapacity {
+    let accounts = account_counts(workspace_root);
+    FleetCapacity {
+        live_workers: small(live_workers),
+        accounts_usable: accounts.map(|(usable, _)| usable),
+        accounts_exhausted: accounts.map(|(_, exhausted)| exhausted),
+        host_breaker: crate::host_breaker::global_snapshot()
+            .filter(|b| b.enabled)
+            .map(|b| b.phase.as_str().to_string()),
+        rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
+            .filter(|b| b.enabled)
+            .map(|b| b.phase.as_str().to_string()),
+        admission_brake_held: crate::admission_brake::global_snapshot()
+            .filter(|b| b.enabled)
+            .map(|b| b.held),
+    }
+}
+
+/// `main` CI status of the repo rooted at `root` from the main-health gate:
+/// red when halted on a verified-red run, unknown when the gate has not
+/// produced a verdict or could not evaluate, else green.
+fn main_ci(states: &crate::main_health_gate::WorkspaceHealthStates, root: &Path) -> MainCi {
+    if states.is_halted(root) {
+        MainCi::Red
+    } else if states.is_unevaluated(root) || states.last_verdict_at(root).is_none() {
+        MainCi::Unknown
+    } else {
+        MainCi::Green
+    }
+}
+
 /// Everything one pass reads.
 pub(super) async fn gather(
+    workspace_root: &Path,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
     host_id: &str,
@@ -297,7 +380,18 @@ pub(super) async fn gather(
     let held = held_sweeps(workspace_pool, slug_cache).await;
     let listings = review_listings(&roots).await;
     let ready = ready_queue(&managed, slug_cache).await;
+    let health = crate::fleet_sync::checkout_ff::health_states();
+    let main_ci = roots
+        .iter()
+        .map(|(root, slug)| (slug.clone(), main_ci(&health, root)))
+        .collect();
+    let capacity = Some(capacity(
+        workspace_root,
+        live_sweep_count(&workspace_pool.provisioned_registries()),
+    ));
     FleetInput {
+        capacity,
+        main_ci,
         host_id: host_id.to_string(),
         managed,
         held,

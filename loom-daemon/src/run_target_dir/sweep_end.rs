@@ -9,7 +9,9 @@
 //! The registry does see the end: the reaper's death path (a completed or
 //! failed sweep) and `finish_cancel` (an operator cancel or a watchdog
 //! auto-cancel, which runs before the watchdog's re-dispatch). Both call
-//! [`reclaim_at_sweep_end`] with the sweep's pid and process group.
+//! [`reclaim_at_sweep_end`] with the sweep's pid and process group. The death
+//! path calls it only once the dead leader's process group has drained
+//! (#11076): until then the sweep is still live and its dir is in use.
 //!
 //! # Which dirs
 //!
@@ -32,7 +34,7 @@
 //!
 //! The removal runs on a detached thread, never under the registry lock: a
 //! 26 GB tree takes seconds to unlink, and the group may need a moment to
-//! drain after the leader's death or a cancel's SIGKILL.
+//! drain after a cancel's SIGKILL.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,8 +42,9 @@ use std::time::{Duration, Instant};
 use super::Removal;
 
 /// How long the reclaim thread waits for a sweep's process group to drain
-/// before leaving the dir to the orphan sweep. Covers the crash path's
-/// deferred SIGKILL escalation, which lands on a later reaper tick.
+/// before leaving the dir to the orphan sweep. Covers a cancel whose SIGKILL
+/// has only just been sent. The reaper's death path has already waited for
+/// the group (#11076), so there this returns at once unless that wait gave up.
 pub const SWEEP_END_GROUP_GRACE: Duration = Duration::from_secs(120);
 
 /// Every run dir directly under `<repo_root>/.loom/targets` whose owner marker

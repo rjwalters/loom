@@ -73,6 +73,58 @@ fn the_end_of_a_sweep_removes_its_run_dir() {
     );
 }
 
+/// #11031 composed with #11076. A dead leader whose process group still has a
+/// live member (the wrapper's retry of the session, which builds into the same
+/// run dir) is not an ended sweep: the entry stays `Running` and NO removal is
+/// scheduled. The removal is scheduled by the tick that finds the group empty.
+///
+/// The middle step is what tells "not scheduled" from "scheduled and waiting":
+/// a removal thread started on the draining tick would delete the dir as soon
+/// as the group emptied, without the registry ever seeing the drain.
+#[test]
+#[serial]
+fn a_draining_group_keeps_the_run_dir_until_the_reaper_sees_it_drained() {
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path();
+    let tail = "bash -c 'trap \"\" TERM; sleep 300' &\nsleep 0.3\nexit 0";
+    let mut reg = lifecycle_registry(ws, &script(tail));
+    let out = reg
+        .dispatch(&SweepKind::Issue(11_033), None, None, None, None)
+        .unwrap();
+    let pgid = reg
+        .get_status(&out.sweep_id)
+        .unwrap()
+        .pgid
+        .expect("a group leader");
+    let dir = run_dir(ws, out.pid);
+    wait_for("the fixture's run dir", || marker_written(&dir));
+
+    // The leader exits; its TERM-trapping child keeps the group alive.
+    wait_for("the reaper to find the leader dead", || {
+        reg.reap_once();
+        reg.pending_group_reaps.contains_key(&out.sweep_id)
+    });
+    let running = |reg: &SweepRegistry| {
+        matches!(reg.get_status(&out.sweep_id).unwrap().state, SweepState::Running)
+    };
+    assert!(running(&reg), "a draining group keeps the sweep live (#11076)");
+    assert!(dir.exists(), "and its run dir");
+
+    // The group empties, but no reaper tick has seen it yet. A removal that
+    // had been scheduled while draining would fire now (it polls at 250 ms).
+    send_group_signal(pgid, 9);
+    wait_for("the group to drain", || !group_has_members(pgid));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(running(&reg), "no tick has run, so the sweep is still live");
+    assert!(marker_written(&dir), "nothing was scheduled while the group was draining");
+
+    // The tick that sees the drained group ends the sweep and removes the dir.
+    reg.reap_once();
+    assert!(!running(&reg), "a drained group ends the sweep");
+    assert!(reg.pending_group_reaps.is_empty());
+    wait_for("the removal after the drain", || !dir.exists());
+}
+
 /// The watchdog's auto-cancel ends the hung sweep before its re-dispatch, and
 /// the abandoned run's dir goes with it: the re-dispatched sweep's dir is the
 /// only one left.
