@@ -321,6 +321,11 @@ fn parse_past_resync(record: &str) -> Option<PastResync> {
     })
 }
 
+/// The checkout's `HEAD` commit.
+pub(super) fn head(root: &Path) -> Option<String> {
+    ok(root, root, &["rev-parse", "--verify", "--quiet", "HEAD"], QUICK).ok()
+}
+
 /// The tree of `commit`.
 pub(super) fn tree_of(root: &Path, commit: &str) -> Result<String> {
     ok(root, root, &["rev-parse", "--verify", &format!("{commit}^{{tree}}")], QUICK)

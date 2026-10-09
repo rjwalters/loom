@@ -464,6 +464,13 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         report.skipped_workspace_commands_missing += 1;
         log::warn!("work_finder: skipping issue #{issue} — {e}");
         Outcome::new(Qd::WorkspaceCommandsMissing, why, "refused", "workspace_commands_missing")
+    } else if let Some(held) = e.downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+    {
+        // Defense in depth (#10719): the per-tick pre-filter holds the whole
+        // workspace; reaching here means the hold was set mid-tick.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        let cause = held.kind.halt_cause().as_str();
+        Outcome::new(Qd::WorkspaceHalted, Some(cause.to_string()), "refused", cause)
     } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
         // Empty/unusable token pool (#4689, typed by #6614): a real failure,
         // still on `errors`, named because the remedy is the pool. The registry

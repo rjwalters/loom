@@ -585,6 +585,10 @@ pub fn loom_min_version() -> Option<String> {
     floor_cell().lock().ok().and_then(|g| g.clone().flatten())
 }
 
+/// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
+/// daemon version a registered workspace NEEDS and this host does not run.
+pub use crate::workspace_hold::repo_ahead_min;
+
 /// The last good floor for this pass to fall back on: this process's value
 /// once a pass has resolved one, else what the previous process recorded in
 /// its snapshot — so a malformed value right after a restart still cannot
@@ -852,7 +856,8 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     let mut lines = vec![head];
     lines.extend(state_lines(s));
     lines.extend(floor_lines(&s.floor));
-    lines.extend(s.workspaces.lines());
+    let interval = std::time::Duration::from_secs(s.interval_secs);
+    lines.extend(s.workspaces.lines_at(Some((now, interval))));
     lines.extend(checkout_ff::lines(&s.checkouts));
     lines.extend(
         s.checkouts_note
