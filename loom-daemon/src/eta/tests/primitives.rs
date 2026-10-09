@@ -232,11 +232,8 @@ fn registry_resolves_current_per_kind() {
             "land-v4",
             "little-v0",
             "land-2026-10-06-brisk-petrel",
-            "land-2026-10-06-quick-tern",
-            "land-2026-10-06-swift-tern",
             "land-2026-10-06-held-heron",
             "land-2026-10-06-keen-wren",
-            "land-2026-10-06-bold-lark",
             "land-2026-10-06-loop-kite",
             "land-2026-10-04-twin-otter-b",
             "land-2026-10-06-tandem-wren"
@@ -276,13 +273,15 @@ fn registry_resolves_current_per_kind() {
             .id(),
         "land-2026-10-06-even-lark"
     );
-    // `land-2026-10-06-quick-tern` (#10524) likewise: registered, not current.
-    assert_eq!(
-        registry
-            .current(Kind::Land, Some("land-2026-10-06-quick-tern"))
-            .id(),
-        "land-2026-10-06-quick-tern"
-    );
+    // The IPCW-wrapped shadows (#10524) were retired 2026-10-08 (#10949):
+    // selecting any of them falls back to the default.
+    for retired in [
+        "land-2026-10-06-quick-tern",
+        "land-2026-10-06-swift-tern",
+        "land-2026-10-06-bold-lark",
+    ] {
+        assert_eq!(registry.current(Kind::Land, Some(retired)).id(), "land-v1");
+    }
     // `land-2026-10-06-held-heron` (#10523) likewise: registered, not current.
     assert_eq!(
         registry
@@ -333,11 +332,8 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v4",
             "little-v0",
             "land-2026-10-06-brisk-petrel",
-            "land-2026-10-06-quick-tern",
-            "land-2026-10-06-swift-tern",
             "land-2026-10-06-held-heron",
             "land-2026-10-06-keen-wren",
-            "land-2026-10-06-bold-lark",
             "land-2026-10-06-loop-kite",
             "land-2026-10-04-twin-otter-b",
             "land-2026-10-06-tandem-wren"

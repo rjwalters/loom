@@ -483,6 +483,7 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
         keys,
         [
             "account",
+            "agent",
             "caller",
             "cred_owner",
             "installation",
@@ -494,6 +495,7 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
         ]
     );
     assert_eq!(ok_point.labels["target_owner"], "acme");
+    assert_eq!(ok_point.labels["agent"], "-", "the daemon's own row (#10607)");
     assert_eq!(ok_point.labels["resource"], "graphql");
     assert_eq!(ok_point.labels["role"], "writer");
     let err = ours

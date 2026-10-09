@@ -1819,6 +1819,15 @@ enum StashesAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Print the cargo build-tree directories (content-verified
+    /// `CACHEDIR.TAG` / `.rustc_info.json`, any name, ignored or not) that a
+    /// quarantine stash of a worktree must exclude, or (`--filter-status`)
+    /// drop build-tree lines from `git status --porcelain` text on stdin
+    /// (#11075). `check-main-clean.sh --quarantine` calls this; exits non-zero
+    /// when the worktree cannot be resolved, which the script treats as
+    /// "could not check", never as "no build trees".
+    BuildTrees(cli::stashes::BuildTreesArgs),
 }
 
 /// Sub-actions for `loom-daemon tokens`.

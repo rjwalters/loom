@@ -98,6 +98,7 @@ fn eta_outcome() -> EtaOutcomeRecord {
         outcome_source: "pulls_read".to_string(),
         outcome_resolution_sec: Some(120),
         result: None,
+        attribution: None,
     }
 }
 
@@ -211,6 +212,10 @@ fn samples() -> Vec<TelemetryRecord> {
         ),
         TelemetryRecord::EtaEstimate(eta_estimate()),
         TelemetryRecord::EtaOutcome(eta_outcome()),
+        wire(json!({"kind": "eta.stage_outcome", "repo": "rjwalters/loom", "issue": 1,
+                    "stage": "review_wait", "left_at": AT, "exit": "pass",
+                    "event": "label.transition", "observed_at": AT, "open_estimates": 0,
+                    "loom": p})),
         wire(json!({"kind": "session.output", "schema": 1, "runtime": "claude",
                     "category": "output", "stream": "assistant", "stream_id": "s",
                     "sequence": 0, "event_id": "e", "source_at": AT, "observed_at": AT,
@@ -224,6 +229,11 @@ fn samples() -> Vec<TelemetryRecord> {
                     "decision": "skip", "reason": "r", "roll_armed": false,
                     "drain": {"armed": false, "pending": false, "refusals": 0},
                     "consecutive_failures": 0, "duration_ms": 0, "loom": p})),
+        wire(json!({"kind": "fleet.state", "schema": "fleet-state/v1", "as_of": AT,
+                    "anchor": true,
+                    "anchor_as_of": AT, "repos": []})),
+        wire(json!({"kind": "host.export", "captured_at": AT, "host": "host-a",
+                    "exporters": []})),
         wire(json!({"kind": "eta.fit", "check_id": "c", "trigger": "t", "started_at": AT,
                     "outcome": "skipped", "snapshots": 0, "duration_ms": 0, "loom": p})),
         TelemetryRecord::PickDecision(pick_decision()),

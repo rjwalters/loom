@@ -331,6 +331,12 @@ pub(crate) enum ScriptPortCommand {
     /// self-replacement design and why `resolve_daemon_bin()` is the wrong
     /// helper for the post-roll version check.
     DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
+    /// The atomic binary write behind `provision-daemon.sh` (#10983): `stage`
+    /// a candidate beside the destination, then `publish` it by rename,
+    /// keeping the binary it replaces. The script requires it; see
+    /// `cli/install_binary.rs`.
+    #[command(subcommand)]
+    InstallBinary(super::install_binary::InstallBinaryCommand),
 
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
@@ -453,6 +459,13 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// The Renovate-side routing contract (#9418): every `labels` array in the
+    /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
+    /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
+    /// any violation; no Renovate config is a clean no-op. Counterpart of
+    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
+
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
@@ -542,6 +555,13 @@ pub(crate) enum ScriptPortCommand {
     /// `super::forge_probe_cmd` for the exit-code and credential contract.
     ForgeProbe(super::forge_probe_cmd::ForgeProbeArgs),
 
+    /// `.loom/resync-ignore` pin fork-point provenance (#8726): `add` pins a
+    /// path and records the upstream commit it forked from in the additive
+    /// `.loom/resync-pin-base` sidecar; `status` reports per-pin drift. Not a
+    /// port: brand-new logic, native per the shell-language policy.
+    #[command(subcommand)]
+    ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -611,6 +631,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::Host(cmd) => cmd.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::InstallBinary(cmd) => cmd.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
@@ -626,6 +647,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
@@ -637,6 +659,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
+            ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
         }
     }
 }

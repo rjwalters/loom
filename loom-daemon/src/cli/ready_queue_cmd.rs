@@ -113,7 +113,11 @@ pub(crate) fn queue_json(report: &DaemonStatusReport, now: DateTime<Utc>) -> ser
         "errors": tick.map(|t| t.errors),
         // Non-empty => the queue is incomplete: these repos' backlogs are missing.
         "listing_failed": tick.map(|t| t.listing_failed.as_slice()).unwrap_or_default(),
-        "complete": tick.is_some_and(|t| t.listing_failed.is_empty()),
+        // Non-empty => these repos' listings came back partial (#11139): some
+        // rows are present, but not all of them.
+        "listing_incomplete": tick.map(|t| t.listing_incomplete.as_slice()).unwrap_or_default(),
+        // `false` when any repo's listing failed OR came back partial.
+        "complete": tick.is_some_and(|t| t.listing_not_whole().next().is_none()),
         "ordering": tick.and_then(ordering),
         "plan": tick.and_then(|t| t.plan.as_ref()),
         "queue": tick.map(|t| t.queue.as_slice()).unwrap_or_default(),
@@ -168,8 +172,16 @@ fn render_ready(report: &DaemonStatusReport, now: DateTime<Utc>) -> String {
             tick.listing_failed.join(", ")
         ));
     }
+    if !tick.listing_incomplete.is_empty() {
+        out.push_str(&format!(
+            "  INCOMPLETE: listing ready issues came back partial for {} — only part of their backlog is below\n",
+            tick.listing_incomplete.join(", ")
+        ));
+    }
     if tick.queue.is_empty() {
-        if !tick.listing_failed.is_empty() {
+        // A failed or partial listing makes an empty table "unknown", never
+        // "no ready work" (#11139).
+        if tick.listing_not_whole().next().is_some() {
             return out;
         }
         out.push_str(if tick.seen == 0 {
@@ -369,6 +381,39 @@ mod tests {
         assert_eq!(j["complete"], false);
         assert_eq!(j["listing_failed"][0], "/src/loom");
         assert_eq!(j["errors"], 1);
+    }
+
+    #[test]
+    fn a_partial_listing_is_incomplete_not_whole() {
+        // #11139: a later page failed / the page cap / a mid-walk change. The
+        // rows read are kept, but neither the JSON nor the human view may
+        // present them as the whole queue.
+        let now = Utc::now();
+        let mut r = report_with(vec![], now);
+        if let Some(t) = r.last_work_finder_tick.as_mut() {
+            t.listing_incomplete = vec!["/src/loom".into()];
+        }
+        let text = render_queue(&r, now);
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("partial for /src/loom"), "{text}");
+        assert!(!text.contains("no ready loom:issue work"), "{text}");
+        let j = queue_json(&r, now);
+        assert_eq!(j["complete"], false);
+        assert_eq!(j["listing_incomplete"][0], "/src/loom");
+        assert_eq!(j["listing_failed"].as_array().map(Vec::len), Some(0));
+
+        // With rows present the view still flags the partial listing.
+        let mut r = report_with(vec![row(1, 10, QueueDisposition::DeferredCapacity)], now);
+        if let Some(t) = r.last_work_finder_tick.as_mut() {
+            t.listing_incomplete = vec!["/src/loom".into()];
+        }
+        assert!(render_queue(&r, now).contains("INCOMPLETE"));
+        assert_eq!(queue_json(&r, now)["complete"], false);
+
+        // A whole listing stays complete.
+        let whole = report_with(vec![row(1, 10, QueueDisposition::DeferredCapacity)], now);
+        assert_eq!(queue_json(&whole, now)["complete"], true);
+        assert!(!render_queue(&whole, now).contains("INCOMPLETE"));
     }
 
     #[test]

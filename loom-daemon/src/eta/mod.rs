@@ -107,6 +107,7 @@ pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
+pub mod explain;
 pub mod explanation;
 pub mod fit;
 pub mod flag_timeline;
@@ -134,6 +135,8 @@ pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
+pub mod hold_kind;
+pub mod hold_marker_log;
 pub mod job_owner;
 pub mod journal;
 pub mod labels;
@@ -149,18 +152,22 @@ pub mod pr_file_log;
 pub mod priority_features;
 pub mod priority_inputs;
 pub mod queue_features;
+pub mod ready_order;
 pub mod recalibrate;
 pub mod recency;
 pub mod regime;
 pub mod repo_priority;
 pub mod retire_filing;
 pub mod roster_history;
+pub mod scope_features;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
 pub mod shadow_lifecycle;
+pub mod shadow_non_refusal;
 pub mod shadow_stats;
 pub mod simulate;
+pub mod stage_forecast;
 pub mod stage_queue;
 pub mod stall;
 pub mod stall_features;
@@ -424,70 +431,10 @@ impl fmt::Display for NoEstimateReason {
     }
 }
 
-/// Which Loom build computed a record — required on every ETA record
-/// (operator requirement on #9289). Sourced from
-/// [`crate::telemetry::trace::provenance::daemon`], the same source every
-/// span's `loom.daemon.*` attributes come from.
-///
-/// A build whose revision or tree state is `unknown` (a tarball build) still
-/// emits, so no data is lost, but with `complete: false`; accuracy queries
-/// exclude incomplete rows, because a result that cannot be pinned to a
-/// commit cannot be attributed to a heuristic's code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Provenance {
-    /// Loom version (`CARGO_PKG_VERSION`).
-    pub version: String,
-    /// Full 40-hex git SHA, or `unknown` for a tarball build.
-    pub revision: String,
-    /// `clean`, `dirty` or `unknown`.
-    pub tree_state: String,
-    /// `revision` is a full 40-hex SHA and `tree_state` is `clean` or
-    /// `dirty`: the build is pinned. Always [`Provenance::completeness`] of
-    /// the other two fields.
-    pub complete: bool,
-}
-
-/// Whether `revision` is a full 40-hex lowercase git SHA.
-fn is_full_sha(revision: &str) -> bool {
-    revision.len() == 40
-        && revision
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-impl Provenance {
-    /// The running binary.
-    #[must_use]
-    pub fn current() -> Self {
-        let build = crate::telemetry::trace::provenance::daemon();
-        Provenance {
-            version: build.version.to_string(),
-            revision: build.revision.to_string(),
-            tree_state: build.tree_state.to_string(),
-            complete: Self::completeness(build.revision, build.tree_state),
-        }
-    }
-
-    /// Whether a build with `revision` and `tree_state` is fully pinned.
-    #[must_use]
-    pub fn completeness(revision: &str, tree_state: &str) -> bool {
-        is_full_sha(revision) && matches!(tree_state, "clean" | "dirty")
-    }
-
-    /// Whether every field is well formed: a non-empty version, a full
-    /// 40-hex revision or the build system's literal `unknown`, a known tree
-    /// state, and a `complete` flag that matches them. An ETA record whose
-    /// provenance fails this is never emitted. An `unknown` revision or tree
-    /// state is well formed (and emitted), but not [`Self::complete`].
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let revision_ok = self.revision == "unknown" || is_full_sha(&self.revision);
-        !self.version.trim().is_empty()
-            && revision_ok
-            && matches!(self.tree_state.as_str(), "clean" | "dirty" | "unknown")
-            && self.complete == Self::completeness(&self.revision, &self.tree_state)
-    }
-}
+/// Which Loom build computed a record. Moved to the neutral
+/// [`crate::telemetry::provenance`] (#11098, Stage 2) because non-ETA records
+/// embed it too; re-exported here so ETA code keeps its path.
+pub use crate::telemetry::provenance::Provenance;
 
 /// What an estimate is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +541,17 @@ pub struct DispatchInput {
     pub saturation_held: bool,
     /// The tick the plan came from.
     pub plan_at: DateTime<Utc>,
+    /// Why this host's planner gave the row no position although the fleet
+    /// can still dispatch it (#10903): its disposition, plus the halt cause
+    /// for a host-local `workspace_halted` (`workspace_halted:token_pool`).
+    /// `None` for a row the planner positioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_here: Option<String>,
+    /// A time-boxed hold's expiry (#9311, #10903): the row cannot be admitted
+    /// before it. Its remaining time from `plan_at` is added to
+    /// [`Self::admission_delay_sec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
 }
 
 impl DispatchInput {
@@ -606,7 +564,10 @@ impl DispatchInput {
 
     /// Fixed seconds from its admitting slot freeing to the dispatch: half a
     /// tick (the mean wait for the next tick), plus one whole tick per full
-    /// admission batch ahead of it when it needs no turnover at all.
+    /// admission batch ahead of it when it needs no turnover at all, plus
+    /// what is left of a time-boxed hold ([`Self::held_until`]) at the tick.
+    /// The hold is added, not overlapped with the queue wait: an upper bound
+    /// when both are long.
     #[must_use]
     pub fn admission_delay_sec(&self) -> i64 {
         let tick = i64::try_from(self.tick_interval_secs).unwrap_or(i64::MAX / 4);
@@ -614,7 +575,12 @@ impl DispatchInput {
             (0, Some(cap)) if cap > 0 => i64::from(self.ahead / cap),
             _ => 0,
         };
-        tick / 2 + batches.saturating_mul(tick)
+        let held = self
+            .held_until
+            .map_or(0, |until| (until - self.plan_at).num_seconds().max(0));
+        (tick / 2)
+            .saturating_add(batches.saturating_mul(tick))
+            .saturating_add(held)
     }
 }
 
@@ -748,19 +714,14 @@ impl Registry {
                 // #10528: twin-otter-b plus the drift-gated regime
                 // adjustment; registered ahead of the other -b wrappers.
                 Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
-                // #10524: wraps twin-otter-b; registered before `-b` so
-                // `-b` stays last but for tandem-wren.
-                Box::new(heuristics::LandQuickTern::new(fit.clone())),
-                // #10524 slice 3: quick-tern made drift-aware (#10528).
-                Box::new(heuristics::LandSwiftTern::new(fit.clone())),
+                // #10524's IPCW wrappers quick-tern and swift-tern (over
+                // `-b`) and bold-lark (over keen-wren) are retired (#10949).
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 // #10508: twin-otter-b's priority-aware successor, also
                 // before `-b`.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
-                // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
-                Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
                 // #10521: keen-wren's friction-aware successor, before
                 // twin-otter-b.
                 Box::new(heuristics::LandLoopKite::new(fit_v3.clone())),

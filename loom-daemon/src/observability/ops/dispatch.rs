@@ -375,8 +375,9 @@ pub fn record_tick(
     // failed-repo discipline (unresolvable roots are dropped, the same
     // accepted edge case its own `failed_slugs` documents).
     let repo_refs = resolved_repo_refs(&report.admissions, &report.queue, roots);
+    // #11139: a partial listing is no evidence of a cleared lock either.
     let failed: Vec<String> = report
-        .listing_failed
+        .listing_not_whole()
         .iter()
         .filter_map(|idx| repo_refs.get(idx).map(|r| r.repo.clone()))
         .collect();

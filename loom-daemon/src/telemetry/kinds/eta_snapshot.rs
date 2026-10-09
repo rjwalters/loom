@@ -161,6 +161,64 @@ pub struct EtaSnapshotRow {
     /// Shadow candidates' estimates for this item (#10390). Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alternates: Vec<EtaSnapshotAlternate>,
+    /// The row's own per-stage forecast (#10929), for the dashboard's
+    /// Time-stage track. It is keyed by the fixed stage enum and holds only
+    /// the stages still ahead. Omitted when empty: a refusal, or a heuristic
+    /// that forecasts no stage.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stages: BTreeMap<Stage, EtaSnapshotStage>,
+}
+
+/// One stage's forecast on a snapshot row (#10929). All values are whole
+/// seconds from the row's `as_of`. Entry and dwell are conditional on
+/// reaching the stage, and `reach_pct` says how likely that is. A
+/// `doctor` stage with `reach_pct: 30` is a 30% branch, not a certainty.
+///
+/// The wire shape loom-ui reads is:
+///
+/// ```json
+/// "stages": {"review_wait": {"entry_p50": 0, "entry_p90": 0,
+///   "dwell_p50": 5400, "dwell_p90": 30000, "reach_pct": 100}}
+/// ```
+///
+/// The full forecast, including each stage's attribution baseline, is on the
+/// estimate's `eta.estimate` body as `stage_predictions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtaSnapshotStage {
+    /// First entry, median.
+    pub entry_p50: i64,
+    /// First entry, 90th percentile.
+    pub entry_p90: i64,
+    /// Total time in the stage, median.
+    pub dwell_p50: i64,
+    /// Total time in the stage, 90th percentile.
+    pub dwell_p90: i64,
+    /// Percentage of simulated paths that reach the stage.
+    pub reach_pct: u8,
+}
+
+impl EtaSnapshotStage {
+    /// The snapshot view of every stage in `predictions`.
+    #[must_use]
+    pub fn all(
+        predictions: &crate::eta::stage_forecast::StagePredictions,
+    ) -> BTreeMap<Stage, EtaSnapshotStage> {
+        predictions
+            .iter()
+            .map(|(stage, p)| {
+                (
+                    *stage,
+                    EtaSnapshotStage {
+                        entry_p50: p.entry_p50,
+                        entry_p90: p.entry_p90,
+                        dwell_p50: p.dwell_p50,
+                        dwell_p90: p.dwell_p90,
+                        reach_pct: p.reach_pct,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// `eta.snapshot`: one host's live ETA estimate set. Host-scoped, newest per

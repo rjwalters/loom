@@ -187,3 +187,79 @@ fn machine_inputs_follow_the_sections_that_report_them() {
     assert_eq!(report.capacity_bound, full.capacity_bound);
     assert_eq!(report.configured_max, full.configured_max);
 }
+
+/// **#10879 review nit.** A sectioned `drain` build with a drain active and
+/// a sweep in flight: `drain` walks the roots for the in-flight count, so
+/// the roll projection names the sweep it is waiting on rather than a
+/// silent zero, without building any per-repo row.
+#[test]
+#[serial_test::serial]
+fn a_sectioned_drain_build_counts_the_sweeps_an_active_drain_waits_on() {
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let spawn_bin = root.join(".loom").join("scripts").join("spawn-claude.sh");
+    std::fs::create_dir_all(spawn_bin.parent().unwrap()).unwrap();
+    std::fs::write(&spawn_bin, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    std::fs::set_permissions(&spawn_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = SweepRegistryConfig::new(root.clone());
+    config.spawn_bin = Some(spawn_bin);
+    config.skip_label_flip = true;
+    config.journal_path = Some(root.join("test-sweeps-journal.json"));
+    let registry = Arc::new(Mutex::new(SweepRegistry::new(config)));
+    std::env::set_var(REGISTRY_PATH_ENV, root.join("no-such-workspaces.json"));
+    let pool = ManyRoots::pool();
+    pool.seed(root.clone(), registry.clone());
+    registry
+        .lock()
+        .unwrap()
+        .dispatch(&crate::types::SweepKind::Issue(10861), None, None, None, None)
+        .expect("dispatch");
+
+    let drain = DrainState::new();
+    let deadline = match drain.begin(std::time::Duration::from_secs(300), false, false) {
+        super::super::DrainBegin::Started { deadline, .. } => deadline,
+        other => panic!("expected Started, got {other:?}"),
+    };
+    let report = build_daemon_status_with_drain(
+        &pool,
+        &WorkspaceHealthStates::new(),
+        &root,
+        &credentials(),
+        &drain,
+        &SectionSet::only([StatusSection::Drain]),
+    );
+    std::env::remove_var(REGISTRY_PATH_ENV);
+
+    assert!(report.draining);
+    assert_eq!(report.drain_deadline, Some(deadline));
+    let roll = report.drain_roll.expect("an active drain reports its roll");
+    assert_eq!(roll.in_flight, 1, "the roll projection lost the sweep it is waiting on");
+    assert!(report.per_repo.is_empty(), "a drain-only build built per-repo rows");
+}
+
+/// #10861: the overlay alone — what each request applies to its copy of a
+/// shared build — carries the whole drain block, and clears it again.
+#[test]
+fn overlay_drain_tracks_the_live_drain_state() {
+    let drain = DrainState::new();
+    let mut report = DaemonStatusReport::default();
+    overlay_drain(&mut report, &drain);
+    assert!(!report.draining && report.drain_deadline.is_none() && report.drain_roll.is_none());
+
+    let deadline = match drain.begin(std::time::Duration::from_secs(300), false, false) {
+        super::super::DrainBegin::Started { deadline, .. } => deadline,
+        other => panic!("expected Started, got {other:?}"),
+    };
+    overlay_drain(&mut report, &drain);
+    assert!(report.draining);
+    assert_eq!(report.drain_deadline, Some(deadline));
+    assert_eq!(report.drain_roll.as_ref().map(|roll| roll.in_flight), Some(0));
+
+    assert!(drain.abort());
+    overlay_drain(&mut report, &drain);
+    assert!(!report.draining && report.drain_roll.is_none());
+}

@@ -5,7 +5,7 @@
 use super::history_a;
 use super::land_twin_otter::{fit_as_of, fixture_fit, review_input};
 use crate::eta::fit::{coeffs, CoefficientFile};
-use crate::eta::heuristics::{LAND_QUICK_TERN, LAND_TWIN_OTTER_B, LAND_V2};
+use crate::eta::heuristics::{LAND_BRISK_PETREL, LAND_TWIN_OTTER_B, LAND_V2};
 use crate::eta::walk_forward::DatedFits;
 use crate::eta::{Heuristic, NoEstimateReason, Registry, StageSamples};
 use chrono::{DateTime, Duration, Utc};
@@ -80,7 +80,7 @@ fn a_walked_fitted_heuristic_answers_exactly_as_its_dated_registry() {
     let late = tagged(input.as_of + Duration::hours(1), "late");
     let fits = DatedFits::new(vec![early.clone(), late]);
     let direct = Registry::with_fit(Some(Arc::new(early)));
-    for id in [LAND_TWIN_OTTER_B, LAND_QUICK_TERN, LAND_V2] {
+    for id in [LAND_TWIN_OTTER_B, LAND_BRISK_PETREL, LAND_V2] {
         let walked = fits.heuristic(id).unwrap().estimate(&input, &history);
         let expected = direct.get(id).unwrap().estimate(&input, &history);
         assert_eq!(bytes(&walked), bytes(&expected), "{id}");

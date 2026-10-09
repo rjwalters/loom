@@ -263,6 +263,29 @@ query ships `disabled`). What it does **not** establish: no rule evaluator ran
 and no notification was delivered — the live fire-and-resolve check is
 [#9006](https://github.com/rjwalters/loom/issues/9006).
 
+`alerts/fleet-singleton-output.json` (#10916) is imported the same way. It
+watches the outputs of one-host fleet jobs on the logs table by `loom.kind`
+(and `loom.repo` for per-repo rows), one deadline per
+`fleet_outputs::SINGLETON_OUTPUTS` row, embedded as the query's `arrayJoin`
+registry literal. Each series' value is seconds past its deadline, so it fires
+above 0. Every watched kind always has a fleet-level series (`repo` empty) that
+fires when the kind has no record in the 72 h window, and `alertOnAbsent`
+covers a query that returns nothing. A `per_repo` row's expected repos come
+from an independent roster, every repo with a `pass.summary`,
+`role_tick.outcome` or `sweep.started` record in the window, left-joined to the
+output, so a repo that never emitted it (or whose outage is older than the
+window) still has a firing series while another repo stays healthy. A repo
+with no such activity in the window is not on the roster, and the
+`per_active_repo` row (`eta.estimate`) is not roster-expanded. `loom-daemon/tests/signoz_fleet_singleton_output_alert.rs`
+asserts in ordinary CI that each embedded deadline equals the registry's and
+that the collector forwards every attribute the query reads. Its Docker half
+replays the 2026-10-07 incident (28 of 30 repos silenced, which fires one
+evaluation past 2 x cadence and not one before), shows that a healthy fleet
+with an idle and an all-abstaining repo does not fire, fires a roster repo with
+no output history and a 100 h-old outage beside a healthy repo, and runs each
+quiet-repo predicate's and the roster's breaking mutation. The same caveat applies: no rule
+evaluator or notification has run.
+
 All five queries are additionally **executed verbatim** against the pinned
 ClickHouse the telemetry store runs, by
 `loom-daemon/tests/signoz_queue_quota_queries.rs`. That run is what establishes
@@ -334,9 +357,10 @@ high-water mark once — a stale reading from another host or (on a
 pre-#10571 daemon's data) an interleaved second bucket never re-charges; (2) the requests `loom.forge.calls` attributed to that bucket, `ok`
 (surely charged) and `ok`+`error` (an upper bound), with 304s and the free
 probe excluded; (3) the shadow band `shadow_low`/`shadow_high` per
-bucket-hour, NULL when GitHub reported no spend; (4) the `invoke github` span
+bucket-hour, NULL when GitHub reported no spend, plus `agent_share`; (4) the `invoke github` span
 cross-check by `github.account`, `github.cred_owner`, `github.resource` and
-`github.billing`. Run it like the queries above:
+`github.billing`; (5) the agent slice (#10607): agent sessions' `gh` calls
+(`agent != '-'`) by role and served/passthrough. Run it like the queries above:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < github-shadow.sql
@@ -348,6 +372,20 @@ against the pinned ClickHouse by `signoz_github_shadow_queries.rs` (stale
 host readings, a genuine reset, 1 s reset jitter, two interleaved windows, an
 owner-less legacy point). Queries 0–4 have also been run read-only against the
 live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
+
+### Export coverage and drops
+
+`host-export-queries.sql` (#11124) answers "which hosts are losing telemetry,
+or not reporting their export view?" from the `host.export` logs: (1) hosts
+whose cumulative `dropped_total` grew in the last 2 h (a decrease is read as a
+daemon restart), and (2) hosts with other Loom logs but no `host.export` in
+that window. Drops are host-level: the log attributes carry only the sum
+across exporters, and the per-exporter split lives in the JSON body. A
+host's latest sample in the 24 h before the window is the baseline, so drops
+between the window start and the first in-window sample are counted; a host
+with no earlier sample has an unknown baseline and its first value counts as
+0. Not yet executed in CI against the pinned ClickHouse, and no fixture covers
+the boundary, increment, no-increase and reset cases yet.
 
 ### Pass activity
 
@@ -524,9 +562,13 @@ data.
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
-| GitHub bucket shadow spend | Dashboards → `Loom quota` → Time series panel. Metric `github.ratelimit.used`, aggregation **Max**, group by `account`, `owner`, `resource` (`owner = '-'` is an operator's ambient login; a pre-#10571 daemon's label set can carry two interleaved windows, so the panel is a browsing surface). The per-hour increments, the attributed `loom.forge.calls` and the shadow band need window functions and a join, so they live in SQL only (`github-shadow.sql` 1–4) |
+| GitHub bucket shadow spend | Dashboards → `Loom quota` → Time series panel. Metric `github.ratelimit.used`, aggregation **Max**, group by `account`, `owner`, `resource` (`owner = '-'` is an operator's ambient login; a pre-#10571 daemon's label set can carry two interleaved windows, so the panel is a browsing surface). The per-hour increments, the attributed `loom.forge.calls` and the shadow band need window functions and a join, so they live in SQL only (`github-shadow.sql` 1–5) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
 | Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
+| Host disk alerts | Alerts → Import `alerts/host-disk-low.json` (warning) and `alerts/host-disk-critical.json` (critical). Both read the direct OTLP gauges `loom.host.worktree_root_free_gb` and `loom.host.worktree_volume.{free,total}_bytes` (no loom-ui d1-export hop), one row per host labelled `host.name`, falling back to `host.id` for series whose `host.name` is empty, over a 60-minute window. Level arm: every free-GB reading in the last 10 minutes breaches (the window's `max` is under the threshold, so one healthy reading clears it). Warning: < 30 GB or < 10% of the volume, or a least-squares slope of free GB over the hour (at least 4 readings spanning 30 minutes, the latest within 10) projecting the volume full in < 6 h; critical: < 5 GB (so 0 included) or < 3%, or full in < 1 h. The percent arm needs the byte gauges; a host without them is judged on GB alone, and a host with no free-space gauge is unknown, never 0 GB. Executed against the pinned ClickHouse over a replay of free GB falling to 0, a 20 GB/h drain (warning only), a recovering host and a host alternating 0 GB and recovered readings within each minute (must not page), by `signoz_ops_alerts.rs`; no rule evaluator or notification has run (#10973) |
+| Work finder stale alert | Alerts → Import `alerts/work-finder-stale.json`. Fires for a host still heartbeating (`loom.host.uptime_seconds` within 10 minutes) whose last `loom.queue.issues` sample (exported once per work-finder tick, zeros included) is older than 2x that host's own tick interval, learned as the median gap between its ticks in the 24 h window (60 s with fewer than 3), floored at 300 s. A host whose finder never ticked in the window (disabled) or that stopped heartbeating (dead, not stalled) is not judged. Replay-tested by `signoz_ops_alerts.rs`: the 2026-10-08 stall at 14:04Z pages at 14:10Z (#10973) |
+| ETA Ready-coverage alert | Alerts → Import `alerts/eta-ready-coverage.json`. Over a 30-minute window, fires when any 10-minute bucket of a host's `ready_wait` `eta.estimate` rows (`loom.eta.stage`) has zero answered and at least half `stale_inputs` refusals. Each ready item produces a record, so rows existing means ready items exist; total silence is the separate no-ETAs-emitted alert (#10898). `stale_inputs` refusals are re-emitted every pass while they persist (#11038), so this stays firing for as long as the outage lasts. Replay-tested by `signoz_ops_alerts.rs` (#10973) |
+| Fleet singleton output alert | Alerts → Import `alerts/fleet-singleton-output.json`. Fires when a watched fleet-singleton output (`loom.kind`, per `loom.repo` for per-repo rows) is older than its `SINGLETON_OUTPUTS` deadline or absent from the 72 h window (per-repo rows: for every repo on the fleet-activity roster); the deadlines are asserted equal to the registry and the 2026-10-07 replay is executed against the pinned ClickHouse by `signoz_fleet_singleton_output_alert.rs` (see above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
 | Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
 | Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |

@@ -77,16 +77,21 @@ pub fn claude_args(
     }
 }
 
-/// [`claude_args`] from the process environment.
+/// [`claude_args`] from the process environment, followed by the pause
+/// hook's `--settings` wiring for a daemon-dispatched session
+/// ([`super::wiring`], #11049): a consumer repo's own settings do not run
+/// the hook, so the launch has to.
 ///
 /// # Errors
 /// As [`claude_args`].
 pub fn claude_args_from_env() -> Result<Vec<String>, String> {
-    claude_args(
+    let mut args = claude_args(
         env_var(RESUME_SESSION_ENV).as_deref(),
         env_var(RESUME_PROMPT_ENV).as_deref(),
         env_var(CLAUDE_SESSION_ENV).as_deref(),
-    )
+    )?;
+    args.extend(super::wiring::settings_args_from_env());
+    Ok(args)
 }
 
 /// The prompt for a Codex resume, after checking the launch is resumable:
@@ -163,6 +168,9 @@ pub struct CapturedHandle {
     pub account: Option<String>,
     #[serde(default)]
     pub container: Option<String>,
+    /// The Codex sandbox mode of the original launch (#10831).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
     pub captured_at: String,
@@ -227,11 +235,23 @@ fn pid_alive(pid: u32) -> bool {
 /// This covers the watcher process only. `spawn-codex.sh` must `exec` it, so
 /// that no backgrounded subshell is left holding a second copy.
 pub fn release_inherited_lease(value: Option<&str>) -> bool {
+    release_lease_descriptor(value, crate::tokens_pool::private_workspace::dispatch::LEASE_FD)
+}
+
+/// [`release_inherited_lease`] against an explicit accepted descriptor.
+///
+/// Only `accepted` is ever closed (#10832, Judge finding on #10974): the
+/// dispatcher hands the lease down on exactly one descriptor, and the same
+/// rule guards the other reader of this variable
+/// (`private_workspace::dispatch::inherited_lease`). A variable naming any
+/// other number is not a lease this process was given, and closing it would
+/// close something unrelated.
+pub(crate) fn release_lease_descriptor(value: Option<&str>, accepted: i32) -> bool {
     let Some(fd) = value.and_then(|v| v.trim().parse::<i32>().ok()) else {
         return false;
     };
     // Never stdin, stdout or stderr, whatever the variable says.
-    if fd <= 2 {
+    if fd <= 2 || fd != accepted {
         return false;
     }
     // SAFETY: closing a descriptor this process inherited and never wrapped
@@ -268,6 +288,84 @@ pub fn capture_codex(spec: &CaptureSpec) -> CaptureOutcome {
             return CaptureOutcome::TimedOut;
         }
         std::thread::sleep(spec.poll);
+    }
+}
+
+/// Whether a rollout for `session_id` exists under a Codex `sessions/` tree
+/// (`sessions/YYYY/MM/DD/rollout-…-<id>.jsonl`). Bounded to that depth.
+fn codex_rollout_exists(dir: &Path, session_id: &str, depth: u8) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let path = e.path();
+        if path.is_dir() {
+            depth > 0 && codex_rollout_exists(&path, session_id, depth - 1)
+        } else {
+            e.file_name().to_string_lossy().contains(session_id)
+        }
+    })
+}
+
+/// H5's "the session store is reachable" check (#10832; design §4, reason
+/// `session-store-unavailable`): can a resume of `session_id` find the saved
+/// session where the runtime will look for it?
+///
+/// * **Claude**: a transcript `projects/*/<id>.jsonl` under `session_store`,
+///   else `$CLAUDE_CONFIG_DIR`, else `~/.claude`. This is the same glob
+///   `claude-wrapper.sh` uses to decide between `--session-id` and `--resume`.
+/// * **Codex**: `session_store` is the account's `CODEX_HOME`. It must be
+///   recorded, exist, and hold a usable `auth.json` (what `spawn-codex.sh`
+///   itself requires of a pinned profile). When the profile's `sessions/`
+///   tree is visible on this host, it must hold the session's rollout.
+///
+/// # Errors
+/// What is missing, for the requeue record.
+pub fn session_store_reachable(
+    runtime: &str,
+    session_id: &str,
+    session_store: Option<&str>,
+) -> Result<(), String> {
+    if !valid_session_id(session_id) {
+        return Err(format!("`{session_id}` is not a session id"));
+    }
+    if runtime == "codex" {
+        let Some(home) = session_store.filter(|s| !s.trim().is_empty()) else {
+            return Err("no CODEX_HOME was recorded for the session".to_string());
+        };
+        let home = Path::new(home);
+        if !home.is_dir() {
+            return Err(format!("the session's CODEX_HOME {} is gone", home.display()));
+        }
+        let auth = home.join("auth.json");
+        if !std::fs::metadata(&auth).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            return Err(format!("{} has no usable auth.json", home.display()));
+        }
+        let sessions = home.join("sessions");
+        if sessions.is_dir() && !codex_rollout_exists(&sessions, session_id, 4) {
+            return Err(format!("no rollout for the session under {}", sessions.display()));
+        }
+        return Ok(());
+    }
+    let config = session_store
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env_var("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let Some(config) = config else {
+        return Err("no Claude config directory resolves".to_string());
+    };
+    let projects = config.join("projects");
+    let transcript = format!("{session_id}.jsonl");
+    let found = std::fs::read_dir(&projects).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|e| e.path().join(&transcript).is_file())
+    });
+    if found {
+        Ok(())
+    } else {
+        Err(format!("no transcript {transcript} under {}", projects.display()))
     }
 }
 

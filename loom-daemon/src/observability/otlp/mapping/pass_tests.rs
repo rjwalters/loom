@@ -7,11 +7,11 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, SeverityNumber};
 
 use super::super::log_record_for;
-use crate::eta::Provenance;
 use crate::telemetry::kinds::pass::{
     BlockerState, GithubSpend, PassMode, PassOutcome, PassSummaryRecord, PassVerdictRecord,
     PASS_LOG_ATTRIBUTE_KEYS,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 const QUERIES: &str = include_str!("../../../../../defaults/observability/signoz/pass-queries.sql");

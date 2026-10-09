@@ -408,7 +408,7 @@ pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
     let mechanism = if supervisor.eq_ignore_ascii_case("launchd") {
         "launchd KeepAlive.SuccessfulExit"
     } else if supervisor.eq_ignore_ascii_case("systemd") {
-        "systemd Restart=on-success"
+        "systemd Restart=always"
     } else {
         "the supervisor's own relaunch-on-success policy"
     };

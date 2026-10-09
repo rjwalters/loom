@@ -28,6 +28,11 @@
 //! [`run_explanation`] rebuilds the whole simulation from an explanation's
 //! fields alone, which is what makes an estimate recomputable offline.
 //!
+//! The per-stage forecast (#10929, [`Simulation::stage_predictions`]) is read
+//! off the same paths: each stage's first entry and total dwell over the
+//! paths that visit it, and its share of the p40–p60 band. It consumes no
+//! uniform, so every quantile and mark is unchanged.
+//!
 //! # Stalls and the residual-life tail (#10210)
 //!
 //! An applied stall (`explanation.stalled.applied`) adds its deterministic
@@ -42,9 +47,11 @@
 //! [`super::explanation::RESIDUAL_LIFE_U_CAP`] — one uniform, as before.
 
 use super::explanation::{
-    Contributions, Explanation, StageMark, CONDITIONING_RESIDUAL_LIFE, RESIDUAL_LIFE_U_CAP,
+    Contributions, Explanation, ReplayEngine, StageMark, CONDITIONING_RESIDUAL_LIFE,
+    RESIDUAL_LIFE_U_CAP,
 };
 use super::grid;
+use super::stage_forecast::{apportion, StagePrediction, StagePredictions};
 use super::{round3, Stage, STAGE_COUNT};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
@@ -131,6 +138,9 @@ pub struct Simulation {
     pub expected_rework_rounds: f64,
     /// What dominates the result.
     pub contributions: Contributions,
+    /// Per-stage forecast (#10929): entry and dwell p50/p90 over the paths
+    /// that visit each stage, reach, and the stage's share of the p50.
+    pub stage_predictions: StagePredictions,
 }
 
 impl Simulation {
@@ -377,6 +387,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     totals.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     let (p25, p50, p75) = nearest_rank3(&totals);
     let quantiles = (p25, p50, p75, nearest_rank(&totals, 90));
+    let stage_predictions =
+        stage_predictions(&entries, &per_stage, &totals, p50, spec.stall_offset_sec.max(0));
 
     // The stage every path ends on: the approving verdict when the path
     // stops there, else `merge_wait`. Its mark is the path completion time —
@@ -431,7 +443,59 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
         mean_visits,
         expected_rework_rounds,
         contributions,
+        stage_predictions,
     })
+}
+
+/// The per-stage forecast (#10929) over the paths' first entries (`entries`,
+/// any order), per-path stage times and the sorted totals. Read-only over
+/// the draws already made.
+fn stage_predictions(
+    entries: &[Vec<(f64, usize)>; STAGE_COUNT],
+    per_stage: &[[f64; STAGE_COUNT]],
+    totals: &[(f64, usize)],
+    p50: i64,
+    stall_offset_sec: i64,
+) -> StagePredictions {
+    let draws = totals.len().max(1) as f64;
+    let (mid, mid_total) = band_means(totals, per_stage, 0.4, 0.6);
+    let visited: Vec<Stage> = Stage::EVERY
+        .into_iter()
+        .filter(|s| !entries[s.index()].is_empty())
+        .collect();
+    // The stages' part of the p50, less an applied stall's own share.
+    let stall_share = if mid_total > 0.0 {
+        (stall_offset_sec as f64 / mid_total * p50 as f64).round() as i64
+    } else {
+        0
+    };
+    let weights: Vec<(Stage, f64)> = visited.iter().map(|s| (*s, mid[s.index()])).collect();
+    let alloc = apportion(&weights, (p50 - stall_share).max(0));
+    visited
+        .into_iter()
+        .map(|stage| {
+            let i = stage.index();
+            let mut entry = entries[i].clone();
+            entry.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut dwell: Vec<(f64, usize)> = entries[i]
+                .iter()
+                .map(|&(_, path)| (per_stage[path][i], path))
+                .collect();
+            dwell.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let reach = (entries[i].len() as f64 / draws * 100.0).round();
+            (
+                stage,
+                StagePrediction {
+                    entry_p50: nearest_rank(&entry, 50),
+                    entry_p90: nearest_rank(&entry, 90),
+                    dwell_p50: nearest_rank(&dwell, 50),
+                    dwell_p90: nearest_rank(&dwell, 90),
+                    alloc: alloc.get(&stage).copied().unwrap_or(0),
+                    reach_pct: reach.clamp(0.0, 100.0) as u8,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples, by
@@ -595,32 +659,42 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 ///
 /// A twin-otter explanation (#10243) has no stage grids: it recomputes
 /// through its own `twin_otter` record (the adapted input, the config and
-/// the model slice) with the seed in `combination`. A calibrated one
-/// (`land-2026-10-06-quick-tern`, #10524) then applies its recorded shift
-/// like any other.
+/// the model slice) with the seed in `combination`. A calibrated one (an
+/// IPCW-wrapped base, #10524, such as the retired
+/// `land-2026-10-06-quick-tern`) then applies its recorded shift like any
+/// other.
 ///
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.
+///
+/// A `little-v0` answer recomputes from its `queue` record (#10930). An
+/// explanation the size cap marked `replayable: false` answers `None`: the
+/// cap dropped a field this reads, and a fallback to another engine would
+/// be a different number.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    if explanation.replay_lost() {
+        return None;
+    }
     // A dependency composition (#10510) recomputes from its node records,
     // a held-heron answer (#10523) from its simulator record. Either may
     // then carry a calibration shift (an IPCW-wrapped base, #10524), applied
-    // below like any other base's.
-    let simulated = if let Some(record) = explanation
-        .dependencies
-        .as_ref()
-        .filter(|d| !d.nodes.is_empty())
-    {
-        super::dependency::recompute(record)?
-    } else if let Some(record) = &explanation.held_heron {
-        super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles)?
-    } else {
-        match &explanation.twin_otter {
-            Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
-            None => {
-                let spec = spec_from_explanation(explanation)?;
-                run(&spec).ok().map(|s| s.quantiles)?
-            }
+    // below like any other base's. `Explanation::replay_engine` mirrors this
+    // dispatch.
+    let simulated = match explanation.replay_engine() {
+        ReplayEngine::Dependency => {
+            super::dependency::recompute(explanation.dependencies.as_ref()?)?
+        }
+        ReplayEngine::HeldHeron => {
+            super::hazard_sim::solve(explanation.held_heron.as_ref()?, explanation.as_of)
+                .map(|s| s.quantiles)?
+        }
+        ReplayEngine::Queue => super::heuristics::recompute_little_v0(explanation.queue.as_ref()?)?,
+        ReplayEngine::TwinOtter => {
+            super::heuristics::recompute_twin_otter(explanation, explanation.twin_otter.as_ref()?)?
+        }
+        ReplayEngine::Path => {
+            let spec = spec_from_explanation(explanation)?;
+            run(&spec).ok().map(|s| s.quantiles)?
         }
     };
     let served = match (&explanation.recalibration, &explanation.calibration) {
@@ -645,4 +719,14 @@ pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)
 pub fn run_marks(explanation: &Explanation) -> Option<Vec<StageMark>> {
     let spec = spec_from_explanation(explanation)?;
     run(&spec).ok().map(|s| s.stage_marks(explanation.as_of))
+}
+
+/// Recompute an explanation's per-stage forecast (#10929) from the same
+/// fields [`run_marks`] reads, and nothing else: the point-in-time replay.
+/// `None` when the explanation carries no simulated estimate or was
+/// truncated.
+#[must_use]
+pub fn run_predictions(explanation: &Explanation) -> Option<StagePredictions> {
+    let spec = spec_from_explanation(explanation)?;
+    run(&spec).ok().map(|s| s.stage_predictions)
 }

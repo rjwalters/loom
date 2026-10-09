@@ -12,8 +12,8 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 use super::payload::{
-    apply, materialize_payload, materialize_with, resync_gate, resync_workspace_with, Payload,
-    ResyncOutcome, ResyncRefusal, Stamp,
+    apply, gate_metadata, materialize_payload, materialize_with, resync_gate,
+    resync_workspace_with, Payload, ResyncOutcome, ResyncRefusal, Stamp,
 };
 use super::{install_payload_files, InitReport};
 use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, INSTALL_METADATA_PATH};
@@ -459,8 +459,8 @@ fn loom_source_repo_is_refused_and_nothing_is_written() {
     assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
 }
 
-/// A payload packed from a dirty checkout is not a release (#10878 review):
-/// `LOOM_DAEMON_GIT_DIRTY` other than `clean` clears `Stamp::release_build`.
+/// A payload that is not an official release's is never applied (#10878
+/// review, #10718): `Stamp::release_build` is false for it.
 #[test]
 fn dirty_build_payload_is_refused_and_nothing_is_written() {
     let tmp = TempDir::new().unwrap();
@@ -482,11 +482,14 @@ fn dirty_build_payload_is_refused_and_nothing_is_written() {
     assert_eq!(touched(&ws, &before, &snapshot(&ws)), Vec::<String>::new());
 }
 
-/// This binary's own stamp follows the build's tree state, and nothing else.
+/// This binary's own stamp follows the release-provenance check, and nothing
+/// else. A clean tree is not enough: the build under test is clean in CI and
+/// is still no release.
 #[test]
-fn this_binary_is_a_release_build_only_when_built_clean() {
+fn this_binary_is_a_release_build_only_when_release_provenance_is_verified() {
     let stamp = Stamp::this_binary().unwrap();
-    assert_eq!(stamp.release_build, crate::self_update::BUILT_TREE_STATE == "clean");
+    assert_eq!(stamp.release_build, crate::release_provenance::is_verified());
+    assert!(!stamp.release_build, "a test build is never an official release build");
 }
 
 /// A recorded version that cannot be ordered might be newer than the daemon
@@ -591,6 +594,92 @@ fn interrupted_before_the_stamp_is_not_an_empty_diff() {
     assert!(meta.get("resync_pending").is_none());
     // Converged: the next one is a true no-op.
     assert_eq!(resync_workspace_with(&payload, &ws).unwrap(), ResyncOutcome::Unchanged);
+}
+
+/// #10718: `loom_version` is stamped last, so a tree a NEWER daemon was
+/// part-way through still reads as the old release. Without the marker's
+/// version an older daemon would "complete" that run from its own payload and
+/// roll the newer files back.
+#[test]
+fn an_interrupted_resync_by_a_newer_daemon_is_refused_and_nothing_is_written() {
+    let tmp = TempDir::new().unwrap();
+    let defaults = fake_defaults(tmp.path());
+    let ws = installed_workspace(tmp.path(), &defaults, "0.19.870");
+    // 0.19.881 got as far as one file before it died.
+    write(&ws.join(".loom/roles/builder.md"), "builder, as of 0.19.881\n");
+    let mut meta = meta_json(&ws);
+    meta["resync_pending"] = "0.19.881".into();
+    write(&ws.join(META), &serde_json::to_string_pretty(&meta).unwrap());
+
+    let before = freeze(&ws);
+    let older = Payload::from_defaults(defaults.clone(), stamp("0.19.880"));
+    assert_eq!(
+        resync_workspace_with(&older, &ws).unwrap(),
+        ResyncOutcome::Refused(ResyncRefusal::PendingAheadOfDaemon {
+            pending: v("0.19.881"),
+            running: v("0.19.880"),
+        })
+    );
+    // `apply` checks for itself, whatever the caller did.
+    let diff = materialize_with(&older, &ws).unwrap();
+    assert!(matches!(
+        apply(&ws, &diff).unwrap(),
+        ResyncOutcome::Refused(ResyncRefusal::PendingAheadOfDaemon { .. })
+    ));
+    assert!(touched(&ws, &before, &snapshot(&ws)).is_empty());
+    assert_eq!(
+        fs::read_to_string(ws.join(".loom/roles/builder.md")).unwrap(),
+        "builder, as of 0.19.881\n"
+    );
+
+    // The daemon that started it, or a newer one, completes it.
+    let same = Payload::from_defaults(defaults, stamp("0.19.881"));
+    assert!(matches!(
+        resync_workspace_with(&same, &ws).unwrap(),
+        ResyncOutcome::Applied { .. }
+    ));
+    assert!(meta_json(&ws).get("resync_pending").is_none());
+}
+
+#[test]
+fn the_pending_marker_is_gated_like_a_version() {
+    let daemon = DaemonCompat {
+        running: v("0.19.880"),
+        supports_installed: v("0.19.0"),
+        floor: None,
+    };
+    let meta = |pending: &str| {
+        format!(
+            r#"{{"loom_version":"0.19.870","requires_daemon":"0.19.772","resync_pending":{pending}}}"#
+        )
+    };
+    assert_eq!(gate_metadata(&meta(r#""0.19.880""#), &daemon), Ok(Compat::Compatible));
+    assert_eq!(gate_metadata(&meta(r#""0.19.800""#), &daemon), Ok(Compat::Compatible));
+    assert_eq!(gate_metadata(&meta("null"), &daemon), Ok(Compat::Compatible));
+    let ahead = gate_metadata(&meta(r#""0.19.881""#), &daemon).unwrap_err();
+    assert!(ahead.repo_ahead_of_daemon(), "{ahead}");
+    // A marker that cannot be ordered may be newer: refuse.
+    for unordered in [r#""0.20.0-rc1""#, r#""""#, "true", "7"] {
+        assert!(
+            matches!(
+                gate_metadata(&meta(unordered), &daemon),
+                Err(ResyncRefusal::UnrecognizedVersion {
+                    field: "resync_pending",
+                    ..
+                })
+            ),
+            "{unordered}"
+        );
+    }
+    // The existing refusals still come first.
+    assert!(matches!(
+        gate_metadata("[]", &daemon),
+        Err(ResyncRefusal::UnreadableMetadata(_))
+    ));
+    assert!(matches!(
+        gate_metadata(r#"{"loom_version":"0.19.900","resync_pending":"0.19.901"}"#, &daemon),
+        Err(ResyncRefusal::RepoAheadOfDaemon { .. })
+    ));
 }
 
 #[test]
@@ -789,9 +878,27 @@ fn payload_surface_covers_everything_the_installer_writes() {
     assert!(diff.changed.is_empty() && diff.removed.is_empty(), "{diff:?}");
     let missed: Vec<&String> = written.iter().filter(|p| !diff.added.contains(p)).collect();
     assert!(missed.is_empty(), "installer writes outside the resync surface: {missed:?}");
-    // The only extra surface is the slash commands `init` copies with `.claude/`.
-    assert!(diff
+    // Beyond that step: the slash commands `init` copies with `.claude/`, and
+    // the two extra surfaces a resync backfills (#10895). The surfaces it only
+    // refreshes when present are not created in a repo that lacks them.
+    let extra: Vec<&String> = diff
         .added
         .iter()
-        .all(|p| written.contains(p) || p.starts_with(".claude/commands/loom/")));
+        .filter(|p| !written.contains(p) && !p.starts_with(".claude/commands/loom/"))
+        .collect();
+    assert!(
+        extra
+            .iter()
+            .all(|p| p.starts_with(".agents/skills/loom-") || *p == ".claude/biome.jsonc"),
+        "{extra:?}"
+    );
+    assert!(extra.len() > 10, "the real payload backfills its generated skills: {extra:?}");
+    for absent in [
+        ".gitignore",
+        ".loom/CLAUDE.md",
+        ".loom/AGENTS.md",
+        ".claude/README.md",
+    ] {
+        assert!(!diff.added.iter().any(|p| p == absent), "{absent} must not be created");
+    }
 }

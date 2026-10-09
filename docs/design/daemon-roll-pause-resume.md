@@ -121,6 +121,22 @@ event, plus a post-tool-use ledger:
    stop while a pause request is active. Its background children are about to
    be stopped with the tree anyway.
 
+**Where the Claude wiring lives (#11049).** A consumer repo's
+`.claude/settings.json` belongs to the consumer. Only `install.sh` adds hook
+entries to it, and the daemon's workspace resync never edits it. So a repo
+installed before #10830 has `.loom/hooks/roll-pause.sh` but no entry that runs
+it. The first fleet roll showed the result: every consumer-repo sweep missed
+its safe point, and the one Loom-repo sweep parked. The launch therefore
+carries the wiring. `loom-daemon agent-resume claude-args` (called by
+`spawn-claude.sh` for every pinned or resumed session) appends
+`--settings <json>` with match-all `PreToolUse`, `PostToolUse` and
+`PostToolUseFailure` entries for the workspace's installed `roll-pause.sh`.
+It does this only for a daemon item, and only when the launch directory's own
+settings do not already run the hook. Claude Code merges these hooks with the
+project's and the user's. Codex needs none of this: its managed `hooks.json`
+is Loom-written at spawn and runs `guard-codex-bridge.sh`, which runs the
+pause hook first.
+
 On resume, the relaunch prompt tells the agent that it was paused for a roll
 (`from → to`), that its last tool call (named in the record) **did not run**,
 and that it should re-run that call if it is still needed and then continue.
@@ -177,9 +193,9 @@ rule (§2) and the requeue rules (§9).
 | **Role run** (`role_runner`: Champion, Curator, Judge, Auditor, Guide, Doctor) | Same as a sweep. New ticks are already skipped while the drain flag is set (`role_runner.rs:3245-3255`). | `role`, `root`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle`, `safe_point`, `timeout_remaining_secs`, `claim` (from the role's claim breadcrumb, if any), `holds_issue_creation_mutex`, `log_path`, `stopped_at` | Relaunch from the session id in `root`, as for a sweep. Seed the role runner's `InProgressGuard` with `(root, role)` so no duplicate run starts. The new run's timeout is `timeout_remaining_secs`: the roll does not count against the run's budget. If the run held the issue-creation mutex, seed the mutex as held by the resumed run (#3707). Role runs have no registry entry today (`ipc.rs:152-154`); this is the first place they are counted across a restart. | The session store is reachable, and the role is still enabled for `root` in the new config. | As for a sweep. A requeued role run releases the claim named in its breadcrumb (§9). With no breadcrumb, the role's own staleness rule (for example `LOOM_STALE_TREATING_MINUTES`) releases it. In both cases the next scheduled tick redoes the work. |
 | **Epic supervisor** | Not an agent. It stops ticking (drain flag, `epic_supervisor.rs:476-480`). | Nothing of its own. Its issue-creation mutex holder is a role run (row above). | Re-derive every epic from the forge (monotone derived state, `epic_supervisor.rs:43-50`). | n/a | n/a. If the mutex holder was requeued, the mutex is free and the next tick's derivation recovers. The machine-wide filing lock (`filing_lock.rs`) is file-based and survives the restart. |
 | **Worktree** (`.loom/worktrees/issue-N`) | None. It is on-disk state and is never paused or touched by the roll. | `path`, `branch`, `head`, `dirty`, carried on the owning item | Reused by the resumed agent. Until H5 completes, the worktree reaper and the orphan-process reaper must treat every worktree named in a live manifest as **owned** (`orphan_process_reaper.rs` fail-safes). | None needed. Git state does not depend on the binary version. | Never deleted by the roll. If its item was reset or requeued, it becomes ordinary stale state under the existing worktree reaper's rules. A later dispatch reuses it under `worktree.sh`'s existing rules. |
-| **Pending dispatch** (spawn in progress, `SweepState::Pending`) | Wait for it to become `Running` or fail (bounded by the existing startup-race window). It is then young, so it is reset. New IPC dispatches are refused while paused (`ipc.rs:706`, `ipc.rs:1913`). | As a sweep | n/a (reset) | n/a | `young-agent-reset` |
+| **Pending dispatch** (spawn in progress: the child is spawned and `finish_issue_dispatch` has not recorded its entry yet. Nothing constructs `SweepState::Pending`, so the count is `sweep_registry::roll_gate`'s, #10974) | Close dispatch, then wait for it to be recorded `Running` or fail (bounded by the existing startup-race window). It is then young, so it is reset. New IPC dispatches are refused while paused (`ipc.rs:706`, `ipc.rs:1913`). | As a sweep | n/a (reset) | n/a | `young-agent-reset` |
 | **In-session sweep / attended builder** (not daemon-owned) | None. It is not the daemon's work, and it has no `LOOM_DAEMON_ITEM_ID`, so the pause hook ignores it. | Not in the manifest. | Nothing to do. Two caveats: during the window, IPC-backed `loom-daemon` CLI calls fail and callers must retry. After the roll, the CLI on `PATH` is the new version. | CLI flag and IPC compatibility. That is the existing release contract, not this design. | None. |
-| **Auto-update state** (settle ceiling, window, stall) | Not work. | Persisted by #10713 in `auto_update_state.json`, not in this manifest. | Loaded by #10713. | #10713's typed load outcome. | n/a |
+| **Auto-update state** (settle ceiling, floor alert) | Not work. | Persisted by #10713 in `auto_update_state.json`, not in this manifest. | Loaded by #10713. | #10713's typed load outcome. | n/a |
 
 An agent that **exits by itself** during H4, before its safe point, is not
 paused. If it exited cleanly, its status is `completed`. Otherwise its status is
@@ -216,8 +232,11 @@ The contract:
    stopped.
 2. **Every paused, reset or requeued item loses its whole tree at H4**, and the
    old binary owns that teardown. Nothing from an agent's tree may outlive H4.
-   On systemd it is `systemctl --user stop <scope_unit>`, which kills the whole
-   cgroup, including `setsid` descendants. On launchd it is the orphan reaper's
+   On systemd it is a stop of `<scope_unit>`, which kills the whole cgroup,
+   including `setsid` descendants. The stop is queued with `--no-block` and
+   the cgroup is sent `SIGKILL` after a 5 s grace, so H4 never waits on
+   systemd's stop job (#11051). H4 runs the teardowns in parallel (8 at once)
+   and ends its stop phase at the pause budget plus a 15 s margin. On launchd it is the orphan reaper's
    freeze-first tree kill over the worktree-attributed and pgid-attributed
    seeds. A pgid-only `kill(-pgid)` is not enough
    (`orphan_process_reaper.rs:16-35`). For session-exec items it is the `.cancel`
@@ -304,6 +323,8 @@ audit.
         "resume_of": null                    // previous item id when this run was itself a resume
       },
       "safe_point": null,                    // {reached_at, parked_tool, parked_summary}
+      "safe_point_miss": null,               // #11049, set with pause-budget-missed:
+                                             //   {cause: no-hook | no-tool-call | hook-refused, detail}
       "checkpoint_phase": "builder",
       "worktree": { "path": "…/issue-10714", "branch": "feature/issue-10714",
                     "head": "abc123…", "dirty": true },
@@ -594,7 +615,7 @@ Reasons are a closed set:
 | Reason | Meaning |
 |---|---|
 | `young-agent-reset` | the agent had run less than `minResumableAgeSecs` at H4 (§2), so it was killed and reset |
-| `pause-budget-missed` | the agent had not reached a safe point when `pauseBudgetSecs` ran out (or its pid died before one) |
+| `pause-budget-missed` | the agent had not reached a safe point when `pauseBudgetSecs` ran out (or its pid died before one). `safe_point_miss.cause` says why (#11049): `no-hook` (the hook never ran for the item), `no-tool-call` (it ran, but no call started in the window), `hook-refused` (it ran in the window but recorded no safe point) |
 | `session-not-resumable` | no session id was captured for the agent, or its runtime has no resume support |
 | `session-store-unavailable` | at H5 the session store (`~/.claude/projects/…`, or the account's `CODEX_HOME`) or the pinned account could not be used |
 | `session-resume-failed` | the relaunch with the saved session id failed to start the session |
@@ -804,3 +825,94 @@ ordinary restarts (§4).
    runs pause at a safe point and resume from their session, with the guard,
    the remaining timeout and the issue-creation mutex seeded. They are subject
    to the 5-minute rule and the requeue rules.
+
+## 13. When a roll starts: the floor drives, no roll windows (#10885)
+
+Operator ruling, 2026-10-08. With H3→H4→H5 in place a roll is a short pause, a
+restart and a resume. The roll window (#9132) existed because drain-based
+rolls were expensive, so it is removed, along with its per-host offset. This
+section records what replaced it. It does not change the roll machine above.
+
+**Every fleet host has a floor.** `loom_min_version` is a required field of
+the fleet store. On startup and on every tick the daemon compares it with the
+version it is running and acts on that tick, through `trigger_pause_roll`.
+This holds on **every fleet host, whatever `autonomous.autoUpdate.enabled`
+says** (operator ruling 2026-10-08, #10954).
+
+| Floor knowledge | Running vs floor | Behaviour |
+|---|---|---|
+| no fleet store (not a fleet host), `autoUpdate.enabled=false` | n/a | No loop, no roll, as before. |
+| no fleet store (not a fleet host), `autoUpdate.enabled=true` | n/a | Opt-in autoUpdate, unchanged apart from the window: artifact path and source path behind the settle gate and its `6 × settleSecs` ceiling. `target_source = autoupdate`. |
+| unknown | n/a | No roll for the floor. The tick's note says the floor is not known and why. Fail closed: a host that may have a floor must not chase the latest release. A workspace that needs a newer daemon (`repo_ahead`, below) still rolls the host, to a real published release. |
+| set | below; the newest release is at or above the floor | Floor roll on this tick. No settle. The target is the newest release at or above the floor, at its exact tag. |
+| set | below; the newest release is below the floor | The `FloorStallReport` ERROR alert; dispatch continues. The host does not roll to the newest release instead. |
+| set | below; no release resolved this tick | No roll; the next tick asks again. The source-rebuild path is not used. |
+| set | at or above | No roll, whatever newer release, re-published same-version artifact or newer source HEAD exists. Nothing is tracked, so no settle clock accumulates. |
+| set, but a version does not parse | n/a | No version roll, one WARN. Not reachable with a release build. |
+
+Consequences:
+
+- **A fleet host moves only when the floor moves**, or on the two triggers
+  that are independent of this table and act in every row: a repo ahead of
+  this daemon (`repo_ahead`, #10719) and a restart-only config change
+  (`config_restart`, #10720). Neither has a producer in this change.
+- **Settle, the settle ceiling (#10418), chase-latest and automatic source
+  rebuilds do not exist for a fleet host.** They remain only for a host with
+  no fleet store.
+- **"Unknown" is three-valued on purpose.** Before #10885 "no store", "a
+  store with no floor" and "no pass has completed yet" all read as "no floor",
+  which then meant "chase latest". They are now `NoStore`, `Unknown` and
+  `Unknown`. A store without the field, a startup pass that hit its cap with
+  no earlier snapshot, and a store that could not be started are all
+  `Unknown`. Before the first pass of a new process completes, the floor the
+  previous process recorded counts as set.
+- **The floor is a lower bound, not a pin.** A host below it installs the
+  newest release at or above it. A release counts only once it publishes this
+  platform's binary and checksum; a tag with no assets is never a target.
+  The release a floor bump installs may therefore be minutes old, which is why
+  rollback (#9735, §8) follows the resume side.
+- **A floor change is acted on at once.** The fleet-sync pass that resolves a
+  floor different from the previous pass's wakes the self-update loop, so the
+  worst case is one `fleet.syncIntervalSecs`, not that plus
+  `autoUpdate.intervalSecs`. The wake fires on a change of value only: a floor
+  roll that keeps failing is paced by its backoff and by the failed-roll guard
+  in H3 (§8), not by the sync cadence.
+- **No jitter.** Hosts already tick at different phases, a roll is a short
+  pause, and the artifact fetch is a handful of hosts against the release CDN.
+  A floor bump rolls every host within about one sync interval, and that is
+  accepted. Two hosts that roll minutes apart across a new release can land on
+  different versions, both at or above the floor.
+- **Old settings and state.** `rollWindowSecs`, `rollWindowOffsetSecs`,
+  `launchdLiveReload` and their env vars are accepted and ignored with one
+  WARN at startup. `auto_update_state.json` stays at schema 1: an older
+  record's `window` object is ignored on load and dropped on the next write,
+  and a binary from before this change reads the new record (its `window`
+  defaults to absent), so a rollback keeps the settle clocks.
+- **The loop runs on every fleet host (#10954).** Before #10954 the loop,
+  and so the floor check, ran only when `autonomous.autoUpdate.enabled` was
+  true (default false), so a fleet host with it off never compared itself
+  with the floor. The spawn decision is now a pure function of the floor
+  knowledge at spawn and `enabled` (`auto_update::loop_mode`):
+
+  | Floor knowledge at spawn | `autoUpdate.enabled` | Loop | Mode (status) |
+  |---|---|---|---|
+  | `Set` or `Unknown` (a fleet host) | false | spawned | `fleet floor only (autoUpdate.enabled=false)` |
+  | `Set` or `Unknown` (a fleet host) | true | spawned | the same tick; `enabled` has no effect |
+  | `NoStore` | true | spawned | chase-latest, settle-gated |
+  | `NoStore` | false | not spawned | off |
+
+  `fleet_sync::start` is awaited before the loop is spawned, so the
+  classification is known. A store that is named but unusable is `Unknown`:
+  the loop runs and does nothing for the floor. It is still one loop and one
+  roll path; nothing else ticks. A workspace that needs a newer daemon
+  (`repo_ahead`) rolls a fleet host with autoUpdate off too. Should a loop
+  spawned for the floor alone see `NoStore` on a later tick, that tick checks
+  nothing rather than chase the newest release.
+- **No per-host opt-out.** Neither `autoUpdate.enabled=false` nor the fleet
+  store's `paused` run state keeps a fleet host from a floor roll. A
+  fleet-paused host below the floor still rolls: the roll replaces the pause's
+  hold with a supervised drain, restarts once nothing is in flight, and the
+  daemon comes back still paused (#10979). An operator stop on record
+  (written by `restart --drain --then-exit` or `fleet drain`) holds a roll,
+  and that tick is skipped; `restart --abort-drain` clears the record and
+  releases the hold. A `stopped` host exits at boot, before the loop exists.

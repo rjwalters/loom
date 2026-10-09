@@ -369,6 +369,10 @@ pub struct ShadowLedger {
     /// evicted first. A ledger written before it reads empty, so the primary
     /// test refuses until items accumulate.
     pub items: BTreeMap<String, BTreeMap<String, ItemSums>>,
+    /// Per comparison, the conditional answer counts of each UTC hour, newest
+    /// [`super::shadow_non_refusal::MAX_HOURS`] kept: the live non-refusal
+    /// check's evidence (#10949). A ledger written before it reads empty.
+    pub answer_hours: super::shadow_non_refusal::AnswerHours,
 }
 
 /// Most per-day folds kept per comparison; the oldest go first.
@@ -391,7 +395,7 @@ pub struct ItemSums {
 }
 
 /// `kind|current|candidate`, the map key for a [`PairKey`].
-fn encode(key: &PairKey) -> String {
+pub(super) fn encode(key: &PairKey) -> String {
     format!("{}|{}|{}", key.kind.as_str(), key.current, key.candidate)
 }
 
@@ -505,7 +509,7 @@ impl ShadowLedger {
     }
 
     /// The encoded key of `(kind, current, candidate)`, registered.
-    fn key_for(&mut self, kind: Kind, current: &str, candidate: &str) -> String {
+    pub(super) fn key_for(&mut self, kind: Kind, current: &str, candidate: &str) -> String {
         let key = PairKey {
             kind,
             current: current.to_string(),
@@ -562,6 +566,7 @@ impl ShadowLedger {
         self.pairs.remove(&encoded);
         self.days.remove(&encoded);
         self.items.remove(&encoded);
+        self.answer_hours.remove(&encoded);
         self.keys.remove(&encoded);
     }
 }
@@ -712,6 +717,14 @@ pub struct PromotionDecision {
     /// logged before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptation: Option<super::shadow_stats::AdaptationCheck>,
+    /// The live non-refusal check (#10949); `None` from [`evaluate`] alone
+    /// and in a record logged before it existed. `eta promote` always sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_refusal: Option<super::shadow_non_refusal::NonRefusal>,
+    /// Where the evidence behind this evaluation is published (an issue
+    /// comment, a write-up), as given to `eta promote --evidence` (#10949).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
     /// Gate 1.
     pub backtest: BacktestGate,
     /// Gate 2 — `NotReached` when gate 1 failed.
@@ -785,6 +798,8 @@ pub fn evaluate(
         candidate_tier,
         shortlist: None,
         adaptation: None,
+        non_refusal: None,
+        evidence: None,
         backtest,
         live,
         promote,

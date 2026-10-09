@@ -77,6 +77,8 @@ pub mod agent;
 pub mod buckets;
 #[path = "forge_call_stats_counters.rs"]
 pub mod counters;
+#[path = "forge_call_stats_ingest.rs"]
+pub mod ingest;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 #[path = "forge_call_stats_sink.rs"]

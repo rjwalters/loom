@@ -142,13 +142,14 @@ use super::config::FleetSignozConfig;
 use super::fleet::FleetSnapshot;
 use super::fleet_fetch::{history, timeline_url, ListedPr, PER_PAGE};
 use super::fleet_refresh::{self, Pass, RepoReport, StopReason, Walk};
-use super::fleet_signoz_refresh::{ClickhouseHttp, Limits, SignozRead};
+use super::fleet_signoz_refresh::Limits;
 use super::fleet_signoz_timeline::{Family, ItemTimeline, Timeline};
 use super::fleet_signoz_timeline_rows::{walk, Lifecycle, Target, TimelineHttp, Transition};
 use super::star::{is_star_label, IssueStarChange};
 use crate::forge_call_stats::ops::TIMELINE_READ;
 use crate::pr_latency::timeline::parse_timeline_page;
 use crate::pr_latency::{PrEvent, PrHistory, PrState, CHANGES_REQUESTED};
+use crate::signoz_read::{ClickhouseHttp, SignozRead};
 
 /// How far before the history window the SigNoz walk starts, so
 /// [`super::fleet_signoz_timeline::Coverage::covers`] can see a row at or

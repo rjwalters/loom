@@ -1,0 +1,17 @@
+estimate 4e0ca2e1084015ed land-v1 land rjwalters/loom#9289 as_of 2026-09-20T12:00:00+00:00
+engine   path
+recorded p25/p50/p75/p90 943s / 2004s / 3552s / 4879s
+replayed p25/p50/p75/p90 943s / 2004s / 3552s / 4879s  parity: exact
+
+stages (stage_predictions):
+  review_wait      entry_p50        0s  dwell_p50     1182s  share  0.692  reach 100%
+  doctor           entry_p50      695s  dwell_p50     1371s  share  0.167  reach  46%
+  merge_wait       entry_p50     1743s  dwell_p50      172s  share  0.141  reach 100%
+
+inputs (one at a time, ranked by |Δp50|):
+  input                                               value    perturbed       Δp50       Δp90
+  current_stage.rework_rounds                             0            1      -728s     -1463s
+  branches.changes_requested.p_by_attempt.0            0.45         0.55      +378s      +318s
+  path.include_merge                                      1            0      -253s      -238s
+  current_stage.age_sec                                   0           60       -60s       -60s
+  branches.changes_requested.p_by_attempt.1           0.222        0.322       +36s      +397s

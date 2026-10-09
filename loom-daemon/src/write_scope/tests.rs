@@ -418,6 +418,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        ("fleet_sync/workspace_resync/host.rs", Gated),
+        (
+            "fleet_store/resync_claim.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         ("star_liveness/task.rs", Gated),
         (
@@ -443,6 +451,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/roll_requeue.rs",
+            Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
+        ),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
@@ -513,6 +525,13 @@ fn daemon_write_paths_are_scoped() {
         ("cli/forge_action.rs", Gated),
         ("cli/forge_verdict_cmd.rs", ShellVetted("post-verdict.sh")),
         ("role_runner/launch.rs", Gated),
+        // #10832: gives back the claim label a role run a roll could not
+        // resume had taken; `release_claim` gates on the root itself.
+        ("role_runner/roll_resume.rs", Gated),
+        (
+            "roll_pause/claim_breadcrumb.rs",
+            NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
+        ),
         ("operator_decision/cli.rs", Gated),
         ("forge_priority_labels.rs", Gated),
         (
@@ -599,6 +618,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
+        (
+            "observability/otlp/relay/server.rs",
+            NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let writes = regex::Regex::new(

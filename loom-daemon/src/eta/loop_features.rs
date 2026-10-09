@@ -108,6 +108,19 @@ pub struct FileSnapshot {
     /// `true`: only complete lists were logged before the field existed.
     #[serde(default = "complete_default")]
     pub complete: bool,
+    /// Lines added across the PR at that head, summed from the per-file
+    /// entries of the same page (no extra forge call). `None` when unknown:
+    /// an older line, an incomplete page, or an entry without the stat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u32>,
+    /// Lines deleted; same provenance and `None` rule as `additions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u32>,
+    /// How many file entries the page listed. Known even when `complete` is
+    /// `false`, so a PR of `MAX_LISTED_FILES` or more reads as huge, never as
+    /// unknown-and-small. `None` on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed: Option<u32>,
 }
 
 const fn complete_default() -> bool {

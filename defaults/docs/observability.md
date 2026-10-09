@@ -17,6 +17,7 @@
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
+- [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -85,7 +86,7 @@ Precedence is **env > config > default**, the same rule every other
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | `"https"` (or `"otlp"`, §3) |
-| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3) |
+| `exporters` | — (config only) | unset ⇒ `exporter` / `"https"` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
@@ -177,6 +178,25 @@ still omit the optional feature. Export remains disabled until explicitly enable
 See [execution traces](tracing.md) for persisted trace identity, correlated logs,
 completed-span export, and bounded shutdown.
 
+Every OTLP request, on all three signals (traces, logs, metrics), carries one
+resource per emitting host with exactly these attributes:
+
+| Resource attribute | Value |
+|---|---|
+| `service.name` | the literal `loom-daemon` |
+| `service.instance.id` | the envelope's `host_id` |
+| `host.id` | the envelope's `host_id` |
+| `host.name` | the envelope's `host_id` (#10977) |
+| `service.version` | the reporting daemon's version (a `host.health` record's `daemon_version`, else the exporting build's) |
+
+`host.name` has one source, the same string as `host.id`: the daemon's host
+identity, which is the operator-assigned `$LOOM_HOST_ID` when it is set and
+otherwise the OS hostname (`$HOSTNAME`, then the `hostname` binary). Set
+`$LOOM_HOST_ID` at provisioning time on any host whose OS hostname is not a name
+you chose (a cloud instance's is derived from its address). The daemon sets
+`host.name` itself, so a receiver reached without a collector gets it too; the
+bundled collector's resource allowlist forwards it unchanged.
+
 ### Multi-exporter fan-out (#8756)
 
 `observability.exporters` accepts a **list**, delivering the same envelopes to
@@ -221,6 +241,90 @@ Back-compat and upgrade rules:
   `misconfigured` status while the other exporters run; only when *no*
   exporter survives — or the shared ingest key is unusable — is export off
   entirely.
+
+### Extra request headers from an owner-only file (`headers_file`, #10961)
+
+An OTLP receiver behind an identity-aware proxy needs request headers the
+exporter's one `Authorization: Bearer <ingest key>` cannot express — a client
+id and client secret pair, for example. An `otlp` entry can name a file of
+such headers, so the daemon reaches that receiver directly instead of through
+a local collector whose only job is to add them:
+
+```json
+{
+  "observability": {
+    "enabled": true,
+    "exporters": [
+      { "kind": "otlp", "endpoint": "https://otlp.example.com",
+        "headers_file": "/path/to/otlp-headers" }
+    ]
+  }
+}
+```
+
+(`otlp.example.com` is a placeholder — the daemon refuses reserved
+documentation domains, so substitute your receiver.) `headersFile` is accepted
+as an alias. The headers are sent on all three signals (`/v1/traces`,
+`/v1/logs`, `/v1/metrics`).
+
+The file holds one `Name: value` per line:
+
+```text
+# identity-aware proxy credentials
+X-Client-Id: <client id>
+X-Client-Secret: <client secret>
+```
+
+- Blank lines, and lines whose first non-blank character is `#`, are ignored.
+  There are **no inline comments**: `#` is legal in a header value, so
+  everything after the first `:` is the value (surrounding spaces and tabs
+  trimmed).
+- The name is everything before the first `:` and must match the HTTP token
+  grammar — letters, digits and ``!#$%&'*+-.^_`|~``, with no space before the
+  colon. The value must be non-empty visible ASCII; interior spaces and tabs
+  are allowed.
+- A name may appear once (case-insensitively). `Host`, `Content-Type`,
+  `Content-Length`, `Transfer-Encoding` and `Connection` belong to the
+  exporter and are refused. A file with no headers at all is refused, and so
+  is one over 64 KiB.
+- **`Authorization` in the file replaces the default Bearer header** — the
+  ingest key is then not sent to this sink at all. Without it, the Bearer
+  header is sent exactly as before, alongside the file's headers.
+  `observability.ingestKeyFile` must still resolve to a readable key either
+  way: it is shared by every exporter and checked before any sink starts.
+
+What gets the entry refused — it degrades to its own `misconfigured` status,
+like any other per-entry policy failure, and other exporters keep running:
+
+- **The file is group- or world-accessible.** It must be a regular file with
+  no group or other permission bits: `chmod 600` it. Checked on Unix, on the
+  opened file, before a byte is parsed.
+- **A malformed line**, or a header name outside the token grammar. The
+  detail names the file and the 1-based line number and a fixed reason —
+  never any text from the file.
+- **A cleartext endpoint.** An entry with `headers_file` must use `https`,
+  unless the endpoint is loopback. This is stricter than the rule for entries
+  without it (which may use plain `http` to a collector on a private
+  network, as in the fan-out example above) and applies only when
+  `headers_file` is set.
+- **`headers_file` on a non-`otlp` entry**, or a value that is not a
+  non-empty string. The native HTTPS exporter does not take extra headers.
+
+Header **values never leave the request**: they are not written to any log
+line, error, `loom-daemon status` field or exported record, and the type that
+holds them has a redacting `Debug`. The path, the header count and whether the
+file sets `Authorization` are logged once when the exporter starts.
+
+The file is read each time the exporter is built — at daemon start, and when
+the attended live-output tailer builds its own — so **rotating a credential is
+a file write plus a daemon restart**, with no config change and no rebuild.
+It is not watched: a running exporter keeps the headers it started with.
+
+`headers_file` belongs to an `observability.exporters` entry, so it has no
+env override, and `$LOOM_OBSERVABILITY_EXPORTER` — which replaces the whole
+list with a single bare kind — drops it along with any per-entry `endpoint`.
+`loom-daemon telemetry-export` (the one-shot fixture replay) does not read
+it.
 
 
 See [OTLP transport and artifact verification](otlp-transport.md) for response
@@ -432,6 +536,31 @@ Import it with `POST /api/v1/rules` or paste its query into a new ClickHouse
 alert. The rule's shape has not yet been tested against a live SigNoz. Standing queries are in
 `defaults/observability/signoz/queue-dwell.sql`.
 
+**Fleet singleton outputs (#10916).** A one-host fleet job can stop producing
+while every host looks healthy (2026-10-07: 28 of ~30 repos had no
+`eta.estimate` for ~31 h). `defaults/observability/signoz/alerts/fleet-singleton-output.json`
+is the cross-host detector: over the logs table it takes the newest record per
+`loom.kind` (and per `loom.repo` for per-repo rows) and fires when one is older
+than its row's deadline in `fleet_outputs::SINGLETON_OUTPUTS` (2 x cadence, or
+the row's override). It checks the output, never the owning host, and a kind
+with no record in the 72 h window fires. A per-repo output (`eta.fleet_refresh`)
+is expected for every repo the fleet is working on, read from an independent
+roster: any repo with a `pass.summary`, `role_tick.outcome` or `sweep.started`
+record in the window (emitted by the host that works the repo, never by a
+fleet singleton). A roster repo with no output in the window fires, so a repo
+the producing host does not cover, or an outage older than the window, stays
+visible while that activity continues. The roster is activity, not
+configuration: a repo with none of those records in the window (no work finder
+or role runner serving it, or none exporting OTLP) is not expected. An
+`eta.estimate` repo is judged only while it owes estimates: an item stops
+owing once a `land` `eta.outcome` closes it or its newest estimate is a
+refusal. That row is not roster-expanded (owing needs the forge's open items,
+which SigNoz does not hold), so an estimate outage older than the window is
+left to the in-daemon path. `signoz_fleet_singleton_output_alert.rs` asserts
+each embedded deadline equals the registry's. Captain-gauge rows (a
+fleet-store heartbeat, not a log kind) and the Warning `ci.run` row are not in
+this critical rule. The in-daemon `fleet_alert` path is #10924.
+
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)
 and `loom.tokens.usage_fraction_weekly` (rolling 7-day, from the
@@ -569,7 +698,10 @@ window), never as a monotone series.
 labelled by caller, inventoried operation, identity role, credential bucket
 (`account`, `cred_owner`, `installation`, `resource`), `target_owner` and `outcome`; the free
 `rate_limit` probe appears under `resource="other"` and is never charged to a
-bucket. On a host
+bucket. Agent sessions' own `gh` calls join it (#10607): the daemon ingests
+the agent `gh` front's sink rows each tick, labelled `agent` = the role
+(`-` on the daemon's rows), served (`caller="agent_gh_front"`) or
+passthrough (`caller="agent.gh.<command>"`). On a host
 without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink. Each `invoke github` span carries the
 same facts per call (#10343): `github.http.{status,not_modified,requests,source}`
@@ -593,9 +725,11 @@ are surely charged (the band's high end), and `ok`+`error` bounds the
 attributed figure from above (an `error` may be a charged 4xx or a local
 failure that sent nothing); 304s and the free probe are excluded. The
 recipe is `defaults/observability/signoz/github-shadow.sql`
-(queries 1–3, with query 4 cross-checking against the spans); a large
-shadow on a bucket means spend from outside this fleet's daemons (agent `gh`
-calls, another host, an operator) or an uninstrumented caller. A negative
+(queries 1–3, with query 4 cross-checking against the spans, and query 5
+plus query 3's `agent_share` splitting out the agent slice, #10607); a large
+shadow on a bucket means spend from outside this fleet's daemons (an agent
+`gh` that bypassed the front, another host, an operator) or an
+uninstrumented caller. A negative
 shadow means the bucket's readings undercount it (sparse readings, or a
 pre-#10571 daemon's readings of another bucket), not that Loom over-spent.
 
@@ -702,7 +836,7 @@ under `Task liveness:` in `loom-daemon status`, and as `task_liveness` in
 silent: that means the sampler or the whole daemon stopped. The self-update
 loop also emits one `auto_update.tick` log per tick. It records the decision
 (`skip`, `defer`, `stale_repo`, `fetch`, `rebuild`, `drain_wait`,
-`roll_stall`, `panic`), the installed and target versions, the defer reason,
+`panic`), the installed and target versions, the defer reason,
 the drain state and the deciding build's version and revision. A host that
 stops converging now says why on every tick. See
 [`telemetry-schema.md` → `auto_update.tick`](telemetry-schema.md#auto_updatetick).
@@ -724,6 +858,16 @@ log their own phase breakdown, and `CancelSweep` / `DispatchSweep` (slow by
 design: the SIGTERM grace and the token-capture poll). See
 [`telemetry-schema.md`](telemetry-schema.md) for the labels.
 
+**Status builds (#10861).** Concurrent `DaemonStatus` requests for the same
+section set share one build, so the latency series above are per request: a
+request that joined a running build reports only the time it waited.
+`loom.daemon.ipc.status_builds{outcome}` counts the builds (`ok`, `panic`,
+`join_error`). `requests{kind=DaemonStatus}` divided by `status_builds` is the
+coalescing ratio; a ratio well above 1 means callers are retrying or polling
+faster than the build completes. A non-zero `panic` count means status
+callers received error frames; the cause is one ERROR line per build in
+`daemon.log`.
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in
@@ -736,7 +880,8 @@ cardinality:
 
 - **SigNoz (OTLP):** every work-finder tick emits `loom.queue.issues{state,reason}`
   gauges, one per queue disposition with zeros included, plus
-  `loom.queue.listing_failed_repos`. These use the labels already on the
+  `loom.queue.listing_failed_repos` and `loom.queue.listing_incomplete_repos`
+  (#11139, a partial listing). These use the labels already on the
   allowlist, so no gateway change is needed. They never carry an issue number
   or a repo.
 - **Fleet dashboard (native HTTPS):** the per-issue rows travel as the
@@ -757,6 +902,192 @@ running / ready / blocked counts with a freshness badge (`idle` = recent tick,
 empty queue; `stale` = no new tick for 15 minutes; `no queue data` = the host
 never sent one), and a fleet-wide work queue listing every issue
 with its host, phase, waiting time, blocking reason and issue / PR links.
+
+## 3d. Agent telemetry relay (Issue #10964)
+
+An agent CLI the daemon launches can export its own OTLP telemetry — model
+requests, tool calls, token and cost counters. Getting that to your store with
+a consistent identity and with secrets scrubbed used to need a separate
+collector on every machine. With the relay on, the daemon is that collector
+for the sessions **it** launches:
+
+```
+launched session ──OTLP/HTTP──▶ 127.0.0.1:<ephemeral port>   (in the daemon)
+   (token in its env)                │ token → the session the daemon launched
+                                     ▼
+                           bind identity · scrub secrets
+                                     ▼
+                           bounded queue (drop-oldest, counted)
+                                     ▼
+                           your configured `otlp` exporter ──▶ your endpoint
+```
+
+**Scope rule.** Only sessions launched by the daemon are wired. An interactive
+session you start yourself — in the same repository, on the same machine — is
+not touched and exports nothing through the daemon: the receiver's address and
+a token are written only into the environment of a child the daemon spawns,
+never into the daemon's own environment, a file, or a config another process
+could read. A machine with no daemon running has no receiver at all.
+
+**Off by default.** The receiver starts only when both hold:
+
+1. an `otlp` exporter is configured and actually started (§3) — the relay
+   never adds or starts an exporter, and has nothing to forward to without
+   one; and
+2. the relay's own switch is on:
+
+   ```json
+   { "observability": { "agentRelay": { "enabled": true } } }
+   ```
+
+   (`LOOM_OBSERVABILITY_AGENT_RELAY` overrides it; **env > config > default
+   `false`**.) Turning the switch off disables the relay and nothing else.
+
+The same switch is read again at each launch against the launched session's
+own workspace, so one repository of a multi-workspace daemon can opt out.
+Requires a daemon built with the `otlp` Cargo feature (release builds are).
+
+**What a wired session is given.** `CLAUDE_CODE_ENABLE_TELEMETRY=1`,
+`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`, `OTEL_{METRICS,LOGS,TRACES}_EXPORTER=otlp`,
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`,
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:<port>` and
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <session token>`. The
+per-signal endpoint, protocol and header variables, OTLP compression and
+client-certificate variables, and the content gates (`OTEL_LOG_USER_PROMPTS`,
+`OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_CONTENT`,
+`OTEL_LOG_RAW_API_BODIES`, `OTEL_LOG_MANAGED_SETTINGS`) are removed from that
+child, so nothing inherited from the daemon's environment can redirect a
+signal or widen what is captured. `OTEL_LOG_TOOL_DETAILS` stays under
+`observability.claudeCodeTelemetry.logToolDetails`
+([`tracing.md`](tracing.md)). When both that block and the relay are on, the
+relay's endpoint wins: the session exports through the daemon, not directly.
+
+**Which launches are wired.**
+
+| Launch | Wired | Why |
+|---|---|---|
+| Sweep child admitted for `claude` | yes | Claude Code is configured entirely by its documented `OTEL_*` environment. |
+| Role-runner tick admitted for `claude` | yes | Same. |
+| Any launch admitted for `codex` | no | Codex configures OTLP export in its `config.toml` `[otel]` table, not `OTEL_EXPORTER_OTLP_*`; wiring it means writing that table per launch. |
+| Any launch admitted for `opencode` | no | No documented OTLP exporter setting to point at the relay. |
+| A launch with no runtime admission | no | The spawn script picks the runtime, so the daemon does not know which CLI will run and will not guess a `service.name`. |
+| Epic-supervisor role dispatch | no | No runtime admission on that path (above). |
+| Containerized dispatch (`runtimes.containment.enabled` / `LOOM_SWEEP_CONTAINERIZED`) | no | The receiver is loopback-only on the host; a container's loopback is its own. |
+
+**Port.** `127.0.0.1` on an ephemeral port the kernel picks when the daemon
+starts. Nothing to configure, no collision between two daemons or two users on
+one host, and no well-known port for other local processes to aim at. The
+address is never anything but loopback.
+
+**Attribution.** Each launch gets its own random token, delivered only in that
+child's environment. The receiver identifies the sender by the token alone —
+nothing in the request body takes part — and answers `401` to a request
+without a live session's token before reading its body. A token stops working
+when its session ends (the sweep's execution closes, or the role tick's child
+exits), and in any case 24 hours after it was minted. The daemon keeps only a
+hash of it, and it is never logged or forwarded.
+
+**Identity.** Every forwarded `Resource` is built by the daemon:
+
+| Attribute | Value |
+|---|---|
+| `service.name` | the harness — `claude-code` |
+| `service.instance.id`, `host.id`, `host.name` (whatever host attributes the daemon's own telemetry carries) | this daemon's host identity |
+| `loom.runtime`, `loom.session.kind` (`sweep`/`role`), `loom.session.launch` (`daemon`) | from the launch |
+| `loom.repo` | the workspace's forge `owner/name`; absent until resolved, never a directory name |
+| `loom.issue`, `loom.role`, `loom.sweep_id` | the issue, role and sweep (or role-tick execution) id the session was launched for, when it has one |
+| `loom.daemon.version`, `loom.relay.redaction` | the relaying build, and the redaction policy applied |
+
+Whatever the sender put under `service.name`, `service.namespace`,
+`service.instance.id`, `host.*` or `loom.*` — in any letter case — is
+discarded, on the resource and on every scope, record, data point, span, span
+event, link and nested map, so a record-level attribute cannot shadow the
+bound one. Other resource attributes the CLI reports about itself
+(`service.version`, `os.type`, …) are kept. Trace and span ids are the
+sender's and are preserved; that is what parents a session's spans under the
+`TRACEPARENT` its launch exported. An id of the wrong length is cleared.
+
+Empty containers are removed before binding, and containers with identical
+sender resources are merged, so a request normally carries one bound
+`Resource`.
+
+**Redaction.** Every string the sender controls passes through the same
+scrubber as live session output ([`session-output.md`](session-output.md),
+policy `producer/v1`): log bodies, attribute values at any depth, span and
+event names, status messages, metric descriptions. An attribute value is
+scrubbed together with its key, so `password = …` is caught even though the
+value alone has no shape to match — numbers included (`password = 123456789`
+becomes the marker). An attribute whose *key* is secret-shaped is dropped
+whole. A `schema_url` the scrubber would change is cleared. A `bytes` value is
+replaced by its length. This scrubs secret *shapes*; it is not a content
+filter — which is why the content gates above stay off.
+
+**Back-pressure.** The receiver acknowledges a request as soon as it is
+scrubbed and queued; it never waits on your endpoint. Each `otlp` sink has its
+own in-memory queue (256 requests / 32 MiB), separate from the daemon's own
+durable queue, drained through that sink's exporter configuration (endpoint,
+ingest key, `headers_file`) on its own task and connection pool — so relayed
+volume cannot evict or delay the daemon's own telemetry, and a slow or
+unreachable endpoint cannot slow a session. When the queue is full the oldest
+request is dropped and counted; when the endpoint next accepts anything, one
+`loom.agent_relay.gap` log record per affected session is delivered first,
+under that session's own identity, with `loom.relay.gap_reason`
+(`relay_queue_overflow` or `upstream_rejected`) and
+`loom.relay.dropped_{requests,log_records,metric_data_points,spans}`. Relayed
+records still queued when the daemon stops are lost.
+
+The queue holds each request **after** binding and scrubbing, protobuf-encoded,
+and its 32 MiB counts those bytes — what it actually keeps, not the size the
+requests arrived in. Loss accounting is bounded too: past 128 distinct
+`(session, reason)` entries awaiting report, further sessions' losses are
+folded into one aggregate record per reason (`loom.relay.aggregated = true`,
+host attributes only). Totals are kept; per-session attribution past the cap
+is not. During a long outage with many short sessions, that map grows to the
+cap and stops.
+
+**Limits.** OTLP/HTTP only (`application/x-protobuf` or `application/json`;
+no gRPC, no compressed bodies); 4 MiB per request; 32 concurrent connections
+(`503` past that, and past twice that the connection is simply closed);
+3 seconds to present an authenticated request head, then 30 seconds for the
+body. A malformed request gets a `4xx` and is never forwarded.
+
+Wire bytes are not memory — an empty OTLP element is two bytes on the wire
+and up to a few hundred decoded — so size is checked twice more, each refusal
+a `413`. Before decoding, the receiver estimates the decoded size from the
+wire bytes (a schema-aware scan for protobuf, a bounded scan for JSON) and
+refuses anything over 8× the body plus 1 MiB, capped at 32 MiB. After binding,
+it refuses a request whose encoded size exceeds 4× the body plus 64 KiB. At
+most two requests are decoded at once, so decoding holds at most about
+2 × 2 × 32 MiB at a time (the factor of two is `Vec` growth).
+
+The OTLP JSON decoder used here (`opentelemetry-proto`) drops a metric's
+data when a data point carries an exemplar; such a metric arrives with no
+points and is not forwarded. Protobuf — what wired sessions are told to use —
+is unaffected.
+
+**What the relay does not stop.** Stated so an operator can decide with them
+in view:
+
+- **Descendants share the session's identity.** Every process the session
+  starts inherits its environment: the token, the endpoint and
+  `OTEL_*_EXPORTER=otlp`. An OpenTelemetry-instrumented tool it runs, or a
+  nested `claude`, exports through the relay under that session's identity.
+  It is bounded by the same queue and limits, and it cannot post as any other
+  session, but it is not the session itself.
+- **A stale port after a daemon restart.** A session adopted across a restart
+  keeps the old address. That port is free once the old daemon exits, and
+  another local process could bind it and receive that session's raw,
+  unscrubbed telemetry, token included. Relaunching the session ends this.
+- **The content gates cover inherited environment only.** The launch removes
+  `OTEL_LOG_USER_PROMPTS` and the other capture switches from the child's
+  environment, but Claude Code also reads an `env` block from its settings
+  files (`settings.json`, `settings.local.json`), and one there can re-enable
+  capture. Not verified against a live session. The relay still scrubs secret
+  shapes in whatever arrives.
+
+A session that outlives the daemon that launched it (a sweep adopted after a
+restart) keeps a stale address and exports nothing until it is relaunched —
+unless something else now holds that address, as above.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 

@@ -9,9 +9,10 @@ on:
   # tree. Dormant until a repository enables a merge queue -- GitHub only
   # emits this event for a queue-enabled branch, and this repository is
   # user-owned, so today it never fires here. Every job a merge group needs
-  # treats `merge_group` exactly like `push`: no path filter (the `changes`
-  # job is PR-only), the full suite. `loom-daemon merge-group-ci audit`
-  # proves that statically; see defaults/docs/merge-queue-ci.md.
+  # runs on `merge_group` with no path filter (the `changes` job is PR-only):
+  # the full suite, a superset of `push`, which path-filters only the image
+  # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
+  # see defaults/docs/merge-queue-ci.md.
   merge_group:
     types: [checks_requested]
 
@@ -98,7 +99,7 @@ jobs:
   # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
   # hiccup from failing the path filter every filtered job `needs`.
   changes:
-    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; push and merge_group run every filtered job unconditionally
+    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; merge_group runs every filtered job unconditionally, and push does too except the image jobs (changes-push, #10825)
     name: Detect Changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -110,7 +111,6 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      docker: ${{ steps.filter.outputs.docker }}
       workflows: ${{ steps.filter.outputs.workflows }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
@@ -193,18 +193,6 @@ jobs:
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
-            docker:
-              - 'docker/**'
-              - '.dockerignore'
-              # The run-job seam (#7853) is the one thing outside docker/ that
-              # this filter's jobs prove: docker/worker/test-run-job.sh drives
-              # these two scripts inside a real worker container to show the
-              # container needs no docker socket. A seam-only PR must re-run
-              # that leg, or the only test that can catch a regression in the
-              # containment story is skipped on exactly the PRs that cause one.
-              - 'defaults/scripts/run-job.sh'
-              - 'defaults/scripts/lib/run-job-exec.sh'
-              - '.github/workflows/ci.yml'
             scripts:
               - 'scripts/**'
               - 'defaults/**'
@@ -231,6 +219,9 @@ jobs:
               # main red after the merge.
               - '.github/dependabot.yml'
               - '**/package.json'
+              # Same for the Renovate side (#9418): `loom-daemon
+              # check-renovate-labels` runs next to it in installer-tests.
+              - 'renovate.json5'
               - '.github/workflows/ci.yml'
             # Every workflow file, for the Workflow Cancellation Lint job
             # (#10670). The `backend` group lists only ci.yml, so without this
@@ -251,6 +242,87 @@ jobs:
           set -euo pipefail
           echo "daemon needed=true"
           echo "needed=true" >> "$GITHUB_OUTPUT"
+
+  # Detect Image Inputs (PR): do the image jobs run on this pull request?
+  # (#10825) The same script `changes-push` runs on main, so PR and push agree
+  # on what an image input is: docker/**, the .dockerignore-allowlisted
+  # private-control files under defaults/ (which the former `docker` paths
+  # group missed), the run-job seam (#7853) and ci.yml. A failed listing fails
+  # CLOSED (docker=true).
+  #
+  # A job of its own, deliberately NOT a step of `changes`: on a PR the
+  # checkout below is the merge ref, so scripts/ci-image-inputs.sh is
+  # UNMERGED PR CODE, and `changes` holds `actions: write` for its
+  # superseded-run cancellation. Running a PR-head script there would hand a
+  # same-repository contributor a write-capable Actions token. This job's token
+  # is read-only (contents + pull-requests); keep it that way, and never run
+  # PR-head code in a job that retains a write permission.
+  changes-images:
+    # merge-group-audit: pr-only -- the image-input decision only trims PR runs; push is decided by changes-push and merge_group runs every image job unconditionally
+    name: Detect Image Inputs (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Decide whether the image jobs run
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-image-inputs.sh pr --repo "$REPO" --pr "$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+  # Detect Image Inputs (push): the ONE path filter on a push to main, and the
+  # operator-approved exception to ci-principles rule 3 (#10825). It decides
+  # only whether `worker-base-image` and the three image smokes run; every
+  # other job still runs unconditionally on push. The base is the head of the
+  # last GREEN `CI` push run on main, never `github.event.before`: main's
+  # concurrency (one running + newest pending) cancels pending runs in a
+  # burst, so `before` can be an unverified commit, and a red smoke run must
+  # not be forgotten by the next clean diff. Fails CLOSED to docker=true, and
+  # if this job itself fails or is cancelled the image jobs run anyway (their
+  # `if:` reads `result != 'success'`) and `CI Result` goes red. Daemon-source
+  # changes are deliberately not image inputs; ci-daily.yml's `docker-smokes`
+  # runs every smoke unfiltered each day (rule 10). Push-only, so it is not a
+  # job the merge-group audit relies on: `merge_group` never path-filters.
+  changes-push:
+    name: Detect Image Inputs (push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push'
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      docker: ${{ steps.images.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            /.dockerignore
+            /scripts/ci-image-inputs.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Decide whether the image jobs run (diff since the last green push run)
+        id: images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: scripts/ci-image-inputs.sh push --repo "$REPO" --sha "$SHA" --branch "$BRANCH" --workflow ci.yml >> "$GITHUB_OUTPUT"
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -295,24 +367,33 @@ jobs:
 
   release-build:
     name: Release Build Check
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-images]
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes-images.outputs.docker == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
     # (cfg(debug_assertions) code, optimisation-only link failures) before
     # merge. They now use the shared debug build, so without this job such a
-    # break would first surface in the post-merge release workflow. Nothing
-    # waits on it, so it stays off the critical path.
+    # break would first surface in the post-merge release workflow.
     #
     # It is ALSO the one release build per CI run (#10824): the binary is
     # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
     # stages it into the Docker build context, so the image smokes no longer
     # build their own. That makes the shipped `--features otlp` binary the one
     # the smokes exercise (they previously ran a non-shipped default-feature
-    # build). The `if:` is the UNION of `backend` and `docker` so a docker-only
-    # PR still produces the artifact; keep it a superset of `worker-base-image`'s
-    # gate (#10825 narrows that one).
+    # build). Since then `worker-base-image` waits on it, so on a run that
+    # builds images this job IS on the image smokes' critical path; on any
+    # other run nothing waits on it.
+    #
+    # Its `if:` MUST stay at least as wide as `worker-base-image`'s (and so the
+    # smokes'): if the base image runs while this job skipped, the artifact
+    # download fails and the smokes go red for no reason. Today it is: this job
+    # runs unconditionally on push and merge_group, where #10825 path-filters
+    # the image jobs on push only via `changes-push`, and on a PR it is the
+    # UNION of `backend` and `docker`, so a docker-only PR still produces the
+    # artifact. Narrowing this gate below the image gate is not allowed; if you
+    # change either, keep this note true (scripts/test-ci-image-inputs.sh pins
+    # it).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -376,11 +457,17 @@ jobs:
       # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
       # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
       # these tests never execute there; the full default-feature suite runs
-      # nightly (ci-daily.yml `full-suite`). The names are DERIVED from source
-      # (a test attribute between the cfg and the fn), never hand-listed
-      # (ci-principles rules 7 and 9); an empty derivation or an empty
-      # selection fails. This is an additional run, not a filterset that skips
-      # work.
+      # nightly (ci-daily.yml `full-suite`). The names are DERIVED by the
+      # compiler, never hand-listed (ci-principles rules 7 and 9): the lib
+      # tests `cargo nextest list` reports with default features minus those it
+      # reports with `--features otlp` (#10845), so every cfg form (on a `mod`,
+      # `all(test, not(..))`, one-line, `#[rstest]`, ...) is covered. Each is
+      # selected by its exact full name, and the step fails unless nextest's
+      # "N tests run" equals the derived count (catches under- and
+      # over-selection), on an empty derivation, or on an empty selection.
+      # This is an additional run, not a filterset that skips work. Cost: one
+      # extra compile of the loom-daemon lib test binary with `otlp` (~2 min
+      # locally); this trailing `!cancelled()` step is off the critical path.
       - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
         with:
           tool: nextest
@@ -388,19 +475,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          names=$(grep -rl 'cfg(not(feature = "otlp"))' loom-daemon/src | sort | xargs awk '
-            /#\[cfg\(not\(feature = "otlp"\)\)\]/ { pend=1; ist=0; next }
-            pend && /#\[(tokio::)?test/ { ist=1; next }
-            pend && /^[ \t]*(pub )?(async )?fn / {
-              if (ist) { l=$0; sub(/.*fn /, "", l); sub(/\(.*/, "", l); print l }
-              pend=0; next }
-            pend && /^[ \t]*(#\[|\/\/|$)/ { next }
-            { pend=0 }
-          ' | sort -u)
-          test -n "$names" || { echo "derived no cfg(not(otlp)) tests" >&2; exit 1; }
-          echo "derived tests:"; echo "$names"
-          filter=$(echo "$names" | sed 's|.*|test(/::&$/)|' | paste -sd'|' - | sed 's/|/ | /g')
-          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail -E "$filter"
+          # The listing below is `--lib` only; integration tests are not in it.
+          if grep -rlF 'cfg(not(feature = "otlp"))' loom-daemon/tests; then
+            echo "::error::cfg(not(feature = \"otlp\")) under loom-daemon/tests/ is not covered: extend this step beyond --lib" >&2
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          # `otlp` first: its build replaces the default one, which the default
+          # listing and the run below then share (two compiles, not three).
+          cargo nextest list -p loom-daemon --lib --features otlp --message-format json > "$tmp/otlp.json"
+          cargo nextest list -p loom-daemon --lib --message-format json > "$tmp/default.json"
+          jq -r '."rust-suites"[].testcases | to_entries[] | select(.value.ignored | not) | .key' "$tmp/default.json" | sort -u > "$tmp/default.txt"
+          jq -r '."rust-suites"[].testcases | keys[]' "$tmp/otlp.json" | sort -u > "$tmp/otlp.txt"
+          comm -23 "$tmp/default.txt" "$tmp/otlp.txt" > "$tmp/derived.txt"
+          derived=$(wc -l < "$tmp/derived.txt" | tr -d ' ')
+          test "$derived" -gt 0 || { echo "::error::derived no cfg(not(otlp)) tests" >&2; exit 1; }
+          echo "derived $derived tests:"; cat "$tmp/derived.txt"
+          filter=$(sed 's/.*/test(=&)/' "$tmp/derived.txt" | paste -sd'|' - | sed 's/|/ | /g')
+          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail --color never -E "$filter" 2>&1 | tee "$tmp/run.log"
+          ran=$(grep -oE '[0-9]+ tests? run' "$tmp/run.log" | tail -1 | grep -oE '^[0-9]+' || true)
+          if [ "${ran:-0}" != "$derived" ]; then
+            echo "::error::nextest ran ${ran:-0} tests but $derived were derived" >&2
+            exit 1
+          fi
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -595,6 +692,18 @@ jobs:
       # zero rows survive the SQL so SigNoz can see a series recover.
       - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      # #10973: replay of the host-disk, work-finder-stale and ETA Ready-coverage alert rules
+      - name: Verify the SigNoz disk, work-finder and ETA Ready-coverage alert rules against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
+      # #10916: the fleet singleton-output alert (alerts/fleet-singleton-output.json),
+      # the cross-host detector for a one-host fleet job that stops producing
+      # while every host looks healthy. Only this run shows that the 2026-10-07
+      # replay (28 of 30 repos without eta.estimate) fires one evaluation past
+      # 2 x cadence and not before, that an idle or all-abstaining repo stays
+      # quiet, and that an empty logs table fires every watched row. Its
+      # deadline-vs-registry no-drift check runs in the ordinary test job.
+      - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
       # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
       # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
       # heuristic is promoted on. eta_artifacts.rs already pins every attribute
@@ -615,6 +724,18 @@ jobs:
       # rows inflates the answer rate because refusals are never refreshed.
       - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
+      # #11125: the same technique for the replay reconstruction
+      # (replay-queries.sql queries 1-3). Only this run shows that an issue
+      # removed, re-added and removed again stays deleted, and that a lost
+      # delta, a missing anchor or delta chunk, or a chain whose anchor never
+      # arrived makes that host unknown instead of rebuilding wrong state.
+      - name: Verify the SigNoz replay reconstruction against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
+      # #11127: `telemetry-replay --as-of` runs those same committed queries
+      # with its own parameter binding and reader over the same fixture store;
+      # only this run shows an uncovered host is reported `unknown`, not empty.
+      - name: Verify telemetry-replay against the replay fixture store
+        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows
@@ -758,6 +879,9 @@ jobs:
       - name: Test the CI Result aggregate gate (#10444)
         if: ${{ !cancelled() }}
         run: bash scripts/test-ci-result-gate.sh
+      - name: Test the image-input detection and the image gate wiring (#10825)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-image-inputs.sh
       - name: Test the release decision and release.yml wiring (#10826)
         if: ${{ !cancelled() }}
         run: bash scripts/test-release-decision.sh
@@ -1794,10 +1918,22 @@ jobs:
     # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
     # by quietly running nothing.
     #
-    # The four slowest suites run in two sibling jobs below (#9065) so that no
-    # one runner carries all ~420s of them: `native-port-daemon-lifecycle` and
-    # `native-port-watchdog-spawn`. Wiring a new suite here is still the
+    # The slowest suites run in the sibling job below (#9065, consolidated by
+    # #9093) so that no one runner carries all ~420s of them:
+    # `native-port-daemon-lifecycle`. Wiring a new suite here is still the
     # default; move one out only when it is long enough to be the pole.
+    #
+    # Every suite step (everything after the binary download/--version
+    # check) runs under
+    # `if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}`
+    # (#9356), so one red suite cannot hide the others — a later suite still
+    # runs and reports its own verdict. `!cancelled()` alone would drop the
+    # implicit success() and let suites run after a FAILED setup, so each
+    # guard also requires the last setup step (`daemon-bin`, the --version
+    # check) to have succeeded; any earlier setup failure skips it, so its
+    # outcome covers all of setup. The setup steps themselves (checkout, git
+    # identity, download-artifact, --version) stay unguarded and fail-fast.
+    # Give a new suite step the same guard.
     #
     # Triggered by `backend` as well as `scripts`: a Rust-only change to
     # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
@@ -1819,28 +1955,44 @@ jobs:
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - id: daemon-bin
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: classify-dependency-block (#5664, #7650)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block.sh
       - name: classify-dependency-block premise-false interaction (#7904)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block-premise-false.sh
       - name: detect-dependency-cycle (#5671)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh
       - name: detect-startable-subset (#5664)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
       - name: dep-recheck-fingerprint (#7281, #7314, #7617)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #11075: check-main-clean.sh --quarantine asks `loom-daemon stashes
+      # build-trees` which cargo build trees to exclude from the rescue stash.
+      - name: check-main-clean (#3513, #11075)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-check-main-clean.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-provision-codex-hooks.sh
       - name: spawn-codex merging-role hook gate (#9390)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
       - name: spawn-codex sealed-registration trust waiver (#10102)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
       - name: spawn-* session identity is not inherited by the agent (#10830)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-session-env.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
@@ -1850,12 +2002,16 @@ jobs:
       # runner — and was moved out of shell-suite-tests/ci-wired.txt for
       # exactly that reason.
       - name: fleet-send safehouse envelope (#9517)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-fleet-send.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
       - name: post-verdict.sh verdict gate + exclusive labels (#10581)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-post-verdict-gate.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
       # #8458: the per-worktree cargo target dir. Its creation half
       # (`cargo-target-dir provision|path`) and both removal-side predicates
@@ -1864,38 +2020,51 @@ jobs:
       # the shared build this job downloads, not shell-suite-tests'
       # toolchain-free runner.
       - name: per-worktree cargo target dir (#8458)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
       # #9657 (#9548 slice): both suites pin the working-tree binary for the
       # real `forge trusted-comments` filter, so they need this job's shared
       # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
       # exactly that reason.
       - name: merge-pr hold-state comment trust (#9657, #9548 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
       - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
       - name: merge-pr stale-check re-date remedy (#8508)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
       - name: merge-pr --auto blocked settle + re-validate (#8410)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
       - name: merge-pr defaults/ version-bump collision guard (#7827, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
       - name: merge-pr merge-ordering guard (#3747 item 2 / #7982, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh
       - name: merge-pr workflow token-scope preflight (#10539)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-workflow-scope-preflight.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update --resolve-json (#7609)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
       # Split out of test-loom-daemon-update.sh by #8028 (epic #7810 PR 6a):
       # fetch_and_verify_artifact() now drives `loom-daemon release-fetch`
@@ -1903,6 +2072,7 @@ jobs:
       # the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update artifact fetch + verify (#8028)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
       # Split out of test-loom-daemon-update-fetch.sh by #8770: scenarios V
       # (#8008) and V2 (#8770) assert what provisioning does to the
@@ -1910,18 +2080,26 @@ jobs:
       # `loom-daemon release-fetch` the same way their former host does, so
       # they need the binary this job downloads.
       - name: loom-daemon-update post-provision signature check (#8008, #8770)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
       # #8654: the forced --fetch refusal classifies a missing artifact via
       # `loom-daemon release-explain` (still uploading vs genuinely unbuilt)
       # and degrades to the flat reason without it, so it needs this build.
       - name: loom-daemon-update --fetch refusal classification (#8654)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
+      # #11044: the fleet floor confirmation runs inside `loom-daemon
+      # daemon-update`, so the suite pins this job's shared build.
+      - name: loom-daemon-update fleet floor confirmation (#11044)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
       # hours; this suite pins the containment guard that prevents it. It
       # sources that library, so it needs the binary this job downloads.
       - name: daemon-update fixture containment (#8712)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
       # #8069: 284 assertions that had never run in ANY CI job. They were
       # excluded on the reason "wiring it needs a cargo build step or a binary
@@ -1929,6 +2107,7 @@ jobs:
       # spawn-claude.sh's token selection — the path behind the 228-instance
       # crash incident (#7708).
       - name: spawn-claude token selection (#4228, #7708)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
@@ -1937,44 +2116,52 @@ jobs:
       # documented fail-safes answer instead, and the backoff-curve assertions
       # fail loudly rather than the suite reporting green on nothing.
       - name: claude-wrapper retry classifiers (#8032, #8037)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-claude-wrapper-retry.sh
       # Split out of the suite above (#8058), same operational need — it
       # drives spawn-claude.sh / claude-wrapper.sh against a real
       # `loom-daemon tokens select|mark-bad`, so it needs the binary this job
       # builds. Wired alongside its parent rather than left excluded.
       - name: token model-class selection (#8058)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-token-model-class.sh
       # #8697: spawn-claude.sh's contained dispatch through the credential
       # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
       # #10413: ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must not
       # shadow the pool token spawn-claude.sh selects — drives a real
       # `loom-daemon tokens select`, so it needs the binary this job
       # downloads. Split from test-spawn-claude.sh (file-size frozen).
       - name: spawn-claude ambient credential scrub (#10413)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude-ambient-scrub.sh
       # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
       # after `loom-daemon session-exec posture` has verified the container's
       # label AND HostConfig, so this suite needs the binary this job downloads.
       - name: spawn-codex session container boundary (#8518, #9979)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
       # #10661: the stale-mount suite's last cases drive the real
       # `loom-daemon session-exec host` (pinned via require-daemon-bin.sh), so
       # it needs the binary this job downloads, like the step above.
       - name: spawn-codex stale-mount refusal (#10364, #10661)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-session-mount-stale.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
       # Moved out of shell-suite-tests by #8191's closed-issue slice: the
       # #6199 `loom:building` strip for an issue the merge itself closes now
       # delegates to `loom-daemon merge-pr closed-building`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr closed-issue loom:building cleanup (#6199, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-closed-issue-cleanup.sh
       # Moved out of shell-suite-tests by #8191's classify-response slice: the
       # head-SHA-mismatch classifier (#5579) this suite is ABOUT, and the
@@ -1982,12 +2169,14 @@ jobs:
       # are now `loom-daemon merge-pr classify-response`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr head-SHA-mismatch classifier (#5579, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-mismatch.sh
       # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
       # the stale-mergeable recheck's terminal classification now delegates to
       # `loom-daemon merge-pr mergeable-recheck`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr stale-mergeable recheck (#6104, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-mergeable.sh
       # Moved out of shell-suite-tests by #8191's reconcile slice: the
       # post-merge stacked-child reconcile decision (#4856) — parent-branch
@@ -1996,6 +2185,7 @@ jobs:
       # so this suite's require-daemon-bin harness needs the binary this job
       # downloads.
       - name: merge-pr post-merge stacked-child reconcile (#4856, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-auto-reconcile.sh
       # Moved out of shell-suite-tests by #8360: check-duplicate.sh's
       # similarity scan (keyword extraction, Jaccard scoring, threshold
@@ -2007,8 +2197,10 @@ jobs:
       # deleting the shell scan — so each needs the binary this job downloads
       # and fails rather than skips without one.
       - name: check-duplicate near-match band + scan port (#4409, #8289, #8360)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-duplicate.sh
       - name: create-issue duplicate backstop graduation (#7971, #8289, #8360)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-create-issue-duplicate-check.sh
       # Moved out of shell-suite-tests by #8656: verify-proposal-refs.sh's
       # line-range check is now `loom-daemon git-blob-lines --range`, which
@@ -2019,6 +2211,7 @@ jobs:
       # script that BLOCKS FILING. The suite needs the binary this job downloads
       # and fails rather than skips without one.
       - name: verify-proposal-refs symlink-aware line ranges (#7658, #8656)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-verify-proposal-refs.sh
       # Moved out of shell-suite-tests by #8583: reconcile-stack.sh's rebase
       # planning/execution (fetch + PIN the remote default-branch tip, worktree
@@ -2029,22 +2222,27 @@ jobs:
       # unchanged against the port apart from J/K (the #8583 regression itself)
       # and the two rebase-target assertions the fix necessarily changed.
       - name: reconcile-stack rebase target + worktree routing (#3776, #7982, #8010, #8583)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-reconcile-stack.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
       # via `loom-daemon runtime-launch-env` before reaching spawn-generic.sh,
       # so this suite needs the binary this job downloads. It pins it via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: tier-3 manifest launch shape (#8671)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
       # binary this job downloads.
       - name: sweep-checkpoint (#8525)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-sweep-checkpoint.sh
       - name: skip-labels (#8255)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-skip-labels.sh
       # Moved out of shell-suite-tests by #8195 slice 2: worktree.sh's three
       # WIP-shelving verbs (`snapshot`, `stash-push`, `stash-pop`) are now thin
@@ -2059,25 +2257,30 @@ jobs:
       # hermetic in shell-suite-tests, which is the point of porting one
       # family at a time.
       - name: worktree snapshot verb (#4778, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-snapshot.sh
       - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
       # #8553: worktree.sh's new issue claim-lock cross-check delegates to
       # `loom-daemon worktree-lock check-issue` (this file is frozen by the
       # file-size ratchet, so the new guard's decision logic lives in Rust,
       # not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
       # rjwalters/kicad-tools#5783: the "existing worktree has uncommitted
       # changes -> preserve" fast path now refuses on 2+ simultaneously fresh
       # sweep leases, via `loom-daemon lease co-occupancy` — needs the binary
       # this job downloads.
       - name: worktree shared-lease co-occupancy guard (kicad-tools#5783)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-lease-co-occupancy.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
       # enrichment — needs the binary this job downloads.
       - name: premise gate exit-code contract (#8396)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-premise-check.sh
       # Moved out of shell-suite-tests by #8195 slice 3: `worktree.sh remove`
       # is now a thin stub over `loom-daemon worktree-remove`, so these three
@@ -2095,10 +2298,13 @@ jobs:
       # hermetic in shell-suite-tests — which is the whole point of porting one
       # cohesive family at a time.)
       - name: worktree remove verb (#3769, #4449, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remove.sh
       - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remove-squash-merge.sh
       - name: cargo target-dir reclaim on worktree removal (#7239, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-cargo-target-dir-reclaim.sh
       # Moved out of shell-suite-tests by #8195 slice 4: worktree.sh's
       # shared-artifact symlinking (root + nested node_modules, linkPaths,
@@ -2106,6 +2312,7 @@ jobs:
       # `loom-daemon worktree-link`. The suite pins the binary via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: worktree shared-artifact symlinks (#3528, #5474, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-nested-symlinks.sh
       # Moved out of shell-suite-tests by #8195 slice 5: worktree.sh's
       # crash-debris pre-flight — the stale index/HEAD/gitdir.lock sweep and
@@ -2122,8 +2329,10 @@ jobs:
       # remaining 12 exercise create-path arms these slices did not touch and
       # stay hermetic in shell-suite-tests.
       - name: worktree orphan guard, space + symlink paths (#7849, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
       - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-concurrency.sh
       # Moved out of shell-suite-tests by #8195 slice 6: lib/worktree-race-rescue.sh
       # is now a thin wrapper over `loom-daemon worktree-reset`, so all 25 of
@@ -2134,6 +2343,7 @@ jobs:
       # wrapper's own no-binary fallback, which is a correct degradation but not
       # the thing this suite exists to measure.
       - name: worktree race rescue on a stale-worktree reset (#6334, #7463, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-race-rescue.sh
       # Moved out of shell-suite-tests by #8195 slice 7: `_handle_feature_branch_
       # in_main_worktree` is now `loom-daemon worktree-branch-conflict`. Its
@@ -2147,11 +2357,13 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one —
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
       # #10203: `sweep-lease-renew.sh start` re-enters through
       # `loom-daemon lease renewer sanitize-exec` so its detached loop holds no
       # fd of the caller's; pins the binary like the suite above.
       - name: lease renewer holds no caller fd (#10203)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
       # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
       # contract. #5657 already skips reuse of an origin/feature/issue-N
@@ -2164,6 +2376,7 @@ jobs:
       # pins the binary via loom_test_require_daemon_bin and FAILS rather
       # than skips without one.
       - name: worktree closed-unmerged-PR branch refusal (#9083)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stale-closed-branch.sh
       # Moved out of shell-suite-tests by #8195 slice 9: worktree.sh's TWO
       # hand-maintained copies of the upstream-tracking correction — the
@@ -2177,15 +2390,19 @@ jobs:
       # would leave the assertions measuring nothing. Both pin the binary via
       # loom_test_require_daemon_bin and FAIL rather than skip.
       - name: worktree local-branch upstream correction (#6095, #6100, ported in #8195 slice 9)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
       # Moved out of shell-suite-tests by #8195 slice 13: worktree.sh's `--base`
       # stacked-PR resolution is `loom-daemon worktree-base`. Both suites pin it
       # via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: worktree --base stacked-PR resolution (#3729, ported in #8195 slice 13)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-base-override.sh
       - name: check_branch_name ref-operand guard (#9106; --base ported in #8195 slice 13)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-branch-name.sh
       # Moved out of shell-suite-tests by #8195 slice 14: worktree.sh's
       # LOCAL-branch reuse arm — the reuse warning, the #6095/#6100 upstream
@@ -2199,8 +2416,10 @@ jobs:
       # so both pin the binary via loom_test_require_daemon_bin and FAIL rather
       # than skip. Each suite's REMOTE-arm tests are untouched by the slice.
       - name: worktree local-branch already-landed refusal (#8280, ported in #8195 slice 14)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stale-merged-branch.sh
       - name: worktree remote/local branch tracking + divergence (#4823, #8280, ported in #8195 slice 14)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remote-branch-tracking.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
@@ -2214,6 +2433,7 @@ jobs:
       # remaining four exercise create-path arms these slices did not touch
       # and stay hermetic in shell-suite-tests.
       - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
@@ -2223,6 +2443,7 @@ jobs:
       # sources that function — needs the binary this job downloads. All six pin
       # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
       # #9576 / PR #9581 review, extended by #9416: the stub-driven
       # verdict-staleness-guard suite (shell-suite-tests) cannot prove what lives
@@ -2231,16 +2452,22 @@ jobs:
       # kill switches — so this sibling drives the guard against the binary this
       # job downloads.
       - name: verdict-staleness-guard equivalence exemption, real verb (#9576, #9416)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-verdict-staleness-guard-tree.sh
       - name: merge-pr dirty-worktree guard (#5031, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh
       - name: merge-pr primary-checkout advice (#4171, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-primary-checkout-advice.sh
       - name: merge-pr primary-worktree guard (#3710, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-primary-worktree-guard.sh
       - name: merge-pr worktree-remove diagnosis (#6372, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
       - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
       # Moved out of shell-suite-tests by #8191's worktrees slice: the three
       # porcelain lookups this suite is ABOUT are now `loom-daemon merge-pr
@@ -2248,13 +2475,16 @@ jobs:
       # downloads. Like its siblings above it pins one via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
       # Moved out of shell-suite-tests by #8191's usage slice: merge-pr.sh's
       # --help text is `loom-daemon merge-pr usage` now, so both suites that
       # read --help pin this job's binary (--self-only) and FAIL without one.
       - name: merge-pr --help (#8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-help.sh
       - name: merge-pr --merge-method (#8845, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-merge-method.sh
       # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
       # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
@@ -2264,6 +2494,7 @@ jobs:
       # loom_test_require_daemon_bin at file scope and FAILS rather than skips
       # without one, so it needs the binary this job downloads.
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
       # #9108: the mcp__loom__.* PreToolUse guard decision is
       # `loom-daemon guard-mcp-tools`, brand-new logic (no shell twin to
@@ -2274,6 +2505,7 @@ jobs:
       # is actually on the mcp__loom__* call path. FAILS rather than skips
       # without a binary.
       - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
       # Moved out of shell-suite-tests by #8191's check-runs-rollup slice:
       # merge-pr.sh's _wait_for_checks_then_sync_merge now reads its
@@ -2283,16 +2515,19 @@ jobs:
       # it via loom_test_require_daemon_bin --self-only and FAIL rather than
       # skip without one.
       - name: merge-pr wait-for-checks empty-settle guard (#6169, #9091, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
       # test-forge-check-runs-pagination.sh's Parts 1/2/4/5 (forge-helpers.sh
       # pagination, no daemon involved) move here with Part 3 rather than
       # splitting the suite.
       - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
       # Its #3664 pending-vs-failing assertions used to mirror the retired jq
       # filters (passing against a copy); they now drive the real
       # `merge-pr check-runs-rollup`, pinned the same way.
       - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
 
   native-port-daemon-lifecycle:
@@ -2309,8 +2544,12 @@ jobs:
     # them moved. Same trigger, same build, and the same FAIL-never-SKIP
     # contract without a binary.
     # The spawn-claude suite moved back to Native Port Suites (#9065 follow-up):
-    # with it, this job was the critical path (build-daemon, then 265s). Every
-    # suite runs under !cancelled(), so one red suite cannot hide the others.
+    # with it, this job was the critical path (build-daemon, then 265s). In
+    # this job, as in Native Port Suites (#9356), every suite step runs under
+    # `!cancelled() && steps.daemon-bin.outcome == 'success'`, so one red
+    # suite cannot hide the others yet no suite runs after a failed setup;
+    # the setup steps (checkout, git identity, download-artifact, --version)
+    # are unguarded and fail-fast.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2328,9 +2567,10 @@ jobs:
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - id: daemon-bin
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Moved out of shell-suite-tests by #8087, the same move #8086 made for
-      # the watchdog (now in native-port-watchdog-spawn) and for the same
+      # the watchdog (now further down this job) and for the same
       # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
       # daemon-start`, so these three suites need the binary this job downloads.
       # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
@@ -2357,13 +2597,13 @@ jobs:
       # giving them inside its concurrent pool — by construction rather than by
       # quarantine list.
       - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-start.sh
       - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
       - name: loom-daemon-update (#4078, #6639, #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
@@ -2379,7 +2619,7 @@ jobs:
       # nothing to bootout. On a developer host, run them through
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
 
   installer-tests:
@@ -2417,6 +2657,13 @@ jobs:
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Check every package manifest has a labeled dependabot entry (#7577)
         run: bash defaults/scripts/check-dependabot-labels.sh
+      # #9418: the Renovate-side counterpart — every `labels` array in
+      # renovate.json5 (top-level and every packageRules / vulnerabilityAlerts /
+      # lockFileMaintenance override, which REPLACE rather than merge) carries
+      # loom:review-requested. A daemon subcommand, not more lines in that
+      # contract-category script (shell-language-policy.md, epic #7810).
+      - name: Check every Renovate labels array carries loom:review-requested (#9418)
+        run: ./target/debug/loom-daemon check-renovate-labels --repo-root .
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
@@ -2654,7 +2901,10 @@ jobs:
     # tarball it uploads, under the exact tags they used before
     # (`loom-worker:ci-smoke` and `ghcr.io/rjwalters/loom-worker:ci-smoke`, the
     # overlays' BASE_IMAGE). Same `if:` as the smokes, so it runs exactly when
-    # they do (#10825 owns changing that condition).
+    # they do: always on merge_group; on push only when `changes-push` found an
+    # image input since the last green push run, or did not succeed (fails
+    # closed); on a PR when `changes-images.docker` is true (#10825). `release-build`'s
+    # gate must stay a superset of this one (see its comment).
     #
     # Layer cache: a REGISTRY cache at ghcr.io/rjwalters/loom-worker:buildcache,
     # not `type=gha`. The Actions cache is already over its 10 GB cap (13.28 GB
@@ -2663,25 +2913,31 @@ jobs:
     # The registry cache costs no Actions-cache budget, survives 7-day
     # eviction (which matters once #10825 makes these jobs rare on main), and
     # the package is public, so every run -- fork PRs included -- reads it
-    # anonymously. It is WRITTEN only from a push to main in rjwalters/loom
-    # (mirrors rust-cache's `save-if`): a fork PR's token cannot push to
-    # ghcr.io/rjwalters/*, and a same-repo PR must not be able to seed the
-    # cache main builds from. `ignore-error=true` keeps a registry hiccup on
-    # export from failing the build. The published `:latest` is not used as
-    # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
-    # never match.
-    needs: [changes, release-build]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    # anonymously. This job only READS it (`packages: read`, no GHCR login,
+    # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
+    # or merge_group token holds `packages: write` (#10846). The cache is
+    # WRITTEN only by `worker-buildcache` below, a separate job gated at job
+    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
+    # same-repo PR must not be able to seed the cache main builds from. The
+    # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
+    # release does not, so its apt layers never match.
+    needs: [changes, changes-images, changes-push, release-build]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
+      packages: read
     env:
       BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
-      WRITE_BUILDCACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # --- Binary staging seam (#10824) -------------------------------------
       # The Linux release binary the Dockerfile COPYs comes from the single
       # `Release Build Check` build (`--features otlp`, the shipped config),
@@ -2701,25 +2957,13 @@ jobs:
       # --- end binary staging seam ------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Log in to GHCR (buildcache writer, main pushes only)
-        if: env.WRITE_BUILDCACHE == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build the loom-worker base image
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          cache_to=()
-          if [[ "$WRITE_BUILDCACHE" == "true" ]]; then
-            cache_to=(--cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true")
-          fi
           docker buildx build -f docker/worker/Dockerfile \
             --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
             --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
-            "${cache_to[@]}" \
             --output type=docker,dest=/tmp/loom-worker-base.tar \
             -t loom-worker:ci-smoke \
             -t ghcr.io/rjwalters/loom-worker:ci-smoke \
@@ -2733,13 +2977,94 @@ jobs:
           compression-level: 1
           retention-days: 1
 
+  worker-buildcache:
+    name: Publish loom-worker build cache
+    # The ONLY job in this workflow with `packages: write` (#10846). It writes
+    # the registry layer cache `worker-base-image` reads
+    # (ghcr.io/rjwalters/loom-worker:buildcache; rationale in that job's
+    # header). Job permissions cannot vary by event, so the write is split out
+    # here and gated at JOB level to a push to main in rjwalters/loom: on
+    # pull_request and merge_group this job is skipped, so no token those
+    # events mint can push to GHCR. Checkout uses `persist-credentials: false`
+    # so the token never lands in .git/config.
+    #
+    # It rebuilds the same Dockerfile with the same build args; its layers are
+    # cache hits from the previous main build, so it is mostly export time.
+    # Nothing `needs:` it except `ci-result` (off the image critical path).
+    # The binary comes from the same staging seam as `worker-base-image`
+    # (#10824; `release-build` runs unconditionally on push). On push it uses
+    # the same `changes-push` filter as `worker-base-image` (#10825): skipped
+    # only when that detector SUCCEEDED with docker=false (no image input
+    # changed, so the cache would be unchanged), run otherwise (fails
+    # closed). `ignore-error=true` keeps a registry hiccup on export from
+    # failing the job.
+    #
+    # Not merge-group relevant: it is skipped on pull_request, so the
+    # merge-group audit does not count it as a relied-on suite (no marker
+    # needed; it is push-only, not pr-only). `ci-result` passes its PR-time
+    # `skipped` because Detect Changes succeeded, and its merge_group skip
+    # because merge_group has no path filter (scripts/ci-result-gate.sh).
+    needs: [changes-push, release-build]
+    if: >-
+      always() && needs.release-build.result == 'success' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
+      (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # --- Binary staging seam (#10824), same as worker-base-image ---------
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: dist
+      - name: Stage dist/loom-daemon-linux-amd64
+        run: |
+          set -euo pipefail
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
+      # --- end binary staging seam ------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR (buildcache writer)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export the loom-worker layer cache
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker buildx build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
+            --cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true" \
+            --output type=cacheonly \
+            .
+
   worker-image-smoke:
     name: loom-worker Image Smoke Test
     # Consumes the image `worker-base-image` built (#10822). `always()` keeps
     # this job RUNNING when that producer failed, so the first step turns it
-    # red instead of skipped (ci-principles rule 7).
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    # red instead of skipped (ci-principles rule 7). The image gate (#10825,
+    # shared by all four image jobs): `merge_group` FIRST, so the merge-group
+    # audit proves it runs there unconditionally; on push, `changes-push`'s
+    # diff since the last green push run, run anyway unless that job
+    # succeeded with docker=false; on a PR, `changes-images.docker`.
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2776,15 +3101,18 @@ jobs:
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test
-    # Mirrors worker-image-smoke exactly (same `changes.docker` gate — this
+    # Mirrors worker-image-smoke exactly (same image gate — this
     # image is FROM loom-worker, so any docker/** change, including a
     # loom-worker-only one, is worth re-validating this layer against): #6899,
     # Epic #6896 Phase 1. Its FROM target is the base image this run's
     # `worker-base-image` built from the PR's own Dockerfile (#10822), loaded
     # under ghcr.io/rjwalters/loom-worker:ci-smoke -- never a pull of the
     # published image, which a PR's Dockerfile changes are not in.
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2819,7 +3147,7 @@ jobs:
   native-image-smoke:
     name: loom-worker-native Image Smoke Test
     # Mirrors session-image-smoke exactly (#8403, Epic #6896 Phase 3): same
-    # `changes.docker` gate, same FROM target (the base image this run's
+    # image gate, same FROM target (the base image this run's
     # `worker-base-image` built, #10822), same timeout. A sibling job rather
     # than a matrix over the two overlay images on purpose — a matrix would
     # couple two independent deliverables' failure modes, and CI here is
@@ -2829,8 +3157,11 @@ jobs:
     # equality assertions in docker/native/Dockerfile and
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
-    needs: [changes, worker-base-image]
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
+    needs: [changes, changes-images, changes-push, worker-base-image]
+    if: >-
+      always() && (github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')) ||
+      (github.event_name == 'pull_request' && needs.changes-images.outputs.docker == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2868,7 +3199,10 @@ jobs:
   # This job runs `if: always()`, needs EVERY other job, and fails when
   # `Detect Changes` is not `success` on a PR, when any job failed/cancelled,
   # or when a job was skipped only because its upstream did not succeed. A
-  # skip the path filter actually decided stays a pass. Rule + tests:
+  # skip the path filter actually decided stays a pass. On push the only
+  # filter is `changes-push` (#10825): the image jobs skip only when it
+  # SUCCEEDED with docker=false; if it fails or is cancelled they run anyway
+  # and its own result fails this gate, so it fails closed. Rule + tests:
   # scripts/ci-result-gate.sh, scripts/test-ci-result-gate.sh. Making it a
   # REQUIRED context is a ruleset change applied by an operator AFTER this job
   # has reported on `main` (setup-branch-protection.sh); a required context
@@ -2881,6 +3215,8 @@ jobs:
     if: always()
     needs:
       - changes
+      - changes-images
+      - changes-push
       - build-daemon
       - release-build
       - node-packages
@@ -2899,6 +3235,7 @@ jobs:
       - codex-adapter-smoke
       - shell-suite-tests
       - worker-base-image
+      - worker-buildcache
       - worker-image-smoke
       - session-image-smoke
       - native-image-smoke

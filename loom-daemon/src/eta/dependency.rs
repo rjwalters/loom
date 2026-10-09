@@ -765,6 +765,7 @@ fn refuse(
     }
     explanation.result = None;
     explanation.contributions = None;
+    explanation.stage_predictions.clear();
     explanation.combination = None;
     explanation.twin_otter = None;
     explanation.calibration = None;

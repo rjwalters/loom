@@ -62,6 +62,11 @@
 //!   test that never touches the environ cannot participate in this class of bug
 //!   at all. Likewise use `tempfile::TempDir` for paths and explicit `.env()` on
 //!   `Command` for child environments.
+//! * **Never let a test reach the machine-wide build slot.** A test that runs
+//!   the build gate, or anything else that calls `build_slot::slot_dir`, holds a
+//!   `build_slot::test_support::BuildSlotEnvGuard` for its whole body. Without
+//!   one the slot resolves to the host's `~/.loom/locks/build-slot`, and
+//!   `slot_dir` panics in test builds rather than touch it (#11014).
 //!
 //! ## When a test truly needs cross-process exclusive state
 //!
@@ -164,6 +169,7 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod docker_image_clean;
 pub mod eager_reclaim;
@@ -172,6 +178,7 @@ pub mod epic_supervisor;
 pub mod errors;
 pub mod eta;
 pub mod event_bus;
+pub mod fetch_headroom;
 pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
@@ -213,10 +220,14 @@ pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
 pub mod forge_tree_unchanged;
 pub mod forge_wait_checks;
+/// Generated content a quarantine must never stash: name-based artifacts and
+/// content-verified cargo build trees (#5690, #11075).
+pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;
 pub mod git_parser;
+pub mod git_tmp_reclaim;
 pub mod git_utils;
 pub mod guard_wiring;
 pub mod guards_status;
@@ -280,6 +291,7 @@ pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;
+pub mod ram_peaks;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
@@ -290,9 +302,13 @@ pub mod reconcile_stack;
 /// `defaults/scripts/lib/default-branch.sh`.
 pub mod refname;
 pub mod release_fetch;
+pub mod release_provenance;
 pub mod release_resolve;
+pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
+/// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
+pub mod resync_pin;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the
@@ -308,6 +324,8 @@ pub mod role_tool_policy;
 pub mod role_validation;
 /// Safe-point pause hook, pause state and resume handles for a daemon roll (#10830).
 pub mod roll_pause;
+/// A Loom-owned `CARGO_TARGET_DIR` per role run under `.loom/targets/` (#8370).
+pub mod run_target_dir;
 pub mod runtime_admission;
 pub mod runtime_launch;
 pub mod runtime_preference;
@@ -330,6 +348,7 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod signoz_read;
 pub mod stale_blocked;
 pub mod star_liveness;
 pub mod startup_adoption;
@@ -363,10 +382,13 @@ pub mod sweep_registry;
 pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
+/// Orphan sweep for Loom-owned and agent-improvised cargo target dirs (#8370).
+pub mod target_orphan_reclaim;
 /// Per-task liveness heartbeats for the daemon's long-running loops (Issue
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
 pub mod telemetry;
+pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's
@@ -399,6 +421,7 @@ pub mod watchdog;
 pub mod watchdog_provisioning_guard;
 pub mod work_finder;
 pub mod worker_spawn;
+pub mod workspace_hold;
 pub mod workspace_pool;
 pub mod workspace_registry;
 pub mod worktree_activity;

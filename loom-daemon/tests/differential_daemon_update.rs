@@ -915,6 +915,28 @@ enum Divergence {
     /// identical. Risk direction: documentation only. Any other difference (an
     /// extra, misplaced, or tampered block) stays unexplained.
     HelpDocumentsSymlinkedDest,
+    /// MECHANISM: #11044 documented the fleet floor confirmation in `--help`
+    /// (a section, the `--yes` / `--to-floor` usage lines, two environment
+    /// entries and the exit-code-1 case), which the frozen pre-port shell
+    /// cannot contain. The port's stdout must equal the shell's stdout with
+    /// exactly the four [`FLOOR_CHECK_INSERTS`] blocks, all of them, each
+    /// inserted immediately before its single anchor line. Exit code and
+    /// stderr must be identical. Risk direction: documentation only for every
+    /// case in this corpus — the check speaks only on a fleet host, and the
+    /// corpus pins `$HOME` and the config tiers to a fixture with no fleet
+    /// store. Any other difference stays unexplained.
+    HelpDocumentsFleetFloorCheck,
+    /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
+    /// the operator to `rm` entries `--prune-stale-entry-points` would not
+    /// remove (it had told them to delete provisioning's rollback copy). For
+    /// an advisory listing only non-Python, non-shim entries, the port's
+    /// stderr must equal the shell's stderr with exactly
+    /// `stale_remediation::STALE_REMEDIATION_SHELL` replaced, once, by
+    /// `stale_remediation::STALE_REMEDIATION_UNRELATED`. The header, every per-entry line and
+    /// the suppression line are unchanged. Risk direction: advisory text only
+    /// — the scan, the exit code and the prune are untouched. Any other stderr
+    /// difference stays unexplained.
+    StaleAdvisoryNoRmForUnprunableEntries,
 }
 
 /// Classify one difference, or return `Err` for "unexplained".
@@ -922,46 +944,59 @@ enum Divergence {
 /// stdout and stderr are classified independently — a half that no class
 /// explains is a finding whatever the other half did.
 fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
-    if shell.rc != port.rc || shell.stderr != port.stderr {
+    if shell.rc != port.rc {
         return Err(());
     }
+    let mut found = Vec::new();
+    if shell.stderr != port.stderr {
+        if !stale_remediation::explains(&shell.stderr, &port.stderr) {
+            return Err(());
+        }
+        found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
+    }
     if shell.stdout == port.stdout {
-        return Ok(Vec::new());
+        return Ok(found);
     }
     // `--help` now carries several documented additions, so accept any
     // combination of them — never anything else.
-    let additions: [(Divergence, &str, &str); 3] = [
-        (Divergence::HelpDocumentsTagPin, TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE),
+    // Each class is one or more (anchor, block) insertions, applied together.
+    let additions: [(Divergence, &[(&str, &str)]); 4] = [
+        (Divergence::HelpDocumentsTagPin, &[(TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE)]),
         (
             Divergence::HelpDocumentsSymlinkedDest,
-            SYMLINKED_DEST_ANCHOR,
-            SYMLINKED_DEST_HELP_BLOCK,
+            &[(SYMLINKED_DEST_ANCHOR, SYMLINKED_DEST_HELP_BLOCK)],
         ),
         (
             Divergence::HelpDocumentsRequireSignature,
-            HELP_BLOCK_ANCHOR,
-            REQUIRE_SIGNATURE_HELP_BLOCK,
+            &[(HELP_BLOCK_ANCHOR, REQUIRE_SIGNATURE_HELP_BLOCK)],
         ),
+        (Divergence::HelpDocumentsFleetFloorCheck, &FLOOR_CHECK_INSERTS),
     ];
     for mask in 1u8..(1 << additions.len()) {
         let mut expected = shell.stdout.clone();
         let mut classes = Vec::new();
         let mut applicable = true;
-        for (i, (class, anchor, block)) in additions.iter().enumerate() {
+        for (i, (class, inserts)) in additions.iter().enumerate() {
             if mask & (1 << i) == 0 {
                 continue;
             }
-            match insert_before_unique(&expected, anchor, block) {
-                Some(next) => expected = next,
-                None => {
-                    applicable = false;
-                    break;
+            for (anchor, block) in *inserts {
+                match insert_before_unique(&expected, anchor, block) {
+                    Some(next) => expected = next,
+                    None => {
+                        applicable = false;
+                        break;
+                    }
                 }
+            }
+            if !applicable {
+                break;
             }
             classes.push(*class);
         }
         if applicable && expected == port.stdout {
-            return Ok(classes);
+            found.extend(classes);
+            return Ok(found);
         }
     }
     Err(())
@@ -1529,3 +1564,10 @@ fn the_oracle_is_host_portable() {
 // invisible to that discovery (Cargo only globs `tests/*.rs`, not `tests/*/*.rs`).
 #[path = "differential_daemon_update/corpus.rs"]
 mod corpus;
+
+#[path = "differential_daemon_update/floor_check_help.rs"]
+mod floor_check_help;
+use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/stale_remediation.rs"]
+mod stale_remediation;

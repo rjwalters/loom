@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 
 use super::supersede::ArmedRoll;
 use super::{ArtifactResolution, UpdateCheck};
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 
 /// One tick's decision and the readings it was made from.
@@ -59,8 +59,12 @@ impl TickSummary {
             in_flight: None,
             drain: armed.map_or_else(DrainSnapshot::default, |roll| DrainSnapshot {
                 armed: true,
-                pending: roll.pending,
-                refusals: roll.refusals,
+                // #10831: no roll is retained across a deadline any more, so
+                // `pending` now reports a roll that can no longer be
+                // superseded and `refusals` is always 0 (fields kept so the
+                // record's shape is unchanged).
+                pending: roll.committed,
+                refusals: 0,
                 target: roll.target.clone(),
             }),
             floor_stall: None,

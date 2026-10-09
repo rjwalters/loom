@@ -38,7 +38,14 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "origin": r.origin,
             "timed_out": r.timed_out,
             "startup_hold": r.startup_hold,
+            // #10831: the H4 pause's step, budgets, per-reason requeue counts
+            // and observed durations. `null` unless this is a pause roll.
+            "pause": r.pause,
         })),
+        // #10832: the pause manifest this process found at startup and what H5
+        // did with it (phase, step, per-reason requeue counts, durations).
+        // `null` when the process started without one.
+        "resume": report.pause_resume,
         // #8652: `{ "YYYY-MM-DD": secs }`, UTC days, live pause included. `{}`
         // when nothing was recorded (and from a pre-#8652 daemon).
         "paused_by_day": report.drain_paused_by_day,
@@ -74,6 +81,11 @@ pub fn paused_by_day_line(report: &DaemonStatusReport) -> Option<String> {
 /// live roll state (no drain active, or a pre-#8514 daemon).
 #[must_use]
 pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
+    // #10832: an H5 resume hold is not a roll waiting on anything; say what
+    // it is doing instead.
+    if let Some(resume) = report.pause_resume.as_ref().filter(|r| r.holding) {
+        return Some(resume_line(resume));
+    }
     let roll = report.drain_roll.as_ref()?;
     // #9588: say WHY dispatch is paused before anything else.
     let state = if roll.startup_hold {
@@ -81,7 +93,12 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
     } else if roll.timed_out {
         "TIMED OUT, dispatch held PAUSED until the stragglers finish (operator drain — \
          `--abort-drain` resumes, `--drain --force-after-timeout` cancels them)"
+    } else if let Some(pause) = &roll.pause {
+        // #10831: a pause roll does not wait for in-flight work; say what it
+        // is doing instead.
+        return Some(pause_line(roll, pause));
     } else if roll.roll_pending {
+        // Only a pre-#10831 daemon still reports a retained roll.
         "PENDING"
     } else {
         "armed"
@@ -109,6 +126,73 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
         roll.in_flight,
         roll.refusals,
     ))
+}
+
+/// The human line for an H5 resume in progress (#10832).
+fn resume_line(resume: &loom_daemon::auto_update::pause_resume::PauseResumeStatus) -> String {
+    let requeued: u32 = resume.requeued_by_reason.values().sum();
+    format!(
+        "       roll RESUMING (H5 {}, manifest {}, phase {}) — dispatch held while this daemon \
+         verifies its health and resumes {} paused agent(s): {} resumed, {requeued} requeued so \
+         far [{} → {}, running {}{}]",
+        resume.step,
+        resume.manifest_id.as_deref().unwrap_or("?"),
+        resume.phase.as_deref().unwrap_or("?"),
+        resume.items,
+        resume.resumed,
+        resume.from_version.as_deref().unwrap_or("?"),
+        resume.to_version.as_deref().unwrap_or("?"),
+        resume.running_version,
+        if resume.resumed_on.as_deref() == Some("rollback") {
+            ", ROLLBACK"
+        } else {
+            ""
+        },
+    )
+}
+
+/// The human line for a pause roll's H4 pause (#10831).
+fn pause_line(
+    roll: &loom_daemon::ipc::DrainRollStatus,
+    pause: &loom_daemon::ipc::PauseRollStatus,
+) -> String {
+    let requeued: u32 = pause.requeued_by_reason.values().sum();
+    let reasons = if pause.requeued_by_reason.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            pause
+                .requeued_by_reason
+                .iter()
+                .map(|(reason, n)| format!("{reason}: {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "       roll PAUSING agents (H4 step {}/10{}) — {} of a {} pause budget, {} agent(s): {} \
+         paused, {requeued} requeued{reasons}, {} exited{}{}",
+        pause.step,
+        if pause.stopped {
+            ", committed: cannot be aborted"
+        } else {
+            ", nothing stopped yet"
+        },
+        human_secs(roll.paused_secs),
+        human_secs(pause.budget_secs),
+        pause.items,
+        pause.paused,
+        pause.exited,
+        pause
+            .to_version
+            .as_deref()
+            .map_or_else(String::new, |v| format!(" [to {v}]")),
+        pause
+            .target_source
+            .as_deref()
+            .map_or_else(String::new, |s| format!(" [source: {s}]")),
+    )
 }
 
 /// `3720` → `1h2m`. Compact because this is appended to an already-long line.
@@ -153,7 +237,80 @@ mod tests {
             origin: "auto-update".to_string(),
             timed_out: false,
             startup_hold: false,
+            pause: None,
         }
+    }
+
+    /// #10832: the resume state is in `--json` whether or not a hold is
+    /// active, and an active hold renders as a resume, not as an armed roll.
+    #[test]
+    fn a_resume_reports_its_manifest_phase_and_per_reason_counts() {
+        let mut report = report_with(None);
+        assert_eq!(drain_json(&report)["resume"], serde_json::Value::Null);
+        report.pause_resume = Some(loom_daemon::auto_update::pause_resume::PauseResumeStatus {
+            manifest_id: Some("rp-1".to_string()),
+            phase: Some("resumed".to_string()),
+            step: "done".to_string(),
+            load: "loaded".to_string(),
+            items: 3,
+            resumed: 2,
+            requeued_by_reason: [("lease-lost".to_string(), 1)].into_iter().collect(),
+            resumed_on: Some("rollback".to_string()),
+            pause_to_resume_secs: Some(140),
+            ..Default::default()
+        });
+        let value = drain_json(&report);
+        assert_eq!(value["resume"]["manifest_id"], "rp-1");
+        assert_eq!(value["resume"]["phase"], "resumed");
+        assert_eq!(value["resume"]["requeued_by_reason"]["lease-lost"], 1);
+        assert_eq!(value["resume"]["resumed_on"], "rollback");
+        assert_eq!(value["resume"]["pause_to_resume_secs"], 140);
+        assert!(roll_line(&report).is_none(), "finished: nothing is held");
+
+        let resume = report.pause_resume.as_mut().unwrap();
+        resume.holding = true;
+        resume.step = "probation".to_string();
+        resume.phase = Some("paused".to_string());
+        let line = roll_line(&report).unwrap();
+        assert!(line.contains("RESUMING") && line.contains("probation"), "{line}");
+        assert!(line.contains("2 resumed, 1 requeued") && line.contains("ROLLBACK"), "{line}");
+    }
+
+    /// #10831: a pause roll reports its H4 progress in `--json` and renders a
+    /// line that says what it is doing, not "waiting for in-flight".
+    #[test]
+    fn a_pause_roll_reports_its_step_budget_and_per_reason_counts() {
+        let mut roll = pending_roll();
+        roll.roll_pending = false;
+        roll.refusals = 0;
+        roll.budget_secs = 120;
+        roll.paused_secs = 40;
+        roll.origin = "pause-roll".to_string();
+        roll.pause = Some(loom_daemon::ipc::PauseRollStatus {
+            step: 5,
+            stopped: true,
+            budget_secs: 120,
+            items: 3,
+            paused: 1,
+            to_version: Some("0.19.900".to_string()),
+            target_source: Some("floor".to_string()),
+            requeued_by_reason: [("young-agent-reset".to_string(), 1)].into_iter().collect(),
+            ..Default::default()
+        });
+        let value = drain_json(&report_with(Some(roll.clone())));
+        assert_eq!(value["roll"]["roll_pending"], serde_json::json!(false));
+        assert_eq!(value["roll"]["refusals"], serde_json::json!(0));
+        assert_eq!(value["roll"]["pause"]["step"], serde_json::json!(5));
+        assert_eq!(value["roll"]["pause"]["budget_secs"], serde_json::json!(120));
+        assert_eq!(
+            value["roll"]["pause"]["requeued_by_reason"]["young-agent-reset"],
+            serde_json::json!(1)
+        );
+        let line = roll_line(&report_with(Some(roll))).unwrap();
+        assert!(line.contains("PAUSING agents (H4 step 5/10, committed"), "{line}");
+        assert!(line.contains("40s of a 2m0s pause budget"), "{line}");
+        assert!(line.contains("young-agent-reset: 1"), "{line}");
+        assert!(line.contains("[source: floor]"), "{line}");
     }
 
     #[test]

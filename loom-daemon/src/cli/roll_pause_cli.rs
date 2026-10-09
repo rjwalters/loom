@@ -142,7 +142,10 @@ impl RollPauseCommand {
 pub(crate) enum AgentResumeCommand {
     /// The arguments spawn-claude.sh appends, NUL-separated: `--resume <id>
     /// <prompt>` (LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT), `--session-id
-    /// <id>` (LOOM_CLAUDE_SESSION_ID), or nothing. Exit 78 on a bad value.
+    /// <id>` (LOOM_CLAUDE_SESSION_ID), or nothing; then, for a daemon item
+    /// (LOOM_DAEMON_ITEM_ID), `--settings <json>` wiring the roll-pause hook
+    /// unless the launch dir's settings already do (#11049). Exit 78 on a
+    /// bad session value.
     ClaudeArgs,
     /// Check a Codex resume launch (session id, prompt, LOOM_CODEX_HOME
     /// pinned) and print its prompt. Exit 78 when it is not resumable.
@@ -162,6 +165,12 @@ pub(crate) enum AgentResumeCommand {
         account: Option<String>,
         #[arg(long)]
         container: Option<String>,
+        /// The Codex sandbox mode the session was launched with (#10831), so a
+        /// resume can relaunch it under the same one. `spawn-codex.sh` passes
+        /// it as `LOOM_CODEX_SANDBOX_MODE` rather than as this flag, so a
+        /// script newer than the binary it runs does not break the capture.
+        #[arg(long)]
+        sandbox: Option<String>,
         #[arg(long, default_value_t = 3600)]
         timeout_secs: u64,
     },
@@ -212,6 +221,7 @@ impl AgentResumeCommand {
                 codex_home,
                 account,
                 container,
+                sandbox,
                 timeout_secs,
             } => {
                 let spec = resume::CaptureSpec {
@@ -224,6 +234,9 @@ impl AgentResumeCommand {
                         session_store: codex_home.filter(|s| !s.is_empty()),
                         account: account.filter(|s| !s.is_empty()),
                         container: container.filter(|s| !s.is_empty()),
+                        sandbox: sandbox
+                            .or_else(|| env_var("LOOM_CODEX_SANDBOX_MODE"))
+                            .filter(|s| !s.is_empty() && s != "unknown"),
                         cwd: std::env::current_dir()
                             .ok()
                             .map(|d| d.display().to_string()),

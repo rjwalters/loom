@@ -73,6 +73,7 @@ pub fn tick_summary(
         queue,
         plan,
         listing_failed: ready_queue::repo_names(&report.listing_failed, roots),
+        listing_incomplete: ready_queue::repo_names(&report.listing_incomplete, roots),
         at,
         max_concurrent,
         seen: report.seen,

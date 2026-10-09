@@ -34,9 +34,11 @@ pub(super) fn estimate_locked(
     let answers = state.tracker.drain_answers();
     if !answers.is_empty() {
         let ids = current_ids(state);
-        state
-            .shadow
-            .record_answers(&|kind| ids.get(&kind).cloned().unwrap_or_default(), &answers);
+        let current = |kind| ids.get(&kind).cloned().unwrap_or_default();
+        state.shadow.record_answers(&current, &answers);
+        // #10949: the same passes, hourly and conditional on `current`
+        // answering — the live non-refusal check `eta promote` reads.
+        state.shadow.record_answer_hours(&current, &answers, now);
         let path = shadow::ledger_path(&state.workspace_root);
         if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
             log::warn!("eta: persisting the shadow ledger failed: {error}");

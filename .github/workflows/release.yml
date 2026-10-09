@@ -398,6 +398,19 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.publish != 'skip'
     runs-on: ${{ matrix.os }}
+    env:
+      # The release stamp (#10718). `loom-daemon/build_stamp.rs` bakes this
+      # into the binary, and a daemon pushes Loom updates into fleet repos only
+      # if it carries the stamp for its own version AND the forge confirms the
+      # tag names the commit it was built from (`release_provenance.rs`). This
+      # is the ONLY place the variable is set: a developer's build, a feature
+      # branch's and every CI job leave it empty, so none of them can push.
+      # Empty on a dry run (`publish == 'false'`), which publishes nothing.
+      #
+      # Job-level on purpose: the collector step below re-runs cargo for this
+      # package, and a step-level value would have it rebuild the binary
+      # without the stamp just before it is packaged.
+      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom' && needs.resolve.outputs.tag) || '' }}
     strategy:
       # Never mask a platform's failure with another's success, and never let
       # one platform's failure cancel an in-flight build for another.
@@ -535,6 +548,31 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/loom-daemon" "dist/loom-daemon-${{ matrix.target }}"
+
+      # The packaged binary must carry exactly the stamp this run set (#10718):
+      # the release tag on a publishing run, nothing on a dry run. Read with
+      # `grep -a` so the cross-compiled artifact, which cannot run here, is
+      # checked too. A release whose binaries lost the stamp would leave every
+      # fleet host unable to resync, so that fails here instead.
+      #
+      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-14 runner
+      # exports LC_ALL=en_US.UTF-8, and its BSD grep (2.6.0-FreeBSD) in a
+      # UTF-8 locale does not find the marker in the Mach-O binary even though
+      # the bytes are there: release run 37837360573 failed this step on
+      # aarch64-apple-darwin only, and diagnostic run 37841304807 showed the
+      # marker at a known offset, the MARKER symbol in __TEXT,__const, grep
+      # count 0 under en_US.UTF-8 and 1 under LC_ALL=C on the same file. The
+      # Linux legs use GNU grep, which is unaffected.
+      - name: Verify the release stamp
+        run: |
+          set -euo pipefail
+          bin="dist/loom-daemon-${{ matrix.target }}"
+          marker="loom-release-build-tag=${LOOM_RELEASE_BUILD_TAG};"
+          if ! LC_ALL=C grep -a -q -F -- "$marker" "$bin"; then
+            echo "::error::$bin does not carry the release stamp '$marker' (LOOM_RELEASE_BUILD_TAG='${LOOM_RELEASE_BUILD_TAG}')." >&2
+            exit 1
+          fi
+          echo "Confirmed: $bin carries '$marker'."
 
       # Detect which signing secrets are present and record the decision as step
       # outputs. GitHub Actions cannot reference `secrets.*` directly in an
@@ -1226,9 +1264,10 @@ jobs:
     # isolation means the image build-worker-image loaded into ITS runner's
     # local docker store does not carry over to this job's fresh runner, so
     # rebuilding locally (identical steps, same inputs) is simpler and more
-    # robust than transferring a `docker save` tarball between jobs, and
-    # keeps this job correct on a workflow_dispatch dry run too, where
-    # nothing was pushed to GHCR for a registry-pull FROM to resolve against.
+    # robust than transferring a `docker save` tarball between jobs. On a
+    # workflow_dispatch dry run, where nothing was pushed to GHCR for a
+    # registry-pull FROM to resolve against, the native build consumes that
+    # local base via the docker-driver builder (#11012, see that step).
     # Multi-arch (#7388): the `needs:` dependency additionally guarantees
     # build-worker-image's own multi-arch PUSH step has already completed
     # before this job's own multi-arch push step runs, so the REGISTRY
@@ -1326,9 +1365,19 @@ jobs:
           tags: |
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
+      # Dry run (#11012): the `docker-container` builder set up above runs
+      # its own BuildKit, which resolves `FROM ${BASE_IMAGE}` against the
+      # REGISTRY and cannot see the base image the step above `load`ed into
+      # the docker daemon's store. A dry run never pushes that base, so on a
+      # version no real release has published yet the FROM is "not found".
+      # `builder: default` (the runner's docker-driver builder) builds inside
+      # the daemon itself, so FROM resolves to the locally loaded base. Only
+      # on `publish == 'false'`: a publishing run keeps the current builder
+      # (empty input), exactly as before.
       - name: Build loom-worker-session image (native amd64, for smoke test)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
+          builder: ${{ needs.resolve.outputs.publish == 'false' && 'default' || '' }}
           context: .
           file: docker/session/Dockerfile
           platforms: linux/amd64
@@ -1468,9 +1517,12 @@ jobs:
           tags: |
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
+      # Dry run (#11012): same `builder: default` routing as
+      # build-session-image's native build, for the same reason.
       - name: Build loom-worker-native image (native amd64, for smoke test)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
+          builder: ${{ needs.resolve.outputs.publish == 'false' && 'default' || '' }}
           context: .
           file: docker/native/Dockerfile
           platforms: linux/amd64
