@@ -231,9 +231,18 @@ listings, and ranks the ready queue by its own planner. Per `(repo, issue)` at
 A host restart begins a new chain with a fresh anchor. Records from before the
 restart never chain into it, because their `anchor_as_of` differs.
 
+## Read client
+
+Replay reads SigNoz through the neutral read client in
+`loom-daemon/src/signoz_read.rs` (#11127): `ClickhouseHttp` (bound
+`param_*` parameters, credential read from an owner-only file at call time and
+never logged) and `FileRows` (a `JSONEachRow` export, used by tests as the
+fixture store). It pages by `(knowable_time_ns, record_id)` and depends on
+nothing under `eta/`, so it survives the ETA subsystem's removal (#11098).
+
 ## Not yet implemented
 
-- `loom-daemon telemetry replay --as-of <t>` and `--check`.
+- `loom-daemon telemetry-replay --as-of <t>` and `--check` (#11127, #11128).
 - `fleet.state` hold and capacity facts (slice R8) and the committed
   volume/coverage ClickHouse query (bytes/day, rows per anchor, anchors
   missing chunks, hosts with no anchor in 2 h).
