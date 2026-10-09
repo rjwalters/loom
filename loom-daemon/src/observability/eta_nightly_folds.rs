@@ -168,12 +168,12 @@ pub fn gate_tick_with(
     gate
 }
 
-/// Durably offer every record of `day` to `sink`, folds then summaries, a
+/// Durably offer every record of `day` to `sink`, folds, summaries, then stage-attribution rows, a
 /// record whose provenance does not validate dropped (it can never be
 /// delivered, so it must not hold the day open). Returns how many were
 /// offered; the first failed offer stops and surfaces, leaving the day pending.
 /// Records already offered stay queued, and a retry re-offers them: each
-/// carries a stable id (`fold_id` / `summary_id`) for the collector to dedupe.
+/// carries a stable id (`fold_id` / `summary_id` / `row_id`) for the collector to dedupe.
 ///
 /// # Errors
 /// A durable offer failed.
@@ -198,6 +198,17 @@ pub fn emit_day(sink: &dyn QueueSink, host_id: &str, day: &DayRecords) -> std::i
         sink.offer_durable(TelemetryEnvelope::new(
             host_id,
             TelemetryRecord::EtaBacktestSummary(summary.clone()),
+        ))?;
+        offered += 1;
+    }
+    for row in &day.stage_attribution {
+        if !row.has_provenance() {
+            log::warn!("eta nightly folds: dropped eta.stage_attribution: invalid provenance");
+            continue;
+        }
+        sink.offer_durable(TelemetryEnvelope::new(
+            host_id,
+            TelemetryRecord::EtaStageAttribution(row.clone()),
         ))?;
         offered += 1;
     }
@@ -511,7 +522,10 @@ mod tests {
         let records = fold_one_day(root.path());
         let sink = Collect::default();
         let offered = deliver_pending(root.path(), Some(&sink), "host");
-        assert_eq!(offered, records.folds.len() + records.summaries.len());
+        assert_eq!(
+            offered,
+            records.folds.len() + records.summaries.len() + records.stage_attribution.len()
+        );
         let kinds = kinds(&sink);
         assert_eq!(
             kinds.iter().filter(|k| **k == "eta.backtest.fold").count(),
@@ -523,6 +537,13 @@ mod tests {
                 .filter(|k| **k == "eta.backtest.summary")
                 .count(),
             records.summaries.len()
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == "eta.stage_attribution")
+                .count(),
+            records.stage_attribution.len()
         );
         let first_summary = kinds.iter().position(|k| *k == "eta.backtest.summary");
         let last_fold = kinds.iter().rposition(|k| *k == "eta.backtest.fold");
@@ -548,7 +569,7 @@ mod tests {
         let sink = Collect::default();
         assert_eq!(
             deliver_pending(root.path(), Some(&sink), "host"),
-            records.folds.len() + records.summaries.len()
+            records.folds.len() + records.summaries.len() + records.stage_attribution.len()
         );
         let after = std::fs::read_to_string(nightly_folds::day_path(
             root.path(),
@@ -567,7 +588,7 @@ mod tests {
         let sink = Collect::default();
         assert_eq!(
             deliver_pending(root.path(), Some(&sink), "host"),
-            records.folds.len() + records.summaries.len()
+            records.folds.len() + records.summaries.len() + records.stage_attribution.len()
         );
         assert!(nightly_folds::pending_delivery(root.path()).is_empty());
     }
@@ -587,12 +608,12 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             deliver_pending(root.path(), Some(&sink), "host"),
-            records.folds.len() + records.summaries.len()
+            records.folds.len() + records.summaries.len() + records.stage_attribution.len()
         );
         assert!(nightly_folds::pending_delivery(root.path()).is_empty());
         assert_eq!(
             sink.inner.0.lock().unwrap().len(),
-            records.folds.len() + records.summaries.len(),
+            records.folds.len() + records.summaries.len() + records.stage_attribution.len(),
             "every record queued exactly once after recovery"
         );
     }

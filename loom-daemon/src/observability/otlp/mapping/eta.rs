@@ -350,6 +350,30 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.stage_outcome", SeverityNumber::Info, nanos(r.left_at), attributes, body))
         }
+        TelemetryRecord::EtaStageAttribution(r) => {
+            // #10957: one (heuristic, stage) rollup row; stamped at its cutoff.
+            let mut attributes = vec![
+                kv_string("loom.eta.stage_attribution.row_id", r.row_id.clone()),
+                kv_string("loom.eta.stage_attribution.day", r.day.clone()),
+                kv_int("loom.eta.stage_attribution.window_days", i64::from(r.window_days)),
+                kv_string("loom.eta.stage_attribution.heuristic", r.heuristic.clone()),
+                kv_string("loom.eta.stage_attribution.kind", r.kind.clone()),
+                kv_string("loom.eta.stage_attribution.stage", r.stage.clone()),
+                kv_int("loom.eta.stage_attribution.n", i64::try_from(r.n).unwrap_or(i64::MAX)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.stage_attribution.bias_sec", r.bias_sec),
+                ("loom.eta.stage_attribution.mean_abs_sec", r.mean_abs_sec),
+                ("loom.eta.stage_attribution.dominant_share", r.dominant_share),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_double(key, value));
+                }
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.stage_attribution", SeverityNumber::Info, nanos(r.cutoff), attributes, body))
+        }
         TelemetryRecord::EtaBacktestFold(r) => {
             // #10492: one heuristic's fold for one day; stamped at its cutoff.
             let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);

@@ -858,3 +858,41 @@ fn the_fold_path_makes_no_forge_call_and_spawns_no_process() {
         assert!(!production.contains(needle), "nightly_folds.rs mentions `{needle}`");
     }
 }
+
+#[test]
+fn the_fold_rolls_the_attribution_log_into_heuristics_times_eight_rows() {
+    use crate::eta::attribution_log::AttributionRow;
+    use crate::eta::stage_forecast::Attribution;
+
+    let mut inputs = inputs();
+    let day = busiest_day(&inputs);
+    let registry = Registry::builtin();
+    let ids: Vec<&str> = registry.for_kind(Kind::Land).map(|h| h.id()).collect();
+    let at = day_start(day) + Duration::hours(3);
+    inputs.attribution = (0..50)
+        .map(|i| AttributionRow {
+            estimate_id: format!("e{i}"),
+            heuristic: ids[0].to_string(),
+            kind: Kind::Land,
+            repo: "rjwalters/loom".into(),
+            issue: 1,
+            as_of: at - Duration::hours(1),
+            actual_at: at,
+            observed_at: at,
+            error_sec: 10,
+            attribution: Attribution {
+                stages: std::collections::BTreeMap::new(),
+                unattributed_sec: 10,
+                dominant_stage: None,
+            },
+        })
+        .collect();
+    let records = fold(&inputs, day);
+    assert_eq!(records.stage_attribution.len(), ids.len() * 8);
+    let un = records
+        .stage_attribution
+        .iter()
+        .find(|r| r.heuristic == ids[0] && r.stage == "unattributed")
+        .unwrap();
+    assert_eq!((un.n, un.bias_sec), (50, Some(10.0)));
+}

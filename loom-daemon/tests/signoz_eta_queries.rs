@@ -104,6 +104,7 @@ fn clickhouse(script: &str, format: &str, repo: &str) -> String {
             "--multiquery",
             &format!("--param_since={SINCE}"),
             &format!("--param_repo={repo}"),
+            "--param_estimate_id=",
             "--output_format_json_quote_denormals=1",
             &format!("--format={format}"),
         ])
@@ -186,9 +187,9 @@ fn sections(repo: &str) -> Vec<Vec<Row>> {
     let committed = statements(QUERIES);
     assert_eq!(
         committed.len(),
-        8,
+        10,
         "eta-queries.sql is documented as section 0 plus Q1-Q7 (Q4-Q7 are proven by \
-         signoz_eta_accuracy_views.rs)"
+         signoz_eta_accuracy_views.rs) and QA/QB (signoz_eta_stage_attribution.rs)"
     );
     run(&committed, repo)
 }

@@ -176,6 +176,7 @@ pub mod eta_fleet_refresh;
 pub mod eta_snapshot;
 
 /// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
+pub mod eta_stage_attribution;
 pub mod eta_stage_outcome;
 
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
@@ -435,6 +436,11 @@ macro_rules! telemetry_kind_table {
             /// the ETA tracker already journals, so no new forge read.
             /// OTLP-only. See [`eta_stage_outcome`].
             EtaStageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::eta_stage_outcome::EtaStageOutcomeRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One (heuristic, stage) row of the nightly stage-error rollup
+            /// (Issue #10957). OTLP-only. See [`eta_stage_attribution`].
+            EtaStageAttribution = "eta.stage_attribution" => $crate::telemetry::kinds::eta_stage_attribution::EtaStageAttributionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One heuristic's nightly walk-forward fold for one UTC day (Issue

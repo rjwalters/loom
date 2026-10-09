@@ -73,18 +73,27 @@
 //! `eta backtest --save-pr-history` ([`pr_history_path`]). It adds no GitHub
 //! calls. A run folds at most [`MAX_CATCH_UP_DAYS`] missed days, oldest first.
 //!
+//! # Stage-error rollup
+//!
+//! The same job rolls the local attribution log up into `eta.stage_attribution`
+//! rows (#10957): [`stage_attribution_fold`] documents the window, the
+//! point-in-time rule and the fixed row budget.
+//!
 //! # Idempotent
 //!
 //! One file per day ([`day_path`]) holds that day's records; a day whose file
 //! exists is never re-run, so a restart does not duplicate records.
 
+use super::attribution_log::{self, AttributionRow};
 use super::backtest::{self, Filter, ReplayCase};
 use super::history::StageSamples;
 use super::journal::{self, JournalEntry};
 use super::score::Score;
 use super::shadow::{self, GateStatus, MIN_FOLDS};
+use super::stage_attribution_fold;
 use super::{EstimateInput, Explanation, Heuristic, Kind, Provenance, Registry, Tier};
 use crate::telemetry::kinds::eta_backtest::{EtaBacktestFoldRecord, EtaBacktestSummaryRecord};
+use crate::telemetry::kinds::eta_stage_attribution::EtaStageAttributionRecord;
 use crate::telemetry::TelemetryEnvelope;
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -152,6 +161,10 @@ pub struct DayRecords {
     pub folds: Vec<EtaBacktestFoldRecord>,
     /// One per non-`current` `land` heuristic.
     pub summaries: Vec<EtaBacktestSummaryRecord>,
+    /// `heuristics × 8` stage-error rollup rows (#10957). Absent in a file
+    /// saved before it existed.
+    #[serde(default)]
+    pub stage_attribution: Vec<EtaStageAttributionRecord>,
 }
 
 /// The newest run, as `eta doctor` reads it.
@@ -174,6 +187,8 @@ pub struct Inputs {
     pub journal: Vec<JournalEntry>,
     /// Extra `land` cases (the offline merged-PR cache).
     pub pr_cases: Vec<ReplayCase>,
+    /// The stage-attribution log (#10957).
+    pub attribution: Vec<AttributionRow>,
 }
 
 /// Read this host's inputs. No forge call.
@@ -212,6 +227,7 @@ pub fn load_inputs(root: &Path) -> Inputs {
         envelopes,
         journal: journal::read(&journal::journal_path(root)),
         pr_cases,
+        attribution: attribution_log::read(&attribution_log::path(root)),
     }
 }
 
@@ -604,6 +620,7 @@ pub fn run_day(
             day: day_s,
             folds: Vec::new(),
             summaries: Vec::new(),
+            stage_attribution: Vec::new(),
         };
     };
     let current_id = current.id();
@@ -662,10 +679,13 @@ pub fn run_day(
     }
 
     let summaries = summaries_for(&cases, history, &current, &by_day, day, loom);
+    let ids: Vec<&str> = registry.for_kind(KIND).map(|h| h.id()).collect();
+    let stage_attribution = stage_attribution_fold::rollup(&inputs.attribution, &ids, day, loom);
     DayRecords {
         day: day_s,
         folds,
         summaries,
+        stage_attribution,
     }
 }
 

@@ -3304,6 +3304,20 @@ day, catches up at most 7 missed days oldest first).
   cache `.loom/state/eta/backtest/pr-history.json` (what
   `eta backtest --forge-pr-cases --save-pr-history` writes); without it only
   cases a local sweep witnessed are replayed.
+- **Stage-error rollup (#10957).** The same job rolls the per-stage error
+  attribution of `eta.outcome` up into `eta.stage_attribution` records: per
+  registered `land` heuristic, one per stage of the fixed enum plus
+  `unattributed` (`heuristics x 8` a day, never a per-item row), each with
+  `n`, `bias_sec`, `mean_abs_sec` and `dominant_share` over the trailing 7
+  days. The source is a local log, `.loom/state/eta/attribution.jsonl`, one row
+  per scored `land` outcome with an attribution, appended where the tracker
+  scores it (no forge call; compacted like `calibration.jsonl`). The fold
+  counts a row only when it was both resolved (`actual_at`) and scored by this
+  daemon (`observed_at`) before the day's cutoff, and once per `estimate_id`,
+  so a later outcome leaves the day's rows bit-identical. There is no
+  backfill: attribution exists only from the release that added the log, so
+  the first window is partial. `eta-queries.sql` QA (one estimate, forecast
+  vs actual per stage) and QB (per-heuristic, per-stage bias) read them.
 - **State.** `.loom/state/eta/backtest/fold-<day>.json` (one per day; its
   existence makes a restart idempotent) and `summary.json` (the newest run).
 - **`eta doctor`** prints the `backtest` link: the newest fold day, then one

@@ -406,3 +406,97 @@ FROM (
 WHERE is_estimate = 1 AND seq < n
 GROUP BY heuristic, revision, kind
 ORDER BY heuristic, revision, kind;
+
+-- QA. One estimate, stage by stage (#10957): what the estimate forecast for
+--     each stage against what happened, and how much of the outcome's error
+--     the stage carries. Pass the estimate id as the `estimate_id` query
+--     parameter (a section that is run with `''` answers no rows).
+--
+--     Source: the `eta.outcome` body's `attribution.stages` (#10929; each
+--     stage's predicted and actual entry and dwell, and `contribution_sec` =
+--     actual - predicted dwell) LEFT JOINed to the `eta.estimate` body's
+--     `stage_predictions` for the interval the estimate gave (`dwell_p90_sec`,
+--     `reach_pct`). A stage the estimate did not forecast (visited anyway) has
+--     NULL predictions; a stage forecast but never visited has
+--     `actual_dwell_sec` 0. `unattributed_sec` is the same on every row: the
+--     error no stage explains, so `sum(contribution_sec) + unattributed_sec`
+--     is the outcome's `error_sec`. Delivery is at least once, so each side
+--     takes one row (`LIMIT 1 BY`) and the stages are in path order.
+--     No `since` bound: a lookup by id must not miss an old estimate.
+SELECT o.stage AS stage,
+       o.predicted_entry_sec AS predicted_entry_sec,
+       o.actual_entry_sec AS actual_entry_sec,
+       o.predicted_dwell_sec AS predicted_dwell_sec,
+       o.actual_dwell_sec AS actual_dwell_sec,
+       o.contribution_sec AS contribution_sec,
+       o.unattributed_sec AS unattributed_sec,
+       if(e.pred = '', NULL, JSONExtractInt(e.pred, 'dwell_p90')) AS predicted_dwell_p90_sec,
+       if(e.pred = '', NULL, JSONExtractInt(e.pred, 'reach_pct')) AS reach_pct
+FROM (
+    SELECT kv.1 AS stage,
+           JSONExtract(kv.2, 'predicted_entry_sec', 'Nullable(Int64)') AS predicted_entry_sec,
+           JSONExtract(kv.2, 'actual_entry_sec', 'Nullable(Int64)') AS actual_entry_sec,
+           JSONExtractInt(kv.2, 'predicted_dwell_sec') AS predicted_dwell_sec,
+           JSONExtractInt(kv.2, 'actual_dwell_sec') AS actual_dwell_sec,
+           JSONExtractInt(kv.2, 'contribution_sec') AS contribution_sec,
+           JSONExtractInt(body, 'attribution', 'unattributed_sec') AS unattributed_sec
+    FROM (
+        SELECT body
+        FROM signoz_logs.distributed_logs_v2
+        WHERE mapContains(attributes_string, 'loom.eta.outcome')
+          AND attributes_string['loom.eta.estimate_id'] = {estimate_id:String}
+        LIMIT 1
+    )
+    ARRAY JOIN JSONExtractKeysAndValuesRaw(body, 'attribution', 'stages') AS kv
+) AS o
+LEFT JOIN (
+    SELECT kv.1 AS stage, kv.2 AS pred
+    FROM (
+        SELECT body
+        FROM signoz_logs.distributed_logs_v2
+        WHERE mapContains(attributes_string, 'loom.eta.trigger')
+          AND attributes_string['loom.eta.estimate_id'] = {estimate_id:String}
+        LIMIT 1
+    )
+    ARRAY JOIN JSONExtractKeysAndValuesRaw(body, 'stage_predictions') AS kv
+) AS e ON o.stage = e.stage
+ORDER BY indexOf(['ready_wait', 'sweep.curator', 'sweep.builder', 'review_wait',
+                  'doctor', 'merge_wait', 'merge_hold'], o.stage), o.stage;
+
+-- QB. Per-heuristic, per-stage error bias (#10957): where each `land`
+--     heuristic is systematically early or late. Source: the nightly
+--     `eta.stage_attribution` rollup (one record per heuristic x stage, plus a
+--     `stage` = 'unattributed' row, per UTC day, over the trailing
+--     `window_days` days; chosen over recomputing from `eta.outcome` bodies so
+--     the figure is the exact one the authority host folded, point-in-time).
+--     `bias_sec` > 0 means the stage ran longer than forecast; `mean_abs_sec`
+--     is the typical miss; `dominant_share` the share of that window's
+--     outcomes whose largest miss was this stage. NULL (not 0) when `n` = 0.
+--     Each day's window overlaps the previous six, so read the newest `day`
+--     per heuristic, or plot one stage over `day`; do not sum days.
+--     De-duplicated on the stable `row_id` (delivery is at least once). Not
+--     scoped by `repo`: the rollup is fleet-wide, and the `repo` parameter is
+--     not used here.
+SELECT day, heuristic, stage, n, bias_sec, mean_abs_sec, dominant_share, window_days
+FROM (
+    SELECT attributes_string['loom.eta.stage_attribution.day'] AS day,
+           attributes_string['loom.eta.stage_attribution.heuristic'] AS heuristic,
+           attributes_string['loom.eta.stage_attribution.stage'] AS stage,
+           attributes_number['loom.eta.stage_attribution.n'] AS n,
+           if(mapContains(attributes_number, 'loom.eta.stage_attribution.bias_sec'),
+              attributes_number['loom.eta.stage_attribution.bias_sec'], NULL) AS bias_sec,
+           if(mapContains(attributes_number, 'loom.eta.stage_attribution.mean_abs_sec'),
+              attributes_number['loom.eta.stage_attribution.mean_abs_sec'], NULL) AS mean_abs_sec,
+           if(mapContains(attributes_number, 'loom.eta.stage_attribution.dominant_share'),
+              attributes_number['loom.eta.stage_attribution.dominant_share'], NULL) AS dominant_share,
+           attributes_number['loom.eta.stage_attribution.window_days'] AS window_days,
+           attributes_string['loom.eta.stage_attribution.row_id'] AS row_id
+    FROM signoz_logs.distributed_logs_v2
+    WHERE mapContains(attributes_string, 'loom.eta.stage_attribution.row_id')
+      AND attributes_bool['loom.eta.provenance_complete'] = true
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+    LIMIT 1 BY row_id
+)
+ORDER BY day DESC, heuristic, indexOf(['ready_wait', 'sweep.curator', 'sweep.builder',
+                                       'review_wait', 'doctor', 'merge_wait', 'merge_hold',
+                                       'unattributed'], stage);

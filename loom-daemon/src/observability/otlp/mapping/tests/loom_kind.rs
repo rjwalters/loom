@@ -20,6 +20,7 @@ use crate::eta::{
 };
 use crate::telemetry::kinds::eta::{EtaEstimateRecord, EtaOutcomeRecord};
 use crate::telemetry::kinds::eta_backtest::{EtaBacktestFoldRecord, EtaBacktestSummaryRecord};
+use crate::telemetry::kinds::eta_stage_attribution::EtaStageAttributionRecord;
 use crate::telemetry::kinds::pick_decision::{
     PickCandidate, PickDecisionRecord, PickTick, PickVerdict,
 };
@@ -152,6 +153,23 @@ fn backtest_fold() -> EtaBacktestFoldRecord {
     }
 }
 
+fn stage_attribution() -> EtaStageAttributionRecord {
+    EtaStageAttributionRecord {
+        row_id: "r".into(),
+        day: "2026-07-30".into(),
+        window_days: 7,
+        heuristic: "h".into(),
+        kind: "land".into(),
+        stage: "review_wait".into(),
+        n: 1,
+        bias_sec: Some(1.0),
+        mean_abs_sec: Some(1.0),
+        dominant_share: Some(1.0),
+        cutoff: ts(),
+        loom: provenance(),
+    }
+}
+
 fn backtest_summary() -> EtaBacktestSummaryRecord {
     EtaBacktestSummaryRecord {
         summary_id: "s".into(),
@@ -237,6 +255,7 @@ fn samples() -> Vec<TelemetryRecord> {
                     "resolution_sec": 0, "loom": p})),
         TelemetryRecord::EtaBacktestFold(backtest_fold()),
         TelemetryRecord::EtaBacktestSummary(backtest_summary()),
+        TelemetryRecord::EtaStageAttribution(stage_attribution()),
         wire(json!({"kind": "pass.summary", "pass_id": "p", "mechanism": "m",
                     "repo": "rjwalters/loom", "host": "host-a", "mode": "dry_run",
                     "outcome": "completed", "started_at": AT, "ended_at": AT,

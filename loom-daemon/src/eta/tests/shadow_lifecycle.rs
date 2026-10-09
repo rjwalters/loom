@@ -57,6 +57,7 @@ fn days(n: usize, per_id: &[(&str, Day)]) -> Vec<DayRecords> {
                 day: day.clone(),
                 folds: per_id.iter().map(|(id, d)| fold(id, &day, *d)).collect(),
                 summaries: Vec::new(),
+                stage_attribution: Vec::new(),
             }
         })
         .collect()

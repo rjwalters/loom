@@ -2432,6 +2432,28 @@ coefficient file): `fold_id`,
 retained coefficient file; absent with none), `cases_before_fit` (cases
 predicted earlier, left out), `fit_id?`, `loom`.
 
+### `eta.stage_attribution`
+
+The nightly per-heuristic, per-stage rollup of `eta.outcome`'s `attribution`
+(Issue #10957; see [eta.md](eta.md#nightly-backtest-folds-autonomousetanightlyfolds-10492)).
+**OTLP-only** (native: `false`), emitted by the same nightly job as
+`eta.backtest.fold`, on the authority host only. Scalars ride as
+`loom.eta.stage_attribution.*` attributes (in `ETA_LOG_ATTRIBUTE_KEYS`,
+allowlisted in the collector's `transform/privacy`); the body is the record's
+JSON. The record time is the day's cutoff. Provenance is required.
+**Absent is never zero.**
+
+One record per registered `land` heuristic per stage of the fixed stage enum
+(7) plus one `stage = "unattributed"` row: `heuristics x 8` per day, whatever
+the number of outcomes. There is never a per-item row. Fields: `row_id`
+(derived from `(heuristic, stage, day)`, so a re-offer dedupes), `day`,
+`window_days` (7, the trailing window ending at `cutoff`), `heuristic`, `kind`,
+`stage`, `n` (outcomes in the window that visited or forecast the stage),
+`bias_sec?` (mean signed contribution; positive is slower than forecast),
+`mean_abs_sec?`, `dominant_share?` (share of those outcomes whose largest miss
+was this stage; absent for `unattributed`), `cutoff`, `loom`. With `n = 0` the
+statistics are omitted.
+
 ### `eta.snapshot`
 
 This host's **live** ETA estimate set (Issue #9329) — one row per

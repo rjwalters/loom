@@ -50,6 +50,7 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
+use crate::eta::attribution_log::{self, AttributionRow};
 use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
 use crate::eta::fit;
@@ -400,6 +401,15 @@ fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
             .calibration
             .retain(|r| !resolved.contains(r.estimate_id.as_str()));
         state.history.calibration.extend(landed);
+    }
+    let attributed: Vec<AttributionRow> = outcomes
+        .iter()
+        .filter_map(|r| AttributionRow::from_resolved(r, now))
+        .collect();
+    if let Err(error) =
+        attribution_log::append(&attribution_log::path(&state.workspace_root), &attributed)
+    {
+        log::warn!("eta: appending the attribution log failed: {error}");
     }
     let ids = current_ids(state);
     state

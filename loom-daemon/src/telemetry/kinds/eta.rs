@@ -129,6 +129,17 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.stage_outcome.left_at",
     "loom.eta.stage_outcome.dwell_sec",
     "loom.eta.stage_outcome.open_estimates",
+    // `eta.stage_attribution` (#10957).
+    "loom.eta.stage_attribution.row_id",
+    "loom.eta.stage_attribution.day",
+    "loom.eta.stage_attribution.window_days",
+    "loom.eta.stage_attribution.heuristic",
+    "loom.eta.stage_attribution.kind",
+    "loom.eta.stage_attribution.stage",
+    "loom.eta.stage_attribution.n",
+    "loom.eta.stage_attribution.bias_sec",
+    "loom.eta.stage_attribution.mean_abs_sec",
+    "loom.eta.stage_attribution.dominant_share",
     // `eta.backtest.fold` (#10492).
     "loom.eta.backtest.fold.fold_id",
     "loom.eta.backtest.fold.heuristic",

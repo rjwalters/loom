@@ -46,6 +46,7 @@ fn clickhouse(script: &str) -> String {
             "--multiquery",
             &format!("--param_since={SINCE}"),
             "--param_repo=",
+            "--param_estimate_id=",
             "--format=JSONEachRow",
         ])
         .stdin(Stdio::piped())
@@ -82,7 +83,7 @@ fn statements() -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect();
-    assert_eq!(all.len(), 8, "eta-queries.sql is documented as section 0 plus Q1-Q7");
+    assert_eq!(all.len(), 10, "eta-queries.sql is section 0, Q1-Q7, QA and QB");
     all
 }
 

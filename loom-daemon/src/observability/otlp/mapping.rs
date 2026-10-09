@@ -612,6 +612,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaFit(_)
         | TelemetryRecord::EtaBacktestFold(_)
         | TelemetryRecord::EtaBacktestSummary(_)
+        | TelemetryRecord::EtaStageAttribution(_)
         | TelemetryRecord::PrResolved(_)
         | TelemetryRecord::EtaStageOutcome(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
