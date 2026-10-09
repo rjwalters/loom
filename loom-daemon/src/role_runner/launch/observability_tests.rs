@@ -61,7 +61,7 @@ fn launch_env(root: &Path, role: &str) -> Vec<(String, Option<String>)> {
     let mut env = Vec::new();
     let _ = crate::observability::lifecycle::role_invocation(root, role, || {
         let mut cmd = Command::new("/bin/true");
-        apply_role_observability(&mut cmd, root, role);
+        let _lease = apply_role_observability(&mut cmd, root, role, Some("claude"));
         env = cmd
             .get_envs()
             .map(|(k, v)| {

@@ -407,6 +407,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
 
+    // #10832: a live pause manifest must hold restart recovery off its paused
+    // agents BEFORE the first registry is reconstructed (design §7 H5).
+    let h5 = auto_update::pause_resume::arm_at_startup();
     let mut sweep = SweepRegistry::with_event_bus(sweep_config, event_bus.clone());
     match sweep.reconstruct() {
         Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
@@ -1361,6 +1364,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `0` rather than "unknown" — and so it is registered exactly once, at the
     // single construction site, rather than from whichever loop happens to spawn.
     role_runner::register_global_in_progress(role_in_progress.clone());
+    // #10832: hold dispatch and run H5 (health probation, then resume the
+    // paused agents) before any dispatch producer below is spawned.
+    h5.spawn(&drain_state, &workspace_pool, &sweep_workspace, &event_bus, &role_in_progress);
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
@@ -2017,8 +2023,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
     // source checkout advances past the commit this binary was built from, the
     // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
-    // and rolls onto the fresh binary via #4090's drain path — in-flight sweeps
-    // finish first and survive in the registry. Gated on a clean tree, a settle
+    // and rolls onto the fresh binary via pause-and-roll (#10831) — every
+    // in-flight agent is paused at a safe point or requeued, then the daemon
+    // restarts. Gated on a clean tree, a settle
     // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
     // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
     //
@@ -2029,6 +2036,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Default OFF (side effects on the running process). Cloned handles here because
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
+    auto_update::removed_settings::warn_if_set(&auto_update_config);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
         let tuning = auto_update::TickTuning::resolve(&auto_update_config);
         log::info!("auto_update: enabled ({})", tuning.describe());
@@ -2036,7 +2044,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             workspace_pool.clone(),
             sweep_workspace.clone(),
         );
-        let trigger = auto_update::IpcDrainTrigger::new(
+        let trigger = auto_update::IpcRollTrigger::new(
             drain_state.clone(),
             workspace_pool.clone(),
             sweep_workspace.clone(),

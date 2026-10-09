@@ -170,6 +170,100 @@ fn unreachable_remotes_are_one_alert_for_the_host_not_one_per_repo() {
     assert_eq!(network(&host.pass()), (0, 0, 0), "inside the hold");
 }
 
+#[test]
+fn a_fetch_skipped_below_the_disk_floor_is_no_network_alert_and_no_backoff() {
+    use crate::fetch_headroom::test_override::with_free_gb;
+    let fx = Fixture::new(current());
+    let host = Host::new(&fx, "host-a");
+    // Origin moves, so every pass's head query names a head the clone lacks
+    // and must fetch it: the fetch the disk floor skips (#10995).
+    fx.push_from_seed("old script back", |seed| {
+        write(&seed.join(".loom/scripts/a.sh"), "#!/bin/sh\necho old\n");
+    });
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        let pass = with_free_gb(1, || host.pass());
+        let report = only(&pass);
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(reason(report).contains("skipped git fetch"), "{report:?}");
+        assert_eq!(network(&pass), (1, 0, 1), "the forge answered; one fetch tried");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no network (or any) alert: {alerts:?}");
+
+    // The disk recovers: the very next pass fetches and resyncs.
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_file(".loom/scripts/a.sh"), "#!/bin/sh\necho new");
+}
+
+#[test]
+fn a_resync_below_the_disk_floor_takes_no_claim_and_counts_no_failure() {
+    use crate::fetch_headroom::test_override::with_free_gb;
+    // The clone already holds the remote head, so classification fetches
+    // nothing and hands W2 a stale candidate: the fetch the floor skips is
+    // the one under the claim (#10995).
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let commits = fx.origin_commits();
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        let pass = with_free_gb(1, || host.pass());
+        let report = only(&pass);
+        assert_eq!(report.state, WState::W1, "still reported stale: {report:?}");
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(reason(report).contains("skipped git fetch"), "{report:?}");
+        assert_eq!(pass.fetches, 0, "classification had nothing to fetch");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no per-repo failure (or any) alert: {alerts:?}");
+    assert!(fx.forge.calls.borrow().is_empty(), "no claim asked for: nothing to release");
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None);
+    assert_eq!(fx.origin_commits(), commits, "nothing pushed");
+
+    // The disk recovers: the very next pass claims, resyncs and releases.
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_commits(), commits + 1);
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "claim released");
+}
+
+#[test]
+fn a_disk_that_fills_once_the_claim_is_held_releases_it_and_counts_no_failure() {
+    use crate::fetch_headroom::test_override;
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let commits = fx.origin_commits();
+    let mut alerts = Vec::new();
+    for _ in 0..3 {
+        // Room at the check before the claim, none by the fetch under it.
+        *host.before_claim.borrow_mut() = Some(Box::new(|| test_override::set(Some(1))));
+        let pass = host.pass();
+        test_override::set(None);
+        let report = only(&pass);
+        assert!(reason(report).starts_with("low-disk: "), "{report:?}");
+        assert!(!fx.forge.calls.borrow().is_empty(), "the claim was taken");
+        assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "and released, not leaked");
+        alerts.extend(pass.alerts.iter().map(|a| a.kind));
+        assert!(host.memory.borrow().backoff.is_empty(), "no backoff growth");
+        assert!(host.memory.borrow().down.is_empty(), "not a down remote");
+        host.advance(INTERVAL);
+    }
+    assert!(alerts.is_empty(), "no per-repo failure (or any) alert: {alerts:?}");
+    assert_eq!(fx.origin_commits(), commits, "nothing pushed");
+    assert!(host.resync_worktrees().is_empty());
+
+    let recovered = host.pass();
+    assert_eq!(only(&recovered).state, WState::W0, "{recovered:?}");
+    assert_eq!(fx.origin_commits(), commits + 1);
+}
+
 // ----------------------------------------------------------------------------
 // The loop bound
 // ----------------------------------------------------------------------------
@@ -429,4 +523,49 @@ fn only_one_pass_runs_at_a_time() {
     });
     assert!(unwound.is_err());
     assert!(super::super::host::begin(&slot).is_some(), "the next tick's pass starts");
+}
+
+// ----------------------------------------------------------------------------
+// Where the host gate's drain facts come from (#10974)
+// ----------------------------------------------------------------------------
+
+/// An enforcer that reports fixed drain facts and does nothing else.
+struct Facts(crate::fleet_state::DrainFacts);
+
+impl crate::fleet_state::Enforcer for Facts {
+    fn hold(&self, _note: String) -> bool {
+        false
+    }
+    fn release(&self) -> bool {
+        false
+    }
+    fn is_held(&self) -> bool {
+        false
+    }
+    fn stop(&self, _reason: String) -> bool {
+        false
+    }
+    fn drain_facts(&self) -> crate::fleet_state::DrainFacts {
+        self.0
+    }
+}
+
+/// `roll_pending` is a pause roll armed, committed or in progress (#10831's
+/// `DrainState::pause_roll_in_progress`), and nothing else: a fleet-state
+/// `paused` hold or an operator drain is `draining` only.
+#[test]
+fn the_host_gate_reads_a_pause_roll_as_roll_pending_and_a_hold_as_draining() {
+    use crate::fleet_state::DrainFacts;
+    let roll = HostGateInputs::live(&Facts(DrainFacts {
+        draining: true,
+        roll_in_progress: true,
+    }));
+    assert!(roll.draining && roll.roll_pending);
+    let hold = HostGateInputs::live(&Facts(DrainFacts {
+        draining: true,
+        roll_in_progress: false,
+    }));
+    assert!(hold.draining && !hold.roll_pending);
+    let idle = HostGateInputs::live(&Facts(DrainFacts::default()));
+    assert!(!idle.draining && !idle.roll_pending);
 }

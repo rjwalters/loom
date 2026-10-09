@@ -8,8 +8,8 @@
 //! daemon and the hook share, and (in [`resume`]) the session handles and the
 //! resume prompt the spawn scripts use.
 //!
-//! Nothing here is called from the roll path yet. PR 2 (#10831) writes pause
-//! requests and polls safe points; PR 3 (#10832) resumes.
+//! H4 (#10831) writes pause requests and polls safe points; H5 (#10832)
+//! resumes. [`suppress`] keeps restart recovery off paused agents in between.
 //!
 //! # Inert by construction
 //!
@@ -29,13 +29,39 @@
 //! | `request` | daemon | a pause is requested; removing it withdraws the request |
 //! | `inflight/<key>` | hook | one file per executing leaf tool call (the ledger) |
 //! | `parked/<key>` | hook | one file per parked call |
-//! | `safe-point.json` | hook | written once, atomically, when a call parks with an empty ledger |
+//! | `safe-point.json` | hook | written once per request, atomically, when a call parks with an empty ledger |
 //! | `handle.json` | spawn script | the live-captured resume handle (Codex) |
+//! | `claim.json` | hook | the claim label the agent took, if any ([`claim_breadcrumb`]) |
 //!
 //! A file per in-flight call, not a counter, so concurrent hooks never race on
 //! a read-modify-write: the count is the directory listing.
+//!
+//! # A safe point answers one request (Judge finding 2 on #10974)
+//!
+//! A safe-point record says "this agent is parked, with nothing running, for
+//! *this* pause request". It says nothing about a later request: by then the
+//! parked call has been released and the agent is running again. So the
+//! record carries the id of the request it answered
+//! ([`SafePoint::request_id`], the request's `manifest_id`), and:
+//!
+//! - the daemon accepts a record only for its current request
+//!   ([`read_safe_point_for`]);
+//! - the hook removes the record when its parked call is released (the
+//!   request was withdrawn), and replaces a record left by another request;
+//! - a pause that stands down removes its own record with its request
+//!   ([`stand_down`]), and a new request clears whatever record it finds
+//!   ([`request_pause`]).
+//!
+//! A record with no id comes from a hook older than this rule (a session
+//! container on an older image). It is accepted only when it was written at or
+//! after the request was raised; `request_pause` has already removed any that
+//! predates it.
 
+pub mod claim_breadcrumb;
+pub mod hold;
+pub mod live_runs;
 pub mod resume;
+pub mod suppress;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -64,6 +90,22 @@ pub const POLL_MS_ENV: &str = "LOOM_ROLL_PAUSE_POLL_MS";
 /// the tree within seconds of the safe-point record, so this only bounds the
 /// case where it does not.
 pub const DEFAULT_PARK_SECS: u64 = 50;
+/// The longest park [`PARK_SECS_ENV`] may ask for (#10831). Claude Code's hook
+/// timeout is 60 s and the generated hook entries set none, so a longer park
+/// would turn the pause into a hook-timeout error instead of a decision: the
+/// env value is clamped here rather than trusted.
+pub const MAX_PARK_SECS: u64 = 55;
+/// An in-flight ledger entry older than this no longer counts as executing
+/// (#10831). A call that another guard hook denied gets its pre-tool-use
+/// entry here but never a post-tool-use event, so without an age limit it
+/// would hold the ledger open and the agent could never reach a safe point.
+/// The default is above Claude Code's longest Bash timeout (10 min), so a
+/// genuinely running call is never aged out; a denied entry younger than this
+/// still blocks the safe point, and the daemon then requeues the agent at the
+/// pause budget (`pause-budget-missed`) rather than wait.
+pub const DEFAULT_INFLIGHT_STALE_SECS: u64 = 660;
+/// Env override for [`DEFAULT_INFLIGHT_STALE_SECS`].
+pub const INFLIGHT_STALE_SECS_ENV: &str = "LOOM_ROLL_PAUSE_INFLIGHT_STALE_SECS";
 const DEFAULT_POLL_MS: u64 = 500;
 
 pub const REQUEST_FILE: &str = "request";
@@ -130,6 +172,10 @@ pub struct SafePoint {
     #[serde(default)]
     pub session_id: Option<String>,
     pub runtime: String,
+    /// The `manifest_id` of the pause request this record answers. `None`
+    /// from a hook that predates the field, or for a request with no id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Write `bytes` to `path` atomically: a temp file in the same directory,
@@ -145,16 +191,61 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // #10831: make the rename itself durable, not only the file's bytes.
+    // Best-effort where a directory cannot be opened for sync.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
-/// Raise a pause request for an item (daemon side).
+/// Raise a pause request for an item (daemon side). A safe-point record
+/// already in the item dir answered an earlier request and is removed first:
+/// no call can be parked for a request that does not exist yet.
 ///
 /// # Errors
 /// When the request cannot be written.
 pub fn request_pause(item_dir: &Path, request: &PauseRequest) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(request).map_err(std::io::Error::other)?;
+    clear_safe_point(item_dir);
     write_atomic(&item_dir.join(REQUEST_FILE), &body)
+}
+
+/// The item's pause request, if one is raised and readable.
+#[must_use]
+pub fn read_request(item_dir: &Path) -> Option<PauseRequest> {
+    let raw = std::fs::read_to_string(item_dir.join(REQUEST_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Remove the item's safe-point record, whatever request it answered.
+pub fn clear_safe_point(item_dir: &Path) {
+    let _ = std::fs::remove_file(item_dir.join(SAFE_POINT_FILE));
+}
+
+/// Whether the request on disk is the one `manifest_id` raised. A request
+/// that cannot be read is nobody's.
+fn request_is(item_dir: &Path, manifest_id: &str) -> bool {
+    read_request(item_dir).is_some_and(|r| r.manifest_id.as_deref() == Some(manifest_id))
+}
+
+/// Withdraw the pause request `manifest_id` raised, and only that one: a
+/// request another pause has raised since is left alone. The safe-point
+/// record stays (the manifest of a completed pause refers to it).
+pub fn withdraw_for(item_dir: &Path, manifest_id: &str) {
+    if request_is(item_dir, manifest_id) {
+        let _ = withdraw(item_dir);
+    }
+}
+
+/// Undo `manifest_id`'s pause of one item: withdraw its request and remove
+/// the safe-point record that answered it. A request or record belonging to
+/// another pause is left alone.
+pub fn stand_down(item_dir: &Path, manifest_id: &str) {
+    withdraw_for(item_dir, manifest_id);
+    if read_safe_point(item_dir).is_some_and(|sp| sp.request_id.as_deref() == Some(manifest_id)) {
+        clear_safe_point(item_dir);
+    }
 }
 
 /// Withdraw a pause request. Parked calls are then released (allowed).
@@ -174,22 +265,64 @@ pub fn is_requested(item_dir: &Path) -> bool {
     item_dir.join(REQUEST_FILE).is_file()
 }
 
-/// The item's safe-point record, if the hook has written one.
+/// The item's safe-point record, if the hook has written one. It may answer
+/// any request: a caller acting on it wants [`read_safe_point_for`].
 #[must_use]
 pub fn read_safe_point(item_dir: &Path) -> Option<SafePoint> {
     let raw = std::fs::read_to_string(item_dir.join(SAFE_POINT_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Number of leaf tool calls currently executing, excluding `except`.
+/// The item's safe-point record **for `request`**, or `None` when there is no
+/// record or it answered another request (see the module doc).
+#[must_use]
+pub fn read_safe_point_for(item_dir: &Path, request: &PauseRequest) -> Option<SafePoint> {
+    let sp = read_safe_point(item_dir)?;
+    let answers = match (&sp.request_id, &request.manifest_id) {
+        (Some(have), Some(want)) => have == want,
+        // A hook that predates the id: only a record no older than the request.
+        (None, _) => {
+            let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+            matches!((at(&sp.reached_at), at(&request.requested_at)), (Some(r), Some(q)) if r >= q)
+        }
+        (Some(_), None) => false,
+    };
+    answers.then_some(sp)
+}
+
+/// Number of leaf tool calls currently executing, excluding `except`. Entries
+/// older than the in-flight stale limit ([`INFLIGHT_STALE_SECS_ENV`]) are not
+/// counted: they are calls that never got a post-tool-use event (#10831).
 #[must_use]
 pub fn inflight_count(item_dir: &Path, except: Option<&str>) -> usize {
+    let stale = Duration::from_secs(
+        std::env::var(INFLIGHT_STALE_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_INFLIGHT_STALE_SECS),
+    );
+    inflight_count_with(item_dir, except, stale)
+}
+
+/// [`inflight_count`] with an explicit stale limit.
+#[must_use]
+pub fn inflight_count_with(item_dir: &Path, except: Option<&str>, stale: Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(item_dir.join(INFLIGHT_DIR)) else {
         return 0;
     };
+    let now = std::time::SystemTime::now();
     entries
         .filter_map(Result::ok)
         .filter(|e| except.is_none_or(|k| e.file_name().to_string_lossy() != k))
+        .filter(|e| {
+            // An unreadable mtime counts as executing: never age out a call
+            // we cannot date.
+            e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_none_or(|age| age < stale)
+        })
         .count()
 }
 
@@ -224,7 +357,7 @@ impl HookEnv {
             item,
             pause_root,
             ledger: var(LEDGER_ENV).is_none_or(|v| v.trim() != "0"),
-            park: Duration::from_secs(secs(PARK_SECS_ENV, DEFAULT_PARK_SECS)),
+            park: Duration::from_secs(secs(PARK_SECS_ENV, DEFAULT_PARK_SECS).min(MAX_PARK_SECS)),
             poll: Duration::from_millis(secs(POLL_MS_ENV, DEFAULT_POLL_MS).max(10)),
             runtime: var(RUNTIME_ENV).unwrap_or_else(|| "claude".to_string()),
             harness_pid,
@@ -338,12 +471,17 @@ fn touch(path: &Path) {
     let _ = std::fs::write(path, b"");
 }
 
-/// Write the safe-point record unless one already exists. Exactly one parked
-/// call wins: the record is linked into place, which fails if it exists.
+/// Write the safe-point record unless one already exists for the same
+/// request. Exactly one parked call wins: the record is linked into place,
+/// which fails if it exists. A record that answered another request is stale
+/// and is removed first.
 fn write_safe_point(dir: &Path, sp: &SafePoint) {
     let target = dir.join(SAFE_POINT_FILE);
     if target.exists() {
-        return;
+        if read_safe_point(dir).is_some_and(|have| have.request_id == sp.request_id) {
+            return;
+        }
+        let _ = std::fs::remove_file(&target);
     }
     let Ok(body) = serde_json::to_vec(sp) else {
         return;
@@ -375,6 +513,9 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
     let dir = item_dir(&env.pause_root, item);
     let key = ledger_key(&payload);
     let count_it = env.ledger && !is_container_call(tool);
+    // #10832: note a claim label the agent takes or releases, so a requeue can
+    // release exactly that claim.
+    claim_breadcrumb::observe(&dir, field("hook_event_name"), &payload, env.ledger);
     match field("hook_event_name") {
         "PostToolUse" | "PostToolUseFailure" => {
             let _ = std::fs::remove_file(dir.join(INFLIGHT_DIR).join(&key));
@@ -402,14 +543,25 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
             .to_string(),
     );
     let deadline = Instant::now() + env.park;
+    // The request this call is parked for. Re-read on every poll: a pause
+    // that stood down and a new one raised between two polls is a new request.
+    let mut request_id = read_request(&dir).and_then(|r| r.manifest_id);
     loop {
         if !is_requested(&dir) {
-            // Withdrawn (an aborted pause): release the call.
+            // Withdrawn (an aborted pause): release the call. The agent is
+            // about to run again, so a safe point recorded for that request
+            // no longer holds.
             let _ = std::fs::remove_file(&parked);
+            if read_safe_point(&dir).is_some_and(|sp| sp.request_id == request_id) {
+                clear_safe_point(&dir);
+            }
             if count_it {
                 touch(&dir.join(INFLIGHT_DIR).join(&key));
             }
             return HookOutcome::Allow;
+        }
+        if let Some(request) = read_request(&dir) {
+            request_id = request.manifest_id;
         }
         if !env.ledger || inflight_count(&dir, Some(&key)) == 0 {
             let session = field("session_id");
@@ -423,6 +575,7 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
                     harness_pid: env.harness_pid,
                     session_id: (!session.is_empty()).then(|| session.to_string()),
                     runtime: env.runtime.clone(),
+                    request_id: request_id.clone(),
                 },
             );
         }

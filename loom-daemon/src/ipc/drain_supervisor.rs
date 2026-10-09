@@ -1,18 +1,20 @@
 //! Handling a `DrainAndRestartDaemon` request and supervising the drain it
-//! starts (Issue #4090, extended by #4343, #4521, #6007, #6969 and #9588).
+//! starts (Issue #4090, extended by #4343, #4521, #6969, #9588 and #10831).
+//!
+//! #10831: an automatic roll is no longer a drain this poll supervises. It is
+//! a [`DrainOrigin::PauseRoll`] drain supervised by
+//! `crate::auto_update::pause_roll`, so the only drain that reaches a deadline
+//! here is an operator drain, and its deadline always holds dispatch paused.
 //!
 //! Moved out of `ipc.rs` because that file is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen. Re-exported from
 //! `crate::ipc` verbatim, so every existing caller is unchanged.
 
-use super::drain_roll::{
-    drain_pending_budget, drain_refusal_path, drain_timeout_action, RefusalPath, TimeoutAction,
-};
 use super::evaluate_drain_tick;
 use super::{
     cancel_all_in_flight, count_in_flight_sweeps, detect_supervisor, DrainBegin, DrainOrigin,
-    DrainState, DrainTick, RollRefusal, DEFAULT_DRAIN_TIMEOUT_SECS, DRAIN_POLL_INTERVAL,
-    EXIT_RESTART, EXIT_SHUTDOWN,
+    DrainState, DrainTick, DEFAULT_DRAIN_TIMEOUT_SECS, DRAIN_POLL_INTERVAL, EXIT_RESTART,
+    EXIT_SHUTDOWN,
 };
 use crate::event_bus::EventBus;
 use crate::types::Response;
@@ -29,17 +31,14 @@ use std::time::Duration;
 /// Must be called from within a tokio runtime context (the connection handler
 /// is) so it can spawn the supervisor.
 ///
-/// Made `pub` for the autonomous self-update loop (#4055): after it rebuilds
-/// and provisions a fresh binary, it triggers the roll through this exact drain
-/// path — not a bare `RestartDaemon` — so in-flight sweeps finish first and
-/// survive in the registry rather than being orphaned. The loop calls it from a
-/// blocking thread inside a `tokio::runtime::Handle::enter()` guard so the
-/// internal `tokio::spawn` of the supervisor still resolves a runtime.
+/// `pub` for callers outside IPC that need an operator drain (the fleet-state
+/// `stopped` enforcer). They call it from a blocking thread inside a
+/// `tokio::runtime::Handle::enter()` guard so the internal `tokio::spawn` of
+/// the supervisor still resolves a runtime. Automatic rolls do **not** come
+/// through here since #10831 (`crate::auto_update::pause_roll`).
 ///
-/// `origin` (#9588) records who asked: every IPC request is
-/// [`DrainOrigin::Operator`]; only the self-update loop passes
-/// [`DrainOrigin::AutoUpdate`]. It decides what a deadline without
-/// `--force-after-timeout` does — see [`DrainOrigin`].
+/// `origin` (#9588) records who asked; every caller passes
+/// [`DrainOrigin::Operator`].
 #[allow(clippy::too_many_arguments)]
 pub fn handle_drain_request(
     drain: &Arc<DrainState>,
@@ -141,24 +140,13 @@ pub fn handle_drain_request(
                     supervisor.as_deref().unwrap_or("unknown")
                 )
             } else {
-                // #6007: the non-force deadline no longer "refuses and resumes
-                // dispatch" on a roll — promising that is what taught operators
-                // to re-run with a bigger --timeout in the first place.
                 let deadline_action = if force_after_timeout {
-                    "cancel stragglers and restart".to_string()
-                } else if origin == DrainOrigin::Operator {
+                    "cancel stragglers and restart"
+                } else {
                     // #9588: an operator drain holds, it never gives up.
                     "keep dispatch PAUSED and report the stragglers — the restart still fires \
                      once they finish; dispatch never resumes on its own (`--abort-drain` \
                      resumes it, `--force-after-timeout` cancels them)"
-                        .to_string()
-                } else {
-                    format!(
-                        "hold the roll PENDING (dispatch stays paused, the restart re-arms \
-                         itself when in-flight reaches zero, for up to {}s total before giving \
-                         up and resuming dispatch)",
-                        drain_pending_budget(timeout).as_secs()
-                    )
                 };
                 format!(
                     "drain scheduled ({}-supervised): {in_flight} in-flight sweep(s); \
@@ -211,12 +199,11 @@ pub fn handle_drain_request(
                      the next supervisor tick"
                 );
             }
-            // #6007: a retained (pending) roll must not be acked as if it were a
-            // first-attempt drain whose "existing deadline is unchanged" — an
-            // operator needs to know the roll already survived a refusal and is
-            // waiting on quiescence.
             let snap = drain.snapshot();
-            let roll_pending = snap.roll_pending;
+            // #10831: a pause roll that has already stopped agents completes
+            // (rule 2 of the operator interplay), so say so instead of
+            // promising a wait for in-flight work.
+            let committed_pause = snap.pause.as_ref().filter(|p| p.stopped);
             let message = if force_escalated {
                 // #9588: any active drain escalates, not only a pending roll.
                 let terminal = if active_then_exit {
@@ -261,14 +248,13 @@ pub fn handle_drain_request(
                      down when drained (then-exit). {in_flight} in-flight sweep(s); the existing \
                      deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
                 )
-            } else if roll_pending {
+            } else if let Some(p) = committed_pause {
                 format!(
-                    "already draining (idempotent): a PENDING ROLL is already retained — it \
-                     survived its deadline, dispatch stays paused, and the restart re-arms \
-                     itself when in-flight reaches zero. {in_flight} in-flight sweep(s); the \
-                     re-armed deadline is unchanged. Use `loom-daemon restart --abort-drain` to \
-                     cancel it, or `loom-daemon restart --drain --force-after-timeout` to cancel \
-                     the stragglers and roll now."
+                    "already draining (idempotent): a pause-and-roll pause is at H4 step {} and \
+                     has already stopped agents, so it completes: the daemon writes the pause \
+                     manifest and restarts onto the new binary within the pause budget ({}s). \
+                     The request was not applied as an operator drain (#10831).",
+                    p.step, p.budget_secs
                 )
             } else {
                 format!(
@@ -279,8 +265,9 @@ pub fn handle_drain_request(
             };
             let message = if origin_promoted {
                 format!(
-                    "{message} The drain was an auto-update roll and is now an OPERATOR drain \
-                     (#9588): a timeout keeps dispatch paused instead of resuming it."
+                    "{message} The drain was a pause roll that had not stopped anything yet and \
+                     is now an OPERATOR drain (#9588, #10831): its pause requests are withdrawn, \
+                     it waits for in-flight work to finish, and a timeout keeps dispatch paused."
                 )
             } else {
                 message
@@ -336,93 +323,6 @@ pub fn drain_complete_log_line(then_exit: bool, supervisor: &str, verify_poll_se
              {supervisor}-supervised relaunch. No sweep was killed; no orphan left behind. {note}"
         )
     }
-}
-
-/// The operator-facing note recorded (and logged) when a drain times out and
-/// refuses the restart (Issue #4090, made actionable by Issue #5340).
-///
-/// Before #5340 this stopped at "no --force-after-timeout", leaving the
-/// operator to guess at a retry — the one they filed #5340 over guessed
-/// `loom-daemon drain` (a bare, nonexistent subcommand) and then
-/// `loom-daemon fleet drain <ssh_host>` (a *different*, newer remote
-/// worker-decommission command that takes a completely different argument).
-/// Naming the exact local retry command removes that guesswork: it is always
-/// the same `restart --drain` invocation the operator already ran, with
-/// `--force-after-timeout` added.
-///
-/// Extracted as a pure function — same rationale as
-/// [`drain_complete_log_line`] just above — so the exact wording is a test
-/// assertion rather than something only exercised by driving the full
-/// supervisor loop to a real timeout.
-#[must_use]
-pub fn drain_timeout_refuse_note(in_flight: usize) -> String {
-    format!(
-        "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
-         (no --force-after-timeout); dispatch resumed, daemon stays up. Retry with: \
-         `loom-daemon restart --drain --force-after-timeout --timeout <secs>` to force through \
-         the remaining sweep(s), or re-run with a larger --timeout if they are simply \
-         long-running rather than stuck."
-    )
-}
-
-/// The operator-facing note recorded when a **relaunch (roll)** drain's deadline
-/// passes and the roll is *retained* rather than discarded (Issue #6007).
-///
-/// This replaces the "dispatch resumed — retry with a bigger number" advice on
-/// the roll path, which is precisely the advice that reproduced the livelock: on
-/// a busy host every re-run raced the same deadline against a work finder that
-/// had just been handed the admission window back. The note therefore says what
-/// happens about the **recurrence** — nothing to re-run, the roll re-arms itself
-/// — and names the two ways an operator can take over instead.
-///
-/// Extracted as a pure function (same rationale as
-/// [`drain_timeout_refuse_note`]) so the wording is a test assertion rather than
-/// something only a real 30-minute timeout exercises.
-#[must_use]
-pub fn drain_roll_pending_note(
-    in_flight: usize,
-    attempt: u32,
-    window: Duration,
-    budget: Duration,
-) -> String {
-    let window_secs = window.as_secs();
-    let budget_secs = budget.as_secs();
-    format!(
-        "drain deadline passed with {in_flight} sweep(s) still in flight — restart REFUSED \
-         (fail-safe: no sweep was cancelled and the pre-update binary keeps running). AUTO-UPDATE \
-         ROLL PENDING (retry {attempt}): the roll intent is RETAINED — new dispatch stays PAUSED so \
-         the in-flight set can reach zero, and the restart re-arms itself the moment it does. \
-         Nothing to re-run: re-issuing `restart --drain` with a larger --timeout is exactly what \
-         this replaces. Next deadline in {window_secs}s; total paused-dispatch budget \
-         {budget_secs}s, after which the roll is abandoned and dispatch resumes. To give up now \
-         and resume dispatch: `loom-daemon restart --abort-drain`. To force through the remaining \
-         sweep(s) instead (cancels them): `loom-daemon restart --drain --force-after-timeout`."
-    )
-}
-
-/// The operator-facing note recorded when a retained (pending) roll finally gives
-/// up because its total paused-dispatch budget is spent (Issue #6007).
-///
-/// Keeps [`drain_timeout_refuse_note`]'s wording as its prefix — `loom-daemon
-/// status` renders it the same way and #5340's exact-retry-command contract still
-/// holds — then explains the recurrence: sweeps that outlived this much *paused*
-/// dispatch are stuck rather than merely long-running, so the fix is to deal with
-/// them, not to widen the window again.
-#[must_use]
-pub fn drain_roll_abandoned_note(in_flight: usize, attempts: u32, elapsed: Duration) -> String {
-    let elapsed_secs = elapsed.as_secs();
-    format!(
-        "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
-         (no --force-after-timeout); dispatch resumed, daemon stays up. AUTO-UPDATE ROLL \
-         ABANDONED (an operator drain would have stayed paused, #9588). The roll was retained \
-         and re-armed {attempts} time(s) across {elapsed_secs}s of PAUSED dispatch and in-flight \
-         still never reached zero, so the roll intent is now ABANDONED rather than starve this \
-         host of work indefinitely — the provisioned binary was NOT activated. A sweep that \
-         outlives {elapsed_secs}s of paused dispatch is stuck, not merely long-running: find it \
-         with `loom-daemon list`, cancel it with `loom-daemon cancel --sweep <id>`, and the next \
-         roll lands on its own. To force through instead: `loom-daemon restart --drain \
-         --force-after-timeout --timeout <secs>`."
-    )
 }
 
 /// Describe every non-terminal sweep across all managed roots as
@@ -495,7 +395,7 @@ pub fn drain_timeout_hold_note(then_exit: bool, stragglers: &[String]) -> String
 /// relaunch-drain can be escalated to stay-down by a later
 /// `--drain --then-exit` request, and a supervisor holding a stale `false` would
 /// exit `0` and be relaunched by the supervisor anyway.
-async fn run_drain_supervisor(
+pub(crate) async fn run_drain_supervisor(
     drain: Arc<DrainState>,
     workspace_pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
@@ -561,13 +461,13 @@ async fn run_drain_supervisor(
                 log::warn!("{}", drain_complete_log_line(false, &sup, verify_poll_secs));
                 crate::observability::shutdown::exit(drain_exit_code(false)).await;
             }
-            DrainTick::TimedOutRefuse
-                if drain_timeout_action(origin, then_exit) == TimeoutAction::HoldPaused =>
-            {
+            DrainTick::TimedOutRefuse => {
                 // Issue #9588. An OPERATOR drain — then-exit or relaunch — never
                 // resumes dispatch on its own: hold it paused, name the
                 // stragglers, clear the deadline, and keep supervising so the
-                // terminal action still fires once in-flight reaches zero.
+                // terminal action still fires once in-flight reaches zero. Since
+                // #10831 this is the only drain this poll supervises (a pause
+                // roll's deadline is its pause budget, in `pause_roll`).
                 let stragglers = list_in_flight_sweeps(&workspace_pool, &fallback_root);
                 let note = drain_timeout_hold_note(then_exit, &stragglers);
                 let _ = event_bus.publish_generic(
@@ -584,83 +484,6 @@ async fn run_drain_supervisor(
                 log::warn!("{note}");
                 drain.hold_after_timeout(note);
                 tokio::time::sleep(poll_interval).await;
-            }
-            DrainTick::TimedOutRefuse => {
-                // AUTO-UPDATE roll drains only (#9588 — operator drains hold,
-                // above). Issue #6007. A **teardown** (`then_exit`) drain keeps the
-                // historical fail-safe byte-for-byte: refuse, resume dispatch,
-                // stay up. `fleet drain` orchestrates those over SSH and keys its
-                // documented exit-2 contract on the remote reporting
-                // `draining: false`, so retaining a pending teardown here would
-                // change a remote-decommission contract this issue is not about.
-                if drain_refusal_path(then_exit) == RefusalPath::ResumeDispatch {
-                    let note = drain_timeout_refuse_note(in_flight);
-                    let _ = event_bus.publish_generic(
-                        "daemon.drain.timeout",
-                        serde_json::json!({
-                            "in_flight": in_flight,
-                            "forced": false,
-                            "then_exit": true,
-                            "roll_pending": false,
-                            "origin": origin.as_str(),
-                            "paused": false,
-                        }),
-                    );
-                    log::warn!("{note}");
-                    drain.resolve_timeout(note);
-                    return;
-                }
-                // A **relaunch (roll)** drain retains its intent instead of
-                // handing the admission window back to the work finder, which is
-                // what made every retry strictly harder to satisfy than the last.
-                match drain.refuse_roll_deadline(Utc::now()) {
-                    RollRefusal::Deferred {
-                        attempt,
-                        window,
-                        budget,
-                        ..
-                    } => {
-                        let note = drain_roll_pending_note(in_flight, attempt, window, budget);
-                        let _ = event_bus.publish_generic(
-                            "daemon.drain.roll_pending",
-                            serde_json::json!({
-                                "in_flight": in_flight,
-                                "attempt": attempt,
-                                "window_secs": window.as_secs(),
-                                "budget_secs": budget.as_secs(),
-                            }),
-                        );
-                        log::warn!("{note}");
-                        drain.set_note(note);
-                        // Dispatch is still paused and this supervisor is still
-                        // the current generation — keep polling so the restart
-                        // fires the instant in-flight reaches zero.
-                        tokio::time::sleep(poll_interval).await;
-                    }
-                    RollRefusal::Abandoned {
-                        attempts, elapsed, ..
-                    } => {
-                        let note = drain_roll_abandoned_note(in_flight, attempts, elapsed);
-                        let _ = event_bus.publish_generic(
-                            "daemon.drain.timeout",
-                            serde_json::json!({
-                                "in_flight": in_flight,
-                                "forced": false,
-                                "then_exit": false,
-                                "roll_pending": false,
-                                "origin": origin.as_str(),
-                                "paused": false,
-                                "attempts": attempts,
-                                "elapsed_secs": elapsed.as_secs(),
-                            }),
-                        );
-                        log::warn!("{note}");
-                        // `refuse_roll_deadline` already cleared the flag and
-                        // bumped the generation; only the note is left to record.
-                        drain.set_note(note);
-                        return;
-                    }
-                }
             }
             DrainTick::TimedOutForce => {
                 let cancelled = cancel_all_in_flight(&workspace_pool, &fallback_root);
