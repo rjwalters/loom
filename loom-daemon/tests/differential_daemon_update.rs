@@ -926,6 +926,17 @@ enum Divergence {
     /// corpus pins `$HOME` and the config tiers to a fixture with no fleet
     /// store. Any other difference stays unexplained.
     HelpDocumentsFleetFloorCheck,
+    /// MECHANISM: #11069 stopped the stale-entry-point advisory from telling
+    /// the operator to `rm` entries `--prune-stale-entry-points` would not
+    /// remove (it had told them to delete provisioning's rollback copy). For
+    /// an advisory listing only non-Python, non-shim entries, the port's
+    /// stderr must equal the shell's stderr with exactly
+    /// `stale_remediation::STALE_REMEDIATION_SHELL` replaced, once, by
+    /// `stale_remediation::STALE_REMEDIATION_UNRELATED`. The header, every per-entry line and
+    /// the suppression line are unchanged. Risk direction: advisory text only
+    /// — the scan, the exit code and the prune are untouched. Any other stderr
+    /// difference stays unexplained.
+    StaleAdvisoryNoRmForUnprunableEntries,
 }
 
 /// Classify one difference, or return `Err` for "unexplained".
@@ -933,11 +944,18 @@ enum Divergence {
 /// stdout and stderr are classified independently — a half that no class
 /// explains is a finding whatever the other half did.
 fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
-    if shell.rc != port.rc || shell.stderr != port.stderr {
+    if shell.rc != port.rc {
         return Err(());
     }
+    let mut found = Vec::new();
+    if shell.stderr != port.stderr {
+        if !stale_remediation::explains(&shell.stderr, &port.stderr) {
+            return Err(());
+        }
+        found.push(Divergence::StaleAdvisoryNoRmForUnprunableEntries);
+    }
     if shell.stdout == port.stdout {
-        return Ok(Vec::new());
+        return Ok(found);
     }
     // `--help` now carries several documented additions, so accept any
     // combination of them — never anything else.
@@ -977,7 +995,8 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
             classes.push(*class);
         }
         if applicable && expected == port.stdout {
-            return Ok(classes);
+            found.extend(classes);
+            return Ok(found);
         }
     }
     Err(())
@@ -1549,3 +1568,6 @@ mod corpus;
 #[path = "differential_daemon_update/floor_check_help.rs"]
 mod floor_check_help;
 use floor_check_help::FLOOR_CHECK_INSERTS;
+
+#[path = "differential_daemon_update/stale_remediation.rs"]
+mod stale_remediation;

@@ -139,6 +139,13 @@ pub fn build_record(
         .iter()
         .filter_map(|root| repos.get(root).cloned())
         .collect();
+    // #11139: a partial listing is reported too, so the snapshot never
+    // passes for the whole queue when a repo's rows are only part of it.
+    let listing_incomplete: Vec<QueueRepoRef> = summary
+        .listing_incomplete
+        .iter()
+        .filter_map(|root| repos.get(root).cloned())
+        .collect();
     QueueSnapshotRecord {
         tick_at: summary.at,
         max_concurrent: summary.max_concurrent,
@@ -146,6 +153,8 @@ pub fn build_record(
         counts,
         listing_failed_unresolved: summary.listing_failed.len() - listing_failed.len(),
         listing_failed,
+        listing_incomplete_unresolved: summary.listing_incomplete.len() - listing_incomplete.len(),
+        listing_incomplete,
         rows,
         unresolved_rows,
         rows_truncated,
@@ -186,7 +195,8 @@ async fn attach_landing(record: &mut QueueSnapshotRecord) {
 /// `ops::disposition` since Issue #9222) so the two callers cannot drift onto
 /// different resolution rules. Only absolute paths are probed; the
 /// single-workspace loop's `workspace #N` placeholders stay unresolved.
-async fn resolve_repos(
+/// `fleet.state` (#10196) resolves its `ready_wait` rows through it too.
+pub(super) async fn resolve_repos(
     summary: &WorkFinderTickSummary,
     slug_cache: &mut HashMap<String, String>,
 ) -> HashMap<String, QueueRepoRef> {
@@ -194,7 +204,7 @@ async fn resolve_repos(
         .queue
         .iter()
         .map(|r| r.repo.as_str())
-        .chain(summary.listing_failed.iter().map(String::as_str))
+        .chain(summary.listing_not_whole().map(String::as_str))
         .collect();
     super::repo_ref::resolve_repo_refs(roots, slug_cache).await
 }

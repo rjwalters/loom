@@ -70,7 +70,7 @@ mod tests {
         );
         std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
         assert!(note.contains(&format!("{}s", crate::restart_verify::DEFAULT_POLL_SECS)));
-        assert!(note.contains("Restart=on-success"));
+        assert!(note.contains("systemd Restart=always"));
     }
 
     /// Nothing was triggered (`drain_accepted == false`) ⇒ nothing is

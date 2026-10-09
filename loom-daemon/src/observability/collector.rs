@@ -958,6 +958,17 @@ async fn sample_snapshots(
     )
     .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // This host's export view (Issue #11124): per-exporter queue depth,
+    // cumulative drops and last flush. Facts only; every host emits its own.
+    queue.offer(TelemetryEnvelope::new(
+        host_id,
+        TelemetryRecord::HostExport(crate::telemetry::kinds::host_export::HostExportRecord::build(
+            host_id,
+            Utc::now(),
+            &super::global_export_statuses(),
+            &super::global_export_queue_stats(),
+        )),
+    ));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
@@ -994,6 +1005,10 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
+    // This host's view of its held sweeps, review PRs and ready queue over
+    // OTLP (Issue #10196), independent of ETA. Hourly anchor, deltas only on
+    // change; its review listings are ETag-cached (warm after stage_dwell).
+    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

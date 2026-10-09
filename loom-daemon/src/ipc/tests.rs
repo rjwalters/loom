@@ -3428,7 +3428,8 @@ fn test_restart_daemon_request_response_round_trip() {
 /// Also pins the shutdown-intent exit-code contract (#4054): only the
 /// restart primitive exits 0, so under a supervisor's "successful exit
 /// restarts" policy (launchd `KeepAlive:SuccessfulExit`, systemd
-/// `Restart=on-success`) it is the only path that relaunches.
+/// `Restart=always` minus the stay-down codes) it is the only clean exit that
+/// relaunches.
 ///
 /// NOTE: this is the sole test touching `LOOM_DAEMON_SUPERVISOR`, so the
 /// env-var mutation cannot race another test reading it.
@@ -3496,10 +3497,16 @@ fn test_build_restart_decision_supervisor_gated() {
                 message.contains("LOOM_DAEMON_SUPERVISOR=systemd"),
                 "restart refusal must mention the systemd retrofit: {message}"
             );
+            // #11111: the stale `Restart=on-success` is gone; the daemon
+            // writes its own supervision drop-in once supervised.
             assert!(
-                    message.contains("Restart=on-success"),
-                    "restart refusal retrofit hint must include the corrected Restart= policy: {message}"
-                );
+                !message.contains("Restart=on-success"),
+                "restart refusal must not suggest the pre-#11058 Restart= policy: {message}"
+            );
+            assert!(
+                message.contains("zz-loom-supervision.conf"),
+                "restart refusal must name the startup drop-in: {message}"
+            );
         }
         other => panic!("Expected DaemonRestart, got: {other:?}"),
     }
@@ -4739,9 +4746,14 @@ fn test_drain_request_unsupervised_refuses_without_pausing() {
                 message.contains("LOOM_DAEMON_SUPERVISOR=systemd"),
                 "drain refusal must mention the systemd retrofit: {message}"
             );
+            // #11111: the stale `Restart=on-success` is gone.
             assert!(
-                message.contains("Restart=on-success"),
-                "drain refusal retrofit hint must include the corrected Restart= policy: {message}"
+                !message.contains("Restart=on-success"),
+                "drain refusal must not suggest the pre-#11058 Restart= policy: {message}"
+            );
+            assert!(
+                message.contains("zz-loom-supervision.conf"),
+                "drain refusal must name the startup drop-in: {message}"
             );
         }
         other => panic!("expected DaemonDrain, got {other:?}"),

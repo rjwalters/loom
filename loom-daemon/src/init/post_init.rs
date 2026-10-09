@@ -226,6 +226,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // as CARGO_TARGET_DIR for every role run, and `role_runner` / the orphan
     // sweep remove them. Gigabytes of build output, never committable.
     ".loom/targets/",
+    // Per-role/ad-hoc cargo target dirs under other names (#11075) — any dir
+    // cargo writes a CACHEDIR.TAG into must stay out of `git status` and so
+    // out of quarantine stashes.
+    ".loom/target*/",
+    ".cargo-target*/",
     // `.loom/state/` is daemon-written, per-host runtime state, ignored
     // WHOLESALE (#9592). It used to be ignored one subsystem at a time
     // (`ci-telemetry/` #8824, `fleet-captain/` #8901, `eta/` #9544), and each
@@ -1056,7 +1061,6 @@ mod tests {
         };
 
         let writers = [
-            crate::observability::eta::pending_path(root),
             crate::ci_telemetry::state_dir(root).join("seen.jsonl"),
             crate::fleet_captain::shell_arm_registry_path(root),
             // A subsystem added after this test: must need no registration.
@@ -1198,6 +1202,8 @@ mod tests {
             ".loom/metrics/",
             // #8370: Loom-owned per-run cargo target dirs.
             ".loom/targets/",
+            ".loom/target*/",
+            ".cargo-target*/",
             ".loom/usage-cache.json",
             ".loom/claude-config/",
             ".loom/native-tools/",

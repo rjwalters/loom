@@ -53,8 +53,8 @@ impl Distribution {
 
 /// The nearest-rank `pct`th percentile of `sorted`: index `ceil(pct·n/100) − 1`,
 /// clamped into the sample, so the value returned is always an observed
-/// sample, never an interpolation. Shared with the ETA grid (`crate::eta::grid`,
-/// #9289), which summarises each stage as 21 of these.
+/// sample, never an interpolation. The ETA grid (#9289) summarises each stage
+/// as 21 of these.
 ///
 /// `sorted` must be non-empty and ascending.
 #[must_use]

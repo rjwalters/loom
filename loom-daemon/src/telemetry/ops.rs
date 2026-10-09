@@ -224,6 +224,12 @@ pub enum MetricName {
     /// value means `loom.queue.issues` is missing their backlog.
     #[serde(rename = "loom.queue.listing_failed_repos")]
     QueueListingFailedRepos,
+    /// Repos whose ready-issue listing came back partial on the last tick
+    /// (#11139: a later page failed, the page cap, a mid-walk change): a
+    /// non-zero value means `loom.queue.issues` holds only part of their
+    /// backlog.
+    #[serde(rename = "loom.queue.listing_incomplete_repos")]
+    QueueListingIncompleteRepos,
     // ---- Quota burn and pool state (Issue #8857) ------------------------
     /// Uncached input tokens consumed since the previous sample.
     #[serde(rename = "loom.llm.tokens.input")]
@@ -426,6 +432,10 @@ pub enum MetricName {
     /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
     #[serde(rename = "loom.captain.gauge_fallback")]
     CaptainGaugeFallback,
+    /// Peak memory (`memory.peak`) of one finished agent scope, by `repo`
+    /// (#11094).
+    #[serde(rename = "loom.agent_scope.peak_memory_bytes")]
+    AgentScopePeakMemoryBytes,
 }
 
 impl MetricName {
@@ -449,6 +459,7 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
+            Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
             Self::LlmTokensInput => "loom.llm.tokens.input",
             Self::LlmTokensOutput => "loom.llm.tokens.output",
             Self::LlmTokensCacheRead => "loom.llm.tokens.cache_read",
@@ -505,6 +516,7 @@ impl MetricName {
             Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
+            Self::AgentScopePeakMemoryBytes => "loom.agent_scope.peak_memory_bytes",
         }
     }
 
@@ -551,7 +563,7 @@ impl MetricName {
             | Self::QueueDispatchWaitSamples => "{issue}",
             Self::DispatchMaxConcurrent => "{sweep}",
             Self::QueueIssues => "{issue}",
-            Self::QueueListingFailedRepos => "{repository}",
+            Self::QueueListingFailedRepos | Self::QueueListingIncompleteRepos => "{repository}",
             Self::LlmTokensInput
             | Self::LlmTokensOutput
             | Self::LlmTokensCacheRead
@@ -623,6 +635,9 @@ impl MetricName {
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
+            Self::QueueListingIncompleteRepos => {
+                "Repos whose ready-issue listing came back partial last tick."
+            }
             Self::LlmTokensInput => "Uncached input tokens consumed, by provider and model.",
             Self::LlmTokensOutput => "Output tokens produced, by provider and model.",
             Self::LlmTokensCacheRead => "Cache-read input tokens, by provider and model.",
@@ -717,6 +732,9 @@ impl MetricName {
             }
             Self::CaptainGaugeFallback => {
                 "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
+            }
+            Self::AgentScopePeakMemoryBytes => {
+                "Peak memory (cgroup memory.peak) of one finished agent scope, by repo."
             }
         }
     }

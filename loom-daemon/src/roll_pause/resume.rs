@@ -77,16 +77,21 @@ pub fn claude_args(
     }
 }
 
-/// [`claude_args`] from the process environment.
+/// [`claude_args`] from the process environment, followed by the pause
+/// hook's `--settings` wiring for a daemon-dispatched session
+/// ([`super::wiring`], #11049): a consumer repo's own settings do not run
+/// the hook, so the launch has to.
 ///
 /// # Errors
 /// As [`claude_args`].
 pub fn claude_args_from_env() -> Result<Vec<String>, String> {
-    claude_args(
+    let mut args = claude_args(
         env_var(RESUME_SESSION_ENV).as_deref(),
         env_var(RESUME_PROMPT_ENV).as_deref(),
         env_var(CLAUDE_SESSION_ENV).as_deref(),
-    )
+    )?;
+    args.extend(super::wiring::settings_args_from_env());
+    Ok(args)
 }
 
 /// The prompt for a Codex resume, after checking the launch is resumable:

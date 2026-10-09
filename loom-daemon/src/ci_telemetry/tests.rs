@@ -10,6 +10,7 @@ mod api_parsing;
 mod backfill_admission;
 mod billing_block;
 mod captain_gate;
+mod compaction;
 mod credential_rejection;
 mod dependency_wait;
 mod feed_capture;

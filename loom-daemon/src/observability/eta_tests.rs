@@ -352,7 +352,9 @@ case "$*" in
   *'&page=2'*)
     if [ -f "$d/fail2" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p2.json" ;;
-  *) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p1.json" ;;
+  *) printf 'HTTP/2.0 200 OK\r\n'
+    [ "$(grep -o '"number"' "$d/p1.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last1" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+    printf '\r\n'; cat "$d/p1.json" ;;
 esac
 "#,
             dir = dir.display()
