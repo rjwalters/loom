@@ -24,6 +24,16 @@
 //! A missing cgroup file (macOS, cgroup v1, a scope that never got created) is
 //! a no-op, never an error. A repo with no history keeps the flat default and
 //! reserves nothing, so behaviour without history is unchanged.
+//!
+//! # Every agent scope, not only sweeps
+//!
+//! The live set is the issue locks' stamped scopes **plus** every
+//! `loom-agent-*.scope` found under [`AGENTS_SLICE`] ([`discover_scopes`]), so
+//! a role agent (Doctor, Judge, …) that holds no issue lock is still sampled
+//! and still reserved for. Such a scope is attributed to the workspace its
+//! processes run in (their `/proc/<pid>/cwd`), else to
+//! [`UNATTRIBUTED_REPO`], whose expected peak falls back to the host's worst
+//! observed repo peak until it has a history of its own.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,11 +52,22 @@ pub const MARGIN_PCT: u64 = 10;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
+/// History key for a live agent scope that maps to no managed workspace.
+pub const UNATTRIBUTED_REPO: &str = "(unattributed)";
+
+/// Unit-name prefix every `spawn-claude.sh` agent scope carries (#6129).
+pub const AGENT_SCOPE_PREFIX: &str = "loom-agent-";
+
+/// Prefix of `spawn-claude.sh`'s throwaway probe scopes, which are not agents.
+const PROBE_SCOPE_PREFIX: &str = "loom-agent-probe-";
+
 /// One live scope's last sample.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InFlight {
     pub repo: String,
-    pub issue: u32,
+    /// The claimed issue; `None` for a role agent with no issue lock.
+    #[serde(default)]
+    pub issue: Option<u32>,
     pub peak_bytes: u64,
     pub current_bytes: u64,
 }
@@ -67,7 +88,7 @@ pub struct Store {
 pub struct EndedScope {
     pub scope: String,
     pub repo: String,
-    pub issue: u32,
+    pub issue: Option<u32>,
     pub peak_bytes: u64,
 }
 
@@ -76,7 +97,8 @@ pub struct EndedScope {
 pub struct LiveScope {
     pub scope: String,
     pub repo: String,
-    pub issue: u32,
+    /// `None` for a scope found only by [`discover_scopes`] (a role agent).
+    pub issue: Option<u32>,
 }
 
 /// Where a sweep's RAM charge came from.
@@ -129,17 +151,41 @@ pub fn charge_gb(
     (default_gb.max(1), ChargeSource::Default)
 }
 
-/// Bytes still to be realised by the in-flight sweeps: for each one whose repo
-/// has history, `max(0, expected_peak - current_usage)`. A sweep that has
-/// already passed its expectation, or whose repo has no history, reserves
-/// nothing (so no-history behaviour is the pre-#11094 snapshot).
+/// The peak a live scope of `repo` is expected to reach: its repo's
+/// high-water mark. An [`UNATTRIBUTED_REPO`] scope with no history of its own
+/// is assumed able to reach the host's worst observed repo peak, so a role
+/// agent outside every workspace still counts toward the reservation.
+#[must_use]
+pub fn expected_peak_bytes(store: &Store, repo: &str) -> Option<u64> {
+    store
+        .repos
+        .get(repo)
+        .and_then(|h| high_water_bytes(h))
+        .or_else(|| {
+            (repo == UNATTRIBUTED_REPO)
+                .then(|| {
+                    store
+                        .repos
+                        .values()
+                        .filter_map(|h| high_water_bytes(h))
+                        .max()
+                })
+                .flatten()
+        })
+}
+
+/// Bytes still to be realised by the live agent scopes (sweeps and role
+/// agents alike): for each one with an expected peak
+/// ([`expected_peak_bytes`]), `max(0, expected_peak - current_usage)`. A scope
+/// that has already passed its expectation, or that has no expectation,
+/// reserves nothing (so no-history behaviour is the pre-#11094 snapshot).
 #[must_use]
 pub fn reserved_bytes(store: &Store) -> u64 {
     store
         .inflight
         .values()
         .filter_map(|f| {
-            let expected = high_water_bytes(store.repos.get(&f.repo)?)?;
+            let expected = expected_peak_bytes(store, &f.repo)?;
             Some(expected.saturating_sub(f.current_bytes))
         })
         .sum()
@@ -294,12 +340,91 @@ pub fn read_scope(slice_dir: &Path, scope: &str) -> Option<(u64, u64)> {
     Some((peak, current))
 }
 
+/// Agent scope units directly under `slice_dir`: every `loom-agent-*.scope`
+/// directory except `spawn-claude.sh`'s probe scopes, sorted.
+#[must_use]
+pub fn list_agent_scopes(slice_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(slice_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            n.starts_with(AGENT_SCOPE_PREFIX)
+                && n.ends_with(".scope")
+                && !n.starts_with(PROBE_SCOPE_PREFIX)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The workspace a scope's processes run in: the first pid in its
+/// `cgroup.procs` whose working directory (`cwd_of`) lies under one of
+/// `roots` (the deepest root wins). `None` when no process maps to a root.
+#[must_use]
+pub fn scope_workspace(
+    slice_dir: &Path,
+    scope: &str,
+    roots: &[PathBuf],
+    cwd_of: impl Fn(u32) -> Option<PathBuf>,
+) -> Option<String> {
+    let procs = std::fs::read_to_string(slice_dir.join(scope).join("cgroup.procs")).ok()?;
+    let canon: Vec<(usize, PathBuf)> = roots
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| {
+            std::iter::once((i, r.clone())).chain(r.canonicalize().ok().map(|c| (i, c)))
+        })
+        .collect();
+    procs
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter_map(&cwd_of)
+        .find_map(|cwd| {
+            canon
+                .iter()
+                .filter(|(_, r)| cwd.starts_with(r))
+                .max_by_key(|(_, r)| r.components().count())
+                .map(|(i, _)| repo_key(&roots[*i]))
+        })
+}
+
+/// The agent scopes under `slice_dir` that `known` (the issue-lock scopes)
+/// does not already cover — role agents, chiefly — each attributed to its
+/// workspace via [`scope_workspace`], else to [`UNATTRIBUTED_REPO`].
+#[must_use]
+pub fn discover_scopes(
+    slice_dir: &Path,
+    roots: &[PathBuf],
+    known: &[LiveScope],
+    cwd_of: impl Fn(u32) -> Option<PathBuf>,
+) -> Vec<LiveScope> {
+    list_agent_scopes(slice_dir)
+        .into_iter()
+        .filter(|s| !known.iter().any(|k| &k.scope == s))
+        .map(|scope| {
+            let repo = scope_workspace(slice_dir, &scope, roots, &cwd_of)
+                .unwrap_or_else(|| UNATTRIBUTED_REPO.to_string());
+            LiveScope {
+                scope,
+                repo,
+                issue: None,
+            }
+        })
+        .collect()
+}
+
 /// Emit the per-scope peak as telemetry (metric + log line).
 fn emit_ended(e: &EndedScope) {
+    let who = e
+        .issue
+        .map_or_else(|| "role agent".to_string(), |n| format!("issue #{n}"));
     log::info!(
-        "ram_peaks: scope {} (issue #{}, repo {}) peaked at {} bytes ({:.2} GiB)",
+        "ram_peaks: scope {} ({who}, repo {}) peaked at {} bytes ({:.2} GiB)",
         e.scope,
-        e.issue,
         e.repo,
         e.peak_bytes,
         e.peak_bytes as f64 / GIB as f64
@@ -312,9 +437,11 @@ fn emit_ended(e: &EndedScope) {
     .label("repo", e.repo.clone())]);
 }
 
-/// The live agent scopes of every managed root, from each registry's claim
-/// locks (agents without a stamped scope unit are skipped), plus the total
-/// number of in-flight sweeps across those roots.
+/// The live agent scopes of every managed root — each registry's claim locks'
+/// stamped scope units, plus every other `loom-agent-*.scope` under the agents
+/// slice ([`discover_scopes`], Linux only), so role agents without an issue
+/// lock are sampled and reserved too — and the number of in-flight sweeps
+/// (issue locks) across those roots.
 #[must_use]
 pub fn live_scopes(
     pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
@@ -333,10 +460,16 @@ pub fn live_scopes(
                 out.push(LiveScope {
                     scope,
                     repo: repo_key(root),
-                    issue: a.issue,
+                    issue: Some(a.issue),
                 });
             }
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(slice) = agents_slice_dir() {
+        let cwd_of = |pid: u32| std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+        let extra = discover_scopes(&slice, roots, &out, cwd_of);
+        out.extend(extra);
     }
     (out, in_flight)
 }
@@ -373,7 +506,7 @@ mod tests {
         LiveScope {
             scope: scope.into(),
             repo: repo.into(),
-            issue: 1,
+            issue: Some(1),
         }
     }
 
@@ -476,7 +609,7 @@ mod tests {
         store.repos.insert("hist".into(), vec![13 * GIB]);
         let f = |repo: &str, cur: u64| InFlight {
             repo: repo.into(),
-            issue: 1,
+            issue: Some(1),
             peak_bytes: cur,
             current_bytes: cur,
         };
@@ -484,6 +617,106 @@ mod tests {
         store.inflight.insert("b".into(), f("nohist", GIB));
         store.inflight.insert("c".into(), f("hist", 20 * GIB)); // past expectation
         assert_eq!(reserved_bytes(&store), 9 * GIB);
+    }
+
+    /// A fake agents slice: `(scope, peak, current, pids)` per scope dir.
+    fn fake_slice(scopes: &[(&str, u64, u64, &[u32])]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for (name, peak, cur, pids) in scopes {
+            let s = d.path().join(name);
+            std::fs::create_dir(&s).unwrap();
+            std::fs::write(s.join("memory.peak"), format!("{peak}\n")).unwrap();
+            std::fs::write(s.join("memory.current"), format!("{cur}\n")).unwrap();
+            let procs: String = pids.iter().map(|p| format!("{p}\n")).collect();
+            std::fs::write(s.join("cgroup.procs"), procs).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn discovery_finds_role_scopes_without_an_issue_lock() {
+        // One sweep scope known from its issue lock, one Doctor scope running
+        // in a `small` worktree, one agent outside every workspace, and a
+        // spawn-claude probe scope that is not an agent.
+        let slice = fake_slice(&[
+            ("loom-agent-10-1.scope", GIB, GIB, &[10]),
+            ("loom-agent-20-2.scope", 7 * GIB, 3 * GIB, &[20, 21]),
+            ("loom-agent-30-3.scope", GIB, GIB, &[30]),
+            ("loom-agent-probe-40-4.scope", 0, 0, &[]),
+        ]);
+        std::fs::write(slice.path().join("not-a-dir.scope"), "").unwrap();
+        let roots = vec![PathBuf::from("/w/heavy"), PathBuf::from("/w/small")];
+        let cwd = |pid: u32| match pid {
+            20 => None, // exited between the procs read and the readlink
+            21 => Some(PathBuf::from("/w/small/.loom/worktrees/pr-7")),
+            30 => Some(PathBuf::from("/tmp/elsewhere")),
+            _ => None,
+        };
+        let known = vec![LiveScope {
+            scope: "loom-agent-10-1.scope".into(),
+            repo: "heavy".into(),
+            issue: Some(5),
+        }];
+        let found = discover_scopes(slice.path(), &roots, &known, cwd);
+        assert_eq!(
+            found,
+            vec![
+                LiveScope {
+                    scope: "loom-agent-20-2.scope".into(),
+                    repo: "small".into(),
+                    issue: None,
+                },
+                LiveScope {
+                    scope: "loom-agent-30-3.scope".into(),
+                    repo: UNATTRIBUTED_REPO.into(),
+                    issue: None,
+                },
+            ]
+        );
+
+        // Sampling: the role scopes are observed like a sweep, and a finished
+        // Doctor's peak lands in its workspace's history.
+        let mut store = Store::default();
+        let live: Vec<LiveScope> = known.into_iter().chain(found).collect();
+        observe(&mut store, &live, |s| read_scope(slice.path(), s));
+        assert_eq!(store.inflight["loom-agent-20-2.scope"].issue, None);
+        assert_eq!(store.inflight["loom-agent-20-2.scope"].peak_bytes, 7 * GIB);
+        let ended = observe(&mut store, &live[..1], |s| read_scope(slice.path(), s));
+        assert_eq!(ended.len(), 2);
+        assert_eq!(store.repos["small"], vec![7 * GIB]);
+        assert_eq!(store.repos[UNATTRIBUTED_REPO], vec![GIB]);
+    }
+
+    #[test]
+    fn role_scopes_without_an_issue_lock_are_reserved_for() {
+        let mut store = Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        store.repos.insert("small".into(), vec![3 * GIB]);
+        let role = |repo: &str, cur: u64| InFlight {
+            repo: repo.into(),
+            issue: None,
+            peak_bytes: cur,
+            current_bytes: cur,
+        };
+        // A Doctor in `small` at 1 GiB of its 3 GiB history reserves 2 GiB.
+        store.inflight.insert("doctor".into(), role("small", GIB));
+        assert_eq!(reserved_bytes(&store), 2 * GIB);
+        // An unattributed agent with no history of its own is assumed able to
+        // reach the host's worst repo peak (13 GiB): 13 - 4 = 9 more.
+        store
+            .inflight
+            .insert("judge".into(), role(UNATTRIBUTED_REPO, 4 * GIB));
+        assert_eq!(reserved_bytes(&store), 11 * GIB);
+        // Once unattributed scopes have their own history, it wins.
+        store.repos.insert(UNATTRIBUTED_REPO.into(), vec![5 * GIB]);
+        assert_eq!(reserved_bytes(&store), 3 * GIB);
+    }
+
+    #[test]
+    fn stored_issue_numbers_from_the_previous_schema_still_load() {
+        let raw = r#"{"inflight":{"s":{"repo":"r","issue":5,"peak_bytes":1,"current_bytes":1}}}"#;
+        let s: Store = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.inflight["s"].issue, Some(5));
     }
 
     #[test]

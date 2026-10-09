@@ -2521,6 +2521,7 @@ mod build_backoff;
 mod main_red_fix;
 mod operator_priority;
 mod ordering;
+mod ram_budget;
 
 // ===================================================================
 // WorkItem

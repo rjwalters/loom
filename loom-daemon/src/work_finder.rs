@@ -1645,7 +1645,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     max_admissions_per_tick: usize,
     saturation_held: bool,
     preferred_slice: Option<&[bool]>,
-    max_concurrent_per_repo: Option<usize>,
+    max_concurrent_per_repo: impl Into<repo_cap::RepoLimits>,
     lanes: &[RedMainLane],
     build_backoff_held: &[bool],
 ) -> TickReport {
@@ -1664,7 +1664,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // track affinity, so neither reads any state the global seed did not.
     let per_repo_occupancy: Vec<usize> = workspaces.iter().map(|(_, d)| d.occupancy()).collect();
     let mut occupancy: usize = per_repo_occupancy.iter().sum();
-    let mut cap = RepoCap::new(max_concurrent_per_repo, per_repo_occupancy);
+    // #11094: `max_concurrent_per_repo` may carry the tick's per-repo RAM budget.
+    let mut cap = RepoCap::from_limits(max_concurrent_per_repo.into(), per_repo_occupancy);
     // The host's single `loom:operator-priority` overflow slot (#9244), taken
     // up front when any workspace already has a live overflow sweep.
     let (max_concurrent, mut overflow) = OverflowSlot::for_workspaces(workspaces, terms);
@@ -2071,11 +2072,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredRampCap, None);
             continue;
         }
-        // Per-repo cap (#9090) — checked LAST of the four admission gates, so
-        // its deferral only ever names a repo that the machine-level gates
-        // above would have admitted. Work-conserving by construction: the
-        // `continue` hands this slot to the next candidate, in another repo.
-        if !over && cap.defer(&cand, &mut report) {
+        // Per-repo cap (#9090) and per-repo RAM charge (#11094) — checked LAST
+        // of the admission gates, so a deferral only ever names a repo that the
+        // machine-level gates above would have admitted. Work-conserving by
+        // construction: the `continue` hands this slot to the next candidate,
+        // in another repo. The RAM charge binds an overflow candidate too.
+        if cap.defer_admission(&cand, over, &mut report) {
             continue;
         }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
@@ -3011,7 +3013,8 @@ pub fn spawn_multi_work_finder_task(
             // #11094: samples every live agent scope's `memory.peak` (folding
             // finished scopes into the repo history) and charges admission
             // with the observed per-repo peak.
-            let ram = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
+            // The budget charges each candidate its OWN repo's peak (pass 2).
+            let (ram, ram_budget) = crate::ram_headroom::ram_headroom_limit_tick(&pool, &roots);
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
@@ -3310,7 +3313,7 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),
-                max_concurrent_per_repo,
+                (max_concurrent_per_repo, ram_budget),
                 &lanes,
                 &build_backoff_held.per_workspace,
             );
