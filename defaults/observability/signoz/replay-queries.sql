@@ -254,6 +254,8 @@ ORDER BY emitter;
 --    loom.fact_id` keeps the earliest knowable-at across hosts. An external
 --    webhook outcome row is primary for the merge/close instant; `pr.resolved`
 --    corroborates it, and a missing webhook row is not a missing outcome.
+--    A record with no forge instant carries no fact id and is not returned
+--    here; see telemetry-replay.md "No forge instant, no fact id" (#11126).
 SELECT attributes_string['loom.kind']    AS kind,
        attributes_string['loom.fact_id'] AS fact_id,
        attributes_string['loom.repo']    AS repo,

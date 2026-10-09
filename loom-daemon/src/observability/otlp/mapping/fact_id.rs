@@ -20,22 +20,32 @@ pub(super) fn derive(kind: &str, key: &[&str]) -> String {
 }
 
 /// The fact id of an outcome record, or `None` for a kind that is not an
-/// outcome fact.
+/// outcome fact or a record with no forge instant to key on. Every key part
+/// is a forge-observed fact, identical on every host that saw it.
 ///
-/// - `pr.resolved`: `(repo, pr_number, state)`
-/// - `eta.stage_outcome`: `(repo, issue, stage, left_at)`
+/// - `pr.resolved`: `(repo, pr_number, state, closed_at)`
+/// - `eta.stage_outcome`: `(repo, issue, stage, next_stage,
+///   forge_transition_at)`; `next_stage` is empty when the item left the
+///   listings
 pub(super) fn of(record: &TelemetryRecord) -> Option<String> {
     match record {
-        TelemetryRecord::PrResolved(r) => {
-            Some(derive("pr.resolved", &[&r.repo, &r.pr_number.to_string(), r.state.as_str()]))
-        }
-        TelemetryRecord::EtaStageOutcome(r) => Some(derive(
+        TelemetryRecord::PrResolved(r) => Some(derive(
+            "pr.resolved",
+            &[
+                &r.repo,
+                &r.pr_number.to_string(),
+                r.state.as_str(),
+                &instant(r.closed_at?),
+            ],
+        )),
+        TelemetryRecord::StageOutcome(r) => Some(derive(
             "eta.stage_outcome",
             &[
                 &r.repo,
                 &r.issue.to_string(),
                 r.stage.as_str(),
-                &instant(r.left_at),
+                r.next_stage.map_or("", |s| s.as_str()),
+                &instant(r.forge_transition_at?),
             ],
         )),
         _ => None,
