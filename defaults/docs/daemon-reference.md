@@ -1067,14 +1067,17 @@ full re-provision:
 
 ```bash
 mkdir -p ~/.config/systemd/user/loom-daemon.service.d
-printf '[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\nRestart=on-success\n' \
+printf '[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\n' \
   > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf
 systemctl --user daemon-reload
 ```
 
-A systemd drop-in's `Environment=` is additive and its `Restart=` overrides the
-base unit, so this one file fixes both defects (the missing supervisor env and
-the wrong restart policy) without touching the rendered base unit.
+A systemd drop-in's `Environment=` is additive, so this file adds the missing
+supervisor env without touching the rendered base unit. Once the daemon runs
+supervised, it writes the restart policy itself as `50-supervision.conf`
+(#11111; see "Supervisor exit-code contract"). An older copy of this hint also
+put `Restart=on-success` in `supervisor.conf`. That file sorts after
+`50-supervision.conf` and overrides it, so delete the line.
 
 ### `fleet bootstrap-spice <ssh-host>` (#4931, Phase 1a)
 
@@ -12152,13 +12155,27 @@ The daemon encodes WHY it exits in its exit code (`ipc.rs`,
 - **A `kill -9` of a systemd-supervised daemon is relaunched**, because it is
   indistinguishable from an OOM kill. Stop with `loom-daemon-stop.sh` or
   `systemctl --user disable --now`.
-- **Existing installs pick the new unit up on re-render**: `loom-daemon-update.sh
-  --relaunch` (re-renders via `loom-daemon-start.sh`; on a fleet worker it
-  rewrites the same `loom-daemon.service`), or any fresh `loom-daemon-start.sh`
-  against a stopped daemon. A plain supervised restart (exit 0) does NOT
-  re-render: the relaunched process runs under the unit systemd already has
-  loaded. `fleet add-worker` skips its `daemon-unit` step on a worker whose unit
-  is already enabled, so use `--relaunch` there too.
+- **Existing installs get these settings at the next daemon startup (#11111)**,
+  with no re-render. A daemon running under systemd on Linux writes them to
+  `~/.config/systemd/user/<unit>.service.d/50-supervision.conf` and runs
+  `systemctl --user daemon-reload`. The file holds the `[Unit]` start limit and
+  the `[Service]` directives of the same `systemd_supervision_block()`, with an
+  empty `RestartPreventExitStatus=` / `SuccessExitStatus=` before each value,
+  because those keys add to the base unit's lists. It is rewritten only when its
+  content differs. systemd reads the settings when the daemon exits, so the next
+  exit is supervised by them; a floor roll is enough to deliver them fleet-wide.
+  It covers the canonical unit and the `fleet add-worker` unit alike. A failure
+  is logged at WARN and the daemon carries on. Nothing is written under launchd
+  or when unsupervised. A drop-in that sorts after it and sets the same keys
+  wins, so startup names one at WARN. The usual one is the pre-#11111 retrofit's
+  `supervisor.conf` with `Restart=on-success`; delete that line.
+- **The unit file itself is re-rendered** only by `loom-daemon-update.sh
+  --relaunch` or a fresh `loom-daemon-start.sh` against a stopped daemon; a
+  supervised restart (exit 0) does not re-render it.
+- **`loom-daemon-start.sh` runs `systemctl --user reset-failed <unit>` before
+  `enable --now` (#11111).** Once the start limit trips, the unit is
+  `failed (Result: start-limit-hit)` and systemd refuses a start for up to
+  `StartLimitIntervalSec`; the reset lets an operator start it at once.
 
 ### macOS TCC hygiene under launchd (#3980)
 

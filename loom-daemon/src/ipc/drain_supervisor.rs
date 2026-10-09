@@ -72,9 +72,11 @@ pub fn handle_drain_request(
                         loom-daemon-start.sh. If this IS a systemd --user service (e.g. a \
                         fleet worker provisioned before #4640), retrofit it instead: mkdir -p \
                         ~/.config/systemd/user/loom-daemon.service.d && printf \
-                        '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\nRestart=on-success\\n' \
+                        '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\n' \
                         > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
-                        systemctl --user daemon-reload."
+                        systemctl --user daemon-reload. Once supervised, the daemon writes \
+                        its own Restart= supervision drop-in (50-supervision.conf, #11111) \
+                        at startup."
                         .to_string(),
                     then_exit,
                 };

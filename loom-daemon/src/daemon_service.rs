@@ -1828,6 +1828,15 @@ pub(crate) async fn run_daemon() -> Result<()> {
         heartbeat_interval.as_secs(),
     ));
 
+    // Startup supervision drop-in (#11111): a floor roll relaunches onto a new
+    // binary without re-rendering the unit, so write #11058's supervision
+    // settings as a drop-in and `daemon-reload`; systemd applies them at this
+    // daemon's next exit. systemd on Linux only; failures log at WARN. On its
+    // own thread so a wedged user manager cannot delay startup.
+    let _ = std::thread::Builder::new()
+        .name("supervision-dropin".to_string())
+        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup);
+
     // Watchdog-provisioning-guard loop (Issue #5405): #5343's
     // heal_watchdog_provisioning_gap() only fires as a side effect of
     // RE-RUNNING loom-daemon-start.sh — a host that was provisioned before
