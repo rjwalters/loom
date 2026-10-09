@@ -9,25 +9,40 @@
 --
 -- STATUS: not yet executed in CI against the pinned ClickHouse.
 
--- 1. Hosts with drops in the last 2 h, worst first.
-WITH samples AS (
+-- 1. Hosts with drops in the last 2 h, worst first. Each host's latest sample
+--    in the 24 h before the window is kept as the baseline, so drops between
+--    the window start and the first in-window sample are counted. A host with
+--    no earlier sample has an unknown baseline: its first value contributes 0
+--    rather than being read as a recent drop.
+WITH raw AS (
     SELECT resources_string['host.id'] AS host,
            toUInt64(attributes_number['loom.host_export.dropped_total']) AS dropped,
            timestamp
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] = 'host.export'
-      AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
+      AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 26 HOUR)
+),
+samples AS (
+    SELECT host, dropped, timestamp, 1 AS in_window
+    FROM raw
+    WHERE timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
+    UNION ALL
+    SELECT host, argMax(dropped, timestamp) AS dropped, max(timestamp) AS timestamp, 0 AS in_window
+    FROM raw
+    WHERE timestamp < toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
+    GROUP BY host
 ),
 steps AS (
     SELECT host,
            dropped,
+           in_window,
            lagInFrame(dropped) OVER (PARTITION BY host ORDER BY timestamp
                                      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prev,
            row_number() OVER (PARTITION BY host ORDER BY timestamp) AS n
     FROM samples
 )
 SELECT host,
-       sum(multiIf(n = 1, 0, dropped >= prev, dropped - prev, dropped)) AS dropped_in_window
+       sum(multiIf(in_window = 0 OR n = 1, 0, dropped >= prev, dropped - prev, dropped)) AS dropped_in_window
 FROM steps
 GROUP BY host
 HAVING dropped_in_window > 0

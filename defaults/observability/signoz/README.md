@@ -381,9 +381,11 @@ whose cumulative `dropped_total` grew in the last 2 h (a decrease is read as a
 daemon restart), and (2) hosts with other Loom logs but no `host.export` in
 that window. Drops are host-level: the log attributes carry only the sum
 across exporters, and the per-exporter split lives in the JSON body. A
-window's first sample counts as 0, so drops that happen before the first
-sample in the window are not counted. Not yet executed in CI against the
-pinned ClickHouse.
+host's latest sample in the 24 h before the window is the baseline, so drops
+between the window start and the first in-window sample are counted; a host
+with no earlier sample has an unknown baseline and its first value counts as
+0. Not yet executed in CI against the pinned ClickHouse, and no fixture covers
+the boundary, increment, no-increase and reset cases yet.
 
 ### Pass activity
 
