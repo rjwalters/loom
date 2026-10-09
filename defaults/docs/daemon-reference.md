@@ -4651,7 +4651,7 @@ touching running work.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370) on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
+| **disk headroom** | since #11191, `sweeps in flight + floor((free - floor - reserved) / smallest repo charge)` on the worktree-root volume, with each repo charged its own measured footprint — see [Disk admission](#disk-admission-11191) (`disk_admission::tick`). With `LOOM_DISK_ADMISSION=0`, or when free space is unmeasurable, the legacy `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370; `disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold, counting the growth the running sweeps have still to write |
 | **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
 | **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
@@ -4662,6 +4662,76 @@ Retired as cap inputs (informational-only now — see `capacity::token_axis_limi
 | **healthy-token count** (retired from the cap, #5270) | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344) | drives spawn-time account **selection** (prefer fresher/healthier accounts, skip exhausted/blocked ones, #3902) and is reported on `status`/`calibrate` for observability — no longer bounds `dynamic_cap` |
 
 **Per-token concurrency** (`LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, #3947) was retired from the cap by #5270 and then removed entirely by #5743 — it fed only a disclaimed `healthy × per-token` status/calibrate figure with no admission effect, which caused mis-diagnosis on the fleet more than once. The knob, its env var, and the status line are gone; a config file that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are ignored, not an error) but the key does nothing.
+
+#### Disk admission (#11191)
+
+A flat 8 GB per sweep, checked against free space *now*, let a host keep
+dispatching while two in-flight loom builds were still going to write 50 GB
+(loom-worker-1, 2026-10-09: about 50 GB free at 15:59, 0 GB at 16:19). Disk
+admission charges each repo what its sweeps actually use and reserves the
+growth the running ones have not written yet. A sweep of repo R is admitted
+only when
+
+```text
+free - floor - reserved >= charge(R)
+reserved = sum over in-flight units u of max(0, charge(u.repo) - written(u))
+```
+
+| Term | Meaning |
+|---|---|
+| `free` | free GB on the worktree-root volume (`df -Pk`, as before) |
+| `floor` | the disk-full halt floor (`LOOM_DISK_FULL_HALT_GB`, default 3), so admission stops before the terminal halt |
+| `charge(R)` | first match wins: R's **observed** high-water mark + 10%, else R's `autonomous.workFinder.diskChargeGb` (**config**, per repo), else `LOOM_PER_WORKTREE_GB` (**default**, 8). Whole GB rounded up, minimum 1 — a repo that builds nothing measures well under 1 GB and is charged 1 |
+| `written(u)` | what an in-flight unit has on disk now; already gone from `free`, so it is not charged twice |
+
+**Measurement.** A `disk-footprint` sampler thread (every
+`LOOM_DISK_SAMPLE_SECS`, default 60) measures every live unit of every
+managed repo: an issue sweep is its worktree (`issue-N`) plus every live
+`.loom/targets/` run dir (#8370) owned by the claim lock's pid or process
+group; any other live run dir (a role-runner tick, a PR-set sweep) is a unit
+of its own. When a unit ends, its peak is folded into the repo's history (the
+last 20 runs) in `~/.loom/disk-footprints.json` (`LOOM_DISK_FOOTPRINT_PATH`);
+the charge is the max of that history. The worktree volume's per-worktree
+cargo target dirs (#8458, `cargo.perWorktreeTargetDir`) live outside both and
+are not measured; a repo using them should set `diskChargeGb`.
+
+**Where it applies.**
+
+- The work finder: a repo whose charge does not fit at the top of a tick is
+  held with the `disk_reservation` halt cause (its `workspace_halted` rows say
+  so); pass 2 debits each admission and defers whatever stops fitting as
+  `deferred_capacity` with a `disk: <repo> charge NGB (source) exceeds
+  remaining MGB (free … - floor … - reserved …)` detail. A heavy repo's
+  charge never blocks a light sibling.
+- Every other dispatch route: the check also runs inside
+  `begin_prepared_issue_dispatch`, after the other guards and before any
+  claim, label or spawn — so the review-stall watchdog's re-dispatch
+  (#3910), its PR-set conversion (#7649), the reaper's resume (#4256),
+  IPC/CLI dispatch and the epic supervisor are gated by the same rule. A
+  refusal is a typed `DiskAdmissionRefused` error naming every figure, logged
+  at WARN. An admitted dispatch is recorded as a *pending* unit, so the next
+  admission reserves for it before any sample has seen it (dropped after 180 s
+  if no sample adopts it).
+
+**Visibility.** `disk_admission: free 50GB - floor 3GB - reserved 30GB =
+17GB; charges [loom:29GB(observed),docs:1GB(observed)]; sweeps_in_flight=2
+cap_term=2 refusing=[loom]` is logged at INFO on change and at WARN on the
+edge into refusing a repo; the `work_finder: tick` line carries the same
+figures in `disk=N [...]`.
+
+**Fail-open cases.** An unmeasurable `df` keeps the legacy term and skips the
+seam check (#4164). A store whose last sample is older than 10 minutes
+reserves nothing for its sampled units. `LOOM_DISK_ADMISSION=0` turns the whole
+mechanism off.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_DISK_ADMISSION` | on | `0`/`false`/`off` restores the legacy flat disk term |
+| `autonomous.workFinder.diskChargeGb` (repo config) | unset | the repo's charge while it has no observed history |
+| `LOOM_PER_WORKTREE_GB` | 8 | the global fallback charge (and the legacy term's divisor) |
+| `LOOM_DISK_FULL_HALT_GB` | 3 | the floor admission keeps clear |
+| `LOOM_DISK_SAMPLE_SECS` | 60 | sampler interval |
+| `LOOM_DISK_FOOTPRINT_PATH` | `~/.loom/disk-footprints.json` | history and in-flight store |
 
 #### Per-repo dispatch cap + track affinity (#9090)
 

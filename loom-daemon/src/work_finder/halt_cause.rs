@@ -63,11 +63,15 @@ pub enum HaltCause {
     /// The root's installed Loom needs a newer daemon than this one (W4,
     /// #10719). Clears when this host has rolled.
     DaemonTooOld,
+    /// The repo's measured disk charge does not fit this host's free space
+    /// after the halt floor and the in-flight sweeps' expected growth
+    /// (#11191). Host-local; clears as sweeps finish or space is reclaimed.
+    DiskReservation,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -78,6 +82,7 @@ impl HaltCause {
         Self::CiBilling,
         Self::InstallIncompatible,
         Self::DaemonTooOld,
+        Self::DiskReservation,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -107,6 +112,7 @@ impl HaltCause {
             Self::CiBilling => "ci_billing",
             Self::InstallIncompatible => "install_incompatible",
             Self::DaemonTooOld => "daemon_too_old",
+            Self::DiskReservation => "disk_reservation",
         }
     }
 }
@@ -185,6 +191,25 @@ pub fn causes_per_root(
             breaker_suppressed.then_some(HaltCause::Breaker)
         })
         .collect()
+}
+
+/// Fold the disk budget's holds (#11191) into the per-root causes: a root no
+/// other hold names, whose disk charge does not fit at the top of the tick,
+/// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
+/// that is red or pool-held still names that cause. No budget: unchanged.
+#[must_use]
+pub fn with_disk_holds(
+    mut causes: Vec<Option<HaltCause>>,
+    disk: Option<&crate::disk_admission::DiskBudget>,
+) -> Vec<Option<HaltCause>> {
+    if let Some(budget) = disk {
+        for (cause, held) in causes.iter_mut().zip(budget.held()) {
+            if cause.is_none() && held {
+                *cause = Some(HaltCause::DiskReservation);
+            }
+        }
+    }
+    causes
 }
 
 /// A halted root's cause: `ci_billing` when its repo owner's Actions jobs are

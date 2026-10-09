@@ -237,6 +237,7 @@ pub mod operator_priority;
 mod ordering;
 pub mod ready_queue;
 mod recheck_interval;
+mod tick_line;
 mod tick_report;
 mod tick_summary;
 use crate::types::QueueDisposition as Qd;
@@ -3010,7 +3011,9 @@ pub fn spawn_multi_work_finder_task(
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
-            let mut disk = disk_headroom_limit(&fallback_root);
+            // #11191: the disk term nets out the in-flight sweeps' expected
+            // growth, and the budget charges each repo its measured footprint.
+            let (mut disk, mut disk_budget) = crate::disk_admission::tick(&roots, &fallback_root);
             // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
             // FIRST becomes the term that binds the cap down, run the existing
             // reclaim passes for `fallback_root` — the same root this
@@ -3027,7 +3030,7 @@ pub fn spawn_multi_work_finder_task(
                     crate::eager_reclaim::run_for(&root_for_task)
                 })
                 .await;
-                disk = disk_headroom_limit(&fallback_root);
+                (disk, disk_budget) = crate::disk_admission::tick(&roots, &fallback_root);
             }
             // Re-armed from the POST-reclaim reading — see the
             // single-workspace loop above.
@@ -3198,6 +3201,9 @@ pub fn spawn_multi_work_finder_task(
                 draining,
                 breaker_suppressed,
             );
+            // #11191: a repo whose disk charge does not fit is held, named.
+            let halt_causes = halt_cause::with_disk_holds(halt_causes, disk_budget.as_ref());
+            let disk_note = crate::disk_admission::note(disk_budget.as_ref());
             let halted: Vec<bool> = halt_causes.iter().map(Option::is_some).collect();
             let preflight_held_count = preflight_held.iter().filter(|&&h| h).count();
             // Distinguish a pre-flight-advisory hold from the main-health /
@@ -3305,7 +3311,7 @@ pub fn spawn_multi_work_finder_task(
                 max_admissions_per_tick,
                 saturation_held,
                 Some(&preferred_slice),
-                (max_concurrent_per_repo, ram_budget),
+                (max_concurrent_per_repo, ram_budget, disk_budget),
                 &lanes,
                 &build_backoff_held.per_workspace,
             );
@@ -3325,70 +3331,20 @@ pub fn spawn_multi_work_finder_task(
             }
             was_halted = report.halted;
 
-            if report.dispatched > 0
-                || report.errors > 0
-                || report.skipped_quarantined > 0
-                || report.skipped_workspace_commands_missing > 0
-                || report.skipped_backoff > 0
-                || report.skipped_pr_open_backoff > 0
-                || report.skipped_noop_cooldown > 0
-                || report.skipped_declined > 0
-                || report.skipped_prless_retry > 0
-                || report.skipped_recheck_interval > 0
-                || report.skipped_host_constraint > 0
-                || report.skipped_pr_open > 0
-                || report.skipped_peer_claim > 0
-                || report.deferred_ramp_cap > 0
-                || report.deferred_saturation > 0
-                || report.deferred_out_of_slice > 0
-                || report.deferred_repo_cap > 0
-            {
-                log::info!(
-                    "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit} [fallback_root probe only], \
-                     min_workspace_healthy={min_workspace_healthy} [minimum across every \
-                     registered workspace's own resolved pool, #7527], disk={disk}, \
-                     ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
-                     {} workspace(s), \
-                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
-                     {} declined-skip, {} prless-retry-skip, \
-                     {} recheck-interval-skip, \
-                     {} host-constraint-skip, {} host-class-skip, \
-                     {} pr-open-skip, \
-                     {} peer-claim-skip, \
-                     {} deferred (capacity), {} deferred (ramp), \
-                     {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
-                     {} deferred (repo cap, #9090), {} deferred (build back-off, #9410), \
-                     {} error(s), {} cross-host-collision(s)",
-                    pairs.len(),
-                    report.seen,
-                    report.dispatched,
-                    report.skipped_labeled,
-                    report.skipped_in_flight,
-                    report.skipped_quarantined,
-                    report.skipped_workspace_commands_missing,
-                    report.skipped_backoff,
-                    report.skipped_pr_open_backoff,
-                    report.skipped_noop_cooldown,
-                    report.skipped_declined,
-                    report.skipped_prless_retry,
-                    report.skipped_recheck_interval,
-                    report.skipped_host_constraint,
-                    report.skipped_host_class,
-                    report.skipped_pr_open,
-                    report.skipped_peer_claim,
-                    report.deferred_capacity,
-                    report.deferred_ramp_cap,
-                    report.deferred_saturation,
-                    report.deferred_out_of_slice,
-                    report.deferred_repo_cap,
-                    report.deferred_build_backoff,
-                    report.errors,
-                    report.collisions
-                );
-            }
+            // The tick line, with the disk budget's figures (#11191).
+            let tick_line = tick_line::TickLine {
+                max_concurrent,
+                pool_size,
+                token_limit,
+                min_workspace_healthy,
+                disk,
+                ram,
+                configured_max,
+                max_admissions_per_tick,
+                workspaces: pairs.len(),
+                disk_note: &disk_note,
+            };
+            tick_line::log(&report, &tick_line);
             // #10624: which repos the build back-off deferred (INFO on change).
             build_backoff.log_deferred(&report.queue, &roots);
 
