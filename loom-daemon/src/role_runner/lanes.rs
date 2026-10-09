@@ -1,4 +1,8 @@
-//! Per-repository doctor lanes (#10632, part of #10630).
+//! Per-repository doctor and judge lanes (#10632, #10630).
+//!
+//! #10630 generalized the doctor rule to judge: see [`super::lane_rule`] for
+//! the `clamp(ceil(debt / laneK), 1, perRepoCap)` formula and the trim order.
+//! Everything below applies to both roles unless it says doctor.
 //!
 //! #9391 made the repository the parallelism boundary with **one** instance
 //! per `(repository, role)`, and `/loom:doctor` fixes one PR per run. Those
@@ -37,9 +41,9 @@
 
 use super::*;
 
-/// Reads `root`'s Doctor queue as PR numbers, in the order Doctor would take
-/// them. `Err` is an unreadable queue.
-pub type LaneQueue = Arc<dyn Fn(&Path) -> Result<Vec<u64>, String> + Send + Sync>;
+/// Reads `root`'s queue for `role` (`doctor` or `judge`, #10630) as PR numbers,
+/// in the order that role would take them. `Err` is an unreadable queue.
+pub type LaneQueue = Arc<dyn Fn(&Path, &str) -> Result<Vec<u64>, String> + Send + Sync>;
 
 /// Runs the stale-verdict guard on one PR: `true` when Doctor may take it.
 pub type VerdictCheck = Arc<dyn Fn(&Path, u64) -> bool + Send + Sync>;
@@ -63,12 +67,17 @@ impl LaneProbe {
     #[must_use]
     pub fn forge() -> Self {
         Self {
-            queue: Arc::new(|root| {
+            queue: Arc::new(|root, role| {
                 let gh_bin = std::env::var("LOOM_GH_BIN")
                     .ok()
                     .filter(|v| !v.trim().is_empty())
                     .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
-                crate::pr_planning::fetch_queue(root, &gh_bin, crate::pr_planning::PrRole::Doctor)
+                let pr_role = if role == "judge" {
+                    crate::pr_planning::PrRole::Judge
+                } else {
+                    crate::pr_planning::PrRole::Doctor
+                };
+                crate::pr_planning::fetch_queue(root, &gh_bin, pr_role)
                     .map(|rows| rows.iter().filter_map(|r| r["number"].as_u64()).collect())
                     .map_err(|e| e.to_string())
             }),
@@ -82,7 +91,7 @@ impl LaneProbe {
     #[must_use]
     pub fn none() -> Self {
         Self {
-            queue: Arc::new(|_| Err("no lane probe configured".to_string())),
+            queue: Arc::new(|_, _| Err("no lane probe configured".to_string())),
             verdict: Arc::new(|_, _| false),
         }
     }
@@ -173,10 +182,12 @@ pub enum LaneTarget {
     Nothing,
 }
 
-/// Pick the PR `lane` of `root` works (see the module doc).
+/// Pick the PR `lane` of `root` works as `role` (see the module doc). Judge
+/// (#10630) shares the reservation and queue read; the stale-verdict guard is
+/// Doctor's alone.
 #[must_use]
-pub fn assign(probe: &LaneProbe, root: &Path, lane: usize) -> LaneTarget {
-    let rows = match (probe.queue)(root) {
+pub fn assign(probe: &LaneProbe, role: &str, root: &Path, lane: usize) -> LaneTarget {
+    let rows = match (probe.queue)(root, role) {
         Ok(rows) => rows,
         Err(e) => {
             log::debug!(
@@ -204,7 +215,7 @@ pub fn assign(probe: &LaneProbe, root: &Path, lane: usize) -> LaneTarget {
             continue;
         };
         tried += 1;
-        if (probe.verdict)(root, pr) {
+        if role != "doctor" || (probe.verdict)(root, pr) {
             return LaneTarget::Pr(hold);
         }
     }
