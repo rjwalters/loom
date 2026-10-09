@@ -22,6 +22,18 @@
 //! inside `worktree.sh` — and no human types it, so clap's own usage error is
 //! the right answer for a malformed invocation and needs no hand-rolled
 //! parser to preserve a code nobody branches on.
+//!
+//! The one operator-typed form, `--retire-aliases` (#9152), keeps that
+//! grammar: it is run by hand once per repo, and clap's usage error is an
+//! adequate answer to a typo there too.
+//!
+//! # `--retire-aliases`
+//!
+//! Unlinks the `node_modules` symlinks into the main workspace that worktrees
+//! created before #8944 still carry on a pnpm workspace — `--worktree` names
+//! one, omitting it covers every worktree. Removes symlinks only, never their
+//! targets and never a real directory; see [`link::retire_aliases`]. Unlike
+//! provisioning it exits 1 if an unlink failed.
 
 use anyhow::Result;
 
@@ -34,9 +46,17 @@ pub(crate) struct WorktreeLinkArgs {
     #[arg(long)]
     repo_root: std::path::PathBuf,
 
-    /// Absolute path of the worktree that was just created.
+    /// Absolute path of the worktree that was just created. With
+    /// `--retire-aliases`, optional: omit it to cover every worktree.
+    #[arg(long, required_unless_present = "retire_aliases")]
+    worktree: Option<std::path::PathBuf>,
+
+    /// Instead of provisioning, retire the `node_modules` symlinks into the
+    /// main workspace that pre-#8944 worktrees still carry on a pnpm
+    /// workspace (#9152). Unlinks symlinks only — never their targets, never
+    /// a real directory. Then run `pnpm install` in each reported worktree.
     #[arg(long)]
-    worktree: std::path::PathBuf,
+    retire_aliases: bool,
 
     /// Print nothing. Passed by `worktree.sh` in `--json` mode, where the
     /// pre-port script suppressed every one of these lines outright.
@@ -47,9 +67,19 @@ pub(crate) struct WorktreeLinkArgs {
 impl WorktreeLinkArgs {
     /// Never returns.
     pub(crate) fn run(self) -> Result<()> {
+        if self.retire_aliases {
+            std::process::exit(link::retire_aliases(&link::RetireOptions {
+                repo_root: self.repo_root,
+                worktree: self.worktree,
+                quiet: self.quiet,
+            }));
+        }
+        let Some(worktree) = self.worktree else {
+            anyhow::bail!("--worktree is required unless --retire-aliases is given");
+        };
         std::process::exit(link::run(&link::Options {
             repo_root: self.repo_root,
-            worktree: self.worktree,
+            worktree,
             quiet: self.quiet,
         }));
     }
