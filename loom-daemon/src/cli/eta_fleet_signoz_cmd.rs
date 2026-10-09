@@ -19,9 +19,8 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 
 use loom_daemon::eta::fleet_signoz::{self, SignozSnapshot};
-use loom_daemon::eta::fleet_signoz_refresh::{
-    self, ClickhouseHttp, FetchReport, FileRows, Limits, SignozRead, SignozStop, OUTCOMES_SQL,
-};
+use loom_daemon::eta::fleet_signoz_refresh::{self, FetchReport, Limits, SignozStop, OUTCOMES_SQL};
+use loom_daemon::signoz_read::{ClickhouseHttp, FileRows, SignozRead, SqlPages};
 
 use super::eta_fleet_cmd::resolve_root;
 
@@ -122,11 +121,17 @@ impl SignozRefreshArgs {
                          autonomous.eta.fleetRefresh.signoz.endpoint"
                     );
                 };
-                Box::new(ClickhouseHttp {
-                    endpoint,
-                    user: self.user.clone().or(configured.user),
-                    credential_file: self.credential_file.clone().or(configured.credential_file),
-                    timeout: std::time::Duration::from_secs(60),
+                Box::new(SqlPages {
+                    http: ClickhouseHttp {
+                        endpoint,
+                        user: self.user.clone().or(configured.user),
+                        credential_file: self
+                            .credential_file
+                            .clone()
+                            .or(configured.credential_file),
+                        timeout: std::time::Duration::from_secs(60),
+                    },
+                    sql: OUTCOMES_SQL,
                 })
             }
         };

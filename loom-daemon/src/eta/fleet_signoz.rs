@@ -79,6 +79,8 @@
 use super::explanation::HistoryScope;
 use super::fleet::{self, RETENTION_DAYS};
 use super::history::{OutcomeFacts, SampleSource, StageSamples};
+// The row paging cursor is owned by the neutral SigNoz read client (#10196 R6).
+use crate::signoz_read::RowCursor;
 use crate::telemetry::{PhaseDuration, SweepResult};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -197,11 +199,6 @@ fn result_str(result: SweepResult) -> &'static str {
         SweepResult::Blocked => "blocked",
     }
 }
-
-/// The paging position of one row: `(observed_timestamp ns, record id)`
-/// exactly as the query orders by, so a continuation resumes after it even
-/// when the row itself is rejected.
-pub type RowCursor = (i64, String);
 
 /// What one row of the query's output parsed to.
 #[derive(Debug, Clone, PartialEq, Eq)]
