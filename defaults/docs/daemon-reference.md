@@ -9575,39 +9575,72 @@ reclaimed immediately.
 `disk < min(ram, configured_max)`, so reclaiming disk would buy back real
 dispatch slots — the dispatch loop runs the *existing* reclaim passes for that
 root right then, on the blocking pool, then **re-probes free space** before
-finalizing the tick's cap. The sub-passes and their order are exactly
-`worktree_reaper::reap_repo`'s: merged-PR worktree reap → `deep_clean` →
-`docker_image_clean` → scratch reclaim (below). No new removal code exists in
-this path — only a decision about *when* to ask.
+finalizing the tick's cap. No new removal code exists in this path — only a
+decision about *when* to ask, and how far to escalate.
+
+**Tiers, safest first (#11192).** The pass escalates through three tiers and
+re-probes free space between them, moving on only while free space is still
+below the floor (`diskWarnFreeGb`) or cannot be measured:
+
+1. merged-PR worktree reap, aborted-fetch `.git` temp files, agent scratch
+   (below), orphaned cargo target dirs;
+2. idle build caches of kept worktrees across every registered root (#11071);
+3. the primary checkout's own build cache (`deep_clean`) and
+   `docker_image_clean`.
+
+A pass that starts above the floor runs tier 1 only; the scheduled reaper
+still runs `docker_image_clean` on its own cadence.
 
 **It cannot bypass a cooldown.** Each sub-pass consults its own cooldown
 (`deep_clean` 6h, `docker_image_clean` 30 min, `scratchReclaim` 30 min), which
 this trigger neither reads nor resets. Triggering eagerly only makes an
 *already-due* pass run promptly instead of up to 15 minutes late.
 
-**Edge-triggered, plus its own cooldown.** The pass fires only on the
-`false → true` transition of the binding condition, never on every tick a
-stubbornly-full disk keeps it true, and additionally not more often than
-`minIntervalSecs` (default 10 min) per root. Both guards protect the one
-sub-pass with no cooldown of its own — the merged-PR worktree reap, which makes
-a forge REST call per candidate worktree. A disk that recovers and later drops
-again is a genuine new crossing and fires again. An **unmeasurable** disk probe
-(`usize::MAX`, the "unknown != zero" contract of #4164) never triggers it, just
-as it never triggers a clamp.
+**Edge and level, plus its own cooldown (#11192).** The pass fires on the
+`false → true` transition of the binding condition, and also on level:
+
+- on every tick while free space is below the floor (`diskWarnFreeGb`);
+- while the disk term keeps binding, each time free space has fallen
+  `fallStepGb` (default 10) below the last pass's reading, or below the
+  highest reading since.
+
+Edge-only triggering could not re-arm on a host whose disk term binds on every
+tick: with `configured_max = 12` it binds whenever free space is under 96 GB,
+and on loom-worker-1 (2026-10-09) no pass ran for 7.5 hours while free space
+fell from 79 GB to 0. Whatever the trigger, a pass runs at most once per
+`minIntervalSecs` (default 10 min) per root, which protects the one sub-pass
+with no cooldown of its own: the merged-PR worktree reap, which makes a forge
+REST call per candidate worktree. An **unmeasurable** disk probe (`usize::MAX`,
+the "unknown != zero" contract of #4164) never triggers it, just as it never
+triggers a clamp.
+
+**Empty passes alert and back off (#11192).** A pass that removed nothing logs
+an `eager_reclaim: ALERT … pass reclaimed nothing (N in a row …)` line at
+`ERROR`: the automatic passes have run out of candidates and what fills the
+disk is not something the daemon removes on its own. While passes keep coming
+back empty, the merged-PR worktree reap backs off to 2x, 4x, then at most 8x
+`minIntervalSecs` between runs. The local sub-passes keep their once-per-window
+cadence.
 
 **Scope.** The dispatch loop's disk term is one machine-level probe against one
 root (`fallback_root` in the production multi-workspace loop), so the eager pass
-reclaims from that same root. The scheduled reaper still walks every registered
-root on its own cadence — eager reclaim is strictly additive.
+reclaims from that same root, except for the tier-2 idle-cache pass, which walks
+every registered root. The scheduled reaper still walks every registered root on
+its own cadence — eager reclaim is strictly additive. Since #11192 the scheduled
+reaper also runs the cross-root idle-cache pass whenever a root it visits is
+below the floor, so that pass no longer depends on the eager trigger. Both
+paths share one host-wide `minIntervalSecs` window for it.
 
 **Log line.** One `WARN` per eager pass, deliberately prefixed `eager_reclaim:`
 so it is never confused with `worktree_reaper:`'s scheduled-pass lines:
 
 ```
-eager_reclaim: /home/u/GitHub/loom disk axis binds the dispatch cap down (3G free)
-— ran an out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's
-own scheduled pass: worktrees 2 removed, deep-clean target/ (6.1G), docker 4
-image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
+eager_reclaim: /home/u/GitHub/loom free space is below the floor (3G free) — ran
+an out-of-cycle pass (tier 3 of 3) now instead of waiting up to 15m for
+worktree_reaper's own scheduled pass: worktrees 2 removed, git-tmp nothing,
+scratch 1.8G, cargo-target orphans nothing, idle worktree targets 1 dir(s)
+(4.0G), deep-clean target/ (6.1G), docker 4 image(s) — now 16G free vs. floor
+20G (#7512, #11192)
 ```
 
 ```json
@@ -9616,7 +9649,8 @@ image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
     "worktreeReaper": {
       "eagerReclaim": {
         "enabled": true,
-        "minIntervalSecs": 600
+        "minIntervalSecs": 600,
+        "fallStepGb": 10
       }
     }
   }
@@ -9627,6 +9661,7 @@ image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
 |---------|-----------|------------|---------|
 | `LOOM_EAGER_RECLAIM` | `autonomous.worktreeReaper.eagerReclaim.enabled` | env > config > default | `true` (on) |
 | `LOOM_EAGER_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.eagerReclaim.minIntervalSecs` | env > config > default | `600` (10 min) |
+| `LOOM_EAGER_RECLAIM_FALL_STEP_GB` | `autonomous.worktreeReaper.eagerReclaim.fallStepGb` | env > config > default | `10` (GB) |
 
 Setting `enabled: false` restores exactly the pre-#7512 behavior: the dispatch
 loop clamps immediately and only the 15-minute reaper cadence reclaims. See

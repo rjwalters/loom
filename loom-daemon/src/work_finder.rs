@@ -2495,14 +2495,12 @@ where
         // Rate-limit skip state (#4429): log the pause/resume edges once, not
         // every skipped tick — same dedup discipline as `was_halted`.
         let mut was_rate_limited = false;
-        // Disk-axis binding state (#7512): tracks whether the disk term was
-        // the axis binding the cap DOWN as of the end of the previous tick, so
-        // the eager reclaim trigger below fires on the false -> true EDGE only
-        // (once per crossing), never on every tick a stubbornly-full disk
-        // keeps it true — see `eager_reclaim::should_trigger`'s doc comment
-        // for why that matters (the merged-PR worktree reap sub-pass has no
-        // cooldown of its own).
-        let mut was_disk_binding = false;
+        // Eager reclaim trigger state (#7512, #11192): fires on the tick the
+        // disk term starts binding the cap DOWN, and on level while free
+        // space is below the floor or keeps falling — see
+        // `eager_reclaim::EagerTrigger` for the rules and the cooldowns that
+        // keep a level trigger from becoming a forge-polling loop.
+        let mut eager_trigger = crate::eager_reclaim::EagerTrigger::default();
         loop {
             ticker.tick().await;
             // GitHub rate-limit circuit breaker (#4429): when the shared API
@@ -2612,27 +2610,18 @@ where
             // to know whether disk is the axis that would bind the cap down,
             // which is a comparison against this term and `configured_max`.
             let ram = crate::ram_headroom::ram_headroom_limit();
-            let mut disk = disk_headroom_limit(&workspace_root);
-            // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
-            // FIRST becomes the term that binds the cap down, run the existing
-            // reclaim passes for this workspace root right now rather than
-            // waiting for the worktree reaper's own up-to-15-minute-away next
-            // tick, then re-probe disk fresh (the loop's existing per-tick
-            // measurement, not a new mechanism) before this tick's cap is
-            // finalized — see `eager_reclaim::run_for`'s doc comment for the
-            // full rationale and the cooldown-safety argument.
-            if crate::eager_reclaim::should_trigger(was_disk_binding, disk, ram, configured_max) {
-                let root_for_task = workspace_root.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::eager_reclaim::run_for(&root_for_task)
-                })
+            // Eager, out-of-cycle reclaim (#7512, #11192): on the tick the
+            // disk axis FIRST becomes the term that binds the cap down, and
+            // again while free space is below the floor or keeps falling, run
+            // the existing reclaim passes for this workspace root right now
+            // rather than waiting for the worktree reaper's own
+            // up-to-15-minute-away next tick. The disk term comes back
+            // re-probed after a pass, before this tick's cap is finalized —
+            // see `eager_reclaim::run_for`'s doc comment for the full
+            // rationale and the cooldown-safety argument.
+            let disk = eager_trigger
+                .tick(&workspace_root, disk_headroom_limit(&workspace_root), ram, configured_max)
                 .await;
-                disk = disk_headroom_limit(&workspace_root);
-            }
-            // Re-armed from the POST-reclaim reading, so a pass that actually
-            // freed space lets a genuine future crossing fire again.
-            was_disk_binding =
-                crate::eager_reclaim::disk_axis_binds_cap_down(disk, ram, configured_max);
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
             // `idle=` figure below plus `loom-daemon status` / `calibrate`, which
@@ -2911,10 +2900,9 @@ pub fn spawn_multi_work_finder_task(
         // Healthy-account transition state (#4344) — see the single-workspace
         // loop above for the full rationale.
         let mut was_healthy_tokens: Option<usize> = None;
-        // Disk-axis binding state (#7512) — see the single-workspace loop
-        // above for the full rationale (edge-triggers the eager reclaim pass
-        // on the "disk starts binding the cap down" transition only).
-        let mut was_disk_binding = false;
+        // Eager reclaim trigger state (#7512, #11192) — see the
+        // single-workspace loop above.
+        let mut eager_trigger = crate::eager_reclaim::EagerTrigger::default();
         // Missing-root hygiene (#4326): tracks which registered roots are
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
@@ -3010,29 +2998,15 @@ pub fn spawn_multi_work_finder_task(
             // Bounded tmpfs-fraction warning (#8572, split from #8512) — logs
             // only, never gates dispatch; see `tmpfs_warning`'s module doc.
             tmpfs_warning::check_and_warn(&fallback_root);
-            let mut disk = disk_headroom_limit(&fallback_root);
-            // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
-            // FIRST becomes the term that binds the cap down, run the existing
-            // reclaim passes for `fallback_root` — the same root this
-            // machine-level disk term is probed against — right now rather
-            // than waiting for the worktree reaper's own up-to-15-minute-away
-            // next tick, then re-probe disk fresh (the loop's existing
-            // per-tick measurement, not a new mechanism) before this tick's
-            // cap is finalized. See `eager_reclaim::run_for`'s doc comment for
-            // the full rationale and cooldown-safety argument, and the
-            // single-workspace loop above for the identical wiring.
-            if crate::eager_reclaim::should_trigger(was_disk_binding, disk, ram, configured_max) {
-                let root_for_task = fallback_root.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::eager_reclaim::run_for(&root_for_task)
-                })
+            // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`
+            // — the same root this machine-level disk term is probed against.
+            // Edge plus level (below the floor, or still falling); the disk
+            // term comes back re-probed after a pass, before this tick's cap
+            // is finalized. See the single-workspace loop above for the
+            // identical wiring and `eager_reclaim::EagerTrigger` for the rules.
+            let disk = eager_trigger
+                .tick(&fallback_root, disk_headroom_limit(&fallback_root), ram, configured_max)
                 .await;
-                disk = disk_headroom_limit(&fallback_root);
-            }
-            // Re-armed from the POST-reclaim reading — see the
-            // single-workspace loop above.
-            was_disk_binding =
-                crate::eager_reclaim::disk_axis_binds_cap_down(disk, ram, configured_max);
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
