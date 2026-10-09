@@ -1363,6 +1363,7 @@ pub fn build_daemon_status_for(
         phase_sweep_command_check += phase_start.elapsed();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
+            maintain_only: workspace_registry.maintain_only_of(root),
             priority: workspace_registry.priority_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),

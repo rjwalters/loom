@@ -2519,6 +2519,7 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
 // red-main-fix lanes live in sibling files (this one is size-frozen).
 mod build_backoff;
 mod main_red_fix;
+mod maintain_only;
 mod operator_priority;
 mod ordering;
 mod ram_budget;

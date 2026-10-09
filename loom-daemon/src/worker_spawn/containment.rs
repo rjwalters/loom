@@ -330,7 +330,19 @@ fn forwarded_by_name(name: &str) -> bool {
     }
     name.starts_with("LOOM_")
         || name.starts_with("SAFEHOUSE")
-        || matches!(name, "GH_TOKEN" | "GITHUB_TOKEN" | "NO_COLOR" | "TERM" | "CARGO_TARGET_DIR")
+        || matches!(
+            name,
+            "GH_TOKEN"
+                | "GITHUB_TOKEN"
+                | "NO_COLOR"
+                | "TERM"
+                | "CARGO_TARGET_DIR"
+                // An operator's own debuginfo choice (#11190): the in-container
+                // seam only keeps a value it can see as ambient, so without
+                // these it would inject its default over the host's setting.
+                | "CARGO_PROFILE_DEV_DEBUG"
+                | "CARGO_PROFILE_TEST_DEBUG"
+        )
 }
 
 /// Build the `docker run` command that re-execs `spawn-worker.sh` inside the
@@ -466,9 +478,13 @@ pub fn docker_command_with(
     }
 
     // --- Env passthrough, BY NAME ----------------------------------------
+    // #11190: a debuginfo variable set but EMPTY is not forwarded — by name,
+    // docker would hand the container the empty value, which cargo rejects
+    // outright wherever the in-container seam does not overwrite it.
     let mut names: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| forwarded_by_name(k))
+        .filter_map(|(k, v)| k.into_string().ok().map(|k| (k, v)))
+        .filter(|(k, v)| forwarded_by_name(k) && !super::cargo_debuginfo::is_empty_cap_var(k, v))
+        .map(|(k, _)| k)
         .collect();
     names.extend(
         credentials

@@ -1456,15 +1456,37 @@ repos:
   - name: app             # unique
     dir: app              # clone directory under root (default: name); one path component
     remote: git@github.com:acme/app.git
-    fleet: true           # the daemon manages it (default false)
+    fleet: true           # the daemon manages it (default false); or `maintain`, below
     fleet_priority: 10    # dispatch tier, lower first (default 100)
     firewall: false       # true = never an unattended-agent target (default false)
 ```
 
-The desired workspace set is every record with `fleet: true` and not
-`firewall: true`. A record with **both** is a hard error for the whole roster,
-never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
-non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+The desired workspace set is every record with `fleet: true` or
+`fleet: maintain`, and not `firewall: true`. A record with **both** is a hard
+error for the whole roster, never a silent exclusion — so is a `fleet` other
+than `true`/`false`/`maintain`, a non-boolean `firewall`, a non-integer
+`fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
+
+**`fleet: maintain`** (#11186) makes a repo **maintain-only**: it is
+registered and kept current exactly like `fleet: true` (the per-repo Loom
+resync, the checkout fast-forward, the floor checks), but the daemon never
+dispatches into it — no sweep, no role-runner tick, no idle-edge role, no epic
+dispatch (the `maintain-only` hold in
+[Dispatch holds](#dispatch-holds-10719)). Flipping a repo between `true` and
+`maintain` changes its registry entry in place; it is never removed and
+re-added. Use it for a repo the fleet should keep current but no agent should
+work in, such as the fleet's own admin repo. `fleet: false` is different: the
+repo is deregistered and its Loom install is no longer maintained at all.
+
+It is a value of `fleet` rather than a separate key on purpose. A daemon that
+predates it refuses the whole roster (`` `fleet` must be true or false (got
+"maintain") ``): that host makes no roster change of any kind, and the token
+pool's firewall input, read from the same roster, fails closed too, until the
+host runs a daemon that knows the value. A separate `dispatch: false` key
+would instead be ignored by an old daemon, like every other unknown key, which
+would register the repo and **dispatch into it**. So a store should start
+using `fleet: maintain` only once every host's daemon understands it, that is
+once `loom_min_version` is at or above the release that added it.
 
 **`loom_min_version`** (#10711): a top-level `"X.Y.Z"` string, the
 fleet-wide minimum Loom version. **Required since #10885**: it is what moves a
@@ -1566,13 +1588,17 @@ start for the startup-resolved knobs — see
 Diffs the desired set against the workspace registry (`~/.loom/workspaces.json`,
 `LOOM_WORKSPACES_PATH`): **adds** (desired, not registered), **removes**
 (registered, and the store has a record for that path that is not desired —
-`fleet: false` or `firewall: true`) and **priority changes**. A registered
+`fleet: false` or `firewall: true`), **mode changes** (a registered repo whose
+`fleet: maintain` differs from its registry entry's maintain-only mark,
+flipped in place, #11186) and **priority changes**. A registered
 workspace the store has no record for is reported as *unmanaged* and left
 alone. Paths are compared after the registry's own normalization.
 
 `--check` exits `1` when the registry differs. `--apply` performs the changes
-through the same code paths as `loom-daemon workspace remove` / `add` /
-`set-priority` (removes first), and only for repos already cloned under
+through the same code paths as `loom-daemon workspace remove` / `hold` /
+`release` / `add` / `set-priority` (removes first, then mode changes; a
+maintain-only add is registered maintain-only in the same write), and only for
+repos already cloned under
 `root` — a missing clone is reported and exits `1`, and is never cloned here.
 
 **Fails closed.** The roster carries the fleet's firewall inputs, so it is
@@ -1824,6 +1850,30 @@ cannot work with this daemon. The checkout copy is
 | compatible, or a resync owed (no `requires_daemon`) | not held | | no |
 | could not be read this pass | the previous verdict stands | | as before |
 
+- **`maintain-only` is the operator's hold (#11186).** A workspace whose
+  registry entry is marked maintain-only (the fleet store's `fleet: maintain`,
+  or `loom-daemon workspace hold <root>`) is held with the typed outcome
+  `maintain-only` and the `workspace_halted` cause `maintain_only`, on every
+  path in the table under "Where it is enforced". It differs from the
+  `W3`/`W4` holds above:
+
+  | | `install-incompatible` / `daemon-too-old` | `maintain-only` |
+  |---|---|---|
+  | Set by | the workspace pass's verdict | the registry entry's mark |
+  | Clears | when the pass's next verdict is clean | only when the mark is lifted (`fleet: true`, or `workspace release`) |
+  | Asks for a roll | `daemon-too-old` may | never |
+  | 30-minute "stood for N minutes" ERROR | yes | never: it is intended |
+  | Resync, checkout fast-forward, floor checks | run | run |
+
+  Both kinds can stand on one workspace at once. Each is set and cleared on
+  its own; dispatch is refused while either stands, and a refusal names
+  `maintain-only` first. The mark is read from the registry file whenever it
+  changes, so a `hold` or `release` takes effect on the next dispatch decision
+  with no restart. `loom-daemon status` shows it in the `Managed repos` table
+  as `maintain-only (fleet store)` or `maintain-only (operator)`, and
+  `status --json` as `per_repo[].maintain_only` (`{"by": "fleet-store" |
+  "operator", "since": …}`). The `Fleet store:` block lists only the pass's
+  own `W3`/`W4` holds.
 - **The ratchet guard.** A repo that is only *ahead* of this daemon is
   neither held nor a reason to roll. Hosts roll at different moments, so a
   host that has just rolled resyncs repos to a release the others do not run
@@ -1870,7 +1920,7 @@ cannot work with this daemon. The checkout copy is
   | Path | Refused by |
   |---|---|
   | Sweeps: the work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | the sweep registry, for issue and PR-set dispatch, with a typed `WorkspaceHeldDispatchError` before any lock, label flip or forge call |
-  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
+  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible`, `daemon_too_old` or `maintain_only` |
   | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
   | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
   | Epic supervisor (`LOOM_EPIC_SUPERVISOR=1`): singleton roles (Architect, Champion) and epic child sweeps | the supervisor skips the held workspace's whole tick, logged each tick. Its role dispatch runs the checkout's spawn script outside the registry, so it also refuses on its own with the same typed `WorkspaceHeldDispatchError` before that script runs |
@@ -2410,13 +2460,13 @@ spawn path can actually pick.
 **Provisioning a managed-repo pool.** Bootstrap the shared pool once per machine:
 
 ```bash
-# Preferred on a host running claude-monitor — reads the live credential store
-# (~/.claude-monitor/usage.db -> oauth_credentials, opened mode=ro), so no
+# Preferred on a host running llm-monitor — reads the live credential store
+# (~/.llm-monitor/usage.db, or ~/.claude-monitor on 1.x -> oauth_credentials, mode=ro), so no
 # accounts.env is needed on this machine at all:
 loom-daemon tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
 loom-daemon tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
 
-# Without claude-monitor — materialize from the accounts.env snapshot instead:
+# Without llm-monitor — materialize from the accounts.env snapshot instead:
 loom-daemon tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
 loom-daemon tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
 ```
@@ -2424,7 +2474,8 @@ loom-daemon tokens check --ranking         # ranks the effective pool (shared wh
 Every consumer repo the daemon dispatches into then falls back to that one pool —
 no per-repo `loom-daemon tokens bootstrap` required. A repo that *wants* its own isolated
 pool can still `loom-daemon tokens bootstrap` locally; the per-repo pool always wins.
-Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
+Selection sources (`~/.llm-monitor/accounts.env` — `~/.claude-monitor` on 1.x; see
+token-pool.md "Monitor directory resolution" — and repo-local `.env`) are
 unchanged for `bootstrap` — `--shared` only redirects the *destination* of the
 materialized pool. `import-from-monitor` bypasses `accounts.env` entirely and
 takes claude-monitor as authoritative for pool membership (use `loom-daemon tokens pin`
@@ -2859,6 +2910,20 @@ ordering:
     (default `100`).
   - `loom-daemon workspace set-priority <path> N` retiers an already-registered
     repo.
+  - `loom-daemon workspace hold <path>` makes an already-registered repo
+    **maintain-only** (#11186): its Loom install is still resynced and its
+    checkout fast-forwarded, but no sweep, role or epic dispatch starts there.
+    `loom-daemon workspace release <path>` lifts it. Both edit the entry in
+    place and hot-apply; an unregistered path is an error.
+    `workspace add <path> --maintain-only` registers a repo maintain-only in
+    one write. The entry records who set it as `"maintain_only": {"by":
+    "operator" | "fleet-store", "since": …}`; an entry without the key is a
+    normal, dispatched workspace. These are for hosts no fleet store drives:
+    on a host with a fleet store and `fleet.autoApply`, the roster's
+    `fleet: true` / `fleet: maintain` wins on its next pass, exactly as it
+    does for `priority`. A daemon older than #11186 ignores the key and
+    dispatches into the repo, and rewriting the file with an older
+    `workspace` verb drops it.
   - `loom-daemon workspace list` prints a `PRIO` column, sorted highest-priority
     first (mutation order on disk is preserved).
 
@@ -6051,7 +6116,7 @@ account health can no longer *slow dispatch down*, only warn about it):
    deliberately **not** what gates dispatch (#5270 dropped that role
    entirely). On the state
    change into a pressured reading it emits an add-capacity advisory naming
-   concrete levers — add accounts to `~/.claude-monitor/accounts.env` +
+   concrete levers — add accounts to `~/.llm-monitor/accounts.env` +
    `loom-daemon tokens bootstrap`, or buy API credits, then re-probe with
    `loom-daemon tokens check --ranking` — with the current numbers (queued
    count, healthy/total accounts, exhausted count, estimated drain time at
@@ -9620,21 +9685,55 @@ as `LOOM_RUN_TARGET_DIR`) and removes the dir when the child exits, on every
 outcome; a removal failure is logged and never fails the tick. It first checks
 the child's process group (`kill(-pgid, 0)`, with a 2 s grace): while a
 descendant is alive (a detached `cargo test`) the dir is kept for the sweep.
-Run-end removal exists for role-runner ticks only. A daemon sweep spawn or a
-manual `spawn-worker.sh` derives a fresh dir per spawn (so each build is cold;
-sccache softens it) and has no process left to remove it, so those dirs are
-collected only by the sweep below, three hours or more after the owner exits.
+A daemon sweep spawn or a manual `spawn-worker.sh` derives a fresh dir per
+spawn, `<role>-<pid>-<ts>` (so each build is cold; sccache softens it).
+`provision` records the harness pid in `.loom-run-owner` and its start
+identity in `.loom-run-owner-start` (Linux: boot id plus `/proc/<pid>/stat`
+start ticks; macOS: the kernel's recorded start time), so a later check can
+tell the owner from an unrelated process that reused its pid.
 
-**The sweep** (`target_orphan_reclaim`) collects what run-end removal cannot
-(daemon sweeps, manual spawns, the legacy prefixes above). It runs from the
+**Sweep-end removal (#11031).** `exec()` keeps the pid along the whole spawn
+chain, so the pid the sweep registry tracks is the pid in the marker. When the
+registry sees a sweep end (the reaper's death path for a completed or failed
+sweep, and `finish_cancel` for an operator cancel or a watchdog auto-cancel),
+it removes every `.loom/targets` dir whose marker names that pid, on a
+detached thread. On the death path that is the tick that finds the dead
+leader's process group empty: while the group is still draining (#11076) the
+sweep is still live and nothing is scheduled. The thread waits up to 120 s for the sweep's process group to drain,
+then removes the dir only when the recorded owner is not running (start
+identity included) and no process holds anything open under it; anything else
+is left to the sweep below. A watchdog re-dispatch cancels first, so the hung
+run's dir is gone before the fresh run starts building. Each removal logs
+`run_target_dir: category=sweep_end_run_dir removed <dir> (<size>) at the end
+of sweep <id>`. A removal deletes everything but the owner files first, so a
+removal cut short leaves a dir the sweep below still recognises.
+
+**The sweep** (`target_orphan_reclaim`) collects what run-end and sweep-end
+removal cannot (a dir kept because a straggler held it, a sweep that ended
+while no daemon was running, manual spawns, the legacy prefixes above). It runs from the
 scheduled reaper tick, the eager below-floor pass, and `loom-daemon clean`
 (report-only unless `-y`; `--dry-run` reports bytes and deletes nothing). It
 removes a direct child of a known prefix only when it is a real directory (not
 a symlink), does not overlap a configured `CARGO_TARGET_DIR` /
-`build.target-dir`, has a newest recursive mtime older than the max age, no
-live claim names its issue, its recorded owner pid (`.loom-run-owner`) is not
-running, and no process holds it open. If the open-handle probe cannot run (no
-`/proc`, no `lsof`) the dir is kept.
+`build.target-dir`, no live claim names its issue, its recorded owner pid
+(`.loom-run-owner`) is not running, its newest recursive mtime is older than
+its age gate, and no process holds it open. If the open-handle probe cannot run
+(no `/proc`, no `lsof`) the dir is kept. An owner pid that is alive but whose
+start identity differs from `.loom-run-owner-start` is a reused pid and counts
+as not running; a missing or unreadable identity keeps the bare liveness
+verdict.
+
+The age gate depends on what proves the run is over. A marked run dir under
+`.loom/targets` whose owner is gone waits only the dead-owner grace (10
+minutes since its last write). Everything else (the legacy prefixes, which
+carry no marker) waits the max age (3 hours). The owner and claim checks run
+before the tree walk, and each eligible dir is removed as soon as it is
+judged.
+
+The full pass has a per-repo cooldown. A daemon pass inside the cooldown
+still scans `.loom/targets` alone (one pid probe per live run, a walk only for
+a dead owner's dir), so a dead sweep's dir goes at the next reaper tick
+(15 minutes) once its grace has passed.
 
 Three more gates bound where it can reach:
 
@@ -9661,7 +9760,8 @@ Each pass logs
 |---|---|
 | `LOOM_TARGET_ORPHAN_RECLAIM` / `autonomous.worktreeReaper.targetOrphanReclaim.enabled` | on |
 | `LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS` / `….maxAgeHours` | 3 |
-| `LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS` / `….minIntervalSecs` (per repo) | 1800 |
+| `LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS` / `….minIntervalSecs` (per repo, full pass) | 1800 |
+| `LOOM_TARGET_ORPHAN_RECLAIM_DEAD_OWNER_GRACE_MINUTES` / `….deadOwnerGraceMinutes` (never longer than the max age) | 10 |
 
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 
@@ -9681,39 +9781,72 @@ reclaimed immediately.
 `disk < min(ram, configured_max)`, so reclaiming disk would buy back real
 dispatch slots — the dispatch loop runs the *existing* reclaim passes for that
 root right then, on the blocking pool, then **re-probes free space** before
-finalizing the tick's cap. The sub-passes and their order are exactly
-`worktree_reaper::reap_repo`'s: merged-PR worktree reap → `deep_clean` →
-`docker_image_clean` → scratch reclaim (below). No new removal code exists in
-this path — only a decision about *when* to ask.
+finalizing the tick's cap. No new removal code exists in this path — only a
+decision about *when* to ask, and how far to escalate.
+
+**Tiers, safest first (#11192).** The pass escalates through three tiers and
+re-probes free space between them, moving on only while free space is still
+below the floor (`diskWarnFreeGb`) or cannot be measured:
+
+1. merged-PR worktree reap, aborted-fetch `.git` temp files, agent scratch
+   (below), orphaned cargo target dirs;
+2. idle build caches of kept worktrees across every registered root (#11071);
+3. the primary checkout's own build cache (`deep_clean`) and
+   `docker_image_clean`.
+
+A pass that starts above the floor runs tier 1 only; the scheduled reaper
+still runs `docker_image_clean` on its own cadence.
 
 **It cannot bypass a cooldown.** Each sub-pass consults its own cooldown
 (`deep_clean` 6h, `docker_image_clean` 30 min, `scratchReclaim` 30 min), which
 this trigger neither reads nor resets. Triggering eagerly only makes an
 *already-due* pass run promptly instead of up to 15 minutes late.
 
-**Edge-triggered, plus its own cooldown.** The pass fires only on the
-`false → true` transition of the binding condition, never on every tick a
-stubbornly-full disk keeps it true, and additionally not more often than
-`minIntervalSecs` (default 10 min) per root. Both guards protect the one
-sub-pass with no cooldown of its own — the merged-PR worktree reap, which makes
-a forge REST call per candidate worktree. A disk that recovers and later drops
-again is a genuine new crossing and fires again. An **unmeasurable** disk probe
-(`usize::MAX`, the "unknown != zero" contract of #4164) never triggers it, just
-as it never triggers a clamp.
+**Edge and level, plus its own cooldown (#11192).** The pass fires on the
+`false → true` transition of the binding condition, and also on level:
+
+- on every tick while free space is below the floor (`diskWarnFreeGb`);
+- while the disk term keeps binding, each time free space has fallen
+  `fallStepGb` (default 10) below the last pass's reading, or below the
+  highest reading since.
+
+Edge-only triggering could not re-arm on a host whose disk term binds on every
+tick: with `configured_max = 12` it binds whenever free space is under 96 GB,
+and on loom-worker-1 (2026-10-09) no pass ran for 7.5 hours while free space
+fell from 79 GB to 0. Whatever the trigger, a pass runs at most once per
+`minIntervalSecs` (default 10 min) per root, which protects the one sub-pass
+with no cooldown of its own: the merged-PR worktree reap, which makes a forge
+REST call per candidate worktree. An **unmeasurable** disk probe (`usize::MAX`,
+the "unknown != zero" contract of #4164) never triggers it, just as it never
+triggers a clamp.
+
+**Empty passes alert and back off (#11192).** A pass that removed nothing logs
+an `eager_reclaim: ALERT … pass reclaimed nothing (N in a row …)` line at
+`ERROR`: the automatic passes have run out of candidates and what fills the
+disk is not something the daemon removes on its own. While passes keep coming
+back empty, the merged-PR worktree reap backs off to 2x, 4x, then at most 8x
+`minIntervalSecs` between runs. The local sub-passes keep their once-per-window
+cadence.
 
 **Scope.** The dispatch loop's disk term is one machine-level probe against one
 root (`fallback_root` in the production multi-workspace loop), so the eager pass
-reclaims from that same root. The scheduled reaper still walks every registered
-root on its own cadence — eager reclaim is strictly additive.
+reclaims from that same root, except for the tier-2 idle-cache pass, which walks
+every registered root. The scheduled reaper still walks every registered root on
+its own cadence — eager reclaim is strictly additive. Since #11192 the scheduled
+reaper also runs the cross-root idle-cache pass whenever a root it visits is
+below the floor, so that pass no longer depends on the eager trigger. Both
+paths share one host-wide `minIntervalSecs` window for it.
 
 **Log line.** One `WARN` per eager pass, deliberately prefixed `eager_reclaim:`
 so it is never confused with `worktree_reaper:`'s scheduled-pass lines:
 
 ```
-eager_reclaim: /home/u/GitHub/loom disk axis binds the dispatch cap down (3G free)
-— ran an out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's
-own scheduled pass: worktrees 2 removed, deep-clean target/ (6.1G), docker 4
-image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
+eager_reclaim: /home/u/GitHub/loom free space is below the floor (3G free) — ran
+an out-of-cycle pass (tier 3 of 3) now instead of waiting up to 15m for
+worktree_reaper's own scheduled pass: worktrees 2 removed, git-tmp nothing,
+scratch 1.8G, cargo-target orphans nothing, idle worktree targets 1 dir(s)
+(4.0G), deep-clean target/ (6.1G), docker 4 image(s) — now 16G free vs. floor
+20G (#7512, #11192)
 ```
 
 ```json
@@ -9722,7 +9855,8 @@ image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
     "worktreeReaper": {
       "eagerReclaim": {
         "enabled": true,
-        "minIntervalSecs": 600
+        "minIntervalSecs": 600,
+        "fallStepGb": 10
       }
     }
   }
@@ -9733,6 +9867,7 @@ image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
 |---------|-----------|------------|---------|
 | `LOOM_EAGER_RECLAIM` | `autonomous.worktreeReaper.eagerReclaim.enabled` | env > config > default | `true` (on) |
 | `LOOM_EAGER_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.eagerReclaim.minIntervalSecs` | env > config > default | `600` (10 min) |
+| `LOOM_EAGER_RECLAIM_FALL_STEP_GB` | `autonomous.worktreeReaper.eagerReclaim.fallStepGb` | env > config > default | `10` (GB) |
 
 Setting `enabled: false` restores exactly the pre-#7512 behavior: the dispatch
 loop clamps immediately and only the 15-minute reaper cadence reclaims. See

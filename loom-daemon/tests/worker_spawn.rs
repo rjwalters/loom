@@ -1112,3 +1112,6 @@ fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
     assert_eq!(used.loom_tool_uses, 1);
     assert!(!used.observed_a_toolless_run());
 }
+
+#[path = "worker_spawn/cargo_debuginfo.rs"]
+mod cargo_debuginfo;

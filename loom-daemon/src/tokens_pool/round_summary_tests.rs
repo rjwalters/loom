@@ -10,6 +10,7 @@ use super::*;
 use crate::tokens_pool::check::{
     run_check_traced, CheckOptions, ProbeError, ProbeResponse, ProbeTransport, Source,
 };
+use crate::tokens_pool::monitor_dir::test_env::MonitorDirEnvGuard;
 
 /// Canned responses in order; records whether each request carried an
 /// `x-api-key` header (a metered API-key probe).
@@ -194,9 +195,9 @@ fn monitor_run(reset_days: i64, statuses: &[u16]) -> (RoundSummary, usize) {
     let (tokens_dir, monitor_dir) = monitor_fixture(tmp.path(), reset_days);
     let stub = Stub::new(statuses);
     let trace = RoundTrace::default();
-    std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+    let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
     let report = run_check_traced(&tokens_dir, &opts(Source::Auto), &stub, &trace);
-    std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+    drop(env_guard);
     let requests = stub.api_key_requests.borrow().len();
     (summarize(&tokens_dir, &report, &trace), requests)
 }
