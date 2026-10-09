@@ -11,7 +11,7 @@
 
 -- 1. Hosts with drops in the last 2 h, worst first.
 WITH samples AS (
-    SELECT resource_attributes_string['host.id'] AS host,
+    SELECT resources_string['host.id'] AS host,
            toUInt64(attributes_number['loom.host_export.dropped_total']) AS dropped,
            timestamp
     FROM signoz_logs.distributed_logs_v2
@@ -39,7 +39,7 @@ ORDER BY dropped_in_window DESC;
 --    stopped OTLP exporter, or a broken pipeline).
 SELECT h.host AS host, h.last_seen
 FROM (
-    SELECT resource_attributes_string['host.id'] AS host,
+    SELECT resources_string['host.id'] AS host,
            max(timestamp) AS last_seen
     FROM signoz_logs.distributed_logs_v2
     WHERE timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)
@@ -48,7 +48,7 @@ FROM (
     GROUP BY host
 ) AS h
 LEFT ANTI JOIN (
-    SELECT DISTINCT resource_attributes_string['host.id'] AS host
+    SELECT DISTINCT resources_string['host.id'] AS host
     FROM signoz_logs.distributed_logs_v2
     WHERE attributes_string['loom.kind'] = 'host.export'
       AND timestamp >= toUnixTimestamp64Nano(now64(9) - INTERVAL 2 HOUR)

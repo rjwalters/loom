@@ -379,7 +379,11 @@ live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
 or not reporting their export view?" from the `host.export` logs: (1) hosts
 whose cumulative `dropped_total` grew in the last 2 h (a decrease is read as a
 daemon restart), and (2) hosts with other Loom logs but no `host.export` in
-that window. Not yet executed in CI against the pinned ClickHouse.
+that window. Drops are host-level: the log attributes carry only the sum
+across exporters, and the per-exporter split lives in the JSON body. A
+window's first sample counts as 0, so drops that happen before the first
+sample in the window are not counted. Not yet executed in CI against the
+pinned ClickHouse.
 
 ### Pass activity
 
