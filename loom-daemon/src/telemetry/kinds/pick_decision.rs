@@ -253,6 +253,24 @@ pub struct PickDecisionRecord {
     /// unexplained candidate is then neither acted nor skipped).
     #[serde(default)]
     pub decisions_observed: bool,
+    /// The per-repository lane computation behind a judge or doctor run
+    /// (#10630): one entry per observed repository, so "why only one Doctor?"
+    /// is one query. Empty for every other record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<PickLane>,
+}
+
+/// One repository's lane computation (#10630): `lanes = clamp(ceil(debt / k),
+/// 1, cap)` before (`wanted`) and after (`lanes`) the host-capacity trim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickLane {
+    pub repo: String,
+    /// The debt the formula read (last-known PRs on the role's axis).
+    pub debt: usize,
+    /// Lanes the formula wanted.
+    pub wanted: usize,
+    /// Lanes after the trim to the host capacity.
+    pub lanes: usize,
 }
 
 /// Identity of the tick a record describes.
@@ -312,6 +330,7 @@ impl PickDecisionRecord {
             skipped,
             candidate_source: source::NONE.to_string(),
             decisions_observed: false,
+            lanes: Vec::new(),
         }
     }
 

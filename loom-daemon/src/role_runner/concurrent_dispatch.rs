@@ -200,6 +200,9 @@ pub enum RootTickDecision {
         /// The run takes an assigned PR rather than the queue head: the
         /// repository's doctor width was above 1 at admission ([`lanes`]).
         assign: bool,
+        /// Every observed repository's lanes and debt for this role (#10630),
+        /// recorded on the run's `pick.decision`. Empty for other roles.
+        lane_plan: Vec<lane_rule::RepoLane>,
     },
     /// Nothing to do for this root (disabled, sharded away, not configured,
     /// ...); the decision already logged why.
@@ -254,14 +257,19 @@ pub fn admit_root_tick_with(
     let budget = resolve_role_max_concurrent(&budgets, role, ceiling);
     let demand_cfg = demand::parse_demand_config(&block);
     let mut lanes = 1;
+    let mut lane_plan = Vec::new();
     let (admission, debt) = if demand_cfg.enabled {
         let host = ledger.host_debt(demand_cfg.stale());
         let decision = demand::decide(role, &budgets, ceiling, &host, &demand_cfg);
         demand::log_if_changed(ledger, &decision, &demand_cfg);
-        if role == "doctor" {
-            // Per-repository width from this root's own changes debt (#10632).
+        if matches!(role, "doctor" | "judge") {
+            // Per-repository width from this root's own debt on the role's axis
+            // (#10632, #10630), trimmed lowest-debt-first to the host capacity.
             let repo = ledger.repo_debt(root, demand_cfg.stale());
-            lanes = demand::repo_lanes(role, &repo, &demand_cfg);
+            let wanted = demand::repo_lanes(role, &repo, &demand_cfg);
+            lane_plan =
+                lane_rule::plan_for(role, ledger, &demand_cfg, ceiling.min(decision.budget));
+            lanes = lane_rule::lanes_for(&lane_plan, root, wanted);
         }
         let admission = RoleRunGuard::admit_lane_with_demand(
             in_progress.clone(),
@@ -287,9 +295,9 @@ pub fn admit_root_tick_with(
         RoleAdmission::Admitted(guard) => {
             if lanes > 1 {
                 log::info!(
-                    "role_runner: {role} lane {} of {lanes} admitted for {} — its own changes \
-                     debt sizes a per-repository width above 1; the run takes an assigned PR \
-                     (autonomous.roleRunner.demandWidth.doctorMaxPerRepo, #10632)",
+                    "role_runner: {role} lane {} of {lanes} admitted for {} — its own debt \
+                     sizes a per-repository width above 1; the run takes an assigned PR \
+                     (autonomous.roleRunner.demandWidth.laneK/perRepoCap, #10630)",
                     guard.lane(),
                     root.display()
                 );
@@ -298,6 +306,7 @@ pub fn admit_root_tick_with(
                 prompt,
                 guard,
                 assign: lanes > 1,
+                lane_plan,
             }
         }
         RoleAdmission::InProgress => {
@@ -488,7 +497,7 @@ fn run_gated<R: RoleInvocationRunner + ?Sized>(
         }
     }
     // Held for the whole invocation, so no other lane takes the same PR.
-    let target = lane.map(|(lane_probe, lane)| lanes::assign(lane_probe, root, lane));
+    let target = lane.map(|(lane_probe, lane)| lanes::assign(lane_probe, role, root, lane));
     let prompt = match &target {
         Some(lanes::LaneTarget::Nothing) => return RoleTickOutcome::QueueEmpty,
         Some(lanes::LaneTarget::Pr(hold)) => format!("{prompt} {}", hold.pr()),
@@ -768,8 +777,9 @@ impl RoleDispatcher {
                     prompt,
                     guard,
                     assign,
+                    lane_plan,
                 } => {
-                    self.spawn(root.clone(), prompt, guard, assign);
+                    self.spawn(root.clone(), prompt, guard, assign, lane_plan);
                     self.last_admitted = Some(root.clone());
                     self.last_admitted_index = index;
                     report.spawned.push(root);
@@ -791,7 +801,14 @@ impl RoleDispatcher {
         report
     }
 
-    fn spawn(&mut self, root: PathBuf, prompt: String, guard: RoleRunGuard, assign: bool) {
+    fn spawn(
+        &mut self,
+        root: PathBuf,
+        prompt: String,
+        guard: RoleRunGuard,
+        assign: bool,
+        lane_plan: Vec<lane_rule::RepoLane>,
+    ) {
         let name = self.spec.name;
         let lane = assign.then(|| (self.lane_probe.clone(), guard.lane()));
         let interval = self.interval;
@@ -808,6 +825,7 @@ impl RoleDispatcher {
             let tick_start = Instant::now();
             let started_at = chrono::Utc::now();
             crate::observability::pick_decision::clear_gate_listings();
+            crate::observability::pick_decision::stash_lane_plan(&task_root, lane_plan);
             let mut runner = factory(task_root.clone());
             let lane = lane.as_ref().map(|(p, l)| (p, *l));
             // Curator/auditor/guide event trigger (#10816); a no-op unless
@@ -905,6 +923,10 @@ impl RoleDispatcher {
 // `role_runner/lanes.rs`.
 #[path = "lanes.rs"]
 pub mod lanes;
+
+// The per-repository lane formula's host plan and trim order (#10630).
+#[path = "lane_rule.rs"]
+pub mod lane_rule;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

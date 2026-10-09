@@ -5163,7 +5163,20 @@ repository is now the parallelism boundary:
   Idle-edge runs keep the Phase 1 budget. `demandWidth.enabled: false` restores
   exactly the Phase 1 admission (no ledger reads, no reservation, no `loom:pr`
   count).
-- **Per-repository doctor lanes (#10632).** One doctor per repository, fixing
+- **Per-repository judge and doctor lanes (#10632, #10630).** The rule is
+  `lanes(repo, role) = clamp(ceil(debt / laneK), 1, cap)` when `debt > 0`: judge
+  reads the repository's review debt (cap `perRepoCap`), doctor its
+  changes-requested debt (cap `doctorMaxPerRepo`, default `perRepoCap`); defaults
+  `laneK = 10`, `perRepoCap = 3`, so 60 PRs gets 3 lanes and 2 PRs gets 1. When
+  the repositories' lanes sum past `min(host ceiling, role budget)`, extra lanes
+  are trimmed lowest-debt repository first (ties by workspace path), then whole
+  repositories only if still over; a repository's first lane is never trimmed
+  by this rule (the usual walk and host limits arbitrate it). Each judge/doctor
+  `pick.decision` carries a `lanes` list (`repo`, `debt`, `wanted`, `lanes` per
+  observed repository), so "why only one Doctor?" is one query. Judge lanes
+  take distinct PRs exactly as described below, without the stale-verdict
+  guard (dispatched as `/loom:judge <PR>`). The rest of this entry describes
+  the mechanism (written for doctor; it applies to judge). One doctor per repository, fixing
   one PR per run, cannot drain a repository with dozens of
   `loom:changes-requested` PRs, however much host budget is idle. So a
   repository's doctor may hold up to
@@ -6219,7 +6232,9 @@ knobs not yet audited here.
 | `autonomous.roleRunner.demandWidth.max` | *(config only)* | `4` | Upper clamp on judge, doctor and champion width. Still capped by the role's `roleMaxConcurrent` budget, so at the default ceiling of 7 (budget 3) it binds only where the budget is 4 or more — demand never raises a role above its budget. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.demandWidth.reserve` | *(config only)* | `true` | Champion-first ceiling reservation: admitting a role leaves free the unfilled `min(width, repositories with debt)` of each higher-priority PR role (champion > judge > doctor > others). `false` keeps the width but reserves nothing. **Live** |
 | `autonomous.roleRunner.demandWidth.nonPrFloor` | *(config only)* | `1` | Ceiling slots the reservation always leaves for non-PR roles: the reservation never exceeds `maxConcurrent − nonPrFloor`. Zero, negative or non-integer drops to the default. **Live** |
-| `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | *(config only)* | `3` | **Per-repository doctor lanes (#10632).** The most doctor runs one repository may hold at once: `clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)`, from that repository's own ledger entry. Each lane is dispatched as `/loom:doctor <PR>` on a different assigned PR and counts against the host ceiling, doctor's budget and the reservation. `1` is the classic one doctor per repository. Zero, negative or non-integer drops to the default; values above `8` are clamped to `8`. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
+| `autonomous.roleRunner.demandWidth.laneK` | *(config only)* | `10` | **Per-repository lane rule (#10630).** Debt items per lane: `lanes = clamp(ceil(repo debt / laneK), 1, cap)` for judge (review debt) and doctor (changes debt). Zero or non-integer drops to the default. Live. |
+| `autonomous.roleRunner.demandWidth.perRepoCap` | *(config only)* | `3` | **Per-repository lane cap (#10630).** Most judge runs (and doctor runs, unless `doctorMaxPerRepo` is set) one repository may hold at once; clamped to `8`. Live. |
+| `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | *(config only)* | `perRepoCap` | **Doctor-only cap override (#10632).** The most doctor runs one repository may hold at once: `clamp(ceil(repo changes debt / laneK), 1, doctorMaxPerRepo)`, from that repository's own ledger entry. Each lane is dispatched as `/loom:doctor <PR>` on a different assigned PR and counts against the host ceiling, doctor's budget and the reservation. `1` is the classic one doctor per repository. Zero, negative or non-integer drops to the default; values above `8` are clamped to `8`. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
 | `autonomous.roleRunner.demandWidth.staleSecs` | *(config only)* | `1800` | Demand-ledger entries older than this many seconds are stale; an axis with no fresh entry is unobserved and falls back to Phase 1 behaviour. The reservation and the #9410 build back-off sum only fresh entries; the PR-role **width** adds in every stale entry's last-known count (#9414), so it is unobserved only when the axis has no fresh entry or a zero total. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
