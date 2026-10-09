@@ -208,11 +208,17 @@ else
   REPO_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .env 2>/dev/null || true); REPO_KEY_COUNT=${REPO_KEY_COUNT:-0}
 fi
 
-# llm-monitor master: same dir precedence as loom-daemon
-MONITOR_DIR="${LOOM_LLM_MONITOR_DIR:-${LOOM_CLAUDE_MONITOR_DIR:-}}"
-if [[ -z "$MONITOR_DIR" ]]; then
-  if [[ -d "$HOME/.llm-monitor" ]]; then MONITOR_DIR="$HOME/.llm-monitor"; else MONITOR_DIR="$HOME/.claude-monitor"; fi
-fi
+# llm-monitor master: same dir rules as loom-daemon (tokens_pool/monitor_dir.rs).
+# First non-blank override wins (whitespace-only is ignored); `~` / `~/...` are
+# expanded literally (no eval); a nonexistent override is authoritative.
+MONITOR_DIR=""
+for _md in "${LOOM_LLM_MONITOR_DIR:-}" "${LOOM_CLAUDE_MONITOR_DIR:-}"; do
+  if [[ -n "${_md//[[:space:]]/}" ]]; then MONITOR_DIR="$_md"; break; fi
+done
+if [[ -n "$MONITOR_DIR" ]]; then
+  if [[ "$MONITOR_DIR" == "~" && -n "${HOME:-}" ]]; then MONITOR_DIR="$HOME"
+  elif [[ "$MONITOR_DIR" == "~/"* && -n "${HOME:-}" ]]; then MONITOR_DIR="$HOME/${MONITOR_DIR:2}"; fi
+elif [[ -d "$HOME/.llm-monitor" ]]; then MONITOR_DIR="$HOME/.llm-monitor"; else MONITOR_DIR="$HOME/.claude-monitor"; fi
 MONITOR_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' "$MONITOR_DIR/accounts.env" 2>/dev/null || true); MONITOR_KEY_COUNT=${MONITOR_KEY_COUNT:-0}
 
 # Opt-in home master — only consulted when LOOM_ACCOUNTS_ENV is set and non-empty (per #3704)

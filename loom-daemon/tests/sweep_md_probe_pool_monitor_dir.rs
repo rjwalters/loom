@@ -3,7 +3,8 @@
 //! same precedence as `loom-daemon`'s `tokens_pool::monitor_dir` resolver:
 //!
 //! `LOOM_LLM_MONITOR_DIR` → `LOOM_CLAUDE_MONITOR_DIR` → `~/.llm-monitor` (if a
-//! directory) → `~/.claude-monitor`.
+//! directory) → `~/.claude-monitor`. Whitespace-only overrides are ignored and
+//! `~` / `~/...` in an override are expanded (never eval'd).
 //!
 //! Kept separate from `sweep_md_stage_minus_one_doc_lint.rs` because that file
 //! sits near the file-size ratchet threshold. Runs the real extracted block
@@ -166,4 +167,101 @@ fn neither_default_resolves_to_legacy_path() {
     let root = tmp.path();
     fs::create_dir_all(root.join("home")).unwrap();
     assert_eq!(run(root, &[]), (s(&root.join("home/.claude-monitor")), "0".into()));
+}
+
+// --- Blank / tilde parity with `tokens_pool::monitor_dir::resolve_monitor_dir` ---
+
+#[test]
+fn tilde_slash_llm_override_expands_to_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.llm-monitor"), 2);
+    let env = [("LOOM_LLM_MONITOR_DIR", "~/.llm-monitor".to_string())];
+    assert_eq!(run(root, &env), (s(&root.join("home/.llm-monitor")), "2".into()));
+}
+
+#[test]
+fn tilde_slash_legacy_override_expands_to_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/pool"), 2);
+    let env = [("LOOM_CLAUDE_MONITOR_DIR", "~/pool".to_string())];
+    assert_eq!(run(root, &env), (s(&root.join("home/pool")), "2".into()));
+}
+
+#[test]
+fn bare_tilde_override_expands_to_home_for_both_vars() {
+    for var in ["LOOM_LLM_MONITOR_DIR", "LOOM_CLAUDE_MONITOR_DIR"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_keys(&root.join("home"), 2);
+        let env = [(var, "~".to_string())];
+        assert_eq!(run(root, &env), (s(&root.join("home")), "2".into()), "{var}");
+    }
+}
+
+#[test]
+fn whitespace_only_llm_override_falls_through_to_legacy_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.llm-monitor"), 1);
+    write_keys(&root.join("legacy"), 2);
+    let env = [
+        ("LOOM_LLM_MONITOR_DIR", " \t ".to_string()),
+        ("LOOM_CLAUDE_MONITOR_DIR", s(&root.join("legacy"))),
+    ];
+    assert_eq!(run(root, &env), (s(&root.join("legacy")), "2".into()));
+}
+
+#[test]
+fn whitespace_only_llm_override_alone_falls_through_to_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.llm-monitor"), 2);
+    let env = [("LOOM_LLM_MONITOR_DIR", "   ".to_string())];
+    assert_eq!(run(root, &env), (s(&root.join("home/.llm-monitor")), "2".into()));
+}
+
+#[test]
+fn whitespace_only_legacy_override_falls_through_to_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.claude-monitor"), 2);
+    let env = [("LOOM_CLAUDE_MONITOR_DIR", "  ".to_string())];
+    assert_eq!(run(root, &env), (s(&root.join("home/.claude-monitor")), "2".into()));
+}
+
+#[test]
+fn whitespace_only_both_overrides_fall_through_to_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.llm-monitor"), 2);
+    let env = [
+        ("LOOM_LLM_MONITOR_DIR", " ".to_string()),
+        ("LOOM_CLAUDE_MONITOR_DIR", "\t".to_string()),
+    ];
+    assert_eq!(run(root, &env), (s(&root.join("home/.llm-monitor")), "2".into()));
+}
+
+#[test]
+fn nonexistent_tilde_override_is_authoritative() {
+    // Expanded but absent: no fallthrough to the populated default.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_keys(&root.join("home/.llm-monitor"), 2);
+    let env = [("LOOM_CLAUDE_MONITOR_DIR", "~/absent".to_string())];
+    assert_eq!(run(root, &env), (s(&root.join("home/absent")), "0".into()));
+}
+
+#[test]
+fn override_shell_text_is_never_evaluated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("home")).unwrap();
+    let raw = "~/$(touch pwned)".to_string();
+    let env = [("LOOM_LLM_MONITOR_DIR", raw)];
+    let (dir, count) = run(root, &env);
+    assert_eq!(dir, format!("{}/$(touch pwned)", s(&root.join("home"))));
+    assert_eq!(count, "0");
+    assert!(!root.join("pwned").exists(), "override text must not be eval'd");
 }
