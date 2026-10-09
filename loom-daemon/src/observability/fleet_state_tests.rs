@@ -454,3 +454,86 @@ fn observed_sources_are_recorded_per_repo() {
     assert!(review.contains(REPO) && !review.contains(OTHER));
     assert!(view.observed[&Source::Ready].contains(OTHER));
 }
+
+/// `ready_complete` is `true` for a repo whose ready listing the tick
+/// completed, and `false` for one it could not (failed, or possibly cut at
+/// one forge page and so left out of `listed`). A flip alone is a change.
+#[test]
+fn ready_complete_marks_whether_the_ready_listing_was_whole() {
+    let view = build_view(&input(), None, t0());
+    let anchor = decide(&view, &stamps(), None, t0()).unwrap();
+    let entry = |record: &crate::telemetry::kinds::fleet_state::FleetStateRecord, repo: &str| {
+        record
+            .repos
+            .iter()
+            .find(|r| r.repo == repo)
+            .cloned()
+            .unwrap()
+    };
+    assert!(entry(&anchor, OTHER).ready_complete);
+    assert!(entry(&anchor, REPO).ready_complete);
+
+    // OTHER's listing may have been truncated: same rows, not complete.
+    let mut inp = input();
+    inp.ready.as_mut().unwrap().listed.remove(OTHER);
+    let later = t0() + Duration::minutes(5);
+    let second = build_view(&inp, Some(&view), later);
+    assert!(!second.ready_complete(OTHER));
+    let last = emitted(view, t0(), t0());
+    let delta = decide(&second, &stamps(), Some(&last), later).expect("the flip is sent");
+    let other = entry(&delta, OTHER);
+    assert!(!other.ready_complete);
+    assert!(other.rows.is_empty() && other.removed.is_empty());
+    assert!(!delta.repos.iter().any(|r| r.repo == REPO), "REPO did not change");
+
+    // No tick at all: nothing is complete.
+    let mut none = input();
+    none.ready = None;
+    let view = build_view(&none, None, t0());
+    let anchor = decide(&view, &stamps(), None, t0()).unwrap();
+    assert!(anchor.repos.iter().all(|r| !r.ready_complete));
+}
+
+/// Rows an incomplete read could not see are never sent as `removed[]`: a
+/// review walk that failed (no listing), or a ready listing possibly cut at
+/// one page (not in `listed`) keeps the earlier rows.
+#[test]
+fn an_incomplete_read_never_removes_what_it_could_not_see() {
+    let first = build_view(&input(), None, t0());
+    let last = emitted(first.clone(), t0(), t0());
+    let mut inp = input();
+    inp.listings.clear();
+    inp.listed_at = None;
+    let ready = inp.ready.as_mut().unwrap();
+    ready.listed.remove(OTHER);
+    ready.items.retain(|i| i.issue != 6);
+    let later = t0() + Duration::minutes(5);
+    let second = build_view(&inp, Some(&first), later);
+    let record = decide(&second, &stamps(), Some(&last), later).unwrap();
+    assert_eq!(record.removed_count(), 0, "{record:?}");
+    assert_eq!(second.repos[REPO].rows[&20], first.repos[REPO].rows[&20]);
+    assert_eq!(second.repos[OTHER].rows[&6], first.repos[OTHER].rows[&6]);
+}
+
+/// `fleet.state` never reads the ETA subsystem, so it is emitted whatever
+/// `autonomous.eta.enabled` says. A source-level guard keeps a later edit
+/// from re-coupling it.
+#[test]
+fn fleet_state_does_not_depend_on_eta() {
+    let sources = [
+        include_str!("fleet_state.rs"),
+        include_str!("fleet_state/sources.rs"),
+        include_str!("../telemetry/kinds/fleet_state.rs"),
+        include_str!("otlp/mapping/fleet_state.rs"),
+    ];
+    let needles = [
+        concat!("crate::", "eta"),
+        concat!("super::", "eta"),
+        "eta.enabled",
+    ];
+    for (i, source) in sources.iter().enumerate() {
+        for needle in needles {
+            assert!(!source.contains(needle), "source #{i} names {needle}");
+        }
+    }
+}

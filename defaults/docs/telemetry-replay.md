@@ -93,17 +93,35 @@ the host can see, it carries stage, entered-at and PR; a row for a sweep the
 host runs also carries `host` and `slot`; a `ready_wait` row carries the
 host's planner `rank` and the planner's inputs (star, starred-at, level,
 fleet priority, creation instant). Per repo it carries the open-PR census,
-which counts open PRs under a Loom review label.
+which counts open PRs under a Loom review label, and `ready_complete`.
+
+What the rows cover is exactly what the host's reads saw:
+
+- **PRs under review**: every open PR under a review label. Each label's
+  listing is walked page by page; a walk that fails, hits its page limit or
+  sees the listing shift is a failed listing, so the repo's `census` is absent
+  and its earlier PR rows are kept, never sent as `removed`.
+- **Ready queue**: every row the planner saw on the host's last work-finder
+  tick. The work finder lists one forge page (100 items) per label until
+  #11139, so that may not be the repo's whole queue. `ready_complete: false`
+  marks a repo whose tick listing failed or may have been cut there; its
+  `ready_wait` rows are not the whole queue, and its earlier ones are kept
+  rather than sent as `removed`. Only a `ready_complete: true` repo's
+  `ready_wait` rows can be read as its full ready queue.
+
+A kept row may be an item that has since left; the next complete read of that
+repo replaces or removes it.
 
 - **Anchor** (`loom.fleet.anchor = true`): the host's full view. Sent on the
   first pass of every daemon process, whenever the planner stamps change, and
   at least every 3600 s after that.
 - **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
   something changed. It holds the added or changed rows, the issues that left
-  (`removed`), and the full census of each repo it names. `anchor_as_of` names
+  (`removed`), and the full census and `ready_complete` of each repo it names. `anchor_as_of` names
   the anchor the delta belongs to, and `prev_as_of` names the record it applies
   on top of.
-- **Chunks**: there is no row cap. A record over ~1 MB of JSON is split into
+- **Chunks**: the emitter has no row cap; it drops none of the rows its reads
+  saw (the bullets above say what they cover). A record over ~1 MB of JSON is split into
   `loom.fleet.chunk_count` log records sharing `as_of`, numbered by
   `loom.fleet.chunk_index`. Today's queue fits in one.
 - **Regime stamps**: every record carries `planner_version`,
@@ -123,7 +141,7 @@ To reconstruct one host's state at `t`:
    empty.
 3. Apply, in `as_of` order, every complete delta whose `anchor_as_of` equals
    A's `as_of`. For each repo entry, drop the `removed` issues, upsert the
-   `rows` by issue, and replace the census. A repo left with no rows and no
+   `rows` by issue, and replace the census and `ready_complete`. A repo left with no rows and no
    census is dropped.
 4. Check the chain. Each applied delta's `prev_as_of` must equal the `as_of`
    of the record applied before it. On a break (a delta lost, incomplete, or

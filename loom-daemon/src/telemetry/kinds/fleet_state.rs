@@ -241,6 +241,14 @@ pub struct FleetStateRepo {
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<FleetPrCensus>,
+    /// The work finder's last tick listed this repo's ready queue completely,
+    /// so its `ready_wait` rows are every ready issue the planner saw there.
+    /// `false` when that listing failed, was not read, or may have been cut
+    /// at one forge page (the work finder lists one page deep until #11139):
+    /// a reader must not treat the repo's `ready_wait` rows as its whole
+    /// queue then. Always sent; missing (an older emitter) decodes to `false`.
+    #[serde(default)]
+    pub ready_complete: bool,
     /// On an anchor, every row. On a delta, rows added or changed since the
     /// previous record. Ordered by issue.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

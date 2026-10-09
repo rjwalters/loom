@@ -10,11 +10,16 @@
 //!   runs): the sweep registries, with the stage read from the sweep's own
 //!   checkpoint and the slot from its overflow mark (#9244).
 //! - **PR rows** (`review_wait`, `doctor`, `merge_wait`, `merge_hold`) and the
-//!   per-repo census: the ETag-cached review-label listings
-//!   (`queue_blocked::list_open`, a `304` costs no rate limit).
+//!   per-repo census: the ETag-cached review-label listings, each walked page
+//!   by page (`forge_listing::list_issues_cached_all_as`; an unchanged page is
+//!   a free `304`). A walk that fails, hits its page limit or sees the
+//!   listing shift is a failed listing: the repo keeps its previous PR rows
+//!   and has no census, so a PR it could not see is never reported removed.
 //! - **`ready_wait` rows**: the work finder's last tick, the same source the
 //!   `queue.snapshot` producer reads, with each row's planner rank and the
-//!   inputs it was ranked on. Nothing re-ranks here.
+//!   inputs it was ranked on. Nothing re-ranks here. The work finder lists
+//!   one forge page per label (#11139), so a repo whose tick may have been
+//!   cut there is not `ready_complete` and keeps its earlier ready rows.
 //!
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
@@ -117,7 +122,9 @@ pub struct ReadyItem {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyQueue {
     pub items: Vec<ReadyItem>,
-    /// Repos whose ready listing the tick completed.
+    /// Repos whose ready listing the tick completed and could not have cut
+    /// at one forge page. A repo outside it keeps its earlier `ready_wait`
+    /// rows rather than reading the missing ones as gone.
     pub listed: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
 }
@@ -159,6 +166,18 @@ pub struct FleetView {
     pub repos: BTreeMap<String, RepoView>,
     /// The repos each listing source observed completely this pass.
     pub observed: BTreeMap<Source, BTreeSet<String>>,
+}
+
+impl FleetView {
+    /// Whether `repo`'s ready queue was listed completely this pass: the
+    /// work finder's tick listed it and its listing could not have been cut
+    /// at one forge page (the wire `ready_complete`).
+    #[must_use]
+    pub fn ready_complete(&self, repo: &str) -> bool {
+        self.observed
+            .get(&Source::Ready)
+            .is_some_and(|set| set.contains(repo))
+    }
 }
 
 /// What the previous record left behind, which the next delta is relative
@@ -373,13 +392,14 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
     })
 }
 
-fn repo_entry(repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
+fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
     FleetStateRepo {
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         census,
+        ready_complete: view.ready_complete(repo),
         rows: Vec::new(),
         removed: Vec::new(),
     }
@@ -420,7 +440,7 @@ pub fn decide(
                 .iter()
                 .map(|(repo, state)| FleetStateRepo {
                     rows: state.rows.values().cloned().collect(),
-                    ..repo_entry(repo, state.census.clone())
+                    ..repo_entry(view, repo, state.census.clone())
                 })
                 .collect();
             return Some(header(true, now, None, repos));
@@ -445,13 +465,17 @@ pub fn decide(
             .filter(|issue| !now_state.rows.contains_key(issue))
             .copied()
             .collect();
-        if rows.is_empty() && removed.is_empty() && now_state.census == was.census {
+        if rows.is_empty()
+            && removed.is_empty()
+            && now_state.census == was.census
+            && view.ready_complete(repo) == last.view.ready_complete(repo)
+        {
             continue;
         }
         repos.push(FleetStateRepo {
             rows,
             removed,
-            ..repo_entry(repo, now_state.census.clone())
+            ..repo_entry(view, repo, now_state.census.clone())
         });
     }
     if repos.is_empty() && view.slots == last.view.slots {

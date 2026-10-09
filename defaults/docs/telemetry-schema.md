@@ -2710,27 +2710,33 @@ three non-ETA sources:
 | Source | Rows | Notes |
 |---|---|---|
 | Sweep registries | the sweeps this host runs (`host`, `slot` set) | stage from the sweep's own checkpoint marker: none → `sweep.curator` (entered at dispatch), `curator-done` → `sweep.builder`, `builder-done` / `doctor-done` → `review_wait`, `judge-rejected` → `doctor`, `judge-done` / `merge-done` → `merge_wait`; `entered_at` is the marker's `timestamp` |
-| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings (a `304` is free). A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
-| Work finder's last tick | `ready_wait` for every ready-queue row that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks |
+| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings, each walked to its last page (an unchanged page is a free `304`). A walk that fails, reads 10 full pages (more than 1000 PRs under one label) or sees the listing shift mid-walk is a **failed** listing, never a partial one. A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
+| Work finder's last tick | `ready_wait` for every ready-queue row the planner saw on that tick that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks. The work finder lists one forge page (100 items) per label until #11139, so the tick may not hold a repo's whole ready queue: `ready_complete` says whether it does |
 
 When sources overlap on one `(repo, issue)`, the held row wins, then the PR
 row, then the `ready_wait` row. A listing row still in the same stage keeps its
 `entered_at` from pass to pass; a row new to a listing that was complete on the
 previous pass entered at this pass's `as_of`; any other row is first seen
 mid-stage and carries `entered_at_lower_bound: true`. A managed repo whose
-listing failed keeps that source's previous rows, and its `census` is absent.
+review listing failed keeps its previous PR rows, and its `census` is absent; a
+managed repo that is not `ready_complete` keeps its previous `ready_wait` rows.
+An item an incomplete read could not see is therefore never sent in `removed`,
+but a kept row may be an item that has since left; it is replaced or removed
+once a complete read sees the repo again.
 
 **Anchors and deltas.** The first pass of a daemon process sends a full
 **anchor** (`anchor: true`, every row), and so does any pass at which the last
 anchor is at least 3600 s old or the planner stamps changed (a regime
 boundary). Between anchors a pass sends a **delta** (`anchor: false`) only if
-rows, a census or the plan slots changed. A delta holds the added or changed
+rows, a census, a repo's `ready_complete` or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
 names. A pass with no change sends nothing. The change test ignores
 `census_at`. A planner rank shift changes every row behind it, so it is a
 change.
 
-**No row cap; chunks by bytes.** Nothing is ever dropped. A record whose JSON
+**No row cap; chunks by bytes.** The emitter drops none of the rows its sources
+read: it has no row cap. (What the sources read is bounded as described above:
+see `ready_complete` for the ready queue.) A record whose JSON
 would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
 limit) is split into several log records that share `as_of` and every header
 field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
@@ -2766,6 +2772,7 @@ Each `repos[]` entry:
 | `repo` | string | forge `owner/repo`, lowercased, never a local path |
 | `visibility` | `public` / `private` | missing or unknown decodes to `private` |
 | `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
+| `ready_complete` | bool | `true` when the work finder's last tick listed this repo's ready queue completely, so its `ready_wait` rows are every ready issue the planner saw there. `false` when that listing failed, was not read, or may have been cut at one forge page: the work finder does not record whether a page was full, so a repo with 100 or more rows on the tick counts as possibly truncated. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false`. #11139 paginates the work finder's listing |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
 | `removed[]` | integers, optional | delta only: issues that left. A repo that left entirely has every prior issue here and no `census` |
 

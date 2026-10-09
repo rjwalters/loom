@@ -68,6 +68,7 @@ fn record() -> FleetStateRecord {
         repos: vec![FleetStateRepo {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
+            ready_complete: true,
             census: Some(FleetPrCensus {
                 open: 2,
                 by_stage: [("review_wait".to_string(), 2)].into_iter().collect(),
@@ -87,6 +88,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
         .map(|(i, repo)| FleetStateRepo {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
+            ready_complete: true,
             census: Some(FleetPrCensus::default()),
             rows: (0..n)
                 .filter(|k| k % 3 == u32::try_from(i).unwrap())
@@ -247,6 +249,20 @@ fn absent_census_is_unknown_and_missing_visibility_is_private() {
     assert_eq!(repo.census, None);
     assert_eq!(repo.visibility, RepoVisibility::Private);
     assert!(repo.rows.is_empty() && repo.removed.is_empty());
+    // An older emitter's entry never claims a complete ready queue.
+    assert!(!repo.ready_complete);
+}
+
+/// `ready_complete` is always on the wire, `false` included: a missing field
+/// would read the same as an older emitter's.
+#[test]
+fn ready_complete_is_always_sent() {
+    let mut r = record();
+    for complete in [true, false] {
+        r.repos[0].ready_complete = complete;
+        let wire = serde_json::to_value(&r).unwrap();
+        assert_eq!(wire["repos"][0]["ready_complete"], serde_json::json!(complete));
+    }
 }
 
 #[test]
@@ -312,6 +328,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
+            ready_complete: true,
             census: None,
             rows: (0..40).map(|k| ready_row(k, k + 1)).collect(),
             removed: (1000..1400).collect(),
@@ -319,6 +336,7 @@ fn removals_and_census_only_repos_survive_a_split() {
         FleetStateRepo {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
+            ready_complete: true,
             census: Some(FleetPrCensus::default()),
             rows: Vec::new(),
             removed: Vec::new(),

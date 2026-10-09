@@ -137,42 +137,87 @@ fn linked_issue(body: &str) -> Option<u32> {
         .map(|(n, _)| *n)
 }
 
-/// Each managed repo's three review-label listings; a repo is included only
-/// when all three succeeded (a partial listing would read as PRs leaving).
+/// One repo's three review-label listings, each walked to its last page
+/// (`list_issues_cached_all_as`: page 1 is the single-page listing's own
+/// cache entry, so an unchanged queue costs one free `304`). Blocking.
+///
+/// # Errors
+///
+/// Any walk failed, read `MAX_PAGES` full pages or saw the listing shift:
+/// the set may be incomplete, so the whole repo is unobserved this pass.
+fn review_listing_with(
+    gh: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    slug: &str,
+) -> anyhow::Result<RepoListing> {
+    let mut seen = BTreeSet::new();
+    let mut prs = Vec::new();
+    for label in REVIEW_LABELS {
+        let items = crate::forge_listing::list_issues_cached_all_as(
+            CALLER,
+            gh,
+            Some(root),
+            repo,
+            label,
+            "open",
+        )?;
+        prs.extend(
+            items
+                .into_iter()
+                .filter(|item| item.is_pull_request && seen.insert(item.number))
+                .map(|item| ListedPr {
+                    number: item.number,
+                    issue: linked_issue(item.body.as_deref().unwrap_or_default()),
+                    labels: item.labels,
+                }),
+        );
+    }
+    Ok(RepoListing {
+        repo: slug.to_string(),
+        prs,
+    })
+}
+
+/// Each managed repo's review listings; a repo is included only when every
+/// walk completed (a partial listing would read as PRs leaving).
 async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
     let mut out = Vec::new();
     for (root, slug) in roots {
-        let mut items = Vec::new();
-        let mut complete = true;
-        for label in REVIEW_LABELS {
-            match crate::observability::queue_blocked::list_open(root.clone(), label, CALLER).await
-            {
-                Some(listing) => items.extend(listing),
-                None => {
-                    complete = false;
-                    break;
-                }
+        let (root, owned) = (root.clone(), slug.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+            review_listing_with(&gh, &root, None, &owned)
+        })
+        .await;
+        match result {
+            Ok(Ok(listing)) => out.push(listing),
+            Ok(Err(error)) => {
+                log::debug!("fleet.state: review listings of {slug} incomplete: {error:#}");
+            }
+            Err(join_error) => {
+                log::debug!("fleet.state: review listings of {slug} panicked: {join_error}");
             }
         }
-        if !complete {
-            continue;
-        }
-        let mut seen = BTreeSet::new();
-        let prs = items
-            .into_iter()
-            .filter(|item| item.is_pull_request && seen.insert(item.number))
-            .map(|item| ListedPr {
-                number: item.number,
-                issue: linked_issue(item.body.as_deref().unwrap_or_default()),
-                labels: item.labels,
-            })
-            .collect();
-        out.push(RepoListing {
-            repo: slug.clone(),
-            prs,
-        });
     }
     out
+}
+
+/// The repo roots whose ready listing in `queue` may have been cut at one
+/// forge page. The work finder lists each label one page
+/// ([`crate::forge_listing::PER_PAGE`] rows) deep until #11139 and does not
+/// record whether a page was full, so a root with at least a page's worth of
+/// rows in the tick counts as possibly truncated. Pure.
+fn possibly_truncated(queue: &[ReadyQueueRow]) -> BTreeSet<&str> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for row in queue {
+        *counts.entry(row.repo.as_str()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= crate::forge_listing::PER_PAGE)
+        .map(|(root, _)| root)
+        .collect()
 }
 
 /// The effective operator priority level the planner ranked `row` on: its
@@ -214,14 +259,17 @@ async fn ready_queue(
             })
         })
         .collect();
-    // A single-workspace tick records no rows, so it observes no repo.
+    // A single-workspace tick records no rows, so it observes no repo. A
+    // failed or possibly truncated listing observes its repo incompletely.
     let listed = if summary.plan.is_some() {
-        let failed: BTreeSet<String> = summary
+        let incomplete: BTreeSet<String> = summary
             .listing_failed
             .iter()
-            .filter_map(|r| slug(r))
+            .map(String::as_str)
+            .chain(possibly_truncated(&summary.queue))
+            .filter_map(slug)
             .collect();
-        managed.difference(&failed).cloned().collect()
+        managed.difference(&incomplete).cloned().collect()
     } else {
         BTreeSet::new()
     };
@@ -269,3 +317,8 @@ pub(super) fn stamps(workspace_root: &Path) -> PlannerStamps {
         fleet_config_hash: crate::fleet_sync::cached_status().and_then(|s| s.config.commit),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "sources_tests.rs"]
+mod tests;
