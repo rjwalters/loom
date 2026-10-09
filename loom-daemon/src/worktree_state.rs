@@ -43,6 +43,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod consumer_canary;
 pub mod stop_hook;
 
 /// Cap on the number of at-risk paths carried in a verdict (a blocked turn's

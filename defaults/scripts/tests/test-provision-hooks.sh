@@ -18,6 +18,8 @@
 #     execs the machine-checkout hook inside one (AC1), and defers to a present
 #     per-repo .loom/hooks/ copy (transition dedup, design decision 3)
 #   - deprovision removes ONLY Loom-owned entries, preserving operator hooks
+#   - #8372: the uncommitted-work consumer canary stub is wired on BOTH Stop and
+#     SubagentStop in both install modes, deduped, deferred, and deprovisioned
 #   - #6544: project-level entries are quoted so a project path containing a
 #     space survives `sh -c` execution, and a pre-existing UNQUOTED entry
 #     self-heals to the quoted form on the next re-provision (not left as an
@@ -665,6 +667,99 @@ NONLOOM25=$(mktemp -d); git -C "$NONLOOM25" init -q
 : > "$ARGV25"
 out=$(cd "$NONLOOM25" && LOOM_HOME="$CHK25" LOOM_DAEMON_SELF_BIN="$FAKE25" bash -c "$CMD25" </dev/null 2>&1); rc=$?
 assert_eq "$out|$rc|$(cat "$ARGV25")" "|0|" "non-Loom repo: the wrapper never runs the stub (PATH untouched)"
+
+# ── Test 26: guard-uncommitted-work.sh on Stop AND SubagentStop (#8372) ─────
+echo "Test 26: uncommitted-work consumer canary stub — both events, both install modes, dedup, deprovision (#8372)"
+# Count entries for <name> under ONE hook event type (machine marker).
+count_marker_in() {
+    local file="$1" ev="$2" name="$3"
+    jq --arg ev "$ev" --arg m "defaults/hooks/$name" '
+        [ (.hooks[$ev] // [])[] | .hooks[]? | .command // "" | select(contains($m)) ] | length
+    ' "$file" 2>/dev/null
+}
+count_project_in() {
+    local file="$1" ev="$2" name="$3"
+    jq --arg ev "$ev" --arg m ".loom/hooks/$name" '
+        [ (.hooks[$ev] // [])[] | .hooks[]? | .command // ""
+          | select(contains($m)) | select(contains("defaults/hooks/") | not) ] | length
+    ' "$file" 2>/dev/null
+}
+UW=guard-uncommitted-work.sh
+
+# 26a: user-scope (machine) provisioning — twice — wires each event exactly once.
+HOME26=$(mktemp -d)
+provision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
+provision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
+S26="$HOME26/.claude/settings.json"
+assert_eq "$(count_marker_in "$S26" Stop "$UW")" "1" "user-scope: Stop entry wired exactly once after two provisions"
+assert_eq "$(count_marker_in "$S26" SubagentStop "$UW")" "1" "user-scope: SubagentStop entry wired exactly once after two provisions"
+assert_eq "$(count_marker_in "$S26" Stop guard-background-subagents.sh)" "1" "user-scope: the existing Stop guard is still wired once alongside it"
+assert_eq "$(count_marker "$S26" "$UW")" "2" "user-scope: two entries total (one per event), never more"
+
+# 26b: project-copy (quick-install) fallback wires both events, idempotently.
+R26=$(mktemp -d); git -C "$R26" init -q
+make_transition_repo "$R26"
+mkdir -p "$R26/.loom/scripts/lib"
+cp "$REPO_ROOT/defaults/hooks/$UW" "$R26/.loom/hooks/$UW"; chmod +x "$R26/.loom/hooks/$UW"
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$R26/.loom/config.json"
+printf '{}\n' > "$R26/.claude/settings.json"
+ensure_project_hook_wiring "$R26" >/dev/null 2>&1
+ensure_project_hook_wiring "$R26" >/dev/null 2>&1
+P26="$R26/.claude/settings.json"
+assert_eq "$(count_project_in "$P26" Stop "$UW")" "1" "project-copy: Stop entry asserted exactly once after two runs"
+assert_eq "$(count_project_in "$P26" SubagentStop "$UW")" "1" "project-copy: SubagentStop entry asserted exactly once after two runs"
+
+# 26c: transition dedup — the user-scope wrapper defers to the project copy, so
+# exactly ONE entry point runs per event in a repo wired both ways.
+CHK26=$(mktemp -d); mkdir -p "$CHK26/defaults/hooks"
+printf '#!/usr/bin/env bash\necho MACHINE-RAN\nexit 0\n' > "$CHK26/defaults/hooks/$UW"
+chmod +x "$CHK26/defaults/hooks/$UW"
+for ev in Stop SubagentStop; do
+    CMD26=$(jq -r --arg ev "$ev" --arg m "defaults/hooks/$UW" '.hooks[$ev][] | .hooks[] | .command | select(contains($m))' "$S26" | head -1)
+    OUT26=$(cd "$R26" && LOOM_HOME="$CHK26" bash -c "$CMD26" </dev/null 2>/dev/null); rc26=$?
+    assert_eq "$OUT26|$rc26" "|0" "$ev: user-scope wrapper defers to the project copy (no double-fire)"
+done
+rm -f "$R26/.loom/hooks/$UW"
+for ev in Stop SubagentStop; do
+    CMD26=$(jq -r --arg ev "$ev" --arg m "defaults/hooks/$UW" '.hooks[$ev][] | .hooks[] | .command | select(contains($m))' "$S26" | head -1)
+    OUT26=$(cd "$R26" && LOOM_HOME="$CHK26" bash -c "$CMD26" </dev/null 2>/dev/null)
+    assert_contains "$OUT26" "MACHINE-RAN" "$ev: with no project copy the machine-checkout stub runs"
+done
+
+# 26d: the REAL stub through the REAL user-scope wrapper, against fake daemons.
+CHK26R=$(mktemp -d); mkdir -p "$CHK26R/defaults/hooks"
+cp "$REPO_ROOT/defaults/hooks/$UW" "$CHK26R/defaults/hooks/$UW"
+ln -s "$REPO_ROOT/defaults/scripts" "$CHK26R/defaults/scripts"
+FAKES26=$(mktemp -d)
+printf '#!/bin/sh\ncat >/dev/null\necho %s\n' "'{\"decision\":\"block\",\"reason\":\"fake block\"}'" > "$FAKES26/block"
+printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$FAKES26/allow"
+printf '#!/bin/sh\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$FAKES26/stale"
+chmod +x "$FAKES26/block" "$FAKES26/allow" "$FAKES26/stale"
+LOG26="$FAKES26/canary.jsonl"
+run26() { # $1=event $2=fake-bin-path -> W26OUT / W26RC
+    local cmd
+    cmd=$(jq -r --arg ev "$1" --arg m "defaults/hooks/$UW" '.hooks[$ev][] | .hooks[] | .command | select(contains($m))' "$S26" | head -1)
+    W26OUT=$(cd "$R26" && LOOM_HOME="$CHK26R" LOOM_DAEMON_SELF_BIN="$2" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$LOG26" \
+        bash -c "$cmd" <<<'{"hook_event_name":"'"$1"'","cwd":"'"$R26"'"}' 2>/dev/null)
+    W26RC=$?
+}
+for ev in Stop SubagentStop; do
+    run26 "$ev" "$FAKES26/block"
+    assert_contains "$W26OUT|$W26RC" '"decision":"block"' "$ev: a successful block verdict passes through the wired stub"
+    assert_eq "$W26RC" "0" "$ev: block is stdout JSON with exit 0"
+    run26 "$ev" "$FAKES26/allow"
+    assert_eq "$W26OUT|$W26RC" "|0" "$ev: an allow is silent"
+    run26 "$ev" "$FAKES26/stale"
+    assert_eq "$W26OUT|$W26RC" "|0" "$ev: a stale daemon (clap exit 2) fails open, never a block"
+    run26 "$ev" "$FAKES26/does-not-exist"
+    assert_eq "$W26RC" "0" "$ev: a missing daemon fails open"
+done
+assert_contains "$(cat "$LOG26" 2>/dev/null)" '"error":"unsupported_subcommand_or_flag"' "stale daemon recorded as a wrapper failure for the opted-in workspace"
+
+# 26e: deprovision removes both events' entries and leaves no empty arrays.
+deprovision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$S26" "$UW")" "0" "deprovision removed both uncommitted-work entries"
+assert_eq "$(jq -r '.hooks.SubagentStop // "absent"' "$S26")" "absent" "deprovision leaves no empty SubagentStop array behind"
 
 echo ""
 echo "======================================"

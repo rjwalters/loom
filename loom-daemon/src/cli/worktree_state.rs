@@ -11,6 +11,9 @@
 //! - `stop-hook` → the `Stop`/`SubagentStop` hook JSON protocol: a decision
 //!   object on stdout, **always exit 0**. A hook that exits non-zero on its own
 //!   bug would surface as a broken session rather than as a missed check.
+//! - `stop-hook --consumer-canary` → the same protocol behind the opt-in
+//!   consumer gate and outcome log (#8372); see
+//!   [`loom_daemon::worktree_state::consumer_canary`].
 //!
 //! The logic lives in [`loom_daemon::worktree_state`]; this module is argument
 //! parsing and exit codes only.
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_state::{self, stop_hook};
+use loom_daemon::worktree_state::{self, consumer_canary, stop_hook};
 
 /// The base ref every Loom issue worktree branches from. Overridable for a
 /// repo whose default branch is not `main`, and for tests.
@@ -110,6 +113,15 @@ pub(crate) struct StopHookArgs {
     /// Branch point to count commits against.
     #[arg(long, value_name = "REF", default_value = DEFAULT_BASE_REF)]
     base: String,
+
+    /// Consumer-workspace canary mode (#8372), used by the
+    /// `defaults/hooks/guard-uncommitted-work.sh` stub. Silent unless the
+    /// workspace's effective config sets
+    /// `guards.uncommittedWorkConsumerCanary: true`; when opted in, every
+    /// decision is also appended to the bounded canary outcome log. Without
+    /// this flag (the dogfood wiring) behaviour is unchanged.
+    #[arg(long)]
+    consumer_canary: bool,
 }
 
 impl StopHookArgs {
@@ -118,6 +130,24 @@ impl StopHookArgs {
         // Every failure below is an ALLOW: a guard that cannot read its own
         // payload must not be the reason a session cannot end.
         if std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw).is_err() {
+            std::process::exit(0);
+        }
+        if self.consumer_canary {
+            let fallback_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let log = consumer_canary::outcome_log_path();
+            let invocation_id = std::env::var(consumer_canary::INVOCATION_ID_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            if let Some(json) = consumer_canary::run(
+                &raw,
+                &self.base,
+                &fallback_cwd,
+                log.as_deref(),
+                &invocation_id,
+            ) {
+                println!("{json}");
+            }
             std::process::exit(0);
         }
         let payload: stop_hook::HookPayload = serde_json::from_str(&raw).unwrap_or_default();
