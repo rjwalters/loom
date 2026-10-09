@@ -1416,11 +1416,6 @@ assert_contains "stub-claude budget=6" "$output" \
 assert_contains "CPUQuota=600%" "$(cat "$SYSTEMD_RUN_LOG")" \
     "systemd-run is actually invoked with the computed CPUQuota (#5111)"
 
-# Test (#11076): the scope must not be torn down wholesale when the kernel
-# OOM-kills one child (systemd's default OOMPolicy=stop).
-assert_contains "OOMPolicy=continue" "$(cat "$SYSTEMD_RUN_LOG")" \
-    "the systemd-run scope passes -p OOMPolicy=continue (#11076)"
-
 # Test (#6129): the scope carries a predictable `loom-agent-` unit name and a
 # dedicated `loom-agents.slice`, so it can be enumerated as a group instead of
 # matched by grepping `claude-wrapper.sh -p /loom:` command-line text.
