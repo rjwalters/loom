@@ -3248,7 +3248,7 @@ Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
 the daemon restarts, so a reader computing "drops in a window" must treat a
 decrease as a counter reset (take the post-reset value, not a negative delta).
 The committed query is
-[`host-export-queries.sql`](../observability/signoz/host-export-queries.sql):
+[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
