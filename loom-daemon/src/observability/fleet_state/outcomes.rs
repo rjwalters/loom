@@ -103,6 +103,14 @@ fn stage_labels(stage: FleetStage) -> Vec<&'static str> {
     }
 }
 
+/// How a row left its stage.
+struct Leaving {
+    exit: StageExit,
+    next_stage: Option<FleetStage>,
+    /// The forge's instant for the move, when known.
+    forge_at: Option<DateTime<Utc>>,
+}
+
 struct Diff<'a, F> {
     forge: &'a mut F,
     loom: &'a Provenance,
@@ -136,11 +144,14 @@ impl<F: ForgeReads> Diff<'_, F> {
         repo: &str,
         issue: u32,
         was: &FleetStateRow,
-        exit: StageExit,
-        next_stage: Option<FleetStage>,
-        forge_at: Option<DateTime<Utc>>,
         source: Option<Source>,
+        leaving: Leaving,
     ) -> StageOutcomeRecord {
+        let Leaving {
+            exit,
+            next_stage,
+            forge_at,
+        } = leaving;
         let left_at = forge_at.unwrap_or(self.now).min(self.now);
         // Only a sweep's own checkpoint dates its entry. A polled row's
         // `entered_at` is the pass that first saw it: the entry fell somewhere
@@ -254,16 +265,15 @@ pub fn diff(
                         }
                         _ => None,
                     };
-                    let exit = StageExit::between(was.stage, now.stage);
-                    out.push(TelemetryRecord::StageOutcome(diff.record(
-                        repo,
-                        issue,
-                        was,
-                        exit,
-                        Some(now.stage),
+                    let leaving = Leaving {
+                        exit: StageExit::between(was.stage, now.stage),
+                        next_stage: Some(now.stage),
                         forge_at,
-                        was_repo.sources.get(&issue).copied(),
-                    )));
+                    };
+                    let source = was_repo.sources.get(&issue).copied();
+                    out.push(TelemetryRecord::StageOutcome(
+                        diff.record(repo, issue, was, source, leaving),
+                    ));
                 }
                 None => {
                     if !pass.managed.contains(repo) {
@@ -287,15 +297,15 @@ pub fn diff(
                         Some(_) => (StageExit::CutShort, None),
                         None => (StageExit::Unknown, None),
                     };
-                    out.push(TelemetryRecord::StageOutcome(diff.record(
-                        repo,
-                        issue,
-                        was,
+                    let leaving = Leaving {
                         exit,
-                        None,
+                        next_stage: None,
                         forge_at,
-                        was_repo.sources.get(&issue).copied(),
-                    )));
+                    };
+                    let source = was_repo.sources.get(&issue).copied();
+                    out.push(TelemetryRecord::StageOutcome(
+                        diff.record(repo, issue, was, source, leaving),
+                    ));
                 }
             }
         }
