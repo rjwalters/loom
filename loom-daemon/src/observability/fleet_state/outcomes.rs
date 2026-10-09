@@ -73,6 +73,9 @@ pub fn listed(listings: &[RepoListing]) -> Listed {
 pub struct Memory {
     /// Each repo's last complete review listing.
     pub listed: Listed,
+    /// Departed PRs whose `pulls/{n}` read failed, per repo (number → issue),
+    /// retried each pass until read.
+    pub unread: Listed,
     /// The previous view.
     pub view: Option<FleetView>,
     /// When the previous pass ran.
@@ -170,14 +173,15 @@ impl<F: ForgeReads> Diff<'_, F> {
 /// The records two consecutive passes give. Pure apart from `forge`.
 #[must_use]
 pub fn diff(
-    memory: &Memory,
+    memory: &mut Memory,
     pass: &Pass<'_>,
     forge: &mut impl ForgeReads,
     loom: &Provenance,
 ) -> Vec<TelemetryRecord> {
-    let (Some(prev), Some(prev_at)) = (memory.view.as_ref(), memory.at) else {
+    let (Some(prev), Some(prev_at)) = (memory.view.clone(), memory.at) else {
         return Vec::new();
     };
+    let prev = &prev;
     let mut diff = Diff {
         forge,
         loom,
@@ -188,13 +192,23 @@ pub fn diff(
     let mut out = Vec::new();
 
     let mut resolved: BTreeMap<(String, u32), PullFacts> = BTreeMap::new();
+    let mut unread = std::mem::take(&mut memory.unread);
+    unread.retain(|repo, _| pass.managed.contains(repo));
     for (repo, now_prs) in pass.listed {
         let Some(was_prs) = memory.listed.get(repo) else {
             continue;
         };
-        for (&number, &issue) in was_prs.iter().filter(|(n, _)| !now_prs.contains_key(n)) {
+        // Departures of this pass, and earlier ones not yet read.
+        let mut departed: BTreeMap<u32, Option<u32>> = unread.remove(repo).unwrap_or_default();
+        departed.extend(was_prs.iter().map(|(&n, &issue)| (n, issue)));
+        departed.retain(|n, _| !now_prs.contains_key(n));
+        for (number, issue) in departed {
             let Some(facts) = diff.forge.pull(repo, number) else {
-                log::debug!("fleet.state: pulls/{number} of {repo} unread; no pr.resolved");
+                log::debug!("fleet.state: pulls/{number} of {repo} unread; retrying next pass");
+                unread
+                    .entry(repo.clone())
+                    .or_default()
+                    .insert(number, issue);
                 continue;
             };
             resolved.insert((repo.clone(), number), facts);
@@ -216,6 +230,7 @@ pub fn diff(
             }));
         }
     }
+    memory.unread = unread;
 
     let empty = super::RepoView::default();
     for (repo, was_repo) in &prev.repos {
@@ -224,8 +239,14 @@ pub fn diff(
             match now_repo.rows.get(&issue) {
                 Some(now) if now.stage == was.stage => {}
                 Some(now) => {
+                    // A hold release is the removal of the hold label; `loom:pr`
+                    // stays applied, so no `labeled` event dates it.
+                    let released =
+                        was.stage == FleetStage::MergeHold && now.stage == FleetStage::MergeWait;
                     let forge_at = match (now_repo.sources.get(&issue), now.pr) {
-                        (Some(Source::Review), Some(pr)) => diff.label_instant(repo, pr, now.stage),
+                        (Some(Source::Review), Some(pr)) if !released => {
+                            diff.label_instant(repo, pr, now.stage)
+                        }
                         _ => None,
                     };
                     let exit = StageExit::between(was.stage, now.stage);
@@ -279,6 +300,7 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
     listed.extend(pass.listed.iter().map(|(k, v)| (k.clone(), v.clone())));
     Memory {
         listed,
+        unread: memory.unread,
         view: Some(pass.view.clone()),
         at: Some(pass.now),
     }

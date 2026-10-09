@@ -35,11 +35,17 @@ struct Forge {
     pulls: BTreeMap<u32, PullFacts>,
     labels: BTreeMap<u32, BTreeMap<String, DateTime<Utc>>>,
     reads: usize,
+    /// `pull` reads that fail before one is answered.
+    pull_failures: usize,
 }
 
 impl ForgeReads for Forge {
     fn pull(&mut self, _repo: &str, number: u32) -> Option<PullFacts> {
         self.reads += 1;
+        if self.pull_failures > 0 {
+            self.pull_failures -= 1;
+            return None;
+        }
         self.pulls.get(&number).copied()
     }
 
@@ -101,7 +107,7 @@ fn run(inputs: &[FleetInput], step: Duration, forge: &mut Forge) -> Vec<Vec<Tele
             managed: &input.managed,
             now,
         };
-        out.push(diff(&memory, &pass, forge, &provenance()));
+        out.push(diff(&mut memory, &pass, forge, &provenance()));
         memory = remember(memory, &pass);
         prev_view = Some(view);
     }
@@ -402,4 +408,70 @@ fn a_record_without_valid_provenance_is_never_offered() {
     let sink = FleetStateSink::new(queue.clone(), "host-a");
     assert_eq!(offer(out[1].clone(), &sink), 0);
     assert!(queue.offered.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_unread_departure_is_retried_until_it_resolves_exactly_once() {
+    let at = t0() + Duration::minutes(7);
+    let mut forge = Forge {
+        pull_failures: 1,
+        ..Forge::default()
+    };
+    forge.pulls.insert(
+        21,
+        PullFacts {
+            merged_at: Some(at),
+            closed_at: Some(at),
+        },
+    );
+    let out = run(
+        &[
+            input(&[(21, "loom:pr", 20)], Vec::new()),
+            input(&[], Vec::new()),
+            input(&[], Vec::new()),
+            input(&[], Vec::new()),
+        ],
+        Duration::minutes(10),
+        &mut forge,
+    );
+    assert!(resolved(&out[1]).is_empty(), "the first read failed");
+    assert_eq!(stages(&out[1])[0].exit, StageExit::Unknown);
+    let late = resolved(&out[2]);
+    assert_eq!(late.len(), 1, "{out:?}");
+    assert_eq!((late[0].pr_number, late[0].state), (21, PrResolution::Merged));
+    assert_eq!(late[0].resolved_at, at);
+    assert!(resolved(&out[3]).is_empty(), "read once, not again");
+    assert_eq!(forge.reads, 2);
+}
+
+#[test]
+fn a_hold_release_is_not_dated_by_the_old_approval_label() {
+    let held_labels = |labels: &[&str]| {
+        let mut i = input(&[(21, "loom:pr", 20)], Vec::new());
+        i.listings[0].prs[0].labels = labels.iter().map(|l| (*l).to_string()).collect();
+        i
+    };
+    let hold = MERGE_HOLD_LABELS.iter().next().expect("a hold label");
+    let mut forge = Forge::default();
+    // The approval is inside the release pass's window and is the only
+    // `loom:pr` instant on the PR.
+    forge
+        .labels
+        .insert(21, [("loom:pr".to_string(), t0() + Duration::minutes(1))].into());
+    let held = held_labels(&["loom:pr", hold]);
+    let open = held_labels(&["loom:pr"]);
+    let out = run(
+        &[held.clone(), held.clone(), open.clone(), held, open],
+        Duration::minutes(5),
+        &mut forge,
+    );
+    for pass in [&out[2], &out[4]] {
+        let r = stages(pass);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert_eq!(r[0].stage, FleetStage::MergeHold);
+        assert_eq!(r[0].next_stage, Some(FleetStage::MergeWait));
+        assert_eq!(r[0].forge_transition_at, None, "no hold-removal instant is known");
+        assert_eq!(r[0].resolution_sec, Some(300));
+    }
+    assert_eq!(forge.reads, 1, "only the re-hold reads events, never a release");
 }

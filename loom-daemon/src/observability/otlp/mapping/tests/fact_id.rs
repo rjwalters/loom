@@ -204,7 +204,7 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
                 managed: &fleet.managed,
                 now,
             };
-            records = diff(&memory, &pass, &mut Forge(approved_at), &provenance());
+            records = diff(&mut memory, &pass, &mut Forge(approved_at), &provenance());
             memory = remember(memory, &pass);
             prev = Some(view);
         }

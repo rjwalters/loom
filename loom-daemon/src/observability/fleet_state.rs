@@ -604,6 +604,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
     emitted: None,
     outcomes: outcomes::Memory {
         listed: BTreeMap::new(),
+        unread: BTreeMap::new(),
         view: None,
         at: None,
     },
@@ -619,7 +620,7 @@ async fn record_outcomes(
     workspace_pool: &crate::workspace_pool::WorkspacePool,
     slug_cache: &mut std::collections::HashMap<String, String>,
 ) {
-    let memory = STATE
+    let mut memory = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .outcomes
@@ -640,7 +641,7 @@ async fn record_outcomes(
         };
         let mut forge = outcomes::GhForgeReads { roots };
         let records = outcomes::diff(
-            &memory,
+            &mut memory,
             &pass,
             &mut forge,
             &crate::telemetry::provenance::Provenance::current(),
