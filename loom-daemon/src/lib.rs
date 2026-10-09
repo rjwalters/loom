@@ -307,6 +307,8 @@ pub mod release_resolve;
 pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
+/// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
+pub mod resync_pin;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the
