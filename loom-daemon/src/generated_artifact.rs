@@ -22,6 +22,11 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// The shell surface (`loom-daemon stashes build-trees`) over this module:
+/// `check-main-clean.sh --quarantine` asks it rather than re-implementing
+/// marker discovery in shell.
+pub mod status;
+
 /// Path components that are unambiguously machine-generated: a virtualenv, a
 /// dependency tree, or an interpreter/tool cache. These normally never reach
 /// a stash at all (they are gitignored, and `git stash push --include-untracked`
@@ -149,7 +154,7 @@ fn dir_has_marker(dir: &Path) -> bool {
 /// stash would capture (untracked, modified or staged). Every ancestor
 /// directory of those files is checked on disk, so a marker that is ignored
 /// (or tracked, or absent from `git status`) is still found.
-pub(crate) fn worktree_build_tree_dirs(worktree: &Path) -> BTreeSet<String> {
+pub fn worktree_build_tree_dirs(worktree: &Path) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let mut checked: HashSet<String> = HashSet::new();
     for args in [

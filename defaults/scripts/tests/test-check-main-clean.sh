@@ -59,6 +59,12 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
 write_scope_allow_all "$WS_STUB_DIR"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/check-main-clean.sh"
+# #11075: --quarantine asks `loom-daemon stashes build-trees` which cargo build
+# trees to exclude, so the 11075 cases need THIS checkout's build. FATAL, not a
+# skip, without one (wired in the "Native Port Suites" job for that reason).
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$HELPERS_DIR" "stashes"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1258,6 +1264,52 @@ else
 fi
 rm -rf "${REPO:?}"
 
+# -------- Test: no usable loom-daemon falls back LOUDLY to include-everything (#11075) --------
+# A missing binary, or one too old to have `stashes build-trees`, must never
+# make the quarantine skip real work. The chosen fail-safe is the pre-#11075
+# rescue (build trees included) with a warning naming the cause.
+echo "Test 11075e: missing / too-old loom-daemon -> loud include-everything fallback"
+STUB_DIR=$(mktemp -d)
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand build-trees" >&2\nexit 2\n' > "$STUB_DIR/loom-daemon"
+chmod +x "$STUB_DIR/loom-daemon"
+# PATH minus every directory that carries a loom-daemon, so "missing" is real.
+NO_DAEMON_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [[ -x "$d/loom-daemon" ]] || printf '%s:' "$d"; done)
+for mode in old missing; do
+    REPO=$(make_repo_with_source)
+    SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075e.txt"
+    ( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+    mkdir -p "$REPO/target-x/debug"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/target-x/CACHEDIR.TAG"
+    printf 'bin\n' > "$REPO/target-x/debug/artifact.o"
+    printf 'def leaked(): pass\n' > "$REPO/leaked_module.py"
+    if [[ "$mode" == old ]]; then
+        out=$( cd "$REPO" && LOOM_QUARANTINE_COMMENT=0 LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon" \
+            "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
+    else
+        out=$( cd "$REPO" && env -u LOOM_DAEMON_SELF_BIN -u LOOM_DAEMON_BIN -u CARGO_TARGET_DIR \
+            LOOM_QUARANTINE_COMMENT=0 LOOM_DAEMON_BIN_DIR="$STUB_DIR/none" PATH="${NO_DAEMON_PATH%:}" \
+            "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075" 2>&1 ); RC=$?
+    fi
+    STASH_FILES=$(stash_files "$REPO")
+    if [[ "$RC" -eq 4 ]] && grep -q '^leaked_module.py$' <<<"$STASH_FILES"; then
+        pass "$mode daemon: real work is still quarantined (exit 4)"
+    else
+        fail "$mode daemon: rescue skipped real work (rc=$RC); stash holds: $STASH_FILES; out=$out"
+    fi
+    if grep -q 'WARNING: .*stashes build-trees' <<<"$out" && grep -q 'NOT be excluded' <<<"$out" \
+        && { [[ "$mode" == old ]] || grep -q 'not found' <<<"$out"; }; then
+        pass "$mode daemon: the fallback warns that build trees are not excluded"
+    else
+        fail "$mode daemon: fallback was silent; out=$out"
+    fi
+    if grep -q '^target-x/' <<<"$STASH_FILES"; then
+        pass "$mode daemon: fallback is the pre-#11075 include-everything rescue"
+    else
+        fail "$mode daemon: expected the include-everything fallback; stash holds: $STASH_FILES"
+    fi
+    rm -rf "${REPO:?}"
+done
+rm -rf "${STUB_DIR:?}"
 
 # -------- Summary --------
 echo ""

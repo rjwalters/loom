@@ -1925,6 +1925,10 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #11075: check-main-clean.sh --quarantine asks `loom-daemon stashes
+      # build-trees` which cargo build trees to exclude from the rescue stash.
+      - name: check-main-clean (#3513, #11075)
+        run: bash defaults/scripts/tests/test-check-main-clean.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)

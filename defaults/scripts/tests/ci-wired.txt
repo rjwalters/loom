@@ -62,7 +62,6 @@ test-check-merge-config.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
-test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh

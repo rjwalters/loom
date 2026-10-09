@@ -31,7 +31,53 @@ pub(crate) fn handle_stashes_command(action: StashesAction) -> Result<()> {
             paths,
             json,
         } => run(&workspace, issue, execute, paths, json),
+        StashesAction::BuildTrees(args) => build_trees(&args),
     }
+}
+
+/// `loom-daemon stashes build-trees` (#11075).
+#[derive(clap::Args)]
+pub(crate) struct BuildTreesArgs {
+    /// Any directory inside the worktree to inspect (default: current
+    /// directory). Directories are printed relative to its top level.
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    workspace: String,
+
+    /// Terminate each directory with NUL instead of a newline.
+    #[arg(short = 'z')]
+    nul: bool,
+
+    /// Read `git status --porcelain` text on stdin and print it without the
+    /// lines that are build-tree content (see
+    /// `generated_artifact::status::filter_status`).
+    #[arg(long, conflicts_with = "nul")]
+    filter_status: bool,
+}
+
+fn build_trees(args: &BuildTreesArgs) -> Result<()> {
+    use loom_daemon::generated_artifact::status;
+    use std::io::{Read, Write};
+
+    let start = std::path::Path::new(&args.workspace);
+    let top = status::worktree_top(start)
+        .ok_or_else(|| anyhow::anyhow!("not inside a git worktree: {}", start.display()))?;
+    let dirs = loom_daemon::generated_artifact::worktree_build_tree_dirs(&top);
+    let mut out = std::io::stdout().lock();
+    if args.filter_status {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let kept = status::filter_status(&top, &dirs, &input);
+        if !kept.is_empty() {
+            writeln!(out, "{}", kept.trim_end_matches('\n'))?;
+        }
+    } else {
+        let end = if args.nul { '\0' } else { '\n' };
+        for dir in &dirs {
+            write!(out, "{dir}{end}")?;
+        }
+    }
+    out.flush()?;
+    Ok(())
 }
 
 /// Shared body for `list` (never executes) and `retire` (`execute` from

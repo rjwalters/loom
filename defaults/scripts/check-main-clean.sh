@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # check-main-clean.sh - Backstop guard: fail if the MAIN worktree is dirty.
+# requires-daemon: stashes optional        --quarantine probes `stashes build-trees`; missing/too old -> loud include-everything rescue (#11075)
 #
 # Detects the #2802 / #3513 failure mode where a Builder agent's cwd resets
 # between tool calls and a repo-relative Write/Edit/Bash file operation lands
@@ -749,96 +750,6 @@ collect_offending_paths() {
     done <<< "$effective_status"
 }
 
-# Cargo target trees (#11075). A directory is a generated build-output tree
-# when it holds a cargo marker whose CONTENT proves cargo wrote it, whatever its
-# name (target-x/, .loom/target-doctor-N/, .cargo-target/): a CACHEDIR.TAG with
-# the cache-dir-tagging signature, or a .rustc_info.json JSON object carrying
-# rustc_fingerprint (cargo writes one at every target root; some real trees had
-# no tag at all, e.g. .loom/target-issue-9748/). Stashing one writes hundreds
-# of MB into refs/stash (stash 7 / #10516 had 7,119 files), so the quarantine
-# rescue must never include it. Mirrors loom-daemon's generated_artifact.rs.
-#
-# Markers are checked ON DISK for every ancestor directory of what the stash
-# would capture (untracked, modified, staged), so an IGNORED marker beside
-# stashable artifacts is still found. The repo root is never a build tree: a
-# root-level tag would otherwise exclude every path and rescue nothing.
-CACHEDIR_SIG='Signature: 8a477f597d28d172789f06886806bc55'
-TAG_DIRS=()
-
-# is_build_tree_dir <repo-relative dir> -> 0 when it holds a verified cargo marker.
-is_build_tree_dir() {
-    local d="$main_root/$1" line=""
-    if [[ -f "$d/CACHEDIR.TAG" ]]; then
-        IFS= read -r line < "$d/CACHEDIR.TAG" 2>/dev/null || true
-        [[ "$line" == "$CACHEDIR_SIG"* ]] && return 0
-    fi
-    if [[ -f "$d/.rustc_info.json" ]]; then
-        line=""
-        IFS= read -r line < "$d/.rustc_info.json" 2>/dev/null || true
-        if [[ "$line" =~ ^[[:space:]]*\{ ]] \
-            && grep -q '"rustc_fingerprint"[[:space:]]*:' "$d/.rustc_info.json" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# under_tag_dir <path> -> 0 when <path> is (or lies under) a tag dir.
-under_tag_dir() {
-    local p="${1%/}" t
-    for t in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do
-        [[ -n "$t" ]] || continue
-        [[ "$p" == "$t" || "$p" == "$t"/* ]] && return 0
-    done
-    return 1
-}
-
-collect_tag_dirs() {
-    TAG_DIRS=()
-    local f d last=""
-    while IFS= read -r -d '' f; do
-        [[ "$f" == */* ]] || continue   # a root-level file: the root is never a tree
-        d="${f%/*}"
-        [[ "$d" == "$last" ]] && continue
-        under_tag_dir "$d" && { last="$d"; continue; }
-        # Walk up until reaching an ancestor of the previous file's dir (git
-        # lists sorted, so those were already checked); stop at the root.
-        while [[ -n "$d" && "$last" != "$d" && "$last" != "$d"/* ]]; do
-            is_build_tree_dir "$d" && TAG_DIRS+=("$d")
-            if [[ "$d" == */* ]]; then d="${d%/*}"; else d=""; fi
-        done
-        last="${f%/*}"
-    done < <(
-        git -C "$main_root" ls-files -z --others --exclude-standard 2>/dev/null || true
-        git -C "$main_root" diff -z --name-only 2>/dev/null || true
-        git -C "$main_root" diff -z --name-only --cached 2>/dev/null || true
-    )
-}
-
-# only_tag_content <collapsed-untracked-dir> -> 0 when everything untracked
-# beneath it lies under a tag dir (so the porcelain line is build output only).
-only_tag_content() {
-    local specs=(":(literal,top)$1") t rest
-    for t in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do specs+=(":(exclude,literal,top)$t"); done
-    rest=$(git -C "$main_root" ls-files --others --exclude-standard -- "${specs[@]}" 2>/dev/null) || return 1
-    [[ -z "$rest" ]]
-}
-
-# drop_tag_status <porcelain-text> -> the text minus lines for paths under a tag dir.
-drop_tag_status() {
-    local line path out=""
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        path="${line:3}"
-        [[ "$path" == *" -> "* ]] && path="${path##* -> }"
-        path=$(unquote_path "$path")
-        under_tag_dir "$path" && continue
-        [[ "${line:0:2}" == "??" && "$path" == */ ]] && only_tag_content "$path" && continue
-        out+="$line"$'\n'
-    done <<< "$1"
-    printf '%s' "${out%$'\n'}"
-}
-
 if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
     stash_msg="loom-quarantine: $QUARANTINE_LABEL"
@@ -860,21 +771,53 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
             <(printf '%s\n' "$recheck_status" | sort) \
             | sed '/^$/d')
     fi
-    effective_status="$recheck_status"
+    # Cargo build trees are never rescued (#11075): a directory holding a
+    # content-verified cargo marker (any name, ignored or not) is excluded from
+    # the stash and its porcelain lines are neither offending nor residual
+    # dirt. Discovery lives in `loom-daemon stashes build-trees` (Rust, shared
+    # with the worktree quarantine) — one implementation, not two that drift.
+    #
+    # No usable daemon (missing, or too old to have the subcommand) falls back
+    # to the pre-#11075 include-everything rescue, LOUDLY. Refusing instead
+    # would leave the dirt on main, which is worse than one oversized stash.
+    TAG_DIRS=(); bt_excludes=(); bt_ok=0
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
+    bt_bin=$(loom_daemon_self_bin_override || LOOM_LOCATE_DAEMON_BIN_QUIET=1 loom_locate_daemon_bin "$main_root" || true)
+    if [[ -n "$bt_bin" ]]; then
+        # A trailing empty record is the success sentinel: it only arrives when
+        # the subcommand exited 0, so a failed or absent subcommand stays bt_ok=0.
+        while IFS= read -r -d '' d; do
+            if [[ -z "$d" ]]; then bt_ok=1; else TAG_DIRS+=("$d"); fi
+        done < <("$bt_bin" stashes build-trees --workspace "$main_root" -z 2>/dev/null && printf '\0')
+    fi
+    if [[ "$bt_ok" -eq 0 ]]; then
+        echo "WARNING: check-main-clean.sh: no loom-daemon with \`stashes build-trees\` (${bt_bin:-not found});" >&2
+        echo "         cargo build trees will NOT be excluded and may be stashed into refs/stash (#11075)." >&2
+        echo "         Update loom-daemon (\`loom update\`) to restore the exclusion." >&2
+    fi
+    for d in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do
+        # Exclude pathspecs only limit the worktree diff; unstage staged copies
+        # so the stash's index commit cannot carry them either.
+        git -C "$main_root" reset -q -- ":(literal,top)$d" >/dev/null 2>&1 || true
+        bt_excludes+=(":(exclude,literal,top)$d")
+    done
+    # bt_filter <porcelain> -> the text minus build-tree lines; unchanged when
+    # the daemon is unusable or the call fails (never drop real dirt).
+    bt_filter() {
+        local out
+        if [[ "$bt_ok" -eq 1 ]] && out=$(printf '%s\n' "$1" | "$bt_bin" stashes build-trees --workspace "$main_root" --filter-status 2>/dev/null); then
+            printf '%s' "$out"
+        else
+            printf '%s' "$1"
+        fi
+    }
+    effective_status=$(bt_filter "$recheck_status")
 
-    collect_tag_dirs
     OFFENDING_PATHS=()
     if [[ -n "$effective_status" ]]; then
         collect_offending_paths
     fi
-    # Cargo target trees are never rescued (#11075): drop paths that are, or
-    # lie under, a CACHEDIR.TAG dir; exclude tag dirs nested under a collapsed
-    # untracked parent (e.g. `?? .loom/`) via the pathspecs below.
-    kept_paths=()
-    for p in ${OFFENDING_PATHS[@]+"${OFFENDING_PATHS[@]}"}; do
-        under_tag_dir "$p" || kept_paths+=("$p")
-    done
-    OFFENDING_PATHS=(${kept_paths[@]+"${kept_paths[@]}"})
 
     if [[ "${#OFFENDING_PATHS[@]}" -eq 0 ]]; then
         # Nothing left to rescue. Emit this as its OWN structured result rather
@@ -910,15 +853,9 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     # offending pathspecs so baselined (pre-existing) dirt is left untouched;
     # `:(literal,top)` anchors each at the repo root and disables glob magic so
     # a path containing `*`/`[` cannot over-match.
-    stash_pathspecs=()
+    stash_pathspecs=(${bt_excludes[@]+"${bt_excludes[@]}"})
     for p in "${OFFENDING_PATHS[@]}"; do
         stash_pathspecs+=(":(literal,top)$p")
-    done
-    for p in ${TAG_DIRS[@]+"${TAG_DIRS[@]}"}; do
-        # Exclude pathspecs only limit the worktree diff; unstage any staged
-        # copies so the stash's index commit cannot carry them either.
-        git -C "$main_root" reset -q -- ":(literal,top)$p" >/dev/null 2>&1 || true
-        stash_pathspecs+=(":(exclude,literal,top)$p")
     done
 
     # Remember the stack top BEFORE pushing. `git stash push` exits 0 and
@@ -942,14 +879,13 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     # no new dirt remains. A partial quarantine is exactly the failure mode this
     # mode exists to prevent, so it is reported as a hard failure, not a success.
     post_status=$(filter_loom_owned "$(git -C "$main_root" status --porcelain 2>/dev/null || true)")
-    post_effective="$post_status"
+    post_effective=$(bt_filter "$post_status")
     if [[ "$MODE" == "baseline" && -r "$MODE_FILE" ]]; then
         post_effective=$(comm -13 \
             <(sort "$MODE_FILE") \
-            <(printf '%s\n' "$post_status" | sort) \
+            <(printf '%s\n' "$post_effective" | sort) \
             | sed '/^$/d')
     fi
-    post_effective=$(drop_tag_status "$post_effective")
     if [[ -n "$post_effective" ]]; then
         quarantine_fail "residual dirt remains after stash: $(printf '%s' "$post_effective" | tr '\n' ';')"
     fi
