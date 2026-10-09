@@ -1,17 +1,17 @@
 # `--body @path` Does NOT Expand — It Posts the Literal String (canonical)
 
-Single canonical copy; role prompts with a short "`--body @path` Does NOT
-Expand" pointer refer here.
+Single canonical copy; role prompts' short pointers refer here.
 
 **If a comment/review body you're posting (via `gh issue comment`, `gh pr
 comment`, or `gh api ... comments`) lives in a scratch/scratchpad file, do not
 pass it as `--body @path`.** Unlike some shells' `@file` conventions, `gh pr
 comment --body @path` and `gh issue comment --body @path` do **not** read the
-file — they post the literal text `@path`. PR #4457 lost an entire
-changes-requested review this way (the body was the string
-`@/private/tmp/.../review.md`, and the file was later overwritten by another
-PR's review). It recurred via `gh api ... -f body=@path` (`-f`/`--raw-field`
-never expands `@path`) — see #5252.
+file — they post the literal text `@path` as the comment. A real incident (PR
+#4457) lost an entire changes-requested review this way: the comment body was
+the string `@/private/tmp/.../scratchpad/review.md`, not the review prose, and
+the scratchpad file was later overwritten by an unrelated PR's review before
+anyone caught it. It recurred again later via `gh api ... -f body=@path`
+(`-f`/`--raw-field` never expands `@path` either) — see #5252.
 
 ```
 ❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
@@ -34,13 +34,17 @@ never expands `@path`) — see #5252.
    gh api repos/{owner}/{repo}/issues/123/comments -F body=@/tmp/review-123.md
 ```
 
-Prefer the inline heredoc when the body is short/dynamic; use
-`-F/--body-file <path>` when it lives in a file — the one flag on `gh pr
-comment`/`gh issue comment` that reads file contents (`gh api ... -F body=@path`
-also works; `-f`/`--raw-field` does **not**). **Never** pass `@path` as the
-value of `--body`/`-b`. **After posting, re-fetch the comment** (`gh pr view <number>
+Prefer the inline heredoc pattern above when the body is short/dynamic; use
+`-F/--body-file <path>` when the body genuinely lives in a file (e.g. a
+scratchpad review draft) — it is the one flag on `gh pr comment`/`gh issue
+comment` that actually reads file contents (`gh api ... -F body=@path` also
+works — but `-f`/`--raw-field` does **not**). **Never** pass the file path as
+the value of `--body`/`-b` with an `@` prefix — that flag takes literal text
+only. **After posting, re-fetch the comment** (`gh pr view <number>
 --comments` / `gh issue view <number> --comments`) to confirm it renders your
 prose, not a path string.
+
+Why `<<'EOF'` must stay quoted: `.loom/docs/comment-body-heredoc-quoting.md`.
 
 ### Name every staged body file after its issue/PR number — never a fixed name (#6381)
 
@@ -49,43 +53,26 @@ body file with the issue or PR number it belongs to** (`pr-body-<N>.md`,
 `review-<N>.md`, `fix-comment-<N>.md`), never a fixed constant like
 `pr-body.md` or `review.md`. Wave subagents dispatched by `/loom:sweep` are
 one level deep from a single orchestrator session and **share one scratchpad
-directory**. Two concurrent agents writing the same fixed path race on it:
-`--body-file <path>` can read the *other* agent's body, silently publishing
-the wrong title, `Closes #N`, or content (#6381). Two independent
-`/loom:sweep` runs on one host collide the same way.
+directory** — there is no per-subagent scratch namespace. Two concurrent
+agents each writing to the same fixed path race on it: one's `create-pr.sh
+--body-file <path>` / `gh pr comment --body-file <path>` can read the *other*
+agent's body between its write and your read, silently publishing a PR or
+comment with the wrong title, wrong `Closes #N`, or wrong content — with
+nothing failing and no error anywhere (#6381, near-miss in a consumer repo,
+a private-repo PR). The same collision applies outside wave dispatch
+too: two independent `/loom:sweep` runs (different terminals, same host) can
+just as easily race on an unnamespaced `/tmp` path.
 
-A namespaced path like `/tmp/pr-body-123.md` is still a literal path argument,
-so it satisfies the destructive-write guard as before (#4921/#4178); it only
-removes the collision.
+A namespaced path like `/tmp/pr-body-123.md` is still a **literal, non-
+interpolated-at-guard-time path argument**, so it satisfies the
+destructive-write guard's literal-path requirement exactly the same as the
+fixed name did (#4921/#4178) — namespacing the filename is not a guard
+workaround, it only removes the cross-agent collision.
 
-**A guard denial is not an invitation to re-shape the same value.**
-`guard-destructive-generic.sh` hard-denies `--body @path`. On that denial, switch
-to `--body-file` or the heredoc — **never** route the same `@path` through a
-variable, `--raw-field`, or other wrapper (that evasion recurred on PR #4600,
-#4601, and is now denied too).
-
-### Why the heredoc delimiter must be quoted (`<<'EOF'`, not `<<EOF`)
-
-The `<<'EOF'` in the "USE ONE OF THESE INSTEAD" block is load-bearing. An
-**unquoted** `<<EOF` expands `$var`, `$(...)` **and backticks**, so prose like
-`` `.loom/` `` is *executed* and replaced by its empty output; the error goes to
-stderr and the post succeeds with the path deleted (seen curating #9123):
-
-```
-❌ cat <<EOF                      → "Sha abc123. The path  is materialized."
-   Sha $SHA. The path `.loom/` is materialized.
-   EOF
-```
-
-- **Rule:** always quote the delimiter for prose bodies — fully literal.
-- **The trap:** you want a variable (`$SHA`) in the body. Do not drop the
-  quotes to get it; use a placeholder and substitute afterward:
-
-  ```
-  ✅ cat <<'EOF' | sed "s/@SHA@/$SHA/g" > /tmp/body-123.md
-     Sha @SHA@. The path `.loom/` is materialized.
-     EOF
-  ```
-- **Escaping is not the answer:** one missed `` \` `` fails silently; the quoted
-  delimiter is all-or-nothing.
-- **Re-read after posting** (see above) — the damage shows only on the forge.
+**A guard denial is not an invitation to re-shape the same value.** The
+`--body @path` shape is hard-denied by `guard-destructive-generic.sh`. If you
+hit that denial, the only correct response is to switch to `--body-file` or
+the heredoc — **never** to route the identical `@path` value through a shell
+variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
+anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
+it is now denied too.
