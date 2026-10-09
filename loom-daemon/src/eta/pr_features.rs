@@ -7,7 +7,9 @@
 //!
 //! # Budget
 //!
-//! At most [`FEATURE_READ_BUDGET`] forge calls per ETA pass, across
+//! At most [`FEATURE_READ_BUDGET`] forge calls per ETA pass for PR reads,
+//! plus [`ISSUE_READ_BUDGET`] for issue reads and [`CHECKS_READ_BUDGET`] for
+//! check-run reads (#11028), across
 //! `pulls/{n}`, `commits/{sha}/check-runs` and `commits/{sha}/status`,
 //! `issues/{n}` and the base branch's required-context lookup (a ruleset call
 //! and a classic branch-protection call). The budget is charged per call
@@ -54,6 +56,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Feature reads allowed per ETA pass, across every repo and read kind.
 pub const FEATURE_READ_BUDGET: usize = 12;
+
+/// Issue reads allowed per ETA pass on top of [`FEATURE_READ_BUDGET`] (#11028).
+/// An issue body changes rarely and its read is one conditional GET, but it
+/// is the only source of `complexity_marker`, `points_marker` and `author`;
+/// sharing one pool with PR reads starved it (`budget_exhausted` on 98% of
+/// estimates). With its own pool the backlog drains in
+/// `ceil(items / ISSUE_READ_BUDGET)` passes, then only refreshes.
+pub const ISSUE_READ_BUDGET: usize = 60;
+
+/// Check-run reads (two forge calls each) allowed per ETA pass on top of
+/// [`FEATURE_READ_BUDGET`] (#11028). `checks_*` need a fresh check read for the
+/// PR's head; sharing the pool with `pulls/{n}` left them null on ~99% of
+/// estimates while `pr_ci_status` (a separate reader) was known on 74%.
+pub const CHECKS_READ_BUDGET: usize = 40;
 
 /// A `pulls/{n}` or check-runs answer is re-read once it is this old.
 pub const PR_REFRESH_SEC: i64 = 15 * 60;
@@ -583,11 +599,24 @@ impl PrFeatureStore {
             ))
         });
         let mut reads = Vec::new();
-        let mut spent = 0;
+        // Three pools (#11028): issue bodies and check reads each have their
+        // own, so PR reads cannot starve them; `pulls/{n}` and the
+        // required-context lookup share `budget`.
+        let mut spent = [0_usize; 3];
+        let caps = if budget == 0 {
+            [0; 3]
+        } else {
+            [budget, ISSUE_READ_BUDGET, CHECKS_READ_BUDGET]
+        };
         for c in candidates {
             let cost = c.read.kind.cost();
-            if spent + cost <= budget {
-                spent += cost;
+            let pool = match c.read.kind {
+                ReadKind::Pull | ReadKind::Required => 0,
+                ReadKind::Issue => 1,
+                ReadKind::Checks => 2,
+            };
+            if spent[pool] + cost <= caps[pool] {
+                spent[pool] += cost;
                 reads.push(c.read);
             } else {
                 self.defer(&c.read);

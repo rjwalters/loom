@@ -41,6 +41,12 @@ fn required_body(contexts: &[&str]) -> Value {
     json!({ "required_contexts": contexts })
 }
 
+/// Reads that draw on the shared `budget` (the issue and check pools are
+/// separate, #11028).
+fn is_shared(r: &FeatureRead) -> bool {
+    matches!(r.kind, ReadKind::Pull | ReadKind::Required)
+}
+
 fn read(kind: ReadKind, number: u32, sha: Option<&str>) -> FeatureRead {
     FeatureRead {
         repo: REPO.to_string(),
@@ -178,9 +184,10 @@ fn an_answer_older_than_its_max_age_is_stale() {
 #[test]
 fn reads_over_the_budget_are_deferred_and_say_so() {
     let mut store = PrFeatureStore::default();
-    let items: Vec<Wanted> = (1..=5).map(|i| wanted(i, Some(100 + i))).collect();
+    let over = ISSUE_READ_BUDGET as u32 + 5;
+    let items: Vec<Wanted> = (1..=over).map(|i| wanted(i, Some(1000 + i))).collect();
     let reads = store.plan(&items, t(-100), 3);
-    assert_eq!(reads.len(), 3);
+    assert_eq!(reads.iter().filter(|r| r.kind == ReadKind::Issue).count(), ISSUE_READ_BUDGET);
     for r in &reads {
         store.answer(r, None, t(-90)); // and they all fail
     }
@@ -204,7 +211,9 @@ fn the_reads_per_pass_never_exceed_the_budget_and_every_item_is_read_in_turn() {
     for pass in 0..10 {
         let now = t(pass * 300);
         let reads = store.plan(&items, now, FEATURE_READ_BUDGET);
-        assert!(reads.len() <= FEATURE_READ_BUDGET, "pass {pass}: {}", reads.len());
+        let shared: Vec<_> = reads.iter().filter(|r| is_shared(r)).cloned().collect();
+        assert!(total_cost(&shared) <= FEATURE_READ_BUDGET, "pass {pass}: {shared:?}");
+        assert!(total_cost(&reads) <= FEATURE_READ_BUDGET + ISSUE_READ_BUDGET + CHECKS_READ_BUDGET);
         for r in &reads {
             let body = match r.kind {
                 ReadKind::Pull => pull_body("open", false, 1, "sha", -1),
@@ -482,13 +491,15 @@ fn the_budget_charges_each_forge_call_not_each_read() {
     for budget in 0..=14 {
         let mut fresh = store.clone();
         let reads = fresh.plan(&items, t(1), budget);
-        assert!(total_cost(&reads) <= budget, "budget {budget}: {reads:?}");
+        let shared: Vec<_> = reads.into_iter().filter(is_shared).collect();
+        assert!(total_cost(&shared) <= budget, "budget {budget}: {shared:?}");
     }
     // One slot is not enough for a two-call read; it is deferred whole.
     assert!(store
         .clone()
         .plan(&items, t(1), 1)
         .iter()
+        .filter(|r| is_shared(r))
         .all(|r| r.kind.cost() == 1));
     assert_eq!(ReadKind::Required.cost(), 2);
     assert_eq!(ReadKind::Checks.cost(), 2);
@@ -529,4 +540,56 @@ fn a_status_for_another_commit_or_a_truncated_one_is_not_trusted() {
     let mut body = checks_body(&[], 0);
     body["status"] = json!({"sha": "abc", "total_count": 150, "statuses": []});
     assert!(parse_checks(&body, "abc", t(0)).unwrap().truncated);
+}
+
+#[test]
+fn issue_reads_have_their_own_pool_and_drain_in_bounded_passes() {
+    // More items than the shared budget could ever cover (#11028).
+    let n = 200u32;
+    let mut store = PrFeatureStore::default();
+    let items: Vec<Wanted> = (1..=n).map(|i| wanted(i, Some(1000 + i))).collect();
+    let passes = (n as usize).div_ceil(ISSUE_READ_BUDGET);
+    let mut read = std::collections::BTreeSet::new();
+    for pass in 0..passes as i64 {
+        let now = t(pass * 300);
+        for r in store.plan(&items, now, FEATURE_READ_BUDGET) {
+            if r.kind == ReadKind::Issue {
+                read.insert(r.number);
+                store.answer(&r, Some(&issue_body("", -1)), now);
+            } else {
+                store.answer(&r, None, now);
+            }
+        }
+    }
+    assert_eq!(read.len(), n as usize, "every issue read within {passes} passes");
+}
+
+#[test]
+fn check_reads_are_not_starved_by_pull_reads_and_fill_checks_features() {
+    // 30 open PRs, pulls already read: only checks and required remain (#11028).
+    let n = 30u32;
+    let mut store = PrFeatureStore::default();
+    let items: Vec<Wanted> = (1..=n).map(|i| wanted(i, Some(100 + i))).collect();
+    for pr in 101..=100 + n {
+        store.answer(
+            &read(ReadKind::Pull, pr, None),
+            Some(&pull_body("open", false, 1, &format!("sha{pr}"), -5)),
+            t(0),
+        );
+    }
+    // A shared budget of 1 cannot cover a check read; the checks pool does.
+    let reads = store.plan(&items, t(1), 1);
+    let checks = reads.iter().filter(|r| r.kind == ReadKind::Checks).count();
+    assert_eq!(checks, CHECKS_READ_BUDGET / ReadKind::Checks.cost());
+    for r in reads.iter().filter(|r| r.kind == ReadKind::Checks) {
+        store.answer(r, Some(&checks_body(&[("build", "completed", Some("failure"))], 1)), t(2));
+    }
+    let base = ("o/r".to_string(), "main".to_string());
+    store.answer(&required_read(&base.1), Some(&required_body(&["build"])), t(2));
+    let mut features = Features::default();
+    let mut omitted = Vec::new();
+    store.write_to(REPO, 1, Ok(101), t(10), &mut features, &mut omitted);
+    assert_eq!(features.checks_failed, Some(1));
+    assert_eq!(features.checks_all_failed, Some(1));
+    assert!(omitted.iter().all(|o| !o.name.starts_with("checks_")), "{omitted:?}");
 }
