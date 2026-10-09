@@ -88,6 +88,9 @@ pub enum Reason {
     NoChangedLines,
     /// A changed line that is not the version line.
     NonVersionLine(String),
+    /// The version-line pattern failed to compile (an internal defect, not a
+    /// forge failure); still fails closed.
+    BadPattern(String),
 }
 
 impl std::fmt::Display for Reason {
@@ -101,6 +104,7 @@ impl std::fmt::Display for Reason {
             Self::PatchEmpty => f.write_str("the forge returned an empty patch"),
             Self::NoChangedLines => f.write_str("the patch has no +/- content line"),
             Self::NonVersionLine(line) => write!(f, "changed line is not a version line: {line}"),
+            Self::BadPattern(why) => write!(f, "version-line pattern did not compile: {why}"),
         }
     }
 }
@@ -133,7 +137,7 @@ pub fn version_only(file: &str, patch: Option<&str>) -> Result<(), Reason> {
         return Err(Reason::PatchEmpty);
     }
     // The patterns are compile-time constants covered by the tests below.
-    let re = Regex::new(pattern).map_err(|e| Reason::FetchFailed(format!("bad pattern: {e}")))?;
+    let re = Regex::new(pattern).map_err(|e| Reason::BadPattern(e.to_string()))?;
     let mut in_hunk = false;
     let mut changed = 0usize;
     for line in patch.split('\n') {

@@ -10,9 +10,9 @@
 # Check") is prose an LLM instance reads and executes, not a standalone
 # script (same situation as test-dependency-parse.sh) — so this file mirrors
 # the documented check-loop (since #9611 the shipped `version_only_diff()` is
-# extracted and run, not mirrored; since #6879, the durable-hold labeling) in local functions
-# and pins the shipped markdown's exact commands with `assert_doc_contains`,
-# catching drift between the two.
+# extracted and run, not mirrored; since #6879, the durable-hold labeling) in
+# local functions and pins the shipped markdown's exact commands with
+# `assert_doc_contains`, catching drift between the two.
 #
 # Incident recap: on PR #4611 (117 changed files), a concurrent Champion
 # evaluation posted "no critical-file changes" despite the PR removing
