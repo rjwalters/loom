@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 /// (`defaults/observability/collector/config.yaml`, contract-tested).
 pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.story",
+    // #11125: cross-host outcome fact id (`pr.resolved`, `eta.stage_outcome`).
+    "loom.fact_id",
     "loom.eta.estimate_id",
     // `eta.estimate` / `eta.outcome` (#10498): the authority host id.
     "loom.eta.authority",

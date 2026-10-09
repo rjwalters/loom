@@ -2428,6 +2428,12 @@ its existing review listing and the PR read the tracker already makes. Only
 the fleet's ETA authority runs the pass, so only it emits these. At most one
 record per `(repo, pr_number, state)` per pass.
 
+**Natural key: `(repo, pr_number, state)`.** The record carries
+`loom.fact_id = derived_hex(["loom.fact", "pr.resolved", repo, pr_number,
+state], 16)`, the same on every host (no `host_id`, no `emitted_at`), so a
+reader dedupes the fact across hosts with `LIMIT 1 BY loom.fact_id`; see
+[`telemetry-replay.md`](telemetry-replay.md).
+
 The log record's **time is `resolved_at`** and its **observed timestamp is
 `observed_at`** (the knowable-at time, see "Event time vs knowable-at"
 above). The body is the record's JSON. The scalars ride as `loom.repo`,
@@ -2458,6 +2464,11 @@ review-label transitions, verdicts, `merge_hold` overlays and the
 `pr.resolved` read. A slot-turnover sample has no issue and gives no
 record. The record joins the issue's story trace when an open estimate
 knew the repo id.
+
+**Natural key: `(repo, issue, stage, left_at)`.** The record carries
+`loom.fact_id = derived_hex(["loom.fact", "eta.stage_outcome", repo, issue,
+stage, left_at], 16)` (`left_at` as RFC 3339 UTC, nanoseconds), the same on
+every host; see [`telemetry-replay.md`](telemetry-replay.md).
 
 The log record's **time is `left_at`** and its **observed timestamp is
 `observed_at`**. The body is the record's JSON. The scalars ride as

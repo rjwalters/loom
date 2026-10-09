@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod fact_id;
 mod host_name;
 mod loom_kind;
 mod record_id;
