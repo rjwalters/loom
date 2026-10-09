@@ -301,6 +301,77 @@ fn the_ordinary_empty_pass_through_case_hashes_exactly_as_it_did_before() {
 }
 
 // ---------------------------------------------------------------------------
+// #9308: exact golden vectors for the PERSISTED CONCLUSION_HASH contract
+//
+// Every expected digest below was computed independently, outside this crate,
+// from an explicit four-field payload:
+//   printf '%s\n%s\n%s\n%s' VERDICT BLOCKERS REASON_KEY ORTHOGONAL_KEY \
+//     | shasum -a 256 | cut -c1-16
+// A self-equality assertion (`hash(x) == hash(x)`) only proves determinism
+// within one build; these pin the value across releases. If one of them moves,
+// every live `curator:dep-recheck` marker carrying it re-posts once.
+// ---------------------------------------------------------------------------
+
+/// The report's verbatim `--block-reason` (sky130-temp-por#40): uppercase repo
+/// owner and `(OPEN)` are exactly what canonicalization folds.
+const REPORT_REASON: &str =
+    "depends on #64, itself blocked on cross-repo 2AMLogic/klayout-tools#1962 (OPEN)";
+
+#[test]
+fn the_reported_block_reason_hashes_to_its_pinned_canonical_digest() {
+    // payload: "blocked\n\n<lowercased reason>\n" (fourth field empty)
+    let o = compute(&[], Some("blocked"), REPORT_REASON, "");
+    assert_eq!(o.conclusion_hash, "e8876061202241c6");
+    assert_eq!(o.block_reason, REPORT_REASON, "the echoed reason stays verbatim");
+    for variant in [
+        "  Depends on #64, itself blocked on cross-repo 2amlogic/klayout-tools#1962 (open) ",
+        "DEPENDS ON #64,\titself blocked on cross-repo 2AMLOGIC/KLAYOUT-TOOLS#1962\n(OPEN)",
+    ] {
+        assert_eq!(compute(&[], Some("blocked"), variant, "").conclusion_hash, "e8876061202241c6");
+    }
+}
+
+#[test]
+fn the_reports_other_digest_is_exactly_the_pre_8320_uncanonicalized_formula() {
+    // #9308's two observed values are not build randomness: 41df30ee... is the
+    // same payload hashed with the reason VERBATIM, i.e. what every build
+    // before #8320 (4daa840bf, first tagged v0.19.187) computed — the shell
+    // original and the 0.19.104..0.19.186 Rust port alike. A host still running
+    // such a build alternates with a current one for any reason containing an
+    // uppercase letter or a non-single-space whitespace run.
+    let legacy = short_sha16(&format!("blocked\n\n{REPORT_REASON}\n"));
+    assert_eq!(legacy, "41df30ee18089360");
+    assert_ne!(compute(&[], Some("blocked"), REPORT_REASON, "").conclusion_hash, legacy);
+}
+
+#[test]
+fn multiple_sorted_blockers_with_a_nonempty_orthogonal_identity_hash_to_a_pinned_digest() {
+    // BLOCKERS sorts lexicographically ("10:" < "64:" < "9:"), and the
+    // orthogonal identity is canonicalized like the reason:
+    //   blocked
+    //   10:OPEN:no-block-label:conflicting
+    //   64:MERGED:no-block-label:n/a
+    //   9:OPEN:block-label:mergeable
+    //   <lowercased REPORT_REASON>
+    //   epic-open-but-complete:2amlogic/klayout-tools#1962
+    let a = pr(9, "OPEN", &["loom:blocked", "loom:pr"], "MERGEABLE", "CLEAN");
+    let b = pr(10, "OPEN", &[], "UNKNOWN", "UNKNOWN");
+    let c = pr(64, "MERGED", &[], "UNKNOWN", "UNKNOWN");
+    let orthogonal = " Epic-Open-But-Complete:2AMLogic/klayout-tools#1962 ";
+    for prs in [[a.clone(), b.clone(), c.clone()], [c, a, b]] {
+        let o = compute(&prs, None, REPORT_REASON, orthogonal);
+        assert_eq!(o.verdict, "blocked");
+        assert_eq!(
+            o.conclusion_hash,
+            "7493cccdbd9a3918",
+            "input order: {:?}",
+            prs.map(|p| p.number)
+        );
+        assert_eq!(o.orthogonal, orthogonal, "the echoed identity stays verbatim");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
 
