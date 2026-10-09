@@ -41,6 +41,11 @@ fn gate(m: &InstallMeta, d: &DaemonCompat) -> Result<Compat, ResyncRefusal> {
     crate::init::payload::resync_gate(m, d)
 }
 
+/// The verdict for one copy, as the pass decides it.
+fn decide(m: &InstallMeta, d: &DaemonCompat, diff: Option<bool>) -> Verdict {
+    decide_hold(&gate(m, d), diff, behind_compatible(m, d))
+}
+
 // ----------------------------------------------------------------------------
 // decide_hold: the decision table
 // ----------------------------------------------------------------------------
@@ -61,19 +66,32 @@ fn the_decision_table() {
         // The ratchet guard: ahead but compatible, with or without a stamp.
         (Some("0.19.950"), Some("0.19.772"), None, Verdict::Clear),
         (Some("0.19.950"), None, None, Verdict::Clear),
-        // W3 keys on the payload diff.
+        // W3 behind only the floor, its requires_daemon met: not held,
+        // whatever the diff says (#11052).
+        (Some("0.19.800"), Some("0.19.772"), Some(true), Verdict::Clear),
+        (Some("0.19.800"), Some("0.19.772"), None, Verdict::Clear),
+        (Some("0.19.800"), Some("0.19.900"), Some(true), Verdict::Clear),
+        // W3 with no requires_daemon on record: held, keyed on the diff.
+        (Some("0.19.800"), None, Some(true), held(HoldKind::InstallIncompatible)),
+        (Some("0.19.800"), None, Some(false), Verdict::Clear),
+        (Some("0.19.800"), None, None, Verdict::Unknown),
         (
             Some("0.19.800"),
-            Some("0.19.772"),
+            Some("unknown"),
             Some(true),
             held(HoldKind::InstallIncompatible),
         ),
-        (Some("0.19.800"), Some("0.19.772"), Some(false), Verdict::Clear),
-        (Some("0.19.800"), Some("0.19.772"), None, Verdict::Unknown),
         // Exactly at the floor is not too old.
         (Some("0.19.850"), Some("0.19.772"), Some(true), Verdict::Clear),
-        // Below supports_installed with no floor in play.
+        // Below supports_installed: a declared break, held even when its
+        // requires_daemon is met.
         (Some("0.18.999"), None, Some(true), held(HoldKind::InstallIncompatible)),
+        (
+            Some("0.18.999"),
+            Some("0.18.900"),
+            Some(true),
+            held(HoldKind::InstallIncompatible),
+        ),
         // Compatible, and the migration case (no requires_daemon).
         (Some("0.19.880"), Some("0.19.772"), Some(true), Verdict::Clear),
         (Some("0.19.880"), None, Some(true), Verdict::Clear),
@@ -81,7 +99,7 @@ fn the_decision_table() {
         (Some("unknown"), None, Some(true), Verdict::Clear),
     ] {
         let m = meta(version, requires);
-        assert_eq!(decide_hold(&gate(&m, &d), diff), want, "{version:?} {requires:?} {diff:?}");
+        assert_eq!(decide(&m, &d, diff), want, "{version:?} {requires:?} {diff:?}");
     }
 }
 
@@ -101,7 +119,10 @@ fn the_other_refusals() {
             Verdict::Hold(HoldKind::InstallIncompatible),
         ),
     ] {
-        assert_eq!(decide_hold(&Err(refusal.clone()), Some(true)), want, "{refusal:?}");
+        // Behind-but-compatible only ever speaks for a W3 copy.
+        for behind in [false, true] {
+            assert_eq!(decide_hold(&Err(refusal.clone()), Some(true), behind), want, "{refusal:?}");
+        }
     }
     // `classify` agrees on W4 over W3: a too-old stamp that needs a newer daemon.
     let d = daemon("0.19.900", Some("0.19.850"));
@@ -140,7 +161,7 @@ fn an_unorderable_version_holds_and_demands_by_requires_daemon_alone() {
             matches!(g, Err(ResyncRefusal::UnrecognizedVersion { .. })),
             "{requires:?}: {g:?}"
         );
-        assert_eq!(decide_hold(&g, None), Verdict::Hold(HoldKind::DaemonTooOld));
+        assert_eq!(decide(&m, &d, None), Verdict::Hold(HoldKind::DaemonTooOld));
         Finding::daemon_too_old(String::new(), m.requires_daemon.as_deref(), d.running)
     };
     for (requires, want, guessed) in [
@@ -216,12 +237,11 @@ fn an_older_compatible_host_neither_rolls_nor_holds_for_a_repo_the_newer_host_st
     let older = daemon("0.19.930", None);
     let newer = daemon("0.19.937", None);
     for (host, d) in [("older", &older), ("newer", &newer)] {
-        let g = gate(&stamp, d);
-        let verdict = decide_hold(&g, Some(true));
+        let verdict = decide(&stamp, d, Some(true));
         assert_eq!(verdict, Verdict::Clear, "{host} host must keep dispatching");
     }
     // The older host's pass: both copies carry the newer stamp.
-    let finding = |d: &DaemonCompat| match decide_hold(&gate(&stamp, d), Some(true)) {
+    let finding = |d: &DaemonCompat| match decide(&stamp, d, Some(true)) {
         Verdict::Clear => Finding::clear(),
         other => panic!("{other:?}"),
     };
@@ -269,8 +289,7 @@ fn an_older_compatible_host_neither_rolls_nor_holds_for_a_repo_the_newer_host_st
     // the assertions above pass because of the guard, not because nothing
     // on this path can ever produce a demand.
     let needy = meta(Some("0.19.937"), Some("0.19.937"));
-    let g = gate(&needy, &older);
-    assert_eq!(decide_hold(&g, Some(true)), Verdict::Hold(HoldKind::DaemonTooOld));
+    assert_eq!(decide(&needy, &older, Some(true)), Verdict::Hold(HoldKind::DaemonTooOld));
     let finding =
         Finding::daemon_too_old(String::new(), needy.requires_daemon.as_deref(), older.running);
     let seen = Observation {
@@ -461,12 +480,13 @@ fn an_interrupted_newer_resync_is_held_without_a_roll_demand() {
         r#"{"loom_version":"0.19.900","requires_daemon":"0.19.772","resync_pending":"0.19.950"}"#;
     let gate = crate::init::payload::gate_metadata(raw, &d);
     assert!(matches!(gate, Err(ResyncRefusal::PendingAheadOfDaemon { .. })), "{gate:?}");
-    let verdict = decide_hold(&gate, None);
+    let compatible = behind_compatible(&InstallMeta::parse(raw).unwrap(), &d);
+    let verdict = decide_hold(&gate, None, compatible);
     assert_eq!(verdict, Verdict::Hold(HoldKind::InstallIncompatible));
     // A pending run at or below this daemon is this daemon's to finish.
     let own = raw.replace("0.19.950", "0.19.900");
     assert_eq!(
-        decide_hold(&crate::init::payload::gate_metadata(&own, &d), None),
+        decide_hold(&crate::init::payload::gate_metadata(&own, &d), None, compatible),
         Verdict::Clear
     );
 
@@ -638,4 +658,201 @@ async fn the_work_finder_holds_only_the_held_root_and_names_the_cause() {
     set_for_test(held_dir.path(), None);
     let (_, causes, _) = preflight_held_causes_per_root(&pool, &roots, t0());
     assert!(causes[0].is_none_or(|c| !hold_causes.contains(&c)), "{:?}", causes[0]);
+}
+
+// ----------------------------------------------------------------------------
+// #11052: behind but compatible, the checkout re-judge, the roll's clearing
+// ----------------------------------------------------------------------------
+
+#[test]
+fn behind_but_compatible_needs_a_met_requires_daemon_and_a_supported_version() {
+    // Just after a floor roll: the daemon and the floor are 0.19.900, the
+    // repos are one release behind.
+    let d = daemon(RUNNING, Some(RUNNING));
+    for (version, requires, want) in [
+        (Some("0.19.899"), Some("0.19.772"), true),
+        (Some("0.19.899"), Some(RUNNING), true),
+        // Nothing on record says the files work here.
+        (Some("0.19.899"), None, false),
+        (Some("0.19.899"), Some("unknown"), false),
+        (Some("0.19.899"), Some(""), false),
+        // Needs a newer daemon: that is W4, never "compatible".
+        (Some("0.19.899"), Some("0.19.901"), false),
+        // Below supports_installed: the daemon declared that break.
+        (Some("0.18.999"), Some("0.18.900"), false),
+        (None, Some("0.19.772"), false),
+    ] {
+        let m = meta(version, requires);
+        assert_eq!(behind_compatible(&m, &d), want, "{version:?} {requires:?}");
+    }
+}
+
+/// The #11052 incident: a floor roll leaves every repo one release behind.
+/// One with a met `requires_daemon` keeps dispatching; one without stays
+/// held until it is resynced; a W4 one stays held and still demands a roll.
+#[test]
+fn after_a_floor_roll_only_repos_nothing_vouches_for_are_held() {
+    let d = daemon(RUNNING, Some(RUNNING));
+    let behind = meta(Some("0.19.899"), Some("0.19.772"));
+    let unread = meta(Some("0.19.899"), None);
+    let needy = meta(Some("0.19.899"), Some("0.19.950"));
+    assert_eq!(gate(&behind, &d), Ok(Compat::InstalledTooOld), "still W3 to the resync");
+    assert_eq!(decide(&behind, &d, Some(true)), Verdict::Clear);
+    assert_eq!(decide(&unread, &d, Some(true)), Verdict::Hold(HoldKind::InstallIncompatible));
+    assert_eq!(decide(&needy, &d, Some(true)), Verdict::Hold(HoldKind::DaemonTooOld));
+
+    let mut holds = Holds::default();
+    let (a, b, c) = ("/nonexistent/a", "/nonexistent/b", "/nonexistent/c");
+    holds.step(
+        &[
+            obs(a, Finding::clear(), Finding::clear()),
+            obs(b, w3(), Finding::clear()),
+            obs(c, w4("0.19.950"), Finding::clear()),
+        ],
+        v(RUNNING),
+        t0(),
+        ALERT_AFTER,
+    );
+    let held = holds.holds();
+    assert!(!held.contains_key(Path::new(a)), "behind but compatible: dispatching");
+    assert_eq!(held[Path::new(b)].kind, HoldKind::InstallIncompatible);
+    assert_eq!(held[Path::new(c)].kind, HoldKind::DaemonTooOld);
+    assert_eq!(holds.demand().map(|d| d.version), Some("0.19.950".to_string()));
+}
+
+#[test]
+fn a_rejudge_clears_a_checkout_hold_and_touches_nothing_else() {
+    let mut holds = Holds::default();
+    let (a, b) = ("/nonexistent/a", "/nonexistent/b");
+    holds.step(
+        &[
+            obs(a, Finding::clear(), w3()),
+            obs(b, w3(), Finding::clear()),
+        ],
+        v(RUNNING),
+        t0(),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.holds().len(), 2);
+
+    // `a`'s checkout fast-forwarded: judged clear, in the same pass.
+    let later = t0() + mins(1);
+    let events = holds.rejudge(
+        &[obs(a, Finding::unknown(), Finding::clear())],
+        v(RUNNING),
+        later,
+        ALERT_AFTER,
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!((events[0].event, events[0].hold.copy), ("cleared", HeldCopy::Checkout));
+    let held = holds.holds();
+    assert!(!held.contains_key(Path::new(a)));
+    assert_eq!(held[Path::new(b)].since, t0(), "b is not observed and keeps its hold");
+
+    // The default-branch copy is unknown to a re-judge: it keeps its hold.
+    let events = holds.rejudge(
+        &[obs(b, Finding::unknown(), Finding::clear())],
+        v(RUNNING),
+        later,
+        ALERT_AFTER,
+    );
+    assert!(events.is_empty(), "{events:?}");
+    assert!(holds.holds().contains_key(Path::new(b)));
+
+    // A workspace no pass has seen is not added by a re-judge.
+    holds.rejudge(
+        &[obs("/nonexistent/new", Finding::clear(), w3())],
+        v(RUNNING),
+        later,
+        ALERT_AFTER,
+    );
+    assert!(!holds.holds().contains_key(Path::new("/nonexistent/new")));
+}
+
+#[test]
+fn the_roll_is_timed_until_its_last_install_incompatible_hold_clears() {
+    let mut holds = Holds::default();
+    let (a, b, c) = ("/nonexistent/a", "/nonexistent/b", "/nonexistent/c");
+    // The first pass after the roll: `c` was not reached (its default branch
+    // is unknown), `a` and `b` are held.
+    holds.step(
+        &[
+            obs(a, w3(), Finding::clear()),
+            obs(b, Finding::clear(), w3()),
+            obs(c, Finding::unknown(), Finding::unknown()),
+        ],
+        v(RUNNING),
+        t0(),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.take_roll_cleared(), None);
+    // `a` is resynced; `c` is reached and held.
+    holds.step(
+        &[
+            obs(a, Finding::clear(), Finding::clear()),
+            obs(b, Finding::clear(), w3()),
+            obs(c, w3(), Finding::clear()),
+        ],
+        v(RUNNING),
+        t0() + mins(4),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.take_roll_cleared(), None);
+    holds.step(
+        &[
+            obs(a, Finding::clear(), Finding::clear()),
+            obs(b, Finding::clear(), w3()),
+            obs(c, Finding::clear(), Finding::clear()),
+        ],
+        v(RUNNING),
+        t0() + mins(8),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.take_roll_cleared(), None, "b's checkout still holds");
+    // `b`'s checkout fast-forwards: the last one clears, timed from the roll.
+    let at = t0() + mins(8) + chrono::Duration::seconds(7);
+    holds.rejudge(&[obs(b, Finding::unknown(), Finding::clear())], v(RUNNING), at, ALERT_AFTER);
+    let cleared = holds
+        .take_roll_cleared()
+        .expect("the roll's holds have cleared");
+    assert_eq!(
+        cleared,
+        RollCleared {
+            since: t0(),
+            at,
+            held: 3
+        }
+    );
+    assert!(
+        roll_cleared_line(&cleared)
+            .contains("3 workspace(s) were held, and the last cleared 8m07s"),
+        "{}",
+        roll_cleared_line(&cleared)
+    );
+    // Once per process.
+    holds.step(&[obs(a, w3(), Finding::clear())], v(RUNNING), at + mins(1), ALERT_AFTER);
+    holds.step(
+        &[obs(a, Finding::clear(), Finding::clear())],
+        v(RUNNING),
+        at + mins(2),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.take_roll_cleared(), None);
+}
+
+#[test]
+fn a_roll_that_held_nothing_reports_nothing_and_w4_does_not_count() {
+    let mut holds = Holds::default();
+    let a = "/nonexistent/a";
+    holds.step(&[obs(a, w4("0.19.950"), Finding::clear())], v(RUNNING), t0(), ALERT_AFTER);
+    assert_eq!(holds.take_roll_cleared(), None);
+    // The episode ended on that first pass: a later W3 is not the roll's.
+    holds.step(&[obs(a, w3(), Finding::clear())], v(RUNNING), t0() + mins(1), ALERT_AFTER);
+    holds.step(
+        &[obs(a, Finding::clear(), Finding::clear())],
+        v(RUNNING),
+        t0() + mins(2),
+        ALERT_AFTER,
+    );
+    assert_eq!(holds.take_roll_cleared(), None);
 }

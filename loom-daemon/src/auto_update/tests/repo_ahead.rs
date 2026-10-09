@@ -237,7 +237,8 @@ fn an_unorderable_version_rolls_a_fleet_host_only_when_requires_daemon_says_so()
             requires_daemon: requires.map(str::to_string),
         };
         let g = crate::init::payload::resync_gate(&m, &d);
-        assert_eq!(decide_hold(&g, None), Verdict::Hold(HoldKind::DaemonTooOld), "{case}");
+        let behind = crate::workspace_hold::behind_compatible(&m, &d);
+        assert_eq!(decide_hold(&g, None, behind), Verdict::Hold(HoldKind::DaemonTooOld), "{case}");
         let found = Finding::daemon_too_old(String::new(), requires, running);
         let mut holds = Holds::default();
         let seen = Observation {

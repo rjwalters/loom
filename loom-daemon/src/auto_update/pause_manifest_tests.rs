@@ -22,6 +22,7 @@ fn sample() -> PauseManifest {
             staged_at: None,
             pause_started_at: t0(),
             pause_completed_at: None,
+            pause_duration_ms: None,
             pause_budget_secs: Some(120),
             min_resumable_age_secs: Some(300),
             max_age_secs: 900,

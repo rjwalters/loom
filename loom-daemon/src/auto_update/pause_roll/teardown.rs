@@ -6,12 +6,17 @@
 //! moves its child to a new group (`orphan_process_reaper.rs`'s module doc has
 //! the incident). So the teardown has three legs, and always runs the last two:
 //!
-//! 1. **systemd scope** (Linux, when a scope unit was recorded):
-//!    `systemctl --user stop <unit>` kills the whole cgroup, `setsid`
-//!    descendants included. A recorded unit is **not** proof the scope exists:
-//!    `owner.json` names one for every Linux dispatch, including Codex and
-//!    Claude launches that never created a scope. When the stop fails or the
-//!    unit is not loaded, the legs below do the work (Judge finding on #10864).
+//! 1. **systemd scope** (Linux, when a scope unit was recorded): the whole
+//!    cgroup is stopped, `setsid` descendants included. A recorded unit is
+//!    **not** proof the scope exists: `owner.json` names one for every Linux
+//!    dispatch, including Codex and Claude launches that never created a
+//!    scope. When the stop fails or the unit is not loaded, the legs below do
+//!    the work (Judge finding on #10864). The stop never waits on systemd's
+//!    stop job (#11051): a blocking `systemctl --user stop` waits out the
+//!    scope's own stop timeout, and on the first live roll it timed out at
+//!    20 s per item. [`ScopeCtl::stop`] queues the stop with `--no-block`
+//!    (systemd sends `SIGTERM` to the cgroup), polls for the scope to empty
+//!    for [`SCOPE_GRACE`], then sends `SIGKILL` to the cgroup itself.
 //! 2. **Freeze-first tree kill** over the item's seeds, each expanded to its
 //!    descendants through the ppid map, which survives `setsid` where the pgid
 //!    does not. This reuses [`crate::orphan_process_reaper::reap_tree`]
@@ -71,8 +76,13 @@ use crate::sweep_registry::reaper::{group_has_members, send_group_signal, send_s
 
 /// How long a stopped tree gets between `SIGTERM` and `SIGKILL`.
 pub const TERM_GRACE: Duration = Duration::from_secs(3);
-/// Bound on the `systemctl --user stop` call.
-const SCOPE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound on each `systemctl --user` call the scope leg makes.
+const SCOPE_CMD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a scope gets to empty after its stop is queued (systemd sends
+/// `SIGTERM`) before the scope leg sends `SIGKILL` to the cgroup.
+pub const SCOPE_GRACE: Duration = Duration::from_secs(5);
+/// How long the scope leg waits for the scope to empty after its `SIGKILL`.
+const SCOPE_KILL_WAIT: Duration = Duration::from_secs(1);
 /// Bound on one `ps` call. A healthy `ps` answers in tens of milliseconds.
 pub const PS_TIMEOUT: Duration = Duration::from_secs(10);
 /// How far a pid's observed start time may drift between two `ps` readings
@@ -410,37 +420,104 @@ pub fn plan_tree(
     (order_parent_first(&all, &parent_map(&entries)), leader)
 }
 
-/// Whether `unit` is a loaded systemd user unit. `false` on any error.
-fn scope_is_loaded(unit: &str) -> bool {
-    let mut cmd = Command::new("systemctl");
-    cmd.args(["--user", "show", unit, "--property=LoadState", "--value"]);
-    matches!(
-        crate::sweep_registry::reaper::output_with_timeout(cmd, SCOPE_STOP_TIMEOUT),
-        Ok(Some(out)) if out.status.success()
-            && String::from_utf8_lossy(&out.stdout).trim() == "loaded"
-    )
+/// How the scope leg reaches systemd. Production uses `systemctl` on `PATH`,
+/// on Linux only ([`Self::system`]); tests point it at a script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeCtl {
+    pub systemctl: PathBuf,
+    /// Bound on each `systemctl` call.
+    pub timeout: Duration,
+    /// How long the scope gets to empty after its stop is queued.
+    pub grace: Duration,
+    /// How long it gets to empty after the `SIGKILL`.
+    pub kill_wait: Duration,
+    /// How often the scope's state is polled.
+    pub poll: Duration,
 }
 
-/// Leg 1: stop the recorded scope if it really exists. `Ok(())` when it was
-/// stopped, `Err(why)` when the caller must rely on the fallback legs.
-fn stop_scope(unit: &str) -> Result<(), String> {
-    if !cfg!(target_os = "linux") {
-        return Err("no systemd on this platform".to_string());
+impl ScopeCtl {
+    /// The system `systemctl`, or `None` where there is no systemd.
+    #[must_use]
+    pub fn system() -> Option<Self> {
+        cfg!(target_os = "linux").then(|| Self {
+            systemctl: PathBuf::from("systemctl"),
+            timeout: SCOPE_CMD_TIMEOUT,
+            grace: SCOPE_GRACE,
+            kill_wait: SCOPE_KILL_WAIT,
+            poll: Duration::from_millis(100),
+        })
     }
-    if !scope_is_loaded(unit) {
-        return Err(format!("scope unit {unit} is not loaded (it was never created)"));
+
+    /// Run `systemctl --user <args>`, bounded by `timeout`. `Some(ok, stdout)`
+    /// when it exited, `None` when it could not run or was killed.
+    fn run(&self, args: &[&str], timeout: Duration) -> Option<(bool, String)> {
+        let mut cmd = Command::new(&self.systemctl);
+        cmd.arg("--user").args(args);
+        run_bounded(cmd, timeout)
+            .map(|(ok, out)| (ok, String::from_utf8_lossy(&out).trim().to_string()))
     }
-    let mut cmd = Command::new("systemctl");
-    cmd.args(["--user", "stop", unit]);
-    match crate::sweep_registry::reaper::output_with_timeout(cmd, SCOPE_STOP_TIMEOUT) {
-        Ok(Some(out)) if out.status.success() => Ok(()),
-        Ok(Some(out)) => Err(format!(
-            "systemctl --user stop {unit} exited {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Ok(None) => Err(format!("systemctl --user stop {unit} timed out")),
-        Err(e) => Err(format!("systemctl --user stop {unit}: {e}")),
+
+    fn show(&self, unit: &str, property: &str, timeout: Duration) -> Option<String> {
+        let prop = format!("--property={property}");
+        match self.run(&["show", unit, &prop, "--value"], timeout) {
+            Some((true, value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Whether the scope has emptied: inactive or failed. A scope that has
+    /// been garbage-collected reads `inactive` too.
+    fn wait_empty(&self, unit: &str, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            // Each probe is bounded by what is left of the wait, so a wedged
+            // `systemctl` cannot stretch it.
+            let left = until
+                .saturating_duration_since(Instant::now())
+                .min(self.timeout)
+                .max(Duration::from_millis(200));
+            let state = self.show(unit, "ActiveState", left);
+            if matches!(state.as_deref(), Some("inactive" | "failed")) {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(self.poll);
+        }
+    }
+
+    /// Leg 1: stop the recorded scope if it really exists, without waiting on
+    /// systemd's stop job. `Ok(())` when the scope emptied, `Err(why)` when
+    /// the caller must rely on the fallback legs. Bounded: about
+    /// `3 * timeout + grace + kill_wait` with every call wedged, and
+    /// `grace + kill_wait` with a scope that ignores `SIGTERM`.
+    ///
+    /// # Errors
+    /// When the unit is not loaded, or did not empty in time.
+    pub fn stop(&self, unit: &str) -> Result<(), String> {
+        if self.show(unit, "LoadState", self.timeout).as_deref() != Some("loaded") {
+            return Err(format!("scope unit {unit} is not loaded (it was never created)"));
+        }
+        // systemd sends SIGTERM to every process in the cgroup. `--no-block`
+        // returns once the job is queued.
+        let queued =
+            matches!(self.run(&["stop", "--no-block", unit], self.timeout), Some((true, _)));
+        if queued && self.wait_empty(unit, self.grace) {
+            return Ok(());
+        }
+        // The grace is over: SIGKILL the whole cgroup ourselves.
+        let killed =
+            matches!(self.run(&["kill", "--signal=SIGKILL", unit], self.timeout), Some((true, _)));
+        if killed && self.wait_empty(unit, self.kill_wait) {
+            return Ok(());
+        }
+        Err(format!(
+            "scope unit {unit} did not empty within {}ms of its stop (stop {}, SIGKILL {})",
+            (self.grace + self.kill_wait).as_millis(),
+            if queued { "queued" } else { "failed" },
+            if killed { "sent" } else { "failed" }
+        ))
     }
 }
 
@@ -487,6 +564,18 @@ pub fn teardown_tree(spec: &TreeSpec, grace: Duration) -> TeardownReport {
 /// [`teardown_tree`] with an explicit process-table source.
 #[must_use]
 pub fn teardown_tree_with(spec: &TreeSpec, grace: Duration, source: &ProcSource) -> TeardownReport {
+    teardown_tree_full(spec, grace, source, ScopeCtl::system().as_ref())
+}
+
+/// [`teardown_tree_with`] with an explicit scope controller (`None`: no
+/// systemd, so the scope leg does not apply).
+#[must_use]
+pub fn teardown_tree_full(
+    spec: &TreeSpec,
+    grace: Duration,
+    source: &ProcSource,
+    scope: Option<&ScopeCtl>,
+) -> TeardownReport {
     let started = Instant::now();
     let mut report = TeardownReport::default();
     let finish = |mut report: TeardownReport| {
@@ -495,7 +584,9 @@ pub fn teardown_tree_with(spec: &TreeSpec, grace: Duration, source: &ProcSource)
     };
 
     if let Some(unit) = spec.scope_unit.as_deref() {
-        match stop_scope(unit) {
+        let stopped = scope
+            .map_or_else(|| Err("no systemd on this platform".to_string()), |ctl| ctl.stop(unit));
+        match stopped {
             Ok(()) => report.scope_stopped = true,
             Err(why) => report.scope_note = Some(why),
         }
