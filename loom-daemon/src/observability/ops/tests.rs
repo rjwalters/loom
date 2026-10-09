@@ -293,6 +293,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CodexSessionMountDrift,
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
+        MetricName::AgentScopePeakMemoryBytes,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }

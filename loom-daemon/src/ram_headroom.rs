@@ -73,6 +73,16 @@ pub fn per_worktree_ram_gb() -> u64 {
         .unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB)
 }
 
+/// The operator's explicit [`PER_WORKTREE_RAM_GB_ENV`] value, if set and valid
+/// (unlike [`per_worktree_ram_gb`], does not fall back to the default).
+#[must_use]
+pub fn env_per_worktree_ram_gb() -> Option<u64> {
+    std::env::var(PER_WORKTREE_RAM_GB_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+}
+
 /// Parse `MemAvailable` (in kB) from Linux `/proc/meminfo` contents.
 ///
 /// `/proc/meminfo` lines are `"<Key>:<spaces><value> kB\n"`. `MemAvailable` is
@@ -162,6 +172,246 @@ pub fn available_ram_gb() -> Option<u64> {
 pub fn ram_headroom(available_gb: u64, per_gb: u64) -> usize {
     let per = per_gb.max(1);
     usize::try_from(available_gb / per).unwrap_or(usize::MAX)
+}
+
+/// RAM headroom net of the in-flight sweeps' unrealised peaks (#11094):
+/// `floor((available - reserved) / charge)`, saturating at 0. Pure.
+#[must_use]
+pub fn ram_headroom_reserved(available_gb: u64, reserved_gb: u64, charge_gb: u64) -> usize {
+    ram_headroom(available_gb.saturating_sub(reserved_gb), charge_gb)
+}
+
+/// The RAM term of the total-concurrency cap. `additional` (see
+/// [`ram_headroom_reserved`]) already nets out the in-flight sweeps'
+/// reservations, so it counts only sweeps *beyond* the running ones; when
+/// `additive` it is added to `occupancy` so the dispatch comparison
+/// (`occupancy >= cap`) does not charge running work a second time. Otherwise
+/// it is the legacy total-cap figure (#11094). Saturating, so `usize::MAX`
+/// stays unbounded.
+#[must_use]
+pub fn ram_total_cap(additional: usize, occupancy: usize, additive: bool) -> usize {
+    if additive {
+        occupancy.saturating_add(additional)
+    } else {
+        additional
+    }
+}
+
+/// One workspace's per-sweep RAM charge (#11094).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCharge {
+    /// The repo key ([`crate::ram_peaks::repo_key`]) whose history set it.
+    pub repo: String,
+    pub gb: u64,
+    pub source: crate::ram_peaks::ChargeSource,
+}
+
+/// The per-tick RAM budget the multi-workspace dispatch loop debits (#11094):
+/// what is left of available memory after the live scopes' reservation, and
+/// each workspace's OWN charge (parallel to the tick's roots). A candidate is
+/// admitted only while its own repo's charge still fits, and each admission
+/// debits that charge — so one heavy repo's history defers that repo's work,
+/// never a small sibling's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RamBudget {
+    pub remaining_gb: u64,
+    pub charges: Vec<RepoCharge>,
+}
+
+impl RamBudget {
+    /// Workspace `idx`'s charge. A missing entry fails open (no charge).
+    #[must_use]
+    pub fn charge(&self, idx: usize) -> Option<&RepoCharge> {
+        self.charges.get(idx)
+    }
+
+    /// Whether workspace `idx`'s charge still fits the remaining budget.
+    #[must_use]
+    pub fn fits(&self, idx: usize) -> bool {
+        self.charge(idx).is_none_or(|c| c.gb <= self.remaining_gb)
+    }
+
+    /// Debit one admission of workspace `idx`, logging (INFO) which repo's
+    /// history set an observed charge.
+    pub fn debit(&mut self, idx: usize) {
+        let Some(c) = self.charges.get(idx) else {
+            return;
+        };
+        let before = self.remaining_gb;
+        self.remaining_gb = before.saturating_sub(c.gb);
+        if c.source == crate::ram_peaks::ChargeSource::Observed {
+            log::info!(
+                "ram_headroom: admitted a {} sweep at {}GB, charged from {}'s observed peak \
+                 history; RAM budget {before}GB -> {}GB",
+                c.repo,
+                c.gb,
+                c.repo,
+                self.remaining_gb
+            );
+        }
+    }
+
+    /// Why workspace `idx` was deferred, for the ready-queue row.
+    #[must_use]
+    pub fn deferral_detail(&self, idx: usize) -> String {
+        self.charge(idx).map_or_else(String::new, |c| {
+            format!(
+                "ram: {} charge {}GB ({}) exceeds remaining {}GB",
+                c.repo,
+                c.gb,
+                c.source.as_str(),
+                self.remaining_gb
+            )
+        })
+    }
+}
+
+/// Sample the live agent scopes (folding finished scopes' peaks into the repo
+/// history), then return the RAM term and per-repo budget for `roots` — the
+/// production tick entry point (#11094).
+#[must_use]
+pub fn ram_headroom_limit_tick(
+    pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
+    roots: &[std::path::PathBuf],
+) -> (usize, Option<RamBudget>) {
+    let (scopes, in_flight) = crate::ram_peaks::live_scopes(pool, roots);
+    crate::ram_peaks::record_tick(&scopes);
+    ram_headroom_limit_for(roots, &in_flight)
+}
+
+/// Pure RAM admission terms for `roots` (#11094), given `available_gb`, the
+/// peak `store`, the number of sweeps in flight in each root (`in_flight`,
+/// parallel to `roots`) and the env override.
+///
+/// Each root is charged by its OWN history ([`crate::ram_peaks::charge_gb`]):
+/// env override, else its observed high-water mark plus margin, else the flat
+/// default. The live scopes' unrealised peaks are reserved first.
+///
+/// - With no history for any root and nothing reserved this is exactly the
+///   legacy [`ram_headroom`] cap, and no budget.
+/// - Otherwise every in-flight sweep is accounted for exactly once before it
+///   is credited back into the cap: a sweep sampled with an expected peak
+///   ([`crate::ram_peaks::accounted_sweeps`]) by its live reservation, and any
+///   other — no scope yet, an unreadable cgroup, a repo with no history — by
+///   a full charge of its own repo, as if it had not started. The cap is then
+///   the in-flight total plus what still fits at the SMALLEST charge (so it
+///   never blocks a small repo on a heavy one's account), and the returned
+///   [`RamBudget`] defers and debits per candidate.
+#[must_use]
+pub fn ram_admission(
+    available_gb: u64,
+    store: &crate::ram_peaks::Store,
+    roots: &[std::path::PathBuf],
+    in_flight: &[usize],
+    env_gb: Option<u64>,
+) -> (usize, Option<RamBudget>) {
+    let occupancy: usize = in_flight.iter().sum();
+    use crate::ram_peaks::{self, ChargeSource};
+    let charges: Vec<RepoCharge> = roots
+        .iter()
+        .map(|r| {
+            let repo = ram_peaks::repo_key(r);
+            let observed = store
+                .repos
+                .get(&repo)
+                .and_then(|h| ram_peaks::high_water_bytes(h));
+            let (gb, source) = ram_peaks::charge_gb(env_gb, observed, DEFAULT_PER_WORKTREE_RAM_GB);
+            RepoCharge { repo, gb, source }
+        })
+        .collect();
+    let reserved_gb = ram_peaks::reserved_bytes(store).div_ceil(1024 * 1024 * 1024);
+    let flat = env_gb.unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB);
+    if reserved_gb == 0 && charges.iter().all(|c| c.source != ChargeSource::Observed) {
+        return (ram_headroom(available_gb, flat), None);
+    }
+    let reserved_gb = reserved_gb.saturating_add(unaccounted_gb(store, &charges, in_flight));
+    let min_charge = charges.iter().map(|c| c.gb).min().unwrap_or(flat);
+    let additional = ram_headroom_reserved(available_gb, reserved_gb, min_charge);
+    let budget = RamBudget {
+        remaining_gb: available_gb.saturating_sub(reserved_gb),
+        charges,
+    };
+    (ram_total_cap(additional, occupancy, true), Some(budget))
+}
+
+/// GB to hold back for the in-flight sweeps the live reservation does NOT
+/// account for (#11094): each root's lock count minus its sampled sweeps with
+/// an expected peak, each charged that root's own charge. A repo key's
+/// accounted sweeps are handed out once across roots sharing that key, so a
+/// sample is never credited twice.
+fn unaccounted_gb(
+    store: &crate::ram_peaks::Store,
+    charges: &[RepoCharge],
+    in_flight: &[usize],
+) -> u64 {
+    let mut accounted = crate::ram_peaks::accounted_sweeps(store);
+    charges
+        .iter()
+        .zip(in_flight)
+        .map(|(c, &n)| {
+            let pool = accounted.get_mut(&c.repo);
+            let covered = pool.map_or(0, |p| {
+                let take = (*p).min(n);
+                *p -= take;
+                take
+            });
+            u64::try_from(n - covered)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(c.gb)
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// Observed-history-aware RAM term and per-repo budget for the given
+/// workspace roots (#11094), where `in_flight` is the number of sweeps already
+/// in flight in each root; see [`ram_admission`]. Each repo's charge, its
+/// source, the reservation and the remaining budget are logged (INFO on
+/// change, DEBUG otherwise), so the log names the repo whose history set each
+/// charge.
+#[must_use]
+pub fn ram_headroom_limit_for(
+    roots: &[std::path::PathBuf],
+    in_flight: &[usize],
+) -> (usize, Option<RamBudget>) {
+    let occupancy: usize = in_flight.iter().sum();
+    use crate::ram_peaks;
+    let Some(available) = available_ram_gb() else {
+        return (ram_headroom_limit(), None);
+    };
+    let store = ram_peaks::store_path()
+        .map(|p| ram_peaks::load(&p))
+        .unwrap_or_default();
+    let (headroom, budget) =
+        ram_admission(available, &store, roots, in_flight, env_per_worktree_ram_gb());
+    let reserved_gb = ram_peaks::reserved_bytes(&store).div_ceil(1024 * 1024 * 1024);
+    let charges = budget.as_ref().map_or_else(
+        || "flat".to_string(),
+        |b| {
+            b.charges
+                .iter()
+                .map(|c| format!("{}:{}GB({})", c.repo, c.gb, c.source.as_str()))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let remaining = budget.as_ref().map_or(available, |b| b.remaining_gb);
+    let line = format!(
+        "ram_headroom: charges=[{charges}] in_flight_reservation={reserved_gb}GB \
+         available={available}GB remaining={remaining}GB in_flight={occupancy} \
+         headroom={headroom}"
+    );
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let key = format!("{charges}/{reserved_gb}/{headroom}");
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.as_deref() == Some(key.as_str()) {
+        log::debug!("{line}");
+    } else {
+        log::info!("{line}");
+        *last = Some(key);
+    }
+    (headroom, budget)
 }
 
 /// Resolve the RAM-headroom concurrency bound for the current host: the
@@ -256,6 +506,221 @@ mod tests {
     #[test]
     fn test_ram_headroom_per_gb_zero_treated_as_one() {
         assert_eq!(ram_headroom(5, 0), 5);
+    }
+
+    // ===================================================================
+    // ram_headroom_reserved — #11094 in-flight reservation
+    // ===================================================================
+
+    #[test]
+    fn test_ram_headroom_reserved_blocks_second_admission() {
+        // 13 GB repo peak (charge 15 with margin), 30 GB host, one sweep
+        // running at 4 GB so far: available 26, reservation 9 -> 17 / 15 = 1,
+        // and with 11 GB already realised elsewhere (available 19): 10/15 = 0.
+        assert_eq!(ram_headroom_reserved(26, 9, 15), 1);
+        assert_eq!(ram_headroom_reserved(19, 9, 15), 0);
+    }
+
+    #[test]
+    fn test_ram_total_cap_does_not_charge_running_sweeps_twice() {
+        // available 26, reservation 9, charge 15 -> one more sweep fits.
+        let additional = ram_headroom_reserved(26, 9, 15);
+        // One sweep already running: the cap is 1 + 1 = 2, so the dispatch
+        // comparison `occupancy >= cap` (1 >= 2) admits the second sweep ...
+        let cap = ram_total_cap(additional, 1, true);
+        assert_eq!(cap, 2);
+        assert!(crate::work_finder::resolve_dynamic_max_concurrent(usize::MAX, cap, 4) > 1);
+        // ... and not a third (2 >= 2).
+        assert_eq!(ram_total_cap(ram_headroom_reserved(19, 9, 15), 2, true), 2);
+        // Legacy figure is passed through untouched; usize::MAX stays unbounded.
+        assert_eq!(ram_total_cap(3, 5, false), 3);
+        assert_eq!(ram_total_cap(usize::MAX, 5, true), usize::MAX);
+    }
+
+    // ===================================================================
+    // ram_admission / RamBudget — #11094 per-repo charge
+    // ===================================================================
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn roots() -> Vec<std::path::PathBuf> {
+        vec!["/w/heavy".into(), "/w/small".into()]
+    }
+
+    #[test]
+    fn test_ram_admission_charges_each_repo_its_own_history() {
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        // 14 GB available, nothing running: the heavy repo's 15 GB charge
+        // must not zero the cap for the small repo (2 GB default).
+        let (cap, budget) = ram_admission(14, &store, &roots(), &[0, 0], None);
+        let b = budget.unwrap();
+        assert_eq!(cap, 7, "cap is set by the smallest charge, not the largest");
+        assert_eq!((b.charges[0].gb, b.charges[1].gb), (15, 2));
+        assert_eq!(b.charges[0].repo, "heavy");
+        assert!(!b.fits(0), "heavy: 15 > 14");
+        assert!(b.fits(1), "small: 2 <= 14");
+        assert!(b
+            .deferral_detail(0)
+            .contains("heavy charge 15GB (observed)"));
+    }
+
+    #[test]
+    fn test_ram_budget_debits_each_admission() {
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        let (_, budget) = ram_admission(20, &store, &roots(), &[0, 0], None);
+        let mut b = budget.unwrap();
+        assert!(b.fits(0));
+        b.debit(0); // 20 - 15 = 5
+        assert_eq!(b.remaining_gb, 5);
+        assert!(!b.fits(0), "a second heavy sweep no longer fits");
+        b.debit(1);
+        b.debit(1);
+        assert_eq!(b.remaining_gb, 1);
+        assert!(!b.fits(1));
+        b.debit(1);
+        assert_eq!(b.remaining_gb, 0, "saturates");
+        assert!(b.fits(9), "an unseeded index fails open");
+    }
+
+    #[test]
+    fn test_ram_admission_reserves_live_scopes_host_wide() {
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("small".into(), vec![3 * GIB]);
+        // A role agent with no issue lock, in `small`, at 1 of its 3 GB.
+        store.inflight.insert(
+            "loom-agent-9-9.scope".into(),
+            crate::ram_peaks::InFlight {
+                repo: "small".into(),
+                issue: None,
+                peak_bytes: GIB,
+                current_bytes: GIB,
+            },
+        );
+        let (cap, budget) = ram_admission(10, &store, &roots(), &[0, 0], None);
+        let b = budget.unwrap();
+        assert_eq!(b.remaining_gb, 8, "10 available - 2 reserved");
+        // small is charged 3 + 10% -> 4; heavy has no history -> 2.
+        assert_eq!((b.charges[0].gb, b.charges[1].gb), (2, 4));
+        assert_eq!(cap, 4);
+    }
+
+    #[test]
+    fn test_ram_admission_no_history_is_the_legacy_flat_cap() {
+        let store = crate::ram_peaks::Store::default();
+        assert_eq!(ram_admission(21, &store, &roots(), &[3, 0], None), (10, None));
+        assert_eq!(ram_admission(21, &store, &roots(), &[3, 0], Some(4)), (5, None));
+    }
+
+    fn sweep(repo: &str, issue: u32, current: u64) -> crate::ram_peaks::InFlight {
+        crate::ram_peaks::InFlight {
+            repo: repo.into(),
+            issue: Some(issue),
+            peak_bytes: current,
+            current_bytes: current,
+        }
+    }
+
+    #[test]
+    fn test_ram_admission_unsampled_sweeps_are_not_credited_for_free() {
+        // The Judge's counterexample: 28 GB available, three heavy sweeps in
+        // flight with no scope stamped yet (nothing in `inflight`), heavy's
+        // observed charge 15 GB. Crediting all three back gave 3 + 1 = 4 and
+        // a budget that admitted a fourth. Each unsampled sweep is now charged
+        // its repo's 15 GB, so nothing is left: cap == occupancy, no admission.
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        let (cap, budget) = ram_admission(28, &store, &roots(), &[3, 0], None);
+        let b = budget.unwrap();
+        assert_eq!(cap, 3, "no room beyond the three running sweeps");
+        assert_eq!(b.remaining_gb, 0, "28 - 3 x 15 saturates");
+        assert!(!b.fits(0), "a fourth heavy sweep is deferred");
+        assert!(!b.fits(1), "and so is a small one: the host is spoken for");
+        // Legacy (flat 2 GB) would give floor(28 / 2) = 14 >= 3 here; the
+        // observed-history path is now the more conservative of the two.
+        let legacy = ram_headroom(28, DEFAULT_PER_WORKTREE_RAM_GB);
+        assert!(cap <= legacy);
+    }
+
+    #[test]
+    fn test_ram_admission_unreadable_cgroup_is_charged_like_no_scope() {
+        // A stamped scope whose cgroup files cannot be read is skipped by
+        // `observe`, so it never reaches `inflight` and must be charged.
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        let live = vec![crate::ram_peaks::LiveScope {
+            scope: "loom-agent-1-1.scope".into(),
+            repo: "heavy".into(),
+            issue: Some(1),
+        }];
+        crate::ram_peaks::observe(&mut store, &live, |_| None);
+        assert!(store.inflight.is_empty());
+        let (cap, budget) = ram_admission(28, &store, &roots(), &[1, 0], None);
+        let b = budget.unwrap();
+        assert_eq!(b.remaining_gb, 13, "28 - the unsampled sweep's 15 GB");
+        assert_eq!(cap, 1 + 6, "one running + floor(13 / 2) at small's charge");
+        assert!(!b.fits(0), "15 > 13: no second heavy sweep");
+    }
+
+    #[test]
+    fn test_ram_admission_sampled_sweep_is_credited_with_its_reservation() {
+        // One heavy sweep sampled at 5 GB of its 13 GB high-water mark: it
+        // reserves 8 GB and is credited back, with no second, flat charge.
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        store
+            .inflight
+            .insert("s1".into(), sweep("heavy", 1, 5 * GIB));
+        let (cap, budget) = ram_admission(28, &store, &["/w/heavy".into()], &[1], None);
+        let b = budget.unwrap();
+        assert_eq!(b.remaining_gb, 20, "28 - 8 reserved, not also - 15");
+        assert_eq!(cap, 1 + 1, "the running sweep + floor(20 / 15)");
+        assert!(b.fits(0));
+    }
+
+    #[test]
+    fn test_ram_admission_mixes_sampled_unsampled_and_default_repos() {
+        // heavy: one sweep sampled at 5 GB (reserves 8) and one unsampled
+        // (charged 15). small has no history: its two sampled sweeps have no
+        // expected peak, so each is charged the 2 GB default, like legacy.
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        store
+            .inflight
+            .insert("h1".into(), sweep("heavy", 1, 5 * GIB));
+        store.inflight.insert("s1".into(), sweep("small", 2, GIB));
+        store.inflight.insert("s2".into(), sweep("small", 3, GIB));
+        let (cap, budget) = ram_admission(40, &store, &roots(), &[2, 2], None);
+        let b = budget.unwrap();
+        assert_eq!(b.remaining_gb, 40 - 8 - 15 - 2 * 2);
+        assert_eq!(cap, 4 + 13 / 2, "four running + floor(13 / 2)");
+        assert!(!b.fits(0), "heavy: 15 > 13");
+        assert!(b.fits(1), "small: 2 <= 13");
+    }
+
+    #[test]
+    fn test_ram_admission_hands_a_shared_repo_keys_samples_out_once() {
+        // Two roots with the same key and one sampled sweep between them: the
+        // sample covers one lock, never both.
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        store
+            .inflight
+            .insert("h1".into(), sweep("heavy", 1, 13 * GIB));
+        let both: Vec<std::path::PathBuf> = vec!["/a/heavy".into(), "/b/heavy".into()];
+        let (_, budget) = ram_admission(30, &store, &both, &[1, 1], None);
+        assert_eq!(budget.unwrap().remaining_gb, 15, "30 - 0 reserved - 15 unsampled");
+    }
+
+    #[test]
+    fn test_ram_headroom_reserved_no_history_equals_flat() {
+        assert_eq!(ram_headroom_reserved(21, 0, 2), ram_headroom(21, 2));
+    }
+
+    #[test]
+    fn test_ram_headroom_reserved_saturates_at_zero() {
+        assert_eq!(ram_headroom_reserved(5, 50, 2), 0);
     }
 
     // ===================================================================
