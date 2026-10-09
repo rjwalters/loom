@@ -403,12 +403,22 @@ impl PeerClaimView {
     /// [`PEER_PRLESS_STREAK_TTL`] for why collapsing them into one clock would
     /// hand the tally straight back to the per-host behaviour #9292 removes.
     ///
-    /// Returns `true` when applied, `false` when ignored as this host's own ad
-    /// — the identical self-claim recognition [`Self::observe_noop_cooldown_at`]
-    /// applies, `UNKNOWN_HOST` carve-out included. Ignoring our own ad is what
-    /// keeps the sum in [`Self::prless_peer_release_count_at`] disjoint from
-    /// the caller's local tally: counting it in both places would double every
-    /// release this host recorded and trip the hold at half the threshold.
+    /// Returns `true` when applied, `false` when ignored as this host's own ad.
+    /// Ignoring our own ad is what keeps the sum in
+    /// [`Self::prless_peer_release_count_at`] disjoint from the caller's local
+    /// tally: counting it in both places would double every release this host
+    /// recorded and trip the hold at half the threshold.
+    ///
+    /// **Unresolved identity (Issue #9518).** The #5063 `UNKNOWN_HOST`
+    /// carve-out ("treat it as a peer, never as self") is correct for the
+    /// window lanes, whose worst case is a harmless extra backoff. This lane
+    /// also stores a *count that gets summed*, and an unresolved sender cannot
+    /// prove its count is disjoint from ours (when both sides are
+    /// `UNKNOWN_HOST` it is very likely our own echoed ad). So an
+    /// `UNKNOWN_HOST` ad keeps its conservative backoff window (and streak
+    /// clock) but contributes `0` to the additive peer tally, whatever the
+    /// receiver's identity. Unidentified senders thus degrade the tally to the
+    /// exact local count plus any identifiable peers.
     ///
     /// A missing/zero `consecutive` (a pre-#9292 peer or a malformed payload)
     /// contributes `0` and a missing/zero `remaining_secs` degrades to
@@ -420,12 +430,18 @@ impl PeerClaimView {
         if ad.host == self.self_host && !is_unresolved_identity {
             return false; // our own releases are already in our local tally
         }
+        // Unresolved senders keep the window but add nothing to the sum (#9518).
+        let consecutive = if is_unresolved_identity {
+            0
+        } else {
+            ad.consecutive.unwrap_or(0)
+        };
         let window =
             Duration::from_secs(ad.remaining_secs.unwrap_or(0)).min(MAX_PEER_PRLESS_RELEASE_TTL);
         self.prless_releases.insert(
             (ad.repo.clone(), ad.issue, ad.host.clone()),
             PeerPrlessRelease {
-                consecutive: ad.consecutive.unwrap_or(0),
+                consecutive,
                 window_expiry: now + window,
                 streak_expiry: now + window.max(PEER_PRLESS_STREAK_TTL),
             },
@@ -967,21 +983,29 @@ mod tests {
     /// This host's own ad is ignored — which is what keeps the peer sum
     /// disjoint from the caller's local tally. Counting it in both places
     /// would double every release and trip the hold at half the threshold.
-    /// The `UNKNOWN_HOST` carve-out still applies, as in every other lane.
+    /// An `UNKNOWN_HOST` ad keeps its window but adds zero to the tally
+    /// (Issue #9518), whatever the receiver's identity.
     #[test]
-    fn a_hosts_own_prless_ad_is_ignored_but_unknown_host_is_not() {
+    fn a_hosts_own_prless_ad_is_ignored_and_unknown_host_counts_zero() {
         let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
         let t = Instant::now();
         assert!(!view.observe_prless_release_at(&prless_ad("A", 8812, 3, 600), t));
         assert_eq!(view.prless_peer_release_count_at("rjwalters/loom", 8812, t), 0);
 
-        let mut unresolved = PeerClaimView::new(
-            crate::sweep_registry::UNKNOWN_HOST.to_string(),
-            Duration::from_secs(120),
-        );
-        let ad = prless_ad(crate::sweep_registry::UNKNOWN_HOST, 8812, 1, 600);
-        assert!(unresolved.observe_prless_release_at(&ad, t));
-        assert_eq!(unresolved.prless_peer_release_count_at("rjwalters/loom", 8812, t), 1);
+        let unknown = crate::sweep_registry::UNKNOWN_HOST;
+        for self_host in [unknown, "A"] {
+            let mut v = PeerClaimView::new(self_host.to_string(), Duration::from_secs(120));
+            let ad = prless_ad(unknown, 8812, 2, 600);
+            assert!(v.observe_prless_release_at(&ad, t));
+            assert_eq!(v.prless_peer_release_count_at("rjwalters/loom", 8812, t), 0);
+            // Window stays conservative.
+            assert!(v
+                .prless_release_issues_at("rjwalters/loom", t)
+                .contains(&8812));
+            // A known peer still adds its own count alongside.
+            v.observe_prless_release_at(&prless_ad("B", 8812, 2, 600), t);
+            assert_eq!(v.prless_peer_release_count_at("rjwalters/loom", 8812, t), 2);
+        }
     }
 
     /// A lapsed entry stops counting — the fleet-wide form of the local
