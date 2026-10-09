@@ -108,6 +108,7 @@ pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
 pub mod explain;
+pub mod explain_read;
 pub mod explanation;
 pub mod fit;
 pub mod flag_timeline;

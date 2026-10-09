@@ -550,7 +550,7 @@ pub(super) fn resolve_scope(flag: Option<&str>, root: &Path) -> Result<HistorySc
 
 /// Parse `owner/repo#issue` (the `eta view` positional argument) into its
 /// `owner/repo` slug and issue number.
-fn parse_story(story: &str) -> Result<(String, u32)> {
+pub(super) fn parse_story(story: &str) -> Result<(String, u32)> {
     let (repo, issue) = story
         .rsplit_once('#')
         .ok_or_else(|| anyhow::anyhow!("expected OWNER/NAME#ISSUE, got {story:?}"))?;
@@ -888,36 +888,47 @@ pub(crate) struct EtaViewArgs {
     pub scope: Option<String>,
 }
 
+/// The live, current-heuristic explanation of `repo#issue` for every eligible
+/// kind: what `eta view --explain` prints, and what `eta explain owner/repo#N`
+/// reuses (#10930). Reads the forge through `gh` and the local journals.
+pub(super) fn live_explanations(
+    root: &Path,
+    repo: &str,
+    issue: u32,
+    scope_flag: Option<&str>,
+) -> Result<Vec<Explanation>> {
+    let now = Utc::now();
+    let Some(issue_labels) = fetch_issue_labels(root, repo, issue) else {
+        bail!("could not read issue {repo}#{issue} (gh issue view did not answer)");
+    };
+    let pr = fetch_open_pr(root, repo, issue);
+    let pr_labels: Option<Vec<String>> = pr.as_ref().map(|(_, labels, _)| labels.clone());
+    let pr_updated_at = pr.as_ref().and_then(|(_, _, at)| *at);
+    let pr_number = pr.as_ref().map(|(n, _, _)| *n);
+
+    let current =
+        resolve_current(root, issue, pr_labels.as_deref(), pr_updated_at, &issue_labels, now);
+
+    let mut subject = Subject::new(repo, resolve_repo_id(root, repo), issue);
+    subject.pr_number = pr_number;
+
+    let scope = resolve_scope(scope_flag, root)?;
+    Ok(explain_current(
+        root,
+        &subject,
+        &current,
+        &issue_labels,
+        pr_number.is_some(),
+        now,
+        scope,
+    ))
+}
+
 impl EtaViewArgs {
     pub(crate) fn run(self) -> Result<()> {
         let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
         let (repo, issue) = parse_story(&self.story)?;
-        let now = Utc::now();
-
-        let Some(issue_labels) = fetch_issue_labels(&root, &repo, issue) else {
-            bail!("could not read issue {repo}#{issue} (gh issue view did not answer)");
-        };
-        let pr = fetch_open_pr(&root, &repo, issue);
-        let pr_labels: Option<Vec<String>> = pr.as_ref().map(|(_, labels, _)| labels.clone());
-        let pr_updated_at = pr.as_ref().and_then(|(_, _, at)| *at);
-        let pr_number = pr.as_ref().map(|(n, _, _)| *n);
-
-        let current =
-            resolve_current(&root, issue, pr_labels.as_deref(), pr_updated_at, &issue_labels, now);
-
-        let mut subject = Subject::new(&repo, resolve_repo_id(&root, &repo), issue);
-        subject.pr_number = pr_number;
-
-        let scope = resolve_scope(self.scope.as_deref(), &root)?;
-        let explanations = explain_current(
-            &root,
-            &subject,
-            &current,
-            &issue_labels,
-            pr_number.is_some(),
-            now,
-            scope,
-        );
+        let explanations = live_explanations(&root, &repo, issue, self.scope.as_deref())?;
 
         if self.explain {
             let value = if explanations.len() == 1 {

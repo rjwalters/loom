@@ -2652,9 +2652,27 @@ accepts `--repo-root PATH` (default: the current directory).
   per-stage breakdown and each input's marginal `Δp50` / `Δp90` (perturbed one at
   a time, deterministic seed). With `--diff` it swaps each changed input from the
   first estimate into the second and ranks them by `|Δp50|`, printing the
-  non-additive residual (#10930). Runs anywhere; reads no live state. Explain by
-  `estimate_id` from SigNoz, a live `repo#N`, and the hindsight
-  `loom.eta.input_error.*` outcome attributes are later slices of #10930.
+  non-additive residual (#10930). Runs anywhere; reads no live state.
+- **`loom-daemon eta explain <ESTIMATE_ID | OWNER/REPO#N> [--signoz | --from-file F] [--at T] [--kind K] [--heuristic H] [--lookback-days N] [--json]`**
+  — the same report with the explanation fetched instead of exported (#10930
+  slice 2).
+  - `<ESTIMATE_ID> --signoz` reads the **emitted** `eta.estimate` body back by
+    `loom.eta.estimate_id` (`explain_read::ESTIMATE_SQL`, through the in-sweep
+    snapshot's `SignozRead` transport: `--endpoint` / `--user` /
+    `--credential-file`, defaulting to `autonomous.eta.fleetRefresh.signoz`).
+    `--from-file F` reads a `clickhouse-client` `JSONEachRow` export of the same
+    query instead.
+  - `OWNER/REPO#N` alone computes the live estimate for every eligible kind
+    exactly as `eta view --explain` does (`--kind` / `--heuristic` filter it).
+  - `OWNER/REPO#N --at T --signoz` returns, per kind, the **newest emitted**
+    estimate with `as_of <= T`. This is a lookup of what the `fleet.etaAuthority`
+    host emitted, **not a recompute as of T**: the history at T cannot be rebuilt
+    locally without walk-forward fits, so `--at` is refused without `--signoz` /
+    `--from-file`, and answers "none" when nothing had been emitted by T. It
+    looks back `--lookback-days` (default 14) from T; a window with more than
+    2000 matching rows is refused rather than answered from a partial read.
+  The hindsight `loom.eta.input_error.*` outcome attributes remain a later
+  slice of #10930.
 - **`loom-daemon eta backtest --heuristic ID [--compare ID] [--since RFC3339] [--json]`**
   — leak-free replay of a heuristic against real `sweep.outcome` history: mean
   pinball loss, p25–p75 coverage and bias, stability of the predicted landing

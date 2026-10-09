@@ -412,8 +412,12 @@ impl SignozRead for FileRows {
             .rows
             .iter()
             .filter(|(cursor, repo, _)| {
-                repo.as_deref()
-                    .is_some_and(|r| r.eq_ignore_ascii_case(&query.repo))
+                // An empty `repo` selects every repo: only the by-id explain
+                // reader (#10930) asks that; the walks always name one.
+                (query.repo.is_empty()
+                    || repo
+                        .as_deref()
+                        .is_some_and(|r| r.eq_ignore_ascii_case(&query.repo)))
                     && cursor.0 >= since
                     && cursor.0 <= until
                     && query.after.as_ref().is_none_or(|after| cursor > after)
@@ -476,6 +480,20 @@ impl ClickhouseHttp {
     ///
     /// The endpoint is not an `http(s)` URL.
     pub fn url(&self, query: &PageQuery) -> Result<reqwest::Url, ReadError> {
+        self.url_with(query, &[])
+    }
+
+    /// [`Self::url`] plus `extra` bound parameters (`param_<name>`), for a
+    /// query that selects on more than a page position (#10930).
+    ///
+    /// # Errors
+    ///
+    /// The endpoint is not an `http(s)` URL.
+    pub fn url_with(
+        &self,
+        query: &PageQuery,
+        extra: &[(&'static str, String)],
+    ) -> Result<reqwest::Url, ReadError> {
         let mut url = reqwest::Url::parse(&self.endpoint)
             .map_err(|e| ReadError::Unavailable(format!("invalid endpoint: {e}")))?;
         if !matches!(url.scheme(), "http" | "https") {
@@ -485,6 +503,9 @@ impl ClickhouseHttp {
             let mut pairs = url.query_pairs_mut();
             for (name, value) in query.params() {
                 pairs.append_pair(&format!("param_{name}"), &value);
+            }
+            for (name, value) in extra {
+                pairs.append_pair(&format!("param_{name}"), value);
             }
         }
         Ok(url)
@@ -506,7 +527,21 @@ impl ClickhouseHttp {
     ///
     /// The backend is unreachable or answered with an error status.
     pub fn post(&self, sql: &'static str, query: &PageQuery) -> Result<String, ReadError> {
-        let url = self.url(query)?;
+        self.post_with(sql, query, &[])
+    }
+
+    /// [`Self::post`] with `extra` bound parameters (see [`Self::url_with`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend is unreachable or answered with an error status.
+    pub fn post_with(
+        &self,
+        sql: &'static str,
+        query: &PageQuery,
+        extra: &[(&'static str, String)],
+    ) -> Result<String, ReadError> {
+        let url = self.url_with(query, extra)?;
         let password = self.password()?;
         let user = self.user.clone();
         let timeout = self.timeout;

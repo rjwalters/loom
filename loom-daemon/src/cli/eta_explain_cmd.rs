@@ -4,7 +4,15 @@
 //! input's marginal contribution, and with `--diff` which inputs moved the
 //! p50 between two estimates.
 //!
-//! Read-only and offline: it reads an explanation export (one
+//! Slice 2 adds the explanation's *source* (#10930): `eta explain <estimate_id>
+//! --signoz` reads the emitted body back by `loom.eta.estimate_id`;
+//! `eta explain owner/repo#N [--kind K] [--heuristic H]` computes the live
+//! estimate the way `eta view --explain` does; and with `--at T` (needs
+//! `--signoz` / `--from-file`) it returns the newest **emitted** estimate with
+//! `as_of <= T` — a lookup, never a recompute (see
+//! [`loom_daemon::eta::explain_read`]).
+//!
+//! Read-only: with `--file` it is offline and reads an explanation export (one
 //! `eta-explanation/v1` JSON object per line, the format
 //! `fleet_agreement::parse_explanations` reads, or one pretty-printed
 //! object) and runs anywhere. The pure core is
@@ -14,22 +22,81 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Duration, Utc};
 
 use loom_daemon::eta::explain::{self, Diff, ExplainReport, Parity};
+use loom_daemon::eta::explain_read::{self, ExplainHttp, Selector};
 use loom_daemon::eta::explanation::Explanation;
 use loom_daemon::eta::fleet_agreement::parse_explanations;
+use loom_daemon::eta::fleet_signoz_refresh::{ClickhouseHttp, FileRows, SignozRead};
 use loom_daemon::eta::simulate::run_explanation;
+use loom_daemon::eta::Kind;
 
 #[derive(clap::Args)]
 pub(crate) struct EtaExplainArgs {
     /// An explanation export: one `eta-explanation/v1` JSON object per line,
     /// or a single JSON object.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["target", "signoz", "from_file"])]
+    pub file: Option<PathBuf>,
+
+    /// What to explain without `--file`: an `estimate_id` (read back from
+    /// SigNoz with `--signoz`, or an export with `--from-file`), or
+    /// `owner/repo#N` (live, as `eta view --explain`; or the newest emitted
+    /// estimate with `--signoz` / `--from-file`).
+    #[arg(value_name = "ESTIMATE_ID | OWNER/REPO#N")]
+    pub target: Option<String>,
+
+    /// Read the emitted `eta.estimate` body from SigNoz's ClickHouse.
+    #[arg(long, requires = "target")]
+    pub signoz: bool,
+
+    /// Read emitted estimates from a `clickhouse-client` `JSONEachRow` export
+    /// of `explain_read::ESTIMATE_SQL` instead of a live backend.
+    #[arg(long, value_name = "PATH", requires = "target")]
+    pub from_file: Option<PathBuf>,
+
+    /// ClickHouse HTTP endpoint (default `autonomous.eta.fleetRefresh.signoz.endpoint`).
+    #[arg(long, value_name = "URL", requires = "signoz")]
+    pub endpoint: Option<String>,
+
+    /// ClickHouse user (default from the same config block).
+    #[arg(long, value_name = "USER", requires = "signoz")]
+    pub user: Option<String>,
+
+    /// Owner-only ClickHouse password file (default from the same config block).
+    #[arg(long, value_name = "PATH", requires = "signoz")]
+    pub credential_file: Option<PathBuf>,
+
+    /// With `owner/repo#N`: the newest EMITTED estimate with `as_of <= T`
+    /// (RFC 3339). A lookup of what the authority emitted, not a recompute as
+    /// of T.
+    #[arg(long, value_name = "RFC3339")]
+    pub at: Option<String>,
+
+    /// With `owner/repo#N`: only this kind (`start` | `finish` | `land`).
+    #[arg(long, value_name = "KIND")]
+    pub kind: Option<String>,
+
+    /// With `owner/repo#N`: only this heuristic id.
+    #[arg(long, value_name = "ID")]
+    pub heuristic: Option<String>,
+
+    /// How far before `--at` (or now) to look for emitted estimates.
+    #[arg(long, value_name = "DAYS", default_value_t = 14)]
+    pub lookback_days: u32,
+
+    /// Directory whose `.loom/` config and journals to read, and to run `gh`
+    /// from for a live `owner/repo#N`. Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
-    pub file: PathBuf,
+    pub repo_root: Option<PathBuf>,
+
+    /// Live history scope (`local` | `augment` | `fleet`), as `eta view --scope`.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: Option<String>,
 
     /// A second export: explain what moved the p50 from `--file`'s estimate
     /// to this one's.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", requires = "file")]
     pub diff: Option<PathBuf>,
 
     /// Pick this estimate id out of `--file` (needed with `--diff` when the
@@ -71,6 +138,19 @@ fn load(path: &Path) -> Result<Vec<Explanation>> {
     Ok(out)
 }
 
+fn parse_at(raw: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| anyhow::anyhow!("invalid --at {raw:?}: {e}"))
+}
+
+fn parse_kind(raw: &str) -> Result<Kind> {
+    [Kind::Start, Kind::Finish, Kind::Land]
+        .into_iter()
+        .find(|k| k.as_str() == raw)
+        .with_context(|| format!("invalid --kind {raw:?} (start | finish | land)"))
+}
+
 /// The one explanation `id` names, or the only one there is.
 fn pick(all: Vec<Explanation>, id: Option<&str>, what: &str) -> Result<Explanation> {
     if let Some(id) = id {
@@ -88,8 +168,115 @@ fn pick(all: Vec<Explanation>, id: Option<&str>, what: &str) -> Result<Explanati
 }
 
 impl EtaExplainArgs {
+    /// The explanations `--file` or the target selects.
+    fn source(&self) -> Result<Vec<Explanation>> {
+        if let Some(file) = &self.file {
+            return load(file);
+        }
+        let Some(target) = self.target.as_deref() else {
+            bail!("name what to explain: --file F, an estimate id, or owner/repo#N");
+        };
+        let emitted = self.signoz || self.from_file.is_some();
+        let root = super::eta_fleet_cmd::resolve_root(self.repo_root.clone());
+        let at = self.at.as_deref().map(parse_at).transpose()?;
+        let kind = self.kind.as_deref().map(parse_kind).transpose()?;
+        let subject = target.contains('#');
+        if !subject && (self.kind.is_some() || self.heuristic.is_some() || self.at.is_some()) {
+            bail!(
+                "--kind / --heuristic / --at select among a subject's estimates; give owner/repo#N"
+            );
+        }
+        if !emitted {
+            if !subject {
+                bail!("an estimate id is read back from SigNoz: add --signoz (or --from-file F)");
+            }
+            if at.is_some() {
+                bail!(
+                    "--at returns the newest emitted estimate, which only SigNoz holds: add \
+                     --signoz (or --from-file F); the live path cannot rebuild the past"
+                );
+            }
+            let (repo, issue) = super::eta_cmd::parse_story(target)?;
+            let mut all =
+                super::eta_cmd::live_explanations(&root, &repo, issue, self.scope.as_deref())?;
+            all.retain(|e| {
+                kind.is_none_or(|k| e.kind == k)
+                    && self.heuristic.as_deref().is_none_or(|h| e.heuristic == h)
+            });
+            if all.is_empty() {
+                bail!("no live estimate for {target} matches --kind / --heuristic");
+            }
+            return Ok(all);
+        }
+        let selector = if subject {
+            let (repo, issue) = super::eta_cmd::parse_story(target)?;
+            Selector {
+                repo: Some(repo),
+                issue: Some(issue),
+                kind,
+                heuristic: self.heuristic.clone(),
+                at,
+                ..Selector::default()
+            }
+        } else {
+            Selector {
+                estimate_id: Some(target.to_string()),
+                ..Selector::default()
+            }
+        };
+        let now = Utc::now();
+        let (since, until) = if subject {
+            let end = at.unwrap_or(now);
+            (end - Duration::days(i64::from(self.lookback_days)), now)
+        } else {
+            (DateTime::<Utc>::UNIX_EPOCH, now)
+        };
+        let mut reader: Box<dyn SignozRead> = match &self.from_file {
+            Some(path) => Box::new(FileRows::read(path).map_err(anyhow::Error::msg)?),
+            None => {
+                let configured = loom_daemon::eta::config::read(&root).fleet_refresh.signoz;
+                let Some(endpoint) = self.endpoint.clone().or(configured.endpoint) else {
+                    bail!(
+                        "no SigNoz source: pass --endpoint or --from-file, or configure \
+                         autonomous.eta.fleetRefresh.signoz.endpoint"
+                    );
+                };
+                Box::new(ExplainHttp {
+                    http: ClickhouseHttp {
+                        endpoint,
+                        user: self.user.clone().or(configured.user),
+                        credential_file: self
+                            .credential_file
+                            .clone()
+                            .or(configured.credential_file),
+                        timeout: std::time::Duration::from_secs(60),
+                    },
+                    selector: selector.clone(),
+                })
+            }
+        };
+        let found = explain_read::read(reader.as_mut(), &selector, since, until)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let found = if subject {
+            explain_read::newest_per_kind(found)
+        } else {
+            found
+        };
+        if found.is_empty() {
+            match at {
+                Some(t) => bail!(
+                    "no estimate for {target} was emitted with as_of <= {} (looked back {} days)",
+                    t.to_rfc3339(),
+                    self.lookback_days
+                ),
+                None => bail!("no emitted estimate matches {target}"),
+            }
+        }
+        Ok(found)
+    }
+
     pub(crate) fn run(self) -> Result<()> {
-        let a = load(&self.file)?;
+        let a = self.source()?;
         if let Some(path) = &self.diff {
             let a = pick(a, self.id.as_deref(), "--file")?;
             let b = pick(load(path)?, self.diff_id.as_deref(), "--diff")?;
