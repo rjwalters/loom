@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 /// must be added here *and* its job registered.
 const OWNING_FILES: &[&str] = &[
     "ci_telemetry/mod.rs",
+    "fleet_alert/output_feed.rs",
     "intake_reconcile/singleton.rs",
     "observability/captain_gauges.rs",
     "observability/eta_fleet_refresh.rs",

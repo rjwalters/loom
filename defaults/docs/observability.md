@@ -559,7 +559,9 @@ which SigNoz does not hold), so an estimate outage older than the window is
 left to the in-daemon path. `signoz_fleet_singleton_output_alert.rs` asserts
 each embedded deadline equals the registry's. Captain-gauge rows (a
 fleet-store heartbeat, not a log kind) and the Warning `ci.run` row are not in
-this critical rule. The in-daemon `fleet_alert` path is #10924.
+this critical rule. The in-daemon path (captain only, all rows including the
+gauges, absent data firing) is in `daemon-reference.md` under
+`autonomous.fleetAlert`.
 
 **Subscription quota utilization (#9005).** The per-account `tokens.snapshot`
 gauges carry both Claude limit windows: `loom.tokens.usage_fraction` (5-hour)

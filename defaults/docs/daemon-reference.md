@@ -3077,6 +3077,29 @@ skips). **No forge call is made anywhere in this path**, so it still delivers
 while `gh` is rate-limited. `loom-daemon health` output and exit codes are
 unchanged.
 
+**Fleet singleton output watchdog (#10916).** On the declared `fleet.captain`
+only (singleton job `fleet-output-watchdog`), the same thread also judges every
+row of `fleet_outputs::SINGLETON_OUTPUTS` and raises `output-missing:<job>:<kind>`
+(inbox severity from the row: `critical`, or `normal` for the Warning `ci.run`).
+It judges what the fleet *recorded*, never which host owns a job, so a job that
+moved to a host that does not produce fires like a stalled one (within the
+row's deadline: 2 x cadence, or the captain-gauge `maxAgeSecs`). A separate
+`fleet-output-watch` thread reads every 5 min: the SigNoz logs table through
+the ETA reader's ClickHouse endpoint (`autonomous.eta.fleetRefresh.signoz.*`,
+newest record per kind and repo over 72 h; the open-item kinds `sweep.started`, `eta.outcome`, `eta.estimate` over 30 d, so an open item and its refusal state do not age out with the 72 h window) and the captain's own
+`captain-gauges/v1` state (what its gauge passes last produced, read in-process,
+never from the fleet store); the alert tick only takes its latest reading. No
+forge call is made anywhere in this path (a source scan pins it), so a
+rate-limited `gh` neither delays an alert nor makes a gauge row fire. Per-repo rows are judged
+against the roster in the fleet store's on-disk cache; `eta.estimate` only
+against repos with an open item (a `sweep.started` not yet closed by a `land`
+`eta.outcome`) whose newest estimate is not a refusal. **Absent data fires**:
+an unconfigured endpoint, a failed read (once the last good read is older
+than 15 min), a malformed row, or a reader that stalled or never read fires
+every row it backs as `unreadable`. Rows whose `enabled_by` toggles are off in
+this host's config are skipped. No extra config: it runs whenever the alert
+thread runs on the captain.
+
 | Config (`autonomous.fleetAlert.*`) | Env | Default |
 |---|---|---|
 | `enabled` | `LOOM_FLEET_ALERT` | `false` (daemon flags default off) |

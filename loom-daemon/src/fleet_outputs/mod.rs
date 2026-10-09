@@ -19,8 +19,9 @@
 //! The `singleton_registry` tests scan the source tree so a new call site of
 //! either gate cannot land without a row here or a reasoned exemption.
 //!
-//! Slice 1 only: no delivery wiring and no runtime behaviour change. Later
-//! slices feed [`Condition`]s into `fleet_alert` and add a SigNoz rule.
+//! [`observed`] is the production [`OutputSource`] (#10916 slice 3a): SigNoz
+//! log records and the captain-gauge heartbeat, read by the captain's
+//! `fleet_alert` thread.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -31,6 +32,10 @@ use crate::observability::captain_gauges::{
     self as gauges, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB, STAR_FACTS_JOB,
 };
 
+pub mod observed;
+
+#[cfg(test)]
+mod observed_tests;
 #[cfg(test)]
 mod registry_tests;
 #[cfg(test)]
@@ -228,6 +233,11 @@ pub const EXEMPT: &[(&str, &str)] = &[
          label is healthy; needs a pass heartbeat before it can be watched (#10916 follow-up)",
     ),
     (
+        crate::fleet_alert::output_feed::SINGLETON_JOB_NAME,
+        "the watchdog itself: its outputs are the alerts, and a healthy fleet raises none; a \
+         reader that stalls or never reads fires every row as unreadable (`output_feed`)",
+    ),
+    (
         crate::eta::retire_filing::JOB_NAME,
         "runs inside eta-nightly-folds (whose eta.backtest.fold row watches the host) and its \
          output is forge issues, filed only when a heuristic should retire: silence is healthy",
@@ -271,6 +281,12 @@ pub trait OutputSource {
     /// the config loud: the default is empty, so every row is judged.
     fn disabled(&self) -> BTreeSet<&'static str> {
         BTreeSet::new()
+    }
+    /// Why `record_kind` could not be read, if it could not. An unreadable
+    /// output is judged missing (absent data fires), with this reason in
+    /// the headline instead of "never observed".
+    fn unreadable(&self, _record_kind: &str) -> Option<String> {
+        None
     }
 }
 
@@ -373,6 +389,9 @@ fn judge(
     };
     let kind = o.record_kind;
     let secs = deadline.as_secs();
+    if let Some(why) = observed.unreadable(kind) {
+        return Some(format!("{kind} unreadable, judged missing: {why}"));
+    }
     match o.scope {
         Scope::FleetWide => match observed.last_seen(kind) {
             None => Some(format!("{kind} never observed")),
