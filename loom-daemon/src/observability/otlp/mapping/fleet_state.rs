@@ -74,9 +74,11 @@ mod tests {
             },
             census_at: Some(as_of),
             slots: None,
+            capacity: None,
             repos: vec![FleetStateRepo {
                 repo: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
+                main_ci: None,
                 ready_complete: false,
                 ready_replace: true,
                 census: Some(FleetPrCensus {

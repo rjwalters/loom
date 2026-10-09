@@ -49,9 +49,9 @@ use serde_json::Value;
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetPrCensus, FleetSlot, FleetSlots, FleetStage, FleetStateRecord,
-    FleetStateRepo, FleetStateRow, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
-    FLEET_STATE_SCHEMA,
+    split_into_chunks, FleetCapacity, FleetHoldKind, FleetPrCensus, FleetSlot, FleetSlots,
+    FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps,
+    ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 
@@ -68,6 +68,27 @@ const TREATING: &str = "loom:treating";
 /// registry's `merge_hold` set.
 static MERGE_HOLD_LABELS: crate::label_registry::LabelSet =
     crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("merge_hold"));
+
+/// The hold kind the hold labels in `labels` name on their own, or `None`
+/// when none holds. Labels alone cannot split `merge_risk` / `critical_file` /
+/// `ac_hold` out of `operator`; that refinement is left to the reader. Pure.
+#[must_use]
+pub fn hold_kind(labels: &[String]) -> Option<FleetHoldKind> {
+    let has = |label: &str| labels.iter().any(|l| l == label);
+    if has("loom:operator-decision") {
+        Some(FleetHoldKind::OperatorDecision)
+    } else if has("loom:operator-only") || has("loom:operator-mechanical") {
+        Some(FleetHoldKind::OperatorOnly)
+    } else if has("loom:operator") {
+        Some(FleetHoldKind::Operator)
+    } else if has("loom:blocked") {
+        Some(FleetHoldKind::Blocked)
+    } else if MERGE_HOLD_LABELS.iter().any(|l| has(l)) {
+        Some(FleetHoldKind::Other)
+    } else {
+        None
+    }
+}
 
 /// Where a row came from, in ascending precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -153,6 +174,10 @@ pub struct FleetInput {
     pub listed_at: Option<DateTime<Utc>>,
     /// `None` before the work finder's first tick.
     pub ready: Option<ReadyQueue>,
+    /// Host capacity, when read.
+    pub capacity: Option<FleetCapacity>,
+    /// Each managed repo's `main` CI status, by lowercased slug.
+    pub main_ci: BTreeMap<String, MainCi>,
 }
 
 /// One repo's full state at one pass.
@@ -164,6 +189,8 @@ pub struct RepoView {
     pub rows: BTreeMap<u32, FleetStateRow>,
     /// Each row's source.
     pub sources: BTreeMap<u32, Source>,
+    /// `main` CI status, when the host read it.
+    pub main_ci: Option<MainCi>,
 }
 
 /// The full state at one pass, before visibility tagging.
@@ -173,6 +200,8 @@ pub struct FleetView {
     pub census_at: Option<DateTime<Utc>>,
     /// Plan slot use.
     pub slots: Option<FleetSlots>,
+    /// Host capacity beside `slots`.
+    pub capacity: Option<FleetCapacity>,
     /// Per-repo state, by lowercased slug.
     pub repos: BTreeMap<String, RepoView>,
     /// The repos each listing source observed completely this pass. For
@@ -298,6 +327,9 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
 
     let mut observed: BTreeMap<Source, BTreeSet<String>> = BTreeMap::new();
     let mut census: BTreeMap<String, FleetPrCensus> = BTreeMap::new();
+    // Label-derived hold kind of every listed PR that names an issue, so a
+    // sweep-owned row (which wins on precedence) can still carry the hold.
+    let mut pr_holds: BTreeMap<(String, u32), Option<FleetHoldKind>> = BTreeMap::new();
     for listing in &input.listings {
         observed
             .entry(Source::Review)
@@ -313,9 +345,16 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 .by_stage
                 .entry(stage.map_or("held", FleetStage::as_str).to_string())
                 .or_default() += 1;
+            if let Some(issue) = pr.issue {
+                let slot = pr_holds
+                    .entry((listing.repo.clone(), issue))
+                    .or_insert(None);
+                *slot = slot.or_else(|| hold_kind(&pr.labels));
+            }
             if let (Some(stage), Some(issue)) = (stage, pr.issue) {
                 let row = FleetStateRow {
                     pr: Some(pr.number),
+                    hold_kind: hold_kind(&pr.labels),
                     ..FleetStateRow::new(issue, stage, now)
                 };
                 offer(&mut candidates, &listing.repo, Source::Review, row);
@@ -386,6 +425,45 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
                 _ => row.entered_at_lower_bound = !prev_observed(source, &repo),
             }
         }
+        // A sweep-owned row keeps its stage/host/slot provenance but takes
+        // its hold from the linked PR's labels. A repo whose listing failed
+        // this pass leaves the hold unknown, so the previous one carries.
+        let review_read = observed
+            .get(&Source::Review)
+            .is_some_and(|set| set.contains(&repo));
+        if source == Source::Held {
+            row.hold_kind = if review_read {
+                pr_holds.get(&(repo.clone(), issue)).copied().flatten()
+            } else {
+                was.and_then(|w| w.hold_kind)
+            };
+        }
+        let hold_source = if source == Source::Held {
+            Source::Review
+        } else {
+            source
+        };
+        // Hold timing. A hold seen before keeps its start; a new one starts
+        // now (a lower bound when the listing was not seen last pass); one
+        // that cleared is stamped with the pass that saw it clear, and keeps
+        // the stamp while nothing else changes.
+        match (row.hold_kind, was) {
+            (Some(_), Some(was)) if was.hold_kind.is_some() => {
+                row.held_since = was.held_since;
+                row.held_since_lower_bound = was.held_since_lower_bound;
+            }
+            (Some(_), _) => {
+                row.held_since = Some(now);
+                row.held_since_lower_bound = !prev_observed(hold_source, &repo);
+            }
+            (None, Some(was))
+                if was.hold_kind.is_some() && (source != Source::Held || review_read) =>
+            {
+                row.hold_released_at = Some(now);
+            }
+            (None, Some(was)) => row.hold_released_at = was.hold_released_at,
+            (None, None) => {}
+        }
         let state = repos.entry(repo).or_default();
         state.rows.insert(issue, row);
         state.sources.insert(issue, source);
@@ -393,9 +471,13 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     for (repo, repo_census) in census {
         repos.entry(repo).or_default().census = Some(repo_census);
     }
+    for (repo, main_ci) in &input.main_ci {
+        repos.entry(repo.clone()).or_default().main_ci = Some(*main_ci);
+    }
     FleetView {
         census_at: input.listed_at.filter(|_| !input.listings.is_empty()),
         slots: input.ready.as_ref().and_then(|r| r.slots),
+        capacity: input.capacity.clone(),
         repos,
         observed,
     }
@@ -412,12 +494,14 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 }
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
+    let main_ci = view.repos.get(repo).and_then(|r| r.main_ci);
     let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
         visibility: RepoVisibility::Private,
+        main_ci,
         census,
         ready_complete,
         ready_replace: !ready_complete,
@@ -457,6 +541,7 @@ pub fn decide(
         stamps: stamps.clone(),
         census_at: view.census_at,
         slots: view.slots,
+        capacity: view.capacity.clone(),
         repos,
     };
     let last = match last {
@@ -510,6 +595,7 @@ pub fn decide(
             && removed.is_empty()
             && !ready_changed
             && now_state.census == was.census
+            && now_state.main_ci == was.main_ci
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
@@ -524,7 +610,7 @@ pub fn decide(
             ..entry
         });
     }
-    if repos.is_empty() && view.slots == last.view.slots {
+    if repos.is_empty() && view.slots == last.view.slots && view.capacity == last.view.capacity {
         return None;
     }
     Some(header(false, last.anchor_as_of, Some(last.as_of), repos))
@@ -674,7 +760,8 @@ pub(super) async fn record(
         return;
     };
     let now = Utc::now();
-    let input = sources::gather(workspace_pool, slug_cache, &sink.host_id, now).await;
+    let input =
+        sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
     let stamps = sources::stamps(workspace_root);
     let state = STATE
         .lock()

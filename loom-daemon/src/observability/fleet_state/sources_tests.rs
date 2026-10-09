@@ -202,3 +202,47 @@ fn only_a_whole_listing_is_ready_complete() {
     assert_eq!(partial.rows.len(), crate::forge_listing::PER_PAGE);
     assert!(!second.repos["acme/partial"].rows.contains_key(&999));
 }
+
+#[test]
+fn account_counts_separate_exhausted_from_other_unavailable() {
+    use super::parse_account_counts;
+    let ranking =
+        "a|available|0.1\nb|exhausted|0.99\nc|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n";
+    assert_eq!(parse_account_counts(ranking), Some((1, 1)));
+    // Blocked, rate-limited and unknown accounts are not exhausted.
+    assert_eq!(
+        parse_account_counts("c|blocked|0.0\nd|rate_limited|0.5\ne|mystery|0.0\n"),
+        Some((0, 0))
+    );
+    assert_eq!(parse_account_counts("b|exhausted|0.99\n"), Some((0, 1)));
+    assert_eq!(parse_account_counts("# only a comment\n"), None);
+}
+
+#[test]
+fn live_workers_counts_every_nonterminal_sweep_regardless_of_kind_or_slug() {
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use crate::types::{SweepKind, SweepState};
+
+    // Plain temp dirs: not git checkouts, so no repo slug can resolve.
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg_a = SweepRegistry::shared(SweepRegistryConfig::new(a.path().to_path_buf()));
+    let reg_b = SweepRegistry::shared(SweepRegistryConfig::new(b.path().to_path_buf()));
+    {
+        let mut r = reg_a.lock().unwrap();
+        r.seed_entry_for_test(SweepKind::Issue(1), SweepState::Running);
+        r.seed_entry_for_test(
+            SweepKind::Issue(2),
+            SweepState::Exited {
+                code: Some(0),
+                at: Utc::now(),
+            },
+        );
+    }
+    reg_b
+        .lock()
+        .unwrap()
+        .seed_entry_for_test(SweepKind::PrSet(vec![10, 20]), SweepState::Running);
+
+    assert_eq!(super::live_sweep_count(&[reg_a, reg_b]), 2);
+    assert_eq!(super::live_sweep_count(&[]), 0);
+}
