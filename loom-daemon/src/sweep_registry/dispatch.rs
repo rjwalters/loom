@@ -461,7 +461,7 @@ impl std::fmt::Display for TokenSelectionDispatchError {
         write!(
             f,
             "issue #{}: spawned child exited immediately — token selection failed (no usable \
-             OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env then \
+             OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env then \
              `loom-daemon tokens bootstrap`, or re-probe an existing pool with `loom-daemon \
              tokens check --ranking`. See the sweep log for the exact failure: {}",
             self.issue,
@@ -2951,7 +2951,7 @@ impl SweepRegistry {
             }
             return Err(anyhow!(
                 "PR set {prs:?}: spawned child exited immediately — token selection failed (no \
-                 usable OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env \
+                 usable OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env \
                  then `loom-daemon tokens bootstrap`, or re-probe an existing pool with \
                  `loom-daemon tokens check --ranking`. See the sweep log for the exact failure: {}",
                 log_path.display()

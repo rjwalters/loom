@@ -2054,7 +2054,7 @@ pub(crate) fn print_status_human(
                 println!(
                     "  token-bound: NO healthy accounts — the concurrency cap is unaffected \
                      (#5270), but every spawn will fail account selection until capacity \
-                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-daemon tokens \
+                     returns. Add accounts (~/.llm-monitor/accounts.env + `loom-daemon tokens \
                      bootstrap`) or buy API credits, then `loom-daemon tokens check --ranking`."
                 );
             } else {
