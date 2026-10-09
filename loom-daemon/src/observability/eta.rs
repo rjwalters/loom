@@ -1168,6 +1168,7 @@ async fn ready_rows(
     slug_cache: &mut HashMap<String, String>,
 ) -> Option<(Vec<ReadyRow>, ReadyPlan)> {
     let summary = crate::work_finder::last_tick_summary()?;
+    let not_whole: Vec<String> = summary.listing_not_whole().cloned().collect();
     let context = summary.plan?;
     let mut rows = Vec::with_capacity(summary.queue.len());
     for row in summary.queue {
@@ -1189,8 +1190,10 @@ async fn ready_rows(
             },
         });
     }
-    let mut listing_failed = Vec::with_capacity(summary.listing_failed.len());
-    for root in &summary.listing_failed {
+    // #11139: a repo whose listing came back partial is as unlisted as a
+    // failed one: its rows are not its whole queue.
+    let mut listing_failed = Vec::with_capacity(not_whole.len());
+    for root in &not_whole {
         if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
             listing_failed.push(slug);
         }

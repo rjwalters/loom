@@ -236,10 +236,11 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
-| `loom.queue.issues`, `loom.queue.listing_failed_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
+| `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
 | `loom.queue.oldest_wait`, `loom.queue.starved[.by_reason]`, `loom.queue.dispatch_wait[.samples]` ([`metric.points`](#metricpoints)) | metric | `observability/ops/dwell.rs` |
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
+| [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 
 The captain gauges are emitted by non-ETA code. Since Stage 2 of #11098,
@@ -1614,9 +1615,11 @@ Every other name is a **`Gauge`**:
 | `loom.queue.starved.by_reason` (`reason` = queue disposition) | count | every multi-workspace tick, non-zero reasons only |
 | `loom.host.memory.available_bytes`, `loom.host.memory.total_bytes` | bytes | `host.health` interval |
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
+| `loom.agent_scope.peak_memory_bytes` (`repo`) | bytes | once per finished agent scope, sweep or role agent (cgroup `memory.peak`, #11094); `repo` is `(unattributed)` for a scope outside every workspace; absent without cgroup v2 |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
+| `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
 | `loom.forge.stage_items` (`state` = `curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) | count | `host.health` interval |
 
@@ -1628,7 +1631,10 @@ one point per queue disposition, labelled `state` (`running`, `ready`,
 host stopped ticking or exporting. Sum by `state` for the running / ready /
 blocked split. `loom.queue.listing_failed_repos` counts the repos whose ready
 listing failed on that tick; when it is non-zero, the depth is incomplete, not
-low. Issue numbers and repos are never labels. The per-issue rows travel in
+low. `loom.queue.listing_incomplete_repos` (#11139) counts the repos whose
+listing came back partial (a later page failed, the page cap, a mid-walk
+change): their rows are counted, but not all of them. The depth is whole only
+when both are `0`. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
 
 Quota burn and pool state (Issues #8857, #8930, `observability/ops/quota.rs`), all on
@@ -1851,7 +1857,7 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
 | `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the row's closed vocabulary — `PARK_LABELS ∪ SKIP_LABELS` for `parked`, `hard_exclusion::HARD_EXCLUSION_LABELS` (e.g. `external`) for `hard_exclusion` (#9672) — so a span names which rule declined the issue. A repo-configured extra skip label, a rule name outside that set, or any other detail text is never exported |
-| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope` (#9673, #9548), `ci_billing` (#10113: owner's Actions jobs blocked by billing/spending limit), `install_incompatible` / `daemon_too_old` (#10719: the workspace's installed Loom cannot work with this daemon, W3 / W4). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
+| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope` (#9673, #9548), `ci_billing` (#10113: owner's Actions jobs blocked by billing/spending limit), `install_incompatible` / `daemon_too_old` (#10719: the workspace's installed Loom cannot work with this daemon, W3 / W4), `maintain_only` (#11186: the workspace is maintain-only, kept current and never dispatched into). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
 | `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
 | `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
@@ -2023,6 +2029,8 @@ daemon process or is disabled.
 | `counts` | object | `running` / `ready` / `blocked` over **every** row, including dropped ones; `blocked` includes the `labelled_blocked` rows |
 | `listing_failed` | array, optional | `{repo, visibility}` for each repo whose ready listing failed; its backlog is absent (incomplete, not empty) |
 | `listing_failed_unresolved` | integer | failed-listing workspaces whose slug could not be resolved |
+| `listing_incomplete` | array, optional | `{repo, visibility}` for each repo whose ready listing came back partial (#11139: a later page failed, the page cap, a mid-walk change); some of its rows are present, but not all, so a missing row is not evidence the issue left the queue |
+| `listing_incomplete_unresolved` | integer, optional | partial-listing workspaces whose slug could not be resolved; omitted when `0` |
 | `rows[]` | array | ranked rows (below), at most 200 |
 | `unresolved_rows` | integer | rows dropped because their workspace's forge slug could not be resolved |
 | `rows_truncated` | integer | rows dropped by the 200-row cap |
@@ -2083,7 +2091,7 @@ describe a different order from the one the tick ran. The `plan` block:
 | `shard` | object | `configured` (`false` when unsharded), `host_shard`, `shard_count` |
 | `scope` | array | the labels the plan covers: `["loom:issue", "loom:blocked"]` |
 | `ordering` | array | comparator key names, in order |
-| `complete` | bool | `false` when some repo's listing failed (like `listing_failed`) |
+| `complete` | bool | `false` when some repo's listing failed (like `listing_failed`) or came back partial (a later page failed, the page cap, a mid-walk change; #11139): the rows are not the whole queue |
 
 **Pre-ready tiers are unordered.** `loom:curated` and `loom:triage` issues have
 no dispatcher order and never appear in the plan; Champion's promotion order is
@@ -2143,7 +2151,9 @@ row on `visibility`. On `/public/*` a private row keeps only `rank`,
 `reason` (plus the #9288 `position`, `plan_state` and `gate`); its `repo`,
 `issue`, `created_at`, `tier`, `detail`, `keys`, `repo_cap`, `owning_shard`,
 `in_slice` and `hot` are withheld, and a private `listing_failed` entry keeps
-only its `visibility`. `counts`, `seen`, `tick_at` and the `plan` block are
+only its `visibility`. A private `listing_incomplete` entry (#11139) needs the
+same treatment; a Worker that does not know the field must drop it rather
+than pass it through. `counts`, `seen`, `tick_at` and the `plan` block are
 aggregate and survive. A Worker older than phase 3 applies the
 unknown-kind rule instead (`/public/*` sees `kind` only).
 
@@ -2705,6 +2715,132 @@ row under "GitHub rate limit" above): `github.caller` inside a caller scope,
 artifact is still held, and which mechanism removed each `loom:blocked`):
 `defaults/observability/signoz/pass-queries.sql`.
 
+### `fleet.state`
+
+This host's own view of the work it holds, the PRs under review in its repos,
+and its ready queue (Issue #10196). It is the state record of the replay
+contract ([`telemetry-replay.md`](telemetry-replay.md)). Envelopes carry
+`schema_version: 12` (the shared post-#8921 gate). The kind is **OTLP-only**:
+one log record per envelope, with the record JSON as the log **body** and a few
+`loom.fleet.*` scalars as attributes. `queue.snapshot` and `eta.snapshot` stay
+native-HTTPS dashboard keys and are unchanged.
+
+The collector builds it on the `host.health` interval. **Every host emits its
+own view; nothing is elected.** The record does not depend on ETA: it is sent
+whenever an OTLP exporter exists, whatever `autonomous.eta.enabled` says, and
+**no record at all** only when there is no OTLP exporter. An anchor with zero
+rows is still sent, because it truthfully says "nothing here". Rows come from
+three non-ETA sources:
+
+| Source | Rows | Notes |
+|---|---|---|
+| Sweep registries | the sweeps this host runs (`host`, `slot` set) | stage from the sweep's own checkpoint marker: none → `sweep.curator` (entered at dispatch), `curator-done` → `sweep.builder`, `builder-done` / `doctor-done` → `review_wait`, `judge-rejected` → `doctor`, `judge-done` / `merge-done` → `merge_wait`; `entered_at` is the marker's `timestamp` |
+| Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings, each walked to its last page (an unchanged page is a free `304`). A walk that fails, reads 10 full pages (more than 1000 PRs under one label) or sees the listing shift mid-walk is a **failed** listing, never a partial one. A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
+| Work finder's last tick | `ready_wait` for every ready-queue row the planner saw on that tick that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks. The work finder walks each repo's `loom:issue` and starred listings to the last page (#11139). A repo whose walk finished is `ready_complete`; a repo whose walk fell short (a later page failed, the page cap, a mid-walk change; the tick's `listing_incomplete`) is not, and its ready rows go out whole with `ready_replace` |
+
+When sources overlap on one `(repo, issue)`, the held row wins, then the PR
+row, then the `ready_wait` row. A listing row still in the same stage keeps its
+`entered_at` from pass to pass; a row new to a listing that was complete on the
+previous pass entered at this pass's `as_of`; any other row is first seen
+mid-stage and carries `entered_at_lower_bound: true`. A managed repo whose
+review listing failed keeps its previous PR rows, and its `census` is absent; a
+managed repo whose ready listing failed keeps its previous `ready_wait` rows.
+An item a failed read could not see is therefore never sent in `removed`, but
+a kept row may be an item that has since left; it is replaced or removed once
+a read sees the repo again. A repo whose ready listing was read but is not
+`ready_complete` has exactly the tick's `ready_wait` rows: none is kept past
+its absence from the tick.
+
+**Anchors and deltas.** The first pass of a daemon process sends a full
+**anchor** (`anchor: true`, every row), and so does any pass at which the last
+anchor is at least 3600 s old or the planner stamps changed (a regime
+boundary). Between anchors a pass sends a **delta** (`anchor: false`) only if
+rows, a census, a repo's `ready_complete` or the plan slots changed. A delta holds the added or changed
+rows, the issues that left (`removed`), and the **full** census of each repo it
+names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
+diffed: every record that names it carries the repo's **entire** observed
+`ready_wait` set in `rows`, a delta names it whenever that set changed, and
+its `removed` never lists a `ready_wait` row. Its other rows are diffed as
+usual. A `ready_complete: true` repo is diffed
+in full, `ready_wait` rows included. A pass with no change sends nothing. The change test ignores
+`census_at`. A planner rank shift changes every row behind it, so it is a
+change.
+
+**No row cap; chunks by bytes.** The emitter drops none of the rows its sources
+read: it has no row cap. (What the sources read is bounded as described above:
+see `ready_complete` for the ready queue.) A record whose JSON
+would exceed ~1 MB (`CHUNK_BYTES`, a quarter of the ~4 MB OTLP/gRPC message
+limit) is split into several log records that share `as_of` and every header
+field, numbered `chunk_index` `0..chunk_count`; rows and `removed` entries are
+packed in order, and a repo that spans chunks repeats its `repo`,
+`visibility`, `census`, `ready_complete` and `ready_replace` in each. A ~3000-row queue (~100-180 bytes a row) is
+one record with `chunk_count: 1`. A reader uses a record only once it holds
+all `chunk_count` chunks of that `(host, as_of)`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | string | `fleet-state/v1` |
+| `as_of` | RFC 3339 | the instant described; also the log `timestamp`; shared by every chunk |
+| `anchor` | bool | full anchor (`true`) or delta (`false`) |
+| `anchor_as_of` | RFC 3339 | the `as_of` of the anchor this record's chain started from (equal to `as_of` on an anchor) |
+| `prev_as_of` | RFC 3339, optional | delta only: the `as_of` of the record this delta applies on top of. A gap in the chain means a lost delta |
+| `chunk_index` | integer | 0-based chunk number (missing decodes to `0`) |
+| `chunk_count` | integer | chunks the record at `as_of` was split into; `1` when unsplit (missing decodes to `1`) |
+| `planner_version` | string | the daemon version whose planner produced the ranks |
+| `planner_config_hash` | string | 12 hex of sha256 over the canonical JSON (sorted keys, no whitespace) of the effective `autonomous.workFinder` and `autonomous.mergeSequencing` blocks; unrelated config never moves it |
+| `fleet_config_hash` | string, optional | the fleet store commit this host's last fleet-sync config pass resolved; absent on a host with no fleet store |
+| `census_at` | RFC 3339, optional | when the review listings were read |
+| `slots` | object, optional | `{max_concurrent, occupancy?}` from the last work-finder dispatch plan |
+| `capacity` | object, optional | host capacity beside `slots` (never repeating `max_concurrent` / `occupancy`); additive on `fleet-state/v1`, absent from older emitters. All discrete: `live_workers` (sweeps this host runs), `accounts_usable` (ranking accounts with status `available`) / `accounts_exhausted` (ranking accounts with status `exhausted` only; `blocked`, `rate_limited` and unknown statuses count in neither), both absent when the ranking is unreadable or lists no account, `host_breaker` / `rate_limit_breaker` (`closed` / `open` / `cooldown`, absent when none is enabled), `admission_brake_held` (bool, absent when none is enabled). No utilisation fraction is carried, so a quiet host stays quiet: a change in any field above is a delta, drift is not |
+| `repos[]` | array | per repo, ordered by slug. An anchor lists every repo with rows or a census; a delta lists only repos that changed |
+
+A change in `planner_version`, `planner_config_hash` or `fleet_config_hash`
+marks a regime boundary; the emitter starts a fresh anchor there, so a reader
+can cut its window at the boundary instead of guessing.
+
+Each `repos[]` entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | forge `owner/repo`, lowercased, never a local path |
+| `visibility` | `public` / `private` | missing or unknown decodes to `private` |
+| `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
+| `main_ci` | `green` / `red` / `unknown`, optional | this repo's `main` CI status from the host's main-health gate: `red` = a verified-red run halted dispatch, `unknown` = the gate has not produced a verdict or could not evaluate, `green` otherwise. Per repo, never per host. Additive on `fleet-state/v1`; absent from older emitters. A change is a delta naming the repo |
+| `ready_complete` | bool | `true` when the work finder's last tick walked this repo's ready listing to its last page (#11139), so its `ready_wait` rows are the whole queue. `false` when the walk fell short (a later page failed, the page cap, a mid-walk change), and on emitters before #11139, which listed one page per label. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
+| `ready_replace` | bool, optional | `true` exactly when `ready_complete` is `false`: `rows` carries the repo's **entire** observed `ready_wait` set, and a reader replaces the repo's `ready_wait` rows with it (drop them all, then apply `removed` and `rows`). Removals of `ready_wait` rows are never sent in `removed` for such a repo, and a reader never infers one from absence otherwise. Absent (`false`, or an older emitter): plain diffing |
+| `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
+| `removed[]` | integers, optional | delta only: issues that left. A repo that left entirely has every prior issue here (but no `ready_wait` issue when `ready_replace` is set) and no `census` |
+
+Each row:
+
+| Field | Type | Notes |
+|---|---|---|
+| `issue` | integer | issue number |
+| `stage` | string | `ready_wait`, `sweep.curator`, `sweep.builder`, `review_wait`, `doctor`, `merge_wait`, `merge_hold` |
+| `entered_at` | RFC 3339 | when the item entered `stage` |
+| `entered_at_lower_bound` | bool, optional | present (`true`) when `entered_at` is only a lower bound, for example when the item was first seen mid-stage after a restart |
+| `pr` | integer, optional | the PR, when known |
+| `host` | string, optional | the host whose sweep holds the item. Present **only** when the emitting host runs it; absent rather than guessed otherwise |
+| `slot` | `regular` / `overflow`, optional | the dispatch slot that sweep holds (`overflow` = the host's single `loom:operator-priority` overflow slot, #9244). Present exactly when `host` is |
+| `rank` | integer, optional | `ready_wait` only: this host's planner rank (1-based position in its dispatch order on the last work-finder tick). Per host: two hosts' ranks for one issue are two true answers |
+| `star` | bool, optional | `ready_wait` only: starred at any level (absent = `false`) |
+| `star_at` | RFC 3339, optional | `ready_wait` only: when it was starred, when known |
+| `level` | integer, optional | `ready_wait` only: effective operator priority level (absent = `0`) |
+| `fleet_priority` | integer, optional | `ready_wait` only: the repo's fleet (workspace) priority tier; lower dispatches first |
+| `created_at` | RFC 3339, optional | `ready_wait` only: the issue's creation instant, the planner's age input (age = `as_of - created_at`; the instant is sent so an unchanged row stays unchanged) |
+| `main_red_fix` | bool, optional | `ready_wait` only: a red-main fix the planner boosted this tick (absent = `false`) |
+| `hold_kind` | string, optional | the item is under a hold now: one of `operator`, `operator_only`, `operator_decision`, `merge_risk`, `critical_file`, `ac_hold`, `blocked`, `other` (the long-standing snake_case hold names). Derived from the PR's labels; the emitter does not read Champion's comments, so it reports `operator` where Champion applied `merge_risk` / `critical_file` / `ac_hold` and leaves that split to the reader. Additive on `fleet-state/v1`; absent = not held (or an older emitter) |
+| `held_since` | RFC 3339, optional | when the current hold began. Present exactly when `hold_kind` is |
+| `held_since_lower_bound` | bool, optional | present (`true`) when `held_since` is the first pass that saw the hold, not an observed transition |
+| `hold_released_at` | RFC 3339, optional | the hold cleared: the pass that first saw it clear. The clearing delta carries it with `hold_kind` / `held_since` absent, and it is kept while the row is otherwise unchanged. A held item that merges or closes gets none: its removal is the end |
+
+Log attributes besides `loom.kind` and `loom.record_id`
+(`FLEET_STATE_LOG_ATTRIBUTE_KEYS`, kept by the collector's `transform/privacy`
+`keep_keys`, contract-tested): `loom.fleet.schema`, `loom.fleet.anchor`,
+`loom.fleet.anchor_as_of`, `loom.fleet.repos`, `loom.fleet.rows`,
+`loom.fleet.removed`, `loom.fleet.chunk_index`, `loom.fleet.chunk_count`.
+Each chunk is its own record with its own `loom.record_id`.
+
 ### `tokens.snapshot`
 
 A point-in-time view of the multi-account token pool (host-level — no `repo` /
@@ -3097,6 +3233,37 @@ like `worktree_root_free_gb`. The same fields ride **span-boundary trace
 attributes** (`loom.host.*`) on role attempts — see
 [tracing.md](tracing.md) — so the state is captured at the decision moment,
 not only on each 30 s sampling cadence.
+
+### `host.export`
+
+This host's own view of its telemetry export (Issue #11124, R2 of #10196).
+One record per `host.health` interval, emitted from the same collector tick.
+Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`). The body
+is the record's JSON. The host-wide sums ride as `loom.host_export.*`
+attributes (`HOST_EXPORT_LOG_ATTRIBUTE_KEYS`, which the collector's
+`transform/privacy` allowlists). Severity is `WARN` when no exporter is active
+and `INFO` otherwise. Facts only: every host emits its own view, nothing is
+elected, there are no caps, and no rate or estimate is computed in the daemon.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC3339 | when the view was sampled; the record time |
+| `host` | string | the sampling host |
+| `exporters` | array | one entry per exporter that started in this process, sorted by name |
+| `exporters[].name` | string | `https` or `otlp` |
+| `exporters[].queue_depth` | integer | envelopes queued, waiting for a flush |
+| `exporters[].dropped_total` | integer | envelopes dropped (oldest first) at a full queue |
+| `exporters[].last_flush_ok_at` | RFC3339? | last acked batch; omitted when none this process (unknown, not a fabricated time) |
+
+Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
+`.dropped_total` (sum), `.last_flush_ok_at` (latest).
+
+**`dropped_total` is cumulative per process lifetime.** It restarts at 0 when
+the daemon restarts, so a reader computing "drops in a window" must treat a
+decrease as a counter reset (take the post-reset value, not a negative delta).
+The committed query is
+[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
+hosts with drops, or with no `host.export` at all, in the last 2 h.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

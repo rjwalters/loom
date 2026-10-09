@@ -291,6 +291,7 @@ pub mod provenance;
 pub mod quarantine_reconciliation;
 pub mod quarantine_stash_status;
 pub mod ram_headroom;
+pub mod ram_peaks;
 pub mod rate_limit_breaker;
 pub mod reclaim_pr_warning;
 pub mod reconcile_stack;
@@ -306,6 +307,8 @@ pub mod release_resolve;
 pub mod renovate_labels;
 pub mod repo_root;
 pub mod restart_verify;
+/// Fork-point provenance for `.loom/resync-ignore` pins (#8726).
+pub mod resync_pin;
 pub mod retry_classify;
 /// The `sweep.outcome` rework-event marker protocol (#9444): where the file
 /// lives, the `kind` vocabulary, the substantive/environmental table, and the
@@ -345,6 +348,7 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod signoz_read;
 pub mod stale_blocked;
 pub mod star_liveness;
 pub mod startup_adoption;
@@ -384,6 +388,7 @@ pub mod target_orphan_reclaim;
 /// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
 pub mod task_liveness;
 pub mod telemetry;
+pub mod telemetry_replay;
 pub mod terminal;
 pub mod terminal_restore;
 /// Test-only capturing logger (see module docs) — single-sourced so the crate's

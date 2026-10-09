@@ -1098,3 +1098,25 @@ mod offline;
 
 #[path = "checkout_ff_holds.rs"]
 mod holds;
+
+/// #11186: a maintain-only workspace's checkout is fast-forwarded like any
+/// other: the step never consults dispatch holds.
+#[test]
+fn a_maintain_only_workspace_is_still_fast_forwarded() {
+    use crate::workspace_hold::{hold_for, set_maintain_only_for_test};
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new();
+    let mark = MaintainOnly {
+        by: MaintainOnlySource::Operator,
+        since: t0(),
+    };
+    set_maintain_only_for_test(&fx.host, Some(mark));
+    let tip = fx.push("src/a.rs", "fn a() {}\n");
+
+    let found = pass(&fx, &Knobs::default());
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded);
+    assert_eq!(fx.head(), tip);
+    assert!(hold_for(&fx.host).is_some(), "while dispatch stays refused");
+
+    set_maintain_only_for_test(&fx.host, None);
+}

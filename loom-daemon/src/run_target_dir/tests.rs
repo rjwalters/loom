@@ -275,3 +275,161 @@ fn the_process_group_probe_tracks_a_real_group() {
     child.wait().unwrap();
     assert!(!process_group_alive(pgid));
 }
+
+// ============================================================================
+// #11031: owner identity, marker-last removal, sweep-end reclaim.
+// ============================================================================
+
+fn provisioned(repo: &Path, name: &str, pid: u32) -> PathBuf {
+    let dir = planned_for(repo, "sweep-lifecycle", name);
+    provision(&dir, pid).unwrap();
+    std::fs::create_dir_all(dir.join("debug/deps")).unwrap();
+    std::fs::write(dir.join("debug/deps/lib.rlib"), b"x").unwrap();
+    dir
+}
+
+/// `provision` records the owner's start identity next to the pid, and the
+/// production probe reads the same identity back for the same live process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn provision_records_the_owners_start_identity() {
+    let repo = cargo_repo();
+    let me = std::process::id();
+    let dir = provisioned(repo.path(), "1", me);
+    let recorded = owner::recorded_start_token(&dir).expect("an identity is recorded");
+    assert_eq!(Some(recorded), owner::process_start_token(me));
+    assert_eq!(owner::running_owner(&dir), Some(me), "a live owner is running");
+}
+
+/// PID reuse: the pid in the marker is alive, but it is not the process that
+/// wrote the marker. The live process here is this test; the recorded
+/// identity is somebody else's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_reused_pid_is_not_the_owner() {
+    let repo = cargo_repo();
+    let me = std::process::id();
+    let dir = provisioned(repo.path(), "1", me);
+    std::fs::write(dir.join(owner::OWNER_START_FILE), "linux:other-boot:1\n").unwrap();
+    assert_eq!(owner::running_owner(&dir), None, "a different process wears the pid");
+}
+
+#[test]
+fn identity_decides_only_on_positive_evidence() {
+    let repo = cargo_repo();
+    let dir = provisioned(repo.path(), "1", 4242);
+    std::fs::write(dir.join(owner::OWNER_START_FILE), "t1\n").unwrap();
+    let alive = |p: u32| p == 4242;
+    let same = |_: u32| Some("t1".to_string());
+    let other = |_: u32| Some("t2".to_string());
+    let unknown = |_: u32| None;
+    assert_eq!(owner::running_owner_with(&dir, &alive, &same), Some(4242));
+    assert_eq!(owner::running_owner_with(&dir, &alive, &other), None, "pid reused");
+    assert_eq!(owner::running_owner_with(&dir, &alive, &unknown), Some(4242), "unknown keeps");
+    assert_eq!(owner::running_owner_with(&dir, &|_| false, &same), None, "owner gone");
+    // A dir provisioned before #11031 has no identity: bare liveness decides.
+    std::fs::remove_file(dir.join(owner::OWNER_START_FILE)).unwrap();
+    assert_eq!(owner::running_owner_with(&dir, &alive, &other), Some(4242));
+}
+
+#[test]
+fn marker_last_removal_removes_everything() {
+    let repo = cargo_repo();
+    let dir = provisioned(repo.path(), "1", 4242);
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.join("link")).unwrap();
+        owner::remove_marker_last(&dir).unwrap();
+        assert!(outside.path().join("keep").exists(), "a symlink's target is untouched");
+    }
+    #[cfg(not(unix))]
+    owner::remove_marker_last(&dir).unwrap();
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_sweeps_dirs_are_found_by_the_pid_in_their_marker() {
+    let repo = cargo_repo();
+    let mine = provisioned(repo.path(), "777-1", 777);
+    let _other = provisioned(repo.path(), "778-1", 778);
+    std::fs::create_dir_all(targets_root(repo.path()).join("sweep-lifecycle-777-2")).unwrap();
+    assert_eq!(sweep_end::dirs_owned_by(repo.path(), 777), vec![mine]);
+    assert!(sweep_end::dirs_owned_by(repo.path(), 0).is_empty());
+    assert!(sweep_end::dirs_owned_by(repo.path(), 779).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_targets_root_yields_no_sweep_dirs() {
+    let repo = cargo_repo();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir = elsewhere.path().join("sweep-lifecycle-777-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(OWNER_FILE), "777\n").unwrap();
+    std::fs::create_dir_all(repo.path().join(".loom")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), targets_root(repo.path())).unwrap();
+    assert!(sweep_end::dirs_owned_by(repo.path(), 777).is_empty());
+}
+
+fn sweep_probes<'a>(
+    group_alive: &'a dyn Fn(u32) -> bool,
+    owner_alive: &'a dyn Fn(u32) -> bool,
+    open_handles: &'a dyn Fn(&Path) -> Option<bool>,
+) -> sweep_end::SweepEndProbes<'a> {
+    sweep_end::SweepEndProbes {
+        group_alive,
+        owner_alive,
+        identity: &|_| None,
+        open_handles,
+        remove: &owner::remove_marker_last,
+    }
+}
+
+/// Every gate keeps the dir on its own; with all of them clear it goes.
+#[test]
+fn the_sweep_end_gates_each_keep_the_dir() {
+    let repo = cargo_repo();
+    let dir = provisioned(repo.path(), "777-1", 777);
+    let free = |_: &Path| Some(false);
+    let kept = |r: Removal| matches!(r, Removal::Kept(_));
+    let probes = sweep_probes(&|_| true, &|_| false, &free);
+    assert!(kept(sweep_end::reclaim_with(&dir, Some(777), &probes)), "group alive");
+    let probes = sweep_probes(&|_| false, &|p| p == 777, &free);
+    assert!(kept(sweep_end::reclaim_with(&dir, Some(777), &probes)), "owner alive");
+    let probes = sweep_probes(&|_| false, &|_| false, &|_| Some(true));
+    assert!(kept(sweep_end::reclaim_with(&dir, Some(777), &probes)), "held open");
+    let probes = sweep_probes(&|_| false, &|_| false, &|_| None);
+    assert!(kept(sweep_end::reclaim_with(&dir, Some(777), &probes)), "probe unavailable");
+    assert!(dir.join("debug/deps/lib.rlib").exists());
+    let probes = sweep_probes(&|_| false, &|_| false, &free);
+    assert_eq!(sweep_end::reclaim_with(&dir, Some(777), &probes), Removal::Removed);
+    assert!(!dir.exists());
+}
+
+/// The production entry point, end to end: a dead owner's dir goes on the
+/// detached thread; a live owner's dir (this process) is never touched.
+#[test]
+fn the_sweep_end_reclaim_removes_a_dead_owners_dir_only() {
+    let repo = cargo_repo();
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let dir = provisioned(repo.path(), "dead", dead);
+    // Should the number be reused meanwhile, the identity still says "gone".
+    std::fs::write(dir.join(owner::OWNER_START_FILE), "exited\n").unwrap();
+    sweep_end::reclaim_at_sweep_end(repo.path(), "sweep-issue-1-1", dead, None)
+        .expect("a dir to reclaim")
+        .join()
+        .unwrap();
+    assert!(!dir.exists());
+
+    let me = std::process::id();
+    let live = provisioned(repo.path(), "live", me);
+    sweep_end::reclaim_at_sweep_end(repo.path(), "sweep-issue-2-1", me, None)
+        .expect("a dir to consider")
+        .join()
+        .unwrap();
+    assert!(live.join("debug/deps/lib.rlib").exists(), "a live owner's dir is never touched");
+}

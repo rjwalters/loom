@@ -208,6 +208,9 @@ fn from_gate(
             meta.requires_daemon.as_deref(),
             judge.running,
         ),
+        // Never a pass verdict: the operator's mark, read from the registry
+        // (#11186), never judged here.
+        Verdict::Hold(HoldKind::MaintainOnly) => Finding::clear(),
     }
 }
 

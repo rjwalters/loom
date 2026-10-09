@@ -284,6 +284,8 @@ pub fn build_snapshot(report: DaemonStatusReport) -> StatusSnapshot {
     }
 }
 
+#[cfg(test)]
+mod dashboard_queue_tests;
 /// The `DaemonStatus` round-trip and its root-scaled budget (Issue #8224),
 /// extracted to a sibling module because this file is frozen by the file-size
 /// ratchet (`scripts/check-file-size-budget.sh`; see
@@ -2411,6 +2413,7 @@ mod tests {
         let mut report = empty_report();
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),
+            maintain_only: None,
             priority: crate::workspace_registry::default_priority(),
             in_flight_count: 0,
             health_gate_halted: false,

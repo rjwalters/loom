@@ -189,6 +189,48 @@ fn records_judge_verdicts_and_doctor_cycles_from_the_label_timeline() {
     assert_eq!(record.doctor_cycles, Some(1));
 }
 
+/// #9062: a daemon base-conflict flag (#8922) on the PR is not a Judge
+/// rejection on the record — the approval after the rebase is first-pass, and
+/// no Doctor cycle is counted.
+#[test]
+#[serial]
+fn a_daemon_base_conflict_flag_is_not_recorded_as_a_judge_rejection() {
+    let dir = tempdir().unwrap();
+    let rows = "2026-09-18T12:00:00Z\tloom:review-requested\n\
+                2026-09-18T12:10:00Z\tbase-conflict-flag\t\
+                {\"user\":{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"},\
+                \"author_association\":\"NONE\"}\n\
+                2026-09-18T12:10:02Z\tloom:changes-requested\n\
+                2026-09-18T12:10:02Z\tloom:merge-conflict\n\
+                2026-09-18T12:40:00Z\tloom:review-requested\n\
+                2026-09-18T13:00:00Z\tloom:pr\n";
+    let mut registry = timeline_registry(dir.path(), &gh_timeline_ok(rows));
+    let issue = 9062;
+    let sweep_id = insert_sweep_with_pr(&mut registry, issue, 9061);
+
+    registry.append_outcome_telemetry_journal(
+        issue,
+        &sweep_id,
+        600,
+        telemetry::SweepResult::Success,
+        None,
+        None,
+        crate::tap_usage::RegionAccounting::default(),
+    );
+
+    let path = registry.config().resolve_outcome_telemetry_path();
+    let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+    let record = records.iter().find(|r| r.issue == issue).unwrap();
+    assert_eq!(
+        record.judge_verdicts,
+        Some(vec![telemetry::JudgeVerdict {
+            attempt: 1,
+            verdict: "pass".to_string(),
+        }])
+    );
+    assert_eq!(record.doctor_cycles, Some(0));
+}
+
 /// AC: first-pass judge approval rate is computable from the journal alone —
 /// `judge_verdicts[0].verdict == "pass"` over the sweeps that have the field.
 #[test]

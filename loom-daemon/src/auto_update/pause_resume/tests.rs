@@ -76,6 +76,7 @@ fn sweep(dir: &Path, id: &str, issue: u32) -> ManifestItem {
             parked_tool: Some("Bash".to_string()),
             parked_summary: Some("cargo test".to_string()),
         }),
+        safe_point_miss: None,
         checkpoint_phase: Some("builder".to_string()),
         worktree: None,
         claim: Some(serde_json::json!({ "label": "loom:building", "on": "issue" })),

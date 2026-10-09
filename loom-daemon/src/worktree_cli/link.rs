@@ -135,6 +135,12 @@
 //!    a scenario the two are meant to disagree on would only teach it to
 //!    accept disagreement. The new behaviour is pinned by this module's own
 //!    unit tests and by Test 8 of the retained shell suite.
+//!
+//! # Retiring aliases that predate #8944
+//!
+//! The skip above only governs worktrees created after it landed. The
+//! operator verb `worktree-link --retire-aliases` ([`retire`], #9152) unlinks
+//! the aliases older worktrees still carry, without touching the create path.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -147,6 +153,9 @@ use std::process::Command;
 use serde_json::Value;
 
 use super::wip::Out;
+
+mod retire;
+pub use retire::{retire_aliases, RetireOptions};
 
 /// `find … -maxdepth 3`. The depth a candidate `node_modules` may sit at,
 /// counted the way `find` counts it: the scan root is depth 0.

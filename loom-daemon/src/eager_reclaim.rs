@@ -52,6 +52,42 @@
 //! across the binding threshold, which would otherwise produce a fresh "edge"
 //! every couple of ticks.
 //!
+//! # …and level, under pressure (#11192)
+//!
+//! Edge alone stopped re-arming on a worker whose disk term bound the cap on
+//! every tick: with `configured_max = 12` the disk term (`free / 8`) binds
+//! whenever free space is under 96 GB, so after one pass at 79 GB free the
+//! trigger stayed disarmed for 7.5 hours while free space fell to 0.
+//! [`EagerTrigger`] (in `level_trigger.rs`) therefore also fires on level:
+//! whenever free space is below the floor (`diskWarnFreeGb`), and whenever
+//! it has fallen another [`DEFAULT_EAGER_FALL_STEP_GB`] below the last pass's
+//! reading while the disk term keeps binding. The 10-minute pass cooldown and
+//! every sub-pass's own cooldown are unchanged, so a level trigger runs at
+//! most one pass per cooldown window.
+//!
+//! # Tiers, safest first (#11192)
+//!
+//! [`run_pass`] escalates through three tiers and re-probes free space
+//! between them, moving to the next tier only while free space is still
+//! below the floor (or cannot be measured, which leaves the decision to the
+//! sub-passes' own gates):
+//!
+//! 1. **Loom debris nobody is using**: merged-PR worktrees, aborted-fetch
+//!    `.git` temp files, agent scratch, orphaned cargo target dirs.
+//! 2. **Idle build caches of kept worktrees**, across every registered root
+//!    (#11071). Costs a rebuild if the worktree is resumed.
+//! 3. **The primary checkout's own build cache** (deep clean) and **docker
+//!    images**. The most invasive tier.
+//!
+//! # Empty passes alert and back off (#11192)
+//!
+//! A pass that reclaimed nothing logs its own `ALERT` line at `error`, so an
+//! operator sees that the automatic passes have run out of things to remove,
+//! rather than inferring it from a falling free-space figure. While passes
+//! keep coming back empty, the one forge-polling sub-pass (the merged-PR
+//! worktree reap) backs off exponentially (2x, 4x, 8x the cooldown). The
+//! local sub-passes keep running once per cooldown window.
+//!
 //! # Scope: the probed root only
 //!
 //! The dispatch-cap loop's disk term is a single machine-level probe against
@@ -62,6 +98,14 @@
 //! registered root" fan-out for a disk term that was never measuring every
 //! root in the first place. The scheduled reaper still walks every registered
 //! root on its own cadence, unchanged.
+//!
+//! One exception (#11071): the idle kept-worktree artifact sub-pass
+//! ([`crate::worktree_reaper::reclaim_idle_targets_below_floor`]) walks every
+//! registered root. On a fleet host the probe root is the daemon's own
+//! checkout, which has no worktrees, so a probe-root-only pass could never
+//! reach the multi-GB `target/` dirs actually filling the volume. It makes no
+//! forge calls and removes no worktree, and it stops as soon as free space is
+//! back above the floor, so the fan-out costs local probes only.
 //!
 //! # Docker eager default (product decision, #7512)
 //!
@@ -92,6 +136,19 @@ use crate::docker_image_clean::DockerRetentionReport;
 use crate::git_tmp_reclaim::GitTmpReclaimReport;
 use crate::scratch_reclaim::ScratchReclaimReport;
 use crate::target_orphan_reclaim::TargetOrphanReport;
+use crate::worktree_reaper::ReclaimReport;
+
+mod idle_schedule;
+mod level_trigger;
+
+pub use idle_schedule::{
+    idle_pass_due, reset_idle_state_for_test, run_idle_targets_if_due, scheduled_idle_pass_with,
+    scheduled_pressure_tier,
+};
+pub use level_trigger::{EagerTrigger, TickReading, TriggerReason};
+
+#[cfg(test)]
+mod level_tests;
 
 // ============================================================================
 // Constants
@@ -113,6 +170,21 @@ pub const EAGER_RECLAIM_MIN_INTERVAL_ENV: &str = "LOOM_EAGER_RECLAIM_MIN_INTERVA
 /// merged-PR worktree reap every couple of dispatch ticks.
 pub const DEFAULT_EAGER_MIN_INTERVAL_SECS: u64 = 600;
 
+/// Env override for the level trigger's fall step (GB, #11192).
+pub const EAGER_RECLAIM_FALL_STEP_ENV: &str = "LOOM_EAGER_RECLAIM_FALL_STEP_GB";
+
+/// While the disk term keeps binding the cap down, a fresh pass is due each
+/// time free space has fallen this many GB below the last pass's reading
+/// (#11192). Ten GB is a little more than one sweep's flat admission charge
+/// (`LOOM_PER_WORKTREE_GB = 8`), so steady sweep growth re-arms the pass
+/// without a disk that only wobbles by a few GB doing so.
+pub const DEFAULT_EAGER_FALL_STEP_GB: u64 = 10;
+
+/// Cap on the empty-pass backoff exponent: the merged-PR worktree reap is
+/// spaced at most `cooldown * 2^3` (80 minutes at the default) apart while
+/// passes keep reclaiming nothing (#11192).
+pub const MAX_EMPTY_BACKOFF_SHIFT: u32 = 3;
+
 // ============================================================================
 // Config (.loom/config.json → autonomous.worktreeReaper.eagerReclaim)
 // ============================================================================
@@ -130,6 +202,9 @@ pub struct EagerReclaimConfig {
     /// `…eagerReclaim.minIntervalSecs` — cooldown between eager passes for one
     /// root (a zero/invalid value drops to `None`).
     pub min_interval_secs: Option<u64>,
+    /// `…eagerReclaim.fallStepGb` — the level trigger's fall step (#11192;
+    /// a zero/invalid value drops to `None`).
+    pub fall_step_gb: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper.eagerReclaim`,
@@ -149,6 +224,10 @@ pub fn read_eager_reclaim_config(repo_root: &Path) -> EagerReclaimConfig {
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        fall_step_gb: block
+            .get("fallStepGb")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&g| g > 0),
     }
 }
 
@@ -173,6 +252,18 @@ pub fn resolve_min_interval_secs(config: &EagerReclaimConfig) -> u64 {
         .filter(|&s| s > 0)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_EAGER_MIN_INTERVAL_SECS)
+}
+
+/// Resolve the level trigger's fall step (GB) — precedence **env > config >
+/// default**. A zero or unparseable env value falls through (#11192).
+#[must_use]
+pub fn resolve_fall_step_gb(config: &EagerReclaimConfig) -> u64 {
+    std::env::var(EAGER_RECLAIM_FALL_STEP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&g| g > 0)
+        .or(config.fall_step_gb)
+        .unwrap_or(DEFAULT_EAGER_FALL_STEP_GB)
 }
 
 // ============================================================================
@@ -226,14 +317,16 @@ pub fn should_trigger(
 // Report
 // ============================================================================
 
-/// One eager-reclaim pass's outcome — bundles the four sub-pass reports plus
-/// the free-GB reading from immediately before and immediately after, so a
-/// single log line can name what every sub-pass did (#7512 AC4).
+/// One eager-reclaim pass's outcome — bundles every sub-pass report plus the
+/// free-GB reading from immediately before and immediately after, so a single
+/// log line can name what every sub-pass did (#7512 AC4).
 #[derive(Debug, Clone)]
 pub struct EagerReclaimReport {
     /// The repo root this pass reclaimed from (the same root the dispatch
     /// loop's disk term was probed against).
     pub repo_root: PathBuf,
+    /// Why the pass was asked for (#11192).
+    pub reason: TriggerReason,
     /// `Some(reason)` when **no sub-pass ran at all** (disabled, or this
     /// pass's own cooldown had not elapsed). `None` on a pass that ran.
     pub skipped: Option<String>,
@@ -245,16 +338,21 @@ pub struct EagerReclaimReport {
     pub free_gb_before: Option<u64>,
     /// Free GB immediately after. The dispatch loop does **not** read this to
     /// finalize its cap — it re-probes `disk_headroom_limit` itself — this is
-    /// for the log line and for tests.
+    /// for the log line, the level trigger's next reference, and tests.
     pub free_gb_after: Option<u64>,
+    /// The highest tier this pass reached (1–3; 0 when skipped, #11192).
+    pub tiers_run: u8,
+    /// Whether the merged-PR worktree reap ran, or was held back by the
+    /// empty-pass backoff (#11192).
+    pub worktree_reap_ran: bool,
     /// How many `issue-<N>` worktrees the merged-PR reap sub-pass removed.
     pub worktrees_removed: usize,
-    /// The [`crate::deep_clean`] sub-pass's own report — `None` only when this
-    /// pass was skipped outright.
+    /// The [`crate::deep_clean`] sub-pass's own report — `None` when tier 3
+    /// was not reached.
     pub deep_clean: Option<DeepCleanReport>,
-    /// The [`crate::docker_image_clean`] sub-pass's own report.
+    /// The [`crate::docker_image_clean`] sub-pass's own report (tier 3).
     pub docker: Option<DockerRetentionReport>,
-    /// The new `/tmp`-shaped scratch sub-pass's own report (#7512 item 3).
+    /// The `/tmp`-shaped scratch sub-pass's own report (#7512 item 3).
     pub scratch: Option<ScratchReclaimReport>,
     /// The orphaned cargo target dir sub-pass's own report (#8370).
     pub target_orphans: Option<TargetOrphanReport>,
@@ -262,6 +360,11 @@ pub struct EagerReclaimReport {
     pub at: DateTime<Utc>,
     /// The aborted-fetch `.git/objects` temp-file sub-pass's report (#10995).
     pub git_tmp: Option<GitTmpReclaimReport>,
+    /// The idle kept-worktree artifact sub-pass's report: every registered
+    /// root, largest first, stopping above the floor (#11071). `None` when
+    /// tier 2 was not reached, or the cross-root pass already ran inside the
+    /// shared window (from either path, #11192).
+    pub idle_targets: Option<ReclaimReport>,
 }
 
 fn gb_or_unknown(free_gb: Option<u64>) -> String {
@@ -269,6 +372,28 @@ fn gb_or_unknown(free_gb: Option<u64>) -> String {
 }
 
 impl EagerReclaimReport {
+    /// Whether any sub-pass removed anything (#11192). Counts removals, not
+    /// the free-space delta, because in-flight builds grow while a pass runs.
+    #[must_use]
+    pub fn reclaimed_anything(&self) -> bool {
+        self.worktrees_removed > 0
+            || self.git_tmp.as_ref().is_some_and(|r| r.totals.files > 0)
+            || self.scratch.as_ref().is_some_and(|r| r.removed_count > 0)
+            || self
+                .target_orphans
+                .as_ref()
+                .is_some_and(|r| !r.removed.is_empty())
+            || self
+                .idle_targets
+                .as_ref()
+                .is_some_and(|r| !r.removed.is_empty())
+            || self
+                .deep_clean
+                .as_ref()
+                .is_some_and(|r| !r.reclaimed.is_empty())
+            || self.docker.as_ref().is_some_and(|r| !r.removed.is_empty())
+    }
+
     /// One human-readable line naming what every sub-pass did and the
     /// resulting free-GB vs. the floor (#7512 AC4). Deliberately prefixed
     /// `eager_reclaim:` so it can never be confused with `worktree_reaper:`'s
@@ -279,19 +404,26 @@ impl EagerReclaimReport {
     pub fn log_line(&self) -> String {
         if let Some(reason) = &self.skipped {
             return format!(
-                "eager_reclaim: {} disk axis binds the dispatch cap down but no pass ran: \
-                 {reason} (#7512)",
-                self.repo_root.display()
+                "eager_reclaim: {} {} but no pass ran: {reason} (#7512)",
+                self.repo_root.display(),
+                self.reason.describe()
             );
         }
+        let not_reached = |tier: u8| {
+            if self.tiers_run < tier {
+                "not needed (above the floor)".to_string()
+            } else {
+                "n/a".to_string()
+            }
+        };
         let deep = self
             .deep_clean
             .as_ref()
-            .map_or_else(|| "n/a".to_string(), DeepCleanReport::reclaimed_summary);
+            .map_or_else(|| not_reached(3), DeepCleanReport::reclaimed_summary);
         let docker = self
             .docker
             .as_ref()
-            .map_or_else(|| "n/a".to_string(), |d| format!("{} image(s)", d.removed.len()));
+            .map_or_else(|| not_reached(3), |d| format!("{} image(s)", d.removed.len()));
         let scratch = self
             .scratch
             .as_ref()
@@ -304,29 +436,70 @@ impl EagerReclaimReport {
             .target_orphans
             .as_ref()
             .map_or_else(|| "n/a".to_string(), TargetOrphanReport::summary);
+        let idle = match &self.idle_targets {
+            Some(r) => format!(
+                "{} dir(s) ({})",
+                r.removed.len(),
+                crate::tmpfs_reclaim::human_size(r.bytes_freed())
+            ),
+            None if self.tiers_run >= 2 => "skipped (the cross-root pass ran recently)".to_string(),
+            None => not_reached(2),
+        };
+        let worktrees = if self.worktree_reap_ran {
+            format!("{} removed", self.worktrees_removed)
+        } else {
+            "held back (empty-pass backoff)".to_string()
+        };
         format!(
-            "eager_reclaim: {} disk axis binds the dispatch cap down ({} free) — ran an \
-             out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's own \
-             scheduled pass: worktrees {} removed, deep-clean {deep}, docker {docker}, scratch \
-             {scratch}, git-tmp {git_tmp}, cargo-target orphans {target_orphans} — now {} free \
-             vs. floor {}G (#7512)",
+            "eager_reclaim: {} {} ({} free) — ran an out-of-cycle pass (tier {} of 3) now \
+             instead of waiting up to 15m for worktree_reaper's own scheduled pass: worktrees \
+             {worktrees}, git-tmp {git_tmp}, scratch {scratch}, cargo-target orphans \
+             {target_orphans}, idle worktree targets {idle}, deep-clean {deep}, docker {docker} \
+             — now {} free vs. floor {}G (#7512, #11192)",
             self.repo_root.display(),
+            self.reason.describe(),
             gb_or_unknown(self.free_gb_before),
-            self.worktrees_removed,
+            self.tiers_run,
             gb_or_unknown(self.free_gb_after),
             self.floor_gb,
         )
+    }
+
+    /// The alert line for a pass that ran and reclaimed nothing (#11192), or
+    /// `None`. `empty_streak` is how many passes in a row came back empty,
+    /// this one included.
+    #[must_use]
+    pub fn empty_pass_alert(&self, empty_streak: u32) -> Option<String> {
+        if self.skipped.is_some() || self.reclaimed_anything() {
+            return None;
+        }
+        Some(format!(
+            "eager_reclaim: ALERT {} pass reclaimed nothing ({} in a row; {}; {} -> {} free vs. \
+             floor {}G). Every automatic reclaim tier ran out of candidates, so what fills this \
+             disk is not something the daemon removes on its own: see `loom-daemon clean \
+             --dry-run` and `du` on the volume (#11192)",
+            self.repo_root.display(),
+            empty_streak,
+            self.reason.describe(),
+            gb_or_unknown(self.free_gb_before),
+            gb_or_unknown(self.free_gb_after),
+            self.floor_gb,
+        ))
     }
 }
 
 /// Log one pass. A pass that ran logs at `warn` (an operator investigating a
 /// starved dispatch queue must see that the daemon tried, and what it got); a
-/// skipped pass logs at `debug`.
-pub fn log_report(report: &EagerReclaimReport) {
+/// skipped pass logs at `debug`. A pass that ran and reclaimed nothing also
+/// logs its own `ALERT` at `error` (#11192).
+pub fn log_report(report: &EagerReclaimReport, empty_streak: u32) {
     if report.skipped.is_some() {
         log::debug!("{}", report.log_line());
-    } else {
-        log::warn!("{}", report.log_line());
+        return;
+    }
+    log::warn!("{}", report.log_line());
+    if let Some(alert) = report.empty_pass_alert(empty_streak) {
+        log::error!("{alert}");
     }
 }
 
@@ -334,7 +507,7 @@ pub fn log_report(report: &EagerReclaimReport) {
 // The pass (injected seams)
 // ============================================================================
 
-/// The four reclaim sub-passes plus the free-space probe, injected so
+/// The reclaim sub-passes plus the free-space probe, injected so
 /// [`run_pass`] is unit-testable without a git repo, a forge, `docker`, or a
 /// host under genuine disk pressure — the same pure-core/IO-shell split
 /// [`crate::deep_clean::run_pass`] and [`crate::docker_image_clean::run_pass`]
@@ -354,10 +527,47 @@ pub struct SubPasses<'a> {
     pub scratch: &'a dyn Fn(&Path) -> ScratchReclaimReport,
     /// [`crate::target_orphan_reclaim::run_for`] (#8370).
     pub target_orphans: &'a dyn Fn(&Path) -> TargetOrphanReport,
-    /// Free GB on the worktree-root volume, sampled before and after.
+    /// Free GB on the worktree-root volume, sampled before, between tiers,
+    /// and after.
     pub free_gb: &'a dyn Fn(&Path) -> Option<u64>,
     /// [`crate::git_tmp_reclaim::run_for`] (#10995).
     pub git_tmp: &'a dyn Fn(&Path) -> GitTmpReclaimReport,
+    /// [`crate::worktree_reaper::reclaim_idle_targets_below_floor`], curried
+    /// with the floor (#11071) and gated by the window it shares with the
+    /// scheduled reaper ([`run_idle_targets_if_due`], #11192). `None` when
+    /// that window had not elapsed.
+    pub idle_targets: &'a dyn Fn(&Path) -> Option<ReclaimReport>,
+}
+
+/// Per-root history the pass-level gates read (#11192): when a pass last
+/// ran, when the merged-PR worktree reap last ran, and how many passes in a
+/// row reclaimed nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassLedger {
+    /// When an eager pass last ran for this root.
+    pub last_run: Option<DateTime<Utc>>,
+    /// When the merged-PR worktree reap sub-pass last ran for this root.
+    pub last_worktree_reap: Option<DateTime<Utc>>,
+    /// Consecutive passes that reclaimed nothing.
+    pub empty_streak: u32,
+}
+
+impl PassLedger {
+    /// Fold one report in. A skipped pass changes nothing.
+    pub fn record(&mut self, report: &EagerReclaimReport) {
+        if report.skipped.is_some() {
+            return;
+        }
+        self.last_run = Some(report.at);
+        if report.worktree_reap_ran {
+            self.last_worktree_reap = Some(report.at);
+        }
+        self.empty_streak = if report.reclaimed_anything() {
+            0
+        } else {
+            self.empty_streak.saturating_add(1)
+        };
+    }
 }
 
 /// Everything one [`run_pass`] needs besides its injected seams.
@@ -367,24 +577,45 @@ pub struct EagerReclaimInputs {
     pub enabled: bool,
     /// Resolved anti-thrash cooldown for this pass itself.
     pub min_interval_secs: u64,
-    /// When an eager pass last ran for this root, or `None`.
-    pub last_run: Option<DateTime<Utc>>,
-    /// The reaper's resolved `diskWarnFreeGb`, reported in the log line and
-    /// handed to the deep-clean sub-pass by [`run_for`].
+    /// This root's pass history (cooldown and empty-pass backoff).
+    pub ledger: PassLedger,
+    /// The reaper's resolved `diskWarnFreeGb`: the tier-escalation target,
+    /// reported in the log line and handed to the deep-clean sub-pass by
+    /// [`run_for`].
     pub floor_gb: u64,
+    /// Why the pass was asked for.
+    pub reason: TriggerReason,
     /// Evaluation timestamp.
     pub now: DateTime<Utc>,
 }
 
-/// Run one eager pass over `repo_root`, in the exact order
-/// [`crate::worktree_reaper::reap_repo`] already uses for its scheduled pass:
-/// merged-PR worktree reap → git temp-file reclaim (#10995) → deep clean →
-/// docker retention → scratch reclaim.
+/// Whether the merged-PR worktree reap is due (#11192): always, unless the
+/// last passes came back empty, in which case it waits `cooldown *
+/// 2^min(streak, MAX_EMPTY_BACKOFF_SHIFT)` since it last ran. This is the
+/// one sub-pass that polls the forge and has no cooldown of its own.
+#[must_use]
+pub fn worktree_reap_due(ledger: &PassLedger, now: DateTime<Utc>, min_interval_secs: u64) -> bool {
+    if ledger.empty_streak == 0 {
+        return true;
+    }
+    let Some(last) = ledger.last_worktree_reap else {
+        return true;
+    };
+    let shift = ledger.empty_streak.min(MAX_EMPTY_BACKOFF_SHIFT);
+    let backoff = min_interval_secs.saturating_mul(1u64 << shift);
+    let since = (now - last).num_seconds();
+    since < 0 || since >= i64::try_from(backoff).unwrap_or(i64::MAX)
+}
+
+/// Run one eager pass over `repo_root`, escalating through the three tiers
+/// in the module docs: tier 1 always, each later tier only while a fresh
+/// probe still reads free space below the floor (or unmeasurable).
 ///
-/// The ordering is load-bearing and inherited, not invented here: the cheap
-/// worktree sweeps run first so that the expensive, pressure-gated deep pass
-/// re-probes free space *after* them and correctly declines to touch a
-/// developer's build cache when the cheap passes already freed enough.
+/// Within the tiers the order is inherited from
+/// [`crate::worktree_reaper::reap_repo`]: the cheap sweeps run first so that
+/// the expensive, pressure-gated deep pass re-probes free space *after* them
+/// and correctly declines to touch a developer's build cache when the cheap
+/// passes already freed enough.
 ///
 /// Returns a report with `skipped: Some(..)` and **no sub-pass invoked** when
 /// disabled or inside this pass's own cooldown. It never records cooldown
@@ -396,12 +627,15 @@ pub fn run_pass(
     inputs: &EagerReclaimInputs,
     passes: &SubPasses<'_>,
 ) -> EagerReclaimReport {
-    let skipped = |reason: String| EagerReclaimReport {
+    let mut report = EagerReclaimReport {
         repo_root: repo_root.to_path_buf(),
-        skipped: Some(reason),
+        reason: inputs.reason,
+        skipped: None,
         floor_gb: inputs.floor_gb,
         free_gb_before: None,
         free_gb_after: None,
+        tiers_run: 0,
+        worktree_reap_ran: false,
         worktrees_removed: 0,
         deep_clean: None,
         docker: None,
@@ -409,84 +643,97 @@ pub fn run_pass(
         target_orphans: None,
         at: inputs.now,
         git_tmp: None,
+        idle_targets: None,
     };
 
     if !inputs.enabled {
-        return skipped(
+        report.skipped = Some(
             "disabled (autonomous.worktreeReaper.eagerReclaim.enabled=false or \
              LOOM_EAGER_RECLAIM unset-falsy) — the scheduled worktree_reaper pass still applies"
                 .to_string(),
         );
+        return report;
     }
 
-    if let Some(last) = inputs.last_run {
+    if let Some(last) = inputs.ledger.last_run {
         let since_secs = (inputs.now - last).num_seconds();
         let min = i64::try_from(inputs.min_interval_secs).unwrap_or(i64::MAX);
         if since_secs >= 0 && since_secs < min {
-            return skipped(format!(
+            report.skipped = Some(format!(
                 "an eager pass ran {since_secs}s ago (cooldown {}s)",
                 inputs.min_interval_secs
             ));
+            return report;
         }
     }
 
-    let free_gb_before = (passes.free_gb)(repo_root);
-    let worktrees_removed = (passes.reap_worktrees)(repo_root);
+    let still_short = |free: Option<u64>| free.is_none_or(|gb| gb < inputs.floor_gb);
+    report.free_gb_before = (passes.free_gb)(repo_root);
+
+    // Tier 1: Loom debris nobody is using.
+    report.tiers_run = 1;
+    report.worktree_reap_ran =
+        worktree_reap_due(&inputs.ledger, inputs.now, inputs.min_interval_secs);
+    if report.worktree_reap_ran {
+        report.worktrees_removed = (passes.reap_worktrees)(repo_root);
+    }
     // #10995: cheap and precise, so before the pressure-gated deep pass, which
     // then re-probes free space after it — as in `reap_repo`.
-    let git_tmp = (passes.git_tmp)(repo_root);
-    let deep_clean = (passes.deep_clean)(repo_root);
-    let docker = (passes.docker)(repo_root);
-    let scratch = (passes.scratch)(repo_root);
-    let target_orphans = (passes.target_orphans)(repo_root);
-    let free_gb_after = (passes.free_gb)(repo_root);
+    report.git_tmp = Some((passes.git_tmp)(repo_root));
+    report.scratch = Some((passes.scratch)(repo_root));
+    report.target_orphans = Some((passes.target_orphans)(repo_root));
 
-    EagerReclaimReport {
-        repo_root: repo_root.to_path_buf(),
-        skipped: None,
-        floor_gb: inputs.floor_gb,
-        free_gb_before,
-        free_gb_after,
-        worktrees_removed,
-        deep_clean: Some(deep_clean),
-        docker: Some(docker),
-        scratch: Some(scratch),
-        target_orphans: Some(target_orphans),
-        at: inputs.now,
-        git_tmp: Some(git_tmp),
+    // Tier 2 (#11071): kept worktrees' idle build caches, largest first, until
+    // free space is back above the floor.
+    if still_short((passes.free_gb)(repo_root)) {
+        report.tiers_run = 2;
+        report.idle_targets = (passes.idle_targets)(repo_root);
+        // Tier 3: the primary checkout's own build cache, then docker images.
+        if still_short((passes.free_gb)(repo_root)) {
+            report.tiers_run = 3;
+            report.deep_clean = Some((passes.deep_clean)(repo_root));
+            report.docker = Some((passes.docker)(repo_root));
+        }
     }
+
+    report.free_gb_after = (passes.free_gb)(repo_root);
+    report
 }
 
 // ============================================================================
-// Process-global per-repo cooldown state
+// Process-global per-repo pass history
 // ============================================================================
 
-static LAST_RUN_AT: OnceLock<Mutex<BTreeMap<PathBuf, DateTime<Utc>>>> = OnceLock::new();
+static LEDGERS: OnceLock<Mutex<BTreeMap<PathBuf, PassLedger>>> = OnceLock::new();
 
-fn last_run_slot() -> &'static Mutex<BTreeMap<PathBuf, DateTime<Utc>>> {
-    LAST_RUN_AT.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn ledger_slot() -> &'static Mutex<BTreeMap<PathBuf, PassLedger>> {
+    LEDGERS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn last_run_at(repo_root: &Path) -> Option<DateTime<Utc>> {
-    last_run_slot()
+fn ledger_for(repo_root: &Path) -> PassLedger {
+    ledger_slot()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(repo_root)
         .copied()
+        .unwrap_or_default()
 }
 
-fn record_run(repo_root: &Path, now: DateTime<Utc>) {
-    last_run_slot()
+/// Fold `report` into `repo_root`'s ledger and return the updated ledger.
+fn record_report(repo_root: &Path, report: &EagerReclaimReport) -> PassLedger {
+    let mut map = ledger_slot()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(repo_root.to_path_buf(), now);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ledger = map.entry(repo_root.to_path_buf()).or_default();
+    ledger.record(report);
+    *ledger
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    last_run_slot()
+    ledger_slot()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
@@ -501,19 +748,21 @@ pub fn reset_state_for_test() {
 /// **Blocking** — it shells to `df`/`git`/`docker` and may probe the forge over
 /// REST, so callers must be on the blocking pool, exactly like the reaper's own
 /// `spawn_blocking(move || reap_repo(..))`. The dispatch loop deliberately
-/// `await`s it before finalizing the tick's cap: the whole point is that the
-/// cap is not clamped on a stale measurement, and a tick whose disk axis is
-/// binding the cap down is a tick that was about to dispatch little or nothing
-/// anyway.
-pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
+/// `await`s it (through [`EagerTrigger::tick`]) before finalizing the tick's
+/// cap: the whole point is that the cap is not clamped on a stale
+/// measurement, and a tick whose disk axis is binding the cap down is a tick
+/// that was about to dispatch little or nothing anyway.
+pub fn run_for(repo_root: &Path, reason: TriggerReason) -> EagerReclaimReport {
     let config = read_eager_reclaim_config(repo_root);
     let reaper_config = crate::worktree_reaper::read_worktree_reaper_config(repo_root);
     let floor_gb = crate::worktree_reaper::resolve_disk_warn_free_gb(&reaper_config);
+    let min_interval_secs = resolve_min_interval_secs(&config);
     let inputs = EagerReclaimInputs {
         enabled: resolve_enabled(&config),
-        min_interval_secs: resolve_min_interval_secs(&config),
-        last_run: last_run_at(repo_root),
+        min_interval_secs,
+        ledger: ledger_for(repo_root),
         floor_gb,
+        reason,
         now: Utc::now(),
     };
 
@@ -528,6 +777,17 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let target_orphans = crate::target_orphan_reclaim::run_for;
     let free_gb = crate::disk_headroom::worktree_root_free_gb;
     let git_tmp = crate::git_tmp_reclaim::run_for;
+    let idle_targets = |root: &Path| {
+        let report = run_idle_targets_if_due(
+            root,
+            floor_gb,
+            Utc::now(),
+            min_interval_secs,
+            &crate::worktree_reaper::reclaim_idle_targets_below_floor,
+        )?;
+        crate::worktree_reaper::log_idle_target_report(root, &report);
+        Some(report)
+    };
     let passes = SubPasses {
         reap_worktrees: &reap_worktrees,
         deep_clean: &deep_clean,
@@ -536,13 +796,12 @@ pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
         target_orphans: &target_orphans,
         free_gb: &free_gb,
         git_tmp: &git_tmp,
+        idle_targets: &idle_targets,
     };
 
     let report = run_pass(repo_root, &inputs, &passes);
-    if report.skipped.is_none() {
-        record_run(repo_root, inputs.now);
-    }
-    log_report(&report);
+    let ledger = record_report(repo_root, &report);
+    log_report(&report, ledger.empty_streak);
     report
 }
 
@@ -715,6 +974,19 @@ mod tests {
         }
     }
 
+    fn stub_idle_target_report() -> ReclaimReport {
+        ReclaimReport {
+            removed: vec![crate::worktree_reaper::ArtifactDir {
+                class: "issue",
+                num: 9243,
+                worktree: std::path::PathBuf::from("/repo/.loom/worktrees/issue-9243"),
+                name: "target".to_string(),
+                bytes: 23 * 1024 * 1024 * 1024,
+            }],
+            ..ReclaimReport::default()
+        }
+    }
+
     fn run_with_counters(inputs: &EagerReclaimInputs, counters: &Counters) -> EagerReclaimReport {
         let now = inputs.now;
         let reap = |_: &Path| {
@@ -742,6 +1014,10 @@ mod tests {
             counters.order.borrow_mut().push("git_tmp");
             stub_git_tmp_report(root, now)
         };
+        let idle_targets = |_: &Path| {
+            counters.order.borrow_mut().push("idle_targets");
+            Some(stub_idle_target_report())
+        };
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
@@ -750,6 +1026,7 @@ mod tests {
             target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
+            idle_targets: &idle_targets,
         };
         run_pass(Path::new("/repo"), inputs, &passes)
     }
@@ -758,8 +1035,9 @@ mod tests {
         EagerReclaimInputs {
             enabled: true,
             min_interval_secs: 600,
-            last_run: None,
+            ledger: PassLedger::default(),
             floor_gb: 20,
+            reason: TriggerReason::Edge,
             now,
         }
     }
@@ -775,14 +1053,16 @@ mod tests {
             vec![
                 "worktrees",
                 "git_tmp",
-                "deep",
-                "docker",
                 "scratch",
-                "target_orphans"
+                "target_orphans",
+                "idle_targets",
+                "deep",
+                "docker"
             ],
-            "must mirror worktree_reaper::reap_repo's own sequencing"
+            "below the floor every tier runs, safest first (#11192)"
         );
         assert!(report.git_tmp.is_some());
+        assert_eq!(report.idle_targets.as_ref().unwrap().removed.len(), 1);
         assert!(report.deep_clean.is_some());
         assert!(report.docker.is_some());
         assert!(report.scratch.is_some());
@@ -795,7 +1075,7 @@ mod tests {
     fn test_run_pass_inside_its_own_cooldown_invokes_no_sub_pass() {
         let counters = Counters::new();
         let mut inputs = base_inputs(t(300));
-        inputs.last_run = Some(t(0)); // 300s ago, cooldown 600s
+        inputs.ledger.last_run = Some(t(0)); // 300s ago, cooldown 600s
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.as_deref().unwrap().contains("cooldown"));
         assert_eq!(counters.total(), 0, "a cooldown-skipped pass must not touch the forge/docker");
@@ -806,10 +1086,10 @@ mod tests {
     fn test_run_pass_past_its_own_cooldown_runs_again() {
         let counters = Counters::new();
         let mut inputs = base_inputs(t(601));
-        inputs.last_run = Some(t(0));
+        inputs.ledger.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.skipped.is_none());
-        assert_eq!(counters.total(), 6);
+        assert_eq!(counters.total(), 7);
     }
 
     #[test]
@@ -860,6 +1140,7 @@ mod tests {
         let target_orphans = |root: &Path| stub_target_orphan_report(root);
         let free_gb = |_: &Path| Some(1u64);
         let git_tmp = |root: &Path| stub_git_tmp_report(root, now);
+        let idle_targets = |_: &Path| Some(ReclaimReport::default());
         let passes = SubPasses {
             reap_worktrees: &reap,
             deep_clean: &deep,
@@ -868,6 +1149,7 @@ mod tests {
             target_orphans: &target_orphans,
             free_gb: &free_gb,
             git_tmp: &git_tmp,
+            idle_targets: &idle_targets,
         };
         let report = run_pass(Path::new("/repo"), &base_inputs(now), &passes);
 
@@ -916,10 +1198,13 @@ mod tests {
         reset_state_for_test();
         std::env::set_var(EAGER_RECLAIM_ENABLE_ENV, "0");
         let tmp = tempfile::tempdir().unwrap();
-        let report = run_for(tmp.path());
+        let report = run_for(tmp.path(), TriggerReason::Edge);
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
         assert!(report.skipped.as_deref().unwrap().contains("disabled"));
-        assert!(last_run_at(tmp.path()).is_none(), "a skipped pass must not arm the cooldown");
+        assert!(
+            ledger_for(tmp.path()).last_run.is_none(),
+            "a skipped pass must not arm the cooldown"
+        );
     }
 
     // ===================================================================
@@ -939,7 +1224,8 @@ mod tests {
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
         assert!(!resolve_enabled(&EagerReclaimConfig {
             enabled: Some(false),
-            min_interval_secs: None
+            min_interval_secs: None,
+            fall_step_gb: None,
         }));
     }
 
@@ -949,7 +1235,8 @@ mod tests {
         std::env::set_var(EAGER_RECLAIM_ENABLE_ENV, "0");
         assert!(!resolve_enabled(&EagerReclaimConfig {
             enabled: Some(true),
-            min_interval_secs: None
+            min_interval_secs: None,
+            fall_step_gb: None,
         }));
         std::env::remove_var(EAGER_RECLAIM_ENABLE_ENV);
     }
@@ -965,6 +1252,7 @@ mod tests {
         let config = EagerReclaimConfig {
             enabled: None,
             min_interval_secs: Some(120),
+            fall_step_gb: None,
         };
         assert_eq!(resolve_min_interval_secs(&config), 120);
         std::env::set_var(EAGER_RECLAIM_MIN_INTERVAL_ENV, "45");
@@ -995,6 +1283,7 @@ mod tests {
             "scratch",
             "git-tmp",
             "cargo-target orphans",
+            "idle worktree targets 1 dir(s) (23.0G)",
             "floor 20G",
         ] {
             assert!(line.contains(needle), "log line missing {needle}: {line}");
@@ -1005,7 +1294,7 @@ mod tests {
     fn test_log_line_for_a_skipped_pass_says_why() {
         let counters = Counters::new();
         let mut inputs = base_inputs(t(10));
-        inputs.last_run = Some(t(0));
+        inputs.ledger.last_run = Some(t(0));
         let report = run_with_counters(&inputs, &counters);
         assert!(report.log_line().contains("cooldown"));
     }

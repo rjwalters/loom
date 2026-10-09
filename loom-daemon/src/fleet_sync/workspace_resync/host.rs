@@ -573,7 +573,7 @@ pub(in crate::fleet_sync) fn spawn_pass<T: Send + 'static>(
             // The checkout step may have re-judged a hold since the pass
             // (#11052): show the holds as they stand now.
             for workspace in &mut found.workspaces {
-                workspace.hold = crate::workspace_hold::hold_for(&workspace.root);
+                workspace.hold = crate::workspace_hold::resync_hold_for(&workspace.root);
             }
             if let Ok(mut latest) = latest_cell().lock() {
                 latest.clone_from(&found);

@@ -113,12 +113,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::workspace_registry::WorkspaceRegistry;
-use crate::worktree_activity::{reclaim_skip_reason, removal_veto, resolve_activity_window};
+use crate::worktree_activity::{removal_veto, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
@@ -377,32 +377,12 @@ pub fn reap_pr_worktrees(
 // Artifact reclaim pass (AC3 of #5177 — #5187)
 // ============================================================================
 
-/// What one artifact-reclaim pass over one repo did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReclaimReport {
-    /// Worktree directories examined by this pass — `issue-<N>` for
-    /// [`reclaim_kept_worktree_artifacts`], `pr-<N>` for
-    /// [`reclaim_kept_pr_worktree_artifacts`] (#5939).
-    pub scanned: usize,
-    /// Issue number -> reclaimed top-level directory names (e.g. `"target"`,
-    /// `"node_modules"`), for worktrees that had at least one.
-    pub reclaimed: Vec<(u32, Vec<String>)>,
-    /// Worktrees this pass left untouched, keyed by why.
-    pub skipped: Vec<(u32, String)>,
-}
+mod artifact_reclaim;
 
-impl ReclaimReport {
-    /// A compact one-line summary for the daemon log.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        format!(
-            "scanned={} reclaimed={} skipped={}",
-            self.scanned,
-            self.reclaimed.len(),
-            self.skipped.len()
-        )
-    }
-}
+pub use artifact_reclaim::{
+    clean_idle_targets, log_idle_target_report, reclaim_idle_targets_below_floor, ArtifactDir,
+    ReclaimReport, CATEGORY as IDLE_TARGET_CATEGORY,
+};
 
 /// Reclaim `target/`/`node_modules/`/... from every **kept** worktree under
 /// `repo_root`'s worktree root — a worktree the removal pass ([`reap_worktrees`])
@@ -422,9 +402,10 @@ impl ReclaimReport {
 ///   outcome the acceptance criteria say must never be touched.
 /// - Every other skip reason (open issue, open/unmerged/absent PR, grace
 ///   period, uncommitted changes, unmanaged, editable install, unknown PR
-///   status): a **kept, idle** worktree — reclaim its build artifacts via
-///   [`clean::reclaim_worktree_artifacts`] — **unless** #8116's activity gate
-///   says otherwise. `activity_window` is the mtime window
+///   status): a **kept, idle** worktree — reclaim its build artifacts
+///   (largest first, each directory vetted and probed: see
+///   [`artifact_reclaim`], #11071) — **unless** #8116's activity gate says
+///   otherwise. `activity_window` is the mtime window
 ///   [`crate::worktree_activity::reclaim_skip_reason`] treats as "a live
 ///   worker is here, whatever the registry thinks"; [`Duration::ZERO`]
 ///   disables that gate and restores the pre-#8116 behavior.
@@ -435,12 +416,20 @@ pub fn reclaim_kept_worktree_artifacts(
     dry_run: bool,
     activity_window: Duration,
 ) -> ReclaimReport {
-    reclaim_kept_artifacts_generic(
+    let classify = |path: &Path, n: u32| clean::classify_worktree(path, n, opts, probes);
+    let class = artifact_reclaim::WorktreeClass {
+        prefix: "issue",
+        parse_name: &crate::worktree_ops::naming::issue_from_worktree,
+        classify: &classify,
+    };
+    let probes = artifact_reclaim::production_artifact_probes();
+    artifact_reclaim::reclaim_kept(
         repo_root,
+        &class,
         dry_run,
         activity_window,
-        &crate::worktree_ops::naming::issue_from_worktree,
-        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+        &probes,
+        &artifact_reclaim::never_stop,
     )
 }
 
@@ -466,99 +455,32 @@ pub fn reclaim_kept_pr_worktree_artifacts(
     dry_run: bool,
     activity_window: Duration,
 ) -> ReclaimReport {
-    reclaim_kept_artifacts_generic(
+    let classify = |path: &Path, n: u32| clean::classify_pr_worktree(path, n, opts, probes);
+    let class = artifact_reclaim::WorktreeClass {
+        prefix: "pr",
+        parse_name: &crate::worktree_ops::naming::pr_from_worktree,
+        classify: &classify,
+    };
+    let probes = artifact_reclaim::production_artifact_probes();
+    artifact_reclaim::reclaim_kept(
         repo_root,
+        &class,
         dry_run,
         activity_window,
-        &crate::worktree_ops::naming::pr_from_worktree,
-        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+        &probes,
+        &artifact_reclaim::never_stop,
     )
 }
 
-/// The shared artifact-reclaim loop behind [`reclaim_kept_worktree_artifacts`]
-/// and [`reclaim_kept_pr_worktree_artifacts`] (#5939) — the reclaim-side
-/// counterpart of [`reap_worktrees_generic`], and split for the same reason:
-/// the two classes differ only in their naming filter and classifier, so
-/// there is exactly one copy of the "which decisions are reclaimable" rule.
-fn reclaim_kept_artifacts_generic(
-    repo_root: &Path,
-    dry_run: bool,
-    activity_window: Duration,
-    parse_name: &dyn Fn(&str) -> Option<u32>,
-    classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
-) -> ReclaimReport {
-    let mut report = ReclaimReport::default();
-    let now = SystemTime::now();
-
-    for entry in enumerate_worktree_dirs(repo_root) {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(num) = parse_name(&name) else {
-            continue;
-        };
-        report.scanned += 1;
-        if name.starts_with("issue-")
-            && crate::tokens_pool::private_workspace::export::has_issue(repo_root, num)
-        {
-            continue;
-        }
-
-        let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        let decision = classify(&worktree_path, num);
-
-        if let Some(reason) = reclaim_skip_reason(&decision, &worktree_path, now, activity_window) {
-            report.skipped.push((num, reason));
-            continue;
-        }
-
-        let reclaimed = clean::reclaim_worktree_artifacts(&worktree_path, dry_run);
-        if reclaimed.is_empty() {
-            continue;
-        }
-        report
-            .reclaimed
-            .push((num, reclaimed.into_iter().map(|a| a.name).collect()));
-    }
-
-    report
-}
-
-/// Log an `issue-<N>` artifact-reclaim pass's outcome, mirroring
-/// [`log_report`]'s shape.
+/// Log an `issue-<N>` artifact-reclaim pass's outcome
+/// ([`artifact_reclaim::log_report`]).
 pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
-    log_reclaim_report_for_class(repo_root, report, "issue");
+    artifact_reclaim::log_report(repo_root, report, "issue");
 }
 
-/// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939) — the PR counterpart
-/// of [`log_reclaim_report`].
+/// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939).
 pub fn log_pr_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
-    log_reclaim_report_for_class(repo_root, report, "pr");
-}
-
-/// Shared body of [`log_reclaim_report`] / [`log_pr_reclaim_report`]. `class`
-/// is the worktree-name prefix without its trailing dash (`"issue"` / `"pr"`),
-/// so a per-worktree log line reads `skipping issue-42` / `skipping pr-5312`
-/// and an operator can tell the two passes apart in one log.
-fn log_reclaim_report_for_class(repo_root: &Path, report: &ReclaimReport, class: &str) {
-    if report.reclaimed.is_empty() {
-        log::debug!(
-            "worktree_reaper: {} {class}-<N> artifact reclaim: nothing to reclaim ({})",
-            repo_root.display(),
-            report.summary()
-        );
-    } else {
-        log::info!(
-            "worktree_reaper: {} {class}-<N> artifact reclaim: {} reclaimed={:?}",
-            repo_root.display(),
-            report.summary(),
-            report.reclaimed
-        );
-    }
-    for (num, reason) in &report.skipped {
-        log::debug!(
-            "worktree_reaper: {} artifact reclaim skipping {class}-{num}: {reason}",
-            repo_root.display()
-        );
-    }
+    artifact_reclaim::log_report(repo_root, report, "pr");
 }
 
 // ============================================================================
@@ -863,7 +785,12 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // both worktree reclaim passes above, so the cheap regenerable-artifact
     // sweeps get their bytes back before the expensive pressure-gated one
     // decides whether the host is still short (#5939 rebase).
-    crate::deep_clean::run_for(repo_root, resolve_disk_warn_free_gb(config));
+    //
+    // #11192: below the floor, the cross-root idle worktree target pass
+    // (#11071) runs first, on this scheduled path as well as the eager one,
+    // sharing one host-wide window with it — so it no longer depends on the
+    // eager trigger re-arming. Then the deep pass, exactly as before.
+    crate::eager_reclaim::scheduled_pressure_tier(repo_root, resolve_disk_warn_free_gb(config));
 
     // #7332: Docker image retention — the session-container CI/smoke/audit
     // flows leave dangling/superseded `loom-worker*` images on the executing
@@ -2309,6 +2236,7 @@ mod tests {
                 scanned: 2,
                 reclaimed: vec![(5312, vec!["target".to_string()])],
                 skipped: vec![(5349, "PR still open".to_string())],
+                ..ReclaimReport::default()
             },
         );
     }
@@ -2482,6 +2410,7 @@ mod tests {
             scanned: 3,
             reclaimed: vec![(1, vec!["target".to_string()])],
             skipped: vec![(2, "in use".to_string())],
+            ..ReclaimReport::default()
         };
         assert_eq!(report.summary(), "scanned=3 reclaimed=1 skipped=1");
     }
@@ -2497,6 +2426,7 @@ mod tests {
                 scanned: 1,
                 reclaimed: vec![(1, vec!["target".to_string(), "node_modules".to_string()])],
                 skipped: vec![(2, "PR still open".to_string())],
+                ..ReclaimReport::default()
             },
         );
     }

@@ -1240,7 +1240,19 @@ enum WorkspaceAction {
         /// first-time consumer install layered on top, clobbering that work.
         #[arg(long)]
         no_init: bool,
+
+        /// Register it maintain-only (#11186): kept current, never dispatched
+        /// into. Same as `workspace hold` right after, in one write.
+        #[arg(long)]
+        maintain_only: bool,
     },
+    /// Make a registered workspace maintain-only (#11186): the daemon keeps
+    /// its Loom install current (resync, checkout fast-forward, floor checks)
+    /// but starts no sweep, role or epic dispatch there. Hot-applies. On a
+    /// host a fleet store drives, the roster (`fleet: maintain`) wins.
+    Hold(cli::workspace_fleet::WorkspaceRoot),
+    /// Lift `workspace hold`: dispatch into the workspace resumes (#11186).
+    Release(cli::workspace_fleet::WorkspaceRoot),
     /// Set the dispatch priority tier of an already-registered workspace (#3946).
     SetPriority {
         /// Path to the repo root (normalized the same way as `add`).
@@ -1904,10 +1916,10 @@ enum TokensAction {
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
-    /// with precedence claude-monitor (`~/.claude-monitor/accounts.env`,
-    /// primary) > repo-local. The home master (`~/.loom/accounts.env`) is
-    /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
-    /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
+    /// with precedence llm-monitor (`~/.llm-monitor/accounts.env`, or a 1.x
+    /// host's `~/.claude-monitor`; primary) > repo-local. The home master
+    /// (`~/.loom/accounts.env`) is opt-in only: read solely when
+    /// `$LOOM_ACCOUNTS_ENV` (or `--home-env`) points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
     /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
     /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081). That Python CLI no
     /// longer exists — the package was deleted in Phase 4 (#4557) — so this name
@@ -1955,8 +1967,9 @@ enum TokensAction {
         json: bool,
     },
 
-    /// Materialize `.loom/tokens/` from claude-monitor's LIVE credential store
-    /// (`~/.claude-monitor/usage.db`) instead of the `accounts.env` snapshot.
+    /// Materialize `.loom/tokens/` from llm-monitor's LIVE credential store
+    /// (`~/.llm-monitor/usage.db`, or a 1.x host's `~/.claude-monitor`) instead
+    /// of the `accounts.env` snapshot.
     /// Use this after rolling accounts: the snapshot keeps the old (now
     /// revoked) tokens, so `bootstrap --force` would rewrite them unchanged.
     /// Native Rust port of the historical Python `loom-tokens
@@ -1974,8 +1987,9 @@ enum TokensAction {
         #[arg(long)]
         shared: bool,
 
-        /// Path to claude-monitor's `usage.db` (default: `<claude-monitor
-        /// dir>/usage.db`, honoring `$LOOM_CLAUDE_MONITOR_DIR`).
+        /// Path to llm-monitor's `usage.db` (default: `<monitor dir>/usage.db`,
+        /// honoring `$LOOM_LLM_MONITOR_DIR`, then `$LOOM_CLAUDE_MONITOR_DIR`,
+        /// then `~/.llm-monitor`, then `~/.claude-monitor`).
         #[arg(long, value_name = "PATH")]
         db: Option<String>,
 

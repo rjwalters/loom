@@ -47,10 +47,19 @@
 //!    ([`host_configured_target_dirs`]): an
 //!    operator's shared `CARGO_TARGET_DIR=/tmp/cargo-target-shared` is not an
 //!    orphan.
-//! 4. The newest mtime anywhere under it (not the directory's own mtime) is
-//!    older than the max age (default [`DEFAULT_MAX_AGE_HOURS`]).
-//! 5. No live claim names its issue number, and a run dir's recorded owner pid
-//!    ([`crate::run_target_dir::OWNER_FILE`]) is not running.
+//! 4. No live claim names its issue number, and a run dir's recorded owner
+//!    ([`crate::run_target_dir::OWNER_FILE`]) is not running. A live pid whose
+//!    start identity differs from the one recorded at provision is a reused
+//!    pid, not the owner ([`crate::run_target_dir::owner`], #11031).
+//! 5. The newest mtime anywhere under it (not the directory's own mtime) is
+//!    older than its age gate. A marked run dir under `.loom/targets` whose
+//!    owner is gone (gate 4) waits only the dead-owner grace (default
+//!    [`DEFAULT_DEAD_OWNER_GRACE_MINUTES`] minutes): the marker proves Loom
+//!    made it and the owner check proves its run is over, so the grace only
+//!    has to cover a straggling write. Every other candidate (the legacy
+//!    improvised locations, which carry no marker) keeps the max age (default
+//!    [`DEFAULT_MAX_AGE_HOURS`] hours). The tree walk runs after the cheaper
+//!    gates, not before them.
 //! 6. No process holds anything open under it
 //!    ([`crate::worktree_ops::safety::find_processes_using_directory`]). When
 //!    neither `/proc` nor `lsof` is available that probe cannot answer, and
@@ -62,7 +71,17 @@
 //! The below-floor tier ([`crate::eager_reclaim`]), the scheduled 15-minute
 //! tier ([`crate::worktree_reaper::reap_repo`]) and `loom-daemon clean`
 //! (report-only without `--force`, and always under `--dry-run`). The two
-//! daemon tiers share one per-repo cooldown; `clean` bypasses it.
+//! daemon tiers share one per-repo cooldown for the full pass; `clean`
+//! bypasses it. A daemon pass inside the cooldown still scans
+//! `.loom/targets` alone ([`run_for`]), which is cheap (one pid probe per live
+//! run, a walk only for a dead owner's dir), so a dead sweep's dir goes at
+//! the reaper's next tick once its grace has passed, not a cooldown later.
+//!
+//! A daemon sweep's dir is normally gone before any of this sees it: the
+//! registry removes it when the sweep ends
+//! ([`crate::run_target_dir::sweep_end`]). This pass is the backstop for a
+//! dir that end-of-run removal kept (a straggling process), a sweep that ended
+//! while no daemon was running, and a manual `spawn-worker.sh` run.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -79,6 +98,8 @@ pub const ENABLE_ENV: &str = "LOOM_TARGET_ORPHAN_RECLAIM";
 pub const MAX_AGE_HOURS_ENV: &str = "LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS";
 /// Env override for the per-repo cooldown (seconds).
 pub const MIN_INTERVAL_ENV: &str = "LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS";
+/// Env override for the dead-owner grace (minutes).
+pub const DEAD_OWNER_GRACE_ENV: &str = "LOOM_TARGET_ORPHAN_RECLAIM_DEAD_OWNER_GRACE_MINUTES";
 
 /// Default max age: 3 hours since the last write anywhere under the dir. Every
 /// leaked dir measured on 2026-10-06 and 2026-10-08 was older than this, and
@@ -86,6 +107,10 @@ pub const MIN_INTERVAL_ENV: &str = "LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS
 pub const DEFAULT_MAX_AGE_HOURS: u64 = 3;
 /// Default cooldown between passes for one repo: 30 minutes.
 pub const DEFAULT_MIN_INTERVAL_SECS: u64 = 1_800;
+/// Default grace for a marked run dir whose owner is gone: 10 minutes since
+/// the last write anywhere under it. The owner check already says the run is
+/// over; this only has to outlast a straggling child's last write.
+pub const DEFAULT_DEAD_OWNER_GRACE_MINUTES: u64 = 10;
 
 /// Name prefix for the improvised location inside the repo's `.loom/`.
 pub const LEGACY_REPO_PREFIX: &str = "target-";
@@ -107,6 +132,7 @@ pub struct TargetOrphanConfig {
     pub enabled: Option<bool>,
     pub max_age_hours: Option<u64>,
     pub min_interval_secs: Option<u64>,
+    pub dead_owner_grace_minutes: Option<u64>,
 }
 
 #[must_use]
@@ -128,6 +154,10 @@ pub fn read_config(repo_root: &Path) -> TargetOrphanConfig {
             .get("minIntervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        dead_owner_grace_minutes: block
+            .get("deadOwnerGraceMinutes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&m| m > 0),
     }
 }
 
@@ -149,6 +179,46 @@ pub fn resolve_max_age_hours(config: &TargetOrphanConfig) -> u64 {
         .filter(|&h| h > 0)
         .or(config.max_age_hours)
         .unwrap_or(DEFAULT_MAX_AGE_HOURS)
+}
+
+/// A zero or unparseable value falls through, for the same reason as the max
+/// age: a 0-minute grace would race a dying run's last writes.
+#[must_use]
+pub fn resolve_dead_owner_grace_minutes(config: &TargetOrphanConfig) -> u64 {
+    std::env::var(DEAD_OWNER_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&m| m > 0)
+        .or(config.dead_owner_grace_minutes)
+        .unwrap_or(DEFAULT_DEAD_OWNER_GRACE_MINUTES)
+}
+
+/// The two age gates one pass applies, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgeGates {
+    /// For a candidate with no proof its owner is gone (the legacy locations).
+    pub max_age_secs: i64,
+    /// For a marked run dir whose recorded owner is gone. Never longer than
+    /// `max_age_secs`.
+    pub dead_owner_grace_secs: i64,
+}
+
+impl AgeGates {
+    #[must_use]
+    pub fn from_units(max_age_hours: u64, dead_owner_grace_minutes: u64) -> Self {
+        let max_age_secs = i64::try_from(max_age_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
+        let grace = i64::try_from(dead_owner_grace_minutes.saturating_mul(60)).unwrap_or(i64::MAX);
+        Self {
+            max_age_secs,
+            dead_owner_grace_secs: grace.min(max_age_secs),
+        }
+    }
+}
+
+/// Both age gates from env > config > default.
+#[must_use]
+pub fn resolve_ages(config: &TargetOrphanConfig) -> AgeGates {
+    AgeGates::from_units(resolve_max_age_hours(config), resolve_dead_owner_grace_minutes(config))
 }
 
 #[must_use]
@@ -280,7 +350,16 @@ pub fn vet_root(repo_root: &Path, root: &ScanRoot) -> Result<(), String> {
     if root.scope == RootScope::Shared {
         return Ok(());
     }
-    let Ok(relative) = root.dir.strip_prefix(repo_root) else {
+    vet_path_inside(repo_root, &root.dir)
+}
+
+/// [`vet_root`]'s check for a root inside the repo, for any `dir` under any
+/// `base`: every component below `base` is a real directory (a symlink at any
+/// level refuses it) and `dir`'s canonical path is strictly inside `base`'s.
+/// Also how the kept-worktree artifact reclaim vets `<worktree>/target`
+/// (#11071).
+pub fn vet_path_inside(repo_root: &Path, dir: &Path) -> Result<(), String> {
+    let Ok(relative) = dir.strip_prefix(repo_root) else {
         return Err(format!("not under the repo root {}", repo_root.display()));
     };
     let mut walked = repo_root.to_path_buf();
@@ -301,7 +380,7 @@ pub fn vet_root(repo_root: &Path, root: &ScanRoot) -> Result<(), String> {
             Err(e) => return Err(format!("{}: {e}", walked.display())),
         }
     }
-    let (Ok(real_root), Ok(real_repo)) = (root.dir.canonicalize(), repo_root.canonicalize()) else {
+    let (Ok(real_root), Ok(real_repo)) = (dir.canonicalize(), repo_root.canonicalize()) else {
         return Err("could not canonicalize the root or the repo root".to_string());
     };
     if real_root == real_repo || !real_root.starts_with(&real_repo) {
@@ -420,6 +499,9 @@ pub struct Probes<'a> {
     /// `Some(true)` held open, `Some(false)` free, `None` could not probe.
     pub open_handles: &'a dyn Fn(&Path) -> Option<bool>,
     pub owner_alive: &'a dyn Fn(u32) -> bool,
+    /// The current start identity of a pid, to see through pid reuse
+    /// ([`crate::run_target_dir::owner::process_start_token`]).
+    pub owner_identity: &'a dyn Fn(u32) -> Option<String>,
     /// Issue numbers with a live claim.
     pub live_issues: &'a HashSet<u32>,
     /// Configured target dirs (already resolved through symlinks).
@@ -463,7 +545,7 @@ fn issue_numbers(name: &str) -> Vec<u32> {
 
 /// The newest mtime anywhere under `path`, and the total size, without
 /// following symlinks. An unreadable child is skipped.
-fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
+pub(crate) fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
     let meta = std::fs::symlink_metadata(path)?;
     let own: DateTime<Utc> = meta.modified().map_or_else(|_| Utc::now(), DateTime::from);
     if !meta.is_dir() {
@@ -482,14 +564,14 @@ fn newest_mtime_and_size(path: &Path) -> std::io::Result<(DateTime<Utc>, u64)> {
     Ok((newest, total))
 }
 
-/// Run every gate on one name-matched path, cheapest first. The open-handle
-/// probe (an `lsof +D` walk on macOS) runs last, only for a dir that is
-/// otherwise eligible.
+/// Run every gate on one name-matched path, cheapest first: the live-claim
+/// and owner gates before the tree walk, and the open-handle probe (an
+/// `lsof +D` walk on macOS) last, only for a dir that is otherwise eligible.
 pub fn evaluate(
     path: &Path,
     gates: RootGates,
     now: DateTime<Utc>,
-    max_age_secs: i64,
+    ages: AgeGates,
     probes: &Probes<'_>,
 ) -> Result<Candidate, KeepReason> {
     use std::os::unix::fs::MetadataExt;
@@ -512,12 +594,6 @@ pub fn evaluate(
     {
         return Err(KeepReason::ConfiguredTargetDir(p.clone()));
     }
-    let (newest_mtime, size_bytes) =
-        newest_mtime_and_size(path).map_err(|_| KeepReason::Unreadable)?;
-    let age_secs = (now - newest_mtime).num_seconds();
-    if age_secs < max_age_secs.max(1) {
-        return Err(KeepReason::Young { age_secs });
-    }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if let Some(n) = issue_numbers(name)
         .into_iter()
@@ -525,8 +601,24 @@ pub fn evaluate(
     {
         return Err(KeepReason::LiveClaim(n));
     }
-    if let Some(pid) = crate::run_target_dir::owner_pid(path).filter(|&p| (probes.owner_alive)(p)) {
+    if let Some(pid) = crate::run_target_dir::owner::running_owner_with(
+        path,
+        probes.owner_alive,
+        probes.owner_identity,
+    ) {
         return Err(KeepReason::OwnerAlive(pid));
+    }
+    // Past the owner gate, a marked run dir's owner is gone (#11031).
+    let min_age_secs = if gates.require_owner_marker {
+        ages.dead_owner_grace_secs
+    } else {
+        ages.max_age_secs
+    };
+    let (newest_mtime, size_bytes) =
+        newest_mtime_and_size(path).map_err(|_| KeepReason::Unreadable)?;
+    let age_secs = (now - newest_mtime).num_seconds();
+    if age_secs < min_age_secs.max(1) {
+        return Err(KeepReason::Young { age_secs });
     }
     match (probes.open_handles)(path) {
         Some(false) => Ok(Candidate {
@@ -549,7 +641,8 @@ pub struct TargetOrphanReport {
     pub repo_root: PathBuf,
     pub enabled: bool,
     pub dry_run: bool,
-    /// Present when the cooldown skipped this evaluation.
+    /// Present when the cooldown skipped the full pass; only `.loom/targets`
+    /// was scanned.
     pub deferred: Option<String>,
     /// Passed every gate (on a dry run, what WOULD be removed).
     pub eligible: Vec<Candidate>,
@@ -621,8 +714,10 @@ pub fn log_report(report: &TargetOrphanReport) {
         return;
     }
     if let Some(reason) = &report.deferred {
-        log::debug!("target_orphan_reclaim: {} skipped: {reason}", report.repo_root.display());
-        return;
+        log::debug!(
+            "target_orphan_reclaim: {} full pass skipped: {reason}; scanned .loom/targets only",
+            report.repo_root.display()
+        );
     }
     for (path, why) in &report.failed {
         log::warn!(
@@ -645,14 +740,16 @@ pub fn log_report(report: &TargetOrphanReport) {
 }
 
 /// Scan `roots`, evaluate every name-matched child, and (unless `dry_run`)
-/// remove the eligible ones. The injectable core; nothing here reads the
-/// environment.
+/// remove each eligible one as soon as it is judged, so the gap between its
+/// checks and its removal does not grow with the number of candidates. A run
+/// dir loses its owner marker last ([`crate::run_target_dir::owner::remove_marker_last`]).
+/// The injectable core; nothing here reads the environment.
 #[must_use]
 pub fn run_with(
     repo_root: &Path,
     roots: &[ScanRoot],
     now: DateTime<Utc>,
-    max_age_secs: i64,
+    ages: AgeGates,
     dry_run: bool,
     probes: &Probes<'_>,
 ) -> TargetOrphanReport {
@@ -680,18 +777,25 @@ pub fn run_with(
                 continue;
             }
             let path = entry.path();
-            match evaluate(&path, gates, now, max_age_secs, probes) {
-                Ok(candidate) => report.eligible.push(candidate),
-                Err(why) => report.kept.push((path, why)),
+            let candidate = match evaluate(&path, gates, now, ages, probes) {
+                Ok(candidate) => candidate,
+                Err(why) => {
+                    report.kept.push((path, why));
+                    continue;
+                }
+            };
+            if !dry_run {
+                let removed = if gates.require_owner_marker {
+                    crate::run_target_dir::owner::remove_marker_last(&candidate.path)
+                } else {
+                    std::fs::remove_dir_all(&candidate.path)
+                };
+                match removed {
+                    Ok(()) => report.removed.push(candidate.clone()),
+                    Err(e) => report.failed.push((candidate.path.clone(), e.to_string())),
+                }
             }
-        }
-    }
-    if !dry_run {
-        for candidate in &report.eligible {
-            match std::fs::remove_dir_all(&candidate.path) {
-                Ok(()) => report.removed.push(candidate.clone()),
-                Err(e) => report.failed.push((candidate.path.clone(), e.to_string())),
-            }
+            report.eligible.push(candidate);
         }
     }
     report
@@ -718,7 +822,7 @@ pub fn host_configured_target_dirs(repo_root: &Path) -> Vec<PathBuf> {
 /// The production open-handle probe. `None` when neither `/proc` nor `lsof`
 /// is available: `find_processes_using_directory` would then report "no
 /// holders", and this pass must not read that as "free".
-fn production_open_handles(path: &Path) -> Option<bool> {
+pub(crate) fn production_open_handles(path: &Path) -> Option<bool> {
     let probe_available = (cfg!(target_os = "linux") && Path::new("/proc/self").is_dir())
         || std::process::Command::new("lsof")
             .arg("-v")
@@ -735,7 +839,19 @@ fn production_open_handles(path: &Path) -> Option<bool> {
 /// One pass with the production probes, no cooldown. `loom-daemon clean` calls
 /// this directly.
 #[must_use]
-pub fn run_now(repo_root: &Path, max_age_hours: u64, dry_run: bool) -> TargetOrphanReport {
+pub fn run_now(repo_root: &Path, ages: AgeGates, dry_run: bool) -> TargetOrphanReport {
+    run_scoped(repo_root, ages, dry_run, false)
+}
+
+/// [`run_now`], optionally over `.loom/targets` alone (`run_dirs_only`): the
+/// cheap pass a daemon tier runs while the full pass is cooling down.
+#[must_use]
+pub fn run_scoped(
+    repo_root: &Path,
+    ages: AgeGates,
+    dry_run: bool,
+    run_dirs_only: bool,
+) -> TargetOrphanReport {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
     let mut roots = scan_roots(repo_root, home.as_deref(), tmpdir.as_deref());
@@ -744,17 +860,20 @@ pub fn run_now(repo_root: &Path, max_age_hours: u64, dry_run: bool) -> TargetOrp
     if cfg!(test) {
         roots.retain(|r| r.scope == RootScope::Repo);
     }
+    if run_dirs_only {
+        roots.retain(|r| r.matcher == NameMatcher::RunDir);
+    }
     let protected = host_configured_target_dirs(repo_root);
     let live_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
     let probes = Probes {
         open_handles: &production_open_handles,
         owner_alive: &crate::live_claim::pid_is_live_process,
+        owner_identity: &crate::run_target_dir::owner::process_start_token,
         live_issues: &live_issues,
         protected: &protected,
         euid: current_euid(),
     };
-    let max_age_secs = i64::try_from(max_age_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
-    run_with(repo_root, &roots, Utc::now(), max_age_secs, dry_run, &probes)
+    run_with(repo_root, &roots, Utc::now(), ages, dry_run, &probes)
 }
 
 // ============================================================================
@@ -796,7 +915,9 @@ fn record_run(repo_root: &Path, now: DateTime<Utc>) {
 }
 
 /// One production pass for the daemon tiers: config, enable switch, per-repo
-/// cooldown, then [`run_now`]. Logs its own report.
+/// cooldown, then [`run_now`]. Inside the cooldown it still runs the
+/// `.loom/targets`-only pass ([`run_scoped`]) and reports the full pass as
+/// `deferred`. Logs its own report.
 #[must_use]
 pub fn run_for(repo_root: &Path) -> TargetOrphanReport {
     let config = read_config(repo_root);
@@ -809,17 +930,17 @@ pub fn run_for(repo_root: &Path) -> TargetOrphanReport {
         log_report(&base);
         return base;
     }
+    let ages = resolve_ages(&config);
     if let Some(reason) = cooldown_reason(repo_root, now, resolve_min_interval_secs(&config)) {
         let report = TargetOrphanReport {
-            enabled: true,
             deferred: Some(reason),
-            ..base
+            ..run_scoped(repo_root, ages, false, true)
         };
         log_report(&report);
         return report;
     }
     record_run(repo_root, now);
-    let report = run_now(repo_root, resolve_max_age_hours(&config), false);
+    let report = run_now(repo_root, ages, false);
     log_report(&report);
     report
 }

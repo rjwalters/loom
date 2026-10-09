@@ -162,6 +162,8 @@ pub(crate) enum ScriptPortCommand {
     /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
     /// `find | read` loop — which is #7858's class. Exit 0 always: this is
     /// best-effort by contract and the worktree already exists.
+    /// `--retire-aliases` instead unlinks the pnpm `node_modules` aliases
+    /// pre-#8944 worktrees still carry (#9152; exit 1 if an unlink failed).
     WorktreeLink(super::worktree_link::WorktreeLinkArgs),
 
     /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
@@ -555,6 +557,13 @@ pub(crate) enum ScriptPortCommand {
     /// `super::forge_probe_cmd` for the exit-code and credential contract.
     ForgeProbe(super::forge_probe_cmd::ForgeProbeArgs),
 
+    /// `.loom/resync-ignore` pin fork-point provenance (#8726): `add` pins a
+    /// path and records the upstream commit it forked from in the additive
+    /// `.loom/resync-pin-base` sidecar; `status` reports per-pin drift. Not a
+    /// port: brand-new logic, native per the shell-language policy.
+    #[command(subcommand)]
+    ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -652,6 +661,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
+            ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
         }
     }
 }

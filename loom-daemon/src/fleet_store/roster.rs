@@ -13,17 +13,36 @@
 //!   - name: app           # unique
 //!     dir: app            # clone directory under root (default: name)
 //!     remote: git@github.com:acme/app.git
-//!     fleet: true         # the daemon manages it (default false)
+//!     fleet: true         # the daemon manages it (default false); `maintain`: see below
 //!     fleet_priority: 10  # dispatch tier, lower first (default 100)
 //!     firewall: true      # must never be an unattended-agent target (default false)
 //! ```
 //!
 //! Other keys are ignored. The desired set is every record with `fleet: true`
-//! and not `firewall: true`. A record with **both** is a hard error for the
-//! whole roster, never a silent exclusion: the manifest is then in exactly the
-//! state `firewall` exists to prevent, and quietly dropping the repo would hide
-//! the drift a human needs to see. A non-boolean flag, a non-integer
-//! priority, a duplicate name or dir, or an unsafe `dir` are hard errors too.
+//! or `fleet: maintain`, and not `firewall: true`. A record with **both** is a
+//! hard error for the whole roster, never a silent exclusion: the manifest is
+//! then in exactly the state `firewall` exists to prevent, and quietly
+//! dropping the repo would hide the drift a human needs to see. A `fleet`
+//! other than `true`/`false`/`maintain`, a non-boolean `firewall`, a
+//! non-integer priority, a duplicate name or dir, or an unsafe `dir` are hard
+//! errors too.
+//!
+//! # `fleet: maintain` (#11186)
+//!
+//! A maintain-only repo is registered and maintained like `fleet: true` (Loom
+//! resync, checkout fast-forward, floor checks), but the daemon never
+//! dispatches into it ([`crate::workspace_hold`]'s `maintain-only` hold).
+//!
+//! It is a third value of `fleet`, not a separate `dispatch: false` key,
+//! because of what a daemon that predates it does with the record. The old
+//! parser refuses any `fleet` that is not a boolean, so it fails the **whole
+//! roster closed**: no add, no remove, no dispatch change on that host until
+//! it runs a daemon that knows the value. A separate key would be ignored
+//! (other keys are), leaving `fleet: true`, and the old daemon would register
+//! the repo and dispatch into it: the one outcome the operator asked to rule
+//! out. Neither form is free on an old daemon (a failed roster also fails the
+//! token pool's firewall input closed), so a store must not use the value
+//! until every host runs a daemon that understands it.
 //!
 //! # Plan
 //!
@@ -53,8 +72,11 @@ pub struct Record {
     pub dir: String,
     /// `remote`, when a string.
     pub remote: Option<String>,
-    /// `fleet`.
+    /// `fleet`: `true` or `maintain`.
     pub fleet: bool,
+    /// `fleet: maintain` (#11186): managed, never dispatched into.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub maintain_only: bool,
     /// `firewall`.
     pub firewall: bool,
     /// `fleet_priority`, when set.
@@ -79,11 +101,14 @@ pub struct Desired {
     pub path: PathBuf,
     /// Priority tier.
     pub priority: u32,
+    /// `fleet: maintain`.
+    pub maintain_only: bool,
 }
 
 impl Roster {
-    /// The desired workspace set: `fleet: true` and not `firewall: true`, in
-    /// file order. (Both flags together were refused at parse time.)
+    /// The desired workspace set: `fleet: true` or `maintain`, and not
+    /// `firewall: true`, in file order. (Both together were refused at parse
+    /// time.)
     #[must_use]
     pub fn desired(&self) -> Vec<Desired> {
         self.records
@@ -93,6 +118,7 @@ impl Roster {
                 name: r.name.clone(),
                 path: self.root.join(&r.dir),
                 priority: r.fleet_priority.unwrap_or(DEFAULT_WORKSPACE_PRIORITY),
+                maintain_only: r.maintain_only,
             })
             .collect()
     }
@@ -170,9 +196,11 @@ fn from_map(top: &serde_json::Map<String, Value>, home: &Path, source: &str) -> 
         }
         if r.fleet && r.firewall {
             errors.push(format!(
-                "record `{}` (dir={}) is fleet: true AND firewall: true — refusing the whole roster \
-                 rather than silently excluding it; fix the manifest",
-                r.name, r.dir
+                "record `{}` (dir={}) is fleet: {} AND firewall: true — refusing the whole \
+                 roster rather than silently excluding it; fix the manifest",
+                r.name,
+                r.dir,
+                if r.maintain_only { "maintain" } else { "true" }
             ));
         }
     }
@@ -219,7 +247,13 @@ fn record(item: &Value) -> Result<Record, String> {
             Some(other) => Err(format!("`{name}`: `{key}` must be true or false (got {other})")),
         }
     };
-    let fleet = flag("fleet")?;
+    let (fleet, maintain_only) = match m.get("fleet") {
+        Some(Value::String(v)) if v == "maintain" => (true, true),
+        Some(Value::Bool(_)) | Some(Value::Null) | None => (flag("fleet")?, false),
+        Some(other) => {
+            return Err(format!("`{name}`: `fleet` must be true, false or maintain (got {other})"))
+        }
+    };
     let firewall = flag("firewall")?;
     let fleet_priority = match m.get("fleet_priority") {
         None | Some(Value::Null) => None,
@@ -237,6 +271,7 @@ fn record(item: &Value) -> Result<Record, String> {
         dir,
         remote,
         fleet,
+        maintain_only,
         firewall,
         fleet_priority,
     })
@@ -249,6 +284,8 @@ pub struct Registered {
     pub root: PathBuf,
     /// Priority tier.
     pub priority: u32,
+    /// Whether the registry marks it maintain-only, by either source.
+    pub maintain_only: bool,
 }
 
 /// One planned change.
@@ -263,6 +300,9 @@ pub enum Change {
         path: PathBuf,
         /// Priority tier.
         priority: u32,
+        /// Register it maintain-only (`fleet: maintain`), in the same write.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        maintain_only: bool,
     },
     /// A desired workspace that cannot be added: not cloned under `root`.
     MissingClone {
@@ -291,12 +331,24 @@ pub enum Change {
         /// Desired tier.
         to: u32,
     },
+    /// Make a registered workspace maintain-only (`to: true`) or a normal,
+    /// dispatched one again, in place (#11186).
+    SetMaintainOnly {
+        /// Record name.
+        name: String,
+        /// Workspace root.
+        path: PathBuf,
+        /// Maintain-only after the change.
+        to: bool,
+    },
 }
 
 /// The roster diffed against the registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Plan {
-    /// Changes, in apply order: removes, then adds, then priority changes.
+    /// Changes, in apply order: removes, then mode changes (so a repo turning
+    /// maintain-only stops taking dispatch first), then adds, then priority
+    /// changes.
     pub changes: Vec<Change>,
     /// Registered workspaces the store has no record for (left alone).
     pub unmanaged: Vec<PathBuf>,
@@ -330,6 +382,7 @@ pub fn plan(
     let mut removes = Vec::new();
     let mut adds = Vec::new();
     let mut reprioritize = Vec::new();
+    let mut modes = Vec::new();
     let mut in_sync = 0;
     let known: Vec<(&Record, PathBuf)> = roster
         .records
@@ -360,18 +413,31 @@ pub fn plan(
                 name: want.name,
                 path,
                 priority: want.priority,
+                maintain_only: want.maintain_only,
             }),
             None => adds.push(Change::MissingClone {
                 name: want.name,
                 path,
             }),
-            Some(r) if r.priority != want.priority => reprioritize.push(Change::SetPriority {
-                name: want.name,
-                path,
-                from: r.priority,
-                to: want.priority,
-            }),
-            Some(_) => in_sync += 1,
+            Some(r) => {
+                let synced = r.priority == want.priority && r.maintain_only == want.maintain_only;
+                if r.maintain_only != want.maintain_only {
+                    modes.push(Change::SetMaintainOnly {
+                        name: want.name.clone(),
+                        path: path.clone(),
+                        to: want.maintain_only,
+                    });
+                }
+                if r.priority != want.priority {
+                    reprioritize.push(Change::SetPriority {
+                        name: want.name,
+                        path,
+                        from: r.priority,
+                        to: want.priority,
+                    });
+                }
+                in_sync += usize::from(synced);
+            }
         }
     }
     let unmanaged = registered
@@ -380,6 +446,7 @@ pub fn plan(
         .map(|r| r.root.clone())
         .collect();
     let mut changes = removes;
+    changes.extend(modes);
     changes.extend(adds);
     changes.extend(reprioritize);
     Plan {
@@ -393,8 +460,14 @@ pub fn plan(
 #[must_use]
 pub fn describe(change: &Change) -> String {
     match change {
-        Change::Add { name, path, priority } => {
-            format!("+ add      {name:<24} {} (priority {priority})", path.display())
+        Change::Add {
+            name,
+            path,
+            priority,
+            maintain_only,
+        } => {
+            let mode = if *maintain_only { ", maintain-only" } else { "" };
+            format!("+ add      {name:<24} {} (priority {priority}{mode})", path.display())
         }
         Change::MissingClone { name, path } => format!(
             "! missing  {name:<24} {} — not cloned; clone it, then re-run (this command never clones)",
@@ -405,6 +478,14 @@ pub fn describe(change: &Change) -> String {
         }
         Change::SetPriority { name, path, from, to } => {
             format!("~ priority {name:<24} {} ({from} -> {to})", path.display())
+        }
+        Change::SetMaintainOnly { name, path, to } => {
+            let (from, to) = if *to {
+                ("dispatch", "maintain-only")
+            } else {
+                ("maintain-only", "dispatch")
+            };
+            format!("~ mode     {name:<24} {} ({from} -> {to})", path.display())
         }
     }
 }

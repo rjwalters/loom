@@ -57,6 +57,7 @@ fn sample() -> PauseManifest {
                 lease_sweep_id: None,
             }),
             safe_point: None,
+            safe_point_miss: None,
             checkpoint_phase: Some("builder".into()),
             worktree: Some(WorktreeRecord {
                 path: "/w".into(),
