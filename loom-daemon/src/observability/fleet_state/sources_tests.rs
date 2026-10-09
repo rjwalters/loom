@@ -22,6 +22,7 @@ fn review_stub(dir: &Path) -> PathBuf {
             r#"#!/bin/sh
 d={dir}
 echo "$*" >> "$d/calls.log"
+n=1
 case "$*" in
   *'&page='*)
     n=$(echo "$*" | sed 's/.*&page=\([0-9]*\).*/\1/')
@@ -32,7 +33,9 @@ case "$*" in
   *'labels=loom:review-requested&'*) f=rr1.json ;;
   *) f=empty.json ;;
 esac
-printf 'HTTP/2.0 200 OK\r\n\r\n'
+printf 'HTTP/2.0 200 OK\r\n'
+[ "$(grep -o '"number"' "$d/$f" | wc -l)" -ge 100 ] && [ ! -f "$d/last$n" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+printf '\r\n'
 cat "$d/$f"
 "#,
             dir = dir.display()

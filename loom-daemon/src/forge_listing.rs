@@ -109,6 +109,7 @@ pub fn list_issues_cached_as(
     state: &str,
 ) -> Result<Vec<RestIssue>> {
     list_issues_cached_retrying(issue_list(caller), gh_bin, cwd, repo_override, label, state, None)
+        .map(|page| page.rows)
 }
 
 /// Most pages [`list_issues_cached_all_as`] reads.
@@ -117,7 +118,10 @@ pub const MAX_PAGES: u32 = 10;
 /// Every item carrying `label` in `state`, page by page through the same
 /// ETag cache (#10389): each page is its own conditional read (an unchanged
 /// page is a free `304`), and page 1 is the very URL, and so the very cache
-/// entry, [`list_issues_cached_as`] keeps. Stops at the first short page.
+/// entry, [`list_issues_cached_as`] keeps. Stops at the last page: on a
+/// `200`, one whose `Link` header names no `rel="next"` page (#11139), so a
+/// full page of exactly 100 items is one request; on a `304`, which carries
+/// no `Link`, a short page (a full one is read on).
 ///
 /// Pages are read one after another, not atomically, so after a multi-page
 /// walk pages `1..n-1` are revalidated with the ETags just stored (#10401):
@@ -125,10 +129,9 @@ pub const MAX_PAGES: u32 = 10;
 /// difference means the listing shifted mid-walk, so the walk is an error
 /// rather than a set that may have lost an item across a page boundary. The
 /// last (short) page is not revalidated: a removal on an earlier page shifts
-/// page `n-1`, which is caught. A single-page walk makes no extra request.
-/// One full page then an empty page 2 is not revalidated either, since no
-/// item can shift across that boundary unseen: exactly 100 rows cost two
-/// requests, and any longer walk of `p` pages costs `2p - 1`.
+/// page `n-1`, which is caught. A single-page walk makes no extra request;
+/// a walk that read `p > 1` pages costs `2p - 1`. An empty last page is no
+/// exception: an item that left page 1 pulls page 2's first item up into it.
 /// The walk is not retried internally; the next call is the retry.
 ///
 /// # Errors
@@ -294,7 +297,8 @@ pub fn list_issues_cached_paged_as(
 }
 
 /// The page walk itself. Page 1 failing is the only error; every other way
-/// the walk falls short returns the rows read plus the reason.
+/// the walk falls short returns the rows read plus the reason. Every walk
+/// that read more than one page revalidates the earlier ones (#10401).
 fn walk_pages_partial(
     site: store::ConditionalRead,
     gh_bin: &Path,
@@ -318,30 +322,20 @@ fn walk_pages_partial(
     };
     let mut pages: Vec<Vec<RestIssue>> = Vec::new();
     for page in 1..=max_pages {
-        let rows = match read(page) {
-            Ok(rows) => rows,
+        let read_page = match read(page) {
+            Ok(read_page) => read_page,
             Err(e) if page == 1 => return Err(e),
             Err(e) => return Ok(partial(pages, e)),
         };
-        let full = rows.len() >= PER_PAGE;
-        let empty_second_page = page == 2 && rows.is_empty();
-        pages.push(rows);
-        if !full {
-            // Exactly one full page: an item that left page 1 meanwhile
-            // shifts nothing onto page 2, and one that arrived would have
-            // made page 2 non-empty. No re-read can find a missed item.
-            if empty_second_page {
-                return Ok(PagedListing {
-                    rows: pages.into_iter().flatten().collect(),
-                    incomplete: None,
-                });
-            }
+        let more = read_page.has_successor();
+        pages.push(read_page.rows);
+        if !more {
             // Revalidate every earlier page (conditional reads: free `304`s
             // when nothing moved). Nothing to do for a single-page walk.
             let last = pages.len() - 1;
             for i in 0..last {
                 let now = match read(i as u32 + 1) {
-                    Ok(now) => now,
+                    Ok(now) => now.rows,
                     Err(e) => return Ok(partial(pages, e)),
                 };
                 let same = snapshot.same(&pages[i], &now);
@@ -393,7 +387,7 @@ fn list_issues_cached_retrying(
     label: &str,
     state: &str,
     page: Option<u32>,
-) -> Result<Vec<RestIssue>> {
+) -> Result<ListedPage> {
     match list_issues_cached_once(site, gh_bin, cwd, repo_override, label, state, page) {
         Ok(issues) => Ok(issues),
         Err(e) => {
@@ -449,6 +443,24 @@ fn issue_list(caller: &'static str) -> store::ConditionalRead {
     store::ConditionalRead::new(caller, crate::forge_call_stats::ops::ISSUE_LIST)
 }
 
+/// One page of a listing, and whether the forge said another follows.
+struct ListedPage {
+    rows: Vec<RestIssue>,
+    /// From a `200`'s `Link` header: `Some(true)` when it names a
+    /// `rel="next"` page, `Some(false)` when it does not. `None` for a page
+    /// served from a `304`, which carries no `Link` (and GitHub's ETag
+    /// covers only the body, so the stored body says nothing about it).
+    next: Option<bool>,
+}
+
+impl ListedPage {
+    /// Whether a walk must read the next page: the forge's word on a `200`,
+    /// else (a `304`) only a full page may have a successor.
+    fn has_successor(&self) -> bool {
+        self.next.unwrap_or(self.rows.len() >= PER_PAGE)
+    }
+}
+
 /// One unconditional attempt at the ETag-cached REST listing — the pre-#6171
 /// body of [`list_issues_cached`], split out so the public function can retry
 /// it exactly once after a forced credential refresh.
@@ -470,7 +482,7 @@ fn list_issues_cached_once(
     label: &str,
     state: &str,
     page: Option<u32>,
-) -> Result<Vec<RestIssue>> {
+) -> Result<ListedPage> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
     // #9252: the URL names the SAME resolved repo the key does (never gh's
@@ -499,7 +511,10 @@ fn list_issues_cached_once(
             // Free cache hit (a 304 does not count against the rate limit).
             if let Some(entry) = sent {
                 log::debug!("forge_listing: 304 cache hit for {url}");
-                return Ok(entry.issues.as_ref().clone());
+                return Ok(ListedPage {
+                    rows: entry.issues.as_ref().clone(),
+                    next: None,
+                });
             }
             // A 304 can only happen because WE sent an etag; without one this
             // is anomalous — drop the key and error so the next call
@@ -518,10 +533,10 @@ fn list_issues_cached_once(
             let issues = parse_rest_issues(&r.body)
                 .with_context(|| format!("parse REST issues JSON from {url}"))?;
             observe_listing(&target, &r.body, sent_at);
-            if page.is_none() && issues.len() >= PER_PAGE {
+            if page.is_none() && r.next_page {
                 log::warn!(
-                    "forge_listing: {url} returned a full page ({PER_PAGE}); the listing may be \
-                     truncated — items beyond the first page are not seen this poll"
+                    "forge_listing: {url} has a next page; the listing is truncated — items \
+                     beyond the first page are not seen this poll"
                 );
             }
             if let Some(etag) = r.etag.clone() {
@@ -537,7 +552,10 @@ fn list_issues_cached_once(
                     guard.insert(cache_key, CacheEntry { etag, issues });
                 }
             }
-            Ok(issues)
+            Ok(ListedPage {
+                rows: issues,
+                next: Some(r.next_page),
+            })
         }
         _ => Err(anyhow!(
             "gh api {url} failed{}: {stderr}",
@@ -622,6 +640,8 @@ pub struct HttpResponse {
     pub body: String,
     /// Free `x-ratelimit-*` headers (#9251), sent on `200`s and `304`s alike.
     pub ratelimit: RateLimitHeaders,
+    /// A `Link` header names a `rel="next"` page (#11139).
+    pub next_page: bool,
 }
 
 /// Parse `gh api --include` output. Returns `None` when the first line is not
@@ -638,6 +658,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
     let status: u16 = parts.next()?.parse().ok()?;
 
     let mut etag = None;
+    let mut next_page = false;
     let mut ratelimit = RateLimitHeaders::default();
     for line in lines {
         let trimmed = line.trim_end_matches('\r');
@@ -647,6 +668,8 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.eq_ignore_ascii_case("etag") {
                 etag = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("link") {
+                next_page = value.contains("rel=\"next\"");
             } else {
                 ratelimit.absorb(name, value);
             }
@@ -671,6 +694,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
         etag,
         body,
         ratelimit,
+        next_page,
     })
 }
 
