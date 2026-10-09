@@ -4,10 +4,12 @@
 use super::*;
 
 pub(crate) mod container_stop;
+mod group_drain;
 mod liveness;
 pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
 pub(crate) mod pr_park;
+pub(crate) use group_drain::{GroupDrain, PendingGroupReap};
 
 // ============================================================================
 // Constants
@@ -501,32 +503,12 @@ pub(crate) fn group_has_members(_pgid: u32) -> bool {
     false
 }
 
-/// Grace between the crash-path reaper's group SIGTERM and its SIGKILL
-/// escalation (Issue #4980).
-///
-/// The escalation is deliberately deferred to a later reaper tick rather than
-/// slept through inline: [`SweepRegistry::reap_once`] also runs on the
-/// `ListSweeps` / `GetSweepStatus` read path (via `reap_liveness`) while holding
-/// the registry mutex, and blocking there for a grace window is the exact
-/// 2026-07-26 wedge [`REAP_GH_TIMEOUT`] exists to prevent. Five seconds means
-/// the next ordinary tick (30s) is always past the deadline.
-pub(crate) const ORPHAN_GROUP_REAP_GRACE: Duration = Duration::from_secs(5);
-
 /// One entry's snapshot taken at the top of a [`SweepRegistry::reap_once`] tick:
 /// `(sweep_id, pid, pgid, state, kind, started_at)`. Snapshotted (rather than
 /// iterated in place) so the loop body can borrow the registry mutably; `pgid`
 /// joined the tuple in #4980 so the crash path can reap a dead leader's
 /// surviving process group.
 pub(crate) type ReapCandidate = (SweepId, u32, Option<u32>, SweepState, SweepKind, DateTime<Utc>);
-
-/// A crash-path group reap awaiting SIGKILL escalation (Issue #4980).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PendingGroupReap {
-    /// The process group that was SIGTERM'd.
-    pub(crate) pgid: u32,
-    /// When SIGKILL becomes due if the group still has members.
-    pub(crate) escalate_at: Instant,
-}
 
 /// Read the last `n` lines of a file. Returns an empty vec when the
 /// file is empty; returns an error when the file does not exist (so the
@@ -620,107 +602,6 @@ impl SweepRegistry {
             return send_signal(pid, sig);
         }
         send_group_signal(pgid, sig)
-    }
-
-    /// Terminate the surviving process group of a sweep whose **leader is
-    /// already dead** (Issue #4980) — the crash path.
-    ///
-    /// A dead wrapper does not imply a dead tree. In the 2026-08-03 incident the
-    /// tracked pid was gone while the `claude` agent it had spawned kept running
-    /// against an issue whose claim had already been returned to the queue: a
-    /// zombie agent, invisible to the registry (`in_flight: 0`), burning CPU and
-    /// mutating a repo it no longer held. `signal_sweep` cannot help here — the
-    /// OS refuses to report a dead pid's group — which is exactly why the pgid is
-    /// persisted while the leader is alive.
-    ///
-    /// Sends SIGTERM now and registers a deferred SIGKILL escalation
-    /// ([`ORPHAN_GROUP_REAP_GRACE`]) picked up by a later
-    /// [`reap_once`](Self::reap_once) tick, so no caller ever blocks on a grace
-    /// window while holding the registry mutex. A no-op (returning `false`) when
-    /// the group is already empty — the overwhelmingly common case, where the
-    /// leader's death took its whole tree with it — and, since #7935, when the
-    /// group id has demonstrably been recycled onto a stranger (see
-    /// [`pid_identity::pgid_number_was_recycled`]).
-    pub(crate) fn reap_orphaned_group(
-        &mut self,
-        sweep_id: &str,
-        issue: Option<u32>,
-        pgid: u32,
-    ) -> bool {
-        if pgid == 0 || Some(pgid) == current_process_group() {
-            log::error!(
-                "reap_orphaned_group: refusing to signal process group {pgid} for sweep \
-                 {sweep_id} — it is zero or THIS process's own group (#4980)"
-            );
-            return false;
-        }
-        // Issue #7935. The recorded pgid is always the dead leader's own pid, so
-        // a LIVE process wearing that number means the kernel reallocated it —
-        // which it can only do once the group had no members left. The group
-        // that answers to this number now is somebody else's, and signalling it
-        // would kill an innocent tree. This became reachable the moment
-        // `poll_liveness` started reporting recycled pids as dead.
-        if pid_identity::pgid_number_was_recycled(pgid) {
-            log::error!(
-                "reap_orphaned_group: refusing to signal process group {pgid} for sweep \
-                 {sweep_id} — a live process currently OWNS pid {pgid}, so this group id was \
-                 recycled after the sweep's own group drained. The members it names today are \
-                 an unrelated process tree (#7935)."
-            );
-            return false;
-        }
-        if !group_has_members(pgid) {
-            return false;
-        }
-        let scope = issue.map_or_else(String::new, |n| format!(" (issue #{n})"));
-        log::warn!(
-            "reap_orphaned_group: sweep {sweep_id}{scope} has a DEAD leader but its process \
-             group {pgid} still has members — an orphaned agent/subtree running unclaimed work. \
-             Sending SIGTERM to the group; escalating to SIGKILL in {}s if it survives (#4980).",
-            ORPHAN_GROUP_REAP_GRACE.as_secs()
-        );
-        send_group_signal(pgid, 15);
-        self.pending_group_reaps.insert(
-            sweep_id.to_string(),
-            PendingGroupReap {
-                pgid,
-                escalate_at: Instant::now() + ORPHAN_GROUP_REAP_GRACE,
-            },
-        );
-        true
-    }
-
-    /// SIGKILL any orphaned group that survived its crash-path SIGTERM past
-    /// [`ORPHAN_GROUP_REAP_GRACE`] (Issue #4980). Called at the top of every
-    /// [`reap_once`](Self::reap_once) tick, mirroring how
-    /// `retry_pending_quarantine_releases` drains its own deferred work.
-    /// Cheap early-return when nothing is pending.
-    pub(crate) fn escalate_pending_group_reaps(&mut self) {
-        if self.pending_group_reaps.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let mut done: Vec<SweepId> = Vec::new();
-        for (sweep_id, pending) in &self.pending_group_reaps {
-            if !group_has_members(pending.pgid) {
-                // The SIGTERM worked (or the group drained on its own).
-                done.push(sweep_id.clone());
-                continue;
-            }
-            if now < pending.escalate_at {
-                continue;
-            }
-            log::warn!(
-                "reap_orphaned_group: process group {} for sweep {sweep_id} survived SIGTERM — \
-                 escalating to SIGKILL (#4980)",
-                pending.pgid
-            );
-            send_group_signal(pending.pgid, 9);
-            done.push(sweep_id.clone());
-        }
-        for sweep_id in done {
-            self.pending_group_reaps.remove(&sweep_id);
-        }
     }
 
     /// Cancel a running sweep.
@@ -1141,25 +1022,25 @@ impl SweepRegistry {
                 // whatever that agent spawned — the zombie-agent shape of the
                 // 2026-08-03 incident, which the registry rendered as
                 // `in_flight: 0` while the survivors kept mutating the repo.
-                // Signal the group before the entry transitions terminal (after
-                // which nothing tracks the pgid at all). No-op when the group is
-                // already empty, which is the ordinary case.
-                if let Some(pgid) = pgid {
-                    let issue = match &kind {
-                        SweepKind::Issue(n) => Some(*n),
-                        SweepKind::PrSet(_) => None,
-                    };
-                    self.reap_orphaned_group(&sweep_id, issue, pgid);
-                }
+                // #11076: and the sweep is not dead until that group is — a
+                // live member may be the wrapper's own retry of this session.
+                // So SIGTERM/SIGKILL it and keep the entry (claim, lock, label)
+                // live until a later tick finds the group empty; one owner of
+                // the session's lifetime, never daemon-released + still running.
+                // Immediate when the group is already empty (the ordinary case).
+                let issue = match &kind {
+                    SweepKind::Issue(n) => Some(*n),
+                    SweepKind::PrSet(_) => None,
+                };
+                let exit_code = match self.await_group_drain(&sweep_id, issue, pgid, exit_code) {
+                    GroupDrain::Draining => continue,
+                    GroupDrain::Drained(code) => code,
+                };
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
                 {
                     changes += 1;
-                    let issue = match &kind {
-                        SweepKind::Issue(n) => Some(*n),
-                        SweepKind::PrSet(_) => None,
-                    };
                     let now = Utc::now();
                     let duration_sec = (now - started_at).num_seconds();
                     // Release lock and decide between Exited vs Crashed.
