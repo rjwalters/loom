@@ -727,3 +727,152 @@ mod role_tick_spans {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9935: `sweep-checkpoint begin` gives a sweep phase an observed start
+// ---------------------------------------------------------------------------
+
+fn drained_spans(journal: &Journal) -> Vec<crate::telemetry::trace::SpanRecord> {
+    let mut spans = Vec::new();
+    journal
+        .drain(|s| {
+            spans.push(s);
+            Ok(())
+        })
+        .unwrap();
+    spans
+}
+
+/// Begin then done: one attempt, completed with a real duration and
+/// `worked=true`, carrying the execution scope and the begin's attributes.
+#[test]
+fn a_begun_phase_completes_with_its_real_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let scope = attributes(&[("loom.repo", "o/r"), ("loom.sweep_id", "sweep-1")]);
+    journal
+        .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
+        .unwrap();
+    for role in ["curator", "builder", "judge", "doctor"] {
+        let begun =
+            checkpoint_begin_observation(&journal, &root, None, 9935, role, Some(1), Some("opus"))
+                .unwrap();
+        assert_eq!(begun.record.attributes["loom.timing_source"], CHECKPOINT_BEGIN_SOURCE);
+        assert!(!begun.record.attributes.contains_key(ATTEMPT_WORKED));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let phase = if role == "judge" {
+            "judge-done".to_owned()
+        } else {
+            format!("{role}-done")
+        };
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            9935,
+            &phase,
+            Some(1),
+            None,
+            Some(7),
+            "checkpoint_write_observed",
+        );
+    }
+    let spans = drained_spans(&journal);
+    assert_eq!(spans.len(), 8, "one phase + one attempt per role, never a second");
+    for span in &spans {
+        assert_eq!(span.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+        assert_eq!(span.attributes[ATTEMPT_WORKED], "true");
+        assert!(span.ended_at - span.started_at >= chrono::Duration::milliseconds(5));
+        assert_eq!(span.attributes["loom.sweep_id"], "sweep-1");
+        assert_eq!(span.attributes["loom.configured_model"], "opus");
+        assert_eq!(span.attributes["loom.issue"], "9935");
+    }
+}
+
+/// Begin with no done: the attempt stays open (no fabricated close) until the
+/// execution ends, which closes it `exit_unobserved` with `worked` absent.
+#[cfg(feature = "otlp")]
+#[test]
+fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let span = begin(root_dir, "sweep-9935", SpanName::Sweep, TraceAttributes::new()).unwrap();
+    checkpoint_begin_observation(&span.journal, span.context(), None, 9935, "builder", None, None)
+        .unwrap();
+    assert_eq!(span.journal.active().unwrap().len(), 3, "root, phase, attempt all open");
+    finish_execution(root_dir, "sweep-9935", "failure", TraceAttributes::new()).unwrap();
+    let spans = drained_spans(&span.journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "exit_unobserved");
+    assert_eq!(attempt.attributes["loom.timing_source"], "terminal_observed");
+    assert!(!attempt.attributes.contains_key(ATTEMPT_WORKED));
+}
+
+/// Parallel builders share one orchestrator journal: each issue's checkpoint
+/// completes its own begun attempt. A re-dispatch supersedes the earlier begin
+/// with `worked` absent, and a done with no begin stays synthetic.
+#[test]
+fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let first_a =
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
+    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None).unwrap();
+    let second_a =
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None).unwrap();
+    for issue in [1, 2] {
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            issue,
+            "builder-done",
+            None,
+            None,
+            None,
+            "checkpoint_write_observed",
+        );
+    }
+    // No begin for issue 3: the synthetic zero-duration completion is unchanged.
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        3,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    let spans = drained_spans(&journal);
+    let attempt = |context: &TraceContext| spans.iter().find(|s| s.context == *context).unwrap();
+    let superseded = attempt(&first_a.record.context);
+    assert_eq!(superseded.attributes["loom.result"], "superseded");
+    assert!(!superseded.attributes.contains_key(ATTEMPT_WORKED));
+    for (owned, issue) in [(&second_a, "1"), (&b, "2")] {
+        let span = attempt(&owned.record.context);
+        assert_eq!(span.attributes["loom.issue"], issue);
+        assert_eq!(span.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+        assert_eq!(span.attributes[ATTEMPT_WORKED], "true");
+    }
+    let synthetic = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.issue"] == "3")
+        .unwrap();
+    assert_eq!(synthetic.started_at, synthetic.ended_at);
+    assert_eq!(synthetic.attributes["loom.timing_source"], "checkpoint_write_observed");
+    assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
+    assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
+}

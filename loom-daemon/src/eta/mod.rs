@@ -431,70 +431,10 @@ impl fmt::Display for NoEstimateReason {
     }
 }
 
-/// Which Loom build computed a record — required on every ETA record
-/// (operator requirement on #9289). Sourced from
-/// [`crate::telemetry::trace::provenance::daemon`], the same source every
-/// span's `loom.daemon.*` attributes come from.
-///
-/// A build whose revision or tree state is `unknown` (a tarball build) still
-/// emits, so no data is lost, but with `complete: false`; accuracy queries
-/// exclude incomplete rows, because a result that cannot be pinned to a
-/// commit cannot be attributed to a heuristic's code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Provenance {
-    /// Loom version (`CARGO_PKG_VERSION`).
-    pub version: String,
-    /// Full 40-hex git SHA, or `unknown` for a tarball build.
-    pub revision: String,
-    /// `clean`, `dirty` or `unknown`.
-    pub tree_state: String,
-    /// `revision` is a full 40-hex SHA and `tree_state` is `clean` or
-    /// `dirty`: the build is pinned. Always [`Provenance::completeness`] of
-    /// the other two fields.
-    pub complete: bool,
-}
-
-/// Whether `revision` is a full 40-hex lowercase git SHA.
-fn is_full_sha(revision: &str) -> bool {
-    revision.len() == 40
-        && revision
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-impl Provenance {
-    /// The running binary.
-    #[must_use]
-    pub fn current() -> Self {
-        let build = crate::telemetry::trace::provenance::daemon();
-        Provenance {
-            version: build.version.to_string(),
-            revision: build.revision.to_string(),
-            tree_state: build.tree_state.to_string(),
-            complete: Self::completeness(build.revision, build.tree_state),
-        }
-    }
-
-    /// Whether a build with `revision` and `tree_state` is fully pinned.
-    #[must_use]
-    pub fn completeness(revision: &str, tree_state: &str) -> bool {
-        is_full_sha(revision) && matches!(tree_state, "clean" | "dirty")
-    }
-
-    /// Whether every field is well formed: a non-empty version, a full
-    /// 40-hex revision or the build system's literal `unknown`, a known tree
-    /// state, and a `complete` flag that matches them. An ETA record whose
-    /// provenance fails this is never emitted. An `unknown` revision or tree
-    /// state is well formed (and emitted), but not [`Self::complete`].
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let revision_ok = self.revision == "unknown" || is_full_sha(&self.revision);
-        !self.version.trim().is_empty()
-            && revision_ok
-            && matches!(self.tree_state.as_str(), "clean" | "dirty" | "unknown")
-            && self.complete == Self::completeness(&self.revision, &self.tree_state)
-    }
-}
+/// Which Loom build computed a record. Moved to the neutral
+/// [`crate::telemetry::provenance`] (#11098, Stage 2) because non-ETA records
+/// embed it too; re-exported here so ETA code keeps its path.
+pub use crate::telemetry::provenance::Provenance;
 
 /// What an estimate is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -170,7 +170,7 @@ fn a_newer_release_inside_the_settle_window_reports_defer() {
         "host-a",
         Utc::now(),
         Duration::from_millis(5),
-        crate::eta::Provenance::current(),
+        crate::telemetry::provenance::Provenance::current(),
     );
     assert_eq!(record.installed_version.as_deref(), Some("0.19.701"));
     assert_eq!(record.target_version.as_deref(), Some("0.19.731"));
@@ -264,7 +264,7 @@ fn every_tick_emits_one_record_with_provenance() {
         panic!("one auto_update.tick record");
     };
     assert_eq!(record.decision, TickDecisionKind::Defer);
-    assert_eq!(record.loom, crate::eta::Provenance::current());
+    assert_eq!(record.loom, crate::telemetry::provenance::Provenance::current());
     assert_eq!(record.tick_id.len(), 32);
 }
 

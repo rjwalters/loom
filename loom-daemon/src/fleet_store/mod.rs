@@ -48,6 +48,7 @@ pub mod floor;
 pub mod gh;
 pub mod pending_restart;
 pub mod propose;
+pub mod publication;
 pub mod reload;
 pub mod render;
 pub mod resync_claim;

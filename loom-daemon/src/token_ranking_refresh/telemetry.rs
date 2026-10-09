@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use super::{RankingRefreshRunner, RefreshOutcome};
-use crate::eta::Provenance;
 use crate::telemetry::kinds::token_ranking_refresh::{
     RankingSource, RoundOutcome, TokenRankingRefreshRecord,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
 use crate::tokens_pool::round_summary::RoundSummary;
 
