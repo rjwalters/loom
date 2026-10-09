@@ -445,6 +445,28 @@ touch "$STUB_DIR/body-check-missing"
 run_pv 109 approved abc1234 --body "a perfectly fine rationale here"
 assert_eq "0" "$EXIT_CODE" "#9258: verb-less binary -> approval still posts"
 assert_contains "$OUTPUT" "Roll loom-daemon" "#9258: ... loudly, naming the fix"
+# ... but a verb-less binary is never weaker than pre-#9258: a lone '-' or
+# '@'-token body is refused in shell for every verdict and posts nothing.
+for body in "@/tmp/x" "@-" "-" "  @-  "; do
+  for verdict in approved changes-requested; do
+    reset_state
+    touch "$STUB_DIR/body-check-missing"
+    run_pv 109 "$verdict" abc1234 --body "$body"
+    assert_eq "2" "$EXIT_CODE" "#9258: verb-less binary + $verdict body '$body' -> exit 2"
+    assert_contains "$OUTPUT" "degraded check" "#9258: verb-less refusal of '$body' names the degraded check"
+    assert_eq "" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "#9258: verb-less binary posts nothing for '$body'"
+  done
+done
+reset_state
+touch "$STUB_DIR/body-check-missing"
+printf '%s' "@-" > "$STUB_DIR/body-at.txt"
+run_pv 109 approved abc1234 --body-file "$STUB_DIR/body-at.txt"
+assert_eq "2" "$EXIT_CODE" "#9258: verb-less binary + --body-file holding '@-' -> exit 2"
+reset_state
+touch "$STUB_DIR/body-check-missing"
+run_pv 109 changes-requested abc1234 --body "@reviewer please fix the failing test"
+assert_eq "0" "$EXIT_CODE" "#9258: verb-less binary + @mention prose still posts"
+assert_eq "109" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "#9258: ... and the comment was posted"
 
 # T11: a `gh pr comment` failure propagates as a non-zero exit — the caller's
 # `&&`-chained label edit must not run on a failed comment.

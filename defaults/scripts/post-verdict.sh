@@ -233,14 +233,16 @@ fi
 # body spelling goes through `loom-daemon forge verdict-body-check`
 # (loom_daemon::verdict_body): empty, `-`, a lone `@`-token or under 20
 # non-whitespace chars is refused here; this script owns none of those rules. A
-# binary WITHOUT the verb (the #10581 capability-probe posture) keeps only the
-# non-empty check, loudly; one that has it but gives no answer refuses an approval.
+# binary WITHOUT the verb (the #10581 capability-probe posture) keeps a degraded
+# shell refusal of a lone `-`/`@`-token (never weaker than pre-#9258), loudly; one
+# that has the verb but gives no answer refuses an approval (fail closed).
 VB_OUT="$(printf '%s' "$BODY" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-body-check 2>&1)"; VB_RC=$?
 case "$VB_RC:$VB_OUT" in
   "0:LOOM-VERDICT-BODY OK"*) ;;
   "1:LOOM-VERDICT-BODY REJECT"*) echo "post-verdict.sh: refusing to post: ${VB_OUT#LOOM-VERDICT-BODY REJECT } (#9258). Nothing was posted; write the rationale to a file and pass --body-file <path>." >&2; exit 2 ;;
   *) "${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-body-check --help >/dev/null 2>&1 && [[ "$VERDICT" == approved ]] && { echo "post-verdict.sh: REFUSING to post an approval: 'forge verdict-body-check' gave no answer: ${VB_OUT:0:300} (#9258). Nothing was posted." >&2; exit 2; }
-     echo "post-verdict.sh: WARNING — verdict body check unavailable (${VB_OUT:0:200}); posting with only the non-empty check. Roll loom-daemon to a build with 'forge verdict-body-check' (#9258)." >&2 ;;
+     [[ "$BODY" =~ ^[[:space:]]*(-|@[^[:space:]]*)[[:space:]]*$ ]] && { echo "post-verdict.sh: refusing to post: the body is a lone '-' or '@' token, which reads nothing (#9258; degraded check, 'forge verdict-body-check' unavailable). Nothing was posted; write the rationale to a file and pass --body-file <path>." >&2; exit 2; }
+     echo "post-verdict.sh: WARNING — verdict body check unavailable (${VB_OUT:0:200}); posting with only the degraded lone-token check. Roll loom-daemon to a build with 'forge verdict-body-check' (#9258)." >&2 ;;
 esac
 
 # --- Formal-review reconciliation gate (#7647) -----------------------------
