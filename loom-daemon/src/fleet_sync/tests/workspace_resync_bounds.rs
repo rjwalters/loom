@@ -569,3 +569,44 @@ fn the_host_gate_reads_a_pause_roll_as_roll_pending_and_a_hold_as_draining() {
     let idle = HostGateInputs::live(&Facts(DrainFacts::default()));
     assert!(!idle.draining && !idle.roll_pending);
 }
+
+/// #11016: a pause manifest H5 has not finished with keeps the host out of
+/// H0, so neither the startup resync pass nor a timer pass claims or pushes
+/// before the freshly rolled daemon has been verified.
+#[test]
+fn a_pending_resume_fails_the_host_gate() {
+    let pending = HostGateInputs {
+        resume_pending: true,
+        ..h0()
+    };
+    assert_eq!(host_gate(&pending), Err(NotCurrent::ResumePending));
+    assert_eq!(NotCurrent::ResumePending.as_str(), "resume-pending");
+    assert_eq!(NotCurrent::ResumePending.host_note(), "host not H0: resume-pending");
+    assert!(!NotCurrent::ResumePending.is_about_the_build());
+}
+
+#[test]
+fn the_host_gate_reads_a_pause_manifest_h5_has_not_finished_with() {
+    use crate::fleet_state::DrainFacts;
+    use crate::roll_pause::suppress;
+    let live = || HostGateInputs::live(&Facts(DrainFacts::default()));
+    // What `arm_at_startup` does when it finds a live manifest.
+    let id = "rp-host-gate-resume-pending";
+    suppress::arm(id, Vec::new());
+    let armed = live();
+    // What H5's `FinishGuard` does on every way H5 ends.
+    suppress::disarm(id);
+    assert!(armed.resume_pending, "{armed:?}");
+    assert!(!armed.draining && !armed.roll_pending, "it is its own fact");
+    assert!(!suppress::is_armed_for(id));
+    // The gate is process-wide, and other tests in this process arm it for a
+    // moment under their own ids. Wait for a read with none armed.
+    let cleared = (0..1200).any(|_| {
+        let clear = !live().resume_pending;
+        if !clear {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        clear
+    });
+    assert!(cleared, "with no manifest armed the host is not resume-pending");
+}

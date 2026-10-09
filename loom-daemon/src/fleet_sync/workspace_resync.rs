@@ -12,13 +12,20 @@
 //! | W0 | the default branch's installed files equal this daemon's payload | nothing |
 //! | W1 | compatible, files differ | try the claim |
 //! | W3 | too old for this daemon or the floor, files differ | as W1, first |
-//! | W4 | the files need a newer daemon | report only |
-//! | repo-ahead | installed by a newer daemon, or a version that cannot be ordered | report only |
+//! | W4 | the files need a newer daemon, or record a version that cannot be ordered | report only |
+//! | repo-ahead | installed by a newer daemon, and still compatible with this one | report only |
 //!
 //! An empty payload diff is W0 whatever the version stamp says: a resync that
 //! changes no file writes nothing, so a stamp that is old or lacks
 //! `requires_daemon` over matching files is never rewritten and must not be
-//! waited for. W4 and repo-ahead are left to the host roll (#10719).
+//! waited for.
+//!
+//! W3 and W4 hold new dispatch into the workspace, and W4 makes this host a
+//! roll candidate ([`crate::workspace_hold`], #10719). A repo that is only
+//! repo-ahead is neither held nor a reason to roll: this host keeps working
+//! it and never resyncs it downward. The one repo-ahead case that is held (and
+//! still no reason to roll) is a resync to a newer release that was
+//! interrupted on the default branch: its files are a mix of two releases.
 //!
 //! W2 is the resync itself, under the per-repo claim
 //! ([`crate::fleet_store::resync_claim`]): a throwaway detached worktree off
@@ -97,6 +104,7 @@
 
 mod git;
 pub mod heads;
+mod hold;
 mod host;
 mod memory;
 mod w2;
@@ -116,7 +124,10 @@ use crate::install_compat::{Compat, DaemonCompat, InstallMeta, Version, SUPPORTS
 
 use heads::{Asked, HeadAsk, Heads};
 pub use host::{host_gate, HostGateInputs, NotCurrent, ABANDON_AFTER, STUCK_AFTER_TICKS};
-pub(super) use host::{latest, mark_boot, mark_verified, spawn_pass};
+pub(super) use host::{latest, mark_boot, mark_verified, registered_roots, spawn_pass};
+/// The hand-off to the checkout step, for its tests (#10869).
+#[cfg(test)]
+pub(super) use host::{spawn_with, Ended};
 use memory::FailureKind;
 pub use memory::{Memory, OUTAGE_HOLD_CAP};
 use w2::attempt;
@@ -156,9 +167,10 @@ pub enum WState {
     W2,
     /// Too old for this daemon or the floor.
     W3,
-    /// Needs a newer daemon than this one.
+    /// Needs a newer daemon than this one, or records a version that cannot
+    /// be ordered against it (so it may).
     W4,
-    /// Installed by a newer daemon, or at a version that cannot be ordered.
+    /// Installed by a newer daemon whose files still work with this one.
     #[serde(rename = "repo-ahead")]
     RepoAhead,
     /// Not a workspace this pass manages (see the reason).
@@ -185,8 +197,8 @@ impl WState {
         }
     }
 
-    /// The repo is ahead of this daemon: the input to #10719's
-    /// `repo_ahead_target` and its `daemon-too-old` hold.
+    /// The repo is ahead of this daemon, so this host never resyncs it.
+    /// Only [`Self::W4`] holds dispatch and asks for a roll (#10719).
     #[must_use]
     pub fn repo_ahead(self) -> bool {
         matches!(self, Self::W4 | Self::RepoAhead)
@@ -209,6 +221,15 @@ pub struct WorkspaceReport {
     pub requires_daemon: Option<String>,
     /// Why it is in that state, or what this pass did about it.
     pub reason: Option<String>,
+    /// The dispatch hold standing on it, if any (#10719).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<crate::workspace_hold::WorkspaceHold>,
+    /// What the gate refused on the default branch, for the dispatch hold.
+    /// Kept apart from `reason`, which a failure replaces with its backoff,
+    /// and carried through a backoff with `requires_daemon`. Not part of the
+    /// snapshot.
+    #[serde(skip)]
+    pub refusal: Option<ResyncRefusal>,
 }
 
 /// A failure that needs a person: published on [`ALERT_TOPIC`].
@@ -258,6 +279,17 @@ pub struct WorkspacePass {
     /// snapshot.
     #[serde(skip)]
     pub fetches: u32,
+    /// This pass's own decision to use the network: `fleet.autoApply` on, the
+    /// host in H0 ([`host_gate`], so also not paused) and no outage hold. The
+    /// checkout step that follows it (#10869) takes this as its own, so the
+    /// two halves never disagree. Not part of the snapshot.
+    #[serde(skip)]
+    pub online: bool,
+    /// Roots whose remote did not answer, or refused, and that this host is
+    /// backing off: nothing on this host asks them again before the backoff
+    /// ends. Not part of the snapshot.
+    #[serde(skip)]
+    pub backing_off: Vec<PathBuf>,
 }
 
 impl WorkspacePass {
@@ -271,6 +303,18 @@ impl WorkspacePass {
     /// The workspace lines of the `Fleet store:` block.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
+        self.lines_at(None)
+    }
+
+    /// [`Self::lines`], read at `now` on a host whose passes run every
+    /// `interval`. A hold whose verdict is older than a few intervals says
+    /// so: passes have stopped, or the held copy has been unreadable since.
+    #[must_use]
+    pub fn lines_at(&self, read: Option<(DateTime<Utc>, Duration)>) -> Vec<String> {
+        let stale = |h: &crate::workspace_hold::WorkspaceHold| {
+            read.and_then(|(now, interval)| h.stale_note(now, interval.saturating_mul(3)))
+                .map_or_else(String::new, |note| format!("; {note}"))
+        };
         let mut lines = Vec::new();
         if let Some(why) = &self.host {
             lines.push(format!("  workspaces: {why}; reporting only"));
@@ -288,7 +332,12 @@ impl WorkspacePass {
                 .reason
                 .as_deref()
                 .map_or_else(String::new, |r| format!(" ({r})"));
-            lines.push(format!("  workspace {name}: {}{reason}{installed}", w.state.as_str()));
+            let hold = w
+                .hold
+                .as_ref()
+                .map_or_else(String::new, |h| format!("; {}: {}{}", h.note(), h.detail, stale(h)));
+            lines
+                .push(format!("  workspace {name}: {}{reason}{installed}{hold}", w.state.as_str()));
         }
         lines
     }
@@ -430,8 +479,10 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     // The network is for a host that may write. One that may not (autoApply
     // off, paused, rolling, not a release build) reports from what its clones
     // already hold and asks nobody.
+    let online = mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none();
+    pass.online = online;
     let mut scan = Scan {
-        online: mode == Mode::Write && gate.is_ok() && memory.outage_hold(started).is_none(),
+        online,
         ..Scan::default()
     };
     let count = roots.len();
@@ -559,6 +610,7 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
     pass.probes = scan.probes;
     pass.fetches = scan.fetches;
     pass.alerts = scan.alerts;
+    pass.backing_off = memory.remotes_backed_off(roots, (env.clock)());
     pass
 }
 
@@ -570,7 +622,20 @@ fn report_for(root: &Path) -> WorkspaceReport {
         installed: None,
         requires_daemon: None,
         reason: None,
+        hold: None,
+        refusal: None,
     }
+}
+
+/// What a finished pass tells the dispatch hold (#10719): both copies of
+/// every workspace in `pass`. Reads each checkout's install metadata; no
+/// network.
+pub fn observations(
+    env: &Env<'_>,
+    pass: &WorkspacePass,
+    memory: &mut Memory,
+) -> Vec<crate::workspace_hold::Observation> {
+    hold::observe(env, &pass.workspaces, (env.gate)(), memory)
 }
 
 fn stamp(at: DateTime<Utc>) -> String {
@@ -652,7 +717,12 @@ fn classify(
     git::clean_stale_worktrees(root);
     if let Some(b) = memory.backoff.get(root) {
         if b.next_attempt > (env.clock)() {
+            // The whole finding the failure interrupted, not only its state:
+            // the hold's demand and detail come from these (#10719).
             report.state = b.state;
+            report.installed.clone_from(&b.installed);
+            report.requires_daemon.clone_from(&b.requires_daemon);
+            report.refusal.clone_from(&b.refusal);
             report.reason =
                 Some(format!("backoff until {}: {}", stamp(b.next_attempt), b.last_error));
             return (report, None);
@@ -732,6 +802,8 @@ fn classify_head(
             .cloned();
         if let Some(verdict) = settled {
             scan.answered(root, memory);
+            // The checkout half (#10869) trusts this answer instead of asking.
+            crate::fleet_sync::checkout_ff::note_remote_head(root, branch, commit);
             verdict.fill(report);
             return Ok(verdict.stale().then(|| (branch.clone(), commit.clone())));
         }
@@ -767,6 +839,7 @@ fn classify_head(
     };
     let commit = if let Some(head) = head {
         scan.answered(root, memory);
+        crate::fleet_sync::checkout_ff::note_remote_head(root, &branch, &head);
         if let Some(verdict) = known(&head) {
             return Ok(reuse(verdict, report));
         }
@@ -825,6 +898,7 @@ fn evaluate(
         }
         Err(refusal) => {
             (report.state, report.reason) = refused(&refusal);
+            report.refusal = Some(refusal);
             return Ok(true);
         }
     };
@@ -867,7 +941,9 @@ fn refused(refusal: &ResyncRefusal) -> (WState, Option<String>) {
         ResyncRefusal::RepoAheadOfDaemon { installed, running } => {
             (WState::RepoAhead, Some(format!("installed {installed} > running {running}")))
         }
-        ResyncRefusal::PendingAheadOfDaemon { .. } | ResyncRefusal::UnrecognizedVersion { .. } => {
+        // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
+        ResyncRefusal::UnrecognizedVersion { .. } => (WState::W4, Some(refusal.to_string())),
+        ResyncRefusal::PendingAheadOfDaemon { .. } => {
             (WState::RepoAhead, Some(refusal.to_string()))
         }
         other => (WState::Unknown, Some(other.to_string())),
@@ -883,6 +959,7 @@ fn diff_is_stale(env: &Env<'_>, root: &Path, commit: &str) -> Result<bool> {
         .tempdir()?;
     git::export_surfaces(root, commit, tree.path())?;
     let diff = materialize_with(payload, tree.path())?;
+    crate::init::payload::surfaces::log_skipped_once(root, &diff.skipped_surfaces);
     Ok(diff.stamp_pending() || {
         let paths: Vec<String> = diff
             .added

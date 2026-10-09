@@ -1869,6 +1869,11 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.45 Workspace hold (Issue #10719): the installed Loom here cannot
+        //      work with this daemon (W3/W4). Structural like 2.4, so `force`
+        //      does not bypass it; before any lock, label flip or forge call.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
+
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
         //     watchdogs (startup #3887, mid-build-death #3895, review-stall
         //     #3910) re-dispatch through this method, and `gh issue edit`
@@ -2891,6 +2896,9 @@ impl SweepRegistry {
             }
             .into());
         }
+
+        // Workspace hold (Issue #10719), mirroring step 2.45.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
 
         let sweep_id = generate_sweep_id(kind);
 

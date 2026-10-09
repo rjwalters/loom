@@ -37,6 +37,10 @@
 //! seam's own strict parser, [`parse_triple`], so the floor is compared by the
 //! same rules that validated it.
 //!
+//! A workspace that needs a newer daemon than this one is a second demand of
+//! the same kind (#10719, [`repo_ahead`]): it enters [`select_target`] beside
+//! the floor target and is recorded as [`TargetSource::RepoAhead`].
+//!
 //! "Newest release at or above the floor" is the resolved latest release when
 //! that meets the floor: releases are monotonic, so if the latest one is below
 //! the floor, no release satisfies it.
@@ -96,12 +100,19 @@ impl FloorStallReport {
 /// record of it that `auto_update_state.json` carries across a restart.
 pub mod alert;
 
+/// #10719: the repo-ahead demand, a second floor from the workspaces.
+pub mod repo_ahead;
+
 /// Who chose a roll target. The settle gate consults this, so a decision
 /// needs no clock to say whether settle applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetSource {
     /// The running version is below the fleet floor: roll now, no settle.
     Floor,
+    /// A registered workspace's installed Loom needs a newer daemon than this
+    /// one (#10719): roll now, no settle. The one roll a fleet host makes
+    /// besides the floor's.
+    RepoAhead,
     /// An ordinary autoUpdate roll on a host with no fleet store: the settle
     /// gate and its ceiling apply.
     AutoUpdate,
@@ -157,31 +168,44 @@ impl Target {
 /// way, because holding a higher target behind settle would keep the host
 /// below the floor. Without one, the autoUpdate target is returned unchanged.
 ///
+/// `repo_ahead_target` (#10719) is a second demand with the same rules:
+/// `target = max(floor, repo_ahead, autoUpdate)`. It counts only when above
+/// `running`, skips settle, and is pinned to its tag. The source is
+/// [`TargetSource::Floor`] whenever the floor counts, and
+/// [`TargetSource::RepoAhead`] when only the repo-ahead demand does.
+///
 /// An unparseable version never wins a comparison: an unparseable
-/// `floor_target` or `running` leaves the decision to autoUpdate, and an
-/// unparseable `autoupdate_target` never displaces a floor target.
+/// `floor_target`, `repo_ahead_target` or `running` leaves the decision to
+/// the others, and an unparseable `autoupdate_target` never displaces a
+/// demanded target.
 #[must_use]
-pub fn select_target(
+pub fn select_target<'a>(
     running: &str,
-    floor_target: Option<&Release>,
-    autoupdate_target: Option<&Release>,
+    floor_target: Option<&'a Release>,
+    repo_ahead_target: Option<&'a Release>,
+    autoupdate_target: Option<&'a Release>,
 ) -> Option<Target> {
-    let floor = floor_target.filter(|f| {
-        matches!(
-            (parse_triple(&f.version), parse_triple(running)),
-            (Some(f), Some(r)) if f > r
-        )
-    });
-    match (floor, autoupdate_target) {
-        (None, None) => None,
-        (None, Some(auto)) => Some(Target::new(auto, TargetSource::AutoUpdate)),
-        (Some(floor), auto) => {
-            let higher = auto
-                .filter(|a| parse_triple(&a.version) > parse_triple(&floor.version))
-                .unwrap_or(floor);
-            Some(Target::new(higher, TargetSource::Floor))
+    let above_running = |target: Option<&'a Release>| -> Option<&'a Release> {
+        target.filter(|t| {
+            matches!(
+                (parse_triple(&t.version), parse_triple(running)),
+                (Some(t), Some(r)) if t > r
+            )
+        })
+    };
+    let higher_of = |a: &Release, b: Option<&Release>| {
+        b.filter(|b| parse_triple(&b.version) > parse_triple(&a.version))
+            .map_or_else(|| a.clone(), Clone::clone)
+    };
+    let (floor, ahead) = (above_running(floor_target), above_running(repo_ahead_target));
+    let (demanded, source) = match (floor, ahead) {
+        (Some(floor), ahead) => (higher_of(floor, ahead), TargetSource::Floor),
+        (None, Some(ahead)) => (ahead.clone(), TargetSource::RepoAhead),
+        (None, None) => {
+            return autoupdate_target.map(|auto| Target::new(auto, TargetSource::AutoUpdate));
         }
-    }
+    };
+    Some(Target::new(&higher_of(&demanded, autoupdate_target), source))
 }
 
 /// What the fleet floor says about this host on one tick.
@@ -369,7 +393,7 @@ impl FloorState {
         match &self.verdict {
             FloorVerdict::Satisfied { floor } => format!(
                 "fleet floor {floor} is met by running {running}{} — a fleet host rolls only \
-                 when loom_min_version moves",
+                 when loom_min_version moves or a workspace needs a newer daemon",
                 unchased.map_or_else(String::new, |what| format!("; not chasing {what}"))
             ),
             FloorVerdict::Unknown { why } => format!(
@@ -421,11 +445,17 @@ impl FloorState {
     }
 
     /// The target for an actionable artifact `info`, given this tick's
-    /// `floor_target` from [`Self::observe`].
+    /// `floor_target` from [`Self::observe`] and the repo-ahead target from
+    /// [`repo_ahead::RepoAheadState::observe`] (#10719).
     #[must_use]
-    pub fn select(&self, floor_target: Option<&Release>, info: &ArtifactInfo) -> Target {
+    pub fn select(
+        &self,
+        floor_target: Option<&Release>,
+        repo_ahead_target: Option<&Release>,
+        info: &ArtifactInfo,
+    ) -> Target {
         let auto = Release::of(info);
-        select_target(&self.running, floor_target, Some(&auto))
+        select_target(&self.running, floor_target, repo_ahead_target, Some(&auto))
             .unwrap_or_else(|| Target::new(&auto, TargetSource::AutoUpdate))
     }
 
@@ -519,33 +549,33 @@ mod tests {
     fn select_target_without_a_floor_target_is_the_autoupdate_target() {
         let auto = rel("0.19.900");
         assert_eq!(
-            select_target("0.19.800", None, Some(&auto)),
+            select_target("0.19.800", None, None, Some(&auto)),
             Some(Target {
                 tag: "v0.19.900".to_string(),
                 version: "0.19.900".to_string(),
                 source: TargetSource::AutoUpdate,
             })
         );
-        assert_eq!(select_target("0.19.800", None, None), None);
+        assert_eq!(select_target("0.19.800", None, None, None), None);
     }
 
     #[test]
     fn a_floor_target_makes_the_roll_floor_driven_and_takes_the_max() {
         let floor = rel("0.19.900");
         // Tie: the floor target, floor-driven.
-        let t = select_target("0.19.800", Some(&floor), Some(&rel("0.19.900"))).unwrap();
+        let t = select_target("0.19.800", Some(&floor), None, Some(&rel("0.19.900"))).unwrap();
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.900", TargetSource::Floor));
         // A higher autoUpdate target wins the tag, still floor-driven.
-        let t = select_target("0.19.800", Some(&floor), Some(&rel("0.19.950"))).unwrap();
+        let t = select_target("0.19.800", Some(&floor), None, Some(&rel("0.19.950"))).unwrap();
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.950", TargetSource::Floor));
         // A lower one does not.
-        let t = select_target("0.19.800", Some(&floor), Some(&rel("0.19.850"))).unwrap();
+        let t = select_target("0.19.800", Some(&floor), None, Some(&rel("0.19.850"))).unwrap();
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.900", TargetSource::Floor));
         // No autoUpdate target at all.
-        let t = select_target("0.19.800", Some(&floor), None).unwrap();
+        let t = select_target("0.19.800", Some(&floor), None, None).unwrap();
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.900", TargetSource::Floor));
         // Numeric, not lexical: 0.19.1000 > 0.19.999.
-        let t = select_target("0.19.800", Some(&floor), Some(&rel("0.19.1000"))).unwrap();
+        let t = select_target("0.19.800", Some(&floor), None, Some(&rel("0.19.1000"))).unwrap();
         assert_eq!(t.tag, "v0.19.1000");
     }
 
@@ -553,7 +583,7 @@ mod tests {
     fn a_floor_target_not_above_running_is_ignored() {
         let auto = rel("0.19.950");
         for running in ["0.19.900", "0.19.901"] {
-            let t = select_target(running, Some(&rel("0.19.900")), Some(&auto)).unwrap();
+            let t = select_target(running, Some(&rel("0.19.900")), None, Some(&auto)).unwrap();
             assert_eq!(t.source, TargetSource::AutoUpdate, "{running}");
         }
     }
@@ -561,19 +591,19 @@ mod tests {
     #[test]
     fn unparseable_versions_never_win() {
         let auto = rel("0.19.950");
-        let t = select_target("dev", Some(&rel("0.19.900")), Some(&auto)).unwrap();
+        let t = select_target("dev", Some(&rel("0.19.900")), None, Some(&auto)).unwrap();
         assert_eq!(t.source, TargetSource::AutoUpdate);
         let bad_floor = Release {
             tag: "vX".to_string(),
             version: "0.19.x".to_string(),
         };
-        let t = select_target("0.19.800", Some(&bad_floor), Some(&auto)).unwrap();
+        let t = select_target("0.19.800", Some(&bad_floor), None, Some(&auto)).unwrap();
         assert_eq!(t.source, TargetSource::AutoUpdate);
         let bad_auto = Release {
             tag: "vY".to_string(),
             version: "garbage".to_string(),
         };
-        let t = select_target("0.19.800", Some(&rel("0.19.900")), Some(&bad_auto)).unwrap();
+        let t = select_target("0.19.800", Some(&rel("0.19.900")), None, Some(&bad_auto)).unwrap();
         assert_eq!((t.tag.as_str(), t.source), ("v0.19.900", TargetSource::Floor));
     }
 

@@ -1767,8 +1767,8 @@ workspace's default branch (never the working tree) and classifies it:
 | `W0` | the installed files equal this daemon's payload | nothing |
 | `W1` | compatible, but the files differ | tries the claim |
 | `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first |
-| `W4` | the installed files need a newer daemon | reports only |
-| `repo-ahead` | installed by a newer daemon, or at a version that cannot be ordered | reports only |
+| `W4` | the installed files need a newer daemon, or record a version that cannot be ordered | reports only |
+| `repo-ahead` | installed by a newer daemon, and still compatible with this one | reports only |
 | `skipped` | the Loom source repo, a non-GitHub origin, or no Loom on the default branch | nothing |
 
 - **An empty payload diff is `W0`, whatever the stamp says.** A resync that
@@ -1776,17 +1776,127 @@ workspace's default branch (never the working tree) and classifies it:
   claim and no commit, and a stamp that is old or lacks `requires_daemon` over
   matching files is left alone.
 - **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
-  They are left to the host roll (#10719).
+  `W4` holds dispatch and asks for a host roll; `repo-ahead` does neither,
+  except that an interrupted resync to a newer release is held (and asks for
+  no roll). See "Dispatch holds" below.
 - **Only from H0.** A host claims and writes only when all of these hold: it is
   a verified official release build (below), a fleet-sync pass has completed,
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
   `paused` reaches it), no pause roll is armed, committed or in progress
   (#10831; reported as `roll pending`, and never set by a fleet hold or an
-  operator drain), the binary on disk is still the one running, self-update is not in backoff or terminal, and the running version
-  is not below `loom_min_version`. The gate is read at the start of the pass,
+  operator drain), no pause manifest found at startup is still waiting for H5
+  to finish with it (#11016; reported as `resume-pending`, so a daemon a pause
+  roll just restarted claims and pushes nothing, in its startup pass or on the
+  timer, until health probation has passed), the binary on disk is still the
+  one running, self-update is not in backoff or terminal, and the running
+  version is not below `loom_min_version`. The gate is read at the start of the pass,
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
+
+#### Dispatch holds (#10719)
+
+Dispatch runs each repo's own installed files: agent worktrees start from the
+default branch, and the spawn script and role runs come from the host's
+checkout. After every workspace pass the daemon judges **both copies** of each
+registered workspace and holds new dispatch into a workspace when either one
+cannot work with this daemon. The checkout copy is
+`<root>/.loom/install-metadata.json` in the working tree.
+
+| Verdict for a copy | Hold | Typed outcome | Asks for a roll |
+|---|---|---|---|
+| its `requires_daemon` is above the running daemon (`W4`) | held | `daemon-too-old` | yes |
+| a contract field that cannot be ordered, such as `0.20.0-rc1`, and `requires_daemon` above the running daemon | held | `daemon-too-old` | yes, for `requires_daemon` |
+| a contract field that cannot be ordered, and `requires_daemon` at or below the running daemon | held | `daemon-too-old` | no |
+| a contract field that cannot be ordered, and no `requires_daemon` that parses | held | `daemon-too-old` | yes, for any release after this one; WARN once per workspace |
+| too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
+| a resync to a release above this daemon was interrupted there (`resync_pending`) | held | `install-incompatible` | no |
+| too old by its stamp, files equal to the payload (`W0`) | not held | | no |
+| installed by a newer daemon, `requires_daemon` at or below this one (`repo-ahead`) | not held | | no |
+| compatible, or a resync owed (no `requires_daemon`) | not held | | no |
+| could not be read this pass | the previous verdict stands | | as before |
+
+- **The ratchet guard.** A repo that is only *ahead* of this daemon is
+  neither held nor a reason to roll. Hosts roll at different moments, so a
+  host that has just rolled resyncs repos to a release the others do not run
+  yet. If that alone made them roll, one straggler would pull the whole fleet
+  forward one release at a time. While the newer files' `requires_daemon` is
+  at or below this daemon, this host keeps working the repo, never resyncs it
+  downward, and reports `repo-ahead`.
+- **A version that cannot be ordered rolls only for a need.** Such a copy
+  is held, because it may be newer than this daemon. Whether it also asks
+  for a roll is decided by its `requires_daemon` alone when that parses:
+  above this daemon it asks for that version, at or below it asks for
+  nothing. Asking for "any newer release" there would make the host chase
+  every new release for as long as the odd version stays. Only when
+  `requires_daemon` is missing or cannot be ordered either does the copy ask
+  for any release after this one, and the daemon logs that at WARN once per
+  workspace so a person fixes the metadata.
+- **An interrupted newer resync is held, and asks for no roll.** When
+  `resync_pending` names a release above this daemon, some of that release's
+  files are in place while the stamp, written last, is still the old
+  release's. The files are a mix of two releases and their `requires_daemon`
+  is not on record, so nothing is dispatched into the workspace. It names a
+  release, not a need, so it raises no roll demand: the ratchet guard holds
+  here too. It clears when a host on that release finishes the resync, or
+  when a person reruns the interrupted resync in the checkout. The daemon's
+  own resync commits only after the stamp, so in practice this is an
+  interrupted CLI resync in a checkout.
+- **A hold is per workspace and stops new dispatch only.** The host is never
+  paused, in-flight sweeps and role runs are not touched, no other workspace
+  is affected, and the workspace is still resynced. IPC `force` does not
+  bypass a hold.
+- **Where it is enforced.** Every path on which the daemon starts new work
+  in a workspace refuses a held one:
+
+  | Path | Refused by |
+  |---|---|
+  | Sweeps: the work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | the sweep registry, for issue and PR-set dispatch, with a typed `WorkspaceHeldDispatchError` before any lock, label flip or forge call |
+  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
+  | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
+  | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
+  | Epic supervisor (`LOOM_EPIC_SUPERVISOR=1`): singleton roles (Architect, Champion) and epic child sweeps | the supervisor skips the held workspace's whole tick, logged each tick. Its role dispatch runs the checkout's spawn script outside the registry, so it also refuses on its own with the same typed `WorkspaceHeldDispatchError` before that script runs |
+
+  Three things are not refused, on purpose. The pause-and-roll resume
+  relaunches sweeps and role runs that were already in flight when the host
+  rolled; a hold is about new work. The workspace resync still runs, because
+  it is what clears a `W3` hold. A terminal a person opens over IPC is not
+  dispatch. Until the first workspace pass after a restart has finished there
+  are no holds at all (see "After a restart" below).
+- **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
+  first pass after a resync has landed on the default branch and this host's
+  checkout is current. `W4` clears once this host runs a daemon at or above
+  `requires_daemon`. A workspace that leaves the registry is dropped.
+- **A hold that stands for 30 minutes alerts** at ERROR, and again every 30
+  minutes for as long as it stands. Every set, clear and standing alert is
+  published on the event-bus topic `fleet_sync.workspace_hold`. The
+  `Fleet store:` block of `loom-daemon status` shows each held workspace with
+  its kind, which copy holds it and since when.
+- **A hold can outlive its evidence, and says so.** A copy that cannot be
+  read keeps its previous verdict, so its hold stands until a pass can read
+  it again. Each hold records when a pass last judged its copy (`verdictAt`).
+  The repeated ERROR names that time when the latest pass could not read the
+  copy. `loom-daemon status` appends `hold verdict is N minutes old` once the
+  verdict is older than three sync intervals, which is also what a host whose
+  workspace passes have stopped shows.
+- **A workspace in backoff stays what it was found to be.** A `W4` workspace
+  whose remote starts failing is reported from its backoff with the same
+  `requires_daemon`, so its roll demand and the versions in its hold do not
+  change while the remote is down.
+- **The roll.** The highest version a `daemon-too-old` copy asks for is the
+  host's repo-ahead demand. The self-update loop treats it like the fleet
+  floor: the target is the newest release at or above it, pinned to the exact
+  tag, with no settle wait, through the same pause-and-roll, recorded as
+  `target_source = repo_ahead` (`floor` when the floor drives too). A fleet
+  host makes this roll even when its floor is met: it is the one roll besides
+  the floor's (#10885). A demand no release satisfies is reported at ERROR
+  and arms nothing; that one workspace stays held and every other workspace
+  keeps dispatching.
+- **The Loom source repo** installs from its own tree and is never resynced,
+  so it is judged for `W4` only. Its `loom_version` moves with every release
+  and never asks for a roll.
+- **After a restart** there are no holds until the first workspace pass has
+  finished.
 
 **Only an official release build pushes.** A daemon resyncs from the payload it
 embeds, so the binary must be a release's. Both of these must hold:
@@ -1892,14 +2002,254 @@ are in memory and reset on restart. Each workspace's state and reason appear on
 the `Fleet store:` status block and under `workspaces` in
 `fleet-sync-status.json`.
 
-The resync covers the payload surfaces only: `.loom/{roles,scripts,hooks,docs,runtimes}/`,
-`.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc` and
-`.claude/commands/loom/`. It does not yet touch `.loom/config.json`,
-`.loom/CLAUDE.md`, `.gitignore`, `.agents/skills/`, `.claude/README.md`,
-`.claude/biome.jsonc`, `.github/CONFIGURATION.md`, or the retired-file sweep and
-`package.json` edit that `resync-installed.sh` performs (#10895). It also does not
-fast-forward a host's own checkout (#10869), so a host keeps running its old
-installed scripts until that checkout is updated.
+A resync never touches a host's own checkout: the checkout fast-forward below
+does that.
+
+#### What a resync refreshes (#10895)
+
+One table in the daemon (`loom-daemon/src/init/payload/surfaces.rs`) names every
+surface. All of them are diffed against the default branch together, so a
+release that changes none of them makes no claim and no commit in any repo, and
+a second resync at the same release writes nothing.
+
+| Surface | Rule |
+|---|---|
+| `.loom/{roles,scripts,hooks,docs,runtimes}/`, `.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc`, `.claude/commands/loom/` | the installer's own payload step: written, and removed only when `installed_files` lists the file |
+| `.agents/skills/loom-<name>/SKILL.md` | written when absent or when the file carries the `<!-- loom-managed-skill -->` marker; one without the marker is never written or removed. A marker-carrying skill the release no longer generates is removed |
+| `.claude/README.md`, `.github/CONFIGURATION.md` | copied, only when the repo already has the file |
+| `.claude/biome.jsonc` | copied, created when absent |
+| `.gitignore` | only the Loom-managed block is merged (as `loom-daemon update-gitignore` does), and only when the file exists. The file is never listed in `installed_files` |
+| `.loom/CLAUDE.md`, `.loom/AGENTS.md` | re-rendered from the release's template with the install date the file already carries, so an unchanged template changes nothing. Only when the file exists and has an `**Installation Date**:` line |
+| files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
+
+A path pinned in `.loom/resync-ignore` is never written or removed, in either
+form the shell resync accepts (`.agents/skills/loom-<name>/SKILL.md` or
+`agents-skills/loom-<name>/SKILL.md`, `.claude/commands/loom/<name>.md` or
+`commands/loom/<name>.md`). A symlink, or a surface reached through a symlinked
+directory, is left alone. A file the repo's ignore rules exclude is never
+committed.
+
+Removing a dropped skill is something only the daemon resync does (the shell
+resync never removes one), and it goes by the marker, not by who wrote the
+file: a copy of a Loom skill kept under another `loom-<name>/` directory with
+the marker line still in it is removed on the next resync. To keep a customised
+skill, detach it: delete the `<!-- loom-managed-skill -->` line from its
+`SKILL.md` (or pin the path). Loom then never writes or removes it.
+
+One file a resync cannot use does not stop the rest. A `.gitignore` or guide
+that is not UTF-8, or a directory where a `SKILL.md` or `.claude/biome.jsonc`
+should be, is skipped: the daemon logs one warning naming the repo and the
+path, never writes or removes that file, and resyncs every other surface. A
+guide with no `**Installation Date**:` line is logged once per repo at `info`,
+since it stays at its old template until the repo is reinstalled. Both are
+logged once per repo and path for the life of the daemon, not once per tick.
+
+The first resync after a host moves to a release with these surfaces can commit
+more than usual in each repo: the skills are backfilled, and a guide rendered
+from an older template is brought up to date.
+
+**Install-time only.** No daemon resync touches these. The installer or
+`resync-installed.sh` does:
+
+| Surface | Why |
+|---|---|
+| `.loom/config.json` | Consumer configuration. The installer merges it on a reinstall and nothing migrates a key afterwards, so **a release that renames or retires a config key must keep reading the old key**. Fleet-wide configuration reaches hosts through the fleet store instead |
+| `package.json` (`loom-workspace` stub) | The removal of its `version` field is a one-time migration (#4285) |
+| root `CLAUDE.md` | Repo-customized. Removing a leftover `**Loom Version**` header is a one-time migration (#6612, #8147) |
+| `.gitattributes` `merge=ours` block and the local `merge.ours.driver` | They resolve per-host resync commits that conflict on the stamp (#4528). The daemon resync has one writer per change. An existing block is left as it is, and local git config cannot be committed |
+| forge labels | The drift check against `.github/labels.yml` is a forge read and a report, not an installed file. Run `sync-labels.sh` |
+
+Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
+`.github/labels.yml`, `.github/workflows/` and `.claude/agents/`.
+
+Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
+a release with these surfaces is the fleet floor.
+
+### Checkout fast-forward (#10869)
+
+A resync lands on a repo's default branch **on the forge**. Each host
+dispatches from its **own main checkout**: the spawn script and the role
+prompts are read from that working tree. So the same timer also fast-forwards
+each registered workspace's main checkout to its default branch.
+
+- **When.** Inside the startup pass, before any dispatch producer exists, so a
+  daemon that just rolled dispatches (and later resumes paused agents) from the
+  installed files that match it. Then on every tick, as the last step of the
+  workspace resync's pass: on that pass's own thread, inside the same
+  supervised closure, so the fleet-sync timer never waits for it, the single
+  flight and the stuck-pass watchdog cover it, it follows any resync that pass
+  pushed, and it never overlaps the next pass. Nothing else schedules it, and
+  it does not wait for a roll window.
+- **Bounded.** It stops starting workspaces after 30 s at startup, and on the
+  timer after 45 s or at the workspace pass's 120 s deadline, whichever comes
+  first; the next pass starts with the ones it did not reach, and they keep
+  their last report. Every git child has a timeout (15 s for a read and for
+  `ls-remote`, 30 s for a fetch). At startup it runs inside the startup pass's
+  own cap (`LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS`), so it never delays boot
+  past it.
+- **Writes need `fleet.autoApply`.** With it off, nothing is modified and a
+  clean checkout that is behind is reported as `behind`, with the count.
+- **A paused host writes nothing.** "Paused" means everything on the host is
+  left as it is, in a state a resume can pick up, so the fast-forward follows
+  the pause just as the network does, though it is only a local write. With
+  `fleet.autoApply` on, no checkout is moved while dispatch is paused (a
+  drain, a roll's pause or a fleet hold), while a pause roll is armed,
+  committed or in progress, or while a pause manifest found at startup is not
+  yet finished by H5 (`resume-pending`). The last covers the startup pass,
+  which runs before H5 is spawned, and every timer pass until H5 ends. The
+  question is asked again right before each merge. A clean checkout that is
+  behind is reported as `behind` with the reason, and the first pass after
+  the pause ends fast-forwards it. A host that is merely offline, or not in
+  H0 for another reason, is not held this way.
+- **The local merge is not tied to provenance; the network is.** The merge is
+  a write to the host's own clean checkout, so any build with
+  `fleet.autoApply` on may fast-forward to the `origin/<default>` its clone
+  already has. Asking a remote or fetching is another matter: this step does
+  that only on a host the workspace resync would itself use the network on
+  (see below), so a build that is not an official release asks nothing.
+- **One git write.** `git merge --ff-only origin/<default>`, with hooks
+  disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
+  `submodule.recurse` and the silent overwrite of ignored files turned off.
+  Never `reset`, `rebase`, `stash`, `checkout`, `clean`, a merge commit, or a
+  removed lock file. Submodules are not updated.
+
+What a pass costs on the network:
+
+- **None at all on a host the workspace resync keeps off the network**: no
+  `ls-remote` and no fetch. The checkout is compared with the clone's own
+  `origin/<default>` as it stands, so the reported count is as of the last
+  fetch anything made in that clone. That is a host:
+  - with `fleet.autoApply` off;
+  - with dispatch paused (a drain, a roll's pause or a fleet hold);
+  - with a resume pending: a pause manifest found at startup that H5 has not
+    finished with;
+  - running a build that is not an official release, or whose release tag is
+    not verified yet;
+  - with a roll pending, or a different binary staged on disk;
+  - running a version below the fleet floor (`loom_min_version`);
+  - whose self-update is backing off or has given up;
+  - in an outage hold (no remote answered in a recent pass).
+
+  On the timer the step does not work this out for itself: it takes the
+  workspace pass's own decision, so the two halves cannot disagree. At startup
+  it applies the same host gate to what is knowable at boot; a fresh daemon is
+  exempt only from "startup pass not complete", since that pass is the one
+  that verifies.
+- **None for a repo the resync is backing off** because its remote did not
+  answer or refused, until that backoff ends.
+- **None for a repo the workspace resync asked about in the same pass.** That
+  pass already learned the head (one batched query per owner) and fetched it
+  if it moved; this step trusts it, and fetches only if the clone's
+  `origin/<default>` is somehow not that head.
+- **One `git ls-remote` per pass for any other root**: the Loom source repo
+  and a non-GitHub origin (which the resync skips), a repo the resync did not
+  reach, and every root at startup. Then a `git fetch` only
+  when the head moved, with `--no-write-fetch-head`. The rate-limit breaker is
+  read immediately before each `ls-remote`; while it is open nothing more is
+  asked and the checkout is compared with the clone as it stands.
+- Three remotes in a row that do not answer end the pass's network use.
+- **No fetch below the free-space floor** (`diskWarnFreeGb`, #10995). A fetch
+  that is due there is not run, at startup or on the timer, and the checkout
+  reports `low-disk`, never `fetch-failed`: it is not a failure, sets no
+  backoff and does not count toward the three-in-a-row stop.
+
+So on a host that may use the network, any commit on the default branch
+reaches every clean checkout on the next tick, and the host that pushed a
+resync fast-forwards to it in the same pass.
+
+The step never waits for its own state: if an earlier step that never ended
+(for example one stuck in a git child) still holds it, the tick's step is
+skipped, the workspace pass it follows still records its result, and the
+`Fleet store:` block says `checkouts: an earlier checkout step has not ended;
+nothing was checked this tick`.
+
+For each workspace the first rule that matches ends the attempt:
+
+| # | Check | State when it fails |
+|---|---|---|
+| 1 | the clone's `origin/HEAD` names the default branch (no remote is asked, `main` is never guessed) | `no-default-branch` |
+| 2 | HEAD is on it, not on another branch and not detached | `wrong-branch` |
+| 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
+| 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
+| 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
+| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed`; `low-disk` when the fetch was not run below the free-space floor and nothing else is to report |
+| 6 | nothing behind and nothing ahead | `current` |
+| 7 | ahead only: unpushed local commits | `ahead` |
+| 8 | ahead and behind | `diverged` |
+| 9 | no staged or unstaged change to any tracked file | `dirty` |
+| 10 | the merge succeeds | `would-overwrite` when a local file is in the way, else `git-failure` |
+| | | `fast-forwarded` |
+
+- **Local work is never touched.** A checkout in any skip state is left exactly
+  as it is: HEAD, index and working tree. Untracked files do not make a
+  checkout dirty; one that sits where an incoming commit adds a file is
+  `would-overwrite`, and nothing is changed.
+- **Stricter than the gate's sync, on purpose.** The main-health gate also
+  brings a checkout to `origin/main` before a gate build
+  (`prepare_workspace_to_origin_main`), with `git reset --hard`, and so may
+  ignore some tracked dirt (lockfiles, a re-stamped
+  `.loom/install-metadata.json`). That sync is unchanged, and it runs only for
+  a repo with a build gate when a gate run is due. This step discards nothing,
+  so any tracked change is `dirty`. The two compose: after a fast-forward the
+  gate's reset is a no-op. They are not mutually excluded: this step checks
+  for a gate run before an attempt and again right before the merge, which
+  narrows the race but does not close it. Both writers are the daemon's own and
+  both only bring the checkout to `origin/<default>`, so a race converges. A
+  checkout left dirty by the retired shell resync shows up once and needs a
+  one-time clean-up.
+- **Not the fleet-refresh task.** `eta-fleet-refresh` (#10263) refreshes ETA
+  snapshots through the forge API on the fleet captain. It runs no git command
+  in any checkout and is unrelated to this step.
+- **A host behind a repo still fast-forwards.** The checkout moves to whatever
+  is on the default branch, even when those installed files are newer than this
+  daemon. Whether that pair may dispatch is the host roll's decision (#10719).
+- **Running agents are unaffected.** Sweeps work in their own worktrees, and a
+  script that is already executing keeps the file it opened.
+
+**The Loom source checkout is included.** The self-update loop still never
+pulls it, and its clean-tree gate is unchanged. What changes is that on a host
+with `fleet.autoApply` on, the checkout the loop compares the running binary
+against now advances on its own:
+
+- A host that installs release artifacts is unaffected: that path never reads
+  the checkout. Between a merge and its release the checkout is ahead of the
+  installed binary, which is the case #9711 describes for a hand-run
+  `loom-daemon-update.sh`; that script's behaviour is not changed here.
+- A fleet host moves only when the floor moves (`loom_min_version`; fleet
+  hosts no longer chase the latest release, #10885). So a newer commit in the
+  checkout is not by itself a reason to roll, and a source-building fleet host
+  does not rebuild as `main` moves. When a roll does build from source, it
+  builds the commit `loom-daemon-update.sh` would itself have fast-forwarded
+  to. Both only move forward along the default branch.
+- The checkout never moves under a running update. The script verifies that
+  the binary it built is a build of the checkout's HEAD and treats a mismatch
+  as terminal, so the daemon holds the checkout for the whole run of the
+  script: this step skips it (`self-update-in-flight`), and an update that
+  starts during an attempt waits for that one attempt. A `loom-daemon-update.sh`
+  run by hand is outside the daemon and is not covered. A fast-forward that
+  lands before its build stamps the commit fails its verification (exit 4),
+  and it is run again. There is a narrow window after the stamp, while the
+  compiler is still reading sources, in which a fast-forward gives a binary
+  stamped with the old commit but built partly from new sources, and the
+  verification passes. It needs a new commit on the default branch to land in
+  that window, after the script's own fast-forward.
+
+Reporting:
+
+- `fleet-sync-status.json` gains `checkouts`, one entry per workspace: `root`,
+  `state`, `branch`, `behind`, `ahead`, `head`, `detail`, `since` and
+  `installedFilesBehind`. The `Fleet store:` status block shows every workspace
+  that is not `current`.
+- `installedFilesBehind` is true when the commits the checkout is missing
+  change `.loom/` or `.claude/commands/loom/`: the host is running stale Loom
+  scripts, not merely stale product code.
+- A state is logged, and published on the event bus as `fleet_sync.checkout`,
+  when it is entered and when it clears, not once per pass. A skip state is a
+  `warn`, or an `error` when `installedFilesBehind` is true. A fast-forward is
+  an `info` naming the old and new commit. `fetch-failed`, `git-failure` and
+  the two in-flight states are reported only after three passes in a row. The
+  memory behind this is per process: a restarted daemon reports each standing
+  skip state once more.
 
 ### ETA fit publication branch (#10395)
 
@@ -5917,11 +6267,12 @@ What it does depends on whether the host reads a fleet store (`fleet.repo`):
 | Floor | Running vs floor | This tick |
 |---|---|---|
 | no fleet store | n/a | Opt-in `autoUpdate` as before: the newest release (or a newer source checkout) behind `settleSecs` and its `6 ×` ceiling. `target_source = autoupdate` |
-| unknown | n/a | No version roll. `last tick:` says `fleet floor not known (…)` and why |
+| unknown | n/a | No roll for the floor. `last tick:` says `fleet floor not known (…)` and why. A workspace that needs a newer daemon still rolls the host (the last row) |
 | set | below; the newest release is at or above it | Pause-and-roll now, no settle, to that release's exact tag. `target_source = floor` |
 | set | below; the newest release is below it | `FLEET FLOOR UNSATISFIABLE` at ERROR. No roll; dispatch continues |
 | set | below; no release resolved | No roll; the next tick asks again |
-| set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists |
+| set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
+| any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
 
 - **A fleet host moves only when the floor moves.** It does not chase the
   newest release and does not rebuild itself from source as `main` advances.
@@ -5936,9 +6287,10 @@ What it does depends on whether the host reads a fleet store (`fleet.repo`):
 - **The floor is unknown** when a store is configured but no floor is known:
   the startup pass has not completed and no earlier snapshot records one, the
   store carries no `loom_min_version`, or the store could not be started. The
-  host does nothing rather than fall back to chasing the latest release, logs
-  one WARN when it enters that state, and repeats the reason on every tick's
-  note. Before the first pass of a new process completes, the floor the
+  host does nothing for the floor rather than fall back to chasing the latest
+  release, logs one WARN when it enters that state, and repeats the reason on
+  every tick's note. It still rolls for a workspace that needs a newer daemon
+  (the last table row), to a real published release. Before the first pass of a new process completes, the floor the
   previous process recorded in `fleet-sync-status.json` counts as set.
 - **A floor bump rolls every host within about one sync interval.** Rolls are
   not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so
@@ -12926,7 +13278,8 @@ window and stampede-gate deadline with `intervalSecs` (default 900) /
 pause with the `pauseRoll.*` budgets (#10831). On a host that reads a fleet
 store, everything below about chasing the newest release, the source fallback
 and the settle window is replaced by one rule: the host rolls only when it is
-below `loom_min_version` (#10885, see
+below `loom_min_version`, or when a registered workspace needs a newer daemon
+(#10719) (#10885, see
 [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). All knobs resolve **env > config > default** through
 `config_resolver`, so the `.loom-project/` tier is honored like every other
 `autonomous.*` block.

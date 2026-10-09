@@ -403,8 +403,9 @@ fn h0() -> HostGateInputs {
 fn the_host_gate_names_each_reason() {
     assert_eq!(host_gate(&h0()), Ok(()));
     type Set = fn(&mut HostGateInputs);
-    let table: [(Set, NotCurrent); 8] = [
+    let table: [(Set, NotCurrent); 9] = [
         (|i| i.draining = true, NotCurrent::Draining),
+        (|i| i.resume_pending = true, NotCurrent::ResumePending),
         (|i| i.staged = true, NotCurrent::Staged),
         (|i| i.roll_pending = true, NotCurrent::RollPending),
         (|i| i.stalled = true, NotCurrent::Stalled),
@@ -824,11 +825,11 @@ fn a_repo_ahead_of_the_daemon_is_never_claimed_or_written() {
             WState::W4,
             "requires daemon 0.19.890 > running 0.19.880",
         ),
-        // Cannot be ordered, so it may be newer.
+        // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
         (
             "0.20.0-rc1",
             Some("0.19.772"),
-            WState::RepoAhead,
+            WState::W4,
             "installed loom_version \"0.20.0-rc1\" is not MAJOR.MINOR.PATCH; it may be newer \
              than this daemon",
         ),
@@ -1132,6 +1133,8 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: Some("0.19.800".to_string()),
                 requires_daemon: None,
                 reason: Some("claim held by host-b since 2026-10-08T12:00:00Z".to_string()),
+                hold: None,
+                refusal: None,
             },
             WorkspaceReport {
                 root: PathBuf::from("/src/lib"),
@@ -1140,6 +1143,8 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: None,
                 requires_daemon: None,
                 reason: None,
+                hold: None,
+                refusal: None,
             },
         ],
         ..WorkspacePass::default()
@@ -1166,3 +1171,9 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
 mod bounds;
 #[path = "workspace_resync_heads.rs"]
 mod head_check;
+#[path = "workspace_resync_hold.rs"]
+mod hold_pass;
+#[path = "workspace_resync_online.rs"]
+mod online;
+#[path = "workspace_resync_surfaces.rs"]
+mod surfaces;
