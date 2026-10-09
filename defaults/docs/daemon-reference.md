@@ -6322,6 +6322,11 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   --drain --then-exit` or `fleet drain`) does hold a roll: that tick is
   skipped. `restart --abort-drain` clears that record and releases the hold.
   A `stopped` host exits at boot, before the loop starts.
+- **A manual `loom-daemon-update.sh` asks first** (#11044). Run by hand on a
+  fleet host, it warns before installing a version that moves the host off
+  the floor, asks `[y/N]` on a terminal and refuses without one unless given
+  `--yes`. `--to-floor` installs exactly the floor's release. See [Fleet floor
+  check](#self-update-rebuild--provision--restart-3968).
 
 ### Sweep-outcome issue write-back (#9056)
 
@@ -12834,7 +12839,64 @@ manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
 ./.loom/scripts/cli/loom-daemon-update.sh --fetch        # REQUIRE a verified release artifact (never silently fall back to a source build); exit 1 if none resolves
 ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch     # never consider release artifacts; always build from local source (pre-#5020 behavior)
 ./.loom/scripts/cli/loom-daemon-update.sh --resolve-json # READ-ONLY (#7609): print ONE JSON object describing the latest release artifact + the installed binary, then exit -- no fetch, no git fetch, no build, no provision, no restart
+./.loom/scripts/cli/loom-daemon-update.sh --yes          # fleet host (#11044): install even if it moves this host off the fleet floor, without asking (= LOOM_DAEMON_UPDATE_YES=1)
+./.loom/scripts/cli/loom-daemon-update.sh --to-floor     # fleet host (#11044): install exactly the floor's release (--fetch --tag v<floor>); nothing to do at or above the floor
 ```
+
+**Fleet floor check (#11044).** On a fleet host the version is set by the
+fleet floor and the host moves only when the floor moves ([The fleet floor
+drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). A manual
+run of this script would otherwise install the newest release (or a source
+build) and silently leave one host ahead of the fleet. So, before it fetches,
+builds or provisions anything, it compares the version it is about to install
+with the floor and the installed version:
+
+| Floor | About to install | Result |
+|---|---|---|
+| no fleet store (not a fleet host) | anything | unchanged, nothing printed |
+| set | the floor's version, or the installed version again | unchanged, nothing printed |
+| set | above the floor, installed version below it (catching up) | unchanged, nothing printed: a floor roll goes there too |
+| set | above the floor, installed version at or above it | warning: moves the host **ahead of the fleet** |
+| set | below the floor | warning: moves the host **below the floor** |
+| unknown (a store, but no floor known) | anything | warning: the floor is not known |
+
+On a warning a run with a terminal on stdin asks `Continue? [y/N]`, and only a
+typed `y` continues. A run without one **refuses** with exit 1 and names the
+override, and never reads stdin. `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
+continues without asking. `--dry-run` prints the warning and never asks.
+`--check` and `--resolve-json` are unchanged.
+
+```text
+This host is in fleet 2AMLogic/fleet-gitops with loom_min_version 0.19.950 (fleet-sync snapshot of 2026-10-09T03:30:25Z). Installing 0.19.953 (release v0.19.953) moves it ahead of the fleet; the fleet changes version by raising the floor.
+Continue? [y/N]
+```
+
+- **How a fleet host is detected.** Without contacting the daemon, so a busy,
+  wedged or stopped daemon cannot hang the script: a store resolved the way
+  the daemon resolves it (`LOOM_FLEET_REPO` over `fleet.repo` in the
+  effective config), **or** a fleet-sync snapshot
+  (`~/.loom/fleet-sync-status.json`, under `LOOM_SOCKET_PATH`'s directory when
+  that is set). The snapshot counts on its own because a host often names its
+  store only in the daemon's launchd plist or systemd unit, which an
+  operator's shell does not carry; the daemon deletes the snapshot at startup
+  when it reads no store, so a snapshot present means it reads one.
+- **Where the floor comes from, and how stale it can be.** The snapshot's
+  `floor`. While the daemon runs it is at most one `fleet.syncIntervalSecs`
+  old; with the daemon stopped it is as old as the daemon's last pass. The
+  warning names the snapshot's time. A store with no snapshot, a snapshot with
+  no floor, or a snapshot for a different store is "unknown".
+- **Runs Loom starts itself never prompt.** The daemon's self-update loop,
+  `fleet roll` and `fleet add-worker` set `LOOM_DAEMON_UPDATE_INVOKER`
+  (`daemon`, `fleet-roll`, `add-worker`). Such a run prints the warning and
+  continues: it has no terminal, and the daemon's own floor rolls target a
+  release at or above the floor anyway. `fleet roll` is an explicit operator
+  command, so it is treated as confirmed; on a fleet host prefer raising the
+  floor.
+- **`--to-floor`** installs exactly the floor's release (`v<floor>`, as
+  `--fetch --tag`) to bring a lagging host up to the fleet, for example a
+  fleet-paused host held by an operator stop. A host already at or above the
+  floor installs nothing (exit 0); it never moves a host down. A host with no
+  fleet store, or whose floor is unknown, is refused (exit 1).
 
 **One-shot drain roll (Issue #5138).** Before this, a drained roll needed the
 documented two-step dance — `loom-daemon-update.sh --no-restart` followed by a

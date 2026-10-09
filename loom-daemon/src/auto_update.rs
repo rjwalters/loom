@@ -1025,6 +1025,9 @@ fn run_update_script_with(
     if let Some(repo) = repo {
         command.env("LOOM_DAEMON_UPDATE_GH_REPO", repo);
     }
+    // #11044: the daemon's own roll must never stop at the fleet floor
+    // confirmation (there is no terminal, and stdin is /dev/null).
+    command.env(crate::daemon_update::floor_guard::INVOKER_ENV, "daemon");
     if low_priority {
         nice_child(&mut command);
     }

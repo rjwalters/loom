@@ -1075,6 +1075,8 @@ mkdir -p "$HOME/.local/bin"
 # never a hard failure on that account. --no-restart is safe here: the
 # loom-daemon systemd unit has not been installed yet (a later step), so there
 # is never a running daemon for this invocation to try to restart.
+# #11044: this is unattended, so the fleet floor confirmation must not stop it.
+export LOOM_DAEMON_UPDATE_INVOKER=add-worker
 UPDATE_SCRIPT="$LOOM_SRC/defaults/scripts/cli/loom-daemon-update.sh"
 if ! "$UPDATE_SCRIPT" --no-restart; then
   # A missing Rust toolchain is the ONLY failure this can repair: install
@@ -1701,3 +1703,8 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod feed_egress_tests;
+
+// #11044: the update-script invoker marker, in its own sibling for the same
+// reason.
+#[cfg(test)]
+mod invoker_tests;
