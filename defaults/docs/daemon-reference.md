@@ -9124,10 +9124,26 @@ a six-builder wave, each loss costing a full Rust rebuild.
 The reaper now also asks the filesystem, which the process table cannot
 contradict: **a worktree with any write in the last `N` minutes is live**,
 whatever the registry thinks. The probe reads the worktree's gitdir refs
-(`HEAD`/`index`/`logs/HEAD` — the only place a *commit* is observable, since
-committing touches no working-tree file), the build-artifact directories at
-depth 1 (a running `cargo` rewrites `target/debug/` constantly), and a bounded
-walk of the source tree, stopping at the first recent entry.
+(`HEAD`/`index` by mtime, `logs/HEAD` by its newest entry's own timestamp — the
+only place a *commit* is observable, since committing touches no working-tree
+file), the build-artifact directories at depth 1 (a running `cargo` rewrites
+`target/debug/` constantly), and a bounded walk of the source tree, stopping at
+the first recent entry.
+
+`logs/HEAD` is read by content, not mtime, since #11071: `git gc`'s `reflog
+expire --all` rewrites the `logs/HEAD` of **every** linked worktree without
+adding an entry, so on a busy host every kept worktree read as live and none was
+ever trimmed (31 hours on loom-worker-1, 40 GB held by idle `target/` dirs).
+
+**Order and logging (#11071).** Eligible directories are removed largest first.
+Each removal logs `category=worktree_target_idle` with the worktree, the
+directory, its bytes and `dry_run`; each artifact directory left in place logs
+why and its bytes (`info` when it holds anything). Below the floor, the eager
+tier runs the same reclaim across **every registered root** (its own probe root
+is usually the daemon's checkout, which has no worktrees), without the forge,
+and stops as soon as free space is back above `diskWarnFreeGb`.
+`loom-daemon clean --dry-run` lists the same candidates; `clean` never removes
+them.
 
 Set `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES=0` to disable the gate and restore
 the pre-#8116 behavior. A worktree the daemon cannot read is never reclaimed
