@@ -194,6 +194,7 @@ mod tests {
     /// first registry is reconstructed; the drain state (with any fleet
     /// `paused` hold the startup fleet-sync pass found) exists before H5 is
     /// spawned; and H5 holds dispatch before any dispatch producer starts.
+    /// The arm also precedes both readers of the host gate's `resume_pending`.
     #[test]
     fn startup_arms_before_recovery_and_holds_before_any_producer() {
         let src = include_str!("../../daemon_service.rs");
@@ -207,6 +208,16 @@ mod tests {
         assert!(arm < at("spawn_startup_passes("), "and before startup claim reconciliation");
         assert!(arm < at("seed_capacity_from_journal("), "and before the journal capacity seed");
         assert!(at("fleet_state::wire(") < spawn, "the fleet hold is applied before H5 starts");
+        // #11016, #10869: the host gate reads `suppress::host_verified()` as
+        // `resume_pending`. Both readers must come after the arm, or they
+        // would see "verified" on a daemon H5 has not looked at yet:
+        // `fleet_sync::start` runs the startup pass (whose checkout half
+        // would fetch and fast-forward), and `fleet_state::wire` starts the
+        // timer task whose first per-repo resync pass would claim and push.
+        let start = at("fleet_sync::start(");
+        assert!(arm < start, "armed before the startup pass's checkout fast-forward");
+        assert!(arm < at("fleet_state::wire("), "and before the first per-repo resync pass");
+        assert!(start < spawn, "the startup pass runs before H5: it must read the arm");
         for producer in [
             "epic_supervisor::spawn_multi_supervisor_thread(",
             "spawn_multi_work_finder_task(",

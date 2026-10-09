@@ -287,6 +287,83 @@ only.
   within one listing interval now closes at the approval (verdict `pass`), as
   the forge measures it, instead of at the release.
 
+### Hold kind and who released it (#10958, Slice 1)
+
+`op_hold` is one bit for every operator hold. Slice 1 adds the inputs that
+split it. It logs data and adds a classifier; no shipped heuristic reads
+either yet. The model that uses them (hold-kind release rates, hour-of-week,
+operator activity) is Slice 2.
+
+**The marker log.** `pr-hold-markers.jsonl`, beside the fleet snapshots
+(`eta::hold_marker_log`), holds one row per trusted Champion hold or release
+marker in a comment:
+
+| Marker | Meaning |
+|---|---|
+| `champion:merge-risk-hold` | criterion #2's hold opened (or re-armed) |
+| `champion:critical-file-hold` | criterion #3's hold opened (or re-armed) |
+| `champion:ac-hold pr=<n> sha=<sha>` | the linked issue's close is held (posted on the issue; logged against PR `n`) |
+| `champion:merge-risk-hold-cleared`, `champion:critical-file-hold-cleared` | Champion closed the episode |
+| `champion:critical-file-release-respected`, `champion:hold-release-respected:<sha>` | Champion acknowledged a human's release |
+
+A row is `{repo, pr, thread, kind, head, comment_id, created_at,
+fetched_at, source}`. `head` comes from the marker or from the comment's
+`champion:hold-state head=<sha>` line. A marker counts only on a line of its
+own, outside a fenced code block, and only from an author
+`comment_trust` believes. A quoted or untrusted marker is prose. Other
+Champion markers (digests, notices, defers) are not hold state. No marker
+exists for a stale-check budget hold: that hold is a label only.
+
+**Reads.** The ETA pass reads the repo-wide comment listing,
+`issues/comments?since=…&sort=updated&direction=asc`, as ETag'd
+conditional GETs through the reader Apps (op `comment.list`). It makes at
+most `MARKER_READ_BUDGET` (6) calls per pass across all repos, and none
+while the rate-limit breaker is open. A repo's first walk starts 28 days
+back (`BACKFILL_DAYS`). After each full page, `since` moves to the newest
+`updated_at` seen, so the walk never pages deep. A short page means the
+repo is caught up. After that, a quiet repo costs one `304` per pass. Rows
+are keyed `(repo, comment_id, kind)`, so the overlap a walk re-reads adds
+nothing. Rows from the first walk are `source: backfill`; later rows are
+`live`, so a fit can drop backfilled rows as an ablation. A marker is
+knowable from its comment's `created_at`, an immutable forge timestamp.
+The residual leak is an edit or delete made after `as_of`, which the log
+never sees.
+
+**Coverage.** The cursor (`pr-hold-markers.cursor`) records each repo's
+coverage: complete from `backfill_from` through `caught_up_at`. An instant
+outside that span is *unknown*, never "no marker".
+
+**The classifier** (`eta::hold_kind`, `RepoHolds`) is pure. It reads by
+slug: the raw event cache's PR label rows plus the repo's marker rows.
+
+- **Spells.** The hold labels in force (`merge_hold` labels, their
+  companions, `loom:blocked`) are replayed strictly before the cutoff. A
+  spell opens when the set becomes non-empty. It ends when the set empties
+  (released), or when the PR merges or closes while held.
+- **Kind.** The labels give the kind on their own: `operator_decision`,
+  then `operator_only` (including `-mechanical`), `operator`, `blocked`,
+  `other`. The latest marker posted in the spell refines it, counting from
+  30 minutes before the spell's first label. A hold marker names the kind
+  (`merge_risk`, `critical_file`, `ac_hold`) and its head. A re-arm at a new
+  head is a newer marker. A release marker with the label still in force
+  means a human put the hold back, so the label kind stands. When the
+  marker log does not cover the spell, the kind is the label kind and
+  `marker_known` is false.
+- **Release.** A release was Champion's when a `-cleared` marker lies within
+  15 minutes (`CLOSER_WINDOW_SEC`) of the labels emptying. Otherwise it was
+  a human's, as `champion-critical-file-hold.md` infers: an open episode
+  whose label is gone can only mean a human removed it. The verdict is
+  `pending` until the window has passed with coverage, so a closer posted
+  after the cutoff never changes an earlier row. No forge `actor` is read:
+  on a host whose writes use a person's token, fleet and operator writes
+  share one login.
+
+A fact is usable only if it is strictly before the cutoff (`t − LAG` in
+training, `as_of` in serving). `eta/tests/hold_kind.rs` checks this: it
+adds labels, merges, closers and backfilled markers at or after each
+cutoff, and every spell stays unchanged. It also checks that the disk read
+matches the in-memory inputs.
+
 ## Heuristics and versioning
 
 | id | kind | reads | an approved path ends |

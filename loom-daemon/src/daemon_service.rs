@@ -1331,7 +1331,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // that repo's dispatch — never the siblings'. With an empty registry (the
     // common single-workspace case) exactly one root is keyed, reducing to the
     // pre-#3930 single-flag behavior byte-for-byte.
-    let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
+    // #10869: made through `checkout_ff`, which registers them so the timer's
+    // checkout fast-forward asks whether a gate run is building in a checkout
+    // before it moves it.
+    let workspace_health_states = loom_daemon::fleet_sync::checkout_ff::health_states();
 
     // Shared drain-and-restart state (Issue #4090). Constructed here — before the
     // epic supervisor, work-finder, and role runner — so its flag can be threaded
@@ -2036,6 +2039,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Default OFF (side effects on the running process). Cloned handles here because
     // `event_bus` is moved into `IpcServer::new` below.
     let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
+    auto_update::removed_settings::warn_if_set(&auto_update_config);
     let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
         let tuning = auto_update::TickTuning::resolve(&auto_update_config);
         log::info!("auto_update: enabled ({})", tuning.describe());

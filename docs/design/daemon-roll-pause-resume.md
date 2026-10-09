@@ -179,7 +179,7 @@ rule (§2) and the requeue rules (§9).
 | **Worktree** (`.loom/worktrees/issue-N`) | None. It is on-disk state and is never paused or touched by the roll. | `path`, `branch`, `head`, `dirty`, carried on the owning item | Reused by the resumed agent. Until H5 completes, the worktree reaper and the orphan-process reaper must treat every worktree named in a live manifest as **owned** (`orphan_process_reaper.rs` fail-safes). | None needed. Git state does not depend on the binary version. | Never deleted by the roll. If its item was reset or requeued, it becomes ordinary stale state under the existing worktree reaper's rules. A later dispatch reuses it under `worktree.sh`'s existing rules. |
 | **Pending dispatch** (spawn in progress: the child is spawned and `finish_issue_dispatch` has not recorded its entry yet. Nothing constructs `SweepState::Pending`, so the count is `sweep_registry::roll_gate`'s, #10974) | Close dispatch, then wait for it to be recorded `Running` or fail (bounded by the existing startup-race window). It is then young, so it is reset. New IPC dispatches are refused while paused (`ipc.rs:706`, `ipc.rs:1913`). | As a sweep | n/a (reset) | n/a | `young-agent-reset` |
 | **In-session sweep / attended builder** (not daemon-owned) | None. It is not the daemon's work, and it has no `LOOM_DAEMON_ITEM_ID`, so the pause hook ignores it. | Not in the manifest. | Nothing to do. Two caveats: during the window, IPC-backed `loom-daemon` CLI calls fail and callers must retry. After the roll, the CLI on `PATH` is the new version. | CLI flag and IPC compatibility. That is the existing release contract, not this design. | None. |
-| **Auto-update state** (settle ceiling, window, stall) | Not work. | Persisted by #10713 in `auto_update_state.json`, not in this manifest. | Loaded by #10713. | #10713's typed load outcome. | n/a |
+| **Auto-update state** (settle ceiling, floor alert) | Not work. | Persisted by #10713 in `auto_update_state.json`, not in this manifest. | Loaded by #10713. | #10713's typed load outcome. | n/a |
 
 An agent that **exits by itself** during H4, before its safe point, is not
 paused. If it exited cleanly, its status is `completed`. Otherwise its status is
@@ -804,3 +804,65 @@ ordinary restarts (§4).
    runs pause at a safe point and resume from their session, with the guard,
    the remaining timeout and the issue-creation mutex seeded. They are subject
    to the 5-minute rule and the requeue rules.
+
+## 13. When a roll starts: the floor drives, no roll windows (#10885)
+
+Operator ruling, 2026-10-08. With H3→H4→H5 in place a roll is a short pause, a
+restart and a resume. The roll window (#9132) existed because drain-based
+rolls were expensive, so it is removed, along with its per-host offset. This
+section records what replaced it. It does not change the roll machine above.
+
+**Every fleet host has a floor.** `loom_min_version` is a required field of
+the fleet store. On startup and on every tick the daemon compares it with the
+version it is running and acts on that tick, through `trigger_pause_roll`.
+
+| Floor knowledge | Running vs floor | Behaviour |
+|---|---|---|
+| no fleet store (not a fleet host) | n/a | Opt-in autoUpdate, unchanged apart from the window: artifact path and source path behind the settle gate and its `6 × settleSecs` ceiling. `target_source = autoupdate`. |
+| unknown | n/a | No version roll. The tick's note says the floor is not known and why. Fail closed: a host that may have a floor must not chase the latest release. |
+| set | below; the newest release is at or above the floor | Floor roll on this tick. No settle. The target is the newest release at or above the floor, at its exact tag. |
+| set | below; the newest release is below the floor | The `FloorStallReport` ERROR alert; dispatch continues. The host does not roll to the newest release instead. |
+| set | below; no release resolved this tick | No roll; the next tick asks again. The source-rebuild path is not used. |
+| set | at or above | No roll, whatever newer release, re-published same-version artifact or newer source HEAD exists. Nothing is tracked, so no settle clock accumulates. |
+| set, but a version does not parse | n/a | No version roll, one WARN. Not reachable with a release build. |
+
+Consequences:
+
+- **A fleet host moves only when the floor moves**, or on the two triggers
+  that are independent of this table and act in every row: a repo ahead of
+  this daemon (`repo_ahead`, #10719) and a restart-only config change
+  (`config_restart`, #10720). Neither has a producer in this change.
+- **Settle, the settle ceiling (#10418), chase-latest and automatic source
+  rebuilds do not exist for a fleet host.** They remain only for a host with
+  no fleet store.
+- **"Unknown" is three-valued on purpose.** Before #10885 "no store", "a
+  store with no floor" and "no pass has completed yet" all read as "no floor",
+  which then meant "chase latest". They are now `NoStore`, `Unknown` and
+  `Unknown`. A store without the field, a startup pass that hit its cap with
+  no earlier snapshot, and a store that could not be started are all
+  `Unknown`. Before the first pass of a new process completes, the floor the
+  previous process recorded counts as set.
+- **The floor is a lower bound, not a pin.** A host below it installs the
+  newest release at or above it. A release counts only once it publishes this
+  platform's binary and checksum; a tag with no assets is never a target.
+  The release a floor bump installs may therefore be minutes old, which is why
+  rollback (#9735, §8) follows the resume side.
+- **A floor change is acted on at once.** The fleet-sync pass that resolves a
+  floor different from the previous pass's wakes the self-update loop, so the
+  worst case is one `fleet.syncIntervalSecs`, not that plus
+  `autoUpdate.intervalSecs`. The wake fires on a change of value only: a floor
+  roll that keeps failing is paced by its backoff and by the failed-roll guard
+  in H3 (§8), not by the sync cadence.
+- **No jitter.** Hosts already tick at different phases, a roll is a short
+  pause, and the artifact fetch is a handful of hosts against the release CDN.
+  A floor bump rolls every host within about one sync interval, and that is
+  accepted. Two hosts that roll minutes apart across a new release can land on
+  different versions, both at or above the floor.
+- **Old settings and state.** `rollWindowSecs`, `rollWindowOffsetSecs`,
+  `launchdLiveReload` and their env vars are accepted and ignored with one
+  WARN at startup. `auto_update_state.json` stays at schema 1: an older
+  record's `window` object is ignored on load and dropped on the next write,
+  and a binary from before this change reads the new record (its `window`
+  defaults to absent), so a rollback keeps the settle clocks.
+- **Unchanged.** The self-update loop, and so the floor check, still runs
+  only when `autonomous.autoUpdate.enabled` is true.

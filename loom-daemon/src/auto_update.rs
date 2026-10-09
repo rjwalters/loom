@@ -25,7 +25,12 @@
 //!    working checkout, so an unattended `cargo build --release` there would
 //!    compile whatever is uncommitted into the running daemon. The loop refuses
 //!    to build unless [`crate::self_update::source_tree_clean`] is `Some(true)`.
-//!    It never runs `git pull` on the operator's behalf.
+//!    It never runs `git pull` on the operator's behalf. (Fleet-sync may
+//!    fast-forward this checkout, as it does every registered workspace, on a
+//!    host with `fleet.autoApply` on — only when it is clean and strictly
+//!    behind, and never while this loop's update script is running in it:
+//!    [`crate::fleet_sync::checkout_ff`], #10869. That is not this loop
+//!    pulling, and this gate is unchanged by it.)
 //! 3. **Backoff on failure** — a source tree that does not compile must not
 //!    retry every tick forever. Retryable build failures back off exponentially
 //!    with a ceiling; the terminal give-up state is surfaced in `loom-daemon status`.
@@ -125,6 +130,18 @@
 //! only `Some(true)` triggers a rebuild. `None` (a tarball install with no
 //! source checkout, or `BUILT_COMMIT == "unknown"`) means "do nothing" — never
 //! "stale".
+//!
+//! # Fleet hosts move only when the floor moves (Issue #10885)
+//!
+//! Everything above (chasing the newest release, the source fallback, the
+//! settle window and its ceiling) is the behaviour of a host with **no fleet
+//! store**. A host that reads one (`fleet.repo`) has a floor,
+//! `loom_min_version`, and that floor is the only thing that moves it: below
+//! the floor it rolls on the tick that sees it, with no settle; at or above it,
+//! or while the floor is not known, it does nothing. It never chases a newer
+//! release and never rebuilds itself from source. [`floor_roll`] has the rule
+//! table. There is no roll window on any host; its removed settings are
+//! accepted and ignored with a warning ([`removed_settings`]).
 //!
 //! # Process-global, not per-workspace
 //!
@@ -268,8 +285,9 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
-    /// #9132's window knobs (`rollWindowSecs`, `rollWindowOffsetSecs`, `launchdLiveReload`).
-    pub roll_window: roll_window::RollWindowConfig,
+    /// #10885: the removed keys this block still sets (see
+    /// [`removed_settings`]). They are ignored; this only feeds the warning.
+    pub removed_keys: Vec<&'static str>,
 }
 
 /// Read `.loom/config.json → autonomous.autoUpdate` through
@@ -299,7 +317,7 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .get("deferDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
-        roll_window: roll_window::RollWindowConfig::from_block(block),
+        removed_keys: removed_settings::keys_in(block),
     }
 }
 
@@ -394,8 +412,6 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
-    /// #9132: the roll schedule, or `None` when no window is configured.
-    pub roll_window: Option<roll_window::RollWindowStatus>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -571,13 +587,13 @@ pub mod pause_classify;
 pub mod pause_manifest;
 pub mod pause_resume;
 pub mod pause_roll;
-/// #10713: `auto_update_state.json` (settle clocks, window).
+/// #10713: `auto_update_state.json` (settle clocks, floor alert).
 pub mod persisted_state;
 pub use pause_roll::RollTarget;
 /// #10712: floor-driven roll targets (target selection, settle skip, stall).
 pub mod floor_roll;
 /// #9132: schedule-driven rolls (window, per-host offset, one arm per window).
-pub mod roll_window;
+pub mod removed_settings;
 /// The loop's resolved knob set, bundled — see the module doc for why a fourth
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
@@ -1010,6 +1026,9 @@ fn run_update_script_with(
         nice_child(&mut command);
     }
 
+    // #10869: the script verifies its build against this checkout's HEAD, so
+    // fleet-sync's fast-forward must not move it until the script has exited.
+    let _checkout = crate::fleet_sync::checkout_ff::hold_for_self_update(cwd);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1214,9 +1233,8 @@ pub struct AutoUpdateState {
     /// surface — a persistently stale-repo host is stuck exactly as a
     /// terminal/backoff one is, just for a different reason.
     stale_repo: stale_repo::StaleRepoStreak,
-    /// #9132's schedule gate (inert unless `rollWindowSecs` is configured).
-    window: roll_window::WindowGate,
-    /// #10712: the fleet floor's basis and last verdict (inert while unset).
+    /// #10712: the fleet floor's basis and last verdict (inert on a host with
+    /// no fleet store).
     floor: floor_roll::FloorState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
@@ -1276,6 +1294,17 @@ impl AutoUpdateState {
                 // streak from a previous tick no longer applies (#8513).
                 self.stale_repo.reset();
                 self.floor.observe(None);
+                // #10885: a fleet host never rebuilds itself from source. With
+                // no release resolved it has nothing to roll to this tick.
+                if self.floor.fleet_host() {
+                    self.clear_tracking();
+                    let unchased = (check.update_available == Some(true))
+                        .then_some("the source checkout's newer HEAD (no source rebuilds)");
+                    return TickDecision::Skip(format!(
+                        "no artifact ({reason}) → {}",
+                        self.floor.hold_reason(unchased)
+                    ));
+                }
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
                     TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
@@ -1384,6 +1413,20 @@ impl AutoUpdateState {
             }
         };
 
+        // #10885: a fleet host rolls only for the floor. With no floor target
+        // this tick (floor met, unknown, or unsatisfiable) the newer release or
+        // re-published artifact above is not chased, and nothing is tracked,
+        // so no settle clock accumulates behind the floor.
+        //
+        // Seam for #10719: a repo-ahead target is a second demand that would
+        // join `floor_target` here (and in `floor_roll::select_target`).
+        if self.floor.fleet_host() && floor_target.is_none() {
+            self.clear_tracking();
+            let seen = why.trim_end_matches(" → fetching");
+            let unchased = format!("release {} ({seen})", info.tag);
+            return TickDecision::Skip(self.floor.hold_reason(Some(&unchased)));
+        }
+
         self.track_target(now, Some(target));
         // Shared bookkeeping with the source path: an idle observation re-arms
         // gate 4's continuous-busy clock for whichever path consults it next.
@@ -1396,7 +1439,8 @@ impl AutoUpdateState {
             return skip;
         }
         // #10712: a floor-driven roll skips settle (and so does its supersede,
-        // which re-decides here still floor-driven); autoUpdate rolls do not.
+        // which re-decides here still floor-driven). Only a host with no fleet
+        // store reaches the settle gate (#10885).
         let selected = self.floor.select(floor_target.as_ref(), info);
         if selected.source == floor_roll::TargetSource::AutoUpdate {
             if let Some(skip) = self.settle_gate(now, settle) {
@@ -1744,7 +1788,6 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
-            roll_window: self.window.status(),
         }
     }
 }

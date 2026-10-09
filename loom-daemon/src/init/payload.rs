@@ -22,34 +22,23 @@
 //! rules (#5971: only Loom-owned files are ever removed), the internal skip
 //! list and the executable bits are the installer's own.
 //!
-//! Consumer configuration (`.loom/config.json`) and the template-substituted
-//! scaffolding (`.loom/CLAUDE.md` carries an install date, so regenerating it
-//! would never be an empty diff) are not part of the payload diff.
+//! # The surfaces beyond the installer step
 //!
-//! # Scope gap against `resync-installed.sh`
+//! `resync-installed.sh` refreshes more than the payload step writes. Those
+//! surfaces, and the one table that names them, are in [`surfaces`] (#10895):
+//! `.agents/skills/` (marker-gated), `.claude/README.md`,
+//! `.github/CONFIGURATION.md`, `.claude/biome.jsonc`, the Loom-managed block
+//! of `.gitignore`, the two template-substituted guides (`.loom/CLAUDE.md`,
+//! `.loom/AGENTS.md`, re-rendered with the install date they already carry)
+//! and the retired-payload sweep. Each is a step over the same staging tree,
+//! so it is diffed and applied like any payload file.
 //!
-//! The payload diff is narrower than the shell resync it will replace. After
-//! a payload resync the stamp says "release X" while every surface below can
-//! still be at an older release. The daemon's workspace resync (#10718)
-//! installs this diff as it is; each surface below needs an owner before
-//! `fleet-resync.sh` is retired (#10895):
-//!
-//! * `.agents/skills/` (the Codex role prompts; marker-gated in the script)
-//! * `.claude/README.md` and `.github/CONFIGURATION.md`
-//! * `.claude/biome.jsonc`
-//! * the retired-payload sweep: files a release deliberately retires. Here a
-//!   file is removed only when `installed_files` lists it, so a retired file
-//!   an older installer never recorded stays
-//! * the `package.json` edit that deletes the `loom-workspace` stub's
-//!   `version` field
-//! * the leftover `**Loom Version**` header removal in `CLAUDE.md` and
-//!   `.loom/CLAUDE.md`
-//! * the Loom-managed `.gitignore` block (`loom-daemon update-gitignore`)
-//! * the `merge=ours` driver for `install-metadata.json` (`.gitattributes`
-//!   block plus local git config)
-//! * the forge label drift check against `.github/labels.yml`
-//! * the `.loom/.resync-in-progress` marker file ([`apply`] records an
-//!   interrupted run in the metadata instead, see below)
+//! Left to the installer and `resync-installed.sh`, deliberately
+//! ([`surfaces::INSTALL_TIME_ONLY`]): consumer configuration
+//! (`.loom/config.json`), the `package.json` stub's `version` removal, the
+//! root `CLAUDE.md` header, the `merge=ours` driver and the forge label drift
+//! check. The `.loom/.resync-in-progress` marker has no counterpart either:
+//! [`apply`] records an interrupted run in the metadata instead, see below.
 //!
 //! # What a resync writes
 //!
@@ -60,7 +49,8 @@
 //! `requires_daemon` and `last_resync` in `.loom/install-metadata.json`.
 //! It also records the added and changed paths in `installed_files` and
 //! drops the removed ones, so a file a resync adds can be retired by a later
-//! one. Every other key is kept.
+//! one. The repo's own `.gitignore` is the exception: Loom merges a block
+//! into it and never lists it as Loom-owned. Every other key is kept.
 //!
 //! # A failed resync is retried
 //!
@@ -108,6 +98,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tempfile::TempDir;
+
+pub(crate) mod surfaces;
 
 use super::file_ops::force_merge_dir_with_report_filtered;
 use super::repo_owned::OwnershipBoundary;
@@ -246,6 +238,11 @@ pub struct PayloadDiff {
     stamp_pending: bool,
     stamp: Stamp,
     staging: TempDir,
+    /// Surfaces left exactly as the workspace has them because their own
+    /// file there is unusable. None is in the lists above. The caller that
+    /// knows which repo this is reports them
+    /// ([`surfaces::log_skipped_once`]).
+    pub(crate) skipped_surfaces: Vec<surfaces::Skipped>,
 }
 
 impl PayloadDiff {
@@ -497,7 +494,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .tempdir()
         .context("create the resync staging dir")?;
     let stage = staging.path();
-    let roots = surface_roots(payload.defaults());
+    let roots = resync_roots(payload.defaults());
 
     // Seed staging with the workspace's current surfaces plus the ownership
     // evidence, so the installer's ownership-gated clean sees what it would
@@ -510,12 +507,22 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         .map(String::as_str)
         .chain([INSTALL_METADATA_PATH, RESYNC_IGNORE_PATH])
     {
+        // An extra surface reached through a symlinked parent (`.agents` or
+        // `.github` linked elsewhere) is the workspace's to keep, like a
+        // symlinked file.
+        if surfaces::is_extra(rel) && under_symlink(dest, rel) {
+            skipped.push(rel.to_string());
+            continue;
+        }
         seed(&dest.join(rel), &stage.join(rel), rel, &mut skipped)
             .with_context(|| format!("stage {rel}"))?;
     }
 
-    let shipped =
+    let mut shipped =
         install_into(payload.defaults(), stage).map_err(|e| anyhow!("stage the payload: {e}"))?;
+    let mut skipped_surfaces = Vec::new();
+    surfaces::stage_extras(payload.defaults(), stage, &mut shipped, &mut skipped_surfaces)
+        .map_err(|e| anyhow!("stage the extra surfaces: {e}"))?;
 
     let ownership = OwnershipBoundary::load(dest);
     let mut diff = PayloadDiff {
@@ -525,6 +532,7 @@ pub fn materialize_with(payload: &Payload, dest: &Path) -> Result<PayloadDiff> {
         stamp_pending: resync_is_pending(dest),
         stamp: payload.stamp().clone(),
         staging,
+        skipped_surfaces,
     };
     let mut staged = BTreeMap::new();
     let mut installed = BTreeMap::new();
@@ -669,6 +677,18 @@ fn gate_workspace(dest: &Path, stamp: &Stamp) -> Result<Compat, ResyncRefusal> {
     gate_metadata(&raw, &daemon)
 }
 
+/// Every repo-relative root a resync diffs: the installer step's, then the
+/// extra surfaces of [`surfaces::EXTRA_SURFACES`].
+pub(crate) fn resync_roots(defaults: &Path) -> Vec<String> {
+    let mut roots = surface_roots(defaults);
+    for surface in surfaces::EXTRA_SURFACES {
+        if !roots.iter().any(|r| r == surface.path) {
+            roots.push(surface.path.to_string());
+        }
+    }
+    roots
+}
+
 /// Every repo-relative path the payload step can write, in a stable order.
 fn surface_roots(defaults: &Path) -> Vec<String> {
     let mut roots = vec![
@@ -771,7 +791,17 @@ fn diff_excludes(path: &str, skipped: &[String], ownership: &OwnershipBoundary) 
             || path
                 .strip_prefix(s.as_str())
                 .is_some_and(|r| r.starts_with('/'))
-    }) || ownership.is_declared_repo_owned(path)
+    }) || surfaces::pin_names(path)
+        .iter()
+        .any(|name| ownership.is_declared_repo_owned(name))
+}
+
+/// A directory above `rel` in `dest` is a symlink.
+fn under_symlink(dest: &Path, rel: &str) -> bool {
+    Path::new(rel).ancestors().skip(1).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && fs::symlink_metadata(dest.join(dir)).is_ok_and(|m| m.file_type().is_symlink())
+    })
 }
 
 fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
@@ -875,8 +905,9 @@ fn restamp_metadata(dest: &Path, diff: &PayloadDiff) -> Result<()> {
 
 /// Keep `installed_files` true to what this resync wrote: the added and
 /// changed paths are Loom's (so a later release can retire them), the removed
-/// ones are gone. Existing entries keep their order; a value that is not an
-/// array is left alone.
+/// ones are gone. A file Loom only merges into (`.gitignore`) is never listed:
+/// the list is deletion evidence. Existing entries keep their order; a value
+/// that is not an array is left alone.
 fn record_ownership(obj: &mut serde_json::Map<String, Value>, diff: &PayloadDiff) {
     let entry = obj
         .entry("installed_files")
@@ -890,7 +921,8 @@ fn record_ownership(obj: &mut serde_json::Map<String, Value>, diff: &PayloadDiff
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
-    for rel in diff.added.iter().chain(&diff.changed) {
+    let owned = diff.added.iter().chain(&diff.changed);
+    for rel in owned.filter(|rel| surfaces::records_ownership(rel)) {
         if listed.insert(rel.clone()) {
             list.push(Value::String(rel.clone()));
         }

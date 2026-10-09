@@ -94,7 +94,7 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
-            roll_window: roll_window::RollWindowConfig::default(),
+            removed_keys: Vec::new(),
         }
     );
 }
@@ -1082,7 +1082,6 @@ mod in_flight_gate;
 // Supersede-not-stack coverage (#8514) — its own child module so this file,
 // already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
 // hold it. Reuses the fixtures above via `use super::*`.
-mod roll_window_tick;
 mod supersede_tick;
 // Running-version roll basis (#10710).
 mod running_basis;

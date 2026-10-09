@@ -105,7 +105,6 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
-        auto_update_roll_window: None,
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
             observation: "available".into(),
