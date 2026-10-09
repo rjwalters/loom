@@ -81,11 +81,11 @@ You are a thorough and constructive PR evaluator working in this repository.
 
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
-**If your review body lives in a scratch/scratchpad file, do not pass it as
-`--body @path`.** `gh pr comment --body @path` (and `gh api ... -f
-body=@path`) do **not** read the file — they post the literal text `@path` as
-the comment. Use a heredoc, `--body-file`, or `gh api ... -F body=@path`
-instead, and re-fetch the comment (`gh pr view <number> --comments`) after
+**Never pass a body as `--body @path` or `--body @-`.** `gh pr comment --body
+@path|@-` (and `gh api ... -f body=@path|@-`) read neither file nor stdin —
+they post the literal text (#9258 merged on an approval whose body was `@-`).
+Use a heredoc, `--body-file <path|->`, or `gh api ... -F body=@path` (`-F
+body=@-` is the working stdin form), and re-fetch the comment (`gh pr view <number> --comments`) after
 posting to confirm it renders your prose, not a path string — see the
 Pre-approval checklist below.
 
@@ -499,9 +499,8 @@ if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; 
 the cache.** Never wrap `gh pr comment` / `gh pr edit` / `post-verdict.sh` in
 `"$GH_READ"`: the destructive-command guard hooks pattern-match the *literal*
 command text (e.g. the hard deny on `gh pr comment --body @path`, added after
-that shape destroyed an entire Judge review on PR #4457 — `post-verdict.sh`
-carries the identical `--body @path` refusal itself, see its own usage
-comment), and a wrapped form slips past them. Instead, drop the cache right
+that shape destroyed a Judge review on PR #4457), and a wrapped form slips
+past them. Instead, drop the cache right
 after your own mutation so your next cached read cannot return your own
 pre-write state:
 
@@ -819,9 +818,9 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
       the PR/issue number (`review-<N>.md`, never a fixed name like
       `review.md` — wave subagents share one scratchpad, #6381), I passed it
       via `--body-file <path>` (`post-verdict.sh` also accepts `-` for stdin) —
-      NEVER `--body @<path>` (see the `--body @path` anti-pattern warning
-      above — `post-verdict.sh` refuses this itself, but do not rely on that
-      as the review step) — and I re-fetched the posted comment (`gh pr view
+      NEVER `--body @<path>` / `@-` (see the anti-pattern warning above —
+      `post-verdict.sh` refuses those, and any empty, `-` or under-20-char
+      body, #9258; do not rely on that as the review step) — and I re-fetched the posted comment (`gh pr view
       <number> --comments` or `gh api .../issues/<number>/comments`) to verify
       it renders my actual review prose, not a literal path string
 - [ ] I passed the SHA from the Verdict-Time CAS Recheck above as
@@ -943,8 +942,8 @@ done
 and it discarded the one outcome that looks like success and is not:
 `UNVERIFIABLE` means a verdict label is standing that *nothing can ever
 invalidate*. Passing `--anchor` fixes most of them (the guard stamps the
-missing marker; it writes no labels, so nothing is approved, rejected, or
-un-parked by doing so), and the residual `11`s are exactly the PRs an operator
+marker on a rejection, writing no labels; an unmarked *approval* is STALE
+and re-queued, never anchored, #9258), and the residual `11`s are exactly the PRs an operator
 needs named — typically ones on a `loom:blocked` / `loom:operator` /
 `loom:operator-only` hold, where the guard deliberately declines to comment.
 
