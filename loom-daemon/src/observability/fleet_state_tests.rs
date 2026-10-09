@@ -83,8 +83,7 @@ fn input() -> FleetInput {
         ready: Some(ReadyQueue {
             items: vec![ready(OTHER, 5, 1), ready(OTHER, 6, 2)],
             listed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
-            // Forced whole so the diffing path stays covered; the work
-            // finder never reports this until #11139.
+            // Both whole, so the diffing path is covered.
             complete: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
             slots: Some(FleetSlots {
                 max_concurrent: 4,
@@ -470,7 +469,7 @@ fn observed_sources_are_recorded_per_repo() {
 }
 
 /// `ready_complete` is `true` only for a repo whose ready listing is known
-/// whole (forced here; never so before #11139). A repo read but not known
+/// whole (#11139). A repo read but not known
 /// whole is `false` and `ready_replace`; a flip alone is a change, and the
 /// delta carries the repo's whole ready set.
 #[test]

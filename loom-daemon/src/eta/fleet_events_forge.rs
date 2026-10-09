@@ -555,6 +555,7 @@ mod tests {
             etag: Some("W/\"e1\"".to_string()),
             body: body.to_string(),
             ratelimit: crate::forge_call_stats::RateLimitHeaders::default(),
+            next_page: false,
         }
     }
 

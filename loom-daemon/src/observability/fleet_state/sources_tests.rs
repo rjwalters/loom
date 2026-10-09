@@ -22,6 +22,7 @@ fn review_stub(dir: &Path) -> PathBuf {
             r#"#!/bin/sh
 d={dir}
 echo "$*" >> "$d/calls.log"
+n=1
 case "$*" in
   *'&page='*)
     n=$(echo "$*" | sed 's/.*&page=\([0-9]*\).*/\1/')
@@ -32,7 +33,9 @@ case "$*" in
   *'labels=loom:review-requested&'*) f=rr1.json ;;
   *) f=empty.json ;;
 esac
-printf 'HTTP/2.0 200 OK\r\n\r\n'
+printf 'HTTP/2.0 200 OK\r\n'
+[ "$(grep -o '"number"' "$d/$f" | wc -l)" -ge 100 ] && [ ! -f "$d/last$n" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+printf '\r\n'
 cat "$d/$f"
 "#,
             dir = dir.display()
@@ -116,34 +119,43 @@ fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     .unwrap()
 }
 
-/// (c) No repo is ever `ready_complete`, whatever the tick's row count: the
-/// work finder cannot prove a listing whole before #11139 (a full raw page of
-/// PRs and issues can leave 40 ready rows and an unseen issue on page 2).
-/// Every read repo is `listed`, a failed one is not, and the wire marks every
-/// repo `ready_replace`; an issue absent from the tick is replaced away,
-/// never sent in `removed[]`.
+/// (c) A repo is `ready_complete` exactly when the tick walked its ready
+/// listing to the last page (#11139), whatever its row count. A failed repo is
+/// not `listed`; a partial one is listed but not complete, so the wire marks
+/// it `ready_replace` and an issue absent from the tick is replaced away,
+/// never sent in `removed[]`. A complete repo is diffed: an issue that left
+/// is sent in `removed[]`.
 #[test]
-fn no_repo_is_ever_ready_complete() {
-    let managed: BTreeSet<String> = ["acme/full", "acme/short", "acme/failed", "acme/idle"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+fn only_a_whole_listing_is_ready_complete() {
+    let managed: BTreeSet<String> = [
+        "acme/full",
+        "acme/short",
+        "acme/failed",
+        "acme/idle",
+        "acme/partial",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
     let per_page = u32::try_from(crate::forge_listing::PER_PAGE).unwrap();
     let mut summary = WorkFinderTickSummary {
         plan: Some(DispatchPlanContext::default()),
         listing_failed: vec!["/src/failed".to_string()],
+        listing_incomplete: vec!["/src/partial".to_string()],
         ..WorkFinderTickSummary::default()
     };
     summary.queue = (1..=per_page).map(|n| row("/src/full", n)).collect();
     summary.queue.extend((1..=40).map(|n| row("/src/short", n)));
+    summary
+        .queue
+        .extend((1..=per_page).map(|n| row("/src/partial", n)));
     let slug = |root: &str| root.strip_prefix("/src/").map(|r| format!("acme/{r}"));
 
     let ready = super::ready_from_tick(&summary, slug, &managed);
-    assert!(ready.complete.is_empty(), "{:?}", ready.complete);
-    let listed: Vec<&str> = ready.listed.iter().map(String::as_str).collect();
-    assert_eq!(listed, ["acme/full", "acme/idle", "acme/short"]);
+    let names = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>();
+    assert_eq!(names(&ready.listed), ["acme/full", "acme/idle", "acme/partial", "acme/short"]);
+    assert_eq!(names(&ready.complete), ["acme/full", "acme/idle", "acme/short"]);
 
-    // On the wire: every repo `ready_complete: false`, `ready_replace: true`.
     let input = |ready| FleetInput {
         managed: managed.clone(),
         ready: Some(ready),
@@ -151,20 +163,23 @@ fn no_repo_is_ever_ready_complete() {
     };
     let now = Utc::now();
     let mut first = input(ready.clone());
-    first.ready.as_mut().unwrap().items.push(ReadyItem {
-        issue: 999,
-        ..ready.items[crate::forge_listing::PER_PAGE].clone()
-    });
+    for repo in ["acme/short", "acme/partial"] {
+        let template = ready.items.iter().find(|i| i.repo == repo).unwrap().clone();
+        first.ready.as_mut().unwrap().items.push(ReadyItem {
+            issue: 999,
+            ..template
+        });
+    }
     let view = build_view(&first, None, now);
     let anchor = decide(&view, &PlannerStamps::default(), None, now).unwrap();
-    assert!(!anchor.repos.is_empty());
-    assert!(anchor
-        .repos
-        .iter()
-        .all(|r| !r.ready_complete && r.ready_replace));
+    for repo in &anchor.repos {
+        let whole = repo.repo != "acme/partial";
+        assert_eq!(repo.ready_complete, whole, "{}", repo.repo);
+        assert_eq!(repo.ready_replace, !whole, "{}", repo.repo);
+    }
+    assert!(anchor.repos.iter().any(|r| r.repo == "acme/partial"));
 
-    // #999 (seen before, absent now, maybe beyond page 1): the short repo
-    // stays incomplete, and #999 is replaced away rather than `removed`.
+    // #999 left both queues: the whole repo says so, the partial one cannot.
     let later = now + chrono::Duration::minutes(5);
     let second = build_view(&input(ready), Some(&view), later);
     let last = Emitted {
@@ -175,8 +190,15 @@ fn no_repo_is_ever_ready_complete() {
     };
     let delta = decide(&second, &PlannerStamps::default(), Some(&last), later).unwrap();
     let short = delta.repos.iter().find(|r| r.repo == "acme/short").unwrap();
-    assert!(!short.ready_complete && short.ready_replace);
-    assert!(short.removed.is_empty());
-    assert_eq!(short.rows.len(), 40);
-    assert!(!second.repos["acme/short"].rows.contains_key(&999));
+    assert!(short.ready_complete && !short.ready_replace);
+    assert_eq!(short.removed, [999]);
+    let partial = delta
+        .repos
+        .iter()
+        .find(|r| r.repo == "acme/partial")
+        .unwrap();
+    assert!(!partial.ready_complete && partial.ready_replace);
+    assert!(partial.removed.is_empty());
+    assert_eq!(partial.rows.len(), crate::forge_listing::PER_PAGE);
+    assert!(!second.repos["acme/partial"].rows.contains_key(&999));
 }

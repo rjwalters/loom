@@ -158,10 +158,11 @@ What the rows cover is exactly what the host's reads saw:
   sees the listing shift is a failed listing, so the repo's `census` is absent
   and its earlier PR rows are kept, never sent as `removed`.
 - **Ready queue**: every row the planner saw on the host's last work-finder
-  tick. The work finder lists one forge page (100 items) per label and cannot
-  yet prove a listing whole, so `ready_complete` is `false` for every repo
-  until #11139: its `ready_wait` rows are not the repo's whole queue. Such a
-  repo is sent with `ready_replace: true`, carrying its **entire** observed
+  tick. A repo whose ready listing the work finder walked to its last page is
+  `ready_complete: true` and its `ready_wait` rows are diffed (#11139). A repo
+  whose listing came back partial (a later page failed, the page cap, a
+  mid-walk change) is `ready_complete: false`: its `ready_wait` rows are not
+  the repo's whole queue. Such a repo is sent with `ready_replace: true`, carrying its **entire** observed
   `ready_wait` set whenever it is named, and the reader replaces rather than
   diffs (step 3 below). A repo whose tick listing failed keeps its earlier
   `ready_wait` rows. Only a `ready_complete: true` repo's `ready_wait` rows

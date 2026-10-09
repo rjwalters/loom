@@ -499,6 +499,15 @@ pub trait WorkSource {
     /// Returns an error when the forge query fails. The caller logs it and
     /// retries on the next tick — the error is never fatal.
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>>;
+
+    /// Whether the last [`Self::list_ready_issues`] returned this repo's
+    /// whole queue (#11139). `false` when it returned only the rows it could
+    /// read (a later page failed, the page cap, a mid-walk change): the tick
+    /// records the repo in [`TickReport::listing_incomplete`]. A source that
+    /// cannot fall short keeps the default.
+    fn listing_complete(&self) -> bool {
+        true
+    }
 }
 
 /// Performs the actual sweep dispatches the finder schedules and reports which
@@ -851,25 +860,6 @@ pub trait WorkDispatcher {
 // Tick
 // ============================================================================
 
-/// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
-/// for carrying a hard-exclusion label (#7528), naming the rule.
-///
-/// DEBUG rather than INFO on purpose. The candidate listing re-evaluates the
-/// same rows every tick, so an INFO here would reproduce the #6440
-/// 865-refusals-in-an-hour shape for an intake backlog that is doing exactly
-/// what it should (sitting still until a maintainer clears the label). The
-/// operator-visible signal is the per-tick `declined-skip` count on the
-/// `work_finder: tick — …` line, plus the reaper's threshold WARN
-/// (`SweepRegistry::record_decline`) for an issue that actually reached
-/// dispatch and burned a session.
-fn log_hard_exclusion_skip(issue: u32, rule: &str) {
-    log::debug!(
-        "work_finder: skipping issue #{issue} — carries the hard-exclusion label `{rule}`, \
-         which every Loom role declines on; a maintainer must remove it (or close the issue) \
-         before it is dispatchable (#7528)"
-    );
-}
-
 /// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
 /// stayed parked, naming the capability gap (#6893 AC1/AC3).
 ///
@@ -1065,6 +1055,7 @@ pub fn tick_with_lanes(
         saturation_held,
         ..TickReport::default()
     };
+    report.note_listing(0, source.listing_complete());
     ready_queue::sort_lanes(&mut ready, red);
     let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
@@ -1191,7 +1182,7 @@ pub fn tick_with_lanes(
         //     standing to act on this issue yet".
         if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
             report.skipped_declined += 1;
-            log_hard_exclusion_skip(item.number, rule);
+            labels::log_hard_exclusion_skip(item.number, rule);
             continue;
         }
         // 1b. Self-declared re-check interval (#6685): the issue's own body
@@ -1830,6 +1821,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         };
         // #10118: resolve the lane first — unpromoted red-main fixes are
         // dropped from `ready` (and from `seen`) unless `main` is red.
+        report.note_listing(idx, source.listing_complete());
         let lane = lanes.get(idx).copied().unwrap_or_default();
         let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
         report.seen += ready.len();
@@ -1926,7 +1918,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
                 report.skipped_declined += 1;
                 skip(Qd::HardExclusion, Some(rule.to_string()), None);
-                log_hard_exclusion_skip(item.number, rule);
+                labels::log_hard_exclusion_skip(item.number, rule);
                 continue;
             }
             // Self-declared re-check interval (#6685): the issue's own body

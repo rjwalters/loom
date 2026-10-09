@@ -241,6 +241,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::HostWorktreeVolumeTotalBytes,
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
+        MetricName::QueueListingIncompleteRepos,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -596,8 +597,9 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         Qd::OpenPr,
     ]);
     summary.listing_failed = vec!["/r2".into()];
+    summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
     let points = super::queue::queue_points(&summary);
-    assert_eq!(points.len(), Qd::ALL.len() + 1);
+    assert_eq!(points.len(), Qd::ALL.len() + 2);
     let value = |reason: &str| {
         points
             .iter()
@@ -621,6 +623,11 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         .find(|p| p.name == MetricName::QueueListingFailedRepos)
         .unwrap();
     assert_eq!(failed.value, MetricValue::Int(1));
+    let partial = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueListingIncompleteRepos)
+        .unwrap();
+    assert_eq!(partial.value, MetricValue::Int(2));
     for point in &points {
         // Every label survives the export policy unchanged: only allowlisted,
         // bounded keys (state, reason), never an issue number or repo.
