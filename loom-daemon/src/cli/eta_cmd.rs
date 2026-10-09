@@ -96,6 +96,11 @@ pub(crate) enum EtaCommand {
     /// Preview a proposed planner config's effect on the live ready roster's
     /// `start` / `land` ETAs (#10528): `loom-daemon eta simulate --planner PATH`.
     Simulate(super::eta_simulate_cmd::EtaSimulateArgs),
+    /// Replay a logged estimate from its explanation export, check parity,
+    /// and explain it: per-stage breakdown, each input's marginal
+    /// contribution, and with `--diff` the inputs that moved the p50
+    /// (#10930): `loom-daemon eta explain --file F [--diff F2] [--json]`.
+    Explain(super::eta_explain_cmd::EtaExplainArgs),
 }
 
 impl EtaCommand {
@@ -112,6 +117,7 @@ impl EtaCommand {
             EtaCommand::Doctor(args) => args.run(),
             EtaCommand::Retire(args) => args.run(),
             EtaCommand::Simulate(args) => args.run(),
+            EtaCommand::Explain(args) => args.run(),
         }
     }
 }

@@ -128,6 +128,23 @@ pub(super) fn log_parts(
             if let Some(not_here) = not_here.and_then(|d| d.input.not_here.as_deref()) {
                 attributes.push(kv_string("loom.eta.not_here", not_here));
             }
+            // #10930: the fit this estimate used, and the queue / capacity
+            // inputs it was made under, as attributes: an estimate joins
+            // `eta.fit` and a replay's inputs are queryable without the body
+            // (whose 32 KiB cap can cut them).
+            if let Some(twin) = &e.twin_otter {
+                attributes.push(kv_string("loom.eta.fit_id", twin.fit_id.clone()));
+            }
+            if let Some(f) = &e.features {
+                opt_int(&mut attributes, "loom.eta.queue_rank", f.queue_rank.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_ready", f.queue_ready.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_running", f.queue_running.map(i64::from));
+                opt_int(
+                    &mut attributes,
+                    "loom.eta.max_concurrent",
+                    f.max_concurrent.map(i64::from),
+                );
+            }
             let body = serde_json::to_string(e).unwrap_or_default();
             Some(("eta.estimate", SeverityNumber::Info, nanos(e.as_of), attributes, body))
         }
