@@ -9141,7 +9141,10 @@ directory, its bytes and `dry_run`; each artifact directory left in place logs
 why and its bytes (`info` when it holds anything). Below the floor, the eager
 tier runs the same reclaim across **every registered root** (its own probe root
 is usually the daemon's checkout, which has no worktrees), without the forge,
-and stops as soon as free space is back above `diskWarnFreeGb`.
+and judges the floor **per volume** (filesystem device): it stops on each
+volume as soon as that volume's free space is back above `diskWarnFreeGb`, so a
+volume already above the floor keeps its caches and never ends the pass before
+a pressured volume is reached.
 `loom-daemon clean --dry-run` lists the same candidates; `clean` never removes
 them.
 

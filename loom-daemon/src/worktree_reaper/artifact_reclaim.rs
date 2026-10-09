@@ -13,9 +13,13 @@
 //! measures every artifact directory it finds, kept or not.
 //!
 //! [`remove`] takes the candidates from any number of [`collect`] calls,
-//! largest first, and asks a stop condition before each one. The scheduled
-//! tier never stops; the below-floor eager tier stops as soon as free space
-//! is back above the floor ([`reclaim_idle_targets_below_floor`]). Just
+//! largest first, and asks a stop condition before each one. The stop is
+//! judged **per volume** (filesystem, `st_dev`): once it fires for a
+//! candidate, every later candidate on that volume is deferred, and
+//! candidates on other volumes carry on. The scheduled tier never stops; the
+//! below-floor eager tier stops on each volume as soon as that volume's free
+//! space is back above the floor ([`reclaim_idle_targets_below_floor`]), so a
+//! healthy volume neither loses its caches nor blocks a pressured one. Just
 //! before a directory is removed it must not be backing a running program
 //! (#6127's [`ProtectedArtifact`] guard) and nothing may hold a file open
 //! under it ([`crate::target_orphan_reclaim::production_open_handles`],
@@ -87,9 +91,10 @@ pub struct ReclaimReport {
     /// Artifact directories left in place, with why: their worktree was
     /// skipped, or the directory itself failed a gate.
     pub kept: Vec<(ArtifactDir, String)>,
-    /// Eligible directories not removed because the stop condition fired.
-    pub deferred: Vec<ArtifactDir>,
-    /// Why the pass stopped early, when it did.
+    /// Eligible directories not removed because the stop condition fired
+    /// for their volume, each with that volume's reason.
+    pub deferred: Vec<(ArtifactDir, String)>,
+    /// The first stop reason, when the stop condition fired on any volume.
     pub stopped: Option<String>,
     /// Eligible directories whose removal failed.
     pub failed: Vec<(ArtifactDir, String)>,
@@ -119,7 +124,7 @@ impl ReclaimReport {
     #[must_use]
     pub fn bytes_kept(&self) -> u64 {
         self.kept.iter().map(|(a, _)| a.bytes).sum::<u64>()
-            + self.deferred.iter().map(|a| a.bytes).sum::<u64>()
+            + self.deferred.iter().map(|(a, _)| a.bytes).sum::<u64>()
     }
 
     /// [`Self::summary`] plus bytes and the per-directory counts.
@@ -160,6 +165,10 @@ pub struct ArtifactProbes<'a> {
     pub open_handles: &'a dyn Fn(&Path) -> Option<bool>,
     /// Processes whose executable image lives under the path (#6127).
     pub executing_within: &'a dyn Fn(&Path) -> Vec<LiveExecutable>,
+    /// The volume (filesystem device id) holding a worktree, so the stop
+    /// condition is judged per volume; `None` when it cannot be read, in
+    /// which case that candidate is judged on its own.
+    pub volume: &'a dyn Fn(&Path) -> Option<u64>,
     /// This process's effective uid: a directory owned by anyone else is kept.
     pub euid: u32,
 }
@@ -170,8 +179,15 @@ pub fn production_artifact_probes() -> ArtifactProbes<'static> {
     ArtifactProbes {
         open_handles: &production_open_handles,
         executing_within: &find_processes_executing_within,
+        volume: &volume_of,
         euid: current_euid(),
     }
+}
+
+/// The device id of the filesystem holding `path`.
+#[must_use]
+pub fn volume_of(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
 /// One naming class of worktree and the classifier that decides for it.
@@ -282,7 +298,13 @@ pub fn never_stop(_: &ArtifactDir) -> Option<String> {
 }
 
 /// Phase two: remove `candidates` largest first, asking `stop` before each.
-/// Once it answers, every remaining candidate is deferred.
+///
+/// `stop` is judged per volume ([`ArtifactProbes::volume`]): once it answers
+/// for a candidate, that candidate and every later one on the same volume are
+/// deferred with its reason, without asking again, while candidates on every
+/// other volume carry on. Candidates are sorted globally across roots, so
+/// without this a large cache on a healthy volume would end the pass before
+/// the pressured volume was touched (#11129 review).
 pub fn remove(
     mut candidates: Vec<ArtifactDir>,
     dry_run: bool,
@@ -292,12 +314,20 @@ pub fn remove(
 ) {
     report.dry_run = dry_run;
     candidates.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path().cmp(&b.path())));
-    let mut pending = candidates.into_iter();
-    for artifact in pending.by_ref() {
+    let mut satisfied: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for artifact in candidates {
+        let volume = (probes.volume)(&artifact.worktree);
+        if let Some(why) = volume.and_then(|v| satisfied.get(&v)) {
+            report.deferred.push((artifact, why.clone()));
+            continue;
+        }
         if let Some(why) = stop(&artifact) {
-            report.stopped = Some(why);
-            report.deferred.push(artifact);
-            break;
+            if let Some(v) = volume {
+                satisfied.insert(v, why.clone());
+            }
+            report.stopped.get_or_insert_with(|| why.clone());
+            report.deferred.push((artifact, why));
+            continue;
         }
         let path = artifact.path();
         let holders = (probes.executing_within)(&path);
@@ -336,7 +366,6 @@ pub fn remove(
             Err(e) => report.failed.push((artifact, e.to_string())),
         }
     }
-    report.deferred.extend(pending);
 }
 
 fn record_removal(report: &mut ReclaimReport, artifact: ArtifactDir) {
@@ -408,13 +437,8 @@ pub fn log_report(repo_root: &Path, report: &ReclaimReport, class: &str) {
             log::debug!("worktree_reaper: keeping {} (bytes=0): {why}", a.label());
         }
     }
-    for a in &report.deferred {
-        log::info!(
-            "worktree_reaper: deferring {} (bytes={}): {}",
-            a.label(),
-            a.bytes,
-            report.stopped.as_deref().unwrap_or("stopped")
-        );
+    for (a, why) in &report.deferred {
+        log::info!("worktree_reaper: deferring {} (bytes={}): {why}", a.label(), a.bytes);
     }
     for (a, why) in &report.failed {
         log::warn!(
@@ -434,8 +458,9 @@ pub fn log_report(repo_root: &Path, report: &ReclaimReport, class: &str) {
 // The below-floor eager tier, across every registered root (#11071)
 // ============================================================================
 
-/// Stop once the volume holding `artifact` has `floor_gb` free, or when free
-/// space cannot be measured (never delete for a need nobody can see).
+/// Stop (for `artifact`'s volume only — see [`remove`]) once the volume
+/// holding it has `floor_gb` free, or when its free space cannot be measured
+/// (never delete for a need nobody can see).
 fn floor_reached(artifact: &ArtifactDir, floor_gb: u64) -> Option<String> {
     match crate::disk_headroom::path_free_gb(&artifact.worktree) {
         Some(free) if free >= floor_gb => {
@@ -447,8 +472,11 @@ fn floor_reached(artifact: &ArtifactDir, floor_gb: u64) -> Option<String> {
 }
 
 /// The eager tier's idle-target pass: kept-worktree artifacts across **every
-/// registered root**, largest first, stopping once free space is back above
-/// `floor_gb`.
+/// registered root**, largest first, stopping on each volume once that
+/// volume's free space is back above `floor_gb`. Each volume is judged
+/// against the same floor on its own: a volume already above it keeps its
+/// caches, and one below it is reclaimed whichever root's probe triggered
+/// the pass.
 ///
 /// The eager tier's own root is the dispatch loop's probe root, which on a
 /// fleet host is the daemon's checkout (`~/loom-daemon`) and holds no

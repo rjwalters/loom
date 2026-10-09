@@ -28,10 +28,16 @@ fn no_executables(_: &Path) -> Vec<LiveExecutable> {
     Vec::new()
 }
 
+/// Every fixture on one volume unless a test injects otherwise.
+fn one_volume(_: &Path) -> Option<u64> {
+    Some(1)
+}
+
 fn free_probes() -> ArtifactProbes<'static> {
     ArtifactProbes {
         open_handles: &no_handles,
         executing_within: &no_executables,
+        volume: &one_volume,
         euid: current_euid(),
     }
 }
@@ -230,6 +236,7 @@ fn a_target_backing_a_live_executable_is_kept() {
     let probes = ArtifactProbes {
         open_handles: &no_handles,
         executing_within: &running,
+        volume: &one_volume,
         euid: current_euid(),
     };
 
@@ -260,6 +267,7 @@ fn an_open_handle_or_an_unprobeable_host_keeps_the_target() {
         let probes = ArtifactProbes {
             open_handles: probe,
             executing_within: &no_executables,
+            volume: &one_volume,
             euid: current_euid(),
         };
         let report = reclaim_kept(
@@ -326,8 +334,12 @@ fn removal_is_largest_first_and_stops_once_above_the_floor() {
     assert!(mid.join("target").is_dir());
     assert!(small.join("target").is_dir());
     assert_eq!(report.reclaimed, vec![(2, vec!["target".to_string()])]);
-    let deferred: Vec<u32> = report.deferred.iter().map(|a| a.num).collect();
+    let deferred: Vec<u32> = report.deferred.iter().map(|(a, _)| a.num).collect();
     assert_eq!(deferred, vec![3, 1], "the rest wait, largest first");
+    assert!(report
+        .deferred
+        .iter()
+        .all(|(_, why)| why.contains("above the floor")));
     assert!(report
         .stopped
         .as_deref()
@@ -480,6 +492,72 @@ fn the_below_floor_pass_spans_every_root_largest_first() {
     assert_eq!(report.scanned, 3);
 }
 
+/// #11129 review: candidates are sorted across roots, so the stop must be
+/// judged per volume. Volume H (healthy, above the floor) holds the largest
+/// cache; volume P (pressured, below it) holds the rest. Each volume's free
+/// space is injected on its own. H's caches are never removed and never stop
+/// P's reclaim; P is reclaimed until *its* free space is back above the floor.
+#[test]
+#[serial]
+fn a_healthy_volume_neither_blocks_nor_loses_caches_to_a_pressured_one() {
+    // `p_needs`: how many of P's targets must go before P is above the floor.
+    for p_needs in [1usize, 2] {
+        let h = tempfile::tempdir().unwrap();
+        let p = tempfile::tempdir().unwrap();
+        let h_root = h.path().canonicalize().unwrap();
+        let p_root = p.path().canonicalize().unwrap();
+        let h_big = worktree(&h_root, "issue-1");
+        let h_small = worktree(&h_root, "pr-2");
+        let p_big = worktree(&p_root, "issue-3");
+        let p_small = worktree(&p_root, "issue-4");
+        fill(&h_big.join("target"), 5 * MB);
+        fill(&h_small.join("target"), MB);
+        fill(&p_big.join("target"), 3 * MB);
+        fill(&p_small.join("target"), 2 * MB);
+
+        let volume = |wt: &Path| Some(if wt.starts_with(&h_root) { 10 } else { 20 });
+        let probes = ArtifactProbes {
+            volume: &volume,
+            ..free_probes()
+        };
+        let h_asked = std::cell::Cell::new(0);
+        let p_targets = [p_big.join("target"), p_small.join("target")];
+        let stop = |a: &ArtifactDir| {
+            if a.worktree.starts_with(&h_root) {
+                h_asked.set(h_asked.get() + 1);
+                return Some("free space back above the floor (H: 80G >= 20G)".to_string());
+            }
+            let gone = p_targets.iter().filter(|t| !t.exists()).count();
+            (gone >= p_needs).then(|| "free space back above the floor (P)".to_string())
+        };
+        let roots = [h_root.clone(), p_root.clone()];
+
+        let report =
+            with_activity_window("0", || reclaim_idle_targets(&roots, false, &probes, &stop));
+
+        assert!(h_big.join("target").is_dir(), "healthy volume kept: {report:?}");
+        assert!(h_small.join("target").is_dir(), "healthy volume kept: {report:?}");
+        assert_eq!(h_asked.get(), 1, "H is measured once, then deferred as a volume");
+        assert!(!p_big.join("target").exists(), "pressured volume reclaimed: {report:?}");
+        assert_eq!(!p_small.join("target").exists(), p_needs == 2, "{report:?}");
+        let removed: Vec<u32> = report.removed.iter().map(|a| a.num).collect();
+        assert_eq!(removed, if p_needs == 1 { vec![3] } else { vec![3, 4] });
+        for (a, why) in &report.deferred {
+            let on_h = a.worktree.starts_with(&h_root);
+            assert_eq!(why.contains("(H:"), on_h, "{a:?} deferred with its own volume's reason");
+        }
+        let deferred: Vec<u32> = report.deferred.iter().map(|(a, _)| a.num).collect();
+        assert_eq!(
+            deferred,
+            if p_needs == 1 {
+                vec![1, 4, 2]
+            } else {
+                vec![1, 2]
+            }
+        );
+    }
+}
+
 #[test]
 fn log_report_handles_every_shape() {
     let tmp = tempfile::tempdir().unwrap();
@@ -500,7 +578,7 @@ fn log_report_handles_every_shape() {
             (dir(2, 5), "in use".to_string()),
             (dir(4, 0), "symlink".to_string()),
         ],
-        deferred: vec![dir(3, 1)],
+        deferred: vec![(dir(3, 1), "above the floor".to_string())],
         stopped: Some("above the floor".to_string()),
         failed: vec![(dir(5, 2), "EACCES".to_string())],
         dry_run: false,
