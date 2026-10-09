@@ -2,6 +2,7 @@
 //! watchdog, and the review-stall watchdog, plus their shared
 //! `StartupRaceConfig` timing knobs.
 
+mod activity;
 mod dirty_probe;
 mod reset_quarantine;
 
@@ -797,16 +798,6 @@ pub(crate) enum LeaseOwnerProbeResult {
     ReadFailed,
 }
 
-/// The pure, no-`&self` half of [`SweepRegistry::log_idle`] — the method
-/// never actually touched `self`, so this is the same body under a
-/// standalone name usable from [`scan_stale_sweep_findings`] below (and from
-/// [`crate::sweep_registry::RegistrySnapshot::stale_sweep_findings`], Issue
-/// #7526) without a `&SweepRegistry` receiver.
-fn log_idle_pure(log_path: &Path) -> Option<Duration> {
-    let modified = std::fs::metadata(log_path).ok()?.modified().ok()?;
-    modified.elapsed().ok()
-}
-
 /// The pure per-entry scan half of [`SweepRegistry::stale_sweep_findings`]
 /// (Issue #7526): takes an entries iterator + an "is this daemon's own
 /// child" predicate instead of `&SweepRegistry` directly, so it can run
@@ -819,6 +810,7 @@ fn log_idle_pure(log_path: &Path) -> Option<Duration> {
 pub(crate) fn scan_stale_sweep_findings<'a>(
     entries: impl Iterator<Item = (&'a SweepId, &'a SweepInfo)>,
     is_own_child: &dyn Fn(&SweepId) -> bool,
+    workspace_root: &Path,
     min_age: Duration,
     log_silence_timeout: Duration,
 ) -> Vec<StaleSweepFinding> {
@@ -846,7 +838,10 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 return None;
             }
             let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
-            let log_idle = log_idle_pure(&info.log_path);
+            // #9533: log mtime alone is not liveness (headless sweeps
+            // write nothing to it); fold in the session transcripts.
+            let log_idle =
+                activity::sweep_idle(&info.log_path, workspace_root, issue, log_silence_timeout);
             if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
                 return None;
             }
@@ -1898,19 +1893,18 @@ impl SweepRegistry {
 
     /// How long a sweep's log file has gone un-appended (its "log silence").
     ///
-    /// The daemon redirects each child's stdout/stderr to `log_path` in append
-    /// mode, so every line a live sweep emits bumps the file's mtime. A sweep
-    /// wedged in a hung role subagent (Judge/Doctor) produces **zero output**
-    /// (#3910), so its log mtime stops advancing — this idle duration is the
-    /// stall signal.
+    /// The daemon redirects each child's stdout/stderr to `log_path`, but a
+    /// headless (`claude -p`) sweep writes nothing there while it works, so
+    /// this is **not** a liveness signal on its own (#9533). The watchdogs
+    /// judge [`activity::sweep_idle`] instead, which also folds in the session
+    /// transcripts' mtimes; this is only the log-file input to it.
     ///
     /// Returns `None` when the file is missing or its mtime is unreadable / in
     /// the future (clock skew) — callers treat `None` as "cannot assess, leave
     /// alone", never as a stall.
+    #[cfg(test)]
     pub(crate) fn log_idle(&self, log_path: &Path) -> Option<Duration> {
         let modified = std::fs::metadata(log_path).ok()?.modified().ok()?;
-        // `elapsed()` errors if `modified` is in the future (clock skew) — map
-        // that to None so we never mistake skew for a stall.
         modified.elapsed().ok()
     }
 
@@ -1977,20 +1971,32 @@ impl SweepRegistry {
             if !self.sweep_made_progress(issue, &log_path) {
                 continue;
             }
-            // No readable mtime ⇒ cannot assess ⇒ leave alone.
-            let Some(idle) = self.log_idle(&log_path) else {
+            // No readable signal ⇒ cannot assess ⇒ leave alone. Log mtime AND
+            // session-transcript mtime (#9533): headless sweeps don't log.
+            let Some(idle) =
+                activity::sweep_idle(&log_path, &self.config.workspace_root, issue, timeout)
+            else {
                 continue;
             };
+            let phase = activity::phase_label(
+                reaper::read_checkpoint_phase(
+                    &self
+                        .config
+                        .checkpoint_dir()
+                        .join(format!("issue-{issue}.json")),
+                )
+                .as_deref(),
+            );
             let already_retried = self.review_stall_retried.contains(&issue);
             match review_stall_decision(idle, timeout, already_retried) {
                 WatchdogDecision::Healthy => {}
                 WatchdogDecision::GiveUp => {
                     if self.review_stall_gaveup.insert(issue) {
                         log::error!(
-                            "review-stall-watchdog: sweep for issue #{issue} ({sweep_id}) stalled \
-                             again (log silent {}s) after an auto-restart — giving up (bounded to \
-                             one retry). Operator intervention needed: the review phase \
-                             (Judge/Doctor) appears wedged; inspect \
+                            "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) \
+                             stalled again (no log or session activity for {}s) after an \
+                             auto-restart — giving up (bounded to one retry). Operator \
+                             intervention needed: it appears wedged; inspect \
                              .loom/logs/sweep-issue-{issue}.log, then cancel + re-dispatch (#3910).",
                             idle.as_secs()
                         );
@@ -2004,11 +2010,23 @@ impl SweepRegistry {
                     }
                 }
                 WatchdogDecision::Restart => {
+                    // #9533: a re-dispatch while a roll/drain is armed keeps
+                    // in_flight above zero and the drain can never converge.
+                    // Leave it to the post-restart daemon.
+                    if crate::roll_pause::suppress::is_armed() || self.closed_for_roll() {
+                        log::warn!(
+                            "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) looks \
+                             stalled ({}s idle) but a drain/roll is armed — not cancelling or \
+                             re-dispatching (#9533).",
+                            idle.as_secs()
+                        );
+                        continue;
+                    }
                     log::warn!(
-                        "review-stall-watchdog: sweep for issue #{issue} ({sweep_id}) produced no \
-                         log output in {}s despite making startup progress — its review phase \
-                         (Judge/Doctor) looks hung; auto-cancelling and re-dispatching once. The \
-                         re-dispatch resumes from the sweep checkpoint (#3910).",
+                        "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) showed no \
+                         log or session activity in {}s despite making startup progress — looks \
+                         hung; auto-cancelling and re-dispatching once. The re-dispatch resumes \
+                         from the sweep checkpoint (#3910).",
                         idle.as_secs()
                     );
                     // Capture re-dispatch params from the wedged entry BEFORE
@@ -2204,6 +2222,7 @@ impl SweepRegistry {
         scan_stale_sweep_findings(
             self.entries.iter(),
             &|id| self.children.contains_key(id),
+            &self.config.workspace_root,
             min_age,
             log_silence_timeout,
         )
@@ -2325,3 +2344,14 @@ mod tests;
     unused_imports
 )]
 mod liveness_tests;
+
+// #9533: the shared-liveness + drain-gate cases, beside (not inside)
+// `tests.rs`, which is at its file-size ratchet baseline.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod stall_activity_tests;

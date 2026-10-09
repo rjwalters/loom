@@ -6585,9 +6585,15 @@ internal Judge or Doctor `Task` running **49–66 minutes (multi-hour in the wor
 cases) emitting zero output until the very end**, silently blocking the sweep's
 back half with no self-heal. The third backstop, running in the same watchdog
 tick, closes that gap: for each still-running daemon-dispatched sweep that has
-already made startup progress, it measures **log silence** (how long the
-per-sweep log file's mtime has gone un-advanced — a live sweep flushes tool
-output continuously, a hung one does not) and, past `reviewStallTimeoutSecs`
+already made startup progress, it measures **activity silence** — the
+minimum idle time over the per-sweep log file's mtime **and** the sweep's
+session transcripts (`~/.claude/projects/<slug>/*.jsonl` plus
+`subagents/*.jsonl`; #9533 — a headless `claude -p` sweep writes nothing to its
+log while it works, so log mtime alone is not liveness; unreadable signals
+are skipped and, with none readable, the sweep is left alone). The same
+predicate backs the stale-sweep backstop below. While a roll/drain is armed the
+watchdog neither cancels nor re-dispatches (a respawn would keep the drain from
+converging), and its log lines name the sweep's checkpoint phase. Past `reviewStallTimeoutSecs`
 (default 45 min), auto-cancels the wedged child and re-dispatches the issue
 **exactly once, bounded, never a loop**. The re-dispatch resumes from the sweep
 checkpoint, so the hung review phase is re-run — not the whole build. A second
