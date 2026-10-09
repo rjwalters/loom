@@ -187,6 +187,8 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         }],
         listed_at: None,
         ready: None,
+        capacity: None,
+        main_ci: BTreeMap::new(),
     };
     let approved_at = ts() + Duration::seconds(100);
     let host = |name: &str, first: i64, second: i64| {
