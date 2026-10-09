@@ -459,7 +459,10 @@ impl SweepRegistry {
     ///   streak either. Same fail-open discipline as
     ///   [`Self::is_no_progress`](Self::is_no_progress)'s two arms.
     /// - **PR-less** — the forge verifiably has no open linked PR. Records the
-    ///   release (see [`Self::record_prless_release`]).
+    ///   release (see [`Self::record_prless_release`]) — unless the leader's
+    ///   `exit_code` shows an external kill ([`external_kill_exemption`],
+    ///   #11076). Applied on this arm only, so the clearing arms above still
+    ///   run for a productive sweep SIGTERMed during teardown.
     ///
     /// Carve-outs that must NOT reach here at all (pool death #7708, pre-flight
     /// death #4386, hard-exclusion decline #7528, superseded claim) are excluded
@@ -470,6 +473,7 @@ impl SweepRegistry {
         sweep_id: &str,
         open_pr: Option<OpenPrProbe>,
         reason: &str,
+        exit_code: Option<i32>,
     ) {
         if !self.prless_retry_config.enabled {
             return;
@@ -531,7 +535,13 @@ impl SweepRegistry {
             }
             // #10642: through the durable floor, so a phaseless death counts
             // across a daemon restart and past the in-memory cold window.
-            OpenPrProbe::NoneOpen => self.record_prless_release_for(issue, sweep_id, reason),
+            OpenPrProbe::NoneOpen => match external_kill_exemption(exit_code) {
+                Some(why) => log::info!(
+                    "sweep_registry: issue #{issue} sweep {sweep_id} not counted as a PR-less \
+                     release: {why} (#11076)"
+                ),
+                None => self.record_prless_release_for(issue, sweep_id, reason),
+            },
         }
     }
 
@@ -566,7 +576,7 @@ impl SweepRegistry {
         let reason = format!("sweep {died}{at_phase} without opening a pull request");
         // `None` open-PR verdict: this branch never probed, so let the bound
         // run (and memo-serve) its own.
-        self.note_prless_terminal_outcome(issue, sweep_id, None, &reason);
+        self.note_prless_terminal_outcome(issue, sweep_id, None, &reason, exit_code);
     }
 
     /// `reap_once`'s **checkpoint-less exit** call site (Issue #7972) — the
@@ -605,7 +615,7 @@ impl SweepRegistry {
             "sweep {ended} without opening a pull request, without a phase checkpoint, and \
              without a self-reported no-op release (#6670)"
         );
-        self.note_prless_terminal_outcome(issue, sweep_id, open_pr, &reason);
+        self.note_prless_terminal_outcome(issue, sweep_id, open_pr, &reason, exit_code);
     }
 
     /// Record one **PR-less release** for `issue` (Issue #7972): a dispatch
@@ -976,6 +986,28 @@ impl SweepRegistry {
     }
 }
 
+/// Issue #11076: a leader killed by SIGKILL / SIGTERM (exit 137 / 143 —
+/// `poll_liveness` maps a signal death to `128 + N`) died of something
+/// outside the sweep: the kernel OOM killer, or systemd stopping the sweep's
+/// scope (`OOMPolicy=stop`). That says nothing about the issue, so it must not
+/// cost a PR-less strike. `Some(reason)` exempts.
+///
+/// Every daemon-initiated kill (`cancel` from the watchdogs / `cancel_sweep`)
+/// transitions the entry terminal itself and never reaches the reaper's
+/// crash/exit outcome paths, so a 137/143 seen here is never the daemon's own.
+///
+/// Session-lifetime model: **the daemon kills survivors** (#4980). When the
+/// leader dies, `reap_orphaned_group` SIGTERMs whatever is left in its process
+/// group — a `claude-wrapper.sh` retry included — and defers a SIGKILL. A
+/// surviving group is therefore not an exemption; only the external cause of
+/// death is. It does NOT wait for the group to exit before the claim is
+/// released, so "no retry outlives the release" is not guaranteed here
+/// (#11076 acceptance criterion 2, still open).
+pub(crate) fn external_kill_exemption(exit_code: Option<i32>) -> Option<&'static str> {
+    matches!(exit_code, Some(137 | 143))
+        .then_some("leader terminated by SIGKILL/SIGTERM (external OOM kill or scope stop)")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -983,6 +1015,35 @@ mod tests {
     use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
     use serial_test::serial;
     use tempfile::tempdir;
+
+    /// #11076: an external OOM / scope stop must not count as a PR-less strike.
+    #[test]
+    fn external_oom_or_scope_stop_is_not_a_prless_strike() {
+        for code in [137, 143] {
+            let mut reg = test_registry();
+            reg.note_prless_crash_outcome(11076, "s", Some(code), 900, Some("builder"));
+            reg.note_prless_exit_outcome(11076, "s", Some(OpenPrProbe::NoneOpen), Some(code), 900);
+            assert_eq!(reg.prless_release_count(11076), 0, "exit {code} must not strike");
+            assert!(reg.prless_retry_remaining(11076, Utc::now()).is_none());
+        }
+        // Control: an ordinary failure, or no observed status, still strikes.
+        for code in [Some(1), None] {
+            let mut reg = test_registry();
+            reg.note_prless_crash_outcome(11076, "s", code, 900, Some("builder"));
+            assert_eq!(reg.prless_release_count(11076), 1, "{code:?} must strike");
+        }
+    }
+
+    /// #11076: the exemption only suppresses the *recording* of a release —
+    /// an externally-killed sweep with an open PR still clears its tally.
+    #[test]
+    fn an_external_kill_with_an_open_pr_still_clears_the_tally() {
+        let mut reg = test_registry();
+        reg.note_prless_crash_outcome(11076, "s", Some(1), 900, Some("builder"));
+        assert_eq!(reg.prless_release_count(11076), 1);
+        reg.note_prless_exit_outcome(11076, "s", Some(OpenPrProbe::Open(9)), Some(143), 900);
+        assert_eq!(reg.prless_release_count(11076), 0, "open PR clears despite SIGTERM");
+    }
 
     /// A registry with forge writes disabled — the tests here drive the
     /// in-memory tally directly, which is the load-bearing half. The
@@ -1059,6 +1120,7 @@ mod tests {
                 "sweep-issue-7893-stub",
                 Some(OpenPrProbe::NoneOpen),
                 "builder failed: scope `safehouse_chatops/` does not exist on main",
+                None,
             );
             assert_eq!(reg.prless_release_count(7893), attempt);
         }
@@ -1091,6 +1153,7 @@ mod tests {
                 "sweep-stub",
                 Some(OpenPrProbe::NoneOpen),
                 "no PR",
+                None,
             );
         }
         assert!(reg.prless_retry_held(7893));
@@ -1172,7 +1235,13 @@ mod tests {
         reg.record_prless_release(7893, "second");
         assert_eq!(reg.prless_release_count(7893), 2);
 
-        reg.note_prless_terminal_outcome(7893, "sweep-stub", Some(OpenPrProbe::Open(8123)), "n/a");
+        reg.note_prless_terminal_outcome(
+            7893,
+            "sweep-stub",
+            Some(OpenPrProbe::Open(8123)),
+            "n/a",
+            None,
+        );
 
         assert_eq!(reg.prless_release_count(7893), 0);
         assert!(reg.prless_retry_remaining(7893, Utc::now()).is_none());
@@ -1185,11 +1254,23 @@ mod tests {
     fn an_unverifiable_probe_neither_arms_nor_clears() {
         let mut reg = test_registry();
 
-        reg.note_prless_terminal_outcome(1, "sweep-stub", Some(OpenPrProbe::ProbeFailed), "x");
+        reg.note_prless_terminal_outcome(
+            1,
+            "sweep-stub",
+            Some(OpenPrProbe::ProbeFailed),
+            "x",
+            None,
+        );
         assert_eq!(reg.prless_release_count(1), 0, "outage must not arm");
 
         reg.record_prless_release(1, "real failure");
-        reg.note_prless_terminal_outcome(1, "sweep-stub", Some(OpenPrProbe::ProbeFailed), "x");
+        reg.note_prless_terminal_outcome(
+            1,
+            "sweep-stub",
+            Some(OpenPrProbe::ProbeFailed),
+            "x",
+            None,
+        );
         assert_eq!(
             reg.prless_release_count(1),
             1,
@@ -1243,7 +1324,7 @@ mod tests {
             ..PrlessRetryConfig::default()
         });
         reg.record_prless_release(1, "boom");
-        reg.note_prless_terminal_outcome(1, "s", Some(OpenPrProbe::NoneOpen), "boom");
+        reg.note_prless_terminal_outcome(1, "s", Some(OpenPrProbe::NoneOpen), "boom", None);
         assert_eq!(reg.prless_release_count(1), 0);
         assert!(reg.prless_retry_remaining(1, Utc::now()).is_none());
         assert!(reg.prless_retry_issues(Utc::now()).is_empty());
