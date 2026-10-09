@@ -1545,7 +1545,7 @@ subscribed). Published once per reap by the agent residue reaper
 | `unit` | string or null | The scope unit, for `scope` and `failed-scope`. |
 | `pids` | integer[] | The processes signalled, for `tree`. |
 | `issue` | integer or null | The issue the run or worktree belonged to, when known. |
-| `sweep_id` | string or null | The sweep, on the exit path. |
+| `sweep_id` | string or null | The sweep (or a role run's `role-<role>-…` item id), on the exit path. |
 | `dry_run` | boolean | `true`: planned only, nothing was stopped, signalled or reset. |
 | `detail` | string or null | Why or the outcome: `worktree issue-N`, or `Result=… ExecMainStatus=…` for a failed scope. |
 

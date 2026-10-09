@@ -10,12 +10,13 @@
 //! `autonomous.processReaper.{enabled,dryRun,minAgeSecs}` switches and the
 //! `LOOM_ORPHAN_PROCESS_REAPER*` env (one switch for all residue reaping):
 //!
-//! 1. **Exit teardown** ([`request_exit_teardown`]): when a sweep reaches a
-//!    terminal state, for any reason, its systemd scope is stopped, its
-//!    recorded process tree is torn down, and processes attributable to its
-//!    worktree that started at or after the agent did are reaped. No grace
-//!    period: the agent is definitively gone. The scope and identity legs are
-//!    the shared #10831 teardown helper
+//! 1. **Exit teardown** ([`request_exit_teardown`]): when a sweep or a role
+//!    run reaches a terminal state, for any reason, its systemd scope is
+//!    stopped and its recorded process tree is torn down; for a sweep,
+//!    processes in its worktree that started at or after the agent did **and
+//!    carry its `LOOM_SWEEP_ID` in their environment** are reaped too. No
+//!    grace period: the agent is definitively gone. The scope and identity
+//!    legs are the shared #10831 teardown helper
 //!    ([`crate::auto_update::pause_roll::teardown`]); the worktree leg reuses
 //!    [`plan_orphan_trees`]'s fail-safes with the start-time bound standing in
 //!    for the age gate.
@@ -28,8 +29,11 @@
 //!
 //! # Safety
 //!
-//! A process is touched only through (a) its `loom-agent-*` scope, or (b) the
-//! worktree attribution plus the start-time or age rules, with the daemon's
+//! A process is touched only through (a) its `loom-agent-*` scope, (b) the
+//! run's recorded pid and process group, or (c) the worktree attribution plus
+//! the age rule (periodic) or the start-time rule *and* the run's own
+//! `LOOM_SWEEP_ID` marker (exit: a later start alone is not ownership; an
+//! unreadable environment is not reaped), with the daemon's
 //! own ancestry and children and any live agent runtime protected. Never by
 //! process name, never a unit outside `loom-agent-*` (`loom-agent-probe-*`
 //! included). `dryRun` records the plan and signals, stops and resets nothing.
@@ -52,8 +56,9 @@ use crate::auto_update::pause_roll::teardown::{
     process_table, run_bounded, Proc, ScopeCtl, TeardownReport, TreeSpec, TERM_GRACE,
 };
 use crate::orphan_process_reaper::{
-    ownership_gate, plan_orphan_trees, production_hooks, reap_tree, snapshot_processes, OrphanTree,
-    OwnershipVerdict, ProcEntry, ReapHooks, DEFAULT_TERM_GRACE,
+    looks_like_agent, ownership_gate, plan_orphan_trees, production_hooks, reap_tree,
+    references_worktree, snapshot_processes, OrphanTree, OwnershipVerdict, ProcEntry, ReapHooks,
+    DEFAULT_TERM_GRACE,
 };
 use crate::types::AgentResidueStatus;
 
@@ -71,6 +76,10 @@ const SCOPE_PID_TOLERANCE_SECS: i64 = 30;
 const START_TOLERANCE_SECS: u64 = 5;
 /// Bound on each `systemctl` call the scope pass makes.
 const CTL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The sweep-identity variable every daemon-dispatched sweep child is given
+/// (#8835, `sweep_registry::dispatch::child_env_markers::SWEEP_ID_ENV`) and
+/// its descendants inherit, `setsid` or not. The exit leg's ownership proof.
+pub const RUN_MARKER_ENV: &str = "LOOM_SWEEP_ID";
 
 // ============================================================================
 // Records
@@ -634,6 +643,18 @@ pub fn issue_worktree_of(path: &Path) -> Option<(PathBuf, u32, PathBuf)> {
     None
 }
 
+/// The absolute paths an argv names (bare, or after `=`, `:`, `,` or a
+/// quote), for candidate discovery where no cwd is readable (the `ps`
+/// snapshot). Pure.
+#[must_use]
+pub fn argv_paths(cmdline: &str) -> Vec<PathBuf> {
+    cmdline
+        .split(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ',' | '\'' | '"'))
+        .filter(|s| s.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// What the worktree pass found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreePlan {
@@ -644,10 +665,12 @@ pub struct WorktreePlan {
 /// Plan the reap of processes living in a deleted worktree, or in a
 /// `.loom-managed` worktree of a workspace that is no longer registered.
 ///
-/// Only processes whose cwd is inside a `.loom/worktrees/issue-<N>` directory
-/// are ever candidates, so an operator process elsewhere in the same checkout
-/// is left alone. The per-process fail-safes (age gate, daemon ancestry and
-/// children, live agent runtime, tree cap) are [`plan_orphan_trees`]'s own.
+/// Candidate worktrees are the `.loom/worktrees/issue-<N>` directories a
+/// process's cwd is in or its argv names (the `ps` snapshot off Linux has no
+/// cwd, so argv is all it has), so an operator process elsewhere in the same
+/// checkout is left alone. The per-process fail-safes (age gate, daemon
+/// ancestry and children, live agent runtime, tree cap) are
+/// [`plan_orphan_trees`]'s own.
 #[must_use]
 pub fn plan_worktree_residue(
     procs: &[ProcEntry],
@@ -662,13 +685,12 @@ pub fn plan_worktree_residue(
     let mut repos: HashMap<PathBuf, PathBuf> = HashMap::new();
     for p in procs {
         let mut p = p.clone();
-        if let Some(cwd) = &p.cwd {
-            let (clean, _) = strip_deleted(cwd);
-            if let Some((worktree, issue, repo)) = issue_worktree_of(&clean) {
+        p.cwd = p.cwd.as_deref().map(|cwd| strip_deleted(cwd).0);
+        for path in p.cwd.iter().cloned().chain(argv_paths(&p.cmdline)) {
+            if let Some((worktree, issue, repo)) = issue_worktree_of(&path) {
                 candidates.insert(worktree.clone(), issue);
                 repos.insert(worktree, repo);
             }
-            p.cwd = Some(clean);
         }
         normalized.push(p);
     }
@@ -727,6 +749,7 @@ pub fn run_worktree_plan(
 /// What the exit teardown needs to know about the finished run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitRequest {
+    /// The sweep id, or a role run's item id (`role-<role>-…`).
     pub sweep_id: String,
     pub issue: Option<u32>,
     pub pid: u32,
@@ -781,6 +804,28 @@ impl ExitRequest {
         }
     }
 
+    /// A finished role run (Champion, Judge, …): its synthetic item id stands
+    /// in for the sweep id, it leads its own process group, and its scope is
+    /// the one recorded at launch. No issue, so no worktree leg.
+    #[must_use]
+    pub fn for_role(
+        workspace_root: &Path,
+        item_id: &str,
+        pid: u32,
+        started_at: DateTime<Utc>,
+        scope_unit: Option<String>,
+    ) -> Self {
+        Self {
+            sweep_id: item_id.to_string(),
+            issue: None,
+            pid,
+            pgid: Some(pid),
+            started_at,
+            workspace_root: workspace_root.to_path_buf(),
+            scope_unit,
+        }
+    }
+
     fn worktree(&self) -> Option<PathBuf> {
         self.issue.map(|n| {
             crate::worktree_root::worktree_root(&self.workspace_root).join(format!("issue-{n}"))
@@ -818,10 +863,14 @@ pub fn resolve_exit_scope(
 }
 
 /// Processes of the finished run: those attributable to its worktree that
-/// started at or after the run did. The start-time bound proves ownership, so
-/// the age gate is zero; the table is restricted to such processes, which
-/// also makes any live agent runtime in it a newer dispatch (a hard stop in
-/// [`plan_orphan_trees`]). Pure.
+/// started at or after the run did **and** that `owned` (the run's
+/// [`RUN_MARKER_ENV`] in the process environment) proves are the run's. A
+/// later start alone is not ownership: an operator's shell or editor opened
+/// in the worktree mid-run starts later too. An attributed process without
+/// the marker (or whose environment is unreadable) is dropped from the table,
+/// so it never seeds, and neither do its children through it; an attributed
+/// agent runtime is kept, so a newer dispatch is still a hard stop in
+/// [`plan_orphan_trees`]. The age gate is zero. Pure.
 #[must_use]
 pub fn plan_exit_tree(
     procs: &[ProcEntry],
@@ -829,14 +878,18 @@ pub fn plan_exit_tree(
     worktree: &Path,
     run_age_secs: u64,
     me: u32,
+    owned: &dyn Fn(u32) -> bool,
 ) -> Option<OrphanTree> {
     let limit = run_age_secs + START_TOLERANCE_SECS;
-    let younger: Vec<ProcEntry> = procs
+    let table: Vec<ProcEntry> = procs
         .iter()
         .filter(|p| p.age_secs.is_some_and(|a| a <= limit))
+        .filter(|p| {
+            !references_worktree(p, worktree) || looks_like_agent(&p.cmdline) || owned(p.pid)
+        })
         .cloned()
         .collect();
-    plan_orphan_trees(&younger, &[(issue, worktree.to_path_buf())], me, 0, &HashMap::new())
+    plan_orphan_trees(&table, &[(issue, worktree.to_path_buf())], me, 0, &HashMap::new())
         .trees
         .into_iter()
         .next()
@@ -852,6 +905,8 @@ pub struct ExitPorts<'a> {
     pub recorder: &'a dyn Recorder,
     /// Whether a different run holds the issue's claim now.
     pub other_claim: &'a dyn Fn() -> bool,
+    /// Whether `pid`'s environment carries `LOOM_SWEEP_ID=<sweep_id>`.
+    pub carries_marker: &'a dyn Fn(u32, &str) -> bool,
     pub now: DateTime<Utc>,
     pub me: u32,
     pub dry_run: bool,
@@ -909,7 +964,9 @@ pub fn run_exit_teardown(req: &ExitRequest, ports: &ExitPorts<'_>) {
     if (ports.other_claim)() {
         return;
     }
-    let Some(tree) = plan_exit_tree(&(ports.procs)(), issue, &worktree, run_age, ports.me) else {
+    let owned = |pid| (ports.carries_marker)(pid, &req.sweep_id);
+    let procs = (ports.procs)();
+    let Some(tree) = plan_exit_tree(&procs, issue, &worktree, run_age, ports.me, &owned) else {
         return;
     };
     let mut rec = base(ResidueKind::Tree);
@@ -951,6 +1008,38 @@ pub fn entries_from_table(table: &[Proc], now: DateTime<Utc>) -> Vec<ProcEntry> 
                 .and_then(|s| u64::try_from((now - s).num_seconds()).ok()),
         })
         .collect()
+}
+
+/// Whether one of `fields` is exactly `LOOM_SWEEP_ID=<sweep_id>`. Pure.
+#[must_use]
+pub fn marker_in<'a>(mut fields: impl Iterator<Item = &'a str>, sweep_id: &str) -> bool {
+    let needle = format!("{RUN_MARKER_ENV}={sweep_id}");
+    !sweep_id.is_empty() && fields.any(|f| f == needle)
+}
+
+/// Whether live `pid`'s environment carries the run's marker: `/proc` on
+/// Linux, `ps -E` on macOS (fields split on whitespace). Anything unreadable
+/// is "no", so the process is left alone.
+#[cfg_attr(test, allow(dead_code))]
+fn production_carries_marker(pid: u32, sweep_id: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|raw| marker_in(String::from_utf8_lossy(&raw).split('\0'), sweep_id))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("ps");
+        cmd.args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()]);
+        run_bounded(cmd, CTL_TIMEOUT).is_some_and(|(ok, out)| {
+            ok && marker_in(String::from_utf8_lossy(&out).split_whitespace(), sweep_id)
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, sweep_id);
+        false
+    }
 }
 
 fn production_ctl() -> Box<dyn SystemCtl> {
@@ -1062,8 +1151,9 @@ pub async fn reap_orphan_processes_for(root: &Path) {
 }
 
 /// Tear down a terminal run's leftovers on a detached thread (the registry
-/// mutex is held by the caller; a scope stop can take seconds). A no-op under
-/// `cfg(test)`, so registry tests never reach systemd.
+/// mutex is held by the caller; a scope stop can take seconds). Under
+/// `cfg(test)` the request is only recorded ([`take_requested`]), so registry
+/// and role-runner tests never reach systemd.
 pub fn request_exit_teardown(req: ExitRequest) {
     #[cfg(not(test))]
     {
@@ -1075,7 +1165,38 @@ pub fn request_exit_teardown(req: ExitRequest) {
         }
     }
     #[cfg(test)]
-    drop(req);
+    REQUESTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(req);
+}
+
+/// Requests its run's exit teardown when dropped. The role launcher holds one
+/// from its spawn on, so every terminal outcome (success, failure, signal,
+/// timeout, a lost wait) hands the run over, like a sweep's terminal state.
+pub struct ExitTeardownOnDrop(pub Option<ExitRequest>);
+
+impl Drop for ExitTeardownOnDrop {
+    fn drop(&mut self) {
+        if let Some(req) = self.0.take() {
+            request_exit_teardown(req);
+        }
+    }
+}
+
+#[cfg(test)]
+static REQUESTED: Mutex<Vec<ExitRequest>> = Mutex::new(Vec::new());
+
+/// Drain the exit teardowns requested for `root` (tests run in parallel, so
+/// each filters by its own temp root).
+#[cfg(test)]
+pub(crate) fn take_requested(root: &Path) -> Vec<ExitRequest> {
+    let mut all = REQUESTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|r| r.workspace_root == root);
+    *all = rest;
+    mine
 }
 
 #[cfg(not(test))]
@@ -1105,6 +1226,7 @@ fn run_exit_teardown_production(req: &ExitRequest) {
             },
             recorder: &ProductionRecorder,
             other_claim: &other_claim,
+            carries_marker: &production_carries_marker,
             now: Utc::now(),
             me: std::process::id(),
             dry_run: settings.dry_run,

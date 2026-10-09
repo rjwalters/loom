@@ -88,6 +88,7 @@ fn request(started_ago: i64, scope_unit: Option<&str>) -> ExitRequest {
     }
 }
 
+/// Every process carries the run's marker: the start-time cases.
 fn run_exit(
     req: &ExitRequest,
     ctl: &dyn SystemCtl,
@@ -95,7 +96,22 @@ fn run_exit(
     other_claim: bool,
     dry_run: bool,
 ) -> (Vec<ReapRecord>, Vec<u32>) {
+    let all: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+    run_exit_marked(req, ctl, procs, &all, other_claim, dry_run)
+}
+
+/// Only `marked` carry `LOOM_SWEEP_ID=<req.sweep_id>`.
+fn run_exit_marked(
+    req: &ExitRequest,
+    ctl: &dyn SystemCtl,
+    procs: Vec<ProcEntry>,
+    marked: &[u32],
+    other_claim: bool,
+    dry_run: bool,
+) -> (Vec<ReapRecord>, Vec<u32>) {
     let recorder: Mutex<Vec<ReapRecord>> = Mutex::new(Vec::new());
+    let sweep = req.sweep_id.clone();
+    let carries = move |pid: u32, id: &str| id == sweep && marked.contains(&pid);
     let pids = with_hooks(|hooks, sent| {
         run_exit_teardown(
             req,
@@ -106,6 +122,7 @@ fn run_exit(
                 identity_leg: &|_| TeardownReport::default(),
                 recorder: &recorder,
                 other_claim: &move || other_claim,
+                carries_marker: &carries,
                 now: Utc::now(),
                 me: ME,
                 dry_run,
@@ -318,6 +335,77 @@ fn exit_leaves_an_operator_process_that_predates_the_agent() {
     assert_eq!(pids, vec![500]);
 }
 
+/// Judge finding 1 (#11238): an operator shell or editor opened in the
+/// worktree AFTER the agent started passes the start-time bound, but carries
+/// no `LOOM_SWEEP_ID` of this run, so it is not the run's and is left alone,
+/// children included. The run's own dev server beside it is still reaped.
+#[test]
+fn exit_leaves_an_operator_process_started_after_the_agent() {
+    let wt = Some("/repo/.loom/worktrees/issue-7");
+    let procs = vec![
+        proc_at(500, 1, wt, "node vite", 300),
+        proc_at(700, 1, wt, "bash", 120), // operator's shell, unmarked
+        proc_at(701, 700, wt, "vim notes.md", 110),
+        proc_at(702, 700, Some("/tmp"), "cargo build", 100),
+    ];
+    let (recs, pids) =
+        run_exit_marked(&request(600, None), &FakeCtl::default(), procs, &[500], false, false);
+    assert_eq!(pids, vec![500]);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].pids, vec![500]);
+}
+
+#[test]
+fn exit_without_ownership_evidence_reaps_nothing_from_the_worktree() {
+    // Unreadable environments (or another run's marker) are never ownership.
+    let wt = Some("/repo/.loom/worktrees/issue-7");
+    let procs = vec![proc_at(500, 1, wt, "node vite", 300)];
+    let (recs, pids) =
+        run_exit_marked(&request(600, None), &FakeCtl::default(), procs, &[], false, false);
+    assert!(pids.is_empty() && recs.is_empty());
+}
+
+#[test]
+fn the_marker_must_name_this_run_exactly() {
+    let env = "PATH=/bin\0LOOM_SWEEP_ID=sweep-1\0HOME=/h";
+    assert!(marker_in(env.split('\0'), "sweep-1"));
+    assert!(!marker_in(env.split('\0'), "sweep-12"));
+    assert!(!marker_in("LOOM_SWEEP_ID=sweep-12".split('\0'), "sweep-1"));
+    assert!(!marker_in("LOOM_SWEEP_ID=".split('\0'), ""));
+    // macOS `ps -E`: argv then environment, whitespace-separated.
+    assert!(marker_in(
+        "node vite LOOM_SWEEP_ID=sweep-1 HOME=/h".split_whitespace(),
+        "sweep-1"
+    ));
+}
+
+#[test]
+fn a_role_exit_request_has_no_worktree_leg() {
+    let at = Utc::now();
+    let req = ExitRequest::for_role(
+        Path::new("/repo"),
+        "role-judge-x",
+        77,
+        at,
+        Some("loom-agent-role-judge-x.scope".to_string()),
+    );
+    assert_eq!((req.issue, req.pgid, req.pid), (None, Some(77), 77));
+    let ctl = FakeCtl {
+        scopes: vec![scope("loom-agent-role-judge-x.scope", "active", Some(5))],
+        ..FakeCtl::default()
+    };
+    let procs = vec![proc_at(
+        500,
+        1,
+        Some("/repo/.loom/worktrees/issue-7"),
+        "node",
+        1,
+    )];
+    let (_, pids) = run_exit(&req, &ctl, procs, false, false);
+    assert_eq!(*ctl.calls.borrow(), vec!["stop loom-agent-role-judge-x.scope"]);
+    assert!(pids.is_empty());
+}
+
 #[test]
 fn exit_leaves_a_process_outside_the_worktree_and_a_newer_agent() {
     let outside = vec![proc_at(500, 1, Some("/repo/src"), "node vite", 100)];
@@ -399,6 +487,42 @@ fn processes_in_a_deleted_worktree_are_reaped() {
         assert_eq!(recs[0].path, ResiduePath::Periodic);
         assert_eq!(recs[0].issue, Some(5));
     });
+}
+
+/// Judge finding 2 (#11238): off Linux the snapshot is a `ps` table with no
+/// cwd, so the deleted worktree must be found from argv. Same fixture shape
+/// as the exit test, run through the periodic plan and reap.
+#[test]
+fn periodic_pass_finds_a_deleted_worktree_from_the_ps_snapshot() {
+    let now = Utc::now();
+    let out = "  200     1   200 Ss   ??     05:00:00 /bin/zsh\n\
+               \x20 500     1   500 S    ??     02:00:00 node /gone/.loom/worktrees/issue-7/node_modules/.bin/vite\n\
+               \x20 501   500   500 S    ??     01:59:59 workerd serve --config=/gone/.loom/worktrees/issue-7/w.json\n\
+               \x20 600     1   600 S    ??     02:00:00 vim /reg/.loom/worktrees/issue-8/notes.md\n";
+    let procs = entries_from_table(&parse_ps(out, now), now);
+    assert!(procs.iter().all(|p| p.cwd.is_none()));
+    // issue-7's checkout was deleted; issue-8 lives on in a registered root.
+    let plan = plan(&procs, &["/reg/.loom/worktrees/issue-8"], &[], false);
+    assert_eq!(plan.trees.len(), 1, "{plan:?}");
+    assert_eq!(plan.trees[0].issue, 7);
+    with_hooks(|hooks, sent| {
+        let rec: Mutex<Vec<ReapRecord>> = Mutex::new(Vec::new());
+        run_worktree_plan(&plan, hooks, &rec, false);
+        assert_eq!(killed(sent), vec![500, 501]);
+        assert_eq!(rec.into_inner().unwrap()[0].path, ResiduePath::Periodic);
+    });
+}
+
+#[test]
+fn argv_paths_are_the_absolute_ones() {
+    assert_eq!(
+        argv_paths("node --root=/a/b x:/c \"/d e\" rel/f"),
+        vec![
+            PathBuf::from("/a/b"),
+            PathBuf::from("/c"),
+            PathBuf::from("/d")
+        ]
+    );
 }
 
 #[test]

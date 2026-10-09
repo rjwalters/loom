@@ -10114,20 +10114,23 @@ config and `LOOM_ORPHAN_PROCESS_REAPER*` env above (one switch for all residue
 reaping; the host-wide periodic pass is on when any registered root has it on,
 dry when any says so, with the longest `minAgeSecs`).
 
-- **Exit teardown** (no grace period): when a sweep reaches a terminal state, for
-  any reason (success, failure, kill, requeue), its scope is stopped (the
-  `scope_unit` recorded in `owner.json`, else the `loom-agent-<pid>-*` scope whose
-  embedded pid is the sweep's and which began within its lifetime), its recorded
-  pid and process group are torn down with the shared #10831 helper
-  (`auto_update/pause_roll/teardown.rs`), and processes attributable to the
-  worktree that started at or after the sweep did are killed freeze-first. On
-  macOS and scope-less Linux only the last two apply (`ps` snapshot, attribution
-  by argv). A live agent runtime in the worktree, or another run holding the
-  issue's claim, skips the worktree leg (a requeue may already be running).
+- **Exit teardown** (no grace period): when a sweep or a role run reaches a
+  terminal state, for any reason (success, failure, kill, timeout, requeue), its
+  scope is stopped (the `scope_unit` recorded in `owner.json` or at role launch,
+  else the `loom-agent-<pid>-*` scope whose embedded pid is the run's and which
+  began within its lifetime), its recorded pid and process group are torn down
+  with the shared #10831 helper (`auto_update/pause_roll/teardown.rs`), and, for
+  a sweep, processes in the worktree that started at or after it did **and carry
+  its `LOOM_SWEEP_ID`** in their environment are killed freeze-first (a later
+  start alone is not ownership: an operator shell opened mid-run is left alone,
+  as is any process whose environment is unreadable). On macOS and scope-less
+  Linux only the last two apply (`ps` snapshot, argv attribution, `ps -E`). A
+  live agent runtime in the worktree, or another run holding the issue's claim,
+  skips the worktree leg (a requeue may already be running).
 - **Periodic pass** (same tick as the worktree reaper): `loom-agent-*` scopes older
   than `minAgeSecs` that no live run claims (recorded `scope_unit`, else the
   embedded pid alive and not started after the scope) are stopped; processes whose
-  cwd is in a deleted `.loom/worktrees/issue-*` directory, or in a
+  cwd is in (or whose argv names) a deleted `.loom/worktrees/issue-*` directory, or in a
   `.loom-managed` one of a workspace that is no longer registered, are reaped with
   the orphan reaper's fail-safes (age, daemon ancestry, live agent, claim). A
   process elsewhere in the same checkout is never touched.
