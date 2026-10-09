@@ -70,11 +70,7 @@ fn decide(root: &Path, is_authority: bool) -> bool {
     let scope = if is_authority {
         None
     } else {
-        scope_for(
-            false,
-            cached_roster(root).as_deref(),
-            &crate::config_resolver::fleet_eta_authority_covers(root),
-        )
+        scope_for(false, cached_roster(root).as_deref(), &crate::eta::coverage::declared_for(root))
     };
     let fallback = scope.is_some();
     if fallback {

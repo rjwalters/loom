@@ -257,7 +257,8 @@ fn repo_ci_yml_preserves_pull_request_and_push_coverage() {
     // Adding merge_group must not take anything away from PR or push runs:
     // every job except the PR-only path filter still runs on push, and every
     // job may still run on a PR. Exceptions, each named explicitly: the
-    // push-only image detector `changes-push`, and the image jobs it gates.
+    // push-only image detector `changes-push`, the image jobs it gates, and
+    // the main-push-only cache writer `worker-buildcache` (#10846).
     let src = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
     let w = wf("ci.yml", &src);
     for t in ["push", "pull_request", "merge_group"] {
@@ -276,6 +277,15 @@ fn repo_ci_yml_preserves_pull_request_and_push_coverage() {
             assert_eq!(j.states[&Event::PullRequest], RunState::Skipped);
             assert_eq!(j.states[&Event::MergeGroup], RunState::Skipped);
             assert!(!j.relied_on, "changes-push must not be a relied-on suite");
+            continue;
+        }
+        if j.id == "worker-buildcache" {
+            // The one `packages: write` job: never on pull_request or
+            // merge_group, so it is not a relied-on suite. Its push state is
+            // decided by `github.repository`/`changes-push`, not asserted here.
+            assert_eq!(j.states[&Event::PullRequest], RunState::Skipped);
+            assert_eq!(j.states[&Event::MergeGroup], RunState::Skipped);
+            assert!(!j.relied_on, "worker-buildcache must not be a relied-on suite");
             continue;
         }
         if PUSH_FILTERED_IMAGE_JOBS.contains(&j.id.as_str()) {

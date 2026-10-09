@@ -64,6 +64,7 @@ mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
 pub mod ops;
+pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
 pub mod trace;

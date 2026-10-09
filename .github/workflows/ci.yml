@@ -2773,13 +2773,15 @@ jobs:
     # The registry cache costs no Actions-cache budget, survives 7-day
     # eviction (which matters once #10825 makes these jobs rare on main), and
     # the package is public, so every run -- fork PRs included -- reads it
-    # anonymously. It is WRITTEN only from a push to main in rjwalters/loom
-    # (mirrors rust-cache's `save-if`): a fork PR's token cannot push to
-    # ghcr.io/rjwalters/*, and a same-repo PR must not be able to seed the
-    # cache main builds from. `ignore-error=true` keeps a registry hiccup on
-    # export from failing the build. The published `:latest` is not used as
-    # cache-from: CI passes APT_MIRROR and release does not, so its apt layers
-    # never match.
+    # anonymously. This job only READS it (`packages: read`, no GHCR login,
+    # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
+    # or merge_group token holds `packages: write` (#10846). The cache is
+    # WRITTEN only by `worker-buildcache` below, a separate job gated at job
+    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
+    # same-repo PR must not be able to seed the cache main builds from. The
+    # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
+    # release does not, so its apt layers never match.
     needs: [changes, changes-images, changes-push, release-build]
     if: >-
       always() && (github.event_name == 'merge_group' ||
@@ -2789,12 +2791,13 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
+      packages: read
     env:
       BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
-      WRITE_BUILDCACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # --- Binary staging seam (#10824) -------------------------------------
       # The Linux release binary the Dockerfile COPYs comes from the single
       # `Release Build Check` build (`--features otlp`, the shipped config),
@@ -2814,25 +2817,13 @@ jobs:
       # --- end binary staging seam ------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Log in to GHCR (buildcache writer, main pushes only)
-        if: env.WRITE_BUILDCACHE == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build the loom-worker base image
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          cache_to=()
-          if [[ "$WRITE_BUILDCACHE" == "true" ]]; then
-            cache_to=(--cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true")
-          fi
           docker buildx build -f docker/worker/Dockerfile \
             --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
             --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
-            "${cache_to[@]}" \
             --output type=docker,dest=/tmp/loom-worker-base.tar \
             -t loom-worker:ci-smoke \
             -t ghcr.io/rjwalters/loom-worker:ci-smoke \
@@ -2845,6 +2836,80 @@ jobs:
           if-no-files-found: error
           compression-level: 1
           retention-days: 1
+
+  worker-buildcache:
+    name: Publish loom-worker build cache
+    # The ONLY job in this workflow with `packages: write` (#10846). It writes
+    # the registry layer cache `worker-base-image` reads
+    # (ghcr.io/rjwalters/loom-worker:buildcache; rationale in that job's
+    # header). Job permissions cannot vary by event, so the write is split out
+    # here and gated at JOB level to a push to main in rjwalters/loom: on
+    # pull_request and merge_group this job is skipped, so no token those
+    # events mint can push to GHCR. Checkout uses `persist-credentials: false`
+    # so the token never lands in .git/config.
+    #
+    # It rebuilds the same Dockerfile with the same build args; its layers are
+    # cache hits from the previous main build, so it is mostly export time.
+    # Nothing `needs:` it except `ci-result` (off the image critical path).
+    # The binary comes from the same staging seam as `worker-base-image`
+    # (#10824; `release-build` runs unconditionally on push). On push it uses
+    # the same `changes-push` filter as `worker-base-image` (#10825): skipped
+    # only when that detector SUCCEEDED with docker=false (no image input
+    # changed, so the cache would be unchanged), run otherwise (fails
+    # closed). `ignore-error=true` keeps a registry hiccup on export from
+    # failing the job.
+    #
+    # Not merge-group relevant: it is skipped on pull_request, so the
+    # merge-group audit does not count it as a relied-on suite (no marker
+    # needed; it is push-only, not pr-only). `ci-result` passes its PR-time
+    # `skipped` because Detect Changes succeeded, and its merge_group skip
+    # because merge_group has no path filter (scripts/ci-result-gate.sh).
+    needs: [changes-push, release-build]
+    if: >-
+      always() && needs.release-build.result == 'success' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'rjwalters/loom' &&
+      (needs.changes-push.result != 'success' || needs.changes-push.outputs.docker != 'false')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILDCACHE_REF: ghcr.io/rjwalters/loom-worker:buildcache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # --- Binary staging seam (#10824), same as worker-base-image ---------
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: loom-daemon-release-linux-amd64
+          path: dist
+      - name: Stage dist/loom-daemon-linux-amd64
+        run: |
+          set -euo pipefail
+          mv dist/loom-daemon dist/loom-daemon-linux-amd64
+          chmod +x dist/loom-daemon-linux-amd64
+          dist/loom-daemon-linux-amd64 --version
+      # --- end binary staging seam ------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR (buildcache writer)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export the loom-worker layer cache
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          docker buildx build -f docker/worker/Dockerfile \
+            --build-arg APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+            --cache-from "type=registry,ref=${BUILDCACHE_REF}" \
+            --cache-to "type=registry,ref=${BUILDCACHE_REF},mode=max,ignore-error=true" \
+            --output type=cacheonly \
+            .
 
   worker-image-smoke:
     name: loom-worker Image Smoke Test
@@ -3030,6 +3095,7 @@ jobs:
       - codex-adapter-smoke
       - shell-suite-tests
       - worker-base-image
+      - worker-buildcache
       - worker-image-smoke
       - session-image-smoke
       - native-image-smoke
