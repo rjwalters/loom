@@ -433,6 +433,24 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         # retries while the daemon has already released the sweep as dead. With
         # `continue` only the offending command fails and the agent can react.
         _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%" -p "OOMPolicy=continue")
+        # MemoryMax from the daemon's observed per-repo peak (issue #11094):
+        # an over-budget build fails inside its own cgroup rather than the
+        # kernel's global OOM killer choosing a victim. Best-effort: no
+        # history / disabled / memory controller not delegated => no limit.
+        _mem_lib="${_script_dir}/lib/memory-budget.sh"
+        if [[ -f "$_mem_lib" ]]; then
+            # shellcheck source=./lib/memory-budget.sh
+            source "$_mem_lib"
+            _mem_max_mb="$(loom_mem_scope_limit_mb "$(basename "$WORKSPACE")" "$(loom_mem_total_mb)" 2>/dev/null || true)"
+            if [[ "$_mem_max_mb" =~ ^[0-9]+$ ]]; then
+                if systemd-run --user --scope --quiet --unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope" -p "MemoryMax=${_mem_max_mb}M" -- true >/dev/null 2>&1; then
+                    _cpu_quota_props+=(-p "MemoryMax=${_mem_max_mb}M")
+                    log_info "spawn-claude: scope MemoryMax=${_mem_max_mb}M from observed per-repo peak (LOOM_SWEEP_MEMORY_MAX=0 disables; issue #11094)"
+                else
+                    log_warn "spawn-claude: MemoryMax=${_mem_max_mb}M rejected by systemd (memory controller not delegated?); scope runs without a memory limit (issue #11094)"
+                fi
+            fi
+        fi
         if [[ "$_cpu_wallclock" != "0" ]]; then
             _cpu_quota_props+=(-p "RuntimeMaxSec=${_cpu_wallclock}")
         fi
