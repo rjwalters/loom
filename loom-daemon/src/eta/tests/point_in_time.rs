@@ -32,6 +32,7 @@ fn run(completed_at: DateTime<Utc>, observed_at: Option<DateTime<Utc>>) -> CiRun
         run_attempt: 1,
         workflow: "CI".into(),
         git_ref: Some("main".into()),
+        pr_numbers: vec![],
         head_sha: "0".repeat(40),
         event: "push".into(),
         status: "completed".into(),

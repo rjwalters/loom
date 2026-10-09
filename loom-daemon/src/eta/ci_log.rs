@@ -21,10 +21,14 @@
 //! one head, is an unknown head and the feature stays unknown; runs of any
 //! other head (stale heads, another repo's same-numbered PR) are never the
 //! subject's. A run at the right head also needs its own ref to name the
-//! subject ([`pr_of_ref`]: `refs/pull/N/merge|head`): a branch run, another
-//! PR's run at the same SHA, a malformed ref or a line logged before the ref
-//! was kept is not attributable and is never counted. Only runs with `known_at` and `completed_at` before
-//! the cutoff count.
+//! subject ([`sole_pr`]). The identity is the run's `pull_requests[].number`
+//! (`loom.ci.pr_numbers`; the producer's `ref` is only the head *branch*
+//! name, e.g. `feature/issue-899`); `refs/pull/N/{merge,head}` is accepted
+//! as an additional source. A branch run with no PR association, another
+//! PR's run at the same SHA, a run naming several PRs, a malformed number or
+//! a line logged before the identity was kept is not attributable and is
+//! never counted. Only runs with `known_at` and `completed_at` before the
+//! cutoff count.
 //!
 //! # Meaning of "last CI run"
 //!
@@ -85,12 +89,12 @@ pub struct CiRecord {
     /// The run's conclusion, when it carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conclusion: Option<String>,
-    /// The run's git ref as logged (`refs/pull/N/merge`, a branch, ...).
-    /// Absent on lines written before the ref was kept.
+    /// The run's ref as logged: the head branch name (the producer's
+    /// `ref`), or a `refs/pull/N/*` ref. Absent on older lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
-    /// The one PR the ref names (`refs/pull/N/{merge,head}`). `None` is
-    /// unknown or not a PR ref (a branch, a malformed ref, an old line): the
+    /// The one PR the run belongs to ([`sole_pr`]). `None` is unknown or
+    /// ambiguous (no PR association, several, malformed, an old line): the
     /// run is attributable to no PR and never counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u32>,
@@ -113,6 +117,26 @@ pub fn pr_of_ref(git_ref: &str) -> Option<u32> {
         return None;
     }
     n.parse().ok().filter(|&n| n > 0)
+}
+
+/// The one PR a run belongs to, or `None` when it is not unambiguous.
+///
+/// The producer's `git_ref` is the run's `head_branch` (a bare branch name),
+/// so PR identity comes from `pr_numbers` (`pull_requests[].number`, logged
+/// as `loom.ci.pr_numbers`). A `refs/pull/N/{merge,head}` ref ([`pr_of_ref`])
+/// is accepted as an additional source. All sources together must name
+/// exactly one PR: none (a plain branch/push run), several, or a malformed
+/// number (`0`) is not attributable.
+#[must_use]
+pub fn sole_pr(pr_numbers: &[u32], git_ref: Option<&str>) -> Option<u32> {
+    let mut named: BTreeSet<u32> = pr_numbers.iter().copied().collect();
+    if named.contains(&0) {
+        return None;
+    }
+    named.extend(git_ref.and_then(pr_of_ref));
+    let mut it = named.into_iter();
+    let one = it.next()?;
+    it.next().is_none().then_some(one)
 }
 
 impl CiRecord {
@@ -139,7 +163,7 @@ impl CiRecord {
             known_at: state.observed_at,
             conclusion: run.conclusion.clone(),
             git_ref: run.git_ref.clone().filter(|r| !r.is_empty()),
-            pr: run.git_ref.as_deref().and_then(pr_of_ref),
+            pr: sole_pr(&run.pr_numbers, run.git_ref.as_deref()),
         })
     }
 
@@ -294,7 +318,7 @@ impl CiLog {
     /// the PR's head is unknown then. Only runs of that head, finished and
     /// known before `as_of`, whose conclusion is an outcome
     /// ([`CiRecord::failed`]), are returned. A run counts only when its own
-    /// ref names this PR ([`CiRecord::pr`]).
+    /// identity names this PR ([`CiRecord::pr`]).
     #[must_use]
     pub fn observations(
         &self,

@@ -135,3 +135,39 @@ fn job_span_carries_the_same_join_keys_as_its_run() {
     assert_eq!(span.get("loom.ci.ref"), Some(&"main".to_string()));
     assert_eq!(span.get("loom.pr_number"), Some(&"555".to_string()));
 }
+
+#[test]
+fn run_record_carries_pull_request_numbers_beside_a_branch_ref() {
+    use crate::telemetry::TelemetryRecord;
+    let repo = bare_repo();
+    let mut run = bare_run();
+    run.head_branch = Some("feature/issue-899".into());
+    run.pull_requests = vec![PullRequestRefJson { number: 7 }];
+    let record = run_envelopes(&repo, &run, "test-host")
+        .into_iter()
+        .find_map(|e| match e.record {
+            TelemetryRecord::CiRun(r) => Some(r),
+            _ => None,
+        })
+        .expect("a ci.run record");
+    assert_eq!(record.git_ref.as_deref(), Some("feature/issue-899"));
+    assert_eq!(record.pr_numbers, vec![7]);
+    let attrs = record.log_attributes();
+    assert!(attrs
+        .iter()
+        .any(|(k, v)| *k == "loom.ci.pr_numbers"
+            && *v == crate::telemetry::ci::CiAttr::Str("7".into())));
+    // No association: the key is absent, never empty.
+    run.pull_requests.clear();
+    let record = run_envelopes(&repo, &run, "test-host")
+        .into_iter()
+        .find_map(|e| match e.record {
+            TelemetryRecord::CiRun(r) => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    assert!(record
+        .log_attributes()
+        .iter()
+        .all(|(k, _)| *k != "loom.ci.pr_numbers"));
+}

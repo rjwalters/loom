@@ -43,6 +43,9 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.run_attempt",
     "loom.ci.workflow",
     "loom.ci.ref",
+    // `ci.run` (#10737): the PR number(s) GitHub associates with the run
+    // (`pull_requests[].number`), comma-separated; absent when none.
+    "loom.ci.pr_numbers",
     "loom.ci.head_sha",
     "loom.ci.event",
     "loom.ci.status",
@@ -231,6 +234,12 @@ pub struct CiRunRecord {
     /// The run's head branch, when GitHub reports one.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// The PR number(s) GitHub associates with the run
+    /// (`pull_requests[].number`, #10737) — the PR identity the CI predictor
+    /// attributes by; `git_ref` is only a branch name. Empty for a run with
+    /// no PR association (push, schedule) and on older journal lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_numbers: Vec<u64>,
     pub head_sha: String,
     /// Triggering event (`push`, `pull_request`, `schedule`, …).
     pub event: String,
@@ -278,6 +287,10 @@ impl CiRunRecord {
         ];
         if let Some(git_ref) = &self.git_ref {
             out.push(("loom.ci.ref", CiAttr::Str(git_ref.clone())));
+        }
+        if !self.pr_numbers.is_empty() {
+            let joined: Vec<String> = self.pr_numbers.iter().map(u64::to_string).collect();
+            out.push(("loom.ci.pr_numbers", CiAttr::Str(joined.join(","))));
         }
         out.push(("loom.ci.head_sha", CiAttr::Str(self.head_sha.clone())));
         out.push(("loom.ci.event", CiAttr::Str(self.event.clone())));

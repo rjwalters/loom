@@ -725,6 +725,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         run_attempt: run.run_attempt,
         workflow: workflow.clone(),
         git_ref: run.head_branch.clone(),
+        pr_numbers: run.pull_requests.iter().map(|p| p.number).collect(),
         head_sha: run.head_sha.clone(),
         event: run.event.clone(),
         status: run.status.clone().unwrap_or_default(),

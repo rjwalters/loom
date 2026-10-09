@@ -240,6 +240,11 @@ pub struct CiRunRow {
     pub run_attempt: u32,
     pub workflow: String,
     pub git_ref: Option<String>,
+    /// The PR number(s) GitHub associated with the run (`loom.ci.pr_numbers`,
+    /// comma-separated); empty when none or on a row logged before #10737.
+    /// A token that is not a positive integer is kept as `0` so a malformed
+    /// list can never read as a single clean PR.
+    pub pr_numbers: Vec<u32>,
     pub head_sha: Option<String>,
     pub status: Option<String>,
     pub conclusion: Option<String>,
@@ -712,6 +717,14 @@ fn ci_body(fields: &Fields<'_>, kind: &str) -> Body {
                 .text(&["loom.ci.workflow", "workflow", "loom.workflow"])
                 .unwrap_or_default(),
             git_ref: fields.text(&["loom.ci.ref", "git_ref", "ref", "loom.ref"]),
+            pr_numbers: fields
+                .text(&["loom.ci.pr_numbers"])
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().parse::<u32>().unwrap_or(0))
+                        .collect()
+                })
+                .unwrap_or_default(),
             head_sha: fields.text(&["loom.ci.head_sha", "head_sha", "loom.head_sha"]),
             status: fields.text(&["loom.ci.status", "status", "loom.status"]),
             conclusion,

@@ -452,6 +452,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         run_attempt: 1,
         workflow: "CI".into(),
         git_ref: Some("main".into()),
+        pr_numbers: vec![],
         head_sha: "0".repeat(40),
         event: "push".into(),
         status: "completed".into(),

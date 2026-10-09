@@ -1,7 +1,9 @@
 //! The CI-run log (#10737): head resolution at the cutoff, the meaning of
 //! "last completed run", observation-time leaks and persistence.
 
-use crate::eta::ci_log::{append, compact, fresh, load, log_path, pr_of_ref, CiLog, CiRecord};
+use crate::eta::ci_log::{
+    append, compact, fresh, load, log_path, pr_of_ref, sole_pr, CiLog, CiRecord,
+};
 use crate::eta::loop_features::FileSnapshot;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
@@ -33,7 +35,7 @@ fn run(sha: &str, id: u64, attempt: u32, done: i64, known: i64, c: Option<&str>)
         completed_at: t(done),
         known_at: t(known),
         conclusion: c.map(str::to_string),
-        git_ref: Some("refs/pull/7/merge".into()),
+        git_ref: Some("feature/issue-899".into()),
         pr: Some(7),
     }
 }
@@ -174,7 +176,8 @@ fn from_state_needs_a_head_and_a_finished_run() {
             run_id: 9,
             run_attempt: 2,
             workflow: "ci".into(),
-            git_ref: Some("refs/heads/x".into()),
+            git_ref: Some("feature/issue-899".into()),
+            pr_numbers: vec![],
             head_sha: head.map(str::to_string),
             status: status.map(str::to_string),
             conclusion: Some("success".into()),
@@ -188,8 +191,25 @@ fn from_state_needs_a_head_and_a_finished_run() {
     let r = CiRecord::from_state("O/R", &state(Some("AbC"), Some("completed"))).unwrap();
     assert_eq!((r.repo.as_str(), r.head_sha.as_str()), ("o/r", "abc"));
     assert_eq!((r.completed_at, r.known_at, r.run_attempt), (t(1), t(3), 2));
-    // A branch ref names no PR.
-    assert_eq!((r.git_ref.as_deref(), r.pr), (Some("refs/heads/x"), None));
+    // A branch run with no PR association names no PR.
+    assert_eq!((r.git_ref.as_deref(), r.pr), (Some("feature/issue-899"), None));
+    // The real producer shape: a branch `ref` plus `pull_requests` numbers.
+    let mut with_pr = state(Some("a"), Some("completed"));
+    with_pr.run.pr_numbers = vec![7];
+    let r = CiRecord::from_state("o/r", &with_pr).unwrap();
+    assert_eq!((r.git_ref.as_deref(), r.pr), (Some("feature/issue-899"), Some(7)));
+    // Several PRs, or a malformed number, are ambiguous: not attributable.
+    with_pr.run.pr_numbers = vec![7, 8];
+    assert_eq!(CiRecord::from_state("o/r", &with_pr).unwrap().pr, None);
+    with_pr.run.pr_numbers = vec![7, 0];
+    assert_eq!(CiRecord::from_state("o/r", &with_pr).unwrap().pr, None);
+    // A repeated number is still one PR; a ref agreeing adds nothing, a
+    // ref naming another PR makes it ambiguous.
+    assert_eq!(sole_pr(&[7, 7], None), Some(7));
+    assert_eq!(sole_pr(&[7], Some("refs/pull/7/merge")), Some(7));
+    assert_eq!(sole_pr(&[7], Some("refs/pull/8/merge")), None);
+    assert_eq!(sole_pr(&[], Some("refs/pull/8/head")), Some(8));
+    assert_eq!(sole_pr(&[], Some("feature/issue-899")), None);
     assert!(CiRecord::from_state("o/r", &state(None, None)).is_none());
     assert!(CiRecord::from_state("o/r", &state(Some("a"), Some("in_progress"))).is_none());
 }
@@ -248,13 +268,14 @@ fn a_run_must_name_the_subject_pr_not_just_its_head() {
     // Newer failing runs at the same SHA from a branch, another PR, a
     // missing ref and a malformed ref change nothing for PR 7.
     let mut branch = run("a", 2, 1, 5, 5, Some("failure"));
-    (branch.git_ref, branch.pr) = (Some("refs/heads/feature/x".into()), None);
+    (branch.git_ref, branch.pr) = (Some("feature/issue-900".into()), None);
     let mut other = run("a", 3, 1, 6, 6, Some("failure"));
-    (other.git_ref, other.pr) = (Some("refs/pull/8/merge".into()), Some(8));
+    (other.git_ref, other.pr) = (Some("feature/issue-901".into()), Some(8));
     let mut missing = run("a", 4, 1, 7, 7, Some("failure"));
     (missing.git_ref, missing.pr) = (None, None);
     let mut garbled = run("a", 5, 1, 8, 8, Some("failure"));
-    (garbled.git_ref, garbled.pr) = (Some("refs/pull/7/merge/x".into()), None);
+    // Named both PRs at once: ambiguous, recorded as no PR.
+    (garbled.git_ref, garbled.pr) = (Some("feature/issue-899".into()), None);
     let log = CiLog::new(&[subject, branch, other.clone(), missing, garbled], &heads);
     assert_eq!(seen(&log, "o/r", 7, 20), Some(vec![(1, false)]));
     // The other PR still sees its own run.
@@ -272,4 +293,48 @@ fn old_lines_without_identity_load_but_never_count() {
     assert_eq!(loaded[0].pr, None);
     let log = CiLog::new(&loaded, &[head("o/r", 7, 0, Some("a"))]);
     assert_eq!(seen(&log, "o/r", 7, 20), Some(vec![]));
+}
+
+#[test]
+fn real_producer_rows_attribute_through_pull_requests_numbers() {
+    use crate::eta::fleet_signoz_timeline::CiRunState;
+    use crate::eta::fleet_signoz_timeline_rows::CiRunRow;
+    let state = |id: u64, prs: Vec<u32>, done: i64, c: &str| CiRunState {
+        run: CiRunRow {
+            run_id: id,
+            run_attempt: 1,
+            workflow: "ci".into(),
+            git_ref: Some("feature/issue-899".into()),
+            pr_numbers: prs,
+            head_sha: Some("a".into()),
+            status: Some("completed".into()),
+            conclusion: Some(c.into()),
+            completed_at: t(done),
+            duration_ms: None,
+        },
+        observed_at: t(done),
+        jobs: vec![],
+        duration_samples: vec![],
+    };
+    let heads = [head("o/r", 7, 0, Some("a")), head("o/r", 8, 0, Some("a"))];
+    let recs = |states: &[CiRunState]| -> Vec<CiRecord> {
+        states
+            .iter()
+            .map(|s| CiRecord::from_state("o/r", s).unwrap())
+            .collect()
+    };
+    let subject = state(1, vec![7], 1, "success");
+    let base = CiLog::new(&recs(std::slice::from_ref(&subject)), &heads);
+    assert_eq!(seen(&base, "o/r", 7, 20), Some(vec![(1, false)]));
+    // Newer failing runs at the same SHA: a push run with no PR, another
+    // PR's run, and a run naming both PRs. None changes PR 7's feature.
+    let all = recs(&[
+        subject,
+        state(2, vec![], 5, "failure"),
+        state(3, vec![8], 6, "failure"),
+        state(4, vec![7, 8], 7, "failure"),
+    ]);
+    let log = CiLog::new(&all, &heads);
+    assert_eq!(seen(&log, "o/r", 7, 20), Some(vec![(1, false)]));
+    assert_eq!(seen(&log, "o/r", 8, 20), Some(vec![(6, true)]));
 }

@@ -1818,10 +1818,14 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   log): runs keyed `(repo, head_sha)` with `completed_at` apart from
   `known_at`, mapped to the PR head known at the cutoff from the file log's
   head history (unknown or ambiguous head: unknown; stale heads and other
-  repos never count). A run must also name the subject PR in its own ref
-  (`refs/pull/N/merge|head`, kept on the record): branch runs, another PR's
-  run at the same SHA, and missing, malformed or pre-ref lines are not
-  attributable and never count. Last completed run by `(completed_at, run_id,
+  repos never count). A run must also name the subject PR. PR identity is the
+  run's `pull_requests[].number`, which the `ci.run` producer logs as
+  `loom.ci.pr_numbers` (comma-separated); the producer's `ref` is only the
+  head branch name (`feature/issue-899`), and a `refs/pull/N/{merge,head}`
+  ref is accepted as an additional source. Exactly one PR across the sources
+  is attributable; a branch run with no PR association, another PR's run at
+  the same SHA, a run naming several PRs, and malformed or pre-identity
+  lines never count. Last completed run by `(completed_at, run_id,
   attempt)`; only `success` and `failure`/`timed_out`/`startup_failure` are
   outcomes, `cancelled`, `neutral`, `skipped` and unknown are ignored.
   Fit and serving both read it. Coverage limit: nothing appends yet.

@@ -876,7 +876,10 @@ fn records_emit_exactly_the_declared_vocabulary() {
         (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
     for env in journal(dir.path()) {
         match env.record {
-            TelemetryRecord::CiRun(r) => {
+            TelemetryRecord::CiRun(mut r) => {
+                // The fixture runs carry no `pull_requests`; give one a PR so
+                // the PR-identity key (#10737) is exercised too.
+                r.pr_numbers = vec![42];
                 log_keys.extend(r.log_attributes().into_iter().map(|(k, _)| k.to_string()))
             }
             TelemetryRecord::CiJob(r) => {
