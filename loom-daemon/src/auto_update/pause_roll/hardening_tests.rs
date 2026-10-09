@@ -505,6 +505,7 @@ fn minimal_manifest() -> PauseManifest {
             staged_at: None,
             pause_started_at: Utc::now(),
             pause_completed_at: None,
+            pause_duration_ms: None,
             pause_budget_secs: None,
             min_resumable_age_secs: None,
             max_age_secs: 900,

@@ -384,3 +384,93 @@ fn the_forced_group_kill_refuses_this_process_and_the_null_groups() {
     }
     assert!(!force_kill_group(&TreeSpec::default()));
 }
+
+/// A fake `systemctl` for the scope leg (#11051). It logs every call. A
+/// blocking `stop` hangs (as a scope whose processes ignore `SIGTERM` makes
+/// it hang until systemd's stop timeout), `--no-block` returns at once, and
+/// `kill` runs `on_kill`. `ActiveState` reads `inactive` once `emptied`
+/// exists.
+fn fake_systemctl(dir: &std::path::Path, on_kill: &str) -> (ScopeCtl, PathBuf) {
+    let log = dir.join("systemctl.log");
+    let emptied = dir.join("emptied");
+    let body = format!(
+        "echo \"$*\" >> '{log}'\n\
+         case \"$*\" in\n\
+           *LoadState*) echo loaded ;;\n\
+           *ActiveState*) if [ -e '{emptied}' ]; then echo inactive; else echo active; fi ;;\n\
+           *'stop --no-block'*) exit 0 ;;\n\
+           *' stop '*) exec sleep 300 ;;\n\
+           *kill*) {on_kill} ;;\n\
+         esac",
+        log = log.display(),
+        emptied = emptied.display(),
+    );
+    let ctl = ScopeCtl {
+        systemctl: script(dir, "fake-systemctl", &body),
+        timeout: Duration::from_millis(500),
+        grace: Duration::from_millis(400),
+        kill_wait: Duration::from_millis(300),
+        poll: Duration::from_millis(50),
+    };
+    (ctl, log)
+}
+
+/// #11051: the scope leg never waits on systemd's stop job. A scope that
+/// ignores `SIGTERM` is sent `SIGKILL` after the grace, and stopped.
+#[test]
+fn a_scope_that_ignores_sigterm_is_killed_after_the_grace_without_a_blocking_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let emptied = dir.path().join("emptied");
+    let (ctl, log) = fake_systemctl(dir.path(), &format!("touch '{}'", emptied.display()));
+    let spec = TreeSpec {
+        scope_unit: Some("loom-agent-x.scope".to_string()),
+        ..TreeSpec::default()
+    };
+
+    let started = Instant::now();
+    let report =
+        teardown_tree_full(&spec, Duration::from_millis(100), &ProcSource::system(), Some(&ctl));
+    let took = started.elapsed();
+
+    assert!(report.scope_stopped, "{report:?}");
+    assert!(took < Duration::from_secs(5), "the scope leg took {took:?}");
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("stop --no-block loom-agent-x.scope"), "{calls}");
+    assert!(calls.contains("kill --signal=SIGKILL loom-agent-x.scope"), "{calls}");
+    assert!(
+        !calls
+            .lines()
+            .any(|l| l.contains(" stop ") && !l.contains("--no-block")),
+        "{calls}"
+    );
+}
+
+/// #11051: with every scope command hanging, the scope leg still ends within
+/// its bound, and the process-tree legs stop the tree.
+#[test]
+fn a_hanging_scope_stop_is_bounded_and_the_tree_kill_still_stops_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tree = OwnTree::spawn(dir.path());
+    let setsid_pid = tree.setsid_pid;
+    let (ctl, _log) = fake_systemctl(dir.path(), "exec sleep 300");
+    let spec = TreeSpec {
+        scope_unit: Some("loom-agent-y.scope".to_string()),
+        ..tree.spec()
+    };
+
+    let started = Instant::now();
+    let report =
+        teardown_tree_full(&spec, Duration::from_millis(300), &ProcSource::system(), Some(&ctl));
+    let took = started.elapsed();
+
+    assert!(took < Duration::from_secs(10), "the hung scope stop blocked for {took:?}");
+    assert!(!report.scope_stopped, "{report:?}");
+    let note = report.scope_note.as_deref().unwrap();
+    assert!(note.contains("did not empty") && note.contains("SIGKILL failed"), "{note}");
+    assert!(report.pids.contains(&setsid_pid), "{report:?}");
+    let _ = tree.child.wait();
+    assert!(
+        crate::sweep_registry::test_support::wait_until_dead(setsid_pid, 5_000),
+        "the setsid'd child outlived the teardown"
+    );
+}
