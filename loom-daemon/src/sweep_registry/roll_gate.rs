@@ -96,7 +96,6 @@ impl SweepRegistry {
     }
 
     /// Whether a roll's pause holds this registry's dispatch gate.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn closed_for_roll(&self) -> bool {
         !self.roll_gate.closed_by.is_empty()

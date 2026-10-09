@@ -731,6 +731,11 @@ jobs:
       # arrived makes that host unknown instead of rebuilding wrong state.
       - name: Verify the SigNoz replay reconstruction against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
+      # #11127: `telemetry-replay --as-of` runs those same committed queries
+      # with its own parameter binding and reader over the same fixture store;
+      # only this run shows an uncovered host is reported `unknown`, not empty.
+      - name: Verify telemetry-replay against the replay fixture store
+        run: cargo test --package loom-daemon --features otlp --test telemetry_replay_fixture_store -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows
@@ -1913,10 +1918,22 @@ jobs:
     # FAILS (not SKIPs) when no binary resolves, so this job cannot report green
     # by quietly running nothing.
     #
-    # The four slowest suites run in two sibling jobs below (#9065) so that no
-    # one runner carries all ~420s of them: `native-port-daemon-lifecycle` and
-    # `native-port-watchdog-spawn`. Wiring a new suite here is still the
+    # The slowest suites run in the sibling job below (#9065, consolidated by
+    # #9093) so that no one runner carries all ~420s of them:
+    # `native-port-daemon-lifecycle`. Wiring a new suite here is still the
     # default; move one out only when it is long enough to be the pole.
+    #
+    # Every suite step (everything after the binary download/--version
+    # check) runs under
+    # `if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}`
+    # (#9356), so one red suite cannot hide the others — a later suite still
+    # runs and reports its own verdict. `!cancelled()` alone would drop the
+    # implicit success() and let suites run after a FAILED setup, so each
+    # guard also requires the last setup step (`daemon-bin`, the --version
+    # check) to have succeeded; any earlier setup failure skips it, so its
+    # outcome covers all of setup. The setup steps themselves (checkout, git
+    # identity, download-artifact, --version) stay unguarded and fail-fast.
+    # Give a new suite step the same guard.
     #
     # Triggered by `backend` as well as `scripts`: a Rust-only change to
     # loom-daemon/src/dep_classify/ or loom-daemon/src/dep_recheck/ is exactly
@@ -1938,32 +1955,44 @@ jobs:
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - id: daemon-bin
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       - name: classify-dependency-block (#5664, #7650)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block.sh
       - name: classify-dependency-block premise-false interaction (#7904)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-dependency-block-premise-false.sh
       - name: detect-dependency-cycle (#5671)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-dependency-cycle.sh
       - name: detect-startable-subset (#5664)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-detect-startable-subset.sh
       - name: dep-recheck-fingerprint (#7281, #7314, #7617)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
       # #11075: check-main-clean.sh --quarantine asks `loom-daemon stashes
       # build-trees` which cargo build trees to exclude from the rescue stash.
       - name: check-main-clean (#3513, #11075)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-main-clean.sh
       # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
       # codex-hooks verify`; the suite pins this job's shared build.
       - name: provision-codex-hooks (#4495, #5005, #9390)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-provision-codex-hooks.sh
       - name: spawn-codex merging-role hook gate (#9390)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
       - name: spawn-codex sealed-registration trust waiver (#10102)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
       - name: spawn-* session identity is not inherited by the agent (#10830)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-session-env.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
@@ -1973,12 +2002,16 @@ jobs:
       # runner — and was moved out of shell-suite-tests/ci-wired.txt for
       # exactly that reason.
       - name: fleet-send safehouse envelope (#9517)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-fleet-send.sh
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
       - name: post-verdict.sh verdict gate + exclusive labels (#10581)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-post-verdict-gate.sh
       - name: merge-pr verdict-label contradiction guard (#8112, #8191 slice 2)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-verdict-label-guard.sh
       # #8458: the per-worktree cargo target dir. Its creation half
       # (`cargo-target-dir provision|path`) and both removal-side predicates
@@ -1987,38 +2020,51 @@ jobs:
       # the shared build this job downloads, not shell-suite-tests'
       # toolchain-free runner.
       - name: per-worktree cargo target dir (#8458)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-per-worktree-target-dir.sh
       - name: merge-pr loom:pr review-signal guard (#7419, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-loom-pr-label-guard.sh
       # #9657 (#9548 slice): both suites pin the working-tree binary for the
       # real `forge trusted-comments` filter, so they need this job's shared
       # build; capacity-defer moved out of shell-suite-tests/ci-wired.txt for
       # exactly that reason.
       - name: merge-pr hold-state comment trust (#9657, #9548 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-hold-state-trust.sh
       - name: classify-capacity-defer comment trust (#9657, #9548 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-classify-capacity-defer.sh
       - name: merge-pr PR-label fetch freshness (#8550)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
       - name: merge-pr stale-check re-date remedy (#8508)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-check-redate.sh
       - name: merge-pr --auto blocked settle + re-validate (#8410)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-auto-blocked-settle.sh
       - name: merge-pr defaults/ version-bump collision guard (#7827, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
       - name: merge-pr merge-ordering guard (#3747 item 2 / #7982, #8191 slice)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh
       - name: merge-pr workflow token-scope preflight (#10539)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-workflow-scope-preflight.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update --resolve-json (#7609)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-resolve-json.sh
       # Split out of test-loom-daemon-update.sh by #8028 (epic #7810 PR 6a):
       # fetch_and_verify_artifact() now drives `loom-daemon release-fetch`
@@ -2026,6 +2072,7 @@ jobs:
       # the binary this job downloads. The parent suite stays in
       # shell-suite-tests, where LIVE_DAEMON_GUARDED_SUITES still owns it.
       - name: loom-daemon-update artifact fetch + verify (#8028)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch.sh
       # Split out of test-loom-daemon-update-fetch.sh by #8770: scenarios V
       # (#8008) and V2 (#8770) assert what provisioning does to the
@@ -2033,15 +2080,18 @@ jobs:
       # `loom-daemon release-fetch` the same way their former host does, so
       # they need the binary this job downloads.
       - name: loom-daemon-update post-provision signature check (#8008, #8770)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-dest-signature.sh
       # #8654: the forced --fetch refusal classifies a missing artifact via
       # `loom-daemon release-explain` (still uploading vs genuinely unbuilt)
       # and degrades to the flat reason without it, so it needs this build.
       - name: loom-daemon-update --fetch refusal classification (#8654)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
       # #11044: the fleet floor confirmation runs inside `loom-daemon
       # daemon-update`, so the suite pins this job's shared build.
       - name: loom-daemon-update fleet floor confirmation (#11044)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
@@ -2049,6 +2099,7 @@ jobs:
       # hours; this suite pins the containment guard that prevents it. It
       # sources that library, so it needs the binary this job downloads.
       - name: daemon-update fixture containment (#8712)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-daemon-update-fixture-containment.sh
       # #8069: 284 assertions that had never run in ANY CI job. They were
       # excluded on the reason "wiring it needs a cargo build step or a binary
@@ -2056,6 +2107,7 @@ jobs:
       # spawn-claude.sh's token selection — the path behind the 228-instance
       # crash incident (#7708).
       - name: spawn-claude token selection (#4228, #7708)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude.sh
       # Moved out of shell-suite-tests by #8037: claude-wrapper.sh's six retry
       # classifiers now delegate to `loom-daemon retry-classify`, so these 44
@@ -2064,44 +2116,52 @@ jobs:
       # documented fail-safes answer instead, and the backoff-curve assertions
       # fail loudly rather than the suite reporting green on nothing.
       - name: claude-wrapper retry classifiers (#8032, #8037)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-claude-wrapper-retry.sh
       # Split out of the suite above (#8058), same operational need — it
       # drives spawn-claude.sh / claude-wrapper.sh against a real
       # `loom-daemon tokens select|mark-bad`, so it needs the binary this job
       # builds. Wired alongside its parent rather than left excluded.
       - name: token model-class selection (#8058)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-token-model-class.sh
       # #8697: spawn-claude.sh's contained dispatch through the credential
       # egress proxy — drives a real `loom-daemon worker proxy-exec` listener
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
       # #10413: ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must not
       # shadow the pool token spawn-claude.sh selects — drives a real
       # `loom-daemon tokens select`, so it needs the binary this job
       # downloads. Split from test-spawn-claude.sh (file-size frozen).
       - name: spawn-claude ambient credential scrub (#10413)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude-ambient-scrub.sh
       # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
       # after `loom-daemon session-exec posture` has verified the container's
       # label AND HostConfig, so this suite needs the binary this job downloads.
       - name: spawn-codex session container boundary (#8518, #9979)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
       # #10661: the stale-mount suite's last cases drive the real
       # `loom-daemon session-exec host` (pinned via require-daemon-bin.sh), so
       # it needs the binary this job downloads, like the step above.
       - name: spawn-codex stale-mount refusal (#10364, #10661)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-codex-session-mount-stale.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr partial-increment labels (#3667, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-partial-increment.sh
       # Moved out of shell-suite-tests by #8191's closed-issue slice: the
       # #6199 `loom:building` strip for an issue the merge itself closes now
       # delegates to `loom-daemon merge-pr closed-building`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr closed-issue loom:building cleanup (#6199, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-closed-issue-cleanup.sh
       # Moved out of shell-suite-tests by #8191's classify-response slice: the
       # head-SHA-mismatch classifier (#5579) this suite is ABOUT, and the
@@ -2109,12 +2169,14 @@ jobs:
       # are now `loom-daemon merge-pr classify-response`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr head-SHA-mismatch classifier (#5579, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-head-mismatch.sh
       # Moved out of shell-suite-tests by the #8191 mergeable-recheck slice:
       # the stale-mergeable recheck's terminal classification now delegates to
       # `loom-daemon merge-pr mergeable-recheck`, so this suite's
       # require-daemon-bin harness needs the binary this job downloads.
       - name: merge-pr stale-mergeable recheck (#6104, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-stale-mergeable.sh
       # Moved out of shell-suite-tests by #8191's reconcile slice: the
       # post-merge stacked-child reconcile decision (#4856) — parent-branch
@@ -2123,6 +2185,7 @@ jobs:
       # so this suite's require-daemon-bin harness needs the binary this job
       # downloads.
       - name: merge-pr post-merge stacked-child reconcile (#4856, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-auto-reconcile.sh
       # Moved out of shell-suite-tests by #8360: check-duplicate.sh's
       # similarity scan (keyword extraction, Jaccard scoring, threshold
@@ -2134,8 +2197,10 @@ jobs:
       # deleting the shell scan — so each needs the binary this job downloads
       # and fails rather than skips without one.
       - name: check-duplicate near-match band + scan port (#4409, #8289, #8360)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-duplicate.sh
       - name: create-issue duplicate backstop graduation (#7971, #8289, #8360)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-create-issue-duplicate-check.sh
       # Moved out of shell-suite-tests by #8656: verify-proposal-refs.sh's
       # line-range check is now `loom-daemon git-blob-lines --range`, which
@@ -2146,6 +2211,7 @@ jobs:
       # script that BLOCKS FILING. The suite needs the binary this job downloads
       # and fails rather than skips without one.
       - name: verify-proposal-refs symlink-aware line ranges (#7658, #8656)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-verify-proposal-refs.sh
       # Moved out of shell-suite-tests by #8583: reconcile-stack.sh's rebase
       # planning/execution (fetch + PIN the remote default-branch tip, worktree
@@ -2156,22 +2222,27 @@ jobs:
       # unchanged against the port apart from J/K (the #8583 regression itself)
       # and the two rebase-target assertions the fix necessarily changed.
       - name: reconcile-stack rebase target + worktree routing (#3776, #7982, #8010, #8583)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-reconcile-stack.sh
       - name: generic runtime adapter through native worker dispatcher (#8362)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic.sh
       # #8671: spawn-generic-launch.sh resolves a tier-3 runtime's launch shape
       # via `loom-daemon runtime-launch-env` before reaching spawn-generic.sh,
       # so this suite needs the binary this job downloads. It pins it via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: tier-3 manifest launch shape (#8671)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-generic-launch.sh
       # #8255: skip-labels.sh is a thin stub over `loom-daemon skip-labels`,
       # the shell-facing union of the fixed hard-exclusion list and a repo's
       # configured `autonomous.workFinder.extraSkipLabels` — needs the
       # binary this job downloads.
       - name: sweep-checkpoint (#8525)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-sweep-checkpoint.sh
       - name: skip-labels (#8255)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-skip-labels.sh
       # Moved out of shell-suite-tests by #8195 slice 2: worktree.sh's three
       # WIP-shelving verbs (`snapshot`, `stash-push`, `stash-pop`) are now thin
@@ -2186,25 +2257,30 @@ jobs:
       # hermetic in shell-suite-tests, which is the point of porting one
       # family at a time.
       - name: worktree snapshot verb (#4778, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-snapshot.sh
       - name: worktree stash-push/stash-pop pair (#5217, #6076, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stash-baseline.sh
       # #8553: worktree.sh's new issue claim-lock cross-check delegates to
       # `loom-daemon worktree-lock check-issue` (this file is frozen by the
       # file-size ratchet, so the new guard's decision logic lives in Rust,
       # not shell) — needs the binary this job downloads.
       - name: worktree issue claim-lock cross-check (#8553)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-issue-lock.sh
       # rjwalters/kicad-tools#5783: the "existing worktree has uncommitted
       # changes -> preserve" fast path now refuses on 2+ simultaneously fresh
       # sweep leases, via `loom-daemon lease co-occupancy` — needs the binary
       # this job downloads.
       - name: worktree shared-lease co-occupancy guard (kicad-tools#5783)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-lease-co-occupancy.sh
       # #8396: premise-check.sh is a thin stub over `loom-daemon
       # premise-check`, the gate Curator and the sweep orchestrator run before
       # enrichment — needs the binary this job downloads.
       - name: premise gate exit-code contract (#8396)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-premise-check.sh
       # Moved out of shell-suite-tests by #8195 slice 3: `worktree.sh remove`
       # is now a thin stub over `loom-daemon worktree-remove`, so these three
@@ -2222,10 +2298,13 @@ jobs:
       # hermetic in shell-suite-tests — which is the whole point of porting one
       # cohesive family at a time.)
       - name: worktree remove verb (#3769, #4449, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remove.sh
       - name: worktree remove squash-aware branch delete (#4889, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remove-squash-merge.sh
       - name: cargo target-dir reclaim on worktree removal (#7239, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-cargo-target-dir-reclaim.sh
       # Moved out of shell-suite-tests by #8195 slice 4: worktree.sh's
       # shared-artifact symlinking (root + nested node_modules, linkPaths,
@@ -2233,6 +2312,7 @@ jobs:
       # `loom-daemon worktree-link`. The suite pins the binary via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: worktree shared-artifact symlinks (#3528, #5474, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-nested-symlinks.sh
       # Moved out of shell-suite-tests by #8195 slice 5: worktree.sh's
       # crash-debris pre-flight — the stale index/HEAD/gitdir.lock sweep and
@@ -2249,8 +2329,10 @@ jobs:
       # remaining 12 exercise create-path arms these slices did not touch and
       # stay hermetic in shell-suite-tests.
       - name: worktree orphan guard, space + symlink paths (#7849, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-orphan-guard-spaces.sh
       - name: worktree concurrency lock + partial-state cleanup (#3380, #6014, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-concurrency.sh
       # Moved out of shell-suite-tests by #8195 slice 6: lib/worktree-race-rescue.sh
       # is now a thin wrapper over `loom-daemon worktree-reset`, so all 25 of
@@ -2261,6 +2343,7 @@ jobs:
       # wrapper's own no-binary fallback, which is a correct degradation but not
       # the thing this suite exists to measure.
       - name: worktree race rescue on a stale-worktree reset (#6334, #7463, ported in #8195)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-race-rescue.sh
       # Moved out of shell-suite-tests by #8195 slice 7: `_handle_feature_branch_
       # in_main_worktree` is now `loom-daemon worktree-branch-conflict`. Its
@@ -2274,11 +2357,13 @@ jobs:
       # loom_test_require_daemon_bin and FAILS rather than skips without one —
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
       # #10203: `sweep-lease-renew.sh start` re-enters through
       # `loom-daemon lease renewer sanitize-exec` so its detached loop holds no
       # fd of the caller's; pins the binary like the suite above.
       - name: lease renewer holds no caller fd (#10203)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
       # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
       # contract. #5657 already skips reuse of an origin/feature/issue-N
@@ -2291,6 +2376,7 @@ jobs:
       # pins the binary via loom_test_require_daemon_bin and FAILS rather
       # than skips without one.
       - name: worktree closed-unmerged-PR branch refusal (#9083)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stale-closed-branch.sh
       # Moved out of shell-suite-tests by #8195 slice 9: worktree.sh's TWO
       # hand-maintained copies of the upstream-tracking correction — the
@@ -2304,15 +2390,19 @@ jobs:
       # would leave the assertions measuring nothing. Both pin the binary via
       # loom_test_require_daemon_bin and FAIL rather than skip.
       - name: worktree local-branch upstream correction (#6095, #6100, ported in #8195 slice 9)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-local-branch-upstream-tracking.sh
       - name: worktree existing-dir upstream + drift check (#6257, #6291, ported in #8195 slice 9)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-existing-dir-drift-check.sh
       # Moved out of shell-suite-tests by #8195 slice 13: worktree.sh's `--base`
       # stacked-PR resolution is `loom-daemon worktree-base`. Both suites pin it
       # via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: worktree --base stacked-PR resolution (#3729, ported in #8195 slice 13)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-base-override.sh
       - name: check_branch_name ref-operand guard (#9106; --base ported in #8195 slice 13)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-check-branch-name.sh
       # Moved out of shell-suite-tests by #8195 slice 14: worktree.sh's
       # LOCAL-branch reuse arm — the reuse warning, the #6095/#6100 upstream
@@ -2326,8 +2416,10 @@ jobs:
       # so both pin the binary via loom_test_require_daemon_bin and FAIL rather
       # than skip. Each suite's REMOTE-arm tests are untouched by the slice.
       - name: worktree local-branch already-landed refusal (#8280, ported in #8195 slice 14)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-stale-merged-branch.sh
       - name: worktree remote/local branch tracking + divergence (#4823, #8280, ported in #8195 slice 14)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-remote-branch-tracking.sh
       # Moved out of shell-suite-tests by #8195 slice 10: worktree.sh's
       # --sparse/--full family is now `loom-daemon worktree-sparse`, including
@@ -2341,6 +2433,7 @@ jobs:
       # remaining four exercise create-path arms these slices did not touch
       # and stay hermetic in shell-suite-tests.
       - name: worktree sentinel back-fill on re-invoke (#3548; --sparse/--full ported in #8195 slice 10)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-worktree-sentinel-reinvoke.sh
       # Moved out of shell-suite-tests by #8191's delete-branch slice:
       # merge-pr.sh's `_maybe_delete_local_branch` now delegates to
@@ -2350,6 +2443,7 @@ jobs:
       # sources that function — needs the binary this job downloads. All six pin
       # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
       # #9576 / PR #9581 review, extended by #9416: the stub-driven
       # verdict-staleness-guard suite (shell-suite-tests) cannot prove what lives
@@ -2358,16 +2452,22 @@ jobs:
       # kill switches — so this sibling drives the guard against the binary this
       # job downloads.
       - name: verdict-staleness-guard equivalence exemption, real verb (#9576, #9416)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-verdict-staleness-guard-tree.sh
       - name: merge-pr dirty-worktree guard (#5031, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh
       - name: merge-pr primary-checkout advice (#4171, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-primary-checkout-advice.sh
       - name: merge-pr primary-worktree guard (#3710, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-primary-worktree-guard.sh
       - name: merge-pr worktree-remove diagnosis (#6372, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-remove-diagnosis.sh
       - name: cleanup-branches pr-* review-branch pass (#4405, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-cleanup-branches-pr-review-branch.sh
       # Moved out of shell-suite-tests by #8191's worktrees slice: the three
       # porcelain lookups this suite is ABOUT are now `loom-daemon merge-pr
@@ -2375,13 +2475,16 @@ jobs:
       # downloads. Like its siblings above it pins one via
       # loom_test_require_daemon_bin and FAILS rather than skips without one.
       - name: merge-pr worktree porcelain parsing (#3671, #3717, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-awk.sh
       # Moved out of shell-suite-tests by #8191's usage slice: merge-pr.sh's
       # --help text is `loom-daemon merge-pr usage` now, so both suites that
       # read --help pin this job's binary (--self-only) and FAIL without one.
       - name: merge-pr --help (#8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-help.sh
       - name: merge-pr --merge-method (#8845, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-merge-method.sh
       # Moved out of shell-suite-tests by #8191's async-close-race slice: Test 7
       # extracts merge-pr.sh's real `_issue_is_closed_for_cleanup` (#4186),
@@ -2391,6 +2494,7 @@ jobs:
       # loom_test_require_daemon_bin at file scope and FAILS rather than skips
       # without one, so it needs the binary this job downloads.
       - name: merge-pr async-close-race cleanup gate (#4186, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-worktree-path.sh
       # #9108: the mcp__loom__.* PreToolUse guard decision is
       # `loom-daemon guard-mcp-tools`, brand-new logic (no shell twin to
@@ -2401,6 +2505,7 @@ jobs:
       # is actually on the mcp__loom__* call path. FAILS rather than skips
       # without a binary.
       - name: mcp__loom__.* PreToolUse argument guard (#9107, #9108)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/hooks/tests/test-guard-mcp-tools.sh
       # Moved out of shell-suite-tests by #8191's check-runs-rollup slice:
       # merge-pr.sh's _wait_for_checks_then_sync_merge now reads its
@@ -2410,16 +2515,19 @@ jobs:
       # it via loom_test_require_daemon_bin --self-only and FAIL rather than
       # skip without one.
       - name: merge-pr wait-for-checks empty-settle guard (#6169, #9091, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
       # test-forge-check-runs-pagination.sh's Parts 1/2/4/5 (forge-helpers.sh
       # pagination, no daemon involved) move here with Part 3 rather than
       # splitting the suite.
       - name: forge check-runs pagination + truncated-read settle guard (#8895, #8987, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-forge-check-runs-pagination.sh
       # Its #3664 pending-vs-failing assertions used to mirror the retired jq
       # filters (passing against a copy); they now drive the real
       # `merge-pr check-runs-rollup`, pinned the same way.
       - name: merge-pr pending-vs-failing check-runs classification (#3664, #8191)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-unstable-fallback.sh
 
   native-port-daemon-lifecycle:
@@ -2436,8 +2544,12 @@ jobs:
     # them moved. Same trigger, same build, and the same FAIL-never-SKIP
     # contract without a binary.
     # The spawn-claude suite moved back to Native Port Suites (#9065 follow-up):
-    # with it, this job was the critical path (build-daemon, then 265s). Every
-    # suite runs under !cancelled(), so one red suite cannot hide the others.
+    # with it, this job was the critical path (build-daemon, then 265s). In
+    # this job, as in Native Port Suites (#9356), every suite step runs under
+    # `!cancelled() && steps.daemon-bin.outcome == 'success'`, so one red
+    # suite cannot hide the others yet no suite runs after a failed setup;
+    # the setup steps (checkout, git identity, download-artifact, --version)
+    # are unguarded and fail-fast.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2455,9 +2567,10 @@ jobs:
         with:
           name: loom-daemon-debug
           path: target/debug
-      - run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
+      - id: daemon-bin
+        run: chmod +x target/debug/loom-daemon && target/debug/loom-daemon --version
       # Moved out of shell-suite-tests by #8087, the same move #8086 made for
-      # the watchdog (now in native-port-watchdog-spawn) and for the same
+      # the watchdog (now further down this job) and for the same
       # reason: cli/loom-daemon-start.sh is now a thin stub over `loom-daemon
       # daemon-start`, so these three suites need the binary this job downloads.
       # Each pins it via loom_test_require_daemon_bin --self-only, which leaves
@@ -2484,13 +2597,13 @@ jobs:
       # giving them inside its concurrent pool — by construction rather than by
       # quarantine list.
       - name: loom-daemon-start (#4773, #6568, #7391, ported in #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-start.sh
       - name: loom-daemon-start launchd plist rendering (#5343, #6387, #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-launchd-plist.sh
       - name: loom-daemon-update (#4078, #6639, #8087)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-update.sh
       # Moved out of shell-suite-tests by #8086: cli/loom-daemon-watchdog.sh is
       # now a thin stub over `loom-daemon daemon-watchdog`, so these two suites
@@ -2506,7 +2619,7 @@ jobs:
       # nothing to bootout. On a developer host, run them through
       # run-ci-suites.sh — the guard still names test-loom-daemon-watchdog.sh.
       - name: loom-daemon-watchdog (#4011, #4398, #5118, ported in #8086)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-loom-daemon-watchdog.sh
 
   installer-tests:

@@ -828,7 +828,7 @@ fn token_ranking_fails_loudly_when_every_account_is_blocked() {
 /// tests above, or `None` when the test environment has no bash — mirrors
 /// `machine_layout_rendered_script_is_valid_shell`'s skip-not-fail
 /// posture for a bash-less CI image.
-fn which_bash() -> Option<PathBuf> {
+pub(super) fn which_bash() -> Option<PathBuf> {
     // Resolve an *absolute* path up front (rather than the bare name
     // "bash") so that setting `HOME` on the child process (below, to
     // point the rendered script's canonical PATH lookup at the stub
@@ -851,7 +851,7 @@ fn which_bash() -> Option<PathBuf> {
 }
 
 /// Write an executable shell-script stub at `path` (mode 0755).
-fn write_executable(path: &std::path::Path, contents: &str) {
+pub(super) fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, contents).unwrap();
     let mut perms = std::fs::metadata(path).unwrap().permissions();

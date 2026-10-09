@@ -123,8 +123,9 @@ use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use crate::eta::fleet_fetch::{ForgeRead, Installation, NoReader, Reader, ReaderForge, RepoTarget};
 use crate::eta::fleet_refresh::{self, Budgets, CycleReport, PassKind, RepoReport, StopReason};
 use crate::eta::fleet_signoz_history::EventsGate;
-use crate::eta::fleet_signoz_refresh::{Limits, SignozRead};
+use crate::eta::fleet_signoz_refresh::Limits;
 use crate::eta::Provenance;
+use crate::signoz_read::SignozRead;
 use crate::task_liveness::ETA_FLEET_REFRESH;
 use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
@@ -673,7 +674,8 @@ pub fn signoz_cycle(
     config: &crate::eta::config::FleetSignozConfig,
     now: DateTime<Utc>,
 ) -> Vec<crate::eta::fleet_signoz_refresh::FetchReport> {
-    use crate::eta::fleet_signoz_refresh::{run_cycle, ClickhouseHttp, Limits};
+    use crate::eta::fleet_signoz_refresh::{run_cycle, Limits, OUTCOMES_SQL};
+    use crate::signoz_read::{ClickhouseHttp, SqlPages};
     let Some(endpoint) = config.endpoint.clone() else {
         log::warn!(
             "eta fleet signoz: enabled but no endpoint configured \
@@ -681,11 +683,14 @@ pub fn signoz_cycle(
         );
         return Vec::new();
     };
-    let mut reader = ClickhouseHttp {
-        endpoint,
-        user: config.user.clone(),
-        credential_file: config.credential_file.clone(),
-        timeout: Duration::from_secs(60),
+    let mut reader = SqlPages {
+        http: ClickhouseHttp {
+            endpoint,
+            user: config.user.clone(),
+            credential_file: config.credential_file.clone(),
+            timeout: Duration::from_secs(60),
+        },
+        sql: OUTCOMES_SQL,
     };
     let limits = Limits {
         page_size: config.page_size,

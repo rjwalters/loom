@@ -1520,6 +1520,7 @@ impl SweepRegistry {
             entries: self.entries.clone(),
             children: self.children.keys().cloned().collect(),
             checkpoint_dir: self.config.checkpoint_dir(),
+            workspace_root: self.config.workspace_root.clone(),
             locks_dir: self.config.locks_dir(),
             quarantined_issues_sorted,
         }
@@ -1633,6 +1634,7 @@ pub struct RegistrySnapshot {
     /// `!self.children.contains_key` eligibility gate.
     children: HashSet<SweepId>,
     checkpoint_dir: PathBuf,
+    workspace_root: PathBuf,
     locks_dir: PathBuf,
     quarantined_issues_sorted: Vec<u32>,
 }
@@ -1670,6 +1672,7 @@ impl RegistrySnapshot {
         scan_stale_sweep_findings(
             self.entries.iter(),
             &|id| self.children.contains(id),
+            &self.workspace_root,
             min_age,
             log_silence_timeout,
         )

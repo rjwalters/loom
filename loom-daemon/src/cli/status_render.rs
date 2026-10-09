@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
@@ -1976,14 +1977,6 @@ pub(crate) fn print_status_human(
     // surfacing on `loom-daemon health`, this is the `status`-side
     // counterpart.
     let dispatch_starved_but_disagrees = ranking_diverges_from_starvation(report, &rc);
-    // #4903: while the saturation admission brake is holding, "the limiter is
-    // work availability" is flatly wrong and is the exact misread the issue was
-    // filed on — a worker at 12× overcommit rendered as an idle host with nine
-    // free slots. The limiter is the HOST. Print the brake's diagnosis in place
-    // of the generic line (the same suppression shape #4386 uses for the
-    // pre-flight tripwire), so an operator reading the capacity block top-to-
-    // bottom cannot miss it.
-    let saturation_note: Option<String> = saturation_hold_note(report, dispatch_cap);
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-daemon tokens check --json"
@@ -2043,28 +2036,14 @@ pub(crate) fn print_status_human(
         // underneath it would contradict it.
         if !dispatch_starved_but_disagrees {
             if !capacity_bound {
-                // In-flight is below the cap: nothing is binding. Naming tokens
-                // (or any resource) as "the bottleneck" here is the #4031
-                // defect — at, say, 1 in-flight against a cap of 7 the limiter
-                // is simply how much ready work exists. Suppress the
-                // token-bound diagnosis.
-                //
-                // #4386: while the pre-flight tripwire is active, this bare
-                // "work availability" line is actively misleading — every
-                // dispatch IS starting, it just dies within ~1s at
-                // claude-wrapper pre-flight, which reads as "no work" rather
-                // than "everything is crashing." The warning printed above
-                // already names the real cause, so suppress this line rather
-                // than let it stand uncontested.
-                if let Some(note) = &saturation_note {
-                    // #4903: the host, not work availability, is the limiter.
-                    println!("{note}");
-                } else if !report.preflight_advisory_active {
-                    println!(
-                        "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is \
-                         work availability, not disk/RAM/CPU)",
-                        report.in_flight.len(),
-                    );
+                // #4031: below the cap nothing is binding, so never name a
+                // resource. #9131: `below_cap_line` names any active dispatch
+                // hold (drain, breaker, brake, red main, pool) before blaming
+                // work availability; #4386 pre-flight suppression lives there too.
+                if let Some(line) =
+                    capacity_line::below_cap_line(report, dispatch_cap, "disk/RAM/CPU")
+                {
+                    println!("{line}");
                 }
             } else if rc.token_bound {
                 // #5305: `token_bound` means genuine starvation (zero healthy
@@ -2089,18 +2068,11 @@ pub(crate) fn print_status_human(
             report.token_pool_size
         );
         if !capacity_bound {
-            if let Some(note) = &saturation_note {
-                // #4903: same substitution as the ranking-present branch above.
-                println!("{note}");
-            } else if !report.preflight_advisory_active {
-                // #4386: same suppression as the ranking-present branch above —
-                // the warning printed at the top of `status` already names the
-                // real cause while the tripwire is active.
-                println!(
-                    "  not capacity-bound ({} in flight, cap {dispatch_cap} — the limiter is work \
-                     availability, not tokens/disk/CPU)",
-                    report.in_flight.len(),
-                );
+            // #9131: same line choice as the ranking-present branch above.
+            if let Some(line) =
+                capacity_line::below_cap_line(report, dispatch_cap, "tokens/disk/CPU")
+            {
+                println!("{line}");
             }
         }
     }

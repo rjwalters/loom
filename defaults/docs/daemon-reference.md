@@ -6655,9 +6655,15 @@ internal Judge or Doctor `Task` running **49–66 minutes (multi-hour in the wor
 cases) emitting zero output until the very end**, silently blocking the sweep's
 back half with no self-heal. The third backstop, running in the same watchdog
 tick, closes that gap: for each still-running daemon-dispatched sweep that has
-already made startup progress, it measures **log silence** (how long the
-per-sweep log file's mtime has gone un-advanced — a live sweep flushes tool
-output continuously, a hung one does not) and, past `reviewStallTimeoutSecs`
+already made startup progress, it measures **activity silence** — the
+minimum idle time over the per-sweep log file's mtime **and** the sweep's
+session transcripts (`~/.claude/projects/<slug>/*.jsonl` plus
+`subagents/*.jsonl`; #9533 — a headless `claude -p` sweep writes nothing to its
+log while it works, so log mtime alone is not liveness; unreadable signals
+are skipped and, with none readable, the sweep is left alone). The same
+predicate backs the stale-sweep backstop below. While a roll/drain is armed the
+watchdog neither cancels nor re-dispatches (a respawn would keep the drain from
+converging), and its log lines name the sweep's checkpoint phase. Past `reviewStallTimeoutSecs`
 (default 45 min), auto-cancels the wedged child and re-dispatches the issue
 **exactly once, bounded, never a loop**. The re-dispatch resumes from the sweep
 checkpoint, so the hung review phase is re-run — not the whole build. A second
@@ -11545,9 +11551,11 @@ not self-healing") — an operator must never be able to read "watchdog job
 installed" as "this host self-heals". The same explicit wording fires when no
 `loom-daemon-start.sh` is resolvable beside the watchdog.
 
-The confirmed-hang path (#4398, a wedged-but-alive daemon) stays report-only and
-is unchanged: the only real fix there is killing the process, which would equally
-kill a daemon under heavy legitimate load.
+The confirmed-hang path (#4398, a wedged-but-alive daemon) is a different case
+and is **report-only by default**: the only real fix there is ending the process,
+which would equally end a daemon under heavy legitimate load. A host may opt in to
+a narrow, bounded, supervised recovery for it — see "Opt-in hang recovery (#7855)"
+below. That path never touches the dead-daemon recovery above.
 
 | File | Env override | Config key | Default |
 |------|--------------|-----------|---------|
@@ -11568,6 +11576,10 @@ kill a daemon under heavy legitimate load.
 | recovery command budget (#5391) | `LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS` | — | `120` |
 | recovery command override (#5391) | `LOOM_WATCHDOG_RECOVER_CMD` | — | sibling `loom-daemon-start.sh` + allowlisted `.daemon.flags` |
 | outage escalation on/off (#5391) | `LOOM_WATCHDOG_ESCALATE` | — | on (one deduped `create-issue.sh` filing per episode) |
+| live-hang recovery on/off (#7855) | `LOOM_WATCHDOG_HANG_RECOVER` | `autonomous.watchdogHangRecover.enabled` (read at start, persisted to marker `watchdog_hang_recover=`) | **off** (report-only) |
+| live-hang dual-signal confirmations (#7855) | `LOOM_WATCHDOG_HANG_RECOVER_CONFIRMATIONS` | `autonomous.watchdogHangRecover.confirmations` (marker `watchdog_hang_recover_confirmations=`) | `3` (also the floor) |
+| live-hang restart cooldown (#7855) | `LOOM_WATCHDOG_HANG_RECOVER_COOLDOWN_SECS` | `autonomous.watchdogHangRecover.cooldownSecs` (marker `watchdog_hang_recover_cooldown_secs=`) | `1800` (also the floor) |
+| live-hang unhealed-restart cap (#7855) | `LOOM_WATCHDOG_HANG_RECOVER_MAX_UNHEALED` | `autonomous.watchdogHangRecover.maxUnhealed` (marker `watchdog_hang_recover_max_unhealed=`) | `3` |
 | provisioning-guard on/off (#5405) | `LOOM_WATCHDOG_PROVISIONING_GUARD` | `autonomous.watchdogProvisioningGuard.enabled` | `true` (on) |
 | provisioning-guard cadence (#5405) | `LOOM_WATCHDOG_PROVISIONING_GUARD_INTERVAL_SECS` | `autonomous.watchdogProvisioningGuard.intervalSecs` | `600` (10 min) |
 
@@ -11652,13 +11664,67 @@ CLI, with these properties:
   does not know the probe subcommand, or a daemon-side *application* error (which
   proves IPC works) all skip the probe rather than invent a divergence. The probe
   never becomes a new hard dependency that pages on its own absence.
-- **Report-only, deliberately.** Unlike #4232's narrow auto-`kickstart`, there is
-  no provably-safe unattended remediation for a wedged-but-alive process — the
-  only real fix is killing it, which would equally kill a daemon merely under
-  heavy legitimate load. A confirmed hang escalates to a maximally actionable
-  DIVERGENCE report (distinct `IPC UNRESPONSIVE (CONFIRMED)` text, explicit
-  recovery commands, exit `1`) and stops there. Auto-kill remediation, if ever
-  wanted, needs its own narrow provably-safe gate.
+- **Report-only by default.** Unlike #4232's narrow auto-`kickstart` of a dead
+  job, there is no provably-safe unattended remediation for a wedged-but-alive
+  process — the only real fix is ending it, and a failed round-trip is also what a
+  daemon merely under heavy legitimate load looks like, so an IPC-only trigger
+  would misfire on exactly the busiest hosts. By default a confirmed hang
+  escalates to a maximally actionable DIVERGENCE report (distinct `IPC
+  UNRESPONSIVE (CONFIRMED)` text, explicit recovery commands, exit `1`) and stops
+  there, saying "No automatic kill/restart is attempted".
+- **Opt-in hang recovery (#7855).** The narrow gate the previous bullet asked
+  for, accepted by the owner's 2026-09-18 ruling and OFF unless enabled:
+  - *How it is enabled.* Start the daemon with `LOOM_WATCHDOG_HANG_RECOVER=1
+    ./.loom/scripts/cli/loom-daemon-start.sh …`, or set
+    `autonomous.watchdogHangRecover.enabled: true` in the starting repo's
+    effective config (`.loom/config.json` and its tiers). The scheduled watchdog
+    job's environment (rendered by `daemon_start/watchdog_job.rs`) carries only
+    paths and the job never reads a config file, so the **start** resolves each
+    setting as **env > config > the prior marker's value > off** and persists
+    the result — and the three tunables in the table above — into the
+    autonomy-desired marker's `watchdog_hang_recover*` fields, which the
+    watchdog reads every tick (env > marker > off there; the environment only
+    matters for a hand-run watchdog). Carrying the prior value means a
+    self-update relaunch or a #5391 watchdog recovery does not silently disable
+    it; `LOOM_WATCHDOG_HANG_RECOVER=0` or config `false` turns it off; an
+    operator stop (which deletes the marker) drops it. A marker healed by the
+    daemon itself (#4331) has no field, i.e. off. A config change takes effect
+    at the next start.
+  - *Trigger.* At least `CONFIRMATIONS` (≥3) **consecutive CONFIRMED ticks** on
+    which the IPC round-trip failed **and** the heartbeat is positively stale for
+    the current boot (older than its threshold, and no older than the process).
+    This dual-signal streak lives in `<loom_dir>/.watchdog-hang-streak`, keyed to
+    the pid, and is separate from the raw IPC-failure threshold above, so the
+    earliest restart is several ticks after the first CONFIRMED line. A fresh,
+    missing, unreadable, prior-boot, or unprovable heartbeat never counts and
+    resets the streak, as does any healthy, sub-threshold, or skipped
+    (startup-grace) tick.
+  - *Bounds.* At most one automatic restart per `COOLDOWN_SECS` (≥1800), recorded
+    in `<loom_dir>/.watchdog-hang-recover-state`. That record is **not** keyed to
+    the pid, so it survives the restart it causes and any watchdog restart. A
+    sibling `.lock` directory serialises concurrent watchdog invocations, and the
+    record is re-read under the lock, so two ticks cannot both restart. The
+    attempt is written **before** the command runs. A corrupt record is aged from
+    its mtime, and an unwritable one refuses the restart. Restarts with no
+    healthy IPC tick between them (failed commands included) are capped at
+    `MAX_UNHEALED`, after which the hang-recovery breaker stays open until a
+    healthy tick or deletion of the record. A wedge inside the window still
+    reports the CONFIRMED DIVERGENCE with the recovery commands.
+  - *Action.* Only the supervisor's own restart of the job it is **proven** to
+    own: liveness must have reported this pid alive under that exact service.
+    That means `launchctl kickstart -k <domain>/<label>` or `systemctl --user
+    restart <unit>`, bounded at 120s (both wait for the wedged process to
+    stop). There is never a bare `kill`, never an unsupervised fallback, and
+    nothing goes over the wedged socket (so not `loom-daemon restart`). A pid-file-only daemon stays report-only. The
+    marker, operator-stop/drain record (#9588) and host opt-out are re-checked
+    under the lock immediately before acting.
+  - *Evidence.* Every automatic restart logs a `[DIVERGENCE] HANG RECOVERY
+    (#7855 …)` line with the IPC detail and streak, heartbeat age and threshold,
+    the dual-signal streak, host load average, the supervisor command and its
+    result, and the remaining bounds.
+  - *Unchanged.* The dead-daemon paths keep their own argv and gates: plain
+    `kickstart` (never `-k`) or `reset-failed`+`start` under the #4232/#4862
+    gate, and #5391's bounded `loom-daemon-start.sh` recovery.
 
 The last no-marker row is the #4331 fix. Before it, a missing marker short-circuited to a
 bare `[OK] … nothing to check` **without probing reality at all** — so a

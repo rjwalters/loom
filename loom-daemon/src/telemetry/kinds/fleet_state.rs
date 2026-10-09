@@ -139,6 +139,74 @@ pub enum FleetSlot {
     Overflow,
 }
 
+/// Why a held item is held, as `fleet.state` reports it. Neutral (not tied to
+/// the ETA subsystem); the wire strings are the long-standing snake_case hold
+/// names, so a reader can join them with historical hold data. All eight
+/// values are carried even when this host's emitter can only tell some of
+/// them from labels (the marker-refined `merge_risk` / `critical_file` /
+/// `ac_hold` split is left to the reader).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHoldKind {
+    /// `loom:operator`.
+    Operator,
+    /// `loom:operator-only` (or `-mechanical`).
+    OperatorOnly,
+    /// `loom:operator-decision`.
+    OperatorDecision,
+    /// Champion's merge-risk hold.
+    MergeRisk,
+    /// Champion's critical-file hold.
+    CriticalFile,
+    /// Champion's acceptance-criteria hold.
+    AcHold,
+    /// `loom:blocked` alone.
+    Blocked,
+    /// A hold label none of the above names.
+    Other,
+}
+
+impl FleetHoldKind {
+    /// Every kind.
+    pub const ALL: [FleetHoldKind; 8] = [
+        FleetHoldKind::Operator,
+        FleetHoldKind::OperatorOnly,
+        FleetHoldKind::OperatorDecision,
+        FleetHoldKind::MergeRisk,
+        FleetHoldKind::CriticalFile,
+        FleetHoldKind::AcHold,
+        FleetHoldKind::Blocked,
+        FleetHoldKind::Other,
+    ];
+
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetHoldKind::Operator => "operator",
+            FleetHoldKind::OperatorOnly => "operator_only",
+            FleetHoldKind::OperatorDecision => "operator_decision",
+            FleetHoldKind::MergeRisk => "merge_risk",
+            FleetHoldKind::CriticalFile => "critical_file",
+            FleetHoldKind::AcHold => "ac_hold",
+            FleetHoldKind::Blocked => "blocked",
+            FleetHoldKind::Other => "other",
+        }
+    }
+}
+
+/// A repo's `main` CI status as this host's main-health gate last saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainCi {
+    /// The gate evaluated `main` and it is green.
+    Green,
+    /// The gate verified `main` red (dispatch halted).
+    Red,
+    /// The gate has not evaluated `main`, or could not.
+    Unknown,
+}
+
 fn is_zero(n: &u8) -> bool {
     *n == 0
 }
@@ -192,6 +260,23 @@ pub struct FleetStateRow {
     /// `ready_wait` only: a red-main fix the planner boosted this tick.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub main_red_fix: bool,
+    /// The item is under a hold (operator or `loom:blocked`) now. Absent when
+    /// it is not. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_kind: Option<FleetHoldKind>,
+    /// When the current hold began. Present exactly when `hold_kind` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<DateTime<Utc>>,
+    /// `held_since` is a lower bound (first seen held), not an observed
+    /// transition. Absent when exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_since_lower_bound: bool,
+    /// The hold was released; the instant this host first saw it clear. Set
+    /// on the row that clears the hold, with `hold_kind` and `held_since`
+    /// absent, and kept while the row is otherwise unchanged. A row that
+    /// leaves while held gets none: its removal is the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_released_at: Option<DateTime<Utc>>,
 }
 
 impl FleetStateRow {
@@ -213,6 +298,10 @@ impl FleetStateRow {
             fleet_priority: None,
             created_at: None,
             main_red_fix: false,
+            hold_kind: None,
+            held_since: None,
+            held_since_lower_bound: false,
+            hold_released_at: None,
         }
     }
 }
@@ -239,6 +328,10 @@ pub struct FleetStateRepo {
     pub repo: String,
     #[serde(default)]
     pub visibility: RepoVisibility,
+    /// This repo's `main` CI status from the main-health gate. Absent when
+    /// the host did not read it (an older emitter). Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_ci: Option<MainCi>,
     /// The census. Absent means unknown at `as_of`, because the repo's
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +368,34 @@ pub struct FleetSlots {
     /// Occupied slots when the tick finished, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occupancy: Option<u32>,
+}
+
+/// Host-level capacity beside [`FleetSlots`] (which it never repeats). Every
+/// field is a discrete fact: a continuous utilisation fraction would turn
+/// every pass into a delta, so none is carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetCapacity {
+    /// Sweeps this host runs now.
+    #[serde(default)]
+    pub live_workers: u32,
+    /// Token accounts the rotation ranking calls healthy. Absent when the
+    /// ranking is unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_usable: Option<u32>,
+    /// Token accounts the ranking calls exhausted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts_exhausted: Option<u32>,
+    /// Host-load breaker phase (`closed`, `open`, `cooldown`). Absent when
+    /// none is registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_breaker: Option<String>,
+    /// Forge rate-limit breaker phase. Absent when none is registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_breaker: Option<String>,
+    /// The admission brake is holding new dispatch. Absent when none is
+    /// registered or it is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_brake_held: Option<bool>,
 }
 
 /// The planner regime a record was observed under.
@@ -327,6 +448,9 @@ pub struct FleetStateRecord {
     /// Slot use from the last dispatch plan, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<FleetSlots>,
+    /// Host capacity beside `slots`, when read. Additive on `fleet-state/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<FleetCapacity>,
     /// On an anchor, every repo with rows or a census. On a delta, only the
     /// repos that changed. Ordered by repo. A chunk carries a slice of them;
     /// one repo's rows may span chunks.

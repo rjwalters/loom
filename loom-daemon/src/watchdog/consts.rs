@@ -35,6 +35,16 @@ pub const DEFAULT_RECOVER_BACKOFF_CAP_SECS: u64 = 1800;
 pub const MIN_HEARTBEAT_STALE_SECS: u64 = 300;
 /// Multiple of the declared heartbeat cadence used as the staleness threshold.
 pub const HEARTBEAT_STALE_CADENCE_MULTIPLE: u64 = 5;
+/// #7855: consecutive CONFIRMED dual-signal ticks (failed IPC AND a positively
+/// stale current-boot heartbeat) before opt-in hang recovery may act. Also the
+/// FLOOR: the owner's ruling is "at least three", so a smaller value is raised.
+pub const HANG_RECOVER_MIN_CONFIRMATIONS: u64 = 3;
+/// #7855: at most one automatic hang restart per this many seconds. Also the
+/// FLOOR (the ruling is "at most one restart per >=30 min").
+pub const HANG_RECOVER_MIN_COOLDOWN_SECS: u64 = 1800;
+/// #7855: hang restarts allowed without an intervening healthy IPC tick before
+/// the hang-recovery breaker latches open.
+pub const HANG_RECOVER_DEFAULT_MAX_UNHEALED: u64 = 3;
 
 /// State files, each overridable so a test can point them at a tempdir.
 pub struct StateFiles {
@@ -44,6 +54,11 @@ pub struct StateFiles {
     pub escalation_sentinel: PathBuf,
     pub peer_coord_sentinel: PathBuf,
     pub peer_coord_cooldown: PathBuf,
+    /// #7855: per-pid dual-signal streak (`<pid> <count>`).
+    pub hang_streak: PathBuf,
+    /// #7855: durable hang-recovery cooldown/attempt record. NOT keyed by pid:
+    /// it must survive the restart it causes.
+    pub hang_state: PathBuf,
 }
 
 impl StateFiles {
@@ -68,6 +83,8 @@ impl StateFiles {
                 "LOOM_WATCHDOG_PEER_COORD_COOLDOWN_STATE",
                 ".watchdog-peer-coord-cooldown",
             ),
+            hang_streak: at("LOOM_WATCHDOG_HANG_RECOVER_STREAK_STATE", ".watchdog-hang-streak"),
+            hang_state: at("LOOM_WATCHDOG_HANG_RECOVER_STATE", ".watchdog-hang-recover-state"),
         }
     }
 }

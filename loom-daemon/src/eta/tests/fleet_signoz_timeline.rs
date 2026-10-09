@@ -10,15 +10,14 @@
 //! producer, so they appear only as synthetic rows built here
 //! ([`label_set`]).
 
-use crate::eta::fleet_signoz_refresh::{
-    FileRows, Limits, PageQuery, ReadError, SignozRead, SignozStop,
-};
+use crate::eta::fleet_signoz_refresh::{Limits, SignozStop};
 use crate::eta::fleet_signoz_timeline::{Family, Timeline, MATCH_SLACK_SEC};
 use crate::eta::fleet_signoz_timeline_rows::{
     parse_row, reject, walk, ItemKey, Lifecycle, ParsedRow, Row, RowBody, Source, Target,
     Transition, SERVICE_WEBHOOK, TIMELINE_SQL,
 };
 use crate::eta::WINDOW_DAYS;
+use crate::signoz_read::{FileRows, PageQuery, ReadError, SignozRead};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use std::collections::BTreeSet;
