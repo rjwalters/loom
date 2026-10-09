@@ -141,6 +141,7 @@ pub(crate) mod preflight;
 pub(crate) mod premise_check;
 pub(crate) mod provenance;
 pub(crate) mod quarantine;
+mod ram_scope_limit;
 pub(crate) mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;
 pub(crate) mod release_explain;

@@ -435,22 +435,20 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%" -p "OOMPolicy=continue")
         # MemoryMax from the daemon's observed per-repo peak (issue #11094):
         # an over-budget build fails inside its own cgroup rather than the
-        # kernel's global OOM killer choosing a victim. Best-effort: no
-        # history / disabled / memory controller not delegated => no limit.
-        _mem_lib="${_script_dir}/lib/memory-budget.sh"
-        if [[ -f "$_mem_lib" ]]; then
-            # shellcheck source=./lib/memory-budget.sh
-            source "$_mem_lib"
-            _mem_max_mb="$(loom_mem_scope_limit_mb "$(basename "$WORKSPACE")" "$(loom_mem_total_mb)" 2>/dev/null || true)"
-            if [[ "$_mem_max_mb" =~ ^[0-9]+$ ]]; then
-                if systemd-run --user --scope --quiet --unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope" -p "MemoryMax=${_mem_max_mb}M" -- true >/dev/null 2>&1; then
-                    _cpu_quota_props+=(-p "MemoryMax=${_mem_max_mb}M")
-                    log_info "spawn-claude: scope MemoryMax=${_mem_max_mb}M from observed per-repo peak (LOOM_SWEEP_MEMORY_MAX=0 disables; issue #11094)"
-                else
-                    log_warn "spawn-claude: MemoryMax=${_mem_max_mb}M rejected by systemd (memory controller not delegated?); scope runs without a memory limit (issue #11094)"
-                fi
-            fi
-        fi
+        # kernel's global OOM killer choosing a victim. The policy and the
+        # systemd probe live in `loom-daemon ram-scope-limit` (exit 0 apply,
+        # 3 rejected by systemd, anything else — incl. an older binary — no limit).
+        # requires-daemon: ram-scope-limit optional   #11094 — any non-0/3 exit (incl. an older binary's unknown-subcommand error) means the scope runs with no MemoryMax, exactly the pre-#11094 behaviour.
+        # shellcheck source=lib/locate-daemon-bin.sh
+        source "${_script_dir}/lib/locate-daemon-bin.sh"
+        _mem_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+        _mem_rc=0
+        _mem_max_mb="$([[ -n "$_mem_bin" ]] && "$_mem_bin" ram-scope-limit --workspace "$WORKSPACE" --probe 2>/dev/null)" || _mem_rc=$?
+        case "$_mem_rc:$_mem_max_mb" in
+            0:[0-9]*) _cpu_quota_props+=(-p "MemoryMax=${_mem_max_mb}M")
+                log_info "spawn-claude: scope MemoryMax=${_mem_max_mb}M from observed per-repo peak (LOOM_SWEEP_MEMORY_MAX=0 disables; issue #11094)" ;;
+            3:[0-9]*) log_warn "spawn-claude: MemoryMax=${_mem_max_mb}M rejected by systemd (memory controller not delegated?); scope runs without a memory limit (issue #11094)" ;;
+        esac
         if [[ "$_cpu_wallclock" != "0" ]]; then
             _cpu_quota_props+=(-p "RuntimeMaxSec=${_cpu_wallclock}")
         fi
