@@ -124,11 +124,23 @@ impl CheckArgs {
     fn verdict(&self) -> Option<String> {
         let policy = self.policy.resolve()?;
         let home = std::env::var("HOME").ok();
-        let hit = match (&self.command, &self.path) {
-            (Some(cmd), _) => policy.check_command(cmd, home.as_deref()),
-            (None, Some(path)) => policy.check_path(path, home.as_deref()),
+        // The Edit/Write hook canonicalizes its target (symlinks resolved), so
+        // a `$HOME` that itself traverses a symlink (macOS `/var` ->
+        // `/private/var`, Fedora Atomic `/home` -> `/var/home`) would never
+        // prefix-match it. Judge against the raw `$HOME` and, when it differs,
+        // its canonical form too — a path under either is below home.
+        let canonical_home = home
+            .as_deref()
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .filter(|c| Some(c.as_str()) != home.as_deref());
+        let check = |h: Option<&str>| match (&self.command, &self.path) {
+            (Some(cmd), _) => policy.check_command(cmd, h),
+            (None, Some(path)) => policy.check_path(path, h),
             (None, None) => None,
-        }?;
+        };
+        let hit = check(home.as_deref())
+            .or_else(|| canonical_home.as_deref().and_then(|c| check(Some(c))))?;
         Some(policy.deny_reason(&hit))
     }
 }
