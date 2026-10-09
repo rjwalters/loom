@@ -119,6 +119,7 @@ fn manifest(id: &str, phase: Phase, items: Vec<ManifestItem>) -> PauseManifest {
             staged_at: None,
             pause_started_at: Utc::now() - chrono::Duration::seconds(30),
             pause_completed_at: Some(Utc::now() - chrono::Duration::seconds(20)),
+            pause_duration_ms: None,
             pause_budget_secs: Some(120),
             min_resumable_age_secs: Some(300),
             max_age_secs: 900,
