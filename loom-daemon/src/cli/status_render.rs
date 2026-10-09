@@ -611,6 +611,7 @@ pub(crate) fn build_status_json_value_for(
         "session_containers": report.session_containers,
         "auto_update": {
             "enabled": report.auto_update_enabled,
+            "mode": report.auto_update_mode, // #10954
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
@@ -2806,7 +2807,8 @@ pub(crate) fn print_status_human(
     // Autonomous self-update loop (#4055) — the daemon-side loop that acts on the
     // staleness above. Only rendered when enabled (opt-in); otherwise silent.
     if report.auto_update_enabled {
-        print!("Auto-update loop: enabled");
+        // #10954: the mode says why the loop runs (e.g. for the fleet floor alone).
+        print!("Auto-update loop: {}", report.auto_update_mode.as_deref().unwrap_or("enabled"));
         match &report.auto_update_last_check {
             Some(ts) => print!(" (last check {})", ts.format("%Y-%m-%dT%H:%M:%SZ")),
             None => print!(" (no check yet)"),

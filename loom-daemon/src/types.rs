@@ -1387,6 +1387,11 @@ pub struct DaemonStatusReport {
     /// mirroring the `draining` forward-compat convention.
     #[serde(default)]
     pub auto_update_enabled: bool,
+    /// Why the self-update loop runs, and in which mode (#10954), e.g. `fleet
+    /// floor only (autoUpdate.enabled=false)`. `None` before the spawn decision
+    /// and from an older daemon, which then renders as plain `enabled`.
+    #[serde(default)]
+    pub auto_update_mode: Option<String>,
     /// Wall-clock time of the auto-update loop's most recent staleness check
     /// (Issue #4055), or `None` when the loop has not ticked yet (or is
     /// disabled). `#[serde(default)]` keeps pre-#4055 wire data compatible.

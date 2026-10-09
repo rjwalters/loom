@@ -359,9 +359,13 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // #10719: and the highest daemon version a registered workspace needs.
     state
         .repo_ahead
-        .set_basis(floor_roll::repo_ahead::Demand::live(), env!("CARGO_PKG_VERSION"));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline)
+        .set_basis(floor.demand(), env!("CARGO_PKG_VERSION"));
+    // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
+    // nothing on a tick where the host has no fleet store.
+    let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match idle {
+        Some(note) => idle_tick(state, status, note),
+        None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
     }));
     let summary = result.unwrap_or_else(|payload| {
         let note = format!(
@@ -378,6 +382,16 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state.persist_state();
     tick_telemetry::emit(&summary, state.consecutive_failures, started_at, started.elapsed());
     summary
+}
+
+/// A tick that checks nothing (#10954, [`loop_mode::idle_reason`]): no
+/// release is resolved, nothing is fetched and no roll is armed.
+fn idle_tick(state: &mut AutoUpdateState, status: &AutoUpdateStatus, note: String) -> TickSummary {
+    log::info!("auto_update: {note}");
+    state.clear_tracking();
+    let unchecked = ArtifactResolution::Unresolved("not checked".to_string());
+    status.publish(state.snapshot(true, Utc::now(), note.clone(), &unchecked));
+    TickSummary::new(None).finish(TickDecisionKind::Skip, note, &unchecked, None)
 }
 
 /// Spawn the **single** process-global auto-update loop on the shared daemon
@@ -418,6 +432,8 @@ where
 pub(super) struct FloorFeed {
     read: Arc<dyn Fn() -> crate::fleet_sync::FloorKnowledge + Send + Sync>,
     wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
+    /// #10719: the highest daemon version a registered workspace needs.
+    demand: Arc<dyn Fn() -> Option<floor_roll::repo_ahead::Demand> + Send + Sync>,
 }
 
 impl FloorFeed {
@@ -426,6 +442,7 @@ impl FloorFeed {
         Self {
             read: Arc::new(crate::fleet_sync::floor_knowledge),
             wake: Arc::new(crate::fleet_sync::floor_wake),
+            demand: Arc::new(floor_roll::repo_ahead::Demand::live),
         }
     }
 
@@ -438,7 +455,15 @@ impl FloorFeed {
         Self {
             read: Arc::new(read),
             wake: Arc::new(move || wake),
+            demand: Arc::new(|| None),
         }
+    }
+
+    /// The same feed, with a fixed repo-ahead demand (#10719).
+    #[cfg(test)]
+    pub(super) fn with_demand(mut self, demand: floor_roll::repo_ahead::Demand) -> Self {
+        self.demand = Arc::new(move || Some(demand.clone()));
+        self
     }
 
     fn knowledge(&self) -> crate::fleet_sync::FloorKnowledge {
@@ -447,6 +472,10 @@ impl FloorFeed {
 
     fn wake(&self) -> &'static crate::fleet_sync::FloorWake {
         (self.wake)()
+    }
+
+    fn demand(&self) -> Option<floor_roll::repo_ahead::Demand> {
+        (self.demand)()
     }
 }
 

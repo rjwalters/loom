@@ -95,6 +95,7 @@ fn test_daemon_status_request_response_round_trip() {
         drain_paused_by_day: std::collections::BTreeMap::new(),
         pause_resume: None,
         auto_update_enabled: true,
+        auto_update_mode: Some("fleet floor only (autoUpdate.enabled=false)".to_string()),
         auto_update_last_check: Some(chrono::Utc::now()),
         auto_update_last_roll: Some(chrono::Utc::now()),
         auto_update_consecutive_failures: 2,
@@ -288,6 +289,10 @@ fn test_daemon_status_request_response_round_trip() {
             assert_eq!(r.disk_headroom, 10);
             assert_eq!(r.logical_cpus, 8);
             assert!(r.auto_update_enabled);
+            assert_eq!(
+                r.auto_update_mode.as_deref(),
+                Some("fleet floor only (autoUpdate.enabled=false)")
+            );
             assert_eq!(r.auto_update_consecutive_failures, 2);
             assert_eq!(r.auto_update_backoff_secs, Some(120));
             assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));

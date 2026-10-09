@@ -815,10 +815,13 @@ section records what replaced it. It does not change the roll machine above.
 **Every fleet host has a floor.** `loom_min_version` is a required field of
 the fleet store. On startup and on every tick the daemon compares it with the
 version it is running and acts on that tick, through `trigger_pause_roll`.
+This holds on **every fleet host, whatever `autonomous.autoUpdate.enabled`
+says** (operator ruling 2026-10-08, #10954).
 
 | Floor knowledge | Running vs floor | Behaviour |
 |---|---|---|
-| no fleet store (not a fleet host) | n/a | Opt-in autoUpdate, unchanged apart from the window: artifact path and source path behind the settle gate and its `6 × settleSecs` ceiling. `target_source = autoupdate`. |
+| no fleet store (not a fleet host), `autoUpdate.enabled=false` | n/a | No loop, no roll, as before. |
+| no fleet store (not a fleet host), `autoUpdate.enabled=true` | n/a | Opt-in autoUpdate, unchanged apart from the window: artifact path and source path behind the settle gate and its `6 × settleSecs` ceiling. `target_source = autoupdate`. |
 | unknown | n/a | No roll for the floor. The tick's note says the floor is not known and why. Fail closed: a host that may have a floor must not chase the latest release. A workspace that needs a newer daemon (`repo_ahead`, below) still rolls the host, to a real published release. |
 | set | below; the newest release is at or above the floor | Floor roll on this tick. No settle. The target is the newest release at or above the floor, at its exact tag. |
 | set | below; the newest release is below the floor | The `FloorStallReport` ERROR alert; dispatch continues. The host does not roll to the newest release instead. |
@@ -864,5 +867,31 @@ Consequences:
   record's `window` object is ignored on load and dropped on the next write,
   and a binary from before this change reads the new record (its `window`
   defaults to absent), so a rollback keeps the settle clocks.
-- **Unchanged.** The self-update loop, and so the floor check, still runs
-  only when `autonomous.autoUpdate.enabled` is true.
+- **The loop runs on every fleet host (#10954).** Before #10954 the loop,
+  and so the floor check, ran only when `autonomous.autoUpdate.enabled` was
+  true (default false), so a fleet host with it off never compared itself
+  with the floor. The spawn decision is now a pure function of the floor
+  knowledge at spawn and `enabled` (`auto_update::loop_mode`):
+
+  | Floor knowledge at spawn | `autoUpdate.enabled` | Loop | Mode (status) |
+  |---|---|---|---|
+  | `Set` or `Unknown` (a fleet host) | false | spawned | `fleet floor only (autoUpdate.enabled=false)` |
+  | `Set` or `Unknown` (a fleet host) | true | spawned | the same tick; `enabled` has no effect |
+  | `NoStore` | true | spawned | chase-latest, settle-gated |
+  | `NoStore` | false | not spawned | off |
+
+  `fleet_sync::start` is awaited before the loop is spawned, so the
+  classification is known. A store that is named but unusable is `Unknown`:
+  the loop runs and does nothing for the floor. It is still one loop and one
+  roll path; nothing else ticks. A workspace that needs a newer daemon
+  (`repo_ahead`) rolls a fleet host with autoUpdate off too. Should a loop
+  spawned for the floor alone see `NoStore` on a later tick, that tick checks
+  nothing rather than chase the newest release.
+- **No per-host opt-out.** Neither `autoUpdate.enabled=false` nor the fleet
+  store's `paused` run state keeps a fleet host from a floor roll. A
+  fleet-paused host below the floor still rolls: the roll replaces the pause's
+  hold with a supervised drain, restarts once nothing is in flight, and the
+  daemon comes back still paused (#10979). An operator stop on record
+  (written by `restart --drain --then-exit` or `fleet drain`) holds a roll,
+  and that tick is skipped; `restart --abort-drain` clears the record and
+  releases the hold. A `stopped` host exits at boot, before the loop exists.
