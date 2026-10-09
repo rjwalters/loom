@@ -16,8 +16,8 @@
 //!   one explanatory comment ([`notice_body`], deduplicated by
 //!   [`NOTICE_MARKER`]). A trusted actor adopts it by applying `loom:issue` by
 //!   hand, or by re-filing it;
-//! - the inputs could not be read -> [`Gate::Unavailable`]: no promotion and
-//!   no comment this pass (fail closed, never spam).
+//! - the issue or its author could not be read -> [`Gate::Unavailable`]: no
+//!   promotion and no comment this pass (fail closed, never spam).
 //!
 //! Passing the gate is not approval: every other promotion criterion still
 //! applies.
@@ -91,9 +91,12 @@ fn describe(author: &Author) -> String {
 /// The gate for one REST issue object (`user`, `author_association`,
 /// `number`). `issue` is `None` when it could not be read.
 /// `admin_roster_expected` is whether a fleet store is configured: then an
-/// unreadable admin roster leaves a user author undecided (one of its admins
-/// may have filed the issue), so the answer is [`Gate::Unavailable`] rather
-/// than a hold notice.
+/// unreadable admin roster still holds a user author (the roster widens
+/// nothing when it cannot be read, exactly as in [`TrustPolicy`]), and the
+/// reason says so. The gate is re-asked on every pass, so a fleet admin's
+/// issue is promoted once the roster loads; failing toward one deduplicated
+/// notice keeps an outside author's hold explained even on a host that can
+/// never read the store.
 #[must_use]
 pub fn decide(issue: Option<&Value>, policy: &TrustPolicy, admin_roster_expected: bool) -> Gate {
     let Some(issue) = issue.filter(|i| i.is_object()) else {
@@ -111,14 +114,15 @@ pub fn decide(issue: Option<&Value>, policy: &TrustPolicy, admin_roster_expected
         // to trust, and no one to name in a notice: hold silently.
         return Gate::Unavailable("the issue's author could not be read".to_string());
     }
-    if !author.app && admin_roster_expected && policy.admins_loaded() == Some(false) {
-        return Gate::Unavailable(
-            "the fleet admin roster could not be read, so a user author is undecided".to_string(),
-        );
-    }
+    let roster_note =
+        if !author.app && admin_roster_expected && policy.admins_loaded() == Some(false) {
+            " (the fleet admin roster could not be read; a later pass re-checks)"
+        } else {
+            ""
+        };
     Gate::Hold(format!(
         "its author {} is not a trusted author (repo insider, this fleet's App, this daemon, \
-         forge.trustedCommenters or a fleet admin)",
+         forge.trustedCommenters or a fleet admin){roster_note}",
         describe(&author)
     ))
 }

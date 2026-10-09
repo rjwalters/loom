@@ -130,8 +130,8 @@ from the REST issue object so a fleet App is spelled `x[bot]`
 | `GATE=` | Meaning | Promote? | Comment |
 |---|---|---|---|
 | `ELIGIBLE` | The author is trusted | Yes, on the other criteria | none |
-| `HOLD` | The author is untrusted | No: stays `loom:curated` | once (`NOTICE=needed`), deduplicated by a trusted `<!-- loom:promotion-author-gate -->` comment |
-| `UNAVAILABLE` | The issue, its author, or (with a fleet store configured, for a user author) the admin roster could not be read | No | none |
+| `HOLD` | The author is untrusted (an unreadable admin roster widens nothing; the reason says so, and a later pass re-checks) | No: stays `loom:curated` | once (`NOTICE=needed`), deduplicated by a trusted `<!-- loom:promotion-author-gate -->` comment |
+| `UNAVAILABLE` | The issue or its author could not be read | No | none |
 
 Callers branch on the `GATE=` line, never the exit code; anything but
 `ELIGIBLE`, including no output from a binary predating the verb, means do

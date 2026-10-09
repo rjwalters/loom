@@ -124,19 +124,26 @@ fn failed_reads_never_promote_and_never_post() {
 }
 
 #[test]
-fn an_unreadable_admin_roster_leaves_a_user_author_undecided() {
+fn an_unreadable_admin_roster_widens_nothing_and_says_so() {
     let down = policy().with_admins(Admins::unavailable("forge unreachable"));
     let user = issue("turian", "User", "NONE");
-    // A configured store whose roster could not be read: no hold notice.
-    assert!(matches!(decide(Some(&user), &down, true), Gate::Unavailable(_)));
-    // No store configured at all: the roster cannot name anyone, so hold.
-    assert!(matches!(decide(Some(&user), &down, false), Gate::Hold(_)));
-    // An App is never on the admin roster: an outside bot is held either way.
-    let bot = issue("dependabot[bot]", "Bot", "NONE");
-    assert!(matches!(decide(Some(&bot), &down, true), Gate::Hold(_)));
+    // A configured store whose roster could not be read: still a hold (the
+    // roster widens nothing), and the reason names the roster.
+    let gate = decide(Some(&user), &down, true);
+    assert!(matches!(gate, Gate::Hold(_)), "{gate:?}");
+    assert!(gate.reason().contains("admin roster could not be read"), "{}", gate.reason());
+    // No store configured at all: a plain hold.
+    let gate = decide(Some(&user), &down, false);
+    assert!(matches!(gate, Gate::Hold(_)) && !gate.reason().contains("could not be read"));
+    // An App is never on the admin roster: no roster note for an outside bot.
+    let bot = decide(Some(&issue("dependabot[bot]", "Bot", "NONE")), &down, true);
+    assert!(matches!(bot, Gate::Hold(_)) && !bot.reason().contains("could not be read"));
     // Insiders do not need the roster.
     let owner = issue("rjwalters", "User", "OWNER");
     assert!(matches!(decide(Some(&owner), &down, true), Gate::Eligible(_)));
+    // Once the roster loads, the same admin-authored issue is eligible.
+    let up = policy().with_admins(admins(&["turian"]));
+    assert!(matches!(decide(Some(&user), &up, true), Gate::Eligible(_)));
 }
 
 #[test]
