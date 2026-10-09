@@ -2,7 +2,7 @@
 //! forge state is a handful of files the test can edit between no-ops.
 
 use super::*;
-use crate::sweep_registry::test_support::{fake_gh_graphql_arm, fake_gh_timeline_rest_arm};
+use crate::sweep_registry::test_support::fake_gh_graphql_arm;
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
@@ -24,6 +24,22 @@ impl Forge {
             "labels": labels.iter().map(|l| l.trim_matches('"')).collect::<Vec<_>>(),
         });
         std::fs::write(self.ws.join(format!("issue-{n}.json")), json.to_string()).unwrap();
+    }
+    /// Linked PRs as `(number, state, merged)`; each body closes [`ISSUE`].
+    fn set_linked_prs(&self, prs: &[(u32, &str, bool)]) {
+        let lines: String = prs
+            .iter()
+            .map(|(n, state, merged)| {
+                format!(
+                    "{{\"number\":{n},\"state\":\"{state}\",\"merged\":{merged},\
+                     \"body\":\"Closes #{ISSUE}\"}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(self.ws.join("timeline.txt"), lines).unwrap();
+    }
+    fn fail_timeline(&self) {
+        std::fs::write(self.ws.join("timeline-fail"), "x").unwrap();
     }
     fn set_comments(&self, lines: &str) {
         std::fs::write(self.ws.join("comments.txt"), lines).unwrap();
@@ -75,7 +91,12 @@ fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
          if [[ -f \"{ws}/edit-fail\" ]]; then printf 'HTTP 422\\n' >&2; exit 1; fi\n\
          exit 0\n\
          fi\n\
-         {timeline}{gql}\
+         if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
+         if [[ -f \"{ws}/timeline-fail\" ]]; then exit 1; fi\n\
+         cat \"{ws}/timeline.txt\" 2>/dev/null\n\
+         exit 0\n\
+         fi\n\
+         {gql}\
          if [[ \"$1\" == \"api\" && \"$*\" == */comments* ]]; then\n\
          cat \"{ws}/comments.txt\" 2>/dev/null\n\
          exit 0\n\
@@ -94,7 +115,6 @@ fn forge_registry(threshold: u32) -> (SweepRegistry, Forge, tempfile::TempDir) {
          exit 0\n",
         log = log.display(),
         ws = ws.display(),
-        timeline = fake_gh_timeline_rest_arm("", 0),
         gql = fake_gh_graphql_arm("", 0),
     );
     let fake_gh = ws.join("fake-gh-noop-hold.sh");
@@ -513,5 +533,73 @@ fn checkpointed_curator_only_crash_feeds_the_hold_unless_externally_killed() {
     reg.note_prless_crash_outcome(ISSUE, "sweep-b", Some(1), 60, Some("builder-done"));
     assert_eq!(reg.noop_streak_count(ISSUE), 0, "past the Curator is not a no-op");
     reg.note_prless_crash_outcome(ISSUE, "sweep-1", Some(1), 60, Some("curator-done"));
+    assert_eq!(reg.noop_streak_count(ISSUE), 1);
+}
+
+/// A linked PR going closed-unmerged -> merged, or a second linked PR changing
+/// while the first stays open, each restart the streak (the "linked PR state
+/// changed" unpark criterion).
+#[test]
+#[serial]
+fn linked_pr_set_and_state_changes_restart_the_streak() {
+    let (mut reg, forge, _dir) = forge_registry(5);
+    forge.set_linked_prs(&[(10, "closed", false)]);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 2);
+    forge.set_linked_prs(&[(10, "closed", true)]);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1, "closed -> merged is a change");
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 2);
+    forge.set_linked_prs(&[(10, "open", false), (11, "open", false)]);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1, "a second linked PR is a change");
+    reg.record_noop_release(ISSUE, None);
+    forge.set_linked_prs(&[(10, "open", false), (11, "closed", false)]);
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1, "the second PR changing is a change");
+}
+
+/// A bare mention is not a link: it must not move the fingerprint.
+#[test]
+#[serial]
+fn a_pr_that_only_mentions_the_issue_is_not_a_linked_pr() {
+    let (mut reg, forge, _dir) = forge_registry(5);
+    reg.record_noop_release(ISSUE, None);
+    std::fs::write(
+        forge.ws.join("timeline.txt"),
+        format!("{{\"number\":9,\"state\":\"open\",\"merged\":false,\"body\":\"see #{ISSUE}\"}}\n"),
+    )
+    .unwrap();
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 2);
+}
+
+/// An unreadable timeline is inconclusive: never counted, never a release.
+#[test]
+#[serial]
+fn an_unreadable_linked_pr_timeline_is_inconclusive() {
+    let (mut reg, forge, _dir) = forge_registry(3);
+    reg.record_noop_release(ISSUE, None);
+    forge.fail_timeline();
+    reg.record_noop_release(ISSUE, None);
+    assert_eq!(reg.noop_streak_count(ISSUE), 1);
+}
+
+/// The checkpoint-less exit path honors the same external-kill exemption as
+/// the checkpointed one: exit 137/143 never advances the hold streak.
+#[test]
+#[serial]
+fn checkpointless_curator_only_exit_skips_external_kills() {
+    let (mut reg, _forge, _dir) = forge_registry(3);
+    for code in [137, 143] {
+        let sweep = format!("sweep-k{code}");
+        reg.seed_curator_only_history_for_test(&sweep);
+        reg.note_prless_exit_outcome(ISSUE, &sweep, None, Some(code), 60);
+        assert_eq!(reg.noop_streak_count(ISSUE), 0, "exit {code} is environmental");
+    }
+    reg.seed_curator_only_history_for_test("sweep-c");
+    reg.note_prless_exit_outcome(ISSUE, "sweep-c", None, Some(1), 60);
     assert_eq!(reg.noop_streak_count(ISSUE), 1);
 }

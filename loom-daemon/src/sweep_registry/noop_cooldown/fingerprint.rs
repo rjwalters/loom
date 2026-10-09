@@ -75,7 +75,7 @@ pub(super) struct IssueSnapshot {
     /// One `id:updated_at` entry per **non-bot, non-Loom-marker** comment, in
     /// forge order.
     pub(super) comments: Vec<String>,
-    /// The linked-PR segment: `none`, or `open:#N`.
+    /// The linked-PR segment: `none`, or each linking PR as `#N:open|closed|merged`.
     pub(super) linked_pr: String,
     /// `(reference, state)` per dependency the body names.
     pub(super) dependencies: Vec<(String, String)>,

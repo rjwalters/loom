@@ -162,6 +162,17 @@ const COMMENTS_JQ: &str = ".[] | select((.user.type // \"\") != \"Bot\") \
                            | \"\\(.id):\\(.updated_at)\"";
 
 /// `jq` over one issue: the facts the fingerprint and dependency scan read.
+/// `--jq` for [`SweepRegistry::read_linked_pr_states`]: one compact object per
+/// same-repo PR that cross-references the issue, any state. The repo slug goes
+/// between the head and tail.
+const LINKED_PRS_JQ_HEAD: &str = ".[] | select(.event == \"cross-referenced\" \
+     and .source.issue.pull_request != null \
+     and .source.issue.repository.full_name == \"";
+const LINKED_PRS_JQ_TAIL: &str = "\") | {number: .source.issue.number, \
+     state: .source.issue.state, \
+     merged: (.source.issue.pull_request.merged_at != null), \
+     body: (.source.issue.body // \"\")}";
+
 const ISSUE_JQ: &str = "{state: .state, body: .body, labels: [(.labels // [])[] | .name]}";
 
 impl SweepRegistry {
@@ -594,6 +605,55 @@ impl SweepRegistry {
         Some((open, body.to_owned(), labels))
     }
 
+    /// The linked-PR segment of the fingerprint: every PR in this repo that
+    /// links `issue` (same #6216 phrase filter as the dispatch guard, so a bare
+    /// mention is not a link) with its `open` / `closed` / `merged` state, or
+    /// `none`. One REST timeline read; `None` when it cannot be read or parsed,
+    /// which makes the snapshot inconclusive. Unlike the open-PR probe this sees
+    /// closed-unmerged and merged PRs and every PR of a set, so a state change
+    /// on any of them resets the streak and releases a persisted hold.
+    fn read_linked_pr_states(&self, slug: &str, issue: u32) -> Option<String> {
+        let path = format!("repos/{slug}/issues/{issue}/timeline");
+        let jq = format!("{}{slug}{}", LINKED_PRS_JQ_HEAD, LINKED_PRS_JQ_TAIL);
+        let out = self
+            .gh_read(
+                "noop_hold.linked_prs",
+                ["api", path.as_str(), "--paginate", "--jq", jq.as_str()],
+            )
+            .ok()??;
+        if !out.status.success() {
+            return None;
+        }
+        let phrase = crate::worktree_ops::gh::linkage_phrase_regex(issue)?;
+        let mut linked = std::collections::BTreeSet::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            let number = v.get("number")?.as_u64()?;
+            let state = v.get("state")?.as_str()?;
+            let merged = v.get("merged")?.as_bool()?;
+            let body = v.get("body").and_then(|b| b.as_str()).unwrap_or_default();
+            if !phrase.is_match(body) {
+                continue;
+            }
+            let state = if merged {
+                "merged"
+            } else if state.eq_ignore_ascii_case("open") {
+                "open"
+            } else {
+                "closed"
+            };
+            linked.insert(format!("#{number}:{state}"));
+        }
+        Some(if linked.is_empty() {
+            "none".to_string()
+        } else {
+            linked.into_iter().collect::<Vec<_>>().join(",")
+        })
+    }
+
     /// Build the [`IssueSnapshot`] for `issue`, or `None` when any part cannot
     /// be read (REST throughout: GraphQL exhaustion is routine at fleet
     /// scale). A dependency that cannot be read makes the snapshot
@@ -624,11 +684,7 @@ impl SweepRegistry {
             .filter(|l| !l.is_empty())
             .map(str::to_owned)
             .collect();
-        let linked_pr = match self.probe_open_linked_pr(issue) {
-            OpenPrProbe::Open(pr) => format!("open:#{pr}"),
-            OpenPrProbe::NoneOpen => "none".to_string(),
-            OpenPrProbe::ProbeFailed => return None,
-        };
+        let linked_pr = self.read_linked_pr_states(&slug, issue)?;
         let mut dependencies = Vec::new();
         for r in crate::dep_classify::refs::parse_named_blocker_refs(&body, &slug)
             .into_iter()

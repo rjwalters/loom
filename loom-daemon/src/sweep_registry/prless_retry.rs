@@ -621,8 +621,11 @@ impl SweepRegistry {
              without a self-reported no-op release (#6670)"
         );
         self.note_prless_terminal_outcome(issue, sweep_id, open_pr, &reason, exit_code);
-        // #10156: a Curator-only stop also feeds the no-op hold.
-        self.note_curator_only_outcome(issue, sweep_id, None);
+        // #10156: a Curator-only stop also feeds the no-op hold, except an
+        // externally-killed one (same exemption as the checkpointed path).
+        if external_kill_exemption(exit_code).is_none() {
+            self.note_curator_only_outcome(issue, sweep_id, None);
+        }
     }
 
     /// Record one **PR-less release** for `issue` (Issue #7972): a dispatch
