@@ -195,7 +195,8 @@ async fn attach_landing(record: &mut QueueSnapshotRecord) {
 /// `ops::disposition` since Issue #9222) so the two callers cannot drift onto
 /// different resolution rules. Only absolute paths are probed; the
 /// single-workspace loop's `workspace #N` placeholders stay unresolved.
-async fn resolve_repos(
+/// `fleet.state` (#10196) resolves its `ready_wait` rows through it too.
+pub(super) async fn resolve_repos(
     summary: &WorkFinderTickSummary,
     slug_cache: &mut HashMap<String, String>,
 ) -> HashMap<String, QueueRepoRef> {

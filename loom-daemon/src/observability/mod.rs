@@ -119,6 +119,7 @@ mod eta_friction;
 pub mod eta_nightly_folds;
 pub mod eta_snapshot;
 pub mod exporter;
+pub mod fleet_state;
 pub mod lifecycle;
 pub mod llm_billing;
 pub mod ops;
@@ -1251,6 +1252,9 @@ pub fn spawn_task(
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
+    // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
+    // built on the collector's snapshot pass whether or not ETA is enabled.
+    fleet_state::register_sink(otlp_queues.clone(), &host_id);
     let eta_handle =
         eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
     // #10414: the ETA pass runs inside the collector's 5-minute pass, which

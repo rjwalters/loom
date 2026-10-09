@@ -190,6 +190,8 @@ pub mod pr_resolved;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
+/// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
+pub mod fleet_state;
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
 
@@ -409,6 +411,14 @@ macro_rules! telemetry_kind_table {
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One host's in-flight items (stage, entered-at, PR, host, slot)
+            /// and per-repo open-PR census (Issue #10196). OTLP-only: the
+            /// replay contract's state record. A full anchor goes out hourly,
+            /// with deltas in between only when something changed. See
+            /// [`fleet_state`].
+            FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One daily-fit check, whether it fitted or skipped (Issue
