@@ -1518,6 +1518,7 @@ pub fn build_daemon_status_for(
         // thread; an unset global (loop never spawned) reads as the default
         // "disabled, never checked" snapshot.
         auto_update_enabled: au.enabled,
+        auto_update_mode: crate::auto_update::loop_mode::current().map(|m| m.describe().into()),
         auto_update_last_check: au.last_check,
         auto_update_last_roll: au.last_roll,
         auto_update_consecutive_failures: au.consecutive_failures,

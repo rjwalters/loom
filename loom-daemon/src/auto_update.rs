@@ -323,7 +323,8 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
 
 /// Resolve whether the loop is enabled with precedence **env > config >
 /// default(false)**. This loop is opt-in (side effects on the running process),
-/// so an absent config leaves it **off**.
+/// so an absent config leaves it **off**. #10954: on a fleet host the loop runs
+/// whatever this says; it governs only a host with no fleet store ([`loop_mode`]).
 #[must_use]
 pub fn resolve_enabled(config: &AutoUpdateConfig) -> bool {
     if let Ok(v) = std::env::var(AUTO_UPDATE_ENABLE_ENV) {
@@ -598,6 +599,8 @@ pub mod removed_settings;
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
 pub use tuning::TickTuning;
+/// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
+pub mod loop_mode;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.

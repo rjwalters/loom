@@ -120,6 +120,7 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         interval,
         settle,
         defer_deadline: Duration::from_secs(3600),
+        chase_enabled: true,
     }
 }
 
@@ -430,4 +431,119 @@ async fn a_floor_change_ticks_now_and_no_change_waits_for_the_interval() {
     let woken = tokio::time::timeout(guard, resolves.recv()).await;
     handle.abort();
     assert_eq!(woken, Ok(Some(2)), "the floor change ticked the loop at once");
+}
+
+// ===================================================================
+// #10954: the floor applies to every fleet host, autoUpdate on or off
+// ===================================================================
+
+/// `X.Y.Z` with the patch moved by `by`, from the version `guarded_tick`
+/// compares the floor with (this build's).
+fn running_plus(by: u64) -> String {
+    let running = env!("CARGO_PKG_VERSION");
+    let (head, patch) = running.rsplit_once('.').unwrap();
+    format!("{head}.{}", patch.parse::<u64>().unwrap() + by)
+}
+
+/// One `guarded_tick` of a loop spawned with `autonomous.autoUpdate.enabled`
+/// off, recording every roll the trigger is asked for.
+fn floor_only_tick(
+    feed: &FloorFeed,
+    artifact: ArtifactResolution,
+) -> (TickSummary, Vec<RollTarget>, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(artifact);
+    let resolves = probe.resolves.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let trigger = Trigger {
+        armed: Mutex::new(None),
+        arms: Some(tx),
+    };
+    let tune = TickTuning {
+        chase_enabled: false,
+        ..tuning(Duration::from_secs(900), Duration::from_secs(600))
+    };
+    let status = AutoUpdateStatus::new(true);
+    let (summary, _) =
+        capture(|| guarded_tick(&mut state(&dir), &status, &mut probe, &trigger, &tune, feed));
+    let mut arms = Vec::new();
+    while let Ok(target) = rx.try_recv() {
+        arms.push(target);
+    }
+    (summary, arms, resolves.load(Ordering::SeqCst))
+}
+
+fn set_floor(version: &str) -> FloorFeed {
+    feed(crate::fleet_sync::FloorKnowledge::Set(version.to_string())).0
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_below_the_floor_rolls_on_that_tick() {
+    let running = env!("CARGO_PKG_VERSION");
+    // The newest release (with its assets) is above the floor: it is the target.
+    let (summary, arms, _) =
+        floor_only_tick(&set_floor(&running_plus(1)), newer(&running_plus(2), running));
+    assert_eq!(summary.decision, TickDecisionKind::Fetch, "{}", summary.note);
+    assert!(summary.roll_armed, "{}", summary.note);
+    let [target] = arms.as_slice() else {
+        panic!("one trigger_pause_roll, got {arms:?}");
+    };
+    assert_eq!(target.source, pause_manifest::TargetSource::Floor);
+    assert_eq!(target.to_version.as_deref(), Some(running_plus(2).as_str()));
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_at_the_floor_ignores_a_newer_release() {
+    let running = env!("CARGO_PKG_VERSION");
+    // At the floor, and above it.
+    for floor in [running, "0.1.0"] {
+        let (summary, arms, _) =
+            floor_only_tick(&set_floor(floor), newer(&running_plus(3), running));
+        assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+        assert!(!summary.roll_armed);
+        assert!(arms.is_empty(), "{arms:?}");
+    }
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_and_an_unknown_floor_does_nothing() {
+    let running = env!("CARGO_PKG_VERSION");
+    let unknown = crate::fleet_sync::FloorKnowledge::Unknown("no pass yet".to_string());
+    let (summary, arms, _) = floor_only_tick(&feed(unknown).0, newer(&running_plus(3), running));
+    assert!(!summary.roll_armed, "{}", summary.note);
+    assert!(arms.is_empty(), "{arms:?}");
+    assert!(summary.note.contains("not known"), "{}", summary.note);
+}
+
+#[test]
+fn a_fleet_host_with_autoupdate_off_rolls_for_a_workspace_that_needs_a_newer_daemon() {
+    let running = env!("CARGO_PKG_VERSION");
+    // The floor is met; a registered workspace needs a newer daemon.
+    let feed = set_floor(running).with_demand(floor_roll::repo_ahead::Demand {
+        version: running_plus(1),
+        workspace: "acme/app".to_string(),
+    });
+    let (summary, arms, _) = floor_only_tick(&feed, newer(&running_plus(2), running));
+    assert!(summary.roll_armed, "{}", summary.note);
+    let [target] = arms.as_slice() else {
+        panic!("one trigger_pause_roll, got {arms:?}");
+    };
+    assert_eq!(target.source, pause_manifest::TargetSource::RepoAhead);
+}
+
+/// A host with no fleet store and autoUpdate off spawns no loop at all
+/// (`loop_mode::LoopMode::decide`). Should a floor-only loop's host lose its
+/// store mid-run, its ticks check nothing rather than start chasing.
+#[test]
+fn a_non_fleet_host_with_autoupdate_off_never_rolls() {
+    let running = env!("CARGO_PKG_VERSION");
+    let mode = loop_mode::LoopMode::decide(&crate::fleet_sync::FloorKnowledge::NoStore, false);
+    assert!(!mode.spawns());
+
+    let (summary, arms, resolves) = floor_only_tick(&no_store(), newer(&running_plus(3), running));
+    assert_eq!(summary.decision, TickDecisionKind::Skip);
+    assert!(!summary.roll_armed);
+    assert!(arms.is_empty(), "{arms:?}");
+    assert_eq!(resolves, 0, "no release is even resolved");
+    assert!(summary.note.contains("not a fleet host"), "{}", summary.note);
 }
