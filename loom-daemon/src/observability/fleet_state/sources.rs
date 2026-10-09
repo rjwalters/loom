@@ -231,11 +231,10 @@ async fn ready_queue(
 ///
 /// `listed` is every managed repo the tick read without a listing failure. A
 /// single-workspace tick records no rows, so it lists no repo. `complete` is
-/// always empty: the work finder lists one forge page per label and cannot
-/// tell a full page from a short one after it filters out PRs and merges the
-/// side listings, so no repo's ready queue is known to be whole (#11139 adds
-/// that evidence). Every listed repo's ready rows are replaced wholesale on
-/// the wire instead (`ready_replace`).
+/// the listed repos whose listing the work finder walked to its last page
+/// (#11139): every listed repo not in `listing_incomplete`. A listed repo
+/// that is not complete has its ready rows replaced wholesale on the wire
+/// (`ready_replace`).
 fn ready_from_tick(
     summary: &WorkFinderTickSummary,
     slug: impl Fn(&str) -> Option<String>,
@@ -259,16 +258,21 @@ fn ready_from_tick(
             })
         })
         .collect();
-    let listed = if summary.plan.is_some() {
-        let failed: BTreeSet<String> = summary
-            .listing_failed
-            .iter()
-            .filter_map(|root| slug(root))
-            .collect();
-        managed.difference(&failed).cloned().collect()
+    let slugs = |roots: &[String]| -> BTreeSet<String> {
+        roots.iter().filter_map(|root| slug(root)).collect()
+    };
+    let listed: BTreeSet<String> = if summary.plan.is_some() {
+        managed
+            .difference(&slugs(&summary.listing_failed))
+            .cloned()
+            .collect()
     } else {
         BTreeSet::new()
     };
+    let complete = listed
+        .difference(&slugs(&summary.listing_incomplete))
+        .cloned()
+        .collect();
     let slots = summary.plan.as_ref().map(|plan| FleetSlots {
         max_concurrent: small(plan.slots.max_concurrent),
         occupancy: plan.slots.occupancy.map(small),
@@ -276,7 +280,7 @@ fn ready_from_tick(
     ReadyQueue {
         items,
         listed,
-        complete: BTreeSet::new(),
+        complete,
         slots,
     }
 }

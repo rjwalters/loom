@@ -17,12 +17,13 @@
 //!   and has no census, so a PR it could not see is never reported removed.
 //! - **`ready_wait` rows**: the work finder's last tick, the same source the
 //!   `queue.snapshot` producer reads, with each row's planner rank and the
-//!   inputs it was ranked on. Nothing re-ranks here. The work finder lists
-//!   one forge page per label and cannot yet prove a listing whole (#11139),
-//!   so no repo is `ready_complete`. Such a repo's ready rows are what the
-//!   tick saw, and every record that names it carries all of them with
-//!   `ready_replace` (see [`decide`]); a repo whose ready listing failed
-//!   keeps its earlier ready rows.
+//!   inputs it was ranked on. Nothing re-ranks here. A repo whose ready
+//!   listing the work finder walked to its last page is `ready_complete`
+//!   (#11139) and its ready rows are diffed. A repo whose listing came back
+//!   partial (a later page failed, the page cap, a mid-walk change) is not:
+//!   its ready rows are what the tick saw, and every record that names it
+//!   carries all of them with `ready_replace` (see [`decide`]). A repo whose
+//!   ready listing failed keeps its earlier ready rows.
 //!
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
@@ -130,7 +131,7 @@ pub struct ReadyQueue {
     /// it keeps its earlier `ready_wait` rows.
     pub listed: BTreeSet<String>,
     /// Repos whose ready listing is known to be whole (the wire
-    /// `ready_complete`). Always empty until #11139; a subset of `listed`.
+    /// `ready_complete`, #11139). A subset of `listed`.
     pub complete: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
 }
@@ -177,7 +178,7 @@ pub struct FleetView {
 
 impl FleetView {
     /// Whether `repo`'s ready queue is known to be whole this pass (the wire
-    /// `ready_complete`). Never true until #11139.
+    /// `ready_complete`, #11139).
     #[must_use]
     pub fn ready_complete(&self, repo: &str) -> bool {
         self.observed

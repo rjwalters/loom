@@ -2734,7 +2734,7 @@ three non-ETA sources:
 |---|---|---|
 | Sweep registries | the sweeps this host runs (`host`, `slot` set) | stage from the sweep's own checkpoint marker: none → `sweep.curator` (entered at dispatch), `curator-done` → `sweep.builder`, `builder-done` / `doctor-done` → `review_wait`, `judge-rejected` → `doctor`, `judge-done` / `merge-done` → `merge_wait`; `entered_at` is the marker's `timestamp` |
 | Review-label listings | open PRs under `loom:review-requested` / `loom:changes-requested` / `loom:pr` (or `loom:treating` alone), plus the per-repo census | ETag-cached REST listings, each walked to its last page (an unchanged page is a free `304`). A walk that fails, reads 10 full pages (more than 1000 PRs under one label) or sees the listing shift mid-walk is a **failed** listing, never a partial one. A row is keyed by the issue the PR body links (a closing keyword first, else `Part of`); a PR linking no issue is in the census only; two PRs for one issue keep the lower PR number. An approved PR under a registry `merge_hold` label is `merge_hold` |
-| Work finder's last tick | `ready_wait` for every ready-queue row the planner saw on that tick that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks. The work finder lists one forge page (100 items) per label and cannot yet prove a listing whole, so `ready_complete` is `false` for every repo until #11139 and the repo's ready rows go out whole with `ready_replace` |
+| Work finder's last tick | `ready_wait` for every ready-queue row the planner saw on that tick that is not running here | the same tick the `queue.snapshot` producer reads; each row carries this host's planner `rank` and the planner's inputs. Nothing re-ranks. The work finder walks each repo's `loom:issue` and starred listings to the last page (#11139). A repo whose walk finished is `ready_complete`; a repo whose walk fell short (a later page failed, the page cap, a mid-walk change; the tick's `listing_incomplete`) is not, and its ready rows go out whole with `ready_replace` |
 
 When sources overlap on one `(repo, issue)`, the held row wins, then the PR
 row, then the `ready_wait` row. A listing row still in the same stage keeps its
@@ -2755,12 +2755,11 @@ anchor is at least 3600 s old or the planner stamps changed (a regime
 boundary). Between anchors a pass sends a **delta** (`anchor: false`) only if
 rows, a census, a repo's `ready_complete` or the plan slots changed. A delta holds the added or changed
 rows, the issues that left (`removed`), and the **full** census of each repo it
-names. **Ready replacement:** a repo with `ready_complete: false` (today every
-repo) is sent with `ready_replace: true`. Its `ready_wait` rows are not
+names. **Ready replacement:** a repo with `ready_complete: false` is sent with `ready_replace: true`. Its `ready_wait` rows are not
 diffed: every record that names it carries the repo's **entire** observed
 `ready_wait` set in `rows`, a delta names it whenever that set changed, and
 its `removed` never lists a `ready_wait` row. Its other rows are diffed as
-usual. A `ready_complete: true` repo (possible only after #11139) is diffed
+usual. A `ready_complete: true` repo is diffed
 in full, `ready_wait` rows included. A pass with no change sends nothing. The change test ignores
 `census_at`. A planner rank shift changes every row behind it, so it is a
 change.
@@ -2803,7 +2802,7 @@ Each `repos[]` entry:
 | `repo` | string | forge `owner/repo`, lowercased, never a local path |
 | `visibility` | `public` / `private` | missing or unknown decodes to `private` |
 | `census` | object, optional | `{open, by_stage?}`: distinct open PRs under a Loom review label, with `by_stage` keys `review_wait` / `doctor` / `merge_wait` / `merge_hold` / `held` (labels that name no single stage). **Absent means unknown** (listing incomplete or not read), never zero. Open PRs with no review label are not counted |
-| `ready_complete` | bool | `true` when the work finder's last tick is known to have listed this repo's whole ready queue. **Always `false` until #11139**: the work finder lists one page per label and, after filtering out PRs and merging side listings, cannot tell a full raw page from a short one, so no row count proves a listing whole. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
+| `ready_complete` | bool | `true` when the work finder's last tick walked this repo's ready listing to its last page (#11139), so its `ready_wait` rows are the whole queue. `false` when the walk fell short (a later page failed, the page cap, a mid-walk change), and on emitters before #11139, which listed one page per label. A reader must not treat a `false` repo's `ready_wait` rows as its whole queue. Always sent; missing (an older emitter) decodes to `false` |
 | `ready_replace` | bool, optional | `true` exactly when `ready_complete` is `false`: `rows` carries the repo's **entire** observed `ready_wait` set, and a reader replaces the repo's `ready_wait` rows with it (drop them all, then apply `removed` and `rows`). Removals of `ready_wait` rows are never sent in `removed` for such a repo, and a reader never infers one from absence otherwise. Absent (`false`, or an older emitter): plain diffing |
 | `rows[]` | array, optional | anchor: every row; delta: added or changed rows. Ordered by issue |
 | `removed[]` | integers, optional | delta only: issues that left. A repo that left entirely has every prior issue here (but no `ready_wait` issue when `ready_replace` is set) and no `census` |

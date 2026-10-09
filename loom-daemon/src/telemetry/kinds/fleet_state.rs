@@ -243,11 +243,10 @@ pub struct FleetStateRepo {
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<FleetPrCensus>,
-    /// The work finder's last tick is known to have listed this repo's whole
-    /// ready queue. Always `false` until #11139 lets the work finder prove a
-    /// listing whole: a reader must not treat a `false` repo's `ready_wait`
-    /// rows as its whole queue. Always sent; missing (an older emitter)
-    /// decodes to `false`.
+    /// The work finder's last tick walked this repo's ready listing to its
+    /// last page (#11139), so its `ready_wait` rows are the whole queue. A
+    /// reader must not treat a `false` repo's `ready_wait` rows as its whole
+    /// queue. Always sent; missing (an older emitter) decodes to `false`.
     #[serde(default)]
     pub ready_complete: bool,
     /// `rows` carries this repo's **entire** `ready_wait` set, not a diff:
