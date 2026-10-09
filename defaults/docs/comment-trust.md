@@ -116,6 +116,41 @@ gh api "repos/{owner}/{repo}/issues/$N/comments" --paginate \
   | loom-daemon forge trusted-comments
 ```
 
+## Promotion author gate (#10827)
+
+The rule above covers markers and control phrases. Separately, an issue
+**authored** by an untrusted identity must not flow Curator → Champion →
+`loom:issue` and get built. The gate reuses the same predicate (no second
+trust table): `TrustPolicy::trusts` applied to the issue's body author, read
+from the REST issue object so a fleet App is spelled `x[bot]`
+(`loom-daemon/src/comment_trust/promotion_gate.rs`).
+
+`loom-daemon forge promotion-gate --issue N [--repo R]` prints:
+
+| `GATE=` | Meaning | Promote? | Comment |
+|---|---|---|---|
+| `ELIGIBLE` | The author is trusted | Yes, on the other criteria | none |
+| `HOLD` | The author is untrusted | No: stays `loom:curated` | once (`NOTICE=needed`), deduplicated by a trusted `<!-- loom:promotion-author-gate -->` comment |
+| `UNAVAILABLE` | The issue, its author, or (with a fleet store configured, for a user author) the admin roster could not be read | No | none |
+
+Callers branch on the `GATE=` line, never the exit code; anything but
+`ELIGIBLE`, including no output from a binary predating the verb, means do
+not promote. The callers are every automatic `loom:issue` write: Champion's
+pre-claim check and Step 3b `promote_labels`, `check-promotion-landed.sh
+--apply` (Pass 0c; `DECISION=GATED`, exit 14), and Curator's starred
+Priority 0 promotion. A notice is posted only on `NOTICE=needed`: an
+unreadable comment listing reports `NOTICE=unknown` and posts nothing, so a
+failed read never spams.
+
+**Adoption.** A held issue is promoted only by a trusted actor applying
+`loom:issue` by hand, or by re-filing it under a trusted identity. Restores of
+a lane label an issue already held (`loom:building` → `loom:issue` on
+reclaim, `release-stale-blocked`) are not new promotions and are not gated;
+nor is `/loom:sweep`'s approval gate, which executes an operator's own
+dispatch. The work finder's red-main admission of an unpromoted issue already
+requires a trusted filer under the same predicate
+(`work_finder/main_red_fix.rs`).
+
 ## Fleet admin roster (#10303)
 
 Precedence: the roster and `forge.trustedCommenters` are a **union**; the

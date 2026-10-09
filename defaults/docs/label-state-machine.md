@@ -18,6 +18,13 @@ refreshing them on curation, re-curation or rescoping. Points do not gate
 `loom:curated`; the complexity routing marker remains required. The retained
 rubric is in `.loom/docs/story-points.md`.
 
+**Promotion author gate (#10827).** No automatic `loom:curated` →
+`loom:issue` write (Champion's Step 3b and its Pass 0c backstop, Curator's
+starred promotion) lands on an issue whose **author** fails the comment-trust
+predicate ([`comment-trust.md`](comment-trust.md) § "Promotion author gate").
+Such an issue stays `loom:curated` with one explanatory comment until a
+trusted actor adopts it: applies `loom:issue` by hand, or re-files it.
+
 `loom:operator` moves that state onto the label substrate, where every other
 pipeline state already lives.
 
@@ -108,7 +115,8 @@ says so, and no role applies it).
   `daemon-reference.md` → "What travels to children".
 - **Starred first, every stage.** Curator curates starred issues first (a
   starred issue with no workflow label counts as `loom:triage`) and promotes
-  them straight to `loom:issue`, because the star is the Tier-3 approval. A
+  them straight to `loom:issue` (author gate permitting, above), because the
+  star is the Tier-3 approval. A
   starred `loom:epic` instead leads Champion's epic queue. Judge, Doctor and Champion drain starred PRs before their oldest-first pass.
   Builder takes starred `loom:issue` work first.
 - **Guards unchanged.** `loom:blocked`, `loom:operator-only`,

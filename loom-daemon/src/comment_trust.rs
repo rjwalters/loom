@@ -44,7 +44,8 @@
 //!
 //! `star_liveness::trust` delegates its decision to [`trusted_by`], and the
 //! shell reaches the same predicate through `loom-daemon forge
-//! trusted-comments`.
+//! trusted-comments`. [`promotion_gate`] applies it to an issue's *body
+//! author* before any automatic `loom:issue` promotion (#10827).
 
 use std::path::Path;
 
@@ -256,6 +257,15 @@ impl TrustPolicy {
         self
     }
 
+    /// Whether the fleet admin roster (rule 5) loaded: `None` when it was not
+    /// consulted (explicit rules), `Some(false)` when it was unreadable.
+    #[must_use]
+    pub fn admins_loaded(&self) -> Option<bool> {
+        self.admins_state
+            .as_deref()
+            .map(|s| !s.starts_with("unavailable"))
+    }
+
     /// Whether `author` is believed.
     #[must_use]
     pub fn trusts(&self, author: &Author) -> bool {
@@ -348,6 +358,7 @@ pub fn parse_listing(bytes: &[u8]) -> Option<Vec<Value>> {
     Some(out)
 }
 
+pub mod promotion_gate;
 pub mod records;
 
 #[cfg(test)]

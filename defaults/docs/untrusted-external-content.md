@@ -88,6 +88,13 @@ that read forge text without the full block (`champion.md`,
 `architect.md`, `hermit.md`, `auditor.md`, `epic.md`, `imagine.md`, `loom.md`,
 `watch.md`) carry a shorter one-line pointer near the top.
 
+The same predicate gates **who wrote the issue** before any automatic
+promotion (#10827): an issue authored by an untrusted identity (an outside
+bot, a non-collaborator) is never auto-promoted to `loom:issue`, however
+well-formed or persuasive its body. It waits at `loom:curated` for a trusted
+actor to adopt it. See [`comment-trust.md`](comment-trust.md) § "Promotion
+author gate".
+
 ## Why a prompt convention and not a hook
 
 A `PreToolUse` guard hook (see [`guard-hooks.md`](guard-hooks.md)) sits between
