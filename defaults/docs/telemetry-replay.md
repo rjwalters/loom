@@ -61,7 +61,7 @@ WHERE timestamp > toUnixTimestamp64Nano(now64(9) - INTERVAL 1 DAY);
 ```
 
 The replay SQL is committed at
-[`observability/signoz/replay-queries.sql`](../observability/signoz/replay-queries.sql):
+[`observability/signoz/replay-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/replay-queries.sql):
 fleet state at `t` (anchors plus deltas, merged per `(repo, issue)`, preferring
 the row that carries a `host`), the spread between hosts' views, coverage at
 `t`, anchor completeness and volume, and outcome facts. It filters on
