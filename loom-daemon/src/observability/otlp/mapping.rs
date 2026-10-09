@@ -5,6 +5,7 @@
 mod auto_update;
 mod ci;
 mod eta;
+mod fact_id;
 mod fleet_state;
 mod metadata;
 mod ops;
@@ -704,6 +705,10 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
     attributes.retain(|kv| kv.key != "loom.kind");
     attributes.insert(0, kv_string("loom.kind", envelope.record.kind().to_string()));
     attributes.insert(0, kv_string("loom.record_id", record_id(envelope)));
+    // Issue #11125: outcome facts also carry a host-independent id.
+    if let Some(fact) = fact_id::of(&envelope.record) {
+        attributes.insert(2, kv_string("loom.fact_id", fact));
+    }
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

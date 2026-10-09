@@ -16,7 +16,7 @@ const PHASES: &[&str] = &[
 
 #[derive(clap::Args)]
 pub(crate) struct SweepCheckpointArgs {
-    /// write/read/phase/attempt/model/exists/delete/list, followed by the legacy arguments.
+    /// write/begin/read/phase/attempt/model/exists/delete/list, followed by the legacy arguments.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -100,15 +100,22 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
     }
     if !matches!(
         command,
-        "write" | "read" | "phase" | "attempt" | "model" | "exists" | "delete" | "jev"
+        "write" | "begin" | "read" | "phase" | "attempt" | "model" | "exists" | "delete" | "jev"
     ) {
-        return Err(invalid("usage: sweep-checkpoint write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
+        return Err(invalid("usage: sweep-checkpoint write ISSUE PHASE [--task-id ID] [--pr-number N] [--attempt N] [--model M]; begin ISSUE ROLE [--attempt N] [--model M]; read/phase/attempt/model/exists/delete ISSUE; jev ISSUE TIER CONFIDENCE; list"));
     }
     let issue_text = args.get(1).ok_or_else(|| invalid("issue is required"))?;
     let issue = number(issue_text)?;
     let target = dir.join(format!("issue-{issue_text}.json"));
     if command == "jev" {
         return patch_jev(&target, args.get(2), args.get(3));
+    }
+    if command == "begin" {
+        // Telemetry only (#9935): the checkpoint file, which drives resume,
+        // is never read or written, and tracing stays best effort.
+        let (role, attempt, model) = parse_begin(&args[2..])?;
+        loom_daemon::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
+        return Ok(());
     }
     if command == "write" {
         let record = parse_write(&args[2..])?;
@@ -195,23 +202,9 @@ fn parse_write(args: &[String]) -> Result<Value> {
             "--pr-number" if value == "null" => record["pr_number"] = Value::Null,
             "--pr-number" => record["pr_number"] = json!(number(value)?),
             "--attempt" if value.is_empty() => {}
-            "--attempt" => {
-                let attempt = number(value)?;
-                if attempt == 0 {
-                    return Err(invalid("--attempt must be >= 1"));
-                }
-                record["attempt"] = json!(attempt);
-            }
+            "--attempt" => record["attempt"] = json!(attempt_value(value)?),
             "--model" if value.is_empty() => {}
-            "--model" => {
-                if !value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                {
-                    return Err(invalid("--model must match [A-Za-z0-9._-]+"));
-                }
-                record["model"] = json!(value);
-            }
+            "--model" => record["model"] = json!(model_value(value)?),
             _ => return Err(invalid("unknown option")),
         }
     }
@@ -219,6 +212,47 @@ fn parse_write(args: &[String]) -> Result<Value> {
         return Err(invalid("judge-rejected requires --pr-number for resume routing"));
     }
     Ok(record)
+}
+
+fn attempt_value(value: &str) -> Result<u32> {
+    match number(value)? {
+        0 => Err(invalid("--attempt must be >= 1")),
+        attempt => Ok(attempt),
+    }
+}
+
+fn model_value(value: &str) -> Result<&str> {
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        Ok(value)
+    } else {
+        Err(invalid("--model must match [A-Za-z0-9._-]+"))
+    }
+}
+
+/// `sweep-checkpoint begin ISSUE ROLE [--attempt N] [--model M]` (#9935).
+fn parse_begin(args: &[String]) -> Result<(&str, Option<u32>, Option<&str>)> {
+    let role = args.first().map(String::as_str).unwrap_or("");
+    if !matches!(role, "curator" | "builder" | "judge" | "doctor" | "merge") {
+        return Err((2, format!("invalid role '{role}'")));
+    }
+    let (mut attempt, mut model) = (None, None);
+    let mut options = args[1..].iter();
+    while let Some(flag) = options.next() {
+        let value = options
+            .next()
+            .ok_or_else(|| invalid("option requires a value"))?;
+        match flag.as_str() {
+            "--attempt" if value.is_empty() => {}
+            "--attempt" => attempt = Some(attempt_value(value)?),
+            "--model" if value.is_empty() => {}
+            "--model" => model = Some(model_value(value)?),
+            _ => return Err(invalid("unknown option")),
+        }
+    }
+    Ok((role, attempt, model))
 }
 
 /// `sweep-checkpoint jev <issue> <tier> <confidence>` (Issue #8543) — patches

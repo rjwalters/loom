@@ -19,7 +19,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::eta::Provenance;
+use crate::telemetry::provenance::Provenance;
 
 /// Every log attribute key `auto_update.tick` exports. The collector's
 /// `transform/privacy` log `keep_keys` must list each one

@@ -7,11 +7,13 @@
 //! output is fresh, so it needs the captain's `as_of`. Hosts have no channel
 //! to each other's telemetry; the one shared surface every host already reads
 //! is the fleet store (`fleet.repo`), the same transport the captain's ETA fit
-//! uses (`eta::fit::publish`, #10395). The heartbeat lives beside the fit: a
-//! single JSON file, [`HEARTBEAT_PATH`], on a dedicated publication branch
-//! (`fleet.captainGauges.ref`, default the fit's own `fleet.etaFitRef`
-//! branch, so no new branch or ruleset exemption is needed). Never on the
-//! store's reviewed branch or `main` ([`refuse_reviewed_branch`]).
+//! used (#10395; the shared helpers live in [`crate::fleet_store::publication`]
+//! since #11098). The heartbeat is a single JSON file, [`HEARTBEAT_PATH`], on a
+//! dedicated publication branch (`fleet.captainGauges.ref`, default
+//! [`DEFAULT_REF`], the existing `eta-fit` branch, so no new branch or ruleset
+//! exemption is needed; a legacy `fleet.etaFitRef` is still honoured as the
+//! fallback, see [`resolve_ref`]). Never on the store's reviewed branch or
+//! `main` ([`refuse_reviewed_branch`]).
 //!
 //! # Contract (`captain-gauges/v1`)
 //!
@@ -63,17 +65,26 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::eta::fit::publish as fit_pub;
 use crate::fleet_store::fetch::Transport;
 use crate::fleet_store::propose::WriteTransport;
+use crate::fleet_store::publication;
 use crate::fleet_store::StoreLocation;
 
 /// The heartbeat's schema tag.
 pub const SCHEMA: &str = "captain-gauges/v1";
 /// Store path of the heartbeat on the publication branch.
 pub const HEARTBEAT_PATH: &str = "captain/gauges.json";
-/// Config key of the publication branch. Unset: the ETA fit's branch.
+/// Config key of the publication branch. Unset: [`LEGACY_REF_KEY`], then
+/// [`DEFAULT_REF`].
 pub const REF_KEY: &str = "fleet.captainGauges.ref";
+/// The publication branch when neither key is set: the branch the heartbeat
+/// has always lived on (beside the former ETA fit), so a host that never
+/// configured a ref keeps publishing and reading the same file (#11098).
+pub const DEFAULT_REF: &str = "eta-fit";
+/// The pre-#11098 fallback: the heartbeat followed the ETA fit's branch key.
+/// Still read, as a plain config key, so a host that set it alone keeps the
+/// same branch; the ETA removal (#11098, Stage 3) decides its retirement.
+pub const LEGACY_REF_KEY: &str = "fleet.etaFitRef";
 /// Clock skew tolerated on a published `as_of`.
 const FUTURE_SLACK_SECS: i64 = 300;
 
@@ -181,14 +192,20 @@ pub fn parse(bytes: &[u8]) -> Result<Heartbeat> {
     Ok(hb)
 }
 
-/// The publication branch (`fleet.captainGauges.ref`, else the ETA fit's).
+/// The publication branch: `fleet.captainGauges.ref`, else the legacy
+/// `fleet.etaFitRef`, else [`DEFAULT_REF`].
 #[must_use]
 pub fn resolve_ref(effective: &Value) -> String {
-    crate::config_resolver::get_path(effective, REF_KEY)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| fit_pub::resolve_ref(effective), str::to_string)
+    let key = |k: &str| {
+        crate::config_resolver::get_path(effective, k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    key(REF_KEY)
+        .or_else(|| key(LEGACY_REF_KEY))
+        .unwrap_or_else(|| DEFAULT_REF.to_string())
 }
 
 /// The store location (its `reference` is the publication branch) and the
@@ -203,7 +220,7 @@ pub fn location_for(
         .map_err(|e| log::warn!("captain gauges: fleet store misconfigured: {e:#}"))
         .ok()??;
     let reference = resolve_ref(effective);
-    if let Err(e) = fit_pub::validate_branch_for(REF_KEY, &reference) {
+    if let Err(e) = publication::validate_branch_for(REF_KEY, &reference) {
         log::warn!("captain gauges: heartbeat disabled, {e:#}");
         return None;
     }
@@ -254,8 +271,8 @@ pub fn fetch(t: &dyn Transport, loc: &StoreLocation, cache: &mut FetchCache) -> 
         .and(cache.etag.as_deref())
         .map(str::to_string);
     let reply = match t.get(
-        &fit_pub::contents_path(loc, HEARTBEAT_PATH),
-        Some(fit_pub::RAW),
+        &publication::contents_path(loc, HEARTBEAT_PATH),
+        Some(publication::RAW),
         etag.as_deref(),
     ) {
         Ok(reply) => reply,
@@ -295,10 +312,42 @@ pub struct PublishCache {
 
 /// This autonomous write lands only on the dedicated publication branch,
 /// never the store's reviewed branch or `main` (the same guard and
-/// normalization as the ETA fit's; `write_scope::tests` asserts it is the
+/// normalization as the ETA fit's, via
+/// [`crate::fleet_store::publication`]; `write_scope::tests` asserts it is the
 /// first statement of [`publish`]).
 fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
-    fit_pub::refuse_reviewed_branch_for(REF_KEY, "the captain gauges heartbeat", loc, base_ref)
+    publication::refuse_reviewed_branch_for(REF_KEY, "the captain gauges heartbeat", loc, base_ref)
+}
+
+/// Create the publication branch from `base_ref` when it does not exist.
+/// Kept here, beside [`publish`], so this file's forge writes stay reviewed
+/// as one `FleetStore` entry in `write_scope::tests`.
+fn ensure_branch(
+    t: &dyn Transport,
+    wt: &dyn WriteTransport,
+    loc: &StoreLocation,
+    base_ref: &str,
+) -> Result<()> {
+    let r = t.get(&format!("repos/{}/git/ref/heads/{}", loc.repo, loc.reference), None, None)?;
+    match r.status {
+        200 => return Ok(()),
+        404 => {}
+        s => anyhow::bail!("HTTP {s} checking branch {} in {}", loc.reference, loc.repo),
+    }
+    let base = t.get(
+        &format!("repos/{}/commits/{base_ref}", loc.repo),
+        Some("application/vnd.github.sha"),
+        None,
+    )?;
+    if base.status != 200 {
+        anyhow::bail!("HTTP {} resolving {base_ref} in {}", base.status, loc.repo);
+    }
+    let reply = wt.write(
+        "POST",
+        &format!("repos/{}/git/refs", loc.repo),
+        &json!({"ref": format!("refs/heads/{}", loc.reference), "sha": base.body.trim()}),
+    )?;
+    publication::ensure_ok(&reply, "creating the publication branch", &loc.repo)
 }
 
 fn put(
@@ -337,7 +386,7 @@ pub(super) fn publish(
 ) -> Result<()> {
     refuse_reviewed_branch(loc, base_ref)?;
     if !cache.branch_ok {
-        fit_pub::ensure_branch(t, wt, loc, base_ref)?;
+        ensure_branch(t, wt, loc, base_ref)?;
         cache.branch_ok = true;
     }
     // Compact: the part 2 facts make this file a few hundred rows on a big
@@ -346,14 +395,14 @@ pub(super) fn publish(
     let message = format!("captain gauges heartbeat ({})", hb.published_at.to_rfc3339());
     let sha = match cache.sha.take() {
         Some(sha) => Some(sha),
-        None => fit_pub::blob_sha(t, loc, HEARTBEAT_PATH)?,
+        None => publication::blob_sha(t, loc, HEARTBEAT_PATH)?,
     };
     let mut reply = put(wt, loc, body.as_bytes(), sha.as_deref(), &message)?;
     if matches!(reply.status, 409 | 422) {
-        let sha = fit_pub::blob_sha(t, loc, HEARTBEAT_PATH)?;
+        let sha = publication::blob_sha(t, loc, HEARTBEAT_PATH)?;
         reply = put(wt, loc, body.as_bytes(), sha.as_deref(), &message)?;
     }
-    fit_pub::ensure_ok(&reply, &format!("writing {HEARTBEAT_PATH}"), &loc.repo)?;
+    publication::ensure_ok(&reply, &format!("writing {HEARTBEAT_PATH}"), &loc.repo)?;
     cache.sha = serde_json::from_str::<Value>(&reply.body)
         .ok()
         .and_then(|v| v["content"]["sha"].as_str().map(str::to_string));
