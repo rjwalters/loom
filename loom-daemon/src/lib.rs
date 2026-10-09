@@ -345,6 +345,7 @@ pub mod session_reconcile;
 pub mod session_status;
 pub mod shell_budget;
 pub mod short_hash;
+pub mod signoz_read;
 pub mod stale_blocked;
 pub mod star_liveness;
 pub mod startup_adoption;
