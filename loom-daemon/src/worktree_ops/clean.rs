@@ -1501,9 +1501,24 @@ pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<St
 /// First line every cargo-written `CACHEDIR.TAG` carries (the cache-dir tagging spec).
 const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
-/// Worktree-relative directories (no trailing slash) containing a
-/// signature-verified `CACHEDIR.TAG` — tracked, staged or untracked. These
-/// are generated build trees that must never be stashed (#11075).
+/// Whether `content` is a genuine cargo target-root marker for file name `name`:
+/// a `CACHEDIR.TAG` with the spec signature, or a `.rustc_info.json` object
+/// holding `rustc_fingerprint` (cargo writes one at every target root).
+fn is_target_marker(name: &str, content: &str) -> bool {
+    match name {
+        "CACHEDIR.TAG" => content.starts_with(CACHEDIR_TAG_SIGNATURE),
+        ".rustc_info.json" => {
+            content.trim_start().starts_with('{') && content.contains("\"rustc_fingerprint\"")
+        }
+        _ => false,
+    }
+}
+
+/// Worktree-relative directories (no trailing slash) containing a verified
+/// cargo target-root marker (`CACHEDIR.TAG` or `.rustc_info.json`) — tracked,
+/// staged, untracked or gitignored. These are generated build trees that must
+/// never be stashed (#11075). Discovery deliberately ignores `.gitignore`: an
+/// ignored marker's sibling artifacts can still be stashable.
 fn cachedir_tag_dirs(worktree_path: &Path) -> Vec<String> {
     let Ok(out) = Command::new("git")
         .args([
@@ -1511,10 +1526,11 @@ fn cachedir_tag_dirs(worktree_path: &Path) -> Vec<String> {
             "-z",
             "--cached",
             "--others",
-            "--exclude-standard",
             "--",
             ":(glob)CACHEDIR.TAG",
             ":(glob)**/CACHEDIR.TAG",
+            ":(glob).rustc_info.json",
+            ":(glob)**/.rustc_info.json",
         ])
         .current_dir(worktree_path)
         .output()
@@ -1524,13 +1540,15 @@ fn cachedir_tag_dirs(worktree_path: &Path) -> Vec<String> {
     let mut dirs: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|f| !f.is_empty())
-        .filter(|f| {
-            std::fs::read_to_string(worktree_path.join(f))
-                .is_ok_and(|c| c.starts_with(CACHEDIR_TAG_SIGNATURE))
+        .filter_map(|f| {
+            let (dir, name) = f.rsplit_once('/').unwrap_or(("", f));
+            // A marker at the worktree root would exclude everything; skip it.
+            if dir.is_empty() {
+                return None;
+            }
+            let content = std::fs::read_to_string(worktree_path.join(f)).ok()?;
+            is_target_marker(name, &content).then(|| dir.to_string())
         })
-        .map(|f| f.strip_suffix("CACHEDIR.TAG").unwrap_or(f).trim_end_matches('/').to_string())
-        // A tag at the worktree root would exclude everything; skip it.
-        .filter(|d| !d.is_empty())
         .collect();
     dirs.sort();
     dirs.dedup();

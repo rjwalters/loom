@@ -338,24 +338,34 @@ fn is_generated_artifact(path: &str) -> bool {
 /// First line of a cargo-written `CACHEDIR.TAG` (cache-dir tagging spec).
 const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
-/// Directories (stash-relative, no trailing slash; `""` = repo root) that hold
-/// a signature-verified `CACHEDIR.TAG` among `paths` (#11075). Content-based,
-/// never name-based: an untagged `target/` may be hand-authored and so is not
-/// matched. `read_blob` returns the stash's bytes for a path.
+/// Directories (stash-relative, no trailing slash) that hold a verified cargo
+/// target-root marker among `paths` (#11075): a signature-checked `CACHEDIR.TAG`
+/// or a `.rustc_info.json` object with `rustc_fingerprint`. Content-based,
+/// never name-based: an unmarked `target/` may be hand-authored and so is not
+/// matched. A root-level marker is ignored (it would class every path as
+/// generated). `read_blob` returns the stash's bytes for a path.
 fn cachedir_tag_dirs(
     paths: &[String],
     read_blob: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
 ) -> BTreeSet<String> {
     let mut dirs = BTreeSet::new();
     for path in paths {
-        let Some(dir) = path
-            .strip_suffix("CACHEDIR.TAG")
-            .filter(|d| d.is_empty() || d.ends_with('/'))
-        else {
+        let Some((dir, name)) = path.rsplit_once('/') else {
             continue;
         };
-        if read_blob(path).is_some_and(|b| b.starts_with(CACHEDIR_TAG_SIGNATURE)) {
-            dirs.insert(dir.trim_end_matches('/').to_string());
+        if dir.is_empty() || !matches!(name, "CACHEDIR.TAG" | ".rustc_info.json") {
+            continue;
+        }
+        let verified = read_blob(path).is_some_and(|b| {
+            if name == "CACHEDIR.TAG" {
+                b.starts_with(CACHEDIR_TAG_SIGNATURE)
+            } else {
+                let text = String::from_utf8_lossy(&b);
+                text.trim_start().starts_with('{') && text.contains("\"rustc_fingerprint\"")
+            }
+        });
+        if verified {
+            dirs.insert(dir.to_string());
         }
     }
     dirs
@@ -363,12 +373,6 @@ fn cachedir_tag_dirs(
 
 /// Whether `path` lies under (or is) a verified cargo tag directory.
 fn is_under_cachedir_tree(path: &str, tag_dirs: &BTreeSet<String>) -> bool {
-    if tag_dirs.is_empty() {
-        return false;
-    }
-    if tag_dirs.contains("") {
-        return true;
-    }
     let mut prefix = path;
     while let Some((parent, _)) = prefix.rsplit_once('/') {
         if tag_dirs.contains(parent) {
@@ -1160,12 +1164,22 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
             ".loom/target-doctor-1/CACHEDIR.TAG",
             "fake/CACHEDIR.TAG",
             "target/CACHEDIR.TAG.bak",
+            ".loom/target-issue-1/.rustc_info.json",
+            ".loom/target-issue-1/debug/b.o",
+            "CACHEDIR.TAG",
+            "notcargo/.rustc_info.json",
         ]
         .map(String::from)
         .to_vec();
         let tag_dirs = cachedir_tag_dirs(&paths, &mut |p| {
             if p.starts_with("fake/") {
                 Some(b"nope".to_vec())
+            } else if p.ends_with(".rustc_info.json") {
+                Some(if p.starts_with("notcargo/") {
+                    br#"{"other":1}"#.to_vec()
+                } else {
+                    br#"{"rustc_fingerprint":1}"#.to_vec()
+                })
             } else {
                 Some(sig.clone())
             }
@@ -1176,6 +1190,13 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
         assert!(!is_under_cachedir_tree("target/spec.md", &tag_dirs));
         assert!(!is_under_cachedir_tree("fake/x.rs", &tag_dirs));
         assert!(!is_generated_artifact("target/spec.md"));
+        // `.rustc_info.json` alone marks a target root (tag lost); bogus one does not.
+        assert!(is_under_cachedir_tree(".loom/target-issue-1/debug/b.o", &tag_dirs));
+        assert!(!is_under_cachedir_tree("notcargo/keep.txt", &tag_dirs));
+        // A root-level tag is ignored: real work is never classed as generated.
+        assert!(!tag_dirs.contains(""));
+        assert!(!is_under_cachedir_tree("src/real_work.rs", &tag_dirs));
+        assert!(!is_under_cachedir_tree("top_level.rs", &tag_dirs));
     }
 
     // ---------- test git repo fixture ----------

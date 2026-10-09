@@ -1150,6 +1150,44 @@ else
 fi
 rm -rf "${REPO:?}"
 
+# -------- Test: ignored / root / .rustc_info.json markers (#11075 review) --------
+echo "Test 11075b: ignored marker, .rustc_info.json-only tree, root-level tag"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-11075b.txt"
+printf 'CACHEDIR.TAG\n' > "$REPO/.gitignore"
+git -C "$REPO" add .gitignore && git -C "$REPO" commit -qm "ignore tags"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+# (a) valid tag that is gitignored, plus a staged copy of its artifact
+mkdir -p "$REPO/target-ign/debug"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/target-ign/CACHEDIR.TAG"
+printf 'bin\n' > "$REPO/target-ign/debug/artifact.o"
+printf 'bin\n' > "$REPO/target-ign/debug/staged.o"
+git -C "$REPO" add target-ign/debug/staged.o
+# (b) target tree whose CACHEDIR.TAG is missing; only .rustc_info.json remains
+mkdir -p "$REPO/.loom/target-issue-1/debug"
+printf '{"rustc_fingerprint":123,"outputs":{}}\n' > "$REPO/.loom/target-issue-1/.rustc_info.json"
+printf 'bin\n' > "$REPO/.loom/target-issue-1/debug/b.o"
+# (c) a bogus .rustc_info.json is NOT a marker: its siblings are rescued
+mkdir -p "$REPO/notcargo"
+printf '{"other":1}\n' > "$REPO/notcargo/.rustc_info.json"
+printf 'keep\n' > "$REPO/notcargo/keep.txt"
+# (d) root-level tag must not turn every path into "build output"
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$REPO/CACHEDIR.TAG"
+printf 'def real(): pass\n' > "$REPO/real_work.py"
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" --quarantine --label "run=R issue=11075b" 2>&1 ); RC=$?
+STASH_FILES=$( { git -C "$REPO" ls-tree -r --name-only 'stash@{0}^3' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}' 2>/dev/null; git -C "$REPO" ls-tree -r --name-only 'stash@{0}^2' 2>/dev/null; } )
+if grep -q 'real_work.py' <<<"$STASH_FILES" && grep -q '^notcargo/keep.txt' <<<"$STASH_FILES"; then
+    pass "root-level tag ignored; real dirt and bogus-marker siblings still rescued"
+else
+    fail "rescue weakened (rc=$RC); stash holds: $STASH_FILES; out=$out"
+fi
+if grep -qE '^(target-ign|\.loom/target-issue-1)/' <<<"$STASH_FILES"; then
+    fail "ignored-tag / rustc_info tree leaked into refs/stash: $STASH_FILES"
+else
+    pass "ignored CACHEDIR.TAG and .rustc_info.json-only trees excluded (incl. staged)"
+fi
+rm -rf "${REPO:?}"
+
 # -------- Summary --------
 echo ""
 if [[ "$TESTS_FAILED" -eq 0 ]]; then

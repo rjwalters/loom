@@ -2238,3 +2238,48 @@ fn cachedir_tag_dirs_requires_signature() {
     .unwrap();
     assert_eq!(cachedir_tag_dirs(dir.path()), vec!["real".to_string()]);
 }
+
+#[test]
+fn quarantine_dirty_worktree_excludes_ignored_marker_rustc_info_and_ignores_root_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo_with_seed_commit(dir.path());
+    let sig = "Signature: 8a477f597d28d172789f06886806bc55\n";
+    std::fs::write(dir.path().join(".gitignore"), "CACHEDIR.TAG\n").unwrap();
+    git(dir.path(), &["add", ".gitignore"]);
+    git(dir.path(), &["commit", "-qm", "ignore tags"]);
+    // Gitignored marker, with a staged artifact beside it.
+    let ign = dir.path().join("target-ign/debug");
+    std::fs::create_dir_all(&ign).unwrap();
+    std::fs::write(dir.path().join("target-ign/CACHEDIR.TAG"), sig).unwrap();
+    std::fs::write(ign.join("artifact.o"), "bin").unwrap();
+    std::fs::write(ign.join("staged.o"), "bin").unwrap();
+    git(dir.path(), &["add", "target-ign/debug/staged.o"]);
+    // Target root whose CACHEDIR.TAG is gone: only .rustc_info.json remains.
+    let ri = dir.path().join(".loom/target-issue-1/debug");
+    std::fs::create_dir_all(&ri).unwrap();
+    std::fs::write(
+        dir.path().join(".loom/target-issue-1/.rustc_info.json"),
+        r#"{"rustc_fingerprint":1}"#,
+    )
+    .unwrap();
+    std::fs::write(ri.join("b.o"), "bin").unwrap();
+    // A bogus .rustc_info.json is not a marker.
+    std::fs::create_dir_all(dir.path().join("notcargo")).unwrap();
+    std::fs::write(dir.path().join("notcargo/.rustc_info.json"), r#"{"other":1}"#).unwrap();
+    std::fs::write(dir.path().join("notcargo/keep.txt"), "keep").unwrap();
+    // A root-level tag must not turn every path into "build output".
+    std::fs::write(dir.path().join("CACHEDIR.TAG"), sig).unwrap();
+    std::fs::write(dir.path().join("real.txt"), "work").unwrap();
+
+    assert_eq!(
+        cachedir_tag_dirs(dir.path()),
+        vec![".loom/target-issue-1".to_string(), "target-ign".to_string()]
+    );
+    quarantine_dirty_worktree(dir.path(), "issue=11075 reason=test")
+        .expect("real dirt must still be quarantined");
+    let files = stash_tree_files(dir.path());
+    assert!(files.contains("real.txt"), "{files}");
+    assert!(files.contains("notcargo/keep.txt"), "{files}");
+    assert!(!files.contains("target-ign"), "{files}");
+    assert!(!files.contains("target-issue-1"), "{files}");
+}

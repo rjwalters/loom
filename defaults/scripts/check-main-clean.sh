@@ -756,24 +756,49 @@ collect_offending_paths() {
 # #10516 had 7,119 files), so the quarantine rescue must never include it.
 CACHEDIR_SIG='Signature: 8a477f597d28d172789f06886806bc55'
 TAG_DIRS=()
+# tag_marker_ok <file> -> 0 when <file> is a genuine cargo target-root marker:
+# a CACHEDIR.TAG whose first line carries the spec signature, or a
+# .rustc_info.json object holding "rustc_fingerprint". Pipeline-free on purpose
+# (the pipefail early-exit-consumer baseline allows none).
+tag_marker_ok() {
+    local file="$1" line="" content=""
+    [[ -r "$file" ]] || return 1
+    case "$file" in
+        */CACHEDIR.TAG|CACHEDIR.TAG)
+            IFS= read -r line < "$file" 2>/dev/null || true
+            [[ "$line" == "$CACHEDIR_SIG"* ]]
+            ;;
+        */.rustc_info.json|.rustc_info.json)
+            content=$(head -c 4096 "$file" 2>/dev/null) || true
+            [[ "$content" == "{"* && "$content" == *'"rustc_fingerprint"'* ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
 collect_tag_dirs() {
     TAG_DIRS=()
     local f d
+    # No --exclude-standard: an ignored marker must still be discovered, since
+    # its sibling artifacts can be stashable regardless of ignore rules.
     while IFS= read -r -d '' f; do
         [[ -n "$f" ]] || continue
-        if [[ -r "$main_root/$f" ]] && head -c 64 "$main_root/$f" 2>/dev/null | grep -q "^$CACHEDIR_SIG"; then
-            d="${f%CACHEDIR.TAG}"
-            TAG_DIRS+=("${d%/}")
-        fi
-    done < <(git -C "$main_root" ls-files -z --cached --others --exclude-standard \
-        -- ':(glob)CACHEDIR.TAG' ':(glob)**/CACHEDIR.TAG' 2>/dev/null)
+        tag_marker_ok "$main_root/$f" || continue
+        d="${f%CACHEDIR.TAG}"
+        [[ "$d" == "$f" ]] && d="${f%.rustc_info.json}"
+        d="${d%/}"
+        # A root-level marker would classify every path as build output; ignore it.
+        [[ -n "$d" ]] || continue
+        TAG_DIRS+=("$d")
+    done < <(git -C "$main_root" ls-files -z --cached --others \
+        -- ':(glob)CACHEDIR.TAG' ':(glob)**/CACHEDIR.TAG' \
+           ':(glob).rustc_info.json' ':(glob)**/.rustc_info.json' 2>/dev/null)
 }
 
 # under_tag_dir <path> -> 0 when <path> is (or lies under) a tag dir.
 under_tag_dir() {
     local p="${1%/}" t
     for t in "${TAG_DIRS[@]}"; do
-        [[ -z "$t" ]] && return 0
+        [[ -n "$t" ]] || continue
         [[ "$p" == "$t" || "$p" == "$t"/* ]] && return 0
     done
     return 1
