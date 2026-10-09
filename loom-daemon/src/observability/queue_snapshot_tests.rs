@@ -134,6 +134,29 @@ fn listing_failures_name_resolved_repos_and_count_the_rest() {
 }
 
 #[test]
+fn a_partial_listing_is_reported_not_passed_off_as_whole() {
+    // #11139: the partial repo's rows ARE exported, and the repo is named in
+    // `listing_incomplete` so a consumer does not read missing rows as gone.
+    let mut s = summary(vec![row(1, ROOT, 100, Qd::DeferredCapacity, None)]);
+    s.listing_incomplete = vec![ROOT.to_string(), "workspace #3".to_string()];
+    let record = build_record(&s, &repos());
+    assert!(record.listing_failed.is_empty());
+    assert_eq!(record.listing_incomplete.len(), 1);
+    assert_eq!(record.listing_incomplete[0].repo, "acme/secret");
+    assert_eq!(record.listing_incomplete_unresolved, 1);
+    assert_eq!(record.rows.len(), 1);
+    let json = serde_json::to_value(&record).unwrap();
+    assert_eq!(json["listing_incomplete"][0]["repo"], "acme/secret");
+    assert_eq!(json["listing_incomplete_unresolved"], 1);
+
+    // A whole tick omits both fields on the wire (older readers unchanged).
+    let whole = build_record(&summary(Vec::new()), &repos());
+    let json = serde_json::to_value(&whole).unwrap();
+    assert!(json.get("listing_incomplete").is_none());
+    assert!(json.get("listing_incomplete_unresolved").is_none());
+}
+
+#[test]
 fn only_a_newer_tick_is_emitted() {
     let t = Utc.timestamp_opt(1_790_000_000, 0).unwrap();
     assert!(is_new_tick(t, None));

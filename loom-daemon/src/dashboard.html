@@ -331,6 +331,9 @@ function renderQueue(report) {
   queue.forEach(function (r) { counts[queueState(r)] += 1; });
   var stale = age > queueStaleSecs(report);
   var failed = tick.listing_failed || [];
+  // #11139: a partial listing (later page failed, page cap, mid-walk change)
+  // keeps the rows read, but they are not the whole queue.
+  var partial = tick.listing_incomplete || [];
   body.appendChild(el("p", {}, [
     el("span", { "class": "pill " + (stale ? "red" : "green"), text: stale ? "STALE" : "fresh" }),
     document.createTextNode(" last tick " + age + "s ago, cap " + tick.max_concurrent + " — " +
@@ -343,8 +346,15 @@ function renderQueue(report) {
         " — their backlog is missing below"),
     ]));
   }
+  if (partial.length > 0) {
+    body.appendChild(el("p", {}, [
+      el("span", { "class": "pill red", text: "INCOMPLETE" }),
+      document.createTextNode(" listing ready issues came back partial for " + partial.join(", ") +
+        " — only part of their backlog is below"),
+    ]));
+  }
   if (queue.length === 0) {
-    if (failed.length > 0) return;
+    if (failed.length > 0 || partial.length > 0) return;
     body.appendChild(el("p", { "class": "muted", text: tick.seen === 0
       ? "no ready loom:issue work" : "this daemon did not record per-issue rows" }));
     return;

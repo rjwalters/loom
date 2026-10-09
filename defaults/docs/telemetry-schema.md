@@ -236,7 +236,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | Phase spans (`trace.span`: `loom.phase`, `loom.role_attempt`) | span, OTLP only | `observability/lifecycle.rs` → `observability/otlp/traces.rs`; see [`tracing.md`](tracing.md#owned-lifecycle-instrumentation) |
 | [`pick.decision`](#pickdecision) | log, OTLP only | `observability/pick_decision.rs` (from `role_tick_telemetry.rs` and `work_finder/tick_summary.rs`) |
 | [`queue.snapshot`](#queuesnapshot) (whole ready queue per tick) | native only | `observability/queue_snapshot.rs` |
-| `loom.queue.issues`, `loom.queue.listing_failed_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
+| `loom.queue.issues`, `loom.queue.listing_failed_repos`, `loom.queue.listing_incomplete_repos` ([`metric.points`](#metricpoints)) | metric | `observability/ops/queue.rs` |
 | `loom.queue.oldest_wait`, `loom.queue.starved[.by_reason]`, `loom.queue.dispatch_wait[.samples]` ([`metric.points`](#metricpoints)) | metric | `observability/ops/dwell.rs` |
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
@@ -1617,6 +1617,7 @@ Every other name is a **`Gauge`**:
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
+| `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
 | `loom.dispatch.idle_slots` | count | every work-finder tick with an occupancy reading |
 | `loom.forge.stage_items` (`state` = `curated`, `issue`, `building`, `review_requested`, `changes_requested`, `pr`) | count | `host.health` interval |
 
@@ -1628,7 +1629,10 @@ one point per queue disposition, labelled `state` (`running`, `ready`,
 host stopped ticking or exporting. Sum by `state` for the running / ready /
 blocked split. `loom.queue.listing_failed_repos` counts the repos whose ready
 listing failed on that tick; when it is non-zero, the depth is incomplete, not
-low. Issue numbers and repos are never labels. The per-issue rows travel in
+low. `loom.queue.listing_incomplete_repos` (#11139) counts the repos whose
+listing came back partial (a later page failed, the page cap, a mid-walk
+change): their rows are counted, but not all of them. The depth is whole only
+when both are `0`. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
 
 Quota burn and pool state (Issues #8857, #8930, `observability/ops/quota.rs`), all on
@@ -2023,6 +2027,8 @@ daemon process or is disabled.
 | `counts` | object | `running` / `ready` / `blocked` over **every** row, including dropped ones; `blocked` includes the `labelled_blocked` rows |
 | `listing_failed` | array, optional | `{repo, visibility}` for each repo whose ready listing failed; its backlog is absent (incomplete, not empty) |
 | `listing_failed_unresolved` | integer | failed-listing workspaces whose slug could not be resolved |
+| `listing_incomplete` | array, optional | `{repo, visibility}` for each repo whose ready listing came back partial (#11139: a later page failed, the page cap, a mid-walk change); some of its rows are present, but not all, so a missing row is not evidence the issue left the queue |
+| `listing_incomplete_unresolved` | integer, optional | partial-listing workspaces whose slug could not be resolved; omitted when `0` |
 | `rows[]` | array | ranked rows (below), at most 200 |
 | `unresolved_rows` | integer | rows dropped because their workspace's forge slug could not be resolved |
 | `rows_truncated` | integer | rows dropped by the 200-row cap |
@@ -2143,7 +2149,9 @@ row on `visibility`. On `/public/*` a private row keeps only `rank`,
 `reason` (plus the #9288 `position`, `plan_state` and `gate`); its `repo`,
 `issue`, `created_at`, `tier`, `detail`, `keys`, `repo_cap`, `owning_shard`,
 `in_slice` and `hot` are withheld, and a private `listing_failed` entry keeps
-only its `visibility`. `counts`, `seen`, `tick_at` and the `plan` block are
+only its `visibility`. A private `listing_incomplete` entry (#11139) needs the
+same treatment; a Worker that does not know the field must drop it rather
+than pass it through. `counts`, `seen`, `tick_at` and the `plan` block are
 aggregate and survive. A Worker older than phase 3 applies the
 unknown-kind rule instead (`/public/*` sees `kind` only).
 

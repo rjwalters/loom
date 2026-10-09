@@ -3297,7 +3297,9 @@ never under 5 minutes), `no_tick` (no tick yet in this daemon process, so the
 queue is unknown rather than empty) or `disabled`. A repo whose forge listing
 failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
 view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
-false`). The `serve`
+false`). A repo whose listing came back partial (#11139: a later page failed,
+the page cap, a mid-walk change) is named in `listing_incomplete`: its rows
+are shown, but the view still says INCOMPLETE and `complete` is `false`. The `serve`
 dashboard has a matching "Ready queue" panel. The single-workspace tick path does
 not record rows. Each row also carries daemon-derived `state` and `reason`
 strings, so clients do not keep their own copy of the mapping. With
