@@ -81,7 +81,10 @@
 #        loom:operator-only,loom:operator-mechanical instead of guessing)
 #   14 = GATED (--apply: `loom-daemon forge promotion-gate` did not say
 #        ELIGIBLE, #10827: the issue's author is untrusted, or the gate could
-#        not run; nothing written, nothing posted)
+#        not run; no label written. Only on GATE=HOLD + NOTICE=needed is the
+#        gate's one adoption notice posted, deduplicated by a trusted
+#        `<!-- loom:promotion-author-gate -->` comment; UNAVAILABLE or an
+#        unreadable comment listing (NOTICE=unknown) posts nothing)
 #
 # CALLERS MUST NOT SWALLOW THE EXIT CODE. OK (0), NOT_OPEN (10), and
 # ALREADY_ESCALATED (0) all mean "nothing to do here";
@@ -258,11 +261,18 @@ fi
 WRITE_REPO="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}" 2>"$GH_STDERR")" || { emit "MISMATCH" "$REASON; --apply refused: loom-daemon forge may-write: $(tr '\n' ' ' <"$GH_STDERR")"; exit 11; }
 
 # #10827: the promotion author gate. An issue whose author fails the
-# comment-trust predicate is never promoted automatically; HOLD/UNAVAILABLE
-# (or a binary predating the verb) writes nothing and posts nothing: exit 14.
-# requires-daemon: forge optional   Without the `promotion-gate` verb (pre-#10827 binary) no GATE=ELIGIBLE line prints, so nothing is promoted (fails closed).
+# comment-trust predicate is never promoted automatically: no label is written
+# and the script exits 14 (GATED). The one write is the adoption notice: on
+# GATE=HOLD + NOTICE=needed the gate's own NOTICE_BODY (led by the
+# `<!-- loom:promotion-author-gate -->` marker) is posted, once: the verb says
+# NOTICE=posted once a TRUSTED comment carries that marker, so a retry posts
+# nothing. UNAVAILABLE, NOTICE=unknown (comments unreadable), a body not led by
+# the marker, or a binary predating the verb post nothing (fail closed).
+# requires-daemon: forge optional   Without the `promotion-gate` verb (pre-#10827 binary) no GATE=ELIGIBLE line prints, so nothing is promoted and nothing is posted (fails closed).
 GATE_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge promotion-gate --issue "$ISSUE" --repo "$WRITE_REPO" 2>/dev/null)"
 if ! grep -qx 'GATE=ELIGIBLE' <<<"$GATE_OUT"; then
+  NOTICE_BODY="$(grep -qx 'GATE=HOLD' <<<"$GATE_OUT" && grep -qx 'NOTICE=needed' <<<"$GATE_OUT" && sed -n 's/^NOTICE_BODY=//p' <<<"$GATE_OUT")"
+  [[ "$NOTICE_BODY" != '<!-- loom:promotion-author-gate -->'* ]] || ( source "$(dirname "${BASH_SOURCE[0]}")/lib/forge-helpers.sh" && forge_gh_comment_rl_safe "$WRITE_REPO" "$ISSUE" "$NOTICE_BODY" ) 2>"$GH_STDERR" || echo "WARNING: the author-gate notice FAILED to post on #$ISSUE (a later pass retries): $(cat "$GH_STDERR")" >&2
   emit "GATED" "$REASON; not promoted: author gate $(grep -m1 '^GATE=' <<<"$GATE_OUT" || echo 'GATE=UNAVAILABLE') $(grep -m1 '^REASON=' <<<"$GATE_OUT")"
   exit 14
 fi

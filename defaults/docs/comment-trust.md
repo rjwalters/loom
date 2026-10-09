@@ -138,16 +138,22 @@ Callers branch on the `GATE=` line, never the exit code; anything but
 not promote. The callers are every automatic `loom:issue` write: Champion's
 pre-claim check and Step 3b `promote_labels`, `check-promotion-landed.sh
 --apply` (Pass 0c; `DECISION=GATED`, exit 14), and Curator's starred
-Priority 0 promotion. A notice is posted only on `NOTICE=needed`: an
-unreadable comment listing reports `NOTICE=unknown` and posts nothing, so a
-failed read never spams.
+Priority 0 promotion. A notice is posted only on `GATE=HOLD` +
+`NOTICE=needed`, by every caller including the `check-promotion-landed.sh`
+backstop (still `GATED`, exit 14; no label written): once one trusted
+`<!-- loom:promotion-author-gate -->` comment exists the verb reports
+`NOTICE=posted`, so a retry posts nothing. An unreadable comment listing
+reports `NOTICE=unknown` and `UNAVAILABLE` carries no notice: both post
+nothing, so a failed read never spams. A Step 3b write-time `HOLD` releases
+the `loom:evaluating` claim and posts no verdict.
 
 **Adoption.** A held issue is promoted only by a trusted actor applying
 `loom:issue` by hand, or by re-filing it under a trusted identity. Restores of
 a lane label an issue already held (`loom:building` → `loom:issue` on
 reclaim, `release-stale-blocked`) are not new promotions and are not gated;
-nor is `/loom:sweep`'s approval gate, which executes an operator's own
-dispatch. The work finder's red-main admission of an unpromoted issue already
+nor is `/loom:sweep`'s Approval gate (`sweep-wave-lifecycle.md` step 3):
+it executes an operator approval already given (the operator named the issue
+or dispatched the sweep), so it is not an automatic promotion. The work finder's red-main admission of an unpromoted issue already
 requires a trusted filer under the same predicate
 (`work_finder/main_red_fix.rs`).
 

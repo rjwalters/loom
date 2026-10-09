@@ -233,8 +233,28 @@ cat > "$STUB_DIR/loom-daemon" <<'STUB'
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub loom-daemon: LOOM_TEST_STUB_DIR not set}"
 if [[ "$1" == "forge" && "$2" == "promotion-gate" && ! -f "$STUB_DIR_FROM_ENV/gate-verb-missing" ]]; then
   echo "$*" >> "$STUB_DIR_FROM_ENV/gate-calls.log"
-  if [[ -f "$STUB_DIR_FROM_ENV/gate-$4" ]]; then cat "$STUB_DIR_FROM_ENV/gate-$4"; exit 1; fi
+  if [[ -f "$STUB_DIR_FROM_ENV/gate-$4" ]]; then
+    # Mirror the real gate's dedup: once a notice for this issue was posted
+    # (it is in the comment log), NOTICE=needed becomes NOTICE=posted and no
+    # NOTICE_BODY is printed.
+    if grep -q "^NOTICE $4 .*<!-- loom:promotion-author-gate -->" "$STUB_DIR_FROM_ENV/comment-writes.log" 2>/dev/null; then
+      sed -e 's/^NOTICE=needed$/NOTICE=posted/' -e '/^NOTICE_BODY=/d' "$STUB_DIR_FROM_ENV/gate-$4"
+    else
+      cat "$STUB_DIR_FROM_ENV/gate-$4"
+    fi
+    exit 1
+  fi
   printf 'GATE=ELIGIBLE\nREASON=trusted body author\nNOTICE=none\n'
+  exit 0
+fi
+# forge comment <N> --repo R --body B: the script comment chokepoint
+# forge_gh_comment_rl_safe uses (LOOM_DAEMON_SELF_BIN points here, so no real
+# binary can ever post from this suite).
+if [[ "$1" == "forge" && "$2" == "comment" ]]; then
+  num="$3"; body=""; prev=""
+  for a in "$@"; do [[ "$prev" == "--body" ]] && body="$a"; prev="$a"; done
+  if [[ -f "$STUB_DIR_FROM_ENV/comment-fail-$num" ]]; then echo "stub: forge comment failed" >&2; exit 1; fi
+  printf 'NOTICE %s %s\n' "$num" "$body" >> "$STUB_DIR_FROM_ENV/comment-writes.log"
   exit 0
 fi
 if [[ "$1" == "forge" && "$2" == "trusted-comments" && ! -f "$STUB_DIR_FROM_ENV/trust-verb-missing" ]]; then
@@ -249,6 +269,7 @@ chmod +x "$STUB_DIR/loom-daemon"
 
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+export LOOM_DAEMON_SELF_BIN="$STUB_DIR/loom-daemon"
 unset LOOM_DAEMON_BIN
 
 labels_json() {
@@ -668,9 +689,10 @@ issue_json "OPEN" "$(labels_json "loom:curated")" "[]" > "$STUB_DIR/issue-503.js
 run_sut --issue 503
 assert_eq "1" "$RC" "(t4) comment fetch failure -> exit 1"
 
-# (g1) #10827 author gate: an untrusted issue author is
-#      HOLD -> GATED, exit 14, and nothing is written or posted -- on every
-#      re-run (idempotent, no repeated comments).
+# (g1) #10827 author gate: an untrusted issue author is HOLD -> GATED, exit
+#      14, loom:issue is never added, and the gate's adoption notice
+#      (NOTICE=needed) is posted exactly ONCE across re-runs: run 2 sees the
+#      notice (the gate now says NOTICE=posted) and posts nothing.
 gate_case() {
     reset_state
     issue_json "OPEN" "$(labels_json "loom:curated")" \
@@ -678,18 +700,45 @@ gate_case() {
       > "$STUB_DIR/issue-$1.json"
     stage_verify "$1" "$(labels_json "loom:issue" "tier:goal-supporting")"
 }
-for G in "HOLD" "UNAVAILABLE"; do
-    gate_case 10827
-    printf 'GATE=%s\nREASON=the body author bot[bot] is not a trusted author\nNOTICE=needed\n' "$G" > "$STUB_DIR/gate-10827"
+NOTICE_LINE='NOTICE_BODY=<!-- loom:promotion-author-gate --> **Not promoted automatically (#10827)**: its author `bot[bot]` (NONE) is not a trusted author. It stays at `loom:curated`.'
+gate_case 10827
+printf 'GATE=HOLD\nREASON=the body author bot[bot] is not a trusted author\nNOTICE=needed\n%s\n' "$NOTICE_LINE" > "$STUB_DIR/gate-10827"
+run_sut --issue 10827 --apply
+assert_eq "14" "$RC" "(g1) gate HOLD run 1 -> exit 14"
+assert_eq "GATED" "$(get_field "$OUT" DECISION)" "(g1) gate HOLD run 1 -> DECISION=GATED"
+assert_contains "$OUT" "GATE=HOLD" "(g1) gate HOLD run 1: REASON names the gate answer"
+assert_eq "" "$EDITS" "(g1) gate HOLD run 1: no label edit (loom:issue never added)"
+assert_eq "1" "$(grep -c '^NOTICE 10827 <!-- loom:promotion-author-gate --> \*\*Not promoted automatically' <<<"$COMMENTS_POSTED")" "(g1) gate HOLD run 1: exactly one marker-led notice posted via forge comment"
+assert_contains "$COMMENTS_POSTED" "bot[bot]" "(g1) gate HOLD run 1: the notice is the gate's NOTICE_BODY verbatim"
+run_sut --issue 10827 --apply
+assert_eq "14" "$RC" "(g1) gate HOLD retry -> exit 14"
+assert_eq "" "$EDITS" "(g1) gate HOLD retry: no label edit"
+assert_eq "1" "$(grep -c '^NOTICE 10827 ' <<<"$COMMENTS_POSTED")" "(g1) gate HOLD retry: deduplicated (still one notice)"
+
+# (g1d) Fail closed, never spam: UNAVAILABLE, NOTICE=unknown (comments
+#       unreadable), NOTICE=posted, and a NOTICE_BODY not led by the marker
+#       all post nothing and write nothing -- on every re-run.
+for V in "UNAVAILABLE:needed:$NOTICE_LINE" "HOLD:unknown:" "HOLD:posted:" "HOLD:needed:NOTICE_BODY=spoofed body without the marker"; do
+    G="${V%%:*}"; rest="${V#*:}"; N_STATE="${rest%%:*}"; BODY_LINE="${rest#*:}"
+    gate_case 10833
+    printf 'GATE=%s\nREASON=x\nNOTICE=%s\n%s\n' "$G" "$N_STATE" "$BODY_LINE" > "$STUB_DIR/gate-10833"
     for run in 1 2; do
-        run_sut --issue 10827 --apply
-        assert_eq "14" "$RC" "(g1) gate $G run $run -> exit 14"
-        assert_eq "GATED" "$(get_field "$OUT" DECISION)" "(g1) gate $G run $run -> DECISION=GATED"
-        assert_contains "$OUT" "GATE=$G" "(g1) gate $G run $run: REASON names the gate answer"
-        assert_eq "" "$EDITS" "(g1) gate $G run $run: no label edit (loom:issue never added)"
-        assert_eq "" "$COMMENTS_POSTED" "(g1) gate $G run $run: no comment posted"
+        run_sut --issue 10833 --apply
+        assert_eq "14" "$RC" "(g1d) gate $G/NOTICE=$N_STATE run $run -> exit 14"
+        assert_eq "GATED" "$(get_field "$OUT" DECISION)" "(g1d) gate $G/NOTICE=$N_STATE run $run -> DECISION=GATED"
+        assert_eq "" "$EDITS" "(g1d) gate $G/NOTICE=$N_STATE run $run: no label edit"
+        assert_eq "" "$COMMENTS_POSTED" "(g1d) gate $G/NOTICE=$N_STATE run $run: no comment posted"
     done
 done
+
+# (g1e) A failed notice post is reported, still GATED; the next pass retries.
+gate_case 10834
+printf 'GATE=HOLD\nREASON=untrusted\nNOTICE=needed\n%s\n' "$NOTICE_LINE" > "$STUB_DIR/gate-10834"
+: > "$STUB_DIR/comment-fail-10834"
+run_sut --issue 10834 --apply
+assert_eq "14" "$RC" "(g1e) notice post failure -> still exit 14"
+assert_contains "$ERR" "FAILED to post" "(g1e) stderr reports the failed post"
+assert_eq "" "$EDITS" "(g1e) no label edit"
 
 # (g2) A binary predating the verb prints no GATE= line: fails closed.
 gate_case 10828

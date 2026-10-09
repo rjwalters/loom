@@ -427,7 +427,7 @@ issue it does exactly one of:
 | `OK` | No APPROVED comment (a search false-positive, or `loom:issue` already present — a concurrent pass may have just reconciled it) — nothing done |
 | `OK` (timeline-confirmed) | `loom:issue` is currently absent, but the label timeline shows it WAS applied after the newest APPROVED comment and the issue has since legitimately progressed further (e.g. `loom:issue` -> `loom:building`, or -> `loom:blocked`) — the promotion landed; this is not #6862's failure mode, and re-adding `loom:issue` here would corrupt the issue's current, further-along state (#6933) |
 | `NOT_OPEN` | Issue is closed — nothing left to reconcile |
-| `GATED` | The author gate did not say `ELIGIBLE` (#10827) — nothing written or posted |
+| `GATED` | The author gate did not say `ELIGIBLE` (#10827) — no label written; only `HOLD` + `NOTICE=needed` posts its notice, once |
 | `COMPLETED` | Recovered the tier from the verdict comment's "Goal Alignment" line, applied `loom:issue` + that tier, and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
 | `ESCALATED` | Could not safely complete (tier unrecoverable from the comment text, or the completing edit's own read-back still failed) — posted an explanatory comment and added `loom:operator-only,loom:operator-mechanical` rather than guess |
 | `ALREADY_ESCALATED` | Tier unrecoverable, but the issue already carries `loom:operator-only` from a prior run — a human already owns it, so no duplicate comment is posted and no redundant label edit is issued (#6942) |
@@ -711,9 +711,9 @@ Never promote an issue whose **author** fails the comment-trust predicate
 trusted actor adopts it (applies `loom:issue` by hand, or re-files it).
 
 ```bash
-GATE_OUT=$(loom-daemon forge promotion-gate --issue "$ISSUE_NUMBER")
+GATE_OUT=$(loom-daemon forge promotion-gate --issue "$ISSUE_NUMBER" || true)
 if ! grep -qx 'GATE=ELIGIBLE' <<<"$GATE_OUT"; then  # HOLD, UNAVAILABLE, or no verb
-  grep -qx 'NOTICE=needed' <<<"$GATE_OUT" && ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "$(sed -n 's/^NOTICE_BODY=//p' <<<"$GATE_OUT")"
+  grep -qx 'NOTICE=needed' <<<"$GATE_OUT" && ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "$(sed -n 's/^NOTICE_BODY=//p' <<<"$GATE_OUT")" || true
   continue  # no claim, evaluation or verdict
 fi
 ```
@@ -728,11 +728,9 @@ completion and decided either "no marker match" or "skip budget exhausted."
 Any pass that, for whatever reason, does not walk that exact call chain end
 to end never reaches the gate at all, and nothing then stops it from
 posting a fresh comment — even when the gate, if it HAD been consulted,
-would have returned `DEFER` on an unchanged fingerprint. (Observed in the
-wild: a proposal accumulated six duplicate "Champion Review: STILL DEFERRED
-(no change)" comments across several days even though the dependency-timing
-gate returned `DEFER` with an unchanged blocker fingerprint on every one of
-those passes — illustrative, not a fixed reference for this repo.)
+would have returned `DEFER` on an unchanged fingerprint. (Observed: six
+duplicate "STILL DEFERRED (no change)" comments on one proposal, each pass's
+`DEFER` fingerprint unchanged.)
 
 **The fix: check unconditionally, first, ahead of and independent of every
 other mechanism in this file.** Before the Idempotency check, before
@@ -1083,7 +1081,7 @@ Re-run the "Verdict-time recheck" (above) immediately before this write; abort i
 comment posted but the label edit silently did not; the issue sat invisible to
 Builder for 6 days. Never trust the edit's exit code: read the label back and
 comment **only** once `loom:issue` is confirmed. `promote_labels` re-asks the
-author gate (#10827) at write time:
+author gate (#10827) at write time; a `HOLD` there only releases the claim:
 
 ```bash
 ISSUE_NUMBER=<number>
@@ -1094,7 +1092,7 @@ TIER_LABEL="tier:goal-advancing"  # OR tier:goal-supporting OR tier:maintenance
 # NOTE: loom:curated is preserved (indicates issue went through curation)
 # Other proposal labels (loom:architect, loom:hermit, loom:auditor) are removed
 promote_labels() {
-  loom-daemon forge promotion-gate --issue "$ISSUE_NUMBER" | grep -qx 'GATE=ELIGIBLE' || return 1
+  loom-daemon forge promotion-gate --issue "$ISSUE_NUMBER" | grep -qx 'GATE=ELIGIBLE' || { gh issue edit "$ISSUE_NUMBER" --remove-label "loom:evaluating"; return 1; }
   gh issue edit "$ISSUE_NUMBER" \
     --remove-label "loom:architect" \
     --remove-label "loom:hermit" \
