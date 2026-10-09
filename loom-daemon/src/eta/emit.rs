@@ -1,8 +1,10 @@
 //! When an estimate is emitted (operator decision on #9289): on every stage
 //! transition immediately, and otherwise refreshed every `refresh_secs`
 //! (5 minutes by default), each with its full explanation. A refusal is
-//! emitted when its reason first appears and is not refreshed. A per-series
-//! hourly cap bounds a flapping item.
+//! emitted when its reason first appears and is not refreshed, except
+//! `stale_inputs` (#10973), which is re-emitted on every pass while the
+//! condition persists so a stalled feed stays visible. A per-series hourly
+//! cap bounds a flapping item.
 //!
 //! The signature is per series: an item's series share its stage, rework
 //! count and refusal reason, except a hold-aware series of a held item
@@ -82,8 +84,10 @@ impl EmitState {
             Some(last) if last != signature => return Some(Trigger::Transition),
             Some(_) => {}
         }
-        if signature.reason.is_some() {
-            return None;
+        if let Some(reason) = signature.reason {
+            // `stale_inputs` is a condition, not a verdict: it persists
+            // until the feed recovers, so every pass says so (#10973).
+            return (reason == NoEstimateReason::StaleInputs).then_some(Trigger::Refresh);
         }
         // A tenth of the interval as slack, so a pass that fires a moment
         // early still refreshes instead of skipping to the next one.
