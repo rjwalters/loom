@@ -857,8 +857,13 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # and this re-exec runs spawn-claude.sh, not spawn-worker.sh, so nothing
     # inside the container re-runs that seam. Without this the worker log
     # records the cap while the in-container cargo builds full DWARF. The two
-    # names are forwarded by the env-passthrough `case` below, which already
-    # has exactly that shape (by name, only when present in `env`).
+    # names are forwarded by the env-passthrough `case` below (by name, when
+    # present in `env`). "Present" is not "set to something", though: the
+    # passthrough forwards a set-but-EMPTY variable too, and cargo hard-fails
+    # on an empty one (`invalid value: string ""`) instead of reading it as
+    # unset, so the loop's input drops those two empties and the container
+    # sees them as unset. (`grep -v` exiting 1 on no output cannot abort this
+    # script: a process substitution's status is never the shell's.)
 
     # --- Env passthrough ---
     # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
@@ -885,7 +890,7 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
-    done < <(env)
+    done < <(env | grep -v '^CARGO_PROFILE_[A-Z]*_DEBUG=$')
     _containment_env+=(-e "LOOM_SPAWN_CONTAINERIZED=1" -e "LOOM_WORKSPACE=${WORKSPACE}" -e "HOME=${HOME:-/home/loom}")
 
     # --- Resource-limit docker flags + observability labels (issue #7430) ---

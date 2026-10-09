@@ -659,7 +659,9 @@ fn run_preflight(
     // value as ambient; spawn-claude.sh's containment forwards the values
     // chosen here, since its re-exec never re-enters this seam.
     let debuginfo = cargo_debuginfo::decide(&cargo_debuginfo::inputs_for(root));
-    command.envs(debuginfo.vars.iter().map(|(k, v)| (*k, v.as_str())));
+    // A variable set but EMPTY is unset rather than inherited: cargo fails
+    // the build on an empty value instead of reading it as unset.
+    cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
     let _ = writeln!(log, "{}", debuginfo.marker);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn

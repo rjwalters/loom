@@ -130,6 +130,35 @@ pub fn decide(inputs: &Inputs) -> Decision {
     }
 }
 
+/// Whether `name` is one of the two cap variables and `value` is empty.
+///
+/// Cargo does not read an empty `CARGO_PROFILE_*_DEBUG` as unset: it fails the
+/// whole build (`invalid value: string ""`). [`inputs_for`] already treats an
+/// empty variable as not ambient, so the seam overwrites it whenever it injects
+/// — but when it injects nothing (an opt-out, a repo profile, `test` inheriting
+/// `dev`) the empty value would be inherited as is. Every boundary a worker's
+/// env crosses uses this to make such a variable unset instead.
+#[must_use]
+pub fn is_empty_cap_var(name: &str, value: &std::ffi::OsStr) -> bool {
+    (name == DEV_VAR || name == TEST_VAR) && value.is_empty()
+}
+
+/// Apply `decision` to the worker's `command`: unset a cap variable that
+/// `ambient` reports as set but empty (see [`is_empty_cap_var`]), then set the
+/// injected ones. In that order, so an injected value replaces the removal.
+pub fn apply(
+    command: &mut std::process::Command,
+    decision: &Decision,
+    ambient: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for var in [DEV_VAR, TEST_VAR] {
+        if ambient(var).is_some_and(|value| is_empty_cap_var(var, &value)) {
+            command.env_remove(var);
+        }
+    }
+    command.envs(decision.vars.iter().map(|(k, v)| (*k, v.as_str())));
+}
+
 /// The production inputs for a worker whose repository is `root`.
 #[must_use]
 pub fn inputs_for(root: &Path) -> Inputs {
@@ -286,6 +315,77 @@ mod tests {
             ..Inputs::default()
         });
         assert_eq!(v, vec![(DEV_VAR, DEFAULT_LEVEL.to_string())]);
+    }
+
+    /// What `apply` leaves on a command, as `(name, Some(value) | None)`
+    /// where `None` is an explicit removal.
+    fn applied(inputs: &Inputs, ambient: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        let mut command = std::process::Command::new("true");
+        apply(&mut command, &decide(inputs), |k| {
+            ambient
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        });
+        command
+            .get_envs()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_set_but_empty_variable_never_reaches_cargo() {
+        // Cargo rejects `CARGO_PROFILE_DEV_DEBUG=` outright, so an empty value
+        // the seam does not overwrite must be removed, not inherited.
+        let both_empty = [(DEV_VAR, ""), (TEST_VAR, "")];
+        let removed = vec![(DEV_VAR.to_string(), None), (TEST_VAR.to_string(), None)];
+        // Opt-out: nothing is injected, both empties are unset.
+        let off = Inputs {
+            setting: Some("full".into()),
+            ..Inputs::default()
+        };
+        assert_eq!(applied(&off, &both_empty), removed);
+        // A repo profile for `dev` (which `test` inherits): same.
+        let repo = Inputs {
+            explicit_dev: true,
+            ..Inputs::default()
+        };
+        assert_eq!(applied(&repo, &both_empty), removed);
+        // `test` kept for the repo's own profile: dev is injected over the
+        // empty value, the empty test variable is unset.
+        let repo_test = Inputs {
+            explicit_test: true,
+            ..Inputs::default()
+        };
+        assert_eq!(
+            applied(&repo_test, &both_empty),
+            vec![
+                (DEV_VAR.to_string(), Some(DEFAULT_LEVEL.to_string())),
+                (TEST_VAR.to_string(), None)
+            ]
+        );
+        // The default case injects both, replacing the removals.
+        assert_eq!(
+            applied(&Inputs::default(), &both_empty),
+            vec![
+                (DEV_VAR.to_string(), Some(DEFAULT_LEVEL.to_string())),
+                (TEST_VAR.to_string(), Some(DEFAULT_LEVEL.to_string()))
+            ]
+        );
+        // A real ambient value and an unset variable are both left alone.
+        let ambient = Inputs {
+            ambient_dev: true,
+            ..Inputs::default()
+        };
+        assert!(applied(&ambient, &[(DEV_VAR, "full")]).is_empty());
+        assert!(applied(&off, &[]).is_empty());
+        // Only the two cap variables are ever treated this way.
+        let empty = std::ffi::OsStr::new("");
+        assert!(is_empty_cap_var(DEV_VAR, empty) && is_empty_cap_var(TEST_VAR, empty));
+        assert!(!is_empty_cap_var(DEV_VAR, std::ffi::OsStr::new("0")));
+        assert!(!is_empty_cap_var("CARGO_TARGET_DIR", empty));
     }
 
     #[test]

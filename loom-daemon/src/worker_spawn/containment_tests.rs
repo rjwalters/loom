@@ -521,6 +521,32 @@ fn a_host_set_debuginfo_choice_is_forwarded_by_name_into_the_container() {
 }
 
 #[test]
+fn a_set_but_empty_debuginfo_variable_is_not_forwarded_into_the_container() {
+    // #11190: `-e NAME` would hand the container the host's EMPTY value, and
+    // cargo fails every build on `CARGO_PROFILE_DEV_DEBUG=` rather than
+    // reading it as unset. A non-empty sibling is still forwarded.
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "");
+    std::env::set_var("CARGO_PROFILE_TEST_DEBUG", "full");
+    let args = build(&profile(None, Some("1g")), &[]);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.starts_with("CARGO_PROFILE_DEV_DEBUG")),
+        "an empty value must not be forwarded, by name or by value: {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "-e" && w[1] == "CARGO_PROFILE_TEST_DEBUG"),
+        "the non-empty one still goes by name: {args:?}"
+    );
+    clear_env();
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+}
+
+#[test]
 fn host_only_paths_are_not_forwarded_into_the_container() {
     assert!(!forwarded_by_name("LOOM_OPENCODE_BIN"));
     assert!(!forwarded_by_name("LOOM_PI_BIN"));
