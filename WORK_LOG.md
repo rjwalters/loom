@@ -7,6 +7,94 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-09
+- **PR #11203**: perf(spawn): cap dev/test debuginfo for Loom-spawned cargo builds (#11190)
+- **PR #11216**: Reclaim finished sweeps' run target dirs at sweep end, and dead owners' dirs within minutes (#11031)
+- **PR #11202**: eager reclaim: re-arm on level below the floor, escalate tiers, alert on empty passes (#11192)
+- **PR #11200**: feat(daemon): maintain-only workspaces (fleet: maintain, workspace hold/release)
+- **PR #11158**: Read llm-monitor's new data dir with ~/.claude-monitor fallback
+- **PR #11170**: feat(worktree): add worktree-link --retire-aliases for pre-#8944 pnpm aliases
+- **PR #11185**: fix(telemetry): stop counting daemon base-conflict flags as Judge rejections
+- **PR #11196**: fix(reaper): hold a dead leader's claim until its process group drains (#11076)
+- **PR #11168**: fix(merge-pr): name the cause when the initial PR fetch fails (#9192)
+- **PR #11169**: fix(status): name active dispatch holds in the below-cap capacity line
+- **PR #10882**: feat(watchdog): opt-in bounded supervised recovery for a wedged daemon (#7855)
+- **PR #11143**: fix(check-ci-status): cancelled zero-job workflow run is no verdict, not success
+- **PR #11166**: feat(fleet-state): holds and capacity as facts in fleet.state (R8 of #10196)
+- **PR #11144**: fix(fleet): add-worker verify accepts status exit 5 as reachable (#9064)
+- **PR #11173**: ci: guard every Native Port Suites step with !cancelled() (#9356)
+- **PR #11164**: fix(ci_telemetry): stop re-compacting an already-compact ledger every cycle
+- **PR #11180**: test(agent_gh): pin that the front leaves the next gh on PATH reachable (#11176)
+- **PR #11108**: fix(watchdog): sweep-log mtime is not a liveness signal (#9533)
+- **PR #11172**: telemetry: move SigNoz read client out of eta/, add telemetry-replay --as-of (#10196 R6)
+- **PR #11181**: fix: unresolved-identity PR-less ads contribute zero to fleet tally (#9518)
+- **PR #11153**: work finder: paginate ready-queue listing and mark incomplete listings (#11139)
+- **PR #11177**: feat(resync): record each resync-ignore pin's upstream fork point (#8726)
+- **PR #11106**: feat(ram): observed per-repo memory peak admission charge (#11094 slice 1)
+- **PR #11129**: fix(reaper): stop git gc's reflog rewrite from pinning every kept worktree's target/
+- **PR #11162**: docs: CI telemetry memory attribution, poll cycle and ledger findings (#11114)
+- **PR #11132**: telemetry: host.export OTLP record with per-exporter dropped_total (#11124)
+- **PR #11155**: fix(champion): carry a released critical-file hold through re-dates around a merge (#10875)
+- **PR #11120**: fix: write #11058 supervision drop-in at daemon startup; reset-failed first
+- **PR #11154**: ci: derive cfg(not(otlp)) tests from nextest list; fail when tests run != derived
+- **PR #11141**: reaper: no PR-less strike on external OOM/scope stop (#11076)
+- **PR #10283**: feat(telemetry): fleet.state OTLP kind with hourly anchor (slice 2 of #10196)
+- **PR #11082**: fix(roll-pause): wire the pause hook at launch so consumer-repo sweeps reach a safe point
+- **PR #11145**: fix(create-issue): REST fallback on GraphQL server errors, reconciled to file once (#9714)
+- **PR #11099**: fix(quarantine): never stash cargo target trees into refs/stash (#11075)
+- **PR #11085**: fix(daemon_update): stale-entry-point advisory no longer flags the rollback copy or says rm for unprunable entries (#11069)
+- **PR #11138**: docs: CI telemetry daemon memory attribution report (#11114)
+- **PR #11142**: fix(claim-staleness): name the age floor in the stand-down message
+- **PR #11135**: feat(telemetry): knowable-at column, replay SQL, cross-host loom.fact_id (#10196 R3+R4)
+- **PR #11134**: fix(renovate): disable Dependency Dashboard and guard loom:review-requested routing (#9418)
+- **PR #11133**: ci: move the loom-worker :buildcache write into a main-only job
+- **PR #11131**: refactor(eta): cut borrowed ETA helpers out of core modules (#11098 Stage 2)
+- **PR #11122**: feat: give sweep phase role_attempt spans a real observed start (#9935)
+- **PR #11102**: spawn-claude: OOMPolicy=continue for agent scopes (#11076)
+- **PR #11093**: fix(daemon): survive a child OOM kill and relaunch a failed daemon (#11058)
+- **Issue #11190** (closed): Loom-spawned cargo builds emit full debuginfo: one loom sweep's run dir reaches 26 GB (55 test binaries × 440 MB, 97% DWARF)
+- **Issue #11031** (closed): Run target dirs of finished daemon sweeps linger 3h+ before the orphan sweep collects them
+- **Issue #11192** (closed): Eager reclaim stays disarmed while the disk term keeps binding: no pass for 7.5 h as free space fell 79 GB to 0
+- **Issue #11186** (closed): Per-repo maintain-only mode: keep a workspace's Loom install current but never dispatch into it
+- **Issue #8849** (closed): Read llm-monitor's new data dir (~/.llm-monitor / LOOM_LLM_MONITOR_DIR), keeping ~/.claude-monitor fallback
+- **Issue #9152** (closed): worktree-link: an already-created worktree keeps its pnpm node_modules alias (#8944 leaves existing worktrees unfixed)
+- **Issue #9062** (closed): Rejection telemetry counts daemon base-conflict flags (#8922) as Judge rejections
+- **Issue #9192** (closed): merge-pr.sh: "Could not fetch PR #N" hides the real cause — forge_get_pr_nocache discards stderr
+- **Issue #9131** (closed): status: a drain-paused host reports "the limiter is work availability" while queue reports HALTED
+- **Issue #7855** (closed): robb-pro daemon stopped heartbeating and answering IPC for 25 min while still logging; the watchdog CONFIRMED the wedge twice and never restarted it
+- **Issue #10415** (closed): Auditor: check-ci-status reports success when CI is cancelled before build and tests
+- **Issue #11123** (closed): telemetry: fleet.state holds and capacity facts (#10196 R8)
+- **Issue #9064** (closed): fleet add-worker verify always fails on a work-finder-off worker: loom-daemon status exits 5 (EXIT_AUTONOMY_MISMATCH), read as 'not ready'
+- **Issue #9356** (closed): ci: 'Native Port Suites' steps lack !cancelled() guards; #9118 comment overstates coverage
+- **Issue #11160** (closed): ci_telemetry: compact_if_large rewrites and fsyncs the whole ledger every poll cycle once the compacted ledger exceeds 8 MB
+- **Issue #11176** (closed): agent gh front: its call ledger is local-only (3 h) and in-process ETag reads never reach a telemetry shim, so Loom agent sessions on a host are uncounted fleet-wide
+- **Issue #11127** (closed): telemetry: move SigNoz read client out of eta/, add telemetry replay --as-of (#10196 R6)
+- **Issue #9518** (closed): prless-retry fleet tally can double-count its own releases on a host whose identity is UNKNOWN_HOST
+- **Issue #11139** (closed): work finder: ready-queue listing reads one page of 100, newest first — oldest ready issues starve past 100 per repo
+- **Issue #11188** (closed): ETA retirement filing vets its write under the process credential, not the root's (same defect as #10837)
+- **Issue #8726** (closed): resync-ignore pins record no fork point: 'can this pin be lifted yet?' is archaeology, not a diff
+- **Issue #11071** (closed): Idle worktrees keep full cargo target/ caches indefinitely — 40 GB of worker-1's 2026-10-09 fill, uncovered by the leak fixes
+- **Issue #11114** (closed): Attribute residual Linux daemon memory after streamed CI journal export
+- **Issue #11077** (closed): Decision: should mail remain a Loom feature? (frozen during stability focus)
+- **Issue #10000** (closed): An agent asks a human only by a decision or a mail; operator labels stay engine-internal
+- **Issue #11124** (closed): telemetry: host.export OTLP record with per-exporter dropped_total (#10196 R2)
+- **Issue #10875** (closed): Champion re-arms a released merge-risk hold after a tree-identical re-date commit
+- **Issue #11111** (closed): Deliver #11058's supervision settings to existing hosts: daemon writes a systemd drop-in at startup; reset-failed before operator start
+- **Issue #10845** (closed): CI: the cfg(not(otlp)) targeted step should fail when tests-run != tests-derived; fix stale OTLP-family doc comments
+- **Issue #11049** (closed): Pause-and-roll: resumable sweeps in consumer repos rarely reach a safe point within the pause budget, so most are requeued instead of resumed
+- **Issue #9714** (closed): create-issue.sh falls back to REST only on rate-limit errors, not on other GraphQL failures
+- **Issue #11075** (closed): Quarantine stashes capture cargo target dirs (tens of GB into refs/stash): auto-gc repack then OOM-kills agents
+- **Issue #11069** (closed): Stale-entry-point advisory flags the rollback copy loom-daemon.previous and tells the operator to rm it
+- **Issue #9927** (closed): claim-staleness.sh stand-down message omits the bounded-fallback age floor, reading as 'overdue' when it is not
+- **Issue #11125** (closed): telemetry: knowable-at column, replay SQL, cross-host outcome ids (#10196 R3+R4)
+- **Issue #9426** (closed): Dependency Dashboard
+- **Issue #9418** (closed): Renovate: Dependency Dashboard is enabled by config:recommended (unlabelled bot issue), and renovate.json5's loom:review-requested label has no structural guard
+- **Issue #10846** (closed): CI: move the loom-worker :buildcache write into a main-only job (no packages:write on PR tokens)
+- **Issue #9063** (closed): Epic: order overlapping PRs first, then add automatic merge consolidation
+- **Issue #9935** (closed): builder role_attempt spans are zero-duration by construction — SigNoz's builder stage distribution is unusable
+- **Issue #9512** (closed): loom-daemon: reaper_sweep_exited_event_carries_no_progress_classification can hang forever, wedging the whole lib suite behind its #[serial] lock
+- **Issue #11058** (closed): systemd unit: OOMPolicy=stop with Restart=on-success lets one OOM-killed child take the daemon down until restarted by hand
+
+### 2026-10-09
 - **PR #11084**: fix(workspace_hold): do not hold dispatch for a behind-but-compatible W3 repo; re-judge checkout holds on fast-forward
 - **PR #11100**: docs(telemetry): exported-facts contract for external ETA consumers (#11098 stage 1)
 - **PR #11081**: pause_roll: stop H4's agents in parallel and bound the stop phase (#11051)
