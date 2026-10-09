@@ -64,6 +64,7 @@ pub fn daemon_bin() -> PathBuf {
 /// | Watch registry + results log | `~/.loom/watches.json` | test watches leak into the real daemon's watch set |
 /// | Default sweep workspace | cwd | claim locks and worktree paths resolve inside the real checkout |
 /// | Session reconcile loop + its fallback-root record | `~/.loom/session-reconcile-fallback-root.json` | the real daemon's record points at a deleted temp dir (#10661); the loop itself acts on real Codex session containers |
+/// | Orphaned cargo target dir sweep | the host's real `/tmp`, `$TMPDIR`, `~/.cache` | a test daemon's first reaper tick `remove_dir_all`s directories on the developer's machine (#8370) |
 ///
 /// This is the confirmed mechanism behind the three #4275 dispatches that had
 /// no entry in the production daemon's log: a debug `loom-daemon` spawned by
@@ -94,6 +95,13 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         // overwritten with this fixture's soon-deleted path, silently
         // degrading the real daemon's hold root set until it restarts.
         .env("LOOM_SESSION_RECONCILE", "0")
+        // #8370: the orphaned-cargo-target sweep runs from the worktree
+        // reaper's first, immediate tick and scans `/tmp`, `$TMPDIR` and
+        // `~/.cache` — none of which a fixture can redirect. The real binary
+        // is not `cfg(test)`, so the lib's own test-only narrowing does not
+        // apply to it. The env switch wins over config, so this is
+        // unconditional: a test daemon never sweeps the host's shared dirs.
+        .env("LOOM_TARGET_ORPHAN_RECLAIM", "0")
         .env(
             "LOOM_SESSION_FALLBACK_ROOT_FILE",
             fixture.join("session-reconcile-fallback-root.json"),
