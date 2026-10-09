@@ -1,8 +1,10 @@
 //! When an estimate is emitted (operator decision on #9289): on every stage
 //! transition immediately, and otherwise refreshed every `refresh_secs`
 //! (5 minutes by default), each with its full explanation. A refusal is
-//! emitted when its reason first appears and is not refreshed. A per-series
-//! hourly cap bounds a flapping item.
+//! emitted when its reason first appears and is not refreshed, except
+//! `stale_inputs` (#10973), which is re-emitted on every pass while the
+//! condition persists so a stalled feed stays visible. A per-series hourly
+//! cap bounds a flapping item.
 //!
 //! The signature is per series: an item's series share its stage, rework
 //! count and refusal reason, except a hold-aware series of a held item
@@ -18,6 +20,10 @@ use std::collections::VecDeque;
 /// Most emissions per `(item, kind, heuristic)` in any rolling hour: twelve
 /// 5-minute refreshes plus headroom for transitions.
 pub const HOURLY_CAP: usize = 20;
+
+/// Most `stale_inputs` re-emits per series in any rolling hour: half the
+/// hard cap, leaving the rest for the transition out of the stall.
+pub const STALE_CAP: usize = HOURLY_CAP / 2;
 
 /// Why an estimate was emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,8 +88,13 @@ impl EmitState {
             Some(last) if last != signature => return Some(Trigger::Transition),
             Some(_) => {}
         }
-        if signature.reason.is_some() {
-            return None;
+        if let Some(reason) = signature.reason {
+            // `stale_inputs` is a condition, not a verdict: it persists
+            // until the feed recovers, so every pass says so (#10973). It
+            // stops at half the hourly cap so the recovery transition (or a
+            // real stage change) always has headroom to be emitted.
+            return (reason == NoEstimateReason::StaleInputs && in_window < STALE_CAP)
+                .then_some(Trigger::Refresh);
         }
         // A tenth of the interval as slack, so a pass that fires a moment
         // early still refreshes instead of skipping to the next one.

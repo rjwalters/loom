@@ -77,6 +77,8 @@ pub mod agent;
 pub mod buckets;
 #[path = "forge_call_stats_counters.rs"]
 pub mod counters;
+#[path = "forge_call_stats_ingest.rs"]
+pub mod ingest;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 #[path = "forge_call_stats_sink.rs"]
@@ -553,6 +555,10 @@ pub struct CallAttribution {
     /// The owner the credential is an installation for (lowercased).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub co: Option<String>,
+    /// The App installation the credential was minted under (#10571), from
+    /// its directory's `identity.json` sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<String>,
     /// Credential kind: `reader`, `writer`, `env` or `ambient`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tk: Option<String>,

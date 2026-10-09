@@ -195,6 +195,78 @@ fn cred_of_classifies_every_credential_shape_without_leaking_a_path() {
     let bare = tempfile::tempdir().unwrap();
     let c = cred_of_with(Some(&bare.path().join(".loom/gh-config-by-owner/acme")), false);
     assert_eq!(c.account, "app-unknown");
+    assert_eq!(c.installation, None);
+
+    // #10571: a directory's sidecar names what was minted into it, and wins
+    // over the roster (`777`) and the remote (`acme`).
+    let side = |dir: &Path, app: &str, inst: &str, owner: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        let s = crate::forge_identity::Sidecar {
+            app_id: app.into(),
+            installation_id: inst.into(),
+            owner: Some(owner.into()),
+            role: crate::forge_identity::SidecarRole::Writer,
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        crate::forge_identity::sidecar::write_sidecar(dir, &s).unwrap();
+    };
+    side(&primary, "777", "7", "acme");
+    side(&owner_dir, "888", "9", "acme");
+    side(&reader, "4242", "11", "acme");
+    let got = |dir: &Path| {
+        let c = cred_of_with(Some(dir), false);
+        (c.account, c.owner, c.kind, c.installation)
+    };
+    assert_eq!(got(&primary), ("app-777".into(), s("acme"), "writer", s("7")));
+    assert_eq!(got(&owner_dir), ("app-888".into(), s("acme"), "writer", s("9")));
+    assert_eq!(got(&reader), ("app-4242".into(), s("acme"), "reader", s("11")));
+    // A reader sidecar for another App names no installation for this dir.
+    side(&reader, "1", "12", "acme");
+    assert_eq!(got(&reader).3, None);
+}
+
+#[test]
+fn headers_are_booked_under_the_sidecar_installation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".loom/gh-config-by-owner/acme10571h");
+    std::fs::create_dir_all(&dir).unwrap();
+    let side = crate::forge_identity::Sidecar {
+        app_id: "1057103".into(),
+        installation_id: "151241341".into(),
+        owner: Some("acme10571h".into()),
+        role: crate::forge_identity::SidecarRole::Writer,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        ..Default::default()
+    };
+    crate::forge_identity::sidecar::write_sidecar(&dir, &side).unwrap();
+    let reset = chrono::Utc::now().timestamp() + 1200;
+    let gh = stub(
+        tmp.path(),
+        "gh-headers",
+        &format!(
+            "printf 'HTTP/2.0 200 OK\\r\\nX-Ratelimit-Limit: 5000\\r\\nX-Ratelimit-Resource: core\\r\\n\
+             X-Ratelimit-Remaining: 4800\\r\\nX-Ratelimit-Used: 200\\r\\nX-Ratelimit-Reset: {reset}\\r\\n\\r\\n{{}}'"
+        ),
+    );
+    let call = inv("claim.pr_get", &["api", "--include", "repos/acme10571h/w/pulls/1"], &gh)
+        .gh_config_dir(Some(&dir))
+        .without_token_env();
+    let lines = raw_lines_after(|| {
+        let _ = call.run();
+    });
+    let l = &lines[0];
+    assert_eq!(
+        (l["ca"].as_str(), l["co"].as_str(), l["ci"].as_str()),
+        (Some("app-1057103"), Some("acme10571h"), Some("151241341"))
+    );
+    let now = chrono::Utc::now().timestamp();
+    let (key, held) = forge_bucket_book::snapshot(now)
+        .into_iter()
+        .find(|(k, _)| k.account == "app-1057103")
+        .expect("the header reading is booked under the minted App");
+    assert_eq!((key.owner.as_str(), key.installation.as_str()), ("acme10571h", "151241341"));
+    assert_eq!(held.used, Some(200));
 }
 
 // ===== 3. bucket from the response headers =====
@@ -411,8 +483,10 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
         keys,
         [
             "account",
+            "agent",
             "caller",
             "cred_owner",
+            "installation",
             "op",
             "outcome",
             "resource",
@@ -421,6 +495,7 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
         ]
     );
     assert_eq!(ok_point.labels["target_owner"], "acme");
+    assert_eq!(ok_point.labels["agent"], "-", "the daemon's own row (#10607)");
     assert_eq!(ok_point.labels["resource"], "graphql");
     assert_eq!(ok_point.labels["role"], "writer");
     let err = ours

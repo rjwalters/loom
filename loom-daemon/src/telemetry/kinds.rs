@@ -161,6 +161,9 @@ pub struct TelemetryKindMeta {
 /// `auto_update.tick` (#10414).
 pub mod auto_update_tick;
 
+/// `host.export` (#11124).
+pub mod host_export;
+
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
@@ -175,6 +178,9 @@ pub mod eta_fleet_refresh;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
+pub mod eta_stage_outcome;
+
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
@@ -186,6 +192,11 @@ pub mod pr_resolved;
 
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
+
+/// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
+pub mod fleet_state;
+/// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
+pub mod token_ranking_refresh;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -405,6 +416,14 @@ macro_rules! telemetry_kind_table {
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
+            /// One host's in-flight items (stage, entered-at, PR, host, slot)
+            /// and per-repo open-PR census (Issue #10196). OTLP-only: the
+            /// replay contract's state record. A full anchor goes out hourly,
+            /// with deltas in between only when something changed. See
+            /// [`fleet_state`].
+            FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One daily-fit check, whether it fitted or skipped (Issue
             /// #10391). OTLP-only, like the other `eta.*` log kinds. See
             /// [`eta_fit`].
@@ -422,6 +441,13 @@ macro_rules! telemetry_kind_table {
             /// already journals, so no new forge read. OTLP-only. See
             /// [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One stage an item left, with its entry and exit instants and the
+            /// estimates open for the item then (Issue #10929). Built from rows
+            /// the ETA tracker already journals, so no new forge read.
+            /// OTLP-only. See [`eta_stage_outcome`].
+            EtaStageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::eta_stage_outcome::EtaStageOutcomeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One heuristic's nightly walk-forward fold for one UTC day (Issue
@@ -444,6 +470,19 @@ macro_rules! telemetry_kind_table {
             /// reason, blockers with their states, labels changed. OTLP-only.
             /// See [`pass`].
             PassVerdict = "pass.verdict" => $crate::telemetry::kinds::pass::PassVerdictRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One workspace's token-ranking refresh round (Issue #10744):
+            /// accounts probed, per-account outcome and credential kind, and
+            /// how many probes used a metered API key. OTLP-only. See
+            /// [`token_ranking_refresh`].
+            TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// This host's export view (Issue #11124, R2 of #10196): active
+            /// exporters, queue depth, cumulative `dropped_total` per exporter
+            /// and the last successful flush. OTLP-only. See [`host_export`].
+            HostExport = "host.export" => $crate::telemetry::kinds::host_export::HostExportRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

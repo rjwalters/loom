@@ -1,13 +1,15 @@
 //! IPCW conformal calibration wrapper (#10524): the point-in-time leak test,
 //! the censoring correction, the regime-shift and no-shift fixtures
-//! (`t_cov ≤ 12 h`, never widening), the half-life fallback, and the shadow
-//! registration.
+//! (`t_cov ≤ 12 h`, never widening), the half-life fallback, and the
+//! retired quick-tern / bold-lark shadows (#10949), rebuilt offline through
+//! [`IpcwWrap`].
 
 use super::{as_of, history_a, input_at};
 use crate::eta::conformal::{apply, Calibration};
 use crate::eta::conformal_ipcw::{self, HALF_LIFE_SEC, METHOD};
+use crate::eta::conformal_wrap::{Calibrator, IpcwWrap};
 use crate::eta::heuristics::{
-    LandBoldLark, LandQuickTern, LandV2, CALIBRATION_BASES, LAND_BOLD_LARK, LAND_KEEN_WREN,
+    LandKeenWren, LandTwinOtterB, LandV2, CALIBRATION_BASES, LAND_BOLD_LARK, LAND_KEEN_WREN,
     LAND_QUICK_TERN, LAND_TWIN_OTTER_B, LAND_V2,
 };
 use crate::eta::recalibrate::{CalibrationObservation, OBSERVATION_SCHEMA};
@@ -15,6 +17,18 @@ use crate::eta::simulate::run_explanation;
 use crate::eta::{Explanation, Heuristic, Kind, Registry, Stage};
 use chrono::{DateTime, Duration, Utc};
 use std::f64::consts::LN_2;
+
+/// The retired `land-2026-10-06-quick-tern` (#10949), rebuilt offline:
+/// twin-otter-b wrapped by [`conformal_ipcw::calibrate`].
+fn quick_tern() -> IpcwWrap<LandTwinOtterB> {
+    IpcwWrap::new(LAND_QUICK_TERN, LandTwinOtterB::default(), Calibrator::Ipcw).unwrap()
+}
+
+/// The retired `land-2026-10-06-bold-lark` (#10949), rebuilt offline:
+/// keen-wren wrapped by [`conformal_ipcw::calibrate`].
+fn bold_lark() -> IpcwWrap<LandKeenWren> {
+    IpcwWrap::new(LAND_BOLD_LARK, LandKeenWren::new(None), Calibrator::Ipcw).unwrap()
+}
 
 pub(super) const HOUR: i64 = 3_600;
 pub(super) const DAY: i64 = 86_400;
@@ -156,15 +170,15 @@ fn quick_tern_leak_perturbing_post_as_of_outcomes_is_bit_identical() {
     future.extend((0..60).map(|i| obs(&format!("f{i}"), Stage::ReviewWait, i * 60, Some(60))));
     assert_eq!(bytes(&calibrate(future)), bytes(&reference));
 
-    // The same through the heuristic itself.
+    // The same through the (offline) wrapper.
     let input = input_at(Stage::ReviewWait, 0, 0);
     let mut history = history_a();
     history.calibration = rows.clone();
-    let a = LandQuickTern::default().estimate(&input, &history);
+    let a = quick_tern().estimate(&input, &history);
     history.calibration.extend(
         (0..60).map(|i| obs(&format!("g{i}"), Stage::ReviewWait, i * 60 + 1, Some(10 * DAY))),
     );
-    let b = LandQuickTern::default().estimate(&input, &history);
+    let b = quick_tern().estimate(&input, &history);
     assert_eq!(bytes(&a), bytes(&b));
 }
 
@@ -321,14 +335,14 @@ fn another_stages_evidence_is_used_pooled() {
 }
 
 #[test]
-fn quick_tern_is_shadow_registered_records_its_method_and_recomputes() {
+fn quick_tern_is_retired_and_offline_records_its_method_and_recomputes() {
     let registry = Registry::builtin();
-    assert!(registry.ids().contains(&LAND_QUICK_TERN));
-    assert!(registry
+    assert!(!registry.ids().contains(&LAND_QUICK_TERN), "retired (#10949)");
+    assert!(!registry
         .for_kind(Kind::Land)
         .any(|h| h.id() == LAND_QUICK_TERN));
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
-    let heuristic = registry.get(LAND_QUICK_TERN).unwrap();
+    let heuristic = quick_tern();
     assert!(heuristic.models_hold(), "as twin-otter-b");
     assert!(CALIBRATION_BASES.contains(&LAND_TWIN_OTTER_B));
 
@@ -416,16 +430,17 @@ fn rows_of(heuristic: &str, rows: Vec<CalibrationObservation>) -> Vec<Calibratio
         .collect()
 }
 
-/// #10524 slice 4: the wrapper over keen-wren is registered, wraps keen-wren's
-/// answer under its own id, and only ever reads keen-wren's logged rows.
+/// #10524 slice 4: the wrapper over keen-wren wraps keen-wren's answer under
+/// its own id, and only ever reads keen-wren's logged rows. Retired as a
+/// registered shadow (#10949); kept offline.
 #[test]
 fn bold_lark_wraps_keen_wren_and_reads_only_its_rows() {
     let registry = Registry::builtin();
-    assert!(registry
+    assert!(!registry
         .for_kind(Kind::Land)
         .any(|h| h.id() == LAND_BOLD_LARK));
     assert!(CALIBRATION_BASES.contains(&LAND_KEEN_WREN));
-    let heuristic = registry.get(LAND_BOLD_LARK).unwrap();
+    let heuristic = bold_lark();
     assert!(heuristic.models_hold(), "as keen-wren");
 
     // Pre-PR stage: keen-wren answers from the dispatch-plan path.
@@ -479,7 +494,7 @@ fn bold_lark_leak_post_as_of_outcomes_cannot_enter_the_calibration_set() {
     let input = input_at(Stage::SweepBuilder, 0, 0);
     let mut history = super::ready::history_ready();
     history.calibration = rows.clone();
-    let a = LandBoldLark::default().estimate(&input, &history);
+    let a = bold_lark().estimate(&input, &history);
     assert!(a.calibration.is_some(), "the leak test exercises calibration");
     // Post-as_of estimates with extreme outcomes, and a pre-as_of estimate
     // whose landing is only known afterwards.
@@ -499,9 +514,9 @@ fn bold_lark_leak_post_as_of_outcomes_cannot_enter_the_calibration_set() {
     let mut with_b = history.clone();
     with_b.calibration.push(late_b);
     assert_eq!(
-        bytes(&LandBoldLark::default().estimate(&input, &with_a)),
-        bytes(&LandBoldLark::default().estimate(&input, &with_b)),
+        bytes(&bold_lark().estimate(&input, &with_a)),
+        bytes(&bold_lark().estimate(&input, &with_b)),
     );
-    let b = LandBoldLark::default().estimate(&input, &history);
+    let b = bold_lark().estimate(&input, &history);
     assert_eq!(bytes(&a), bytes(&b));
 }

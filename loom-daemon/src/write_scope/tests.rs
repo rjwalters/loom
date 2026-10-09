@@ -375,7 +375,8 @@ enum Scope {
     /// `GhTransport::write_raw`), never a `gh` child of its own; the file
     /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
     /// named caller reaches the named call only under its captain `gate`
-    /// (e.g. `RefreshGate::Captain`), so only the declared captain writes.
+    /// (e.g. `RefreshGate::Captain`), so only the declared captain (or the
+    /// single refresher it stands for) writes.
     FleetStore {
         caller: &'static str,
         call: &'static str,
@@ -417,6 +418,14 @@ fn daemon_write_paths_are_scoped() {
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
         ("quarantine_reconciliation.rs", Gated),
+        ("fleet_sync/workspace_resync/host.rs", Gated),
+        (
+            "fleet_store/resync_claim.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         ("star_liveness/task.rs", Gated),
         (
@@ -442,6 +451,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/watchdog.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
+        (
+            "sweep_registry/roll_requeue.rs",
+            Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
+        ),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
             "sweep_registry/prless_retry/hold.rs",
@@ -510,7 +523,15 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("cli/forge_action.rs", Gated),
+        ("cli/forge_verdict_cmd.rs", ShellVetted("post-verdict.sh")),
         ("role_runner/launch.rs", Gated),
+        // #10832: gives back the claim label a role run a roll could not
+        // resume had taken; `release_claim` gates on the root itself.
+        ("role_runner/roll_resume.rs", Gated),
+        (
+            "roll_pause/claim_breadcrumb.rs",
+            NotAWrite("parses an agent's own gh argv for the claim it took (#10832), runs none"),
+        ),
         ("operator_decision/cli.rs", Gated),
         ("forge_priority_labels.rs", Gated),
         (
@@ -525,9 +546,9 @@ fn daemon_write_paths_are_scoped() {
             "eta/fit/publish.rs",
             FleetStore {
                 caller: "observability/eta_fleet_refresh.rs",
-                call: "distribute_publish(root, &captain",
-                gate: "RefreshGate::Captain)",
-                why: "the captain publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
+                call: "distribute_publish(root, &publisher",
+                gate: "RefreshGate::Captain | RefreshGate::Authority)",
+                why: "the refresher (the captain, or the explicit ETA authority, #10918) publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
             },
         ),
         (
@@ -550,6 +571,14 @@ fn daemon_write_paths_are_scoped() {
         (
             "watchdog/peer_coord.rs",
             NotAWrite("follow-up on the issue this watchdog filed"),
+        ),
+        (
+            "forge_probe.rs",
+            NotAWrite(
+                "the hosted-trial probe writes to the candidate instance's disposable \
+                 repo ($GITEA_QUAL_* runbook env) — never the daemon's managed forge: \
+                 no gh, no forge credential path (#9789)",
+            ),
         ),
         (
             "dep_recheck/decide.rs",
@@ -589,6 +618,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
+        (
+            "observability/otlp/relay/server.rs",
+            NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let writes = regex::Regex::new(

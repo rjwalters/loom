@@ -175,7 +175,7 @@ pub(crate) fn render(
 /// One key cell; a bucket's `rst` renders as its reset time.
 fn cell(by: GroupBy, index: usize, key: &[String]) -> String {
     let raw = key.get(index).cloned().unwrap_or_default();
-    if by == GroupBy::Bucket && index == 3 {
+    if by == GroupBy::Bucket && index == 4 {
         return raw.parse::<i64>().map_or(raw, hhmm);
     }
     raw

@@ -962,6 +962,7 @@ mod tests {
                 complexity: None,
                 tokens_status: None,
                 tokens_status_reason: None,
+                no_phase_cause: None,
                 attempt_index: None,
                 previous_sweep_id: None,
                 trigger: None,

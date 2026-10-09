@@ -32,6 +32,7 @@ fn facts() -> TickFacts {
             context: TraceContext::derived("execution", &["rjwalters/usage", &execution]),
             execution,
             started_at,
+            failure: None,
         },
         role: "judge".into(),
         ended_at: started_at + chrono::Duration::seconds(60),

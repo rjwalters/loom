@@ -12,13 +12,13 @@
 //!   carried no `used` or the forge-call ledger is off.
 //! - **`github.ratelimit.{remaining,used,reset}` gauges** (W1, #10343), one
 //!   series per billed bucket: every point is labelled `resource`,
-//!   `account`, `owner` and `role`. On an App host every reading in
-//!   [`crate::forge_bucket_book`] is exported once per tick, and the 60 s
-//!   `gh api rate_limit` probe (free — it does not count against the quota)
-//!   is booked there under `(writer account, primary owner, resource)`
-//!   first, so no point leaves without an `owner` and the legacy owner-less
-//!   series no longer interleaves with a bucket's. (One label set is still
-//!   not guaranteed to be one GitHub bucket — #10571.) An ambient-login host (an operator's
+//!   `account`, `owner` and `role` (and a bucket point `installation`). On
+//!   an App host every reading in [`crate::forge_bucket_book`] is exported
+//!   once per tick, and the 60 s `gh api rate_limit` probe (free — it does
+//!   not count against the quota) is booked there under the primary
+//!   directory's own key (the identity minted into it, #10571) first, so no
+//!   point leaves without an `owner` and the legacy owner-less series no
+//!   longer interleaves with a bucket's. An ambient-login host (an operator's
 //!   own `gh`) has no bucket book entries of its own: it exports the probe
 //!   (falling back to the breaker's trip-time budget) as `owner="-"`,
 //!   `role="ambient"`.
@@ -349,10 +349,11 @@ pub fn quota_points(
 }
 
 /// Gauges for every believed bucket-book reading (W1), labelled
-/// `resource`, `account`, `owner` and `role` — one series per billed
-/// bucket. `role` is `writer` for the workspace's writer App
-/// (`writer_account`, [`crate::forge_bucket_book::writer_account`]) and
-/// `reader` for any other App (the same split as `ProbeTarget.role`).
+/// `resource`, `account`, `owner`, `installation` (#10571, `-` when no
+/// sidecar named one) and `role` — one series per billed bucket. `role` is
+/// `writer` for the workspace's writer App (`writer_account`: the App
+/// minted into the primary credential directory, else the roster's —
+/// [`writer_account_for`]) and `reader` for any other App.
 #[must_use]
 pub fn bucket_points(
     readings: &[(crate::forge_bucket_book::BucketKey, crate::forge_bucket_book::Reading)],
@@ -370,6 +371,7 @@ pub fn bucket_points(
                 .label("resource", key.resource.as_str())
                 .label("account", key.account.as_str())
                 .label("owner", key.owner.as_str())
+                .label("installation", key.installation.as_str())
                 .label("role", role)
         };
         if let Some(remaining) = reading.remaining {
@@ -384,12 +386,18 @@ pub fn bucket_points(
 }
 
 /// Book one 60 s probe reading into the bucket book (#10343) under
-/// `(account, owner, core|graphql)` with [`Source::Probe`], read at the
+/// `(account, owner, core|graphql)`, witnessed by `installation`, with
+/// [`Source::Probe`], read at the
 /// snapshot's `probed_at`. Only a live probe is booked: the breaker's
 /// trip-time fallback would carry the wrong `observed_at`.
 ///
 /// [`Source::Probe`]: crate::forge_bucket_book::Source::Probe
-pub fn book_budget(budget: &BudgetSnapshot, account: &str, owner: &str) {
+pub fn book_budget(
+    budget: &BudgetSnapshot,
+    account: &str,
+    owner: &str,
+    installation: Option<&str>,
+) {
     use crate::forge_bucket_book::{insert, BucketKey, Reading, Resource, Source};
     for (resource, remaining, used, reset) in [
         (Resource::Core, budget.core_remaining, budget.core_used, budget.core_reset),
@@ -401,7 +409,7 @@ pub fn book_budget(budget: &BudgetSnapshot, account: &str, owner: &str) {
         ),
     ] {
         insert(
-            BucketKey::new(account, owner, resource),
+            BucketKey::new(account, owner, resource).with_installation(installation),
             Reading {
                 limit: None,
                 remaining: Some(remaining),
@@ -419,7 +427,11 @@ pub fn book_budget(budget: &BudgetSnapshot, account: &str, owner: &str) {
 pub enum ProbeHost {
     /// The daemon runs under its GitHub App credential: the probe reads the
     /// writer App's bucket for the workspace's own owner.
-    App { account: String, owner: String },
+    App {
+        account: String,
+        owner: String,
+        installation: Option<String>,
+    },
     /// An ambient `gh` login (an operator's machine).
     Ambient,
 }
@@ -435,9 +447,13 @@ pub fn probe_points(
     account: impl FnOnce() -> String,
 ) -> Vec<MetricPoint> {
     match host {
-        ProbeHost::App { account, owner } => {
+        ProbeHost::App {
+            account,
+            owner,
+            installation,
+        } => {
             if let Some(budget) = &probed {
-                book_budget(budget, account, owner);
+                book_budget(budget, account, owner, installation.as_deref());
             }
             Vec::new()
         }
@@ -488,19 +504,43 @@ fn probe_host(workspace_root: &Path) -> ProbeHost {
 }
 
 /// [`probe_host`] with the App-host predicate supplied. The App key is the
-/// same `(writer_account, primary_owner)` derivation
-/// [`crate::forge_bucket_book::probe_targets`] uses for the same
-/// `.loom/gh-config` directory, so the 60 s probe adds no key of its own.
+/// identity [`crate::forge_bucket_book::probe_targets`] uses for the same
+/// `.loom/gh-config` directory — its sidecar's, else the roster and remote
+/// ([`crate::forge_bucket_book::dir_identity`], #10571) — so the 60 s probe
+/// adds no key of its own.
 fn probe_host_for(workspace_root: &Path, on_app: bool) -> ProbeHost {
-    if on_app {
-        ProbeHost::App {
-            account: crate::forge_bucket_book::writer_account(workspace_root),
-            owner: crate::forge_bucket_book::primary_owner(workspace_root)
-                .unwrap_or_else(|| "unknown".to_string()),
-        }
-    } else {
-        ProbeHost::Ambient
+    if !on_app {
+        return ProbeHost::Ambient;
     }
+    let id = primary_identity(workspace_root);
+    ProbeHost::App {
+        account: id.account,
+        owner: id.owner.unwrap_or_else(|| "unknown".to_string()),
+        installation: id.installation,
+    }
+}
+
+/// The identity minted into the workspace's primary credential directory.
+fn primary_identity(workspace_root: &Path) -> crate::forge_bucket_book::CredIdentity {
+    let dir = crate::credential_preflight::github_app_gh_config_dir(workspace_root);
+    let class = crate::forge_bucket_book::DirClass::PrimaryWriter {
+        root: workspace_root.to_path_buf(),
+    };
+    crate::forge_bucket_book::dir_identity(&dir, &class).unwrap_or_else(|| {
+        crate::forge_bucket_book::CredIdentity {
+            account: crate::forge_bucket_book::writer_account(workspace_root),
+            owner: crate::forge_bucket_book::primary_owner(workspace_root),
+            installation: None,
+            source: crate::forge_bucket_book::IdentitySource::Derived,
+        }
+    })
+}
+
+/// The writer App's account label for [`bucket_points`]' `role`: the App
+/// minted into the primary credential directory, else the roster's.
+#[must_use]
+pub fn writer_account_for(workspace_root: &Path) -> String {
+    primary_identity(workspace_root).account
 }
 
 /// An ambient host's account label: the `gh` login (one core call).
@@ -553,7 +593,8 @@ pub fn fresh_fallback(
     budget.filter(|b| b.core_reset.min(b.graphql_reset) > now)
 }
 
-/// One rate-limit tick: flush the skip counter, probe the budget (booking it
+/// One rate-limit tick: flush the skip counter, ingest agent `gh` front rows
+/// (#10607), probe the budget (booking it
 /// on an App host, else falling back to the breaker's trip-time reading)
 /// and export the gauges — the bucket book's once, after the probe. Returns
 /// before any probe when no OTLP exporter is running.
@@ -567,6 +608,9 @@ pub async fn record(workspace_root: &Path) {
         .unwrap_or_else(PoisonError::into_inner)
         .replace(now);
     sink.emit_metrics_since(drain_skip_points(), since);
+    // #10607: the agent `gh` fronts' new sink rows join this drain.
+    let now_s = now.timestamp();
+    let _ = tokio::task::spawn_blocking(move || crate::forge_call_stats::ingest::tick(now_s)).await;
     emit_chunked(sink, super::forge_calls::drain_points(), since);
     sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     let root = workspace_root.to_path_buf();
@@ -583,7 +627,7 @@ pub async fn record(workspace_root: &Path) {
             },
             || account(now),
         );
-        (points, crate::forge_bucket_book::writer_account(&root))
+        (points, writer_account_for(&root))
     })
     .await;
     let Ok((points, writer)) = sampled else {

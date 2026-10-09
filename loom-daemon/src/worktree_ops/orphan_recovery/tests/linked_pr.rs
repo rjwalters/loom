@@ -452,6 +452,93 @@ fn expired_lease_does_not_block_recovery_body() {
     assert!(gh.calls().contains("issue edit"));
 }
 
+/// #10570: the #10161 shape seen from the RECOVERING host. An attended claim
+/// made elsewhere leaves nothing on this host's disk (no claim file, no
+/// journal, no spawn-loop entry) and has no PR yet; its only liveness signal
+/// is the lease its deferred publisher put on the forge once a released
+/// sweep's leftover lease aged out. While that lease is renewed the claim
+/// survives every pass; once the session ends and the lease goes stale, the
+/// same pass reclaims it under the unchanged gates.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn a_remote_attended_lease_holds_the_claim_until_it_goes_stale() {
+    a_remote_attended_lease_holds_the_claim_until_it_goes_stale_body();
+}
+
+#[serial]
+fn a_remote_attended_lease_holds_the_claim_until_it_goes_stale_body() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A second repository root: nothing local vouches for the claim.
+    let dir = tempdir().unwrap();
+    assert!(!has_valid_claim(dir.path(), 5501));
+    // The forge's view of the lease comment's `updated_at`, mutable per pass.
+    let forge_lease = dir.path().join("forge-lease-updated-at");
+    let set_lease_age = |minutes: i64| {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        std::fs::write(&forge_lease, ts).unwrap();
+    };
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.path().join("gh-invocations.log");
+    let lease_stdout = with_fleet_author(&format!(
+        r#"printf '{{"updated_at":"%s"}}' "$(cat '{}')""#,
+        forge_lease.display()
+    ));
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" >> '{log}'\n\
+         if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then\n\
+         printf '%s' '[{{\"number\":5501,\"title\":\"attended work\"}}]'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"repo\" ]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n\
+         printf '%s' '{payload}'\n\
+         exit 0\n\
+         fi\n\
+         case \"$*\" in */comments*) {lease_stdout}; exit 0;; esac\n\
+         if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+         exit 0\n",
+        log = log.display(),
+        payload = closes_graph(""),
+    );
+    let fake_gh = bin.join("gh");
+    std::fs::write(&fake_gh, script).unwrap();
+    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ws = WritableRoot::register_with_gh(dir.path(), &fake_gh);
+    std::env::set_var("LOOM_GH_BIN", &ws.gh);
+    let gh = FakeGh { log, _ws: ws };
+
+    // Published, then renewed every few minutes while the session lives.
+    for age in [1, 4] {
+        set_lease_age(age);
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+        assert!(result.orphaned.is_empty(), "lease {age}m old: {:?}", result.orphaned);
+        assert_eq!(result.watched.len(), 1, "{:?}", result.watched);
+        assert_eq!(result.watched[0].reason, "lease_fresh");
+    }
+    assert!(!gh.calls().contains("issue edit"), "{}", gh.calls());
+
+    // The session ended; renewal stopped and the lease aged past its TTL.
+    set_lease_age(30);
+    let mut result = OrphanRecoveryResult::default();
+    check_untracked_building(&evidence_without_the_issue(), &mut result, dir.path(), 600, false);
+    assert_eq!(result.orphaned.len(), 1, "{:?}", result.orphaned);
+    assert_eq!(result.orphaned[0].reason, "no_spawn_loop_entry");
+    let mut recovery = OrphanRecoveryResult::default();
+    recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+    assert!(gh.calls().contains("issue edit"), "{}", gh.calls());
+}
+
 /// Same shape as [`install_fake_gh_with_lease`], but the `.../comments`
 /// lease probe FAILS outright (non-zero exit) instead of answering
 /// (successfully) with either a timestamp or nothing — modeling a

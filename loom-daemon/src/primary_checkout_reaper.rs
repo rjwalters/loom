@@ -318,7 +318,7 @@ fn is_primary_checkout_dirty(repo_root: &Path) -> bool {
 /// bare `.git` join) so this still works if `.git` is ever a gitfile rather
 /// than a directory. Fails closed: an unresolvable git-dir reads as "in a
 /// special state".
-fn in_special_git_state(repo_root: &Path) -> bool {
+pub(crate) fn in_special_git_state(repo_root: &Path) -> bool {
     let git_dir = match Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .current_dir(repo_root)

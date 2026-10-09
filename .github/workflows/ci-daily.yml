@@ -552,10 +552,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
-      # No rust-cache and no `changes.docker` gate. ci.yml only builds these
-      # images when the PR touched docker/**, so a change to the daemon's own
+      # No rust-cache and no image-input gate. ci.yml builds these images only
+      # when a PR, or a push to main since the last green push run (#10825),
+      # touched an image input (scripts/ci-image-inputs.sh), and the daemon
+      # source is deliberately not one. So a change to the daemon's own
       # startup path -- which every one of these smokes exercises inside the
-      # image -- is never validated against the image until a release.
+      # image -- is validated against the image HERE, daily, and nowhere else
+      # before a release. Keep this job unconditional (ci-principles rule 3's
+      # exception depends on it).
       - name: Build loom-daemon (release)
         run: cargo build --release --package loom-daemon
       - name: Package the binary where the Dockerfiles expect it
@@ -606,6 +610,69 @@ jobs:
         run: ./docker/native/test-image.sh loom-worker-native:ci-daily
 
   # ===========================================================================
+  # Item 8 -- the compatibility floor itself (#10868).
+  # ===========================================================================
+  compat-floor:
+    name: Compatibility Floor (SUPPORTS_INSTALLED)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release tags: direction A reads `v<SUPPORTS_INSTALLED>:defaults`
+          # out of git, and direction B lists the tags at or above
+          # REQUIRES_DAEMON.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Build loom-daemon (debug)
+        run: cargo build --package loom-daemon
+      # ci.yml's `Compatibility contract across adjacent releases` step runs
+      # direction A against ONE release: the newest tag at or below VERSION.
+      # So the oldest installed Loom the daemon claims to work with,
+      # SUPPORTS_INSTALLED, is never the one tested, and the claim would rest
+      # on file presence alone. This names it with --prev-ref: every
+      # `loom-daemon <sub>` that release's installed shell calls must exist in
+      # today's daemon, and every file today's daemon executes must exist in
+      # that release's tree.
+      #
+      # The value is read from the built daemon, so raising the constant needs
+      # no edit here. When this goes red the claim is false: restore what the
+      # old installed shell needs, or raise SUPPORTS_INSTALLED to the oldest
+      # release this passes for (defaults/docs/release-cadence.md,
+      # "Compatibility contract").
+      #
+      # Direction B runs too, because `check` has no way to leave it out and
+      # fails without an old daemon. It is the same proof ci.yml makes.
+      - name: Direction A against v<SUPPORTS_INSTALLED>
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          floor="$(./target/debug/loom-daemon install-compat show --json | jq -r '.supports_installed')"
+          if ! [[ "$floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::install-compat show --json gave no supports_installed version (got '$floor')."
+            exit 1
+          fi
+          if ! git rev-parse --quiet --verify "refs/tags/v$floor^{commit}" >/dev/null; then
+            echo "::error::SUPPORTS_INSTALLED is $floor but there is no release tag v$floor in this checkout, so the claim cannot be exercised."
+            exit 1
+          fi
+          echo "SUPPORTS_INSTALLED=$floor"
+          ./target/debug/loom-daemon install-compat check --repo-root . \
+            --prev-ref "v$floor" \
+            --fetch-old-daemon --release-repo "$GITHUB_REPOSITORY" \
+            --asset loom-daemon-x86_64-unknown-linux-gnu | tee /tmp/compat-floor.log
+          # The run names the claim itself, so it can never take the
+          # "declared break" skip. Assert direction A really ran rather than
+          # trusting the exit code of a run that skipped it.
+          if ! grep -Fq "A (v$floor installed files vs new daemon): " /tmp/compat-floor.log; then
+            echo "::error::direction A did not run against v$floor; see the output above."
+            exit 1
+          fi
+
+  # ===========================================================================
   # How failures surface: one tracking issue per failing job.
   # ===========================================================================
   report:
@@ -618,6 +685,7 @@ jobs:
       - flake-shell
       - beta-toolchain
       - docker-smokes
+      - compat-floor
     # `always()` would also run after the operator cancels the run, and a
     # cancelled job is not a failing job. `!cancelled()` runs after failures
     # and successes and nothing else.

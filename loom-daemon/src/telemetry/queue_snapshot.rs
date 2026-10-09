@@ -121,6 +121,16 @@ pub struct QueueSnapshotRecord {
     /// Workspaces in `listing_failed` whose slug could not be resolved.
     #[serde(default)]
     pub listing_failed_unresolved: usize,
+    /// Repos whose ready listing came back partial on this tick (#11139: a
+    /// later page failed, the page cap, a mid-walk change). Some of their
+    /// rows are present, but not all: a missing row is not evidence the
+    /// issue left the queue. The snapshot is whole only when this,
+    /// `listing_failed` and both `*_unresolved` counters are empty/zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<QueueRepoRef>,
+    /// Workspaces in `listing_incomplete` whose slug could not be resolved.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub listing_incomplete_unresolved: usize,
     pub rows: Vec<QueueSnapshotRow>,
     /// Rows dropped because their repo slug could not be resolved.
     #[serde(default)]
@@ -167,4 +177,9 @@ pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) ->
         | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
         _ => None,
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

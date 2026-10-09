@@ -71,6 +71,23 @@ pub(crate) enum ScriptPortCommand {
     /// leaves the session classified as before.
     CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
+    /// The daemon-roll pause hook and pause state (#10830). `hook` is inert
+    /// unless LOOM_DAEMON_ITEM_ID is set; an older binary lacking it leaves
+    /// every tool call unparked.
+    #[command(subcommand)]
+    RollPause(super::roll_pause_cli::RollPauseCommand),
+
+    /// Session handles for a roll resume (#10830): Claude `--session-id` /
+    /// `--resume` args, the Codex resume check, live Codex id capture.
+    #[command(subcommand)]
+    AgentResume(super::roll_pause_cli::AgentResumeCommand),
+
+    /// The installed-Loom / daemon compatibility contract (#10716): `show`
+    /// this daemon's claims (and a repo's), `check` them across adjacent
+    /// releases in CI. Here, not in a script, per the shell-language policy.
+    #[command(subcommand)]
+    InstallCompat(super::install_compat_cli::InstallCompatCommand),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -145,6 +162,8 @@ pub(crate) enum ScriptPortCommand {
     /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
     /// `find | read` loop — which is #7858's class. Exit 0 always: this is
     /// best-effort by contract and the worktree already exists.
+    /// `--retire-aliases` instead unlinks the pnpm `node_modules` aliases
+    /// pre-#8944 worktrees still carry (#9152; exit 1 if an unlink failed).
     WorktreeLink(super::worktree_link::WorktreeLinkArgs),
 
     /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
@@ -314,6 +333,12 @@ pub(crate) enum ScriptPortCommand {
     /// self-replacement design and why `resolve_daemon_bin()` is the wrong
     /// helper for the post-roll version check.
     DaemonUpdate(super::daemon_update::DaemonUpdateArgs),
+    /// The atomic binary write behind `provision-daemon.sh` (#10983): `stage`
+    /// a candidate beside the destination, then `publish` it by rename,
+    /// keeping the binary it replaces. The script requires it; see
+    /// `cli/install_binary.rs`.
+    #[command(subcommand)]
+    InstallBinary(super::install_binary::InstallBinaryCommand),
 
     /// The combined "not a work item" label list for a role prompt's
     /// unfiltered fallback query (#8255): the fleet-wide hard exclusions
@@ -436,6 +461,13 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// The Renovate-side routing contract (#9418): every `labels` array in the
+    /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
+    /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
+    /// any violation; no Renovate config is a clean no-op. Counterpart of
+    /// `check-dependabot-labels.sh` (#7577), in Rust per the shell policy.
+    CheckRenovateLabels(super::check_renovate_labels::CheckRenovateLabelsArgs),
+
     /// Guard configuration diagnostics (#10434): `guards status` shows each
     /// guard category's effective value and source, hook wiring, a decision-log
     /// summary, and misconfiguration warnings. Read-only; always exits 0.
@@ -516,6 +548,22 @@ pub(crate) enum ScriptPortCommand {
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
 
+    /// `loom-daemon forge-probe …` — the hosted-qualification probe runner
+    /// (#9789, phase 1 of epic #9769): executes the #9777 probe manifest
+    /// against a live forge and prints a sanitized receipt. Read-only by
+    /// default; write cases refuse without `--live-write`. Unlike
+    /// `forge-inventory` this one's whole purpose IS forge calls — bounded
+    /// by a per-call timeout, never retried. See
+    /// `super::forge_probe_cmd` for the exit-code and credential contract.
+    ForgeProbe(super::forge_probe_cmd::ForgeProbeArgs),
+
+    /// `.loom/resync-ignore` pin fork-point provenance (#8726): `add` pins a
+    /// path and records the upstream commit it forked from in the additive
+    /// `.loom/resync-pin-base` sidecar; `status` reports per-pin drift. Not a
+    /// port: brand-new logic, native per the shell-language policy.
+    #[command(subcommand)]
+    ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -553,6 +601,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
             ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
+            ScriptPortCommand::RollPause(cmd) => cmd.run(),
+            ScriptPortCommand::AgentResume(cmd) => cmd.run(),
+            ScriptPortCommand::InstallCompat(cmd) => cmd.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::Eta(cmd) => cmd.run(),
@@ -582,6 +633,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::Host(cmd) => cmd.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
+            ScriptPortCommand::InstallBinary(cmd) => cmd.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
@@ -597,6 +649,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
             ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
@@ -607,6 +660,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
+            ScriptPortCommand::ForgeProbe(args) => args.run(),
+            ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
         }
     }
 }
@@ -826,6 +881,13 @@ pub(crate) enum MergePrCommand {
     /// — see `cli::merge_pr_version_policy`.
     VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
 
+    /// The pre-merge `workflow` token-scope guard (#10539): refuse a PR that
+    /// touches `.github/workflows/` when the `gh` token's `X-OAuth-Scopes` is
+    /// present and lacks `workflow`. Exit 1 = block (message on stdout), 0 =
+    /// proceed; fails open on any lookup error — see
+    /// `cli::merge_pr_workflow_scope`.
+    WorkflowScope(super::merge_pr_workflow_scope::WorkflowScopeArgs),
+
     /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
     /// discover open CHILD PRs still targeting this parent branch and
     /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
@@ -965,6 +1027,18 @@ pub(crate) enum MergePrCommand {
     /// the shell falls back to the budget on any fault — see
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
+
+    /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
+    /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
+    /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
+    /// deadline compare itself on any fault — see `cli::merge_pr_poll_wait`.
+    PollWait(super::merge_pr_poll_wait::PollWaitArgs),
+
+    /// The post-`--auto`-wait re-read decision (#8410/#8896, #8191 slice):
+    /// stdin is the uncached PR payload; prints MERGED / NO-HEAD / MOVED <sha>
+    /// / CLEAR + labels. The shell refuses on any other output — see
+    /// `cli::merge_pr_revalidate_head`.
+    RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
 }
 
 impl MergePrCommand {
@@ -996,6 +1070,7 @@ impl MergePrCommand {
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::WorkflowScope(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),
@@ -1014,6 +1089,8 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::PollWait(args) => args.run(),
+            MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

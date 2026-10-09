@@ -254,6 +254,96 @@ cannot be added there without first porting the resolution behind the daemon.
 Tracked separately in
 [#8654](https://github.com/rjwalters/loom/issues/8654).
 
+## Compatibility contract (#10716)
+
+Each release declares what its two halves need from each other (tracker
+[#10698](https://github.com/rjwalters/loom/issues/10698), D3/D4). Both values
+are constants in `loom-daemon/src/install_compat.rs`:
+
+| Constant | Meaning | Recorded where |
+|---|---|---|
+| `SUPPORTS_INSTALLED` | the oldest installed Loom (`loom_version`) this daemon works with | in the daemon only |
+| `REQUIRES_DAEMON` | the oldest daemon the installed files this release ships work with | `.loom/install-metadata.json` `requires_daemon`, written by `loom-daemon init` and `scripts/install-loom.sh` |
+
+**They move only when a change breaks compatibility**, in the PR that breaks
+it, never at release time:
+
+- Raise `REQUIRES_DAEMON` when shipped shell starts needing something an older
+  daemon lacks: a new `loom-daemon` subcommand, or a hard
+  `# requires-daemon: <sub> >= <version>` floor above the current value. Name
+  a published release, or the version this change ships as (`VERSION` + 1
+  patch) when the dependency lands in the same PR. The value is a floor, not
+  a tag: releases skip versions (above), so `v<REQUIRES_DAEMON>` may never be
+  published, and CI proves the claim against the oldest published release at
+  or above it.
+- Raise `SUPPORTS_INSTALLED` when the daemon stops working with older
+  installed files: it starts executing an installed file that older releases
+  do not ship, or relies on a changed argument contract. Add any newly
+  executed file to `DAEMON_INVOKED_INSTALLED_FILES` in the same PR.
+
+The `Compatibility contract across adjacent releases` step of CI's
+`Install Surface Checks` job (`loom-daemon install-compat check`) proves both
+claims. It runs the previous release's installed files against the new daemon,
+and the new installed files against the oldest published release at or above
+`REQUIRES_DAEMON` (`--fetch-old-daemon`; a release whose assets are still
+uploading is skipped). While no such release is published, which is the PR
+that raises the value and `main` until the next release, the new daemon stands
+in for it. It fails when a claim is violated. To try a proposed value before
+changing the constant, run it locally with `--requires-daemon <v>` /
+`--supports-installed <v>` and `--fetch-old-daemon` (or `--old-daemon <that
+release's binary>`). `loom-daemon install-compat show --repo <clone>` prints
+both sides for one repo and how they classify.
+
+Three things about that step's verdict (#10868):
+
+- **A release still uploading is skipped, and the output says so.** The note
+  names each tag passed over (`release v<x> is tagged but its assets are not
+  uploaded yet`). A listed asset that then fails to download is retried, three
+  attempts five seconds apart, before the step fails naming the tag and the
+  asset. An asset listing the forge could not answer still fails the step.
+- **A daemon that crashes is a violation, not a pass.** A subcommand is
+  missing only when clap refuses it. A probe binary that cannot be executed,
+  is killed by a signal or panics is reported as broken, with the binary, the
+  subcommand and the exit status. It is never counted as having the
+  subcommand.
+- **The floor check also runs as a unit test.**
+  `no_shipped_hard_floor_is_above_requires_daemon`
+  (`loom-daemon/src/install_compat/tests.rs`) walks `defaults/` with the
+  harness's own code and fails when a hard `# requires-daemon:` floor is above
+  `REQUIRES_DAEMON`. It catches a floor that is too high, never one that is
+  too low.
+
+### The daily proof of `SUPPORTS_INSTALLED`
+
+The CI step tests one release in direction A: the newest tag at or below
+`VERSION`. So nothing in the merge gate runs the release `SUPPORTS_INSTALLED`
+itself names. The `Compatibility Floor (SUPPORTS_INSTALLED)` job of
+`.github/workflows/ci-daily.yml` does, once a day:
+
+```bash
+loom-daemon install-compat check --prev-ref "v<SUPPORTS_INSTALLED>" --fetch-old-daemon
+```
+
+It reads the value from the built daemon (`install-compat show --json`), so
+moving the constant needs no workflow edit. A failure opens the
+`[ci-daily] Compatibility Floor (SUPPORTS_INSTALLED)` tracking issue.
+
+When it fails the claim is false, and there are two ways to make it true:
+
+- **Raise `SUPPORTS_INSTALLED`** to the oldest release for which the command
+  above passes (try one with `--supports-installed <v> --prev-ref v<v>`), and
+  update the constant's comment. This is the default. What it means: once the
+  dispatch hold ([#10719](https://github.com/rjwalters/loom/issues/10719))
+  acts on the value, a repo installed below it is held until it is resynced.
+  Fleet repos are resynced by the daemon; a repo outside the fleet that old
+  needs a manual resync.
+- **Keep the value** and restore in the daemon whatever the old installed
+  shell needs. Choose this when the gap is a regression, not an intended
+  break.
+
+`SUPPORTS_INSTALLED` must name a release tag: the job fails when `v<value>`
+does not exist, because then nothing can be run against it.
+
 ## See also
 
 - `CLAUDE.md` § "Forge Authentication & Releasing" — how `/repo:release` works

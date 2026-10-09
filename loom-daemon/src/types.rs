@@ -406,6 +406,26 @@ pub enum Request {
     /// the IPC handler, so the `loom-daemon status` CLI shells out to
     /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
     DaemonStatus,
+    /// `DaemonStatus` for only the named top-level sections of
+    /// `status --json` (Issue #10787, `loom-daemon status --json --section`).
+    /// The daemon runs only the build phases those sections need — notably
+    /// it skips the `O(roots)` per-root walk unless a section reads it (see
+    /// [`crate::status_section::SectionSet`]). The reply is the same
+    /// `Response::DaemonStatus`; fields of unrequested sections are
+    /// unspecified (typically their defaults) and the CLI emits only the
+    /// requested keys.
+    ///
+    /// A separate variant rather than a field on `DaemonStatus`, so the
+    /// existing `{"type":"DaemonStatus"}` frame and every client sending it
+    /// are untouched, an older daemon rejects this frame with a parse error
+    /// the CLI can name ("daemon too old for --section") instead of silently
+    /// answering with a full build, and the IPC latency metrics
+    /// (`loom.daemon.ipc.*`) label it with its own `kind`,
+    /// `DaemonStatusSections`, so cheap sectioned calls do not dilute the
+    /// full build's latency series.
+    DaemonStatusSections {
+        sections: Vec<crate::status_section::StatusSection>,
+    },
     // ========================================================================
     // Workspace Registry Requests (Issue #3926 — phase 1 of #3835)
     // ========================================================================
@@ -1346,13 +1366,20 @@ pub struct DaemonStatusReport {
     /// transition) these are always queryable, so a host idling behind a roll
     /// is visible to a single `loom-daemon status --json`.
     #[serde(default)]
-    pub drain_roll: Option<crate::ipc::drain_roll::DrainRollStatus>,
+    pub drain_roll: Option<crate::ipc::drain_status::DrainRollStatus>,
     /// Cumulative dispatch-paused seconds attributable to drain-and-restart
     /// rolls, per UTC day (Issue #8652), from a ledger persisted across the
     /// restart a successful roll performs. Includes the elapsed portion of an
     /// in-progress pause. Empty from a pre-#8652 daemon (`#[serde(default)]`).
     #[serde(default)]
     pub drain_paused_by_day: std::collections::BTreeMap<chrono::NaiveDate, u64>,
+    /// The pause-and-roll resume state (#10832): the pause manifest this
+    /// process found at startup, the H5 step it is on (or how it ended), and
+    /// what became of each paused agent, with per-reason requeue counters and
+    /// observed durations. `None` when the process started without a manifest
+    /// (and from a pre-#10832 daemon). Rendered as `drain.resume`.
+    #[serde(default)]
+    pub pause_resume: Option<crate::auto_update::pause_resume::PauseResumeStatus>,
     /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
     /// daemon process. `false` in the common opt-out case (the loop is
     /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older
@@ -1360,6 +1387,11 @@ pub struct DaemonStatusReport {
     /// mirroring the `draining` forward-compat convention.
     #[serde(default)]
     pub auto_update_enabled: bool,
+    /// Why the self-update loop runs, and in which mode (#10954), e.g. `fleet
+    /// floor only (autoUpdate.enabled=false)`. `None` before the spawn decision
+    /// and from an older daemon, which then renders as plain `enabled`.
+    #[serde(default)]
+    pub auto_update_mode: Option<String>,
     /// Wall-clock time of the auto-update loop's most recent staleness check
     /// (Issue #4055), or `None` when the loop has not ticked yet (or is
     /// disabled). `#[serde(default)]` keeps pre-#4055 wire data compatible.
@@ -1422,11 +1454,6 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
-    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
-    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
-    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
-    #[serde(default)]
-    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -2365,6 +2392,9 @@ pub struct ForgeBucketStatus {
     pub account: String,
     /// The installation's owner, or `-` when the credential has none.
     pub cred_owner: String,
+    /// The App installation the bucket was read under (#10571), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<String>,
     pub resource: String,
     /// Requests charged (`ok` rows × pages).
     pub charged: u64,

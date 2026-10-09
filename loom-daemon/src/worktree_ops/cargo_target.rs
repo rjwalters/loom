@@ -294,13 +294,13 @@ pub fn redirect_possible_with(workspace_root: &Path, env_override: Option<&str>)
         })
 }
 
-fn env_cargo_target_dir() -> Option<String> {
+pub(crate) fn env_cargo_target_dir() -> Option<String> {
     std::env::var("CARGO_TARGET_DIR")
         .ok()
         .filter(|v| !v.is_empty())
 }
 
-fn cargo_home() -> Option<PathBuf> {
+pub(crate) fn cargo_home() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("CARGO_HOME") {
         if !explicit.is_empty() {
             return Some(PathBuf::from(explicit));
@@ -324,7 +324,7 @@ fn cargo_home() -> Option<PathBuf> {
 /// the worktree is off disk, which is exactly why it reads the config files
 /// directly instead of asking cargo: every file it reads lives outside the
 /// worktree and is therefore still there.
-fn machine_global_target_dirs_with(
+pub(crate) fn machine_global_target_dirs_with(
     worktree_path: &Path,
     env_override: Option<&str>,
     cargo_home: Option<&Path>,

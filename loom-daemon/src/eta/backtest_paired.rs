@@ -29,6 +29,7 @@
 use super::super::offline::evaluate::{bootstrap, Estimate, IssueSums, BOOTSTRAP_SEED};
 use super::super::score::{bucket, EstimateSummary, Score};
 use super::super::shadow::{DaySums, DayWins, ANSWER_RATE_SLACK, LATE_SURPRISE_SLACK};
+use super::censored::late_flag;
 use super::ReplayCase;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -192,9 +193,12 @@ pub struct Paired {
     pub a_mean_pinball4_loss_sec: Option<f64>,
     /// `b`'s.
     pub b_mean_pinball4_loss_sec: Option<f64>,
-    /// Cases whose late surprise (`actual > p90`) is decided on both sides.
+    /// Cases both sides answered with a p90, in-flight cases included
+    /// (#9970 Slice 2) — the same population as [`Self::delta_late_rate`].
     pub late_pairs: usize,
-    /// `a`'s late-surprise rate over them.
+    /// `a`'s late-surprise (`actual > p90`) rate over them. An in-flight case
+    /// still inside its p90 counts as not late, so this is a lower bound,
+    /// never an overstatement; with no in-flight cases it is the resolved rate.
     pub a_late_rate: Option<f64>,
     /// `b`'s.
     pub b_late_rate: Option<f64>,
@@ -208,6 +212,12 @@ pub struct Paired {
     /// Distinct issues behind [`Self::delta_pinball4_loss_sec`]: the
     /// promotion gate's independence count (#10525).
     pub delta4_items: usize,
+    /// `b − a` late-surprise rate over every case both sides answered with a
+    /// p90, **in-flight cases included** (#9970 Slice 2), with its 95%
+    /// issue-bootstrap interval. An in-flight case still inside the p90
+    /// counts as not late, so each rate is a lower bound. Negative favours
+    /// `b`. `None` when no case was decidable.
+    pub delta_late_rate: Option<Estimate>,
     /// The walk-forward daily folds, oldest first.
     pub folds: Vec<Fold>,
     /// `b`'s per-day win rate over `a` on the deciding loss, with its 95%
@@ -234,6 +244,7 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     let (mut a_late, mut b_late) = (0_usize, 0_usize);
     let mut days: BTreeMap<String, (usize, DaySums)> = BTreeMap::new();
     let (mut delta, mut delta4) = (IssueSums::new(), IssueSums::new());
+    let mut delta_late = IssueSums::new();
     let add = |sums: &mut IssueSums, key: &str, d: f64| {
         let e = sums.entry(key.to_string()).or_insert((0.0, 0));
         e.0 += d;
@@ -242,8 +253,9 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     for (ra, rb) in a.iter().zip(b) {
         let issue = format!("{}#{}", ra.case.subject.repo, ra.case.subject.issue);
         let (sa, sb) = (&ra.score, &rb.score);
-        out.a_answered += usize::from(sa.pinball_loss_sec.is_some());
-        out.b_answered += usize::from(sb.pinball_loss_sec.is_some());
+        // Answered, not merely loss-scored: an in-flight case carries no loss.
+        out.a_answered += usize::from(ra.summary.quantiles().is_some());
+        out.b_answered += usize::from(rb.summary.quantiles().is_some());
         let day = days
             .entry(ra.case.as_of.format("%Y-%m-%d").to_string())
             .or_default();
@@ -263,7 +275,11 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
             day.1.current_loss4_sec += la;
             day.1.candidate_loss4_sec += lb;
         }
-        if let (Some(la), Some(lb)) = (sa.above_p90, sb.above_p90) {
+        // One lower-bound late flag feeds both the gate's rates and
+        // `delta_late_rate`: keying on raw `above_p90` would admit only the
+        // in-flight cases already past p90 and overstate lateness (#9970).
+        if let (Some(la), Some(lb)) = (late_flag(ra), late_flag(rb)) {
+            add(&mut delta_late, &issue, f64::from(u8::from(lb)) - f64::from(u8::from(la)));
             out.late_pairs += 1;
             a_late += usize::from(la);
             b_late += usize::from(lb);
@@ -283,6 +299,7 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     out.delta_pinball_loss_sec = ci(&delta);
     out.delta_pinball4_loss_sec = ci(&delta4);
     out.delta4_items = delta4.len();
+    out.delta_late_rate = ci(&delta_late);
     let sums: BTreeMap<String, DaySums> = days.iter().map(|(d, (_, s))| (d.clone(), *s)).collect();
     out.day_wins = DayWins::of(&sums);
     out.folds = days

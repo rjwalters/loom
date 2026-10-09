@@ -511,15 +511,15 @@ fn remote(repo: &str, number: i64, state: &str) -> RemoteRef {
 fn a_closed_cross_repo_declared_blocker_is_stale() {
     let e = Evidence {
         declared: vec![BlockerRef {
-            repo: Some("2AMLogic/2am".into()),
-            number: 1088,
+            repo: Some("example-org/tool-repo".into()),
+            number: 202,
         }],
-        remote: vec![remote("2AMLogic/2am", 1088, "CLOSED")],
+        remote: vec![remote("example-org/tool-repo", 202, "CLOSED")],
         ..Evidence::default()
     };
     assert!(!undeclared(&e));
     match classify(&e) {
-        Verdict::Stale(r) => assert!(r[0].contains("2AMLogic/2am#1088:CLOSED"), "{r:?}"),
+        Verdict::Stale(r) => assert!(r[0].contains("example-org/tool-repo#202:CLOSED"), "{r:?}"),
         v => panic!("{v:?}"),
     }
 }

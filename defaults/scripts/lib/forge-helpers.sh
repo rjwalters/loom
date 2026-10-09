@@ -401,26 +401,20 @@ forge_update_branch() {
 # Get PR details.
 # Usage: forge_get_pr NWO PR_NUMBER
 # Returns JSON with .state, .merged, .head.ref, .title, .mergeable
+# On failure stderr carries the forge's own error (#9192) -- silence it at the
+# call site (`2>/dev/null`) if unwanted; the helper no longer discards it.
+# (Compacted to offset forge_fetch_error_cause on the shell-budget ratchet.)
 forge_get_pr() {
-  local nwo="$1"
-  local pr_number="$2"
-  local gh_cmd="${3:-gh}"
-
-  if [[ "$FORGE_TYPE" == "gitea" ]]; then
-    forge_split_nwo "$nwo"
-    gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"
-  else
-    "$gh_cmd" api "repos/$nwo/pulls/$pr_number" 2>/dev/null
-  fi
-}
+  local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then forge_split_nwo "$nwo"; gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"; else "$gh_cmd" api "repos/$nwo/pulls/$pr_number"; fi; }
 
 # Get PR details without cache (for race-condition rechecks).
-# Usage: forge_get_pr_nocache NWO PR_NUMBER
+# Usage: forge_get_pr_nocache NWO PR_NUMBER [GH_CMD]
+# Like forge_get_pr, stderr is NOT discarded (#9192): a 401 / rate-limit 403 /
+# 404 reaches the caller, which can hand it to forge_fetch_error_cause. Every
+# recheck caller in merge-pr.sh silences it itself (`2>/dev/null || echo '{}'`).
 forge_get_pr_nocache() {
-  local nwo="$1"
-  local pr_number="$2"
-  local gh_cmd="${3:-gh}"
-
+  local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     # Gitea has no caching layer like gh-cached
     forge_get_pr "$nwo" "$pr_number"
@@ -431,11 +425,30 @@ forge_get_pr_nocache() {
     # flag, and with 2>/dev/null the error is swallowed and callers substitute
     # '{}', silently breaking merge verification and race-condition rechecks
     # whenever gh-cached is absent (issue #3547).
-    "$gh_cmd" api "repos/$nwo/pulls/$pr_number" 2>/dev/null
+    "$gh_cmd" api "repos/$nwo/pulls/$pr_number"
   else
     # gh-cached wrapper: --no-cache bypasses its cache layer as intended.
-    "$gh_cmd" --no-cache api "repos/$nwo/pulls/$pr_number" 2>/dev/null
+    "$gh_cmd" --no-cache api "repos/$nwo/pulls/$pr_number"
   fi
+}
+
+# forge_fetch_error_cause STDERR [BODY] -> one line naming the HTTP status, what
+# it means for the operator, and the forge's own message (#9192). A bare "could
+# not fetch" made a 401 (re-authenticate), a rate-limit 403 (wait for the reset)
+# and a 404 (fix the reference) indistinguishable; worse, `gh auth status` also
+# reports a rate-limited token as "invalid". A rate-limit 403 names the
+# authenticated user ID, which a bad credential cannot -- so it is classified as
+# a rate limit (is_rate_limit_error) BEFORE the generic 403 arm. Token-shaped
+# strings are redacted and the message is capped at 300 chars.
+forge_fetch_error_cause() {
+  local all="$1 $2" code msg; code=$(grep -oE 'HTTP [0-9]{3}' <<<"$all" | head -1 | cut -c6- || true); [[ -n "$code" ]] || code=$(jq -r '.status // empty' <<<"$2" 2>/dev/null || true)
+  msg=$(jq -r '.message // empty' <<<"$2" 2>/dev/null || true); [[ -n "$msg" ]] || msg=$(jq -r '.message // empty' <<<"$1" 2>/dev/null || true); msg=$(printf '%s' "${msg:-$1}" | tr '\n' ' ' | sed -E 's/(gh[opsur]_|github_pat_)[A-Za-z0-9_]+/<redacted>/g' | cut -c1-300)
+  if is_rate_limit_error "$all" || [[ "$code" == 429 ]]; then printf 'HTTP %s rate limit -- the credential DID authenticate (do not re-authenticate); wait for the reset' "${code:-403}"
+  elif [[ "$code" == 401 ]]; then printf 'HTTP 401 auth failure -- the credential is invalid or expired; re-authenticate'
+  elif [[ "$code" == 403 ]]; then printf 'HTTP 403 forbidden (not a rate limit) -- the credential lacks access to this repository'
+  elif [[ "$code" == 404 ]]; then printf 'HTTP 404 not found -- the PR does not exist in this repository, or the credential cannot see the repository'
+  elif is_forge_transient_error "$all"; then printf 'transient forge/network failure%s -- retry' "${code:+ (HTTP $code)}"
+  else printf 'HTTP %s' "${code:-status unknown}"; fi; printf ': %s' "${msg:-<no message from the forge>}"
 }
 
 # Get an issue's open/closed state.
@@ -773,61 +786,6 @@ forge_get_workflow_runs() {
 }
 
 # --- PR Listing Helpers ---
-
-# List merged PRs.
-# Usage: forge_list_merged_prs NWO LIMIT [DATE_FILTER]
-# GitHub: gh pr list --state merged
-# Gitea: GET /repos/{owner}/{repo}/pulls?state=closed + client-side merge filter
-forge_list_merged_prs() {
-  local nwo="$1"
-  local limit="$2"
-  local date_filter="${3:-}"
-
-  if [[ "$FORGE_TYPE" == "gitea" ]]; then
-    forge_split_nwo "$nwo"
-    local page=1
-    local per_page=50
-    local collected=0
-    local results="[]"
-
-    while [[ $collected -lt $limit ]]; do
-      local batch
-      batch=$(gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls?state=closed&sort=updated&limit=$per_page&page=$page" 2>/dev/null) || break
-
-      local batch_len
-      batch_len=$(echo "$batch" | jq 'length')
-      [[ "$batch_len" -eq 0 ]] && break
-
-      # Filter to merged PRs and optionally by date
-      local filtered
-      if [[ -n "$date_filter" ]]; then
-        filtered=$(echo "$batch" | jq --arg df "$date_filter" '[.[] | select(.merged == true and .merged_at != null and .merged_at >= $df) | {number: .number, mergedAt: .merged_at}]')
-      else
-        filtered=$(echo "$batch" | jq '[.[] | select(.merged == true) | {number: .number, mergedAt: .merged_at}]')
-      fi
-
-      results=$(echo "$results" "$filtered" | jq -s '.[0] + .[1]')
-      collected=$(echo "$results" | jq 'length')
-
-      # If we got a full page, there may be more
-      [[ "$batch_len" -lt "$per_page" ]] && break
-      page=$((page + 1))
-
-      # Rate limiting protection for Gitea
-      sleep 0.2
-    done
-
-    # Trim to limit and output just the numbers
-    echo "$results" | jq -r ".[:$limit] | .[].number"
-  else
-    if [[ -n "$date_filter" ]]; then
-      gh pr list --state merged --limit "$limit" --json number,mergedAt \
-        --jq '[.[] | select(.mergedAt >= "'"$date_filter"'")] | .[].number' 2>/dev/null || echo ""
-    else
-      gh pr list --state merged --limit "$limit" --json number --jq '.[].number' 2>/dev/null || echo ""
-    fi
-  fi
-}
 
 # Get PR body.
 # Usage: forge_get_pr_body NWO PR_NUMBER
@@ -1627,10 +1585,8 @@ forge_gh_create_issue_rl_safe() {
   shift 3
   local labels=("$@")
 
-  local -a create_args=(--title "$title" --body "$body")
-  if [[ -n "$nwo" ]]; then
-    create_args+=(--repo "$nwo")
-  fi
+  # loom_write_repo always yields a repo (#9548), so it is named unconditionally.
+  local -a create_args=(--title "$title" --body "$body" --repo "$nwo")
   local label
   for label in "${labels[@]+"${labels[@]}"}"; do
     create_args+=(--label "$label")
@@ -1639,7 +1595,8 @@ forge_gh_create_issue_rl_safe() {
   # Capture stdout (the issue URL) separately from stderr (the error text the
   # rate-limit signature table is matched against), so a successful create
   # never returns gh's progress chatter as the URL.
-  local err_file out err rc=0
+  # t0 bounds the #9714 duplicate probe: taken BEFORE the attempt, minus skew.
+  local err_file out err rc=0 t0; t0=$(jq -nr 'now - 60 | todate')
   err_file=$(mktemp)
   out=$(forge_gh_perm_safe issue create "${create_args[@]}" 2>"$err_file") || rc=$?
   err=$(cat "$err_file" 2>/dev/null || true)
@@ -1654,28 +1611,40 @@ forge_gh_create_issue_rl_safe() {
     return 0
   fi
 
-  if is_rate_limit_error "$err"; then
+  # #9714: a server error ("Something went wrong while executing your query",
+  # HTTP 502/503/504) also falls back -- but unlike a rate-limit rejection,
+  # which is refused BEFORE execution, the mutation may have committed. So
+  # first reconcile against the non-search, DB-consistent issue listing (the
+  # search index lags creation by exactly the window that matters): an
+  # exact-title non-PR issue since t0 is adopted; an unreadable listing, or a
+  # FULL first page with no match (the original may be on page two), means NO
+  # POST. An empty t0 (jq failure) yields `since=`, which the forge rejects ->
+  # also no POST. Empty stderr / invalid JSON / signals never get here; they
+  # keep the #8289 "MAY exist" message below. is_rate_limit_error is shared
+  # by every #4856 fallback, so the server-error table stays local.
+  local server_err=0; grep -qiE 'something went wrong while executing your query|HTTP 50[234]' <<<"$err" && server_err=1
+  if is_rate_limit_error "$err" || [[ $server_err -eq 1 ]]; then
+    local rest_path="repos/$nwo/issues" listing hit payload labels_json
+    if ! is_rate_limit_error "$err"; then
+      if ! listing=$(gh api "$rest_path?state=all&sort=created&direction=desc&per_page=20&since=$t0" 2>/dev/null) \
+          || ! hit=$(jq -r --arg t "$title" 'def tr: gsub("^\\s+|\\s+$"; ""); map(select(.pull_request == null and (.title | tr) == ($t | tr)))[0].html_url // (if length >= 20 then error("full page") else empty end)' <<<"$listing" 2>/dev/null); then
+        echo "gh issue create hit a server error, and the duplicate probe failed or could not prove absence, so no REST retry was made. The issue MAY exist; check the forge before re-filing rather than blind-retrying. ($err)" >&2
+        return 1
+      fi
+      [[ -n "$hit" ]] && { printf '%s\n' "$hit"; return 0; }
+    fi
     # One POST carries title + body + labels together. `--input -` takes the
     # JSON body on stdin, which also sidesteps the guard false positive where
     # a heredoc body containing `>=` is classified as a Bash redirect.
-    local payload labels_json
     labels_json=$(jq -nc '$ARGS.positional' --args "${labels[@]+"${labels[@]}"}")
     payload=$(jq -n --arg t "$title" --arg b "$body" --argjson l "$labels_json" \
       '{title: $t, body: $b, labels: $l}')
-    local rest_path
-    if [[ -n "$nwo" ]]; then
-      rest_path="repos/$nwo/issues"
-    else
-      # Unreachable since #9548 (loom_write_repo always yields a repo); kept
-      # only because this frozen file cannot restructure the branch for free.
-      rest_path='repos/{owner}/{repo}/issues'
-    fi
     if out=$(printf '%s' "$payload" \
         | gh api --method POST "$rest_path" --input - --jq '.html_url' 2>/dev/null); then
       printf '%s\n' "$out"
       return 0
     fi
-    echo "gh issue create rate-limited, and the REST fallback also failed: $err" >&2
+    echo "gh issue create failed ($err), and the REST fallback also failed." >&2
     return 1
   fi
 

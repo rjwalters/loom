@@ -1,6 +1,6 @@
 //! Delivery: what the ETA hook offers to the OTLP queues.
 
-use super::authority::{drop_pending, gate_delivery};
+use super::authority::{drop_pending, gate_delivery, report_coverage, scope_for};
 use super::*;
 use crate::eta::tests::{as_of, history_a, provenance};
 use crate::eta::tracker::{EstimateContext, IssueState};
@@ -76,18 +76,19 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // answer (land-v3 and amber-heron retired, #10484; fresh-tide retired,
     // #10549; land-2026-10-04-twin-otter, which refused this pre-PR stage,
     // retired, #10528); little-v0 (#10208) refuses it; the twin-otter -b
-    // composition (#10244) answers it from land-v2's path, and so do its
-    // land-2026-10-06-quick-tern and -swift-tern calibration wrappers
-    // (#10524), the land-2026-10-06-held-heron hybrid (#10523), which routes
+    // composition (#10244) answers it from land-v2's path (its IPCW
+    // calibration wrappers quick-tern, swift-tern and bold-lark, #10524, are
+    // retired, #10949), and so do the land-2026-10-06-held-heron hybrid
+    // (#10523), which routes
     // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
     // (#10508), land-2026-10-06-loop-kite (#10521), whose pre-PR stages
     // take the dispatch plan and land-v2's path, the
     // land-2026-10-06-tandem-wren dependency wrapper (#10510; no edge, so
     // -b's own answer), and land-2026-10-06-brisk-petrel (#10528),
     // twin-otter-b plus the regime adjustment.
-    assert_eq!(delivered.emitted, 14, "finish + land + the twelve answering land shadows");
+    assert_eq!(delivered.emitted, 11, "finish + land + the nine answering land shadows");
     assert_eq!(delivered.refused, 1, "little-v0: unknown_stage before a PR");
-    assert_eq!(delivered.outcomes, 15, "finish finished, every land estimate abandoned");
+    assert_eq!(delivered.outcomes, 12, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
     let kinds: Vec<&str> = offered.iter().map(|e| e.record.kind()).collect();
@@ -106,12 +107,6 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
             "eta.estimate",
             "eta.estimate",
             "eta.estimate",
-            "eta.estimate",
-            "eta.estimate",
-            "eta.estimate",
-            "eta.outcome",
-            "eta.outcome",
-            "eta.outcome",
             "eta.outcome",
             "eta.outcome",
             "eta.outcome",
@@ -157,7 +152,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (14, 1, 15));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (11, 1, 12));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -171,15 +166,15 @@ fn records_without_valid_provenance_are_never_offered() {
     let (emissions, outcomes) = lifecycle(bad.clone());
     let sink = Capture::default();
     let delivered = deliver(emissions, Vec::new(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 15);
+    assert_eq!(delivered.invalid, 12);
     assert!(sink.0.lock().unwrap().is_empty());
     // … and outcomes observed by one, or scoring one.
     let delivered =
         deliver(Vec::new(), outcomes.clone(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 15, "the estimating build's provenance is checked too");
+    assert_eq!(delivered.invalid, 12, "the estimating build's provenance is checked too");
     let (_, good_outcomes) = lifecycle(provenance());
     let delivered = deliver(Vec::new(), good_outcomes, &bad, "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 15, "the observing build's provenance is checked too");
+    assert_eq!(delivered.invalid, 12, "the observing build's provenance is checked too");
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -232,7 +227,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (14, 15, 0),
+        (11, 12, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {
@@ -357,7 +352,9 @@ case "$*" in
   *'&page=2'*)
     if [ -f "$d/fail2" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p2.json" ;;
-  *) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p1.json" ;;
+  *) printf 'HTTP/2.0 200 OK\r\n'
+    [ "$(grep -o '"number"' "$d/p1.json" | wc -l)" -ge 100 ] && [ ! -f "$d/last1" ] && printf 'Link: <https://api.github.com/next>; rel="next"\r\n'
+    printf '\r\n'; cat "$d/p1.json" ;;
 esac
 "#,
             dir = dir.display()
@@ -431,4 +428,73 @@ fn demotion_drops_the_pending_store_once() {
     // Idempotent: a second drop finds nothing and does not fail.
     assert_eq!(drop_pending(&mut tracker, &path), 0);
     assert!(read_pending(&path).is_empty(), "nothing is restored after a restart either");
+}
+
+// ===== Authority coverage of the fleet roster (#10897) =====
+
+fn roster_of(n: usize) -> Vec<crate::eta::repo_priority::FleetMember> {
+    (1..=n)
+        .map(|i| crate::eta::repo_priority::FleetMember {
+            repo: Some(format!("acme/repo{i}")),
+            priority: 50,
+        })
+        .collect()
+}
+
+fn faults(captured: &crate::observability::ops::capture::Captured) -> usize {
+    use crate::telemetry::ops::MetricName;
+    captured
+        .metrics
+        .iter()
+        .filter(|p| {
+            p.name == MetricName::DaemonTaskFaults
+                && p.labels.get("reason").map(String::as_str) == Some("eta_authority_coverage")
+        })
+        .count()
+}
+
+#[test]
+fn an_authority_managing_two_of_five_raises_the_critical_signal_and_others_keep_emitting() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let c = coverage(&roster, &["acme/repo1", "acme/repo2"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "loom-fleet-captain");
+    });
+    assert_eq!(faults(&captured), 1, "eta.authority.coverage fires");
+    assert_eq!(c.missing, vec!["acme/repo3", "acme/repo4", "acme/repo5"]);
+    // A non-authority host is not suppressed: undeclared, it emits every
+    // roster repo; declared with the authority's two, it emits the other three.
+    let all = scope_for(false, Some(&roster), &Declared::Undeclared).unwrap();
+    assert_eq!(all.len(), 5);
+    let declared = Declared::Repos(["acme/repo1".to_string(), "acme/repo2".to_string()].into());
+    let rest = scope_for(false, Some(&roster), &declared).unwrap();
+    assert_eq!(rest.len(), 3);
+    assert!(!rest.contains("acme/repo1"));
+}
+
+#[test]
+fn a_healthy_authority_raises_no_signal_and_others_stay_silent() {
+    use crate::eta::coverage::{coverage, Declared};
+    let roster = roster_of(5);
+    let slugs: Vec<String> = (1..=5).map(|i| format!("acme/repo{i}")).collect();
+    let c = coverage(&roster, &slugs);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, Some(&roster), &Declared::All), None);
+}
+
+#[test]
+fn an_unknown_roster_raises_nothing_and_changes_no_gating() {
+    use crate::eta::coverage::{coverage, Declared};
+    let c = coverage::<&str>(&[], &["acme/repo1"]);
+    let ((), captured) = crate::observability::ops::capture::capture(|| {
+        report_coverage(&c, "robb-studio");
+    });
+    assert_eq!(faults(&captured), 0);
+    assert_eq!(scope_for(false, None, &Declared::Undeclared), None);
+    // The authority itself never takes a fallback scope.
+    assert_eq!(scope_for(true, Some(&roster_of(3)), &Declared::Undeclared), None);
 }

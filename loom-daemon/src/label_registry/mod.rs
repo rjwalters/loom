@@ -14,13 +14,16 @@
 //! derived too; `tests.rs` pins each to its previous literal. dep_classify's
 //! operator-only labels are single named consts, kept in lockstep by a test.
 //!
-//! Fields documented as inert (`stale_after_minutes`, `lifecycle`,
-//! `propagate`) have no consumer yet.
+//! Final slice (AC 6): `propagate` holds #10012's propagation rule table;
+//! `star_liveness::propagation_rules::RULES` is derived from it.
+//!
+//! Fields documented as inert (`stale_after_minutes`, `lifecycle`) have no
+//! consumer yet.
 
 use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub mod generate;
 
@@ -58,6 +61,8 @@ pub const BOOL_PROPERTIES: &[&str] = &[
     "hard_exclusion",
     "champion_path",
     "human_gated",
+    "merge_hold",
+    "operator_hold",
     "contradicts_approval",
 ];
 
@@ -79,6 +84,53 @@ pub const KINDS: &[&str] = &[
 /// Allowed values of [`Label::lifecycle`].
 pub const LIFECYCLES: &[&str] = &["active", "paused", "retired"];
 
+/// Which way a label travels along a containment edge. Only downward today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    ParentToChild,
+}
+
+/// When a child gets a propagating label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AddMode {
+    /// Whenever an ancestor carries it and the child does not.
+    Always,
+    /// Only as a default: the child carries no member of the family yet.
+    /// Never overwrites a child's own choice.
+    DefaultIfFamilyAbsent,
+}
+
+/// When propagation takes a label back off a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Removal {
+    /// Once no ancestor carries it any more, and only a copy whose provenance
+    /// is propagation (never one a human applied to the child).
+    WithParent,
+    /// Never: once copied, the child owns it.
+    Never,
+}
+
+/// A label's propagation rule (#10012 §6); `None` on [`Label::propagate`]
+/// means it never propagates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Propagate {
+    pub direction: Direction,
+    /// 1-based rule order (adds, then removals, are planned in this order).
+    /// Members of one `family` share one rule and so one rank.
+    pub rank: u32,
+    /// A mutually exclusive family prefix (e.g. `tier:`): the rule covers
+    /// every label with that prefix, and all members carry the same object.
+    pub family: Option<String>,
+    pub add: AddMode,
+    pub removal: Removal,
+    /// A PR linked to the child (or the parent) gets it too (§5).
+    pub to_prs: bool,
+}
+
 /// One label's full definition.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +149,10 @@ pub struct Label {
     pub hard_exclusion: bool,
     pub champion_path: bool,
     pub human_gated: bool,
+    /// Operator holds that make an approved PR's wait a merge hold (#10218).
+    pub merge_hold: bool,
+    /// Operator holds: a human is needed before the item moves (#10210).
+    pub operator_hold: bool,
     /// 1-based position in the order labels that contradict `loom:pr` are
     /// reported; `None` = does not contradict.
     pub contradicts_approval: Option<u32>,
@@ -106,8 +162,8 @@ pub struct Label {
     pub remove_with: Vec<String>,
     /// Inert: `active`, `paused` or `retired`.
     pub lifecycle: String,
-    /// Inert: reserved for #10012's propagation rules.
-    pub propagate: Option<serde_json::Value>,
+    /// #10012's propagation rule; `None` = never propagates.
+    pub propagate: Option<Propagate>,
     /// Trailing `# note` on the generated `color:` line.
     pub color_note: Option<String>,
     /// Comment/blank lines emitted verbatim above the generated entry.
@@ -136,6 +192,8 @@ impl Label {
             "hard_exclusion" => self.hard_exclusion,
             "champion_path" => self.champion_path,
             "human_gated" => self.human_gated,
+            "merge_hold" => self.merge_hold,
+            "operator_hold" => self.operator_hold,
             "contradicts_approval" => self.contradicts_approval.is_some(),
             _ => return None,
         })
@@ -213,6 +271,41 @@ impl Registry {
         ranks.sort_unstable();
         if ranks.iter().copied().ne(1..=ranks.len() as u32) {
             bail!("contradicts_approval ranks must be 1..=N without gaps");
+        }
+        self.validate_propagate()
+    }
+
+    /// `propagate` invariants: a family rule is shared verbatim by its
+    /// members and is the only way to say "default if family absent"; each
+    /// rule (a family counts once) has a distinct rank, 1..=N without gaps.
+    fn validate_propagate(&self) -> Result<()> {
+        let mut rules: Vec<&Propagate> = Vec::new();
+        for l in &self.labels {
+            let Some(p) = &l.propagate else { continue };
+            match &p.family {
+                Some(f) if !l.name.starts_with(f.as_str()) => {
+                    bail!("{}: propagate.family {f} is not a prefix of the name", l.name)
+                }
+                None if p.add == AddMode::DefaultIfFamilyAbsent => {
+                    bail!("{}: default-if-family-absent needs a propagate.family", l.name)
+                }
+                _ => {}
+            }
+            match rules
+                .iter()
+                .find(|r| p.family.is_some() && r.family == p.family)
+            {
+                Some(r) if *r != p => {
+                    bail!("{}: family members must share one propagate object", l.name)
+                }
+                Some(_) => {}
+                None => rules.push(p),
+            }
+        }
+        let mut ranks: Vec<u32> = rules.iter().map(|r| r.rank).collect();
+        ranks.sort_unstable();
+        if ranks.iter().copied().ne(1..=ranks.len() as u32) {
+            bail!("propagate ranks must be 1..=N without gaps (a family counts once)");
         }
         Ok(())
     }

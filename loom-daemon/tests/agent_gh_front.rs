@@ -712,25 +712,48 @@ fn a_passthrough_is_one_ledger_row_under_the_sessions_role_and_bucket() {
         assert!(out.status.success(), "{out:?}");
         stdout(&out)
     };
-    let by_role = report("role");
-    let line = |text: &str, key: &str| {
-        text.lines()
-            .find(|l| l.split_whitespace().next() == Some(key))
-            .map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_else(|| panic!("no {key} row in:\n{text}"))
+    // Cells are located by their header name, never by position, so a new
+    // column (INSTALLATION, #10571) cannot shift what a lookup reads.
+    let table = |text: &str, first: &str| -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut lines = text
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>());
+        let header = lines
+            .find(|w| w.first() == Some(&first))
+            .unwrap_or_else(|| panic!("no {first} header in:\n{text}"));
+        lines
+            .filter(|w| w.len() == header.len())
+            .map(|w| {
+                header
+                    .iter()
+                    .map(|h| (*h).to_string())
+                    .zip(w.iter().map(|c| (*c).to_string()))
+                    .collect()
+            })
+            .collect()
     };
-    assert_eq!(line(&by_role, "agent-builder")[1], "3", "{by_role}");
-    assert_eq!(line(&by_role, "agent-judge")[1], "1", "{by_role}");
+    let by_role = report("role");
+    let role = |key: &str| {
+        table(&by_role, "ROLE")
+            .into_iter()
+            .find(|r| r["ROLE"] == key)
+            .unwrap_or_else(|| panic!("no {key} row in:\n{by_role}"))
+    };
+    assert_eq!(role("agent-builder")["CHARGED"], "3", "{by_role}");
+    assert_eq!(role("agent-judge")["CHARGED"], "1", "{by_role}");
     let by_bucket = report("bucket");
     let bucket = |resource: &str| {
-        by_bucket
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>())
-            .find(|w| w.len() > 4 && w[1] == "acme" && w[2] == resource)
-            .map(|w| w[4].to_string())
+        table(&by_bucket, "ACCOUNT")
+            .into_iter()
+            .find(|r| r["CRED_OWNER"] == "acme" && r["RESOURCE"] == resource)
+            .unwrap_or_else(|| panic!("no acme/{resource} bucket in:\n{by_bucket}"))
     };
-    assert_eq!(bucket("graphql").as_deref(), Some("3"), "{by_bucket}");
-    assert_eq!(bucket("core").as_deref(), Some("1"), "{by_bucket}");
+    assert_eq!(bucket("graphql")["CHARGED"], "3", "{by_bucket}");
+    assert_eq!(bucket("core")["CHARGED"], "1", "{by_bucket}");
+    // The agent rows carry the installation end to end (#10571): this
+    // fixture's credential dir has no identity sidecar, so it is `-`.
+    assert_eq!(bucket("graphql")["INSTALLATION"], "-", "{by_bucket}");
+    assert_eq!(bucket("core")["INSTALLATION"], "-", "{by_bucket}");
     assert!(report("caller").contains("agent.gh.pr"));
 }
 
@@ -998,4 +1021,62 @@ fn cargo_never_hands_a_test_binary_the_inherited_forge_call_sink() {
         "",
         "a test process inherited a forge-call sink"
     );
+}
+
+/// #10607 slice B: the daemon's ingest of those rows. A passthrough
+/// `gh pr create` from a host session (rows in the sink itself) and a served
+/// `gh issue view` from a container (whose front sees the sink's path but
+/// writes the host's `contained/` subdirectory) both come out as
+/// `loom.forge.calls` series carrying the agent role and served/passthrough.
+#[test]
+fn the_daemon_ingests_a_passthrough_pr_create_and_a_served_issue_view() {
+    use loom_daemon::forge_call_stats::ingest::{drain, Cursors, Source};
+    use loom_daemon::observability::ops::forge_calls::CallOutcome;
+    let s = Sandbox::new();
+    let sink = s.p("sink");
+    let contained = sink.join("contained");
+    let now = || chrono::Utc::now().timestamp();
+    let mut cursors = Cursors::default();
+    assert!(drain(&sink, &mut cursors, now()).calls.is_empty(), "priming");
+
+    let host = sink.display().to_string();
+    let create = ["pr", "create", "--title", "t", "--body", "b", "-R", "o/r"];
+    let env = [
+        ("LOOM_FORGE_CALL_STATS_DIR", host.as_str()),
+        ("LOOM_ROLE", "builder"),
+    ];
+    assert!(s.gh(&create, &env).status.success());
+    let boxed = contained.display().to_string();
+    let env = [
+        ("LOOM_FORGE_CALL_STATS_DIR", boxed.as_str()),
+        ("LOOM_ROLE", "judge"),
+    ];
+    for _ in 0..2 {
+        assert_eq!(stdout(&s.gh(VIEW, &env)), VIEW_JSON);
+    }
+
+    let got = drain(&sink, &mut cursors, now());
+    assert_eq!(got.rejected, 0, "{got:?}");
+    let calls = got.calls;
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let pr = calls
+        .iter()
+        .find(|c| c.labels.caller == "agent.gh.pr")
+        .unwrap();
+    assert_eq!((pr.agent, pr.via, pr.source), ("builder", "passthrough", Source::Host));
+    assert_eq!((pr.labels.outcome, pr.labels.resource.as_str()), (CallOutcome::Ok, "graphql"));
+    assert_eq!(pr.labels.target_owner, "o");
+    let views: Vec<_> = calls
+        .iter()
+        .filter(|c| c.labels.caller == "agent_gh_front")
+        .collect();
+    assert!(
+        views
+            .iter()
+            .all(|c| (c.agent, c.via, c.source) == ("judge", "served", Source::Contained)),
+        "{views:?}"
+    );
+    let outcomes: Vec<_> = views.iter().map(|c| c.labels.outcome).collect();
+    assert_eq!(outcomes, [CallOutcome::Ok, CallOutcome::NotModified]);
+    assert!(drain(&sink, &mut cursors, now()).calls.is_empty(), "each row once");
 }

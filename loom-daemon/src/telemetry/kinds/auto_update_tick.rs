@@ -19,7 +19,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::eta::Provenance;
+use crate::telemetry::provenance::Provenance;
 
 /// Every log attribute key `auto_update.tick` exports. The collector's
 /// `transform/privacy` log `keep_keys` must list each one
@@ -64,10 +64,8 @@ pub enum TickDecisionKind {
     Fetch,
     /// A source rebuild ran.
     Rebuild,
-    /// A roll is already armed; the tick waits for its drain.
+    /// A roll or drain is already armed; the tick leaves it to finish.
     DrainWait,
-    /// The armed roll's drain condition was declared unsatisfiable (#8998).
-    RollStall,
     /// The tick panicked. The loop recorded it and keeps running.
     Panic,
 }
@@ -83,7 +81,6 @@ impl TickDecisionKind {
             Self::Fetch => "fetch",
             Self::Rebuild => "rebuild",
             Self::DrainWait => "drain_wait",
-            Self::RollStall => "roll_stall",
             Self::Panic => "panic",
         }
     }
@@ -94,9 +91,11 @@ impl TickDecisionKind {
 pub struct DrainSnapshot {
     /// A drain/roll is armed.
     pub armed: bool,
-    /// It has survived at least one deadline refusal (dispatch paused).
+    /// It can no longer be superseded: its pause has stopped an agent, or it
+    /// is an operator drain. (Before #10831: it had survived a deadline
+    /// refusal.)
     pub pending: bool,
-    /// Deadlines this roll has refused so far.
+    /// Always `0` since #10831: a roll no longer refuses deadlines.
     pub refusals: u32,
     /// The artifact identity it rolls to, when the auto-updater armed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +145,8 @@ pub struct AutoUpdateTickRecord {
     /// #10712: the fleet floor is above every published release, so this host
     /// cannot reach it (the alert text). Absent when the floor is unset,
     /// satisfied, or being rolled to. Raises the record's severity to ERROR.
+    /// #10719: also carries the unsatisfiable repo-ahead demand (a workspace
+    /// needs a daemon no release provides) when the floor has no stall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_stall: Option<String>,
     /// Consecutive retryable failures for the tracked target.

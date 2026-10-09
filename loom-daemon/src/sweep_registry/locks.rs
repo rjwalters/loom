@@ -154,7 +154,7 @@ impl LockReleaseOutcome {
 /// `live_sweep_lock_owner_pid()` all treat an unparseable owner as "no owner",
 /// which drops a *live* sweep's lock. The absent-pgid case degrades to
 /// single-PID signalling with a log line instead.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LockOwner {
     pub(crate) issue: u32,
     pub(crate) owner_pid: u32,
@@ -203,6 +203,21 @@ pub(crate) struct LockOwner {
     /// is the honest value for both.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) overflow: bool,
+    /// Pause-and-roll identity (Issue #10830), stamped at spawn by
+    /// [`resume_handle::DispatchSession::stamp`](super::resume_handle::DispatchSession::stamp):
+    /// the item id that arms the pause hook, the systemd scope unit (the H4
+    /// teardown unit, Linux only), the session's FIRST start (the 5-minute
+    /// rule's clock, carried across roll resumes), and the resume handle.
+    /// Same `Option` + `#[serde(default)]` contract as `pgid`/`model`: an
+    /// `owner.json` from an older binary has none of them and still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scope_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_handle: Option<super::resume_handle::ResumeHandle>,
 }
 
 impl LockOwner {
@@ -227,6 +242,10 @@ impl LockOwner {
             model: None,
             effort: None,
             overflow: false,
+            item_id: None,
+            scope_unit: None,
+            agent_started_at: None,
+            resume_handle: None,
         }
     }
 }
@@ -861,8 +880,18 @@ impl SweepRegistry {
     /// are skipped, so the daemon no longer ingests phantom entries for sweeps
     /// it does not own. Genuine daemon-crash recovery is preserved because the
     /// lock survives a daemon crash (it is only removed on clean release).
-    #[allow(clippy::too_many_lines)]
     pub fn reconstruct(&mut self) -> Result<usize> {
+        self.reconstruct_issues(None)
+    }
+
+    /// [`Self::reconstruct`], restricted to `only` when it is given (#10832).
+    /// H5 uses it to hand a paused sweep it could not finish back to ordinary
+    /// crash recovery: the item was skipped at startup because a pause
+    /// manifest held it, and this runs the same recovery for just that issue
+    /// once the hold is gone, without re-adopting every other live sweep.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn reconstruct_issues(&mut self, only: Option<&HashSet<u32>>) -> Result<usize> {
+        let skipped = |issue: u32| only.is_some_and(|set| !set.contains(&issue));
         let locks_dir = self.config.locks_dir();
         let mut admitted = 0usize;
         // Issues that had a daemon-owned lock whose owner PID is now dead.
@@ -894,6 +923,9 @@ impl SweepRegistry {
                 let Ok(issue): Result<u32, _> = issue_str.parse() else {
                     continue;
                 };
+                if skipped(issue) {
+                    continue;
+                }
                 let owner_path = path.join("owner.json");
                 let owner: Option<LockOwner> = std::fs::read_to_string(&owner_path)
                     .ok()
@@ -903,7 +935,23 @@ impl SweepRegistry {
                     let _ = std::fs::remove_dir_all(&path);
                     continue;
                 };
-                if !pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at) {
+                let alive =
+                    pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at);
+                // #10832: a roll's H4 pause stopped this agent on purpose and
+                // left its lock for H5, which resumes the saved session or
+                // requeues it. Crash recovery must not get there first: keep
+                // the lock, reap nothing, and synthesize no `Crashed` entry.
+                if !alive
+                    && crate::roll_pause::suppress::held_issue(&self.config.workspace_root, issue)
+                        .is_some()
+                {
+                    log::info!(
+                        "reconstruct: issue #{issue} was paused for a daemon roll; leaving its \
+                         lock for the resume (#10832)"
+                    );
+                    continue;
+                }
+                if !alive {
                     // Stale lock: the daemon-dispatched child's PID (recorded
                     // by `record_child_pid_in_lock`, #3808) is dead. This lock
                     // is the daemon's own crash-surviving evidence that it
@@ -1045,6 +1093,9 @@ impl SweepRegistry {
                 let Ok(issue): Result<u32, _> = issue_str.parse() else {
                     continue;
                 };
+                if skipped(issue) {
+                    continue;
+                }
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
                     matches!(info.state, SweepState::Running | SweepState::Pending)

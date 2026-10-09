@@ -72,6 +72,9 @@ Thumbs.db
 .loom/exit-codes/
 .loom/sweep-checkpoint/
 .loom/sweep-run/
+.loom/targets/
+.loom/target*/
+.cargo-target*/
 .loom/state/*
 !.loom/state/detect-unlabeled-epics-dismissed
 .loom/concierge/

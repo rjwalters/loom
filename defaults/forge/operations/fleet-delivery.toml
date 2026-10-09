@@ -73,6 +73,12 @@ path = "loom-daemon/src/credential_preflight/pool.rs"
 [[operation.callers]]
 kind = "installer"
 path = "scripts/install/validate-target.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/workflow_scope.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
 
 [[operation]]
 id = "identity.actor-trust"
@@ -554,6 +560,49 @@ kind = "rust"
 path = "loom-daemon/src/fleet_store/gh.rs"
 
 [[operation]]
+id = "git.default-branch-heads"
+group = "git-objects-remote-writes"
+summary = "Read the default branch's name and head commit for a batch of repositories in one request."
+profile = "fleet-bootstrap"
+disposition = "optional"
+class = "read"
+inputs = ["owner", "repo_names"]
+outputs = ["default_branch", "head_sha"]
+required_fields = []
+actor = "daemon"
+permissions = ["contents:read", "metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::git-default-branch-heads"
+test_status = "implemented"
+test_path = "loom-daemon/src/fleet_sync/tests/workspace_resync_heads.rs"
+owner = "daemon-fleet"
+risk = "normal"
+github = { commands = [
+  "gh api graphql (repository.defaultBranchRef.target.oid, aliased per repository)",
+], routes = [] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "complete"
+exclusion_reason = "A quota optimisation, not a requirement: one query per owner replaces one `git ls-remote` per repository in the workspace resync's per-tick head check. When the query is unavailable or fails, that check falls back to `git ls-remote` per repository, which needs no forge API at all."
+preflight = "warn-and-disable"
+unknowns = [
+  "GraphQL is a POST: there is no ETag and no free 304, so each query costs one point on the credential's GraphQL bucket whether or not any head moved",
+  "an installation token sees only its own installation's repositories, so the batch is per owner; a provider with no batched ref read keeps the per-repository `git ls-remote`",
+  "a repository the credential cannot see answers NOT_FOUND, exactly like a deleted one, so that answer is confirmed with `git ls-remote` under the repository's own credential before it is reported",
+]
+notes = "One aliased query per owner per fleet-sync tick, up to 100 repositories each, under the writer credential. Sent only by a host that may write (fleet.autoApply on, in H0) and never while the rate-limit breaker is open."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_sync/workspace_resync/heads.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_store/gh.rs"
+
+[[operation]]
 id = "git.write-refs-and-contents"
 group = "git-objects-remote-writes"
 summary = "Create a ref/commit or PUT file content remotely, guarded by a known base SHA."
@@ -727,6 +776,13 @@ path = "loom-daemon/src/release_resolve/resolve.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/release_fetch/fetch.rs"
+# The install-compat CI proof (#10716) resolves the oldest release at or
+# above REQUIRES_DAEMON and downloads its binary. A delayed publication is
+# skipped (the new daemon stands in), so it never blocks a merge; a forge
+# outage during the lookup fails the step on purpose, as a proof step.
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/install_compat_harness.rs"
 
 [[operation]]
 id = "release.publish"

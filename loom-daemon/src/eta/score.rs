@@ -192,6 +192,12 @@ pub struct EstimateSummary {
     /// (#10210) — whether or not the heuristic applied its term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_cause: Option<StallCause>,
+    /// The estimate's per-stage forecast (#10929), kept so its outcome can be
+    /// attributed by stage ([`super::stage_forecast::attribute_scored`]) and
+    /// the live snapshot can draw it. Empty for a heuristic that forecasts no
+    /// stage, and on a summary persisted before the field existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_predictions: super::stage_forecast::StagePredictions,
 }
 
 /// One stage's predicted duration quartiles.
@@ -245,6 +251,7 @@ impl EstimateSummary {
                 .as_ref()
                 .is_some_and(|r| r.tail_extrapolated),
             stall_cause: explanation.stalled.as_ref().map(|s| s.cause),
+            stage_predictions: explanation.stage_predictions.clone(),
         }
     }
 
@@ -333,6 +340,35 @@ pub fn score(
         if let Some(p90) = estimate.p90_sec {
             result.above_p90 = Some(actual > p90);
             result.pinball4_loss_sec = Some(loss + pinball(0.9, a - p90 as f64));
+        }
+    }
+    result
+}
+
+/// Score an estimate whose subject is **still in flight** at `cutoff` (#9970
+/// Slice 2): the actual is only known to be later than `cutoff`.
+///
+/// Only what that lower bound already decides is set, never a guess:
+/// `above_p75` / `covered = false` once the elapsed time exceeds the p75, and
+/// `above_p90` once it exceeds the p90 (strict, as for a resolved case). An
+/// elapsed time still inside the interval decides nothing, and every loss and
+/// error stays absent — a pinball loss or an error against `cutoff` would
+/// understate a landing that has not happened. The same rule
+/// [`super::tracker_censor::censor`] applies at pending-estimate expiry, for
+/// the backtest.
+#[must_use]
+pub fn score_censored(estimate: &EstimateSummary, cutoff: DateTime<Utc>) -> Score {
+    let mut result = score(estimate, OutcomeKind::Censored, cutoff, &[]);
+    if let Some((_, _, p75)) = estimate.quantiles() {
+        if result.lead_sec > p75 {
+            result.above_p75 = Some(true);
+            result.covered = Some(false);
+            result.below_p25 = Some(false);
+        }
+        if let Some(p90) = estimate.p90_sec {
+            if result.lead_sec > p90 {
+                result.above_p90 = Some(true);
+            }
         }
     }
     result

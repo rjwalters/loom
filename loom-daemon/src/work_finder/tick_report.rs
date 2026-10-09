@@ -237,6 +237,11 @@ pub struct TickReport {
     /// Workspaces whose ready-issue listing failed this tick, so their
     /// backlog is missing from [`Self::queue`] (Issue #8852).
     pub listing_failed: Vec<usize>,
+    /// Workspaces whose ready-issue listing returned only part of its queue
+    /// this tick (#11139): a later page failed, the page cap was hit, or the
+    /// listing moved mid-walk. Their rows ARE in [`Self::queue`], but a
+    /// missing row is not evidence the issue left the queue.
+    pub listing_incomplete: Vec<usize>,
     /// The subset of [`skipped_backoff`](Self::skipped_backoff) that lost the
     /// lease-order tie-break (`LeaseOrderDispatchError`, #6287). A subset, so
     /// the `backoff-skip` tally and `loom-daemon health` are unchanged;
@@ -282,6 +287,29 @@ pub struct TickReport {
 }
 
 impl TickReport {
+    /// Record whether workspace `idx`'s listing came back whole (#11139).
+    pub fn note_listing(&mut self, idx: usize, complete: bool) {
+        if !complete {
+            self.listing_incomplete.push(idx);
+        }
+    }
+
+    /// Workspaces whose backlog this tick does not hold whole: the failed
+    /// listings and the incomplete ones, each once, in index order (#11139).
+    /// A consumer that reads a missing row as "left the queue" uses this.
+    #[must_use]
+    pub fn listing_not_whole(&self) -> Vec<usize> {
+        let mut idxs: Vec<usize> = self
+            .listing_failed
+            .iter()
+            .chain(&self.listing_incomplete)
+            .copied()
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs
+    }
+
     /// An empty report for a multi-workspace tick run under these admission
     /// knobs.
     #[must_use]
@@ -464,6 +492,13 @@ fn classify(report: &mut TickReport, issue: u32, outcome: &Result<bool>) -> Outc
         report.skipped_workspace_commands_missing += 1;
         log::warn!("work_finder: skipping issue #{issue} — {e}");
         Outcome::new(Qd::WorkspaceCommandsMissing, why, "refused", "workspace_commands_missing")
+    } else if let Some(held) = e.downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+    {
+        // Defense in depth (#10719): the per-tick pre-filter holds the whole
+        // workspace; reaching here means the hold was set mid-tick.
+        log::info!("work_finder: skipping issue #{issue} — {e}");
+        let cause = held.kind.halt_cause().as_str();
+        Outcome::new(Qd::WorkspaceHalted, Some(cause.to_string()), "refused", cause)
     } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
         // Empty/unusable token pool (#4689, typed by #6614): a real failure,
         // still on `errors`, named because the remedy is the pool. The registry

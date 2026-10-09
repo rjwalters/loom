@@ -27,6 +27,7 @@ fn facts(role: &str) -> TickFacts {
             context: TraceContext::derived("execution", &["rjwalters/loom", &execution]),
             execution,
             started_at,
+            failure: None,
         },
         role: role.to_string(),
         ended_at: started_at + chrono::Duration::seconds(90),
@@ -313,10 +314,10 @@ fn journalling_is_idempotent_per_span_id() {
 fn every_story_attribute_survives_the_daemon_allowlist() {
     let span = story_span(
         &facts("doctor"),
-        "rjwalters/loom",
+        "RJWalters/Loom",
         &StoryRef {
             repo_id: REPO_ID,
-            story: "rjwalters/loom#1".into(),
+            story: "RJWalters/Loom#1".into(),
             issue: 1,
             pr_number: Some(2),
             root: story_context(REPO_ID, 1).unwrap(),
@@ -325,6 +326,36 @@ fn every_story_attribute_survives_the_daemon_allowlist() {
     for key in STORY_SPAN_ATTRIBUTE_KEYS {
         assert!(span.attributes.contains_key(*key), "allowlist drops {key}");
     }
+    // #10637: GitHub's spelling, never lowercased.
+    assert_eq!(span.attributes["loom.repo"], "RJWalters/Loom");
+}
+
+/// #10640: a failed tick's story copy says why, exactly as its root does,
+/// and the reason survives the allowlist.
+#[test]
+fn a_failed_ticks_story_copy_carries_its_failure() {
+    use crate::observability::lifecycle::{RoleFailure, EXIT_CODE, FAILURE_CLASS};
+    let mut failed = facts("judge");
+    failed.result = "failure".to_string();
+    failed.trace.failure =
+        Some(RoleFailure::new("exit-1", Some(1), "role child exited with code 1"));
+    let story = StoryRef {
+        repo_id: REPO_ID,
+        story: "rjwalters/loom#1".into(),
+        issue: 1,
+        pr_number: None,
+        root: story_context(REPO_ID, 1).unwrap(),
+    };
+    let span = story_span(&failed, "rjwalters/loom", &story);
+    assert_eq!(span.status, SpanStatus::Error);
+    assert_eq!(span.attributes[FAILURE_CLASS], "exit-1");
+    assert_eq!(span.attributes[EXIT_CODE], "1");
+    assert_eq!(
+        span.attributes[crate::telemetry::trace::STATUS_MESSAGE],
+        "role child exited with code 1"
+    );
+    let ok = story_span(&facts("judge"), "rjwalters/loom", &story);
+    assert!(!ok.attributes.contains_key(FAILURE_CLASS));
 }
 
 // ------------------------------------------------------------------------

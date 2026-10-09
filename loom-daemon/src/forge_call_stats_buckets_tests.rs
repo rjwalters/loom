@@ -59,6 +59,7 @@ fn attributed(pg: Option<u32>) -> CallAttribution {
         ro: Some("target".into()),
         ca: Some("app-42".into()),
         co: Some("acme".into()),
+        ci: Some("7".into()),
         tk: Some("reader".into()),
         rr: Some("core".into()),
         pg,
@@ -75,7 +76,7 @@ fn a_pre_w1_line_parses_with_no_attribution() {
     assert_eq!(line.rp.as_deref(), Some("acme/widget"));
     let agg = aggregate_lines([PRE_W1].into_iter(), 0, GroupBy::Bucket);
     assert_eq!(agg.groups.len(), 1);
-    assert_eq!(agg.groups[0].key, ["unknown", "-", "graphql", "-"]);
+    assert_eq!(agg.groups[0].key, ["unknown", "-", "-", "graphql", "-"]);
     assert_eq!((agg.groups[0].charged, agg.no_account), (1, 1));
 }
 
@@ -83,7 +84,7 @@ fn a_pre_w1_line_parses_with_no_attribution() {
 fn a_w1_line_parses_under_the_old_shape() {
     let raw = w1_line(1_900_000_000, "claim.pr_get", Outcome::Ok, attributed(Some(3)));
     for key in [
-        "\"ro\"", "\"ca\"", "\"co\"", "\"tk\"", "\"rr\"", "\"pg\"", "\"rd\"",
+        "\"ro\"", "\"ca\"", "\"co\"", "\"ci\"", "\"tk\"", "\"rr\"", "\"pg\"", "\"rd\"",
     ] {
         assert!(raw.contains(key), "{key} in {raw}");
     }
@@ -111,7 +112,7 @@ fn charged_counts_ok_pages_and_never_a_304_or_a_limited_call() {
     let agg = aggregate_lines(lines.iter().map(String::as_str), 1_900_000_000, GroupBy::Bucket);
     assert_eq!(agg.lines, 5, "the old line is outside the window");
     let g = &agg.groups[0];
-    assert_eq!(g.key, ["app-42", "acme", "core", "1900003600"]);
+    assert_eq!(g.key, ["app-42", "acme", "7", "core", "1900003600"]);
     assert_eq!((g.rows, g.charged, g.not_modified, g.rate_limited, g.error), (5, 4, 1, 1, 1));
     assert_eq!(agg.cwd_route_disagree, 5);
 

@@ -9,8 +9,9 @@
 //! Safety: each probe runs with that directory as `GH_CONFIG_DIR` and every
 //! token env var removed ([`GhInvocation::without_token_env`]), so it can
 //! never spend — or report on — an operator's personal token. Enumeration
-//! reads directory names, the presence of `hosts.yml` and a reader's
-//! `identity.json` sidecar; it never opens `hosts.yml` or reads a token.
+//! reads directory names, the presence of `hosts.yml` and each directory's
+//! `identity.json` sidecar (which App and installation was minted into it,
+//! #10571); it never opens `hosts.yml` or reads a token.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,21 @@ pub struct ProbeTarget {
     /// The owner readings are booked under (`unknown` when the workspace's
     /// own owner cannot be resolved locally).
     pub owner: String,
+    /// The installation the directory's sidecar names (#10571), if any.
+    pub installation: Option<String>,
+}
+
+/// The target for writer directory `dir`: keyed by its sidecar, else by the
+/// roster and the path / `origin` remote ([`super::dir_identity`]).
+fn writer_target(dir: PathBuf) -> Option<ProbeTarget> {
+    let id = super::dir_identity(&dir, &super::classify_dir(&dir))?;
+    Some(ProbeTarget {
+        dir,
+        role: IdentityRole::Writer,
+        account: id.account,
+        owner: id.owner.unwrap_or_else(|| "unknown".to_string()),
+        installation: id.installation,
+    })
 }
 
 /// Every credential directory published under `workspace_root` worth a
@@ -51,15 +67,9 @@ pub struct ProbeTarget {
 pub fn probe_targets(workspace_root: &Path, now: SystemTime) -> Vec<ProbeTarget> {
     let mut out = Vec::new();
     let has_token_file = |dir: &Path| dir.join("hosts.yml").is_file();
-    let writer = super::writer_account(workspace_root);
     let primary = crate::credential_preflight::github_app_gh_config_dir(workspace_root);
     if has_token_file(&primary) {
-        out.push(ProbeTarget {
-            dir: primary,
-            role: IdentityRole::Writer,
-            account: writer.clone(),
-            owner: super::primary_owner(workspace_root).unwrap_or_else(|| "unknown".to_string()),
-        });
+        out.extend(writer_target(primary));
     }
     let by_owner = workspace_root.join(".loom").join("gh-config-by-owner");
     let mut owners: Vec<(String, PathBuf)> = read_subdirs(&by_owner)
@@ -70,12 +80,7 @@ pub fn probe_targets(workspace_root: &Path, now: SystemTime) -> Vec<ProbeTarget>
     for (owner, owner_dir) in owners {
         let owner_lc = owner.to_ascii_lowercase();
         if has_token_file(&owner_dir) {
-            out.push(ProbeTarget {
-                dir: owner_dir.clone(),
-                role: IdentityRole::Writer,
-                account: writer.clone(),
-                owner: owner_lc.clone(),
-            });
+            out.extend(writer_target(owner_dir.clone()));
         }
         let mut readers: Vec<(String, PathBuf)> = read_subdirs(&owner_dir)
             .into_iter()
@@ -89,6 +94,7 @@ pub fn probe_targets(workspace_root: &Path, now: SystemTime) -> Vec<ProbeTarget>
                 continue;
             }
             out.push(ProbeTarget {
+                installation: installation_of(&dir),
                 dir,
                 role: IdentityRole::Reader,
                 account: crate::observability::ops::ratelimit::app_account_label(&app_id),
@@ -97,6 +103,12 @@ pub fn probe_targets(workspace_root: &Path, now: SystemTime) -> Vec<ProbeTarget>
         }
     }
     out
+}
+
+/// The installation `dir`'s sidecar names, validated as
+/// [`super::dir_identity`] does for the header path.
+fn installation_of(dir: &Path) -> Option<String> {
+    super::dir_identity(dir, &super::classify_dir(dir))?.installation
 }
 
 /// `(name, path)` of each real subdirectory of `dir` (symlinks excluded).
@@ -198,7 +210,9 @@ fn run_probe(target: &ProbeTarget, program: Option<&Path>) -> bool {
     let readings = parse_probe(&resp.body, at);
     let any = !readings.is_empty();
     for (resource, reading) in readings {
-        super::insert(BucketKey::new(&target.account, &target.owner, resource), reading);
+        let key = BucketKey::new(&target.account, &target.owner, resource)
+            .with_installation(target.installation.as_deref());
+        super::insert(key, reading);
     }
     any
 }
@@ -281,11 +295,13 @@ pub fn probe_one_with(
     if !claim_probe_slot(app_id, owner, now) {
         return false;
     }
+    let installation = installation_of(&dir);
     let target = ProbeTarget {
         dir,
         role: IdentityRole::Reader,
         account: crate::observability::ops::ratelimit::app_account_label(app_id),
         owner: owner.to_ascii_lowercase(),
+        installation,
     };
     let booked = run_probe(&target, program);
     if booked {

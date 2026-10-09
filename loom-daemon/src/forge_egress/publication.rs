@@ -244,6 +244,10 @@ pub fn publish_hosts_with_stance(
     let hosts_path = config_dir.join("hosts.yml");
     let previous = std::fs::read(&hosts_path).ok();
     write_hosts_atomically(config_dir, render_hosts_yaml(token, stance).as_bytes())?;
+    if matches!(stance, Stance::Required { .. }) {
+        // A token-less profile spends no App installation (#10571).
+        crate::forge_identity::sidecar::remove_sidecar(config_dir);
+    }
 
     if let (Stance::Observe { .. }, Some(workspace)) = (stance, workspace) {
         let findings = assert(workspace);
@@ -292,7 +296,7 @@ pub fn gateway_owned_preflight() -> crate::credential_preflight::GithubAppPrefli
             checked_at: chrono::Utc::now(),
             pool: None,
         },
-        minted_gh_token: None,
+        minted: None,
     }
 }
 

@@ -192,7 +192,7 @@ fn write_reader_dir(
     expires: chrono::DateTime<chrono::Utc>,
 ) -> PathBuf {
     let dir = reader_dir(ws, owner, reader);
-    publish(&dir, "ghs_test", reader, "999", &expires.to_rfc3339()).unwrap();
+    publish(&dir, "ghs_test", reader, owner, "999", &expires.to_rfc3339()).unwrap();
     dir
 }
 

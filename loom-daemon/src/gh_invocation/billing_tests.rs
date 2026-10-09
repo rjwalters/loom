@@ -151,6 +151,7 @@ fn identity_values_never_carry_a_token_hash_or_path() {
         account: pat.clone(),
         owner: Some(pat.clone()),
         kind: "env",
+        installation: Some(pat.clone()),
     };
     let b = Billing::not_sent(&pat, &hostile, &pat);
     for (key, value) in b.attributes() {

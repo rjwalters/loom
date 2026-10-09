@@ -1,4 +1,4 @@
-//! Historic repo priority (#10508): the fleet store's `repos.yml` as it was
+//! Historic repo priority (#10508): the fleet store's roster as it was
 //! knowable at a cutoff, and a repo's normalized dispatch rank within it.
 //!
 //! The candidate input `repo_rank` of the `eta-fit/v2` feature set
@@ -23,7 +23,7 @@
 //! [`revision_at`] returns the **last revision in history order** knowable
 //! strictly before the cutoff. When none is (the history starts after the
 //! cutoff, or there is no history), the answer is `None`: unknown. It never
-//! falls back to today's `repos.yml`.
+//! falls back to today's roster.
 //!
 //! # Membership and rank
 //!
@@ -67,7 +67,7 @@ pub enum KnowBasis {
     CommitDate,
 }
 
-/// The fleet store's `repos.yml` at one commit.
+/// The fleet store's roster at one commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterRevision {
     /// The commit's date.

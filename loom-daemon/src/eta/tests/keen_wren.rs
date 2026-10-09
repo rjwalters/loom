@@ -15,8 +15,8 @@ use crate::eta::fit::{
     TrainingRow, FEATURES, SCHEMA,
 };
 use crate::eta::heuristics::{
-    LandKeenWren, LandTwinOtter, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_BOLD_LARK, LAND_KEEN_WREN,
-    LAND_LOOP_KITE, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
+    LandKeenWren, LandTwinOtter, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_KEEN_WREN, LAND_LOOP_KITE,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
 };
 use crate::eta::simulate::run_explanation;
 use crate::eta::twin_otter::{evaluate, EvalConfig, TwinOtterModel, PROBIT_TAUS};
@@ -134,6 +134,8 @@ fn at_stage(stage: Stage) -> EstimateInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: input.as_of,
+        not_here: None,
+        held_until: None,
     });
     input
 }
@@ -339,14 +341,13 @@ fn keen_wren_is_a_land_candidate_registered_before_the_twin_otter_pair() {
     );
     for registry in [Registry::builtin(), fitted] {
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        // bold-lark (#10524) and loop-kite (#10521), its successor, sit
-        // between it and the pair; `land-2026-10-06-tandem-wren` (#10510)
-        // is registered after the pair.
+        // loop-kite (#10521), its successor, sits between it and the pair
+        // (bold-lark, #10524, did too until retired, #10949);
+        // `land-2026-10-06-tandem-wren` (#10510) is registered after the pair.
         assert_eq!(
-            land[land.len() - 5..],
+            land[land.len() - 4..],
             [
                 LAND_KEEN_WREN,
-                LAND_BOLD_LARK,
                 LAND_LOOP_KITE,
                 LAND_TWIN_OTTER_B,
                 LAND_TANDEM_WREN
@@ -486,6 +487,8 @@ fn keen_wren_ready_wait_follows_the_real_dispatch_order() {
                 tick_interval_secs: 60,
                 saturation_held: false,
                 plan_at: as_of() - Duration::seconds(30),
+                not_here: None,
+                held_until: None,
             }));
             let e = wren.estimate(&input, &history);
             let path = e.path.as_ref().expect("a path");

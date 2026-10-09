@@ -106,7 +106,9 @@ enum FleetConfigCommand {
         offline: bool,
     },
     /// Open a PR against the store instead of hand-editing it (#9599).
-    /// Always a branch + PR — never a direct push. Needs the writer app's
+    /// Always a branch + PR — never a direct push. Edits `fleet.yml`, the
+    /// store's source, and regenerates its renders with the store's own
+    /// `scripts/render.py` when `python3` with PyYAML is available (#10905). Needs the writer app's
     /// `contents: write` and `pull_requests: write` on the store, an
     /// explicit operator grant; without it this fails with a clear error,
     /// not a crash.
@@ -119,7 +121,7 @@ enum FleetConfigCommand {
 #[derive(Subcommand)]
 enum ProposeCommand {
     /// Move a host (or, with no `--host`, the fleet default) to a new
-    /// desired run state in `fleet/state.yml`.
+    /// desired run state in `fleet.yml`'s `state:`.
     State {
         /// `running`, `paused` or `stopped`.
         state: String,
@@ -136,7 +138,7 @@ enum ProposeCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Change one `repos.yml` record's dispatch priority.
+    /// Change one `fleet.yml` `repos:` record's dispatch priority.
     Priority {
         /// The record's `name:`.
         repo: String,
@@ -147,7 +149,7 @@ enum ProposeCommand {
         dry_run: bool,
     },
     /// Turn this host's `render --check` drift into a PR that moves the
-    /// on-disk values into `fleet/hosts/<host>/…`.
+    /// on-disk values into `fleet.yml`'s `config.hosts.<host>`.
     Adopt {
         /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
         #[arg(long, value_name = "HOST")]
@@ -581,48 +583,22 @@ fn cmd_propose_state(
     // current in this invocation, or its blob `sha` (and so the PUT below)
     // could target a commit that has already moved on.
     let loaded = ctx.load(Policy::FailClosed)?;
-    let text = loaded.snapshot.text(store::STATE_PATH)?.ok_or_else(|| {
-        anyhow!("the store has no {} to propose a state change to", store::STATE_PATH)
-    })?;
+    let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
     let by = by.unwrap_or_else(loom_daemon::sweep_registry::host_identity);
     let since = Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
-    let after = propose::edit_state(&text, host.as_deref(), run_state, &reason, &by, &since)?;
-    let change = propose::FileChange {
-        before_sha: loaded
-            .snapshot
-            .manifest
-            .files
-            .get(store::STATE_PATH)
-            .cloned(),
-        path: store::STATE_PATH.to_string(),
-        before: Some(text),
-        after,
-    };
+    let after =
+        propose::edit_state(&source.text, host.as_deref(), run_state, &reason, &by, &since)?;
     let who = host.as_deref().unwrap_or("the fleet default");
     let title = format!("fleet-config: set {who} state to {}", run_state.as_str());
-    submit_or_print(ctx, &loaded, "state", vec![change], title, dry_run)
+    submit_or_print(ctx, &loaded, &source, "state", after, title, dry_run)
 }
 
 fn cmd_propose_priority(ctx: &Ctx, repo: String, priority: u32, dry_run: bool) -> Result<i32> {
     let loaded = ctx.load(Policy::FailClosed)?;
-    let text = loaded
-        .snapshot
-        .text(store::ROSTER_PATH)?
-        .ok_or_else(|| anyhow!("the store has no {}", store::ROSTER_PATH))?;
-    let after = propose::edit_priority(&text, &repo, priority)?;
-    let change = propose::FileChange {
-        before_sha: loaded
-            .snapshot
-            .manifest
-            .files
-            .get(store::ROSTER_PATH)
-            .cloned(),
-        path: store::ROSTER_PATH.to_string(),
-        before: Some(text),
-        after,
-    };
+    let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
+    let after = propose::edit_priority(&source.text, &repo, priority)?;
     let title = format!("fleet-config: set {repo} priority to {priority}");
-    submit_or_print(ctx, &loaded, "priority", vec![change], title, dry_run)
+    submit_or_print(ctx, &loaded, &source, "priority", after, title, dry_run)
 }
 
 fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i32> {
@@ -637,23 +613,16 @@ fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i
     let local_path = ctx
         .workspace
         .join(loom_daemon::config_resolver::LOCAL_CONFIG_REL);
-    let adopted = propose::adopt::plan(&loaded.snapshot, &host, &machine_path, &local_path)?;
-    if adopted.is_empty() {
+    let source = propose::source::load(&ctx.transport, &ctx.location.repo, &loaded.snapshot)?;
+    let Some(after) =
+        propose::adopt::plan(&loaded.snapshot, &source.text, &host, &machine_path, &local_path)?
+    else {
         println!("{}", source_line(ctx, &loaded));
         println!("{host}: no drift to adopt — the on-disk config already matches the store");
         return Ok(0);
-    }
-    let files: Vec<propose::FileChange> = adopted
-        .into_iter()
-        .map(|f| propose::FileChange {
-            before_sha: loaded.snapshot.manifest.files.get(&f.path).cloned(),
-            path: f.path,
-            before: f.before,
-            after: f.after,
-        })
-        .collect();
+    };
     let title = format!("fleet-config: adopt {host}'s local drift");
-    submit_or_print(ctx, &loaded, "adopt", files, title, dry_run)
+    submit_or_print(ctx, &loaded, &source, "adopt", after, title, dry_run)
 }
 
 /// Common tail of every `propose` sub-verb: print the branch/title/diff
@@ -662,27 +631,55 @@ fn cmd_propose_adopt(ctx: &Ctx, host: Option<String>, dry_run: bool) -> Result<i
 /// A sub-verb whose edit turned out to be a no-op (the store already says
 /// what it was asked to say) stops here with nothing proposed: an empty PR
 /// is noise for the operator who has to review it.
+///
+/// Otherwise the edited `fleet.yml` is rendered with the store's own
+/// renderer, and the PR carries it with every render it changes, so it
+/// passes the store's `validate` (#10905). When the renderer cannot run
+/// here, the PR carries `fleet.yml` alone and its body says so.
 fn submit_or_print(
     ctx: &Ctx,
     loaded: &Loaded,
+    source: &propose::source::Source,
     kind: &str,
-    files: Vec<propose::FileChange>,
+    after: String,
     title: String,
     dry_run: bool,
 ) -> Result<i32> {
-    let files = propose::drop_unchanged(files);
+    let mut files = propose::drop_unchanged(vec![source.change(after.clone())]);
     if files.is_empty() {
         println!("{}", source_line(ctx, loaded));
         println!("nothing to propose — the store already matches this change");
         return Ok(0);
     }
+    let renders = match propose::source::render(&ctx.transport, source, &loaded.snapshot, &after)? {
+        propose::source::Rendered::Files(rendered) => {
+            files.extend(propose::drop_unchanged(rendered));
+            format!(
+                "`{}` and every file it renders to were regenerated with the store's own `{}`.",
+                propose::source::SOURCE_PATH,
+                propose::source::RENDERER
+            )
+        }
+        propose::source::Rendered::Skipped(why) => {
+            eprintln!(
+                "warning: renders not regenerated ({why}); run `python3 {}` on the PR branch \
+                 before it can pass the store's validate check",
+                propose::source::RENDERER
+            );
+            format!(
+                "**Renders not regenerated** ({why}): run `python3 {}` on this branch and push \
+                 the result, or the store's `validate` check fails (`fleet-stale`).",
+                propose::source::RENDERER
+            )
+        }
+    };
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let branch = propose::branch_name(kind, &stamp);
     let marker = propose::provenance_marker(&ctx.workspace, &loaded.snapshot.manifest.commit);
     let body = format!(
         "Opened by `loom-daemon fleet-config propose {kind}` (see `daemon-reference.md` § \
          \"Fleet store\" for the store's file contract). Merges stay the operator's — this \
-         command only ever proposes.\n\n{marker}\n"
+         command only ever proposes.\n\n{renders}\n\n{marker}\n"
     );
     let proposal = propose::Proposal {
         branch,

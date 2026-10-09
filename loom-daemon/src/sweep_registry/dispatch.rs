@@ -8,6 +8,10 @@ use super::*;
 
 pub(super) mod child_env_markers;
 
+// Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
+mod lease_renewal_start;
+use lease_renewal_start::lease_renewal_start_command;
+
 /// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
 /// daemon-spawned sweep child is a headless `claude -p` session; in print mode
 /// the harness reaps still-running background tasks (the sweep's Builder/Judge
@@ -83,7 +87,7 @@ const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 ///   persisted group is the only handle on any surviving descendants. Every
 ///   consumer re-checks `group_has_members` before signalling, so a fully-dead
 ///   group is a no-op.
-fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+pub(super) fn spawned_leader_pgid(pid: u32) -> Option<u32> {
     if !cfg!(unix) {
         return None;
     }
@@ -1748,6 +1752,9 @@ impl SweepRegistry {
             }
         }
 
+        // #10974: a daemon roll is pausing agents; nothing new may start.
+        self.roll_gate.admit(kind)?;
+
         // Forge egress admission (#9984): a fresh `forge egress assert`. Under
         // `enforcement.api = required` a routing finding refuses the dispatch
         // here, before any claim/label/account/log/spawn side effect, and the
@@ -1861,6 +1868,11 @@ impl SweepRegistry {
             }
             .into());
         }
+
+        // 2.45 Workspace hold (Issue #10719): the installed Loom here cannot
+        //      work with this daemon (W3/W4). Structural like 2.4, so `force`
+        //      does not bypass it; before any lock, label flip or forge call.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
 
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
         //     watchdogs (startup #3887, mid-build-death #3895, review-stall
@@ -2549,6 +2561,7 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            mid_spawn: self.roll_gate.enter(),
         })))
     }
 
@@ -2585,6 +2598,7 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2882,6 +2896,9 @@ impl SweepRegistry {
             }
             .into());
         }
+
+        // Workspace hold (Issue #10719), mirroring step 2.45.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
 
         let sweep_id = generate_sweep_id(kind);
 
@@ -3224,30 +3241,8 @@ fn run_lease_renewal_start(
         );
         return None;
     }
-    let mut cmd = Command::new(&script);
-    cmd.arg("start")
-        .arg(issue.to_string())
-        .arg("--watch-pid")
-        .arg(child_pid.to_string())
-        // Exact-match targeting (#6485): without BOTH of these the loop
-        // falls back to "newest lease wins" and can spend the sweep
-        // renewing a PEER dispatcher's lease comment while this claim's
-        // own `updated_at` never advances. The daemon knows both values
-        // exactly — it published them itself in `write_lease_comment`.
-        .arg("--host")
-        .arg(host)
-        .arg("--sweep-id")
-        .arg(sweep_id)
-        // Same workspace every other forge mutation in this registry runs
-        // in, so `gh` resolves this repo in a multi-workspace daemon
-        // (#3928/#3937).
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        // Piped and read below purely to capture the loop pid `start`
-        // prints. Safe to read to EOF: the detached loop redirects its OWN
-        // stdout to /dev/null, so nothing holds this pipe open past
-        // `start`'s return.
-        .stdout(Stdio::piped());
+    let mut cmd =
+        lease_renewal_start_command(&script, issue, sweep_id, child_pid, host, workspace_root);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)

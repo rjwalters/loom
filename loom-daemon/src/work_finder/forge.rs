@@ -35,6 +35,9 @@ pub struct GhWorkSource {
     /// without a single machine-global `LOOM_REPO`. `None` keeps today's
     /// behavior (inherit the daemon's cwd).
     cwd: Option<PathBuf>,
+    /// Whether the last [`WorkSource::list_ready_issues`] call read every
+    /// listing whole (#11139); see [`WorkSource::listing_complete`].
+    complete: bool,
 }
 
 impl GhWorkSource {
@@ -46,6 +49,7 @@ impl GhWorkSource {
             gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: None,
+            complete: true,
         }
     }
 
@@ -61,6 +65,7 @@ impl GhWorkSource {
             gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: Some(root.to_path_buf()),
+            complete: true,
         }
     }
 
@@ -88,8 +93,12 @@ impl WorkSource for GhWorkSource {
             // #10763: `crate::stale_blocked::release_task`.
         }
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
-        // `gh issue list`.
-        let ready = self.list_label("loom:issue")?;
+        // `gh issue list`. Every page of it (#11139): a repo with more than
+        // 100 ready issues no longer starves its oldest ones. Page 1 failing
+        // fails the listing; any later shortfall keeps the rows read and
+        // marks this repo's queue incomplete.
+        self.complete = true;
+        let ready = self.list_label("loom:issue", true)?;
         // Second ETag-cached listing (#9244 §4): starred issues outside
         // `loom:issue` (triage, curated, or no workflow label at all). Its
         // failure never costs the `loom:issue` rows: log, feed the rate-limit
@@ -98,7 +107,7 @@ impl WorkSource for GhWorkSource {
         // level): a level-2 issue need not carry the star itself.
         let mut starred: Vec<WorkItem> = Vec::new();
         for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
-            let rows = self.list_side_label(label);
+            let rows = self.list_side_label(label, true);
             let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
             starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
         }
@@ -139,8 +148,12 @@ impl WorkSource for GhWorkSource {
         // at most once per tick, and only if a marker-bearing row needs it.
         let mut policy: Option<crate::comment_trust::TrustPolicy> = None;
         let root = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        // First page only (#11139): these listings are large (this repo has
+        // ~300 `loom:triage`) and churn on every filing, so walking them would
+        // cost several requests a tick for rows the lane drops unless `main`
+        // is red; a fresh fix filing sorts first (newest first).
         for label in super::main_red_fix::UNPROMOTED_LABELS {
-            let rows = self.list_side_label(label);
+            let rows = self.list_side_label(label, false);
             items = super::main_red_fix::merge_red_fix_candidates(items, rows, |author| {
                 policy
                     .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(&root))
@@ -149,33 +162,70 @@ impl WorkSource for GhWorkSource {
         }
         Ok(items)
     }
+
+    fn listing_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 impl GhWorkSource {
     /// A listing other than `loom:issue` (#9244 §4, #10118). Its failure
     /// never costs the `loom:issue` rows: log, feed the rate-limit breaker,
-    /// and carry on without it.
-    fn list_side_label(&self, label: &str) -> Vec<WorkItem> {
-        self.list_label(label).unwrap_or_else(|e| {
+    /// and carry on without it, but the repo's queue is then incomplete
+    /// (#11139). `all_pages` as [`Self::list_label`].
+    fn list_side_label(&mut self, label: &str, all_pages: bool) -> Vec<WorkItem> {
+        self.list_label(label, all_pages).unwrap_or_else(|e| {
             log::warn!("work_finder: listing {label} issues failed ({e}); skipping that listing");
             crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+            self.complete = false;
             Vec::new()
         })
     }
 
-    /// One ETag-cached REST listing of open issues carrying `label` (#4428):
-    /// a poll where nothing changed costs zero rate limit (304). REST issue
+    /// The ETag-cached REST listing of open issues carrying `label` (#4428):
+    /// a page where nothing changed costs zero rate limit (304). REST issue
     /// listings include PRs, so `pull_request`-marked rows are dropped.
-    fn list_label(&self, label: &str) -> Result<Vec<WorkItem>> {
-        let rows = crate::forge_listing::list_issues_cached_as(
-            "work_finder",
-            &self.gh_bin,
-            self.cwd.as_deref(),
-            self.repo.as_deref(),
-            label,
-            "open",
-        )?;
-        Ok(rows
+    ///
+    /// `all_pages` (#11139) walks every page; a single-page listing still
+    /// makes one request, its page 1 the same cache entry as before. A walk
+    /// that fell short after page 1 (a page failed, the page cap, a mid-walk
+    /// change) returns what it read and clears [`Self::complete`]; only page
+    /// 1 failing is an error. Without `all_pages`, page 1 alone.
+    fn list_label(&mut self, label: &str, all_pages: bool) -> Result<Vec<WorkItem>> {
+        let (gh, cwd, repo) = (&self.gh_bin, self.cwd.as_deref(), self.repo.as_deref());
+        let listing = if all_pages {
+            crate::forge_listing::list_issues_cached_paged_as(
+                "work_finder",
+                gh,
+                cwd,
+                repo,
+                label,
+                "open",
+            )?
+        } else {
+            crate::forge_listing::PagedListing {
+                rows: crate::forge_listing::list_issues_cached_as(
+                    "work_finder",
+                    gh,
+                    cwd,
+                    repo,
+                    label,
+                    "open",
+                )?,
+                incomplete: None,
+            }
+        };
+        if let Some(e) = &listing.incomplete {
+            log::warn!(
+                "work_finder: the {label} listing is incomplete ({e:#}); using the {} rows read \
+                 and marking this repo's queue incomplete",
+                listing.rows.len()
+            );
+            crate::rate_limit_breaker::global_observe_failure(&format!("{e:#}"), "work_finder");
+            self.complete = false;
+        }
+        Ok(listing
+            .rows
             .into_iter()
             .filter(|r| !r.is_pull_request)
             // The REST listing already returns `body` (#4827) — carrying it

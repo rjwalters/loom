@@ -24,7 +24,16 @@ mod observability_tests;
 /// Claude Code's `-p` sessions read) exactly as the sweep path's
 /// `observability::tracing::prepare_child` does, and removed when the tick has
 /// none, so an ambient daemon value can never parent this session.
-pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path, role: &str) {
+///
+/// Last — opt-in, default-off (#10964) — the session's own OTLP export is
+/// pointed at this daemon's loopback relay. The returned lease is that
+/// session's relay access: the caller holds it until the child has exited.
+pub(super) fn apply_role_observability(
+    cmd: &mut Command,
+    workspace_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
     let execution = crate::observability::lifecycle::role_command(cmd);
     let context = cmd
@@ -41,7 +50,18 @@ pub(super) fn apply_role_observability(cmd: &mut Command, workspace_root: &Path,
         role,
         execution.as_deref(),
     );
+    crate::observability::agent_relay::prepare_role_child(
+        cmd,
+        workspace_root,
+        runtime,
+        role,
+        execution.as_deref(),
+    )
 }
+
+// #10640: why a launched tick failed, for its `loom.role_attempt` span.
+mod failure_class;
+use crate::observability::lifecycle::note_role_failure;
 
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
@@ -65,7 +85,15 @@ pub(super) fn run_role_with_timeout(
     load_per_core_override: Option<f64>,
     backstop: Option<crate::runtime_preference::Reservation>,
     contained: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
+    resume: Option<&roll_resume::RoleRollResume>,
 ) -> RoleTickOutcome {
+    // #10832: a saved session only resumes on the runtime that owns it. A role
+    // whose binding moved to another runtime since the pause is refused here,
+    // before anything is spawned, and H5 requeues the run.
+    if let Some(refused) = resume.and_then(|r| r.refuse(admission)) {
+        note_pre_spawn_skip(&logs_dir, role, &refused);
+        return RoleTickOutcome::Failure(refused);
+    }
     // #9548: every scheduled role (Champion, Curator, Judge, Doctor, ...)
     // writes labels and control markers on this workspace's repo, through
     // `gh` calls that resolve it the way `gh` does, an `upstream` remote
@@ -168,7 +196,17 @@ pub(super) fn run_role_with_timeout(
 
     let mut cmd = Command::new(script);
     cmd.env(crate::provenance::origin::ENV, "autonomous");
-    cmd.arg("-p").arg(prompt);
+    // #10832: a roll resume passes no prompt of its own (see
+    // `sweep_registry::spawn_process`'s identical branch).
+    match resume.map(|r| r.launch.runtime.as_str()) {
+        None => {
+            cmd.arg("-p").arg(prompt);
+        }
+        Some("codex") => {}
+        Some(_) => {
+            cmd.arg("-p");
+        }
+    }
     // Model pin (issue #4501): appended immediately after the prompt, exactly as
     // `sweep_registry::spawn_child` does, so a role child never inherits the
     // account's interactive CLI default (`fable` on the affected host — the most
@@ -242,28 +280,116 @@ pub(super) fn run_role_with_timeout(
         cmd.process_group(0);
     }
 
-    apply_role_observability(&mut cmd, workspace_root, role);
+    // Held to the end of this (blocking) launch: dropping it ends the
+    // session's relay access (#10964).
+    let _relay_lease = apply_role_observability(
+        &mut cmd,
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
+    // #10830: a role run is paused and resumed like a sweep (design Q7), so it
+    // gets the same pause-and-roll identity. Role runs have no claim lock; the
+    // item id is synthetic (`role-<role>-<time>-<rand>`).
+    let item = format!(
+        "role-{role}-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    // #8370: this run's Loom-owned CARGO_TARGET_DIR. `worker_spawn` creates
+    // it (or not: an operator CARGO_TARGET_DIR, no Cargo.toml); the guard
+    // removes it when this function returns, on every outcome. That is after
+    // the child has exited or been killed, but not necessarily after its
+    // descendants have: the guard checks the child's process group first
+    // (`watch_process_group` below) and leaves the dir to the orphan sweep
+    // while anything in it is alive.
+    let mut run_target = crate::run_target_dir::RunDirGuard::plan(workspace_root, role, &item);
+    run_target.apply(&mut cmd);
+    let runtime = admission.map(|a| a.runtime.as_str());
+    let session = match resume {
+        None => sweep_registry::resume_handle::DispatchSession::new(&item, workspace_root, runtime),
+        Some(r) => r.session(&item, workspace_root),
+    };
+    if resume.is_some() && session.is_none() {
+        let reason = "roll resume refused: the saved session id is not usable (#10832)";
+        note_pre_spawn_skip(&logs_dir, role, reason);
+        return RoleTickOutcome::Failure(reason.to_string());
+    }
+    if let Some(session) = &session {
+        session.apply_env(&mut cmd);
+    }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
+    // #10974: nothing new starts once a roll's pause is requested. The permit
+    // is held until the run is registered, so the pause's snapshot cannot
+    // fall between this spawn and that registration.
+    let Some(launch_permit) = crate::roll_pause::live_runs::begin_launch(workspace_root) else {
+        return RoleTickOutcome::Failure(
+            "role launch refused: the daemon is pausing every agent for a version roll (#10831)"
+                .to_string(),
+        );
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return RoleTickOutcome::Failure(format!("could not spawn `{}`: {e}", script.display()))
+            note_role_failure(failure_class::launch_failed(&e));
+            return RoleTickOutcome::Failure(format!(
+                "could not spawn `{}`: {e}",
+                script.display()
+            ));
         }
     };
     if let Some(selection) = &selection {
         selection.spawned();
     }
     let pid = child.id();
+    // `process_group(0)` above made the child its own group leader, so its
+    // pid is the group id.
+    #[cfg(unix)]
+    run_target.watch_process_group(pid);
     // #8555: hand this tick's metered backstop slot (the one `runtime_preflight`
     // took, carried here by value) to the child that will spend it. No-op when
     // no ceiling is configured or the tick did not fall through to a governed
     // tap; every bail-out before this point dropped it, releasing it.
     crate::runtime_preference::handoff::attach(backstop, pid);
     crate::observability::lifecycle::role_child_spawned(pid);
+    // #10831: list this run for the pause-and-roll H4 snapshot until it ends
+    // (every return below drops the guard).
+    let live_run = session
+        .as_ref()
+        .map(|s| crate::roll_pause::live_runs::LiveRun {
+            item_id: s.item_id.clone(),
+            role: role.to_string(),
+            root: workspace_root.to_path_buf(),
+            pid,
+            // The session's FIRST start: carried across a roll resume.
+            started_at: chrono::DateTime::parse_from_rfc3339(&s.agent_started_at)
+                .map_or_else(|_| chrono::Utc::now(), |t| t.with_timezone(&chrono::Utc)),
+            runtime: s.runtime.clone(),
+            claude_session_id: s
+                .claude_session_id
+                .clone()
+                .or_else(|| s.resume.as_ref().map(|l| l.session_id.clone())),
+            scope_unit: s.scope_unit.clone(),
+            pause_root: s.pause_root.clone(),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            timeout,
+            started_mono: Instant::now(),
+            resume: s.resume.clone(),
+        });
+    // Registering consumes the permit. With no pause identity there is nothing
+    // to register, and the permit must still be released here: it holds the
+    // launch gate's lock.
+    let _live_run = match live_run {
+        Some(run) => Some(launch_permit.register(run)),
+        None => {
+            drop(launch_permit);
+            None
+        }
+    };
 
     let start = Instant::now();
     loop {
@@ -291,6 +417,7 @@ pub(super) fn run_role_with_timeout(
                 // `toolless_launch`'s module doc for the four conditions.
                 if let Some(detail) = toolless_launch::detect(&log_path, admission, &tick_anchor) {
                     log::warn!("role_runner: {detail}");
+                    note_role_failure(failure_class::toolless_launch());
                     return RoleTickOutcome::Failure(detail);
                 }
                 // Issue #10003: exit 0 is not evidence a CODEX tick did
@@ -303,6 +430,7 @@ pub(super) fn run_role_with_timeout(
                     let verdict = sandbox_noop::detect(&log_path, admission, &tick_anchor);
                     if let Some(detail) = sandbox_noop::apply(verdict, &admitted.runtime, now) {
                         log::warn!("role_runner: role={role} {detail}");
+                        note_role_failure(failure_class::sandbox_unavailable());
                         return RoleTickOutcome::Failure(detail);
                     }
                 }
@@ -320,6 +448,7 @@ pub(super) fn run_role_with_timeout(
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
                 let detail = describe_role_failure(&full_log, &log_path, &tick_anchor);
+                note_role_failure(failure_class::exited(status, &full_log, &tick_anchor));
                 // Issue #8443: same terminal-record feedback on a non-zero
                 // exit — this is the path a `TOKEN_EXHAUSTED` death actually
                 // takes.
@@ -358,15 +487,22 @@ pub(super) fn run_role_with_timeout(
                     // deterministically.
                     let load_per_core =
                         load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
-                    return terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
+                    let outcome =
+                        terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
+                    // A load-saturated ceiling is `skipped_load`, not a failure.
+                    if matches!(outcome, RoleTickOutcome::Failure(_)) {
+                        note_role_failure(failure_class::timed_out(timeout));
+                    }
+                    return outcome;
                 }
                 std::thread::sleep(INVOCATION_POLL_INTERVAL);
             }
             Err(e) => {
+                note_role_failure(failure_class::wait_failed(&e));
                 return RoleTickOutcome::Failure(format!(
                     "could not poll `{}`: {e}",
                     script.display()
-                ))
+                ));
             }
         }
     }
@@ -421,6 +557,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         match outcome {
             RoleTickOutcome::Failure(reason) => {
@@ -453,6 +590,7 @@ mod tests {
             "default",
             "",
             "default",
+            None,
             None,
             None,
             None,

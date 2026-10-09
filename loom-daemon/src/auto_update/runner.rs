@@ -47,10 +47,11 @@ pub fn liveness_window(interval: Duration) -> Duration {
 }
 
 /// Run one full tick: publish `last_check`, probe, decide, and — on a `Rebuild`
-/// decision — rebuild and (on success) trigger the drain-and-restart. Pure of
+/// or `FetchArtifact` decision — install and (on success) trigger the
+/// pause-and-roll (#10831: the one roll path for every trigger). Pure of
 /// spawning concerns so tests can drive it directly. Returns what the tick
 /// decided, for the `auto_update.tick` record (#10414).
-pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
+pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state: &mut AutoUpdateState,
     status: &AutoUpdateStatus,
     probe: &mut P,
@@ -60,61 +61,17 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 ) -> TickSummary {
     let now = Instant::now();
     let last_check = Utc::now();
-    let settle = state.window.begin_tick(last_check, trigger, settle);
-    // Issue #8998: before either cooperating with an armed roll or arming a new
-    // one, ask whether the condition it waits for (in-flight reaches zero) is
-    // reachable at all. The in-flight count is read only when there is an
-    // episode to advance — a roll is armed, or one was declared unsatisfiable
-    // and we are waiting for the host to go quiet — so an ordinary up-to-date
-    // tick pays nothing extra for this.
     let armed = trigger.armed_roll();
     let mut summary = TickSummary::new(armed.as_ref());
-    if armed.is_some() || state.roll_stall_active() {
-        let stall_in_flight = probe.in_flight_sweeps();
-        summary.in_flight = Some(stall_in_flight);
-        let stall = state.observe_roll_stall(last_check, armed.as_ref(), stall_in_flight);
-        // Issue #9010: a standing declaration that has stood for its full cooldown
-        // is dropped inside `observe` (returning `None`, so this tick falls through
-        // and arms a roll normally). Surface that as its own WARN rather than
-        // letting the suppression end silently — an operator watching a host that
-        // stopped updating needs to see the retry being spent as well as the
-        // declaration that preceded it.
-        if let Some(retry) = state.take_roll_stall_retry_note() {
-            log::warn!("auto_update: {retry}");
-        }
-        if let Some(report) = stall {
-            let note = report.note();
-            log::warn!("auto_update: {note}");
-            // Only ever a roll this loop armed and labelled with an artifact
-            // target. `observe` already refuses to advance — or to re-report — an
-            // episode while a teardown or an untargeted operator drain is armed,
-            // but this is the call that actually reaches `DrainState::abort()`,
-            // so it re-states the ownership test rather than trusting an
-            // invariant asserted one module away. Gating on `armed.is_some()`
-            // instead is what let a latched declaration cancel an operator's
-            // teardown within one tick (the defect PR #9004 shipped first).
-            if armed
-                .as_ref()
-                .is_some_and(|roll| !roll.then_exit && roll.target.is_some())
-            {
-                trigger.abandon_roll(&note);
-            }
-            let armed_artifact = probe.resolve_artifact();
-            status.publish(state.snapshot(true, last_check, note.clone(), &armed_artifact));
-            return summary.finish(TickDecisionKind::RollStall, note, &armed_artifact, None);
-        }
-    }
-    // Issue #6007: cooperate with the drain rather than racing it. A roll that is
-    // already armed — including one *retained* across a refused deadline
-    // (dispatch paused, restart re-arming itself at quiescence) — needs no second
-    // rebuild; the binary is provisioned and the restart is coming.
+    // Cooperate with a roll or drain that is already armed rather than racing
+    // it: the binary is provisioned and the restart is coming, so no second
+    // install is needed.
     //
-    // Issue #8514 narrows that skip by exactly one case: a **pending** roll
-    // whose artifact has since been overtaken by a newer release is superseded
-    // rather than waited out, so the host does not spend its paused-dispatch
-    // budget converging on a binary that is already stale. Every other shape —
-    // a first-attempt drain, a teardown, an untargeted operator drain, no newer
-    // artifact — still skips, byte-for-byte as before.
+    // Issue #8514 narrows that skip by exactly one case: a pause roll that has
+    // not stopped any agent yet, whose artifact has since been overtaken by a
+    // newer release, is superseded rather than completed onto a binary that is
+    // already stale. Every other shape — a pause that has already stopped
+    // agents, a teardown, an operator drain, no newer artifact — still skips.
     if trigger.roll_in_progress() {
         let armed_artifact = probe.resolve_artifact();
         match supersede::decide_armed_roll(armed.as_ref(), &armed_artifact) {
@@ -125,7 +82,6 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             }
             supersede::ArmedRollAction::Supersede { from, to } => {
                 let note = supersede::supersede_note(&from, &to);
-                state.window.allow_retarget();
                 log::warn!("auto_update: {note}");
                 if !trigger.supersede_roll(&from, &to) {
                     // The roll completed or was abandoned between the two reads
@@ -165,9 +121,13 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     // but a day-long incident needs a signal that reaches the daemon's own
     // log without anyone asking. Logged every tick the threshold is crossed
     // (bounded by `interval`, default 900s — not spammy).
-    if let Some(warning) =
-        crate::self_update::staleness_warning_default(check.commits_behind, check.hours_behind)
-    {
+    //
+    // #10885: not on a fleet host. It does not follow its source checkout (it
+    // moves when the floor moves), so being behind it is by design and a
+    // WARN every tick would be noise.
+    let staleness =
+        crate::self_update::staleness_warning_default(check.commits_behind, check.hours_behind);
+    if let Some(warning) = staleness.filter(|_| !state.floor.fleet_host()) {
         log::warn!("auto_update: {warning}");
     }
 
@@ -178,7 +138,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         in_flight,
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
-    let (kind, outcome, note) = match state.window.gate(last_check, decision) {
+    let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
             // refusal — the generic reason alone gave no way to tell an
@@ -200,7 +160,8 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             // unless read live at exactly the right moment).
             log::info!("auto_update: {reason}");
             // #10414: a skip with a target being tracked is a roll some gate
-            // held back (settle, backoff, terminal, in-flight, roll window).
+            // held back (settle, backoff, terminal, in-flight). A fleet host
+            // holding at its floor tracks nothing, so it reports `skip`.
             let kind = if state.tracked_target.is_some() {
                 TickDecisionKind::Defer
             } else {
@@ -228,10 +189,12 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 );
             }
             let outcome = probe.rebuild(low_priority);
-            // `None`: a source-path roll has no release-artifact identity, so it
-            // is never a supersede candidate (#8514).
-            let drain_accepted =
-                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_for(None);
+            // A source-path roll: the checkout is ahead of the running binary
+            // (`repo_ahead`). It has no release-artifact identity, so it is
+            // never a supersede candidate (#8514).
+            state.persist_before_arm(&outcome);
+            let drain_accepted = matches!(outcome, RebuildOutcome::Success)
+                && trigger.trigger_pause_roll(&RollTarget::repo_ahead());
             summary.roll_armed = drain_accepted;
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
@@ -273,11 +236,24 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                 // produced from a `Resolved` artifact.
                 ArtifactResolution::Unresolved(_) => ArtifactInfo::default(),
             };
-            // #8514: label the roll with the artifact identity it is rolling to,
-            // so a later tick can tell a still-current pending roll from one a
-            // newer release has overtaken.
-            let drain_accepted = matches!(outcome, RebuildOutcome::Success)
-                && trigger.trigger_for(Some(&supersede::artifact_roll_target(&info)));
+            // #10831: floor-driven and ordinary autoUpdate rolls take the same
+            // pause path; only the recorded `target_source` differs. #8514: the
+            // label is the artifact identity a later tick compares against to
+            // tell a still-current roll from one a newer release has overtaken.
+            let target = RollTarget {
+                source: match state.floor.roll_source() {
+                    floor_roll::TargetSource::Floor => pause_manifest::TargetSource::Floor,
+                    // #10719: only a workspace that needs a newer daemon drives it.
+                    _ if state.repo_ahead.driving() => pause_manifest::TargetSource::RepoAhead,
+                    _ => pause_manifest::TargetSource::AutoUpdate,
+                },
+                to_version: Some(version.clone()),
+                to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
+                label: Some(supersede::artifact_roll_target(&info)),
+            };
+            state.persist_before_arm(&outcome);
+            let drain_accepted =
+                matches!(outcome, RebuildOutcome::Success) && trigger.trigger_pause_roll(&target);
             summary.roll_armed = drain_accepted;
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
@@ -293,12 +269,38 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
     };
     // #10712: a host below the fleet floor says so on whatever the tick
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
-    // alert is never a gate: nothing above was held back for it and dispatch
-    // is untouched.
-    let note = format!("{note}{}", state.floor.note_suffix());
+    // alert is never a gate: nothing above was held back for it, no pause is
+    // started for it, and dispatch is untouched.
+    let note = format!("{note}{}{}", state.floor.note_suffix(), state.repo_ahead.note_suffix());
+    // #10866: the note and the record's `floor_stall` are state and are set on
+    // every tick the stall stands. Only the ERROR line is rate-limited.
+    summary.floor_alerted = state
+        .floor
+        .alert_due(last_check, floor_roll::alert::REMINDER);
     if let Some(stall) = state.floor.stall() {
-        log::error!("auto_update: {}", stall.note());
+        if summary.floor_alerted {
+            let since = state.floor.stall_declared_at().unwrap_or(last_check);
+            log::error!(
+                "auto_update: {} [standing since {}; logged again when it changes, else once per \
+                 {}s]",
+                stall.note(),
+                since.format("%Y-%m-%dT%H:%M:%SZ"),
+                floor_roll::alert::REMINDER.as_secs()
+            );
+        }
         summary.floor_stall = Some(stall.note());
+    }
+    // #10719: a repo-ahead demand no release satisfies is the same kind of
+    // stall. It arms nothing; the record's stall field names it when the
+    // floor has none of its own.
+    let ahead_alert = state
+        .repo_ahead
+        .alert_due(last_check, floor_roll::alert::REMINDER);
+    if let Some(stall) = state.repo_ahead.stall() {
+        if ahead_alert {
+            log::error!("auto_update: {stall}");
+        }
+        summary.floor_stall.get_or_insert(stall);
     }
 
     status.publish(state.snapshot(true, last_check, note.clone(), &artifact));
@@ -338,23 +340,32 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// One tick under `catch_unwind`, emitting its `auto_update.tick` record. A
 /// panic is published as the status note and reported as `decision = panic`;
 /// the caller's loop continues either way (#10414).
-pub(super) fn guarded_tick<P: AutoUpdateProbe, T: DrainTrigger>(
+pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state: &mut AutoUpdateState,
     status: &AutoUpdateStatus,
     probe: &mut P,
     trigger: &T,
     tuning: &TickTuning,
+    floor: &FloorFeed,
 ) -> TickSummary {
     let started_at = Utc::now();
     let started = Instant::now();
-    // #10712: the fleet floor in force (updated by fleet-sync without a
-    // restart) against the version this process is running. Read here, not in
-    // `run_tick`, so tick tests set the basis themselves.
+    // #10712: what is known about the fleet floor (updated by fleet-sync
+    // without a restart) against the version this process is running. Read
+    // here, not in `run_tick`, so tick tests set the basis themselves.
     state
         .floor
-        .set_basis(crate::fleet_sync::loom_min_version(), env!("CARGO_PKG_VERSION"));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline)
+        .set_basis(floor.knowledge(), env!("CARGO_PKG_VERSION"));
+    // #10719: and the highest daemon version a registered workspace needs.
+    state
+        .repo_ahead
+        .set_basis(floor.demand(), env!("CARGO_PKG_VERSION"));
+    // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
+    // nothing on a tick where the host has no fleet store.
+    let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match idle {
+        Some(note) => idle_tick(state, status, note),
+        None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
     }));
     let summary = result.unwrap_or_else(|payload| {
         let note = format!(
@@ -367,8 +378,20 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    // #10713: persist after every tick (a no-op unless attached at spawn).
+    state.persist_state();
     tick_telemetry::emit(&summary, state.consecutive_failures, started_at, started.elapsed());
     summary
+}
+
+/// A tick that checks nothing (#10954, [`loop_mode::idle_reason`]): no
+/// release is resolved, nothing is fetched and no roll is armed.
+fn idle_tick(state: &mut AutoUpdateState, status: &AutoUpdateStatus, note: String) -> TickSummary {
+    log::info!("auto_update: {note}");
+    state.clear_tracking();
+    let unchecked = ArtifactResolution::Unresolved("not checked".to_string());
+    status.publish(state.snapshot(true, Utc::now(), note.clone(), &unchecked));
+    TickSummary::new(None).finish(TickDecisionKind::Skip, note, &unchecked, None)
 }
 
 /// Spawn the **single** process-global auto-update loop on the shared daemon
@@ -392,38 +415,110 @@ pub fn spawn_auto_update_task<P, T>(
 ) -> tokio::task::JoinHandle<()>
 where
     P: AutoUpdateProbe + Send + 'static,
-    T: DrainTrigger + Send + Sync + 'static,
+    T: RollTrigger + Send + Sync + 'static,
 {
     register_global_status(status.clone());
     log::info!("auto_update: starting loop ({})", tuning.describe());
     task_liveness::register(AUTO_UPDATE, tuning.interval, liveness_window(tuning.interval));
-    let mut state = AutoUpdateState::new()
-        .with_roll_stall_deadlines(tuning.roll_stall_deadlines)
-        .with_roll_stall_cooldown(tuning.roll_stall_cooldown);
-    state.window = roll_window::WindowGate::new(tuning.roll_window);
-    tokio::spawn(run_loop(state, probe, trigger, status, tuning))
+    let mut state = AutoUpdateState::new();
+    state.attach_persistence(persisted_state::default_path());
+    tokio::spawn(run_loop(state, probe, trigger, status, tuning, FloorFeed::fleet_sync()))
 }
 
-/// The loop [`spawn_auto_update_task`] runs: tick every `tuning.interval`,
-/// beat liveness after each tick, and stop (visibly) only if a tick's task is
-/// lost outright.
+/// Where the loop reads the fleet floor from, and the wake that says it
+/// changed (#10885). Production reads fleet-sync's process-wide value
+/// ([`Self::fleet_sync`]); tests supply their own so they do not depend on it.
+#[derive(Clone)]
+pub(super) struct FloorFeed {
+    read: Arc<dyn Fn() -> crate::fleet_sync::FloorKnowledge + Send + Sync>,
+    wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
+    /// #10719: the highest daemon version a registered workspace needs.
+    demand: Arc<dyn Fn() -> Option<floor_roll::repo_ahead::Demand> + Send + Sync>,
+}
+
+impl FloorFeed {
+    /// The fleet-sync loop's floor and its wake.
+    pub(super) fn fleet_sync() -> Self {
+        Self {
+            read: Arc::new(crate::fleet_sync::floor_knowledge),
+            wake: Arc::new(crate::fleet_sync::floor_wake),
+            demand: Arc::new(floor_roll::repo_ahead::Demand::live),
+        }
+    }
+
+    /// A feed over an arbitrary reader and wake.
+    #[cfg(test)]
+    pub(super) fn new(
+        read: impl Fn() -> crate::fleet_sync::FloorKnowledge + Send + Sync + 'static,
+        wake: &'static crate::fleet_sync::FloorWake,
+    ) -> Self {
+        Self {
+            read: Arc::new(read),
+            wake: Arc::new(move || wake),
+            demand: Arc::new(|| None),
+        }
+    }
+
+    /// The same feed, with a fixed repo-ahead demand (#10719).
+    #[cfg(test)]
+    pub(super) fn with_demand(mut self, demand: floor_roll::repo_ahead::Demand) -> Self {
+        self.demand = Arc::new(move || Some(demand.clone()));
+        self
+    }
+
+    fn knowledge(&self) -> crate::fleet_sync::FloorKnowledge {
+        (self.read)()
+    }
+
+    fn wake(&self) -> &'static crate::fleet_sync::FloorWake {
+        (self.wake)()
+    }
+
+    fn demand(&self) -> Option<floor_roll::repo_ahead::Demand> {
+        (self.demand)()
+    }
+}
+
+/// The loop [`spawn_auto_update_task`] runs: tick at once, then every
+/// `tuning.interval` or as soon as the fleet floor changes, whichever comes
+/// first. Beats liveness after each tick, and stops (visibly) only if a tick's
+/// task is lost outright.
+///
+/// #10885: the first tick runs at spawn, so a host that starts below its floor
+/// rolls without waiting an interval. A floor change wakes the loop
+/// ([`crate::fleet_sync::FloorWake`]) and restarts the interval from that
+/// tick. The wake fires on a change of value only, so a floor roll that keeps
+/// failing is paced by its backoff.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
     mut trigger: T,
     status: Arc<AutoUpdateStatus>,
     tuning: TickTuning,
+    floor: FloorFeed,
 ) where
     P: AutoUpdateProbe + Send + 'static,
-    T: DrainTrigger + Send + Sync + 'static,
+    T: RollTrigger + Send + Sync + 'static,
 {
     let mut ticker = tokio::time::interval(tuning.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let wake = floor.wake();
+    // The generation the last tick started under. A change that lands while a
+    // tick is running is therefore still pending when it returns.
+    let mut seen = wake.generation();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = wake.changed_since(seen) => {
+                log::info!("auto_update: the fleet floor changed — ticking now, not at the next interval");
+                ticker.reset();
+            }
+        }
+        seen = wake.generation();
+        let floor_task = floor.clone();
         let status_task = status.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            guarded_tick(&mut state, &status_task, &mut probe, &trigger, &tuning);
+            guarded_tick(&mut state, &status_task, &mut probe, &trigger, &tuning, &floor_task);
             (state, probe, trigger)
         });
         match wait_for_tick(handle, tuning.interval, TICK_OVERRUN).await {

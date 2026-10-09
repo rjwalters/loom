@@ -53,7 +53,7 @@
 
 use super::history::StageSamples;
 use super::journal::JournalEntry;
-use super::score::{score, EstimateSummary, OutcomeKind, Score};
+use super::score::{score, score_censored, EstimateSummary, OutcomeKind, Score};
 use super::tracker::READY_FIRST_SEEN;
 use super::{
     explanation, AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic,
@@ -280,30 +280,73 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
     cases
 }
 
-/// The identity a replay case has whichever source derived it: subject
-/// (repo, case-insensitive, and issue), kind, stage, and which entry of that
-/// stage it is — the *n*-th, by `as_of`, among the subject's cases of that
-/// kind and stage in the same set. Two sources disagree on the exact `as_of`
-/// (a sweep's is reconstructed from phase durations, the forge's is a label
-/// event), so the instant itself cannot be the key; the lap ordinal can.
-type CaseIdentity = (String, u32, Kind, Stage, usize);
+/// Repo (lowercased), issue, kind and stage: the cases a lap is counted
+/// among.
+type LapGroup = (String, u32, Kind, Stage);
 
-fn identities(cases: &[ReplayCase]) -> Vec<CaseIdentity> {
-    let mut groups: BTreeMap<(String, u32, Kind, Stage), Vec<usize>> = BTreeMap::new();
-    for (i, c) in cases.iter().enumerate() {
+/// `cases`' still-`open` members grouped by [`LapGroup`] — and by PR when
+/// `by_pr` — each group in lap order (`as_of`, then position).
+fn laps(
+    cases: &[ReplayCase],
+    open: &[bool],
+    by_pr: bool,
+) -> BTreeMap<(LapGroup, Option<u32>), Vec<usize>> {
+    let mut groups: BTreeMap<(LapGroup, Option<u32>), Vec<usize>> = BTreeMap::new();
+    for (i, c) in cases.iter().enumerate().filter(|&(i, _)| open[i]) {
+        let s = &c.subject;
+        let group = (s.repo.to_ascii_lowercase(), s.issue, c.kind, c.stage);
         groups
-            .entry((c.subject.repo.to_ascii_lowercase(), c.subject.issue, c.kind, c.stage))
+            .entry((group, if by_pr { s.pr_number } else { None }))
             .or_default()
             .push(i);
     }
-    let mut ids = vec![(String::new(), 0, Kind::Land, Stage::ReviewWait, 0); cases.len()];
-    for ((repo, issue, kind, stage), mut members) in groups {
+    for members in groups.values_mut() {
         members.sort_by_key(|&i| (cases[i].as_of, i));
-        for (ordinal, i) in members.into_iter().enumerate() {
-            ids[i] = (repo.clone(), issue, kind, stage, ordinal);
+    }
+    groups
+}
+
+/// For each of `cases`, whether `held` already holds it (#9579, #10781):
+/// the same case, read from another source or known at an earlier cutoff.
+/// Each `held` case answers at most one of `cases`.
+///
+/// Two sources disagree on a case's exact `as_of` (a sweep's is reconstructed
+/// from phase durations, the forge's is a label event), so the instant itself
+/// cannot be the identity. The lap can: the *n*-th, by `as_of`, of a
+/// subject's cases of one kind and stage.
+///
+/// 1. Cases naming the same PR (or both naming none) match lap for lap,
+///    counted among that PR's cases. Another PR on the same issue, whether
+///    merged outside a sweep or resolving out of prediction order, never
+///    shifts a lap. So it is neither dropped for this PR's case nor counted
+///    beside it (#10626, #10781).
+/// 2. What is left on each side falls back to the issue-level lap, counted
+///    among the issue's still-unmatched cases. It matches only when either
+///    side does not know its PR: a sweep record from before #9441, or a
+///    merge-ending one whose checkpoint sampling missed `pr_number`. Two
+///    known, different PRs are never the same case.
+#[must_use]
+pub fn already_held(held: &[ReplayCase], cases: &[ReplayCase]) -> Vec<bool> {
+    let mut held_open = vec![true; held.len()];
+    let mut found = vec![false; cases.len()];
+    for by_pr in [true, false] {
+        let theirs = laps(held, &held_open, by_pr);
+        let open: Vec<bool> = found.iter().map(|f| !f).collect();
+        for (key, members) in laps(cases, &open, by_pr) {
+            let Some(held_members) = theirs.get(&key) else {
+                continue;
+            };
+            for (&i, &h) in members.iter().zip(held_members) {
+                let unknown =
+                    cases[i].subject.pr_number.is_none() || held[h].subject.pr_number.is_none();
+                if by_pr || unknown {
+                    found[i] = true;
+                    held_open[h] = false;
+                }
+            }
         }
     }
-    ids
+    found
 }
 
 /// `primary` plus every `secondary` case that is not already in it (#9579).
@@ -311,11 +354,11 @@ fn identities(cases: &[ReplayCase]) -> Vec<CaseIdentity> {
 ///
 /// Every `primary` case is kept as-is. `secondary` is first reduced to
 /// distinct cases (the same PR read twice — an offline file and a forge
-/// fetch — is the same case, not two), then any case whose
-/// [`CaseIdentity`] `primary` already holds is dropped: a PR merged inside a
-/// sweep is answered by both its `sweep.outcome` record and its forge
-/// timeline, and must be scored once. Genuine second laps keep distinct
-/// ordinals and so are never collapsed.
+/// fetch — is the same case, not two), then any case [`already_held`] finds
+/// in `primary` is dropped: a PR merged inside a sweep is answered by both
+/// its `sweep.outcome` record and its forge timeline, and must be scored
+/// once. Genuine second laps keep distinct laps and so are never collapsed;
+/// nor is a second PR on the same issue (#10781).
 #[must_use]
 pub fn merge_case_sets(
     primary: Vec<ReplayCase>,
@@ -336,12 +379,11 @@ pub fn merge_case_sets(
             ))
         })
         .collect();
-    let taken: BTreeSet<CaseIdentity> = identities(&primary).into_iter().collect();
-    let ids = identities(&distinct);
+    let held = already_held(&primary, &distinct);
     let mut merged = primary;
     let mut added = 0_usize;
-    for (case, id) in distinct.into_iter().zip(ids) {
-        if !taken.contains(&id) {
+    for (case, held) in distinct.into_iter().zip(held) {
+        if !held {
             merged.push(case);
             added += 1;
         }
@@ -442,6 +484,12 @@ pub struct BacktestReport {
     /// diagnostic, never a promotion input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_adaptation: Option<RegimeAdaptation>,
+    /// The late-surprise rate over resolved **and** in-flight (censored)
+    /// cases, with an issue-bootstrap interval and the resolved-only rate
+    /// beside it (#9970 Slice 2, [`censored`]). Present only when some case
+    /// was censored, so every report without one is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_surprise: Option<LateSurprise>,
 }
 
 /// `by_tail` key for an ordinary estimate (or a refusal).
@@ -566,7 +614,11 @@ fn replay(
         .map(|case| {
             let input = case_input(case, loom);
             let summary = EstimateSummary::of(&heuristic.estimate(&input, history));
-            let score = score(&summary, case.outcome, case.actual_at, &[]);
+            let score = if case.outcome == OutcomeKind::Censored {
+                score_censored(&summary, case.actual_at)
+            } else {
+                score(&summary, case.outcome, case.actual_at, &[])
+            };
             Replayed {
                 case: case.clone(),
                 summary,
@@ -593,8 +645,18 @@ pub fn replay_scored(
         .collect()
 }
 
-fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport {
+fn report_of(heuristic: &dyn Heuristic, every: &[Replayed]) -> BacktestReport {
     let kind = heuristic.kind();
+    // In-flight cases are reported apart (`late_surprise`): in the buckets a
+    // decided late miss would read as a refusal, and the loss-based figures
+    // have nothing to say about an actual that is only a lower bound.
+    let late_surprise = censored::late_surprise_of(every);
+    let resolved: Vec<Replayed> = every
+        .iter()
+        .filter(|r| r.case.outcome != OutcomeKind::Censored)
+        .cloned()
+        .collect();
+    let replayed = resolved.as_slice();
     let all: Vec<&Score> = replayed.iter().map(|r| &r.score).collect();
     let overall = bucket_of(&all);
 
@@ -653,6 +715,7 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         by_tail,
         by_subset: subsets::subsets_of(replayed),
         regime_adaptation: None,
+        late_surprise,
     }
 }
 
@@ -686,7 +749,7 @@ pub fn calibration_from_replay(
 }
 
 /// Give the calibrating `land` heuristics (`land-2026-10-06-even-lark`,
-/// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
+/// #10489, over `land-v2`; an offline IPCW wrap, #10524, over
 /// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
 /// whose regime residuals are the same `-b` rows) their calibration evidence
 /// from the replay itself: each [`super::heuristics::CALIBRATION_BASES`]
@@ -824,6 +887,11 @@ pub use paired::{Convergence, Fold, Paired, Stability};
 pub mod subsets;
 
 pub use subsets::{PairedSubset, SubsetBucket};
+
+#[path = "backtest_censored.rs"]
+pub mod censored;
+
+pub use censored::{censor_at, LateSurprise};
 
 #[path = "backtest_adaptation.rs"]
 pub mod adaptation;

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 /// The workspace the command runs for: the MAIN checkout of the cwd's repo
 /// (so a linked worktree still sees the workspace's local config tier and its
 /// published reader tokens), else the cwd.
-fn workspace() -> PathBuf {
+pub(super) fn workspace() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let common = std::process::Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])

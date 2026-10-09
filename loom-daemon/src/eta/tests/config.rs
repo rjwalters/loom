@@ -89,6 +89,7 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
         c,
         FleetRefreshConfig {
             enabled: true,
+            env_enabled: None,
             interval_secs: 3600,
             max_calls_per_cycle: 300,
             backfill_max_calls_per_cycle: 600,
@@ -240,6 +241,11 @@ fn fleet_refresh_follows_env_then_config_then_default() {
 
     let off = |key: &str| (key == "LOOM_ETA_FLEET_REFRESH_ENABLED").then(|| "0".to_string());
     assert!(!resolve(&json!({}), off).fleet_refresh.enabled);
+    // #10918: the env override is kept apart, so an env `false` stays the hard
+    // stop even on the explicit ETA authority; a config `false` is not one.
+    assert_eq!(resolve(&json!({}), off).fleet_refresh.env_enabled, Some(false));
+    let config_off = json!({"autonomous": {"eta": {"fleetRefresh": {"enabled": false}}}});
+    assert_eq!(resolve(&config_off, no_env).fleet_refresh.env_enabled, None);
 }
 
 #[test]

@@ -72,6 +72,39 @@ fn canonical() -> EtaSnapshotRecord {
                 no_estimate_reason: Some(NoEstimateReason::NoModel),
             },
         ],
+        // #10929: the row's own per-stage forecast (loom-ui#2753).
+        stages: BTreeMap::from([
+            (
+                Stage::ReviewWait,
+                EtaSnapshotStage {
+                    entry_p50: 0,
+                    entry_p90: 0,
+                    dwell_p50: 2_400,
+                    dwell_p90: 10_800,
+                    reach_pct: 100,
+                },
+            ),
+            (
+                Stage::Doctor,
+                EtaSnapshotStage {
+                    entry_p50: 2_700,
+                    entry_p90: 9_000,
+                    dwell_p50: 1_800,
+                    dwell_p90: 5_400,
+                    reach_pct: 30,
+                },
+            ),
+            (
+                Stage::MergeWait,
+                EtaSnapshotStage {
+                    entry_p50: 2_700,
+                    entry_p90: 12_600,
+                    dwell_p50: 600,
+                    dwell_p90: 3_600,
+                    reach_pct: 100,
+                },
+            ),
+        ]),
     };
     let refusal = EtaSnapshotRow {
         repo: "acme/secret-app".to_string(),
@@ -88,6 +121,7 @@ fn canonical() -> EtaSnapshotRecord {
         stage: None,
         no_estimate_reason: Some(NoEstimateReason::Blocked),
         alternates: Vec::new(),
+        stages: BTreeMap::new(),
     };
     let start = EtaSnapshotRow {
         repo: "rjwalters/loom".to_string(),
@@ -104,11 +138,16 @@ fn canonical() -> EtaSnapshotRecord {
         stage: Some(Stage::ReadyWait),
         no_estimate_reason: None,
         alternates: Vec::new(),
+        stages: BTreeMap::new(),
     };
+    // Cut-priority order (#10928): the estimating `land` row, then the
+    // `land` refusal, then `start`. One row's alternates did not fit the
+    // byte budget, so `alternates_truncated` is on the wire too.
     EtaSnapshotRecord {
         as_of: at(12, 0),
-        rows: vec![refusal, land, start],
+        rows: vec![land, refusal, start],
         rows_truncated: 1,
+        alternates_truncated: 1,
         rows_truncated_by_kind: BTreeMap::from([(Kind::Finish, 1)]),
     }
 }

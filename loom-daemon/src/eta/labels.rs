@@ -36,16 +36,25 @@ pub const READY_LABEL: &str = "loom:issue";
 /// drift apart. Every entry is also a [`hold_labels`] entry (tested), so a
 /// label-registry rename fails loudly instead of silently un-holding a PR.
 /// It is also the set behind [`pr_flags`]' [`FLAG_OP_HOLD`].
-pub const MERGE_HOLD_LABELS: &[&str] = &[
-    "loom:operator",
-    "loom:operator-only",
-    "loom:operator-decision",
-];
+///
+/// Derived (#10013): the registry's `merge_hold` labels.
+pub static MERGE_HOLD_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("merge_hold"));
 
 /// Hold labels that may accompany a [`MERGE_HOLD_LABELS`] entry without
 /// turning the hold into a refusal: `loom:operator-mechanical` is a
 /// `loom:operator-only` sub-kind and never stands alone.
-pub const MERGE_HOLD_COMPANION_LABELS: &[&str] = &["loom:operator-mechanical"];
+///
+/// Derived (#10013): the registry's `operator_hold` labels that are not
+/// `merge_hold` labels.
+pub static MERGE_HOLD_COMPANION_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| {
+        let merge = crate::label_registry::embedded_set("merge_hold");
+        crate::label_registry::embedded_set("operator_hold")
+            .into_iter()
+            .filter(|l| !merge.contains(l))
+            .collect()
+    });
 
 /// [`pr_flags`] bit 0: an operator hold (any of [`MERGE_HOLD_LABELS`]).
 pub const FLAG_OP_HOLD: u8 = 1;
@@ -79,8 +88,8 @@ pub fn level_from_flags(mask: u8) -> u8 {
 }
 
 /// Each [`pr_flags`] bit and the labels that set it.
-const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
-    (FLAG_OP_HOLD, MERGE_HOLD_LABELS),
+/// [`FLAG_OP_HOLD`] is set separately, from [`MERGE_HOLD_LABELS`].
+const PR_FLAG_LABELS: [(u8, &[&str]); 5] = [
     (FLAG_SEQUENCED, &["loom:sequenced"]),
     (FLAG_STARRED, &["loom:operator-priority"]),
     (FLAG_CONFLICT, &["loom:merge-conflict"]),
@@ -94,10 +103,18 @@ const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
 /// (#10243) both call it, so train and serve cannot drift.
 #[must_use]
 pub fn pr_flags(labels: &[String]) -> u8 {
+    let op_hold = if labels
+        .iter()
+        .any(|l| MERGE_HOLD_LABELS.contains(&l.as_str()))
+    {
+        FLAG_OP_HOLD
+    } else {
+        0
+    };
     PR_FLAG_LABELS
         .iter()
         .filter(|(_, set)| labels.iter().any(|l| set.contains(&l.as_str())))
-        .fold(0, |mask, (bit, _)| mask | bit)
+        .fold(op_hold, |mask, (bit, _)| mask | bit)
         | match crate::operator_levels::level(labels) {
             0 => 0,
             1 => FLAG_STARRED,
@@ -139,12 +156,24 @@ pub fn check_holds(labels: &[String]) -> Result<(), NoEstimateReason> {
 /// The operator hold labels (#10210): a human is needed before the item moves.
 /// A subset of [`hold_labels`]; `loom:operator-priority` is the operator's
 /// star, never a hold, and is deliberately absent.
-pub const OPERATOR_HOLD_LABELS: &[&str] = &[
-    "loom:operator",
-    "loom:operator-only",
-    "loom:operator-decision",
-    "loom:operator-mechanical",
-];
+///
+/// Derived (#10013): the registry's `operator_hold` labels, ordered as the
+/// generic hold, the base park, then sub-kinds (the order
+/// [`operator_hold_label`] reports the first match in).
+pub static OPERATOR_HOLD_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| {
+        let reg = crate::label_registry::Registry::embedded();
+        let mut set = crate::label_registry::embedded_set("operator_hold");
+        set.sort_by_key(|n| {
+            let l = reg.get(n).expect("with_property names a registry label");
+            (
+                *n != "loom:operator",
+                l.requires_base.is_some(),
+                *n == "loom:operator-mechanical",
+            )
+        });
+        set
+    });
 
 /// The first operator hold label on the item, when it has one.
 #[must_use]

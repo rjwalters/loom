@@ -70,7 +70,8 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 | `command` | string | _(none)_ | Shell-style command run in the worktree (parsed with `shlex.split`). When omitted, the build check is skipped but the has-commits and has-real-changes checks still run. |
 | `realChangeGlobs` | array of strings | _(default exclusions)_ | Positive globs. A changed file must match at least one to count as "real." When omitted, every changed file counts unless it matches one of the default scratch exclusions: `.loom-*`, `*.log`, `.no-changes-needed`. |
 | `timeoutSeconds` | integer | `600` | Timeout for the `command` run. |
-| `preflightMaxAttempts` | integer | `3` | Max failed in-session `loom-daemon preflight` runs before the terminal `preflight_unresolved` outcome (#10476). |
+| `preflightMaxAttempts` | integer | `3` | Max failed in-session `loom-daemon preflight` runs before the terminal `preflight_unresolved` outcome (#10476). Timed-out runs are counted separately against the same number. |
+| `preflightPathScopes` | array of objects | _(none)_ | In-session `loom-daemon preflight` only (#10860): `[{"env", "suite", "runWhenChanged": [globs]}]`. A suite whose globs match nothing the worktree changes is dropped by exporting `env` empty to `command`. See [Path-scoped suites](#path-scoped-suites). |
 | `loadThreshold` | number | `0.9` | Daemon main-health gate only (#4259): 1-minute load average per logical CPU at/above which the gate DEFERS instead of running the full suite. Env override `LOOM_BUILD_GATE_LOAD_THRESHOLD`. See "Tiered gate + load-aware deferral". |
 | `maxDeferSeconds` | integer | `1800` | Daemon main-health gate only (#4259): after this many seconds of consecutive load-deferred ticks, the FAST tier runs regardless of load so a permanently-loaded host still reaches a verdict. Env override `LOOM_BUILD_GATE_MAX_DEFER_SECS`. |
 | `fastCommand` | string | _(derived)_ | Daemon main-health gate only (#4259): the command run for the fast tier. When omitted, the base `command` is run with `LOOM_BUILD_GATE_TIER=fast` prefixed. |
@@ -89,10 +90,22 @@ The orchestrator-side gate above runs *after* the Builder exits, so the failing 
 |------|---------|
 | `0` | Gate passed (a receipt for `HEAD` is recorded), or no enabled `buildGate` command — a no-op. |
 | `1` | Failed, attempts remain: the output tail is printed; fix, commit, re-run. |
-| `4` | Attempts exhausted: `reason=preflight_unresolved`. The claim is released via the protected restore path (a parked, closed or PR target is not re-queued; a failed release is reported) and the Builder opens **no PR**. |
+| `4` | Attempts exhausted: `reason=preflight_unresolved`. The claim is released via the protected restore path (a parked, closed or PR target is not re-queued, and neither is an issue that did not carry `loom:issue` when it was claimed, #10955; a failed release is reported) and the Builder opens **no PR**. |
+| `5` | Timed out at `timeoutSeconds` (#10860). Not a check failure: it does not count toward the failure cap, writes no receipt, and **never releases the claim**. The message names the running `[build-gate]` stage. The gate's whole process tree is ended first, including stages in other process groups or sessions: SIGTERM, 5 s for the gate's EXIT trap, then SIGKILL (#10955). Re-run when the host is less loaded; once timeouts reach `preflightMaxAttempts` it prints `reason=preflight_timeout`, the Builder opens **no PR** (claim kept), and a further run in the same episode exits `5` without running the gate. |
+| `6` | Deferred (#10955): the host's 1-minute load per CPU is above `buildGate.loadThreshold` (default 0.9, the orchestrator gate's threshold), so the gate was **not run**. Not a failure and not a timeout: no counter moves, and the claim is kept. Re-run in a few minutes. Once deferrals in one episode span `buildGate.maxDeferSeconds` (default 1800) the gate runs regardless of load. |
 | `7` | `--check` only: `HEAD` has no passing receipt. |
 
+**Flaky tests (#10955).** `build-gate.sh` runs nextest with `--retries 1` (`LOOM_BUILD_GATE_TEST_RETRIES` overrides; `0` turns it off), so a test that fails once and passes on its retry does not fail the gate or consume an attempt. Pre-flight then prints `preflight: PASS (flaky, passed on retry: <names>)`. CI does not retry (`retries = 0` in `.config/nextest.toml`), so the same flake can still fail CI: file it.
+
 Attempts and the receipt live in the worktree's git dir (never committed); `buildGate.preflightMaxAttempts` (default 3) bounds the loop within one dispatch episode (`LOOM_SWEEP_ID`); a re-dispatch into the same worktree starts a fresh budget. **Enforcement:** `create-pr.sh` runs `loom-daemon preflight --check` and exits `7` for an un-gated `HEAD`; a binary predating the subcommand skips the check (fail-open, like its sibling guards). A new commit invalidates the receipt, so fixes must be re-gated. Repos with no `buildGate` block are unchanged.
+
+### Path-scoped suites
+
+`buildGate.preflightPathScopes` lets pre-flight skip a slow suite that the change cannot affect (#10860). Pre-flight computes the changed set as the union of the commits since `git merge-base HEAD origin/main`, tracked uncommitted changes, and untracked (not ignored) files; renames count at both paths (`--no-renames`). For each scope whose `runWhenChanged` globs match none of those paths, it exports `env` **empty** to the gate command and prints `preflight: skipping <suite> — diff touches none of its inputs (CI still runs it)`. Otherwise it removes `env` so the suite runs. Globs use the `realChangeGlobs` matcher: a pattern with `/` matches the full path and `*` crosses `/` (`defaults/*` covers the whole tree).
+
+It fails safe: if the merge-base or diff cannot be computed, or the changed set is empty, every suite runs. Malformed entries (no `env`, a non-identifier `env`, no globs) are ignored. Pre-flight always sets `LOOM_BUILD_GATE_INSTALLER_SUITE` explicitly (removed unless skipped), so an inherited value cannot skip it. Only pre-flight reads the key; the post-builder and main-health gates run the full command unless that variable is in the daemon's environment.
+
+`build-gate.sh` honours one such variable, `LOOM_BUILD_GATE_INSTALLER_SUITE`: unset, its bash-suite loop runs `scripts/test-installer.sh` as before; exported empty, it skips that suite and runs the other four. Loom's own `.loom/config.json` scopes it to the installer inputs (`install.sh`, `scripts/install*`, `defaults/*`, `loom-daemon/src/init/*`, the `spawn-worker` sources its dispatcher suite runs, `.claude/settings.json`, the scoping code and its config, …). The transitive reach cannot be fully enumerated; CI runs the full suite as the backstop. The key is not set in `defaults/config.json`, so consumer repos are unaffected.
 
 **Measuring first-pass Judge approval (post-merge observation, not a merge gate).** The target (>80%, from ~43%) is the share of PRs whose first Judge verdict is approve, i.e. PRs with exactly one `loom:review-requested` cycle. Query it in SigNoz on the Judge review spans/verdict events grouped by PR (first verdict per PR = approved vs. changes-requested), comparing before/after this lands; a `preflight_unresolved` log line counts sweeps stopped before any PR existed.
 
@@ -231,7 +244,9 @@ stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
    against a disposable scratch repo `CHANGELOG_REPO_ROOT` — no network, no
    dependency on this repo's own history), `scripts/test-daemon-liveness.sh`
    (#5548), `scripts/test-install-local-mode.sh` and
-   `scripts/test-migrate-consumer.sh` (#5276).
+   `scripts/test-migrate-consumer.sh` (#5276). In-session pre-flight skips
+   `scripts/test-installer.sh` when the diff touches no installer input (see
+   [Path-scoped suites](#path-scoped-suites)).
 
 ### The structural phase (#9140)
 
@@ -440,6 +455,29 @@ Two concrete failure classes motivated the split (#3985):
   diagnostic — how to recognize `syspolicyd` saturation live and unwedge it — see
   [`troubleshooting.md`](troubleshooting.md) → "Several unrelated things hang at
   once (macOS Gatekeeper / `syspolicyd`)".
+
+A third class was added by #9360, and it is the one to reach for first when the
+gate reds on a **dispatch worker** while the same commit is green in CI:
+
+- **An inherited runtime pin.** The gate runs *inside* an agent session, and
+  every Loom agent session is deliberately spawned with the admitted runtime
+  pinned into its environment (`LOOM_RUNTIME`, plus `LOOM_RUNTIME_<ROLE>` —
+  `launch_env::apply_launch_env`, so `spawn-worker.sh` cannot re-resolve a
+  different runtime after the pre-spawn decision). Those variables outrank every
+  config file a unit-test fixture can write, and the shared
+  `runtime_admission::resolve_binding` reads them first — so on a native worker
+  (`LOOM_RUNTIME=opencode`) a test that installs a Claude surface gets
+  `RuntimeRejected`, and a test asserting the `--model` pin gets no `--model` at
+  all, because the native default-model branch has no shipped default. Three
+  tests failed exactly that way; see #9360's gate log. **The fix belongs in the
+  test, not in the gate**: take
+  `runtime_selection_test_support::ClearedRuntimeSelectionEnv` (an RAII guard
+  that clears every variable `resolve_binding` reads and restores them on drop)
+  in any test that asserts on a runtime binding, an admission outcome, or a
+  resolved dispatch model, and hold a `serial_test` key while it is alive. The
+  gate deliberately does **not** sanitize the environment wholesale: it needs
+  the real `PATH`/`HOME`/credential environment to run at all, and an `env -i`
+  wrapper would hide exactly the host-shaped reds this section is about.
 
 **The gate runs at a mild throttle relative to sweeps (#4020, revises #3985).**
 `build-gate.sh` now defaults to `nice 5` — a mild positive niceness, a real but

@@ -29,6 +29,56 @@ fn metric_names_kinds_and_units() {
     assert_eq!(MetricName::DaemonIpcLatencyMax.unit(), "s");
     assert_eq!(MetricName::DaemonIpcLatency.unit(), "s");
     assert_eq!(MetricName::DaemonIpcRequests.unit(), "{request}");
+    assert_eq!(MetricName::DaemonIpcStatusBuilds.as_str(), "loom.daemon.ipc.status_builds");
+    assert_eq!(MetricName::DaemonIpcStatusBuilds.kind(), MetricKind::DeltaCounter);
+    assert_eq!(MetricName::DaemonIpcStatusBuilds.unit(), "{build}");
+}
+
+fn builds(points: &[MetricPoint], outcome: &str) -> Option<MetricValue> {
+    points
+        .iter()
+        .find(|p| {
+            p.name == MetricName::DaemonIpcStatusBuilds
+                && p.labels.get("outcome").map(String::as_str) == Some(outcome)
+        })
+        .map(|p| p.value)
+}
+
+/// #10861: status builds are counted per build, by a closed `outcome` set,
+/// beside (not instead of) the per-request series.
+#[test]
+fn status_builds_drain_into_one_point_per_outcome() {
+    let (points, _) = capture(|| {
+        // Three requests shared the first build; the second build panicked.
+        for _ in 0..3 {
+            record("DaemonStatus", Duration::from_secs(2));
+        }
+        record_status_build_outcome(StatusBuildOutcome::Ok);
+        record_status_build_outcome(StatusBuildOutcome::Ok);
+        record_status_build_outcome(StatusBuildOutcome::Panic);
+        drain_points()
+    });
+    assert_eq!(builds(&points, "ok"), Some(MetricValue::Int(2)), "{points:?}");
+    assert_eq!(builds(&points, "panic"), Some(MetricValue::Int(1)), "{points:?}");
+    assert_eq!(builds(&points, "join_error"), None, "an unseen outcome emits no point");
+    let requests = point(&points, MetricName::DaemonIpcRequests, "DaemonStatus");
+    assert_eq!(requests.value, MetricValue::Int(3), "requests stay per request");
+
+    let record = crate::telemetry::MetricPointsRecord {
+        captured_at: chrono::Utc::now(),
+        interval_start: None,
+        points: points.clone(),
+    };
+    assert_eq!(record.bounded_points(), points, "the `outcome` label is allowlisted");
+    assert!(drain_points().is_empty(), "delta: a second drain is empty");
+    assert_eq!(StatusBuildOutcome::JoinError.as_str(), "join_error");
+}
+
+#[test]
+fn no_status_build_accumulates_when_ops_signals_are_not_exported() {
+    record_status_build_outcome(StatusBuildOutcome::Ok);
+    let (points, _) = capture(drain_points);
+    assert!(points.is_empty(), "{points:?}");
 }
 
 #[test]
@@ -106,7 +156,12 @@ fn every_label_survives_the_ops_label_policy() {
 #[test]
 fn slow_by_design_kinds_do_not_trigger_the_slow_request_warn() {
     let slow = SLOW_REQUEST_WARN + Duration::from_secs(25);
-    for kind in ["DaemonStatus", "CancelSweep", "DispatchSweep"] {
+    for kind in [
+        "DaemonStatus",
+        "DaemonStatusSections",
+        "CancelSweep",
+        "DispatchSweep",
+    ] {
         assert!(!warns_when_slow(kind, slow), "{kind} is slow by design");
     }
     assert!(warns_when_slow("ListWorkspaces", SLOW_REQUEST_WARN));

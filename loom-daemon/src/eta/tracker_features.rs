@@ -554,7 +554,7 @@ impl Tracker {
 
     /// Hand the tracker the fleet roster's revisions, oldest first (#10508):
     /// what every later estimate's roster-derived `eta-fit/v2` inputs read
-    /// (`None`: unknown). Never today's `repos.yml` standing in for history.
+    /// (`None`: unknown). Never today's roster standing in for history.
     pub fn set_fleet_history(&mut self, history: Option<Vec<RosterRevision>>) {
         self.context.fleet_history = history;
     }
@@ -806,6 +806,8 @@ impl Tracker {
             // #10521: the v3 friction predictors, through the builder the
             // fit calls, over the same timeline at `now − LAG`.
             features.loops = Some(self.loop_features_of(&key.repo, pr, now));
+            // #10960: the size and scope predictors, likewise.
+            features.scope = self.scope_features_of(&key.repo, pr, now);
         }
         let pr = item.pr_number.ok_or(reason::NO_PR_YET);
         self.context

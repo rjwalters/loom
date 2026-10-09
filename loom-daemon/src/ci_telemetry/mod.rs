@@ -78,6 +78,7 @@ pub mod nextest;
 pub mod owners;
 pub mod poll;
 pub mod records;
+pub mod rotation;
 pub mod state;
 pub mod story;
 pub mod suites;
@@ -168,6 +169,11 @@ pub struct CiTelemetryConfig {
     pub log_capture_max_bytes: Option<usize>,
     /// Repos whose **logs** are not captured (records and metrics still are).
     pub log_capture_excluded_repos: Option<Vec<RepoExclusion>>,
+    /// Rotate the journal once the export cursor passes this many bytes
+    /// (#11045; see [`rotation`]).
+    pub journal_rotate_bytes: Option<u64>,
+    /// Rotated journals kept (#11045).
+    pub journal_rotate_keep: Option<usize>,
 }
 
 /// Split an `excludedRepos` value into admitted entries and named refusals.
@@ -268,6 +274,14 @@ pub fn read_config(root: &Path) -> CiTelemetryConfig {
             .filter(|v| *v > 0)
             .and_then(|v| usize::try_from(v).ok()),
         log_capture_excluded_repos: (!log_excluded.is_empty()).then_some(log_excluded),
+        journal_rotate_bytes: block
+            .get("journalRotateBytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|v| *v > 0),
+        journal_rotate_keep: block
+            .get("journalRotateKeep")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok()),
     }
 }
 

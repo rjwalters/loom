@@ -320,7 +320,7 @@ fn only_landed_land_estimates_become_observations_and_the_log_round_trips() {
     let mut foreign = summary.clone();
     foreign.estimate_id = "pending-foreign".to_string();
     foreign.heuristic = "land-v1".to_string();
-    // #10524: twin-otter-b is a calibration base too (quick-tern's).
+    // #10524: twin-otter-b is a calibration base too (the offline IPCW wrap's).
     let mut twin = summary.clone();
     twin.estimate_id = "pending-twin".to_string();
     twin.heuristic = LAND_TWIN_OTTER_B.to_string();

@@ -69,9 +69,10 @@ use super::fleet_fetch::{
     Reader, RepoTarget, PER_PAGE,
 };
 use super::fleet_signoz_history::{self as signoz_history, HistoryNote, HistorySource, Plan};
-use super::fleet_signoz_refresh::{Limits, SignozRead};
+use super::fleet_signoz_refresh::Limits;
 use crate::forge_call_stats::ops::ISSUE_LIST;
 use crate::forge_call_stats::ForgeOp;
+use crate::signoz_read::SignozRead;
 
 /// Schema tag of a state file.
 pub const STATE_SCHEMA: &str = "eta-fleet-refresh-state/v1";

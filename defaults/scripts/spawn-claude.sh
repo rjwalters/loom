@@ -427,7 +427,12 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     fi
 
     if command -v is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
-        _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%")
+        # OOMPolicy=continue (issue #11076): the systemd default (stop) tears
+        # down the WHOLE scope when the kernel OOM-kills any one child (a
+        # `git`/`rustc`), SIGTERMing the claude CLI; the resilient wrapper then
+        # retries while the daemon has already released the sweep as dead. With
+        # `continue` only the offending command fails and the agent can react.
+        _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%" -p "OOMPolicy=continue")
         if [[ "$_cpu_wallclock" != "0" ]]; then
             _cpu_quota_props+=(-p "RuntimeMaxSec=${_cpu_wallclock}")
         fi
@@ -451,7 +456,7 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         # it from ever colliding with the real unit this spawn will create,
         # regardless of how quickly systemd garbage-collects the probe scope.
         _scope_slice="loom-agents.slice"
-        _scope_unit="loom-agent-$$-${RANDOM}${RANDOM}.scope"
+        _scope_unit="${LOOM_AGENT_SCOPE_UNIT:-loom-agent-$$-${RANDOM}${RANDOM}.scope}"
         _scope_probe_unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope"
         _scope_props=(--slice="$_scope_slice")
         # Probe with a trivial `true` invocation first: a real scope create +
@@ -1106,11 +1111,31 @@ _loom_account_provider_for_runtime() {
 
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    # --- Ambient Anthropic credential scrub (#10413) ---
+    # Reached only when Loom itself is about to choose the child's credential
+    # (no LOOM_SPAWN_NO_EXPORT, no caller-set CLAUDE_CODE_OAUTH_TOKEN): the
+    # pool token SELECTED AND EXPORTED by this block is authoritative for the
+    # spawned session. Claude Code's credential precedence is API-key env var
+    # > OAuth-token env var > keychain, so an ANTHROPIC_API_KEY or
+    # ANTHROPIC_AUTH_TOKEN inherited from the spawning shell (e.g. a
+    # machine-level rc file pinning a console key) would silently shadow the
+    # selected account and the session would run — and die on quota errors —
+    # on a key nobody chose (the 2026-10-04 incident, #10413: a zero-credit
+    # console key leaked into every spawned session, and no subscription
+    # switch ever reached any of them). Unset both names before selection —
+    # unset of an absent name is a no-op — loud and secret-free: the warning
+    # names the variables, never their values. Explicit-credential callers
+    # (the skipped branch) keep their environment byte-identical; the
+    # containerized path is unaffected (ANTHROPIC_* never crosses the docker
+    # boundary by name). This cannot be a loom-daemon subcommand: a child
+    # process cannot unset its parent's environment, so the scrub must run
+    # here — which is also why it is kept to the portable-shell floor.
+    [[ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]] && log_warn "spawn-claude: unsetting ambient ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN — they would shadow the pool token 'tokens select' is about to export (Claude Code precedence: API-key env > OAuth-token env > keychain; #10413)"
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
     _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
     if [[ -z "$_daemon_bin" ]] || ! "$_daemon_bin" tokens select --help >/dev/null 2>&1; then
-        log_error "No loom-daemon binary supporting 'tokens select' was found."
-        log_error "(\$LOOM_DAEMON_BIN -> 'loom-daemon' on PATH -> build-output-relative"
-        log_error "candidates under the repo all came up empty or stale.)"
+        log_error "No loom-daemon binary supporting 'tokens select' was found (\$LOOM_DAEMON_BIN -> 'loom-daemon' on PATH -> build-output candidates all empty or stale)."
         log_error "Build or start one, then retry:"
         log_error "  ./.loom/scripts/cli/loom-daemon-start.sh"
         log_error "  cargo build --release -p loom-daemon"
@@ -1247,6 +1272,40 @@ if [[ "$_loom_print_mode" == "true" ]]; then
     export LOOM_HEADLESS_SESSION=1
 fi
 unset _loom_print_mode
+
+# --- Session pinning and roll resume (issue #10830) ---
+# Pause-and-roll (docs/design/daemon-roll-pause-resume.md) resumes a paused
+# agent from its saved session, so the daemon pins every Claude session id at
+# dispatch (LOOM_CLAUDE_SESSION_ID) and a resume launch passes
+# LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT. `loom-daemon agent-resume
+# claude-args` validates them and prints the arguments to append, NUL-separated:
+# `--session-id <id>`, or `--resume <id> <prompt>` (the caller then passes no
+# prompt of its own). A daemon too old to answer costs only the pin (the session
+# runs unpinned and a roll requeues it); a resume it cannot build is refused.
+# The session id is pinned once here: claude-wrapper.sh turns it into --resume
+# on a retry, because Claude refuses a second launch with the same id.
+# For a daemon item it also prints `--settings <json>` wiring the roll-pause
+# hook, which a consumer repo's own .claude/settings.json does not (#11049).
+if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
+    _resume_args_file="$(mktemp -t loom-resume-args.XXXXXX 2>/dev/null || mktemp)"
+    if ! "$(loom_resolve_self_daemon_bin)" agent-resume claude-args >"$_resume_args_file"; then
+        [[ -z "${LOOM_RESUME_SESSION_ID:-}" ]] || { log_error "spawn-claude: cannot build the resume launch (loom-daemon agent-resume claude-args, #10830)"; rm -f "$_resume_args_file"; exit 78; }
+        log_warn "spawn-claude: session id not pinned (loom-daemon agent-resume claude-args unavailable); a daemon roll will requeue this session instead of resuming it (#10830)"
+        : >"$_resume_args_file"
+    fi
+    while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
+    rm -f "$_resume_args_file"
+fi
+# The dispatch identity is consumed: left exported it would reach the agent's own
+# Bash calls, and a nested spawn-claude.sh would reuse the parent's session id and
+# collide on its scope unit (the scope was named at the systemd-run probe above).
+# LOOM_CLAUDE_SESSION_ID is dropped below, on the direct path only, because
+# claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
+# a nested agent shares the item's pause state. LOOM_RESUME_HANDLE_FILE is not
+# read here, but a nested spawn-codex.sh would write the parent's handle through
+# it. The proxied host half keeps
+# them: its in-container copy receives them by name and drops them itself.
+[[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT LOOM_RESUME_HANDLE_FILE
 
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
@@ -1396,4 +1455,5 @@ if ! command -v claude >/dev/null 2>&1; then
     exit 127
 fi
 echo "# LOOM_CLI_START runtime=claude" >&2
+unset LOOM_CLAUDE_SESSION_ID # #10830: pinned via --session-id above; must not reach nested spawns
 exec ${SLEEP_INHIBIT_WRAP[@]+"${SLEEP_INHIBIT_WRAP[@]}"} ${CPU_QUOTA_WRAP[@]+"${CPU_QUOTA_WRAP[@]}"} claude "${PASSTHROUGH_ARGS[@]}"

@@ -8,7 +8,7 @@
 -- STATUS: vocabulary-guarded by `loom-daemon/tests/signoz_trial_artifacts.rs`
 -- (every metric name, metric label and span attribute below must still be
 -- emitted by the daemon and forwarded by the gateway's keep_keys), and all
--- five queries are executed verbatim against the pinned
+-- six queries are executed verbatim against the pinned
 -- `clickhouse/clickhouse-server:25.12.5` by
 -- `loom-daemon/tests/signoz_github_shadow_queries.rs` in CI. Run read-only
 -- against the live store during PR #10565's review; the one-hour 10 %
@@ -26,15 +26,28 @@
 --
 -- Since #10343 every `github.ratelimit.*` point carries `owner` and `role`,
 -- and the legacy owner-less 60 s probe series is gone (it is booked into the
--- bucket book instead). A label set is still NOT guaranteed to be one bucket:
--- live data shows `(account, owner, resource)` series carrying two
--- interleaved hourly reset chains (rjwalters/loom#10571), and several hosts
--- export the same bucket with readings of different ages. So `used` is never
--- read as monotone across samples -- queries 1 and 3 key every reading by its
--- quota WINDOW (the paired `github.ratelimit.reset`) and charge each window's
--- high-water mark once. An operator's ambient-login host reports
+-- bucket book instead). Since rjwalters/loom#10571 `account`/`owner` are the
+-- identity actually minted into each credential directory (its sidecar), and
+-- `installation` names the App installation, so two installations no longer
+-- share one label set; older daemons' data can still carry two interleaved
+-- hourly reset chains under one set, and several hosts export the same
+-- bucket with readings of different ages. So `used` is never read as
+-- monotone across samples -- queries 1 and 3 key every reading by its quota
+-- WINDOW (the paired `github.ratelimit.reset`) and charge each window's
+-- high-water mark once (defence in depth). An operator's ambient-login host reports
 -- `owner = '-'`, `role = 'ambient'`; it has no attributed counterpart in
 -- query 2 and shows as all-shadow by construction.
+--
+-- The AGENT slice (#10607): agent sessions' own `gh` calls -- served reads
+-- through the agent front (`caller = 'agent_gh_front'`) and passthroughs
+-- (`caller = 'agent.gh.<command>'`) -- reach `loom.forge.calls` through the
+-- daemon's ingest of the host sink, labelled `agent` = the agent role. The
+-- daemon's own series carry `agent = '-'` (absent on older daemons), so
+-- `agent NOT IN ('', '-')` selects the agent share. Agent rows already count
+-- toward queries 2 and 3's attributed figures; `agent_attributed` and
+-- query 5 say how much of the attributed spend they are. A passthrough is
+-- booked `ok` before it runs (charged by intent), so its share is an upper
+-- bound for calls that failed locally.
 --
 -- time_series_v4 holds one row per series per hour, so every metric query
 -- joins a de-duplicated fingerprint set (`any(labels) GROUP BY fingerprint`);
@@ -44,7 +57,12 @@
 --    `loom.forge.calls` is exported as a delta Sum: query 2 sums its samples,
 --    which is only right while `temporality` reads Delta. If it reads
 --    Cumulative, rewrite query 2 with query 1's lag-delta pattern.
-SELECT metric_name, type, temporality, uniqExact(fingerprint) AS series
+--    `installations` counts the App installations (#10571) the family's
+--    series name; `-` (no sidecar) and an older daemon's absent label are
+--    not counted.
+SELECT metric_name, type, temporality, uniqExact(fingerprint) AS series,
+       uniqExactIf(JSONExtractString(labels, 'installation'),
+                   JSONExtractString(labels, 'installation') NOT IN ('', '-')) AS installations
 FROM signoz_metrics.time_series_v4
 WHERE metric_name IN ('github.ratelimit.used', 'github.ratelimit.reset', 'loom.forge.calls')
 GROUP BY metric_name, type, temporality
@@ -149,7 +167,11 @@ SELECT JSONExtractString(t.labels, 'account') AS account,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok') AS attributed_min,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') IN ('ok', 'error')) AS attributed_max,
        sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'not_modified') AS free_304,
-       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'rate_limited') AS refused
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'rate_limited') AS refused,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok'
+                      AND JSONExtractString(t.labels, 'agent') NOT IN ('', '-')) AS agent_attributed,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'not_modified'
+                      AND JSONExtractString(t.labels, 'agent') NOT IN ('', '-')) AS agent_free_304
 FROM signoz_metrics.samples_v4 AS s
 INNER JOIN (SELECT fingerprint, any(labels) AS labels
             FROM signoz_metrics.time_series_v4
@@ -166,6 +188,8 @@ ORDER BY hour, account, owner, resource;
 --    (account, owner, resource, hour).
 --      shadow_low  = 1 - attributed_max / github_used
 --      shadow_high = 1 - attributed_min / github_used
+--      agent_share = agent_attributed / github_used (#10607): how much of the
+--                    bill the agent slice explains.
 --    NULL (not 0) when GitHub reported no spend. A negative shadow_low means
 --    `error` rows over-count local failures for that bucket; a bucket with
 --    spend but no attributed row at all is external (or unattributed) spend.
@@ -243,7 +267,9 @@ attributed AS (
            JSONExtractString(t.labels, 'resource') AS resource,
            toStartOfHour(toDateTime(intDiv(s.unix_milli, 1000))) AS hour,
            sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok') AS attributed_min,
-           sumIf(s.value, JSONExtractString(t.labels, 'outcome') IN ('ok', 'error')) AS attributed_max
+           sumIf(s.value, JSONExtractString(t.labels, 'outcome') IN ('ok', 'error')) AS attributed_max,
+           sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok'
+                          AND JSONExtractString(t.labels, 'agent') NOT IN ('', '-')) AS agent_attributed
     FROM signoz_metrics.samples_v4 AS s
     INNER JOIN (SELECT fingerprint, any(labels) AS labels
                 FROM signoz_metrics.time_series_v4
@@ -259,7 +285,9 @@ SELECT g.account, g.owner, g.resource, g.hour, g.github_used,
        coalesce(a.attributed_min, 0) AS attributed_min,
        coalesce(a.attributed_max, 0) AS attributed_max,
        round(1 - coalesce(a.attributed_max, 0) / nullIf(g.github_used, 0), 3) AS shadow_low,
-       round(1 - coalesce(a.attributed_min, 0) / nullIf(g.github_used, 0), 3) AS shadow_high
+       round(1 - coalesce(a.attributed_min, 0) / nullIf(g.github_used, 0), 3) AS shadow_high,
+       coalesce(a.agent_attributed, 0) AS agent_attributed,
+       round(coalesce(a.agent_attributed, 0) / nullIf(g.github_used, 0), 3) AS agent_share
 FROM spend AS g
 LEFT JOIN attributed AS a
   ON g.account = a.account AND g.owner = a.owner
@@ -285,3 +313,28 @@ WHERE name = 'invoke github'
   AND timestamp >= now() - INTERVAL 1 DAY
 GROUP BY account, owner, resource, billing, hour
 ORDER BY hour, account, owner, resource, billing;
+
+-- 5. The agent slice by role, last 24 h (#10607): per bucket-hour, which
+--    agent roles spent what, served (`agent_gh_front`) vs passthrough
+--    (`agent.gh.<command>`). `charged` is `ok` rows (a passthrough is booked
+--    `ok` before it runs); `free_304` is what the front's ETag reads saved.
+SELECT JSONExtractString(t.labels, 'account') AS account,
+       JSONExtractString(t.labels, 'cred_owner') AS owner,
+       JSONExtractString(t.labels, 'resource') AS resource,
+       toStartOfHour(toDateTime(intDiv(s.unix_milli, 1000))) AS hour,
+       JSONExtractString(t.labels, 'agent') AS agent,
+       if(JSONExtractString(t.labels, 'caller') = 'agent_gh_front', 'served', 'passthrough') AS via,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'ok') AS charged,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'not_modified') AS free_304,
+       sumIf(s.value, JSONExtractString(t.labels, 'outcome') = 'error') AS errors
+FROM signoz_metrics.samples_v4 AS s
+INNER JOIN (SELECT fingerprint, any(labels) AS labels
+            FROM signoz_metrics.time_series_v4
+            WHERE metric_name = 'loom.forge.calls'
+            GROUP BY fingerprint) AS t USING (fingerprint)
+WHERE s.metric_name = 'loom.forge.calls'
+  AND JSONExtractString(t.labels, 'agent') NOT IN ('', '-')
+  AND JSONExtractString(t.labels, 'resource') != 'other'
+  AND s.unix_milli >= toUnixTimestamp(now() - INTERVAL 1 DAY) * 1000
+GROUP BY account, owner, resource, hour, agent, via
+ORDER BY hour, account, owner, resource, agent, via;

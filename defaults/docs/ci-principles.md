@@ -43,11 +43,47 @@ the next person to add one will have an equally good argument.
    `cancelled` or red commit is never released; its version may be skipped
    ([release-cadence](release-cadence.md)).
 
+   Tell the two kinds of `cancelled` apart before reading a high rate as a
+   regression (#10670): a run the bound superseded while *pending* has no
+   jobs; a run cancelled after it *started* has some, and that one breaks
+   this rule. On 2026-10-06 54 of the last 100 `main` runs were cancelled and
+   every one was job-less. `signoz/ci-queries.sql` section 18 reports the
+   split (`cancelled_after_start` must stay 0), and loom-daemon's
+   `merge_group_ci::main_cancel` lint fails CI if any workflow change could
+   cancel a started `push` or `merge_group` run: a `cancel-in-progress` that
+   is not provably false there, a group shared with a cancelling PR run, or a
+   run-cancelling step reachable there. The lint runs on every PR that
+   touches any `.github/workflows/**` file (ci.yml's `Workflow Cancellation
+   Lint` job), not only on Rust changes. One gap is known: concurrency groups
+   are repo-wide, but the lint compares groups only within one workflow, so
+   two *different* workflows sharing a literal group (one on `push`, one
+   cancelling on `pull_request`) is not detected. Keep every group prefixed
+   with its workflow's name, as all current ones are.
+
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
    path. `conflict-markers` states this in its own comment and is right:
    "must NOT be path-filtered — the corruption can land in any file, including
    one whose path group the PR did not otherwise touch."
+
+   A push to `main` runs every job with no path filter, with **one
+   operator-approved exception** (#10825, 2026-10-07): the image jobs
+   (`worker-base-image` and the three `*-image-smoke` jobs). On push they run
+   only when `changes-push` finds an image input in the diff, as defined by
+   `scripts/ci-image-inputs.sh`, the one definition the PR filter shares.
+   Image inputs are every path `.dockerignore` re-includes, `.dockerignore`
+   itself, `ci.yml`, the run-job seam and the script. The diff base is the
+   head of the last **green** `CI` push run on `main`, never
+   `github.event.before`. In a burst, `before` can be a commit whose run was
+   superseded (rule 2), and after a red smoke the next clean diff would go
+   green over it (rule 6). The filter fails **closed**: no green base, a base
+   that is not an ancestor, a failed or truncated file list, or a failed or
+   cancelled `changes-push` all run the image jobs, and the last two also
+   turn `CI Result` red. The loom-daemon **source** is deliberately not an
+   image input, though the images ship it. That observation is owed to
+   `ci-daily.yml`'s `docker-smokes`, which builds the daemon from the commit
+   and runs every smoke unfiltered (rule 10). Adding a second push-time
+   filter needs its own operator approval.
 
 4. **One mechanism per behaviour.** If two mechanisms implement cancellation,
    skipping, or retry, their interaction is owned by nobody and will surprise
@@ -146,7 +182,8 @@ the next person to add one will have an equally good argument.
     still pending. Without that key the queue would wait on a check that never
     reports. A suite that is skipped on `merge_group` is not coverage
     (rule 6), and path filters do not apply there (rule 3). `merge_group` runs
-    exactly what `push` runs. `loom-daemon merge-group-ci audit` checks all of
+    the full suite: everything `push` runs, plus the image jobs that `push`
+    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit` checks all of
     this statically, and it counts any suite it cannot prove runs as
     uncovered. See [merge-queue-ci](merge-queue-ci.md).
 
@@ -162,6 +199,12 @@ first build, the whole release target matrix minus signing, every
 `package-lock.json`, `cargo deny` against `deny.toml`, the shell suites at
 parallelism 1 and 8 and on macOS/bash 3.2, `nextest` three times over for
 flakes, Rust beta, and the Docker smokes without their path filter.
+
+One job is not a speed trade-off paid back but a proof `ci.yml` cannot make
+(#10868): `Compatibility Floor (SUPPORTS_INSTALLED)` runs the compatibility
+contract's direction A against the release `SUPPORTS_INSTALLED` names, where
+`ci.yml` tests only the release just before the change
+([`release-cadence.md`](release-cadence.md), "Compatibility contract").
 
 The full **default-feature** suite runs only here (#10823): `ci.yml`'s
 `Rust Unit Tests` legs run the whole workspace with `--features
@@ -250,6 +293,7 @@ a cancellation rate.
 
 - #7779 / PR #7803 — the cancellation fix; #9608 — the bounded `main` queue
   (one running + newest pending) that rule 2 now allows
+- #10670 — the `main_cancel` lint and the superseded-vs-started cancel split
 - #7789 / #7791 — flake tracking, and why retry must *record* rather than hide
 - #7745 / #7761 — the same "a skipped check must not read as a pass" rule,
   learned in the resync and guard layers

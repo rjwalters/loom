@@ -554,6 +554,8 @@ fn the_cap_drops_the_model_slice_after_features_and_only_when_present() {
     assert_eq!(record.fit_id.len(), 16, "the identity survives");
     assert_eq!(e.quantiles_with_p90(), answer, "the numbers survive");
     assert_eq!(run_explanation(&e), None, "without the slice nothing recomputes");
+    assert_eq!(e.replayable, Some(false), "and the record says so (#10930)");
+    assert_eq!(e.replayable_reason.as_deref(), Some("truncated:twin_otter.model"));
 
     // An explanation with no slice never names one.
     let mut v1 = crate::eta::heuristics::LandV1.estimate(&review_input(), &history_a());
@@ -794,6 +796,8 @@ fn at_stage(stage: Stage) -> EstimateInput {
         tick_interval_secs: 60,
         saturation_held: false,
         plan_at: input.as_of,
+        not_here: None,
+        held_until: None,
     });
     input
 }

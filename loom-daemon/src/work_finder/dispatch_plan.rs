@@ -140,7 +140,7 @@ pub fn annotate(
         shard: inputs.shard,
         scope: PLAN_SCOPE.iter().map(|s| (*s).to_string()).collect(),
         ordering: ready_queue::ordering_names(),
-        complete: report.listing_failed.is_empty(),
+        complete: report.listing_not_whole().is_empty(),
     }
 }
 

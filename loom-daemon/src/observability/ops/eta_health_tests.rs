@@ -45,6 +45,7 @@ fn est(issue: u32, kind: Kind, heuristic: &str, mins: i64, refused: bool) -> Est
         stage_quartiles: Vec::new(),
         tail_extrapolated: false,
         stall_cause: None,
+        stage_predictions: Default::default(),
     }
 }
 
@@ -111,7 +112,13 @@ fn full_fixture_emits_every_gauge_with_its_labels_and_values() {
         gate: Some("captain".into()),
         last_tick: Some(now() - Duration::minutes(5)),
         refresh_repos: BTreeMap::from([("no_reader".to_string(), 2)]),
-        snapshot_rows: Some((7, 3)),
+        snapshot_stats: Some(SnapshotStats {
+            rows: 7,
+            alternates_rows: 3,
+            rows_truncated: 2,
+            alternates_truncated: 4,
+            bytes: 9_000,
+        }),
         ..Facts::default()
     };
     let p = points(&facts);
@@ -136,6 +143,9 @@ fn full_fixture_emits_every_gauge_with_its_labels_and_values() {
     assert_eq!(value(repos[0]), 2);
     assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotRows, None)[0]), 7);
     assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotAlternatesRows, None)[0]), 3);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotRowsTruncated, None)[0]), 2);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotAlternatesTruncated, None)[0]), 4);
+    assert_eq!(value(find(&p, MetricName::EtaHealthSnapshotBytes, None)[0]), 9_000);
     for point in &p {
         assert!(point
             .labels
@@ -195,6 +205,31 @@ fn a_host_whose_refresh_never_ticked_emits_the_gate_but_no_age() {
     assert!(find(&c.metrics, MetricName::EtaHealthRefreshRepos, None).is_empty());
 }
 
+/// #10918: before the first tick, a workspace naming this host the explicit
+/// ETA authority reads `authority` (a state of its own, not `captain`), even
+/// with this host's own `fleetRefresh.enabled` off; another host reads
+/// `disabled` with it off.
+#[test]
+fn the_explicit_authority_has_its_own_gate_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"fleet": {"captain": "cap", "etaAuthority": "w1"},
+            "autonomous": {"eta": {"fleetRefresh": {"enabled": false}}}}"#,
+    )
+    .unwrap();
+    for (host, state) in [("w1", "authority"), ("cap", "disabled")] {
+        let mut health = EtaHealth::default();
+        let (_, c) = capture(|| export(dir.path(), host, now(), &mut health));
+        let gate = find(&c.metrics, MetricName::EtaHealthRefreshGate, None);
+        let on: Vec<_> = gate.iter().filter(|p| value(p) == 1).collect();
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].labels.get("state").map(String::as_str), Some(state), "{host}");
+    }
+}
+
 #[test]
 fn no_coefficient_file_means_fit_not_loaded_and_no_fit_age() {
     let mut health = EtaHealth::default();
@@ -218,7 +253,11 @@ fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
     )
     .unwrap();
     health.fit_check(now() - Duration::minutes(20), "no_snapshots");
-    health.snapshot(4, 1);
+    health.snapshot(SnapshotStats {
+        rows: 4,
+        alternates_rows: 1,
+        ..SnapshotStats::default()
+    });
     let (_, c) = capture(|| {
         export(dir.path(), "test-host", now(), &mut health);
         // The second pass reuses the mtime cache.

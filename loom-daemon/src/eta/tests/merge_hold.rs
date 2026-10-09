@@ -6,8 +6,8 @@ use super::{as_of, history_a, input_at};
 use crate::eta::explanation::Explanation;
 use crate::eta::grid;
 use crate::eta::heuristics::{
-    estimate_path, PathRules, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN,
-    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
+    estimate_path, PathRules, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_LOOP_KITE,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
 };
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
@@ -43,7 +43,7 @@ fn merge_hold_is_the_last_stage_in_every_but_not_in_all() {
 
 #[test]
 fn every_operator_hold_on_an_approved_pr_is_merge_hold() {
-    for hold in MERGE_HOLD_LABELS {
+    for hold in MERGE_HOLD_LABELS.iter().copied() {
         assert_eq!(
             stage_from_pr_labels(&labels(&["loom:pr", hold])),
             Ok(Stage::MergeHold),
@@ -82,7 +82,7 @@ fn other_holds_and_holds_off_an_approved_pr_are_still_refused() {
         );
     }
     for stage_label in ["loom:review-requested", "loom:changes-requested"] {
-        for hold in MERGE_HOLD_LABELS {
+        for hold in MERGE_HOLD_LABELS.iter().copied() {
             assert_eq!(
                 stage_from_pr_labels(&labels(&[stage_label, hold])),
                 Err(NoEstimateReason::Blocked),
@@ -114,7 +114,10 @@ fn the_operator_star_alone_is_not_a_hold() {
 fn every_merge_hold_label_is_a_registry_hold_label() {
     // A label-registry rename must fail here, not silently un-hold a PR.
     let holds = hold_labels();
-    for label in MERGE_HOLD_LABELS.iter().chain(MERGE_HOLD_COMPANION_LABELS) {
+    for label in MERGE_HOLD_LABELS
+        .iter()
+        .chain(MERGE_HOLD_COMPANION_LABELS.iter())
+    {
         assert!(holds.contains(label), "{label} is not a hold label");
     }
 }
@@ -141,11 +144,8 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         models_hold,
         vec![
             LAND_BRISK_PETREL,
-            LAND_QUICK_TERN,
-            LAND_SWIFT_TERN,
             LAND_HELD_HERON,
             LAND_KEEN_WREN,
-            LAND_BOLD_LARK,
             LAND_LOOP_KITE,
             LAND_TWIN_OTTER_B,
             LAND_TANDEM_WREN
