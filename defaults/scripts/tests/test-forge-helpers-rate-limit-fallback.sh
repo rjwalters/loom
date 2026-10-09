@@ -187,6 +187,10 @@ if [[ "$1" == "api" ]]; then
     servererr-nomatch:*) echo '[{"title":"A title","html_url":"https://github.test/o/r/pull/7","pull_request":{}},{"title":"Other","html_url":"https://github.test/o/r/issues/8"}]'; exit 0 ;;
     servererr-match:"api repos/owner/repo/issues?"*) echo '[{"title":"A title","html_url":"https://github.test/o/r/issues/555"}]'; exit 0 ;;
     servererr-probefail:"api repos/owner/repo/issues?"*) echo "HTTP 502: Bad Gateway" >&2; exit 1 ;;
+    # A FULL page (== per_page=20) of newer, other-title issues: the original
+    # may sit on page two, so absence is unproven (#11145 review).
+    servererr-fullpage:"api --method POST"*) echo "https://github.test/o/r/issues/duplicate"; exit 0 ;;
+    servererr-fullpage:"api repos/owner/repo/issues?"*) jq -nc '[range(20) | {title: "Other \(.)", html_url: "https://github.test/o/r/issues/\(.)"}]'; exit 0 ;;
   esac
   if [[ "$mode" == "ratelimited" ]]; then
     # POST .../issues --jq .html_url returns the new issue's URL (#5047).
@@ -438,6 +442,27 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: server error + probe failure must say MAY exist (got: $err)"
 fi
+
+# Full first page, no exact-title match -> absence unproven: zero POSTs,
+# return 1, "MAY exist" (the original may be on page two).
+rc=0
+err=$(_run_stubbed servererr-fullpage forge_gh_create_issue_rl_safe "owner/repo" "A title" "A body" 2>&1 >/dev/null) || rc=$?
+assert_eq "1" "$rc" "server error + full page, no match: returns 1"
+assert_eq "0" "$(_post_count)" "server error + full page, no match: ZERO REST POSTs (no double-filing)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$err" == *"MAY exist"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: server error + full page, no match: stderr says the issue MAY exist"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: server error + full page, no match must say MAY exist (got: $err)"
+fi
+
+# Exact-title comparison trims surrounding whitespace on both sides.
+rc=0
+out=$(_run_stubbed servererr-match forge_gh_create_issue_rl_safe "owner/repo" "  A title " "A body" 2>/dev/null) || rc=$?
+assert_eq "0:https://github.test/o/r/issues/555:0" "$rc:$out:$(_post_count)" \
+    "server error + whitespace-padded title: adopts the trimmed exact match, ZERO POSTs"
 
 # Unknown-outcome shapes keep #8289; HTTP 422 stays non-retryable. No REST at all.
 for m in emptyerr emptyok badjson http422; do

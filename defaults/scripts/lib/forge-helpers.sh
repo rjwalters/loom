@@ -1603,8 +1603,10 @@ forge_gh_create_issue_rl_safe() {
   # which is refused BEFORE execution, the mutation may have committed. So
   # first reconcile against the non-search, DB-consistent issue listing (the
   # search index lags creation by exactly the window that matters): an
-  # exact-title non-PR issue since t0 is adopted, and an unreadable listing
-  # means NO POST. Empty stderr / invalid JSON / signals never get here; they
+  # exact-title non-PR issue since t0 is adopted; an unreadable listing, or a
+  # FULL first page with no match (the original may be on page two), means NO
+  # POST. An empty t0 (jq failure) yields `since=`, which the forge rejects ->
+  # also no POST. Empty stderr / invalid JSON / signals never get here; they
   # keep the #8289 "MAY exist" message below. is_rate_limit_error is shared
   # by every #4856 fallback, so the server-error table stays local.
   local server_err=0; grep -qiE 'something went wrong while executing your query|HTTP 50[234]' <<<"$err" && server_err=1
@@ -1612,8 +1614,8 @@ forge_gh_create_issue_rl_safe() {
     local rest_path="repos/$nwo/issues" listing hit payload labels_json
     if ! is_rate_limit_error "$err"; then
       if ! listing=$(gh api "$rest_path?state=all&sort=created&direction=desc&per_page=20&since=$t0" 2>/dev/null) \
-          || ! hit=$(jq -r --arg t "$title" 'map(select(.pull_request == null and .title == $t))[0].html_url // empty' <<<"$listing" 2>/dev/null); then
-        echo "gh issue create hit a server error, and the duplicate probe failed, so no REST retry was made. The issue MAY exist; check the forge before re-filing rather than blind-retrying. ($err)" >&2
+          || ! hit=$(jq -r --arg t "$title" 'def tr: gsub("^\\s+|\\s+$"; ""); map(select(.pull_request == null and (.title | tr) == ($t | tr)))[0].html_url // (if length >= 20 then error("full page") else empty end)' <<<"$listing" 2>/dev/null); then
+        echo "gh issue create hit a server error, and the duplicate probe failed or could not prove absence, so no REST retry was made. The issue MAY exist; check the forge before re-filing rather than blind-retrying. ($err)" >&2
         return 1
       fi
       [[ -n "$hit" ]] && { printf '%s\n' "$hit"; return 0; }
