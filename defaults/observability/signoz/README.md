@@ -592,6 +592,22 @@ at Loom's own ~300 KB anchor (~3000 rows) that is ~90 MB of log body per host
 per day before ClickHouse compression (~33 GB per host per year), plus the
 60-second deltas, which carry only changed rows.
 
+Against the live store's budget (#11161 acceptance):
+
+| Input | Value | Source |
+|---|---|---|
+| Store volume | 1536 GiB gp3, ~1.4 TiB free | 2AMLogic/2am#2251 (verified live 2026-10-04); `infra/signoz/runbooks/ops.md` (1.4 TiB free, 2026-10-08) |
+| Existing ingest | ~38 MB/day compressed (~135 GiB over 10 years) | `signozcapacity`, 2026-09-29; reconciled in 2AMLogic/2am#1648 |
+| Retention | 3650 days today; logs and traces to 90 days once the S3 archive is verified | 2AMLogic/2am#1633, 2AMLogic/2am#3333 |
+| Emitting hosts | 5 daemon hosts (loom-worker-1/2/3, loom-fleet-captain, robb-pro) | 2AMLogic/fleet-gitops `fleet.yml` |
+
+- **Raw, worst case:** 5 hosts × ~90 MB = ~450 MB/day, ~1.6 TB over 3650 days. Uncompressed, that alone would exceed the free space, so the 10-year case **depends on ClickHouse compression**.
+- **With compression:** it fits once compression exceeds ~1.2× (room for the existing ~135 GiB as well); at 5×, a common ratio for repetitive JSON log bodies, it is ~90 MB/day, ~330 GB over 10 years, about 23% of free space. **The ratio is an assumption, not measured.**
+- **At 90-day retention (2am#3333):** ~40 GB raw, negligible.
+- **Growth:** at 10 hosts the 10-year raw case needs ~2.2× compression.
+- **Watch:** the disk-fill alerts of 2am#2251 (`signozdiskwatch`; days-to-full < 180 warns, < 60 critical, 24 h ingest > 3× the 7-day rate warns) catch a miss. The response is more disk or less ingest, never a shorter TTL.
+- **To measure after rollout:** after 24 h, record on #11161 the stored bytes per `fleet.state` anchor and per day per host (ClickHouse `system.parts` for the logs table, filtered by `loom.kind`), replacing the 300 KB estimate and the compression assumption.
+
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
 CI duration/outcome trends in `ci-queries.sql` 1–3 are the retro asset, and
