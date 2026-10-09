@@ -1472,6 +1472,7 @@ pub fn build_daemon_status_for(
         preflight_advisory_active,
         preflight_advisory_message,
         preflight_advisory_changed_at,
+        agent_residue: crate::agent_residue_reaper::status_snapshot(),
         configured_max,
         dynamic_cap,
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the

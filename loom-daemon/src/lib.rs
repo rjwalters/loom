@@ -135,6 +135,7 @@
 pub mod activity;
 pub mod admission_brake;
 pub mod agent_gh;
+pub mod agent_residue_reaper;
 pub mod agent_session;
 pub mod agent_skills;
 pub mod api_keys_pool;

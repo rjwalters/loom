@@ -39,6 +39,7 @@
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
+//! | `daemon.agent_residue.reaped` | Agent residue reaper (#10802) | `{source, path, kind, unit, pids, issue, sweep_id, dry_run, detail}` |
 //! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 //! | `operator_priority.escalation` | Star-liveness pass (#9321); `fleet_alert` (#10164) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!

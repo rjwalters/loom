@@ -1037,6 +1037,42 @@ fn default_sweep_runtime() -> String {
 // Autonomous Daemon Status Types (Issue #3891 — follow-up to #3813 Phase D)
 // ========================================================================
 
+/// Agent-residue reap counters (#10802), reported as `agent_residue` in
+/// `status --json`. Counts reaps since the daemon started; planned (`dryRun`)
+/// reaps are counted apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResidueStatus {
+    /// `loom-agent-*` scopes stopped.
+    #[serde(default)]
+    pub scope: u64,
+    /// Process trees reaped (recorded identity, or worktree attribution).
+    #[serde(default)]
+    pub tree: u64,
+    /// Failed `loom-agent-*` scopes cleared with `reset-failed`.
+    #[serde(default)]
+    pub failed_scope: u64,
+    /// Reaps that `dryRun` planned and did not perform.
+    #[serde(default)]
+    pub dry_run_planned: u64,
+    /// When the last real reap happened.
+    #[serde(default)]
+    pub last_reap_at: Option<DateTime<Utc>>,
+}
+
+impl AgentResidueStatus {
+    /// All zero (usable in a `static`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            scope: 0,
+            tree: 0,
+            failed_scope: 0,
+            dry_run_planned: 0,
+            last_reap_at: None,
+        }
+    }
+}
+
 /// The autonomous-mode operability snapshot returned by `Request::DaemonStatus`
 /// and rendered by the `loom-daemon status` CLI subcommand.
 ///
@@ -1190,6 +1226,10 @@ pub struct DaemonStatusReport {
     /// compatible (an absent field parses as `None`).
     #[serde(default)]
     pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
+    /// Agent-residue reap counters (#10802). `#[serde(default)]` keeps older
+    /// wire data compatible (an absent field parses as all zero).
+    #[serde(default)]
+    pub agent_residue: AgentResidueStatus,
     /// Dynamic-cap input 3: **the** per-machine admission knob
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     /// Since #4512 this is the only *policy* term in the cap — the other two

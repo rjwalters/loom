@@ -1517,6 +1517,38 @@ On the OTLP path this maps to a log record (severity `Info`) with
 `loom.topic` and `loom.payload` (the payload carried whole as one
 compact-JSON string, since its shape varies per topic) attributes.
 
+#### `daemon.agent_residue.reaped` (#10802)
+
+Also mirrored as a `daemon.event` record (the `daemon.agent_residue` prefix is
+subscribed). Published once per reap by the agent residue reaper
+(`agent_residue_reaper.rs`); the payload carries no absolute host path.
+
+```json
+{
+  "source": "agent-residue-reaper",
+  "path": "exit",
+  "kind": "scope",
+  "unit": "loom-agent-4242-99.scope",
+  "pids": [],
+  "issue": 7,
+  "sweep_id": "sweep-1",
+  "dry_run": false,
+  "detail": null
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `source` | string | Always `"agent-residue-reaper"`. |
+| `path` | string | `"exit"` (the run just ended) or `"periodic"` (the sweep on the worktree-reaper tick). |
+| `kind` | string | `"scope"` (a `loom-agent-*` scope stopped), `"tree"` (processes killed) or `"failed-scope"` (`reset-failed`). |
+| `unit` | string or null | The scope unit, for `scope` and `failed-scope`. |
+| `pids` | integer[] | The processes signalled, for `tree`. |
+| `issue` | integer or null | The issue the run or worktree belonged to, when known. |
+| `sweep_id` | string or null | The sweep, on the exit path. |
+| `dry_run` | boolean | `true`: planned only, nothing was stopped, signalled or reset. |
+| `detail` | string or null | Why or the outcome: `worktree issue-N`, or `Result=… ExecMainStatus=…` for a failed scope. |
+
 ### `ci.run` / `ci.job` / `ci.duration`
 
 GitHub Actions telemetry from the `loom-daemon ci-telemetry` poller (#8824).

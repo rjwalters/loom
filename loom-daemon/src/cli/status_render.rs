@@ -775,6 +775,9 @@ pub(crate) fn build_status_json_value_for(
             "autonomy_mismatch": autonomy_mismatch(Some(p), report),
         })),
     });
+    // Agent-residue reap counters (#10802); added outside the literal above,
+    // which is at the macro recursion limit.
+    value["agent_residue"] = serde_json::json!(report.agent_residue);
     // Restart-survivorship seed (#6262). Inserted after the literal rather than
     // added as another `json!` key: the macro above is already at the recursion
     // limit (see the `role_agents` comment), and a post-insert costs nothing and
