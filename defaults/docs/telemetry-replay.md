@@ -67,6 +67,17 @@ the row that carries a `host`), the spread between hosts' views, coverage at
 `t`, anchor completeness and volume, and outcome facts. It filters on
 `created_at < t` and dedupes with `LIMIT 1 BY`. It introduces no row caps.
 
+Per issue, the **last** operation on a host's chain wins, so an issue that is
+removed, re-added and removed again stays deleted. A host's state is used only
+when it is reconstructable: its base anchor (the one its newest chain names)
+and every delta on the chain arrived with all their byte chunks, and each
+delta's `prev_as_of` is the record before it. Anything else (a lost delta, a
+missing chunk, a chain whose anchor never arrived) makes that host **unknown**
+at `t`: it contributes no rows and coverage reports it as not covered. A lost
+delta at the very end of a chain cannot be detected; coverage shows how fresh
+each chain is. `loom-daemon/tests/signoz_replay_queries.rs` runs these queries
+against a pinned ClickHouse over a fixture for each case.
+
 ## Identity and dedupe
 
 Delivery is at least once. Every log record carries `loom.record_id`, a

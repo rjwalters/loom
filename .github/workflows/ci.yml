@@ -705,6 +705,13 @@ jobs:
       # rows inflates the answer rate because refusals are never refreshed.
       - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
+      # #11125: the same technique for the replay reconstruction
+      # (replay-queries.sql queries 1-3). Only this run shows that an issue
+      # removed, re-added and removed again stays deleted, and that a lost
+      # delta, a missing anchor or delta chunk, or a chain whose anchor never
+      # arrived makes that host unknown instead of rebuilding wrong state.
+      - name: Verify the SigNoz replay reconstruction against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_replay_queries -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows
