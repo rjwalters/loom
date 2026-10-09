@@ -513,6 +513,9 @@ fixture. A behaviour change is a new id registered beside the old one
        last emitted state forward — never as answered rows over all rows, because a refusal
        is emitted once and never refreshed (bar `stale_inputs`, re-emitted every pass, #10973) while an answer is refreshed every
        few minutes;
+       a `stale_inputs` series re-emits at most 10 times an hour (half the
+       hourly cap, so the recovery row is never starved), and those refusal
+       rows score nothing, so they never form shadow pairs;
      - its p25–p75 coverage inside `[40%, 60%]`;
      - the **day consistency check**: pairs are folded by the UTC day of
        their `as_of`, a day goes to whichever side had the lower mean

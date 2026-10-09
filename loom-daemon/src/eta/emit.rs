@@ -21,6 +21,10 @@ use std::collections::VecDeque;
 /// 5-minute refreshes plus headroom for transitions.
 pub const HOURLY_CAP: usize = 20;
 
+/// Most `stale_inputs` re-emits per series in any rolling hour: half the
+/// hard cap, leaving the rest for the transition out of the stall.
+pub const STALE_CAP: usize = HOURLY_CAP / 2;
+
 /// Why an estimate was emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,8 +90,11 @@ impl EmitState {
         }
         if let Some(reason) = signature.reason {
             // `stale_inputs` is a condition, not a verdict: it persists
-            // until the feed recovers, so every pass says so (#10973).
-            return (reason == NoEstimateReason::StaleInputs).then_some(Trigger::Refresh);
+            // until the feed recovers, so every pass says so (#10973). It
+            // stops at half the hourly cap so the recovery transition (or a
+            // real stage change) always has headroom to be emitted.
+            return (reason == NoEstimateReason::StaleInputs && in_window < STALE_CAP)
+                .then_some(Trigger::Refresh);
         }
         // A tenth of the interval as slack, so a pass that fires a moment
         // early still refreshes instead of skipping to the next one.
