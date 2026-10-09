@@ -81,6 +81,9 @@ pub(super) enum FailureKind {
     /// or renamed, or the credential may not read it. This repo's failure
     /// alone, alerted as `repo-access`; never part of a network outage.
     Refused,
+    /// git got no credential from the host's credential helper. The host's
+    /// failure, alerted once (`credential-helper`), never per repo.
+    Credential,
     /// Anything else.
     Other,
 }
@@ -121,6 +124,9 @@ pub struct Memory {
     /// The rate-limit breaker was open at the last pass (said once per time
     /// it opens).
     breaker_open: bool,
+    /// The credential-helper alert for this run of failing passes was
+    /// published.
+    credential_alerted: bool,
 }
 
 impl Memory {
@@ -152,9 +158,10 @@ impl Memory {
             .saturating_add(1);
         let delay = match kind {
             FailureKind::Protected => BACKOFF_CAP,
-            FailureKind::Unreachable | FailureKind::Refused | FailureKind::Other => {
-                Self::delay(interval, failures)
-            }
+            FailureKind::Unreachable
+            | FailureKind::Refused
+            | FailureKind::Credential
+            | FailureKind::Other => Self::delay(interval, failures),
         };
         let next_attempt = now + chrono_of(delay);
         self.backoff.insert(
@@ -174,7 +181,7 @@ impl Memory {
             FailureKind::Protected => self
                 .noted
                 .insert(format!("protected:{}", report.root.display())),
-            FailureKind::Unreachable => false,
+            FailureKind::Unreachable | FailureKind::Credential => false,
             FailureKind::Refused | FailureKind::Other => failures >= ALERT_AFTER,
         };
         let alert = alerts.then(|| Alert {
@@ -183,7 +190,9 @@ impl Memory {
             kind: match kind {
                 FailureKind::Protected => "branch-protection",
                 FailureKind::Refused => "repo-access",
-                FailureKind::Unreachable | FailureKind::Other => "failure",
+                FailureKind::Unreachable | FailureKind::Credential | FailureKind::Other => {
+                    "failure"
+                }
             },
             failures,
             detail: detail.to_string(),
@@ -220,6 +229,34 @@ impl Memory {
     /// that is news: it just opened, or just closed.
     pub(super) fn note_breaker(&mut self, open: bool) -> bool {
         std::mem::replace(&mut self.breaker_open, open) != open
+    }
+
+    /// Fold one pass's credential-helper failures into their record: the one
+    /// host-level alert a run of failing passes gets, however many repos hit
+    /// it. A pass with none ends the run.
+    pub(super) fn note_credential(
+        &mut self,
+        detail: Option<&str>,
+        interval: Duration,
+        now: DateTime<Utc>,
+    ) -> Option<Alert> {
+        let Some(detail) = detail else {
+            self.credential_alerted = false;
+            return None;
+        };
+        if std::mem::replace(&mut self.credential_alerted, true) {
+            return None;
+        }
+        Some(Alert {
+            root: PathBuf::new(),
+            repo: None,
+            kind: "credential-helper",
+            failures: 1,
+            detail: format!(
+                "git could not get a credential from this host's credential helper, so private                  repos cannot be read (one alert for the host, not one per repo): {detail}"
+            ),
+            next_attempt: now + chrono_of(interval),
+        })
     }
 
     /// Fold one pass's head query into its record. `failure` is why it got
@@ -274,7 +311,12 @@ impl Memory {
             .filter(|root| {
                 self.backoff.get(*root).is_some_and(|b| {
                     b.next_attempt > now
-                        && matches!(b.kind, FailureKind::Unreachable | FailureKind::Refused)
+                        && matches!(
+                            b.kind,
+                            FailureKind::Unreachable
+                                | FailureKind::Refused
+                                | FailureKind::Credential
+                        )
                 })
             })
             .cloned()

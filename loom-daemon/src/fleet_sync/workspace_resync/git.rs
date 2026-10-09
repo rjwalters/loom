@@ -68,6 +68,30 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// git could not get a credential from the host's credential helper. About
+/// the host, not the repo: every private repo fails the same way, so it is
+/// reported once for the host (`credential-helper`), never as one
+/// `repo-access` alert per repo.
+#[derive(Debug)]
+pub(super) struct Credential(pub(super) String);
+
+impl std::fmt::Display for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Credential {}
+
+/// Does git's stderr say it got no credential at all (the helper is broken or
+/// missing, and prompts are off)?
+pub(super) fn is_credential_failure(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    ["could not read username", "could not read password"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
 /// Does a failed `ls-remote` or `fetch` say the remote answered and refused,
 /// as opposed to not answering? Read from git's own stderr: GitHub's "not
 /// found" (which is also its answer to a credential that may not see the
@@ -77,8 +101,6 @@ pub(super) fn is_refusal(stderr: &str) -> bool {
     [
         "repository not found",
         "authentication failed",
-        "could not read username",
-        "could not read password",
         "invalid username or",
         "bad credentials",
         "permission to ",
@@ -91,9 +113,12 @@ pub(super) fn is_refusal(stderr: &str) -> bool {
 }
 
 /// The error for a network child (`ls-remote`, `fetch`) that exited non-zero.
-fn network_failure(what: &str, stderr: &[u8]) -> anyhow::Error {
+pub(super) fn network_failure(what: &str, stderr: &[u8]) -> anyhow::Error {
     let detail = format!("{what} failed: {}", first_line(stderr));
-    if is_refusal(&String::from_utf8_lossy(stderr)) {
+    let text = String::from_utf8_lossy(stderr);
+    if is_credential_failure(&text) {
+        Credential(detail).into()
+    } else if is_refusal(&text) {
         Refused(detail).into()
     } else {
         Unreachable(detail).into()

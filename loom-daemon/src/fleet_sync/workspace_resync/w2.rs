@@ -318,9 +318,15 @@ fn fail_attempt(
     let refused = error
         .chain()
         .any(|cause| cause.downcast_ref::<git::Refused>().is_some());
+    let credential = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<git::Credential>().is_some());
     let kind = if unreachable {
         scan.no_answer(&report.root, nwo, &detail, memory);
         FailureKind::Unreachable
+    } else if credential {
+        scan.no_credential(nwo, &detail);
+        FailureKind::Credential
     } else if refused {
         FailureKind::Refused
     } else {
