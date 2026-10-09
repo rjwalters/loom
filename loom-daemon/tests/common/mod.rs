@@ -80,6 +80,13 @@ pub fn daemon_bin() -> PathBuf {
 pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
     deny_real_gh(cmd);
     cmd.current_dir(fixture)
+        // #11111: a sweep's environment carries the production daemon's
+        // `LOOM_DAEMON_SUPERVISOR=systemd`. A test daemon must never believe
+        // it is supervised: the startup supervision drop-in would otherwise
+        // try to write the live unit's drop-in and `daemon-reload` the real
+        // user manager (#8077). The daemon's own MainPID check is the primary
+        // fence; this is the belt to its braces.
+        .env_remove("LOOM_DAEMON_SUPERVISOR")
         .env("LOOM_WORKSPACES_PATH", fixture.join("workspaces.json"))
         .env("LOOM_SWEEPS_JOURNAL_PATH", fixture.join("sweeps.json"))
         .env("LOOM_WATCHES_PATH", fixture.join("watches.json"))
@@ -168,7 +175,9 @@ impl TestDaemon {
 
         let mut cmd = Command::new(daemon_bin());
         deny_real_gh(&mut cmd);
-        cmd.env("LOOM_SOCKET_PATH", &socket_path)
+        // #11111: never a supervised daemon (see `isolate_daemon_state`).
+        cmd.env_remove("LOOM_DAEMON_SUPERVISOR")
+            .env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
             // Disable restore_from_tmux() to prevent cross-test-binary contamination
             // via the shared tmux server. Each test manages its own terminals.
