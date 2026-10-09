@@ -12603,7 +12603,13 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   - **Who is requeued, and how it is recorded.** An agent younger than
     `pauseRoll.minResumableAgeSecs` (`young-agent-reset`), one with no resumable
     session (`session-not-resumable`), and one that missed the budget
-    (`pause-budget-missed`). Each requeue restores the label through the usual
+    (`pause-budget-missed`). A missed item's manifest entry and its
+    `daemon.roll.item` event carry `safe_point_miss` (#11049): `no-hook` (the
+    pause hook never ran for it), `no-tool-call` (it ran, but no call started
+    in the window), or `hook-refused` (it ran in the window but recorded no
+    safe point), with the evidence. A Claude sweep gets the hook wiring from
+    its launch (`--settings`, from `agent-resume claude-args`), not from the
+    consumer's `.claude/settings.json`. Each requeue restores the label through the usual
     claim-restore path (a closed issue is never re-queued, a parked one stays
     parked), posts **one comment** naming the roll (`from → to`), the phase and
     age reached, the reason and whether a worktree with uncommitted edits is

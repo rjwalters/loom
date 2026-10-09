@@ -620,6 +620,9 @@ fn rule_2_once_something_is_stopped_requests_do_not_promote_abort_is_refused_and
     let m = load(&plan);
     assert_eq!(m.phase, Phase::Paused);
     assert_eq!(item(&m, "old").reason.as_deref(), Some(REASON_BUDGET_MISSED));
+    // #11049: the manifest says why. The fake agent never ran the hook.
+    let miss = item(&m, "old").safe_point_miss.clone().unwrap();
+    assert_eq!(miss.cause, "no-hook", "{miss:?}");
 }
 
 /// Rule 3: a then-exit request always wins. After something is stopped it is
@@ -1069,6 +1072,8 @@ fn h4_pauses_resets_and_requeues_real_agents_and_keeps_the_paused_items_recovery
     assert!(pe["safe_point_wait_ms"].is_u64() && pe["teardown_ms"].is_u64(), "{pe}");
     assert_eq!(by_id(&young_id)["reason"], "young-agent-reset");
     assert_eq!(by_id(&missed_id)["reason"], "pause-budget-missed");
+    assert_eq!(by_id(&missed_id)["safe_point_miss"], "no-hook", "#11049");
+    assert!(by_id(&paused_id)["safe_point_miss"].is_null());
     assert!(events.iter().any(|(t, _)| t == "daemon.roll.paused"));
     let status = drain.snapshot().pause.unwrap();
     assert_eq!((status.items, status.paused, status.step), (3, 1, 10));

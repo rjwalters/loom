@@ -121,6 +121,22 @@ event, plus a post-tool-use ledger:
    stop while a pause request is active. Its background children are about to
    be stopped with the tree anyway.
 
+**Where the Claude wiring lives (#11049).** A consumer repo's
+`.claude/settings.json` belongs to the consumer. Only `install.sh` adds hook
+entries to it, and the daemon's workspace resync never edits it. So a repo
+installed before #10830 has `.loom/hooks/roll-pause.sh` but no entry that runs
+it. The first fleet roll showed the result: every consumer-repo sweep missed
+its safe point, and the one Loom-repo sweep parked. The launch therefore
+carries the wiring. `loom-daemon agent-resume claude-args` (called by
+`spawn-claude.sh` for every pinned or resumed session) appends
+`--settings <json>` with match-all `PreToolUse`, `PostToolUse` and
+`PostToolUseFailure` entries for the workspace's installed `roll-pause.sh`.
+It does this only for a daemon item, and only when the launch directory's own
+settings do not already run the hook. Claude Code merges these hooks with the
+project's and the user's. Codex needs none of this: its managed `hooks.json`
+is Loom-written at spawn and runs `guard-codex-bridge.sh`, which runs the
+pause hook first.
+
 On resume, the relaunch prompt tells the agent that it was paused for a roll
 (`from → to`), that its last tool call (named in the record) **did not run**,
 and that it should re-run that call if it is still needed and then continue.
@@ -304,6 +320,8 @@ audit.
         "resume_of": null                    // previous item id when this run was itself a resume
       },
       "safe_point": null,                    // {reached_at, parked_tool, parked_summary}
+      "safe_point_miss": null,               // #11049, set with pause-budget-missed:
+                                             //   {cause: no-hook | no-tool-call | hook-refused, detail}
       "checkpoint_phase": "builder",
       "worktree": { "path": "…/issue-10714", "branch": "feature/issue-10714",
                     "head": "abc123…", "dirty": true },
@@ -594,7 +612,7 @@ Reasons are a closed set:
 | Reason | Meaning |
 |---|---|
 | `young-agent-reset` | the agent had run less than `minResumableAgeSecs` at H4 (§2), so it was killed and reset |
-| `pause-budget-missed` | the agent had not reached a safe point when `pauseBudgetSecs` ran out (or its pid died before one) |
+| `pause-budget-missed` | the agent had not reached a safe point when `pauseBudgetSecs` ran out (or its pid died before one). `safe_point_miss.cause` says why (#11049): `no-hook` (the hook never ran for the item), `no-tool-call` (it ran, but no call started in the window), `hook-refused` (it ran in the window but recorded no safe point) |
 | `session-not-resumable` | no session id was captured for the agent, or its runtime has no resume support |
 | `session-store-unavailable` | at H5 the session store (`~/.claude/projects/…`, or the account's `CODEX_HOME`) or the pinned account could not be used |
 | `session-resume-failed` | the relaunch with the saved session id failed to start the session |

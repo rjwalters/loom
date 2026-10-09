@@ -399,6 +399,7 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         run_started_at: c.run_started_at,
         resume_handle: c.resume_handle.clone(),
         safe_point: None,
+        safe_point_miss: None,
         checkpoint_phase: c.checkpoint_phase.clone(),
         worktree: c.worktree.clone(),
         // A sweep's claim is its issue's `loom:building`; a role run's is
@@ -480,6 +481,7 @@ impl Run<'_> {
             "disposition": w.item.disposition.as_str(),
             "status": w.item.status.as_str(),
             "reason": w.item.reason,
+            "safe_point_miss": w.item.safe_point_miss.as_ref().map(|m| m.cause.clone()),
             "agent_age_secs": w.cand.agent_age_secs(now),
             "issue": w.item.issue,
             "role": w.item.role,
@@ -938,8 +940,13 @@ pub(crate) fn run_h4_with(
         w.item.disposition = Disposition::Requeue;
         w.item.status = ItemStatus::Planned;
         w.item.reason = Some(REASON_BUDGET_MISSED.to_string());
+        // #11049: name the cause, so the next roll is diagnosable from the
+        // manifest alone.
+        let miss = roll_pause::miss::diagnose(w.cand.pause_dir.as_deref(), &request);
+        let detail = format!("{}: {}", miss.cause, miss.detail);
+        w.item.safe_point_miss = Some(miss);
         let id = w.item.id.clone();
-        run.event(Some(&id), "budget_missed", None);
+        run.event(Some(&id), "budget_missed", Some(detail));
     }
     let stop_secs = stop_started.elapsed().as_secs();
     drain.pause_update(plan.generation, |p| p.stop_secs = Some(stop_secs));

@@ -32,6 +32,7 @@
 //! | `safe-point.json` | hook | written once per request, atomically, when a call parks with an empty ledger |
 //! | `handle.json` | spawn script | the live-captured resume handle (Codex) |
 //! | `claim.json` | hook | the claim label the agent took, if any ([`claim_breadcrumb`]) |
+//! | `hook-seen` | hook | touched on every `PreToolUse`: the hook's last run ([`miss`], #11049) |
 //!
 //! A file per in-flight call, not a counter, so concurrent hooks never race on
 //! a read-modify-write: the count is the directory listing.
@@ -60,8 +61,10 @@
 pub mod claim_breadcrumb;
 pub mod hold;
 pub mod live_runs;
+pub mod miss;
 pub mod resume;
 pub mod suppress;
+pub mod wiring;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -521,7 +524,7 @@ pub fn run_hook(env: &HookEnv, payload: &str) -> HookOutcome {
             let _ = std::fs::remove_file(dir.join(INFLIGHT_DIR).join(&key));
             return HookOutcome::Allow;
         }
-        "PreToolUse" => {}
+        "PreToolUse" => touch(&dir.join(miss::SEEN_FILE)),
         _ => return HookOutcome::Allow,
     }
     if !is_requested(&dir) {

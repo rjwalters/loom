@@ -266,6 +266,11 @@ pub struct ManifestItem {
     pub resume_handle: Option<ResumeHandle>,
     #[serde(default)]
     pub safe_point: Option<SafePointRecord>,
+    /// Why the item reached no safe point within the budget, when it did
+    /// not (`pause-budget-missed`, #11049): `no-hook`, `no-tool-call` or
+    /// `hook-refused`, with the evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_point_miss: Option<crate::roll_pause::miss::SafePointMiss>,
     #[serde(default)]
     pub checkpoint_phase: Option<String>,
     #[serde(default)]
