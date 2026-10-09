@@ -191,6 +191,22 @@ pub fn reserved_bytes(store: &Store) -> u64 {
         .sum()
 }
 
+/// Per repo key, the in-flight SWEEPS (issue-lock scopes) whose future use
+/// [`reserved_bytes`] accounts for: sampled into `inflight` AND with an
+/// expected peak. Only these may be credited back into the admission cap; a
+/// lock with no scope, an unreadable cgroup or a repo without history is
+/// charged by admission instead (#11094).
+#[must_use]
+pub fn accounted_sweeps(store: &Store) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for f in store.inflight.values() {
+        if f.issue.is_some() && expected_peak_bytes(store, &f.repo).is_some() {
+            *out.entry(f.repo.clone()).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
 /// Fold one observation tick into `store`. `read` returns `(peak, current)`
 /// bytes for a scope, or `None` when its cgroup files are unavailable (the
 /// scope is then left out of `inflight`: a no-op, not an error). Scopes that
@@ -443,21 +459,22 @@ fn emit_ended(e: &EndedScope) {
 /// stamped scope units, plus every other `loom-agent-*.scope` under the agents
 /// slice ([`discover_scopes`], Linux only), so role agents without an issue
 /// lock are sampled and reserved too — and the number of in-flight sweeps
-/// (issue locks) across those roots.
+/// (issue locks) of each root, parallel to `roots`. Every lock is counted,
+/// sampled or not, so admission can charge the ones no sample accounts for.
 #[must_use]
 pub fn live_scopes(
     pool: &std::sync::Arc<crate::workspace_pool::WorkspacePool>,
     roots: &[PathBuf],
-) -> (Vec<LiveScope>, usize) {
+) -> (Vec<LiveScope>, Vec<usize>) {
     let mut out = Vec::new();
-    let mut in_flight = 0;
-    for root in roots {
+    let mut in_flight = vec![0; roots.len()];
+    for (idx, root) in roots.iter().enumerate() {
         let registry = pool.get_or_provision(root);
         let sr = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for a in sr.in_flight_snapshot() {
-            in_flight += 1;
+            in_flight[idx] += 1;
             if let Some(scope) = a.scope_unit {
                 out.push(LiveScope {
                     scope,
