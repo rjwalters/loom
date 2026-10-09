@@ -50,7 +50,7 @@
 use super::fetch::{self, FetchInputs, FetchOutcome, SignaturePolicy};
 use super::signature::{SignatureState, VerifiedBy};
 use super::source::SourceReport;
-use crate::eta::Provenance;
+use crate::telemetry::provenance::Provenance;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;

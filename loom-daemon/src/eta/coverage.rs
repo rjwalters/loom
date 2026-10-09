@@ -177,6 +177,19 @@ pub enum Declared {
     Repos(BTreeSet<String>),
 }
 
+const FLEET_ETA_AUTHORITY_COVERS_KEY: &str = "fleet.etaAuthorityCovers";
+
+/// What the committed config declares about the ETA authority's repos
+/// (#10897): `fleet.etaAuthorityCovers` is `"all"` or a list of `owner/repo`
+/// slugs. Soft-fails to undeclared like
+/// [`crate::config_resolver::fleet_eta_authority`]. Lived in
+/// `config_resolver` until #11098 (Stage 2) moved it beside its parser.
+#[must_use]
+pub fn declared_for(repo_root: &Path) -> Declared {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    parse_declared(crate::config_resolver::get_path(&effective, FLEET_ETA_AUTHORITY_COVERS_KEY))
+}
+
 /// Parse the `fleet.etaAuthorityCovers` value: `"all"`, or an array of
 /// `owner/repo` strings. Anything else (null, blank, wrong type, an empty
 /// array) is [`Declared::Undeclared`].
