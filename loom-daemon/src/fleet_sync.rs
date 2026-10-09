@@ -89,6 +89,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 
 pub mod checkout_ff;
 mod floor_knowledge;
+pub mod offline_floor;
 pub mod workspace_resync;
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};

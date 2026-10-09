@@ -653,6 +653,28 @@ fn test_run_update_script_exit_0_is_success() {
     );
 }
 
+/// #11044: every update the daemon starts carries the invoker marker, so the
+/// script's fleet floor confirmation never prompts or refuses it, and its
+/// stdin is never a terminal it could block on.
+#[test]
+fn test_run_update_script_marks_the_run_as_daemon_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = write_fake_script(
+        tmp.path(),
+        r#"[ "$LOOM_DAEMON_UPDATE_INVOKER" = daemon ] || exit 9; [ -t 0 ] && exit 8; exit 0"#,
+    );
+    assert_eq!(
+        run_update_script(&s, tmp.path(), Duration::from_secs(10), false),
+        RebuildOutcome::Success,
+        "the source-rebuild path"
+    );
+    assert_eq!(
+        run_update_script_with(&s, tmp.path(), Duration::from_secs(10), false, &["--fetch"], None),
+        RebuildOutcome::Success,
+        "the artifact path"
+    );
+}
+
 #[test]
 fn test_run_update_script_exit_1_is_retryable() {
     let tmp = tempfile::tempdir().unwrap();

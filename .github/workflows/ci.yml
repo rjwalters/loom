@@ -2009,6 +2009,10 @@ jobs:
       # and degrades to the flat reason without it, so it needs this build.
       - name: loom-daemon-update --fetch refusal classification (#8654)
         run: bash defaults/scripts/tests/test-loom-daemon-update-fetch-refusal.sh
+      # #11044: the fleet floor confirmation runs inside `loom-daemon
+      # daemon-update`, so the suite pins this job's shared build.
+      - name: loom-daemon-update fleet floor confirmation (#11044)
+        run: bash defaults/scripts/tests/test-loom-daemon-update-floor-confirm.sh
       # #8712: the fixture library is the subject, not any one flow. A fake
       # loom-daemon from lib/daemon-update-fixtures.sh that escapes to a real
       # loom-daemon/target/release/ stalled a fleet host's auto_update for
