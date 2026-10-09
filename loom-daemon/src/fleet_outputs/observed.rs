@@ -32,6 +32,13 @@ use crate::observability::captain_gauges::{self as gauges, store::Heartbeat};
 /// longest registry deadline (48 h).
 pub const WINDOW: Duration = Duration::from_secs(72 * 3600);
 
+/// Look-back for the open-item kinds ([`SWEEP_STARTED`], [`OUTCOME`],
+/// [`ESTIMATE`]). Longer than [`WINDOW`] on purpose: an item still open (and
+/// its refusal state) must not age out of the read at 72 h, or an estimate
+/// alert that is firing would clear solely because the start scrolled away.
+/// An item open longer than this stops being tracked.
+pub const ITEM_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// `eta.estimate`, the one [`super::Scope::PerActiveRepo`] row.
 pub const ESTIMATE: &str = "eta.estimate";
 /// The open-item signal: a sweep started on the item, by any host.
@@ -39,7 +46,8 @@ pub const SWEEP_STARTED: &str = "sweep.started";
 /// The closing signal: a `land` outcome.
 pub const OUTCOME: &str = "eta.outcome";
 
-/// The aggregate read: one row per `(kind, repo, issue)` over the window.
+/// The aggregate read: one row per `(kind, repo, issue)` over the window
+/// ([`ITEM_WINDOW`] for the open-item kinds).
 ///
 /// The kind list must hold every log-kind registry row plus
 /// [`SWEEP_STARTED`] and [`OUTCOME`] (`observed_tests` checks it). The issue
@@ -58,10 +66,12 @@ SELECT
     toUInt8(argMax(mapContains(attributes_string, 'loom.eta.no_estimate_reason'), timestamp)) AS refused,
     toUInt8(countIf(attributes_string['loom.eta.kind'] = 'land') > 0) AS landed
 FROM signoz_logs.distributed_logs_v2
-WHERE timestamp >= {since_ns:UInt64}
+WHERE timestamp >= {item_since_ns:UInt64}
   AND timestamp <= {until_ns:UInt64}
   AND attributes_string['loom.kind'] IN ('eta.fleet_refresh', 'eta.backtest.fold', 'ci.run',
       'eta.fit', 'eta.estimate', 'eta.outcome', 'sweep.started')
+  AND (timestamp >= {since_ns:UInt64}
+       OR attributes_string['loom.kind'] IN ('eta.estimate', 'eta.outcome', 'sweep.started'))
 GROUP BY kind, repo, issue
 LIMIT 200000
 FORMAT JSONEachRow
@@ -72,7 +82,13 @@ FORMAT JSONEachRow
 pub fn params(now: DateTime<Utc>) -> Vec<(&'static str, String)> {
     let window = chrono::Duration::from_std(WINDOW).unwrap_or_else(|_| chrono::Duration::zero());
     let ns = |at: DateTime<Utc>| at.timestamp_nanos_opt().unwrap_or(0).max(0).to_string();
-    vec![("since_ns", ns(now - window)), ("until_ns", ns(now))]
+    let items =
+        chrono::Duration::from_std(ITEM_WINDOW).unwrap_or_else(|_| chrono::Duration::zero());
+    vec![
+        ("since_ns", ns(now - window)),
+        ("item_since_ns", ns(now - items)),
+        ("until_ns", ns(now)),
+    ]
 }
 
 /// One row of [`OUTPUTS_SQL`].

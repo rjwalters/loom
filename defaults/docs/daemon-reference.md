@@ -3059,7 +3059,7 @@ moved to a host that does not produce fires like a stalled one (within the
 row's deadline: 2 x cadence, or the captain-gauge `maxAgeSecs`). A separate
 `fleet-output-watch` thread reads every 5 min: the SigNoz logs table through
 the ETA reader's ClickHouse endpoint (`autonomous.eta.fleetRefresh.signoz.*`,
-newest record per kind and repo over 72 h) and the captain's own
+newest record per kind and repo over 72 h; the open-item kinds `sweep.started`, `eta.outcome`, `eta.estimate` over 30 d, so an open item and its refusal state do not age out with the 72 h window) and the captain's own
 `captain-gauges/v1` state (what its gauge passes last produced, read in-process,
 never from the fleet store); the alert tick only takes its latest reading. No
 forge call is made anywhere in this path (a source scan pins it), so a

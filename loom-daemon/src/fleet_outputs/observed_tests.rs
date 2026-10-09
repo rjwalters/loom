@@ -228,6 +228,54 @@ fn expected_estimate_repos_come_from_open_items_not_estimates() {
 }
 
 #[test]
+fn open_item_older_than_the_output_window_still_owes_an_estimate() {
+    let repos = roster(2);
+    let old = now() - Cd::hours(100);
+    // repo-00: started 100 h ago, never estimated, still open. repo-01: same
+    // start, but its newest estimate is a refusal.
+    let rows = vec![
+        row(observed::SWEEP_STARTED, &repos[0], 1, old),
+        row(observed::SWEEP_STARTED, &repos[1], 2, old),
+        Row {
+            refused: true,
+            ..row(observed::ESTIMATE, &repos[1], 2, old)
+        },
+    ];
+    let o = build(&reading(Ok(rows), Ok(None)), repos.clone(), BTreeSet::new(), now());
+    assert_eq!(o.expected_repos(observed::ESTIMATE), Some(vec![repos[0].clone()]));
+}
+
+#[test]
+fn estimate_outage_persists_across_the_output_window_boundary() {
+    let repos = roster(1);
+    let start = now() - Cd::hours(60);
+    let rows = vec![row(observed::SWEEP_STARTED, &repos[0], 1, start)];
+    let before = build(&reading(Ok(rows.clone()), Ok(None)), repos.clone(), BTreeSet::new(), now());
+    // 20 h later the start is past the 72 h window; the read still carries it.
+    let later = now() + Cd::hours(20);
+    let after = build(
+        &Reading {
+            at: later,
+            ..reading(Ok(rows), Ok(None))
+        },
+        repos.clone(),
+        BTreeSet::new(),
+        later,
+    );
+    assert_eq!(before.expected_repos(observed::ESTIMATE), Some(repos.clone()));
+    assert_eq!(after.expected_repos(observed::ESTIMATE), Some(repos));
+}
+
+#[test]
+fn item_kinds_use_the_longer_window_in_the_query() {
+    let p: BTreeMap<_, _> = observed::params(now()).into_iter().collect();
+    let ns = |k: &str| p[k].parse::<i64>().unwrap();
+    assert!(ns("item_since_ns") < ns("since_ns"));
+    assert!(observed::OUTPUTS_SQL.contains("{item_since_ns:UInt64}"));
+    assert!(observed::OUTPUTS_SQL.contains("{since_ns:UInt64}"));
+}
+
+#[test]
 fn outputs_sql_names_every_log_kind() {
     for o in SINGLETON_OUTPUTS
         .iter()
