@@ -421,6 +421,34 @@ pub(crate) enum ForgeAction {
         head: String,
     },
 
+    /// `forge version-only-diff <pr> <file> [--repo OWNER/REPO]` (#9611) —
+    /// is `<file>`'s diff in PR `<pr>` nothing but a version-string change?
+    /// Champion criterion #3's version-only carve-out (#6147).
+    ///
+    /// Exits 0 (`VERSION_ONLY=1`) ONLY when `<file>` is exactly one of the six
+    /// version-bearing files (`package.json`, `mcp-loom/package.json`,
+    /// `mcp-loom/package-lock.json`, `loom-daemon/Cargo.toml`,
+    /// `loom-api/Cargo.toml`, `Cargo.lock`), the paginated
+    /// `pulls/<pr>/files` read succeeded, the file carries a non-empty
+    /// `patch`, and every changed line is the version line. Every other
+    /// outcome — a forge error, unparseable JSON, the file absent, no
+    /// `patch`, no changed line, any other change — exits 1 with the reason
+    /// on stderr. Callers treat any non-zero exit as "not eligible".
+    #[command(name = "version-only-diff")]
+    VersionOnlyDiff {
+        /// Pull request number.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// Repo-relative path of the changed file.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// `OWNER/REPO` (default: resolved by `gh` from the current repo).
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -1038,6 +1066,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             reviewed,
             head,
         },
+        ForgeAction::VersionOnlyDiff {
+            pr_number,
+            file,
+            repo,
+        } => ForgeCmd::VersionOnlyDiff(loom_daemon::forge_version_only_diff::Args {
+            pr: pr_number,
+            file,
+            repo,
+        }),
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
         ForgeAction::MergeConfig {
             repo,
