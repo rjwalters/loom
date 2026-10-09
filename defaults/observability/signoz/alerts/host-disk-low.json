@@ -1,9 +1,9 @@
 {
   "alert": "Loom host worktree disk low",
-  "alertType": "LOGS_BASED_ALERT",
+  "alertType": "METRIC_BASED_ALERT",
   "ruleType": "threshold_rule",
   "version": "v4",
-  "evalWindow": "10m0s",
+  "evalWindow": "60m0s",
   "frequency": "5m0s",
   "condition": {
     "compositeQuery": {
@@ -12,14 +12,14 @@
       "chQueries": {
         "A": {
           "name": "A",
-          "query": "SELECT toStartOfInterval(toDateTime(intDiv(timestamp, 1000000000)), INTERVAL 1 MINUTE) AS ts,\n       if(JSONExtractString(body, 'host_id') != '', JSONExtractString(body, 'host_id'), attributes_string['loom.record.host_id']) AS host,\n       min(toUInt8(JSONExtractFloat(body, 'worktree_root_free_gb') < 30\n                   OR (JSONExtractFloat(body, 'worktree_root_total_gb') > 0\n                       AND JSONExtractFloat(body, 'worktree_root_free_gb') / JSONExtractFloat(body, 'worktree_root_total_gb') < 0.1))) AS value\nFROM signoz_logs.distributed_logs_v2\nWHERE resources_string['service.name'] = 'loom-ui-d1-export'\n  AND JSONExtractString(body, 'kind') = 'host.health'\n  AND JSONHas(body, 'worktree_root_free_gb')\n  AND timestamp >= {{.start_timestamp_nano}}\n  AND timestamp < {{.end_timestamp_nano}}\nGROUP BY ts, host\nORDER BY ts",
+          "query": "WITH\n  toInt64({{.end_timestamp_ms}}) AS end_ms,\n  end_ms - 600000 AS recent_ms,\n  series AS (\n    SELECT fingerprint,\n           any(if(JSONExtractString(labels, 'host.name') != '', JSONExtractString(labels, 'host.name'), JSONExtractString(labels, 'host.id'))) AS host\n    FROM signoz_metrics.time_series_v4\n    WHERE metric_name IN ('loom.host.worktree_root_free_gb', 'loom.host.worktree_volume.free_bytes',\n                          'loom.host.worktree_volume.total_bytes')\n    GROUP BY fingerprint\n  ),\n  pts AS (\n    SELECT series.host AS host, s.metric_name AS metric, s.unix_milli AS ms, s.value AS value\n    FROM signoz_metrics.samples_v4 AS s\n    INNER JOIN series USING (fingerprint)\n    WHERE s.metric_name IN ('loom.host.worktree_root_free_gb', 'loom.host.worktree_volume.free_bytes',\n                          'loom.host.worktree_volume.total_bytes')\n      AND s.unix_milli >= {{.start_timestamp_ms}}\n      AND s.unix_milli < {{.end_timestamp_ms}}\n  ),\n  per_host AS (\n    SELECT host,\n           maxOrNullIf(value, metric = 'loom.host.worktree_root_free_gb' AND ms >= recent_ms) AS recent_max_gb,\n           maxOrNullIf(value, metric = 'loom.host.worktree_volume.free_bytes' AND ms >= recent_ms) AS recent_max_free_bytes,\n           maxOrNullIf(value, metric = 'loom.host.worktree_volume.total_bytes' AND ms >= recent_ms) AS total_bytes,\n           argMaxIf(value, ms, metric = 'loom.host.worktree_root_free_gb') AS latest_gb,\n           maxIf(ms, metric = 'loom.host.worktree_root_free_gb') AS latest_ms,\n           minIf(ms, metric = 'loom.host.worktree_root_free_gb') AS first_ms,\n           countIf(metric = 'loom.host.worktree_root_free_gb') AS n,\n           simpleLinearRegressionIf(toFloat64(ms - end_ms) / 3600000, value,\n                                    metric = 'loom.host.worktree_root_free_gb').1 AS gb_per_hour\n    FROM pts\n    WHERE host != ''\n    GROUP BY host\n  )\nSELECT toDateTime(intDiv(end_ms, 1000)) AS ts,\n       host,\n       toFloat64(ifNull(recent_max_gb < 30, 0)\n                 OR ifNull(total_bytes > 0 AND recent_max_free_bytes / total_bytes < 0.1, 0)\n                 OR (latest_ms >= recent_ms AND n >= 4 AND latest_ms - first_ms >= 1800000\n                     AND gb_per_hour < 0 AND latest_gb / -gb_per_hour < 6)) AS value\nFROM per_host\nORDER BY host",
           "disabled": false
         }
       }
     },
     "selectedQueryName": "A",
     "op": "1",
-    "matchType": "2",
+    "matchType": "1",
     "target": 0
   },
   "labels": {
@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom host worktree disk low",
-    "description": "Host {{$labels.host}} reports worktree_root_free_gb below 30 GB or below 10% of worktree_root_total_gb in every host.health record for 10 min (loom-ui-d1-export). A host with no worktree_root_free_gb is unknown, not low. Free space: `loom-daemon clean`/`loom-clean --force`, see troubleshooting.md 'Worker disk full'. Issue #10973."
+    "description": "Host {{$labels.host}}: every worktree_root_free_gb reading in the last 10 min is below 30 GB or below 10% of the volume, OR the least-squares slope of free GB over the last hour (at least 4 readings spanning 30 min, the latest within 10 min) projects the volume full in under 6 h. Keyed on the direct OTLP gauges loom.host.worktree_root_free_gb and loom.host.worktree_volume.{free,total}_bytes, host label host.name with a host.id fallback. A host that reports no free-space gauge is unknown, never 0 GB. Free space: `loom-daemon clean`/`loom-clean --force`, see troubleshooting.md 'Worker disk full'. Issue #10973."
   },
   "disabled": false
 }
