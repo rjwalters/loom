@@ -1,7 +1,7 @@
 //! `fleet.state` building, anchor/delta decisions, stamps and routing (Issue
 //! #10196). Everything here is pure: no ETA state, no forge.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -13,8 +13,8 @@ use super::{
 };
 use crate::observability::queue::QueueSink;
 use crate::telemetry::kinds::fleet_state::{
-    split_into_chunks, FleetSlot, FleetSlots, FleetStage, PlannerStamps, ANCHOR_INTERVAL_SECS,
-    CHUNK_BYTES,
+    split_into_chunks, FleetSlot, FleetSlots, FleetStage, FleetStateRecord, FleetStateRepo,
+    FleetStateRow, PlannerStamps, ANCHOR_INTERVAL_SECS, CHUNK_BYTES,
 };
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
@@ -83,12 +83,25 @@ fn input() -> FleetInput {
         ready: Some(ReadyQueue {
             items: vec![ready(OTHER, 5, 1), ready(OTHER, 6, 2)],
             listed: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
+            // Forced whole so the diffing path stays covered; the work
+            // finder never reports this until #11139.
+            complete: [REPO, OTHER].iter().map(|s| (*s).to_string()).collect(),
             slots: Some(FleetSlots {
                 max_concurrent: 4,
                 occupancy: Some(1),
             }),
         }),
     }
+}
+
+/// `repo`'s entry in `record`.
+fn entry(record: &FleetStateRecord, repo: &str) -> FleetStateRepo {
+    record
+        .repos
+        .iter()
+        .find(|r| r.repo == repo)
+        .cloned()
+        .unwrap()
 }
 
 fn emitted(view: FleetView, as_of: DateTime<Utc>, anchor_as_of: DateTime<Utc>) -> Emitted {
@@ -225,6 +238,7 @@ fn a_failed_listing_carries_the_last_rows_and_drops_the_census() {
     inp.listings.clear();
     inp.listed_at = None;
     inp.ready.as_mut().unwrap().listed.remove(OTHER);
+    inp.ready.as_mut().unwrap().complete.remove(OTHER);
     inp.ready.as_mut().unwrap().items.clear();
     let second = build_view(&inp, Some(&first), t0() + Duration::minutes(5));
     assert_eq!(second.repos[REPO].rows[&20], first.repos[REPO].rows[&20]);
@@ -455,35 +469,30 @@ fn observed_sources_are_recorded_per_repo() {
     assert!(view.observed[&Source::Ready].contains(OTHER));
 }
 
-/// `ready_complete` is `true` for a repo whose ready listing the tick
-/// completed, and `false` for one it could not (failed, or possibly cut at
-/// one forge page and so left out of `listed`). A flip alone is a change.
+/// `ready_complete` is `true` only for a repo whose ready listing is known
+/// whole (forced here; never so before #11139). A repo read but not known
+/// whole is `false` and `ready_replace`; a flip alone is a change, and the
+/// delta carries the repo's whole ready set.
 #[test]
 fn ready_complete_marks_whether_the_ready_listing_was_whole() {
     let view = build_view(&input(), None, t0());
     let anchor = decide(&view, &stamps(), None, t0()).unwrap();
-    let entry = |record: &crate::telemetry::kinds::fleet_state::FleetStateRecord, repo: &str| {
-        record
-            .repos
-            .iter()
-            .find(|r| r.repo == repo)
-            .cloned()
-            .unwrap()
-    };
     assert!(entry(&anchor, OTHER).ready_complete);
+    assert!(!entry(&anchor, OTHER).ready_replace);
     assert!(entry(&anchor, REPO).ready_complete);
 
-    // OTHER's listing may have been truncated: same rows, not complete.
     let mut inp = input();
-    inp.ready.as_mut().unwrap().listed.remove(OTHER);
+    inp.ready.as_mut().unwrap().complete.remove(OTHER);
     let later = t0() + Duration::minutes(5);
     let second = build_view(&inp, Some(&view), later);
     assert!(!second.ready_complete(OTHER));
     let last = emitted(view, t0(), t0());
     let delta = decide(&second, &stamps(), Some(&last), later).expect("the flip is sent");
     let other = entry(&delta, OTHER);
-    assert!(!other.ready_complete);
-    assert!(other.rows.is_empty() && other.removed.is_empty());
+    assert!(!other.ready_complete && other.ready_replace);
+    let issues: Vec<u32> = other.rows.iter().map(|r| r.issue).collect();
+    assert_eq!(issues, vec![5, 6], "the whole ready set");
+    assert!(other.removed.is_empty());
     assert!(!delta.repos.iter().any(|r| r.repo == REPO), "REPO did not change");
 
     // No tick at all: nothing is complete.
@@ -491,12 +500,15 @@ fn ready_complete_marks_whether_the_ready_listing_was_whole() {
     none.ready = None;
     let view = build_view(&none, None, t0());
     let anchor = decide(&view, &stamps(), None, t0()).unwrap();
-    assert!(anchor.repos.iter().all(|r| !r.ready_complete));
+    assert!(anchor
+        .repos
+        .iter()
+        .all(|r| !r.ready_complete && r.ready_replace));
 }
 
-/// Rows an incomplete read could not see are never sent as `removed[]`: a
-/// review walk that failed (no listing), or a ready listing possibly cut at
-/// one page (not in `listed`) keeps the earlier rows.
+/// Rows a failed read could not see are never sent as `removed[]`: a review
+/// walk that failed (no listing), or a ready listing that failed (not in
+/// `listed`), keeps the earlier rows.
 #[test]
 fn an_incomplete_read_never_removes_what_it_could_not_see() {
     let first = build_view(&input(), None, t0());
@@ -506,6 +518,7 @@ fn an_incomplete_read_never_removes_what_it_could_not_see() {
     inp.listed_at = None;
     let ready = inp.ready.as_mut().unwrap();
     ready.listed.remove(OTHER);
+    ready.complete.remove(OTHER);
     ready.items.retain(|i| i.issue != 6);
     let later = t0() + Duration::minutes(5);
     let second = build_view(&inp, Some(&first), later);
@@ -535,5 +548,170 @@ fn fleet_state_does_not_depend_on_eta() {
         for needle in needles {
             assert!(!source.contains(needle), "source #{i} names {needle}");
         }
+    }
+}
+
+/// A host's state as a reader holds it: rows by repo, then issue.
+type Replayed = BTreeMap<String, BTreeMap<u32, FleetStateRow>>;
+
+/// The documented reader rule (`telemetry-replay.md`, step 3) over one
+/// assembled record: an anchor resets the state; per repo entry, a
+/// `ready_replace` entry first drops every `ready_wait` row of the repo
+/// (once per record), then `removed` is dropped and `rows` upserted. A repo
+/// left with no rows is dropped (the census is not tracked here).
+fn replay(state: &mut Replayed, record: &FleetStateRecord) {
+    if record.anchor {
+        state.clear();
+    }
+    let mut replaced = BTreeSet::new();
+    for entry in &record.repos {
+        let rows = state.entry(entry.repo.clone()).or_default();
+        if entry.ready_replace && replaced.insert(entry.repo.clone()) {
+            rows.retain(|_, row| row.stage != FleetStage::ReadyWait);
+        }
+        for issue in &entry.removed {
+            rows.remove(issue);
+        }
+        for row in &entry.rows {
+            rows.insert(row.issue, row.clone());
+        }
+    }
+    state.retain(|_, rows| !rows.is_empty());
+}
+
+/// The rows of `view`, as [`replay`] holds them.
+fn rows_of(view: &FleetView) -> Replayed {
+    view.repos
+        .iter()
+        .filter(|(_, state)| !state.rows.is_empty())
+        .map(|(repo, state)| (repo.clone(), state.rows.clone()))
+        .collect()
+}
+
+/// One pass of the replay scenario: OTHER's ready items and held sweeps,
+/// whether OTHER's ready listing failed, and whether it is forced whole.
+fn pass(ready_items: &[(u32, u32)], held_other: &[u32], failed: bool, whole: bool) -> FleetInput {
+    let mut inp = input();
+    inp.held.extend(
+        held_other
+            .iter()
+            .map(|&i| held(OTHER, i, FleetStage::SweepCurator, false)),
+    );
+    let queue = inp.ready.as_mut().unwrap();
+    queue.items = ready_items
+        .iter()
+        .map(|&(issue, rank)| ready(OTHER, issue, rank))
+        .collect();
+    if failed {
+        queue.listed.remove(OTHER);
+    }
+    if failed || !whole {
+        queue.complete.clear();
+    }
+    inp
+}
+
+/// Drive `passes` through `build_view` / `decide` / the chunker and the
+/// reader rule. After every pass the reader's state equals the emitter's
+/// view, and an incomplete repo's records never name a `ready_wait` row in
+/// `removed`. Returns each pass's record (if any) and the reader's state.
+fn drive(passes: &[FleetInput]) -> Vec<(Option<FleetStateRecord>, Replayed)> {
+    let mut prev: Option<FleetView> = None;
+    let mut last: Option<Emitted> = None;
+    let mut state = Replayed::new();
+    let mut out = Vec::new();
+    for (i, inp) in passes.iter().enumerate() {
+        let now = t0() + Duration::minutes(5 * i64::try_from(i).unwrap());
+        let view = build_view(inp, prev.as_ref(), now);
+        let record = decide(&view, &stamps(), last.as_ref(), now);
+        if let Some(record) = &record {
+            for entry in record.repos.iter().filter(|e| e.ready_replace) {
+                let held = state.get(&entry.repo).cloned().unwrap_or_default();
+                for issue in &entry.removed {
+                    assert_ne!(
+                        held.get(issue).map(|r| r.stage),
+                        Some(FleetStage::ReadyWait),
+                        "pass {i}: removed[] names ready_wait #{issue}"
+                    );
+                }
+            }
+            // Tiny chunks: the replace rule must hold across a split record.
+            let chunks = split_into_chunks(record.clone(), 600);
+            let mut assembled = chunks[0].clone();
+            assembled.repos = chunks.into_iter().flat_map(|c| c.repos).collect();
+            replay(&mut state, &assembled);
+            last = Some(emitted(view.clone(), now, record.anchor_as_of));
+        }
+        assert_eq!(state, rows_of(&view), "pass {i}: reader diverged");
+        prev = Some(view);
+        out.push((record, state.clone()));
+    }
+    out
+}
+
+/// (a) An issue leaves an incomplete repo's ready queue: the next delta
+/// names the repo with its whole remaining ready set and no `removed[]`
+/// entry, and the reader drops the issue.
+#[test]
+fn an_issue_leaving_an_incomplete_ready_queue_is_replaced_away_not_removed() {
+    let out = drive(&[
+        pass(&[(5, 1), (6, 2)], &[], false, false),
+        pass(&[(5, 1)], &[], false, false),
+    ]);
+    let delta = out[1].0.as_ref().expect("a changed ready set always sends");
+    assert!(!delta.anchor);
+    let other = entry(delta, OTHER);
+    assert!(other.ready_replace && !other.ready_complete);
+    assert_eq!(other.rows.iter().map(|r| r.issue).collect::<Vec<_>>(), vec![5]);
+    assert!(other.removed.is_empty(), "{other:?}");
+    assert!(!out[1].1[OTHER].contains_key(&6));
+}
+
+/// (b) Replayed by the reader rule, no `ready_wait` row of an incomplete
+/// repo survives its absence from the observed set, through departures, a
+/// handoff to a held sweep and back out, rank shifts and an emptied queue. A
+/// failed listing (not an observation) keeps the earlier rows. The same
+/// passes with the repo forced whole reconstruct exactly by plain diffing.
+#[test]
+fn no_ready_row_outlives_its_absence_from_the_observed_set() {
+    type Step = (&'static [(u32, u32)], &'static [u32], bool);
+    let steps: [Step; 8] = [
+        (&[(5, 1), (6, 2), (7, 3)], &[], false),
+        (&[(6, 1), (7, 2)], &[5], false),
+        (&[(7, 1), (6, 2)], &[5], false),
+        (&[(7, 1)], &[], false),
+        (&[(7, 1)], &[], true),
+        (&[], &[], false),
+        (&[(8, 1), (9, 2)], &[], false),
+        (&[(9, 1)], &[8], false),
+    ];
+    for whole in [false, true] {
+        let passes: Vec<FleetInput> = steps
+            .iter()
+            .map(|(items, held, failed)| pass(items, held, *failed, whole))
+            .collect();
+        let out = drive(&passes);
+        for (i, ((items, _, failed), (_, state))) in steps.iter().zip(&out).enumerate() {
+            if *failed {
+                continue;
+            }
+            let observed: BTreeSet<u32> = items.iter().map(|(issue, _)| *issue).collect();
+            let replayed: BTreeSet<u32> = state
+                .get(OTHER)
+                .map(|rows| {
+                    rows.values()
+                        .filter(|r| r.stage == FleetStage::ReadyWait)
+                        .map(|r| r.issue)
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(replayed, observed, "whole={whole} pass {i}");
+        }
+        // The failed pass kept #7; the next observation replaced it away.
+        assert!(out[4].1[OTHER].contains_key(&7));
+        assert!(!out[5]
+            .1
+            .get(OTHER)
+            .is_some_and(|rows| rows.contains_key(&7)));
     }
 }

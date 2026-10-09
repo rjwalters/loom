@@ -158,22 +158,26 @@ What the rows cover is exactly what the host's reads saw:
   sees the listing shift is a failed listing, so the repo's `census` is absent
   and its earlier PR rows are kept, never sent as `removed`.
 - **Ready queue**: every row the planner saw on the host's last work-finder
-  tick. The work finder lists one forge page (100 items) per label until
-  #11139, so that may not be the repo's whole queue. `ready_complete: false`
-  marks a repo whose tick listing failed or may have been cut there; its
-  `ready_wait` rows are not the whole queue, and its earlier ones are kept
-  rather than sent as `removed`. Only a `ready_complete: true` repo's
-  `ready_wait` rows can be read as its full ready queue.
+  tick. The work finder lists one forge page (100 items) per label and cannot
+  yet prove a listing whole, so `ready_complete` is `false` for every repo
+  until #11139: its `ready_wait` rows are not the repo's whole queue. Such a
+  repo is sent with `ready_replace: true`, carrying its **entire** observed
+  `ready_wait` set whenever it is named, and the reader replaces rather than
+  diffs (step 3 below). A repo whose tick listing failed keeps its earlier
+  `ready_wait` rows. Only a `ready_complete: true` repo's `ready_wait` rows
+  can be read as its full ready queue.
 
-A kept row may be an item that has since left; the next complete read of that
-repo replaces or removes it.
+A kept row (after a failed read) may be an item that has since left; the next
+read of that repo replaces or removes it.
 
 - **Anchor** (`loom.fleet.anchor = true`): the host's full view. Sent on the
   first pass of every daemon process, whenever the planner stamps change, and
   at least every 3600 s after that.
 - **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
   something changed. It holds the added or changed rows, the issues that left
-  (`removed`), and the full census and `ready_complete` of each repo it names. `anchor_as_of` names
+  (`removed`), and the full census and `ready_complete` of each repo it names;
+  a `ready_replace` repo's `rows` also hold its whole `ready_wait` set, and its
+  `removed` names no `ready_wait` row. `anchor_as_of` names
   the anchor the delta belongs to, and `prev_as_of` names the record it applies
   on top of.
 - **Chunks**: the emitter has no row cap; it drops none of the rows its reads
@@ -196,9 +200,14 @@ To reconstruct one host's state at `t`:
    complete anchor in that window, the host's state at `t` is **unknown**, not
    empty.
 3. Apply, in `as_of` order, every complete delta whose `anchor_as_of` equals
-   A's `as_of`. For each repo entry, drop the `removed` issues, upsert the
-   `rows` by issue, and replace the census and `ready_complete`. A repo left with no rows and no
-   census is dropped.
+   A's `as_of`. For each repo entry: if it has `ready_replace: true`, first
+   drop **every** `ready_wait` row held for that repo (once per record, before
+   any of the record's rows for the repo, since a repo's entries may span
+   chunks); then drop the `removed` issues, upsert the `rows` by issue, and
+   replace the census and `ready_complete`. A repo left with no rows and no
+   census is dropped. Never infer a `ready_wait` removal from a row's absence
+   except through this replace rule: without `ready_replace` (a
+   `ready_complete: true` repo, or an older emitter) only `removed` removes.
 4. Check the chain. Each applied delta's `prev_as_of` must equal the `as_of`
    of the record applied before it. On a break (a delta lost, incomplete, or
    not yet knowable), the state is exact only up to the break. Report it as

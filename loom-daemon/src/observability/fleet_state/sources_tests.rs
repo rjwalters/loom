@@ -1,9 +1,14 @@
 //! The `fleet.state` reads (Issue #10196): the paged review listings and the
-//! ready-listing truncation check.
+//! ready queue's completeness.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::types::ReadyQueueRow;
+use chrono::Utc;
+
+use super::super::{build_view, decide, Emitted, FleetInput, ReadyItem};
+use crate::telemetry::kinds::fleet_state::PlannerStamps;
+use crate::types::{DispatchPlanContext, ReadyQueueRow, WorkFinderTickSummary};
 
 /// A `gh` stub serving the open-item listings. `loom:review-requested`
 /// answers `rr1.json` on page 1 and `rr2.json` on `&page=2`; the other review
@@ -111,15 +116,67 @@ fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     .unwrap()
 }
 
-/// A root with a full page's worth of rows in the tick may have been cut at
-/// one page; a root with fewer cannot have been.
+/// (c) No repo is ever `ready_complete`, whatever the tick's row count: the
+/// work finder cannot prove a listing whole before #11139 (a full raw page of
+/// PRs and issues can leave 40 ready rows and an unseen issue on page 2).
+/// Every read repo is `listed`, a failed one is not, and the wire marks every
+/// repo `ready_replace`; an issue absent from the tick is replaced away,
+/// never sent in `removed[]`.
 #[test]
-fn a_full_page_of_ready_rows_is_possibly_truncated() {
+fn no_repo_is_ever_ready_complete() {
+    let managed: BTreeSet<String> = ["acme/full", "acme/short", "acme/failed", "acme/idle"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let per_page = u32::try_from(crate::forge_listing::PER_PAGE).unwrap();
-    let mut queue: Vec<ReadyQueueRow> = (1..=per_page).map(|n| row("/src/full", n)).collect();
-    queue.extend((1..per_page).map(|n| row("/src/short", n)));
-    let truncated = super::possibly_truncated(&queue);
-    assert!(truncated.contains("/src/full"));
-    assert!(!truncated.contains("/src/short"));
-    assert!(super::possibly_truncated(&[]).is_empty());
+    let mut summary = WorkFinderTickSummary {
+        plan: Some(DispatchPlanContext::default()),
+        listing_failed: vec!["/src/failed".to_string()],
+        ..WorkFinderTickSummary::default()
+    };
+    summary.queue = (1..=per_page).map(|n| row("/src/full", n)).collect();
+    summary.queue.extend((1..=40).map(|n| row("/src/short", n)));
+    let slug = |root: &str| root.strip_prefix("/src/").map(|r| format!("acme/{r}"));
+
+    let ready = super::ready_from_tick(&summary, slug, &managed);
+    assert!(ready.complete.is_empty(), "{:?}", ready.complete);
+    let listed: Vec<&str> = ready.listed.iter().map(String::as_str).collect();
+    assert_eq!(listed, ["acme/full", "acme/idle", "acme/short"]);
+
+    // On the wire: every repo `ready_complete: false`, `ready_replace: true`.
+    let input = |ready| FleetInput {
+        managed: managed.clone(),
+        ready: Some(ready),
+        ..Default::default()
+    };
+    let now = Utc::now();
+    let mut first = input(ready.clone());
+    first.ready.as_mut().unwrap().items.push(ReadyItem {
+        issue: 999,
+        ..ready.items[crate::forge_listing::PER_PAGE].clone()
+    });
+    let view = build_view(&first, None, now);
+    let anchor = decide(&view, &PlannerStamps::default(), None, now).unwrap();
+    assert!(!anchor.repos.is_empty());
+    assert!(anchor
+        .repos
+        .iter()
+        .all(|r| !r.ready_complete && r.ready_replace));
+
+    // #999 (seen before, absent now, maybe beyond page 1): the short repo
+    // stays incomplete, and #999 is replaced away rather than `removed`.
+    let later = now + chrono::Duration::minutes(5);
+    let second = build_view(&input(ready), Some(&view), later);
+    let last = Emitted {
+        view,
+        stamps: PlannerStamps::default(),
+        as_of: now,
+        anchor_as_of: now,
+    };
+    let delta = decide(&second, &PlannerStamps::default(), Some(&last), later).unwrap();
+    let short = delta.repos.iter().find(|r| r.repo == "acme/short").unwrap();
+    assert!(!short.ready_complete && short.ready_replace);
+    assert!(short.removed.is_empty());
+    assert_eq!(short.rows.len(), 40);
+    assert!(!second.repos["acme/short"].rows.contains_key(&999));
 }

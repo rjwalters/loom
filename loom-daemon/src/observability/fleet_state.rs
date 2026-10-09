@@ -18,8 +18,11 @@
 //! - **`ready_wait` rows**: the work finder's last tick, the same source the
 //!   `queue.snapshot` producer reads, with each row's planner rank and the
 //!   inputs it was ranked on. Nothing re-ranks here. The work finder lists
-//!   one forge page per label (#11139), so a repo whose tick may have been
-//!   cut there is not `ready_complete` and keeps its earlier ready rows.
+//!   one forge page per label and cannot yet prove a listing whole (#11139),
+//!   so no repo is `ready_complete`. Such a repo's ready rows are what the
+//!   tick saw, and every record that names it carries all of them with
+//!   `ready_replace` (see [`decide`]); a repo whose ready listing failed
+//!   keeps its earlier ready rows.
 //!
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
@@ -122,10 +125,13 @@ pub struct ReadyItem {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyQueue {
     pub items: Vec<ReadyItem>,
-    /// Repos whose ready listing the tick completed and could not have cut
-    /// at one forge page. A repo outside it keeps its earlier `ready_wait`
-    /// rows rather than reading the missing ones as gone.
+    /// Repos whose ready listing the tick read without a failure. Their
+    /// `ready_wait` rows are exactly the tick's rows; a managed repo outside
+    /// it keeps its earlier `ready_wait` rows.
     pub listed: BTreeSet<String>,
+    /// Repos whose ready listing is known to be whole (the wire
+    /// `ready_complete`). Always empty until #11139; a subset of `listed`.
+    pub complete: BTreeSet<String>,
     pub slots: Option<FleetSlots>,
 }
 
@@ -164,14 +170,14 @@ pub struct FleetView {
     pub slots: Option<FleetSlots>,
     /// Per-repo state, by lowercased slug.
     pub repos: BTreeMap<String, RepoView>,
-    /// The repos each listing source observed completely this pass.
+    /// The repos each listing source observed completely this pass. For
+    /// [`Source::Ready`] that is the `ready_complete` repos only.
     pub observed: BTreeMap<Source, BTreeSet<String>>,
 }
 
 impl FleetView {
-    /// Whether `repo`'s ready queue was listed completely this pass: the
-    /// work finder's tick listed it and its listing could not have been cut
-    /// at one forge page (the wire `ready_complete`).
+    /// Whether `repo`'s ready queue is known to be whole this pass (the wire
+    /// `ready_complete`). Never true until #11139.
     #[must_use]
     pub fn ready_complete(&self, repo: &str) -> bool {
         self.observed
@@ -264,7 +270,9 @@ fn offer(candidates: &mut Candidates, repo: &str, source: Source, row: FleetStat
 /// a row still in the same stage keeps its entry instant, a row new to a
 /// listing that was complete last pass entered at `now`, and any other row is
 /// first seen mid-stage (`entered_at_lower_bound`). A managed repo whose
-/// listing failed this pass keeps that source's previous rows. Pure.
+/// listing failed this pass keeps that source's previous rows; a repo whose
+/// ready listing was read but not known whole has exactly the tick's ready
+/// rows (no carry-forward, so no ready row outlives its absence). Pure.
 #[must_use]
 pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Utc>) -> FleetView {
     let mut candidates = Candidates::new();
@@ -311,11 +319,14 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
         census.insert(listing.repo.clone(), repo_census);
     }
 
+    // The repos whose ready rows this pass read, whole or not.
+    let mut ready_read: BTreeSet<String> = BTreeSet::new();
     if let Some(ready) = &input.ready {
         observed
             .entry(Source::Ready)
             .or_default()
-            .extend(ready.listed.iter().cloned());
+            .extend(ready.complete.iter().cloned());
+        ready_read.extend(ready.listed.iter().chain(&ready.complete).cloned());
         for item in &ready.items {
             let row = FleetStateRow {
                 rank: Some(item.rank),
@@ -336,9 +347,12 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
     if let Some(prev) = prev {
         for (repo, state) in &prev.repos {
             for (issue, source) in &state.sources {
-                let unseen = matches!(source, Source::Review | Source::Ready)
-                    && input.managed.contains(repo)
-                    && !observed.get(source).unwrap_or(&empty).contains(repo);
+                let read = match source {
+                    Source::Review => observed.get(source).unwrap_or(&empty),
+                    Source::Ready => &ready_read,
+                    Source::Held => continue,
+                };
+                let unseen = input.managed.contains(repo) && !read.contains(repo);
                 if unseen {
                     if let Some(row) = state.rows.get(issue) {
                         offer(&mut candidates, repo, *source, row.clone());
@@ -393,13 +407,15 @@ pub fn needs_anchor(last: Option<&Emitted>, stamps: &PlannerStamps, now: DateTim
 }
 
 fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
+    let ready_complete = view.ready_complete(repo);
     FleetStateRepo {
         repo: repo.to_string(),
         // Tagged by the caller once the record is known to be sent; private
         // until then is the safe default.
         visibility: RepoVisibility::Private,
         census,
-        ready_complete: view.ready_complete(repo),
+        ready_complete,
+        ready_replace: !ready_complete,
         rows: Vec::new(),
         removed: Vec::new(),
     }
@@ -412,6 +428,12 @@ fn repo_entry(view: &FleetView, repo: &str, census: Option<FleetPrCensus>) -> Fl
 ///
 /// The change test ignores `census_at`, which advances every pass; it is
 /// still carried on every record that is sent.
+///
+/// A repo that is not `ready_complete` has `ready_replace` set: its
+/// `ready_wait` rows are not diffed. Every record that names it carries its
+/// whole ready set, it is named whenever that set changed, and no
+/// `ready_wait` row of it is ever sent in `removed`. A reader replaces the
+/// repo's `ready_wait` rows with the set. Other rows are diffed as usual.
 #[must_use]
 pub fn decide(
     view: &FleetView,
@@ -453,29 +475,48 @@ pub fn decide(
     for repo in names {
         let now_state = view.repos.get(repo).unwrap_or(&empty);
         let was = last.view.repos.get(repo).unwrap_or(&empty);
-        let rows: Vec<FleetStateRow> = now_state
+        let entry = repo_entry(view, repo, now_state.census.clone());
+        let replace = entry.ready_replace;
+        // With `ready_replace`, `ready_wait` rows go out as a whole set.
+        let diffed = |row: &FleetStateRow| !replace || row.stage != FleetStage::ReadyWait;
+        let ready_set = |state: &RepoView| -> Vec<FleetStateRow> {
+            state
+                .rows
+                .values()
+                .filter(|row| row.stage == FleetStage::ReadyWait)
+                .cloned()
+                .collect()
+        };
+        let mut rows: Vec<FleetStateRow> = now_state
             .rows
             .iter()
-            .filter(|(issue, row)| was.rows.get(issue) != Some(row))
+            .filter(|(issue, row)| diffed(row) && was.rows.get(issue) != Some(row))
             .map(|(_, row)| row.clone())
             .collect();
         let removed: Vec<u32> = was
             .rows
-            .keys()
-            .filter(|issue| !now_state.rows.contains_key(issue))
-            .copied()
+            .iter()
+            .filter(|(issue, row)| diffed(row) && !now_state.rows.contains_key(issue))
+            .map(|(issue, _)| *issue)
             .collect();
+        let ready_now = ready_set(now_state);
+        let ready_changed = replace && ready_now != ready_set(was);
         if rows.is_empty()
             && removed.is_empty()
+            && !ready_changed
             && now_state.census == was.census
             && view.ready_complete(repo) == last.view.ready_complete(repo)
         {
             continue;
         }
+        if replace {
+            rows.extend(ready_now);
+            rows.sort_by_key(|row| row.issue);
+        }
         repos.push(FleetStateRepo {
             rows,
             removed,
-            ..repo_entry(view, repo, now_state.census.clone())
+            ..entry
         });
     }
     if repos.is_empty() && view.slots == last.view.slots {

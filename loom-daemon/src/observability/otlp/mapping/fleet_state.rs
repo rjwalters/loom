@@ -77,7 +77,8 @@ mod tests {
             repos: vec![FleetStateRepo {
                 repo: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
-                ready_complete: true,
+                ready_complete: false,
+                ready_replace: true,
                 census: Some(FleetPrCensus {
                     open: 1,
                     by_stage: Default::default(),

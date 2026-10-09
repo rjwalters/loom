@@ -11,7 +11,7 @@ use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
 use crate::telemetry::kinds::fleet_state::{FleetSlots, PlannerStamps};
-use crate::types::{ReadyQueueRow, SweepKind};
+use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
 use crate::worktree_ops::gh::{linkage_refs, LinkageKind};
 
@@ -203,23 +203,6 @@ async fn review_listings(roots: &[(PathBuf, String)]) -> Vec<RepoListing> {
     out
 }
 
-/// The repo roots whose ready listing in `queue` may have been cut at one
-/// forge page. The work finder lists each label one page
-/// ([`crate::forge_listing::PER_PAGE`] rows) deep until #11139 and does not
-/// record whether a page was full, so a root with at least a page's worth of
-/// rows in the tick counts as possibly truncated. Pure.
-fn possibly_truncated(queue: &[ReadyQueueRow]) -> BTreeSet<&str> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for row in queue {
-        *counts.entry(row.repo.as_str()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .filter(|(_, n)| *n >= crate::forge_listing::PER_PAGE)
-        .map(|(root, _)| root)
-        .collect()
-}
-
 /// The effective operator priority level the planner ranked `row` on: its
 /// `operator_priority_level` comparator key, else the bare star.
 fn level(row: &ReadyQueueRow) -> u8 {
@@ -241,6 +224,23 @@ async fn ready_queue(
     let summary = crate::work_finder::last_tick_summary()?;
     let refs = crate::observability::queue_snapshot::resolve_repos(&summary, slug_cache).await;
     let slug = |root: &str| refs.get(root).map(|r| r.repo.to_ascii_lowercase());
+    Some(ready_from_tick(&summary, slug, managed))
+}
+
+/// [`ready_queue`] over one tick, with `slug` resolving a root. Pure.
+///
+/// `listed` is every managed repo the tick read without a listing failure. A
+/// single-workspace tick records no rows, so it lists no repo. `complete` is
+/// always empty: the work finder lists one forge page per label and cannot
+/// tell a full page from a short one after it filters out PRs and merges the
+/// side listings, so no repo's ready queue is known to be whole (#11139 adds
+/// that evidence). Every listed repo's ready rows are replaced wholesale on
+/// the wire instead (`ready_replace`).
+fn ready_from_tick(
+    summary: &WorkFinderTickSummary,
+    slug: impl Fn(&str) -> Option<String>,
+    managed: &BTreeSet<String>,
+) -> ReadyQueue {
     let items = summary
         .queue
         .iter()
@@ -259,17 +259,13 @@ async fn ready_queue(
             })
         })
         .collect();
-    // A single-workspace tick records no rows, so it observes no repo. A
-    // failed or possibly truncated listing observes its repo incompletely.
     let listed = if summary.plan.is_some() {
-        let incomplete: BTreeSet<String> = summary
+        let failed: BTreeSet<String> = summary
             .listing_failed
             .iter()
-            .map(String::as_str)
-            .chain(possibly_truncated(&summary.queue))
-            .filter_map(slug)
+            .filter_map(|root| slug(root))
             .collect();
-        managed.difference(&incomplete).cloned().collect()
+        managed.difference(&failed).cloned().collect()
     } else {
         BTreeSet::new()
     };
@@ -277,11 +273,12 @@ async fn ready_queue(
         max_concurrent: small(plan.slots.max_concurrent),
         occupancy: plan.slots.occupancy.map(small),
     });
-    Some(ReadyQueue {
+    ReadyQueue {
         items,
         listed,
+        complete: BTreeSet::new(),
         slots,
-    })
+    }
 }
 
 /// Everything one pass reads.

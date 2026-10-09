@@ -26,6 +26,8 @@
 //! [`ANCHOR_INTERVAL_SECS`]. Between anchors it sends a **delta**
 //! (`anchor: false`) only when something changed: the changed or added rows,
 //! the issues that left (`removed`), and the full census of each repo it names.
+//! A repo flagged `ready_replace` carries its whole `ready_wait` set instead
+//! of a ready diff ([`FleetStateRepo::ready_replace`]).
 //!
 //! There is **no row cap**. A record whose JSON would exceed
 //! [`CHUNK_BYTES`] is split by [`split_into_chunks`] into several records that
@@ -241,14 +243,22 @@ pub struct FleetStateRepo {
     /// listings were incomplete or not read. It never means zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub census: Option<FleetPrCensus>,
-    /// The work finder's last tick listed this repo's ready queue completely,
-    /// so its `ready_wait` rows are every ready issue the planner saw there.
-    /// `false` when that listing failed, was not read, or may have been cut
-    /// at one forge page (the work finder lists one page deep until #11139):
-    /// a reader must not treat the repo's `ready_wait` rows as its whole
-    /// queue then. Always sent; missing (an older emitter) decodes to `false`.
+    /// The work finder's last tick is known to have listed this repo's whole
+    /// ready queue. Always `false` until #11139 lets the work finder prove a
+    /// listing whole: a reader must not treat a `false` repo's `ready_wait`
+    /// rows as its whole queue. Always sent; missing (an older emitter)
+    /// decodes to `false`.
     #[serde(default)]
     pub ready_complete: bool,
+    /// `rows` carries this repo's **entire** `ready_wait` set, not a diff:
+    /// a reader first drops every `ready_wait` row it holds for the repo,
+    /// then applies `removed` and `rows`. It never infers a ready removal
+    /// from absence otherwise, and `removed` names no `ready_wait` row of
+    /// the repo. Set exactly when `ready_complete` is `false`; on a chunked
+    /// record the drop happens once, before any chunk's rows. Missing (an
+    /// older emitter) decodes to `false`: plain diffing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready_replace: bool,
     /// On an anchor, every row. On a delta, rows added or changed since the
     /// previous record. Ordered by issue.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -348,7 +358,8 @@ fn json_len<T: Serialize>(value: &T) -> usize {
 /// Every chunk shares the header (`as_of`, `anchor`, stamps, `slots`, ...);
 /// the repos' rows and `removed` entries are packed in order, so the union of
 /// the chunks is exactly `record`: nothing is dropped. A repo whose entries
-/// span chunks repeats its `repo`, `visibility` and `census` in each. Pure.
+/// span chunks repeats its `repo`, `visibility`, `census`, `ready_complete`
+/// and `ready_replace` in each. Pure.
 #[must_use]
 pub fn split_into_chunks(mut record: FleetStateRecord, max_bytes: usize) -> Vec<FleetStateRecord> {
     record.chunk_index = 0;

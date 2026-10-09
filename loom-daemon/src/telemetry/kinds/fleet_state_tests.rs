@@ -69,6 +69,7 @@ fn record() -> FleetStateRecord {
             repo: "rjwalters/loom".to_string(),
             visibility: RepoVisibility::Public,
             ready_complete: true,
+            ready_replace: false,
             census: Some(FleetPrCensus {
                 open: 2,
                 by_stage: [("review_wait".to_string(), 2)].into_iter().collect(),
@@ -89,6 +90,7 @@ fn anchor_with(n: u32) -> FleetStateRecord {
             repo: (*repo).to_string(),
             visibility: RepoVisibility::Private,
             ready_complete: true,
+            ready_replace: false,
             census: Some(FleetPrCensus::default()),
             rows: (0..n)
                 .filter(|k| k % 3 == u32::try_from(i).unwrap())
@@ -329,6 +331,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/a".to_string(),
             visibility: RepoVisibility::Private,
             ready_complete: true,
+            ready_replace: false,
             census: None,
             rows: (0..40).map(|k| ready_row(k, k + 1)).collect(),
             removed: (1000..1400).collect(),
@@ -337,6 +340,7 @@ fn removals_and_census_only_repos_survive_a_split() {
             repo: "acme/b".to_string(),
             visibility: RepoVisibility::Private,
             ready_complete: true,
+            ready_replace: false,
             census: Some(FleetPrCensus::default()),
             rows: Vec::new(),
             removed: Vec::new(),
@@ -357,6 +361,37 @@ fn removals_and_census_only_repos_survive_a_split() {
     for c in &chunks {
         assert!(serde_json::to_vec(c).unwrap().len() <= 2_000);
     }
+}
+
+/// `ready_replace` is sent only when set, a missing one (an older emitter)
+/// decodes to plain diffing, and a repo split across chunks repeats it in
+/// every chunk so a reader can apply the replace rule to the whole record.
+#[test]
+fn ready_replace_is_additive_and_rides_every_chunk() {
+    let mut r = record();
+    let wire = serde_json::to_value(&r).unwrap();
+    assert!(wire["repos"][0].get("ready_replace").is_none());
+    let back: FleetStateRepo =
+        serde_json::from_value(serde_json::json!({"repo": "acme/old"})).unwrap();
+    assert!(!back.ready_replace);
+
+    r.repos = vec![FleetStateRepo {
+        repo: "acme/a".to_string(),
+        visibility: RepoVisibility::Private,
+        ready_complete: false,
+        ready_replace: true,
+        census: None,
+        rows: (0..60).map(|k| ready_row(k, k + 1)).collect(),
+        removed: Vec::new(),
+    }];
+    let wire = serde_json::to_value(&r).unwrap();
+    assert_eq!(wire["repos"][0]["ready_replace"], serde_json::json!(true));
+    let chunks = split_into_chunks(r, 2_000);
+    assert!(chunks.len() > 1);
+    assert!(chunks
+        .iter()
+        .flat_map(|c| &c.repos)
+        .all(|repo| repo.ready_replace && !repo.ready_complete));
 }
 
 /// A record from before the chunk fields decodes as one complete chunk.
