@@ -7,6 +7,7 @@ mod ci;
 mod eta;
 mod fact_id;
 mod fleet_state;
+mod host_export;
 mod metadata;
 mod ops;
 mod pass;
@@ -633,6 +634,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         }
         TelemetryRecord::AutoUpdateTick(_)
         | TelemetryRecord::TokenRankingRefresh(_)
+        | TelemetryRecord::HostExport(_)
         | TelemetryRecord::PassSummary(_)
         | TelemetryRecord::PassVerdict(_)
         | TelemetryRecord::FleetState(_) => {
@@ -646,6 +648,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let r = &envelope.record;
             let (event_name, severity, at, attributes, body) = auto_update::log_parts(r)
                 .or_else(|| token_ranking::log_parts(r))
+                .or_else(|| host_export::log_parts(r))
                 .or_else(|| pass::log_parts(r))
                 .or_else(|| fleet_state::log_parts(r))?;
             time_unix_nano = at;

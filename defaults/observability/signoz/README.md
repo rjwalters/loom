@@ -373,6 +373,14 @@ host readings, a genuine reset, 1 s reset jitter, two interleaved windows, an
 owner-less legacy point). Queries 0–4 have also been run read-only against the
 live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
 
+### Export coverage and drops
+
+`host-export-queries.sql` (#11124) answers "which hosts are losing telemetry,
+or not reporting their export view?" from the `host.export` logs: (1) hosts
+whose cumulative `dropped_total` grew in the last 2 h (a decrease is read as a
+daemon restart), and (2) hosts with other Loom logs but no `host.export` in
+that window. Not yet executed in CI against the pinned ClickHouse.
+
 ### Pass activity
 
 `pass-queries.sql` (#10752) answers "what did the daemon's hold-cleanup pass

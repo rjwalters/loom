@@ -683,6 +683,48 @@ pub fn global_export_statuses(
         .collect()
 }
 
+/// Process-global per-exporter queues (Issue #11124), keyed like
+/// [`GLOBAL_EXPORT_STATUSES`], so the `host.export` record can read each
+/// exporter's depth and lifetime drop count. Last-wins, for the same reason.
+static GLOBAL_EXPORT_QUEUES: std::sync::Mutex<
+    Option<std::collections::BTreeMap<String, Arc<DurableQueue>>>,
+> = std::sync::Mutex::new(None);
+
+/// Publish the per-exporter queues as the process-global (Issue #11124).
+pub fn register_global_export_queues(
+    queues: std::collections::BTreeMap<String, Arc<DurableQueue>>,
+) {
+    *GLOBAL_EXPORT_QUEUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(queues);
+}
+
+/// Every running exporter's queue depth and lifetime drop count, keyed by
+/// exporter name. Empty when no exporter started.
+#[must_use]
+pub fn global_export_queue_stats(
+) -> std::collections::BTreeMap<String, crate::telemetry::kinds::host_export::QueueStats> {
+    let guard = GLOBAL_EXPORT_QUEUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .as_ref()
+        .map(|map| {
+            map.iter()
+                .map(|(name, queue)| {
+                    (
+                        name.clone(),
+                        crate::telemetry::kinds::host_export::QueueStats {
+                            depth: u64::try_from(queue.len()).unwrap_or(u64::MAX),
+                            dropped_total: queue.dropped_total(),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// **env(singular) > config list > config singular > default (`[https]`)**
 /// (Issue #8756). Resolves the full exporter list [`spawn_task`] fans out to:
 ///
@@ -1079,6 +1121,8 @@ pub fn spawn_task(
     // `async-trait`).
     let mut sender_handles = Vec::with_capacity(planned.len());
     let mut queues: Vec<Arc<DurableQueue>> = Vec::with_capacity(planned.len());
+    let mut export_queues: std::collections::BTreeMap<String, Arc<DurableQueue>> =
+        std::collections::BTreeMap::new();
     // The OTLP-only subset, for the `ops` sink (Issue #8860).
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
@@ -1216,6 +1260,7 @@ pub fn spawn_task(
         } else {
             native_queues.push(queue.clone());
         }
+        export_queues.insert(name.to_string(), queue.clone());
         queues.push(queue);
         sender_handles.push(sender_handle);
     }
@@ -1224,6 +1269,7 @@ pub fn spawn_task(
         register_global_export_status(primary_status_for(&entries, &statuses));
         return None;
     }
+    register_global_export_queues(export_queues);
     let fanout = Arc::new(queue::FanoutQueue::new(queues));
     // `session.summary` emission (Issue #8757, fanned out by #8756): hand the
     // transcript-ingest thread the same fan-out sink every other producer

@@ -240,6 +240,7 @@ cycle) is added only when loom-ui's error tracking shows it is needed.
 | `loom.queue.oldest_wait`, `loom.queue.starved[.by_reason]`, `loom.queue.dispatch_wait[.samples]` ([`metric.points`](#metricpoints)) | metric | `observability/ops/dwell.rs` |
 | [`loom.dispatch.disposition`](#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting) rows (`loom.queue.*` attributes) and `loom.queue.disposition_rows_dropped` | span + metric, OTLP only | `observability/ops/disposition.rs` |
 | [`host.health`](#hosthealth) | gauges, native + OTLP | `observability/collector.rs` (+ `exporter.rs`, `sender.rs`) |
+| [`host.export`](#hostexport) | log, OTLP only | `observability/collector.rs` |
 | Captain gauges: `loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`, `loom.forge.stage_dwell`, `loom.forge.stage_items` ([`metric.points`](#metricpoints)) | metric | `observability/captain_gauges.rs`, `observability/ops/stage_dwell.rs` |
 
 The captain gauges are emitted by non-ETA code. Since Stage 2 of #11098,
@@ -3218,6 +3219,37 @@ like `worktree_root_free_gb`. The same fields ride **span-boundary trace
 attributes** (`loom.host.*`) on role attempts — see
 [tracing.md](tracing.md) — so the state is captured at the decision moment,
 not only on each 30 s sampling cadence.
+
+### `host.export`
+
+This host's own view of its telemetry export (Issue #11124, R2 of #10196).
+One record per `host.health` interval, emitted from the same collector tick.
+Envelopes carry `schema_version: 12`. **OTLP-only** (native: `false`). The body
+is the record's JSON. The host-wide sums ride as `loom.host_export.*`
+attributes (`HOST_EXPORT_LOG_ATTRIBUTE_KEYS`, which the collector's
+`transform/privacy` allowlists). Severity is `WARN` when no exporter is active
+and `INFO` otherwise. Facts only: every host emits its own view, nothing is
+elected, there are no caps, and no rate or estimate is computed in the daemon.
+
+| Field | Type | Notes |
+|---|---|---|
+| `captured_at` | RFC3339 | when the view was sampled; the record time |
+| `host` | string | the sampling host |
+| `exporters` | array | one entry per exporter that started in this process, sorted by name |
+| `exporters[].name` | string | `https` or `otlp` |
+| `exporters[].queue_depth` | integer | envelopes queued, waiting for a flush |
+| `exporters[].dropped_total` | integer | envelopes dropped (oldest first) at a full queue |
+| `exporters[].last_flush_ok_at` | RFC3339? | last acked batch; omitted when none this process (unknown, not a fabricated time) |
+
+Attributes: `loom.host_export.exporters` (count), `.queue_depth` (sum),
+`.dropped_total` (sum), `.last_flush_ok_at` (latest).
+
+**`dropped_total` is cumulative per process lifetime.** It restarts at 0 when
+the daemon restarts, so a reader computing "drops in a window" must treat a
+decrease as a counter reset (take the post-reset value, not a negative delta).
+The committed query is
+[`host-export-queries.sql`](../observability/signoz/host-export-queries.sql):
+hosts with drops, or with no `host.export` at all, in the last 2 h.
 
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 

@@ -232,6 +232,8 @@ fn samples() -> Vec<TelemetryRecord> {
         wire(json!({"kind": "fleet.state", "schema": "fleet-state/v1", "as_of": AT,
                     "anchor": true,
                     "anchor_as_of": AT, "repos": []})),
+        wire(json!({"kind": "host.export", "captured_at": AT, "host": "host-a",
+                    "exporters": []})),
         wire(json!({"kind": "eta.fit", "check_id": "c", "trigger": "t", "started_at": AT,
                     "outcome": "skipped", "snapshots": 0, "duration_ms": 0, "loom": p})),
         TelemetryRecord::PickDecision(pick_decision()),

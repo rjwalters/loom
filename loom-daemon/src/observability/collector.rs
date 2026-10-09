@@ -958,6 +958,17 @@ async fn sample_snapshots(
     )
     .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // This host's export view (Issue #11124): per-exporter queue depth,
+    // cumulative drops and last flush. Facts only; every host emits its own.
+    queue.offer(TelemetryEnvelope::new(
+        host_id,
+        TelemetryRecord::HostExport(crate::telemetry::kinds::host_export::HostExportRecord::build(
+            host_id,
+            Utc::now(),
+            &super::global_export_statuses(),
+            &super::global_export_queue_stats(),
+        )),
+    ));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
