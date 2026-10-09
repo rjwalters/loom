@@ -11,10 +11,9 @@
 //! `land-2026-10-04-twin-otter-b` (#10244) for PR stages, and its module stays
 //! for `-b`, keen-wren, held-heron and the fit (`recompute`, `adapt_input`,
 //! `visit_*`, `DRAW_ORDER`).
-//! `land-2026-10-06-even-lark` (#10489) and `land-2026-10-06-quick-tern`
-//! (#10524) are calibration wrappers over `land-v2` and
-//! `land-2026-10-04-twin-otter-b` respectively (even-lark replaced the
-//! log-scale `land-2026-10-06-calm-plover`, retired and removed in #10489).
+//! `land-2026-10-06-even-lark` (#10489) is a calibration wrapper over
+//! `land-v2` (it replaced the log-scale `land-2026-10-06-calm-plover`,
+//! retired and removed in #10489).
 //! `land-2026-10-06-held-heron` (#10523) is twin-otter-b with a held or
 //! sequenced PR routed to the competing-risks simulator
 //! ([`crate::eta::hazard_sim`]).
@@ -22,9 +21,11 @@
 //! successor: the same evaluation over an `eta-fit/v2` file.
 //! `land-2026-10-06-brisk-petrel` (#10528) is twin-otter-b scaled by the
 //! drift-gated latent-regime residual adjustment ([`crate::eta::regime`]).
-//! `land-2026-10-06-swift-tern` (#10524) is quick-tern made drift-aware
-//! (#10528's drift check: shorter half-life; the inflation the check asks
-//! for is recorded, not applied).
+//! The IPCW-wrapped shadows `land-2026-10-06-quick-tern`, `-swift-tern` and
+//! `-bold-lark` (#10524) are retired and removed (#10949): the 2026-10-08
+//! walk-forward scored them 7–13 h of pinball4 worse than `land-v1`. The
+//! wrapper itself stays offline ([`crate::eta::conformal_wrap`], `eta
+//! backtest --wrap`); their ids are kept below so they are never reused.
 //! `land-2026-10-06-loop-kite` (#10521) is keen-wren's friction-aware
 //! successor: the same evaluation over an `eta-fit/v3` file, which adds the
 //! review-loop, Judge-rate, file-overlap and own-CI predictors and the
@@ -32,15 +33,12 @@
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
-mod land_bold_lark;
 mod land_brisk_petrel;
 mod land_dependency;
 mod land_even_lark;
 mod land_held_heron;
 mod land_keen_wren;
 mod land_loop_kite;
-mod land_quick_tern;
-mod land_swift_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
 mod land_v1;
@@ -51,7 +49,6 @@ mod little_v0;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
-pub use land_bold_lark::{LandBoldLark, LAND_BOLD_LARK};
 pub use land_brisk_petrel::{LandBriskPetrel, LAND_BRISK_PETREL};
 pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
 pub use land_even_lark::{LandEvenLark, LAND_EVEN_LARK};
@@ -61,8 +58,6 @@ pub use land_held_heron::{
 };
 pub use land_keen_wren::{LandKeenWren, LAND_KEEN_WREN, PRE_PR_METHOD as KEEN_WREN_PRE_PR_METHOD};
 pub use land_loop_kite::{LandLoopKite, LAND_LOOP_KITE};
-pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
-pub use land_swift_tern::{LandSwiftTern, LAND_SWIFT_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
     adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
@@ -75,8 +70,25 @@ pub use land_v3::{
     INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
 };
 pub use land_v4::{LandV4, LAND_V4};
-pub use little_v0::{is_shadow_only, wait_sec, LittleV0, LITTLE_V0};
+pub use little_v0::{
+    is_shadow_only, recompute as recompute_little_v0, wait_sec, LittleV0, LITTLE_V0,
+    MAX_SHAPE as LITTLE_V0_MAX_SHAPE,
+};
 pub use start_v1::{StartV1, START_V1};
+
+/// `land-2026-10-06-quick-tern` (#10524): twin-otter-b wrapped by IPCW
+/// split-conformal. Retired and removed (#10949); the id is never reused.
+/// `IpcwWrap::new(LAND_QUICK_TERN, LandTwinOtterB, Calibrator::Ipcw)`
+/// ([`crate::eta::conformal_wrap`]) reproduces it offline.
+pub const LAND_QUICK_TERN: &str = "land-2026-10-06-quick-tern";
+
+/// `land-2026-10-06-swift-tern` (#10524): quick-tern made drift-aware
+/// (`Calibrator::IpcwDrift`). Retired and removed (#10949).
+pub const LAND_SWIFT_TERN: &str = "land-2026-10-06-swift-tern";
+
+/// `land-2026-10-06-bold-lark` (#10524): keen-wren wrapped by IPCW
+/// split-conformal. Retired and removed (#10949).
+pub const LAND_BOLD_LARK: &str = "land-2026-10-06-bold-lark";
 
 /// The heuristic whose track record the calibration log (#10207) records.
 /// (The `land-2026-10-04-amber-heron` shadow that consumed it was retired
@@ -86,9 +98,12 @@ pub const CALIBRATION_BASE: &str = LAND_V2;
 
 /// Every heuristic whose landed and still-open `land` estimates are kept as
 /// calibration evidence ([`crate::eta::calibration_log`]): [`CALIBRATION_BASE`]
-/// for `land-2026-10-06-even-lark`, and [`LAND_TWIN_OTTER_B`] for
-/// `land-2026-10-06-quick-tern` and `land-2026-10-06-swift-tern` (#10524), and
-/// [`LAND_KEEN_WREN`] for `land-2026-10-06-bold-lark` (#10524). Each calibrator filters the rows
+/// for `land-2026-10-06-even-lark`, and [`LAND_TWIN_OTTER_B`] and
+/// [`LAND_KEEN_WREN`], the bases the offline IPCW wrapper
+/// ([`crate::eta::conformal_wrap`], `eta backtest --wrap`) and the
+/// conformal-over-twin-otter-b follow-up (#10950) calibrate against. Their
+/// registered wrappers (quick-tern, swift-tern, bold-lark, #10524) are
+/// retired (#10949); the evidence is kept. Each calibrator filters the rows
 /// on its own base, so they never mix.
 pub const CALIBRATION_BASES: &[&str] = &[CALIBRATION_BASE, LAND_TWIN_OTTER_B, LAND_KEEN_WREN];
 
@@ -175,6 +190,7 @@ fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation
     }
     explanation.result = None;
     explanation.contributions = None;
+    explanation.stage_predictions.clear();
     explanation.combination = None;
     explanation.twin_otter = None;
     explanation.enforce_cap();
@@ -237,6 +253,8 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         no_estimate_reason: None,
         stalled: stall::binding(&input.stalls, as_of),
         truncated: Vec::new(),
+        replayable: None,
+        replayable_reason: None,
         recalibration: None,
         calibration: None,
         twin_otter: None,
@@ -245,6 +263,7 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         regime_adjustment: None,
         planner_version: None,
         held_heron: None,
+        stage_predictions: std::collections::BTreeMap::new(),
     }
 }
 
@@ -581,6 +600,7 @@ fn finish_estimate(
         tail_extrapolated,
     });
     explanation.contributions = Some(simulation.contributions);
+    explanation.stage_predictions = simulation.stage_predictions;
     explanation.enforce_cap();
     explanation
 }

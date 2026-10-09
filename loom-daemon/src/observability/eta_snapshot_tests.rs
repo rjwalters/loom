@@ -80,6 +80,7 @@ fn summary(
         stage_quartiles: Vec::new(),
         tail_extrapolated: false,
         stall_cause: None,
+        stage_predictions: Default::default(),
     }
 }
 
@@ -636,13 +637,12 @@ fn registering_a_fifteenth_land_heuristic_fails_loudly() {
     assert!(land - 1 <= crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
 }
 
-/// #10521: `land-2026-10-06-loop-kite` is the fourteenth land heuristic, so
-/// the daemon carries 13 alternates. A loom-ui still slicing at the old 12
-/// drops only the 13th by id: with the shipped registry and the default
-/// `current`, `little-v0`, a baseline the chooser never offers. So either
-/// deploy order loses no candidate.
+/// #10521 made `land-2026-10-06-loop-kite` the fourteenth land heuristic
+/// (13 alternates); #10949 retired the three IPCW arms, so `land` registers
+/// 11 and a snapshot row carries 10 alternates. Every one attaches, and a
+/// loom-ui still slicing at the old 12 drops none of them.
 #[test]
-fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_only_a_baseline() {
+fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_none() {
     let registered = registered();
     let pending: Vec<EstimateSummary> = registered[&Kind::Land]
         .iter()
@@ -651,14 +651,15 @@ fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_only_a_basel
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
     assert_eq!(list.len(), registered[&Kind::Land].len() - 1, "the daemon drops none");
-    let past_old_cap: Vec<&str> = list[12..].iter().map(|e| e.heuristic.as_str()).collect();
-    assert_eq!(past_old_cap, ["little-v0"]);
-    assert_eq!(Registry::builtin().tier_of("little-v0"), Some(crate::eta::Tier::Baseline));
+    assert_eq!(list.len(), 10, "the IPCW arms are no longer alternates (#10949)");
+    assert!(list.len() <= 12, "an old twelve-slice loom-ui drops none");
 }
 
 /// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
 /// live shadow set, #10549 `land-2026-10-04-fresh-tide`, #10528
-/// `land-2026-10-04-twin-otter`, and #10489 `land-2026-10-06-calm-plover`. Pending
+/// `land-2026-10-04-twin-otter`, #10489 `land-2026-10-06-calm-plover`, and
+/// #10949 the IPCW arms `land-2026-10-06-quick-tern`, `-swift-tern` and
+/// `-bold-lark`. Pending
 /// estimates restored from disk that still name them are never offered as
 /// `alternates[]`; the live shadows are.
 #[test]
@@ -669,6 +670,9 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         "land-2026-10-04-fresh-tide",
         "land-2026-10-04-twin-otter",
         "land-2026-10-06-calm-plover",
+        "land-2026-10-06-quick-tern",
+        "land-2026-10-06-swift-tern",
+        "land-2026-10-06-bold-lark",
     ];
     let registered = registered();
     for id in retired {
@@ -682,6 +686,9 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         summary(REPO, 1, Kind::Land, "land-2026-10-04-fresh-tide", 0, Some(500)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-twin-otter", 0, Some(400)),
         summary(REPO, 1, Kind::Land, "land-2026-10-06-calm-plover", 0, Some(400)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-quick-tern", 0, Some(300)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-swift-tern", 0, Some(300)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-bold-lark", 0, Some(300)),
     ];
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
@@ -898,4 +905,43 @@ fn rows_too_large_for_the_budget_are_cut_by_bytes() {
     assert!(bytes > MAX_RECORD_BYTES - 2 * row - 1_024, "cut early: {bytes} B");
     // The survivors are the first by issue number.
     assert_eq!(record.rows.last().unwrap().issue, u32::try_from(record.rows.len()).unwrap());
+}
+
+/// #10929: a row's own stage forecast never costs a row. It rides in row
+/// order while it fits, before any alternate, and the record stays within
+/// the budget.
+#[test]
+fn stage_forecasts_ride_before_alternates_and_never_cost_a_row() {
+    use crate::eta::stage_forecast::StagePrediction;
+    use crate::telemetry::kinds::eta_snapshot::MAX_RECORD_BYTES;
+    let (mut selected, alternates) = fleet(700, |i| (Kind::Land, (i % 5 != 4).then_some(3_600)));
+    let forecast = |entry: i64| StagePrediction {
+        entry_p50: entry,
+        entry_p90: entry * 3,
+        dwell_p50: 2_400,
+        dwell_p90: 10_800,
+        alloc: 2_000,
+        reach_pct: 100,
+    };
+    for estimate in selected.iter_mut().filter(|e| e.p50_sec.is_some()) {
+        estimate.stage_predictions = [
+            (Stage::ReviewWait, forecast(0)),
+            (Stage::Doctor, forecast(2_400)),
+            (Stage::MergeWait, forecast(4_800)),
+        ]
+        .into();
+    }
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), 700, "a forecast never costs a row");
+    assert!(wire_bytes(&record) <= MAX_RECORD_BYTES);
+    let staged = record.rows.iter().filter(|r| !r.stages.is_empty()).count();
+    assert_eq!(staged, 560, "every estimating row keeps its forecast");
+    assert!(record.rows[..560].iter().all(|r| r.stages.len() == 3));
+    assert!(
+        record.rows[560..].iter().all(|r| r.stages.is_empty()),
+        "refusals forecast nothing"
+    );
+    let row = &record.rows[0].stages[&Stage::Doctor];
+    assert_eq!((row.entry_p50, row.entry_p90, row.reach_pct), (2_400, 7_200, 100));
+    assert_alternates_are_a_prefix(&record);
 }

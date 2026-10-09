@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::memory::FailureKind;
 use super::{
-    cooldown, daemon, git, record_failure, refused, stamp, Alert, Candidate, Env, Memory, Scan,
-    WState, WorkspaceReport,
+    daemon, git, record_failure, refused, stamp, Alert, Candidate, Env, Memory, Scan, WState,
+    WorkspaceReport,
 };
 use crate::fleet_store::resync_claim::{stale_after, Acquire, Claimant, ForgeUnreachable, Held};
 use crate::init::payload::{gate_metadata, resync_workspace_with, Payload, ResyncOutcome};
@@ -27,8 +27,6 @@ pub(super) enum Bound {
     /// This repo was already resynced to the running version and is stale
     /// again. Never resynced a second time at this version.
     Loop(String),
-    /// Some daemon resynced this repo less than [`cooldown`] ago.
-    Cooling(DateTime<Utc>),
 }
 
 /// The loop bound for the default branch at `commit`, which the caller knows
@@ -39,12 +37,12 @@ pub(super) enum Bound {
 /// * This process resynced the repo to the running version already: `Loop`.
 /// * The branch's recent history carries a resync commit for the running
 ///   version, from any host: `Loop`.
-/// * It carries a resync commit, for any version, younger than
-///   [`cooldown`]: `Cooling`.
 ///
-/// So a repo gets at most one daemon resync commit per version fleet-wide,
-/// and at most one per cooldown. Local: it reads history already in the
-/// clone.
+/// So a repo gets at most one daemon resync commit per version fleet-wide.
+/// That is the whole bound (#10987 removed a 15-minute wait between any two
+/// resync commits): a resync to another version is not a loop, and a host
+/// never installs a version older than the repo's. Local: it reads history
+/// already in the clone.
 pub(super) fn bound(env: &Env<'_>, root: &Path, commit: &str, memory: &Memory) -> Result<Bound> {
     let version = env.running.to_string();
     if let Some((_, earlier)) = memory.resynced.get(root).filter(|(v, _)| *v == version) {
@@ -61,15 +59,7 @@ pub(super) fn bound(env: &Env<'_>, root: &Path, commit: &str, memory: &Memory) -
             short(&p.commit)
         )));
     }
-    let window =
-        chrono::Duration::from_std(cooldown(env.interval)).unwrap_or(chrono::Duration::MAX);
-    let now = (env.clock)();
-    Ok(match past.first() {
-        // Either side of now: a committer clock that is ahead must not make
-        // the cooldown vanish.
-        Some(p) if (now - p.at).abs() < window => Bound::Cooling(p.at + window),
-        _ => Bound::Clear,
-    })
+    Ok(Bound::Clear)
 }
 
 /// Say that the loop bound refused `report`'s repo: in the report, in the
@@ -83,7 +73,6 @@ fn refuse_loop(
 ) {
     let version = env.running;
     report.reason = Some(format!("resync-loop: {detail}; not resynced again at v{version}"));
-    memory.hold(&report.root);
     if !memory
         .noted
         .insert(format!("loop:{}:{version}", report.root.display()))
@@ -180,15 +169,20 @@ pub(super) fn attempt(
             refuse_loop(env, report, &detail, memory, &mut scan.alerts);
             return false;
         }
-        Ok(Bound::Cooling(until)) => {
-            report.reason = Some(format!("resynced recently; cooling down until {}", stamp(until)));
-            return false;
-        }
         Err(e) => {
             let detail = format!("{e:#}");
             record_failure(env, report, FailureKind::Other, &detail, memory, &mut scan.alerts);
             return false;
         }
+    }
+    // The disk floor, before any claim (#10995): the first thing done under
+    // the claim is a fetch, and below the floor that fetch is skipped. So no
+    // claim is taken for it and no forge request spent. Not a failure: no
+    // backoff, no alert, and the next candidate (perhaps on another volume)
+    // still gets its turn.
+    if let Some(low) = crate::fetch_headroom::skip_reason(&root) {
+        skip_low_disk(report, &low);
+        return false;
     }
     // The gate again, immediately before the claim: classification may have
     // taken a while, and a pause or a roll may have started since.
@@ -285,11 +279,20 @@ fn settle_current(
     memory: &mut Memory,
 ) {
     let version = env.running.to_string();
-    memory.settle(root, branch, commit, &version, report, true, (env.clock)(), env.interval);
+    memory.settle(root, branch, commit, &version, report);
+}
+
+/// Report a resync that was not tried because the checkout's volume is below
+/// the disk floor (#10995). It says nothing about the remote or the repo, so
+/// it is not counted anywhere: the state stays what classification found.
+fn skip_low_disk(report: &mut WorkspaceReport, low: &str) {
+    log::info!("workspace_resync: {}: low-disk: {low}", report.root.display());
+    report.reason = Some(format!("low-disk: {low}"));
 }
 
 /// Count a failed attempt: an unreachable remote or forge for the host (one
-/// alert for the outage), anything else against the repo.
+/// alert for the outage), anything else against the repo. A fetch skipped
+/// below the disk floor is not a failure and is counted against neither.
 fn fail_attempt(
     env: &Env<'_>,
     nwo: &str,
@@ -298,14 +301,28 @@ fn fail_attempt(
     memory: &mut Memory,
     scan: &mut Scan,
 ) {
+    // The disk fell below the floor after the check in `attempt` (#10995).
+    // The claim, if one was held, is already released by its guard.
+    if let Some(low) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<git::LowDisk>())
+    {
+        skip_low_disk(report, &low.0);
+        return;
+    }
     let detail = format!("{error:#}");
     let unreachable = error.chain().any(|cause| {
         cause.downcast_ref::<git::Unreachable>().is_some()
             || cause.downcast_ref::<ForgeUnreachable>().is_some()
     });
+    let refused = error
+        .chain()
+        .any(|cause| cause.downcast_ref::<git::Refused>().is_some());
     let kind = if unreachable {
         scan.no_answer(&report.root, nwo, &detail, memory);
         FailureKind::Unreachable
+    } else if refused {
+        FailureKind::Refused
     } else {
         FailureKind::Other
     };
@@ -389,15 +406,8 @@ impl Step<'_, '_> {
         // There is something to push. The loop bound again, on the head that
         // was just read: another host may have resynced this version while
         // the claim was being taken.
-        match bound(env, root, self.commit, self.memory)? {
-            Bound::Clear => {}
-            Bound::Loop(detail) => return Ok(Done::Loop(detail)),
-            Bound::Cooling(until) => {
-                return Ok(Done::Aborted(format!(
-                    "resynced recently; cooling down until {}",
-                    stamp(until)
-                )));
-            }
+        if let Bound::Loop(detail) = bound(env, root, self.commit, self.memory)? {
+            return Ok(Done::Loop(detail));
         }
         // The gate (which carries `paused`, a roll and the floor) and the
         // fence, immediately before the push. A roll that started since the

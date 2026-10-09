@@ -2,8 +2,8 @@
 
 use super::{history_a, input_at, EXPLANATION_GOLDEN};
 use crate::eta::explanation::{
-    Explanation, MAX_BYTES, TARGET_BYTES, TRUNCATED_DETAIL, TRUNCATED_FEATURES, TRUNCATED_GRIDS,
-    TRUNCATED_STAGE_MARKS,
+    Explanation, MAX_BYTES, TARGET_BYTES, TRUNCATED_CONTEXT, TRUNCATED_DETAIL, TRUNCATED_FEATURES,
+    TRUNCATED_GRIDS, TRUNCATED_STAGE_MARKS,
 };
 use crate::eta::heuristics::{FinishV1, LandV1, LandV2, LandV3};
 use crate::eta::simulate::{run_explanation, run_marks};
@@ -170,7 +170,13 @@ fn explanation_size_within_cap() {
     let big = LandV1.estimate(&input, &history_a());
     assert!(big.size_bytes() <= MAX_BYTES, "{} bytes", big.size_bytes());
     assert_eq!(big.truncated, vec![TRUNCATED_FEATURES.to_string()]);
-    assert_eq!(big.features, None);
+    // … down to the input vector (#10930), never to nothing.
+    assert_eq!(
+        big.features,
+        input.features.input_vector().into(),
+        "the input vector survives the cut"
+    );
+    assert_eq!(big.features.as_ref().unwrap().labels, None);
     assert!(
         !big.stages[0].distribution.grid_sec.is_empty(),
         "grids survive when features suffice"
@@ -189,80 +195,40 @@ fn explanation_size_within_cap() {
         "features never move the estimate"
     );
 
-    // … and the grids second, when dropping features is not enough. The
-    // marks ride in `result`, so they survive this tier: the timeline stays
-    // self-contained even when the grids were dropped.
+    // … then the marks and the context lists, which no replay reads: a
+    // record padded in its context still fits with every replay input
+    // intact, and still replays exactly (#10930). The order past that, and
+    // the `replayable: false` record, are tested in `tests/explain.rs`.
     let mut huge = golden_explanation();
-    let mut probe = huge.clone();
-    probe.features = None;
-    probe.features_omitted.clear();
-    let pad = MAX_BYTES - probe.size_bytes() + 64;
     huge.history_window
         .as_mut()
         .unwrap()
         .sources
-        .push("x".repeat(pad));
-    huge.enforce_cap();
-    assert_eq!(
-        huge.truncated,
-        vec![TRUNCATED_FEATURES.to_string(), TRUNCATED_GRIDS.to_string()]
-    );
-    assert!(huge.size_bytes() <= MAX_BYTES, "{} bytes", huge.size_bytes());
-    assert!(huge
-        .stages
-        .iter()
-        .all(|e| e.distribution.grid_sec.is_empty()));
-    assert!(
-        !huge
-            .result
-            .as_ref()
-            .expect("result always survives")
-            .stage_marks
-            .is_empty(),
-        "the marks survive the grids tier"
-    );
-    assert_eq!(
-        run_explanation(&huge),
-        None,
-        "a truncated grid is not recomputable, and says so"
-    );
-
-    // … and the marks third, when the grids alone were not enough either:
-    // dropped as one named unit, the scalars in `result` always survive.
-    let mut huge = golden_explanation();
-    let mut probe = huge.clone();
-    probe.features = None;
-    probe.features_omitted.clear();
-    for entry in &mut probe.stages {
-        entry.distribution.grid_pct.clear();
-        entry.distribution.grid_sec.clear();
-    }
-    let pad = MAX_BYTES - probe.size_bytes() + 64;
-    huge.history_window
-        .as_mut()
-        .unwrap()
-        .sources
-        .push("x".repeat(pad));
+        .push("x".repeat(MAX_BYTES));
     huge.enforce_cap();
     assert_eq!(
         huge.truncated,
         vec![
             TRUNCATED_FEATURES.to_string(),
-            TRUNCATED_GRIDS.to_string(),
-            TRUNCATED_STAGE_MARKS.to_string()
+            TRUNCATED_STAGE_MARKS.to_string(),
+            TRUNCATED_CONTEXT.to_string()
         ]
     );
     assert!(huge.size_bytes() <= MAX_BYTES, "{} bytes", huge.size_bytes());
-    let result = huge.result.as_ref().expect("result always survives");
-    assert!(result.stage_marks.is_empty());
+    assert!(huge
+        .stages
+        .iter()
+        .all(|e| e.distribution.grid_sec.len() == crate::eta::grid::GRID_POINTS));
+    assert_eq!(huge.replayable, None);
     assert_eq!(
-        result.p50_sec,
-        golden_explanation()
-            .result
-            .as_ref()
-            .expect("golden")
-            .p50_sec,
-        "the terminal scalar never moves"
+        run_explanation(&huge),
+        golden_explanation().quantiles_with_p90(),
+        "the grids survive, so the record still replays"
+    );
+    assert_eq!(
+        run_marks(&huge),
+        Some(golden_explanation().result.unwrap().stage_marks),
+        "the dropped marks are recomputable from the grids"
     );
 }
 
@@ -304,10 +270,11 @@ fn every_null_feature_has_a_reason() {
 #[test]
 fn explanation_cap_holds_even_when_grids_are_not_enough() {
     let mut huge = golden_explanation();
-    huge.history_window
+    huge.branches
         .as_mut()
         .unwrap()
-        .sources
+        .changes_requested
+        .source_by_attempt
         .push("x".repeat(MAX_BYTES + 2048));
     huge.enforce_cap();
     assert!(huge.size_bytes() <= MAX_BYTES, "{} bytes", huge.size_bytes());
@@ -315,16 +282,21 @@ fn explanation_cap_holds_even_when_grids_are_not_enough() {
         huge.truncated,
         vec![
             TRUNCATED_FEATURES.to_string(),
-            TRUNCATED_GRIDS.to_string(),
             TRUNCATED_STAGE_MARKS.to_string(),
+            TRUNCATED_CONTEXT.to_string(),
+            TRUNCATED_GRIDS.to_string(),
             TRUNCATED_DETAIL.to_string()
         ]
     );
-    // Identity, provenance and the numbers survive the last resort.
+    // Identity, provenance and the numbers survive the last resort; the
+    // replay is named as lost at the first replay input dropped.
     let golden = golden_explanation();
     assert_eq!(huge.estimate_id, golden.estimate_id);
     assert_eq!(huge.loom, golden.loom);
     assert_eq!(huge.quantiles(), golden.quantiles());
+    assert_eq!(huge.replayable, Some(false));
+    assert_eq!(huge.replayable_reason.as_deref(), Some("truncated:stages.distribution.grid"));
+    assert_eq!(run_explanation(&huge), None);
 }
 
 #[test]

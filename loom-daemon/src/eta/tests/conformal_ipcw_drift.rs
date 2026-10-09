@@ -1,13 +1,15 @@
-//! The drift-aware IPCW wrapper, `land-2026-10-06-swift-tern` (#10524 slice
-//! 3, #10528): the drift-shortened half-life, the withheld inflation, the
-//! leak test and the registration, on quick-tern's synthetic fixtures
+//! The drift-aware IPCW wrapper, the calibrator of the retired
+//! `land-2026-10-06-swift-tern` (#10524 slice 3, #10528; retired #10949):
+//! the drift-shortened half-life, the withheld inflation, the leak test and
+//! the offline wrap, on quick-tern's synthetic fixtures
 //! (`tests::conformal_ipcw`).
 
 use super::conformal_ipcw::{at, base_explanation, bytes, coverage, fixture, obs, BASE, HOUR};
 use super::input_at;
 use crate::eta::conformal::{apply, Calibration, Q4};
 use crate::eta::conformal_ipcw::{self, HALF_LIFE_SEC, METHOD_DRIFT};
-use crate::eta::heuristics::{LandSwiftTern, LAND_SWIFT_TERN, LAND_TWIN_OTTER_B};
+use crate::eta::conformal_wrap::{self, IpcwWrap};
+use crate::eta::heuristics::{LandTwinOtterB, LAND_SWIFT_TERN, LAND_TWIN_OTTER_B};
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::recency::DRIFTED_DIVISOR;
 use crate::eta::regime::MAX_INFLATION;
@@ -233,14 +235,19 @@ fn swift_tern_leak_perturbing_post_as_of_outcomes_is_bit_identical() {
 }
 
 #[test]
-fn swift_tern_is_shadow_registered_and_recomputes() {
+fn swift_tern_is_retired_and_its_offline_wrap_recomputes() {
     let registry = Registry::builtin();
-    assert!(registry.ids().contains(&LAND_SWIFT_TERN));
-    assert!(registry
+    assert!(!registry.ids().contains(&LAND_SWIFT_TERN), "retired (#10949)");
+    assert!(!registry
         .for_kind(Kind::Land)
         .any(|h| h.id() == LAND_SWIFT_TERN));
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
-    let heuristic = registry.get(LAND_SWIFT_TERN).unwrap();
+    let heuristic = IpcwWrap::new(
+        LAND_SWIFT_TERN,
+        LandTwinOtterB::default(),
+        conformal_wrap::Calibrator::IpcwDrift,
+    )
+    .unwrap();
     assert!(heuristic.models_hold(), "as twin-otter-b");
 
     let input = input_at(Stage::SweepBuilder, 0, 0);
@@ -263,7 +270,7 @@ fn swift_tern_is_shadow_registered_and_recomputes() {
         })
         .filter(|o| o.as_of < at(0))
         .collect();
-    let e = LandSwiftTern::default().estimate(&input, &history);
+    let e = heuristic.estimate(&input, &history);
     let record = e.calibration.as_ref().expect("calibrated");
     assert_eq!(record.method, METHOD_DRIFT);
     assert_eq!(record.base, LAND_TWIN_OTTER_B);

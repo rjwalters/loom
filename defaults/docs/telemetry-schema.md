@@ -1770,7 +1770,7 @@ tick; otherwise a root of its own. Attributes:
 | `loom.queue.transition` | `changed` (first sight, or the disposition itself changed) / `refresh` (same disposition, resent after the refresh window) / `left_queue` (the row disappeared from a repo whose listing succeeded) |
 | `loom.queue.previous_disposition` | present only on a `changed` transition after the first sighting |
 | `loom.queue.park_label` | only for `parked`/`hard_exclusion`, and only when the label is in the row's closed vocabulary — `PARK_LABELS ∪ SKIP_LABELS` for `parked`, `hard_exclusion::HARD_EXCLUSION_LABELS` (e.g. `external`) for `hard_exclusion` (#9672) — so a span names which rule declined the issue. A repo-configured extra skip label, a rule name outside that set, or any other detail text is never exported |
-| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope` (#9673, #9548), `ci_billing` (#10113: owner's Actions jobs blocked by billing/spending limit). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
+| `loom.queue.halt_cause` | only for `workspace_halted`: the closed-vocabulary `work_finder::halt_cause` token (#9017) — `main_red`, `gate_pending`, `token_pool`, `preflight_advisory`, `drain`, `breaker`, `write_scope` (#9673, #9548), `ci_billing` (#10113: owner's Actions jobs blocked by billing/spending limit), `install_incompatible` / `daemon_too_old` (#10719: the workspace's installed Loom cannot work with this daemon, W3 / W4). Absent on a cause-less legacy row; a detail token outside the vocabulary is never exported |
 | `loom.pr_number` | only for `open_pr`, parsed from the row's structured detail |
 | `lockout.frozen_candidates_count` | only for `open_pr` (Issue #9674): how many ready issues in this repo the #4123 open-PR guard is currently blocking (`pr-open-skip`) — the repo's frozen backlog |
 | `lockout.frozen_points_sum` | only for `open_pr` (Issue #9674): the summed story points of those blocked issues (`points:*` labels, `crate::story_points`); unsized issues contribute nothing — absent is never `0` |
@@ -2099,6 +2099,16 @@ example `peer_claim` or `workspace_halted:token_pool`, and it equals the
 explanation's `path.dispatch.not_here`. See
 [`eta.md`](eta.md#the-model).
 
+**Inputs as attributes, and the size cap (#10930).** An `eta.estimate` for a
+fitted heuristic carries `loom.eta.fit_id` (joins `eta.fit`), and one with
+queue features carries `loom.eta.queue_rank`, `loom.eta.queue_ready`,
+`loom.eta.queue_running` and `loom.eta.max_concurrent`: scalar integers on the
+existing row, so no new record kind and no per-path data. The 32 KiB body cap
+now cuts what no replay reads first, keeps the input vector
+(`Features::INPUT_VECTOR`) when it cuts `features`, and marks the record
+`replayable: false` (with `replayable_reason`) if it must drop a replay input.
+`loom-daemon eta explain --file F [--diff F2]` replays an exported body.
+
 **Provenance is required on both.** `version`, the full 40-hex `revision`
 (or `unknown` for a tarball build), `tree_state` and `complete` (a full SHA
 and a `clean`/`dirty` tree) of the computing daemon,
@@ -2118,7 +2128,7 @@ carries **both** the estimating build (`estimate.loom`, exported as
 | Field | Type | Notes |
 |---|---|---|
 | `trigger` | string | `first`, `transition` (stage, rework or refusal changed) or `refresh` (every `refreshSecs`, default 300) |
-| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result` (with `p90_sec`, #10211, and `stage_marks`, #9366), `contributions`, `features` (including the queue, drain and friction group, #10201: `ahead`, `n_stage_repo`/`_fleet`, `exits_repo_*`/`exits_fleet_*`, `merges_repo_24h`, `merges_fleet_6h`, `since_merge_sec`, `open_prs_repo`, `fleet_scope_repos`, `repo_pr_open_skip`; and the item facts, #10231: `tier`, `workspace_priority`, `issue_created_at`, `issue_age_sec`, `sweep_runtime`, `sweep_model`, `sweep_effort`, `attempt`, `judge_verdicts_so_far`, `repo_first_pass_approval_rate`, with `urgent` deprecated and always null; additive, the schema stays v1, omission reasons are free-form strings; see [`eta.md` → Features](eta.md#features)), `features_omitted`, `no_estimate_reason`, `truncated` |
+| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result` (with `p90_sec`, #10211, and `stage_marks`, #9366), `contributions`, `stage_predictions` (#10929, see below), `features` (including the queue, drain and friction group, #10201: `ahead`, `n_stage_repo`/`_fleet`, `exits_repo_*`/`exits_fleet_*`, `merges_repo_24h`, `merges_fleet_6h`, `since_merge_sec`, `open_prs_repo`, `fleet_scope_repos`, `repo_pr_open_skip`; and the item facts, #10231: `tier`, `workspace_priority`, `issue_created_at`, `issue_age_sec`, `sweep_runtime`, `sweep_model`, `sweep_effort`, `attempt`, `judge_verdicts_so_far`, `repo_first_pass_approval_rate`, with `urgent` deprecated and always null; additive, the schema stays v1, omission reasons are free-form strings; see [`eta.md` → Features](eta.md#features)), `features_omitted`, `no_estimate_reason`, `truncated` |
 
 A refusal is an estimate too: `explanation.result` is absent (never zero) and
 `no_estimate_reason` names why. Refusals are emitted when the reason first
@@ -2134,6 +2144,32 @@ appears and are not refreshed.
 | `outcome_source` | string | `bus` (in-sweep merge), `pulls_read` (the PR's merge time), `issues_read` (the issue's close state), `sweep_terminal`, `pending_expiry` (a `censored` outcome, #10233) |
 | `outcome_resolution_sec` | integer? | how late the resolution may be |
 | `result` | string? | `finish`: the sweep's terminal class, `exited` or `crashed` |
+| `attribution` | object? | the error split by stage (#10929, see below). Absent when the estimate forecast no stage or the outcome has no `error_sec` |
+
+**Per-stage forecasts and attribution (#10929).** A path-engine estimate's
+explanation carries `stage_predictions`, keyed by stage. It covers each stage
+still ahead and holds `entry_p50` / `entry_p90` (the first entry) and
+`dwell_p50` / `dwell_p90` (total time in the stage across visits), all in
+whole seconds from `as_of` and conditional on reaching the stage. It also
+holds `reach_pct` (the percentage of simulated paths that visit the stage) and
+`alloc` (the stage's share of the p50 total; the stages' `alloc` values sum to
+the simulated p50). These are read off the draws the simulation already made,
+so no quantile moves. Other heuristics omit the field, which means "not
+modelled". The pending summary (`estimate.stage_predictions`) keeps it, so
+the outcome can attribute.
+
+`eta.outcome.attribution` holds `stages`, keyed by stage. Each entry has
+`predicted_entry_sec?`, `predicted_dwell_sec` (`alloc`),
+`actual_entry_sec?`, `actual_dwell_sec` (time observed in the stage after
+`as_of`, summed over visits) and `contribution_sec`
+(`actual_dwell_sec − predicted_dwell_sec`). The object also holds
+`unattributed_sec` and `dominant_stage?` (the largest `|contribution_sec|`).
+**Invariant:** `Σ contribution_sec + unattributed_sec = score.error_sec`.
+`unattributed_sec` collects time the tracker did not observe exactly, an
+applied stall, and a calibration or regime shift between the simulated and
+served p50. It is `0` on a fully observed, unshifted path. The attributes
+are `loom.eta.attribution.dominant_stage` and
+`loom.eta.attribution.unattributed_sec`.
 
 Absent is never zero: `abandoned` outcomes (the issue closed as **not
 planned**) and outcomes of refusals carry no error fields at all, so they are
@@ -2199,23 +2235,24 @@ record's JSON. The scalars ride as `loom.auto_update.*` attributes
 allowlists). The record time is the tick's start. Provenance is required:
 `loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
-never emitted. Severity is `ERROR` for `panic`. It is `WARN` for `roll_stall`,
+never emitted. Severity is `ERROR` for `panic`. It is `WARN` for
 `stale_repo` and a fetch or rebuild that did not succeed, and `INFO`
-otherwise.
+otherwise. (#10831 removed the stall decision along with the wait-for-zero
+roll it reported; no record carries it any more.)
 
 | Field | Type | Notes |
 |---|---|---|
 | `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
 | `started_at` | RFC3339 | the tick's start |
-| `decision` | string | `skip` (nothing to roll onto), `defer` (a newer target exists, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, roll window), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll is already armed), `roll_stall` (#8998), `panic` (the tick panicked; the loop keeps running) |
+| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
 | `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
 | `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
-| `roll_armed` | bool | the fetch or rebuild succeeded and its drain-and-restart was accepted |
+| `roll_armed` | bool | the fetch or rebuild succeeded and its pause-and-roll started (#10831) |
 | `installed_version` | string? | the installed binary's version as the artifact probe read it, else the running build's |
 | `target_version` / `target_published_at` | string? | the newest release artifact resolved for this host |
 | `commits_behind` / `hours_behind` | integer? | source-checkout staleness, when the tick read it |
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
-| `drain` | object | `{armed, pending, refusals, target?}`: the drain armed at tick start |
+| `drain` | object | `{armed, pending, refusals, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) and `refusals` is always `0` |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |
 | `loom` | object | the deciding (running) daemon's provenance (required) |
@@ -2329,6 +2366,45 @@ Provenance is required, as for `eta.estimate`, and exports as
 | `resolution_sec` | integer | how late `resolved_at` can be: `0` for a merge, the listing interval for a close (polling time) |
 | `loom` | object | the observing daemon's provenance (required) |
 
+### `eta.stage_outcome`
+
+One stage an item actually left (Issue #10929). Envelopes carry
+`schema_version: 12`. **OTLP-only** (native: `false`), and emitted only by the
+fleet's ETA authority (#10498, with `loom.eta.authority`). The record is
+built from the stage-journal rows the tracker already writes at each
+boundary, so it needs **no new forge read**. Those boundaries are bus phases,
+review-label transitions, verdicts, `merge_hold` overlays and the
+`pr.resolved` read. A slot-turnover sample has no issue and gives no
+record. The record joins the issue's story trace when an open estimate
+knew the repo id.
+
+The log record's **time is `left_at`** and its **observed timestamp is
+`observed_at`**. The body is the record's JSON. The scalars ride as
+`loom.repo`, `loom.issue`, `loom.pr_number` and the
+`loom.eta.stage_outcome.*` attributes (`stage`, `exit`, `next_stage`,
+`entered_at`, `left_at`, `dwell_sec`, `open_estimates`). Provenance is
+required and exports as `loom.eta.version` / `revision` / `tree_state` /
+`provenance_complete`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/repo` |
+| `repo_id` | integer? | from an open estimate, for the story trace |
+| `issue` | integer | the issue |
+| `pr_number` | integer? | the PR, when known |
+| `stage` | string | the stage left |
+| `entered_at` | RFC3339? | present only when the entry was observed exactly (absent for a stage first seen mid-way) |
+| `left_at` | RFC3339 | the event time |
+| `dwell_sec` | integer? | `left_at − entered_at`, only when the stage completed with an exact entry; never a lower bound |
+| `exit` | string | `advance`, `pass`, `rework`, `hold`, `released`, `judged` (the sweep's Judge phase ended before the verdict was known), `landed`, `cut_short` (closed unmerged, or ended without completing), `unknown` |
+| `next_stage` | string? | the stage entered next |
+| `event` | string | the journal event (`sweep.phase`, `label.transition`, `pr.resolved`, …) |
+| `observed_at` | RFC3339 | when this daemon observed it (knowable-at) |
+| `resolution_sec` | integer? | how late `left_at` can be: a listing interval, `0` for a bus event |
+| `open_estimates` | integer | every estimate open for the item with `as_of < left_at` |
+| `estimate_ids[]` | array | the newest such estimate per `(kind, heuristic)` series. Bounded by the registry, not by refreshes. Any other estimate joins on `(repo, issue)` with `as_of < left_at` |
+| `loom` | object | the observing daemon's provenance (required) |
+
 ### `eta.backtest.fold` and `eta.backtest.summary`
 
 The fleet captain's nightly walk-forward backtest (Issue #10492; see
@@ -2408,6 +2484,19 @@ Each row:
 | `stage` | string, optional | the stage the item was in (`ready_wait`, `sweep.curator`, …) |
 | `no_estimate_reason` | string, optional | why there is no estimate (`blocked`, `human_gated`, `insufficient_samples`, …), present exactly when the quantiles are absent |
 | `alternates[]` | array, optional | shadow heuristics' estimates for the same item (#10390); omitted when empty, so `start`/`finish` rows and hosts without shadows are unchanged |
+| `stages` | object, optional | the row's own per-stage forecast (#10929), keyed by stage name (`review_wait`, `doctor`, `merge_wait`, …), covering only the stages still ahead. Omitted on a refusal and for a heuristic that forecasts no stage |
+
+**`stages` (#10929)** is additive: `schema_version` stays 12. It feeds the
+dashboard's Time-stage track (loom-ui#2753). It sits on the row only, never
+on an alternate. Like `alternates[]`, it never costs a row under the 1 MiB
+budget (#10928). The forecasts ride in row order while they fit, and before
+any alternate. Each entry holds whole seconds from the row's `as_of`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `entry_p50` / `entry_p90` | integer | first entry into the stage, over the simulated paths that reach it |
+| `dwell_p50` / `dwell_p90` | integer | total time in the stage across visits, over the same paths |
+| `reach_pct` | integer | percentage (0–100) of simulated paths that reach the stage; entry and dwell are conditional on it, so a `doctor` stage at 30 is a 30% branch |
 
 **`alternates[]` (#10390)** is additive: `schema_version` stays 12 and older
 readers ignore it. One entry per registered non-current heuristic of the row's

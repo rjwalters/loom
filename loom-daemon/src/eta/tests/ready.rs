@@ -477,6 +477,35 @@ fn a_stale_plan_refuses_with_stale_inputs() {
 }
 
 #[test]
+fn stale_inputs_refusals_are_re_emitted_every_pass_while_stale() {
+    let history = history_ready();
+    let mut tracker = Tracker::new(provenance());
+    let mut plan = ready_plan(true);
+    plan.at = as_of() - Duration::hours(2);
+    tracker.on_ready_queue(&[row(10, PlanState::Next, Some(1))], &plan, as_of());
+    let first = estimate(&mut tracker, &history).len();
+    assert!(first > 0);
+    for _ in 0..4 {
+        tracker.on_ready_queue(&[row(10, PlanState::Next, Some(1))], &plan, as_of());
+        let again = estimate(&mut tracker, &history);
+        assert_eq!(again.len(), first, "one row per series per pass");
+        for e in &again {
+            assert_eq!(e.explanation.no_estimate_reason, Some(NoEstimateReason::StaleInputs));
+        }
+    }
+}
+
+#[test]
+fn a_non_stale_refusal_is_still_emitted_once() {
+    let history = history_ready();
+    let mut tracker = Tracker::new(provenance());
+    tracker.on_ready_queue(&[row(10, PlanState::Next, None)], &ready_plan(true), as_of());
+    assert!(!estimate(&mut tracker, &history).is_empty());
+    tracker.on_ready_queue(&[row(10, PlanState::Next, None)], &ready_plan(true), as_of());
+    assert!(estimate(&mut tracker, &history).is_empty());
+}
+
+#[test]
 fn slot_turnover_rows_feed_the_ready_wait_history() {
     let tracker = Tracker::new(provenance());
     let from = as_of() - Duration::seconds(1000);

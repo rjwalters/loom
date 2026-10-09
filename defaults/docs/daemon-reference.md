@@ -233,9 +233,21 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.started`     | Drain supervisor (#4090)       | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
 | `daemon.drain.completed`   | Drain supervisor (#4090)       | `{in_flight}` (always `0`) |
 | `daemon.drain.aborted`     | Daemon IPC (#4090)             | `{was_draining}` |
-| `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, roll_pending?, attempts?, elapsed_secs?}` |
-| `daemon.drain.roll_pending` | Drain supervisor (#6007)      | `{in_flight, attempt, window_secs, budget_secs}` |
+| `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, origin?, paused?, stragglers?}` |
 | `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
+| `daemon.roll.pause_started` | Pause-and-roll (#10831)       | `{target_source, from_version, to_version, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs}` |
+| `daemon.roll.item`         | Pause-and-roll (#10831)        | `{manifest_id, item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, target_source, pause_budget_secs, verify_probation_secs, resume_budget_secs, min_resumable_age_secs, safe_point_wait_ms, teardown_ms, forge}` (one per agent; `forge` is `none`, `done` or `deferred`) |
+| `daemon.roll.paused`       | Pause-and-roll (#10831)        | `{manifest_id, items, then_exit, from_version, to_version, target_source, pause_budget_secs, settle_secs, stop_secs, total_secs}` |
+| `daemon.roll.pause_failed` | Pause-and-roll (#10831)        | `{manifest_id, error, items?}` (the manifest could not be written, the pause task failed, or the H4 deadline passed, each before anything was stopped; dispatch resumed) |
+| `daemon.roll.forced`       | Pause-and-roll (#10831)        | `{manifest_id, reason, forced_items, h4_deadline_secs}` (a pause that had already stopped an agent could not finish; the rest were killed by process group and the daemon restarts) |
+| `daemon.roll.refused`      | Pause-and-roll (#10831)        | `{state, reason, target_source, to_version}` (`state`: `unsupervised`, `pause-failed`, `resume-pending`, `roll-attempt-backoff`; a standing refusal is published once, then at most every 5 minutes) |
+| `daemon.roll.stood_down`   | Pause-and-roll (#10831)        | `{manifest_id, promoted, items}` (aborted, superseded or promoted before anything was stopped) |
+| `daemon.roll.config_rejected` | Pause-and-roll (#10831)     | `{reason}` (invalid `pauseRoll` budgets; defaults used) |
+| `daemon.roll.item` (`stage: "resume"`) | Pause-and-roll resume (#10832) | `{stage, manifest_id, item_id, new_item_id, kind, runtime, disposition, status, reason, agent_age_secs, issue, role, from_version, to_version, running_version, resumed_on, verify_probation_secs, resume_budget_secs, forge}` (one per agent H5 resumed, requeued, completed or handed to restart recovery) |
+| `daemon.roll.item.residue_reaped` | Pause-and-roll resume (#10832) | `{manifest_id, item_id, pids, survivors, scope_stopped}` (processes of a paused agent still alive at H5) |
+| `daemon.roll.manifest.unreadable` | Pause-and-roll resume (#10832) | `{path, outcome, detail, running_version}` (`outcome`: `corrupt`, `unknown-version`; nothing is resumed, restart recovery takes every item) |
+| `daemon.roll.health_failed` | Pause-and-roll resume (#10832) | `{manifest_id, reason, running_version, to_version, failures}` (health did not hold during probation; nothing is resumed until it does) |
+| `daemon.roll.paused.resumed` | Pause-and-roll resume (#10832) | `{manifest_id, phase, from_version, to_version, running_version, resumed_on, items, resumed, completed, requeued_by_reason, recovered, residue_reaped, health_failures, verify_probation_secs, resume_budget_secs, probation_secs, resume_secs, pause_to_resume_secs, max_age_secs}` (`resumed_on`: `target` or `rollback`) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 | `operator_priority.escalation` | Star-liveness pass (#9321)   | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 
@@ -250,14 +262,13 @@ Four of the `daemon.drain.*` topics were authorized by **#4090** for the schedul
 drain-and-restart primitive — `started` when a drain is accepted, `completed`
 when the last in-flight sweep finishes (right before the supervised relaunch),
 `aborted` when an operator cancels a drain, and `timeout` when the deadline is
-reached *terminally* (`forced` distinguishes a refusal from a force-cancel
-restart). **#6007** adds a fifth, `roll_pending`: a relaunch drain whose deadline
-passed with work still in flight now **retains** the roll (dispatch stays paused,
-the restart re-arms itself at quiescence) and publishes `roll_pending` per re-arm;
-`timeout` then fires only if the whole paused-dispatch budget is spent and the roll
-is abandoned. **#8514** adds a sixth, `superseded`: the auto-update loop discarded
-a *pending* roll because a newer release artifact had overtaken the one it was
-armed for, and re-armed for that newer artifact instead. See
+reached (`forced` distinguishes an operator drain held paused from a
+force-cancel restart). **#8514** adds `superseded`: the auto-update loop discarded
+an armed roll that had not stopped any agent yet because a newer release artifact
+had overtaken the one it was armed for, and re-armed for that newer artifact
+instead. **#10831** removed `daemon.drain.roll_pending` (no roll is retained
+across a deadline any more) and added the `daemon.roll.*` topics: every automatic
+roll now pauses its agents and restarts, and narrates that here. See
 [Supervised restart primitive](#supervised-restart-primitive-4054) below.
 They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
@@ -1449,9 +1460,12 @@ The desired workspace set is every record with `fleet: true` and not
 never a silent exclusion — so is a non-boolean `fleet`/`firewall`, a
 non-integer `fleet_priority`, a duplicate `name` or `dir`, or an unsafe `dir`.
 
-**`loom_min_version`** (#10711): an optional top-level `"X.Y.Z"` string, the
-fleet-wide minimum Loom version. Read from the top level of `fleet.json` when
-the store has that file (a valid one without the key means no floor; an invalid
+**`loom_min_version`** (#10711): a top-level `"X.Y.Z"` string, the
+fleet-wide minimum Loom version. **Required since #10885**: it is what moves a
+fleet host, and a host whose store does not carry it does not roll at all (see
+[The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)).
+Read from the top level of `fleet.json` when
+the store has that file (a valid one without the key leaves the floor *unknown*; an invalid
 one is a fleet-sync error, with no `repos.yml` fallback); only when
 `fleet.json` is absent is it read from the top level of `repos.yml` (an extra
 key there, which the roster ignores). In `fleet.json` it is always a JSON
@@ -1459,8 +1473,11 @@ string; in `repos.yml` quote it (an unquoted `X.Y.Z` is also read, an unquoted
 `X.Y` is a number and is refused). It must be canonical: no whitespace, no
 leading zeros (`"0.0.0"` and `"0.19.830"` are fine, `"01.2.3"` and
 `" 0.19.830 "` are not). Every fleet-sync pass reads it into a process-wide value, not
-the config tiers, so a change takes effect on the next tick without a restart.
-Absent means no floor; a malformed value (not a string, not canonical `X.Y.Z`) keeps the
+the config tiers, so a change takes effect without a restart: a pass that
+resolves a floor different from the previous pass's wakes the self-update loop
+at once (#10885), so a floor bump is acted on within one `fleet.syncIntervalSecs`
+and not up to `autoUpdate.intervalSecs` later.
+Absent means the floor is unknown (the host does nothing and says so); a malformed value (not a string, not canonical `X.Y.Z`) keeps the
 last good floor and is reported as a fleet-sync error. It appears as
 `floor` in `fleet-sync-status.json` and on the `Fleet store:` status block.
 The self-update loop rolls a host below it (#10712), and the workspace resync
@@ -1738,6 +1755,9 @@ Nothing else schedules it, and it does not wait for a roll window.
 A pass runs on its own task and the timer never waits for it, so it cannot
 delay the fleet-store sync, the floor, or `paused`/`stopped` enforcement. Only
 one pass runs at a time: while one is still running, the next tick starts none.
+A pass still running at the fifth tick in a row is one `pass-stuck` alert. After
+15 minutes the task stops waiting for it and frees the slot; until the old pass
+ends, each new one does nothing and says so on the status block.
 
 Each pass reads `.loom/install-metadata.json` from every registered
 workspace's default branch (never the working tree) and classifies it:
@@ -1747,8 +1767,8 @@ workspace's default branch (never the working tree) and classifies it:
 | `W0` | the installed files equal this daemon's payload | nothing |
 | `W1` | compatible, but the files differ | tries the claim |
 | `W3` | too old for this daemon or the floor, and the files differ | as `W1`, first |
-| `W4` | the installed files need a newer daemon | reports only |
-| `repo-ahead` | installed by a newer daemon, or at a version that cannot be ordered | reports only |
+| `W4` | the installed files need a newer daemon, or record a version that cannot be ordered | reports only |
+| `repo-ahead` | installed by a newer daemon, and still compatible with this one | reports only |
 | `skipped` | the Loom source repo, a non-GitHub origin, or no Loom on the default branch | nothing |
 
 - **An empty payload diff is `W0`, whatever the stamp says.** A resync that
@@ -1756,16 +1776,127 @@ workspace's default branch (never the working tree) and classifies it:
   claim and no commit, and a stamp that is old or lacks `requires_daemon` over
   matching files is left alone.
 - **Never a downgrade.** `W4` and `repo-ahead` are never claimed or written.
-  They are left to the host roll (#10719).
+  `W4` holds dispatch and asks for a host roll; `repo-ahead` does neither,
+  except that an interrupted resync to a newer release is held (and asks for
+  no roll). See "Dispatch holds" below.
 - **Only from H0.** A host claims and writes only when all of these hold: it is
   a verified official release build (below), a fleet-sync pass has completed,
   dispatch is not paused (a drain, a roll's pause or a fleet hold, which is how
-  `paused` reaches it), no roll is retained, the binary on disk is still the one
-  running, self-update is not in backoff or terminal, and the running version
-  is not below `loom_min_version`. The gate is read at the start of the pass,
+  `paused` reaches it), no pause roll is armed, committed or in progress
+  (#10831; reported as `roll pending`, and never set by a fleet hold or an
+  operator drain), no pause manifest found at startup is still waiting for H5
+  to finish with it (#11016; reported as `resume-pending`, so a daemon a pause
+  roll just restarted claims and pushes nothing, in its startup pass or on the
+  timer, until health probation has passed), the binary on disk is still the
+  one running, self-update is not in backoff or terminal, and the running
+  version is not below `loom_min_version`. The gate is read at the start of the pass,
   again immediately before the claim, and again immediately before the push.
   A newer release merely existing is not a reason to wait.
 - **Writes need `fleet.autoApply`**, like every other timer write.
+
+#### Dispatch holds (#10719)
+
+Dispatch runs each repo's own installed files: agent worktrees start from the
+default branch, and the spawn script and role runs come from the host's
+checkout. After every workspace pass the daemon judges **both copies** of each
+registered workspace and holds new dispatch into a workspace when either one
+cannot work with this daemon. The checkout copy is
+`<root>/.loom/install-metadata.json` in the working tree.
+
+| Verdict for a copy | Hold | Typed outcome | Asks for a roll |
+|---|---|---|---|
+| its `requires_daemon` is above the running daemon (`W4`) | held | `daemon-too-old` | yes |
+| a contract field that cannot be ordered, such as `0.20.0-rc1`, and `requires_daemon` above the running daemon | held | `daemon-too-old` | yes, for `requires_daemon` |
+| a contract field that cannot be ordered, and `requires_daemon` at or below the running daemon | held | `daemon-too-old` | no |
+| a contract field that cannot be ordered, and no `requires_daemon` that parses | held | `daemon-too-old` | yes, for any release after this one; WARN once per workspace |
+| too old for this daemon or the floor, **and** the files differ from the payload (`W3`) | held | `install-incompatible` | no |
+| a resync to a release above this daemon was interrupted there (`resync_pending`) | held | `install-incompatible` | no |
+| too old by its stamp, files equal to the payload (`W0`) | not held | | no |
+| installed by a newer daemon, `requires_daemon` at or below this one (`repo-ahead`) | not held | | no |
+| compatible, or a resync owed (no `requires_daemon`) | not held | | no |
+| could not be read this pass | the previous verdict stands | | as before |
+
+- **The ratchet guard.** A repo that is only *ahead* of this daemon is
+  neither held nor a reason to roll. Hosts roll at different moments, so a
+  host that has just rolled resyncs repos to a release the others do not run
+  yet. If that alone made them roll, one straggler would pull the whole fleet
+  forward one release at a time. While the newer files' `requires_daemon` is
+  at or below this daemon, this host keeps working the repo, never resyncs it
+  downward, and reports `repo-ahead`.
+- **A version that cannot be ordered rolls only for a need.** Such a copy
+  is held, because it may be newer than this daemon. Whether it also asks
+  for a roll is decided by its `requires_daemon` alone when that parses:
+  above this daemon it asks for that version, at or below it asks for
+  nothing. Asking for "any newer release" there would make the host chase
+  every new release for as long as the odd version stays. Only when
+  `requires_daemon` is missing or cannot be ordered either does the copy ask
+  for any release after this one, and the daemon logs that at WARN once per
+  workspace so a person fixes the metadata.
+- **An interrupted newer resync is held, and asks for no roll.** When
+  `resync_pending` names a release above this daemon, some of that release's
+  files are in place while the stamp, written last, is still the old
+  release's. The files are a mix of two releases and their `requires_daemon`
+  is not on record, so nothing is dispatched into the workspace. It names a
+  release, not a need, so it raises no roll demand: the ratchet guard holds
+  here too. It clears when a host on that release finishes the resync, or
+  when a person reruns the interrupted resync in the checkout. The daemon's
+  own resync commits only after the stamp, so in practice this is an
+  interrupted CLI resync in a checkout.
+- **A hold is per workspace and stops new dispatch only.** The host is never
+  paused, in-flight sweeps and role runs are not touched, no other workspace
+  is affected, and the workspace is still resynced. IPC `force` does not
+  bypass a hold.
+- **Where it is enforced.** Every path on which the daemon starts new work
+  in a workspace refuses a held one:
+
+  | Path | Refused by |
+  |---|---|
+  | Sweeps: the work finder, IPC/MCP `DispatchSweep`, epic child sweeps, watchdog re-dispatch, crash resume | the sweep registry, for issue and PR-set dispatch, with a typed `WorkspaceHeldDispatchError` before any lock, label flip or forge call |
+  | Work-finder selection, the pre-flight recovery probe, the red-main fix lane | the per-root pre-filter: the held workspace's batch is skipped once per tick with `workspace_halted` rows whose cause is `install_incompatible` or `daemon_too_old` |
+  | Role runner, interval ticks | the tick's root filter; the hold is logged once when it starts and once when it ends |
+  | Role runner, idle-edge (`onIdle`) runs | the idle-edge planner. A hold stops new sweeps, so the workspace drains and goes idle; the hold therefore causes the idle edge, and the planner refuses it. The edge is spent: the role fires on the next idle edge after the hold clears |
+  | Epic supervisor (`LOOM_EPIC_SUPERVISOR=1`): singleton roles (Architect, Champion) and epic child sweeps | the supervisor skips the held workspace's whole tick, logged each tick. Its role dispatch runs the checkout's spawn script outside the registry, so it also refuses on its own with the same typed `WorkspaceHeldDispatchError` before that script runs |
+
+  Three things are not refused, on purpose. The pause-and-roll resume
+  relaunches sweeps and role runs that were already in flight when the host
+  rolled; a hold is about new work. The workspace resync still runs, because
+  it is what clears a `W3` hold. A terminal a person opens over IPC is not
+  dispatch. Until the first workspace pass after a restart has finished there
+  are no holds at all (see "After a restart" below).
+- **How it clears.** The holds are rebuilt on every pass. `W3` clears on the
+  first pass after a resync has landed on the default branch and this host's
+  checkout is current. `W4` clears once this host runs a daemon at or above
+  `requires_daemon`. A workspace that leaves the registry is dropped.
+- **A hold that stands for 30 minutes alerts** at ERROR, and again every 30
+  minutes for as long as it stands. Every set, clear and standing alert is
+  published on the event-bus topic `fleet_sync.workspace_hold`. The
+  `Fleet store:` block of `loom-daemon status` shows each held workspace with
+  its kind, which copy holds it and since when.
+- **A hold can outlive its evidence, and says so.** A copy that cannot be
+  read keeps its previous verdict, so its hold stands until a pass can read
+  it again. Each hold records when a pass last judged its copy (`verdictAt`).
+  The repeated ERROR names that time when the latest pass could not read the
+  copy. `loom-daemon status` appends `hold verdict is N minutes old` once the
+  verdict is older than three sync intervals, which is also what a host whose
+  workspace passes have stopped shows.
+- **A workspace in backoff stays what it was found to be.** A `W4` workspace
+  whose remote starts failing is reported from its backoff with the same
+  `requires_daemon`, so its roll demand and the versions in its hold do not
+  change while the remote is down.
+- **The roll.** The highest version a `daemon-too-old` copy asks for is the
+  host's repo-ahead demand. The self-update loop treats it like the fleet
+  floor: the target is the newest release at or above it, pinned to the exact
+  tag, with no settle wait, through the same pause-and-roll, recorded as
+  `target_source = repo_ahead` (`floor` when the floor drives too). A fleet
+  host makes this roll even when its floor is met: it is the one roll besides
+  the floor's (#10885). A demand no release satisfies is reported at ERROR
+  and arms nothing; that one workspace stays held and every other workspace
+  keeps dispatching.
+- **The Loom source repo** installs from its own tree and is never resynced,
+  so it is judged for `W4` only. Its `loom_version` moves with every release
+  and never asks for a roll.
+- **After a restart** there are no holds until the first workspace pass has
+  finished.
 
 **Only an official release build pushes.** A daemon resyncs from the payload it
 embeds, so the binary must be a release's. Both of these must hold:
@@ -1783,26 +1914,36 @@ claims or writes. If the tag lookup gets no answer, the host reports
 `this daemon's release tag is not verified yet`, pushes nothing, and retries on
 a later tick (one sync interval apart at first, doubling, capped at one hour).
 
-**What a pass costs.** The verdict is cached per default-branch commit and
-running version, in process memory.
+**What a pass costs.** Every pass checks every workspace's default-branch
+head (#10987), so a change made by anyone is classified on the next tick. The
+verdict is cached per default-branch commit and running version, in process
+memory.
 
-| Workspace | Per tick |
+| Case | Per tick |
 |---|---|
-| any, on a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
-| settled (`W0`, `W4`, `repo-ahead`, not installed) | nothing for 15 sync intervals, then one `git ls-remote` of the default branch |
-| stale (`W1`, `W3`) | one `git ls-remote` |
+| a host that may not write (`fleet.autoApply` off, `paused`, or otherwise not in H0) | no network call; classified from the clone's own `origin/<default>` |
+| a host that may write | one GraphQL query per repo owner, naming every repo's default branch and head (100 repos per query) |
+| head is the cached commit | nothing more: no git child, no fetch |
 | head moved since the cached verdict | one `git fetch` of the default branch, only if the clone does not already have the commit |
+| the query failed, or does not cover a repo | one `git ls-remote` for each such repo, 8 at a time |
+| the rate-limit breaker is open | nothing is asked; the pass reports from the cache and says so |
 
-A restart empties the cache, and the running version only changes with a
-restart, so startup and a version change both check every workspace. At
-60 repos and 5 hosts with a 60s interval, the steady state is about 1,200
-`git ls-remote` an hour fleet-wide and no `git fetch`.
+The query runs under the writer App through `gh api graphql` and costs one
+point on that installation's GraphQL bucket (not the REST core bucket); a
+`POST` has no ETag, so an unchanged fleet still pays it. An installation token
+sees one owner's repos, hence one query per owner. At 60 repos and 5 hosts
+with a 60s interval that is 300 queries an hour per owner fleet-wide (600 for
+two owners), no `git ls-remote` and no `git fetch`. A query that fails in
+three passes in a row while the remotes still answer is one `head-query`
+alert. A restart empties the cache, so startup and a version change both
+evaluate every workspace.
 
-**A pass is bounded.** Classification stops asking the network after 45s; the
-workspaces it did not reach keep their last verdict and are first in the next
-pass. Every git child has a timeout: 15s for `ls-remote`, 30s for a fetch, 60s
-for the worktree checkout, the commit and the push, 20s for local plumbing.
-Three remotes in a row that do not answer end the pass's network use.
+**A pass is bounded.** Classification stops after 45s; the workspaces it did
+not reach keep their last verdict and are first in the next pass. No resync
+starts more than 120s into a pass. Every child has a timeout: 15s for the head
+query and for `ls-remote`, 30s for a fetch, 60s for the worktree checkout, the
+commit and the push, 20s for local plumbing. Three remotes in a row that do
+not answer end the pass's network use.
 
 A stale workspace is resynced under a per-repo claim, the ref
 `refs/loom/resync-claim`:
@@ -1836,12 +1977,12 @@ credential is a repo admin can bypass branch protection.
 
 **A repo cannot be resynced in a loop.** Whatever makes a repo stale again (a
 host on the same version with other files, a person or a tool undoing the
-resync), it gets at most one daemon resync commit per version, from any host,
-and at most one per `max(10 x syncIntervalSecs, 15 min)`. The record is the
-default branch itself: the last 300 commits are searched for
+resync), it gets at most one daemon resync commit per version, from any host.
+The record is the default branch itself: the last 300 commits are searched for
 `Loom-Resync-Version`. A workspace that is stale again at a version it was
 already resynced to is left alone, reported as `resync-loop`, and alerted once.
-The next release resyncs it.
+The next release resyncs it. There is no wait between resyncs to different
+versions: a host never installs a version older than the repo's.
 
 | Outcome | Result |
 |---|---|
@@ -1850,9 +1991,9 @@ The next release resyncs it.
 | branch moved | re-read and retried once, then next tick |
 | host left H0, or the claim was taken over, before the claim or the push | abandoned, no push; not a failure |
 | already resynced to this version | `resync-loop`: no push, one alert per repo and version |
-| another resync landed within the cooldown | waits; not a failure |
 | branch protection or a ruleset refused the push | backoff of 6h; one alert per repo, then logged only |
 | a remote or the forge did not answer | backoff for that repo, no alert for it; one `network` alert for the host per outage, from the third failing pass |
+| the forge or the remote refuses one repo (deleted, renamed, or the credential may not read it) | backoff for that repo and a `repo-access` alert from the third in a row; never counted as an outage |
 | any other failure | backoff from one sync interval, doubling, capped at 6h; alert from the third in a row |
 
 Alerts are logged at `error` and published on the event bus as
@@ -1861,14 +2002,254 @@ are in memory and reset on restart. Each workspace's state and reason appear on
 the `Fleet store:` status block and under `workspaces` in
 `fleet-sync-status.json`.
 
-The resync covers the payload surfaces only: `.loom/{roles,scripts,hooks,docs,runtimes}/`,
-`.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc` and
-`.claude/commands/loom/`. It does not yet touch `.loom/config.json`,
-`.loom/CLAUDE.md`, `.gitignore`, `.agents/skills/`, `.claude/README.md`,
-`.claude/biome.jsonc`, `.github/CONFIGURATION.md`, or the retired-file sweep and
-`package.json` edit that `resync-installed.sh` performs (#10895). It also does not
-fast-forward a host's own checkout (#10869), so a host keeps running its old
-installed scripts until that checkout is updated.
+A resync never touches a host's own checkout: the checkout fast-forward below
+does that.
+
+#### What a resync refreshes (#10895)
+
+One table in the daemon (`loom-daemon/src/init/payload/surfaces.rs`) names every
+surface. All of them are diffed against the default branch together, so a
+release that changes none of them makes no claim and no commit in any repo, and
+a second resync at the same release writes nothing.
+
+| Surface | Rule |
+|---|---|
+| `.loom/{roles,scripts,hooks,docs,runtimes}/`, `.loom/bin/`, `.loom/README.md`, `.loom/pricing.json`, `.loom/biome.jsonc`, `.claude/commands/loom/` | the installer's own payload step: written, and removed only when `installed_files` lists the file |
+| `.agents/skills/loom-<name>/SKILL.md` | written when absent or when the file carries the `<!-- loom-managed-skill -->` marker; one without the marker is never written or removed. A marker-carrying skill the release no longer generates is removed |
+| `.claude/README.md`, `.github/CONFIGURATION.md` | copied, only when the repo already has the file |
+| `.claude/biome.jsonc` | copied, created when absent |
+| `.gitignore` | only the Loom-managed block is merged (as `loom-daemon update-gitignore` does), and only when the file exists. The file is never listed in `installed_files` |
+| `.loom/CLAUDE.md`, `.loom/AGENTS.md` | re-rendered from the release's template with the install date the file already carries, so an unchanged template changes nothing. Only when the file exists and has an `**Installation Date**:` line |
+| files in `defaults/.loom-retired.list` | removed when present, whether or not `installed_files` lists them |
+
+A path pinned in `.loom/resync-ignore` is never written or removed, in either
+form the shell resync accepts (`.agents/skills/loom-<name>/SKILL.md` or
+`agents-skills/loom-<name>/SKILL.md`, `.claude/commands/loom/<name>.md` or
+`commands/loom/<name>.md`). A symlink, or a surface reached through a symlinked
+directory, is left alone. A file the repo's ignore rules exclude is never
+committed.
+
+Removing a dropped skill is something only the daemon resync does (the shell
+resync never removes one), and it goes by the marker, not by who wrote the
+file: a copy of a Loom skill kept under another `loom-<name>/` directory with
+the marker line still in it is removed on the next resync. To keep a customised
+skill, detach it: delete the `<!-- loom-managed-skill -->` line from its
+`SKILL.md` (or pin the path). Loom then never writes or removes it.
+
+One file a resync cannot use does not stop the rest. A `.gitignore` or guide
+that is not UTF-8, or a directory where a `SKILL.md` or `.claude/biome.jsonc`
+should be, is skipped: the daemon logs one warning naming the repo and the
+path, never writes or removes that file, and resyncs every other surface. A
+guide with no `**Installation Date**:` line is logged once per repo at `info`,
+since it stays at its old template until the repo is reinstalled. Both are
+logged once per repo and path for the life of the daemon, not once per tick.
+
+The first resync after a host moves to a release with these surfaces can commit
+more than usual in each repo: the skills are backfilled, and a guide rendered
+from an older template is brought up to date.
+
+**Install-time only.** No daemon resync touches these. The installer or
+`resync-installed.sh` does:
+
+| Surface | Why |
+|---|---|
+| `.loom/config.json` | Consumer configuration. The installer merges it on a reinstall and nothing migrates a key afterwards, so **a release that renames or retires a config key must keep reading the old key**. Fleet-wide configuration reaches hosts through the fleet store instead |
+| `package.json` (`loom-workspace` stub) | The removal of its `version` field is a one-time migration (#4285) |
+| root `CLAUDE.md` | Repo-customized. Removing a leftover `**Loom Version**` header is a one-time migration (#6612, #8147) |
+| `.gitattributes` `merge=ours` block and the local `merge.ours.driver` | They resolve per-host resync commits that conflict on the stamp (#4528). The daemon resync has one writer per change. An existing block is left as it is, and local git config cannot be committed |
+| forge labels | The drift check against `.github/labels.yml` is a forge read and a report, not an installed file. Run `sync-labels.sh` |
+
+Also unchanged by a resync: the root `CLAUDE.md` / `AGENTS.md` pointer sections,
+`.github/labels.yml`, `.github/workflows/` and `.claude/agents/`.
+
+Rollout: keep running `resync-installed.sh` (or a fleet wrapper around it) until
+a release with these surfaces is the fleet floor.
+
+### Checkout fast-forward (#10869)
+
+A resync lands on a repo's default branch **on the forge**. Each host
+dispatches from its **own main checkout**: the spawn script and the role
+prompts are read from that working tree. So the same timer also fast-forwards
+each registered workspace's main checkout to its default branch.
+
+- **When.** Inside the startup pass, before any dispatch producer exists, so a
+  daemon that just rolled dispatches (and later resumes paused agents) from the
+  installed files that match it. Then on every tick, as the last step of the
+  workspace resync's pass: on that pass's own thread, inside the same
+  supervised closure, so the fleet-sync timer never waits for it, the single
+  flight and the stuck-pass watchdog cover it, it follows any resync that pass
+  pushed, and it never overlaps the next pass. Nothing else schedules it, and
+  it does not wait for a roll window.
+- **Bounded.** It stops starting workspaces after 30 s at startup, and on the
+  timer after 45 s or at the workspace pass's 120 s deadline, whichever comes
+  first; the next pass starts with the ones it did not reach, and they keep
+  their last report. Every git child has a timeout (15 s for a read and for
+  `ls-remote`, 30 s for a fetch). At startup it runs inside the startup pass's
+  own cap (`LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS`), so it never delays boot
+  past it.
+- **Writes need `fleet.autoApply`.** With it off, nothing is modified and a
+  clean checkout that is behind is reported as `behind`, with the count.
+- **A paused host writes nothing.** "Paused" means everything on the host is
+  left as it is, in a state a resume can pick up, so the fast-forward follows
+  the pause just as the network does, though it is only a local write. With
+  `fleet.autoApply` on, no checkout is moved while dispatch is paused (a
+  drain, a roll's pause or a fleet hold), while a pause roll is armed,
+  committed or in progress, or while a pause manifest found at startup is not
+  yet finished by H5 (`resume-pending`). The last covers the startup pass,
+  which runs before H5 is spawned, and every timer pass until H5 ends. The
+  question is asked again right before each merge. A clean checkout that is
+  behind is reported as `behind` with the reason, and the first pass after
+  the pause ends fast-forwards it. A host that is merely offline, or not in
+  H0 for another reason, is not held this way.
+- **The local merge is not tied to provenance; the network is.** The merge is
+  a write to the host's own clean checkout, so any build with
+  `fleet.autoApply` on may fast-forward to the `origin/<default>` its clone
+  already has. Asking a remote or fetching is another matter: this step does
+  that only on a host the workspace resync would itself use the network on
+  (see below), so a build that is not an official release asks nothing.
+- **One git write.** `git merge --ff-only origin/<default>`, with hooks
+  disabled (`core.hooksPath=/dev/null`), and with `merge.autoStash`,
+  `submodule.recurse` and the silent overwrite of ignored files turned off.
+  Never `reset`, `rebase`, `stash`, `checkout`, `clean`, a merge commit, or a
+  removed lock file. Submodules are not updated.
+
+What a pass costs on the network:
+
+- **None at all on a host the workspace resync keeps off the network**: no
+  `ls-remote` and no fetch. The checkout is compared with the clone's own
+  `origin/<default>` as it stands, so the reported count is as of the last
+  fetch anything made in that clone. That is a host:
+  - with `fleet.autoApply` off;
+  - with dispatch paused (a drain, a roll's pause or a fleet hold);
+  - with a resume pending: a pause manifest found at startup that H5 has not
+    finished with;
+  - running a build that is not an official release, or whose release tag is
+    not verified yet;
+  - with a roll pending, or a different binary staged on disk;
+  - running a version below the fleet floor (`loom_min_version`);
+  - whose self-update is backing off or has given up;
+  - in an outage hold (no remote answered in a recent pass).
+
+  On the timer the step does not work this out for itself: it takes the
+  workspace pass's own decision, so the two halves cannot disagree. At startup
+  it applies the same host gate to what is knowable at boot; a fresh daemon is
+  exempt only from "startup pass not complete", since that pass is the one
+  that verifies.
+- **None for a repo the resync is backing off** because its remote did not
+  answer or refused, until that backoff ends.
+- **None for a repo the workspace resync asked about in the same pass.** That
+  pass already learned the head (one batched query per owner) and fetched it
+  if it moved; this step trusts it, and fetches only if the clone's
+  `origin/<default>` is somehow not that head.
+- **One `git ls-remote` per pass for any other root**: the Loom source repo
+  and a non-GitHub origin (which the resync skips), a repo the resync did not
+  reach, and every root at startup. Then a `git fetch` only
+  when the head moved, with `--no-write-fetch-head`. The rate-limit breaker is
+  read immediately before each `ls-remote`; while it is open nothing more is
+  asked and the checkout is compared with the clone as it stands.
+- Three remotes in a row that do not answer end the pass's network use.
+- **No fetch below the free-space floor** (`diskWarnFreeGb`, #10995). A fetch
+  that is due there is not run, at startup or on the timer, and the checkout
+  reports `low-disk`, never `fetch-failed`: it is not a failure, sets no
+  backoff and does not count toward the three-in-a-row stop.
+
+So on a host that may use the network, any commit on the default branch
+reaches every clean checkout on the next tick, and the host that pushed a
+resync fast-forwards to it in the same pass.
+
+The step never waits for its own state: if an earlier step that never ended
+(for example one stuck in a git child) still holds it, the tick's step is
+skipped, the workspace pass it follows still records its result, and the
+`Fleet store:` block says `checkouts: an earlier checkout step has not ended;
+nothing was checked this tick`.
+
+For each workspace the first rule that matches ends the attempt:
+
+| # | Check | State when it fails |
+|---|---|---|
+| 1 | the clone's `origin/HEAD` names the default branch (no remote is asked, `main` is never guessed) | `no-default-branch` |
+| 2 | HEAD is on it, not on another branch and not detached | `wrong-branch` |
+| 3 | no rebase, merge, cherry-pick, bisect or revert is in progress | `mid-operation` |
+| 4 | no main-health gate run is building in the checkout | `gate-in-flight` |
+| 4 | the daemon's self-update is not running in the checkout | `self-update-in-flight` |
+| 5 | `origin/<default>` is the remote's head, asking it only when the resync did not | `fetch-failed`; `low-disk` when the fetch was not run below the free-space floor and nothing else is to report |
+| 6 | nothing behind and nothing ahead | `current` |
+| 7 | ahead only: unpushed local commits | `ahead` |
+| 8 | ahead and behind | `diverged` |
+| 9 | no staged or unstaged change to any tracked file | `dirty` |
+| 10 | the merge succeeds | `would-overwrite` when a local file is in the way, else `git-failure` |
+| | | `fast-forwarded` |
+
+- **Local work is never touched.** A checkout in any skip state is left exactly
+  as it is: HEAD, index and working tree. Untracked files do not make a
+  checkout dirty; one that sits where an incoming commit adds a file is
+  `would-overwrite`, and nothing is changed.
+- **Stricter than the gate's sync, on purpose.** The main-health gate also
+  brings a checkout to `origin/main` before a gate build
+  (`prepare_workspace_to_origin_main`), with `git reset --hard`, and so may
+  ignore some tracked dirt (lockfiles, a re-stamped
+  `.loom/install-metadata.json`). That sync is unchanged, and it runs only for
+  a repo with a build gate when a gate run is due. This step discards nothing,
+  so any tracked change is `dirty`. The two compose: after a fast-forward the
+  gate's reset is a no-op. They are not mutually excluded: this step checks
+  for a gate run before an attempt and again right before the merge, which
+  narrows the race but does not close it. Both writers are the daemon's own and
+  both only bring the checkout to `origin/<default>`, so a race converges. A
+  checkout left dirty by the retired shell resync shows up once and needs a
+  one-time clean-up.
+- **Not the fleet-refresh task.** `eta-fleet-refresh` (#10263) refreshes ETA
+  snapshots through the forge API on the fleet captain. It runs no git command
+  in any checkout and is unrelated to this step.
+- **A host behind a repo still fast-forwards.** The checkout moves to whatever
+  is on the default branch, even when those installed files are newer than this
+  daemon. Whether that pair may dispatch is the host roll's decision (#10719).
+- **Running agents are unaffected.** Sweeps work in their own worktrees, and a
+  script that is already executing keeps the file it opened.
+
+**The Loom source checkout is included.** The self-update loop still never
+pulls it, and its clean-tree gate is unchanged. What changes is that on a host
+with `fleet.autoApply` on, the checkout the loop compares the running binary
+against now advances on its own:
+
+- A host that installs release artifacts is unaffected: that path never reads
+  the checkout. Between a merge and its release the checkout is ahead of the
+  installed binary, which is the case #9711 describes for a hand-run
+  `loom-daemon-update.sh`; that script's behaviour is not changed here.
+- A fleet host moves only when the floor moves (`loom_min_version`; fleet
+  hosts no longer chase the latest release, #10885). So a newer commit in the
+  checkout is not by itself a reason to roll, and a source-building fleet host
+  does not rebuild as `main` moves. When a roll does build from source, it
+  builds the commit `loom-daemon-update.sh` would itself have fast-forwarded
+  to. Both only move forward along the default branch.
+- The checkout never moves under a running update. The script verifies that
+  the binary it built is a build of the checkout's HEAD and treats a mismatch
+  as terminal, so the daemon holds the checkout for the whole run of the
+  script: this step skips it (`self-update-in-flight`), and an update that
+  starts during an attempt waits for that one attempt. A `loom-daemon-update.sh`
+  run by hand is outside the daemon and is not covered. A fast-forward that
+  lands before its build stamps the commit fails its verification (exit 4),
+  and it is run again. There is a narrow window after the stamp, while the
+  compiler is still reading sources, in which a fast-forward gives a binary
+  stamped with the old commit but built partly from new sources, and the
+  verification passes. It needs a new commit on the default branch to land in
+  that window, after the script's own fast-forward.
+
+Reporting:
+
+- `fleet-sync-status.json` gains `checkouts`, one entry per workspace: `root`,
+  `state`, `branch`, `behind`, `ahead`, `head`, `detail`, `since` and
+  `installedFilesBehind`. The `Fleet store:` status block shows every workspace
+  that is not `current`.
+- `installedFilesBehind` is true when the commits the checkout is missing
+  change `.loom/` or `.claude/commands/loom/`: the host is running stale Loom
+  scripts, not merely stale product code.
+- A state is logged, and published on the event bus as `fleet_sync.checkout`,
+  when it is entered and when it clears, not once per pass. A skip state is a
+  `warn`, or an `error` when `installedFilesBehind` is true. A fast-forward is
+  an `info` naming the old and new commit. `fetch-failed`, `git-failure` and
+  the two in-flight states are reported only after three passes in a row. The
+  memory behind this is per process: a restarted daemon reports each standing
+  skip state once more.
 
 ### ETA fit publication branch (#10395)
 
@@ -4241,7 +4622,7 @@ touching running work.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
+| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` (default 8 GB, #8370) on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
 | **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
 | **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
@@ -5449,7 +5830,8 @@ config (`autonomous.workFinder.enabled`, see "Operability" below). Tunables:
 supervisor's 300s so the `loom:issue` backlog drains promptly),
 `LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
 dynamic policy above, not a fixed target), and `LOOM_PER_WORKTREE_GB` (default
-2 — the per-worktree disk estimate the disk-headroom bound divides by). A zero
+8 since #8370, calibrated from measured cargo target dirs — the per-worktree
+disk estimate the disk-headroom bound divides by). A zero
 or unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
@@ -5701,7 +6083,9 @@ concurrency ceiling 5" and share it with the team:
       "excludedRepos": [],
       "logCaptureEnabled": false,
       "logCaptureMaxBytes": 5242880,
-      "logCaptureExcludedRepos": []
+      "logCaptureExcludedRepos": [],
+      "journalRotateBytes": 268435456,
+      "journalRotateKeep": 2
     },
     "sweepOutcomeWriteback": {
       "enabled": false
@@ -5846,9 +6230,9 @@ knobs not yet audited here.
 | `safehouse.rooms.byRepo` | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,…`) | `{}` | Attention-class routing (#4225): per-repo **firehose** room ids keyed by workspace-root basename — `task`/`chat` narration. A repo absent from the map is created lazily as `fleet-<repo>`; a refused creation degrades that repo to the signal room with one `warn!`. The env form replaces the whole map |
 | `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
-| `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
+| `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055) **on a host with no fleet store only**. **Opt-in** there (it rebuilds + restarts the daemon process). On a fleet host (`fleet.repo` set) it governs nothing: the loop runs whatever it says, for the fleet floor and for a workspace that needs a newer daemon, and never chases the newest release (#10954, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
-| `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
+| `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default. **Only on a host with no fleet store** (#10885): a fleet host rolls for its floor on the tick that sees it and never waits on settle |
 | `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | **`true`** | Periodic transcript token/cost ingestion into `~/.loom/activity.db` (#8059, flipped default-on by #8477). **Deliberately defaults ON against FLAGS-OFF**, like the `autonomous.eta.*` writers: it generates no work (a passive, ledgered, idempotent telemetry writer), while default-*off* silently destroyed data — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30), so every host that never hand-set the env var lost its cost history permanently. Env `0`/`false`/`no`/`off` opts out; an unrecognized value falls through to config/default rather than silently disabling. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
 | `autonomous.transcriptIngest.intervalSecs` | `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between ingestion passes. Zero/invalid → default. **Restart required** |
 | `autonomous.transcriptIngest.windowHours` | `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history (the unchanged-file ledger keeps that cheap after the first pass). **Restart required** |
@@ -5858,12 +6242,12 @@ knobs not yet audited here.
 | `autonomous.transcriptArchive.archiveDir` | `LOOM_TRANSCRIPT_ARCHIVE_DIR` | `~/.loom/transcript-archives` | Where the scheduled pass writes its `.tar.zst` + `.manifest.json` pairs (same default as the CLI's `--archive-dir`). **Restart required** |
 | `autonomous.transcriptArchive.sinks` | *(config only)* | `["local"]` | Destination identities to ledger under. `local` is the only sink implemented (#8758's scope); unknown names are warned about and dropped, and an enabled pass whose list retains no recognized sink does not start — a future remote sink (#8759) listing must never silently disable `local`. **Restart required** |
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
-| `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
-| `autonomous.autoUpdate.rollStallCooldownSecs` | `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS` | `21600` (6h) | Bounds the `rollStallDeadlines` suppression above in TIME as well as by the `in_flight == 0` sample (#9010): once a standing unsatisfiability declaration has stood for this long, it is dropped and the next tick arms a roll for **one** more bounded attempt — if the host still cannot drain, the detector re-declares after `rollStallDeadlines` more deadlines rather than cycling, so the cost is one paused-dispatch budget per cooldown period instead of unbounded staleness on a host whose `in_flight == 0` sample never lands. Zero/invalid → default, exactly like `rollStallDeadlines`: a `0` would clear a declaration on the tick it was made, re-entering #8998's livelock through the knob. Set it very large to make the retry effectively unreachable |
+| ~~`autonomous.autoUpdate.rollStallDeadlines`~~, ~~`autonomous.autoUpdate.rollStallCooldownSecs`~~ | ~~`LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES`~~, ~~`LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`~~ | — | **Removed by #10831.** They tuned the unsatisfiable-drain detector (#8998/#9010) of the wait-for-zero roll, which no longer exists: every automatic roll is now a pause-and-roll bounded by `pauseRoll.pauseBudgetSecs`. Both keys and both env vars are ignored if still set. |
+| `autonomous.autoUpdate.pauseRoll.pauseBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_PAUSE_BUDGET_SECS` | `120` | Pause-and-roll H4 (#10831, design §7): how long a roll waits for its agents to reach a safe point. An agent that has not parked by then (a tool call longer than the budget, a runtime whose image has no pause hook) is stopped and requeued with `pause-budget-missed`. Read per roll, **no restart**. Validated together with the two keys below: the three must sum to less than two thirds of the lease TTL (`LOOM_LEASE_TTL_MINUTES`, default 15 min → under 600s), or the combination is **rejected** (ERROR + `daemon.roll.config_rejected`) and the defaults are used. |
+| `autonomous.autoUpdate.pauseRoll.verifyProbationSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_VERIFY_PROBATION_SECS` | `90` | Pause-and-roll H5 health probation (#10832, design §7): after a roll's restart, how long the daemon's IPC must keep answering and its heartbeat stay fresh before any paused agent is relaunched. A failed sample restarts the window. Dispatch is held throughout. Read at startup. Validated with the two keys beside it so the pause→resume window stays under the lease TTL. |
+| `autonomous.autoUpdate.pauseRoll.resumeBudgetSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_RESUME_BUDGET_SECS` | `120` | Pause-and-roll H5 resume budget (#10832): how long the relaunch of the paused agents may take once probation has passed. An agent not reached by then is requeued with `resume-timeout`. Read at startup. |
 | `autonomous.autoUpdate.pauseRoll.minResumableAgeSecs` | `LOOM_AUTO_UPDATE_PAUSE_ROLL_MIN_RESUMABLE_AGE_SECS` | `300` (5 min) | Pause-and-roll (#10830, design `docs/design/daemon-roll-pause-resume.md` §2): an agent whose session first started less than this long ago is reset (killed and requeued with reason `young-agent-reset`) at a roll instead of being paused and resumed. The age is measured from the session's first start, carried across earlier roll resumes. `0` disables the rule. Resolved now but **not yet consumed**: no roll pauses agents until #10831/#10832 land |
-| `autonomous.autoUpdate.rollWindowSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS` | *(off)* | Period of the scheduled roll window (#9132). **Unset/zero/invalid → no window**: rolls arm on every new build exactly as before (opt-in; this default preserves existing behaviour). When set, a new build arms **nothing** outside an open window, the settle gate is bypassed (the window is the batching mechanism, so a busy `main` cannot starve the host), and at most one roll arms per window — see [Scheduled roll windows](#scheduled-roll-windows-9132). **Restart required** |
-| `autonomous.autoUpdate.rollWindowOffsetSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS` | derived from host id | Where window 0 opens within the period. Zero/invalid → the **derived** offset: `fnv1a(host_id) mod period`, stable across restarts and spread across hosts. An explicit value is reduced modulo the period, so the offset is always `< rollWindowSecs`. Only meaningful with `rollWindowSecs`. **Restart required** |
-| `autonomous.autoUpdate.launchdLiveReload` | `LOOM_AUTO_UPDATE_LAUNCHD_LIVE_RELOAD` | `false` | Opt-in for the launchd skip-the-drain path (`restart --reload-supervisor`, #6682). Selected **only** on launchd **and** only when `true`; systemd always uses the bounded drain. Depends on #9452 (the stale-sweep watchdog killing journal-adopted survivors) — do not enable on a real host before that is resolved. **Not yet wired to execute**: the selection is reported in `status` and logged, and rolls still use the bounded drain until live-host verification lands |
+| ~~`autonomous.autoUpdate.rollWindowSecs`~~, ~~`autonomous.autoUpdate.rollWindowOffsetSecs`~~, ~~`autonomous.autoUpdate.launchdLiveReload`~~ | ~~`LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS`~~, ~~`LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS`~~, ~~`LOOM_AUTO_UPDATE_LAUNCHD_LIVE_RELOAD`~~ | — | **Removed by #10885.** They scheduled the roll window (#9132), which no longer exists: a roll is a short pause, so nothing batches rolls into a window, and the fleet floor decides when a fleet host moves. All six are accepted and ignored; a host that still sets any of them logs one `auto_update: ignored: …` WARN at startup naming them. Remove them from host configs and the fleet store |
 | `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
 | `autonomous.ciTelemetry.owners` | `LOOM_CI_TELEMETRY_OWNERS` (comma-separated) | `["2amlogic"]` | Orgs **and user accounts** whose repos are auto-discovered and polled (#9188). Each kind comes from `GET /users/{owner}`, probed once per daemon lifetime. Wins over `org` at the same tier. Empty → unset. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
 | `autonomous.ciTelemetry.org` | `LOOM_CI_TELEMETRY_ORG` | — | Deprecated single-owner alias of `owners`: one declared organization, not probed. Empty → unset. **Restart required** |
@@ -5872,43 +6256,81 @@ knobs not yet audited here.
 | `autonomous.ciTelemetry.logCaptureEnabled` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_ENABLED` | `false` | Phase 2 (#8825) gate. **Restart required** — resolved once by `spawn_task` before the poll loop starts |
 | `autonomous.ciTelemetry.logCaptureMaxBytes` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES` | `5242880` (5 MiB) | Per-job cap on captured log text. Zero/invalid → default. **Restart required** |
 | `autonomous.ciTelemetry.logCaptureExcludedRepos` | *(config only)* | `[]` | Repos excluded from **log capture only** — their `ci.run`/`ci.job` records and duration metrics are still captured unconditionally, same admission rule (`repo` + non-empty `reason`) as `excludedRepos`. Distinct key from `excludedRepos` deliberately: excluding a repo there would also drop its metrics, which the ci-observability policy forbids. **Restart required** |
+| `autonomous.ciTelemetry.journalRotateBytes` | `LOOM_CI_TELEMETRY_JOURNAL_ROTATE_BYTES` | `268435456` (256 MiB) | Rotate `.loom/logs/ci-telemetry.jsonl` once the export cursor has passed this many bytes **and** every line is exported (#11045). The observability export pass rotates it under `poll.lock`. Zero/invalid → default. Read on every export pass, no restart needed. See [`ci-observability.md`](ci-observability.md#journal-rotation-11045) |
+| `autonomous.ciTelemetry.journalRotateKeep` | `LOOM_CI_TELEMETRY_JOURNAL_ROTATE_KEEP` | `2` | Rotated journals kept (`ci-telemetry.jsonl.1` newest … `.N` oldest; capped at 32). `0` deletes the journal at rotation instead of keeping it. Read on every export pass |
 | `autonomous.sweepOutcomeWriteback.enabled` | `LOOM_SWEEP_OUTCOME_WRITEBACK` | `false` | Post-`Success` issue write-back comment (#9056). Opt-in, unlike the safety backstops above — it posts a forge-visible comment, not a dispatch decision. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Resolved fresh at each terminal `Success` transition (not cached at startup), so a config edit takes effect on the very next sweep to finish with no daemon restart. See "Sweep-outcome issue write-back (#9056)" below |
 
-### Scheduled roll windows (#9132)
+### The fleet floor drives rolls; no roll windows (#10885)
 
-With `autonomous.autoUpdate.rollWindowSecs` set, the auto-update loop rolls on a
-**schedule**, not on build arrival. Windows start at `offset + k * period` (UTC epoch
-seconds) and stay open for `max(2 x intervalSecs, 600s)` (capped at the period), so a
-tick always lands inside one.
+There is no roll window, no per-host offset and no jitter. On startup and on
+every tick the self-update loop compares the fleet floor (`loom_min_version`,
+above) with the version it is running, and acts on that tick.
 
-- **Outside an open window nothing arms.** `status` reports `scheduled wait: ...`.
-  The roll targets whatever artifact is on disk when the window is open, so nothing
-  chases a moving target.
-- **One arm per window.** A drain that times out (the roll goes *pending*, #6007) is
-  abandoned so dispatch resumes, and nothing re-arms until the next window, however
-  many ticks or releases pass (`drain timed out, waiting for next window`). This
-  composes with #8998/#9010 (their abandonment and cooldown still apply inside a
-  window) and #8514 (a still-draining roll overtaken by a newer release is retargeted
-  once, inside the same open window; after the window closes the stale target is
-  dropped and the newest waits). Operator drains (`restart --drain`, `--then-exit`
-  teardowns) are never abandoned or counted as an update pause.
-- **Stable per-host offset.** Derived from the host id unless configured, identical on
-  every restart.
-- **`status`** (`Auto-update loop:` lines and `auto_update.roll_window` in `--json`)
-  shows the period/offset, whether a window is open, when the next one opens, the roll
-  target, whether an update drain holds dispatch paused, the last deferral reason and
-  the selected restart path.
+What it does depends on whether the host reads a fleet store (`fleet.repo`).
+**This applies to every fleet host, whatever `autonomous.autoUpdate.enabled`
+says** (#10954): the loop is spawned on every host with a fleet store, and
+`enabled` only decides whether a host with no fleet store runs it at all.
 
-**Fleet-overlap guarantee, stated precisely.** Distinct per-host offsets *reduce
-synchronized drain starts*; they do **not** guarantee that two hosts' drains never
-overlap. A drain can last up to its own timeout, which can exceed the gap between two
-hosts' offsets, and there is no fleet coordination or budget rule (a host does not look
-at what its peers are doing). Treat offsets as spreading, not mutual exclusion. A
-fleet-level "do not arm while a peer is draining" rule is not implemented.
+| Floor | Running vs floor | This tick |
+|---|---|---|
+| no fleet store, `autoUpdate.enabled=false` | n/a | No loop and no roll, as before |
+| no fleet store, `autoUpdate.enabled=true` | n/a | Opt-in `autoUpdate` as before: the newest release (or a newer source checkout) behind `settleSecs` and its `6 ×` ceiling. `target_source = autoupdate` |
+| unknown | n/a | No roll for the floor. `last tick:` says `fleet floor not known (…)` and why. A workspace that needs a newer daemon still rolls the host (the last row) |
+| set | below; the newest release is at or above it | Pause-and-roll now, no settle, to that release's exact tag. `target_source = floor` |
+| set | below; the newest release is below it | `FLEET FLOOR UNSATISFIABLE` at ERROR. No roll; dispatch continues |
+| set | below; no release resolved | No roll; the next tick asks again |
+| set | at or above | **No roll**, whatever newer release, re-published artifact or source HEAD exists, unless a registered workspace needs a newer daemon (the next row) |
+| any store, floor unknown included | a workspace's installed Loom needs a newer daemon (`W4`, #10719) | Pause-and-roll now, no settle, to the newest published release (binary and `.sha256` present) at or above its `requires_daemon`. `target_source = repo_ahead` (`floor` when the floor drives too). See [Dispatch holds](#dispatch-holds-10719) |
 
-**Restart path.** systemd always uses the bounded drain. On launchd the drain is skipped
-only with `launchdLiveReload: true`, which is off by default and is not yet wired to
-execute (see the knob above); freshness deadlines never become an implicit force-kill.
+- **A fleet host moves only when the floor moves.** It does not chase the
+  newest release and does not rebuild itself from source as `main` advances.
+  The settle window and its ceiling do not apply to it at all. (A repo ahead
+  of the daemon, #10719, and a restart-only config change, #10720, are separate
+  triggers that also act on the next tick.)
+- **The target is the newest release at or above the floor**, not the floor's
+  own tag: the floor is a lower bound, not a pin. "Newest release" is the
+  forge's latest release, and only once it publishes this platform's binary
+  and its `.sha256`. A tag with no assets yet is never a target; a host below
+  the floor waits for the next tick.
+- **The floor is unknown** when a store is configured but no floor is known:
+  the startup pass has not completed and no earlier snapshot records one, the
+  store carries no `loom_min_version`, or the store could not be started. The
+  host does nothing for the floor rather than fall back to chasing the latest
+  release, logs one WARN when it enters that state, and repeats the reason on
+  every tick's note. It still rolls for a workspace that needs a newer daemon
+  (the last table row), to a real published release. Before the first pass of a new process completes, the floor the
+  previous process recorded in `fleet-sync-status.json` counts as set.
+- **A floor bump rolls every host within about one sync interval.** Rolls are
+  not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so
+  hosts rolling together is accepted. Two hosts that roll minutes apart across
+  a new release can land on different versions, both at or above the floor.
+- **Backoff still applies.** A failed fetch backs off as before, and a roll
+  whose new binary did not take is held back per target by the failed-roll
+  guard (#10832) inside the pause-and-roll itself.
+- **Every fleet host runs the loop, `autoUpdate.enabled` or not** (#10954).
+  The mode is chosen once at startup, after the startup fleet-sync pass has
+  classified the host: a store that is named but unusable is a fleet host
+  whose floor is unknown, so the loop runs and does nothing for the floor.
+  Status says why the loop runs: `Auto-update loop: fleet floor only
+  (autoUpdate.enabled=false)` (`auto_update.mode` in `status --json`). On a
+  fleet host `enabled` has no effect, since a fleet host never chases the
+  newest release; on a host with no fleet store it still switches the opt-in
+  loop on and off. Should a floor-only loop's host stop reading a fleet store
+  while running, its ticks check nothing rather than start chasing.
+- **There is no per-host opt-out from a floor roll.** `autoUpdate.enabled=false`
+  does not stop one, and neither does the fleet store's `paused` run state
+  ([Run-state enforcement](#run-state-enforcement-9598)): a fleet-paused host
+  below the floor still rolls. The roll replaces the pause's hold with a
+  supervised drain, restarts once nothing is in flight, and the daemon comes
+  back still paused (#10979). An operator stop on record (written by `restart
+  --drain --then-exit` or `fleet drain`) does hold a roll: that tick is
+  skipped. `restart --abort-drain` clears that record and releases the hold.
+  A `stopped` host exits at boot, before the loop starts.
+- **A manual `loom-daemon-update.sh` asks first** (#11044). Run by hand on a
+  fleet host, it warns before installing a version that moves the host off
+  the floor, asks `[y/N]` on a terminal and refuses without one unless given
+  `--yes`. `--to-floor` installs exactly the floor's release. See [Fleet floor
+  check](#self-update-rebuild--provision--restart-3968).
 
 ### Sweep-outcome issue write-back (#9056)
 
@@ -9027,6 +9449,66 @@ See `loom-daemon/src/tmpfs_visibility.rs`,
 `loom-daemon/src/health/tmpfs_visibility_section.rs`, and
 `loom-daemon/src/work_finder/tmpfs_warning.rs`.
 
+#### Orphaned cargo target dir reclaim (#8370)
+
+**The leak.** Agents that were not handed a `CARGO_TARGET_DIR` improvised one:
+`<repo>/.loom/target-{builder,doctor,judge}-<N>` (85 GB on one fleet host),
+`/tmp/loom-target-*`, `/tmp/cargo-target-{issue,review}-<N>`,
+`$TMPDIR/cargo-target-*`, `~/.cache/cargo-target-*`. Nothing owned them, so
+nothing removed them.
+
+**Prevention.** `worker_spawn` now exports a Loom-owned
+`CARGO_TARGET_DIR=<repo>/.loom/targets/<role>-<run-id>` (logged as
+`# LOOM_CARGO_TARGET_DIR … (#8370)`) unless the #8458 per-worktree dir applies,
+`CARGO_TARGET_DIR` is already set, the spawn is a containerized re-entry, or
+the repo has no root `Cargo.toml`. A role-runner tick plans the path (passed
+as `LOOM_RUN_TARGET_DIR`) and removes the dir when the child exits, on every
+outcome; a removal failure is logged and never fails the tick. It first checks
+the child's process group (`kill(-pgid, 0)`, with a 2 s grace): while a
+descendant is alive (a detached `cargo test`) the dir is kept for the sweep.
+Run-end removal exists for role-runner ticks only. A daemon sweep spawn or a
+manual `spawn-worker.sh` derives a fresh dir per spawn (so each build is cold;
+sccache softens it) and has no process left to remove it, so those dirs are
+collected only by the sweep below, three hours or more after the owner exits.
+
+**The sweep** (`target_orphan_reclaim`) collects what run-end removal cannot
+(daemon sweeps, manual spawns, the legacy prefixes above). It runs from the
+scheduled reaper tick, the eager below-floor pass, and `loom-daemon clean`
+(report-only unless `-y`; `--dry-run` reports bytes and deletes nothing). It
+removes a direct child of a known prefix only when it is a real directory (not
+a symlink), does not overlap a configured `CARGO_TARGET_DIR` /
+`build.target-dir`, has a newest recursive mtime older than the max age, no
+live claim names its issue, its recorded owner pid (`.loom-run-owner`) is not
+running, and no process holds it open. If the open-handle probe cannot run (no
+`/proc`, no `lsof`) the dir is kept.
+
+Three more gates bound where it can reach:
+
+- **The scan root.** `<repo>/.loom` and `<repo>/.loom/targets` are scanned
+  only when every component below the repo root is a real directory and the
+  canonical path is inside the canonical repo root. A symlinked root is
+  refused whole (`not scanning … is a symlink`), because its children belong
+  to wherever the link points.
+- **The name.** Under `.loom/targets` a dir needs the `<role>-<run-id>` shape
+  **and** the `.loom-run-owner` marker `provision` writes. Under `/tmp`,
+  `$TMPDIR` and `~/.cache` the prefix must be followed by an agent-shaped
+  suffix: `-`-separated tokens, each one of `issue`, `review`, `pr`,
+  `builder`, `doctor`, `judge` or a number, with at least one word and one
+  number (`cargo-target-issue-10078`, `loom-target-10570-doctor`). A human's
+  `~/.cache/cargo-target-shared` never matches.
+- **The owner.** Under those three shared roots a dir owned by any uid other
+  than the daemon's effective uid is kept (`ForeignOwner`), root daemon
+  included: liveness cannot be established for another user's processes.
+
+Each pass logs
+`target_orphan_reclaim: category=cargo_target_orphan … removed=N bytes_freed=B`.
+
+| Knob | Default |
+|---|---|
+| `LOOM_TARGET_ORPHAN_RECLAIM` / `autonomous.worktreeReaper.targetOrphanReclaim.enabled` | on |
+| `LOOM_TARGET_ORPHAN_RECLAIM_MAX_AGE_HOURS` / `….maxAgeHours` | 3 |
+| `LOOM_TARGET_ORPHAN_RECLAIM_MIN_INTERVAL_SECS` / `….minIntervalSecs` (per repo) | 1800 |
+
 #### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
 
 **The gap this closes.** Every reclaim pass above runs on the **worktree
@@ -9153,6 +9635,61 @@ re-walk `.loom/claude-config/*/tmp` every 60 seconds.
 | `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
 
 See `loom-daemon/src/scratch_reclaim.rs`.
+
+#### Aborted-fetch `.git/objects` temp-file reclaim (#10995)
+
+**What was leaking.** A `git fetch` that runs out of disk aborts and leaves its
+partial download as `objects/pack/tmp_pack_*` (loose: `objects/??/tmp_obj_*`).
+Git removes those only in a `gc`/`prune` older than `gc.pruneExpire` (two
+weeks), and the daemon retries its fetches every tick, so a full disk fed
+itself (35 GiB of `size-garbage` in one checkout on loom-worker-1).
+
+**What it removes, and the gates.** Only regular files named `tmp_pack_*`
+directly in `<git-common-dir>/objects/pack`, or `tmp_obj_*` directly in a
+two-hex-digit `objects/??` directory; real packs, `tmp_idx_*`, symlinks and
+every other path are never candidates. A file must be at least `graceMinutes`
+old (default 60, floor 5). The whole checkout is skipped while any `git`
+process has its cwd or an open file in the checkout, its common dir or a linked
+worktree (Linux: `/proc`; elsewhere: `lsof -c git`), and also when that probe
+cannot answer. Each pass that finds debris logs `category=git_tmp_pack` with
+the file count and `bytes_freed`.
+
+**Where it runs.** The scheduled `worktreeReaper` tick and the eager
+below-floor tier (both before the deep clean, with a shared 10-minute per-repo
+cooldown), and `loom-daemon clean` (no cooldown; `--dry-run` reports without
+deleting).
+
+**Fetch precheck.** The daemon's managed-checkout fetches (main-health gate,
+workspace resync, `loom-daemon update`) are skipped and logged when the
+checkout's volume is below `diskWarnFreeGb`. The main-health gate reports the
+skip as the `low-disk` unevaluated class, never as a git failure or a red
+`main`; the workspace resync reports it as a `low-disk:` reason on the
+workspace, never as an unreachable remote or a failure of the repo, so it
+raises no `network` or per-repo `failure` alert and grows no backoff, and it
+takes no resync claim for a resync whose fetch would be skipped; an
+unmeasurable volume never skips a fetch.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "gitTmpReclaim": {
+        "enabled": true,
+        "graceMinutes": 60,
+        "minIntervalSecs": 600
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_GIT_TMP_RECLAIM` | `autonomous.worktreeReaper.gitTmpReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_GIT_TMP_RECLAIM_GRACE_MINUTES` | `autonomous.worktreeReaper.gitTmpReclaim.graceMinutes` | env > config > default | `60` (min 5) |
+| `LOOM_GIT_TMP_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.gitTmpReclaim.minIntervalSecs` | env > config > default | `600` (10 min) |
+
+See `loom-daemon/src/git_tmp_reclaim.rs` and `loom-daemon/src/fetch_headroom.rs`.
 
 #### Guarded native-harness launch state reclaim (#8650, dedup + path fix #8693)
 
@@ -12021,13 +12558,9 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     fires when in-flight reaches zero. It never resumes on its own — only
     `restart --abort-drain` does. `status` shows `timed_out`/`origin`;
     `fleet drain` maps a held remote to its exit code `2`.
-  - **The auto-update roll** keeps the roll **pending**: dispatch stays paused
-    and the restart fires the instant in-flight reaches zero. Retry windows
-    widen geometrically (`base × 2ⁿ`, capped at 2h each) within a total
-    paused-dispatch budget of `4 × --timeout` (capped at 4h); once spent the
-    roll is **abandoned** and dispatch resumes, so a version roll nobody asked
-    for can never starve a host of work. An operator request against it
-    promotes it to an operator drain (one-way).
+  - **An automatic roll is not a drain of this kind any more (#10831).** It
+    never reaches this deadline: it is a `pause-roll` drain bounded by its pause
+    budget, described under "Automatic rolls pause and roll" below.
   - **Escalation (#9588):** a later `restart --drain --force-after-timeout`
     escalates ANY active drain in place — the deadline only moves earlier
     (`now` for a held or pending drain) — and `--then-exit` escalates
@@ -12037,128 +12570,190 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
     never revives past it, startup healing never re-arms the marker, and a
     supervised relaunch (`RunAtLoad`, reboot) comes up with dispatch **held**.
     `restart --abort-drain` restores the marker; an explicit start clears it.
-  Why this asymmetry: on a host that is actually working, resuming dispatch at the
-  deadline handed the admission window straight back to the work finder, which
-  admitted more sweeps, which made the *next* drain strictly harder to satisfy. In
-  the 2026-08-11 fleet roll three of four hosts never activated the new binary for
-  exactly this reason (in-flight went `1 → refused → 3`), and the only workarounds
-  were an operator-guessed `--timeout 7200` or destroying work with
-  `--force-after-timeout`. Both refusal notes (rendered by `loom-daemon status` as
-  `Drain: not draining (last: …)`, or on the line under `Drain: DRAINING …` while a
-  roll is pending) name the exact local retry —
-  `loom-daemon restart --drain --force-after-timeout --timeout <secs>` — so an
-  operator is never left guessing at a nonexistent bare `drain` subcommand or the
-  unrelated `fleet drain <ssh_host>` remote worker-decommission command (#5340;
-  see "`fleet drain`" above — same word, different command, different host).
-- **The auto-update loop cooperates rather than racing (#6007).** While any roll is
-  armed — including one retained across a refused deadline — `auto_update`'s tick
-  skips instead of rebuilding again: the binary is already provisioned and the
-  restart is already coming, and a redundant `cargo build` would compete for CPU
-  with the very in-flight sweeps the pending roll is waiting on.
-- **…but a superseded pending roll is replaced, not waited out (#8514).** That
-  skip was unconditional, so a release published mid-pause was ignored until the
-  armed roll finished or spent its budget — on a multi-release day a host could
-  sit paused for up to the whole budget converging on a binary that was already
-  stale. A tick now compares the release it resolves against the identity the
-  armed roll was triggered for (its tag + published asset checksum, recorded by
-  `DrainState::set_roll_target`) and **supersedes** a stale one: the roll is
-  discarded through the same `--abort-drain` primitive (flag cleared, generation
-  bumped, #6007's pending bookkeeping reset — dispatch resumes while the new
-  artifact is fetched), then re-armed for the newer artifact, publishing
-  `daemon.drain.superseded`. Deliberately narrow — every other shape still skips
-  exactly as before: a **first-attempt** drain (still inside its own deadline), a
-  **then-exit teardown**, an **untargeted** operator `restart --drain`, and any
-  tick whose resolved artifact is unresolved, already installed, or older
-  (#8513's stale-repo shape).
-- **…and a roll whose wait condition is unsatisfiable is abandoned rather than
-  re-armed forever (#8998).** #6007's budget bounds **one drain**. It does not
-  bound the *sequence* — arm → refuse → retain → abandon → arm again — and each
-  new release restarted the budget from zero (a #8514 supersede restarted it
-  mid-pause, too). On 2026-09-25 two fleet dispatchers spent **21 hours** in that
-  cycle (72 and 65 consecutive "a drain-and-restart roll is already armed …
-  skipping this tick" ticks) and never once rolled; the blocker was a
-  genuinely-working 9h32m analog-simulation sweep (`sky130-sar-adc#431`), so
-  "wait for in-flight to reach zero" was structurally unachievable on that host.
-  Because `draining: true` suppresses **role spawns** as well as sweep dispatch,
-  one host produced zero role ticks for 4h20m.
-  `auto_update` now counts drain deadline expiries **across roll lifetimes** and
-  tracks the lowest in-flight count seen at any of them. Once
-  `rollStallDeadlines` (default 3) deadlines have expired with that floor never
-  improving, the roll is **abandoned** — through the same `--abort-drain`
-  primitive a supersede uses, so dispatch (and role spawns) resume and #6007's
-  bookkeeping is fully reset — and **no new roll is armed** until in-flight is
-  observed at zero. **Be precise about what clears it**, because "self-clearing"
-  is easy to over-read: the *fast path* is an auto-update tick that *samples*
-  `in_flight == 0`, i.e. on the `autoUpdate.intervalSecs` cadence (default 900s)
-  and **with dispatch running**. That is strictly harder to hit than the drain's
-  own quiescence watch, which is continuous *and* observes a paused dispatcher
-  where in-flight can only fall: once dispatch resumes, a cap-12 dispatcher
-  refills the in-flight set as soon as the long sweep ends, so a 900s sample can
-  miss every lull. **The declaration also expires on TIME (#9010).** Once it has
-  stood for `rollStallCooldownSecs` (default 21600s / 6h; env
-  `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS`, `env > config > default`, a
-  zero/invalid value dropped on both tiers exactly like `rollStallDeadlines`,
-  since a `0` would clear a declaration on the tick it was made) the whole
-  episode is dropped and the next tick arms a roll normally, for **one** more
-  bounded attempt. If the host still cannot drain, the detector re-declares
-  after `rollStallDeadlines` more deadlines rather than cycling, so the cost is
-  one bounded paused-dispatch budget per cooldown period, not a continuous one —
-  staleness is **bounded**, not indefinite. A cooldown-released retry logs its
-  own WARN (`RELEASING ONE BOUNDED RETRY`) naming how many cooldown retries have
-  already been spent since the host was last seen idle; that count is zeroed by
-  the next `in_flight == 0` sample, so a host that recovers and later stalls
-  again starts from "retry 1". The finding is logged at WARN, published as
-  `auto_update_note`, recorded as `drain_note`, and emitted on the bus as
-  `daemon.drain.roll_unsatisfiable`; it names the deadline count, the in-flight
-  floor, how long the **stalled episode** has run (which spans ticks with
-  nothing armed — it is not the live roll's armed duration), the cooldown
-  window and retries already spent, and the three operator actions
-  (`loom-daemon list` to find the sweep, `loom-daemon cancel --sweep <id>`, or
-  `restart --drain --force-after-timeout` to force through).
-  **The fail-safe is untouched: no sweep is ever cancelled**, and the pre-update
-  binary keeps running — the change trades a silent indefinite livelock for one
-  loud, actionable state, not for a cancelled sweep. Deliberately narrow in the
-  same way #8514 is: an episode only advances for a **relaunch** roll this daemon
-  armed and **labelled with an artifact target**, so a `fleet drain` teardown and
-  an operator's untargeted `restart --drain` are never abandoned by the loop.
-  That holds **while a declaration is standing, too** — the ownership test runs
-  ahead of the sticky flag in `RollStallTracker::observe`, and the abandonment in
-  `run_tick` re-tests it before calling `abort()`, so a drain armed *after* the
-  declaration latches is left alone rather than cancelled on the next tick. Both
-  halves are needed: `fleet drain` detects a remote refusal by observing
-  `drain.draining == false`, so aborting an operator's teardown would leave the
-  host running and be read as a refusal nobody is told about. What this does
-  **not** do is let such a host update:
-  #8998's other two directions (age-excluding a long sweep from the drain
-  condition; dropping the full-drain requirement for artifact rolls) are the
-  work that would, and both change safety-relevant semantics.
-- **Worst-case pause, per path — and why the two paths keep sharing one budget
-  (#8514).** The budget constants (`DRAIN_PENDING_BUDGET_MULTIPLIER` = 4,
-  `MAX_DRAIN_PENDING_BUDGET_SECS` = 4h, `MAX_DRAIN_RETRY_WINDOW_SECS` = 2h, all in
-  `loom-daemon/src/ipc/drain_roll.rs`) are deliberately **shared** between the
-  automatic auto-update roll and an operator-issued `restart --drain --timeout`,
-  because the budget is already derived from the *requested* timeout and the two
-  paths request different ones:
-
-  | Path | Requested timeout | Pending budget | Worst case dispatch stays paused |
-  |---|---|---|---|
-  | Auto-update roll (`IpcDrainTrigger::trigger`, `timeout_secs = None`) | `DEFAULT_DRAIN_TIMEOUT_SECS` = 1800s | `4 × 1800s` = **2h** | 2h, then abandon + dispatch resumes |
-  | `restart --drain` (no `--timeout`) | 1800s | 2h | as above |
-  | `restart --drain --timeout 60` | 60s | 240s | 4m |
-  | `restart --drain --timeout 7200` | 7200s | `min(4 × 7200, 4h)` = **4h** | 4h (the absolute cap) |
-
-  A separate, smaller constant for the automatic path was considered and
-  **rejected**: abandoning sooner does not shorten the pause a busy host
-  experiences, it only makes it *repeat* sooner. Abandon resumes dispatch, but the
-  artifact is still not installed, so the next auto-update tick re-arms the roll
-  and re-pauses dispatch — a 30m budget would oscillate pause/resume every 30m
-  instead of every 2h, adding drain-supervisor churn and more `daemon.drain.*`
-  noise for no extra dispatch throughput. The multi-release day the issue actually
-  reported is fixed by the supersede bullet above (the pause now ends when a newer
-  release lands, not when a timer expires), and the previously-invisible pause is
-  fixed by the live `drain.roll` fields in the observability bullet below.
-  Operators who *do* want a shorter automatic bound should shorten the **timeout**
-  (which the budget follows), not the multiplier.
+  The hold note (rendered by `loom-daemon status` under `Drain: DRAINING …`)
+  names the exact local commands — `loom-daemon restart --drain
+  --force-after-timeout` to cancel the stragglers, `loom-daemon restart
+  --abort-drain` to resume — so an operator is never left guessing at a
+  nonexistent bare `drain` subcommand or the unrelated `fleet drain <ssh_host>`
+  remote worker-decommission command (#5340; see "`fleet drain`" above — same
+  word, different command, different host).
+- **Automatic rolls pause and roll (#10831).** Every automatic roll — a
+  floor-driven roll (`floor`), a source rebuild because the checkout is ahead
+  (`repo_ahead`), a restart-only config change (`config_restart`) and an ordinary
+  autoUpdate roll (`autoupdate`) — goes through one trigger
+  (`trigger_pause_roll`) and one path. **No automatic roll waits for in-flight
+  work to reach zero.** The design is `docs/design/daemon-roll-pause-resume.md`
+  (in the Loom repository). H3 → H4 below is the old binary's side; the next
+  start's side (H5, #10832) follows it.
+  - **What it does (H4).** It sets the same dispatch-pause flag, with origin
+    `pause-roll`, then: closes dispatch in every registry and in the role
+    runner (a dispatch that had already passed the flag is refused too) and
+    waits, for at most 30s, for any dispatch that is mid-spawn to be recorded;
+    snapshots every daemon-dispatched agent (sweeps in every managed root, plus role runs);
+    writes the pause manifest (`roll-pause-manifest.json` in the auto-update
+    state dir, `phase = pausing`) **before signalling anything**; stops at once
+    every agent it will not resume; asks the rest to stop at a **safe point** (a
+    moment between tool calls, via the `roll-pause` hook) and stops each one's
+    whole process tree as soon as its safe-point record **for this pause**
+    appears (a record left by an earlier pause that stood down is never
+    trusted); refreshes each
+    paused agent's lease once; requeues whatever has not parked when
+    `pauseRoll.pauseBudgetSecs` runs out; does the requeue forge writes; rewrites
+    the manifest with `phase = paused`; and exits for the supervised relaunch.
+  - **Who is requeued, and how it is recorded.** An agent younger than
+    `pauseRoll.minResumableAgeSecs` (`young-agent-reset`), one with no resumable
+    session (`session-not-resumable`), and one that missed the budget
+    (`pause-budget-missed`). Each requeue restores the label through the usual
+    claim-restore path (a closed issue is never re-queued, a parked one stays
+    parked), posts **one comment** naming the roll (`from → to`), the phase and
+    age reached, the reason and whether a worktree with uncommitted edits is
+    left, and emits `daemon.roll.item`. A forge write that does not finish in
+    the forge window (what is left of the budget, at least 30s) is left
+    `planned` in the manifest for the next start; a slow forge never blocks the
+    roll.
+  - **What is never touched.** A paused or requeued sweep's claim lock
+    (`owner.json`), journal entry and checkpoint. They are what a binary that
+    cannot read the manifest recovers from (ordinary restart recovery), so H4
+    never deletes them, and the sweep reaper leaves a sweep alone once the
+    pause has taken it over.
+  - **Process trees.** Stopping an agent stops everything it started: the
+    recorded systemd scope when it really exists (`systemctl --user stop`), and
+    always a freeze-first kill of its process group and its descendants
+    (followed through `setsid`). Nothing else is signalled: a process is not
+    part of the tree because it runs in the agent's worktree, the daemon, its
+    ancestors and its other children are excluded before descendants are
+    followed, and a pid is signalled only while its start time is still the one
+    recorded at the snapshot (a recycled pid is left alone). A recorded
+    scope unit that was never created falls back to that tree kill. A
+    containerized (session-exec) agent's invocation is cancelled through the
+    spawn script's `.cancel` marker; the session container keeps running.
+  - **What can stop it.** No supervisor (nothing would relaunch the daemon), no
+    state directory for the manifest, a manifest from the previous roll that
+    is still live (H5 has not finished with it), or a target whose last roll
+    did not take and is still backing off: the roll is **refused** (`daemon.roll.refused`, ERROR) and
+    nothing is paused. A manifest that cannot be written aborts the pause before
+    anything is signalled and dispatch resumes (`daemon.roll.pause_failed`).
+    There is no drain fallback in any of these cases. While the previous
+    roll's manifest stays live the refusal repeats on every tick; it is logged
+    and published once per manifest, then at most every 5 minutes.
+  - **It always ends.** Every command H4 runs is bounded, and the pause as a
+    whole has a deadline: its settle window, `pauseBudgetSecs`, the 30s forge
+    floor and a 90s margin (270s with the defaults). Past it, a pause that has
+    stopped nothing is ended, its requests, holds and manifest are removed and
+    dispatch resumes (`daemon.roll.pause_failed`); one that has already stopped
+    an agent kills what is left by process group, records those agents
+    `requeue` / `planned` / `pause-budget-missed` in the manifest (left at
+    `phase = pausing`, which the next start finishes) and restarts
+    (`daemon.roll.forced`). Dispatch is never left paused with
+    `--abort-drain` refused.
+  - **Operator commands during a pause.** Until the pause has stopped an agent,
+    `restart --drain` promotes it to an ordinary operator drain (the pause
+    withdraws its requests, deletes its manifest and stops nothing) and
+    `restart --abort-drain` cancels it. Once it has stopped an agent, a
+    `restart --drain` is acknowledged without changing anything, an
+    `--abort-drain` is **refused** with a message naming the step, and the roll
+    completes. `--then-exit` always wins: the daemon finishes the pause, writes
+    `phase = paused` and stays down; the next start resumes from the manifest.
+  - **What the next start does (H5, #10832).** A daemon that starts and finds
+    the pause manifest (`phase` `paused`, or `pausing`/`resuming` after a
+    crash) holds dispatch and, in order: keeps restart recovery off the paused
+    agents (`reconstruct`, dead-pid claim reclaim, the sweep reaper and the
+    orphan-process and worktree reapers all skip the manifest's items, from
+    their first pass); reaps anything of a paused agent's recorded process tree
+    that is still alive (`daemon.roll.item.residue_reaped`: the recorded pid
+    and its group, only while the pid is still the recorded process, and the
+    scope unit; never by worktree, so a pause H4 had to finish by force is
+    re-checked rather than trusted, and a session whose old tree survives the
+    reap is requeued, not resumed); **refreshes the lease of
+    every agent it will resume, first**; then waits out **health probation**
+    (`pauseRoll.verifyProbationSecs`: IPC answering and the heartbeat fresh,
+    sustained). Only then does it relaunch each paused agent **from its saved
+    session** (`claude -p --resume <id>`, or `codex exec resume <id>` in the
+    same account and, for a session-managed account, the same container, under
+    the sandbox mode the session was started with), in the same workspace, with
+    its claim kept: the claim lock is rebound to the new run and records
+    `resume_of`, the same lease record gets a new renewal loop, and the
+    session's first start is carried so the 5-minute rule does not restart. A
+    role run is resumed the same way with the time it had left, its
+    in-progress guard and (if it held it) the issue-creation mutex seeded
+    first. Dispatch resumes when every item is resumed or requeued; the
+    manifest is archived as `roll-pause-manifest.<id>.done.json` (newest 10
+    kept).
+  - **What is requeued at H5, and why.** Before each relaunch H5 re-checks the
+    live state and requeues on a positive answer, with the same label restore
+    and single comment as H4: `manifest-stale` (the daemon came back after the
+    lease TTL; the manifest is archived `abandoned`), `lease-lost`,
+    `issue-closed` (recorded, never written to the forge), `issue-parked`,
+    `worktree-changed`, `session-store-unavailable`, `session-down` (the
+    session container is not up, or does not mount the workspace),
+    `role-disabled`, `guard-refused:<step>`, `session-resume-failed` (the
+    relaunch exited before its session was running, including a session
+    container image too old to resume in), `resume-attempts-exhausted` (a
+    session already resumed across three rolls) and `resume-timeout`. A
+    requeue releases the agent's claim lock and journal entry and keeps its
+    checkpoint. A requeued role run gives back the claim label it took
+    (`loom:reviewing`, `loom:treating`, `loom:curating`), recorded by the pause
+    hook when the agent ran its `gh pr edit … --add-label`; without that record
+    the role's own staleness rule releases it, as before. An agent whose work
+    ended by itself during the pause is released as completed, with no forge
+    write. A requeue whose forge write fails is handed to ordinary restart
+    recovery.
+  - **An unhealthy binary resumes nothing.** A failed health sample restarts
+    probation (`daemon.roll.health_failed`, ERROR) and dispatch stays held.
+    Once the manifest is older than the lease TTL the paused agents are
+    requeued instead, so no claim is held forever. Rolling back and
+    quarantining a bad binary is #9735's and is not done here.
+  - **Rollback.** A binary at or after #10715 that starts on a manifest written
+    for another version resumes it all the same and reports `resumed_on =
+    rollback`. If it is *older* than the roll's target, the roll did not take:
+    the target is recorded (`roll-failed-target.json` in the auto-update state
+    dir) and no roll to that same target starts for 15 minutes, doubling per
+    repeat up to 6 hours (`daemon.roll.refused`, state `roll-attempt-backoff`);
+    a different target is not held back. This guard stops the pause, not the
+    download: the full arm-time record is #10880. A manifest from a newer
+    schema is reported (`daemon.roll.manifest.unreadable`) and left alone. A
+    binary older than #10715 never reads the manifest: H4 left each agent's
+    lock, journal entry and checkpoint in place, so its ordinary restart
+    recovery drops the stale locks and claim reconciliation reclaims each
+    `loom:building` claim on the dead journal pid once the lease H4 refreshed
+    has aged out.
+  - **Operator commands during H5.** `restart --abort-drain` is **refused**
+    while H5 holds dispatch (the hold ends by itself, within the probation and
+    resume budgets). A real `restart --drain` replaces the hold; H5 then stops
+    relaunching and waits. A `--then-exit` drain exits and the next start
+    finishes the manifest; an aborted drain lets H5 re-hold dispatch and carry
+    on; a drain that outlasts the manifest's max age (the lease TTL) gets
+    every item not yet relaunched requeued, and the manifest archived, so no
+    paused claim waits for a restart. An operator stop already in force at
+    startup is respected the same way: H5 waits for it, resumes nothing
+    meanwhile, and gives the claims back once the manifest is stale. Staleness
+    is also re-checked before each relaunch, and every way out of H5 (a
+    manifest missing or unreadable when H5 loads it, a panic) still lifts the
+    dispatch hold and the recovery suppression.
+  - **A fleet-paused host (#10979).** A fleet `paused` state lets in-flight
+    work finish, and the paused agents are in-flight work: H5 resumes them
+    under the fleet hold and releases nothing, so the host does not dispatch
+    after H5. The startup fleet-sync pass re-applies `paused` before H5 is
+    spawned; a `paused` that arrives while H5 holds dispatch takes the hold
+    over in place.
+  - **Where to look.** `status --json` → `drain.resume`: the manifest id and
+    phase, the H5 step, `resumed_on`, counts of resumed / completed / recovered
+    agents, requeues by reason, and the observed `probation_secs`,
+    `resume_secs` and `pause_to_resume_secs` (pause start to resume end, the
+    window the lease TTL bounds). It stays readable after H5 has finished.
+  - **A newer release supersedes an armed roll (#8514)** only until the pause
+    has stopped an agent; after that it is too late and the roll completes.
+  - **Floor rolls (#10712)** take this same path. They skip the settle gate,
+    and since #10885 nothing else holds them: there is no roll window, and the
+    roll arms on the tick that sees the host below its floor. An unsatisfiable
+    floor still starts no roll, pauses nothing, and alerts at ERROR while
+    dispatch continues.
+  - **Removed with the wait-for-zero roll:** the retained ("pending") roll and
+    its re-arm/abandon budget (#6007), the unsatisfiable-drain detector and its
+    cooldown (#8998/#9010, `rollStallDeadlines` / `rollStallCooldownSecs`), the
+    `daemon.drain.roll_pending` and `daemon.drain.roll_unsatisfiable` events, and
+    the stall decision of the `auto_update.tick` record. The trade-off those managed is now the pause
+    budget's: a tool call longer than the budget costs its agent a requeue.
 - **Supervision proof is checked up front (AC5):** on an unsupervised host the
   request is refused **before** dispatch is paused (`accepted: false`), so a caller
   can detect nothing happened and no silent outage is introduced.
@@ -12174,11 +12769,19 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   below. Since **#8514** the roll state is also **live and queryable** rather than
   only a one-shot note: `status --json`'s `drain.roll` object (`null` when no
   drain is active) carries `roll_pending`, `started_at`, `paused_secs`,
-  `budget_secs`, `refusals`, `in_flight`, `target` and `then_exit`, and the human
-  renderer prints the same under the `Drain: DRAINING …` line as
-  `roll PENDING since T — dispatch paused Dm of a 2h0m budget, N in flight, …`.
-  That is what makes a host idling behind a roll visible from one poll — and, by
-  diffing `paused_secs` across polls, whether the pause is still advancing.
+  `budget_secs`, `refusals`, `in_flight`, `target`, `then_exit`, `origin`,
+  `timed_out`, `startup_hold` and `pause`. **Since #10831** `roll_pending` is
+  always `false` and `refusals` always `0` (no roll is retained across a
+  deadline; both stay in the object so older readers still parse it),
+  `budget_secs` is the pause budget for a `pause-roll` drain and `0` otherwise,
+  and `origin` reads `operator` or `pause-roll`. `pause` is `null` except during
+  a pause roll, when it carries the H4 `step` (1-10), `stopped` (whether an
+  abort is still possible), `budget_secs`, `min_resumable_age_secs`,
+  `manifest_id`, `target_source`, `to_version`, `items`, `paused`, `exited`,
+  `requeued_by_reason` (a count per reason), `deferred_forge_writes`, and the
+  observed `settle_secs` / `stop_secs`. The human renderer prints
+  `roll PAUSING agents (H4 step N/10, …)` for it. That is what makes a host
+  paused behind a roll visible from one poll.
 - **Cumulative paused time per host per day (#8652).** `status --json`'s
   `drain.paused_by_day` is `{ "YYYY-MM-DD": secs }` — dispatch-paused seconds per
   **UTC** day, including the elapsed portion of a pause in progress; the text
@@ -12240,7 +12843,64 @@ manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
 ./.loom/scripts/cli/loom-daemon-update.sh --fetch        # REQUIRE a verified release artifact (never silently fall back to a source build); exit 1 if none resolves
 ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch     # never consider release artifacts; always build from local source (pre-#5020 behavior)
 ./.loom/scripts/cli/loom-daemon-update.sh --resolve-json # READ-ONLY (#7609): print ONE JSON object describing the latest release artifact + the installed binary, then exit -- no fetch, no git fetch, no build, no provision, no restart
+./.loom/scripts/cli/loom-daemon-update.sh --yes          # fleet host (#11044): install even if it moves this host off the fleet floor, without asking (= LOOM_DAEMON_UPDATE_YES=1)
+./.loom/scripts/cli/loom-daemon-update.sh --to-floor     # fleet host (#11044): install exactly the floor's release (--fetch --tag v<floor>); nothing to do at or above the floor
 ```
+
+**Fleet floor check (#11044).** On a fleet host the version is set by the
+fleet floor and the host moves only when the floor moves ([The fleet floor
+drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). A manual
+run of this script would otherwise install the newest release (or a source
+build) and silently leave one host ahead of the fleet. So, before it fetches,
+builds or provisions anything, it compares the version it is about to install
+with the floor and the installed version:
+
+| Floor | About to install | Result |
+|---|---|---|
+| no fleet store (not a fleet host) | anything | unchanged, nothing printed |
+| set | the floor's version, or the installed version again | unchanged, nothing printed |
+| set | above the floor, installed version below it (catching up) | unchanged, nothing printed: a floor roll goes there too |
+| set | above the floor, installed version at or above it | warning: moves the host **ahead of the fleet** |
+| set | below the floor | warning: moves the host **below the floor** |
+| unknown (a store, but no floor known) | anything | warning: the floor is not known |
+
+On a warning a run with a terminal on stdin asks `Continue? [y/N]`, and only a
+typed `y` continues. A run without one **refuses** with exit 1 and names the
+override, and never reads stdin. `--yes` or `LOOM_DAEMON_UPDATE_YES=1`
+continues without asking. `--dry-run` prints the warning and never asks.
+`--check` and `--resolve-json` are unchanged.
+
+```text
+This host is in fleet 2AMLogic/fleet-gitops with loom_min_version 0.19.950 (fleet-sync snapshot of 2026-10-09T03:30:25Z). Installing 0.19.953 (release v0.19.953) moves it ahead of the fleet; the fleet changes version by raising the floor.
+Continue? [y/N]
+```
+
+- **How a fleet host is detected.** Without contacting the daemon, so a busy,
+  wedged or stopped daemon cannot hang the script: a store resolved the way
+  the daemon resolves it (`LOOM_FLEET_REPO` over `fleet.repo` in the
+  effective config), **or** a fleet-sync snapshot
+  (`~/.loom/fleet-sync-status.json`, under `LOOM_SOCKET_PATH`'s directory when
+  that is set). The snapshot counts on its own because a host often names its
+  store only in the daemon's launchd plist or systemd unit, which an
+  operator's shell does not carry; the daemon deletes the snapshot at startup
+  when it reads no store, so a snapshot present means it reads one.
+- **Where the floor comes from, and how stale it can be.** The snapshot's
+  `floor`. While the daemon runs it is at most one `fleet.syncIntervalSecs`
+  old; with the daemon stopped it is as old as the daemon's last pass. The
+  warning names the snapshot's time. A store with no snapshot, a snapshot with
+  no floor, or a snapshot for a different store is "unknown".
+- **Runs Loom starts itself never prompt.** The daemon's self-update loop,
+  `fleet roll` and `fleet add-worker` set `LOOM_DAEMON_UPDATE_INVOKER`
+  (`daemon`, `fleet-roll`, `add-worker`). Such a run prints the warning and
+  continues: it has no terminal, and the daemon's own floor rolls target a
+  release at or above the floor anyway. `fleet roll` is an explicit operator
+  command, so it is treated as confirmed; on a fleet host prefer raising the
+  floor.
+- **`--to-floor`** installs exactly the floor's release (`v<floor>`, as
+  `--fetch --tag`) to bring a lagging host up to the fleet, for example a
+  fleet-paused host held by an operator stop. A host already at or above the
+  floor installs nothing (exit 0); it never moves a host down. A host with no
+  fleet store, or whose floor is unknown, is refused (exit 1).
 
 **One-shot drain roll (Issue #5138).** Before this, a drained roll needed the
 documented two-step dance — `loom-daemon-update.sh --no-restart` followed by a
@@ -12692,18 +13352,23 @@ daemon **installs and restarts itself** onto a fresher binary without operator
 action, instead of only surfacing the read-only "update available" hint above.
 It is the *deciding + sequencing* layer — it reuses `loom-daemon-update.sh`
 (driven with `--no-restart`, plus `--fetch` on the artifact path) for the
-fetch-or-rebuild/provision and the #4090 drain primitive for the restart,
+fetch-or-rebuild/provision and pause-and-roll (#10831) for the restart,
 reimplementing neither. Since Issue #7609 a published Release artifact is what
 drives a roll, and the source checkout is only the fallback — see
 [Artifact-first auto-update ticks](#artifact-first-auto-update-ticks-7609)
 below.
 
-**Opt-in, default OFF** (it has side effects on the running process). Enable via
-`autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
-window, stampede-gate deadline, and unsatisfiable-drain threshold/cooldown with
-`intervalSecs` (default 900) / `settleSecs` (default 600) / `deferDeadlineSecs`
-(default 21600) / `rollStallDeadlines` (default 3) / `rollStallCooldownSecs`
-(default 21600, #9010). All six knobs resolve **env > config > default** through
+**Opt-in, default OFF on a host with no fleet store** (it has side effects on
+the running process); a fleet host always runs it, for the floor (#10954).
+Enable via `autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence, settle
+window and stampede-gate deadline with `intervalSecs` (default 900) /
+`settleSecs` (default 600) / `deferDeadlineSecs` (default 21600), and the roll's
+pause with the `pauseRoll.*` budgets (#10831). On a host that reads a fleet
+store, everything below about chasing the newest release, the source fallback
+and the settle window is replaced by one rule: the host rolls only when it is
+below `loom_min_version`, or when a registered workspace needs a newer daemon
+(#10719) (#10885, see
+[The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). All knobs resolve **env > config > default** through
 `config_resolver`, so the `.loom-project/` tier is honored like every other
 `autonomous.*` block.
 

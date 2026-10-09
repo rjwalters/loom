@@ -135,6 +135,9 @@ mod quarantine_escalation;
 pub(crate) mod reaper;
 mod restore_to_ready;
 pub(crate) mod resume_handle;
+pub(crate) mod roll_gate;
+pub(crate) mod roll_requeue;
+pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
 #[cfg(test)]
@@ -148,6 +151,8 @@ mod watchdog;
 // Several submodules (e.g. `stacking`) only contribute inherent
 // `impl SweepRegistry` methods with nothing free-standing to import, so the
 // glob below is a no-op for them -- harmless, silenced explicitly.
+/// #10719: the typed refusal for a held workspace, beside the other dispatch errors.
+pub use crate::workspace_hold::WorkspaceHeldDispatchError;
 #[allow(unused_imports)]
 pub use crash_signals::*;
 #[allow(unused_imports)]
@@ -846,6 +851,8 @@ pub struct SweepRegistry {
     /// tie-break, spawn failure) never wedges the key against a later,
     /// legitimate same-key dispatch.
     inflight_idempotency: HashMap<String, SweepId>,
+    /// #10974: the dispatch gate a daemon roll closes (`roll_gate`).
+    roll_gate: roll_gate::RollGate,
 }
 
 /// Resolve this host's identity string for collision records (Issue #4085) and
@@ -1071,6 +1078,8 @@ pub struct PreparedIssueDispatch {
     /// `None` for an unsized issue, a defective points label set, or a skipped
     /// label read — never `0`.
     pub(crate) story_points: Option<u32>,
+    /// #10974: counts this dispatch as mid-spawn until it is dropped (`roll_gate`).
+    pub(crate) mid_spawn: roll_gate::MidSpawn,
 }
 
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
@@ -1186,6 +1195,7 @@ impl SweepRegistry {
             activity_window: None,
             owner_repo_cache: Mutex::new(None),
             inflight_idempotency: HashMap::new(),
+            roll_gate: roll_gate::RollGate::default(),
         }
     }
 

@@ -306,6 +306,8 @@ pub fn run_backfill_pass_all(
             run_backfill_pass(root, queue)
                 + super::lifecycle::backfill(root, queue)
                 // Issue #8824: the CI telemetry journal rides the same pass.
+                // #11045: it streams from its cursor under `poll.lock`, so it
+                // never overlaps a ci_telemetry poll cycle.
                 + crate::ci_telemetry::export::backfill(root, queue)
         })
         .sum()

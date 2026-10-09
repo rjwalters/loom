@@ -851,6 +851,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
 pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
     let report = reap_worktrees_only(repo_root, config);
 
+    // #10995: aborted-fetch debris (`.git/objects/pack/tmp_pack_*`,
+    // `objects/??/tmp_obj_*`). Cheap and precise, so it runs before the
+    // pressure-gated deep pass, which then sees the bytes it freed.
+    let _ = crate::git_tmp_reclaim::run_for(repo_root);
+
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
     // free. Fires only under disk pressure, holds the machine build slot, and
@@ -882,6 +887,10 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // process survives to clean up after a session. See
     // `crate::native_state_reclaim`'s module docs.
     let _ = crate::native_state_reclaim::run_for(repo_root);
+
+    // #8370: orphaned cargo target dirs under `.loom/targets/` and the known
+    // improvised prefixes. Own per-repo cooldown, shared with the eager tier.
+    let _ = crate::target_orphan_reclaim::run_for(repo_root);
 
     report
 }

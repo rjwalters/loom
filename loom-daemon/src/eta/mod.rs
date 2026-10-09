@@ -107,6 +107,7 @@ pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
+pub mod explain;
 pub mod explanation;
 pub mod fit;
 pub mod flag_timeline;
@@ -134,6 +135,8 @@ pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
+pub mod hold_kind;
+pub mod hold_marker_log;
 pub mod job_owner;
 pub mod journal;
 pub mod labels;
@@ -156,12 +159,15 @@ pub mod regime;
 pub mod repo_priority;
 pub mod retire_filing;
 pub mod roster_history;
+pub mod scope_features;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
 pub mod shadow_lifecycle;
+pub mod shadow_non_refusal;
 pub mod shadow_stats;
 pub mod simulate;
+pub mod stage_forecast;
 pub mod stage_queue;
 pub mod stall;
 pub mod stall_features;
@@ -768,19 +774,14 @@ impl Registry {
                 // #10528: twin-otter-b plus the drift-gated regime
                 // adjustment; registered ahead of the other -b wrappers.
                 Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
-                // #10524: wraps twin-otter-b; registered before `-b` so
-                // `-b` stays last but for tandem-wren.
-                Box::new(heuristics::LandQuickTern::new(fit.clone())),
-                // #10524 slice 3: quick-tern made drift-aware (#10528).
-                Box::new(heuristics::LandSwiftTern::new(fit.clone())),
+                // #10524's IPCW wrappers quick-tern and swift-tern (over
+                // `-b`) and bold-lark (over keen-wren) are retired (#10949).
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 // #10508: twin-otter-b's priority-aware successor, also
                 // before `-b`.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
-                // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
-                Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
                 // #10521: keen-wren's friction-aware successor, before
                 // twin-otter-b.
                 Box::new(heuristics::LandLoopKite::new(fit_v3.clone())),

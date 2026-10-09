@@ -1,20 +1,24 @@
 //! The IPCW conformal wrapper over **any** `land` base (#10524, slice 5).
 //!
-//! `land-2026-10-06-quick-tern` and `-swift-tern` are the two IPCW
-//! calibrators ([`super::conformal_ipcw`]) hard-wired over
-//! `land-2026-10-04-twin-otter-b`. [`IpcwWrap`] is the same wrapper with the
-//! base as a parameter: it runs the base, re-identifies the explanation as
-//! its own, and calibrates it against the base's own track record
-//! (`calibration` rows whose `heuristic` is the base's id). Over twin-otter-b
-//! it is quick-tern (or swift-tern) byte for byte; that parity is pinned by
-//! a test, so the wrapper evaluated here is the one that ships.
+//! [`IpcwWrap`] applies one of the two IPCW calibrators
+//! ([`super::conformal_ipcw`]) to a `land` base given as a parameter: it runs
+//! the base, re-identifies the explanation as its own, and calibrates it
+//! against the base's own track record (`calibration` rows whose `heuristic`
+//! is the base's id).
+//!
+//! The registered IPCW shadows built this way (`land-2026-10-06-quick-tern`
+//! and `-swift-tern` over `land-2026-10-04-twin-otter-b`, `-bold-lark` over
+//! keen-wren, #10524) are retired (#10949): the 2026-10-08 walk-forward
+//! scored them 7–13 h of pinball4 worse than `land-v1`, with 82–95% of
+//! wrapped estimates on the unresolved-tail rule. `IpcwWrap::new(<retired
+//! id>, <base>, <calibrator>)` reproduces any of them offline.
 //!
 //! # Why it is not registered
 //!
-//! The `land` shadow budget (#10525, 13 per kind) is full once the in-flight
-//! `land` candidates land, and a calibrated base needs evidence before it
-//! deserves a slot. So this slice wraps bases **offline**: `eta backtest
-//! --wrap ipcw|ipcw-drift` scores `<base>+ipcw` on the replay set, and
+//! A calibrated base needs evidence before it deserves a slot in the `land`
+//! shadow budget (#10525), and the walk-forward evidence so far is against
+//! the IPCW wrapper over every base (#10949). So this slice wraps bases
+//! **offline**: `eta backtest --wrap ipcw|ipcw-drift` scores `<base>+ipcw` on the replay set, and
 //! `--compare <base>` pairs it against the unwrapped base. That is the
 //! comparison the #10524 acceptance asks for ("pinball no worse than the
 //! unwrapped base, paired CI"), for the priority model (#10508), the hazard
@@ -28,8 +32,8 @@
 //! - **`land` only.** The calibration evidence is landings; [`IpcwWrap::new`]
 //!   refuses any other kind.
 //! - **Never twice.** A base whose explanation already carries a
-//!   `calibration` or `recalibration` record (even-lark, quick-tern,
-//!   swift-tern, bold-lark) is left as the base answered, only re-identified: a second
+//!   `calibration` or `recalibration` record (even-lark) is left as the
+//!   base answered, only re-identified: a second
 //!   shift would overwrite the first record and the explanation would no
 //!   longer recompute.
 //! - **Transform order is the recompute's.** A regime-adjusted base
@@ -37,7 +41,7 @@
 //!   regime factor re-applied last, as [`run_explanation`] replays it.
 //! - **Degrades to the base.** A refusal, a base without p90, or too few
 //!   effective landings is the base's answer unchanged (re-identified, with
-//!   no `calibration` record), as for quick-tern.
+//!   no `calibration` record).
 //! - **Point-in-time.** Exactly [`super::conformal_ipcw`]'s: no estimate
 //!   made at or after `as_of`, and no outcome known at or after it, is used
 //!   as an event.
@@ -45,7 +49,7 @@
 //! Pure: no clock, no file, no forge.
 
 use super::conformal_ipcw;
-use super::heuristics::{LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_QUICK_TERN, LAND_SWIFT_TERN};
+use super::heuristics::LAND_EVEN_LARK;
 use super::history::StageSamples;
 use super::regime;
 use super::simulate::run_explanation;
@@ -54,19 +58,14 @@ use super::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
 /// The registered `land` heuristics that already calibrate their own
 /// estimate. Wrapping one is the identity (see "Never twice"), so `eta
 /// backtest --wrap` refuses them.
-pub const CALIBRATED: &[&str] = &[
-    LAND_EVEN_LARK,
-    LAND_QUICK_TERN,
-    LAND_SWIFT_TERN,
-    LAND_BOLD_LARK,
-];
+pub const CALIBRATED: &[&str] = &[LAND_EVEN_LARK];
 
 /// Which IPCW calibrator wraps the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Calibrator {
-    /// [`conformal_ipcw::calibrate`]: quick-tern's.
+    /// [`conformal_ipcw::calibrate`] (retired quick-tern's).
     Ipcw,
-    /// [`conformal_ipcw::calibrate_drift_aware`]: swift-tern's.
+    /// [`conformal_ipcw::calibrate_drift_aware`] (retired swift-tern's).
     IpcwDrift,
 }
 
@@ -134,7 +133,7 @@ impl<H: Heuristic> Heuristic for IpcwWrap<H> {
         Kind::Land
     }
 
-    /// A candidate (#10525), as quick-tern.
+    /// A candidate (#10525).
     fn tier(&self) -> Tier {
         Tier::Candidate
     }

@@ -1,6 +1,6 @@
 //! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289),
-//! `eta.fleet_refresh` (#10263), `eta.fit` (#10391) and `pr.resolved`
-//! (#10519).
+//! `eta.fleet_refresh` (#10263), `eta.fit` (#10391), `pr.resolved`
+//! (#10519) and `eta.stage_outcome` (#10929).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -54,9 +54,9 @@ fn opt_int(attributes: &mut Vec<KeyValue>, key: &str, value: Option<i64>) {
     }
 }
 
-/// #10498: only the fleet's ETA authority emits estimates and outcomes, so
-/// the emitting host *is* the authority. Pushes `loom.eta.authority` for those
-/// two kinds; a no-op for every other record. Kept here, not in the caller,
+/// #10498: only the fleet's ETA authority emits estimates, outcomes and
+/// stage outcomes (#10929), so the emitting host *is* the authority. Pushes
+/// `loom.eta.authority` for those three kinds; a no-op for every other record. Kept here, not in the caller,
 /// because this file is the one place `loom.eta.*` attributes are produced
 /// (`tests/eta_artifacts.rs` scans it).
 pub(super) fn push_authority(
@@ -64,8 +64,24 @@ pub(super) fn push_authority(
     record: &TelemetryRecord,
     host_id: &str,
 ) {
-    if matches!(record, TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_)) {
+    if matches!(
+        record,
+        TelemetryRecord::EtaEstimate(_)
+            | TelemetryRecord::EtaOutcome(_)
+            | TelemetryRecord::EtaStageOutcome(_)
+    ) {
         attributes.push(kv_string("loom.eta.authority", host_id.to_string()));
+    }
+}
+
+/// The knowable-at instant of a record whose event time is not when the
+/// daemon observed it: `pr.resolved` (#10519) and `eta.stage_outcome`
+/// (#10929). `None` for every other kind.
+pub(super) fn observed_at(record: &TelemetryRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    match record {
+        TelemetryRecord::PrResolved(r) => Some(r.observed_at),
+        TelemetryRecord::EtaStageOutcome(r) => Some(r.observed_at),
+        _ => None,
     }
 }
 
@@ -112,6 +128,23 @@ pub(super) fn log_parts(
             if let Some(not_here) = not_here.and_then(|d| d.input.not_here.as_deref()) {
                 attributes.push(kv_string("loom.eta.not_here", not_here));
             }
+            // #10930: the fit this estimate used, and the queue / capacity
+            // inputs it was made under, as attributes: an estimate joins
+            // `eta.fit` and a replay's inputs are queryable without the body
+            // (whose 32 KiB cap can cut them).
+            if let Some(twin) = &e.twin_otter {
+                attributes.push(kv_string("loom.eta.fit_id", twin.fit_id.clone()));
+            }
+            if let Some(f) = &e.features {
+                opt_int(&mut attributes, "loom.eta.queue_rank", f.queue_rank.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_ready", f.queue_ready.map(i64::from));
+                opt_int(&mut attributes, "loom.eta.queue_running", f.queue_running.map(i64::from));
+                opt_int(
+                    &mut attributes,
+                    "loom.eta.max_concurrent",
+                    f.max_concurrent.map(i64::from),
+                );
+            }
             let body = serde_json::to_string(e).unwrap_or_default();
             Some(("eta.estimate", SeverityNumber::Info, nanos(e.as_of), attributes, body))
         }
@@ -156,6 +189,16 @@ pub(super) fn log_parts(
             }
             if let Some(late) = s.above_p90 {
                 attributes.push(kv_bool("loom.eta.above_p90", late));
+            }
+            // #10929: the stage that dominates the miss, and what no stage
+            // explains; the per-stage split is in the body.
+            if let Some(a) = &r.attribution {
+                attributes
+                    .push(kv_int("loom.eta.attribution.unattributed_sec", a.unattributed_sec));
+                if let Some(stage) = a.dominant_stage {
+                    attributes
+                        .push(kv_string("loom.eta.attribution.dominant_stage", stage.as_str()));
+                }
             }
             if let Some(loss) = s.pinball4_loss_sec {
                 attributes.push(kv_double("loom.eta.pinball4_loss_sec", loss));
@@ -275,6 +318,38 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
         }
+        TelemetryRecord::EtaStageOutcome(r) => {
+            // #10929: stamped at `left_at`; the caller sets the observed
+            // timestamp to `observed_at` (the knowable-at time).
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_int("loom.issue", i64::from(r.issue)),
+                kv_string("loom.eta.stage_outcome.stage", r.stage.as_str()),
+                kv_string("loom.eta.stage_outcome.exit", r.exit.as_str()),
+                kv_string("loom.eta.stage_outcome.left_at", instant(r.left_at)),
+                kv_int(
+                    "loom.eta.stage_outcome.open_estimates",
+                    i64::try_from(r.open_estimates).unwrap_or(i64::MAX),
+                ),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(&mut attributes, "loom.pr_number", r.pr_number.map(i64::from));
+            opt_int(&mut attributes, "loom.eta.stage_outcome.dwell_sec", r.dwell_sec);
+            for (key, value) in [
+                (
+                    "loom.eta.stage_outcome.next_stage",
+                    r.next_stage.map(|s| s.as_str().to_string()),
+                ),
+                ("loom.eta.stage_outcome.entered_at", r.entered_at.map(instant)),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value));
+                }
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.stage_outcome", SeverityNumber::Info, nanos(r.left_at), attributes, body))
+        }
         TelemetryRecord::EtaBacktestFold(r) => {
             // #10492: one heuristic's fold for one day; stamped at its cutoff.
             let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
@@ -352,6 +427,11 @@ pub(super) fn log_parts(
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "eta_stage_outcome_tests.rs"]
+mod stage_outcome_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -521,6 +601,7 @@ mod tests {
             outcome_source: "sweep_terminal".to_string(),
             outcome_resolution_sec: Some(0),
             result: Some("exited".to_string()),
+            attribution: None,
         };
         // The keys #10211 added are actually emitted, so the allowlist check
         // below is not vacuous for them.
@@ -585,6 +666,7 @@ mod tests {
                 outcome_source: "pulls_read".to_string(),
                 outcome_resolution_sec: Some(0),
                 result: None,
+                attribution: None,
             };
             log_record_for(&TelemetryEnvelope::new("host", TelemetryRecord::EtaOutcome(record)))
                 .unwrap()

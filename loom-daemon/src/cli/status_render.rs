@@ -14,12 +14,12 @@ mod forge_calls_render;
 mod forge_egress_line;
 mod forge_events_line;
 mod holds;
+mod last_tick_line;
 mod model_class;
 mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
-mod roll_window_line;
 mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
@@ -611,13 +611,13 @@ pub(crate) fn build_status_json_value_for(
         "session_containers": report.session_containers,
         "auto_update": {
             "enabled": report.auto_update_enabled,
+            "mode": report.auto_update_mode, // #10954
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
-            "roll_window": report.auto_update_roll_window,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -2807,7 +2807,8 @@ pub(crate) fn print_status_human(
     // Autonomous self-update loop (#4055) — the daemon-side loop that acts on the
     // staleness above. Only rendered when enabled (opt-in); otherwise silent.
     if report.auto_update_enabled {
-        print!("Auto-update loop: enabled");
+        // #10954: the mode says why the loop runs (e.g. for the fleet floor alone).
+        print!("Auto-update loop: {}", report.auto_update_mode.as_deref().unwrap_or("enabled"));
         match &report.auto_update_last_check {
             Some(ts) => print!(" (last check {})", ts.format("%Y-%m-%dT%H:%M:%SZ")),
             None => print!(" (no check yet)"),
@@ -2833,7 +2834,7 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
-        roll_window_line::print_tail(report);
+        last_tick_line::print(report);
     }
     task_liveness_line::print(&report.task_liveness);
     session_containers_line::print(report.session_containers.as_ref());

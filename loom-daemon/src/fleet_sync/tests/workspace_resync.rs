@@ -3,8 +3,9 @@
 //! Real git, in temp dirs only: a bare `origin`, a `seed` clone that stands
 //! for everyone else pushing to it, and one clone per "host". The forge (the
 //! claim ref) is the in-memory `FakeRefForge` behind the fleet store's
-//! transport seams. The payload is a small synthetic `defaults/` tree. No
-//! network, no `gh`, no registered workspace.
+//! transport seams, and its batched head query is the in-memory `ForgeHeads`
+//! (see `workspace_resync_heads.rs`). The payload is a small synthetic
+//! `defaults/` tree. No network, no `gh`, no registered workspace.
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use tempfile::TempDir;
 
-use super::git::{classify_rejection, Push, WORKTREE_PREFIX};
+use super::git::WORKTREE_PREFIX;
 use super::*;
 use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared};
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
@@ -252,6 +253,10 @@ struct Host<'f> {
     /// Runs once, after this host has classified and just before it asks for
     /// the claim: the moment another writer can slip in.
     before_claim: RefCell<Option<Box<dyn FnOnce() + 'f>>>,
+    /// The forge's batched head query, and whether the pass is past its
+    /// deadline.
+    heads: head_check::ForgeHeads,
+    overdue: Cell<bool>,
 }
 
 impl<'f> Host<'f> {
@@ -282,6 +287,8 @@ impl<'f> Host<'f> {
             now: Cell::new(t0()),
             budget: Cell::new(u32::MAX),
             before_claim: RefCell::new(None),
+            heads: head_check::ForgeHeads::default(),
+            overdue: Cell::new(false),
         }
     }
 
@@ -341,6 +348,8 @@ impl<'f> Host<'f> {
                 classified.set(classified.get() + 1);
                 classified.get() > self.budget.get()
             },
+            overdue: &|| self.overdue.get(),
+            heads: &|asks| self.heads.answer(asks),
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
     }
@@ -372,6 +381,11 @@ fn reason(report: &WorkspaceReport) -> &str {
     report.reason.as_deref().unwrap_or("")
 }
 
+/// What a pass asked the network: `(head queries, ls-remotes, fetches)`.
+fn network(pass: &WorkspacePass) -> (u32, u32, u32) {
+    (pass.head_queries, pass.probes, pass.fetches)
+}
+
 // ----------------------------------------------------------------------------
 // The host gate
 // ----------------------------------------------------------------------------
@@ -389,8 +403,9 @@ fn h0() -> HostGateInputs {
 fn the_host_gate_names_each_reason() {
     assert_eq!(host_gate(&h0()), Ok(()));
     type Set = fn(&mut HostGateInputs);
-    let table: [(Set, NotCurrent); 8] = [
+    let table: [(Set, NotCurrent); 9] = [
         (|i| i.draining = true, NotCurrent::Draining),
+        (|i| i.resume_pending = true, NotCurrent::ResumePending),
         (|i| i.staged = true, NotCurrent::Staged),
         (|i| i.roll_pending = true, NotCurrent::RollPending),
         (|i| i.stalled = true, NotCurrent::Stalled),
@@ -435,7 +450,7 @@ fn a_host_that_is_not_h0_reports_and_never_claims() {
         assert_eq!(pass.host, Some(format!("host not H0: {why}")));
         assert_eq!(only(&pass).state, WState::W1, "still classified: {why}");
         assert!(pass.alerts.is_empty());
-        assert_eq!((pass.probes, pass.fetches), (0, 0), "and asks no remote: {why}");
+        assert_eq!(network(&pass), (0, 0, 0), "and asks no remote: {why}");
     }
     assert!(fx.forge.calls.borrow().is_empty(), "no claim call for any reason");
     assert_eq!(fx.origin_head(), before);
@@ -810,11 +825,11 @@ fn a_repo_ahead_of_the_daemon_is_never_claimed_or_written() {
             WState::W4,
             "requires daemon 0.19.890 > running 0.19.880",
         ),
-        // Cannot be ordered, so it may be newer.
+        // Cannot be ordered, so it may need a newer daemon: W4 (#10719).
         (
             "0.20.0-rc1",
             Some("0.19.772"),
-            WState::RepoAhead,
+            WState::W4,
             "installed loom_version \"0.20.0-rc1\" is not MAJOR.MINOR.PATCH; it may be newer \
              than this daemon",
         ),
@@ -1118,6 +1133,8 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: Some("0.19.800".to_string()),
                 requires_daemon: None,
                 reason: Some("claim held by host-b since 2026-10-08T12:00:00Z".to_string()),
+                hold: None,
+                refusal: None,
             },
             WorkspaceReport {
                 root: PathBuf::from("/src/lib"),
@@ -1126,6 +1143,8 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
                 installed: None,
                 requires_daemon: None,
                 reason: None,
+                hold: None,
+                refusal: None,
             },
         ],
         ..WorkspacePass::default()
@@ -1148,29 +1167,13 @@ fn status_shows_each_workspace_and_an_old_snapshot_still_reads() {
     assert!(WorkspacePass::default().lines().is_empty());
 }
 
-#[test]
-fn a_failed_push_is_read_as_moved_protected_or_neither() {
-    let moved = " ! [rejected]        HEAD -> main (fetch first)\nerror: failed to push some refs";
-    assert_eq!(classify_rejection(moved), Some(Push::NonFastForward));
-    let stale = " ! [rejected]        HEAD -> main (non-fast-forward)";
-    assert_eq!(classify_rejection(stale), Some(Push::NonFastForward));
-    let raced = " ! [remote rejected] HEAD -> main (cannot lock ref 'refs/heads/main')";
-    assert_eq!(classify_rejection(raced), Some(Push::NonFastForward));
-    let ruleset = "remote: error: GH013: Repository rule violations found for refs/heads/main.\n \
-                   ! [remote rejected] HEAD -> main (push declined due to repository rule violations)";
-    assert_eq!(
-        classify_rejection(ruleset),
-        Some(Push::Protected(
-            "error: GH013: Repository rule violations found for refs/heads/main.".to_string()
-        ))
-    );
-    let hook = " ! [remote rejected] HEAD -> main (pre-receive hook declined)";
-    assert_eq!(classify_rejection(hook), Some(Push::Protected(hook.trim().to_string())));
-    assert_eq!(
-        classify_rejection("fatal: unable to access 'https://…': Could not resolve host"),
-        None
-    );
-}
-
 #[path = "workspace_resync_bounds.rs"]
 mod bounds;
+#[path = "workspace_resync_heads.rs"]
+mod head_check;
+#[path = "workspace_resync_hold.rs"]
+mod hold_pass;
+#[path = "workspace_resync_online.rs"]
+mod online;
+#[path = "workspace_resync_surfaces.rs"]
+mod surfaces;
