@@ -177,6 +177,33 @@ so the decision lives once, in `loom-daemon worktree-closed-pr-branch`. A
 daemon predating the subcommand degrades to the pre-#9083 reuse behavior
 rather than surfacing a clap usage error.
 
+### An existing worktree still aliases `node_modules` on a pnpm workspace (#9152)
+
+**Symptom**: on a pnpm workspace, `ls -l .loom/worktrees/issue-N/node_modules`
+shows a symlink into the primary clone's `node_modules` (or a nested
+`apps/*/node_modules` does). #8944 stopped `worktree-link` creating these, but
+only for **new** worktrees: re-running `worktree.sh N` on an existing worktree
+returns early and never re-links. The alias is dangerous — pnpm purges
+**through** it into the main workspace, destroying every worktree's
+dependencies at once.
+
+**Fix**: retire the aliases once per repo, from the primary clone:
+
+```bash
+loom-daemon worktree-link --retire-aliases --repo-root "$(git rev-parse --show-toplevel)"
+# or one worktree:   ... --worktree .loom/worktrees/issue-N
+```
+
+Then run `pnpm install` in each worktree it names (cheap — hardlinks from
+pnpm's store).
+
+**What it touches**: only a symlink named `node_modules` whose target resolves
+to a directory inside the main workspace and outside that worktree. It
+`unlink`s the link — never its target, never a real directory (someone's own
+install), never a link pointing elsewhere. It does nothing on a non-pnpm repo
+or when `worktree.linkNodeModules` is `true`. The stale `.git/info/exclude`
+entry is harmless and left in place. Exit 1 only if an unlink failed.
+
 ### `git push --force-with-lease` prints a rejection for a ref update that landed (#6695)
 
 On a repository using Git LFS, `git push --force-with-lease=<branch>:<old-sha>

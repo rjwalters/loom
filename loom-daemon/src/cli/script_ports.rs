@@ -162,6 +162,8 @@ pub(crate) enum ScriptPortCommand {
     /// all path interpolation — four `ln -s "$src" "$dst"` pairs and a
     /// `find | read` loop — which is #7858's class. Exit 0 always: this is
     /// best-effort by contract and the worktree already exists.
+    /// `--retire-aliases` instead unlinks the pnpm `node_modules` aliases
+    /// pre-#8944 worktrees still carry (#9152; exit 1 if an unlink failed).
     WorktreeLink(super::worktree_link::WorktreeLinkArgs),
 
     /// `worktree.sh`'s crash-debris pre-flight (#8195, slice 5): the stale
