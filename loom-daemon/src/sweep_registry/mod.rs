@@ -1525,35 +1525,6 @@ impl SweepRegistry {
         }
     }
 
-    /// Test seam: record a bare entry of `kind` in `state`, with no process.
-    #[cfg(test)]
-    pub(crate) fn seed_entry_for_test(&mut self, kind: SweepKind, state: SweepState) {
-        let sweep_id = format!("seed-{}", self.entries.len());
-        self.entries.insert(
-            sweep_id.clone(),
-            SweepInfo {
-                pgid: None,
-                sweep_id,
-                kind,
-                pid: 2_147_483_640,
-                token_name: String::new(),
-                runtime: "claude".into(),
-                runtime_source: None,
-                log_path: PathBuf::new(),
-                idempotency_key: None,
-                started_at: Utc::now(),
-                state,
-                latest_phase: None,
-                pr_number: None,
-                model: None,
-                effort: None,
-                depends_on: None,
-                repo: None,
-                overflow: false,
-            },
-        );
-    }
-
     /// Internal helper: publish an event on the attached bus (if any).
     /// Best-effort — logs a debug line if no subscribers are listening.
     ///
