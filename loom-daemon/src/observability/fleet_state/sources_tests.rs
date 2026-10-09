@@ -195,3 +195,32 @@ fn account_counts_separate_exhausted_from_other_unavailable() {
     assert_eq!(parse_account_counts("b|exhausted|0.99\n"), Some((0, 1)));
     assert_eq!(parse_account_counts("# only a comment\n"), None);
 }
+
+#[test]
+fn live_workers_counts_every_nonterminal_sweep_regardless_of_kind_or_slug() {
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use crate::types::{SweepKind, SweepState};
+
+    // Plain temp dirs: not git checkouts, so no repo slug can resolve.
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let reg_a = SweepRegistry::shared(SweepRegistryConfig::new(a.path().to_path_buf()));
+    let reg_b = SweepRegistry::shared(SweepRegistryConfig::new(b.path().to_path_buf()));
+    {
+        let mut r = reg_a.lock().unwrap();
+        r.seed_entry_for_test(SweepKind::Issue(1), SweepState::Running);
+        r.seed_entry_for_test(
+            SweepKind::Issue(2),
+            SweepState::Exited {
+                code: Some(0),
+                at: Utc::now(),
+            },
+        );
+    }
+    reg_b
+        .lock()
+        .unwrap()
+        .seed_entry_for_test(SweepKind::PrSet(vec![10, 20]), SweepState::Running);
+
+    assert_eq!(super::live_sweep_count(&[reg_a, reg_b]), 2);
+    assert_eq!(super::live_sweep_count(&[]), 0);
+}

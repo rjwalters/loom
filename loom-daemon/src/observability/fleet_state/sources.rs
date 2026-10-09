@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use super::{
     held_stage, FleetInput, HeldSweep, ListedPr, ReadyItem, ReadyQueue, RepoListing, REVIEW_LABELS,
 };
+use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::kinds::fleet_state::{FleetCapacity, FleetSlots, MainCi, PlannerStamps};
 use crate::types::{ReadyQueueRow, SweepKind, WorkFinderTickSummary};
 use crate::workspace_pool::WorkspacePool;
@@ -75,6 +76,27 @@ fn checkpoint(
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok()),
     )
+}
+
+/// Non-terminal sweeps of every provisioned registry, of any kind (`Issue` or
+/// `PrSet`). Deliberately independent of [`held_sweeps`]' issue-row projection
+/// and of repo-slug resolution: `capacity.live_workers` counts workers this
+/// host runs, not rows that can be attributed to a repo.
+fn live_sweep_count(registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>>]) -> usize {
+    registries
+        .iter()
+        .map(|registry| {
+            let snapshot = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot();
+            snapshot
+                .list(None)
+                .iter()
+                .filter(|info| !info.state.is_terminal())
+                .count()
+        })
+        .sum()
 }
 
 /// The live issue sweeps of every provisioned registry. Each registry lock is
@@ -359,7 +381,10 @@ pub(super) async fn gather(
         .iter()
         .map(|(root, slug)| (slug.clone(), main_ci(&health, root)))
         .collect();
-    let capacity = Some(capacity(workspace_root, held.len()));
+    let capacity = Some(capacity(
+        workspace_root,
+        live_sweep_count(&workspace_pool.provisioned_registries()),
+    ));
     FleetInput {
         capacity,
         main_ci,
