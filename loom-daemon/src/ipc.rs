@@ -225,7 +225,7 @@ pub fn build_restart_decision(in_flight: usize) -> (Response, bool) {
                     '[Service]\\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\\n' \
                     > ~/.config/systemd/user/loom-daemon.service.d/supervisor.conf && \
                     systemctl --user daemon-reload. Once supervised, the daemon writes \
-                    its own Restart= supervision drop-in (50-supervision.conf, #11111) at \
+                    its own Restart= supervision drop-in (zz-loom-supervision.conf, #11111) at \
                     startup."
                     .to_string(),
             },

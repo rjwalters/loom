@@ -8,7 +8,7 @@
 //! and the default `OOMPolicy=stop`.
 //!
 //! So at startup, when systemd supervises it, the daemon writes
-//! `~/.config/systemd/user/<unit>.service.d/50-supervision.conf` and runs
+//! `~/.config/systemd/user/<unit>.service.d/zz-loom-supervision.conf` and runs
 //! `systemctl --user daemon-reload`. systemd reads `Restart=` and the start
 //! limit when the daemon exits, so the settings apply from the next exit with
 //! no restart needed. The drop-in covers both the canonical unit and the
@@ -23,9 +23,12 @@
 //!
 //! systemd applies drop-ins in file-name order, so a later file in the same
 //! directory wins. The pre-#11111 retrofit hint had operators write
-//! `supervisor.conf` with `Restart=on-success`, which sorts after this file and
-//! would undo it. [`shadowing_dropins`] finds such a file, and startup names
-//! it at WARN.
+//! `supervisor.conf` with `Restart=on-success`, so the file is named
+//! [`DROPIN_NAME`] (`zz-…`) to sort after it and after the other usual operator
+//! names (`override.conf`, `NN-*.conf`). A file that still sorts later and sets
+//! the same keys is rare; [`shadowing_dropins`] finds one, and startup names it
+//! at WARN. A copy under the pre-release name [`LEGACY_DROPIN_NAME`] is removed
+//! when the drop-in is written, so two copies never coexist.
 //!
 //! Every failure is logged at WARN and swallowed: a daemon that cannot write
 //! its own drop-in is still a working daemon.
@@ -36,8 +39,13 @@ use std::process::{Command, Stdio};
 
 use super::render;
 
-/// The drop-in's file name inside `<unit>.service.d/`.
-pub const DROPIN_NAME: &str = "50-supervision.conf";
+/// The drop-in's file name inside `<unit>.service.d/`. It starts with `zz-` so
+/// it sorts after any operator drop-in, and the last drop-in wins.
+pub const DROPIN_NAME: &str = "zz-loom-supervision.conf";
+
+/// The name an unreleased build of #11111 used. It sorted before an operator's
+/// `supervisor.conf`; [`ensure_with`] removes it when present.
+pub const LEGACY_DROPIN_NAME: &str = "50-supervision.conf";
 
 /// The directives systemd treats as lists, where a later assignment ADDS to the
 /// earlier ones. Each needs an empty `Key=` reset before its value.
@@ -97,6 +105,11 @@ pub trait DropinHost {
     /// # Errors
     /// Any I/O failure.
     fn write_atomic(&self, path: &Path, content: &str) -> io::Result<()>;
+    /// Remove `path`. A missing file is not an error.
+    ///
+    /// # Errors
+    /// Any removal failure other than not-found.
+    fn remove(&self, path: &Path) -> io::Result<()>;
     /// The file names in `dir`, empty when it does not exist.
     ///
     /// # Errors
@@ -123,6 +136,13 @@ impl DropinHost for RealHost {
 
     fn write_atomic(&self, path: &Path, content: &str) -> io::Result<()> {
         crate::roll_pause::write_atomic(path, content.as_bytes())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
     }
 
     fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
@@ -158,9 +178,10 @@ impl DropinHost for RealHost {
 pub enum Outcome {
     /// Not supervised by systemd on Linux (launchd, macOS, unsupervised): nothing written.
     NotSystemd,
-    /// The drop-in already has this content: no write, no reload.
+    /// The drop-in already has this content and no legacy copy exists: no
+    /// write, no reload.
     Unchanged(PathBuf),
-    /// Written and reloaded.
+    /// Written (or a legacy copy removed) and reloaded.
     Written(PathBuf),
     /// The read or write failed. Non-fatal.
     WriteFailed(PathBuf, String),
@@ -170,7 +191,8 @@ pub enum Outcome {
 }
 
 /// Write the drop-in when `supervisor` is systemd on Linux and its content
-/// differs, then reload. Never fails; see [`Outcome`].
+/// differs, remove a [`LEGACY_DROPIN_NAME`] copy, then reload. Never fails; see
+/// [`Outcome`].
 pub fn ensure_with(
     supervisor: Option<&str>,
     is_linux: bool,
@@ -181,15 +203,33 @@ pub fn ensure_with(
     if !is_linux || supervisor != Some("systemd") {
         return Outcome::NotSystemd;
     }
-    let path = dropin_dir(unit_dir, unit).join(DROPIN_NAME);
+    let dir = dropin_dir(unit_dir, unit);
+    let path = dir.join(DROPIN_NAME);
+    let legacy = dir.join(LEGACY_DROPIN_NAME);
+    let legacy_present = matches!(host.read(&legacy), Ok(Some(_)));
     let want = render_dropin();
-    match host.read(&path) {
-        Ok(Some(have)) if have == want => return Outcome::Unchanged(path),
-        Ok(_) => {}
+    let current = match host.read(&path) {
+        Ok(have) => have.as_deref() == Some(want.as_str()),
         Err(e) => return Outcome::WriteFailed(path, format!("read: {e}")),
+    };
+    if current && !legacy_present {
+        return Outcome::Unchanged(path);
     }
-    if let Err(e) = host.write_atomic(&path, &want) {
-        return Outcome::WriteFailed(path, e.to_string());
+    if !current {
+        if let Err(e) = host.write_atomic(&path, &want) {
+            return Outcome::WriteFailed(path, e.to_string());
+        }
+    }
+    if legacy_present {
+        // Ours sorts after the legacy copy and so wins either way; a failed
+        // removal only leaves a redundant file behind.
+        if let Err(e) = host.remove(&legacy) {
+            log::warn!(
+                "supervision drop-in: could not remove the legacy {} ({e}); {DROPIN_NAME} \
+                 sorts after it and takes precedence",
+                legacy.display()
+            );
+        }
     }
     match host.daemon_reload() {
         Ok(()) => Outcome::Written(path),
@@ -270,8 +310,7 @@ pub fn ensure_on_startup() {
         if !shadows.is_empty() {
             log::warn!(
                 "supervision drop-in: {} in {} sort(s) after {DROPIN_NAME} and override its \
-                 settings (a pre-#11111 retrofit's Restart=on-success?); remove those lines \
-                 so the #11058 supervision applies",
+                 settings; remove those lines so the #11058 supervision applies",
                 shadows.join(", "),
                 dir.display()
             );
@@ -293,6 +332,7 @@ mod tests {
         reloads: RefCell<usize>,
         fail_write: bool,
         fail_reload: bool,
+        fail_remove: bool,
     }
 
     impl DropinHost for FakeHost {
@@ -307,6 +347,13 @@ mod tests {
             self.files
                 .borrow_mut()
                 .insert(path.to_path_buf(), content.to_string());
+            Ok(())
+        }
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            if self.fail_remove {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "read-only"));
+            }
+            self.files.borrow_mut().remove(path);
             Ok(())
         }
         fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
@@ -330,6 +377,10 @@ mod tests {
     const UNIT_DIR: &str = "/h/.config/systemd/user";
 
     fn dropin_path() -> PathBuf {
+        PathBuf::from("/h/.config/systemd/user/loom-daemon.service.d/zz-loom-supervision.conf")
+    }
+
+    fn legacy_path() -> PathBuf {
         PathBuf::from("/h/.config/systemd/user/loom-daemon.service.d/50-supervision.conf")
     }
 
@@ -457,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_retrofit_dropin_that_sets_our_keys_is_reported() {
+    fn a_later_dropin_that_sets_our_keys_is_reported() {
         let host = FakeHost::default();
         let dir = dropin_dir(Path::new(UNIT_DIR), "loom-daemon.service");
         let put = |name: &str, text: &str| {
@@ -465,18 +516,100 @@ mod tests {
                 .borrow_mut()
                 .insert(dir.join(name), text.to_string());
         };
-        // The pre-#11111 retrofit hint: sorts after 50-supervision.conf.
-        put(
-            "supervisor.conf",
-            "[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\nRestart=on-success\n",
-        );
+        // Sorts after zz-loom-supervision.conf and sets Restart=: it wins.
+        put("zzz-local.conf", "[Service]\nRestart=on-failure\n");
         // Sorts after, but sets none of our keys.
-        put("zz-env.conf", "[Service]\nEnvironment=FOO=1\n");
-        // Sets Restart=, but sorts before ours, so ours wins.
-        put("10-old.conf", "[Service]\nRestart=no\n");
-        put("supervisor.conf.bak", "[Service]\nRestart=no\n");
-        assert_eq!(shadowing_dropins(&dir, &host), ["supervisor.conf"]);
+        put("zzz-env.conf", "[Service]\nEnvironment=FOO=1\n");
+        // The pre-#11111 retrofit and `systemctl edit`'s file set Restart=, but
+        // sort before ours, so ours wins.
+        put("supervisor.conf", "[Service]\nRestart=on-success\n");
+        put("override.conf", "[Service]\nRestart=no\n");
+        // Not a drop-in: systemd only reads `*.conf`.
+        put("zzz.conf.bak", "[Service]\nRestart=no\n");
+        assert_eq!(shadowing_dropins(&dir, &host), ["zzz-local.conf"]);
         assert!(shadowing_dropins(Path::new("/nowhere"), &host).is_empty());
+    }
+
+    /// The value systemd ends up with for a single-valued `key` across the
+    /// drop-ins in `dir`: files applied in file-name order, the last one wins.
+    fn effective(host: &FakeHost, dir: &Path, key: &str) -> Option<String> {
+        let mut names = host.list(dir).expect("list");
+        names.retain(|n| n.ends_with(".conf"));
+        names.sort();
+        let mut value = None;
+        for n in names {
+            let text = host.read(&dir.join(n)).expect("read").expect("present");
+            if let Some(v) = values(&text, key).last() {
+                value = Some((*v).to_string());
+            }
+        }
+        value
+    }
+
+    #[test]
+    fn an_operator_supervisor_conf_does_not_override_the_dropin() {
+        // The pre-#11111 retrofit hint wrote this file. Our name must sort after
+        // it, and after the other usual operator names, so our settings win.
+        for operator in [
+            "supervisor.conf",
+            "override.conf",
+            "99-local.conf",
+            "50-supervision.conf",
+        ] {
+            assert!(DROPIN_NAME > operator, "{DROPIN_NAME} must sort after {operator}");
+        }
+        let host = FakeHost::default();
+        let dir = dropin_dir(Path::new(UNIT_DIR), "loom-daemon.service");
+        host.files.borrow_mut().insert(
+            dir.join("supervisor.conf"),
+            "[Service]\nEnvironment=LOOM_DAEMON_SUPERVISOR=systemd\nRestart=on-success\n"
+                .to_string(),
+        );
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Written(dropin_path()));
+        assert_eq!(effective(&host, &dir, "Restart").as_deref(), Some("always"));
+        assert_eq!(effective(&host, &dir, "OOMPolicy").as_deref(), Some("continue"));
+        assert!(shadowing_dropins(&dir, &host).is_empty());
+    }
+
+    #[test]
+    fn the_legacy_dropin_is_removed_when_writing() {
+        let host = FakeHost::default();
+        host.files
+            .borrow_mut()
+            .insert(legacy_path(), "[Service]\nRestart=always\n".to_string());
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Written(dropin_path()));
+        assert!(!host.files.borrow().contains_key(&legacy_path()));
+        assert_eq!(host.files.borrow().get(&dropin_path()), Some(&render_dropin()));
+        assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (1, 1));
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Unchanged(dropin_path()));
+    }
+
+    #[test]
+    fn a_legacy_copy_beside_a_current_dropin_is_removed_and_reloaded() {
+        let host = FakeHost::default();
+        host.files
+            .borrow_mut()
+            .insert(dropin_path(), render_dropin());
+        host.files
+            .borrow_mut()
+            .insert(legacy_path(), "[Service]\nRestart=always\n".to_string());
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Written(dropin_path()));
+        assert!(!host.files.borrow().contains_key(&legacy_path()));
+        // Nothing to rewrite, but the directory changed, so systemd reloads.
+        assert_eq!((*host.writes.borrow(), *host.reloads.borrow()), (0, 1));
+    }
+
+    #[test]
+    fn a_failed_legacy_removal_is_non_fatal() {
+        let host = FakeHost {
+            fail_remove: true,
+            ..FakeHost::default()
+        };
+        host.files
+            .borrow_mut()
+            .insert(legacy_path(), "[Service]\nRestart=always\n".to_string());
+        assert_eq!(ensure(&host, Some("systemd"), true), Outcome::Written(dropin_path()));
+        assert_eq!(*host.reloads.borrow(), 1);
     }
 
     #[test]
@@ -488,6 +621,11 @@ mod tests {
         assert_eq!(RealHost.read(&path).expect("read").as_deref(), Some("x\n"));
         let dir = path.parent().expect("dir");
         assert_eq!(RealHost.list(dir).expect("list"), [DROPIN_NAME]);
+        RealHost.remove(&path).expect("remove");
+        assert_eq!(RealHost.read(&path).expect("read"), None);
+        RealHost
+            .remove(&path)
+            .expect("removing an absent file is not an error");
         assert!(RealHost
             .list(&tmp.path().join("absent"))
             .expect("list")

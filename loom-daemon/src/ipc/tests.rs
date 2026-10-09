@@ -3504,7 +3504,7 @@ fn test_build_restart_decision_supervisor_gated() {
                 "restart refusal must not suggest the pre-#11058 Restart= policy: {message}"
             );
             assert!(
-                message.contains("50-supervision.conf"),
+                message.contains("zz-loom-supervision.conf"),
                 "restart refusal must name the startup drop-in: {message}"
             );
         }
@@ -4752,7 +4752,7 @@ fn test_drain_request_unsupervised_refuses_without_pausing() {
                 "drain refusal must not suggest the pre-#11058 Restart= policy: {message}"
             );
             assert!(
-                message.contains("50-supervision.conf"),
+                message.contains("zz-loom-supervision.conf"),
                 "drain refusal must name the startup drop-in: {message}"
             );
         }

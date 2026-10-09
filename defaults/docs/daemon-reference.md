@@ -1074,10 +1074,11 @@ systemctl --user daemon-reload
 
 A systemd drop-in's `Environment=` is additive, so this file adds the missing
 supervisor env without touching the rendered base unit. Once the daemon runs
-supervised, it writes the restart policy itself as `50-supervision.conf`
+supervised, it writes the restart policy itself as `zz-loom-supervision.conf`
 (#11111; see "Supervisor exit-code contract"). An older copy of this hint also
-put `Restart=on-success` in `supervisor.conf`. That file sorts after
-`50-supervision.conf` and overrides it, so delete the line.
+put `Restart=on-success` in `supervisor.conf`. That file sorts before
+`zz-loom-supervision.conf`, so the daemon's setting wins; the stale line is
+harmless and can be deleted.
 
 ### `fleet bootstrap-spice <ssh-host>` (#4931, Phase 1a)
 
@@ -12178,7 +12179,7 @@ The daemon encodes WHY it exits in its exit code (`ipc.rs`,
   `systemctl --user disable --now`.
 - **Existing installs get these settings at the next daemon startup (#11111)**,
   with no re-render. A daemon running under systemd on Linux writes them to
-  `~/.config/systemd/user/<unit>.service.d/50-supervision.conf` and runs
+  `~/.config/systemd/user/<unit>.service.d/zz-loom-supervision.conf` and runs
   `systemctl --user daemon-reload`. The file holds the `[Unit]` start limit and
   the `[Service]` directives of the same `systemd_supervision_block()`, with an
   empty `RestartPreventExitStatus=` / `SuccessExitStatus=` before each value,
@@ -12187,9 +12188,13 @@ The daemon encodes WHY it exits in its exit code (`ipc.rs`,
   exit is supervised by them; a floor roll is enough to deliver them fleet-wide.
   It covers the canonical unit and the `fleet add-worker` unit alike. A failure
   is logged at WARN and the daemon carries on. Nothing is written under launchd
-  or when unsupervised. A drop-in that sorts after it and sets the same keys
-  wins, so startup names one at WARN. The usual one is the pre-#11111 retrofit's
-  `supervisor.conf` with `Restart=on-success`; delete that line.
+  or when unsupervised. systemd applies drop-ins in file-name order and the
+  last one wins, so the `zz-` name sorts after any operator drop-in, including
+  the pre-#11111 retrofit's `supervisor.conf` with `Restart=on-success` and
+  `systemctl edit`'s `override.conf`. A drop-in that still sorts after it and
+  sets the same keys would win; startup names such a file at WARN. Writing the
+  drop-in also removes a `50-supervision.conf`, the name an unreleased build
+  used, so two copies never coexist.
 - **The unit file itself is re-rendered** only by `loom-daemon-update.sh
   --relaunch` or a fresh `loom-daemon-start.sh` against a stopped daemon; a
   supervised restart (exit 0) does not re-render it.
