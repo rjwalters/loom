@@ -6,7 +6,8 @@
 //! Curator `## Affected Files` set intersects the surface already occupied in
 //! its repo this tick is deferred to a later tick.
 //!
-//! * **Surface**: backtick-quoted paths under an `Affected Files` heading.
+//! * **Surface**: backtick-quoted paths under an `Affected Files` heading (a
+//!   span with a `/`, or a root file with a known extension).
 //! * **Unknown surface** (no section, "To be determined", no paths) is
 //!   excluded entirely: it neither blocks nor occupies.
 //! * **Scheduling signal only**: no label, hold, or stacking edge (#3729).
@@ -48,8 +49,18 @@ fn backticked(line: &str) -> impl Iterator<Item = String> + '_ {
         .map(|(_, s)| s.trim().to_string())
 }
 
+/// Extensions a slash-less span must end in to count as a root-level file
+/// (`CLAUDE.md`, `Cargo.toml`). Without this, `WorkItem.body`, `Type.ALL` or
+/// `v0.19.1` would read as paths and over-defer (#9781 review).
+const ROOT_FILE_EXTS: &[&str] = &[
+    "rs", "md", "sh", "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "yml", "yaml", "toml", "py",
+    "txt", "lock", "html", "css", "sql", "go", "rb", "cfg", "ini", "xml", "svg",
+];
+
 /// `span` as a repo-relative file path, or `None` when it is not path-shaped
 /// (an identifier, a code snippet, a bare word). A trailing `:line` is dropped.
+/// A span with a `/` is a path; one without must end in a known file
+/// extension ([`ROOT_FILE_EXTS`]).
 fn as_path(span: &str) -> Option<String> {
     let base = match span.rsplit_once(':') {
         Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
@@ -60,7 +71,7 @@ fn as_path(span: &str) -> Option<String> {
         return None;
     }
     let has_ext = base.rsplit_once('.').is_some_and(|(stem, ext)| {
-        !stem.is_empty() && !ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        !stem.is_empty() && ROOT_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
     });
     (base.contains('/') || has_ext).then(|| base.to_string())
 }

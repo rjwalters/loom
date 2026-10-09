@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use super::super::*;
-use super::{affected_surface, overlap};
+use super::{affected_surface, overlap, OverlapGate};
 use crate::telemetry::kinds::pick_decision::PickSkipReason;
 
 fn body(paths: &[&str]) -> String {
@@ -76,6 +76,21 @@ fn parser_extracts_backticked_paths_and_treats_the_rest_as_unknown() {
     assert_eq!(
         affected_surface("## Affected Files\n- `src/x.rs:120`\n").unwrap(),
         set(&["src/x.rs"])
+    );
+}
+
+#[test]
+fn slashless_spans_need_a_known_file_extension() {
+    let s = affected_surface(
+        "## Affected Files\n- `WorkItem.body` via `PickSkipReason.ALL` since `v0.19.1`\n- `CLAUDE.md`, `Cargo.toml`\n",
+    )
+    .unwrap();
+    assert_eq!(s, set(&["CLAUDE.md", "Cargo.toml"]), "identifiers and versions are not paths");
+    assert_eq!(affected_surface("## Affected Files\n- `WorkItem.body`\n"), None);
+    assert_eq!(
+        affected_surface("## Affected Files\n- `src/Type.weird`\n").unwrap(),
+        set(&["src/Type.weird"]),
+        "a `/` alone makes it a path"
     );
 }
 
@@ -157,13 +172,43 @@ fn identical_paths_in_different_repos_do_not_defer() {
 fn starred_candidate_is_never_deferred_but_still_occupies() {
     let items = vec![
         item(9, Some(body(&["a.rs"])), Some("loom:building")),
-        item(1, Some(body(&["a.rs"])), None),
-        item(2, Some(body(&["a.rs"])), Some("loom:operator-priority")),
+        item(1, Some(body(&["b.rs"])), None),
+        item(2, Some(body(&["a.rs", "b.rs"])), Some("loom:operator-priority")),
     ];
     let mut disp = Disp::default();
     disp.in_flight.insert(9);
     let mut ws = [(Src(Some(items)), disp)];
     let report = run(&mut ws);
-    assert_eq!(ws[0].1.dispatched, vec![2], "the star ignores the occupied surface");
-    assert_eq!(row(&report, 1).unwrap().0, Qd::DeferredFileOverlap);
+    assert_eq!(ws[0].1.dispatched, vec![2], "the star ignores the occupied `a.rs`");
+    let (d, detail) = row(&report, 1).unwrap();
+    assert_eq!(d, Qd::DeferredFileOverlap, "the admitted star occupies `b.rs`");
+    let detail = detail.unwrap();
+    assert!(detail.contains("b.rs") && !detail.contains("a.rs"), "{detail}");
+}
+
+fn cand(number: u32, operator_priority: bool, main_red_fix: bool) -> PriorityCandidate {
+    PriorityCandidate {
+        workspace_idx: 0,
+        workspace_priority: 0,
+        operator_level: u8::from(operator_priority),
+        operator_priority,
+        operator_priority_at: None,
+        main_red_fix,
+        created_at: None,
+        number,
+        complexity: None,
+    }
+}
+
+#[test]
+fn red_main_fix_is_never_deferred_but_still_occupies() {
+    let mut gate = OverlapGate::default();
+    gate.note(0, 9, Some(&body(&["a.rs"])), true);
+    gate.note(0, 1, Some(&body(&["a.rs", "b.rs"])), false);
+    gate.note(0, 2, Some(&body(&["b.rs"])), false);
+    let fix = cand(1, false, true);
+    assert!(gate.overlapping(&fix).is_empty(), "red-main fix bypasses the gate");
+    assert_eq!(gate.overlapping(&cand(1, false, false)), vec!["a.rs"], "control");
+    gate.occupy(&fix);
+    assert_eq!(gate.overlapping(&cand(2, false, false)), vec!["b.rs"]);
 }

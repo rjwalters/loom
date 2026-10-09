@@ -4885,6 +4885,30 @@ in a fixed order: the sharding slice partition runs first, affinity reorders
 within its result, and the cap gates admission last. Starred and red-main-fix
 candidates are exempt from both partitions (#9244).
 
+#### Same-repo file-overlap deferral (#9781)
+
+Two same-repo issues that edit the same files and build in parallel cost a
+Doctor rebase cycle as soon as the first PR merges. Pass 2 therefore defers a
+candidate whose Curator `## Affected Files` paths intersect the surface already
+**occupied** in its repo: candidates admitted earlier this tick, plus in-flight
+items the tick's own `loom:issue` listing still carries a body for. It runs
+after the capacity, ramp, RAM and per-repo-cap gates, so it is work-conserving
+— the slot goes to the next candidate in order. Always on; no config.
+
+- **Disposition** `deferred_file_overlap` (state `ready`, plan gate
+  `file_overlap`); the row's `detail` is `file overlap: <paths>`, and the
+  `pick.decision` skip (`overlap_chain`) carries the same `detail`.
+- **Surface** = backtick-quoted paths under an `Affected Files` heading (a span
+  with a `/`, or a root file with a known extension such as `CLAUDE.md`). No
+  section, "To be determined", or no paths ⇒ *unknown*: never deferred and
+  never occupying — same rule as `/loom:sweep`'s overlap-aware waves.
+- **Scheduling signal only**: no label, hold, stacking edge or extra forge read.
+  Starred and red-main-fix candidates are never deferred but still occupy.
+- **v1 limitation**: an in-flight issue absent from the `loom:issue` listing
+  (the usual case once it flips to `loom:building`) is not seen, so the gate
+  mainly separates same-tick admissions; the reactive Doctor rebase stays the
+  backstop.
+
 #### Why there is no CPU term in admission (#4512)
 
 From #3978 until #4512 the `min(...)` carried a fourth term:

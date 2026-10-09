@@ -37,7 +37,7 @@ use crate::telemetry::kinds::pick_decision::{
     PickVerdict, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
-use crate::types::WorkFinderTickSummary;
+use crate::types::{QueueDisposition, WorkFinderTickSummary};
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
 pub const REPO_UNRESOLVED: &str = "repo_unresolved";
@@ -153,9 +153,17 @@ pub fn work_finder_record(
                     value,
                 }),
             };
-            let verdict = match PickSkipReason::from_disposition(row.disposition) {
-                None => PickVerdict::Acted("dispatched"),
-                Some(reason) => PickVerdict::Skipped(reason),
+            let verdict = match (PickSkipReason::from_disposition(row.disposition), &row.detail) {
+                (None, _) => PickVerdict::Acted("dispatched"),
+                // #9781: a file-overlap deferral names the shared paths. Only
+                // this disposition's detail is carried: it is daemon-templated
+                // from parsed paths, unlike free-form dispatch-error text.
+                (Some(reason), Some(detail))
+                    if row.disposition == QueueDisposition::DeferredFileOverlap =>
+                {
+                    PickVerdict::SkippedWithDetail(reason, detail.clone())
+                }
+                (Some(reason), _) => PickVerdict::Skipped(reason),
             };
             (candidate, verdict)
         })
