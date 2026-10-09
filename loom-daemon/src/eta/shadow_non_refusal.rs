@@ -170,7 +170,7 @@ impl ShadowLedger {
             (current_answered > 0).then(|| candidate_answered as f64 / current_answered as f64);
         let pct = |r: f64| r * 100.0;
         let (status, detail) = match rate {
-            _ if observed_hours.map_or(true, |h| h < WINDOW_HOURS) => (
+            _ if observed_hours.is_none_or(|h| h < WINDOW_HOURS) => (
                 GateStatus::Failed,
                 format!(
                     "{current} vs {candidate} observed for {} h, {WINDOW_HOURS} h required",
