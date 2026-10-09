@@ -19,17 +19,31 @@
 //!   skips the mirror.
 //! - `LOOM_TEST_IMAGE_HUB`: host to use in place of Docker Hub for the
 //!   fallback, e.g. an unreachable one to prove the mirror path stands alone.
+//!
+//! Every `docker` call has a deadline, so a stalled registry costs one attempt
+//! instead of the job: the attempt count bounds retries, the deadline bounds
+//! time.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_MIRROR: &str = "mirror.gcr.io";
 const MIRROR_ATTEMPTS: usize = 2;
 /// Waits between Docker Hub attempts; one more attempt than entries.
-const HUB_BACKOFF_SECS: [u64; 3] = [15, 30, 60];
+const HUB_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+/// Deadline for one `docker pull`. Six attempts plus backoff stay under the
+/// 30-minute job limit, so exhaustion is reported rather than cancelled.
+const PULL_DEADLINE: Duration = Duration::from_secs(180);
+/// Deadline for a local `docker image inspect` / `docker tag`.
+const LOCAL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// True when `image` names a Docker Hub repository (no registry host).
 pub fn is_docker_hub(image: &str) -> bool {
@@ -58,24 +72,119 @@ pub fn on_registry(registry: &str, image: &str) -> String {
     }
 }
 
-fn docker(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .expect("docker is required for this test");
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+/// Where and how patiently to pull. [`Puller::from_env`] is what the proofs
+/// use; the fields are public so a test can aim it at a fake `docker`.
+pub struct Puller {
+    pub docker: PathBuf,
+    /// Mirror host; empty skips the mirror.
+    pub mirror: String,
+    /// Host standing in for Docker Hub on the fallback; empty means Docker Hub.
+    pub hub: String,
+    pub pull_deadline: Duration,
+    pub hub_backoff: Vec<Duration>,
+}
+
+impl Puller {
+    pub fn from_env() -> Self {
+        let env =
+            |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
+        Self {
+            docker: PathBuf::from("docker"),
+            mirror: env("LOOM_TEST_IMAGE_MIRROR", DEFAULT_MIRROR),
+            hub: env("LOOM_TEST_IMAGE_HUB", ""),
+            pull_deadline: PULL_DEADLINE,
+            hub_backoff: HUB_BACKOFF.to_vec(),
+        }
     }
-}
 
-fn is_local(reference: &str) -> bool {
-    docker(&["image", "inspect", reference]).is_ok()
-}
+    /// Runs `docker <args>`, killing and reaping it at `deadline`.
+    fn docker(&self, args: &[&str], deadline: Duration) -> Result<(), String> {
+        let mut child = Command::new(&self.docker)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("docker is required for this test");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait for docker") {
+                break Some(status);
+            }
+            if started.elapsed() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        match status {
+            Some(status) if status.success() => Ok(()),
+            Some(_) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                Err(stderr.trim().to_string())
+            }
+            None => Err(format!("timed out after {}s", deadline.as_secs_f32())),
+        }
+    }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+    fn is_local(&self, reference: &str) -> bool {
+        self.docker(&["image", "inspect", reference], LOCAL_DEADLINE)
+            .is_ok()
+    }
+
+    /// Returns the reference to pass to `docker` for `image`, pulling it if it
+    /// is not already local, or every attempt's failure once all are spent.
+    pub fn pull(&self, image: &str) -> Result<String, Vec<String>> {
+        if !is_docker_hub(image) || self.is_local(image) {
+            return Ok(image.to_string());
+        }
+        let pinned = image.contains('@');
+        let mut failures = Vec::new();
+
+        if !self.mirror.is_empty() {
+            let mirrored = on_registry(&self.mirror, image);
+            if pinned && self.is_local(&mirrored) {
+                return Ok(mirrored);
+            }
+            for attempt in 1..=MIRROR_ATTEMPTS {
+                let pulled = self
+                    .docker(&["pull", "--quiet", &mirrored], self.pull_deadline)
+                    .and_then(|()| {
+                        if pinned {
+                            return Ok(mirrored.clone());
+                        }
+                        self.docker(&["tag", &mirrored, image], LOCAL_DEADLINE)
+                            .map(|()| image.to_string())
+                    });
+                match pulled {
+                    Ok(reference) => return Ok(reference),
+                    Err(error) => failures.push(format!("{mirrored} (attempt {attempt}): {error}")),
+                }
+            }
+            eprintln!("hub_image: mirror failed for {image}; falling back to Docker Hub");
+        }
+
+        let hub = if self.hub.is_empty() {
+            image.to_string()
+        } else {
+            on_registry(&self.hub, image)
+        };
+        for attempt in 0..=self.hub_backoff.len() {
+            match self.docker(&["pull", "--quiet", &hub], self.pull_deadline) {
+                Ok(()) => return Ok(hub),
+                Err(error) => failures.push(format!("{hub} (attempt {}): {error}", attempt + 1)),
+            }
+            if let Some(wait) = self.hub_backoff.get(attempt) {
+                eprintln!("hub_image: Docker Hub pull of {image} failed; retrying in {wait:?}");
+                std::thread::sleep(*wait);
+            }
+        }
+        Err(failures)
+    }
 }
 
 /// Returns the reference to pass to `docker` for the Docker Hub image `image`,
@@ -92,73 +201,35 @@ pub fn resolve(image: &str) -> String {
     if let Some(reference) = resolved.get(image) {
         return reference.clone();
     }
-    let reference = pull(image);
+    let reference = Puller::from_env().pull(image).unwrap_or_else(|failures| {
+        let summary = std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from);
+        panic!("{}", report_infrastructure_failure(image, &failures, summary.as_deref()))
+    });
     resolved.insert(image.to_string(), reference.clone());
     reference
 }
 
-fn pull(image: &str) -> String {
-    if !is_docker_hub(image) || is_local(image) {
-        return image.to_string();
-    }
-    let pinned = image.contains('@');
-    let mut failures = Vec::new();
-
-    let mirror = env_or("LOOM_TEST_IMAGE_MIRROR", DEFAULT_MIRROR);
-    if !mirror.is_empty() {
-        let mirrored = on_registry(&mirror, image);
-        if pinned && is_local(&mirrored) {
-            return mirrored;
-        }
-        for attempt in 1..=MIRROR_ATTEMPTS {
-            let pulled = docker(&["pull", "--quiet", &mirrored]).and_then(|()| {
-                if pinned {
-                    Ok(mirrored.clone())
-                } else {
-                    docker(&["tag", &mirrored, image]).map(|()| image.to_string())
-                }
-            });
-            match pulled {
-                Ok(reference) => return reference,
-                Err(error) => failures.push(format!("{mirrored} (attempt {attempt}): {error}")),
-            }
-        }
-        eprintln!("hub_image: mirror failed for {image}; falling back to Docker Hub");
-    }
-
-    let hub = match std::env::var("LOOM_TEST_IMAGE_HUB") {
-        Ok(host) if !host.is_empty() => on_registry(&host, image),
-        _ => image.to_string(),
-    };
-    for attempt in 0..=HUB_BACKOFF_SECS.len() {
-        match docker(&["pull", "--quiet", &hub]) {
-            Ok(()) => return hub,
-            Err(error) => failures.push(format!("{hub} (attempt {}): {error}", attempt + 1)),
-        }
-        if let Some(seconds) = HUB_BACKOFF_SECS.get(attempt) {
-            eprintln!("hub_image: Docker Hub pull of {image} failed; retrying in {seconds}s");
-            std::thread::sleep(Duration::from_secs(*seconds));
-        }
-    }
-    infrastructure_failure(image, &failures)
-}
-
 /// Reports an exhausted pull as infrastructure — in the job summary when CI
-/// provides one — so a registry outage is not read as a test failure.
-fn infrastructure_failure(image: &str, failures: &[String]) -> ! {
+/// provides one — so a registry outage is not read as a test failure. Returns
+/// the message to panic with.
+pub fn report_infrastructure_failure(
+    image: &str,
+    failures: &[String],
+    summary: Option<&Path>,
+) -> String {
     let headline = format!(
         "INFRASTRUCTURE FAILURE (not a test failure): could not pull {image} \
          from the mirror or from Docker Hub"
     );
     println!("::error title=Infrastructure: image pull failed::{headline}");
-    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut summary) = std::fs::OpenOptions::new().append(true).open(path) {
+    if let Some(path) = summary {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
             let _ = writeln!(
-                summary,
+                file,
                 "### Infrastructure failure: image pull\n\n{headline}. Re-run the job; \
                  the change under test did not cause this.\n"
             );
         }
     }
-    panic!("{headline}\n{}", failures.join("\n"));
+    format!("{headline}\n{}", failures.join("\n"))
 }
