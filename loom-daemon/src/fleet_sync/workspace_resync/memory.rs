@@ -35,6 +35,8 @@ pub(super) struct Backoff {
     pub(super) installed: Option<String>,
     pub(super) requires_daemon: Option<String>,
     pub(super) refusal: Option<crate::init::payload::ResyncRefusal>,
+    /// How the last failure counted.
+    pub(super) kind: FailureKind,
 }
 
 /// What a workspace was found to be at one default-branch commit, for one
@@ -165,6 +167,7 @@ impl Memory {
                 installed: report.installed.clone(),
                 requires_daemon: report.requires_daemon.clone(),
                 refusal: report.refusal.clone(),
+                kind,
             },
         );
         let alerts = match kind {
@@ -259,6 +262,23 @@ impl Memory {
             next_attempt: now + chrono_of(interval),
         };
         (false, Some(alert))
+    }
+
+    /// The `roots` this host is backing off because their remote did not
+    /// answer or refused it (#10869): the checkout step does not ask them
+    /// either until the backoff ends. A repo backed off for a refused push
+    /// still answers reads, and is not listed.
+    pub(super) fn remotes_backed_off(&self, roots: &[PathBuf], now: DateTime<Utc>) -> Vec<PathBuf> {
+        roots
+            .iter()
+            .filter(|root| {
+                self.backoff.get(*root).is_some_and(|b| {
+                    b.next_attempt > now
+                        && matches!(b.kind, FailureKind::Unreachable | FailureKind::Refused)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     /// Is the host staying off the network after an outage?

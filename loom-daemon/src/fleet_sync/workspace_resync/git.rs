@@ -223,12 +223,15 @@ pub(super) fn remote_head(root: &Path, branch: &str) -> Result<String> {
     if !out.status.success() {
         return Err(network_failure("git ls-remote origin", &out.stderr));
     }
-    String::from_utf8_lossy(&out.stdout)
+    let head = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.split_once('\t'))
         .find(|(sha, listed)| *listed == name && sha.len() >= 40)
         .map(|(sha, _)| sha.to_string())
-        .ok_or_else(|| anyhow!("origin has no {name}"))
+        .ok_or_else(|| anyhow!("origin has no {name}"))?;
+    // The checkout half (#10869) does not ask again for what was just answered.
+    crate::fleet_sync::checkout_ff::note_remote_head(root, branch, &head);
+    Ok(head)
 }
 
 /// The commit the clone's `origin/<branch>` is at; `None` when it has never
