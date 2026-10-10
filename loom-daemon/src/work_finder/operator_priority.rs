@@ -741,7 +741,7 @@ impl From<usize> for CapTerms {
 ///   sweep, which is what keeps it to *one* over-limit sweep.
 ///
 /// Every other gate still applies before this is consulted: the saturation
-/// brake, host-class and pool gates, skip/park labels, quarantine, backoff,
+/// brake, host-affinity and pool gates, skip/park labels, quarantine, backoff,
 /// peer claims and the per-tick ramp cap. Unstarred work, including red-main
 /// fixes, never uses the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

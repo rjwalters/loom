@@ -14,9 +14,6 @@ use std::cmp::Ordering;
 /// `dispatch()` back to the owning workspace. Built by
 /// [`super::ready_queue::key_of`], then globally sorted by [`candidate_cmp`]
 /// before the shared concurrency budget is filled.
-///
-/// `loom:urgent` is **not** a key any more (#9244). The label is still
-/// tolerated on an issue; it just no longer changes where the issue sorts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PriorityCandidate {
     /// The owning workspace's index in the `workspaces` slice (dispatch routing).

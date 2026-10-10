@@ -10,8 +10,8 @@ version: 2
 # updates are capped at zero, which is exactly why this file is kept rather
 # than deleted outright.
 #
-# Every ecosystem below applies `loom:review-requested` in addition to its own
-# labels. That is not cosmetic — it is what keeps a Dependabot PR OUT of the
+# Every ecosystem below applies `loom:review-requested` (only that: the generic
+# `dependencies` tag was dropped and the label deleted, #11105). That is not cosmetic — it is what keeps a Dependabot PR OUT of the
 # Judge's fallback queue (#5455).
 #
 # The fallback queue is defined as "open PRs carrying no `loom:` label", and the
@@ -61,7 +61,6 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 0
     labels:
-      - "dependencies"
       - "loom:review-requested"
     groups:
       dev-dependencies:
@@ -78,7 +77,6 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 0
     labels:
-      - "dependencies"
       - "loom:review-requested"
     groups:
       all-dependencies:
@@ -92,7 +90,6 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 0
     labels:
-      - "dependencies"
       - "loom:review-requested"
     groups:
       all-dependencies:
@@ -106,5 +103,4 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 0
     labels:
-      - "dependencies"
       - "loom:review-requested"

@@ -1574,8 +1574,7 @@ Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 `reason` ∈ `dispatched`, `labeled`, `in_flight`, `quarantined`,
 `workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
-`recheck_interval`, `host_constraint`, `host_class` (#9034: a `loom:heavy`
-candidate refused on a `local-dev` host), `capacity`, `ramp_cap`, `saturation`,
+`recheck_interval`, `host_constraint`, `capacity`, `ramp_cap`, `saturation`,
 `build_backoff` (#9410: the build back-off held an unstarred issue build),
 `out_of_slice`, `repo_cap` (#9090: the candidate's own repo was at
 `maxConcurrentPerRepo`), `error`, plus the typed dispatch refusals (#8907):
@@ -1583,8 +1582,7 @@ candidate refused on a `local-dev` host), `capacity`, `ramp_cap`, `saturation`,
 (empty or fully bad-marked token pool), `claim_collision` (cross-host collision
 enforcement) and `claim_lock_held` (the local claim lock already existed).
 These are the same buckets as the `work_finder: tick` log line
-(`loom-daemon health`'s last-tick summary omits `prless_retry` and
-`host_class`), except that
+(`loom-daemon health`'s last-tick summary omits `prless_retry`), except that
 the log line and `health` still fold `lease_order_lost` into `backoff` and the
 other three into `error`. The exported `backoff` and `error` are net of them,
 so each candidate is counted under exactly one reason. There is no
@@ -1803,7 +1801,7 @@ refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s), or once as a
 terminal record when it leaves a successfully-listed repo's queue. Unlike
 `loom.dispatch.admission`, this covers every candidate the tick evaluated —
 including one filtered out before `dispatch()` was ever attempted
-(`workspace_halted`, `parked`, `deferred_saturation`, `host_class_refused`,
+(`workspace_halted`, `parked`, `deferred_saturation`, `host_constraint`,
 …) — so a per-issue "why" is answerable for the entire `QueueDisposition`
 vocabulary, not just the subset that reached an admission attempt.
 
@@ -1819,7 +1817,7 @@ tick; otherwise a root of its own. Attributes:
 | `loom.repo` | forge `owner/repo`. Rows whose root never resolved to a slug are dropped and counted, never exported as a local path |
 | `loom.repo.visibility` | `public` / `private` |
 | `loom.issue` | the issue number |
-| `loom.queue.disposition` | the `QueueDisposition` wire name (`deferred_saturation`, `parked`, `workspace_halted`, `host_class_refused`, …) |
+| `loom.queue.disposition` | the `QueueDisposition` wire name (`deferred_saturation`, `parked`, `workspace_halted`, `host_constraint`, …) |
 | `loom.queue.state` | `running` / `ready` / `blocked` |
 | `loom.queue.rank` | 1-based dispatch-order rank over every row the tick ranked; absent on a `left_queue` span (the row is no longer ranked) |
 | `loom.queue.candidate_rank` | 1-based queue position at the sampled tick (Issue #9669): the dispatch-plan `position` in the shaped pass-2 candidate order when the row has one, else the comparator `rank` — a blocked row's would-be position once unblocked. Absent on a `left_queue` span |
@@ -1982,7 +1980,7 @@ The work finder's ranked ready queue as of its last tick (Issue #8852, phase
 dispatch comparator (#9244): starred (`loom:operator-priority`) first, starred
 issues by starred-at, then red-main fixes while their repo's `main` is verified
 red, then workspace priority, then oldest `createdAt`, then issue number.
-`loom:urgent` and `tier:*` labels do not affect the order.
+`tier:*` labels do not affect the order.
 Envelopes carry `schema_version: 11`. **Native-HTTPS only**: the OTLP
 exporter never receives it (the mirror of `metric.points`).
 
@@ -2017,12 +2015,12 @@ Each row:
 | `visibility` | `public` / `private` | per row; missing or unknown decodes to `private` |
 | `issue` | integer | issue number |
 | `workspace_priority` | integer | lower dispatches first |
-| `urgent` | bool | **deprecated (#9244): always `false`**. `loom:urgent` no longer orders dispatch; the field stays on the wire for one release, then goes |
+| `urgent` | bool | **deprecated (#9244): always `false`**. Its label was deleted (#11105); the field stays on the wire only for compatibility |
 | `operator_priority` | bool | starred: carries `loom:operator-priority`, which sorts it ahead of all other work (#9244). Absent on older daemons, which decodes as `false` |
 | `operator_priority_at` | RFC 3339, optional | when it was starred (the `labeled` timeline event), when known. Omitted for an unstarred issue, or a starred one ordered by its `created_at` fallback |
 | `created_at` | RFC 3339, optional | issue creation time (the age ordering key) |
 | `tier` | string, optional | the `tier:*` label, informational only |
-| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_build_backoff`, `deferred_out_of_slice`, `deferred_repo_cap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `host_class_refused`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `labelled_blocked` (unknown values are forward-compatible) |
+| `disposition` | string | `dispatched`, `in_flight`, `deferred_capacity`, `deferred_ramp_cap`, `deferred_saturation`, `deferred_build_backoff`, `deferred_out_of_slice`, `deferred_repo_cap`, `workspace_halted`, `workspace_commands_missing`, `host_constraint`, `parked`, `hard_exclusion`, `recheck_interval`, `quarantined`, `dispatch_backoff`, `open_pr_backoff`, `noop_cooldown`, `declined`, `prless_retry`, `peer_claim`, `open_pr`, `dispatch_error`, `labelled_blocked` (unknown values are forward-compatible) |
 | `state` | string | `running` / `ready` / `blocked`, derived by the daemon so clients never keep a copy of the mapping |
 | `reason` | string | human-readable reason, also daemon-derived |
 | `detail` | string, optional | only for `parked` (the park label), `open_pr` (`open PR #N`) and `labelled_blocked` (the hold labels it also carries, from `loom:operator`, `loom:operator-only`, `loom:operator-mechanical`, `loom:needs-capability`). Free-form dispatch-error and comment text is never exported |

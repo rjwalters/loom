@@ -143,29 +143,6 @@ fn host_constraint_refusal(
     ))
 }
 
-/// Decide whether `issue`'s `loom:heavy` label refuses an explicit dispatch
-/// when this host is classified `local-dev` (Issue #9034). `None` means no
-/// refusal: the issue is not `loom:heavy`, or this host is not `local-dev`.
-///
-/// Pure and side-effect-free — mirrors [`host_constraint_refusal`] exactly,
-/// including reusing the same best-effort label fetch
-/// ([`fetch_issue_for_host_check`]) the caller already made for the
-/// host-affinity check above, so this needs no extra `gh` call.
-fn heavy_local_refusal(
-    issue: u32,
-    labels: &[String],
-    host_class: loom_daemon::work_finder::host_class::HostClass,
-) -> Option<String> {
-    use loom_daemon::work_finder::host_class::{HostClass, LOOM_HEAVY_LABEL};
-    if host_class != HostClass::LocalDev || !labels.iter().any(|l| l == LOOM_HEAVY_LABEL) {
-        return None;
-    }
-    Some(format!(
-        "dispatch refused: issue #{issue} carries `{LOOM_HEAVY_LABEL}` and this host is \
-         classified `local-dev` (Issue #9034). Re-run with --allow-local to dispatch anyway."
-    ))
-}
-
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
 /// daemon over its Unix socket and enqueues a sweep via the same `DispatchSweep`
 /// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
@@ -187,18 +164,6 @@ fn heavy_local_refusal(
 /// happens entirely client-side, before the socket round-trip: the CLI
 /// process and the daemon it talks to over a Unix socket always share one
 /// host identity, so there is no protocol change to make here.
-///
-/// # Host-class gate (#9034)
-///
-/// Same fetch, same client-side timing: unless `allow_local` is set, refuses
-/// a `loom:heavy` issue when this host resolves to `host_class: local-dev`
-/// (env `LOOM_HOST_CLASS` / `autonomous.workFinder.hostClass`), mirroring
-/// the work-finder's own autonomous gate (see [`heavy_local_refusal`] and
-/// `loom_daemon::work_finder::host_class`).
-#[allow(clippy::too_many_arguments)] // one flag per independent CLI override
-                                     // (`--force`, `--ignore-host-constraint`, `--allow-local`,
-                                     // #9034); splitting into a struct is a bigger refactor than
-                                     // this issue's scope.
 pub(crate) async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
@@ -207,38 +172,28 @@ pub(crate) async fn handle_dispatch_command(
     depends_on: Option<u32>,
     force: bool,
     ignore_host_constraint: bool,
-    allow_local: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry =
         loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
 
-    if !ignore_host_constraint || !allow_local {
+    if !ignore_host_constraint {
         let root = workspace
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| cwd.clone());
         if let Some((labels, body)) = fetch_issue_for_host_check(&root, issue) {
-            if !ignore_host_constraint {
-                let current_host_id = sweep_registry::host_identity();
-                if let Some(refusal) =
-                    host_constraint_refusal(issue, &labels, body.as_deref(), &current_host_id)
-                {
-                    eprintln!("{refusal}");
-                    std::process::exit(1);
-                }
-            }
-            if !allow_local {
-                let host_class = loom_daemon::work_finder::host_class::resolve_at_startup(&root);
-                if let Some(refusal) = heavy_local_refusal(issue, &labels, host_class) {
-                    eprintln!("{refusal}");
-                    std::process::exit(1);
-                }
+            let current_host_id = sweep_registry::host_identity();
+            if let Some(refusal) =
+                host_constraint_refusal(issue, &labels, body.as_deref(), &current_host_id)
+            {
+                eprintln!("{refusal}");
+                std::process::exit(1);
             }
         }
         // A fetch failure (missing `gh`, offline, etc.) falls through and
-        // proceeds with the dispatch for both checks above — see
+        // proceeds with the dispatch for the check above — see
         // `fetch_issue_for_host_check`'s doc comment for why this fails open
         // rather than refusing every dispatch on a transient forge hiccup.
     }
@@ -312,16 +267,12 @@ mod dispatch_tests {
     //! plumbing into the `DispatchSweep` IPC request, a successful round-trip
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
-    use super::{
-        build_dispatch_request, heavy_local_refusal, host_constraint_refusal,
-        resolve_cli_dispatch_workspace,
-    };
+    use super::{build_dispatch_request, host_constraint_refusal, resolve_cli_dispatch_workspace};
     use crate::cli::common::{
         query_daemon_bounded, resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV,
         DISPATCH_ACK_TIMEOUT,
     };
     use loom_daemon::types::{Request, Response, SweepKind};
-    use loom_daemon::work_finder::host_class::HostClass;
     use serial_test::serial;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -471,43 +422,6 @@ mod dispatch_tests {
         let body = "<!-- loom:requires-host=loom-worker-2 -->";
         assert!(host_constraint_refusal(42, &[], Some(body), "mac-studio").is_some());
         assert!(host_constraint_refusal(42, &[], Some(body), "loom-worker-2").is_none());
-    }
-
-    // ===== Host-class gate (#9034) =====
-
-    /// The core acceptance criterion: a `loom:heavy` issue refuses an
-    /// explicit dispatch on a `local-dev`-classified host, naming both the
-    /// label and the override flag.
-    #[test]
-    fn heavy_local_refusal_on_a_local_dev_host() {
-        let labels = vec!["loom:issue".to_string(), "loom:heavy".to_string()];
-        let refusal = heavy_local_refusal(42, &labels, HostClass::LocalDev);
-        let message = refusal.expect("must refuse a heavy issue on a local-dev host");
-        assert!(message.contains("#42"), "{message}");
-        assert!(message.contains("loom:heavy"), "{message}");
-        assert!(message.contains("--allow-local"), "{message}");
-    }
-
-    /// A non-heavy issue is never refused, on any host class.
-    #[test]
-    fn heavy_local_refusal_none_for_a_non_heavy_issue() {
-        let labels = vec!["loom:issue".to_string()];
-        for class in [
-            HostClass::LocalDev,
-            HostClass::RemoteWorker,
-            HostClass::Unclassified,
-        ] {
-            assert!(heavy_local_refusal(42, &labels, class).is_none(), "{class:?}");
-        }
-    }
-
-    /// A `loom:heavy` issue is never refused on a `remote-worker` or
-    /// unclassified host — only `local-dev` gates.
-    #[test]
-    fn heavy_local_refusal_none_off_local_dev() {
-        let labels = vec!["loom:issue".to_string(), "loom:heavy".to_string()];
-        assert!(heavy_local_refusal(42, &labels, HostClass::RemoteWorker).is_none());
-        assert!(heavy_local_refusal(42, &labels, HostClass::Unclassified).is_none());
     }
 
     /// A fake daemon that accepts one connection, verifies the received request

@@ -255,12 +255,6 @@ pub use tick_summary::{
     publish_tick_summary_with_roots_at, tick_summary,
 };
 
-/// The legacy urgency label (Issue #3946). Since #9244 it is **not** an
-/// ordering key: `loom:operator-priority` replaced it. It is still parsed
-/// harmlessly (an item carrying it is never an error) and still reported by
-/// the blocked-queue view; the constant goes in a follow-up after one release.
-pub const URGENT_LABEL: &str = "loom:urgent";
-
 // ============================================================================
 // Fetched work facts
 // ============================================================================
@@ -438,9 +432,9 @@ impl WorkItem {
     /// `held_capabilities` fully covers, is **not** skipped — it is dispatchable
     /// into the propose-mode lane. Everything else about the park is unchanged:
     ///
-    /// - The other three sub-kinds (`loom:operator-decision`,
-    ///   `loom:operator-blocked`, `loom:operator-objective`) stay hard-skipped
-    ///   unconditionally, marker or no marker.
+    /// - The other two sub-kinds (`loom:operator-decision`,
+    ///   `loom:operator-blocked`) stay hard-skipped unconditionally, marker or
+    ///   no marker.
     /// - `loom:blocked`, `loom:needs-capability` and `loom:operator` veto the
     ///   exemption outright, as does [`BUILDING_LABEL`] and any
     ///   `extra_skip_labels` entry — the exemption only ever relaxes
@@ -474,13 +468,6 @@ impl WorkItem {
             return true;
         }
         !self.mechanical_routing(held_capabilities).is_dispatchable()
-    }
-
-    /// True when the issue carries the legacy [`URGENT_LABEL`] (#3946). Parsed
-    /// harmlessly only: since #9244 it no longer affects dispatch order.
-    #[must_use]
-    pub fn is_urgent(&self) -> bool {
-        self.labels.iter().any(|l| l == URGENT_LABEL)
     }
 }
 
@@ -770,16 +757,6 @@ pub trait WorkDispatcher {
     /// env vars.
     fn current_host_id(&self) -> String {
         crate::sweep_registry::host_identity()
-    }
-
-    /// This host's `host_class` (startup-captured, #9034) plus this
-    /// workspace's live `allowHeavyLocal` override — see
-    /// [`host_class::HeavyLocalPolicy`]. Defaults to
-    /// `HeavyLocalPolicy::default()` (unclassified, no override), which is
-    /// both the zero-boilerplate test-fake opt-out and the real default for
-    /// every host that has not opted in.
-    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
-        host_class::HeavyLocalPolicy::default()
     }
 
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
@@ -1095,8 +1072,6 @@ pub fn tick_with_lanes(
     // tick, like `extra_skip_labels` above. Empty on every host that has not
     // opted in, which makes the check below byte-for-byte the pre-#6893 one.
     let held_capabilities = dispatcher.declared_capabilities();
-    // Host-class gate policy (#9034) — once per tick, like the sets above.
-    let heavy_local_policy = dispatcher.heavy_local_policy();
     // This host's identity (#7456) — resolved once per tick, like
     // `held_capabilities` above, so an issue's host-affinity constraint can
     // be checked per candidate without a repeated env/hostname resolution.
@@ -1152,13 +1127,6 @@ pub fn tick_with_lanes(
                 host_constraint.describe(),
                 current_host_id
             );
-            continue;
-        }
-        // 0c. Host-class gate (#9034): a `loom:heavy` candidate is refused on
-        //     a `local-dev`-classified host, unless the workspace's
-        //     `allowHeavyLocal` override is set — see `host_class` module doc.
-        //     Same zero-side-effect contract as 0b above.
-        if host_class::gate(&item, heavy_local_policy, &mut report.skipped_host_class) {
             continue;
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
@@ -1767,13 +1735,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.current_host_id())
         .collect();
 
-    // Snapshot each workspace's host-class gate policy (#9034) alongside the
-    // host identities above.
-    let heavy_local_policies: Vec<host_class::HeavyLocalPolicy> = workspaces
-        .iter()
-        .map(|(_, d)| d.heavy_local_policy())
-        .collect();
-
     // Snapshot each workspace's workspace-commands-missing flag (#6440,
     // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
     // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
@@ -1890,17 +1851,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                     item.number,
                     host_constraint.describe(),
                     current_host_ids[idx]
-                );
-                continue;
-            }
-            // Host-class gate (#9034) — mirrors the single-workspace step
-            // 0c above: same zero-side-effect contract as the host-affinity
-            // check just above.
-            if host_class::gate(&item, heavy_local_policies[idx], &mut report.skipped_host_class) {
-                skip(
-                    Qd::HostClassRefused,
-                    Some(heavy_local_policies[idx].class.as_str().to_string()),
-                    None,
                 );
                 continue;
             }
@@ -2726,7 +2676,7 @@ where
                              {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
                              {} declined-skip, {} prless-retry-skip, \
                              {} recheck-interval-skip, \
-                             {} host-constraint-skip, {} host-class-skip, \
+                             {} host-constraint-skip, \
                              {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
@@ -2745,7 +2695,6 @@ where
                             report.skipped_prless_retry,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
-                            report.skipped_host_class,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -2862,9 +2811,6 @@ pub fn spawn_multi_work_finder_task(
     mut startup_reconciliation_ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     configured_max::log_loop_start(interval, configured_max, max_admissions_per_tick);
-    // #9034: a fact about the host, resolved ONCE here — never per tick.
-    let host_class = host_class::resolve_at_startup(&fallback_root);
-    log::info!("work_finder: host_class={} (startup-captured, #9034)", host_class.as_str());
     tokio::spawn(async move {
         // #9060: the operator ceiling is re-resolved every tick (see the
         // `configured_max` module) — no longer a frozen startup value.
@@ -3226,7 +3172,7 @@ pub fn spawn_multi_work_finder_task(
                 draining || breaker_suppressed,
             );
 
-            let mut pairs = forge::dispatcher_pairs(&pool, &roots, host_class);
+            let mut pairs = forge::dispatcher_pairs(&pool, &roots);
 
             // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
             // WARN per root on the transition into (and recovery from) the
@@ -3536,10 +3482,6 @@ pub use configured_max::{ConfiguredMax, ConfiguredMaxReloader};
 pub mod repo_cap;
 pub use repo_cap::{tick_multi_with_sharding, RepoCap};
 
-/// Host-class routing + the `loom:heavy` gate (#9034). Its own file for the
-/// same file-size-ratchet reason as [`registry_refresh`].
-pub mod host_class;
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
@@ -3551,11 +3493,3 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod prless_retry_tests;
-
-/// Tick-level coverage for the #9034 host-class gate, in both
-/// `tick`/`tick_with_saturation_brake` and `tick_multi`. Its own file (with
-/// its own minimal fakes), mirroring [`prless_retry_tests`] exactly, for the
-/// same reason: `tests.rs` is over threshold and frozen.
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod host_class_gate_tests;

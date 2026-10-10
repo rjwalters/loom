@@ -51,7 +51,6 @@ pub const OPERATOR_ONLY_LABELS: &[&str] = &[
     "loom:operator-only",
     "loom:operator-blocked",
     "loom:operator-mechanical",
-    "loom:operator-objective",
     "loom:needs-capability",
 ];
 /// The blocked park.

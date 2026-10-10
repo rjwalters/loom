@@ -14,7 +14,7 @@
 //! inside it, is unchanged.
 
 use super::{
-    host_class, operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
+    operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
     WorkDispatcher, WorkItem, WorkSource,
 };
 use crate::sweep_registry::SweepRegistry;
@@ -255,31 +255,14 @@ impl GhWorkSource {
 /// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
-    /// This host's `host_class` (#9034). NOT read here: it is resolved once
-    /// at work-finder startup ([`host_class::resolve_at_startup`]) and
-    /// threaded in via [`Self::with_host_class`] / [`dispatcher_pairs`], since
-    /// the multi-workspace loop rebuilds every dispatcher each tick.
-    host_class: host_class::HostClass,
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry, unclassified (the
-    /// host-class gate inert). Production goes through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry. Production goes
+    /// through [`dispatcher_pairs`].
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
-        Self::with_host_class(registry, host_class::HostClass::Unclassified)
-    }
-
-    /// Construct a dispatcher carrying the startup-resolved `host_class`.
-    #[must_use]
-    pub fn with_host_class(
-        registry: Arc<Mutex<SweepRegistry>>,
-        host_class: host_class::HostClass,
-    ) -> Self {
-        Self {
-            registry,
-            host_class,
-        }
+        Self { registry }
     }
 
     /// The shared registry behind this dispatcher. Test-only seam so a
@@ -569,28 +552,6 @@ impl WorkDispatcher for RegistryDispatcher {
         crate::capability::held_capabilities()
     }
 
-    /// This host's startup-resolved `host_class` plus a fresh-each-call read
-    /// of `allowHeavyLocal` (#9034). The class is never re-read here; the override is re-read from
-    /// `<workspace_root>/.loom/config.json` every call, mirroring
-    /// [`extra_skip_labels`](Self::extra_skip_labels) — a cheap JSON read, so
-    /// an operator's `autonomous.workFinder.allowHeavyLocal` edit takes
-    /// effect on the very next tick with no daemon restart required.
-    fn heavy_local_policy(&self) -> host_class::HeavyLocalPolicy {
-        let allow_heavy_local = match self.registry.lock() {
-            Ok(reg) => host_class::resolve_allow_heavy_local(&read_work_finder_config(
-                &reg.config().workspace_root,
-            )),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                false
-            }
-        };
-        host_class::HeavyLocalPolicy {
-            class: self.host_class,
-            allow_heavy_local,
-        }
-    }
-
     fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
         self.dispatch_with(issue, complexity, false)
     }
@@ -673,23 +634,17 @@ impl WorkDispatcher for RegistryDispatcher {
     }
 }
 
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924),
-/// each dispatcher carrying the SAME `host_class` resolved once at
-/// work-finder startup (#9034) — so the per-tick rebuild never re-reads it.
+/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
 #[must_use]
 pub fn dispatcher_pairs(
     pool: &crate::workspace_pool::WorkspacePool,
     roots: &[PathBuf],
-    host_class: host_class::HostClass,
 ) -> Vec<(GhWorkSource, RegistryDispatcher)> {
     roots
         .iter()
         .map(|root| {
             let registry = pool.get_or_provision(root);
-            (
-                GhWorkSource::for_root(root),
-                RegistryDispatcher::with_host_class(registry, host_class),
-            )
+            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
         })
         .collect()
 }

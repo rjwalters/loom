@@ -160,13 +160,6 @@ pub struct TickReport {
     /// flip, no comment, no cooldown/backoff record — this candidate is not
     /// actionable on this host at all, so it is never even attempted.
     pub skipped_host_constraint: usize,
-    /// Issues skipped because they carry `loom:heavy` and this host is
-    /// classified `local-dev` (Issue #9034), with no override set — see
-    /// [`crate::work_finder::host_class`]. Checked immediately after
-    /// [`skipped_host_constraint`](Self::skipped_host_constraint), and carries
-    /// the same zero-side-effect contract: no claim flip, no comment, no
-    /// cooldown/backoff record.
-    pub skipped_host_class: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0

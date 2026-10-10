@@ -253,8 +253,8 @@ pub fn finish(rows: &[TickQueueRow], roots: &[PathBuf]) -> Vec<ReadyQueueRow> {
                 repo: repo_name(r.key.workspace_idx, roots),
                 issue: r.key.number,
                 workspace_priority: r.key.workspace_priority,
-                // Deprecated by #9244: `loom:urgent` no longer orders anything.
-                // Kept on the wire, always false, for one release.
+                // Deprecated by #9244 (its label deleted in #11105): always
+                // false, kept only for wire compatibility.
                 urgent: false,
                 operator_priority: r.key.operator_priority,
                 operator_priority_at: r.key.operator_priority_at.clone(),

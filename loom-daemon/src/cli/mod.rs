@@ -65,6 +65,7 @@ mod install_binary;
 pub(crate) mod install_compat_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
+mod labels_undeclared;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod lease_renewer;

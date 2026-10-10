@@ -1999,6 +1999,9 @@ jobs:
       - name: merge-pr close-triggered loom:blocked re-check (#9102)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-merge-pr-notify-cleared-blockers.sh
+      - name: sync-labels --prune-undeclared (#11105)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-sync-labels-prune-undeclared.sh
       - name: post-verdict.sh verdict gate + exclusive labels (#10581)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-post-verdict-gate.sh
