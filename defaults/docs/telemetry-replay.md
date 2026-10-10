@@ -158,8 +158,12 @@ slice.
 
 ## Fleet state (`fleet.state`)
 
-Every host with an OTLP exporter sends `fleet.state` log records on its
-5-minute snapshot pass. **Each host emits its
+Every host with an OTLP exporter builds and diffs `fleet.state` after every
+work-finder tick (default 60 s; the header's `tick_interval_secs` names the
+cadence) and on its 5-minute snapshot pass.
+A pass with no change sends nothing. The review listings are read only on
+the 5-minute pass, so PR rows and the census move at that cadence; held and
+`ready_wait` rows move at tick cadence. **Each host emits its
 own view; nothing is elected.** The field reference is in
 [`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per `(repo, issue)`
 the host can see, it carries stage, entered-at and PR; a row for a sweep the
@@ -190,7 +194,7 @@ read of that repo replaces or removes it.
 
 - **Anchor** (`loom.fleet.anchor = true`): the host's full view. Sent on the
   first pass of every daemon process, whenever the planner stamps change, and
-  at least every 3600 s after that.
+  at least every 300 s after that.
 - **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
   something changed. It holds the added or changed rows, the issues that left
   (`removed`), and the full census and `ready_complete` of each repo it names;
@@ -213,8 +217,10 @@ To reconstruct one host's state at `t`:
    `loom.record_id`. Group them by `as_of`; a group is usable only when it
    holds all `chunk_count` chunks. The union of a group's chunks is the
    record (a repo split across chunks contributes rows from each).
-2. Take the newest complete anchor among them, A. Because anchors are hourly,
-   A is at most about 65 minutes before `t` on a healthy host. With no
+2. Take the newest complete anchor among them, A. Because anchors go out
+   every 5 minutes, A is at most about 6 minutes before `t` on a healthy
+   host (300 s plus one pass), which also bounds how long a lost delta
+   leaves the reconstruction wrong. With no
    complete anchor in that window, the host's state at `t` is **unknown**, not
    empty.
 3. Apply, in `as_of` order, every complete delta whose `anchor_as_of` equals

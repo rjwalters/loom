@@ -190,7 +190,7 @@ fn first_sight_is_a_lower_bound_and_a_later_arrival_is_exact() {
     // The host-held row's entry comes from the checkpoint, not first sight.
     assert!(!first.repos[REPO].rows[&10].entered_at_lower_bound);
 
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let mut inp = input();
     inp.ready.as_mut().unwrap().items.push(ready(OTHER, 7, 3));
     let second = build_view(&inp, Some(&first), later);
@@ -206,7 +206,7 @@ fn first_sight_is_a_lower_bound_and_a_later_arrival_is_exact() {
 #[test]
 fn a_stage_change_is_a_new_entry_and_a_handoff_keeps_it() {
     let first = build_view(&input(), None, t0());
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     // #20's PR is approved: a new stage, observed this pass.
     let mut inp = input();
     inp.listings[0].prs[0] = pr(21, "loom:pr", Some(20));
@@ -242,14 +242,14 @@ fn a_failed_listing_carries_the_last_rows_and_drops_the_census() {
     inp.ready.as_mut().unwrap().listed.remove(OTHER);
     inp.ready.as_mut().unwrap().complete.remove(OTHER);
     inp.ready.as_mut().unwrap().items.clear();
-    let second = build_view(&inp, Some(&first), t0() + Duration::minutes(5));
+    let second = build_view(&inp, Some(&first), t0() + Duration::minutes(1));
     assert_eq!(second.repos[REPO].rows[&20], first.repos[REPO].rows[&20]);
     assert_eq!(second.repos[REPO].census, None, "unknown, not zero");
     assert_eq!(second.repos[OTHER].rows[&5], first.repos[OTHER].rows[&5]);
     assert_eq!(second.census_at, None);
     // A repo no longer managed is not carried.
     inp.managed.remove(OTHER);
-    let third = build_view(&inp, Some(&first), t0() + Duration::minutes(5));
+    let third = build_view(&inp, Some(&first), t0() + Duration::minutes(1));
     assert!(!third.repos.contains_key(OTHER));
 }
 
@@ -323,7 +323,7 @@ fn an_unchanged_pass_sends_nothing() {
     // `census_at` moves every pass; that alone is not a change.
     let mut next = view;
     next.census_at = Some(t0() + Duration::minutes(4));
-    assert_eq!(decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(5)), None);
+    assert_eq!(decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(1)), None);
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn a_delta_carries_changed_rows_removals_and_the_full_census() {
     let mut inp = input();
     inp.held.clear();
     inp.ready.as_mut().unwrap().items.retain(|i| i.issue != 6);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&first), later);
     let record = decide(&second, &stamps(), Some(&last), later).unwrap();
     assert!(!record.anchor);
@@ -354,7 +354,7 @@ fn a_rank_shift_is_a_change() {
     let mut inp = input();
     inp.ready.as_mut().unwrap().items[1].rank = 1;
     inp.ready.as_mut().unwrap().items[0].rank = 2;
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let record =
         decide(&build_view(&inp, Some(&first), later), &stamps(), Some(&last), later).unwrap();
     assert_eq!(record.row_count(), 2);
@@ -369,12 +369,12 @@ fn a_slot_change_alone_sends_a_delta_with_no_repos() {
         max_concurrent: 4,
         occupancy: Some(2),
     });
-    let record = decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(5)).unwrap();
+    let record = decide(&next, &stamps(), Some(&last), t0() + Duration::minutes(1)).unwrap();
     assert!(!record.anchor && record.repos.is_empty());
 }
 
 #[test]
-fn the_anchor_repeats_hourly_and_on_a_regime_change() {
+fn the_anchor_repeats_every_five_minutes_and_on_a_regime_change() {
     let view = build_view(&input(), None, t0());
     let last = emitted(view.clone(), t0(), t0());
     let at = |s: i64| t0() + Duration::seconds(s);
@@ -485,7 +485,7 @@ fn ready_complete_marks_whether_the_ready_listing_was_whole() {
 
     let mut inp = input();
     inp.ready.as_mut().unwrap().complete.remove(OTHER);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&view), later);
     assert!(!second.ready_complete(OTHER));
     let last = emitted(view, t0(), t0());
@@ -522,7 +522,7 @@ fn an_incomplete_read_never_removes_what_it_could_not_see() {
     ready.listed.remove(OTHER);
     ready.complete.remove(OTHER);
     ready.items.retain(|i| i.issue != 6);
-    let later = t0() + Duration::minutes(5);
+    let later = t0() + Duration::minutes(1);
     let second = build_view(&inp, Some(&first), later);
     let record = decide(&second, &stamps(), Some(&last), later).unwrap();
     assert_eq!(record.removed_count(), 0, "{record:?}");
@@ -623,7 +623,7 @@ fn drive(passes: &[FleetInput]) -> Vec<(Option<FleetStateRecord>, Replayed)> {
     let mut state = Replayed::new();
     let mut out = Vec::new();
     for (i, inp) in passes.iter().enumerate() {
-        let now = t0() + Duration::minutes(5 * i64::try_from(i).unwrap());
+        let now = t0() + Duration::minutes(i64::try_from(i).unwrap());
         let view = build_view(inp, prev.as_ref(), now);
         let record = decide(&view, &stamps(), last.as_ref(), now);
         if let Some(record) = &record {
@@ -773,9 +773,9 @@ fn hold_kind_comes_from_the_labels() {
 #[test]
 fn hold_appears_then_releases_across_two_deltas() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
-    let t2 = t0() + Duration::minutes(10);
-    let t3 = t0() + Duration::minutes(15);
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
     let v0 = build_view(&with_pr_labels(&["loom:pr"]), None, t0());
     let anchor = decide(&v0, &stamps, None, t0()).unwrap();
     assert!(anchor.anchor);
@@ -804,10 +804,10 @@ fn hold_appears_then_releases_across_two_deltas() {
     assert_eq!(row.held_since, None);
     assert_eq!(row.hold_released_at, Some(t3));
     // The stamp is kept, so the next pass is quiet.
-    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(5));
+    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(1));
     assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
     let e3 = emitted(v3, t3, t0());
-    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(5)).is_none());
+    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(1)).is_none());
 }
 
 #[test]
@@ -832,7 +832,7 @@ fn capacity(live: u32) -> FleetCapacity {
 #[test]
 fn capacity_change_produces_delta() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
+    let t1 = t0() + Duration::minutes(1);
     let mut i = input();
     i.capacity = Some(capacity(2));
     let v0 = build_view(&i, None, t0());
@@ -855,7 +855,7 @@ fn capacity_change_produces_delta() {
 #[test]
 fn main_ci_rides_each_repo_entry_and_a_change_is_a_delta() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
+    let t1 = t0() + Duration::minutes(1);
     let mut i = input();
     i.main_ci.insert(REPO.to_string(), MainCi::Green);
     let v0 = build_view(&i, None, t0());
@@ -901,10 +901,10 @@ fn sweep_with_pr_labels(pr_labels: &[&str]) -> FleetInput {
 
 #[test]
 fn sweep_owned_row_takes_hold_from_its_pr_and_releases() {
-    let t1 = t0() + Duration::minutes(5);
-    let t2 = t0() + Duration::minutes(10);
-    let t3 = t0() + Duration::minutes(15);
-    let t4 = t0() + Duration::minutes(20);
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
+    let t4 = t0() + Duration::minutes(4);
     let v0 = build_view(&sweep_with_pr_labels(&["loom:pr"]), None, t0());
     assert_eq!(v0.repos[REPO].sources[&20], Source::Held);
 
@@ -938,4 +938,140 @@ fn sweep_owned_row_takes_hold_from_its_pr_and_releases() {
     // The stamp persists while nothing changes.
     let v4 = build_view(&sweep_with_pr_labels(&["loom:pr"]), Some(&v3), t4);
     assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
+}
+
+/// One tick's queue under `/src/anvil`: `(issue, rank)` rows.
+fn tick(rows: &[(u32, u32)]) -> crate::types::WorkFinderTickSummary {
+    let queue = rows
+        .iter()
+        .map(|&(issue, rank)| {
+            serde_json::from_value(serde_json::json!({
+                "rank": rank, "repo": "/src/anvil", "issue": issue,
+                "workspace_priority": 100, "urgent": false, "disposition": "queued"
+            }))
+            .unwrap()
+        })
+        .collect();
+    crate::types::WorkFinderTickSummary {
+        plan: Some(crate::types::DispatchPlanContext::default()),
+        queue,
+        ..Default::default()
+    }
+}
+
+/// #11161: the slug cache also holds roots that are not managed, or that
+/// spell a managed repo's path differently. A tick pass reads `main_ci` from
+/// the managed roots alone, so it matches the collector's and never flaps.
+#[test]
+fn tick_main_ci_covers_only_the_managed_roots() {
+    let reused = super::sources::Reused {
+        managed: [OTHER.to_string()].into(),
+        roots: vec![(std::path::PathBuf::from("/src/anvil"), OTHER.to_string())],
+        slugs: [
+            ("/src/anvil".to_string(), OTHER.to_string()),
+            ("/src/anvil/".to_string(), OTHER.to_string()),
+            ("/src/retired".to_string(), "acme/retired".to_string()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let keys: Vec<_> = super::sources::tick_main_ci(&reused).into_keys().collect();
+    assert_eq!(keys, vec![OTHER.to_string()]);
+}
+
+/// #11161: a pass runs after every work-finder tick, so three ticks inside
+/// one 5-minute window that each move a rank send three records, each a
+/// delta on the one before. A tick that changes nothing sends nothing. The
+/// tick passes reuse the collector pass's listings, so they cost no forge
+/// read.
+#[test]
+fn three_ticks_in_one_five_minute_window_that_change_a_rank_send_three_records() {
+    let reused = super::sources::Reused {
+        managed: [OTHER.to_string()].into(),
+        listings: vec![RepoListing {
+            repo: OTHER.to_string(),
+            prs: vec![pr(41, "loom:review-requested", Some(40))],
+        }],
+        listed_at: Some(t0()),
+        slugs: [("/src/anvil".to_string(), OTHER.to_string())].into(),
+        roots: Vec::new(),
+        visibility: BTreeMap::new(),
+    };
+    let pass_at = |rows: &[(u32, u32)]| FleetInput {
+        ready: Some(super::sources::ready_input(&tick(rows), &reused)),
+        ..super::sources::reused_input("robb-studio", &reused)
+    };
+    let view = build_view(&pass_at(&[(5, 1), (6, 2)]), None, t0());
+    let anchor = decide(&view, &stamps(), None, t0()).unwrap();
+    assert!(anchor.anchor);
+    let mut prev = view.clone();
+    let mut last = emitted(view, t0(), t0());
+
+    let ticks: [&[(u32, u32)]; 4] = [
+        &[(6, 1), (5, 2)],
+        &[(5, 1), (6, 2)],
+        &[(6, 1), (5, 2)],
+        &[(6, 1), (5, 2)],
+    ];
+    let mut records = Vec::new();
+    for (i, rows) in ticks.iter().enumerate() {
+        let now = t0() + Duration::seconds(60 * (i64::try_from(i).unwrap() + 1));
+        let view = build_view(&pass_at(rows), Some(&prev), now);
+        if let Some(record) = decide(&view, &stamps(), Some(&last), now) {
+            assert!(!record.anchor, "tick {i}");
+            assert_eq!(record.prev_as_of, Some(last.as_of), "tick {i}");
+            let ranks: Vec<(u32, Option<u32>)> = entry(&record, OTHER)
+                .rows
+                .iter()
+                .filter(|r| r.stage == FleetStage::ReadyWait)
+                .map(|r| (r.issue, r.rank))
+                .collect();
+            let want: Vec<(u32, Option<u32>)> = {
+                let mut w: Vec<_> = rows.iter().map(|&(i, r)| (i, Some(r))).collect();
+                w.sort_unstable();
+                w
+            };
+            assert_eq!(ranks, want, "tick {i}");
+            last = emitted(view.clone(), now, last.anchor_as_of);
+            records.push(record);
+        }
+        prev = view;
+    }
+    assert_eq!(records.len(), 3, "the unchanged fourth tick sends nothing");
+    assert!(records
+        .iter()
+        .all(|r| r.as_of - t0() < Duration::seconds(ANCHOR_INTERVAL_SECS)));
+    // The reused listing is not a change: no record names the PR row again.
+    assert!(records
+        .iter()
+        .flat_map(|r| &r.repos)
+        .flat_map(|r| &r.rows)
+        .all(|row| row.stage == FleetStage::ReadyWait));
+}
+
+/// #11161: the anchor interval is 5 minutes. With nothing changed, a pass
+/// 299 s after the last anchor sends nothing and a pass at 300 s sends a
+/// full anchor.
+#[test]
+fn an_anchor_goes_out_once_the_last_is_300_s_old() {
+    assert_eq!(ANCHOR_INTERVAL_SECS, 300);
+    let view = build_view(&input(), None, t0());
+    let at = |s: i64| t0() + Duration::seconds(s);
+    let last = emitted(view.clone(), at(240), t0());
+    assert_eq!(decide(&view, &stamps(), Some(&last), at(299)), None);
+    let record = decide(&view, &stamps(), Some(&last), at(300)).unwrap();
+    assert!(record.anchor);
+    assert_eq!((record.anchor_as_of, record.prev_as_of), (at(300), None));
+    let first = decide(&view, &stamps(), None, t0()).unwrap();
+    assert_eq!(record.row_count(), first.row_count());
+}
+
+/// A finished tick wakes the tick pass, and a tick that finishes while no
+/// pass waits is not lost.
+#[tokio::test]
+async fn a_finished_tick_wakes_the_tick_pass() {
+    super::tick_completed();
+    tokio::time::timeout(std::time::Duration::from_secs(1), super::ticked().notified())
+        .await
+        .expect("the tick left a wake-up");
 }

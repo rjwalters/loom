@@ -1289,8 +1289,13 @@ pub fn spawn_task(
     #[cfg(feature = "otlp")]
     ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
-    // built on the collector's snapshot pass.
+    // built after every work-finder tick (#11161) and on the collector's
+    // snapshot pass.
     fleet_state::register_sink(otlp_queues.clone(), &host_id);
+    if !otlp_queues.is_empty() {
+        ops_handles
+            .extend(fleet_state::spawn_tick_task(workspace_root.clone(), workspace_pool.clone()));
+    }
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the

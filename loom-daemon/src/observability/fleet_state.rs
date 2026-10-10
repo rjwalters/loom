@@ -1,7 +1,13 @@
 //! `fleet.state` emission (Issue #10196). This host's own view of the work it
 //! holds, the PRs under review in its repos and its ready queue is sent to the
-//! **OTLP** exporters on the collector's 5-minute snapshot pass. Record
-//! semantics are in [`crate::telemetry::kinds::fleet_state`].
+//! **OTLP** exporters. Record semantics are in
+//! [`crate::telemetry::kinds::fleet_state`].
+//!
+//! A pass runs after every work-finder tick ([`tick_completed`], #11161) and
+//! on the collector's 5-minute snapshot pass. Only the collector pass reads
+//! the forge (the review listings, slugs and visibility); a tick pass reuses
+//! what the last collector pass read ([`sources::Reused`]). The two never
+//! run at once.
 //!
 //! Every row comes from state the daemon keeps for its own work, never from
 //! the ETA subsystem ([`sources`]):
@@ -33,15 +39,15 @@
 //!
 //! [`build_view`] and [`decide`] are pure. A full anchor goes out on the first
 //! pass of a process, whenever the planner stamps change, and once the last
-//! anchor is [`ANCHOR_INTERVAL_SECS`] old; in between a delta goes out only
-//! when something changed. There is no row cap: a record over
+//! anchor is [`ANCHOR_INTERVAL_SECS`] (5 minutes) old; in between a delta
+//! goes out only when something changed. There is no row cap: a record over
 //! [`CHUNK_BYTES`] is split into chunks ([`split_into_chunks`]). The only case
 //! with no record at all is no OTLP exporter (no sink registered); whether
 //! ETA is enabled does not matter. An anchor with zero rows is still sent,
 //! because it truthfully says "nothing here".
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
@@ -539,6 +545,7 @@ pub fn decide(
         chunk_index: 0,
         chunk_count: 1,
         stamps: stamps.clone(),
+        tick_interval_secs: None,
         census_at: view.census_at,
         slots: view.slots,
         capacity: view.capacity.clone(),
@@ -750,7 +757,40 @@ async fn record_outcomes(
     outcomes::offer(records, sink);
 }
 
-/// One `fleet.state` pass.
+/// Held for a whole pass, so a tick pass and a collector pass never diff
+/// against the same record.
+fn pass_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn ticked() -> &'static tokio::sync::Notify {
+    static TICKED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    TICKED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// A work-finder tick finished and published its summary. Wakes the tick
+/// pass; ticks that finish while a pass runs make one more pass.
+pub fn tick_completed() {
+    ticked().notify_one();
+}
+
+/// The task that runs a pass after every work-finder tick, or `None` with no
+/// OTLP exporter.
+pub(super) fn spawn_tick_task(
+    workspace_root: PathBuf,
+    workspace_pool: Arc<crate::workspace_pool::WorkspacePool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    SINK.get()?;
+    Some(tokio::spawn(async move {
+        loop {
+            ticked().notified().await;
+            record_tick(&workspace_root, &workspace_pool).await;
+        }
+    }))
+}
+
+/// One collector pass: refresh the forge reads, then build and send.
 pub(super) async fn record(
     workspace_root: &Path,
     workspace_pool: &crate::workspace_pool::WorkspacePool,
@@ -759,16 +799,56 @@ pub(super) async fn record(
     let Some(sink) = SINK.get() else {
         return;
     };
+    let _pass = pass_lock().lock().await;
     let now = Utc::now();
-    let input =
+    let (input, mut reused) =
         sources::gather(workspace_root, workspace_pool, slug_cache, &sink.host_id, now).await;
-    let stamps = sources::stamps(workspace_root);
     let state = STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
     record_outcomes(sink, &input, &view, now, workspace_pool, slug_cache).await;
+    for repo in view.repos.keys().chain(&input.managed) {
+        if !reused.visibility.contains_key(repo) {
+            let visibility = super::collector::resolve_visibility(repo).await;
+            reused.visibility.insert(repo.clone(), visibility);
+        }
+    }
+    sources::keep(reused.clone());
+    send(sink, workspace_root, view, state, now, &reused);
+}
+
+/// One tick pass: no forge read, so it waits for the first collector pass.
+async fn record_tick(workspace_root: &Path, workspace_pool: &crate::workspace_pool::WorkspacePool) {
+    let Some(sink) = SINK.get() else {
+        return;
+    };
+    let _pass = pass_lock().lock().await;
+    let Some(reused) = sources::reused() else {
+        return;
+    };
+    let now = Utc::now();
+    let input = sources::tick_input(workspace_root, workspace_pool, &sink.host_id, &reused);
+    let state = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let view = build_view(&input, state.prev.as_ref(), now);
+    send(sink, workspace_root, view, state, now, &reused);
+}
+
+/// Diff `view` against what was last sent, send the record if any, and keep
+/// the pass for the next one.
+fn send(
+    sink: &FleetStateSink,
+    workspace_root: &Path,
+    view: FleetView,
+    state: PassState,
+    now: DateTime<Utc>,
+    reused: &sources::Reused,
+) {
+    let stamps = sources::stamps(workspace_root);
     let Some(mut record) = decide(&view, &stamps, state.emitted.as_ref(), now) else {
         STATE
             .lock()
@@ -776,8 +856,13 @@ pub(super) async fn record(
             .prev = Some(view);
         return;
     };
+    record.tick_interval_secs = Some(sources::tick_interval_secs(workspace_root));
     for repo in &mut record.repos {
-        repo.visibility = super::collector::resolve_visibility(&repo.repo).await;
+        repo.visibility = reused
+            .visibility
+            .get(&repo.repo)
+            .copied()
+            .unwrap_or(RepoVisibility::Private);
     }
     let anchor_as_of = record.anchor_as_of;
     let chunks = split_into_chunks(record, CHUNK_BYTES);

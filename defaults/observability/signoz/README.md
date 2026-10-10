@@ -587,6 +587,26 @@ real-canary comparison still needs.
 > ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
 > `retention.sql` there (#8946 item 2 stays held).
 
+`fleet.state` volume (#11161): a full anchor every 5 minutes is 288 a day, so
+at Loom's own ~300 KB anchor (~3000 rows) that is ~90 MB of log body per host
+per day before ClickHouse compression (~33 GB per host per year), plus the
+60-second deltas, which carry only changed rows.
+
+Check it against your store's budget before raising the cadence on a long
+retention:
+
+- **Raw upper bound:** hosts × ~90 MB/day × retention days. At a 10-year
+  retention, 5 hosts is ~1.6 TB before compression, so a long-retention store
+  depends on ClickHouse compression to hold it. Compare with free disk, after
+  the store's existing ingest × retention.
+- **Short retention:** at 90 days the same 5 hosts are ~40 GB raw.
+- **Compression is an assumption until measured.** After 24 h, read the stored
+  bytes per `fleet.state` anchor and per host per day from ClickHouse
+  `system.parts` for the logs table (filtered by `loom.kind`), and replace the
+  300 KB estimate with that figure.
+- **Watch it:** alert on projected days-to-full and on a 24 h ingest jump
+  against the 7-day rate. The response is more disk or less ingest.
+
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
 CI duration/outcome trends in `ci-queries.sql` 1–3 are the retro asset, and
