@@ -87,12 +87,22 @@ pub const QUEUE_PAGES: usize = 64;
 /// faster than the configured sweep, nor slower than the rescan window allows.
 #[must_use]
 pub fn resolve_floor_interval_secs(root: &Path, interval_secs: u64) -> u64 {
+    resolve_floor_interval_secs_with_env(root, interval_secs, &super::process_env)
+}
+
+/// [`resolve_floor_interval_secs`] against `env` instead of the process env
+/// (#11066: tests pass a fixed map rather than writing process-global env).
+#[must_use]
+pub fn resolve_floor_interval_secs_with_env(
+    root: &Path,
+    interval_secs: u64,
+    env: super::EnvLookup<'_>,
+) -> u64 {
     let config = crate::config_resolver::resolve_effective_config(root);
     let configured =
         crate::config_resolver::get_path(&config, "autonomous.ciTelemetry.feedFloorIntervalSecs")
             .and_then(serde_json::Value::as_u64);
-    let raw = std::env::var(FEED_FLOOR_INTERVAL_SECS_ENV)
-        .ok()
+    let raw = env(FEED_FLOOR_INTERVAL_SECS_ENV)
         .and_then(|v| v.trim().parse::<u64>().ok())
         .or(configured)
         .filter(|v| *v > 0)
