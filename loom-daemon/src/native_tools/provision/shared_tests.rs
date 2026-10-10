@@ -139,9 +139,9 @@ fn the_binding_key_is_content_addressed_and_stable() {
     assert_eq!(key, binding_key());
 }
 
-/// OpenCode 2.x rejects a function default export (even one with props); the
-/// module must default-export a plain `{ id, server }` object (#11283). 1.18.x
-/// accepts that same object, so the single template serves both majors.
+/// Source-text pin only (#11283): the module default-exports a plain
+/// `{ id, server }` object. This does NOT show either OpenCode major loads it;
+/// 2.x may require `setup`/`effect` and 1.18.x acceptance is unverified (#11308).
 #[test]
 fn opencode_plugin_default_exports_a_plain_object_with_server() {
     let src = include_str!("../opencode.mjs");
@@ -151,12 +151,12 @@ fn opencode_plugin_default_exports_a_plain_object_with_server() {
     );
     assert!(
         !src.contains("export default async function") && !src.contains("export default function"),
-        "a function default export is rejected by OpenCode 2.x"
+        "the plain-object export replaced the function default export"
     );
     assert!(src.contains("async function server()"), "server hook is the async body");
 }
 
-/// The 1.x-compatible behaviour is unchanged: receipt write precedes the
+/// The existing receipt/fail-closed behaviour is unchanged (source-text pin): receipt write precedes the
 /// fail-closed context check, and the four loom_* tools are still returned.
 #[test]
 fn opencode_plugin_keeps_receipt_and_fail_closed_behaviour_for_1x() {
