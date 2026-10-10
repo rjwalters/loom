@@ -291,6 +291,43 @@ fn role_suggested_worker_type(role_manifest_path: &Path) -> Option<String> {
     nonempty(value.get("suggestedWorkerType")?.as_str())
 }
 
+/// Stable name of the Judge/Z.ai exclusion, quoted in every refusal so a log
+/// grep finds them all (#11284).
+pub const JUDGE_ZAI_RULE: &str = "judge-excluded-from-zai";
+
+/// The model profile a native-harness launch of `runtime` would run on:
+/// the tap's own profile, else `LOOM_MODEL_PROFILE`, else
+/// `runtimes.defaultModelProfile`, else the harness default (`zai-flash`) —
+/// the same ladder `worker_spawn::profiles::lookup` applies at spawn.
+fn effective_native_profile(root: &Path, tap_profile: Option<&str>) -> String {
+    nonempty(tap_profile)
+        .or_else(|| nonempty(std::env::var("LOOM_MODEL_PROFILE").ok().as_deref()))
+        .or_else(|| {
+            let config = crate::config_resolver::resolve_effective_config(root);
+            crate::config_resolver::get_path(&config, "runtimes.defaultModelProfile")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| nonempty(Some(v)))
+        })
+        .unwrap_or_else(|| "zai-flash".to_string())
+}
+
+/// `Some(profile)` when `role` is Judge and the launch would run on a `zai-*`
+/// model profile, whatever picked the runtime (config pin, env pin, explicit
+/// dispatch or preference list). Only native harnesses take a model profile;
+/// Claude/Codex are never on a Z.ai profile.
+fn judge_zai_profile(
+    root: &Path,
+    canonical: &str,
+    runtime: &str,
+    tap_profile: Option<&str>,
+) -> Option<String> {
+    if canonical != "judge" || !crate::worker_spawn::is_native(runtime) {
+        return None;
+    }
+    let profile = effective_native_profile(root, tap_profile);
+    profile.starts_with("zai-").then_some(profile)
+}
+
 fn choose_runtime(
     explicit: Option<&str>,
     role_env: Option<&str>,
@@ -631,7 +668,31 @@ pub fn resolve_and_admit_in(
         root,
         role,
         explicit,
+        None,
         context,
+        crate::daemon_bin_resolve::resolve_daemon_bin,
+    )
+}
+
+/// [`resolve_and_admit`] for one preference-list candidate that names its own
+/// model profile (#11284): `tap_profile` is the profile the launch will pin via
+/// `LOOM_MODEL_PROFILE`, so the Judge/`zai-*` exclusion judges THAT profile
+/// rather than whatever the daemon's environment or config default would pick.
+///
+/// # Errors
+/// As [`resolve_and_admit`].
+pub fn resolve_and_admit_tap(
+    root: &Path,
+    role: &str,
+    runtime: &str,
+    tap_profile: Option<&str>,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    resolve_and_admit_with(
+        root,
+        role,
+        Some(runtime),
+        tap_profile,
+        AdmissionContext::Host,
         crate::daemon_bin_resolve::resolve_daemon_bin,
     )
 }
@@ -644,7 +705,25 @@ fn resolve_and_admit_with(
     root: &Path,
     role: &str,
     explicit: Option<&str>,
+    tap_profile: Option<&str>,
     context: AdmissionContext<'_>,
+    resolve_native_adapter: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    admit_inner(root, role, explicit, tap_profile, context, true, resolve_native_adapter)
+}
+
+/// The admission core. `enforce_judge_zai` is `false` only for the nested
+/// per-phase probe of a native `sweep-lifecycle` admission: a sweep runs every
+/// phase on one runtime, so the phase-level Judge exclusion cannot be honoured
+/// there until phase routing lands (#11285). Standalone Judge launches always
+/// enforce it.
+fn admit_inner(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    tap_profile: Option<&str>,
+    context: AdmissionContext<'_>,
+    enforce_judge_zai: bool,
     resolve_native_adapter: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
     let Some(canonical) = canonical_role(role) else {
@@ -817,13 +896,37 @@ fn resolve_and_admit_with(
     });
     if canonical == "sweep-lifecycle" && crate::worker_spawn::is_native(&runtime) {
         for phase in ["curator", "judge", "doctor"] {
-            resolve_and_admit_in(root, phase, Some(&runtime), context).map_err(|error| {
+            admit_inner(
+                root,
+                phase,
+                Some(&runtime),
+                None,
+                context,
+                false,
+                crate::daemon_bin_resolve::resolve_daemon_bin,
+            )
+            .map_err(|error| {
                 reject(
                     format!("native sweep phase {phase}: {}", error.reason),
                     error.unmet_capabilities,
                 )
             })?;
         }
+    }
+    if let Some(profile) = enforce_judge_zai
+        .then(|| judge_zai_profile(root, canonical, &runtime, tap_profile))
+        .flatten()
+    {
+        return Err(RuntimeRejection {
+            role: canonical.to_string(),
+            runtime,
+            source: source.clone(),
+            unmet_capabilities: vec![],
+            reason: format!(
+                "{JUDGE_ZAI_RULE}: role judge is never admitted on model profile {profile:?} \
+                 (#11284); pin a different runtime or profile for judge"
+            ),
+        });
     }
     Ok(ResolvedRuntime {
         role: canonical.to_string(),

@@ -160,7 +160,7 @@
     "roles": {
       "judge": "codex"
     },
-    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (metered z.ai, backstop only) -> gemini (last). Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps its own rolePreference with Codex first, for review independence from the Builder's runtime.",
+    "_comment": "preference follows the operator's runtime order: Claude -> Codex -> OpenCode (z.ai, GLM) -> gemini (last), but the coding roles (Builder, Doctor) are z.ai-first via rolePreference: the flat-rate z.ai seats are paid for and capped weekly, so an idle seat is wasted capacity, and the claude fall-through when the z.ai pool is empty bounds the cap (#11284). Judge is never z.ai: admission refuses role judge on any zai-* model profile whatever the source (config pin, env pin, explicit dispatch or preference entry), so its list is Codex then Claude only, and Curator keeps the global order. Codex is NOT dropped for Builder/Doctor by a per-role list: defaults/runtimes/codex.json declares worktreeIsolation 'partial' (#4495) and defaults/roles/builder.json / doctor.json require it, so the admission gate skips Codex for those two roles only (logged as codex:not-admitted(worktreeIsolation)) and lifts automatically once the capability is promoted. Judge (requires only loomControl) keeps its own rolePreference with Codex first, for review independence from the Builder's runtime.",
     "preference": [
       "claude",
       "codex",
@@ -171,13 +171,23 @@
       "gemini"
     ],
     "rolePreference": {
-      "judge": [
-        "codex",
-        "claude",
+      "builder": [
         {
           "runtime": "opencode",
           "modelProfile": "zai-flash"
-        }
+        },
+        "claude"
+      ],
+      "doctor": [
+        {
+          "runtime": "opencode",
+          "modelProfile": "zai-flash"
+        },
+        "claude"
+      ],
+      "judge": [
+        "codex",
+        "claude"
       ]
     }
   },
