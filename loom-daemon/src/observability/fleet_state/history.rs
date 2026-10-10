@@ -1,5 +1,5 @@
 //! One issue's or PR's label history from its `issues/{n}/events` pages
-//! (#11367): every `labeled` / `unlabeled` and `closed` instant, so one read
+//! (#11367): every `labeled` / `unlabeled`, `closed` and `reopened` instant, so one read
 //! dates both the stage a row left and the stage it entered.
 
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ pub enum HistoryEvent {
     Labeled(String),
     Unlabeled(String),
     Closed,
+    Reopened,
 }
 
 /// The events of one issue or PR, oldest first.
@@ -37,6 +38,7 @@ impl LabelHistory {
                 Some("labeled") => label().map(HistoryEvent::Labeled),
                 Some("unlabeled") => label().map(HistoryEvent::Unlabeled),
                 Some("closed") => Some(HistoryEvent::Closed),
+                Some("reopened") => Some(HistoryEvent::Reopened),
                 _ => None,
             };
             if let Some(parsed) = parsed {
