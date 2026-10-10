@@ -57,15 +57,21 @@ fn git(repo: &Path, args: &[&str]) -> std::process::Output {
 
 /// A one-commit repo at `<dir>/<name>`. `name` may contain spaces.
 ///
-/// **Background maintenance is off (#9973).** Hypothesis (NOT reproduced; see
-/// the PR): `git commit` ends by spawning `git maintenance run --auto
-/// --detach`, which daemonizes without leaving the `git -C` cwd, so for a
-/// short window a reparented `git` could sit inside the repo and the #7463
-/// liveness probe [`super::run`] opens with would refuse. The production
-/// fetches that precede a reset already pass `-c maintenance.auto=false`
-/// (#9620) and `tests/worktree_reset_differential.rs` sets these keys too.
-/// Only the fixture changes; the probe and its veto are untouched, so every
-/// liveness case below still proves a *real* holder refuses.
+/// **Background maintenance is off (#9973).** This was the unexpected holder.
+/// On git >= 2.47, `git commit` ends by spawning `git maintenance run --auto
+/// --quiet --detach`. That process daemonizes without leaving the `git -C`
+/// cwd, and the daemonized half is still running after `git commit` itself
+/// has exited. Measured with trace2 on git 2.56 and no hooks (CI's shape): it
+/// outlived the commit in 37 of 40 runs, by 0.4–5 ms. A test that writes a
+/// file and calls [`super::run`] right after its only fixture commit lands in
+/// that window, and the #7463 liveness probe correctly refuses. All four
+/// recorded CI failures were tests of that shape. The production fetches that
+/// precede a reset already pass `-c maintenance.auto=false` (#9620), and
+/// `tests/worktree_reset_differential.rs` sets these keys too. Only the fixture
+/// changes; the probe and its veto are untouched, so every liveness case below
+/// still proves a *real* holder refuses.
+/// `a_fixture_commit_spawns_no_background_maintenance` pins this
+/// deterministically.
 fn repo(dir: &Path, name: &str) -> PathBuf {
     let repo = dir.join(name);
     fs::create_dir_all(&repo).unwrap();
@@ -622,11 +628,9 @@ fn describe_pids(pids: &[u32]) -> String {
 
 #[test]
 fn fixture_repos_disable_gits_detached_background_maintenance() {
-    // A fixture pin (#9973), not a regression test: it asserts the keys are
-    // set, and cannot tell the old behaviour from the new. The prior fixture
-    // left both unset, so — per the unreproduced hypothesis on `repo()` — on
-    // git >= 2.47 a fixture commit could leave a daemonized
-    // `git maintenance run --auto --detach` inside the repo.
+    // A fixture pin (#9973): it asserts the keys are set. The regression test
+    // that tells the old fixture from the new is
+    // `a_fixture_commit_spawns_no_background_maintenance` below.
     let dir = tmpdir("fixture-maintenance");
     let repo = repo(&dir, "repo");
     let get = |key: &str| {
@@ -641,12 +645,12 @@ fn fixture_repos_disable_gits_detached_background_maintenance() {
 #[test]
 fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
     // A guard, not proof: probe immediately after each fixture commit, which
-    // is when a detached maintenance child (if any) would be alive.
-    // Hypothesis (#9973, unreproduced; 0/40 trips on git 2.54 with the prior
-    // fixture): a detached maintenance child could be visible here. With
-    // maintenance off it has nothing to find on any git, so it should not fail
-    // spuriously; if it ever does, the message names the holder from this same
-    // probe call.
+    // is when a detached maintenance child (if any) would be alive. The window
+    // is a few milliseconds (#9973), so this alone rarely trips on the old
+    // fixture. The deterministic check is the trace2 test below. With
+    // maintenance off there is nothing to find on any git, so this should not
+    // fail spuriously. If it ever does, the message names the holder from this
+    // same probe call.
     let dir = tmpdir("fixture-no-holder");
     let repo = repo(&dir, "repo");
     if !probe_available(&repo) {
@@ -664,6 +668,82 @@ fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
             );
         }
     }
+}
+
+/// The argv of every child process a `git -C repo commit` started, read from
+/// its own trace2 event stream. trace2 records the spawn whether the child
+/// lives for a millisecond or a minute, so unlike a `/proc` scan this cannot
+/// miss a short-lived holder.
+fn children_spawned_by_a_commit(repo: &Path, trace: &Path) -> Vec<String> {
+    let _ = fs::remove_file(trace);
+    fs::write(repo.join("tracked.txt"), "traced commit\n").unwrap();
+    git(repo, &["add", "tracked.txt"]);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "-q", "-m", "traced"])
+        .env("GIT_TRACE2_EVENT", trace)
+        .output()
+        .expect("run git commit");
+    assert!(
+        out.status.success(),
+        "traced commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(trace)
+        .expect("git wrote no trace2 events")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["event"] == "child_start")
+        .map(|e| {
+            e["argv"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn is_background_maintenance(argv: &str) -> bool {
+    argv.contains("maintenance run") || argv.contains("gc --auto")
+}
+
+#[test]
+fn a_fixture_commit_spawns_no_background_maintenance() {
+    // The regression for #9973's holder. A fixture repo's commit must not
+    // spawn `git maintenance run --auto` (detached on git >= 2.47), because
+    // that child keeps the repo as its cwd after `git commit` returns.
+    let dir = tmpdir("fixture-trace");
+    let hardened = repo(&dir, "repo");
+    let spawned = children_spawned_by_a_commit(&hardened, &dir.join("hardened.trace"));
+    assert!(
+        !spawned.iter().any(|a| is_background_maintenance(a)),
+        "a fixture commit spawned background maintenance, which would sit in \
+         the worktree and veto the reset: {spawned:?}"
+    );
+
+    // Negative control: the same commit in a repo shaped like the fixture
+    // before #11226 does spawn it. This is what makes the assertion above mean
+    // something on this git. `maintenance.auto=true` is explicit so a host's
+    // global config cannot make the control pass vacuously. It is git's
+    // default, and CI's runners leave it at that default.
+    let control = dir.join("control");
+    fs::create_dir_all(&control).unwrap();
+    git(&control, &["init", "-q", "-b", "main"]);
+    git(&control, &["config", "user.email", "t@t"]);
+    git(&control, &["config", "user.name", "t"]);
+    git(&control, &["config", "maintenance.auto", "true"]);
+    let spawned = children_spawned_by_a_commit(&control, &dir.join("control.trace"));
+    assert!(
+        spawned.iter().any(|a| is_background_maintenance(a)),
+        "control: an unhardened commit should spawn `git maintenance run --auto`; \
+         if git stopped doing that, this test no longer distinguishes anything: {spawned:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
