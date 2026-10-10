@@ -413,6 +413,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling, or `None`.
+    pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -601,6 +603,8 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+/// #11042: the unsupervised re-download guard and the typed not-rolling reason.
+pub mod not_rolling;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -1246,6 +1250,8 @@ pub struct AutoUpdateState {
     repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
+    /// #11042: the target an unsupervised host installed and could not roll to.
+    unsupervised: not_rolling::UnsupervisedStage,
 }
 
 impl AutoUpdateState {
@@ -1816,6 +1822,7 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
+            floor_not_rolling: None,
         }
     }
 }

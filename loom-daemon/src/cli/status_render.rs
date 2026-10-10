@@ -613,6 +613,8 @@ pub(crate) fn build_status_json_value_for(
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "mode": report.auto_update_mode, // #10954
+            "config_enabled": report.auto_update_config_enabled, // #11042
+            "floor_not_rolling": report.auto_update_floor_not_rolling, // #11042
             "last_check": report.auto_update_last_check,
             "last_roll": report.auto_update_last_roll,
             "consecutive_failures": report.auto_update_consecutive_failures,
@@ -2809,6 +2811,9 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(why) = report.auto_update_floor_not_rolling {
+            println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
+        }
         last_tick_line::print(report);
     }
     task_liveness_line::print(&report.task_liveness);

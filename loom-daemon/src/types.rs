@@ -1454,6 +1454,17 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling (typed:
+    /// `unsupervised`, `backoff`, `unsatisfiable`, …), or `None` when it is
+    /// not below the floor or is rolling. Absent from an older daemon.
+    #[serde(default)]
+    pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
+    /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
+    /// does for the floor alone; this is the setting beside it. `None` before
+    /// the spawn decision and from an older daemon.
+    #[serde(default)]
+    pub auto_update_config_enabled: Option<bool>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]

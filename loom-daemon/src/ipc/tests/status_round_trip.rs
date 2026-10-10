@@ -107,6 +107,10 @@ fn test_daemon_status_request_response_round_trip() {
         auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
+        auto_update_floor_not_rolling: Some(
+            crate::auto_update::not_rolling::FloorNotRolling::Unsupervised,
+        ),
+        auto_update_config_enabled: Some(false),
         task_liveness: Vec::new(),
         session_containers: Some(crate::session_status::SessionContainersReport {
             observation: "available".into(),
@@ -295,6 +299,11 @@ fn test_daemon_status_request_response_round_trip() {
                 Some("fleet floor only (autoUpdate.enabled=false)")
             );
             assert_eq!(r.auto_update_consecutive_failures, 2);
+            assert_eq!(
+                r.auto_update_floor_not_rolling,
+                Some(crate::auto_update::not_rolling::FloorNotRolling::Unsupervised)
+            );
+            assert_eq!(r.auto_update_config_enabled, Some(false));
             assert_eq!(r.auto_update_backoff_secs, Some(120));
             assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));
             assert_eq!(r.loadavg_1m, Some(1.25));

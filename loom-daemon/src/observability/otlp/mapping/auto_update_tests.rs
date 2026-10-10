@@ -30,6 +30,7 @@ fn record() -> AutoUpdateTickRecord {
             target: Some("artifact:0.19.731:feedface".to_string()),
         },
         floor_stall: None,
+        floor_not_rolling: None,
         consecutive_failures: 0,
         duration_ms: 4200,
         loom: Provenance {

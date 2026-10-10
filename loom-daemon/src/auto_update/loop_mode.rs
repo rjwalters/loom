@@ -72,6 +72,35 @@ impl LoopMode {
         self != Self::Off
     }
 
+    /// What `autonomous.autoUpdate.enabled` resolved to (#11042), reported in
+    /// `status` beside `enabled`, which since #10954 means "the loop runs".
+    #[must_use]
+    pub fn config_enabled(self) -> bool {
+        match self {
+            Self::Fleet {
+                auto_update_enabled,
+            } => auto_update_enabled,
+            Self::ChaseLatest => true,
+            Self::Off => false,
+        }
+    }
+
+    /// The one-time INFO line for a fleet host whose operator turned
+    /// autoUpdate off explicitly (#11042): the setting does not exempt the
+    /// host from the floor. `None` for every other mode, and when the setting
+    /// was only defaulted.
+    #[must_use]
+    pub fn ignored_opt_out_note(self, explicitly_disabled: bool) -> Option<&'static str> {
+        (explicitly_disabled
+            && self
+                == Self::Fleet {
+                    auto_update_enabled: false,
+                })
+        .then_some(
+            "autoUpdate.enabled=false is set explicitly, but this is a fleet host: the setting              is ignored for the fleet floor. The loop still rolls this host up to              loom_min_version (and for a workspace that needs a newer daemon), never to the              newest release",
+        )
+    }
+
     /// The status / log rendering: what the loop does and why it runs.
     #[must_use]
     pub fn describe(self) -> &'static str {
@@ -101,6 +130,15 @@ pub fn idle_reason(chase_enabled: bool, fleet_host: bool) -> Option<String> {
     })
 }
 
+/// Whether autoUpdate was turned off on purpose: `LOOM_AUTO_UPDATE` set to a
+/// value that does not enable it, or `autonomous.autoUpdate.enabled: false`.
+fn explicitly_disabled(config: &super::AutoUpdateConfig) -> bool {
+    match std::env::var(super::AUTO_UPDATE_ENABLE_ENV) {
+        Ok(_) => !super::resolve_enabled(config),
+        Err(_) => config.enabled == Some(false),
+    }
+}
+
 static MODE: OnceLock<LoopMode> = OnceLock::new();
 
 /// The mode this process chose at spawn, or `None` before [`start`] ran.
@@ -123,6 +161,10 @@ pub fn start(
     let enabled = super::resolve_enabled(&config);
     let mode = LoopMode::decide(&crate::fleet_sync::floor_knowledge(), enabled);
     let _ = MODE.set(mode);
+    // #11042: once, at spawn (this runs once per process).
+    if let Some(note) = mode.ignored_opt_out_note(explicitly_disabled(&config)) {
+        log::info!("auto_update: {note}");
+    }
     if !mode.spawns() {
         log::debug!(
             "auto_update: disabled (not a fleet host; set LOOM_AUTO_UPDATE=1 or \
@@ -188,6 +230,22 @@ mod tests {
     fn status_says_why_the_loop_runs_with_autoupdate_off() {
         let mode = LoopMode::decide(&set(), false);
         assert_eq!(mode.describe(), "fleet floor only (autoUpdate.enabled=false)");
+    }
+
+    /// #11042: `enabled` in status means the loop runs; the setting is
+    /// reported beside it, and an explicit opt-out on a fleet host is noted.
+    #[test]
+    fn the_setting_is_reported_and_an_explicit_fleet_opt_out_is_noted() {
+        let fleet_off = LoopMode::decide(&set(), false);
+        assert!(!fleet_off.config_enabled());
+        assert!(LoopMode::decide(&set(), true).config_enabled());
+        assert!(LoopMode::ChaseLatest.config_enabled());
+        assert!(!LoopMode::Off.config_enabled());
+        let note = fleet_off.ignored_opt_out_note(true).expect("noted");
+        assert!(note.contains("ignored for the fleet floor"), "{note}");
+        assert_eq!(fleet_off.ignored_opt_out_note(false), None, "only an explicit setting");
+        assert_eq!(LoopMode::decide(&set(), true).ignored_opt_out_note(true), None);
+        assert_eq!(LoopMode::Off.ignored_opt_out_note(true), None);
     }
 
     #[test]
