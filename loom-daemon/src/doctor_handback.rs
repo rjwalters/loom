@@ -134,6 +134,11 @@ pub trait Forge {
     fn add(&mut self, label: &str) -> bool;
     /// Remove one label (absent is not an error the caller relies on).
     fn remove(&mut self, label: &str) -> bool;
+    /// Whether a trusted `changes-requested` verdict marker exists for `head`.
+    /// The rejection this Doctor is answering was rendered against an older
+    /// head, so one at the pushed head is a new rejection. `None` when the
+    /// comments could not be read.
+    fn rejected_at(&mut self, head: &str) -> Option<bool>;
 }
 
 /// The result of one hand-back.
@@ -222,12 +227,27 @@ pub fn run(forge: &mut impl Forge, expected_head: &str) -> Outcome {
             let Some(pre) = pre else {
                 return Outcome::Failed("unreachable: no pre-read".into());
             };
-            hand_back(forge, &pre)
+            hand_back(forge, &pre, expected_head)
         }
     }
 }
 
-fn hand_back(forge: &mut impl Forge, pre: &Snapshot) -> Outcome {
+/// The pushed head's rejection state could not be read: undo the add, touch
+/// nothing else, and let the caller retry.
+fn unverified_rejection(forge: &mut impl Forge) -> Outcome {
+    if !forge.remove(QUEUE) {
+        return Outcome::Failed(format!(
+            "the comments could not be read to tell a new {CHANGES} from the old one, and the \
+             own {QUEUE} could not be withdrawn"
+        ));
+    }
+    Outcome::Failed(format!(
+        "the comments could not be read to tell a new {CHANGES} from the old one; withdrew own \
+         {QUEUE}, left {CHANGES} and {CLAIM} in place"
+    ))
+}
+
+fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Outcome {
     // Add first: if it fails nothing is removed, so the PR keeps its
     // changes-requested/treating state instead of dropping out of every queue.
     if !forge.add(QUEUE) {
@@ -235,16 +255,32 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot) -> Outcome {
             "{QUEUE} could not be added; {CHANGES} and {CLAIM} were left in place"
         ));
     }
+    // `pre` carrying CHANGES says nothing about *which* rejection: a Judge may
+    // have rejected the pushed head since. Labels carry no identity, so ask the
+    // verdict markers, and keep the label unless the evidence says it is the
+    // old one.
+    let mut changes_removed = false;
+    let mut fresh_rejection = false;
     if pre.has(CHANGES) {
-        forge.remove(CHANGES);
+        match forge.rejected_at(expected_head) {
+            Some(false) => changes_removed = forge.remove(CHANGES),
+            Some(true) => fresh_rejection = true,
+            None => {
+                return unverified_rejection(forge);
+            }
+        }
     }
     forge.remove(CLAIM);
     let Some(post) = forge.read() else {
         return Outcome::Failed("the labels could not be re-read to verify the hand-back".into());
     };
+    // A CHANGES that survives our own successful remove, or that we kept
+    // because it is a new rejection, is a raced verdict, not a stuck label.
     let rivals: Vec<String> = RIVALS
         .iter()
-        .filter(|l| !pre.has(l) && post.has(l))
+        .filter(|l| {
+            post.has(l) && (!pre.has(l) || (**l == CHANGES && (changes_removed || fresh_rejection)))
+        })
         .map(|l| (*l).to_string())
         .collect();
     // The claim is ours alone: no rival writes it, so one that survived the
