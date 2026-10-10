@@ -284,22 +284,20 @@ Local verification:
 - [ ] The project's check command passes (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`)
 - [ ] Formatter + linter run on changed files (see "Format and Lint Changed Files" below) — a format-only CI failure is a guaranteed Judge rejection
 - [ ] Commits are signed off if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` requirement — `git commit --signoff`; see "DCO sign-off" above)
-- [ ] Relevant tests pass
+- [ ] Relevant tests pass. Production shell changed and CI runs `shell-budget --check`? After the final commit, `loom-daemon shell-budget --check --base <PR base, default origin/main>`: nonzero = this branch's own growth (never pre-existing); no review until counted shell is cut or moved to the daemon and a rerun exits 0. Comments, follow-up issues or arbitrary trailers are not permission
 - [ ] Each criterion has explicit verification (not "I think it works")
-- [ ] Ran the "defaults/ Version-Bearing-Files Gate" command block below (not just read it) — exited 0. It fails if this PR hand-edits any version-bearing file's value (`package.json`, `mcp-loom/package.json`, `Cargo.toml`, `VERSION`) — those are now bumped automatically at merge time (#7743), never by hand in a feature PR.
+- [ ] Ran the "defaults/ Version-Bearing-Files Gate" command block below (not just read it) — exited 0 (fails if you hand-edit a version-bearing file; those bump at merge, #7743).
 ```
 
-**Run the defaults/ Version-Bearing-Files Gate locally — an actual command, not a checklist bullet to read (#6675, recurring Judge rejection: #6598, #6599, #6610, #6611, #6630, #6668 all hit this in CI because it was never run pre-PR). A single automated workflow (`.github/workflows/version-bump-on-merge.yml`, #7743) now owns bumping `VERSION` and the other version-bearing files, once, right after any merge that touched `defaults/` — a feature PR must not carry its own edit to any of them. `./.loom/scripts/create-pr.sh` also runs a version-bearing-file consistency check (`version-check-gate.sh`, #6730) before creating the PR, so running the block below by hand is defense-in-depth, not the only line of defense; still run it locally to catch a hand-edit before pushing rather than at CI time:**
+**Run the defaults/ Version-Bearing-Files Gate locally — an actual command, not a checklist bullet to read (#6675, recurring Judge rejection: #6598, #6599, #6610, #6611, #6630, #6668 all hit this in CI because it was never run pre-PR). A single automated workflow (`.github/workflows/version-bump-on-merge.yml`, #7743) now owns bumping `VERSION` and the other version-bearing files, once, right after any merge that touched `defaults/` — a feature PR must not carry its own edit to any of them. `./.loom/scripts/create-pr.sh` also runs `version-check-gate.sh` (#6730); running the block below by hand is defense-in-depth that catches a hand-edit before pushing rather than at CI time:**
 
 ```bash
 # Run from your worktree, AFTER your last commit, BEFORE
 # ./.loom/scripts/create-pr.sh. Mirrors the CI job "PRs Must Not Hand-Edit
 # Version-Bearing Files" (.github/workflows/ci.yml) — no PR exists yet at
 # Builder time, so use the merge-base with origin/main as --base instead of
-# a PR base sha. (`--forbid-bump` also narrows to merge-base(base, head)
-# internally since #7823, so passing one here is idempotent, not redundant
-# belt-and-braces you could drop: it keeps this block correct on an older
-# installed copy of the script too.)
+# a PR base sha. (`--forbid-bump` narrows to the merge-base itself since
+# #7823; passing one is idempotent and keeps older installed copies correct.)
 MERGE_BASE="$(git merge-base origin/main HEAD)"
 
 # Exit 0 = no version-bearing file's VALUE changed anywhere in your diff;
