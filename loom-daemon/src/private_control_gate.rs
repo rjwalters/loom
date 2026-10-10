@@ -210,9 +210,13 @@ fn parse_policy(clean: &str) -> Result<BTreeMap<String, String>> {
         .ok_or_else(|| anyhow!("`const POLICY` has no `=` initializer"))?;
     // Declared length, e.g. `[(&str, &str); 10]`.
     let ty = &rest[..eq];
-    let declared_len = ty
+    let (_, len_text) = ty
         .rsplit_once(';')
-        .and_then(|(_, n)| n.trim().trim_end_matches(']').trim().parse::<usize>().ok());
+        .ok_or_else(|| anyhow!("`const POLICY` type has no `; N` array length"))?;
+    let len_text = len_text.trim().trim_end_matches(']').trim();
+    let declared_len = len_text.parse::<usize>().map_err(|_| {
+        anyhow!("`const POLICY` array length `{len_text}` is not an integer literal")
+    })?;
     let chars: Vec<char> = rest[eq + 1..].chars().collect();
     let mut i = 0;
     expect(&chars, &mut i, '[')?;
@@ -242,8 +246,11 @@ fn parse_policy(clean: &str) -> Result<BTreeMap<String, String>> {
                     bail!("duplicate POLICY key `{key}`");
                 }
                 skip_ws(&chars, &mut i);
-                if chars.get(i) == Some(&',') {
-                    i += 1;
+                // Entries are comma-separated; only the trailing comma is optional.
+                match chars.get(i) {
+                    Some(',') => i += 1,
+                    Some(']') => {}
+                    _ => bail!("expected `,` between POLICY entries"),
                 }
             }
             _ => {
@@ -253,10 +260,8 @@ fn parse_policy(clean: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     expect(&chars, &mut i, ';')?;
-    if let Some(n) = declared_len {
-        if n != count {
-            bail!("POLICY is annotated with length {n} but has {count} entries");
-        }
+    if declared_len != count {
+        bail!("POLICY is annotated with length {declared_len} but has {count} entries");
     }
     Ok(policy)
 }

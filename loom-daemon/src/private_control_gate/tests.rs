@@ -237,6 +237,14 @@ fn malformed_and_ambiguous_declarations_fail() {
             "pub const CONTROL_VERSION: u32 = 2;\npub const POLICY: [(&str, &str); 1] = build();\n",
             "expected `[`",
         ),
+        (
+            "pub const CONTROL_VERSION: u32 = 2;\npub const POLICY: [(&str, &str); nope] = [(\"A\", \"1\")];\n",
+            "array length `nope` is not an integer",
+        ),
+        (
+            "pub const CONTROL_VERSION: u32 = 3;\npub const POLICY: [(&str, &str); 2] = [(\"A\", \"1\") (\"B\", \"2\")];\n",
+            "expected `,` between POLICY entries",
+        ),
     ];
     for (text, needle) in cases {
         let err = format!("{:#}", parse_declarations(text).unwrap_err());
