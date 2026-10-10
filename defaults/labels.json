@@ -643,6 +643,37 @@
       ]
     },
     {
+      "name": "loom:blocked-unnamed",
+      "description": "loom:blocked names no blocker: queued for Curator to name it or release it",
+      "color": "F87171",
+      "kind": "workflow",
+      "applied_by": "daemon tick (stale-blocked unnamed-queue pass, #10558)",
+      "removed_by": "Curator (after naming the blocker, recording a reason, or releasing the block) or the daemon tick once the issue is documented",
+      "park": false,
+      "skip": false,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "merge_hold": false,
+      "operator_hold": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "propagate": null,
+      "color_note": "red-400",
+      "yaml_preamble": [
+        "# loom:blocked-unnamed (#10558): a queue marker, NOT a park label. It coexists",
+        "# with loom:blocked. Applied by the daemon tick to an open loom:blocked issue",
+        "# that names no blocker and states no reason; removed by Curator after it names",
+        "# the blocker, records a reason, or releases the block."
+      ]
+    },
+    {
       "name": "loom:urgent",
       "description": "Retired (#9244): use loom:operator-priority",
       "color": "DC2626",

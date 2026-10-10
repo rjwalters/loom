@@ -162,6 +162,7 @@ impl StaleBlockedArgs {
         let mut superseded: Vec<Finding> = Vec::new();
         let mut unticked: Vec<Finding> = Vec::new();
         let mut undocumented: Vec<Finding> = Vec::new();
+        let mut held: Vec<Finding> = Vec::new();
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
 
@@ -192,6 +193,7 @@ impl StaleBlockedArgs {
                 Verdict::Superseded { .. } => superseded.push(finding),
                 Verdict::Unticked { .. } => unticked.push(finding),
                 Verdict::Undocumented => undocumented.push(finding),
+                Verdict::HeldWithReason { .. } => held.push(finding),
                 Verdict::StillBlocked => {}
             }
         }
@@ -201,6 +203,7 @@ impl StaleBlockedArgs {
             superseded: &superseded,
             unticked: &unticked,
             undocumented: &undocumented,
+            held: &held,
             prose_only: &prose_only,
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
@@ -225,6 +228,9 @@ struct Sections<'a> {
     superseded: &'a [Finding],
     unticked: &'a [Finding],
     undocumented: &'a [Finding],
+    /// Parked with a stated reason and no numbered blocker (#10558). Reported,
+    /// but not a warning: the record is the documentation.
+    held: &'a [Finding],
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
@@ -450,6 +456,23 @@ fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: boo
         return;
     }
 
+    // Informational, not a warning: a held-with-reason issue needs no action,
+    // so `--quiet` (the sweep pre-flight) never prints it (#10602).
+    if !s.held.is_empty() {
+        let _ = writeln!(
+            w,
+            "HELD WITH A STATED REASON — a park record states why, no numbered blocker ({}):",
+            s.held.len()
+        );
+        for f in s.held {
+            let (by, reason) = match &f.verdict {
+                Verdict::HeldWithReason { by, reason } => (by.as_deref().unwrap_or("?"), reason),
+                _ => ("?", &String::new()),
+            };
+            let _ = writeln!(w, "  {} {} (by {by}: {reason})", f.reference(), f.title);
+        }
+    }
+
     // Only when something was examined: an empty population stays silent.
     if s.cost.projected != budget::Projection::default() {
         let _ = writeln!(w, "{}", s.cost.summary());
@@ -542,6 +565,18 @@ fn print_json(s: &Sections<'_>) {
         })
         .collect();
     let undoc_json: Vec<_> = s.undocumented.iter().map(row).collect();
+    let held_json: Vec<_> = s
+        .held
+        .iter()
+        .map(|f| {
+            let mut v = row(f);
+            if let Verdict::HeldWithReason { by, reason } = &f.verdict {
+                v["by"] = serde_json::json!(by);
+                v["reason"] = serde_json::json!(reason);
+            }
+            v
+        })
+        .collect();
     let prose_only_json: Vec<_> = s.prose_only.iter().map(row).collect();
     let uneval_json: Vec<_> = s
         .unevaluated
@@ -555,6 +590,7 @@ fn print_json(s: &Sections<'_>) {
             "superseded": superseded_json,
             "unticked": unticked_json,
             "undocumented": undoc_json,
+            "held_with_reason": held_json,
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
@@ -590,6 +626,7 @@ mod tests {
             superseded: &[],
             unticked: &f,
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &uneval,
             enumerate_error: None,
@@ -611,6 +648,7 @@ mod tests {
             superseded: &[],
             unticked: &[],
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &[],
             enumerate_error: None,
@@ -647,5 +685,46 @@ mod tests {
             assert!(section < footer, "unticked must precede the footer:\n{err}");
             assert!(err.contains("issue #42 parked"));
         }
+    }
+
+    /// Judge (#10602): a held-with-reason issue needs no action, so a run
+    /// where every issue is held prints nothing at all under `--quiet`, and
+    /// without it lists them with no WARNING banner.
+    #[test]
+    fn quiet_prints_nothing_when_every_issue_is_held_with_a_reason() {
+        let held = [Finding {
+            kind: Artifact::Issue,
+            number: 7,
+            title: "waiting".into(),
+            verdict: Verdict::HeldWithReason {
+                by: Some("curator".into()),
+                reason: "vendor answer".into(),
+            },
+            undeclared: false,
+        }];
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &[],
+            undocumented: &[],
+            held: &held,
+            prose_only: &[],
+            unevaluated: &[],
+            enumerate_error: None,
+            cost: &cost,
+            archived: Some(false),
+        };
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, true);
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, false);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("HELD WITH A STATED REASON"), "{err}");
+        assert!(err.contains("issue #7 waiting (by curator: vendor answer)"), "{err}");
+        assert!(!err.contains("WARNING"), "{err}");
     }
 }
