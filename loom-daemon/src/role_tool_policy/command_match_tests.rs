@@ -574,3 +574,13 @@ fn ansi_c_escapes_are_decoded_before_matching() {
     assert!(hits_cap(r"$'ssh' example.invalid", "remote-shell"));
     assert_clean(r"echo $'a\tb'");
 }
+
+#[test]
+fn ansi_c_nul_truncates_the_word_like_bash() {
+    assert!(hits_cap(r"$'ssh\0suffix' example.invalid", "remote-shell"));
+    assert!(hits_cap(r"$'aws\x00suffix' sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap(r"$'ssh\u0000suffix' example.invalid", "remote-shell"));
+    assert!(hits_cap(r"$'ssh\U00000000suffix' example.invalid", "remote-shell"));
+    assert!(hits_cap(r"$'ssh\000suffix' example.invalid", "remote-shell"));
+    assert_clean(r"$'ls\0ssh' example.invalid");
+}

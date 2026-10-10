@@ -201,6 +201,9 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("sudo --user root aws sts get-caller-identity", "cloud-cli"),
     (r"$'\x73sh' example.invalid", "remote-shell"),
     (r"$'\141ws' sts get-caller-identity", "cloud-cli"),
+    // Round 5: bash truncates an ANSI-C string at the first NUL.
+    (r"$'ssh\0suffix' example.invalid", "remote-shell"),
+    (r"$'aws\x00suffix' sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]
