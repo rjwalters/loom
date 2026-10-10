@@ -539,6 +539,7 @@ impl StaleBlockedForge for World {
             state: "open".into(),
             body: Some("Blocked by #200: needs that first.".into()),
             author: None,
+            author_association: None,
             is_pull_request: false,
             comments: 1 + u32::try_from(self.comments.len()).unwrap(),
         });
@@ -606,6 +607,7 @@ fn blocked_row() -> RestIssue {
         state: "open".into(),
         body: None,
         author: None,
+        author_association: None,
         is_pull_request: false,
         comments: 0,
     }
