@@ -9,7 +9,8 @@ everyone. The operator, Guide and Champion may all add or remove both.
 | important | `loom:important` |
 | very important | `loom:very-important` |
 
-`loom:very-important` is capped so it cannot be flooded. Neither label is a
+`loom:very-important` is to be capped so it cannot be flooded; the cap is
+follow-up #11278 and is not enforced yet. Neither label is a
 hold, and the daemon never inherits either one: if a blocker must go first,
 whoever sets the priority labels the blocker too. That judgment belongs to
 roles (Guide, Champion), not to dispatch.

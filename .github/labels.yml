@@ -289,12 +289,12 @@
   color: "CA8A04"  # yellow-600 - the middle priority level
 
 # loom:very-important (#11103) is the top priority level. A workspace holding
-# dispatchable very-important work wins the workspace draw; capped so it cannot
-# be flooded (see daemon-reference.md, per-workspace priority). NOT a hold,
+# dispatchable very-important work wins the workspace draw; a flood cap is
+# follow-up #11278, not enforced yet (see priority-model.md). NOT a hold,
 # never inherited by the daemon. Applied by / removed by: the operator, Guide
 # and Champion alike.
 - name: loom:very-important
-  description: "Priority level 3 of 3: wins the workspace draw, capped (not a hold). Anyone may set."
+  description: "Priority level 3 of 3: wins the workspace draw (not a hold; cap lands in #11278). Anyone may set."
   color: "B45309"  # amber-700 - one shade above important
 
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the
