@@ -1670,6 +1670,9 @@ the 5-minute snapshot cadence:
 | `loom.pool.exhausted` | `Gauge` | `1` | `provider` | `1` when the pool has an exhausted account and no usable one |
 | `loom.pool.exhaustions` | delta `Sum` | `{account}` | `provider` | accounts newly exhausted since the previous sample |
 | `loom.pool.exhausted_seconds` | delta `Sum` | `s` | `provider` | the interval, credited when the pool read exhausted at its start (sample-and-hold downtime) |
+| `loom.pool.account_state` | `Gauge` | `1` | `provider`, `account`, `state` ∈ `usable`, `exhausted` | per account (#11286): `1` for the state the account is in, `0` for the other, every sample |
+| `loom.pool.plan_token_limit` | `Gauge` | `{token}` | `provider`, `account` | an API-key seat's declared plan allowance per window (`api-keys limit --plan-token-limit`); only where declared, never `0` |
+| `loom.pool.plan_window_seconds` | `Gauge` | `s` | `provider`, `account` | that seat's declared plan window (`api-keys limit --exhaustion-window`); only where declared |
 
 Burn is read incrementally from every subscription store on the host: Claude
 transcripts (`provider=claude`), Codex rollouts including pooled profiles
@@ -1684,8 +1687,16 @@ count in the current window), windows end 60 s before the sample and are
 stamped at that end so they abut, and the first sample after daemon start only
 anchors, so TPM/RPM are `rate(loom.llm.tokens.*)`/`rate(loom.llm.requests)`
 with no double count and no replayed history. Pool state covers the `tokens.snapshot` accounts (Claude,
-Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …), aggregated per
-provider with no `account` label; delta counters start from the second sample.
+Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …); the four
+`loom.pool.accounts`/`exhausted`/`exhaustions`/`exhausted_seconds` families
+are aggregated per provider with no `account` label, and the `account_state`
+and `plan_*` families (#11286) carry the account's non-secret pool name.
+Utilization against a declared plan (e.g. Z.ai) is computed downstream:
+`loom.llm.tokens.*{provider}` summed over `plan_window_seconds`, divided by the
+summed `plan_token_limit` — the daemon exports only the raw facts. OpenCode
+burn includes every guarded per-launch store under the native-tools state dir
+(the most recently written 128), which is where daemon-dispatched OpenCode
+sweeps write (#11286). Delta counters start from the second sample.
 
 Worker turnaround and forge stage dwell (Issue #8929), per host (the
 resource `host.id`), never labelled by issue or repo:

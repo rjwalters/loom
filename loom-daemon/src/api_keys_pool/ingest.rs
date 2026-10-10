@@ -41,12 +41,14 @@
 //!
 //! ## What it costs, stated plainly
 //!
-//! The mark lands when the supervising process next looks — after the run
-//! exits, not during it. A spawn that dies of exhaustion at minute 1 still
-//! holds its account until it exits. And a run whose log Loom never retains
-//! (no `--log`, output discarded) is never ingested at all. Both are honest
-//! limits of the post-hoc choice, not bugs; the alternative was the dispatch
-//! core.
+//! The mark lands when the supervising process next looks. For a
+//! daemon-dispatched sweep that is now *while the run is live*: the reaper
+//! tails the same retained log on every tick through [`super::live_watch`]
+//! (#11286) and marks an exhaustion as soon as the provider's words reach the
+//! log — still post-hoc reading of already-captured text, no supervisor in the
+//! exec chain. Everywhere else (role ticks, hand launches) the mark still
+//! lands after the run exits. A run whose log Loom never retains (no `--log`,
+//! output discarded) is never ingested at all.
 //!
 //! # Five guards keep this from bad-marking a healthy account
 //!
@@ -91,7 +93,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::bad_marks::{self, BadMark};
-use super::classify::{classify_launch_region, Classification};
+use super::classify::{classify_launch_region, provider_lines, Classification};
+use super::reset;
 
 /// Prefix of the line `worker_spawn::run` writes before handing off to a
 /// native harness. Everything after it is one JSON object.
@@ -262,6 +265,29 @@ pub fn ingest_launch_log(
     exit_code: Option<i32>,
 ) -> Option<LaunchFeedback> {
     let (record, classification) = classify_launch_log(contents, anchor, exit_code)?;
+    // The reset horizon (#11286) is read from the same provider-only lines
+    // the classifier saw — never the agent's transcript.
+    let provider_text = provider_lines(region_after(contents, anchor)?);
+    apply_mark(workspace, record, classification, &provider_text, "the launch log")
+}
+
+/// Record the bad mark `classification` implies for a pool-selected
+/// `record` — the shared second half of [`ingest_launch_log`] and the in-run
+/// watcher ([`super::live_watch`], #11286), so both apply guard 4 and resolve
+/// the horizon identically. `origin` names the evidence in the mark's reason
+/// and the operator detail (`"the launch log"`, `"the live launch log"`).
+///
+/// The cooldown is [`reset::resolve_cooldown`]'s: a reset instant the
+/// provider printed in `provider_text`, else the account's configured plan
+/// window (`Exhausted` only), else the classification's default.
+#[must_use]
+pub fn apply_mark(
+    workspace: &Path,
+    record: LaunchRecord,
+    classification: Classification,
+    provider_text: &str,
+    origin: &str,
+) -> Option<LaunchFeedback> {
     let provider = record.provider?;
     let account = record.account?;
     let model_class = record
@@ -273,7 +299,7 @@ pub fn ingest_launch_log(
         .map_or_else(|| "account-wide".to_string(), |class| format!("model class {class}"));
 
     // Guard 4: a credential/config failure gets no exhaustion horizon.
-    let Some(cooldown) = classification.default_cooldown_secs() else {
+    if !classification.marks_bad() {
         return Some(LaunchFeedback {
             detail: format!(
                 "api-keys pool: {provider}/{account} reported a {} — NOT bad-marked (a \
@@ -287,9 +313,8 @@ pub fn ingest_launch_log(
             classification,
             mark: None,
         });
-    };
+    }
 
-    let reason = format!("{} (classified from the launch log)", classification.label());
     let root = match super::paths::resolve_provider_root(workspace, &provider)
         .map_err(|e| e.to_string())
     {
@@ -308,6 +333,11 @@ pub fn ingest_launch_log(
             });
         }
     };
+    let window = reset::configured_window(&root, &provider, &account);
+    let (cooldown, source) =
+        reset::resolve_cooldown(classification, provider_text, bad_marks::epoch_now(), window)?;
+    let reason =
+        format!("{} (classified from {origin}; {})", classification.label(), source.label());
     // #8699 AC2's double-mark guard: the egress proxy (or a concurrent
     // launch on the same account) may already have bad-marked this
     // `(account, class)` pair. `escalate_bad_for_class` skips the write only
@@ -328,16 +358,17 @@ pub fn ingest_launch_log(
         Ok(bad_marks::MarkWrite::Written(mark)) => (
             format!(
                 "api-keys pool: bad-marked {provider}/{account} ({scope}) as {} for {cooldown}s \
-                 from the launch log",
-                classification.label()
+                 ({}) from {origin}",
+                classification.label(),
+                source.label()
             ),
             Some(mark),
         ),
         Ok(bad_marks::MarkWrite::AlreadyCovered(existing)) => (
             format!(
                 "api-keys pool: {provider}/{account} ({scope}) is already bad-marked ({}) at \
-                 least as long as a {cooldown}s {} mark — skipping a duplicate mark from the \
-                 launch log (likely already marked at the egress proxy, #8699)",
+                 least as long as a {cooldown}s {} mark — skipping a duplicate mark from \
+                 {origin} (likely already marked at the egress proxy, #8699, or in-run, #11286)",
                 existing.reason,
                 classification.label()
             ),

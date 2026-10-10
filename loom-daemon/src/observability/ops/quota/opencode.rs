@@ -37,10 +37,14 @@
 //! not emitted.
 //!
 //! Stores: `${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db` (an
-//! operator's own OpenCode) plus every Loom-managed
-//! `~/.loom/opt/opencode-<ver>/…/opencode.db`
+//! operator's own OpenCode), every Loom-managed
+//! `~/.loom/opt/opencode-<ver>/…/opencode.db`, and — Issue #11286 — the most
+//! recently written guarded per-launch stores under the native-tools state
+//! dir, which is where every daemon-dispatched OpenCode sweep writes
 //! ([`opencode_usage::discover_opencode_dbs`], whose `LOOM_OPENCODE_DB`
-//! override replaces the whole set).
+//! override replaces the whole set). A per-launch store first seen mid-run is
+//! read from the start like any other new store; its steps that completed
+//! within [`super::burn::LATE_GRACE_SECS`] are still counted.
 //!
 //! # Security: one query, naming `message` only
 //!

@@ -431,3 +431,53 @@ fn a_claude_insta_crash_mark_emits_exactly_one_reason_classified_point() {
     let wire = serde_json::to_string(point).unwrap();
     assert!(!wire.contains("secret") && !wire.contains("usage credits"), "{wire}");
 }
+
+/// #11286 item 3: a live native sweep's seat is marked while the run is still
+/// going — before any exit — and the exit-time ingest that then finds the
+/// same mark covering it emits no second `loom.pool.account_marks` point.
+/// The provider line is SYNTHETIC (no real Z.ai capture exists).
+#[test]
+fn a_live_native_sweep_is_marked_in_run_and_counted_once() {
+    use crate::api_keys_pool::{bad_marks, ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "live-seat", "LOOM_TEST_KEY_11286", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "model": "glm-5.3-flash",
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "live-seat",
+    });
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        75,
+        UNKNOWN_TOKEN_NAME,
+        &format!("{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n"),
+    );
+    registry.entries.get_mut(&sweep_id).unwrap().runtime = "opencode".into();
+    let marked = || {
+        bad_marks::is_bad_for_class(&pool, "loomtest", "live-seat", None, bad_marks::epoch_now())
+            .unwrap()
+    };
+
+    // Nothing yet: the run is healthy.
+    registry.watch_in_run_exhaustion(&sweep_id);
+    assert!(!marked());
+
+    // The provider says the plan is gone while the run is still live.
+    let log_path = registry.entries[&sweep_id].log_path.clone();
+    let mut body = std::fs::read_to_string(&log_path).unwrap();
+    body.push_str("Error: insufficient balance for this account\n");
+    std::fs::write(&log_path, body).unwrap();
+    let ((), live) = crate::observability::ops::capture::capture(|| {
+        registry.watch_in_run_exhaustion(&sweep_id);
+        registry.watch_in_run_exhaustion(&sweep_id);
+    });
+    assert!(marked(), "marked before the run exits");
+    assert_eq!(live.metrics.len(), 1, "{:?}", live.metrics);
+
+    let ((), exit) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    assert!(exit.metrics.is_empty(), "{:?}", exit.metrics);
+}
