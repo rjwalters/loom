@@ -36,6 +36,9 @@
 //!   any dispatch producer exists), and then on the workspace resync's own
 //!   task, right after each resync pass, so the timer never waits for it
 //!   either. It writes only with `fleet.autoApply` on.
+//! - **Roster clones** ([`roster_clone`], #11218): with `fleet.autoApply` on, a
+//!   timer pass clones a desired repo that is not cloned under `root` yet
+//!   (HTTPS, bounded per pass) and registers it in the same pass.
 //!
 //! # Invariants this module keeps
 //!
@@ -90,6 +93,7 @@ use crate::fleet_store::{self as store, StoreLocation};
 pub mod checkout_ff;
 mod floor_knowledge;
 pub mod offline_floor;
+pub mod roster_clone;
 pub mod workspace_resync;
 
 pub use floor_knowledge::{floor_knowledge, floor_wake, FloorKnowledge, FloorWake};
@@ -369,6 +373,9 @@ pub struct RosterPass {
     pub applied: usize,
     /// Desired repos that could not be applied (not cloned under `root`).
     pub unapplied: usize,
+    /// Missing clones this pass cloned or tried to (#11218).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clones: Vec<roster_clone::CloneAttempt>,
     /// Why the pass could not be completed, when it could not be.
     pub error: Option<String>,
     /// Why the roster was not consulted at all this pass — set when the
@@ -411,39 +418,16 @@ pub fn roster_pass(
 }
 
 /// Turn a [`Plan`] into a [`RosterPass`], applying it through `apply` when
-/// `auto_apply` is set. `apply` is a seam so tests never touch a real registry;
-/// production passes [`apply_change`].
+/// `auto_apply` is set, and never cloning: a missing clone is counted
+/// unapplied. `apply` is a seam so tests never touch a real registry;
+/// production passes [`apply_change`]. The timer clones through
+/// [`roster_clone::summarize`] instead (#11218).
 pub fn summarize_roster(
     plan: &Plan,
     auto_apply: bool,
     apply: &mut dyn FnMut(&Change) -> Result<()>,
 ) -> RosterPass {
-    let drift: Vec<String> = plan.changes.iter().map(roster::describe).collect();
-    let mut out = RosterPass {
-        drift,
-        ..RosterPass::default()
-    };
-    if !auto_apply {
-        return out;
-    }
-    for change in &plan.changes {
-        if matches!(change, Change::MissingClone { .. }) {
-            out.unapplied += 1;
-            continue;
-        }
-        match apply(change) {
-            Ok(()) => out.applied += 1,
-            Err(e) => {
-                out.unapplied += 1;
-                let detail = format!("{}: {e:#}", roster::describe(change));
-                out.error = Some(match out.error.take() {
-                    Some(prev) => format!("{prev}; {detail}"),
-                    None => detail,
-                });
-            }
-        }
-    }
-    out
+    roster_clone::summarize(plan, auto_apply, &roster_clone::Clones::off(), apply)
 }
 
 /// Apply one planned change to the machine-level workspace registry at
@@ -475,9 +459,8 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
         Change::SetMaintainOnly { path, to, .. } => registry
             .set_maintain_only(path, mode(*to), Utc::now())
             .unwrap_or(false),
-        // Never reachable: `summarize_roster` counts these as unapplied
-        // without calling here — a desired repo that is not cloned is
-        // reported, never cloned (the roster's own contract).
+        // Never reachable: a missing clone is counted unapplied, or cloned
+        // and then applied as an `Add` (`roster_clone`, #11218).
         Change::MissingClone { .. } => false,
     };
     if changed {
@@ -899,6 +882,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     for d in &s.roster.drift {
         lines.push(format!("  roster: DRIFT — {d}"));
     }
+    lines.extend(roster_clone::lines(&s.roster.clones));
     if s.roster.applied > 0 || s.roster.unapplied > 0 {
         lines.push(format!(
             "  roster: {} applied, {} unapplied",
@@ -995,6 +979,7 @@ struct PassInputs {
     cache: PathBuf,
     interval: Duration,
     auto_apply: bool,
+    clones: roster_clone::CloneConfig,
 }
 
 /// Run one complete pass (config tiers + roster) against the real forge. Pure
@@ -1039,7 +1024,9 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             ..ConfigPass::default()
         },
     };
-    let roster = roster_half(inputs, &transport, &config, mode, now);
+    // #11218: only a timer pass on a host free to dispatch clones.
+    let clone = pass == "timer" && enforced == Enforcement::Proceed;
+    let roster = roster_half(inputs, &transport, &config, (mode, clone), now);
     // #10711: the floor, from the snapshot the halves above just refreshed,
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
@@ -1087,7 +1074,7 @@ fn roster_half(
     inputs: &PassInputs,
     transport: &dyn Transport,
     config: &ConfigPass,
-    mode: Mode,
+    (mode, clone): (Mode, bool),
     now: DateTime<Utc>,
 ) -> RosterPass {
     if config.cached {
@@ -1143,10 +1130,16 @@ fn roster_half(
         &|p: &Path| p.join(".git").exists(),
         now,
     );
+    let clones = if clone {
+        roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones)
+    } else {
+        roster_clone::Clones::off()
+    };
+    let write = mode == Mode::Write && inputs.auto_apply;
     match plan {
-        Ok(plan) => summarize_roster(&plan, mode == Mode::Write && inputs.auto_apply, &mut |c| {
-            apply_change(&registry_path, c)
-        }),
+        Ok(plan) => {
+            roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c))
+        }
         Err(e) => RosterPass {
             error: Some(format!("{e:#}")),
             ..RosterPass::default()
@@ -1165,6 +1158,7 @@ fn report(status: &FleetSyncStatus, bus: Option<&crate::event_bus::EventBus>) {
     } else {
         log::debug!("fleet_sync: {summary}");
     }
+    roster_clone::announce(status, bus);
     let (Some(bus), true) = (bus, status.drifted() || status.errored()) else {
         return;
     };
@@ -1298,6 +1292,7 @@ pub async fn start(
         cache,
         interval: config.interval,
         auto_apply,
+        clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
     log::info!(
         "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",

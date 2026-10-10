@@ -1414,7 +1414,9 @@ answering the on-command verbs below.
 | `fleet.repo` | `LOOM_FLEET_REPO` | *(unset: feature off)* | The store, `OWNER/REPO`. Read from the daemon workspace's effective config (any tier) |
 | `fleet.ref` | `LOOM_FLEET_REF` | `main` | Branch, tag or commit to read |
 | `fleet.syncIntervalSecs` | `LOOM_FLEET_SYNC_INTERVAL_SECS` | `300` | Cadence of the daemon's own sync timer; clamped up to a `30`s floor |
-| `fleet.autoApply` | `LOOM_FLEET_AUTO_APPLY` | `false` | Let a **timer** pass write (render) and apply (roster) on its own. Off by default — `roster --apply` deregisters workspaces |
+| `fleet.autoApply` | `LOOM_FLEET_AUTO_APPLY` | `false` | Let a **timer** pass write (render) and apply (roster) on its own, cloning a desired repo that is not cloned yet ([Roster clones](#roster-clones-11218)). Off by default — `roster --apply` deregisters workspaces |
+| `fleet.cloneMaxPerPass` | `LOOM_FLEET_CLONE_MAX_PER_PASS` | `2` | Most missing clones one `autoApply` timer pass clones; the rest wait for the next pass. `0` never clones |
+| `fleet.cloneTimeoutSecs` | `LOOM_FLEET_CLONE_TIMEOUT_SECS` | `300` | Wall-clock cap on one clone (clamped up to `30`); a clone that hits it is killed, removed and retried next pass |
 | *(startup cap)* | `LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS` | `60` | Wall-clock cap on the startup pass, so a hanging forge cannot hold up boot. `0` waits indefinitely |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
 
@@ -1599,7 +1601,9 @@ through the same code paths as `loom-daemon workspace remove` / `hold` /
 `release` / `add` / `set-priority` (removes first, then mode changes; a
 maintain-only add is registered maintain-only in the same write), and only for
 repos already cloned under
-`root` — a missing clone is reported and exits `1`, and is never cloned here.
+`root` — a missing clone is reported and exits `1`, and is never cloned here
+(the daemon's `fleet.autoApply` timer pass clones it: [Roster
+clones](#roster-clones-11218)).
 
 **Fails closed.** The roster carries the fleet's firewall inputs, so it is
 read only from a snapshot the forge confirmed current in the same invocation
@@ -1695,7 +1699,8 @@ runs the same reader the verbs above use, twice over:
   published on the event bus as `fleet.sync.drift`, and recorded for
   `loom-daemon status` — and **nothing is written**, unless `fleet.autoApply` is
   on, in which case a timer pass renders and applies exactly as `render` /
-  `roster --apply` would. `autoApply` is ignored (with a warning) on a repo that
+  `roster --apply` would, and also clones a desired repo that is not cloned
+  yet ([Roster clones](#roster-clones-11218)). `autoApply` is ignored (with a warning) on a repo that
   sets `daemon.delegatedTo`.
 
 Three properties are preserved deliberately:
@@ -1720,6 +1725,47 @@ drift, roster drift, and whether anything was written), and `status --json`
 carries the same record under `fleet_store`. Both are read host-locally from
 `~/.loom/fleet-sync-status.json`, so they still answer when the daemon does not
 — including when the startup pass itself is what went wrong.
+
+### Roster clones (#11218)
+
+Admitting a repo is a fleet-store merge and nothing else. A timer pass with
+`fleet.autoApply` on **clones** a desired repo that has no clone under `root`
+yet, then registers it in the same pass, exactly as an existing clone is
+registered (its `fleet_priority`, `fleet: maintain`, `add_and_trust`; nothing
+is written into the working tree). Without `autoApply` the missing clone is
+only reported, as before.
+
+- **Only from a fail-closed roster.** The clone acts on the plan the
+  fail-closed roster read just built, so an unconfirmable snapshot, a
+  `firewall: true` record or a both-flags roster never reaches it.
+- **HTTPS, with this daemon's forge credential.** The record's `remote` names
+  the repo (`git@github.com:o/n.git`, `ssh://git@github.com/o/n.git` or
+  `https://github.com/o/n(.git)`); the clone always uses
+  `https://github.com/o/n.git`, never SSH. Git runs as every other daemon git
+  network call does: no prompt, the host's credential helper, and, for an owner
+  with its own per-owner credential, that owner's `GH_CONFIG_DIR`. A record
+  with no `remote`, or one that is not a github.com repo, is reported
+  (`clone REFUSED`) and never guessed at.
+- **Never over something.** A path that exists and is not an empty directory
+  is refused and left untouched. The clone is made in a hidden sibling
+  (`.<dir>.loom-clone`) and renamed into place only when complete, so a
+  failed or killed clone never leaves a half-repo the next pass would
+  register; the sibling is removed on failure. A volume below the
+  `diskWarnFreeGb` floor skips the clone.
+- **Bounded.** At most `fleet.cloneMaxPerPass` clones per pass, each capped
+  at `fleet.cloneTimeoutSecs`; the rest are `deferred`. A failure is recorded
+  and retried on the next pass, never a crash and never a roster error. The
+  startup pass never clones (boot does not wait on a transfer), and neither
+  does a pass whose run state is `paused` or `stopped`. A clone runs on the
+  timer's own pass, so a slow one delays the next tick by at most
+  `cloneMaxPerPass × cloneTimeoutSecs`.
+- **Visible.** Each attempt is a `roster: CLONED …` / `clone FAILED …` /
+  `clone REFUSED …` / `clone deferred …` line on the `Fleet store:` status
+  block, a `roster.clones[]` entry (`name`, `repo`, `path`, `outcome`,
+  `durationMs`, `registered`, `detail`) in `fleet-sync-status.json`, a daemon
+  log line, and an event on the bus topic `fleet_sync.clone` (`host`, `repo`,
+  `name`, `dir`, `outcome`, `durationMs`, `registered`, `detail`, with no
+  absolute path).
 
 ### Run-state enforcement (#9598)
 
