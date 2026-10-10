@@ -119,8 +119,8 @@ pub(crate) enum RenewerAction {
         key: KeyArgs,
     },
     /// Stop a renewer safely (#11086): `stop <PID>` signals the pid only if it
-    /// is provably a lease renewer (its command line is `sweep-lease-renew.sh
-    /// start ...` or `loom-daemon lease renewer ...`, with a start identity
+    /// is provably a lease renewer (its command line is `<bash|sh|zsh|dash>
+    /// sweep-lease-renew.sh start ...` or `loom-daemon lease renewer ...`, with a start identity
     /// that did not change while it was checked); `stop --issue N` ends every
     /// recorded renewer of issue N in this repo (any sweep unless `--sweep-id`
     /// is given) and never a peer issue's. Anything else is refused (exit 1)
@@ -399,23 +399,41 @@ pub(crate) fn end_owners(
     Ok(n)
 }
 
+/// The basename of a path-like argv element.
+fn argv_base(a: &str) -> &str {
+    a.rsplit('/').next().unwrap_or(a)
+}
+
 /// Is this argv a lease renewer this tooling started? Either
-/// `<shell> .../sweep-lease-renew.sh start ...` (the detached loop is a
-/// subshell of that script, so it shares its argv) or
-/// `.../loom-daemon lease renewer ...`.
+/// `<shell> [-flags] .../sweep-lease-renew.sh start ...` (the detached loop is
+/// a subshell of that `#!/usr/bin/env bash` script, so it shares its argv) or
+/// `.../loom-daemon lease renewer ...`. The program must be a shell
+/// (bash/sh/zsh/dash by basename) running the script FILE: any other program
+/// (an editor, another interpreter) and command-string / stdin forms (`-c`,
+/// `-s`) or option clusters that may consume the script path as their own
+/// argument (`-o`, `-O`, any `--long` option) are refused (#11086).
 pub(crate) fn is_renewer_argv(argv: &[String]) -> bool {
-    let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
-    // The script follows the interpreter, optionally after option flags only.
-    let script_start = argv
-        .iter()
-        .skip(1)
-        .position(|a| !a.starts_with('-'))
-        .map(|i| i + 1)
-        .is_some_and(|i| {
-            base(&argv[i]) == "sweep-lease-renew.sh"
-                && argv.get(i + 1).is_some_and(|a| a == "start")
+    let is_shell = argv
+        .first()
+        .is_some_and(|a| matches!(argv_base(a), "bash" | "sh" | "zsh" | "dash"));
+    let script_start = is_shell && {
+        let rest = argv.get(1..).unwrap_or_default();
+        let first = rest.iter().position(|a| !a.starts_with('-'));
+        // Only plain short-flag clusters may precede the script.
+        let flags_ok = rest[..first.unwrap_or(rest.len())].iter().all(|f| {
+            f.len() > 1
+                && !f.starts_with("--")
+                && f[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() && !"csoO".contains(c))
         });
-    let daemon = argv.first().is_some_and(|a| base(a) == "loom-daemon")
+        flags_ok
+            && first.is_some_and(|i| {
+                argv_base(&rest[i]) == "sweep-lease-renew.sh"
+                    && rest.get(i + 1).is_some_and(|a| a == "start")
+            })
+    };
+    let daemon = argv.first().is_some_and(|a| argv_base(a) == "loom-daemon")
         && argv.get(1).is_some_and(|a| a == "lease")
         && argv.get(2).is_some_and(|a| a == "renewer");
     script_start || daemon
@@ -476,9 +494,11 @@ pub(crate) fn stop_pid(
         return StopOutcome::Refused(format!("cannot read the command line of pid {pid}"));
     };
     if !is_renewer_argv(&argv) {
+        // Name only the program's basename: the full argv of an unrelated
+        // process may carry credentials and must not reach logs (#11086).
+        let program = argv.first().map_or("?", |a| argv_base(a));
         return StopOutcome::Refused(format!(
-            "pid {pid} is not a lease renewer (command: {}); for an issue number use `stop --issue N`",
-            argv.join(" ")
+            "pid {pid} is not a lease renewer (program: {program}); for an issue number use `stop --issue N`"
         ));
     }
     if ident_of(pid).as_deref() != Some(before.as_str()) {
