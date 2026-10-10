@@ -2002,8 +2002,7 @@ unrepresentable on **both** out-paths, not just on `relay`.
 
 ### `dispatch` is gated here even though it is not gated at the daemon
 
-3a leaves `dispatch` un-nonced on purpose (see
-[Why `dispatch` is not nonce-gated](#why-dispatch-is-not-nonce-gated-decision-8021)):
+3a leaves `dispatch` un-nonced on purpose (decision #8021):
 gating the routine verb trains a reflexive `confirm` that ruins the gate on the
 dangerous one. **That reasoning is about a human typing `dispatch 42`
 deliberately.** The concierge turns a probabilistic read of prose into the same
