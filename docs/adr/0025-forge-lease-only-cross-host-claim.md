@@ -32,9 +32,16 @@ cross-host signal that went through it:
      `sweep_registry/quarantine.rs` has no publish or consume path. It was
      deferred and nothing was built.
 
-The one property that must survive is correctness: **two hosts on a shared
-backlog never build the same issue at once.** The cooldowns are optimisations
-on top of that property. They do not provide it.
+The property #11112 asks for is **two hosts on a shared backlog never build
+the same issue at once.** The cooldowns are optimisations on top of whatever
+exclusion the claim provides. They do not provide it. The peer-claim channel
+did not provide it either: it was a soft advisory read before the label flip,
+and it never took part in the lease tie-break below. So removing it neither
+weakens nor strengthens that tie-break.
+
+This ADR does **not** claim that #11112's unconditional criterion is fully
+enforced. It records the narrower property the forge lease does give and the
+fail-open cases where it does not (see "Retained fail-open limitation").
 
 ## Decision
 
@@ -42,13 +49,21 @@ on top of that property. They do not provide it.
    `<!-- loom:lease host=… sweep=… -->` (`lease ensure`, `write_lease_comment`)
    and then runs the claim-then-verify-order tie-break
    (`SweepRegistry::resolve_lease_order`, #6287, with #6816/#6951/#6994
-   retries and the #9453 leaseless-label leg). The earliest lease in the
-   forge's id order wins. Every other dispatcher yields before it spawns a
-   builder or touches a worktree. No side channel is consulted.
-   `loom-daemon/src/sweep_registry/lease_cross_host_tests.rs` pins this. It
-   runs two registries under two `LOOM_HOST_ID`s with no shared local state and
-   no peer-claim publisher. Given one shared forge lease list, exactly one host
-   proceeds, and flipping the forge order flips the winner.
+   retries and the #9453 leaseless-label leg). No side channel is consulted.
+   **When a dispatcher can read the forge and sees both its own lease and an
+   earlier peer lease inside its bounded read-back and confirmation window**
+   (a few retries of 300 ms and 500 ms, about 2 s in total), it yields before
+   it spawns a builder or touches a worktree. The earliest lease in the
+   forge's id order wins.
+   `loom-daemon/src/sweep_registry/lease_cross_host_tests.rs` pins both what
+   this gives and what it does not. It runs two registries under two
+   `LOOM_HOST_ID`s with no shared local state and no peer-claim publisher.
+   With both leases visible, exactly one host proceeds and flipping the forge
+   order flips the winner. A dispatch-level case runs the two hosts one after
+   the other on one shared forge comment list and shows only the first-leased
+   host reaching builder spawn. That is the visible case. It is not a test of
+   concurrent publication. The same file
+   also asserts the fail-open cases below, where both hosts proceed.
 2. **No-op cooldown (#7477): per-host only.** The cooldown broadcast is
    removed with the peer-claim code in a later slice of #11112. Each host keeps
    its own local cooldown. No forge marker replaces the broadcast.
@@ -73,12 +88,49 @@ on top of that property. They do not provide it.
 
 - **Up to N× dilution of the no-op cooldown.** On an N-host fleet, a no-op
   candidate can be dispatched up to N times per cooldown window: each host
-  tries once and then arms its own cooldown. This costs extra work, not
-  correctness, because the lease still makes each of those dispatches
-  exclusive. No-op releases are rare and the cost limits itself.
+  tries once and then arms its own cooldown. Each of those dispatches goes
+  through the same lease tie-break, so they are exclusive under the
+  visibility assumptions in Decision 1 and subject to the same fail-open
+  limitation below. No-op releases are rare and the cost limits itself.
 - A host learns about a peer's claim only from the forge, so it pays one lease
   read-back per dispatch. That read already happens today. The peer view only
   ever added an early back-off on top of it.
+
+### Retained fail-open limitation
+
+`resolve_lease_order` only adds a refusal when it has positive evidence of an
+earlier peer lease. It never makes one up from a read it cannot verify. This
+ADR keeps that policy as it is. As a result, **two hosts can both proceed**
+in these cases, and the tests above assert that they do:
+
+- **Exhausted read-back.** Every lease read fails (rate limit, outage) for
+  the whole retry budget. The dispatcher proceeds (`guards.rs`, the
+  `read_lease_comments` → `None` branch). Pinned by
+  `exhausted_read_back_lets_both_hosts_proceed` and
+  `resolve_lease_order_proceeds_when_the_read_fails`.
+- **Own lease not visible.** The dispatcher never sees its own lease within
+  the retry budget, because its write failed or did not propagate. It
+  proceeds. Pinned by `own_lease_never_visible_lets_both_hosts_proceed` and
+  `resolve_lease_order_proceeds_when_its_own_comment_is_not_found`.
+- **Peer invisible past the window.** The confirmation window is bounded. If
+  a peer's earlier lease is still invisible to a host when that host's
+  window closes, the host proceeds. The peer later sees both leases, finds
+  itself earliest, and proceeds too. Pinned by
+  `staggered_visibility_both_proceed_inside_the_invisible_window` and
+  `dispatch_with_a_peer_lease_never_visible_spawns_on_both_hosts`.
+
+So the forge lease alone gives exclusion **only when each dispatcher can read
+the forge and sees the competing lease inside its window**. It does not give
+unconditional exclusion. Removing the Matrix peer-claim channel does not
+change this, because that channel was never part of the tie-break. Fixing the
+limitation would mean changing the fail-open policy (for example, failing
+closed or re-checking later in the lifecycle). That trades the residual race
+for a risk of wedging dispatch, so it needs its own decision and is out of
+scope here.
+
+**Status of #11112's "never build at once" criterion:** still open. This
+increment verifies only the narrower property above. It does not enforce the
+unconditional criterion.
 
 ## Alternatives Considered
 
