@@ -77,6 +77,7 @@ mod merge_pr_checks_failure;
 mod merge_pr_ci_result;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;
+mod merge_pr_closed_by_merge;
 mod merge_pr_consolidate;
 mod merge_pr_delete_branch;
 mod merge_pr_dirty_guard;
