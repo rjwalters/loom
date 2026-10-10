@@ -189,6 +189,8 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
 
 /// [`loom_daemon::doctor_handback::Forge`] over REST (`gh api`, uncached).
 struct GhHandback<'a> {
+    repo: String,
+    pr: u64,
     labels: String,
     pull: String,
     root: &'a Path,
@@ -213,6 +215,15 @@ impl loom_daemon::doctor_handback::Forge for GhHandback<'_> {
         loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], self.root, false)
             .ok_output()
             .is_some()
+    }
+    fn rejected_at(&mut self, head: &str) -> Option<bool> {
+        let comments = loom_daemon::comment_trust::records::fetch_trusted_comments(
+            &self.repo,
+            &self.pr.to_string(),
+            self.root,
+            false,
+        )?;
+        Some(gate::count_markers(&comments, head, VerdictKind::ChangesRequested) > 0)
     }
 }
 
@@ -240,6 +251,8 @@ pub(crate) fn doctor_handback(pr: u64, repo: Option<&str>, expected_head: &str) 
         .unwrap_or(90);
     let outcome = if acquire_lock(&lock, std::time::Duration::from_secs(wait)) {
         let mut forge = GhHandback {
+            repo: repo.clone(),
+            pr,
             labels: format!("repos/{repo}/issues/{pr}/labels"),
             pull: format!("repos/{repo}/pulls/{pr}"),
             root: &root,

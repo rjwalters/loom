@@ -21,6 +21,10 @@ struct Fake {
     fail_remove: Vec<&'static str>,
     after_add: Vec<&'static str>,
     after_add_remove: Vec<&'static str>,
+    /// `(removed, lands)`: a rival's label lands right after `removed` is deleted.
+    after_remove: Vec<(&'static str, &'static str)>,
+    /// What `rejected_at` answers: a trusted changes-requested marker at the head.
+    rejected: Option<bool>,
     reads: usize,
     reads_fail_from: Option<usize>,
     calls: Vec<String>,
@@ -31,6 +35,7 @@ impl Fake {
         Self {
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
             head: head.to_string(),
+            rejected: Some(false),
             ..Self::default()
         }
     }
@@ -42,7 +47,7 @@ impl Fake {
     fn writes(&self) -> Vec<&str> {
         self.calls
             .iter()
-            .filter(|c| c.as_str() != "read")
+            .filter(|c| c.as_str() != "read" && c.as_str() != "rejected_at")
             .map(String::as_str)
             .collect()
     }
@@ -84,7 +89,16 @@ impl Forge for Fake {
             return false;
         }
         self.labels.retain(|l| l != label);
+        for (_, lands) in self.after_remove.iter().filter(|(r, _)| *r == label) {
+            if !self.labels.iter().any(|x| x == lands) {
+                self.labels.push((*lands).to_string());
+            }
+        }
         true
+    }
+    fn rejected_at(&mut self, _head: &str) -> Option<bool> {
+        self.calls.push("rejected_at".into());
+        self.rejected
     }
 }
 
@@ -342,4 +356,41 @@ fn a_race_that_leaves_the_claim_on_is_a_failure_not_a_race() {
     // The own add is still withdrawn, so the verdict label stands alone.
     assert!(!f.labels.iter().any(|l| l == QUEUE), "{:?}", f.labels);
     assert_eq!(out.render().1, EXIT_FAILED);
+}
+
+/// The normal feedback path starts with CHANGES + CLAIM. A Judge that rejected
+/// the pushed head meanwhile left CHANGES on: it is the new rejection, so the
+/// hand-back must keep it and report a race, not delete it and report failure.
+#[test]
+fn a_new_rejection_during_a_hand_back_that_starts_with_changes_is_kept() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected = Some(true);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]), "rejection kept, claim and own add gone");
+    assert!(!f.writes().contains(&format!("remove {CHANGES}").as_str()));
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+/// The Judge's rejection lands just after the hand-back deleted the old
+/// CHANGES: the survivor is a raced verdict, not a failed transition.
+#[test]
+fn a_rejection_landing_right_after_the_changes_removal_is_a_race() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.after_remove = vec![(CHANGES, CHANGES)];
+    f.after_add_remove = vec![];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]));
+}
+
+/// Verdict evidence that cannot be read must not be guessed: nothing but the
+/// own add is touched, and that is withdrawn.
+#[test]
+fn unreadable_verdict_evidence_leaves_changes_and_claim_alone() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected = None;
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(&out, Outcome::Failed(why) if why.contains("withdrew own")), "{out:?}");
+    assert_eq!(f.sorted(), names(&[CHANGES, CLAIM]));
 }
