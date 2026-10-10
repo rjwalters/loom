@@ -1,6 +1,7 @@
 //! `loom-daemon forge verdict-gate | verdict-labels` (#10581): the I/O half of
 //! [`loom_daemon::verdict_gate`], called by `post-verdict.sh` before and after
-//! it posts a verdict comment. Reads and writes go through REST (`gh api`),
+//! it posts a verdict comment. Also `forge doctor-handback` (#9388), the I/O
+//! half of [`loom_daemon::doctor_handback`]. Reads and writes go through REST (`gh api`),
 //! never GraphQL, so they survive an exhausted GraphQL pool.
 
 use std::path::Path;
@@ -184,6 +185,76 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str) -> Result<()> {
         gate::repair_command(pr, repo, kind)
     );
     std::process::exit(1)
+}
+
+/// [`loom_daemon::doctor_handback::Forge`] over REST (`gh api`, uncached).
+struct GhHandback<'a> {
+    labels: String,
+    pull: String,
+    root: &'a Path,
+}
+
+impl loom_daemon::doctor_handback::Forge for GhHandback<'_> {
+    fn read(&mut self) -> Option<loom_daemon::doctor_handback::Snapshot> {
+        // One `pulls/{n}` read carries both labels and head, so they agree.
+        let out = loom_daemon::script_helpers::run_gh(&["api", &self.pull], self.root, false);
+        let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
+        loom_daemon::doctor_handback::snapshot_from_pull(&doc)
+    }
+    fn add(&mut self, label: &str) -> bool {
+        let field = format!("labels[]={label}");
+        let argv = ["api", "-X", "POST", &self.labels, "-f", &field];
+        loom_daemon::script_helpers::run_gh(&argv, self.root, false)
+            .ok_output()
+            .is_some()
+    }
+    fn remove(&mut self, label: &str) -> bool {
+        let path = format!("{}/{}", self.labels, label.replace(':', "%3A"));
+        loom_daemon::script_helpers::run_gh(&["api", "-X", "DELETE", &path], self.root, false)
+            .ok_output()
+            .is_some()
+    }
+}
+
+/// `forge doctor-handback` (#9388). Held under the per-PR verdict lock so a
+/// same-host `post-verdict.sh` cannot interleave; the re-read covers other hosts.
+pub(crate) fn doctor_handback(pr: u64, repo: Option<&str>, expected_head: &str) -> Result<()> {
+    use loom_daemon::doctor_handback as hb;
+    if expected_head.trim().is_empty() {
+        eprintln!("forge doctor-handback: --expected-head-sha must be the SHA you pushed");
+        std::process::exit(2)
+    }
+    let cwd = std::env::current_dir()?;
+    let repo = match loom_daemon::write_scope::may_write_from(&cwd, repo) {
+        loom_daemon::write_scope::Verdict::Allow(nwo) => nwo,
+        loom_daemon::write_scope::Verdict::Deny(why) => {
+            println!("{} FAILED may not write: {why}", hb::SENTINEL);
+            std::process::exit(hb::EXIT_FAILED)
+        }
+    };
+    let root = super::forge_identity_cmd::workspace();
+    let lock = lock_path(pr, &repo);
+    let wait = std::env::var("LOOM_VERDICT_LOCK_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+    let outcome = if acquire_lock(&lock, std::time::Duration::from_secs(wait)) {
+        let mut forge = GhHandback {
+            labels: format!("repos/{repo}/issues/{pr}/labels"),
+            pull: format!("repos/{repo}/pulls/{pr}"),
+            root: &root,
+        };
+        let outcome = hb::run(&mut forge, expected_head);
+        let _ = std::fs::remove_dir(&lock);
+        outcome
+    } else {
+        hb::Outcome::Failed(format!(
+            "a verdict on PR #{pr} held the lock for {wait}s; wrote nothing, retry"
+        ))
+    };
+    let (line, code) = outcome.render();
+    println!("{line}");
+    std::process::exit(code)
 }
 
 /// The lock directory for one PR (`owner/name` flattened, so it is one path
