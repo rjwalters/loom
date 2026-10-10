@@ -29,6 +29,10 @@ use crate::tokens_pool::codex_reset::exhaustion_reset_horizon;
 struct InRunWatch {
     watch: crate::api_keys_pool::live_watch::LiveWatch,
     mark: Option<crate::api_keys_pool::BadMark>,
+    /// When the watcher first acted on the exhaustion evidence — the instant
+    /// its horizon was anchored on, reused at exit so the same evidence
+    /// resolves the same deadline (#11286).
+    evidence_at: Option<u64>,
 }
 
 /// Per-sweep in-run watchers, keyed by sweep id. Process-global rather than a
@@ -38,13 +42,14 @@ struct InRunWatch {
 static IN_RUN_WATCHES: std::sync::Mutex<std::collections::BTreeMap<String, InRunWatch>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Drop `sweep_id`'s in-run watcher, returning the mark it wrote (if any).
-fn forget_in_run_watch(sweep_id: &str) -> Option<crate::api_keys_pool::BadMark> {
+/// Drop `sweep_id`'s in-run watcher, returning the mark it wrote (if any)
+/// and the instant its horizon was anchored on.
+fn forget_in_run_watch(sweep_id: &str) -> (Option<crate::api_keys_pool::BadMark>, Option<u64>) {
     IN_RUN_WATCHES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(sweep_id)
-        .and_then(|entry| entry.mark)
+        .map_or((None, None), |entry| (entry.mark, entry.evidence_at))
 }
 
 impl SweepRegistry {
@@ -133,17 +138,23 @@ impl SweepRegistry {
     ) {
         // #11286: the in-run watcher's mark (if any) for this sweep, so the
         // exit-time ingest that finds it already covering the seat is not
-        // counted as a second `loom.pool.account_marks` point.
-        let live_mark = forget_in_run_watch(sweep_id);
-        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at(
+        // counted as a second `loom.pool.account_marks` point. The exit pass
+        // anchors its horizon on the watcher's instant, so re-reading the
+        // same evidence resolves the deadline already written instead of
+        // `exit time + window` (which would extend the hold and re-count).
+        let (live_mark, evidence_at) = forget_in_run_watch(sweep_id);
+        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at_since(
             &self.config.workspace_root,
             log_path,
             &format!("sweep_id={sweep_id}"),
             exit_code,
+            evidence_at,
         ) else {
             return;
         };
-        if live_mark.is_none() || feedback.mark != live_mark {
+        // `record_api_key` counts only a `Some` mark, so an exit that finds
+        // the hold lapsed (`mark: None`) is not counted either.
+        if feedback.mark != live_mark {
             crate::observability::ops::pool_marks::record_api_key(&feedback);
         }
         log::warn!("sweep_registry: {sweep_id} {}", feedback.detail);
@@ -181,6 +192,7 @@ impl SweepRegistry {
                         "sweep_id={sweep_id}"
                     )),
                     mark: None,
+                    evidence_at: None,
                 })
                 .watch
                 .poll(&info.log_path)
@@ -188,12 +200,14 @@ impl SweepRegistry {
         let Some(decided) = decided else {
             return;
         };
-        let Some(feedback) = crate::api_keys_pool::ingest::apply_mark(
+        let evidence_at = crate::api_keys_pool::bad_marks::epoch_now();
+        let Some(feedback) = crate::api_keys_pool::ingest::apply_mark_at(
             &self.config.workspace_root,
             decided.record,
             decided.classification,
             &decided.provider_text,
             "the live launch log",
+            evidence_at,
         ) else {
             return;
         };
@@ -205,6 +219,7 @@ impl SweepRegistry {
             .get_mut(sweep_id.as_str())
         {
             entry.mark = feedback.mark;
+            entry.evidence_at = Some(evidence_at);
         }
     }
 
