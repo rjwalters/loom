@@ -535,3 +535,42 @@ fn glob_rules() {
     assert!(!glob_match("*", ".ssh"), "a wildcard never matches a leading dot");
     assert!(!glob_match(".bash*", ".ssh"));
 }
+
+// ---------------------------------------------------------------------------
+// Wrapper options and ANSI-C quoting must not hide the executable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn time_options_do_not_hide_the_executable() {
+    for cmd in [
+        "time -p ssh example.invalid",
+        "time -o /tmp/t -f %e ssh example.invalid",
+        "time -- ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("time -p aws sts get-caller-identity", "cloud-cli"));
+    assert_clean("time -p ls");
+}
+
+#[test]
+fn sudo_long_options_consume_their_values() {
+    for cmd in [
+        "sudo --user root aws sts get-caller-identity",
+        "sudo --group wheel --user root aws sts get-caller-identity",
+        "sudo --chdir /tmp ssh example.invalid",
+        "sudo --user=root aws sts get-caller-identity",
+    ] {
+        assert!(!caps(cmd).is_empty(), "{cmd}");
+    }
+    assert_clean("sudo --user root ls");
+}
+
+#[test]
+fn ansi_c_escapes_are_decoded_before_matching() {
+    assert!(hits_cap(r"$'\x73sh' example.invalid", "remote-shell"));
+    assert!(hits_cap(r"$'\163sh' example.invalid", "remote-shell"));
+    assert!(hits_cap(r"$'\141ws' sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap(r"$'ssh' example.invalid", "remote-shell"));
+    assert_clean(r"echo $'a\tb'");
+}

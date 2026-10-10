@@ -277,12 +277,13 @@ fn lex(input: &str) -> Lexed {
                 continue;
             }
             '$' if next == Some('\'') => {
-                // ANSI-C quoting: kept literally, escapes undecoded.
+                // ANSI-C quoting: escapes are decoded so `$'\x73sh'` matches `ssh`.
                 i += 2;
                 while i < c.len() && c[i] != '\'' {
                     if c[i] == '\\' && i + 1 < c.len() {
-                        cur.push(c[i + 1]);
-                        i += 2;
+                        let (decoded, used) = decode_ansi_c_escape(&c[i + 1..]);
+                        cur.push_str(&decoded);
+                        i += 1 + used;
                         continue;
                     }
                     cur.push(c[i]);
@@ -565,6 +566,56 @@ fn short_cluster_flags(word: &str) -> (Option<bool>, bool) {
     (None, false)
 }
 
+/// Decode one backslash escape of `$'...'` (the text after the backslash).
+/// Returns the decoded text and how many chars were consumed. Escapes that
+/// decode to NUL or to an invalid scalar yield nothing, as bash truncates
+/// at NUL; unknown escapes keep the escaped char.
+fn decode_ansi_c_escape(rest: &[char]) -> (String, usize) {
+    let radix_run = |radix: u32, max: usize, skip: usize| {
+        let digits: String = rest[skip..]
+            .iter()
+            .take(max)
+            .take_while(|ch| ch.is_digit(radix))
+            .collect();
+        let value = u32::from_str_radix(&digits, radix).ok();
+        (value, digits.len())
+    };
+    let simple = |ch: char| -> Option<char> {
+        Some(match ch {
+            'a' => '\x07',
+            'b' => '\x08',
+            'e' | 'E' => '\x1b',
+            'f' => '\x0c',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\x0b',
+            _ => return None,
+        })
+    };
+    let first = rest[0];
+    if let Some(ch) = simple(first) {
+        return (ch.to_string(), 1);
+    }
+    let (value, used) = match first {
+        'x' => radix_run(16, 2, 1),
+        'u' => radix_run(16, 4, 1),
+        'U' => radix_run(16, 8, 1),
+        '0'..='7' => radix_run(8, 3, 0),
+        _ => return (first.to_string(), 1),
+    };
+    let consumed = if first.is_digit(8) { used } else { 1 + used };
+    if used == 0 {
+        return (first.to_string(), 1);
+    }
+    let decoded = value
+        .filter(|v| *v != 0)
+        .and_then(char::from_u32)
+        .map(String::from)
+        .unwrap_or_default();
+    (decoded, consumed)
+}
+
 fn seg_runs_shell(seg: &[Word]) -> bool {
     seg.iter()
         .find(|w| w.kind == WordKind::Plain && !is_assignment(&w.text))
@@ -610,7 +661,12 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
     }
     let mut i = 0;
     while i < argv.len() && (is_assignment(&argv[i]) || KEYWORDS.contains(&argv[i].as_str())) {
+        let is_time = argv[i] == "time";
         i += 1;
+        if is_time {
+            // `time -p cmd` / `time -o file -f fmt cmd`: skip time's own options.
+            i += skip_options(&argv[i..], &["-o", "-f", "--output", "--format"]);
+        }
     }
     let Some(word) = argv.get(i) else { return };
     let prog = basename(word);
@@ -622,7 +678,34 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
     };
 
     if PLAIN_WRAPPERS.contains(&prog) {
-        let j = skip_options(rest, &["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-a"]);
+        let j = skip_options(
+            rest,
+            &[
+                "-u",
+                "-g",
+                "-C",
+                "-D",
+                "-h",
+                "-p",
+                "-r",
+                "-t",
+                "-U",
+                "-a",
+                "--user",
+                "--group",
+                "--chdir",
+                "--chroot",
+                "--host",
+                "--prompt",
+                "--role",
+                "--type",
+                "--close-from",
+                "--other-user",
+                "--command-timeout",
+                "--login-class",
+                "--auth-type",
+            ],
+        );
         recurse(j, hits);
         return;
     }

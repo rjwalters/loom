@@ -196,6 +196,11 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("screen ssh h", "remote-shell"),
     ("git -c core.sshCommand='ssh -i k' fetch", "remote-shell"),
     ("GIT_SSH_COMMAND='ssh -i k' git fetch", "remote-shell"),
+    // Round 4: wrapper options and ANSI-C quoting must not hide the executable.
+    ("time -p ssh example.invalid", "remote-shell"),
+    ("sudo --user root aws sts get-caller-identity", "cloud-cli"),
+    (r"$'\x73sh' example.invalid", "remote-shell"),
+    (r"$'\141ws' sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]
