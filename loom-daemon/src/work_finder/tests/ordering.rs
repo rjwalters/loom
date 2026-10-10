@@ -83,35 +83,22 @@ fn starred_in_a_priority_100_repo_beats_unstarred_in_a_priority_0_repo() {
 }
 
 #[test]
-fn two_starred_issues_order_by_starred_at_not_age() {
-    // #9244 key 2: #1 is older but was starred LATER than #2. (A live
-    // overflow sweep keeps the second starred issue from going over the cap.)
+fn two_starred_issues_order_by_age_not_starred_at() {
+    // #11103 removed the starred-at key: two issues at the same level order
+    // oldest `createdAt` first. #1 is older but was starred LATER than #2.
+    // (A live overflow sweep keeps the second starred issue from going over
+    // the cap.)
     let mut multi = vec![(
         FakeSource::once(vec![
-            starred_at(1, "2020-01-01T00:00:00Z", Some("2026-09-02T00:00:00Z")),
             starred_at(2, "2026-01-01T00:00:00Z", Some("2026-09-01T00:00:00Z")),
+            starred_at(1, "2020-01-01T00:00:00Z", Some("2026-09-02T00:00:00Z")),
+            starred_at(3, "2019-08-01T00:00:00Z", None),
         ]),
         no_overflow(),
     )];
     let report = tick_multi(&mut multi, &[100], 1, &[false]);
     assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![2], "starred first lands first");
-}
-
-#[test]
-fn a_missing_starred_at_falls_back_to_created_at() {
-    // #9244 key 2 fallback: #3 has no starred-at, so it orders by its
-    // createdAt (2026-08-01), which is earlier than #4's starred-at.
-    let mut multi = vec![(
-        FakeSource::once(vec![
-            starred_at(4, "2020-01-01T00:00:00Z", Some("2026-09-01T00:00:00Z")),
-            starred_at(3, "2026-08-01T00:00:00Z", None),
-        ]),
-        no_overflow(),
-    )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(multi[0].1.dispatched, vec![3]);
+    assert_eq!(multi[0].1.dispatched, vec![3], "the oldest lands first");
 }
 
 #[test]
@@ -163,10 +150,10 @@ fn test_tick_multi_missing_priority_entry_defaults() {
 }
 
 #[test]
-fn single_workspace_tick_moves_starred_first_and_keeps_listing_order_otherwise() {
-    // The single-workspace tick sorts by the lane keys only: the starred
-    // issue jumps the queue, and the unstarred ones keep their listing order
-    // (newest-first here) exactly as before #9244.
+fn single_workspace_tick_moves_starred_first_then_oldest_first() {
+    // #11103: the single-workspace tick uses the in-workspace order — level
+    // (the star bridges to `important`), oldest `createdAt`, number — not the
+    // listing order (newest-first here).
     let mut source = FakeSource::once(vec![
         issue_at(3, "2026-03-01T00:00:00Z"),
         issue_at(1, "2026-01-01T00:00:00Z"),
@@ -176,13 +163,13 @@ fn single_workspace_tick_moves_starred_first_and_keeps_listing_order_otherwise()
     let mut dispatcher = RecordingDispatcher::default();
     let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
     assert_eq!(report.dispatched, 4);
-    assert_eq!(dispatcher.dispatched, vec![9, 3, 1, 2]);
+    assert_eq!(dispatcher.dispatched, vec![9, 1, 2, 3]);
 
-    // Nothing starred: byte-for-byte the listing order.
+    // Nothing starred and no `createdAt`: issue number ascending.
     let mut source = FakeSource::once(vec![issue(5), issue(4), issue(6)]);
     let mut dispatcher = RecordingDispatcher::default();
     tick(&mut source, &mut dispatcher, 10, false).unwrap();
-    assert_eq!(dispatcher.dispatched, vec![5, 4, 6]);
+    assert_eq!(dispatcher.dispatched, vec![4, 5, 6]);
 }
 
 #[test]

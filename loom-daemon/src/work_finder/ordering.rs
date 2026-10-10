@@ -42,6 +42,10 @@ pub struct PriorityCandidate {
     pub created_at: Option<String>,
     /// The issue number (dispatch target + final deterministic tiebreak).
     pub number: u32,
+    /// The issue's priority level (#11103), which the multi-workspace tick's
+    /// workspace draw and in-workspace order use
+    /// ([`super::workspace_draw`]). Not one of [`candidate_cmp`]'s keys.
+    pub level: crate::priority_pick::Level,
     /// The issue's `<!-- loom:complexity=<tier> -->` stratum (#4827), carried
     /// from its work item so pass 2's `dispatch()` can stratify the
     /// model-cost A/B arm assignment without re-fetching the body. Not part of
@@ -62,8 +66,11 @@ pub struct PriorityCandidate {
 /// 5. `createdAt` oldest first (a dated issue sorts before an undated one);
 /// 6. issue number ascending, so the order is fully deterministic.
 ///
-/// Keys 0-3 are [`lane_cmp`]; the single-workspace tick sorts by those alone
-/// so its listing order is untouched when nothing is starred or red.
+/// The multi-workspace tick no longer dispatches in this order (#11103): it
+/// orders candidates by weighted workspace draws
+/// ([`super::workspace_draw`]). This comparator still ranks the published
+/// ready-queue rows (`rank`); a row's dispatch position is its plan
+/// `position`.
 ///
 /// The keys themselves live in [`candidate_keys`] (Issue #9288), the one seam
 /// the published dispatch plan is projected from; this is their
@@ -71,18 +78,6 @@ pub struct PriorityCandidate {
 #[must_use]
 pub fn candidate_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
     candidate_keys(a).cmp(&candidate_keys(b))
-}
-
-/// How many leading [`candidate_keys`] are the #9244 lane keys.
-const LANE_KEYS: usize = 4;
-
-/// Keys 0-3 of [`candidate_cmp`]: level, starred first, then starred-at
-/// among starred issues, then red-main fixes. Two unstarred, non-fix candidates
-/// compare equal, which is what lets a stable sort by this comparator leave
-/// ordinary work in its existing order.
-#[must_use]
-pub fn lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
-    candidate_keys(a)[..LANE_KEYS].cmp(&candidate_keys(b)[..LANE_KEYS])
 }
 
 /// One comparator key's value, carrying its own direction so the derived
@@ -158,11 +153,11 @@ pub struct CandidateKey<'a> {
 
 /// The dispatch ordering keys of `c`, in comparator order (Issue #9288).
 ///
-/// **The single seam for dispatch order**: [`candidate_cmp`] and
-/// [`lane_cmp`] are lexicographic compares of these keys, and every ready-queue
-/// row's plan `keys` and the plan's `ordering` are projected from them, so the
-/// published order can never describe a different comparator from the one
-/// the tick ran. A new ordering key goes here, and nowhere else.
+/// **The single seam for ready-queue rank**: [`candidate_cmp`] is the
+/// lexicographic compare of these keys, and every ready-queue
+/// row's plan `keys` and the plan's `ordering` are projected from them. The
+/// order the tick dispatches in is the workspace draw (#11103), published as
+/// each row's plan `position` and the `pick.decision` draw log.
 ///
 /// Key 2 (starred-at) only orders starred issues among themselves: for an
 /// unstarred candidate it is `None`, which ties with every other unstarred

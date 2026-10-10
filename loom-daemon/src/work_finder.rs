@@ -242,6 +242,7 @@ mod recheck_interval;
 mod tick_line;
 mod tick_report;
 mod tick_summary;
+pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::{BUILDING_LABEL, OPERATOR_HOLD_LABEL, PARK_LABELS, SKIP_LABELS};
 pub use main_red_fix::RedMainLane;
@@ -1365,16 +1366,14 @@ pub fn tick_with_lanes(
 /// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
 /// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
 /// Rather than dispatching each workspace's backlog in registration order, this
-/// gathers every eligible candidate across all workspaces into one queue, sorts
-/// it by [`candidate_cmp`] — **(starred first, starred-at, red-main fix,
-/// workspace priority asc, issue age asc, number asc)** (#9244) — and then
-/// fills the single shared concurrency budget in that global order. So a deep, old product-repo backlog never
-/// starves a small higher-priority tool repo: the tool repo's candidates are
-/// dispatched first even though the product repo has older / more work. The
-/// cap/budget mechanics are unchanged — this only orders the queue.
-///
-/// Strict priority is intentional (v1): a permanently-full higher tier starves
-/// lower tiers. Fairness reservations are an explicit follow-up.
+/// gathers every eligible candidate across all workspaces and orders them by
+/// **weighted workspace draws** ([`workspace_draw`], #11103): each draw picks a
+/// workspace at random weighted by its priority (a workspace with
+/// `loom:very-important` work next wins), then takes that workspace's next
+/// candidate by level, oldest `createdAt`, number. The single shared
+/// concurrency budget is filled in that order, so a higher-priority tool repo
+/// is usually served first without a permanently-full tier starving the rest.
+/// The cap/budget mechanics are unchanged — this only orders the queue.
 /// Compute, per root (parallel to `roots`), whether the work-finder should hold
 /// new dispatch off that root this tick — the `halted` slice `tick_multi`
 /// consumes.
@@ -1548,7 +1547,7 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// The per-repo counter is seeded from each dispatcher's OWN
 /// [`WorkDispatcher::occupancy`] — the same per-repo value this function
 /// already sums for its global seed — so it costs no extra forge/registry
-/// reads. [`candidate_cmp`] is untouched.
+/// reads. The workspace-draw order ([`workspace_draw`]) is untouched.
 ///
 /// # Repo-sharding slice preference (#6243)
 ///
@@ -1558,9 +1557,9 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 /// [`crate::role_shard::decide`]'s `owned` verdict per root, see
 /// [`spawn_multi_work_finder_task`]).
 ///
-/// The already-globally-sorted candidate list (by [`candidate_cmp`]) is split
+/// The already-ordered candidate list (by [`workspace_draw`]) is split
 /// into in-slice / out-of-slice while preserving each partition's relative
-/// order, so `candidate_cmp`'s ordering guarantees hold WITHIN either
+/// order, so the draw order holds WITHIN either
 /// partition unchanged. Out-of-slice candidates are dispatched THIS TICK only
 /// when the slice was completely empty at the top of the tick
 /// (work-conservation, #6243's AC) — never interleaved by priority with
@@ -2010,13 +2009,13 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
-    // Global priority sort (#3946, #9244): starred, starred-at, red-main fix,
-    // workspace priority, age, number.
-    candidates.sort_by(candidate_cmp);
+    // Workspace-first order (#11103): weighted workspace draws, each placing
+    // the drawn workspace's next candidate (level, oldest, number).
+    let candidates = workspace_draw::order(candidates, priorities, &mut report);
 
     // Candidate-list shaping (`repo_cap::shape_queue`): the #6243 repo-sharding
     // slice partition, then #9090's track-affinity partition. Both are stable
-    // partitions of the ALREADY-sorted list, so `candidate_cmp` still decides
+    // partitions of the ALREADY-drawn list, so the draw order still decides
     // order within each group; with `preferred_slice: None` and no per-repo cap
     // the list is byte-for-byte unchanged, and every pre-#6243/#9090
     // priority-ordering test stays exactly as it was.

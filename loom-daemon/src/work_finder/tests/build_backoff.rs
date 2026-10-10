@@ -93,7 +93,8 @@ fn starred_and_red_main_fix_candidates_bypass_the_backoff() {
         RecordingDispatcher::default(),
     )];
     let report = run(&mut multi, 10, None, &[RED], &[true]);
-    assert_eq!(multi[0].1.dispatched, vec![5, 9]);
+    // #11103: the verified fix (`very-important`) goes before the star.
+    assert_eq!(multi[0].1.dispatched, vec![9, 5]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (2, 1));
 
     // Without a verified-red main the marker is inert: the fix waits too.
@@ -143,7 +144,9 @@ fn not_held_is_the_repo_cap_tick_exactly() {
         }
         format!("{r:?}")
     };
-    assert_eq!(via_backoff.admissions.len(), 1);
+    // The fix (`very-important`, #11103) fills the repo's cap of 1; the star
+    // then takes the overflow slot.
+    assert_eq!(via_backoff.admissions.len(), 2);
     assert_eq!(unstamped(via_backoff.clone()), unstamped(via_repo_cap));
     assert_eq!(a[0].1.dispatched, b[0].1.dispatched);
     assert_eq!((via_backoff.deferred_build_backoff, via_backoff.build_backoff_held), (0, false));
