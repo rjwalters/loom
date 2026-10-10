@@ -33,6 +33,16 @@
 //! dropped if the row comes back, emitted once the departure shows, and
 //! after [`PENDING_READY_MAX_PASSES`] one `unknown` without a fact id.
 //!
+//! **Pre-ready exits (#11368).** `triage_wait` (creation or latest reopen to
+//! the first `loom:curated` / `loom:issue` label; `approval_wait` follows
+//! unless it was a one-step promotion) and `approval_wait` (the latest
+//! `loom:curated` before the `loom:issue` label, to that label) are read from
+//! an issue's history when it first shows in a complete `loom:curated`
+//! listing or enters `ready_wait`. They are never `fleet.state` rows. A repo
+//! whose curated listing was incomplete is skipped; one issue's exit is
+//! emitted once (its forge instants key the fact id), and a failed history
+//! read is retried next pass.
+//!
 //! A `ready_wait` row that leaves the view is not a record unless the repo's
 //! ready listing was whole in both passes (never before #11139): the work
 //! finder's listing can drop a row that is still ready. A row of a repo no
@@ -58,6 +68,11 @@ use crate::telemetry::TelemetryRecord;
 const READY_LABEL: &str = "loom:issue";
 /// The label of a claimed issue.
 const CLAIM_LABEL: &str = "loom:building";
+/// The label of a curated issue awaiting approval.
+pub const CURATED_LABEL: &str = "loom:curated";
+
+/// How long a pre-ready exit stays remembered as emitted.
+const PRE_READY_MEMORY_DAYS: i64 = 14;
 
 /// Passes a departed `ready_wait` row waits for its forge departure before
 /// it is emitted as `unknown` (about an hour at the collector's cadence).
@@ -94,6 +109,10 @@ pub fn listed(listings: &[RepoListing]) -> Listed {
         .collect()
 }
 
+/// Open `loom:curated` issue number → creation instant, per repo whose
+/// listing was complete (a repo with a failed or partial listing is absent).
+pub type Curated = BTreeMap<String, BTreeMap<u32, Option<DateTime<Utc>>>>;
+
 /// A `ready_wait` row that left the view before the forge showed it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingReady {
@@ -123,6 +142,16 @@ pub struct Memory {
     /// Departed `ready_wait` rows awaiting their forge departure, by
     /// `(repo, issue)`.
     pub pending_ready: BTreeMap<(String, u32), PendingReady>,
+    /// Each repo's last complete `loom:curated` listing (#11368).
+    pub curated: Curated,
+    /// This pass's complete curated listings, set by the caller before
+    /// [`diff`] and moved into `curated` by [`remember`].
+    pub curated_now: Option<Curated>,
+    /// Pre-ready exits already emitted: `(repo, issue, stage, left)`.
+    pub pre_ready_done: BTreeSet<(String, u32, FleetStage, DateTime<Utc>)>,
+    /// Issues whose history read failed, retried each pass while they are
+    /// still curated or ready.
+    pub pre_ready_retry: BTreeSet<(String, u32)>,
     /// The previous view.
     pub view: Option<FleetView>,
     /// When the previous pass ran.
@@ -319,6 +348,46 @@ impl<F: ForgeReads> Diff<'_, F> {
         })
     }
 
+    /// The pre-ready exits of `issue`, each at most once. `ready` is whether
+    /// the issue is in `ready_wait` now. A failed history read is `false`.
+    fn pre_ready(
+        &mut self,
+        key: (&str, u32),
+        created_at: Option<DateTime<Utc>>,
+        ready: bool,
+        done: &mut BTreeSet<(String, u32, FleetStage, DateTime<Utc>)>,
+        out: &mut Vec<TelemetryRecord>,
+    ) -> bool {
+        let (repo, issue) = key;
+        let now = self.now;
+        let Some(history) = self.history(repo, issue) else {
+            return false;
+        };
+        for exit in pre_ready_exits(history, created_at, now, ready) {
+            if !done.insert((repo.to_string(), issue, exit.stage, exit.left)) {
+                continue;
+            }
+            out.push(TelemetryRecord::StageOutcome(StageOutcomeRecord {
+                repo: repo.to_string(),
+                issue,
+                pr_number: None,
+                stage: exit.stage,
+                entered_at: Some(exit.entered),
+                entered_at_source: Some(EnteredAtSource::Forge),
+                left_at: exit.left,
+                dwell_sec: dwell(StageExit::Advance, Some(exit.entered), exit.left),
+                exit: StageExit::Advance,
+                next_stage: Some(exit.next),
+                event: FLEET_STATE_EVENT.to_string(),
+                observed_at: now,
+                resolution_sec: Some(0),
+                forge_transition_at: Some(exit.left),
+                loom: self.loom.clone(),
+            }));
+        }
+        true
+    }
+
     fn record(
         &mut self,
         repo: &str,
@@ -359,6 +428,143 @@ impl<F: ForgeReads> Diff<'_, F> {
     }
 }
 
+/// One pre-ready stage an issue's history says it left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreReadyExit {
+    stage: FleetStage,
+    entered: DateTime<Utc>,
+    left: DateTime<Utc>,
+    next: FleetStage,
+}
+
+/// The pre-ready exits `history` shows by `now`. The triage entry is the
+/// latest `reopened`, else `created_at` (none known: no exit, never a guessed
+/// duration); it ends at the first later `loom:curated` / `loom:issue` label.
+/// With `ready`, a curated issue's approval ran from its latest
+/// `loom:curated` before its latest `loom:issue` label to that label; a
+/// one-step promotion (or equal instants) has none.
+fn pre_ready_exits(
+    history: &LabelHistory,
+    created_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    ready: bool,
+) -> Vec<PreReadyExit> {
+    let mut out = Vec::new();
+    let entered = history
+        .latest(now, |e| *e == HistoryEvent::Reopened)
+        .or(created_at);
+    let first = entered.and_then(|entered| {
+        history
+            .first_after(entered, |e| labeled(e, &[CURATED_LABEL, READY_LABEL]))
+            .filter(|(at, _)| *at <= now)
+            .map(|(at, event)| (entered, at, *event == HistoryEvent::Labeled(CURATED_LABEL.into())))
+    });
+    if let Some((entered, left, curated)) = first {
+        out.push(PreReadyExit {
+            stage: FleetStage::TriageWait,
+            entered,
+            left,
+            next: if curated {
+                FleetStage::ApprovalWait
+            } else {
+                FleetStage::ReadyWait
+            },
+        });
+    }
+    // The approval needs no triage entry: it is the latest curated label
+    // before the label that made the issue ready (after the entry, when known).
+    if let (true, Some(approved)) = (ready, history.latest(now, |e| labeled(e, &[READY_LABEL]))) {
+        let before = approved - Duration::nanoseconds(1);
+        let floor = entered.filter(|entered| *entered < approved);
+        if let Some(at) = history
+            .latest(before, |e| labeled(e, &[CURATED_LABEL]))
+            .filter(|at| floor.is_none_or(|f| *at > f))
+        {
+            out.push(PreReadyExit {
+                stage: FleetStage::ApprovalWait,
+                entered: at,
+                left: approved,
+                next: FleetStage::ReadyWait,
+            });
+        }
+    }
+    out
+}
+
+/// Derive this pass's pre-ready exits (#11368): for issues new to a complete
+/// curated listing or to `ready_wait`, and for earlier failed reads.
+fn pre_ready_pass<F: ForgeReads>(
+    memory: &mut Memory,
+    prev: &FleetView,
+    pass: &Pass<'_>,
+    diff: &mut Diff<'_, F>,
+    out: &mut Vec<TelemetryRecord>,
+) {
+    let empty_curated = BTreeMap::new();
+    let curated_now = memory.curated_now.clone().unwrap_or_default();
+    let curated_of = |repo: &str, issue: u32| {
+        curated_now
+            .get(repo)
+            .and_then(|c| c.get(&issue))
+            .or_else(|| memory.curated.get(repo).and_then(|c| c.get(&issue)))
+            .copied()
+    };
+    let ready_row = |view: &FleetView, repo: &str, issue: u32| {
+        view.repos
+            .get(repo)
+            .and_then(|r| r.rows.get(&issue))
+            .filter(|row| row.stage == FleetStage::ReadyWait)
+            .map(|row| row.created_at)
+    };
+    // (repo, issue) -> creation instant, when known.
+    let mut candidates: BTreeMap<(String, u32), Option<DateTime<Utc>>> = BTreeMap::new();
+    for (repo, items) in &curated_now {
+        // No earlier complete listing: nothing is known to be new.
+        let Some(was) = memory.curated.get(repo) else {
+            continue;
+        };
+        for (&issue, &created) in items.iter().filter(|(n, _)| !was.contains_key(n)) {
+            candidates.insert((repo.clone(), issue), created);
+        }
+    }
+    for (repo, now_repo) in &pass.view.repos {
+        if !pass.managed.contains(repo) {
+            continue;
+        }
+        for (&issue, row) in &now_repo.rows {
+            if row.stage == FleetStage::ReadyWait && ready_row(prev, repo, issue).is_none() {
+                let created = row.created_at.or_else(|| curated_of(repo, issue).flatten());
+                candidates.insert((repo.clone(), issue), created);
+            }
+        }
+    }
+    for (repo, issue) in &memory.pre_ready_retry {
+        let created = match (
+            curated_now.get(repo).unwrap_or(&empty_curated).get(issue),
+            ready_row(pass.view, repo, *issue),
+        ) {
+            (None, None) => continue,
+            (c, r) => r.flatten().or_else(|| c.copied().flatten()),
+        };
+        candidates.entry((repo.clone(), *issue)).or_insert(created);
+    }
+    let mut done = std::mem::take(&mut memory.pre_ready_done);
+    let mut retry = BTreeSet::new();
+    for ((repo, issue), created) in candidates {
+        if !pass.managed.contains(&repo) {
+            continue;
+        }
+        let ready = ready_row(pass.view, &repo, issue).is_some();
+        if !diff.pre_ready((&repo, issue), created, ready, &mut done, out) {
+            retry.insert((repo, issue));
+        }
+    }
+    let horizon = pass.now - Duration::days(PRE_READY_MEMORY_DAYS);
+    done.retain(|(repo, _, _, left)| *left >= horizon && pass.managed.contains(repo));
+    memory.pre_ready_done = done;
+    memory.pre_ready_retry = retry;
+}
+
 /// The records two consecutive passes give. Pure apart from `forge`.
 #[must_use]
 pub fn diff(
@@ -379,6 +585,7 @@ pub fn diff(
         histories: BTreeMap::new(),
     };
     let mut out = Vec::new();
+    pre_ready_pass(memory, prev, pass, &mut diff, &mut out);
 
     let mut resolved: BTreeMap<(String, u32), PullFacts> = BTreeMap::new();
     let mut unread = std::mem::take(&mut memory.unread);
@@ -602,7 +809,14 @@ pub fn remember(memory: Memory, pass: &Pass<'_>) -> Memory {
     let mut listed = memory.listed;
     listed.retain(|repo, _| pass.managed.contains(repo));
     listed.extend(pass.listed.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let mut curated = memory.curated;
+    curated.retain(|repo, _| pass.managed.contains(repo));
+    curated.extend(memory.curated_now.unwrap_or_default());
     Memory {
+        curated,
+        curated_now: None,
+        pre_ready_done: memory.pre_ready_done,
+        pre_ready_retry: memory.pre_ready_retry,
         listed,
         unread: memory.unread,
         settled: memory.settled,

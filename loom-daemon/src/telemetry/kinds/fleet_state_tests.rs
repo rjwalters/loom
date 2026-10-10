@@ -251,6 +251,8 @@ fn stage_wire_names_are_the_contract_names() {
         (FleetStage::Doctor, "doctor"),
         (FleetStage::MergeWait, "merge_wait"),
         (FleetStage::MergeHold, "merge_hold"),
+        (FleetStage::TriageWait, "triage_wait"),
+        (FleetStage::ApprovalWait, "approval_wait"),
     ] {
         assert_eq!(stage.as_str(), name);
         assert_eq!(serde_json::to_value(stage).unwrap(), name);

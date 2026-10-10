@@ -113,6 +113,15 @@ pub enum FleetStage {
     /// Approved, held for a human by an operator hold label.
     #[serde(rename = "merge_hold")]
     MergeHold,
+    /// Pre-ready: from the issue's creation (or latest reopen) until
+    /// `loom:curated`, or `loom:issue` for a one-step promotion (#11368).
+    /// Only ever an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "triage_wait")]
+    TriageWait,
+    /// Pre-ready: from `loom:curated` until `loom:issue` (#11368). Only ever
+    /// an `eta.stage_outcome` stage; never a `fleet.state` row.
+    #[serde(rename = "approval_wait")]
+    ApprovalWait,
 }
 
 impl FleetStage {
@@ -127,6 +136,8 @@ impl FleetStage {
             FleetStage::Doctor => "doctor",
             FleetStage::MergeWait => "merge_wait",
             FleetStage::MergeHold => "merge_hold",
+            FleetStage::TriageWait => "triage_wait",
+            FleetStage::ApprovalWait => "approval_wait",
         }
     }
 }
