@@ -1123,17 +1123,10 @@ cmd_start() {
 
 # Teardown is `loom-daemon lease renewer stop` (#11086): it verifies the target
 # is a renewer before signalling. This stays a thin delegate and fails CLOSED --
-# a missing/older daemon exits non-zero without signalling anything.
+# a missing/older daemon (or a missing argument) exits non-zero, nothing signalled.
 cmd_stop() {
-    [[ $# -gt 0 ]] || {
-        echo "ERROR: stop requires a PID argument (or --issue N)" >&2
-        exit 1
-    }
-    "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer stop "$@" || {
-        local rc=$?
-        echo "sweep-lease-renew: stop refused or unavailable (exit ${rc}); nothing was signalled" >&2
-        exit "$((rc == 0 ? 1 : rc))"
-    }
+    "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer stop "$@" && return 0
+    local rc=$?; echo "sweep-lease-renew: stop refused or unavailable (exit ${rc}); nothing was signalled -- usage: stop <PID> | stop --issue N" >&2; exit "$rc"
 }
 
 main() {
