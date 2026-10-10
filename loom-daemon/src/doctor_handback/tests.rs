@@ -314,3 +314,20 @@ fn an_unverifiable_or_partial_hand_back_fails() {
         "{out:?}"
     );
 }
+
+/// A raced hand-back whose claim release failed is not "done": exit 13 tells
+/// the Doctor to write nothing more, which would strand `loom:treating`.
+#[test]
+fn a_race_that_leaves_the_claim_on_is_a_failure_not_a_race() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.after_add = vec!["loom:pr"];
+    f.fail_remove = vec![CLAIM];
+    let out = run(&mut f, PUSHED);
+    assert!(
+        matches!(&out, Outcome::Failed(why) if why.contains("still carries loom:treating")),
+        "{out:?}"
+    );
+    // The own add is still withdrawn, so the verdict label stands alone.
+    assert!(!f.labels.iter().any(|l| l == QUEUE), "{:?}", f.labels);
+    assert_eq!(out.render().1, EXIT_FAILED);
+}
