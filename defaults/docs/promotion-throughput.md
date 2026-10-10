@@ -86,8 +86,8 @@ forward across a re-render" in `daemon-reference.md`. For a hand-run
 keys of the `champion` group of the `hyperparameters` config block
 (`prSlice`, `promotionSlice`, `tier2Cap`, `tier3Cap`, `tier3BacklogCap`;
 defaults 10, 3, 2, 1, 5), so the fleet store's machine tier
-(`fleet/defaults.json`) can carry them and they enter the run digest
-(`hyperparameters.md`). Precedence is env var > `LOOM_HYPERPARAMS` vector >
+(`fleet/defaults.json`) can carry them
+(`hyperparameters.md`). Precedence is env var >
 config block > default. Follow-on work: the daemon does not yet export the
 resolved block values as `LOOM_CHAMPION_*` into role sessions, so Champion's
 shell snippets honour only the env vars today.
