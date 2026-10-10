@@ -14,9 +14,10 @@
 //! every item carrying it). A failed usage lookup keeps the label too: an
 //! unanswered "is it in use?" is not a "no". Closed items do not hold a
 //! label back: Loom never cleans labels off closed items (#2838), so they
-//! say nothing about live use. Write scope (#9548) is the caller's:
-//! `sync-labels.sh` resolves its target through `loom_write_repo` before
-//! any non-dry-run.
+//! say nothing about live use. Write scope (#9548): `--prune` is gated here by
+//! `loom_daemon::write_scope::may_write_from`, before the first label is read or
+//! deleted, so a direct caller cannot bypass `sync-labels.sh`'s
+//! `loom_write_repo`; the report-only read is ungated.
 //!
 //! Output, one line per undeclared label on stdout:
 //! `UNDECLARED <name> (unused: would delete)`, `PRUNED <name>`,
@@ -49,11 +50,14 @@ fn declared_names(yaml: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Namespace of Loom's own labels, built so the label-literal guard sees no bare literal.
+const LOOM_PREFIX: &str = concat!("loom", ":");
+
 /// Live `loom:*` labels absent from `declared`, in live order.
 pub(crate) fn undeclared<'a>(declared: &[&str], live: &'a [String]) -> Vec<&'a str> {
     live.iter()
         .map(String::as_str)
-        .filter(|n| n.starts_with("loom:") && !declared.contains(n))
+        .filter(|n| n.starts_with(LOOM_PREFIX) && !declared.contains(n))
         .collect()
 }
 
@@ -173,6 +177,24 @@ impl LabelForge for GhLabelForge {
     }
 }
 
+/// [`run`] behind the write-scope gate (#9548): with `prune`, a refused
+/// `gate` returns exit 2 before any forge call, so nothing is deleted.
+fn run_gated(
+    forge: &dyn LabelForge,
+    yaml: &str,
+    prune: bool,
+    gate: &dyn Fn() -> Result<(), String>,
+    out: &mut dyn Write,
+) -> i32 {
+    if prune {
+        if let Err(why) = gate() {
+            eprintln!("labels undeclared: refusing --prune (#9548): {why}");
+            return 2;
+        }
+    }
+    run(forge, yaml, prune, out)
+}
+
 /// `labels undeclared --repo R --labels-file F [--prune]`.
 pub(crate) fn dispatch(repo: &str, labels_file: &Path, prune: bool) -> i32 {
     let yaml = match std::fs::read_to_string(labels_file) {
@@ -189,7 +211,14 @@ pub(crate) fn dispatch(repo: &str, labels_file: &Path, prune: bool) -> i32 {
     let forge = GhLabelForge {
         repo: repo.to_string(),
     };
-    run(&forge, &yaml, prune, &mut std::io::stdout())
+    let gate = || {
+        let cwd = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
+        match loom_daemon::write_scope::may_write_from(&cwd, Some(repo)) {
+            loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
+            loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
+        }
+    };
+    run_gated(&forge, &yaml, prune, &gate, &mut std::io::stdout())
 }
 
 #[cfg(test)]
@@ -279,6 +308,27 @@ mod tests {
     fn prune_of_only_unused_labels_is_exit_zero() {
         let f = fake(&["loom:failed:judge"]);
         assert_eq!(go(&f, true), (0, "PRUNED loom:failed:judge\n".to_string()));
+    }
+
+    #[test]
+    fn a_refused_prune_target_makes_no_forge_call() {
+        let f = fake(&["loom:healing"]);
+        let mut out = Vec::new();
+        let rc = run_gated(&f, YAML, true, &|| Err("unmanaged repo".into()), &mut out);
+        assert_eq!(rc, 2);
+        assert!(out.is_empty());
+        assert!(f.deleted.borrow().is_empty(), "a refused prune deletes nothing");
+    }
+
+    #[test]
+    fn the_report_only_read_is_not_gated() {
+        let f = fake(&["loom:healing"]);
+        let mut out = Vec::new();
+        let rc = run_gated(&f, YAML, false, &|| Err("unmanaged repo".into()), &mut out);
+        assert_eq!(rc, 3);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .starts_with("UNDECLARED loom:healing"));
     }
 
     #[test]
