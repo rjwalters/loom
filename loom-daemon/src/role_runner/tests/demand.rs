@@ -283,6 +283,101 @@ fn parked_prs_are_not_changes_debt() {
     assert_eq!(ledger.host_debt(HOUR).changes, Some(AxisDebt::default()));
 }
 
+/// A `label` queue row that also carries each of `extra`.
+fn queue_row(number: u32, label: &str, extra: &[&str]) -> RestIssue {
+    let mut labels = vec![label.to_string()];
+    labels.extend(extra.iter().map(ToString::to_string));
+    RestIssue {
+        labels,
+        ..row(number, true)
+    }
+}
+
+#[test]
+fn all_parked_changes_listing_does_not_open_the_gate() {
+    // #9435: every open PR is one doctor.md Priority 2 skips, so a Doctor run
+    // would find nothing. `loom:blocked` is also the Doctor-cycle-cap park.
+    let label = "loom:changes-requested";
+    let parked = vec![
+        queue_row(1, label, &["loom:blocked"]),
+        queue_row(2, label, &["loom:operator-only"]),
+        queue_row(3, label, &["loom:blocked", "loom:operator-only"]),
+    ];
+    assert!(!listing_has_work(label, &parked));
+    assert!(!listing_has_work(label, &[]), "an empty listing never opens it");
+}
+
+#[test]
+fn drainable_changes_pr_opens_the_gate() {
+    // One PR Doctor would drain is enough, whatever is parked beside it.
+    // `loom:operator` is still Doctor work (#7660); `loom:treating` is a live
+    // claim, not a park.
+    let label = "loom:changes-requested";
+    for extra in [&[][..], &["loom:operator"], &["loom:treating"]] {
+        let rows = vec![
+            queue_row(1, label, &["loom:blocked"]),
+            queue_row(2, label, extra),
+        ];
+        assert!(listing_has_work(label, &rows), "{extra:?}");
+    }
+    // A drainable label does not rescue a PR that is also parked.
+    let both = [queue_row(1, label, &["loom:operator", "loom:blocked"])];
+    assert!(!listing_has_work(label, &both));
+    // Doctor's queue is open PRs: a closed row or a plain issue is not work.
+    let closed = RestIssue {
+        state: "closed".to_string(),
+        ..queue_row(1, label, &[])
+    };
+    let issue = RestIssue {
+        is_pull_request: false,
+        ..queue_row(2, label, &[])
+    };
+    assert!(!listing_has_work(label, &[closed, issue]));
+}
+
+#[test]
+fn review_and_axisless_gates_keep_the_any_row_rule() {
+    // Judge's queue has no label exclusions (judge.md), so parked PRs still
+    // open it, exactly as before #9435.
+    let review = "loom:review-requested";
+    let parked = vec![
+        queue_row(1, review, &["loom:blocked"]),
+        queue_row(2, review, &["loom:operator-only"]),
+    ];
+    assert!(listing_has_work(review, &parked));
+    assert!(!listing_has_work(review, &[]));
+    // The review gate is not narrowed to open PRs either: any row opens it.
+    let issue = RestIssue {
+        is_pull_request: false,
+        ..queue_row(3, review, &[])
+    };
+    assert!(listing_has_work(review, &[issue]));
+
+    // A label that feeds no debt axis: any row, parked or not.
+    let other = "loom:curated";
+    assert_eq!(DebtAxis::for_label(other), None);
+    assert!(listing_has_work(other, &[queue_row(1, other, &["loom:blocked"])]));
+    assert!(listing_has_work(other, &[row(2, false)]));
+    assert!(!listing_has_work(other, &[]));
+}
+
+#[test]
+fn gate_decision_ignores_demand_width_config() {
+    // The ledger records only for a root with demand width enabled; the gate
+    // decision takes no root at all, so it cannot follow that switch. Pin the
+    // contrast: a disabled root records nothing while the gate still filters.
+    let label = "loom:changes-requested";
+    let parked = vec![queue_row(1, label, &["loom:blocked"])];
+    let drainable = vec![queue_row(2, label, &[])];
+    let ledger = DemandLedger::default();
+    let off = workspace(r#"{"autonomous":{"roleRunner":{"demandWidth":{"enabled":false}}}}"#);
+    assert!(!read_demand_config(off.path()).enabled);
+    record_listing(&ledger, off.path(), label, &drainable);
+    assert_eq!(ledger.host_debt(HOUR).changes, None, "disabled root records nothing");
+    assert!(!listing_has_work(label, &parked));
+    assert!(listing_has_work(label, &drainable));
+}
+
 #[test]
 fn review_debt_counts_held_and_parked_prs() {
     // #9421: Judge's queue has no label exclusions, so every open
