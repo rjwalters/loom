@@ -242,6 +242,9 @@ kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/forge_version_only_diff.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
 [[operation.callers]]
 kind = "script"
