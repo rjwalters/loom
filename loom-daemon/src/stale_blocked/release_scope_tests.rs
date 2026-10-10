@@ -106,3 +106,59 @@ fn cross_owner_root_write_is_vetted_under_the_roots_own_credential() {
     drop(fixture);
     clear_owner_root_registry();
 }
+
+/// Like [`owner_scoped_gh`], and also answers the label-remove `DELETE` a
+/// release makes, so a write the scope admits reaches `gh` and succeeds.
+fn owner_scoped_gh_accepting_writes(bin: &Path, repo: &str, owner_dir: &Path) -> PathBuf {
+    let gh = owner_scoped_gh(bin, repo, owner_dir);
+    let script = std::fs::read_to_string(&gh).unwrap().replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nif [ \"$1\" = api ] && [ \"$2\" = -X ]; then exit 0; fi\n",
+        1,
+    );
+    std::fs::write(&gh, script).unwrap();
+    gh
+}
+
+/// #10837, second half: once the comment was vetted under the root's
+/// credential (above) it posted, and the body/label edit that follows was
+/// still refused by `GhForge`'s process-credential `may_write_from` — the
+/// fleet log read `re-park body write failed: refusing the write (#9548): the
+/// credential in use cannot write to 2AMLogic/loom-ui`. The pass's
+/// [`super::park_forge`] must vet under the root's credential too.
+#[test]
+#[serial_test::serial]
+fn cross_owner_root_label_and_body_writes_are_vetted_under_the_roots_own_credential() {
+    use crate::park_record::apply::ParkForge;
+
+    clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("other-owner");
+    let fixture = WritableRoot::register(&root);
+    let owner_dir = base.join("gh-config-by-owner");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = owner_scoped_gh_accepting_writes(bin.path(), &fixture.repo, &owner_dir);
+    let _env = GhBinEnv::set(&gh);
+    register_root_gh_config_dir(&root, &owner_dir);
+    assert!(crate::write_scope::root_writable_with(&root, &gh).is_allowed());
+
+    // Control: the CLI's process-credential vetting is unchanged and refuses.
+    let mut cli = crate::operator_decision::cli::GhForge::new(root.clone(), None);
+    let refused = ParkForge::remove_label(&mut cli, 1, "loom:blocked");
+    assert!(refused.as_ref().is_err_and(|e| e.contains("#9548")), "{refused:?}");
+
+    let mut park = super::park_forge(&root, None);
+    let written = ParkForge::remove_label(&mut park, 1, "loom:blocked");
+    assert_eq!(written, Ok(()), "the release's label write must use the root's credential");
+
+    let scope = crate::write_scope::probe::CacheScope::GitHub;
+    if let Some(key) = crate::write_scope::probe::cache_key(None, &scope, &fixture.repo) {
+        let _ = std::fs::remove_file(
+            crate::write_scope::probe::cache_dir().join(format!("{key}.json")),
+        );
+    }
+    drop(fixture);
+    clear_owner_root_registry();
+}

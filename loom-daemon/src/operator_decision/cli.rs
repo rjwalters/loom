@@ -256,6 +256,8 @@ pub struct GhForge {
     repo: Option<String>,
     /// Memoized write-scope verdict: `Err(reason)` refuses every write.
     write_ok: Option<Result<(), String>>,
+    /// Vet under `repo_root`'s own credential ([`Self::vetted_under_root`]).
+    root_credential: bool,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -283,20 +285,49 @@ impl GhForge {
             repo_root,
             repo,
             write_ok: None,
+            root_credential: false,
+        }
+    }
+
+    /// Vet writes under `repo_root`'s **own** credential — the per-owner
+    /// `GH_CONFIG_DIR` (#5401) every `gh` call here already runs under, since
+    /// each runs with `repo_root` as its cwd — instead of the process's.
+    ///
+    /// For a daemon pass serving many workspaces (#10837): the daemon's process
+    /// credential is its home owner's, so `may_write_from` refused every write
+    /// to another owner's root that the pass's own gate had admitted.
+    #[must_use]
+    pub fn vetted_under_root(mut self) -> Self {
+        self.root_credential = true;
+        self
+    }
+
+    /// The write-scope verdict for this forge's target.
+    fn scope_verdict(&self) -> crate::write_scope::Verdict {
+        let (root, repo) = (&self.repo_root, self.repo.as_deref());
+        if !self.root_credential {
+            return crate::write_scope::may_write_from(root, repo);
+        }
+        let gh = crate::write_scope::default_gh();
+        match repo {
+            Some(r) => crate::write_scope::repo_writable_with(root, r, &gh),
+            None => crate::write_scope::root_writable_with(root, &gh),
         }
     }
 
     /// Refuse a forge write the write scope denies (#9548).
     fn check_write(&mut self) -> Result<(), String> {
-        let (root, repo) = (&self.repo_root, self.repo.as_deref());
-        self.write_ok
-            .get_or_insert_with(|| match crate::write_scope::may_write_from(root, repo) {
+        if self.write_ok.is_none() {
+            self.write_ok = Some(match self.scope_verdict() {
                 crate::write_scope::Verdict::Allow(_) => Ok(()),
                 crate::write_scope::Verdict::Deny(why) => {
                     Err(format!("refusing the write (#9548): {why}"))
                 }
-            })
+            });
+        }
+        self.write_ok
             .clone()
+            .unwrap_or_else(|| Err("refusing the write (#9548): scope not evaluated".into()))
     }
 
     fn issue_path(&self, issue: u64) -> String {

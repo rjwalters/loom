@@ -259,6 +259,35 @@ fn never_approved_issue_is_released_without_loom_issue() {
     assert!(w.extra.posted[0].1.contains("was not restored"));
 }
 
+/// Regression coverage for #10837 (loom-ui#1695): a starred, triage-only issue
+/// carrying three identical-reason park records whose same-repo blockers are
+/// all CLOSED is released, with no `loom:issue` invented and the star kept.
+#[test]
+fn starred_triage_only_issue_with_three_identical_reason_parks_is_released() {
+    let mut w = World::new();
+    let reason = Some("needs slice 1a, finished-item mode and compact layout");
+    let records: Vec<String> = [1689u64, 1692, 1693]
+        .iter()
+        .map(|b| render_park(&[*b], Some("guide"), Some("2026-10-05T21:24:30Z"), reason))
+        .collect();
+    let body = format!("Work.\n\n{}\n", records.join("\n"));
+    w.with_body(1695, false, &body, &["loom:triage", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra
+        .events
+        .insert(1695, vec!["loom:triage".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert!(r.released[0].applied && r.released[0].commented);
+    assert_eq!(w.park.writes, vec!["remove #1695 loom:blocked"]);
+    let l = w.labels(1695);
+    assert!(!l.contains("loom:blocked") && !l.contains("loom:issue"));
+    assert!(l.contains("loom:triage") && l.contains("loom:operator-priority"));
+}
+
 #[test]
 fn merged_pr_blocker_counts_as_resolved() {
     let mut w = World::new();
@@ -730,6 +759,143 @@ fn dry_run_plans_with_zero_writes() {
     let json = serde_json::to_value(&r).unwrap();
     assert_eq!(json["released"].as_array().unwrap().len(), 1);
     assert!(r.summary().contains("dry-run"));
+}
+
+// --- incident shapes (#10837) ---------------------------------------------------
+
+/// The three Guide records loom-ui#1695 carried, verbatim: identical `reason=`.
+const LOOM_UI_1695_RECORDS: &str = "\
+<!-- loom:park Blocked by: #1689 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->
+<!-- loom:park Blocked by: #1692 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->
+<!-- loom:park Blocked by: #1693 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->";
+
+#[test]
+fn loom_ui_1695_shape_releases_without_inventing_approval() {
+    // Starred, triage-only lane (never carried `loom:issue`), every blocker closed.
+    let mut w = World::new();
+    let body = format!("Card layout work.\n\n{LOOM_UI_1695_RECORDS}\n");
+    w.with_body(1695, false, &body, &["loom:triage", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    let lane = ["loom:triage", "loom:blocked", "loom:operator-priority"];
+    w.extra.events.insert(1695, lane.map(String::from).to_vec());
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![1689, 1692, 1693]);
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #1695 loom:blocked"]);
+    let labels = w.labels(1695);
+    assert!(labels.contains("loom:triage") && !labels.contains("loom:issue"));
+}
+
+#[test]
+fn records_quoted_in_a_code_fence_never_release_an_unrecorded_hold() {
+    // #10837 itself: its body quotes #1695's records as evidence, and an
+    // operator later parked it with no record of its own. Before the fix the
+    // pass read the quotes as declarations and released the hold.
+    let mut w = World::new();
+    let body = format!("Reproduction:\n\n```\n{LOOM_UI_1695_RECORDS}\n```\n\nMore prose.\n");
+    w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(skipped(&r, "no-park-record"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty());
+    assert!(w.no_writes());
+    assert!(w.labels(10837).contains("loom:blocked"));
+}
+
+#[test]
+fn quoted_or_indented_records_never_release_but_a_real_one_after_indented_backticks_does() {
+    // #10837 review: indented / blockquoted markers are not records, so they
+    // cannot release an unrecorded hold ...
+    for body in [
+        format!("Evidence:\n\n    {}\n", LOOM_UI_1695_RECORDS.replace('\n', "\n    ")),
+        format!("> {}\n", LOOM_UI_1695_RECORDS.replace('\n', "\n> ")),
+    ] {
+        let mut w = World::new();
+        w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+        for b in [1689, 1692, 1693] {
+            w.state(b, "CLOSED", false);
+        }
+        w.extra.events.insert(10837, vec!["loom:issue".into()]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "no-park-record"), 1, "{body}: {}", r.summary());
+        assert!(r.released.is_empty() && w.no_writes(), "{body}");
+    }
+    // ... while a real record after a 4-space-indented ``` still releases.
+    let mut w = World::new();
+    let body = "Evidence:\n\n    ```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    w.with_body(10837, false, body, &["loom:curated"]);
+    w.state(7, "CLOSED", false);
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
+}
+
+#[test]
+fn quoted_after_heading_or_even_backslashes_never_release_an_unrecorded_hold() {
+    // #10837 review: a marker indented under a heading, or inside a span opened
+    // after an even backslash run, is quoted code; closed #1689 causes no write.
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("## Evidence\n    {q}\n"),
+        format!("\\\\`{q}`\n"),
+        format!("Evidence\n--\n    {q}\n"),
+    ] {
+        let mut w = World::new();
+        w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+        w.state(1689, "CLOSED", false);
+        w.extra.events.insert(10837, vec!["loom:issue".into()]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "no-park-record"), 1, "{body}: {}", r.summary());
+        assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes(), "{body}");
+    }
+    // Control: a real record after the code block still releases.
+    let mut w = World::new();
+    let body =
+        "## Evidence\n    <!-- loom:park Blocked by: #7 -->\n\n<!-- loom:park Blocked by: #7 -->\n";
+    w.with_body(10837, false, body, &["loom:curated"]);
+    w.state(7, "CLOSED", false);
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
+}
+
+#[test]
+fn records_quoted_in_a_list_item_fence_never_release_but_a_real_one_after_the_list_does() {
+    // #10837 review: a fence opened directly inside a list item quotes its
+    // content, so it cannot release an unrecorded hold ...
+    let body = format!(
+        "Evidence:\n\n- ```\n\n  {}\n\n  ```\n",
+        LOOM_UI_1695_RECORDS.replace('\n', "\n  ")
+    );
+    let mut w = World::new();
+    w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(skipped(&r, "no-park-record"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes());
+    // ... while a real record after the list still releases.
+    let mut w = World::new();
+    let body = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+    w.with_body(10837, false, &body, &["loom:curated"]);
+    // The quoted refs are still prose references the pass must see closed.
+    for b in [7, 1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
 }
 
 // --- the tick's gate ------------------------------------------------------------
