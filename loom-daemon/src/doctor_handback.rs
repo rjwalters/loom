@@ -180,8 +180,8 @@ impl Outcome {
             }
             Self::HeadMoved(sha) => (
                 format!(
-                    "{SENTINEL} HEAD-MOVED head is now {sha}, not the SHA you pushed; wrote no \
-                     state label, released {CLAIM}"
+                    "{SENTINEL} HEAD-MOVED head is now {sha}, not the SHA you pushed; left no \
+                     state label of its own, released {CLAIM}"
                 ),
                 EXIT_HEAD_MOVED,
             ),
@@ -247,6 +247,38 @@ fn unverified_rejection(forge: &mut impl Forge) -> Outcome {
     ))
 }
 
+/// The post-removal rejection check was unreadable: put the old label back
+/// and withdraw the own add, as if the removal never happened.
+fn unverified_removal(forge: &mut impl Forge) -> Outcome {
+    let restored = forge.add(CHANGES);
+    let withdrawn = forge.remove(QUEUE);
+    if restored && withdrawn {
+        Outcome::Failed(format!(
+            "the comments could not be read after removing {CHANGES}; restored it and withdrew \
+             own {QUEUE}"
+        ))
+    } else {
+        Outcome::Failed(format!(
+            "the comments could not be read after removing {CHANGES}, and the restore of \
+             {CHANGES} or the withdrawal of own {QUEUE} failed"
+        ))
+    }
+}
+
+/// The head moved while we wrote: the labels we touched may now describe the
+/// newer head. Undo our writes (the claim is already released) and stand down.
+fn stand_down_head_moved(forge: &mut impl Forge, head: String, restore_changes: bool) -> Outcome {
+    let restored = !restore_changes || forge.add(CHANGES);
+    let withdrawn = forge.remove(QUEUE);
+    if restored && withdrawn {
+        Outcome::HeadMoved(head)
+    } else {
+        Outcome::Failed(format!(
+            "head moved to {head} during the hand-back and the labels could not be put back"
+        ))
+    }
+}
+
 fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Outcome {
     // Add first: if it fails nothing is removed, so the PR keeps its
     // changes-requested/treating state instead of dropping out of every queue.
@@ -263,7 +295,27 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     let mut fresh_rejection = false;
     if pre.has(CHANGES) {
         match forge.rejected_at(expected_head) {
-            Some(false) => changes_removed = forge.remove(CHANGES),
+            Some(false) => {
+                changes_removed = forge.remove(CHANGES);
+                // The first answer predates the DELETE; a Judge on another host
+                // can land a rejection in between, and the DELETE took it.
+                if changes_removed {
+                    match forge.rejected_at(expected_head) {
+                        Some(false) => {}
+                        Some(true) => {
+                            if !forge.add(CHANGES) {
+                                return Outcome::Failed(format!(
+                                    "a new {CHANGES} landed before the old one was removed and \
+                                     the removal deleted it; {CHANGES} could not be restored"
+                                ));
+                            }
+                            changes_removed = false;
+                            fresh_rejection = true;
+                        }
+                        None => return unverified_removal(forge),
+                    }
+                }
+            }
             Some(true) => fresh_rejection = true,
             None => {
                 return unverified_rejection(forge);
@@ -274,6 +326,9 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     let Some(post) = forge.read() else {
         return Outcome::Failed("the labels could not be re-read to verify the hand-back".into());
     };
+    if !same_sha(&post.head_sha, expected_head) {
+        return stand_down_head_moved(forge, post.head_sha, changes_removed);
+    }
     // A CHANGES that survives our own successful remove, or that we kept
     // because it is a new rejection, is a raced verdict, not a stuck label.
     let rivals: Vec<String> = RIVALS

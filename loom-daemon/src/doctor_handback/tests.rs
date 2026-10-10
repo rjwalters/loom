@@ -18,6 +18,8 @@ struct Fake {
     labels: Vec<String>,
     head: String,
     fail_add: bool,
+    /// Only adds of this label fail.
+    fail_add_of: Option<&'static str>,
     fail_remove: Vec<&'static str>,
     after_add: Vec<&'static str>,
     after_add_remove: Vec<&'static str>,
@@ -25,6 +27,10 @@ struct Fake {
     after_remove: Vec<(&'static str, &'static str)>,
     /// What `rejected_at` answers: a trusted changes-requested marker at the head.
     rejected: Option<bool>,
+    /// Answers for successive `rejected_at` calls, before falling back to `rejected`.
+    rejected_seq: Vec<Option<bool>>,
+    /// The head becomes this right after the hand-back's add.
+    head_after_add: Option<&'static str>,
     reads: usize,
     reads_fail_from: Option<usize>,
     calls: Vec<String>,
@@ -67,7 +73,7 @@ impl Forge for Fake {
     }
     fn add(&mut self, label: &str) -> bool {
         self.calls.push(format!("add {label}"));
-        if self.fail_add {
+        if self.fail_add || self.fail_add_of == Some(label) {
             return false;
         }
         if !self.labels.iter().any(|l| l == label) {
@@ -77,6 +83,9 @@ impl Forge for Fake {
             if !self.labels.iter().any(|x| x == l) {
                 self.labels.push(l.to_string());
             }
+        }
+        if let Some(h) = self.head_after_add.take() {
+            self.head = h.to_string();
         }
         for l in std::mem::take(&mut self.after_add_remove) {
             self.labels.retain(|x| x != l);
@@ -98,6 +107,9 @@ impl Forge for Fake {
     }
     fn rejected_at(&mut self, _head: &str) -> Option<bool> {
         self.calls.push("rejected_at".into());
+        if !self.rejected_seq.is_empty() {
+            return self.rejected_seq.remove(0);
+        }
         self.rejected
     }
 }
@@ -393,4 +405,62 @@ fn unreadable_verdict_evidence_leaves_changes_and_claim_alone() {
     let out = run(&mut f, PUSHED);
     assert!(matches!(&out, Outcome::Failed(why) if why.contains("withdrew own")), "{out:?}");
     assert_eq!(f.sorted(), names(&[CHANGES, CLAIM]));
+}
+
+/// `rejected_at` said no, then a Judge on another host rejected the pushed head
+/// before the DELETE: the DELETE took the new rejection, so it is put back.
+#[test]
+fn a_rejection_landing_between_the_evidence_read_and_the_delete_is_restored() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(false), Some(true)];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::Raced(vec![CHANGES.into()]));
+    assert_eq!(f.sorted(), names(&[CHANGES]), "rejection restored, claim and own add gone");
+    assert_eq!(out.render().1, EXIT_RACED);
+}
+
+#[test]
+fn a_rejection_that_cannot_be_restored_is_loud() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(false), Some(true)];
+    f.fail_add_of = Some(CHANGES);
+    let out = run(&mut f, PUSHED);
+    assert!(
+        matches!(&out, Outcome::Failed(why) if why.contains("could not be restored")),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn unreadable_evidence_after_the_delete_restores_changes_and_withdraws_the_add() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(false), None];
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(&out, Outcome::Failed(why) if why.contains("restored it")), "{out:?}");
+    assert_eq!(
+        f.sorted(),
+        names(&[CHANGES, CLAIM]),
+        "pre-state restored, claim kept for a retry"
+    );
+}
+
+/// A push between the first read and the verifying read: the hand-back is not
+/// verified for that head, so it stands down and restores what it touched.
+#[test]
+fn a_head_that_moves_during_the_write_is_not_a_verified_hand_back() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(out.render().1, EXIT_HEAD_MOVED);
+    assert_eq!(f.sorted(), names(&[CHANGES]), "pre-state restored minus the claim");
+}
+
+#[test]
+fn a_head_move_with_no_changes_label_only_withdraws_the_add() {
+    let mut f = Fake::new(&[CLAIM, "loom:ci-failure"], PUSHED);
+    f.head_after_add = Some(OTHER);
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&["loom:ci-failure"]));
 }
