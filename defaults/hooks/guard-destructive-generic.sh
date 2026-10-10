@@ -6354,7 +6354,14 @@ ALWAYS_BLOCK_PATTERNS=(
     # only an unquoted pipe followed by a shell command word matches. Kept as
     # a regex refinement (not a daemon subcommand) because this is a one-token
     # change to an existing floor pattern that must stay fail-closed in-hook.
-    '(^|[;&|[:space:](])(curl|wget)([^;&|'"'"'"]|'"'"'[^'"'"']*'"'"'|"[^"]*"|\|)*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])'
+    # Fail-closed on stray quotes: `\\.` consumes a backslash-escaped char
+    # (`curl a\' | sh`), and the two trailing sink alternatives let an
+    # UNBALANCED quote (no partner later on the line) degrade to the old
+    # `[^;&]*` over-match. A plain lone-quote span alternative is NOT enough:
+    # grep -E accepts any parse, so it would re-split `'a|dash|b'` and restore
+    # the #11136 false positive. Pathological-input cost is polynomial (DFA, no
+    # backrefs), measured ~4ms at 4KB.
+    '(^|[;&|[:space:](])(curl|wget)([^;&|'"'"'"\\]|\\.|'"'"'[^'"'"']*'"'"'|"([^"\\]|\\.)*"|\|)*(\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])|'"'"'[^'"'"';&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])[^'"'"']*$|"[^";&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])[^"]*$)'
 
     # Cloud infrastructure destruction. The aws forms below are specific
     # multi-token phrases, so they stay in this raw substring scan. The az/gcloud
