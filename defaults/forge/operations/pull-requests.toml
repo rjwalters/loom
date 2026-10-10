@@ -132,9 +132,6 @@ path = "loom-daemon/src/worktree_ops/linked_pr_listing.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/pr_planning/listing.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/observability/eta_friction.rs"
 
 [[operation]]
 id = "pr.view-state"
@@ -242,7 +239,13 @@ kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/forge_version_only_diff.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/cli/merge_pr_workflow_scope.rs"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "pr.commits-and-compare"
@@ -282,6 +285,9 @@ path = "loom-daemon/src/forge_tree_unchanged.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/blame-issue.sh"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-image-inputs.sh"
 
 [[operation]]
 id = "git.fetch-branch"
@@ -355,9 +361,6 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-review-feedback.sh"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_events_forge.rs"
 
 [[operation]]
 id = "review.thread-resolution"
@@ -527,12 +530,6 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/cli/merge_pr_refs.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_events_forge.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/cli/eta_backtest_cases.rs"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/curator.md"

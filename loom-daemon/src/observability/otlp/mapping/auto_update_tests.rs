@@ -3,10 +3,10 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
 use super::super::log_record_for;
-use crate::eta::Provenance;
 use crate::telemetry::kinds::auto_update_tick::{
     AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind, AUTO_UPDATE_LOG_ATTRIBUTE_KEYS,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 fn record() -> AutoUpdateTickRecord {
@@ -59,7 +59,8 @@ fn a_full_tick_emits_every_key_and_only_allowlisted_ones() {
     assert_eq!(log.severity_number, SeverityNumber::Info as i32);
     for kv in &log.attributes {
         assert!(
-            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str()) || kv.key == "loom.record_id",
+            AUTO_UPDATE_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                || ["loom.record_id", "loom.kind"].contains(&kv.key.as_str()),
             "{} is not allowlisted",
             kv.key
         );
@@ -112,7 +113,6 @@ fn optional_fields_are_omitted_not_fabricated() {
 fn severity_tracks_whether_the_host_is_converging() {
     let cases = [
         (TickDecisionKind::Panic, None, SeverityNumber::Error),
-        (TickDecisionKind::RollStall, None, SeverityNumber::Warn),
         (TickDecisionKind::StaleRepo, None, SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("retryable"), SeverityNumber::Warn),
         (TickDecisionKind::Fetch, Some("success"), SeverityNumber::Info),
@@ -159,7 +159,7 @@ fn collector_keeps_every_auto_update_log_attribute() {
         .find(|l| {
             l.contains("keep_keys(attributes, [")
                 && l.contains("loom.ci.chunk_index")
-                && l.contains("loom.eta.estimate_id")
+                && l.contains("loom.eta.pr.state")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in AUTO_UPDATE_LOG_ATTRIBUTE_KEYS {

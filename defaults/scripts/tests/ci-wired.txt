@@ -62,7 +62,6 @@ test-check-merge-config.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
-test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-pipefail-early-exit.sh
 test-check-promotion-landed.sh
@@ -84,6 +83,7 @@ test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
+test-critical-file-hold-tick.sh
 test-curator-rightsizing.sh
 test-default-branch.sh
 test-dependency-parse.sh
@@ -126,7 +126,6 @@ test-guide-work-plan-operator-only-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
-test-inbox-mail.sh
 test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
@@ -262,6 +261,7 @@ tests/hooks/test-pre-commit-missing-formatter.sh
 
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh
+defaults/hooks/tests/test-roll-pause.sh
 defaults/hooks/tests/test-guard-forge-egress.sh
 defaults/hooks/tests/test-guard-installed-file-writes.sh
 defaults/hooks/tests/test-guard-loom-workspace.sh
@@ -306,3 +306,7 @@ scripts/test-changelog.sh
 # #9987: spawn-claude.sh managed-gh container admission. Hermetic: a fake daemon
 # and docker stub under mktemp -d; no network, forge or real daemon binary.
 test-spawn-claude-managed-gh.sh
+
+# #11076: spawn-claude.sh's systemd scope carries OOMPolicy=continue. Hermetic:
+# systemd-run/systemctl/claude stubs under mktemp -d, no daemon, forge or network.
+test-spawn-claude-oom-policy.sh

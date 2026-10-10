@@ -422,6 +422,91 @@ enum Divergence {
     /// missing key or a different `<key>Label</key>` therefore cannot hide in
     /// here.
     EnvOrder,
+    /// The supervision policy changed on purpose after the port (#11058).
+    ///
+    /// Mechanism: a deliberate edit, not a porting artefact. The retired shell
+    /// rendered `Restart=on-success` (a daemon killed by anything but a clean
+    /// exit stayed down) under systemd's default `OOMPolicy=stop` (one
+    /// OOM-killed child stopped the whole unit), and `KeepAlive` without
+    /// `Crashed`. #11058 replaced exactly those lines, and the `--help` line
+    /// that describes them.
+    ///
+    /// Recognised by replaying that exact edit over the SHELL's answer
+    /// ([`replay_11058`]) and requiring the result to match the port, alone or
+    /// composed with the other stdout classes. The replacement text is written
+    /// out literally in this file rather than imported from the renderer, so a
+    /// later change to the supervision block cannot ride in under this class.
+    SupervisionPolicy11058,
+}
+
+/// Unit `[Service]` lines the retired shell rendered, replaced by #11058.
+const OLD_UNIT_SUPERVISION: &str = "Restart=on-success\nKillMode=mixed\nTimeoutStopSec=20\n\
+     SuccessExitStatus=143 130\nRestartPreventExitStatus=143 130\n";
+
+/// What #11058 renders in their place.
+const NEW_UNIT_SUPERVISION: &str = "\
+# Exit-code contract (#4054, #6129, #11058). Restart=always relaunches after
+# every exit EXCEPT the stay-down codes in RestartPreventExitStatus, and
+# never after `systemctl --user stop`/`disable --now` (operator stop).
+#   0    EXIT_RESTART          supervised restart / idle exit   -> relaunch
+#   1    EXIT_STARTUP_FAILURE  startup refusal (singleton etc.) -> stay down
+#   79   EXIT_FLEET_STOPPED    fleet run state is `stopped`     -> stay down
+#   130  EXIT_SIGINT           Ctrl-C                           -> stay down
+#   143  EXIT_SIGTERM / EXIT_SHUTDOWN: SIGTERM, IPC Shutdown,
+#        restart --drain --then-exit                            -> stay down
+#   SIGTERM/SIGINT death before the handler is installed      -> stay down
+#   anything else: SIGKILL (kernel OOM kill), SIGSEGV/SIGABRT,
+#   a panic (101), a stop timeout                             -> relaunch
+# RestartSec=5 plus [Unit] StartLimitBurst=5 per StartLimitIntervalSec=600
+# bound a crash loop; past that the unit is failed and the autonomy-loss
+# watchdog takes over. OOMPolicy=continue: an OOM-killed child no longer
+# stops the whole unit (the systemd default, OOMPolicy=stop, did).
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+OOMPolicy=continue
+SuccessExitStatus=143 130
+RestartPreventExitStatus=1 79 130 143 SIGTERM SIGINT
+";
+
+/// The `[Unit]` tail before and after #11058 added the start-rate limit.
+const OLD_UNIT_HEAD: &str = "Wants=network-online.target\n\n[Service]\n";
+const NEW_UNIT_HEAD: &str =
+    "Wants=network-online.target\nStartLimitIntervalSec=600\nStartLimitBurst=5\n\n[Service]\n";
+
+/// The plist `KeepAlive` dict before and after #11058 added `Crashed`.
+const OLD_KEEP_ALIVE: &str = "<key>SuccessfulExit</key>\n        <true/>\n    </dict>\n";
+const NEW_KEEP_ALIVE: &str = "<key>SuccessfulExit</key>\n        <true/>\n        \
+     <key>Crashed</key>\n        <true/>\n    </dict>\n";
+
+/// `--help`'s one-line description of the unit's policy, before and after.
+const OLD_HELP_POLICY: &str =
+    "(#4268) that mirrors the launchd contract (Restart=on-success,\n    \
+     disable-on-stop, LOOM_DAEMON_SUPERVISOR=systemd)";
+const NEW_HELP_POLICY: &str =
+    "(#4268) that mirrors the launchd contract (Restart=always minus the\n    \
+     stay-down exit codes, OOMPolicy=continue (#11058), disable-on-stop,\n    \
+     LOOM_DAEMON_SUPERVISOR=systemd)";
+
+/// The shell's document with exactly the #11058 edit applied, or the document
+/// unchanged when it carries none of the replaced text. Each fragment must
+/// occur exactly once, so a document with a second copy (or a mangled one)
+/// is left alone and stays unexplained.
+fn replay_11058(doc: &str) -> String {
+    let once = |pat: &str| doc.matches(pat).count() == 1;
+    if once(OLD_UNIT_SUPERVISION) && once(OLD_UNIT_HEAD) {
+        return doc
+            .replace(OLD_UNIT_SUPERVISION, NEW_UNIT_SUPERVISION)
+            .replace(OLD_UNIT_HEAD, NEW_UNIT_HEAD);
+    }
+    if once(OLD_KEEP_ALIVE) {
+        return doc.replace(OLD_KEEP_ALIVE, NEW_KEEP_ALIVE);
+    }
+    if once(OLD_HELP_POLICY) {
+        return doc.replace(OLD_HELP_POLICY, NEW_HELP_POLICY);
+    }
+    doc.to_string()
 }
 
 /// Split a rendered document into (env entries, everything else).
@@ -530,8 +615,18 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     if shell.stderr != port.stderr {
         found.push(classify_stderr(shell, port).ok_or(())?);
     }
-    if shell.stdout != port.stdout {
-        found.extend(classify_stdout(shell, port).ok_or(())?);
+    // #11058 is replayed first and the remaining classes are judged against
+    // the replayed document, so a re-render whose env block is also in bash's
+    // hash order is explained by both, not by neither.
+    let replayed = Answer {
+        stdout: replay_11058(&shell.stdout),
+        ..shell.clone()
+    };
+    if replayed.stdout != shell.stdout {
+        found.push(Divergence::SupervisionPolicy11058);
+    }
+    if replayed.stdout != port.stdout {
+        found.extend(classify_stdout(&replayed, port).ok_or(())?);
     }
     Ok(found)
 }

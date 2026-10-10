@@ -268,3 +268,96 @@ fn exportable_detail_passes_the_cause_through() {
     // Free-form dispositions stay redacted.
     assert_eq!(exportable_detail(QueueDisposition::DispatchError, Some("boom")), None);
 }
+
+// ---- disk admission (#11191) ------------------------------------------------
+
+/// `heavy` (28 GB observed charge) and `light` (1 GB), `remaining_gb` left.
+fn disk_budget(remaining_gb: u64) -> crate::disk_admission::DiskBudget {
+    use crate::disk_admission::{ChargeSource, RepoCharge};
+    let c = |repo: &str, gb| RepoCharge {
+        repo: repo.into(),
+        gb,
+        source: ChargeSource::Observed,
+    };
+    crate::disk_admission::DiskBudget {
+        free_gb: remaining_gb + 3,
+        floor_gb: 3,
+        reserved_gb: 0,
+        remaining_gb,
+        sweeps_in_flight: 0,
+        charges: vec![c("heavy", 28), c("light", 1)],
+    }
+}
+
+#[test]
+fn disk_reservation_is_a_pinned_lowest_precedence_cause() {
+    assert_eq!(HaltCause::DiskReservation.as_str(), "disk_reservation");
+    assert_eq!(HaltCause::from_wire("disk_reservation"), Some(HaltCause::DiskReservation));
+    let b = disk_budget(14);
+    // Not otherwise held: the heavy root is held for disk, the light one not.
+    let folded = super::with_disk_holds(vec![None, None], Some(&b));
+    assert_eq!(folded, vec![Some(HaltCause::DiskReservation), None]);
+    // A root another hold already names keeps that cause.
+    let folded = super::with_disk_holds(vec![Some(HaltCause::MainRed), None], Some(&b));
+    assert_eq!(folded[0], Some(HaltCause::MainRed));
+    // No budget (admission off or unmeasured): unchanged.
+    assert_eq!(super::with_disk_holds(vec![None, None], None), vec![None, None]);
+}
+
+#[test]
+fn pass_two_defers_a_heavy_repo_on_disk_and_admits_a_light_one() {
+    let mut multi = vec![
+        (OneShotSource(Some(vec![item(1)])), Disp::default()),
+        (OneShotSource(Some(vec![item(2), item(3)])), Disp::default()),
+    ];
+    let report = super::super::tick_multi_with_build_backoff(
+        &mut multi,
+        &[1, 100],
+        10.into(),
+        &[false, false],
+        None,
+        usize::MAX,
+        false,
+        None,
+        (None, None, Some(disk_budget(14))),
+        &[],
+        &[],
+    );
+    assert!(multi[0].1.dispatched.is_empty(), "28 GB does not fit 14 GB");
+    assert_eq!(multi[1].1.dispatched, vec![2, 3], "a light repo still admits");
+    assert_eq!((report.dispatched, report.deferred_capacity), (2, 1));
+    let rows = super::super::ready_queue::finish(&report.queue, &[]);
+    let heavy = rows.iter().find(|r| r.issue == 1).unwrap();
+    assert_eq!(heavy.disposition, QueueDisposition::DeferredCapacity);
+    let detail = heavy.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("disk: heavy charge 28GB (observed) exceeds remaining 14GB"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn pass_two_debits_each_disk_admission() {
+    // 30 GB: one heavy sweep fits (28), the second does not, and the 2 GB
+    // left then admits two light sweeps but not a third.
+    let mut multi = vec![
+        (OneShotSource(Some(vec![item(1), item(2)])), Disp::default()),
+        (OneShotSource(Some(vec![item(3), item(4), item(5)])), Disp::default()),
+    ];
+    let report = super::super::tick_multi_with_build_backoff(
+        &mut multi,
+        &[1, 100],
+        10.into(),
+        &[false, false],
+        None,
+        usize::MAX,
+        false,
+        None,
+        (None, None, Some(disk_budget(30))),
+        &[],
+        &[],
+    );
+    assert_eq!(multi[0].1.dispatched, vec![1]);
+    assert_eq!(multi[1].1.dispatched, vec![3, 4]);
+    assert_eq!(report.deferred_capacity, 2);
+}

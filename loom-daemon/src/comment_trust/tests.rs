@@ -227,6 +227,11 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/read_cache_tests.rs", "test"),
         ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
+        // #9258: WRITES the anchor marker (moved here from claim_reconciliation.rs)
+        // and acts on `decide_anchor`; it reads no comment bodies itself.
+        ("claim_reconciliation/unanchored_verdict.rs", "writer, never a reader"),
+        ("claim_reconciliation/unanchored_verdict_tests.rs", "test"),
+        ("verdict_body.rs", "doc mention only; classifies a body, reads no comments"),
         // #9709: reads the RAW listing deliberately, but only to NAME the
         // author of a marker the policy dropped, in the stale-clear notice.
         // The decision is made upstream from trusted markers only and nothing

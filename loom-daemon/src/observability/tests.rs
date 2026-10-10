@@ -68,7 +68,8 @@ fn absent_config_resolves_to_documented_defaults() {
         resolve_exporters(&config),
         vec![ExporterEntry {
             kind: ExporterKind::Https,
-            endpoint: None
+            endpoint: None,
+            headers_file: None
         }],
         "https is the default exporter"
     );
@@ -135,7 +136,8 @@ fn resolve_exporter_unknown_value_falls_back_to_https() {
         resolve_exporters(&config),
         vec![ExporterEntry {
             kind: ExporterKind::Https,
-            endpoint: None
+            endpoint: None,
+            headers_file: None
         }],
         "a sole unknown singular value still degrades to the https default"
     );
@@ -156,6 +158,7 @@ fn raw(kind: &str, endpoint: Option<&str>) -> RawExporterEntry {
     RawExporterEntry {
         kind: kind.to_string(),
         endpoint: endpoint.map(str::to_string),
+        headers_file: None,
     }
 }
 
@@ -163,6 +166,7 @@ fn entry(kind: ExporterKind, endpoint: Option<&str>) -> ExporterEntry {
     ExporterEntry {
         kind,
         endpoint: endpoint.map(str::to_string),
+        headers_file: None,
     }
 }
 
@@ -710,17 +714,10 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured ⇒ spawn_task must return Some");
     // Issue #8760: `daemon_event::spawn_task` adds a third handle alongside
-    // `collector`'s and the sender's.
-    // Issue #9289: the ETA tracker's bus subscriber (on by default) adds one.
-    // Issue #10245/#10263: the daily refit, run by the fleet snapshot refresh
-    // task (both on by default; either/or, so one handle) adds one.
-    // Issue #10492: the captain-gated nightly backtest-folds task (on by
-    // default, independent of the refit/refresh either/or) adds one.
-    assert_eq!(
-        handles.len(),
-        6,
-        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
-    );
+    // `collector`'s and the sender's. The HTTPS-only sink starts no OTLP ops
+    // tasks, and the ETA subscriber / fleet refresh / nightly folds tasks are
+    // gone with the ETA subsystem (#11098).
+    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
     for handle in handles {
         handle.abort();
     }
@@ -752,16 +749,14 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #8760: `daemon_event::spawn_task` adds one more handle alongside
     // `collector`'s and one sender per exporter.
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
-    // Issue #9289: the ETA tracker's bus subscriber (on by default).
-    // Issue #10245/#10263: the fleet refresh task, which owns the daily refit
-    // (either/or with the standalone refit task, so one handle).
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
-    // Issue #10492: the nightly backtest-folds task (on by default).
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
+    // (The ETA tasks were removed with the ETA subsystem, #11098.)
+    // Issue #11161: the `fleet.state` pass after each work-finder tick.
     assert_eq!(
         handles.len(),
-        10,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+        8,
+        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -797,13 +792,9 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
             .expect("the https exporter is fully configured and must still run");
-    // Issue #8760: `daemon_event::spawn_task` adds one more handle.
-    // Issue #10492: the nightly backtest-folds task (on by default) adds one.
-    assert_eq!(
-        handles.len(),
-        6,
-        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
-    );
+    // Issue #8760: `daemon_event::spawn_task` adds one more handle. No OTLP
+    // sink started, so no OTLP ops tasks (the ETA tasks are gone, #11098).
+    assert_eq!(handles.len(), 3, "collector + daemon_event + only the https sender");
     let statuses = global_export_statuses();
     assert_eq!(
         statuses["otlp"].state,
@@ -892,11 +883,12 @@ async fn malformed_otlp_configuration_has_no_collector_or_queue_activity() {
 /// The `otlp`-feature counterpart of
 /// `spawn_task_fully_configured_spawns_three_tasks`: `exporter=otlp`
 /// with the feature compiled in spawns the same collector+daemon_event+sender
-/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`.
+/// trio, just wired to `otlp::OtlpExporter` instead of `HttpsExporter`, plus
+/// the three OTLP ops-sink tasks.
 #[cfg(feature = "otlp")]
 #[tokio::test]
 #[serial]
-async fn spawn_task_otlp_exporter_spawns_three_tasks() {
+async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
     clear_env();
     let bus = EventBus::new();
     let dir = tempdir().unwrap();
@@ -913,15 +905,18 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
+    // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
-    // Issue #10492: the nightly backtest-folds task (on by default).
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
+    // Issue #11161: the `fleet.state` pass after each work-finder tick.
     assert_eq!(
         handles.len(),
-        9,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+        7,
+        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
     );
     for handle in handles {
         handle.abort();
     }
 }
+
+mod headers_file;

@@ -148,6 +148,27 @@ via systemctl and follows the PID-file/nohup restart path instead. Darwin
 behavior is entirely unaffected — this tier is inert unless
 `is_linux_systemd()` (lib/systemd-user.sh) resolves true.
 
+Fleet floor check (Issue #11044): on a fleet host (a fleet store is
+configured: `fleet.repo` / LOOM_FLEET_REPO) the version is set by the fleet
+floor, `loom_min_version`, and the host moves only when the floor moves
+(#10885). Before it builds or fetches anything, this script compares the
+version it is about to install with the floor and the installed version.
+It warns when the install moves the host AHEAD of the fleet (above the
+floor while the installed version already meets it), BELOW the floor, or
+when the floor is not known. It says nothing for a host with no fleet
+store, for the floor's own version, for a reinstall of the installed
+version, or for a lagging host going to a release above the floor (where a
+floor roll would go too). The floor is read without contacting the daemon,
+from the host's fleet-sync snapshot (~/.loom/fleet-sync-status.json), which
+is at most one fleet.syncIntervalSecs old while the daemon runs and as old
+as its last pass when it does not; the warning names the snapshot's time.
+On a warning: with a terminal on stdin it asks `Continue? [y/N]` and only
+a typed y continues; without one it refuses (exit 1) and names the
+override, and never waits on stdin. --yes / LOOM_DAEMON_UPDATE_YES=1
+continue without asking. --dry-run prints the warning and never asks.
+--check and --resolve-json are unchanged. A run started by the daemon or by
+Loom tooling (LOOM_DAEMON_UPDATE_INVOKER) prints it and continues.
+
 Usage:
   ./.loom/scripts/cli/loom-daemon-update.sh              Detect, rebuild if stale, provision, restart (preserving flags)
   ./.loom/scripts/cli/loom-daemon-update.sh --check       Detect only; exit 0 (up to date) or 3 (update available); no writes
@@ -166,9 +187,19 @@ Usage:
   ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch      Disable artifact-fetch mode entirely; always use the local source-build path (pre-#5020 behavior). Same as LOOM_DAEMON_UPDATE_FETCH=0.
   ./.loom/scripts/cli/loom-daemon-update.sh --resolve-json  READ-ONLY resolution (Issue #7609): resolve the latest Release artifact for this host's platform and print ONE JSON object on stdout describing it (tag/version/published_at/asset sha256) alongside the installed binary (path/version/commit/sha256) and the source tree's VERSION — then exit WITHOUT fetching, building, provisioning, or restarting anything (no `git fetch`/ff-sync either). Every other line this script prints goes to stderr in this mode, so stdout is pure JSON. Exit 0 when a release artifact resolved, 1 when it did not (`.ok` says which, `.reason` says why). This is the query `loom-daemon`'s auto_update loop drives its artifact-first tick from, so the resolution logic lives here once instead of being duplicated in Rust.
   ./.loom/scripts/cli/loom-daemon-update.sh --prune-stale-entry-points  Remove exactly the PATH entries the stale-entry-point advisory below (#4079/#4557) classifies as a "Python console script (stale pip/pipx editable install)" — a frozen console script left behind by the retired pip/pipx package (epic #4081 Phase 4 / #4557) that never resolves to the current loom-daemon binary and so is never touched by an update again. Conservative by construction: it reuses the SAME classification the advisory already computes, so `loom-daemon` itself and the auto-generated bash-wrapper shims (`loom-clean`/`loom-recover-orphans`/`loom-claim`, #4272/#4275 — including a STALE shim whose target moved) are never candidates, only ever reported. Standalone: performs the prune, reports what it removed, and exits — no build/provision/restart. Idempotent (a second run finds nothing to remove) and reports "nothing to prune" when the PATH is already clean. Honors LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 (a no-op, matching the check it would otherwise act on) (#5139).
+  ./.loom/scripts/cli/loom-daemon-update.sh --yes         Fleet hosts (Issue #11044): install even when the version would move this host off the fleet floor, without asking. Same as LOOM_DAEMON_UPDATE_YES=1. See "Fleet floor check" above.
+  ./.loom/scripts/cli/loom-daemon-update.sh --to-floor    Fleet hosts (Issue #11044): install EXACTLY the floor's release (vX.Y.Z of loom_min_version) instead of the newest one — to bring a lagging host up to the fleet. Implies --fetch --tag v<floor>. A host already at or above the floor installs nothing (exit 0); a host with no fleet store, or whose floor is not known, is refused (exit 1). Cannot be combined with --tag, --no-fetch or --resolve-json.
   ./.loom/scripts/cli/loom-daemon-update.sh --help
 
 Environment:
+  LOOM_DAEMON_UPDATE_YES  1/true/yes: same as --yes (Issue #11044).
+  LOOM_DAEMON_UPDATE_INVOKER  Set by Loom's own non-interactive callers —
+                         the daemon's self-update loop (`daemon`), `fleet
+                         roll` (`fleet-roll`) and `fleet add-worker`
+                         (`add-worker`). A run carrying it never prompts and
+                         is never refused by the fleet floor check; it prints
+                         the warning and continues. Not for operators: use
+                         --yes.
   LOOM_DAEMON_UPDATE_FETCH  Artifact-fetch precedence (Epic #4990 Phase 3,
                          #5020): 1/true/yes forces it (same as --fetch,
                          hard-fails without a matching artifact); 0/false/no
@@ -358,6 +389,11 @@ Exit codes:
      the JSON object is still printed on stdout with `.ok=false` and a
      `.reason`, and callers are expected to read the JSON rather than
      branch on the exit code alone.
+     Also used by the fleet floor check (#11044) when a fleet host would
+     move off its floor and the run was not confirmed: the operator
+     answered anything but y at the prompt, or there was no terminal to
+     ask on and neither --yes nor LOOM_DAEMON_UPDATE_YES=1 was given.
+     Nothing was changed. Also used by --to-floor when there is no floor.
   3  (--check only) update available
   4  build verification FAILED: the freshly-built binary's embedded commit
      does not match the source HEAD it was built from. This is a BUILD-SYSTEM

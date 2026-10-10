@@ -806,17 +806,17 @@ Run the appropriate build check after every meaningful code change:
 | Language | Build Check Command | What It Catches |
 |----------|-------------------|-----------------|
 | Rust | `cargo check` | Type errors, borrow checker violations, async Send issues |
-| Rust | `cargo clippy` | Common mistakes, anti-patterns, correctness issues |
+| Rust | CI's clippy lines | Anti-patterns, unused imports |
 | TypeScript | `pnpm tsc --noEmit` | Type errors, missing imports |
 
 For Rust changes specifically, run these **before committing**:
 ```bash
-cargo check          # Fast compilation check (no codegen)
-cargo clippy         # Lint for common mistakes
-cargo fmt            # Format code
+cargo check          # Fast (no codegen)
+grep -rn 'cargo clippy' .github/workflows  # run each hit verbatim
+cargo fmt
 ```
 
-`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
+Scoped tests are not lint; report it apart (no CI hit: bare `cargo clippy`; no clippy: "unvalidated"). Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
 
 ### Build-time performance
 
@@ -854,17 +854,17 @@ Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Before a local cargo result counts as "tests pass": a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 
 ## Guidelines
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
 - **Update labels**: Always mark issues as `loom:building` when starting
-- **Read before writing**: Examine existing code to understand patterns and conventions
-- **Verify builds**: Run language-appropriate build checks after writing code (see Build Verification above)
-- **Test your changes**: Run relevant tests after making modifications
-- **Follow conventions**: Match the existing code style and architecture
-- **Be thorough**: Complete the full task, don't leave TODOs
+- **Read before writing**: Read existing code for patterns and conventions
+- **Verify builds**: Run language-appropriate build checks (see Build Verification above)
+- **Test your changes**: Grep fixtures, differential oracles, expectations for changed contracts (env names, CLI help, fields); align them; run the affected suite before review
+- **Follow conventions**: Match existing style and architecture
+- **Be thorough**: Complete the task; no TODOs
 - **Stay in scope**: If you discover new work, PAUSE and create an issue - don't expand scope
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why

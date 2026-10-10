@@ -2519,8 +2519,10 @@ fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
 // red-main-fix lanes live in sibling files (this one is size-frozen).
 mod build_backoff;
 mod main_red_fix;
+mod maintain_only;
 mod operator_priority;
 mod ordering;
+mod ram_budget;
 
 // ===================================================================
 // WorkItem
@@ -4428,18 +4430,15 @@ fn test_dispatch_held_per_root_with_drain_no_drain_matches_per_root() {
     assert_eq!(plain, with_drain, "draining=false ⇒ identical to dispatch_held_per_root");
 }
 
-/// Issue #6007 — the livelock, from the *admission* side. The work finder
-/// reads exactly one bit (`DrainState::flag`, surfaced here as `draining`), so
-/// what matters is what a **refused** drain deadline does to that bit. Before
-/// #6007 the first refusal cleared it, dispatch resumed, more sweeps were
-/// admitted, and the next drain was strictly harder to satisfy — a busy host
-/// could never roll. Now the refusal *retains* the roll, so admission stays
-/// held and the in-flight set can actually reach zero; only once the roll is
-/// abandoned (its paused-dispatch budget spent) does admission resume, so real
-/// work is never blocked indefinitely.
+/// The admission side of a roll (#6007's test, restated for #10831). The work
+/// finder reads exactly one bit (`DrainState::flag`, surfaced here as
+/// `draining`). A pause roll holds it for the whole pause, so no new sweep is
+/// admitted while agents are being stopped; if the roll ends without a restart
+/// (superseded or aborted before it stopped anything) admission resumes, so a
+/// roll can never hold dispatch indefinitely.
 #[test]
-fn test_admission_stays_held_across_a_roll_refusal_then_resumes_when_abandoned() {
-    use crate::ipc::{DrainState, RollRefusal};
+fn test_admission_stays_held_for_a_pause_roll_and_resumes_when_it_ends_without_a_restart() {
+    use crate::ipc::{DrainOrigin, DrainState};
 
     let states = WorkspaceHealthStates::new();
     let root_a = std::path::PathBuf::from("/tmp/repo-a");
@@ -4447,35 +4446,19 @@ fn test_admission_stays_held_across_a_roll_refusal_then_resumes_when_abandoned()
     let roots = [root_a, root_b];
 
     let drain = DrainState::new();
-    let _ = drain.begin(std::time::Duration::from_secs(1800), false, false);
+    let _ =
+        drain.begin_as(std::time::Duration::from_secs(120), false, false, DrainOrigin::PauseRoll);
     assert_eq!(
         dispatch_held_per_root_with_drain(&states, &roots, true, drain.is_draining()),
         vec![true, true],
-        "a scheduled drain holds every root"
+        "a pause roll holds every root"
     );
 
-    // The deadline passes with sweeps still in flight: refused, roll retained.
-    let started = drain.snapshot().started_at.expect("started_at");
-    assert!(matches!(
-        drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)),
-        RollRefusal::Deferred { .. }
-    ));
-    assert_eq!(
-        dispatch_held_per_root_with_drain(&states, &roots, true, drain.is_draining()),
-        vec![true, true],
-        "#6007: admission must STAY held across the refusal — resuming here is the livelock"
-    );
-
-    // Budget spent: the roll is abandoned and admission resumes, so a wedged
-    // sweep cannot starve the host of work forever.
-    assert!(matches!(
-        drain.refuse_roll_deadline(started + chrono::Duration::seconds(7200)),
-        RollRefusal::Abandoned { .. }
-    ));
+    assert!(drain.abort_pause_roll());
     assert_eq!(
         dispatch_held_per_root_with_drain(&states, &roots, true, drain.is_draining()),
         vec![false, false],
-        "an abandoned roll returns the admission window to the work finder"
+        "a roll that ended without a restart returns the admission window to the work finder"
     );
 }
 

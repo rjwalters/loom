@@ -101,6 +101,55 @@ pub fn resolve(config: &WorkFinderConfig) -> Option<usize> {
     env_max_concurrent_per_repo().or(config.max_concurrent_per_repo)
 }
 
+/// The per-repo admission limits pass 2 enforces: the #9090 per-repo cap and,
+/// in production since #11094, the per-repo RAM budget
+/// ([`crate::ram_headroom::RamBudget`]). `Option<usize>` converts to a
+/// RAM-less value, so every pre-#11094 caller is unchanged.
+/// Since #11191 it also carries the per-repo disk budget
+/// ([`crate::disk_admission::DiskBudget`]).
+#[derive(Debug, Clone, Default)]
+pub struct RepoLimits {
+    pub per_repo: Option<usize>,
+    pub ram: Option<crate::ram_headroom::RamBudget>,
+    pub disk: Option<crate::disk_admission::DiskBudget>,
+}
+
+impl From<Option<usize>> for RepoLimits {
+    fn from(per_repo: Option<usize>) -> Self {
+        Self {
+            per_repo,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<(Option<usize>, Option<crate::ram_headroom::RamBudget>)> for RepoLimits {
+    fn from((per_repo, ram): (Option<usize>, Option<crate::ram_headroom::RamBudget>)) -> Self {
+        Self {
+            per_repo,
+            ram,
+            disk: None,
+        }
+    }
+}
+
+/// The production tick's limits (#11191): per-repo cap, RAM and disk budgets.
+type TickLimits = (
+    Option<usize>,
+    Option<crate::ram_headroom::RamBudget>,
+    Option<crate::disk_admission::DiskBudget>,
+);
+
+impl From<TickLimits> for RepoLimits {
+    fn from((per_repo, ram, disk): TickLimits) -> Self {
+        Self {
+            per_repo,
+            ram,
+            disk,
+        }
+    }
+}
+
 /// Pass 2's per-repo admission counter: the cap plus one live occupancy count
 /// per workspace, seeded from each dispatcher's **own**
 /// [`WorkDispatcher::occupancy`] — already per-repo, and already the value the
@@ -115,6 +164,10 @@ pub struct RepoCap {
     /// affinity "hot track" set. Snapshotted, not live, so the ordering a tick
     /// computes cannot shift underneath its own dispatch loop.
     hot: Vec<bool>,
+    /// The tick's per-repo RAM budget (#11094); `None` ⇒ no RAM gate here.
+    ram: Option<crate::ram_headroom::RamBudget>,
+    /// The tick's per-repo disk budget (#11191); `None` ⇒ no disk gate here.
+    disk: Option<crate::disk_admission::DiskBudget>,
 }
 
 impl RepoCap {
@@ -125,10 +178,18 @@ impl RepoCap {
     /// zero, so this only guards a hand-constructed value.
     #[must_use]
     pub fn new(cap: Option<usize>, occupancy: Vec<usize>) -> Self {
+        Self::from_limits(cap.into(), occupancy)
+    }
+
+    /// [`Self::new`] plus the tick's per-repo RAM budget (#11094).
+    #[must_use]
+    pub fn from_limits(limits: RepoLimits, occupancy: Vec<usize>) -> Self {
         Self {
-            cap: cap.filter(|&c| c > 0),
+            cap: limits.per_repo.filter(|&c| c > 0),
             hot: occupancy.iter().map(|&o| o > 0).collect(),
             occupancy,
+            ram: limits.ram,
+            disk: limits.disk,
         }
     }
 
@@ -178,6 +239,37 @@ impl RepoCap {
         true
     }
 
+    /// Pass 2's per-repo gate (#11094): defer `cand` when its OWN repo's RAM
+    /// charge no longer fits the tick's remaining RAM budget — checked even
+    /// for an `over` (overflow-slot) candidate, since a star cannot buy
+    /// memory — and otherwise, unless `over`, when its repo is at its #9090
+    /// cap ([`Self::defer`]). A RAM deferral counts as `deferred_capacity`
+    /// with a `ram:` detail naming the repo and its charge. Work-conserving:
+    /// the next candidate, in a lighter repo, may still fit.
+    pub fn defer_admission(
+        &self,
+        cand: &PriorityCandidate,
+        over: bool,
+        report: &mut TickReport,
+    ) -> bool {
+        if let Some(ram) = self.ram.as_ref().filter(|r| !r.fits(cand.workspace_idx)) {
+            let detail = ram.deferral_detail(cand.workspace_idx);
+            log::debug!("work_finder: deferring issue #{} — {detail}", cand.number);
+            report.deferred_capacity += 1;
+            ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
+            return true;
+        }
+        // #11191: the same for the repo's disk charge; a star cannot buy disk.
+        if let Some(disk) = self.disk.as_ref().filter(|d| !d.fits(cand.workspace_idx)) {
+            let detail = disk.deferral_detail(cand.workspace_idx);
+            log::debug!("work_finder: deferring issue #{} — {detail}", cand.number);
+            report.deferred_capacity += 1;
+            ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
+            return true;
+        }
+        !over && self.defer(cand, report)
+    }
+
     /// The cap and the per-workspace occupancy as they stand now — at the
     /// top of the tick when [`shape_queue`] records it (Issue #9288).
     #[must_use]
@@ -193,6 +285,12 @@ impl RepoCap {
     pub fn admit(&mut self, idx: usize) {
         if let Some(slot) = self.occupancy.get_mut(idx) {
             *slot += 1;
+        }
+        if let Some(ram) = self.ram.as_mut() {
+            ram.debit(idx);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.debit(idx);
         }
     }
 }

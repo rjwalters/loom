@@ -69,6 +69,9 @@ pub fn active_spawn_loop_issues(repo_root: &Path) -> std::collections::HashSet<u
         .map(|t| t.issue)
         .collect();
     active.extend(active_locked_issues(repo_root));
+    // #10832: a worktree named in a live pause manifest is owned until H5
+    // resumes or requeues its agent, whatever its lock looks like.
+    active.extend(crate::roll_pause::suppress::held_issues(repo_root));
     active
 }
 

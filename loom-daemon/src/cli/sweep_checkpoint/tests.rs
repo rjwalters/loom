@@ -164,3 +164,36 @@ fn concurrent_atomic_writers_leave_complete_checkpoint_without_temporary_files()
         1
     );
 }
+
+/// #9935: `begin` is telemetry only. Without an inherited trace it is a
+/// silent no-op, and it never creates, reads, or alters the checkpoint file
+/// that drives resume.
+#[test]
+fn begin_is_telemetry_only_and_never_touches_the_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(invoke(dir.path(), &["begin", "42", "builder"]).unwrap(), "");
+    assert_eq!(invoke(dir.path(), &["exists", "42"]).unwrap_err().0, 1);
+    invoke(dir.path(), &["write", "42", "curator-done", "--task-id", "run-1"]).unwrap();
+    let before = invoke(dir.path(), &["read", "42"]).unwrap();
+    for role in ["curator", "builder", "judge", "doctor", "merge"] {
+        invoke(dir.path(), &["begin", "42", role, "--attempt", "2", "--model", "opus"]).unwrap();
+    }
+    assert_eq!(invoke(dir.path(), &["read", "42"]).unwrap(), before);
+    assert_eq!(invoke(dir.path(), &["phase", "42"]).unwrap(), "curator-done\n");
+    assert_eq!(
+        invoke(dir.path(), &["begin", "42", "builder-done"])
+            .unwrap_err()
+            .0,
+        2
+    );
+    assert_eq!(invoke(dir.path(), &["begin", "42"]).unwrap_err().0, 2);
+    for bad in [
+        &["begin", "42", "builder", "--attempt", "0"][..],
+        &["begin", "42", "builder", "--model", "a b"],
+        &["begin", "42", "builder", "--task-id", "x"],
+        &["begin", "42", "builder", "--attempt"],
+        &["begin", "x", "builder"],
+    ] {
+        assert_eq!(invoke(dir.path(), bad).unwrap_err().0, 1, "{bad:?}");
+    }
+}

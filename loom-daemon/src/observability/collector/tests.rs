@@ -1049,7 +1049,6 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         // not about the `tmpfs_visibility` axis.
         tmpfs_visibility: None,
         ci_telemetry: None,
-        inbox_mail: None,
     }
 }
 

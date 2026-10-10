@@ -392,6 +392,7 @@ fn registered(path: &str, priority: u32) -> Registered {
     Registered {
         root: PathBuf::from(path),
         priority,
+        maintain_only: false,
     }
 }
 
@@ -497,6 +498,37 @@ fn a_both_flags_record_is_a_hard_error_for_the_whole_roster() {
     assert!(msg.contains("refusing the whole roster"), "{msg}");
 }
 
+/// #11186: the timer's apply flips an existing workspace into maintain-only
+/// and back, in place: it is never removed, and keeps its priority.
+#[test]
+fn apply_change_flips_maintain_only_in_place() {
+    use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
+    let dir = tempfile::tempdir().expect("dir");
+    let repo = dir.path().join("admin");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let path = dir.path().join("workspaces.json");
+    let mut reg = WorkspaceRegistry::default();
+    reg.add_with_priority(&repo, None, 7).expect("add");
+    reg.save(&path).expect("save");
+    let flip = |to| Change::SetMaintainOnly {
+        name: "admin".into(),
+        path: repo.clone(),
+        to,
+    };
+
+    apply_change(&path, &flip(true)).expect("into");
+    let reg = WorkspaceRegistry::load(&path).expect("load");
+    assert_eq!(reg.workspaces.len(), 1);
+    assert_eq!(reg.workspaces[0].priority, 7);
+    let mark = reg.maintain_only_of(&repo).expect("maintain-only");
+    assert_eq!(mark.by, MaintainOnlySource::FleetStore);
+
+    apply_change(&path, &flip(false)).expect("out");
+    let reg = WorkspaceRegistry::load(&path).expect("load");
+    assert_eq!((reg.workspaces.len(), reg.workspaces[0].priority), (1, 7));
+    assert!(reg.maintain_only_of(&repo).is_none());
+}
+
 // ------------------------------------------------------------------------
 // The host-level snapshot and its `status` line
 // ------------------------------------------------------------------------
@@ -515,6 +547,9 @@ fn sample_status() -> FleetSyncStatus {
         state: StatePass::default(),
         enforced: Enforcement::Proceed,
         floor: FloorPass::default(),
+        workspaces: workspace_resync::WorkspacePass::default(),
+        checkouts: Vec::new(),
+        checkouts_note: None,
     }
 }
 
@@ -599,6 +634,14 @@ fn status_line_distinguishes_a_skipped_roster_from_a_clean_one() {
     assert!(line.contains("CACHED snapshot"), "{line}");
     assert!(line.contains("roster: not checked"), "{line}");
     assert!(!line.contains("roster: in sync"), "a skipped roster is not a clean one: {line}");
+}
+
+#[test]
+fn status_line_says_when_a_checkout_step_was_skipped_because_an_earlier_one_holds_it() {
+    let mut status = sample_status();
+    status.checkouts_note = Some(checkout_ff::BUSY_NOTE.to_string());
+    let line = render_line(Some(&status), Utc::now()).expect("a line");
+    assert!(line.contains(&format!("checkouts: {}", checkout_ff::BUSY_NOTE)), "{line}");
 }
 
 // ------------------------------------------------------------------------

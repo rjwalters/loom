@@ -41,8 +41,6 @@ const SIGNOZ_README: &str = include_str!("../../defaults/observability/signoz/RE
 /// The standing build/CI retro queries (#8826). Governed by the CI record
 /// family's own vocabulary, not the shared fixture manifest's.
 const CI_QUERIES: &str = include_str!("../../defaults/observability/signoz/ci-queries.sql");
-/// The ETA accuracy queries (#9289).
-const ETA_QUERIES: &str = include_str!("../../defaults/observability/signoz/eta-queries.sql");
 /// The measured token/cost usage queries (#8528 scope item 4). Governed by the
 /// `loom.runtime.usage` span's own emitted vocabulary, not the shared fixture
 /// manifest's — the fixture generator emits no usage spans, so these read real
@@ -270,7 +268,6 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         ("fixture-queries.sql", FIXTURE_QUERIES),
         ("queries.sql", ADHOC_QUERIES),
         ("ci-queries.sql", CI_QUERIES),
-        ("eta-queries.sql", ETA_QUERIES),
         ("usage-queries.sql", USAGE_QUERIES),
         // Only query 5 (the dispatch disposition/admission span read) uses
         // these containers; queries 1-4 read `signoz_metrics` exclusively —
@@ -913,47 +910,6 @@ fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
     );
 }
 
-/// The same coupling for `eta-queries.sql` (#9289, executed against the pinned
-/// engine by `signoz_eta_queries.rs` in #8528). Its sections are `0` plus
-/// `Q1`-`Q7` (Q4-Q7 since #10233), so the citation is matched on those tokens rather than on bare
-/// digits — and section 0 is cited here, unlike `usage-queries.sql`'s, because
-/// the ETA preflight is the thing that says whether Q1-Q3 rest on anything and
-/// a reader must be sent to it from the table itself.
-#[test]
-fn every_eta_query_section_is_cited_by_a_readme_saved_view() {
-    let citation = Regex::new(r"`eta-queries\.sql`([^)]*)\)").unwrap();
-    let cited: Vec<String> = SIGNOZ_README
-        .lines()
-        .filter(|line| line.starts_with("| "))
-        .flat_map(|line| {
-            citation
-                .captures_iter(line)
-                .map(|capture| capture.get(1).unwrap().as_str().to_string())
-                .collect::<Vec<String>>()
-        })
-        .collect();
-    assert!(
-        !cited.is_empty(),
-        "the SigNoz README's Saved views table cites no `eta-queries.sql` section at all"
-    );
-    let all = cited.join(" ");
-    for section in ["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"] {
-        assert!(
-            Regex::new(&format!(r"(?m)^-- {}\. ", regex::escape(section)))
-                .unwrap()
-                .is_match(ETA_QUERIES),
-            "eta-queries.sql is missing section {section}"
-        );
-        assert!(
-            Regex::new(&format!(r"\b{}\b", regex::escape(section)))
-                .unwrap()
-                .is_match(&all),
-            "the SigNoz README's Saved views table has no row citing `eta-queries.sql` \
-             {section}; its citations are {cited:?}"
-        );
-    }
-}
-
 /// Sections 1-6 are the reproducible views; section 0 is the arrival preflight
 /// the subsection prose describes rather than a saved view of its own.
 #[test]
@@ -1208,6 +1164,8 @@ fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
         "outcome",
         "op",
         "installation",
+        "agent",
+        "caller",
     ] {
         assert!(labels.contains(label), "github-shadow.sql no longer reads label '{label}'");
     }

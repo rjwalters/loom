@@ -135,6 +135,24 @@ pub fn emit() {
     };
     println!("cargo:rustc-env=LOOM_DAEMON_GIT_COMMIT_FULL={full}");
     println!("cargo:rustc-env=LOOM_DAEMON_GIT_DIRTY={dirty}");
+    // The release stamp (#10718): the tag this binary is being built for, set
+    // ONLY by `.github/workflows/release.yml` on a publishing run. Every other
+    // build (a developer's, a feature branch's, CI's test and release-check
+    // jobs, `scripts/daemon-build.sh`) leaves it unset and bakes in the empty
+    // string, which `release_provenance` reads as "not a release build". A
+    // value that is not a plain tag name is dropped rather than baked in.
+    println!("cargo:rerun-if-env-changed=LOOM_RELEASE_BUILD_TAG");
+    let release_tag = std::env::var("LOOM_RELEASE_BUILD_TAG")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| {
+            !t.is_empty()
+                && t.len() <= 64
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        })
+        .unwrap_or_default();
+    println!("cargo:rustc-env=LOOM_DAEMON_RELEASE_TAG={release_tag}");
     // The dirty flag goes stale if an edit does not re-run this script: watch
     // the crate's own inputs (cargo scans a directory recursively), so any
     // edit that changes the binary also re-derives the flag. HEAD movement

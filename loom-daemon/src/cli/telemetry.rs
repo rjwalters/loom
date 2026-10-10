@@ -40,6 +40,8 @@ mod telemetry_fixture;
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
 mod telemetry_overhead;
+#[path = "telemetry_replay.rs"]
+mod telemetry_replay;
 #[path = "usage_record.rs"]
 mod usage_record;
 
@@ -53,6 +55,8 @@ pub(crate) enum TelemetryCommand {
     TelemetryOverhead(telemetry_overhead::OverheadArgs),
     /// Send a bounded JSONL fixture to an explicit OTLP Collector endpoint.
     TelemetryExport(telemetry_export::TelemetryExportArgs),
+    /// Print fleet state at an instant from SigNoz, as a daemon then could have known it.
+    TelemetryReplay(telemetry_replay::ReplayArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
     TelemetryCapabilities {
         /// Fail when this artifact cannot export OTLP.
@@ -185,6 +189,7 @@ impl TelemetryCommand {
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
+            TelemetryCommand::TelemetryReplay(args) => args.run(),
             TelemetryCommand::TelemetryCapabilities { require_otlp } => {
                 println!(
                     "{}",

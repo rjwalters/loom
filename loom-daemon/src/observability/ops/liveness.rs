@@ -8,9 +8,8 @@
 //! at the moment they happen.
 //!
 //! The gauges are sampled on their own ticker ([`spawn_task`],
-//! [`SAMPLE_INTERVAL`]), not in the collector's pass. A stuck collector pass,
-//! which is also where the ETA pass runs, therefore shows as
-//! `task_alive{task=eta_pass} = 0` instead of hiding itself. This sampler is
+//! [`SAMPLE_INTERVAL`]), not in the collector's pass. A stuck collector pass
+//! therefore cannot hide another loop's death. This sampler is
 //! not in the registry. If it stops, every `task_alive` series goes silent.
 //! Alert on that silence as well as on a `0`.
 
@@ -26,11 +25,6 @@ pub enum Fault {
     Overrun,
     /// The loop exited for good.
     Exit,
-    /// A non-authority host reached the ETA sink (#10498).
-    EtaNonAuthorityEmit,
-    /// The ETA authority's pass covers fewer repos than the fleet roster
-    /// (#10897): `eta.authority.coverage`.
-    EtaAuthorityCoverage,
 }
 
 impl Fault {
@@ -41,8 +35,6 @@ impl Fault {
             Self::Panic => "panic",
             Self::Overrun => "overrun",
             Self::Exit => "exit",
-            Self::EtaNonAuthorityEmit => "eta_non_authority_emit",
-            Self::EtaAuthorityCoverage => "eta_authority_coverage",
         }
     }
 }
@@ -107,20 +99,23 @@ mod tests {
 
     #[test]
     fn one_gauge_per_task_valued_one_or_zero() {
-        let points = points(&[entry("auto_update", true), entry("eta_pass", false)]);
+        let points = points(&[
+            entry("auto_update", true),
+            entry("role_runner.judge", false),
+        ]);
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].name, MetricName::DaemonTaskAlive);
         assert_eq!(MetricName::DaemonTaskAlive.kind(), MetricKind::Gauge);
         assert_eq!(points[0].value, MetricValue::Int(1));
         assert_eq!(points[0].labels["task"], "auto_update");
         assert_eq!(points[1].value, MetricValue::Int(0));
-        assert_eq!(points[1].labels["task"], "eta_pass");
+        assert_eq!(points[1].labels["task"], "role_runner.judge");
     }
 
     #[test]
     fn a_fault_is_a_delta_counter_labelled_task_and_reason() {
         let ((), captured) = crate::observability::ops::capture::capture(|| {
-            fault("eta_fleet_refresh", Fault::Overrun);
+            fault("role_runner.champion", Fault::Overrun);
         });
         let point = captured
             .metrics
@@ -128,7 +123,7 @@ mod tests {
             .find(|p| p.name == MetricName::DaemonTaskFaults)
             .unwrap();
         assert_eq!(MetricName::DaemonTaskFaults.kind(), MetricKind::DeltaCounter);
-        assert_eq!(point.labels["task"], "eta_fleet_refresh");
+        assert_eq!(point.labels["task"], "role_runner.champion");
         assert_eq!(point.labels["reason"], "overrun");
     }
 }

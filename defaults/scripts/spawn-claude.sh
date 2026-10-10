@@ -427,7 +427,12 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     fi
 
     if command -v is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
-        _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%")
+        # OOMPolicy=continue (issue #11076): the systemd default (stop) tears
+        # down the WHOLE scope when the kernel OOM-kills any one child (a
+        # `git`/`rustc`), SIGTERMing the claude CLI; the resilient wrapper then
+        # retries while the daemon has already released the sweep as dead. With
+        # `continue` only the offending command fails and the agent can react.
+        _cpu_quota_props=(-p "CPUQuota=${_cpu_quota_pct}%" -p "OOMPolicy=continue")
         if [[ "$_cpu_wallclock" != "0" ]]; then
             _cpu_quota_props+=(-p "RuntimeMaxSec=${_cpu_wallclock}")
         fi
@@ -451,7 +456,7 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         # it from ever colliding with the real unit this spawn will create,
         # regardless of how quickly systemd garbage-collects the probe scope.
         _scope_slice="loom-agents.slice"
-        _scope_unit="loom-agent-$$-${RANDOM}${RANDOM}.scope"
+        _scope_unit="${LOOM_AGENT_SCOPE_UNIT:-loom-agent-$$-${RANDOM}${RANDOM}.scope}"
         _scope_probe_unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope"
         _scope_props=(--slice="$_scope_slice")
         # Probe with a trivial `true` invocation first: a real scope create +
@@ -846,6 +851,19 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # `CARGO_INCREMENTAL=1 cargo …` outranks the ambient value for that
     # invocation only.
     _containment_env+=(-e "CARGO_INCREMENTAL=0")
+    # The debuginfo cap (#11190) rides the same boundary, but by NAME (`-e
+    # VAR`, no value) and only when set: the daemon-side seam already chose
+    # the value — or kept an operator's own — before it spawned this script,
+    # and this re-exec runs spawn-claude.sh, not spawn-worker.sh, so nothing
+    # inside the container re-runs that seam. Without this the worker log
+    # records the cap while the in-container cargo builds full DWARF. The two
+    # names are forwarded by the env-passthrough `case` below (by name, when
+    # present in `env`). "Present" is not "set to something", though: the
+    # passthrough forwards a set-but-EMPTY variable too, and cargo hard-fails
+    # on an empty one (`invalid value: string ""`) instead of reading it as
+    # unset, so the loop's input drops those two empties and the container
+    # sees them as unset. (`grep -v` exiting 1 on no output cannot abort this
+    # script: a process substitution's status is never the shell's.)
 
     # --- Env passthrough ---
     # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
@@ -868,11 +886,11 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_*)
+            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_* | CARGO_PROFILE_DEV_DEBUG | CARGO_PROFILE_TEST_DEBUG)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac
-    done < <(env)
+    done < <(env | grep -v '^CARGO_PROFILE_[A-Z]*_DEBUG=$')
     _containment_env+=(-e "LOOM_SPAWN_CONTAINERIZED=1" -e "LOOM_WORKSPACE=${WORKSPACE}" -e "HOME=${HOME:-/home/loom}")
 
     # --- Resource-limit docker flags + observability labels (issue #7430) ---
@@ -1268,6 +1286,40 @@ if [[ "$_loom_print_mode" == "true" ]]; then
 fi
 unset _loom_print_mode
 
+# --- Session pinning and roll resume (issue #10830) ---
+# Pause-and-roll (docs/design/daemon-roll-pause-resume.md) resumes a paused
+# agent from its saved session, so the daemon pins every Claude session id at
+# dispatch (LOOM_CLAUDE_SESSION_ID) and a resume launch passes
+# LOOM_RESUME_SESSION_ID + LOOM_RESUME_PROMPT. `loom-daemon agent-resume
+# claude-args` validates them and prints the arguments to append, NUL-separated:
+# `--session-id <id>`, or `--resume <id> <prompt>` (the caller then passes no
+# prompt of its own). A daemon too old to answer costs only the pin (the session
+# runs unpinned and a roll requeues it); a resume it cannot build is refused.
+# The session id is pinned once here: claude-wrapper.sh turns it into --resume
+# on a retry, because Claude refuses a second launch with the same id.
+# For a daemon item it also prints `--settings <json>` wiring the roll-pause
+# hook, which a consumer repo's own .claude/settings.json does not (#11049).
+if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
+    _resume_args_file="$(mktemp -t loom-resume-args.XXXXXX 2>/dev/null || mktemp)"
+    if ! "$(loom_resolve_self_daemon_bin)" agent-resume claude-args >"$_resume_args_file"; then
+        [[ -z "${LOOM_RESUME_SESSION_ID:-}" ]] || { log_error "spawn-claude: cannot build the resume launch (loom-daemon agent-resume claude-args, #10830)"; rm -f "$_resume_args_file"; exit 78; }
+        log_warn "spawn-claude: session id not pinned (loom-daemon agent-resume claude-args unavailable); a daemon roll will requeue this session instead of resuming it (#10830)"
+        : >"$_resume_args_file"
+    fi
+    while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
+    rm -f "$_resume_args_file"
+fi
+# The dispatch identity is consumed: left exported it would reach the agent's own
+# Bash calls, and a nested spawn-claude.sh would reuse the parent's session id and
+# collide on its scope unit (the scope was named at the systemd-run probe above).
+# LOOM_CLAUDE_SESSION_ID is dropped below, on the direct path only, because
+# claude-wrapper.sh still reads it. LOOM_DAEMON_ITEM_ID stays exported on purpose:
+# a nested agent shares the item's pause state. LOOM_RESUME_HANDLE_FILE is not
+# read here, but a nested spawn-codex.sh would write the parent's handle through
+# it. The proxied host half keeps
+# them: its in-container copy receives them by name and drops them itself.
+[[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] || unset LOOM_AGENT_SCOPE_UNIT LOOM_RESUME_SESSION_ID LOOM_RESUME_PROMPT LOOM_RESUME_HANDLE_FILE
+
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
 # resolve, inject a session-scoped MCP config that adds the `safehouse` stdio
@@ -1416,4 +1468,5 @@ if ! command -v claude >/dev/null 2>&1; then
     exit 127
 fi
 echo "# LOOM_CLI_START runtime=claude" >&2
+unset LOOM_CLAUDE_SESSION_ID # #10830: pinned via --session-id above; must not reach nested spawns
 exec ${SLEEP_INHIBIT_WRAP[@]+"${SLEEP_INHIBIT_WRAP[@]}"} ${CPU_QUOTA_WRAP[@]+"${CPU_QUOTA_WRAP[@]}"} claude "${PASSTHROUGH_ARGS[@]}"

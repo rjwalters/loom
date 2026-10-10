@@ -244,6 +244,30 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
     effective
 }
 
+/// Tier files that exist but could not contribute (#11029): unreadable,
+/// malformed JSON, or not a JSON object. [`resolve_effective_config`]
+/// soft-fails each of these to `{}`, which is right for most keys but wrong
+/// for "is this a fleet host": a key the dead tier carried (`fleet.repo`)
+/// reads as unset. A missing file is not listed. Returns `(path, why)`.
+#[must_use]
+pub fn unreadable_tiers(repo_root: &Path) -> Vec<(PathBuf, String)> {
+    tier_paths_by_precedence(repo_root)
+        .into_iter()
+        .filter_map(|path| {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => return Some((path, e.to_string())),
+            };
+            match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(_)) => None,
+                Ok(_) => Some((path, "top level is not a JSON object".to_string())),
+                Err(e) => Some((path, e.to_string())),
+            }
+        })
+        .collect()
+}
+
 /// The tier files consulted by [`resolve_effective_config`], **highest
 /// precedence first** — the reverse of the merge order, i.e. the order in which
 /// to search for "who actually supplied this value".
@@ -363,34 +387,6 @@ pub fn fleet_captain(repo_root: &Path) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-const FLEET_ETA_AUTHORITY_KEY: &str = "fleet.etaAuthority";
-
-/// The explicit ETA authority host id (#10498): `fleet.etaAuthority` from the
-/// effective config. Same soft-fail contract as [`fleet_captain`]: `None` for
-/// a missing/malformed file, a non-string value or a blank string.
-#[must_use]
-pub fn fleet_eta_authority(repo_root: &Path) -> Option<String> {
-    let effective = resolve_effective_config(repo_root);
-    let raw = get_path(&effective, FLEET_ETA_AUTHORITY_KEY).and_then(Value::as_str)?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-const FLEET_ETA_AUTHORITY_COVERS_KEY: &str = "fleet.etaAuthorityCovers";
-
-/// What the committed config declares about the ETA authority's repos
-/// (#10897): `fleet.etaAuthorityCovers` is `"all"` or a list of `owner/repo`
-/// slugs. Soft-fails to undeclared like [`fleet_eta_authority`].
-#[must_use]
-pub fn fleet_eta_authority_covers(repo_root: &Path) -> crate::eta::coverage::Declared {
-    let effective = resolve_effective_config(repo_root);
-    crate::eta::coverage::parse_declared(get_path(&effective, FLEET_ETA_AUTHORITY_COVERS_KEY))
 }
 
 const FLEET_CAPTAIN_ARM_TTL_SECS_KEY: &str = "fleet.captainArmTtlSecs";
@@ -864,6 +860,39 @@ mod tests {
         assert_eq!(captain, Some("loom-worker-1".to_string()));
     }
 
+    /// #11098 Stage 3: the ETA subsystem and its keys are gone. A host config
+    /// that still carries `autonomous.eta.*`, `fleet.etaAuthority`,
+    /// `fleet.etaAuthorityCovers` or `fleet.etaFitRepo` must resolve as usual:
+    /// no panic, no error, the unrelated keys intact, and the only reader of
+    /// the old keys (the deprecated SigNoz endpoint fallback) names its legacy
+    /// fields once so the caller can warn a single time.
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_stale_eta_keys_in_a_host_config_are_ignored() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{
+                "fleet": {"captain": "loom-worker-1", "etaAuthority": "loom-worker-2",
+                          "etaAuthorityCovers": ["a/b"], "etaFitRepo": "a/store"},
+                "autonomous": {"eta": {"enabled": true, "fit": {"enabled": true},
+                    "fleetRefresh": {"signoz": {"endpoint": "http://127.0.0.1:8123",
+                                                "user": "u"}}},
+                               "ciTelemetry": {"enabled": true}}
+            }"#,
+        );
+        let effective = resolve_effective_config(dir.path());
+        let captain = fleet_captain(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(captain, Some("loom-worker-1".to_string()));
+        assert_eq!(get_path(&effective, "autonomous.ciTelemetry.enabled"), Some(&json!(true)));
+        // The one surviving reader degrades to a single deprecation notice.
+        let endpoint = crate::signoz_read::EndpointConfig::from_config(&effective);
+        assert_eq!(endpoint.endpoint.as_deref(), Some("http://127.0.0.1:8123"));
+        assert_eq!(endpoint.legacy, ["endpoint", "user"]);
+    }
+
     #[test]
     #[serial(loom_config_env)]
     fn test_fleet_captain_default_off_when_key_absent() {
@@ -1101,5 +1130,19 @@ mod tests {
             effective, expected,
             "Rust resolver diverged from the cross-language conformance fixture's expected.json"
         );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn unreadable_tiers_lists_malformed_but_not_missing_files() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unreadable_tiers(dir.path()).is_empty(), "missing tiers are fine");
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(LEGACY_CONFIG_REL), "{ not json").unwrap();
+        let got = unreadable_tiers(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0.ends_with(LEGACY_CONFIG_REL));
     }
 }

@@ -1,6 +1,7 @@
 //! Native runtime dispatch behind the existing spawn-worker.sh invocation contract.
 //! Unix exec keeps PID, signal semantics and streaming intact; the daemon remains
 //! responsible for deadlines/process-group teardown. Models are profiles, not adapters.
+pub mod cargo_debuginfo;
 pub mod containment;
 // `pub(crate)` rather than private since #8436: `runtime_preference::
 // availability` mirrors `credential::resolve`'s ladder to decide whether a
@@ -651,6 +652,17 @@ fn run_preflight(
     // Docker boundaries that bypass it (spawn-claude.sh's containment,
     // spawn-codex.sh's session-exec) export it explicitly on their own.
     command.env("CARGO_INCREMENTAL", "0");
+    // #11190: cap dev/test debuginfo (default `line-tables-only`) beside it,
+    // without overriding an ambient CARGO_PROFILE_*_DEBUG, the repo's own
+    // `[profile.*] debug`, or a `cargo.debuginfo: "full"` opt-out. Native
+    // containment forwards both names so the in-container seam sees a host
+    // value as ambient; spawn-claude.sh's containment forwards the values
+    // chosen here, since its re-exec never re-enters this seam.
+    let debuginfo = cargo_debuginfo::decide(&cargo_debuginfo::inputs_for(root));
+    // A variable set but EMPTY is unset rather than inherited: cargo fails
+    // the build on an empty value instead of reading it as unset.
+    cargo_debuginfo::apply(&mut command, &debuginfo, |k| std::env::var_os(k));
+    let _ = writeln!(log, "{}", debuginfo.marker);
     // The other half of #8453, on the same seam and for the same reason
     // (#8458): when the repo opts in (`cargo.perWorktreeTargetDir`), a spawn
     // that OWNS a sweep's claim runs under that issue worktree's own
@@ -659,13 +671,37 @@ fn run_preflight(
     // role-runner tick or an interactive spawn (no single worktree to attribute
     // a target dir to), and a no-op on a host whose cargo output is not
     // redirected outside the worktree in the first place.
-    if let Some(dir) = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
+    let per_worktree = crate::worktree_ops::cargo_target::provision::spawn_target_dir(
         root,
         nonempty_env("LOOM_SWEEP_CLAIM_OWNED").as_deref(),
         nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
-    ) {
-        command.env("CARGO_TARGET_DIR", &dir);
+    );
+    if let Some(dir) = &per_worktree {
+        command.env("CARGO_TARGET_DIR", dir);
         let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8458)", dir.display());
+    }
+    // #8370: every other run gets a Loom-owned dir under `.loom/targets/`, so
+    // the agent never improvises one nothing reclaims. `exec()` below keeps
+    // this pid, so the owner file names the harness for the whole run.
+    let run_id = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp());
+    let (ambient, planned, role) = (
+        nonempty_env("CARGO_TARGET_DIR"),
+        nonempty_env(crate::run_target_dir::RUN_TARGET_DIR_ENV),
+        nonempty_env("LOOM_ROLE"),
+    );
+    let run_inputs = crate::run_target_dir::SpawnInputs {
+        per_worktree: per_worktree.as_deref(),
+        ambient: ambient.as_deref(),
+        containerized: nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_some(),
+        planned: planned.as_deref(),
+        role: role.as_deref(),
+        run_id: &run_id,
+    };
+    if let Some(dir) = crate::run_target_dir::decide(root, &run_inputs)
+        .and_then(|dir| crate::run_target_dir::provision(&dir, std::process::id()))
+    {
+        command.env("CARGO_TARGET_DIR", &dir);
+        let _ = writeln!(log, "# LOOM_CARGO_TARGET_DIR {} (#8370)", dir.display());
     }
     // Preserve #8077 isolation defaults without repointing live IPC/token paths.
     if nonempty_env("LOOM_DAEMON_LOG").is_none() {

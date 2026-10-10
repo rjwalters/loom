@@ -248,6 +248,79 @@ pub fn start_launchd(ctx: &Ctx) -> ! {
     std::process::exit(0);
 }
 
+/// One `systemctl --user` call of an operator start.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartStep {
+    /// The arguments after `systemctl`.
+    pub args: Vec<String>,
+    /// Whether a failure aborts the start. Only `enable --now` must succeed.
+    pub required: bool,
+}
+
+/// The `systemctl --user` calls an operator start makes, in order.
+///
+/// `reset-failed` (#11111) comes before `enable --now`: once #11058's start
+/// limit (`StartLimitBurst` per `StartLimitIntervalSec`) trips, systemd refuses
+/// a start of the `failed (Result: start-limit-hit)` unit for up to the whole
+/// interval, so a manual `loom-daemon-start.sh` would fail for ten minutes.
+/// `reset-failed` clears the counter. It is best-effort: on a unit that is not
+/// loaded yet it errors, and that must not stop the start.
+#[must_use]
+pub fn systemd_start_steps(unit: &str) -> Vec<StartStep> {
+    let step = |args: &[&str], required| StartStep {
+        args: args.iter().map(ToString::to_string).collect(),
+        required,
+    };
+    vec![
+        step(&["--user", "daemon-reload"], false),
+        step(&["--user", "reset-failed", unit], false),
+        step(&["--user", "enable", "--now", unit], true),
+    ]
+}
+
+/// Run [`systemd_start_steps`] through `run`. `Err` carries the failing
+/// required step's stderr, when there is one to show.
+///
+/// # Errors
+/// When a required step cannot run or exits non-zero.
+pub fn run_systemd_start_steps(
+    unit: &str,
+    run: &mut dyn FnMut(&StartStep) -> std::io::Result<std::process::Output>,
+) -> Result<(), Option<String>> {
+    for step in systemd_start_steps(unit) {
+        let result = run(&step);
+        if !step.required {
+            continue;
+        }
+        match result {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => return Err(Some(String::from_utf8_lossy(&o.stderr).into_owned())),
+            Err(_) => return Err(None),
+        }
+    }
+    Ok(())
+}
+
+/// The real `systemctl` runner: a best-effort step is silent, a required
+/// step's stdout goes to the terminal and its stderr is captured for the error.
+fn real_systemctl(step: &StartStep) -> std::io::Result<std::process::Output> {
+    let stdout = if step.required {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+    let stderr = if step.required {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    Command::new("systemctl")
+        .args(&step.args)
+        .stdout(stdout)
+        .stderr(stderr)
+        .output()
+}
+
 /// The Linux `systemd --user` service path (#4268).
 pub fn start_systemd(ctx: &Ctx) -> ! {
     let unit = platform::systemd_unit();
@@ -281,27 +354,12 @@ pub fn start_systemd(ctx: &Ctx) -> ! {
     out::say(&format!("Systemd unit:   {unit}"));
     out::say(&format!("Unit file:      {}", unit_path.display()));
 
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    match Command::new("systemctl")
-        .args(["--user", "enable", "--now", &unit])
-        .stdout(Stdio::inherit())
-        .output()
-    {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            out::err(&format!("systemctl --user enable --now failed for {unit}:"));
-            eprint!("{}", String::from_utf8_lossy(&o.stderr));
-            std::process::exit(1);
+    if let Err(stderr) = run_systemd_start_steps(&unit, &mut real_systemctl) {
+        out::err(&format!("systemctl --user enable --now failed for {unit}:"));
+        if let Some(stderr) = stderr {
+            eprint!("{stderr}");
         }
-        Err(_) => {
-            out::err(&format!("systemctl --user enable --now failed for {unit}:"));
-            std::process::exit(1);
-        }
+        std::process::exit(1);
     }
 
     std::thread::sleep(Duration::from_secs(2));
@@ -589,6 +647,70 @@ fn num_env(name: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(code: i32) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: if code == 0 {
+                Vec::new()
+            } else {
+                b"boom\n".to_vec()
+            },
+        }
+    }
+
+    #[test]
+    fn reset_failed_runs_after_the_reload_and_before_enable_now() {
+        let mut calls = Vec::new();
+        let r = run_systemd_start_steps("loom-daemon.service", &mut |s| {
+            calls.push(s.args.join(" "));
+            Ok(status(0))
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            calls,
+            [
+                "--user daemon-reload",
+                "--user reset-failed loom-daemon.service",
+                "--user enable --now loom-daemon.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_reset_failed_does_not_stop_the_start() {
+        let mut calls = Vec::new();
+        let r = run_systemd_start_steps("u.service", &mut |s| {
+            calls.push(s.args[1].clone());
+            if s.args[1] == "reset-failed" {
+                Ok(status(5))
+            } else if s.args[1] == "daemon-reload" {
+                Err(std::io::Error::other("no systemctl"))
+            } else {
+                Ok(status(0))
+            }
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(calls, ["daemon-reload", "reset-failed", "enable"]);
+    }
+
+    #[test]
+    fn a_failed_enable_now_fails_the_start_with_its_stderr() {
+        let r = run_systemd_start_steps("u.service", &mut |s| {
+            Ok(status(if s.args[1] == "enable" { 1 } else { 0 }))
+        });
+        assert_eq!(r, Err(Some("boom\n".to_string())));
+        let r = run_systemd_start_steps("u.service", &mut |s| {
+            if s.args[1] == "enable" {
+                Err(std::io::Error::other("gone"))
+            } else {
+                Ok(status(0))
+            }
+        });
+        assert_eq!(r, Err(None));
+    }
 
     #[test]
     fn the_eio_guard_rejects_a_digit_prefixed_code() {

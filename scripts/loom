@@ -537,19 +537,6 @@ loom_cmd_status() {
     fi
 }
 
-# Thin passthrough to `loom-daemon eta` (view/list/backfill/backtest, #9327):
-# no repo-context detection of its own, since every `eta` subcommand already
-# resolves its own `--repo-root` (defaulting to `.`) the same way
-# `pr-latency`/`backfill`/`backtest` do — this wrapper only saves typing
-# `loom-daemon`.
-loom_cmd_eta() {
-    if ! command -v loom-daemon >/dev/null 2>&1; then
-        _err "loom-daemon not found on PATH."
-        exit 1
-    fi
-    exec loom-daemon eta "$@"
-}
-
 loom_print_help() {
     cat <<EOF
 loom — machine-level Loom dispatcher (Epic #3835 Phase 3a/3b)
@@ -567,7 +554,6 @@ COMMANDS:
     migrate   Migrate a historical file-copy install in the current repo to the
               machine-level daemon model (--dry-run for a plan; Epic #3835 Phase 6)
     update    Thin delegate to loom-daemon-update.sh (no rebuild logic of its own)
-    eta       Thin passthrough to 'loom-daemon eta' (view/list/backfill/backtest)
     help      Show this help
     version   Show dispatcher version
 
@@ -594,7 +580,6 @@ main() {
         sweep)               loom_cmd_sweep "$@" ;;
         migrate)             loom_cmd_migrate "$@" ;;
         update)              loom_cmd_update "$@" ;;
-        eta)                 loom_cmd_eta "$@" ;;
         help|--help|-h)      loom_print_help ;;
         version|--version|-v) echo "loom dispatcher v${DISPATCHER_VERSION} (machine-level)" ;;
         *)

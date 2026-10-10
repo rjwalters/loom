@@ -1480,10 +1480,8 @@ diagnosed-but-orthogonal case, and it escalates rather than settling. See
 **Problem this section fixes**: the re-check above runs on *every* Curator pass
 over a `loom:blocked` issue, and multiple invocations (manual, autonomous, sweep-triggered)
 land on the same stale issue. Without a dedup rule the steady state is "one
-comment per pick-up, forever" — #4736 collected six near-identical "still
-blocked on PR #4743, no change" comments between 2026-07-31 and 2026-08-01,
-several less than an hour apart, each restating the same blocker with zero new
-information.
+comment per pick-up, forever" — #4736 got six near-identical "still blocked
+on PR #4743, no change" comments in a day.
 
 **Rule**: a Dependencies re-check comment is only worth posting when its
 *conclusion* differs from the conclusion you last reported on that issue.
@@ -1519,7 +1517,8 @@ below decides whether to claim at all:
   (`loom:changes-requested` or `loom:blocked` — presence/absence only, not the
   full label set) and its merge-state bucket (mergeable vs conflicting), plus
   the block reason when the block came from the secondary heuristic rather
-  than a linked PR.
+  than a linked PR (hashed case/space-folded since v0.19.187, #8320;
+  older builds hashed it verbatim — see `recheck.rs`, #9308).
 
 Two passes have the *same* conclusion only when both parts match exactly. A
 different blocking number, a blocker that closed or merged, a superseding-block
@@ -1589,9 +1588,9 @@ else
 fi
 ```
 
-`eval` is safe here exactly as it is for `claim-staleness.sh`: the script
-emits only `KEY=VALUE` lines built from a fixed enum, pre-sorted plain-text
-blocker lines and a hex hash — never raw forge text. **If
+`eval` is safe here because every value is shell-quoted, not because of its
+source: `BLOCK_REASON`/`ORTHOGONAL` are your own free text, echoed back
+as one quoted word each (#9041). **If
 `.loom/scripts/dep-recheck-fingerprint.sh` is missing** (an older install
 that has not been resynced yet): fall back to computing `VERDICT`/`BLOCKERS`
 inline exactly as this section did before #7281, but apply the same UNKNOWN
@@ -1768,9 +1767,9 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
   then `loom-daemon operator-decision apply <number>` (clears the bounce label).
   Same for a prose `loom:operator-decision` issue you touch, if faithful.
 - **No real operator call**: remove the label, comment why, and re-route per
-  `label-state-machine.md` (normal flow, `loom:operator-objective`, or inbox mail).
-- **No-loop guard**: a decision-bounce newer than your repair marker means the
-  repair bounced. Comment once and leave it.
+  `label-state-machine.md` (normal flow, `loom:operator-objective`, or a human-gated park).
+- **No-loop guard**: a decision-bounce comment newer than your repair marker means
+  the repair bounced. Comment once and leave it alone.
 
 ## Revising `loom:needs-revision` (#10753)
 

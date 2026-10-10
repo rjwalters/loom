@@ -1533,6 +1533,12 @@ pub enum AnchorAction {
     /// marker comment. **Writes no labels**: the verdict is neither granted,
     /// revoked, nor re-queued — it merely becomes invalidatable from here on.
     Anchor { head_sha: String },
+    /// An unmarked **approval** (#9258): never anchored, re-queued instead —
+    /// `loom:pr` off, `loom:review-requested` on. Since #6382 `post-verdict.sh`
+    /// marks every verdict, so a markerless approval bypassed the mechanism
+    /// and approves no known tree; anchoring it would stamp an unreviewed head
+    /// as approved. Done by [`unanchored_verdict::handle_unverifiable`].
+    RequeueApproval,
     /// Leave it alone.
     Skip(AnchorSkipReason),
 }
@@ -1556,6 +1562,11 @@ pub enum AnchorAction {
 /// recover a head move that happened *before* the anchor — a verdict anchored
 /// late is anchored to a tree that may never have been reviewed, which is why
 /// this is a backstop for judge.md's marker rather than a replacement.
+///
+/// That residual is why an **approval** is never anchored (#9258): it would
+/// launder an approval posted at SHA A into a FRESH one at SHA B, so an
+/// unmarked `loom:pr` gets [`AnchorAction::RequeueApproval`] instead. A
+/// `loom:changes-requested` verdict cannot merge anything and still anchors.
 #[must_use]
 pub fn decide_anchor(pr: &VerdictPr) -> AnchorAction {
     if pr.marker_sha.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -1566,6 +1577,9 @@ pub fn decide_anchor(pr: &VerdictPr) -> AnchorAction {
     }
     if !pr.marker_scan_ok {
         return AnchorAction::Skip(AnchorSkipReason::MarkerScanFailed);
+    }
+    if pr.kind == VerdictKind::Approved {
+        return AnchorAction::RequeueApproval;
     }
     match pr.head_sha.as_deref() {
         Some(head_sha) if !head_sha.is_empty() => AnchorAction::Anchor {
@@ -1609,6 +1623,8 @@ pub struct VerdictReconcileStats {
     /// (`pr_latency::segments::PrSegments::approval_invalidations`); the
     /// `redundant_comments_skipped` counter above does not.
     pub tree_identical_reanchors: usize,
+    /// Unmarked approvals re-queued instead of anchored (#9258).
+    pub unanchored_approvals_requeued: usize,
 }
 
 impl VerdictReconcileStats {
@@ -1616,7 +1632,8 @@ impl VerdictReconcileStats {
     /// exposure an operator needs to see.
     #[must_use]
     pub fn residual_unverifiable(&self) -> usize {
-        self.unverifiable.saturating_sub(self.anchored)
+        self.unverifiable
+            .saturating_sub(self.anchored + self.unanchored_approvals_requeued)
     }
 
     /// Fold another workspace's counters in.
@@ -1627,6 +1644,7 @@ impl VerdictReconcileStats {
         self.anchored += other.anchored;
         self.redundant_comments_skipped += other.redundant_comments_skipped;
         self.tree_identical_reanchors += other.tree_identical_reanchors;
+        self.unanchored_approvals_requeued += other.unanchored_approvals_requeued;
     }
 }
 
@@ -1907,11 +1925,12 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     if verdict_stats.unverifiable > 0 {
         log::warn!(
             "claim_reconciliation: verdict-staleness pass found {} verdict(s) with no \
-             verdict-sha marker across {} workspace(s) — anchored {} to their current head, {} \
-             still UNVERIFIABLE (a verdict nothing can invalidate; see #6319)",
+             verdict-sha marker across {} workspace(s) — anchored {} to their current head, \
+             re-queued {} unmarked approval(s) (#9258), {} still UNVERIFIABLE (see #6319)",
             verdict_stats.unverifiable,
             roots.len(),
             verdict_stats.anchored,
+            verdict_stats.unanchored_approvals_requeued,
             verdict_stats.residual_unverifiable()
         );
     }
@@ -2024,6 +2043,11 @@ mod verdict_stale_comment;
 /// leaving a single dispatch call in the match arm here.
 mod verdict_invalidation;
 
+/// The `Keep(Unverifiable)` arm of [`forge::reconcile_pr_verdicts`]: anchor an
+/// unmarked rejection (#6319), re-queue an unmarked approval (#9258) — a
+/// sibling file per the file-size ratchet.
+mod unanchored_verdict;
+
 pub mod merge_sequence;
 /// The #8922 base-conflict pass for `loom:review-requested` PRs — a sibling
 /// file per the file-size ratchet, run on the same tick right after
@@ -2054,13 +2078,13 @@ pub(crate) mod read_cache;
 pub mod forge {
     use super::gh_call;
     use super::{
-        apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
-        extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
-        resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
-        verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
-        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
-        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
-        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
+        apply_live_claim_veto, classify_lease_evidence, decide_verdict, extract_latest_verdict_sha,
+        most_recent_claim_activity_at, plan, plan_pr, resolve_lease_ttl_minutes,
+        resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_anchoring_enabled,
+        verdict_staleness_enabled, ClaimedPr, LeaseEvidence, NoProgressEvidence, PrClaimKind,
+        PrClaimOutcome, PrComment, PrReclaimReason, PrReconcileAction, ReclaimReason,
+        ReconcileAction, VerdictAction, VerdictKeepReason, VerdictKind, VerdictPr,
+        VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -3072,53 +3096,6 @@ pub mod forge {
             .collect())
     }
 
-    /// Anchor one unmarked verdict to the PR's current head (Issue #6319):
-    /// post a comment carrying the `<!-- loom:verdict-sha ... -->` marker
-    /// judge.md was supposed to write, so the verdict becomes invalidatable
-    /// by the ordinary staleness path from here on.
-    ///
-    /// **No label is touched.** This is the whole safety argument: the
-    /// verdict label was already there and stays exactly as it was, so
-    /// anchoring cannot approve, reject, or un-park anything. The only state
-    /// it changes is "this verdict can now be checked".
-    ///
-    /// Idempotent by construction — the marker it posts is precisely what
-    /// [`extract_latest_verdict_sha`] scans for, so the next pass reads the
-    /// verdict as `Fresh` and never anchors it twice.
-    fn anchor_verdict(gh_bin: &Path, root: &Path, pr: &VerdictPr, head_sha: &str) -> Result<()> {
-        let label = pr.kind.label();
-        let token = pr.kind.marker_token();
-        let body = format!(
-            "<!-- loom:verdict-sha sha={head_sha} verdict={token} -->\n\
-             **Verdict anchored to the current head — no marker had been recorded**\n\n\
-             This PR carries `{label}`, but no verdict-SHA marker was ever written for that \
-             verdict, so it was **unverifiable**: nothing could tell whether it still described \
-             the tree in front of it, and it would have survived a force-push undetected — the \
-             exact pre-#5686 hazard.\n\n\
-             This comment records the head SHA as of now, `{head_sha}`. It is **not** a review \
-             and implies no judgment about this tree: the `{label}` label is unchanged. From \
-             here on the verdict is invalidatable — if the head moves off `{head_sha}`, the \
-             stale-verdict pass clears `{label}` and returns the PR to `loom:review-requested`.\n\n\
-             Anchoring bounds future exposure; it cannot reconstruct which tree was actually \
-             reviewed. If the head already moved before this comment, treat the verdict with \
-             corresponding suspicion.\n\n\
-             ---\n\
-             *Automated by loom-daemon claim reconciliation (#6319)*"
-        );
-
-        let n = pr.number.to_string();
-        let out = gh_call::output(
-            gh_call::write("verdict.anchor_comment", gh_bin, root)
-                .args(["pr", "comment", &n, "--body", &body])
-                .args(gh_call::loom_repo_flag()),
-        )?;
-        if !out.status.success() {
-            let (root, err) = (root.display(), gh_call::stderr(&out));
-            return Err(anyhow!("gh pr comment (anchor {label}) failed for #{n} in {root}: {err}"));
-        }
-        Ok(())
-    }
-
     /// Reconcile stale `loom:pr` / `loom:changes-requested` verdicts for one
     /// registered workspace `root` (Issue #5686) — the always-on daemon
     /// backstop behind judge.md's Stale-Verdict Sweep, doctor.md's
@@ -3133,8 +3110,9 @@ pub mod forge {
     ///
     /// An unmarked verdict is additionally **counted and anchored** (Issue
     /// #6319) rather than silently kept: see [`decide_anchor`] /
-    /// [`anchor_verdict`]. Anchoring writes no labels, so the staleness
-    /// behavior of every already-marked verdict is untouched.
+    /// [`super::unanchored_verdict`]. Anchoring writes no labels, so the
+    /// staleness behavior of every already-marked verdict is untouched; an
+    /// unmarked APPROVAL is re-queued instead of anchored (#9258).
     ///
     /// # Held PRs are NOT covered by this pass (pre-existing, #8900 scope note)
     ///
@@ -3211,51 +3189,9 @@ pub mod forge {
                         &mut stats,
                     ),
                     VerdictAction::Keep(VerdictKeepReason::Unverifiable) => {
-                        // Count only what we POSITIVELY know is unanchored. A
-                        // held PR's comments are never fetched and a failed
-                        // fetch looks identical to "no marker" — folding
-                        // either into the counter would turn an API outage
-                        // into a fake integrity alarm.
-                        if !pr.marker_scan_ok {
-                            continue;
-                        }
-                        stats.unverifiable += 1;
-                        log::warn!(
-                            "claim_reconciliation: PR #{} in {} carries {} with NO verdict-sha \
-                             marker — the verdict is UNVERIFIABLE and would survive a \
-                             force-push undetected (#6319)",
-                            pr.number,
-                            root.display(),
-                            pr.kind.label(),
+                        super::unanchored_verdict::handle_unverifiable(
+                            gh_bin, root, &pr, anchoring, &mut stats,
                         );
-                        if !anchoring {
-                            continue;
-                        }
-                        let AnchorAction::Anchor { head_sha } = decide_anchor(&pr) else {
-                            continue;
-                        };
-                        match anchor_verdict(gh_bin, root, &pr, &head_sha) {
-                            Ok(()) => {
-                                stats.anchored += 1;
-                                log::info!(
-                                    "claim_reconciliation: anchored PR #{}'s {} verdict to \
-                                     {head_sha} in {} — it is now invalidatable by the ordinary \
-                                     staleness pass (#6319)",
-                                    pr.number,
-                                    pr.kind.label(),
-                                    root.display(),
-                                );
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "claim_reconciliation: failed to anchor PR #{}'s {} verdict \
-                                     in {}: {e} — it stays UNVERIFIABLE until the next tick",
-                                    pr.number,
-                                    pr.kind.label(),
-                                    root.display()
-                                );
-                            }
-                        }
                     }
                     VerdictAction::Keep(_) => {}
                 }
@@ -3287,3 +3223,7 @@ mod trusted_comments_tests;
 // #10382: the pass family's files / by-head reads are REST-only.
 #[cfg(test)]
 mod rest_only_tests;
+
+// #9258: an unmarked approval is re-queued, never anchored.
+#[cfg(test)]
+mod unanchored_verdict_tests;

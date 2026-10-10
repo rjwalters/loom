@@ -87,7 +87,7 @@ const LEASE_RENEW_START_TIMEOUT: Duration = Duration::from_secs(10);
 ///   persisted group is the only handle on any surviving descendants. Every
 ///   consumer re-checks `group_has_members` before signalling, so a fully-dead
 ///   group is a no-op.
-fn spawned_leader_pgid(pid: u32) -> Option<u32> {
+pub(super) fn spawned_leader_pgid(pid: u32) -> Option<u32> {
     if !cfg!(unix) {
         return None;
     }
@@ -461,7 +461,7 @@ impl std::fmt::Display for TokenSelectionDispatchError {
         write!(
             f,
             "issue #{}: spawned child exited immediately — token selection failed (no usable \
-             OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env then \
+             OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env then \
              `loom-daemon tokens bootstrap`, or re-probe an existing pool with `loom-daemon \
              tokens check --ranking`. See the sweep log for the exact failure: {}",
             self.issue,
@@ -1752,6 +1752,9 @@ impl SweepRegistry {
             }
         }
 
+        // #10974: a daemon roll is pausing agents; nothing new may start.
+        self.roll_gate.admit(kind)?;
+
         // Forge egress admission (#9984): a fresh `forge egress assert`. Under
         // `enforcement.api = required` a routing finding refuses the dispatch
         // here, before any claim/label/account/log/spawn side effect, and the
@@ -1829,6 +1832,8 @@ impl SweepRegistry {
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
             SweepKind::PrSet(prs) => {
+                // #11191: disk admission, as for an issue before step 3.
+                crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
                 return Ok(BeginIssueDispatch::Done(self.dispatch_prset_inner(
                     prs,
                     kind,
@@ -1865,6 +1870,11 @@ impl SweepRegistry {
             }
             .into());
         }
+
+        // 2.45 Workspace hold (Issue #10719): the installed Loom here cannot
+        //      work with this daemon (W3/W4). Structural like 2.4, so `force`
+        //      does not bypass it; before any lock, label flip or forge call.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
 
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
         //     watchdogs (startup #3887, mid-build-death #3895, review-stall
@@ -2274,6 +2284,17 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.98 Disk admission (#11191): the repo's measured disk charge must fit
+        //      the free space left after the halt floor and the growth the
+        //      in-flight sweeps are still expected to write. Last of the guards,
+        //      so a candidate another guard refuses never leaves a pending
+        //      reservation behind; before any claim, label or spawn. Every
+        //      dispatch route converges here — the work finder, the watchdogs'
+        //      re-dispatch (#3910) and PR-set conversion (#7649, the PrSet arm
+        //      above), the reaper's resume (#4256), IPC/CLI and the epic
+        //      supervisor — so none of them bypasses the work finder's rule.
+        crate::disk_admission::admit_dispatch(&self.config.workspace_root, kind)?;
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         if let Some(selection) = &selection {
@@ -2553,6 +2574,7 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            mid_spawn: self.roll_gate.enter(),
         })))
     }
 
@@ -2589,6 +2611,7 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
         // Issue #4689: the child already died — synchronously observed,
@@ -2887,6 +2910,9 @@ impl SweepRegistry {
             .into());
         }
 
+        // Workspace hold (Issue #10719), mirroring step 2.45.
+        crate::workspace_hold::guard(&self.config.workspace_root)?;
+
         let sweep_id = generate_sweep_id(kind);
 
         // Per-PR claim lock (Issue #5342): acquired atomically, one mkdir per
@@ -2938,7 +2964,7 @@ impl SweepRegistry {
             }
             return Err(anyhow!(
                 "PR set {prs:?}: spawned child exited immediately — token selection failed (no \
-                 usable OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env \
+                 usable OAuth token in the pool). Add accounts to ~/.llm-monitor/accounts.env \
                  then `loom-daemon tokens bootstrap`, or re-probe an existing pool with \
                  `loom-daemon tokens check --ranking`. See the sweep log for the exact failure: {}",
                 log_path.display()

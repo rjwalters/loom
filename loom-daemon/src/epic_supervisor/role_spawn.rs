@@ -42,6 +42,33 @@ pub(super) fn command(
     cmd
 }
 
+/// Whether the supervisor serving `root` must skip this tick because the
+/// workspace is held (#10719). Logged each tick it is, like the supervisor's
+/// main-health and drain skips. Here, not in `tick`, because
+/// `epic_supervisor.rs` is frozen by the file-size ratchet.
+pub(super) fn tick_held(root: Option<&Path>) -> bool {
+    let Some((root, hold)) = root.and_then(|r| Some((r, crate::workspace_hold::hold_for(r)?)))
+    else {
+        return false;
+    };
+    // A maintain-only workspace is held on purpose and for good (#11186):
+    // a WARN every tick would only be noise.
+    let level = if hold.kind == crate::workspace_hold::HoldKind::MaintainOnly {
+        log::Level::Debug
+    } else {
+        log::Level::Warn
+    };
+    log::log!(
+        level,
+        "epic_supervisor: workspace {} is held ({}): {}; skipping tick (no epic dispatch) \
+         (#10719)",
+        root.display(),
+        hold.describe(),
+        hold.detail
+    );
+    true
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -152,6 +179,176 @@ mod tests {
             assert_eq!(env(&cmd, name), Some(None), "{name} is removed when off");
         }
         assert_eq!(env(&cmd, RESOURCE_ATTRIBUTES_ENV), None, "no attribute stamp when off");
+    }
+
+    /// #10719: the singleton role dispatch runs this checkout's own spawn
+    /// script and never reaches the registry, so it refuses a held workspace
+    /// itself, with the same typed error, and spawns nothing. A sibling
+    /// workspace on the same host is not affected.
+    #[test]
+    #[serial_test::serial]
+    fn a_held_workspace_refuses_the_epic_role_dispatch_and_its_sibling_does_not() {
+        use super::super::{forge::SpawnDispatcher, EpicDispatcher};
+        use crate::workspace_hold::{
+            set_for_test, HeldCopy, HoldKind, WorkspaceHeldDispatchError, WorkspaceHold,
+        };
+        let _guard = EnvGuard::clear();
+        let dispatcher = |dir: &Path| {
+            let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
+            let bin = dir.join(".loom/scripts/spawn-claude.sh");
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+            (SpawnDispatcher::new(bin, registry), log)
+        };
+        let (held_dir, free_dir) = (root(false), root(false));
+        let (mut held, held_log) = dispatcher(held_dir.path());
+        let (mut free, free_log) = dispatcher(free_dir.path());
+        set_for_test(
+            held_dir.path(),
+            Some(WorkspaceHold {
+                kind: HoldKind::InstallIncompatible,
+                copy: HeldCopy::Checkout,
+                since: chrono::Utc::now(),
+                detail: "installed 0.19.800 is too old for daemon 0.19.900".into(),
+                verdict_at: chrono::Utc::now(),
+            }),
+        );
+
+        let err = held.dispatch_role(42, &shape()).expect_err("held");
+        let typed = err
+            .downcast_ref::<WorkspaceHeldDispatchError>()
+            .expect("the typed refusal the registry guard returns");
+        assert_eq!(typed.kind, HoldKind::InstallIncompatible);
+        assert!(err.to_string().contains("install-incompatible"), "{err}");
+        assert!(!held_log.exists(), "the held checkout's spawn script never ran");
+
+        free.dispatch_role(42, &shape())
+            .expect("the sibling dispatches");
+        assert!(free_log.exists(), "the sibling's spawn script ran");
+
+        // The hold lifts: the same workspace dispatches again.
+        set_for_test(held_dir.path(), None);
+        held.dispatch_role(42, &shape())
+            .expect("dispatches once the hold clears");
+        assert!(held_log.exists());
+    }
+
+    /// #10719: the supervisor's whole tick is skipped for a held workspace,
+    /// over the real spawn dispatcher: a flat epic would start an Architect
+    /// through the held checkout's own spawn script. A second supervisor on
+    /// the same host, for an unheld workspace, still dispatches.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_held_workspace_skips_the_supervisor_tick_and_its_sibling_does_not() {
+        use super::super::{
+            forge::SpawnDispatcher, EpicSnapshot, EpicSource, EpicSupervisor, IssueCreationMutex,
+        };
+        use crate::workspace_hold::{set_for_test, HeldCopy, HoldKind, WorkspaceHold};
+        struct OneFlatEpic;
+        impl EpicSource for OneFlatEpic {
+            fn list_open_epics(&mut self) -> anyhow::Result<Vec<EpicSnapshot>> {
+                Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            }
+        }
+        let _guard = EnvGuard::clear();
+        let supervisor = |dir: &Path| {
+            let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
+            let bin = dir.join(".loom/scripts/spawn-claude.sh");
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+            let dispatcher = SpawnDispatcher::new(bin, registry);
+            let supervisor =
+                EpicSupervisor::new(OneFlatEpic, dispatcher, IssueCreationMutex::new())
+                    .with_hold_root(dir.to_path_buf());
+            (supervisor, log)
+        };
+        let (held_dir, free_dir) = (root(false), root(false));
+        let (mut held, held_log) = supervisor(held_dir.path());
+        let (mut free, free_log) = supervisor(free_dir.path());
+        set_for_test(
+            held_dir.path(),
+            Some(WorkspaceHold {
+                kind: HoldKind::DaemonTooOld,
+                copy: HeldCopy::Checkout,
+                since: chrono::Utc::now(),
+                detail: "requires daemon 0.19.950 > running 0.19.900".into(),
+                verdict_at: chrono::Utc::now(),
+            }),
+        );
+
+        let report = held.tick().await.unwrap();
+        assert!(report.halted, "a hold halts the tick");
+        assert_eq!((report.epics_seen, report.roles_dispatched), (0, 0), "before the forge list");
+        assert!(!held_log.exists(), "the held checkout's spawn script never ran");
+
+        let report = free.tick().await.unwrap();
+        assert!(!report.halted);
+        assert_eq!(report.roles_dispatched, 1, "the sibling's epic still advances");
+        assert!(free_log.exists());
+
+        // The hold lifts: the next tick dispatches.
+        set_for_test(held_dir.path(), None);
+        let report = held.tick().await.unwrap();
+        assert_eq!((report.halted, report.roles_dispatched), (false, 1));
+        assert!(held_log.exists());
+    }
+
+    /// #11186: a maintain-only workspace is refused by both epic paths, the
+    /// whole tick and the role dispatch, and a normal sibling is not.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_maintain_only_workspace_skips_the_tick_and_refuses_the_role_dispatch() {
+        use super::super::{
+            forge::SpawnDispatcher, EpicDispatcher, EpicSnapshot, EpicSource, EpicSupervisor,
+            IssueCreationMutex,
+        };
+        use crate::workspace_hold::{set_maintain_only_for_test, HoldKind};
+        use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+        struct OneFlatEpic;
+        impl EpicSource for OneFlatEpic {
+            fn list_open_epics(&mut self) -> anyhow::Result<Vec<EpicSnapshot>> {
+                Ok(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            }
+        }
+        let _guard = EnvGuard::clear();
+        let dispatcher = |dir: &Path| {
+            let (registry, log) = crate::sweep_registry::test_support::fixture_registry(dir);
+            let bin = dir.join(".loom/scripts/spawn-claude.sh");
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
+            (SpawnDispatcher::new(bin, registry), log)
+        };
+        let (held_dir, free_dir) = (root(false), root(false));
+        let mark = MaintainOnly {
+            by: MaintainOnlySource::Operator,
+            since: chrono::Utc::now(),
+        };
+        set_maintain_only_for_test(held_dir.path(), Some(mark));
+
+        let (mut direct, direct_log) = dispatcher(held_dir.path());
+        let err = direct.dispatch_role(42, &shape()).expect_err("held");
+        let typed = err
+            .downcast_ref::<crate::workspace_hold::WorkspaceHeldDispatchError>()
+            .expect("the typed refusal");
+        assert_eq!(typed.kind, HoldKind::MaintainOnly);
+        assert!(!direct_log.exists(), "the spawn script never ran");
+
+        let supervisor = |dir: &Path| {
+            let (d, log) = dispatcher(dir);
+            let s = EpicSupervisor::new(OneFlatEpic, d, IssueCreationMutex::new())
+                .with_hold_root(dir.to_path_buf());
+            (s, log)
+        };
+        let (mut held, held_log) = supervisor(held_dir.path());
+        let (mut free, free_log) = supervisor(free_dir.path());
+        let report = held.tick().await.unwrap();
+        assert!(report.halted);
+        assert_eq!((report.epics_seen, report.roles_dispatched), (0, 0));
+        assert!(!held_log.exists());
+        let report = free.tick().await.unwrap();
+        assert_eq!((report.halted, report.roles_dispatched), (false, 1));
+        assert!(free_log.exists());
+
+        set_maintain_only_for_test(held_dir.path(), None);
+        let report = held.tick().await.unwrap();
+        assert_eq!((report.halted, report.roles_dispatched), (false, 1), "released");
     }
 
     /// #9473: the gateway contract survives only into `spawn-worker.sh`.

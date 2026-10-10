@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as Cd, TimeZone, Utc};
 
 use super::state::{self, AlertState, Kind};
-use super::task::{inbox_payload, run_tick, AlertSink, BusSink};
+use super::task::{run_tick, AlertSink, BusSink, TickContext};
 use super::*;
 use crate::types::{CapacityReport, DaemonStatusReport, RoleTickRecord, WorkFinderTickSummary};
 
@@ -98,11 +98,11 @@ fn classify_halted_tick_without_token_starvation() {
         ..Default::default()
     });
     let c = classify(&s, t0(), WINDOW, TokenCause::Exhausted);
-    assert_eq!(c.iter().map(|c| c.key).collect::<Vec<_>>(), vec![KEY_DISPATCH]);
+    assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_DISPATCH]);
     // With tokens at zero the halt is the token alert's symptom: not doubled.
     s.capacity.healthy_accounts = 0;
     let c = classify(&s, t0(), WINDOW, TokenCause::Exhausted);
-    assert_eq!(c.iter().map(|c| c.key).collect::<Vec<_>>(), vec![KEY_TOKENS]);
+    assert_eq!(c.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![KEY_TOKENS]);
 }
 
 #[test]
@@ -217,7 +217,18 @@ fn a_failing_sink_does_not_suppress_the_other() {
         }),
     ];
     let mut st = AlertState::new(1, Duration::from_secs(3600));
-    let out = run_tick(&mut st, &sinks, Some(&status(0, 1)), t0(), WINDOW, "h", None);
+    let out = run_tick(
+        &mut st,
+        &sinks,
+        &TickContext {
+            status: Some(&status(0, 1)),
+            window: WINDOW,
+            host: "h",
+            pool_dir: None,
+            outputs: None,
+        },
+        t0(),
+    );
     assert_eq!(out.len(), 1);
     assert_eq!(log.lock().unwrap().len(), 2);
 }
@@ -230,8 +241,31 @@ fn unreachable_status_changes_nothing() {
         fail: false,
     })];
     let mut st = AlertState::new(1, Duration::from_secs(3600));
-    run_tick(&mut st, &sinks, Some(&status(0, 1)), t0(), WINDOW, "h", None);
-    assert!(run_tick(&mut st, &sinks, None, t0(), WINDOW, "h", None).is_empty());
+    run_tick(
+        &mut st,
+        &sinks,
+        &TickContext {
+            status: Some(&status(0, 1)),
+            window: WINDOW,
+            host: "h",
+            pool_dir: None,
+            outputs: None,
+        },
+        t0(),
+    );
+    assert!(run_tick(
+        &mut st,
+        &sinks,
+        &TickContext {
+            status: None,
+            window: WINDOW,
+            host: "h",
+            pool_dir: None,
+            outputs: None
+        },
+        t0()
+    )
+    .is_empty());
     assert!(st.is_active(KEY_TOKENS));
 }
 
@@ -252,8 +286,18 @@ fn incident_2026_10_04_produces_alerts_naming_auth_401() {
     let mut rx = bus.subscribe(["operator_priority"]);
     let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(BusSink(bus))];
     let mut st = AlertState::new(1, Duration::from_secs(3600));
-    let out =
-        run_tick(&mut st, &sinks, Some(&s), t0(), WINDOW, "joseph-superset", Some(dir.path()));
+    let out = run_tick(
+        &mut st,
+        &sinks,
+        &TickContext {
+            status: Some(&s),
+            window: WINDOW,
+            host: "joseph-superset",
+            pool_dir: Some(dir.path()),
+            outputs: None,
+        },
+        t0(),
+    );
     assert_eq!(out.len(), 2);
     let tokens = out.iter().find(|t| t.key == KEY_TOKENS).unwrap();
     assert!(tokens.headline.contains("auth_401"));
@@ -261,9 +305,19 @@ fn incident_2026_10_04_produces_alerts_naming_auth_401() {
     let ev = rx.try_recv().expect("bus event");
     assert_eq!(ev.topic(), "operator_priority.escalation");
     // Same state next tick: no second alert.
-    assert!(
-        run_tick(&mut st, &sinks, Some(&s), t0() + Cd::minutes(1), WINDOW, "h", None).is_empty()
-    );
+    assert!(run_tick(
+        &mut st,
+        &sinks,
+        &TickContext {
+            status: Some(&s),
+            window: WINDOW,
+            host: "h",
+            pool_dir: None,
+            outputs: None
+        },
+        t0() + Cd::minutes(1)
+    )
+    .is_empty());
 }
 
 /// The common 401 path: `claude-wrapper.sh` / the `tokens check` reprobe write
@@ -304,26 +358,6 @@ fn blocked_with_exhaustion_bad_tokens_entry_is_exhausted() {
 }
 
 #[test]
-fn inbox_payload_keyed_and_resolves_on_clear() {
-    let t = state::Transition {
-        kind: Kind::Started,
-        key: KEY_TOKENS.into(),
-        headline: "h".into(),
-        fix: "f".into(),
-    };
-    let p = inbox_payload(&t, "box");
-    assert_eq!(p["key"], "mail-box-fleet-degraded-tokens-zero-healthy");
-    assert!(p["body"].as_str().unwrap().contains("Fix: f"));
-    let c = state::Transition {
-        kind: Kind::Cleared,
-        ..t
-    };
-    let p = inbox_payload(&c, "box");
-    assert_eq!(p["resolve"], true);
-    assert_eq!(p["key"], "mail-box-fleet-degraded-tokens-zero-healthy");
-}
-
-#[test]
 fn settings_block_and_defaults() {
     let d = Settings::from_block(None);
     assert!(!d.enabled);
@@ -337,3 +371,156 @@ fn settings_block_and_defaults() {
 }
 
 use std::sync::Arc;
+
+// --- #10916 slice 2a: output watchdog riding the fleet alert path ---
+
+mod output_watch {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::fleet_alert::outputs::{self, OutputWatch};
+    use crate::fleet_outputs::OutputSource;
+
+    /// Every registry row produced fresh, for every roster repo.
+    struct Healthy(DateTime<Utc>);
+    impl OutputSource for Healthy {
+        fn last_seen(&self, _: &str) -> Option<DateTime<Utc>> {
+            Some(self.0)
+        }
+        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
+            ["a/x", "b/y"]
+                .iter()
+                .map(|r| ((*r).to_string(), self.0))
+                .collect()
+        }
+        fn expected_repos(&self, _: &str) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    /// Nothing observed at all (a host that does not produce).
+    struct Silent;
+    impl OutputSource for Silent {
+        fn last_seen(&self, _: &str) -> Option<DateTime<Utc>> {
+            None
+        }
+        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
+            BTreeMap::new()
+        }
+    }
+
+    /// Everything fresh except one fleet-wide `record_kind`.
+    struct SilentKind(&'static str, DateTime<Utc>);
+    impl OutputSource for SilentKind {
+        fn last_seen(&self, kind: &str) -> Option<DateTime<Utc>> {
+            (kind != self.0).then_some(self.1)
+        }
+        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
+            ["a/x", "b/y"]
+                .iter()
+                .map(|r| ((*r).to_string(), self.1))
+                .collect()
+        }
+    }
+
+    /// `ci.run` is a Warning row (a quiet spell is legal): it must reach the
+    /// inbox as a non-critical alert, while critical rows stay critical.
+    #[test]
+    fn warning_row_is_not_escalated_to_critical() {
+        let r = roster();
+        let src = SilentKind("ci.run", t0());
+        let w = OutputWatch {
+            source: &src,
+            roster: &r,
+        };
+        let conds = outputs::conditions(&w, t0());
+        assert_eq!(conds.len(), 1);
+        assert!(conds[0].headline.starts_with("WARNING"));
+        assert!(!conds[0].critical);
+
+        let mut st = AlertState::new(1, Duration::from_secs(3600));
+        let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
+        let out = run_tick(
+            &mut st,
+            &sinks,
+            &TickContext {
+                status: Some(&status(1, 1)),
+                window: WINDOW,
+                host: "h",
+                pool_dir: None,
+                outputs: Some(&w),
+            },
+            t0(),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(outputs::is_output_key(&out[0].key));
+        assert!(!out[0].critical);
+    }
+
+    fn roster() -> Vec<String> {
+        vec!["a/x".into(), "b/y".into()]
+    }
+
+    #[test]
+    fn healthy_fleet_does_not_fire() {
+        let r = roster();
+        let src = Healthy(t0());
+        let w = OutputWatch {
+            source: &src,
+            roster: &r,
+        };
+        assert!(outputs::conditions(&w, t0()).is_empty());
+    }
+
+    #[test]
+    fn silent_fleet_fires_critical_through_the_sinks_after_debounce() {
+        let r = roster();
+        let w = OutputWatch {
+            source: &Silent,
+            roster: &r,
+        };
+        let conds = outputs::conditions(&w, t0());
+        assert!(!conds.is_empty());
+        assert!(conds.iter().all(|c| outputs::is_output_key(&c.key)));
+        assert!(conds.iter().any(|c| c.headline.starts_with("CRITICAL")));
+
+        let mut st = AlertState::new(1, Duration::from_secs(3600));
+        let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
+        let out = run_tick(
+            &mut st,
+            &sinks,
+            &TickContext {
+                status: Some(&status(1, 1)),
+                window: WINDOW,
+                host: "h",
+                pool_dir: None,
+                outputs: Some(&w),
+            },
+            t0(),
+        );
+        assert_eq!(out.len(), conds.len());
+        assert!(out.iter().all(|t| t.kind == Kind::Started));
+        assert!(out.iter().any(|t| t.critical));
+
+        // Output resumes: every alert clears.
+        let src = Healthy(t0());
+        let ok = OutputWatch {
+            source: &src,
+            roster: &r,
+        };
+        let out = run_tick(
+            &mut st,
+            &sinks,
+            &TickContext {
+                status: Some(&status(1, 1)),
+                window: WINDOW,
+                host: "h",
+                pool_dir: None,
+                outputs: Some(&ok),
+            },
+            t0(),
+        );
+        assert!(out.iter().all(|t| t.kind == Kind::Cleared));
+        assert!(!out.is_empty());
+    }
+}

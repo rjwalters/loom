@@ -107,6 +107,7 @@ mod tests {
             visibility: crate::telemetry::RepoVisibility::Private,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             issue,
             sweep_id: sweep_id.to_string(),
             model: None,

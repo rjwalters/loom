@@ -57,11 +57,25 @@ pub enum HaltCause {
     /// Actions jobs are not starting (billing failure / spending limit,
     /// #10113). A human org owner must fix it; a code fix cannot.
     CiBilling,
+    /// The root's installed Loom is too old for this daemon or the fleet
+    /// floor and differs from the payload (W3, #10719). Clears on a resync.
+    InstallIncompatible,
+    /// The root's installed Loom needs a newer daemon than this one (W4,
+    /// #10719). Clears when this host has rolled.
+    DaemonTooOld,
+    /// The registry marks the root maintain-only (#11186): the daemon keeps
+    /// its Loom install current and never dispatches into it. An operator's
+    /// choice; it clears only when the mark is lifted.
+    MaintainOnly,
+    /// The repo's measured disk charge does not fit this host's free space
+    /// after the halt floor and the in-flight sweeps' expected growth
+    /// (#11191). Host-local; clears as sweeps finish or space is reclaimed.
+    DiskReservation,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 12] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -70,6 +84,10 @@ impl HaltCause {
         Self::Breaker,
         Self::WriteScope,
         Self::CiBilling,
+        Self::InstallIncompatible,
+        Self::DaemonTooOld,
+        Self::MaintainOnly,
+        Self::DiskReservation,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -97,8 +115,29 @@ impl HaltCause {
             Self::Breaker => "breaker",
             Self::WriteScope => "write_scope",
             Self::CiBilling => "ci_billing",
+            Self::InstallIncompatible => "install_incompatible",
+            Self::DaemonTooOld => "daemon_too_old",
+            Self::MaintainOnly => "maintain_only",
+            Self::DiskReservation => "disk_reservation",
         }
     }
+}
+
+/// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in
+/// [`HaltCause::ALL`] order, for the work finder's pre-dispatch hold line.
+/// That slice folds four holds (pre-flight advisory, token pool, write scope
+/// and the #10719 workspace hold), so the line names the ones in force
+/// instead of guessing.
+#[must_use]
+pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
+    let parts: Vec<String> = HaltCause::ALL
+        .iter()
+        .filter_map(|cause| {
+            let n = causes.iter().filter(|c| **c == Some(*cause)).count();
+            (n > 0).then(|| format!("{n} {}", cause.as_str()))
+        })
+        .collect();
+    parts.join(", ")
 }
 
 /// The per-root cause fold — the named-cause counterpart of
@@ -158,6 +197,25 @@ pub fn causes_per_root(
             breaker_suppressed.then_some(HaltCause::Breaker)
         })
         .collect()
+}
+
+/// Fold the disk budget's holds (#11191) into the per-root causes: a root no
+/// other hold names, whose disk charge does not fit at the top of the tick,
+/// is held as [`HaltCause::DiskReservation`]. Lowest precedence, so a root
+/// that is red or pool-held still names that cause. No budget: unchanged.
+#[must_use]
+pub fn with_disk_holds(
+    mut causes: Vec<Option<HaltCause>>,
+    disk: Option<&crate::disk_admission::DiskBudget>,
+) -> Vec<Option<HaltCause>> {
+    if let Some(budget) = disk {
+        for (cause, held) in causes.iter_mut().zip(budget.held()) {
+            if cause.is_none() && held {
+                *cause = Some(HaltCause::DiskReservation);
+            }
+        }
+    }
+    causes
 }
 
 /// A halted root's cause: `ci_billing` when its repo owner's Actions jobs are

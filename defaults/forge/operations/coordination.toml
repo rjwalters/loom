@@ -87,9 +87,6 @@ path = "loom-daemon/src/work_finder/forge.rs"
 kind = "rust"
 path = "loom-daemon/src/forge_listing.rs"
 [[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_fetch.rs"
-[[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/guide.md"
 
@@ -221,6 +218,9 @@ path = "loom-daemon/src/forge_check_claim.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/claim_reconciliation.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
@@ -403,6 +403,9 @@ path = "defaults/.claude/commands/loom/champion-common.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
 
 [[operation]]
 id = "comment.list"
@@ -524,12 +527,6 @@ path = "defaults/scripts/check-promotion-landed.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_dwell.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_events_forge.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/stale_blocked/release_gh.rs"
