@@ -62,6 +62,7 @@ pub(crate) mod host;
 pub(crate) mod inflight;
 mod install_binary;
 pub(crate) mod install_compat_cli;
+pub(crate) mod journal_cli;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;

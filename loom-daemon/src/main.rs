@@ -1116,6 +1116,9 @@ enum Commands {
     /// = drift detector), diff/apply the `roster`, and report the desired run
     /// `state`. Args live in `cli::fleet_config` (main.rs is size-frozen).
     FleetConfig(cli::fleet_config::FleetConfigArgs),
+
+    /// The shared bounded journal core (#11345): `verify` a journal root.
+    Journal(cli::journal_cli::JournalArgs),
 }
 
 /// Sub-actions for `loom-daemon checkpoint` (issue #4275).
@@ -2369,6 +2372,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::SweepOutcomes(args) => cli::sweep_outcomes_cli::dispatch(args),
         Commands::FleetConfig(args) => cli::fleet_config::dispatch(args),
+        Commands::Journal(args) => cli::journal_cli::dispatch(args),
         Commands::Stats {
             command,
             role,
