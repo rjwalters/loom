@@ -104,9 +104,14 @@ resolved release against the **source tree's own `VERSION` file** (not just
 the installed binary's version) and reports the gap on both paths:
 
 - **Resolution time** (any `--check`/plain run, not just `--fetch`): when the
-  newest release is behind the source tree's `VERSION`, a warning is printed:
-  `Artifact path cannot reach current source: newest release ... is behind
-  this source tree's VERSION (...)`.
+  newest release is behind the source tree's `VERSION`, an informational note
+  is printed. When the release IS newer than the installed binary (so this
+  run installs it), the note says so plainly — the target of a release
+  install is the release, not the checkout, and a checkout a few commits ahead
+  is routine (#11070). When it is not, the note says no release artifact can
+  update this host until a release >= the source `VERSION` is cut. Neither
+  note predicts a hard-fail; under a forced `--fetch` the refusal below is
+  the only message, and only when it actually happens.
 - **`--check`**: the same gap is summarized up front —
   `Release gap: installed ..., newest release ..., source ... — the
   artifact-fetch path cannot reach current source until a release >= ... is
