@@ -103,3 +103,62 @@ async fn sweep_started_carries_the_facts_its_outcome_reports() {
         assert_eq!(outcome[key], want, "sweep.outcome {key}");
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn outcome_reuses_dispatch_lineage_after_journal_rotation() {
+    std::env::set_var("LOOM_REPO", REPO);
+    let dir = tempdir().unwrap();
+    let (mut registry, _rec) = fixture_registry(dir.path());
+    let issue = 11280;
+    seed_prior_attempt(&registry, issue);
+    let journal = registry.config().resolve_outcome_telemetry_path();
+
+    let sweep_id = registry
+        .dispatch(&SweepKind::Issue(issue), None, Some("opus"), Some("high"), None)
+        .unwrap()
+        .sweep_id;
+    // Another issue's outcome rotates the journal before this sweep reaps.
+    let backup = journal
+        .with_file_name(format!("{}.1", journal.file_name().and_then(|n| n.to_str()).unwrap()));
+    std::fs::rename(&journal, &backup).unwrap();
+
+    assert!(wait_for_condition(5_000, || {
+        registry.reap_once();
+        registry
+            .entries
+            .get(&sweep_id)
+            .is_some_and(|i| i.state.is_terminal())
+    }));
+    let outcome = sweep_outcomes::read_all_sweep_outcomes(&journal)
+        .into_iter()
+        .find(|r| r.sweep_id == sweep_id)
+        .expect("the dispatched sweep's outcome");
+    std::env::remove_var("LOOM_REPO");
+
+    assert_eq!(outcome.attempt_index, Some(2));
+    assert_eq!(outcome.previous_sweep_id.as_deref(), Some("sweep-prior"));
+}
+
+#[tokio::test]
+#[serial]
+async fn unreadable_journal_leaves_start_lineage_absent() {
+    std::env::set_var("LOOM_REPO", REPO);
+    let dir = tempdir().unwrap();
+    let (mut registry, _rec) = fixture_registry(dir.path());
+    // A directory where the journal file belongs: `read_to_string` fails.
+    let journal = registry.config().resolve_outcome_telemetry_path();
+    std::fs::create_dir_all(&journal).unwrap();
+
+    let sweep_id = registry
+        .dispatch(&SweepKind::Issue(11280), None, Some("opus"), Some("high"), None)
+        .unwrap()
+        .sweep_id;
+    std::env::remove_var("LOOM_REPO");
+
+    let facts = registry.start_facts_snapshot();
+    let facts = facts.get(&sweep_id).expect("start facts recorded");
+    assert_eq!(facts.attempt_index, None);
+    assert_eq!(facts.previous_sweep_id, None);
+    assert_eq!(facts.trigger, None);
+}

@@ -28,8 +28,11 @@ impl SweepRegistry {
             self.resolve_owner_repo()
                 .map(|(owner, repo)| format!("{owner}/{repo}"))
         }?;
-        let prior =
-            sweep_outcomes::read_all_sweep_outcomes(&self.config.resolve_outcome_telemetry_path());
+        // `None` on an unreadable journal: unknown lineage is omitted, never
+        // published as a known first attempt.
+        let prior = sweep_outcomes::try_read_all_sweep_outcomes(
+            &self.config.resolve_outcome_telemetry_path(),
+        )?;
         lineage::derive_lineage(&prior, &slug, issue, sweep_id)
     }
 
