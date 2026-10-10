@@ -819,6 +819,19 @@ for CFG in '{"guards":{"uncommittedWorkConsumerCanary":null}}' '{"guards":null}'
         bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
     assert_eq "$(cat "$P26X/ok/canary.jsonl" 2>/dev/null)" "" "local $CFG over config true writes no wrapper record"
 done
+
+# 26d6b: a malformed or non-object tier is ignored as {} (config_resolver.rs
+# soft_read_json_object), so the lower-tier true still records a lib_missing
+# failure on both events.
+for CFG in 'null' '[]' '{broken' '"str"' ''; do
+    for ev in Stop SubagentStop; do
+        : > "$P26X/ok/canary.jsonl"
+        printf '%s' "$CFG" > "$P26X/.loom-local/local.json"
+        LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$P26X/ok/canary.jsonl" \
+            bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"'"$ev"'"}' >/dev/null 2>&1
+        assert_eq "$(grep -c '"error":"lib_missing"' "$P26X/ok/canary.jsonl" 2>/dev/null)" "1" "$ev: invalid local tier [$CFG] is ignored, lower-tier true still records"
+    done
+done
 printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
 
 # 26d7: opted in but unable to record -> exit 0 and a non-blocking coverage

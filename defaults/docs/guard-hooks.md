@@ -1421,7 +1421,7 @@ one, and a canary that cannot log must never keep a session from stopping.
 Wrapper records are written only for a workspace whose *effective* config sets
 the canary key to `true`: `jq` deep-merges the tiers in precedence order — private defaults,
 `.loom/config.json`, `.loom-project/project.json`, `.loom-local/local.json` — with the same
-semantics as the daemon's resolver, so a higher-tier `false`, non-boolean, `null`, or a
+semantics as the daemon's resolver (a missing, malformed or non-object tier is ignored as `{}`), so a higher-tier `false`, non-boolean, `null`, or a
 scalar replacing the whole `guards` object opts the workspace out (no `jq` means no record).
 For an opted-in workspace whose wrapper record cannot be written (path rejected or
 unresolvable, directory or unwritable log, log at the 1 MiB bound, append failure) the stub
