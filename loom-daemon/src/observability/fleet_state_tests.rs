@@ -773,9 +773,9 @@ fn hold_kind_comes_from_the_labels() {
 #[test]
 fn hold_appears_then_releases_across_two_deltas() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
-    let t2 = t0() + Duration::minutes(10);
-    let t3 = t0() + Duration::minutes(15);
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
     let v0 = build_view(&with_pr_labels(&["loom:pr"]), None, t0());
     let anchor = decide(&v0, &stamps, None, t0()).unwrap();
     assert!(anchor.anchor);
@@ -804,10 +804,10 @@ fn hold_appears_then_releases_across_two_deltas() {
     assert_eq!(row.held_since, None);
     assert_eq!(row.hold_released_at, Some(t3));
     // The stamp is kept, so the next pass is quiet.
-    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(5));
+    let v4 = build_view(&with_pr_labels(&["loom:pr"]), Some(&v3), t3 + Duration::minutes(1));
     assert_eq!(v4.repos[REPO].rows[&20].hold_released_at, Some(t3));
     let e3 = emitted(v3, t3, t0());
-    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(5)).is_none());
+    assert!(decide(&v4, &stamps, Some(&e3), t3 + Duration::minutes(1)).is_none());
 }
 
 #[test]
@@ -832,7 +832,7 @@ fn capacity(live: u32) -> FleetCapacity {
 #[test]
 fn capacity_change_produces_delta() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
+    let t1 = t0() + Duration::minutes(1);
     let mut i = input();
     i.capacity = Some(capacity(2));
     let v0 = build_view(&i, None, t0());
@@ -855,7 +855,7 @@ fn capacity_change_produces_delta() {
 #[test]
 fn main_ci_rides_each_repo_entry_and_a_change_is_a_delta() {
     let stamps = stamps();
-    let t1 = t0() + Duration::minutes(5);
+    let t1 = t0() + Duration::minutes(1);
     let mut i = input();
     i.main_ci.insert(REPO.to_string(), MainCi::Green);
     let v0 = build_view(&i, None, t0());
@@ -901,10 +901,10 @@ fn sweep_with_pr_labels(pr_labels: &[&str]) -> FleetInput {
 
 #[test]
 fn sweep_owned_row_takes_hold_from_its_pr_and_releases() {
-    let t1 = t0() + Duration::minutes(5);
-    let t2 = t0() + Duration::minutes(10);
-    let t3 = t0() + Duration::minutes(15);
-    let t4 = t0() + Duration::minutes(20);
+    let t1 = t0() + Duration::minutes(1);
+    let t2 = t0() + Duration::minutes(2);
+    let t3 = t0() + Duration::minutes(3);
+    let t4 = t0() + Duration::minutes(4);
     let v0 = build_view(&sweep_with_pr_labels(&["loom:pr"]), None, t0());
     assert_eq!(v0.repos[REPO].sources[&20], Source::Held);
 
