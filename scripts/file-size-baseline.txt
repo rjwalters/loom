@@ -28,7 +28,7 @@
 3655 loom-daemon/src/cli/status_render.rs
 1913 loom-daemon/src/credential_preflight.rs
 1840 loom-daemon/src/daemon_install_state.rs
-1222 loom-daemon/src/daemon_service.rs
+1210 loom-daemon/src/daemon_service.rs
 1575 loom-daemon/src/epic_supervisor.rs
 1108 loom-daemon/src/fleet/add_worker.rs
 1362 loom-daemon/src/fleet/add_worker/tests.rs
@@ -52,12 +52,12 @@
 3913 loom-daemon/src/safehouse/tests.rs
 1532 loom-daemon/src/script_helpers/sweep_experiment.rs
 1946 loom-daemon/src/script_helpers/validate_phase.rs
-1839 loom-daemon/src/serve.rs
+1834 loom-daemon/src/serve.rs
 1132 loom-daemon/src/stash_retirement.rs
 1607 loom-daemon/src/sweep_registry/dispatch.rs
 3198 loom-daemon/src/sweep_registry/dispatch/tests.rs
 2319 loom-daemon/src/sweep_registry/guards.rs
-1074 loom-daemon/src/sweep_registry/mod.rs
+1022 loom-daemon/src/sweep_registry/mod.rs
 1669 loom-daemon/src/sweep_registry/quarantine.rs
 2210 loom-daemon/src/sweep_registry/reaper/tests.rs
 1729 loom-daemon/src/sweep_registry/test_support.rs
@@ -71,7 +71,7 @@
 1510 loom-daemon/src/tokens_pool/session_lifecycle.rs
 1656 loom-daemon/src/types.rs
 1050 loom-daemon/src/watch_registry.rs
-1580 loom-daemon/src/work_finder.rs
+1516 loom-daemon/src/work_finder.rs
 3455 loom-daemon/src/work_finder/tests.rs
 1225 loom-daemon/src/worktree_ops/cargo_target.rs
 2370 loom-daemon/src/worktree_ops/clean.rs

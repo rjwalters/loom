@@ -206,8 +206,8 @@
 #     form of this host's own identity (Issue #6322): the opaque id
 #     (`opaque_host_id`, mirroring `sweep_registry::opaque_host_id` byte for
 #     byte) of the raw identity `sweep_registry::host_identity()` resolves
-#     (`LOOM_HOST_ID` env > `$HOSTNAME` > the `hostname` binary >
-#     `unknown-host`) -- unless `LOOM_LEASE_PUBLISH_HOSTNAME` opts into raw
+#     (`loom-daemon host-id`: `LOOM_HOST_ID` > `fleet.hostId` > the
+#     persisted `~/.loom/host-id`, #10023) -- unless `LOOM_LEASE_PUBLISH_HOSTNAME` opts into raw
 #     publishing, in which case the raw identity is used directly, matching
 #     `write_lease_comment`'s own opt-in. An explicit --host is used verbatim
 #     (no transform applied) -- it is the caller's job to pass whatever value
@@ -223,6 +223,9 @@
 #          DIFFERENT host (all fail-open, see above and Issue #6783) -- AND
 #          the branch is absent, this worktree's own push, or a closed PR's
 #          preserved head (#10027).
+#          (also PASS: no host identity at all, #10023 -- no `loom-daemon host-id`
+#          answer and no $LOOM_HOST_ID; warned on stderr, never compared as a
+#          made-up id.)
 #       1  Usage error (bad issue number, unknown flag, non-numeric
 #          --ttl-minutes).
 #       3  ABORT: EXPIRED -- the freshest lease comment is older than
@@ -311,7 +314,7 @@ lease_publish_raw_hostname() {
 # posture (see the fail-open discussion below `resolve_host`).
 resolve_published_host() {
     local raw
-    raw="$(resolve_host)"
+    raw="$(resolve_host)" || return 1
     if lease_publish_raw_hostname; then
         printf '%s' "$raw"
         return 0
@@ -331,23 +334,15 @@ gh_repo_path() {
     printf '%s' "${LOOM_REPO:-$placeholder}"
 }
 
-# --- Host identity, mirroring sweep_registry::host_identity()'s precedence -
+# --- Host identity (#10023): `loom_host_id` (lib/locate-daemon-bin.sh) asks
+# the daemon's own `host-id` on the binary loom_resolve_self_daemon_bin names,
+# never a bare PATH lookup, so this script and the daemon cannot disagree. It
+# falls back only to $LOOM_HOST_ID, and otherwise returns 1 with a stderr
+# explanation -- never a made-up `unknown-host` shared by every such host.
+# shellcheck source=./lib/locate-daemon-bin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
 resolve_host() {
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${HOSTNAME:-}" ]]; then
-        printf '%s' "$HOSTNAME"
-        return 0
-    fi
-    local h
-    h="$(hostname 2>/dev/null || true)"
-    if [[ -n "$h" ]]; then
-        printf '%s' "$h"
-        return 0
-    fi
-    printf 'unknown-host'
+    loom_host_id
 }
 
 # --- ISO-8601 -> epoch (portable across GNU date and BSD/macOS date, same
@@ -447,7 +442,7 @@ cmd_check() {
         exit 1
     }
 
-    local host="" ttl_minutes="$DEFAULT_TTL_MINUTES" branch="feature/issue-${issue}"
+    local host="" ttl_minutes="$DEFAULT_TTL_MINUTES" branch="feature/issue-${issue}" no_identity=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --branch)
@@ -474,7 +469,8 @@ cmd_check() {
         # PUBLISHED (opaque by default), not the raw hostname -- an explicit
         # --host is a caller-supplied literal and is compared verbatim,
         # unmodified by this transform.
-        host="$(resolve_published_host)"
+        host="$(resolve_published_host)" || host=""
+        [[ -n "$host" ]] || no_identity=1
     fi
     if ! [[ "$ttl_minutes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "ERROR: check: --ttl-minutes must be a non-negative number (got: '$ttl_minutes')" >&2
@@ -486,7 +482,15 @@ cmd_check() {
     # Precedence: 5, then a lease abort (3/4), then 6, then 0.
     local rc=0 lease_rc=0
     check_branch_collision "$issue" "$branch" || rc=$?
-    check_lease "$issue" "$host" "$ttl_minutes" || lease_rc=$?
+    # #10023: no identity -> this sweep cannot tell its own lease from a peer's,
+    # so the lease evidence is unverifiable: fail OPEN like every other
+    # unverifiable case, loudly, and never compare as `unknown-host`. The
+    # branch-collision leg above stays fail-closed regardless.
+    if ((no_identity)); then
+        echo "WARNING: check: no host identity for issue #${issue} (see loom_host_id above) -- lease fence skipped (fail-open)" >&2
+    else
+        check_lease "$issue" "$host" "$ttl_minutes" || lease_rc=$?
+    fi
     echo "VERDICT: issue #${issue} branch-exit=${rc} (${branch}) lease-exit=${lease_rc}" >&2
     ((rc == 5 || lease_rc == 0)) && exit "$rc"
     exit "$lease_rc"

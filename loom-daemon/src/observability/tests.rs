@@ -717,7 +717,12 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
     // `collector`'s and the sender's. The HTTPS-only sink starts no OTLP ops
     // tasks, and the ETA subscriber / fleet refresh / nightly folds tasks are
     // gone with the ETA subsystem (#11098).
-    assert_eq!(handles.len(), 3, "collector + daemon_event collector + sender");
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
+    assert_eq!(
+        handles.len(),
+        4,
+        "collector + daemon_event collector + sender + daemon.heartbeat loop (#10023)"
+    );
     for handle in handles {
         handle.abort();
     }
@@ -753,10 +758,11 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
     // (The ETA tasks were removed with the ETA subsystem, #11098.)
     // Issue #11161: the `fleet.state` pass after each work-finder tick.
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
     assert_eq!(
         handles.len(),
-        8,
-        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
+        9,
+        "collector + daemon_event + turnaround + two senders + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161) + daemon.heartbeat loop (#10023)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -792,9 +798,13 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
             .expect("the https exporter is fully configured and must still run");
-    // Issue #8760: `daemon_event::spawn_task` adds one more handle. No OTLP
     // sink started, so no OTLP ops tasks (the ETA tasks are gone, #11098).
-    assert_eq!(handles.len(), 3, "collector + daemon_event + only the https sender");
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
+    assert_eq!(
+        handles.len(),
+        4,
+        "collector + daemon_event + only the https sender + daemon.heartbeat loop (#10023)"
+    );
     let statuses = global_export_statuses();
     assert_eq!(
         statuses["otlp"].state,
@@ -911,8 +921,8 @@ async fn spawn_task_otlp_exporter_spawns_trio_plus_ops_tasks() {
     // Issue #11161: the `fleet.state` pass after each work-finder tick.
     assert_eq!(
         handles.len(),
-        7,
-        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161)"
+        8,
+        "collector + daemon_event + turnaround (#8929) + sender + task-liveness sampler (#10414) + IPC latency exporter (#10765) + fleet.state tick pass (#11161) + daemon.heartbeat loop (#10023)"
     );
     for handle in handles {
         handle.abort();

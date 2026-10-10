@@ -19,6 +19,7 @@
 - [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
+- [3e. Host identity and daemon lifecycle (Issue #10023)](#3e-host-identity-and-daemon-lifecycle-issue-10023)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
 - [5. Authenticated vs. public: two views, one redaction policy](#5-authenticated-vs-public-two-views-one-redaction-policy)
 - [5b. Doc-maintenance throughput (Guide, local-only, issue #6136)](#5b-doc-maintenance-throughput-guide-local-only-issue-6136)
@@ -335,7 +336,7 @@ canary. Mapping details remain in `observability/otlp/mapping.rs`.
 **The HTTPS exporter verifies its own identity** (issue #4830). Each `/ingest`
 success response echoes the `host_id` the presented key is bound to; the
 exporter compares that against the identity this daemon resolved for itself
-(`$LOOM_HOST_ID` > `$HOSTNAME` > `hostname`). On a disagreement — the wrong
+(see §3e — `$LOOM_HOST_ID` > `fleet.hostId` > persisted id). On a disagreement — the wrong
 host's key file installed on a machine, which silently mislabeled a whole
 night of telemetry on 2026-07-31 — it logs a WARN **once per daemon lifetime**
 and `loom-daemon health` reports an `observability DEGRADED` section (exit
@@ -1102,6 +1103,114 @@ in view:
 A session that outlives the daemon that launched it (a sweep adopted after a
 restart) keeps a stale address and exports nothing until it is relaunched —
 unless something else now holds that address, as above.
+
+## 3e. Host identity and daemon lifecycle (Issue #10023)
+
+### One `host.id` per machine
+
+Every surface that names "this host" — the OTLP Resource (`host.id`,
+`service.instance.id`) on spans, logs and metrics, the envelope `host_id`,
+peer claims, lease records, fleet-store keys, and the shell exporters
+(`merge-admission-telemetry.sh`, `guide-docs-telemetry.sh`,
+`lib/filing-lock.sh`, `sweep-lease-{publish,renew,fence}.sh`) — resolves one
+value, `loom-daemon host-id` (`--source` / `--json` show where it came from):
+
+1. `$LOOM_HOST_ID` — the provisioned fleet name. Set it on every fleet host.
+2. `fleet.hostId` in the **host-level** config tier
+   (`~/.local/share/loom/config/defaults.json`, or
+   `$LOOM_CONFIG_DEFAULTS_FILE`). Never read from a repo's committed
+   `.loom/config.json`, which every host shares.
+3. A generated `loom-host-<12 hex>` id persisted in `~/.loom/host-id`
+   (owner-only, created atomically on first use, override the path with
+   `$LOOM_HOST_ID_FILE`). Stable across restarts and launch contexts.
+
+It is **never** `$HOSTNAME` or the `hostname` binary any more: those vary by
+launch context (an interactive shell exports `$HOSTNAME`, launchd/systemd do
+not) and by OS (macOS returns the ComputerName or `*.localdomain`), which is
+how one machine reported as both `joseph-superset` and `2026-009-019`. Only a
+host that can neither read nor create the persisted id (no home directory, a
+read-only `~/.loom`, any other I/O error) falls back to `unknown-host`: the
+daemon keeps running under it (one WARN), but `loom-daemon host-id` exits
+non-zero, and the shell exporters (`lib/locate-daemon-bin.sh`'s
+`loom_host_id`) then fall back only to `$LOOM_HOST_ID` and otherwise refuse
+— a lease is not published, the fence fails open with a warning — rather
+than act under a sentinel every such host shares. At startup the daemon
+exports its resolved id to its children as `$LOOM_HOST_ID`, so a script it
+spawns cannot resolve a different one under another `$HOME`.
+
+**Migrating a hostname-keyed host.** A host that ran without `$LOOM_HOST_ID`
+reported its hostname. After upgrading it reports a generated id instead —
+once — and logs a WARN naming it. Its records before the upgrade stay under
+the old id: SQL keyed on `host.id` (`signoz/*.sql`, `sweep-facts/*`,
+`cycle-time-*`) sees a second id for that machine from the upgrade on; treat
+pre-upgrade rows as legacy. If the old name must be kept — a native ingest key
+bound to it (§3, #4830), fleet-store entries, in-flight peer claims and leases
+— pin `LOOM_HOST_ID=<old name>` (or `fleet.hostId`) **before** upgrading.
+Nothing re-keys silently.
+
+A host with a **native ingest key** bound to its old hostname that upgrades
+without pinning trips the #4830 identity check (§3) on its first acked
+batch: the key's bound `host_id` no longer equals the new generated
+`host.id`, so the daemon publishes `ObservabilityHostIdMismatch`
+(`observability_host_id_mismatch` / `observability_export.state ==
+"host_id_mismatch"` in `loom-daemon status --json`), logs one WARN, and
+`loom-daemon health` reports `observability DEGRADED` (exit `1`). Batches
+are still acked under the key's old name, so the backend and the daemon's
+own records now disagree. Remedy: pin `LOOM_HOST_ID=<the key's bound name>`
+and restart (or re-issue the key for the new id). Check before upgrading
+with `loom-daemon host-id --source`: `env`/`config` is already pinned, while
+`generated`/`persisted` means the host will report the new id.
+
+### `daemon.start` / `daemon.shutdown` / `daemon.heartbeat`
+
+Three `daemon.event` log records (`loom.kind = daemon.event`,
+`loom.topic` = the event) on every exporter, body = the payload JSON:
+
+| Topic | When | Typed attributes |
+|---|---|---|
+| `daemon.start` | Exporter comes up | `loom.daemon.version`, `.revision` (full commit), `.tree_state`, `.supervisor` (`launchd`/`systemd`/`none`) |
+| `daemon.shutdown` | Every clean exit (signal, IPC stop, restart, drain, fleet stop), enqueued **before** the final drain | `loom.daemon.exit_code`, `.exit_reason`, `.uptime_sec` |
+| `daemon.heartbeat` | Every `observability.heartbeatSecs` (env `LOOM_OBSERVABILITY_HEARTBEAT_SECS`, default 120 s) | `loom.export.last_success_at`, `.last_failure_at`, `.queued`, `.dropped`, `loom.daemon.uptime_sec`; per-exporter detail in the body |
+
+SIGKILL, a crash, a power loss or a sleeping laptop emit nothing — that
+absence *is* the signal. A heartbeat is queued like any record, so after an
+export outage the backlog arrives with its original timestamps and a
+`last_success_at` far behind its own time: export was failing, the host was
+up.
+
+**Last state per host** (SigNoz ClickHouse; set `heartbeat_secs` to the
+configured cadence):
+
+```sql
+SELECT host_id,
+       argMax(topic, ts) AS last_topic,
+       toDateTime(intDiv(max(ts), 1000000000)) AS last_seen,
+       multiIf(last_topic = 'daemon.shutdown', 'stopped',
+               dateDiff('second', last_seen, now()) <= 3 * {heartbeat_secs:UInt32}, 'running',
+               'silent') AS state,
+       argMaxIf(export_ok, ts, topic = 'daemon.heartbeat') AS export_last_success_at,
+       argMaxIf(queued, ts, topic = 'daemon.heartbeat') AS queued,
+       argMaxIf(dropped, ts, topic = 'daemon.heartbeat') AS dropped
+FROM (
+    SELECT resources_string['host.id'] AS host_id,
+           attributes_string['loom.topic'] AS topic,
+           timestamp AS ts,
+           attributes_string['loom.export.last_success_at'] AS export_ok,
+           attributes_number['loom.export.queued'] AS queued,
+           attributes_number['loom.export.dropped'] AS dropped
+    FROM signoz_logs.distributed_logs_v2
+    WHERE attributes_string['loom.kind'] = 'daemon.event'
+      AND attributes_string['loom.topic'] IN ('daemon.start', 'daemon.shutdown', 'daemon.heartbeat')
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+)
+GROUP BY host_id
+ORDER BY last_seen DESC;
+```
+
+`stopped` = a clean shutdown was the last word; `running` = a record within
+three heartbeats; `silent` = neither, since `last_seen`. To tell a silent
+host's "export failing" from "down", check `loom-daemon status` on it (§3b),
+or wait: once export recovers its queued heartbeats fill the gap.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 

@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 pub struct ObservabilityHostIdMismatch {
     /// What this daemon calls itself —
     /// [`crate::sweep_registry::host_identity`], resolved with the precedence
-    /// `$LOOM_HOST_ID`, then `$HOSTNAME`, then the `hostname` binary, then
-    /// `"unknown-host"`. The same value it stamps on every outgoing envelope.
+    /// `$LOOM_HOST_ID`, then `fleet.hostId`, then the persisted
+    /// `~/.loom/host-id` (#10023). The same value it stamps on every outgoing envelope.
     pub daemon_host_id: String,
     /// The `host_id` the `/ingest` response echoed — the identity the
     /// authenticated key is bound to, i.e. the host every pushed record is
