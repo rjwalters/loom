@@ -21,6 +21,16 @@
 //!   vocabulary, a sanitised model name and ids reach telemetry. An error body
 //!   is classified to a code and dropped.
 //!
+//! **Where records go.** In the daemon process the records ride the
+//! registered ops sink. A proxied launch, though, runs the proxy inside the
+//! `loom-daemon worker …` launcher, a separate process with no sink, where
+//! `ops::emit_*` would silently drop everything. There, each request's span is
+//! journalled instead: one completed root span per request in its own
+//! process-safe journal under `<workspace>/.loom/logs/trace-context/`, which
+//! the daemon's backfill pass drains into the OTLP queue exactly like a
+//! worker's lifecycle spans ([`ObserveContext::with_journal`]). The span holds
+//! every field the metric points do, so nothing is lost but the metric form.
+//!
 //! Default off: a record carries an [`ObserveContext`] only when the profile's
 //! `credentialProxy.observe` is true **and** [`enabled`] (env
 //! `LOOM_EGRESS_PROXY_OBSERVE` over `runtimes.containment.credentialProxyObserve`).
@@ -33,6 +43,7 @@ use crate::observability::ops::pool_marks::{provider_label, MarkReason};
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -75,6 +86,9 @@ pub struct ObserveContext {
     pub issue: Option<u32>,
     pub pr: Option<u32>,
     pub sweep_id: Option<String>,
+    /// Trace-journal directory for a process with no ops sink (the worker
+    /// launcher); `None` when the workspace does not export traces.
+    pub journal_dir: Option<PathBuf>,
 }
 
 impl ObserveContext {
@@ -103,8 +117,26 @@ impl ObserveContext {
             issue,
             pr: get("LOOM_PR_NUMBER").and_then(|v| v.trim().parse().ok()),
             sweep_id,
+            journal_dir: None,
         }
     }
+
+    /// Journal observations under `root`'s trace-context directory when no ops
+    /// sink is registered in this process — only if `root` exports traces at
+    /// all (the daemon's backfill would otherwise never drain the files).
+    #[must_use]
+    pub fn with_journal(mut self, root: &Path) -> Self {
+        if crate::observability::tracing::enabled(root) {
+            self.journal_dir = Some(journal_dir(root));
+        }
+        self
+    }
+}
+
+/// `<root>/.loom/logs/trace-context`, the directory the daemon backfills.
+#[must_use]
+pub fn journal_dir(root: &Path) -> PathBuf {
+    root.join(".loom").join("logs").join("trace-context")
 }
 
 /// Token counts and model read off one response. `None` = not reported.
@@ -490,13 +522,38 @@ pub fn span(ctx: &ObserveContext, launch_id: &str, obs: &Observation) -> SpanRec
     }
 }
 
-/// Export one observation. A no-op when no ops sink is registered.
+/// Export one observation: through the ops sink when this process has one,
+/// else into a per-request trace journal when the context names a directory,
+/// else nowhere.
 pub fn publish(ctx: &ObserveContext, provider: &str, launch_id: &str, obs: &Observation) {
-    if !ops::spans_exported() {
+    if ops::spans_exported() {
+        ops::emit_metrics(metric_points(ctx, provider, obs));
+        ops::emit_span(span(ctx, launch_id, obs));
         return;
     }
-    ops::emit_metrics(metric_points(ctx, provider, obs));
-    ops::emit_span(span(ctx, launch_id, obs));
+    let Some(dir) = ctx.journal_dir.clone() else {
+        return;
+    };
+    let record = span(ctx, launch_id, obs);
+    // The journal write fsyncs; keep it off the async workers. The response
+    // has already been relayed by the time this runs either way.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || journal(&dir, record));
+        }
+        Err(_) => journal(&dir, record),
+    }
+}
+
+/// Write `record` as the only entry of its own journal, named by its span id,
+/// so a journal is never appended to after the daemon may have retired it.
+/// Failure is logged (no request data in the message) and otherwise ignored.
+pub fn journal(dir: &Path, record: SpanRecord) {
+    let path = dir.join(format!("egress-{}.jsonl", record.context.span_id.as_str()));
+    let journal = crate::telemetry::trace::journal::Journal::from_path(path);
+    if let Err(error) = journal.append_completed(record) {
+        log::warn!("egress-proxy: observe record not journalled: {error}");
+    }
 }
 
 #[cfg(test)]
