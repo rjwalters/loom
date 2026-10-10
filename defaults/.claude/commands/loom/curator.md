@@ -115,16 +115,16 @@ The workflow with two-gate approval:
 
 ### Who promotes `loom:curated` → `loom:issue`
 
-This is the single authoritative statement of `loom:issue` promotion ownership. `.github/labels.yml`'s `loom:issue` `Applied by:` field and `/loom:sweep`'s Approval gate (Wave Lifecycle, step 3) both point back here instead of restating the rule — if a third place asserts who can promote and it disagrees with this section, this section wins; fix the other one (see #4163, which this section resolves).
+This is the single authoritative statement of `loom:issue` promotion ownership. `.github/labels.yml`'s `loom:issue` `Applied by:` field and `/loom:sweep`'s Approval gate (Wave Lifecycle, step 3) both point back here; if another place disagrees, this section wins and the other is fixed (#4163).
 
 Four things can add `loom:issue` to a `loom:curated` issue. **The Curator is only the fourth:**
 
 1. **A human**, directly, at any time.
 2. **Champion**, during its routine autonomous evaluation pass (`.claude/commands/loom/champion-issue-promo.md`). This repo runs autonomy-by-default (CLAUDE.md § "Issues Are Suggestions") — Champion promoting a well-formed issue on its own judgment is normal operation, not a special case that requires human sign-off.
 3. **The `/loom:sweep` orchestrator's Approval gate**, for an issue already in the sweep's resolved candidate set. The operator approved its inclusion one step earlier (naming the issue, confirming a Mode B/C preview, or triggering the daemon dispatch); the gate *executes* that approval, it does not originate one.
-4. **The Curator, for a `loom:operator-priority` (starred) issue only** (#9244): the star is the operator's Tier-3 approval, so Curator executes it right after curating (Priority 0 below; not for a `loom:epic`). Champion's evaluation is skipped for it.
+4. **The Curator, for a `loom:operator-priority` (starred) issue only** (#9244): the star is the operator's Tier-3 approval, so Curator executes it right after curating (Priority 0 below; not for a `loom:epic`). Champion's evaluation is skipped for it. Only on `GATE=ELIGIBLE` from `loom-daemon forge promotion-gate --issue N` (trusted author, #10827); else only `loom:curated`, posting `NOTICE_BODY` once on `NOTICE=needed`.
 
-A Curator subagent that finds `loom:curated` with no `loom:issue` should do exactly what the rest of this file says elsewhere: leave the label alone and move on — including when the Curator is itself running inside a `/loom:sweep` invocation. Promoting is never the Curator's call for an unstarred issue.
+A Curator (even inside `/loom:sweep`) that finds `loom:curated` with no `loom:issue` leaves the label alone and moves on: promoting an unstarred issue is never its call.
 
 **IMPORTANT: Ignore Hard-Excluded Issues**
 
@@ -202,7 +202,7 @@ done
 ```
 
 Curate each now (no workflow label = `loom:triage`), then add
-`loom:curated` and `loom:issue` in ONE label POST. A starred `loom:epic` gets
+`loom:curated` and (gate permitting, item 4) `loom:issue` in ONE label POST. A starred `loom:epic` gets
 only `loom:curated`; Champion's epic queue takes it first. Skip the query's labels and hard exclusions. Never add or remove a priority label (star and level 2 are human-only; `*-inherited` is daemon-only). Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate, never
 promote (the daemon admits them on a red `main`). Then revision requests ("Revising `loom:needs-revision`" below, #10753):

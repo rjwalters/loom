@@ -43,6 +43,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
 /// `(script, token)` pairs in the shell scripts that are comment markers, not
 /// labels. Only ever remove entries.
 const SCRIPT_ALLOWLIST: &[(&str, &str)] = &[
+    ("check-promotion-landed.sh", "loom:promotion-author-gate"),
     ("extract-capability-markers.sh", "loom:capability"),
     ("verdict-staleness-guard.sh", "loom:verdict-sha"),
     ("verdict-staleness-guard.sh", "loom:verdict-stale"),
