@@ -16,9 +16,11 @@ const DAEMON_CHURN_LABELS: &[&str] = &[
     "loom:treating",
 ];
 
-/// Most dependency issues whose state is folded into one fingerprint. Bounds
-/// the forge reads a single no-op can cost.
-pub(super) const MAX_DEPENDENCY_READS: usize = 6;
+/// Most dependency issues one fingerprint will read. Every named dependency is
+/// folded in (a truncated prefix would miss a later dependency changing state),
+/// so a body naming more than this makes the snapshot inconclusive instead of
+/// silently partial: never counted, never a release.
+pub(super) const MAX_DEPENDENCY_READS: usize = 50;
 
 /// Which park a held issue gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

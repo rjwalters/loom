@@ -482,6 +482,31 @@ fn an_unreadable_dependency_never_releases_an_applied_hold() {
     assert_eq!(forge.calls("issue edit").len(), edits, "no label write on an unread dependency");
 }
 
+/// Every named dependency is fingerprinted, not a prefix: closing the seventh
+/// of eight releases the hold.
+#[test]
+#[serial]
+fn a_dependency_beyond_the_sixth_releases_an_applied_hold() {
+    let (mut reg, forge, _dir) = forge_registry(2);
+    let body: String = std::iter::once("## Dependencies\n".to_string())
+        .chain((71..=78).map(|n| format!("- [ ] #{n} upstream\n")))
+        .collect();
+    forge.set_issue(ISSUE, "open", &body, &["loom:issue"]);
+    for n in 71..=78 {
+        forge.set_issue(n, "open", "", &[]);
+    }
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE));
+    forge.set_issue(ISSUE, "open", &body, &["loom:blocked"]);
+    let t0 = std::time::Instant::now();
+    reg.reconcile_noop_holds(t0);
+    assert!(reg.noop_hold_applied(ISSUE), "unchanged dependencies keep the hold");
+    forge.set_issue(78, "closed", "", &[]);
+    reg.reconcile_noop_holds(t0 + RECONCILE_INTERVAL * 2);
+    assert!(!reg.noop_hold_applied(ISSUE), "an omitted-prefix dependency closing releases");
+}
+
 #[test]
 #[serial]
 fn an_applied_hold_is_released_after_a_daemon_restart() {

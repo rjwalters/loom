@@ -685,11 +685,12 @@ impl SweepRegistry {
             .map(str::to_owned)
             .collect();
         let linked_pr = self.read_linked_pr_states(&slug, issue)?;
+        let refs = crate::dep_classify::refs::parse_named_blocker_refs(&body, &slug);
+        if refs.len() > MAX_DEPENDENCY_READS {
+            return None;
+        }
         let mut dependencies = Vec::new();
-        for r in crate::dep_classify::refs::parse_named_blocker_refs(&body, &slug)
-            .into_iter()
-            .take(MAX_DEPENDENCY_READS)
-        {
+        for r in refs {
             // A dependency that cannot be read leaves the whole snapshot
             // inconclusive: a `?` placeholder would differ from a recorded
             // `open` and release a hold on no observed change.
