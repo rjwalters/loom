@@ -74,3 +74,18 @@ handoff/blocker rather than looping on the same command. If a prerequisite or
 helper is unavailable, record an actionable handoff and accurate forge state;
 do not improvise past it. Finish with the existing summary vocabulary and
 transcript archival.
+
+## Per-phase runtime: `loom-daemon worker run` (#11285)
+
+A Claude-orchestrated sweep can run only its Builder and Doctor phases on
+another runtime (e.g. `opencode:zai-flash`) via `runtimes.rolePreference`.
+Before each such phase the orchestrator calls
+`loom-daemon worker run --role builder --issue N --json` (Doctor:
+`--role doctor --pr N`). The command resolves the role's runtime; when that is
+`claude` it prints `outcome=delegate-to-claude` and exits 0 without launching
+(dispatch the Task subagent as before). Otherwise it blocks, launches the guarded
+native worker in `.loom/worktrees/issue-N`, and exits 0 (artifact produced:
+PR labelled `loom:review-requested` / new Doctor commit with the label
+flipped), 1 (ran, no artifact), 75 (no eligible runtime or pool seat: fall back
+to Claude), 78 (config unresolvable) or 124 (`--timeout`). `--role judge` and
+`--role curator` are refused (exit 2); they stay Claude Task subagents.
