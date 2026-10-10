@@ -601,6 +601,15 @@ pub(crate) enum ForgeAction {
         source: String,
     },
 
+    /// `forge verdict-body-check` (#9258) — is the verdict body on stdin a
+    /// rationale at all? Prints `LOOM-VERDICT-BODY OK` (exit 0) or
+    /// `LOOM-VERDICT-BODY REJECT <why>` (exit 1) for an empty body, a lone `-`,
+    /// a lone `@`-token (`@-`, `@path`) or one under 20 non-whitespace
+    /// characters. `post-verdict.sh` calls it before posting. See
+    /// `loom_daemon::verdict_body`.
+    #[command(name = "verdict-body-check")]
+    VerdictBodyCheck,
+
     /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
     /// this verdict be posted? Reads the PR's trusted comments and labels.
     /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
@@ -912,6 +921,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
         ForgeAction::VerdictGate {
             pr,
             repo,

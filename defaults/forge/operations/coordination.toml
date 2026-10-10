@@ -223,6 +223,9 @@ kind = "rust"
 path = "loom-daemon/src/claim_reconciliation.rs"
 [[operation.callers]]
 kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
+[[operation.callers]]
+kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
 [[operation.callers]]
 kind = "rust"
@@ -403,6 +406,9 @@ path = "defaults/.claude/commands/loom/champion-common.md"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet/drain_reset.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/unanchored_verdict.rs"
 
 [[operation]]
 id = "comment.list"
