@@ -504,6 +504,12 @@ gitignored (the managed block ignores all of `.loom/state/*`, #9592).
   no stamp, keys of a repo with no watermark, and unconfirmed units are always
   kept; compaction stamps unstamped keys, so they age out later. `status`
   counts the retained keys.
+  The boundary is enforced for the feed-driven single-run path too
+  (`poll/targeted.rs`): a hinted run whose forge `created_at` is older than
+  its repo's watermark minus 45 days is refused after the one run fetch (no
+  jobs, artifacts or logs), because its expired keys could no longer prove it
+  was already emitted. `created_at` is fixed across re-runs, so legitimate
+  recent re-runs are unaffected.
 - **Commit first, then emit.** For each run, the job units are committed
   first and the run unit last, all in a single fsynced append. Their
   envelopes are then appended (and fsynced) to the journal, and the batch is

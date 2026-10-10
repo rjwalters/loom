@@ -676,6 +676,19 @@ impl Ledger {
         self.repaired
     }
 
+    /// Whether a run created at `created_at` is older than `repo`'s retention
+    /// boundary (watermark − [`SEEN_RETENTION_DAYS`]). Such a run's keys may
+    /// have been dropped by [`open`](Self::open), so [`is_seen`](Self::is_seen)
+    /// can no longer vouch for it and a consumer fed an arbitrary run key (the
+    /// feed-driven path) must refuse it rather than record it again (#11159).
+    /// `false` when the repo has no watermark (nothing is ever expired there).
+    #[must_use]
+    pub fn run_is_past_retention(&self, repo: &str, created_at: DateTime<Utc>) -> bool {
+        self.watermarks
+            .get(repo)
+            .is_some_and(|watermark| created_at < *watermark - Duration::days(SEEN_RETENTION_DAYS))
+    }
+
     #[must_use]
     pub fn is_seen(&self, key: &UnitKey) -> bool {
         self.lookup(key)
