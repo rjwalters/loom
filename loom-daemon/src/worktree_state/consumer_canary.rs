@@ -190,21 +190,24 @@ pub fn append_record(log: &Path, record: &serde_json::Value) -> Result<(), Strin
         .map_err(|e| format!("write {}: {e}", log.display()))
 }
 
-/// Merge a coverage-gap notice into the hook output, preserving any decision.
-fn with_gap_notice(out: Option<serde_json::Value>, why: &str) -> serde_json::Value {
+/// The hook output when a record could not be written: a NON-blocking coverage
+/// gap notice. The decision is dropped (fail open) — a canary that cannot
+/// record must never be the reason a session cannot stop — but any
+/// `systemMessage` the decision carried is kept, so an advisory still shows.
+fn gap_notice(out: Option<serde_json::Value>, why: &str) -> serde_json::Value {
     let notice = format!(
         "uncommitted-work consumer canary (#8372): this decision was NOT recorded ({why}); \
          the canary sample for this window is incomplete."
     );
-    let mut out = out.unwrap_or_else(|| serde_json::json!({}));
-    if let Some(obj) = out.as_object_mut() {
-        let msg = match obj.get("systemMessage").and_then(|m| m.as_str()) {
-            Some(existing) => format!("{existing}\n{notice}"),
-            None => notice,
-        };
-        obj.insert("systemMessage".into(), serde_json::Value::from(msg));
-    }
-    out
+    let msg = match out
+        .as_ref()
+        .and_then(|o| o.get("systemMessage"))
+        .and_then(|m| m.as_str())
+    {
+        Some(existing) => format!("{existing}\n{notice}"),
+        None => notice,
+    };
+    serde_json::json!({ "systemMessage": msg })
 }
 
 /// End-to-end for `stop-hook --consumer-canary`: raw stdin in, hook JSON out.
@@ -266,7 +269,7 @@ pub fn run(
         Ok(()) => out,
         Err(why) => {
             eprintln!("worktree-state stop-hook --consumer-canary: outcome not recorded: {why}");
-            Some(with_gap_notice(out, &why))
+            Some(gap_notice(out, &why))
         }
     }
 }

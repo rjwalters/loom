@@ -1405,12 +1405,16 @@ both events in both install modes, dedup, transition deferral and deprovision.
 | `worktree`, `guard_enabled` | the owned worktree (null if none) and the `uncommittedWork` toggle as resolved |
 | `state` | the measured worktree state at decision time: branch, commit/uncommitted/untracked counts, push state, up to 8 at-risk **paths** (names only, never contents), verdict |
 
-If a record cannot be written, the decision stands and the session sees a
-`systemMessage` saying the decision was **not recorded** — an unrecorded decision
-is a coverage gap, never a measured one. Wrapper records are written only for a
-workspace whose config tiers name the canary key as `true` (a text match; a key
-set only in the private-defaults tier is not seen there), and the stub never
-appends past the size bound.
+If a record cannot be written, the canary **fails open**: the block is dropped
+and the session sees only a non-blocking `systemMessage` saying the decision was
+**not recorded** — an unrecorded decision is a coverage gap, never a measured
+one, and a canary that cannot log must never keep a session from stopping.
+Wrapper records are written only for a workspace whose *effective* config sets
+the canary key to `true` (a text match over the tiers in precedence order —
+private defaults, `.loom/config.json`, `.loom-project/project.json`,
+`.loom-local/local.json` — where the last tier naming the key wins, so a
+higher-tier `false` suppresses them), and the stub never appends past the size
+bound.
 
 **Retrieving the sample:**
 

@@ -29,8 +29,8 @@
 #
 # WRAPPER-FAILURE RECORDS. When the daemon cannot run, it cannot record
 # anything, so this stub appends ONE line itself (`"source":"wrapper"`) to the
-# same bounded canary log — but only for a workspace whose config tiers name the
-# canary key as true (a cheap text match, used ONLY to decide whether to record;
+# same bounded canary log — but only for a workspace whose effective config sets the
+# canary key to true (a cheap text match, used ONLY to decide whether to record;
 # the real gate is the daemon's config resolution). These records stay visible
 # and are excluded from the detection false-positive denominator. The stub
 # never grows the log past its size bound; the daemon owns rotation.
@@ -52,12 +52,25 @@ ROOT="${LOOM_PROJECT_ROOT:-}"
 [[ -n "$ROOT" ]] || ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)/.." 2>/dev/null && pwd)"
 [[ -n "$ROOT" ]] || ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# $1 = failure class. Records only for a workspace whose config tiers name the
-# canary key as true (grep -q exits 0 on a match even if another tier is missing),
-# and never grows the log past its 1 MiB bound (the daemon owns rotation).
+# Effective value of the canary key across the config tiers, lowest to highest
+# precedence (private defaults < .loom/config.json < .loom-project/project.json
+# < .loom-local/local.json — config_resolver.rs): the LAST tier naming the key
+# as a boolean wins, so a higher-tier false suppresses wrapper records. Returns
+# 0 only when the effective value is true. A text match, not a JSON parse.
+_canary_effective_true() {
+    local f v eff="" defaults="${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}"
+    for f in "$defaults" "$ROOT/.loom/config.json" "$ROOT/.loom-project/project.json" "$ROOT/.loom-local/local.json"; do
+        [[ -n "$f" && -r "$f" ]] || continue
+        v="$(grep -Eso '"uncommittedWorkConsumerCanary"[[:space:]]*:[[:space:]]*(true|false)' "$f" 2>/dev/null | tail -n1)"
+        [[ -n "$v" ]] && eff="${v##*[: ]}"
+    done
+    [[ "$eff" == true ]]
+}
+
+# $1 = failure class. Records only for a workspace whose EFFECTIVE canary key is
+# true (see _canary_effective_true), and never grows the log past its 1 MiB bound (the daemon owns rotation).
 _record_wrapper_failure() {
-    grep -Eqs '"uncommittedWorkConsumerCanary"[[:space:]]*:[[:space:]]*true' \
-        "$ROOT/.loom/config.json" "$ROOT/.loom-project/project.json" "$ROOT/.loom-local/local.json" || return 0
+    _canary_effective_true || return 0
     local log="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" event="" ws
     [[ "$log" == /* ]] && mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || return 0  # missing log -> "" -> 0

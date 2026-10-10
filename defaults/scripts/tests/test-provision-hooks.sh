@@ -756,6 +756,24 @@ for ev in Stop SubagentStop; do
 done
 assert_contains "$(cat "$LOG26" 2>/dev/null)" '"error":"unsupported_subcommand_or_flag"' "stale daemon recorded as a wrapper failure for the opted-in workspace"
 
+# 26d2: effective precedence — a higher-tier false (local) overrides a lower-tier
+# true (.loom/config.json): no wrapper record; reversing the order records one.
+P26X=$(mktemp -d); mkdir -p "$P26X/.loom" "$P26X/.loom-local" "$P26X/defaults/hooks"
+cp "$REPO_ROOT/defaults/hooks/$UW" "$P26X/defaults/hooks/$UW"   # no ../scripts/lib -> lib_missing
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom/config.json"
+printf '{"guards":{"uncommittedWorkConsumerCanary":false}}\n' > "$P26X/.loom-local/local.json"
+LOG26X="$P26X/canary.jsonl"
+for ev in Stop SubagentStop; do
+    LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$LOG26X" \
+        bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"'"$ev"'"}' >/dev/null 2>&1
+done
+assert_eq "$(cat "$LOG26X" 2>/dev/null)" "" "effective false (local overrides config true) writes no wrapper record"
+printf '{"guards":{"uncommittedWorkConsumerCanary":false}}\n' > "$P26X/.loom/config.json"
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
+LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$LOG26X" \
+    bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+assert_contains "$(cat "$LOG26X" 2>/dev/null)" '"error":"lib_missing"' "effective true (local overrides config false) writes a wrapper record"
+
 # 26e: deprovision removes both events' entries and leaves no empty arrays.
 deprovision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$S26" "$UW")" "0" "deprovision removed both uncommitted-work entries"

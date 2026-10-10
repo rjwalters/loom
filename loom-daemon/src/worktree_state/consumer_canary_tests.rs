@@ -293,22 +293,33 @@ fn a_missing_transcript_is_an_allow() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_log_write_failure_keeps_the_decision_and_surfaces_the_gap() {
+fn a_log_write_failure_fails_open_and_surfaces_the_gap() {
     let ws = Ws::opted_in();
     std::fs::write(ws.wt().join("probe.sh"), "#!/bin/sh\n").unwrap();
     // A log path whose parent is a regular file cannot be created.
     let blocker = ws.logs.path().join("not-a-dir");
     std::fs::write(&blocker, "").unwrap();
     let bad_log = blocker.join("canary.jsonl");
-    let raw = ws.payload("Stop", &ws.wt(), None, false);
-    let out = run(&raw, "main", ws.main(), Some(&bad_log), "inv");
-    assert!(is_block(&out), "a logging failure must not change the decision");
-    let msg = out.unwrap()["systemMessage"].as_str().unwrap().to_string();
-    assert!(msg.contains("NOT recorded"), "{msg}");
+    for event in ["Stop", "SubagentStop"] {
+        let raw = ws.payload(event, &ws.wt(), None, false);
+        // Sanity: with a working log this very input is a block.
+        assert!(is_block(&ws.run(&raw)), "{event}: fixture must block when recorded");
 
-    // No log location at all: same contract.
-    let out = run(&raw, "main", ws.main(), None, "inv");
-    assert!(is_block(&out));
+        let out = run(&raw, "main", ws.main(), Some(&bad_log), "inv");
+        assert!(!is_block(&out), "{event}: an unrecorded decision must not block");
+        let out = out.expect("the gap must be visible, not silent");
+        assert!(out.get("decision").is_none(), "{event}: no decision field: {out}");
+        let msg = out["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("NOT recorded"), "{msg}");
+
+        // No log location at all: same contract.
+        let out = run(&raw, "main", ws.main(), None, "inv");
+        assert!(!is_block(&out), "{event}: no log location must not block");
+        assert!(out.unwrap()["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("NOT recorded"));
+    }
 }
 
 #[test]
