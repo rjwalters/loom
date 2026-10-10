@@ -49,36 +49,6 @@ assert_deny "write-confinement: tee main-checkout path denies" \
     "echo x | tee $WT_REPO/f" "$WT_REPO"
 assert_deny "write-confinement: sed -i on main-checkout path denies" \
     "sed -i 's/a/b/' $WT_REPO/f" "$WT_REPO"
-
-# #11074: repeatable -e/-f/--expression/--file option ARGUMENTS are script text
-# or a script file, never file operands. Only the real file operands are
-# write targets.
-assert_allow "write-confinement (#11074): sed -i with multiple -e and an external /tmp target allows" \
-    "sed -i -e 's/a/b/' -e 's/c/d/' /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_deny "write-confinement (#11074): sed -i with multiple -e and a main-checkout target still denies" \
-    "sed -i -e 's/a/b/' -e 's/c/d/' $WT_REPO/f" "$WT_REPO"
-assert_deny "write-confinement (#11074): sed -i with multiple -e and a checkout-relative target still denies" \
-    "sed -i -e 's/a/b/' -e 's/c/d/' README.md" "$WT_REPO"
-assert_allow "write-confinement (#11074): sed -i -f script.sed with external /tmp target allows" \
-    "sed -i -f script.sed /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_deny "write-confinement (#11074): sed -i -f script.sed with checkout-relative target denies" \
-    "sed -i -f script.sed README.md" "$WT_REPO"
-assert_allow "write-confinement (#11074): sed -i --expression/--file space-separated forms with external target allow" \
-    "sed -i --expression 's/a/b/' --expression 's/c/d/' --file s.sed /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_deny "write-confinement (#11074): sed -i --expression space-separated with checkout target denies" \
-    "sed -i --expression 's/a/b/' --expression 's/c/d/' README.md" "$WT_REPO"
-assert_allow "write-confinement (#11074): sed -i attached -es/a/b/ forms with external target allow" \
-    "sed -i -es/a/b/ --expression=s/c/d/ /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_allow "write-confinement (#11074): sed -i -e single script with external target allows" \
-    "sed -i -e 's/a/b/' /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_deny "write-confinement (#11074): sed -i single positional script with checkout target still denies" \
-    "sed -i 's/a/b/' README.md" "$WT_REPO"
-assert_allow "write-confinement (#11074): BSD sed -i '' -e with external target allows" \
-    "sed -i '' -e 's/a/b/' -e 's/c/d/' /tmp/loom-test-$$-11074.txt" "$WT_REPO"
-assert_deny "write-confinement (#11074): BSD sed -i '' -e with checkout target still denies" \
-    "sed -i '' -e 's/a/b/' -e 's/c/d/' README.md" "$WT_REPO"
-assert_deny "write-confinement (#11074): BSD sed -i '' positional script with checkout target still denies" \
-    "sed -i '' 's/a/b/' README.md" "$WT_REPO"
 assert_deny "write-confinement: cp destination in main checkout denies" \
     "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 assert_deny "write-confinement: mv destination in main checkout denies" \

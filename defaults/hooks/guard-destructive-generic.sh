@@ -8734,20 +8734,18 @@ _extract_write_targets_scan() {
                     if (j in numfd_redir) continue
                     if (toks[j] == "-i") { has_i = 1; bare_i_pending = 1; continue }
                     if (toks[j] ~ /^-i/) has_i = 1
-                    # Repeatable script options (#11074): a bare `-e`/`-f`
-                    # (or a short cluster ending in one, e.g. `-ne`, with no
-                    # `i` -- after `i` the rest is the backup suffix) or
-                    # `--expression`/`--file` takes the NEXT token as its
-                    # argument (script text / script file), never a file
-                    # operand. Consume it, and note that no positional script
-                    # exists, so every remaining non-option token is a file.
-                    # Attached forms (`-es/a/b/`, `--expression=...`) are
-                    # single tokens already skipped by the `^-` rule below.
+                    # Script options (#11074): `-e`/`-f`/`--expression`/`--file`
+                    # (or a short cluster ending in e/f with no `i` before it --
+                    # after `i` the rest is the backup suffix) take the NEXT
+                    # token as script text/file, never a file operand; attached
+                    # forms (`-es/a/b/`, `--file=s.sed`) carry it in-token. Either
+                    # way there is no positional script: every remaining
+                    # non-option token is a file.
                     if (toks[j] == "--expression" || toks[j] == "--file" || toks[j] ~ /^-[^-eif]*[ef]$/) {
-                        have_script = 1
-                        bare_i_pending = 0
-                        j++
-                        continue
+                        have_script = 1; bare_i_pending = 0; j++; continue
+                    }
+                    if (toks[j] ~ /^--(expression|file)=/ || toks[j] ~ /^-[^-eif]*[ef]./) {
+                        have_script = 1; bare_i_pending = 0; continue
                     }
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
