@@ -62,8 +62,8 @@ pub struct QueueSnapshotRow {
     pub visibility: RepoVisibility,
     pub issue: u32,
     pub workspace_priority: u32,
-    /// Deprecated (#9244): always `false`. `loom:urgent` no longer affects
-    /// dispatch order; kept on the wire for one release.
+    /// Deprecated (#9244): always `false`. Its label was deleted in #11105;
+    /// kept on the wire only for compatibility.
     pub urgent: bool,
     /// Whether the issue is starred (`loom:operator-priority`, #9244), which
     /// sorts it ahead of all other work.

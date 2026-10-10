@@ -85,8 +85,8 @@ const TABLE: &[(&str, Reloadability)] = &[
     ("autonomous.workFinder.redFixEscalateAfterSecs", Reloadability::Live),
     // Everything else under `autonomous.workFinder` — `enabled` (gates
     // whether the loop is spawned at all), `intervalSecs` (the ticker's
-    // fixed period), `maxAdmissionsPerTick`, `hostClass` /
-    // `allowHeavyLocal`, `saturationBrake.*` — is resolved once at daemon
+    // fixed period), `maxAdmissionsPerTick`, `saturationBrake.*` — is
+    // resolved once at daemon
     // bring-up in `daemon_service.rs`'s work-finder startup block, before
     // the loop is spawned.
     ("autonomous.workFinder", Reloadability::RestartRequired),

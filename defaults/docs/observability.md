@@ -585,7 +585,7 @@ merge-chain head that `main` keeps moving under. Details are in
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`, `deferred_saturation`,
-`host_class_refused`, a backoff, a cooldown, …) had no per-issue SigNoz record
+`host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
 refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or

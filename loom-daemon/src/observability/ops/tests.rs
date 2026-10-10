@@ -390,7 +390,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         seen: 6,
         dispatched: 2,
         skipped_peer_claim: 1,
-        skipped_host_class: 1,
+        skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
     };
@@ -405,7 +405,7 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
         [
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
-            ("host_class".to_string(), MetricValue::Int(1)),
+            ("host_constraint".to_string(), MetricValue::Int(1)),
             ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()

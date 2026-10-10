@@ -156,7 +156,7 @@ impl PickSkipReason {
             Qd::WorkspaceCommandsMissing | Qd::Quarantined | Qd::LabelledBlocked | Qd::Unknown => {
                 Self::Blocked
             }
-            Qd::HostConstraint | Qd::HostClassRefused | Qd::PeerClaim => Self::HostConstraint,
+            Qd::HostConstraint | Qd::PeerClaim => Self::HostConstraint,
             Qd::Parked | Qd::HardExclusion | Qd::Declined => Self::OperatorHold,
             Qd::OpenPrBackoff | Qd::OpenPr => Self::PrOpenSkip,
             Qd::DispatchError => Self::Error,

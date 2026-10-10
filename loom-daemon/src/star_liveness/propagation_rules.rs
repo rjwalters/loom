@@ -86,13 +86,12 @@ fn rules_from(reg: &'static Registry) -> Vec<Rule> {
 }
 
 /// Registry kinds that never propagate, whatever the label: per-item state
-/// (holds, claims, lifecycle, PR lanes), proposal kinds, structure, size and
-/// resource weight. Decomposition exists to separate the automatable part
-/// from the rest, so a hold or claim on the parent says nothing about a child;
-/// `loom:heavy` would false-positive on the light children. A registry label
-/// of one of these kinds must carry `propagate: null` (tested). Within a
-/// propagating kind, `null` also covers the retired `loom:urgent` and the
-/// #10307 priority levels, which reach *blockers* by their own pass.
+/// (holds, claims, lifecycle, PR lanes), proposal kinds, structure and
+/// size. Decomposition exists to separate the automatable part
+/// from the rest, so a hold or claim on the parent says nothing about a child.
+/// A registry label of one of these kinds must carry `propagate: null`
+/// (tested). Within a propagating kind, `null` also covers the #10307
+/// priority levels, which reach *blockers* by their own pass.
 pub const NEVER_KINDS: &[&str] = &[
     "workflow",
     "claim",
@@ -101,7 +100,6 @@ pub const NEVER_KINDS: &[&str] = &[
     "hold",
     "structural",
     "size",
-    "resource",
 ];
 
 /// The rule covering `label`, or `None` when it never propagates.
@@ -289,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn holds_claims_lifecycle_heavy_and_points_never_propagate() {
+    fn holds_claims_lifecycle_and_points_never_propagate() {
         for l in [
             "loom:blocked",
             "loom:operator",
@@ -304,9 +302,7 @@ mod tests {
             "loom:architect",
             "loom:epic",
             "loom:epic-phase",
-            "loom:heavy",
             "points:3",
-            "loom:urgent",
             "loom:operator-high-priority",
             "loom:high-priority-inherited",
             // Not a Loom label at all.
@@ -314,13 +310,7 @@ mod tests {
         ] {
             assert!(rule_for(l).is_none(), "{l} must never propagate");
         }
-        let parent = v(&[
-            "loom:blocked",
-            "loom:operator",
-            "loom:heavy",
-            "points:8",
-            "loom:building",
-        ]);
+        let parent = v(&["loom:blocked", "loom:operator", "points:8", "loom:building"]);
         assert!(plan(&[parent], issue(&[], &[]), true).is_empty());
     }
 

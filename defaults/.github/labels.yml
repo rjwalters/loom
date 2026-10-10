@@ -31,7 +31,7 @@
   description: "Approved for work. Applied by: humans, Champion, sweep gate, Curator (starred) — see curator.md."
   color: "3B82F6"  # blue-500
 
-# DEPRECATED: loom:in-progress removed (use role-specific labels)
+# Role-specific claim labels (they replaced one shared in-progress label):
 # - loom:building (Builder implementing issue)
 # - loom:curating (Curator enhancing issue)
 # - loom:reviewing (Judge reviewing PR)
@@ -167,10 +167,6 @@
   description: "Implementation blocked, needs help or clarification"
   color: "EF4444"  # red-500
 
-- name: loom:urgent
-  description: "Retired (#9244): use loom:operator-priority"
-  color: "DC2626"  # red-600
-
 - name: loom:abort
   description: "Signal to abort the sweep for this issue (returns to loom:issue)"
   color: "F97316"  # orange-500 - warning/signal color
@@ -198,15 +194,17 @@
   color: "FDE68A"  # amber-200 - distinct from the operator-only orange family
 
 # loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
-# carrying at least four meanings with no mechanical way to tell them apart —
-# these four ALWAYS accompany `loom:operator-only` (never replace it; every
+# carrying several meanings with no mechanical way to tell them apart —
+# these three ALWAYS accompany `loom:operator-only` (never replace it; every
 # existing filter/skip that keys off the base label is unaffected) and record
-# WHICH kind at the point of application. Exactly one of the four is applied
+# WHICH kind at the point of application. Exactly one of the three is applied
 # per issue/PR. See .loom/docs/label-state-machine.md "operator-only sub-kinds"
 # for the full decision table and the machine-readable-blocker convention.
 # NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —
 # being unsure is a sign the analysis is incomplete, not a reason to apply the
-# label. Only apply loom:operator-only once a specific sub-kind fits.
+# label. Only apply loom:operator-only once a specific sub-kind fits. An
+# unstated objective is filed as a decision (#10000; the objective sub-kind was
+# retired in #11105).
 # NOTE (#6881, updated #6893): loom:operator-mechanical's "no judgement
 # required" describes the WORK. The base loom:operator-only label's hard skip
 # still wins for every sub-kind by default -- with ONE narrow, fail-closed
@@ -214,7 +212,7 @@
 # `<!-- loom:capability=<name> -->` marker(s) (#6892) that the executing HOST
 # holds (LOOM_WORKER_CAPABILITIES, env-only) is routed to a PROPOSE-ONLY lane
 # instead of parked -- it emits the commands / a PR for an operator to
-# approve, never a live credentialed action. The other three sub-kinds are
+# approve, never a live credentialed action. The other two sub-kinds are
 # unchanged and hard-skip unconditionally, marker or no marker.
 - name: loom:operator-blocked
   description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
@@ -222,7 +220,7 @@
 
 # A loom:operator-mechanical item may additionally declare the capability(ies)
 # it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)
-# -- meaningful only alongside THIS sub-kind, ignored by the other three. See
+# -- meaningful only alongside THIS sub-kind, ignored by the other two. See
 # .loom/docs/label-state-machine.md "Capability-declaration convention" for
 # the closed vocabulary and parser contract, and its "Dispatch path (#6893)"
 # subsection for the four gates that consume it.
@@ -237,10 +235,6 @@
 - name: loom:decision-malformed
   description: "operator-decision bounced for missing/invalid decision block; Curator repairs or re-routes (#10057)"
   color: "C2410C"  # same family as loom:operator-decision
-
-- name: loom:operator-objective
-  description: "operator-only sub-kind: determined once operator states objective; lists candidates"
-  color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
 
 # loom:operator is the first-class "a human is needed" pipeline state (#5502):
 # the engine (any role, plus sweep/shepherd dispatch) will not act on this
@@ -371,14 +365,6 @@
 - name: points:13
   description: "Story-point size class 13, the largest (paused). Applied by: Curator only."
   color: "06B6D4"  # cyan-500 - story-point size family
-
-# loom:heavy (#9034): the mechanical "heavy" signal the host-class gate refuses
-# on a host_class: local-dev machine (autonomous.workFinder.hostClass) unless
-# explicitly overridden (--allow-local / allowHeavyLocal). A resource-weight
-# axis, deliberately NOT the same thing as the tier:* priority axis above.
-- name: loom:heavy
-  description: "CPU/RAM-intensive sweep; refused on local-dev host_class. Applied by: humans/Curator/Architect."
-  color: "B60205"  # red - resource-intensive caution signal
 
 # External Contribution Gate
 # Not part of the loom: workflow. A non-collaborator submission needs maintainer

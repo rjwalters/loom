@@ -115,24 +115,6 @@ fn a_missing_starred_at_falls_back_to_created_at() {
 }
 
 #[test]
-fn loom_urgent_no_longer_changes_order() {
-    // #9244: `loom:urgent` is tolerated but is not a key. The older
-    // non-urgent issue dispatches first; the urgent one is not an error.
-    let mut multi = vec![(
-        FakeSource::once(vec![
-            labelled_at(9, URGENT_LABEL, "2026-01-01T00:00:00Z"),
-            issue_at(1, "2023-01-01T00:00:00Z"),
-        ]),
-        RecordingDispatcher::default(),
-    )];
-    let report = tick_multi(&mut multi, &[100], 1, &[false]);
-    assert_eq!((report.dispatched, report.errors), (1, 0));
-    assert_eq!(multi[0].1.dispatched, vec![1], "age, not urgency, decides");
-    // The label is still parsed harmlessly.
-    assert!(labelled_at(9, URGENT_LABEL, "2026-01-01T00:00:00Z").is_urgent());
-}
-
-#[test]
 fn test_tick_multi_oldest_first_within_same_tier() {
     // Same tier, nothing starred: oldest-first by createdAt. Cap 1 ⇒ the
     // oldest (#7, 2022) dispatches before the newer (#2, 2024).
@@ -235,10 +217,4 @@ fn test_candidate_cmp_ordering() {
 
     // 6. Fully-tied keys fall through to the number tiebreak.
     assert_eq!(candidate_cmp(&mk(100, None, 3), &mk(100, None, 8)), Ordering::Less);
-}
-
-#[test]
-fn test_work_item_is_urgent_still_parses() {
-    assert!(!issue(1).is_urgent());
-    assert!(WorkItem::new(1, vec!["loom:issue".into(), "loom:urgent".into()]).is_urgent());
 }
