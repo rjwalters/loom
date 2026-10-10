@@ -696,14 +696,17 @@ pub fn collect_callout_evidence(
     }
     let out = Command::new("git")
         .current_dir(root)
-        // `--unified=0`: a hunk with no context lines is exactly the block of
-        // adjacent added lines the attribution rule needs.
-        .args(["diff", "--unified=0", "--no-color", base_rev, "--", "*.sh"])
+        // The rendering is pinned against the user's git config (#9529): the
+        // parser reads this text, so nothing about it may be ambient.
+        .arg("diff")
+        .args(callout::EVIDENCE_DIFF_FLAGS)
+        .args([base_rev, "--", "*.sh"])
         .output()
         .map_err(|e| format!("could not run git diff: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "git diff --unified=0 {base_rev} -- '*.sh' failed: {}",
+            "git diff {} {base_rev} -- '*.sh' failed: {}",
+            callout::EVIDENCE_DIFF_FLAGS.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
