@@ -29,6 +29,17 @@ fn registry(
     post_flip_stdout: &str,
     post_flip_exit: i32,
 ) -> (SweepRegistry, PathBuf, PathBuf) {
+    registry_with_edit_exit(ws, post_flip_stdout, post_flip_exit, 0)
+}
+
+/// As [`registry`], but every `issue edit --remove-label loom:building` exits
+/// `remove_exit` (non-zero simulates a failed claim release).
+fn registry_with_edit_exit(
+    ws: &Path,
+    post_flip_stdout: &str,
+    post_flip_exit: i32,
+    remove_exit: i32,
+) -> (SweepRegistry, PathBuf, PathBuf) {
     touch_sweep_command(ws);
     let gh_log = ws.join("gh-invocations.log");
     let flipped = ws.join("flipped");
@@ -39,6 +50,9 @@ fn registry(
          if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" && \"$*\" == *--add-label\\ loom:building* ]]; then\n\
          touch \"{flipped}\"\n\
          exit 0\n\
+         fi\n\
+         if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" && \"$*\" == *--remove-label\\ loom:building* ]]; then\n\
+         exit {remove_exit}\n\
          fi\n\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
          if [[ ! -e \"{flipped}\" ]]; then exit 1; fi\n\
@@ -54,6 +68,7 @@ fn registry(
         flipped = flipped.display(),
         state = post_flip_stdout,
         exit = post_flip_exit,
+        remove_exit = remove_exit,
     );
     make_executable(&fake_gh, &script);
     let spawn_marker = ws.join("spawn-called");
@@ -140,4 +155,29 @@ fn post_claim_probe_error_stays_fail_open() {
         .unwrap();
     assert!(outcome.was_new);
     assert_child_wrote(&spawn_marker, "spawned");
+}
+
+#[test]
+#[serial]
+fn failed_label_release_is_reported_not_swallowed() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let (mut reg, _gh_log, spawn_marker) =
+        registry_with_edit_exit(ws, &state_probe_json("closed", false), 0, 1);
+
+    let err = reg
+        .dispatch(&SweepKind::Issue(11307), None, None, None, None)
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("FAILED"), "restore failure must be surfaced: {msg}");
+    assert!(
+        !msg.contains("claim was released"),
+        "must not claim a release that did not happen: {msg}"
+    );
+    assert!(!spawn_marker.exists(), "no builder may be spawned for a closed issue");
+    assert!(reg.entries.is_empty());
+    assert!(
+        !ws.join(".loom/locks/issues/11307").exists(),
+        "local claim lock is still unwound"
+    );
 }
