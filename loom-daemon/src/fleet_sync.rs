@@ -76,7 +76,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -1131,7 +1131,8 @@ fn roster_half(
         now,
     );
     let clones = if clone {
-        roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones)
+        let memory = roster_clone::memory::global();
+        roster_clone::Clones::on(&roster_clone::GitCloner, inputs.clones, memory, Instant::now())
     } else {
         roster_clone::Clones::off()
     };

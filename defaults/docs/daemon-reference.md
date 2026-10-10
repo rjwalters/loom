@@ -1743,22 +1743,32 @@ only reported, as before.
   `https://github.com/o/n(.git)`); the clone always uses
   `https://github.com/o/n.git`, never SSH. Git runs as every other daemon git
   network call does: no prompt, the host's credential helper, and, for an owner
-  with its own per-owner credential, that owner's `GH_CONFIG_DIR`. A record
+  with its own per-owner credential, that owner's `GH_CONFIG_DIR`. It also runs
+  with `protocol.allow=never`, `protocol.https.allow=always` and
+  `protocol.ssh.allow=never`, so a host `url.*.insteadOf` rewrite to SSH fails
+  the clone rather than using SSH. A record
   with no `remote`, or one that is not a github.com repo, is reported
   (`clone REFUSED`) and never guessed at.
 - **Never over something.** A path that exists and is not an empty directory
-  is refused and left untouched. The clone is made in a hidden sibling
-  (`.<dir>.loom-clone`) and renamed into place only when complete, so a
-  failed or killed clone never leaves a half-repo the next pass would
-  register; the sibling is removed on failure. A volume below the
-  `diskWarnFreeGb` floor skips the clone.
+  is refused and left untouched. The clone is made in a uniquely-named hidden
+  sibling (`.<dir>.loom-clone-<random>`) whose first content is a Loom marker
+  file, and renamed into place only when complete, so a failed or killed clone
+  never leaves a half-repo the next pass would register; the sibling is
+  removed on failure. A leftover sibling is reclaimed only when it carries the
+  marker; one with that name and no marker (or a symlink) is left untouched
+  and the clone is refused with a report. A volume below the `diskWarnFreeGb`
+  floor skips the clone.
 - **Bounded.** At most `fleet.cloneMaxPerPass` clones per pass, each capped
   at `fleet.cloneTimeoutSecs`; the rest are `deferred`. A failure is recorded
-  and retried on the next pass, never a crash and never a roster error. The
+  and retried after a per-repo backoff (5 minutes, doubling to 2 hours; held
+  in memory, so a restart resets it), never a crash and never a roster error.
+  Repos that have never failed are tried first, then the least recently
+  failed, so a repo that keeps failing cannot use up the cap. The
   startup pass never clones (boot does not wait on a transfer), and neither
   does a pass whose run state is `paused` or `stopped`. A clone runs on the
   timer's own pass, so a slow one delays the next tick by at most
-  `cloneMaxPerPass × cloneTimeoutSecs`.
+  `cloneMaxPerPass × cloneTimeoutSecs`, and a `paused`/`stopped` order that
+  lands during a clone is read that much later.
 - **Visible.** Each attempt is a `roster: CLONED …` / `clone FAILED …` /
   `clone REFUSED …` / `clone deferred …` line on the `Fleet store:` status
   block, a `roster.clones[]` entry (`name`, `repo`, `path`, `outcome`,

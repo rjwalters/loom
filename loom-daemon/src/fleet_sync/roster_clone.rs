@@ -22,15 +22,21 @@
 //!   (no prompt, the host's credential helper), with `GH_CONFIG_DIR` pointed
 //!   at that owner's per-owner credential when it is a cross-owner one
 //!   ([`crate::credential_preflight::apply_gh_config_for_owner_slug`]).
+//!   The clone runs with `protocol.allow=never`, `protocol.https.allow=always`
+//!   and `protocol.ssh.allow=never`, so a host `url.*.insteadOf` rewrite to
+//!   SSH (or any other transport) makes it fail rather than go over SSH.
 //! - **Never over something.** A path that exists and is not an empty
 //!   directory is refused and reported, never touched. The clone goes to a
-//!   temporary sibling and is renamed into place only once it is complete, so
-//!   a failed or killed clone never leaves a half-repo that the next plan's
-//!   `is_cloned` (a `.git` check) would register.
+//!   uniquely-named, marked staging sibling ([`staging`]) and is renamed into
+//!   place only once it is complete, so a failed or killed clone never leaves
+//!   a half-repo that the next plan's `is_cloned` (a `.git` check) would
+//!   register. A leftover sibling is reclaimed only when it carries the marker.
 //! - **Bounded.** At most [`CloneConfig::max_per_pass`] clones per pass, each
 //!   under [`CloneConfig::timeout`]; the rest are deferred to the next pass. A
-//!   failure is recorded in the pass ([`CloneAttempt`]) and retried next pass;
-//!   it never panics and never becomes a roster *error*.
+//!   failure is recorded in the pass ([`CloneAttempt`]) and retried after a
+//!   per-repo backoff ([`memory`]), never-failed and least-recently-failed
+//!   repos first, so a repo that always fails cannot starve the others. It
+//!   never panics and never becomes a roster *error*.
 //! - **No scaffolding.** Registration is `add_and_trust`: nothing is written
 //!   into the working tree (the `--no-init` semantics, #6636).
 //!
@@ -44,7 +50,8 @@
 //! or stops this host, so a clone never delays a `paused`/`stopped` order read
 //! in the same pass. The cost is that a slow clone delays the *next* timer
 //! tick by at most `max_per_pass × timeout`; the defaults keep that small, and
-//! a repo is cloned once.
+//! a repo is cloned once. A `paused`/`stopped` order that lands *during* a
+//! clone is likewise read one such delay later.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -56,6 +63,11 @@ use serde_json::Value;
 
 use super::{FleetSyncStatus, RosterPass};
 use crate::fleet_store::roster::{self, Change, Plan};
+
+pub mod memory;
+pub mod staging;
+
+pub use memory::CloneMemory;
 
 /// Config key: clones per timer pass. `0` turns cloning off.
 pub const MAX_PER_PASS_KEY: &str = "fleet.cloneMaxPerPass";
@@ -151,20 +163,7 @@ impl Cloner for GitCloner {
         if let Some(why) = dest.parent().and_then(crate::fetch_headroom::skip_reason) {
             return Err(why.replace("git fetch", "git clone"));
         }
-        let mut cmd = Command::new("git");
-        // Hooks off: a template hook must not run unattended in the daemon.
-        cmd.args(["-c", "core.hooksPath=/dev/null", "clone", "--quiet"])
-            .args(["--no-recurse-submodules", "--", url])
-            .arg(dest)
-            .stdin(Stdio::null())
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "never")
-            .env("LC_ALL", "C");
-        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
-            cmd.env_remove(var);
-        }
-        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, slug);
-        match run_bounded(cmd, timeout) {
+        match run_bounded(clone_command(slug, url, dest), timeout) {
             Ok(Completion::Exited(out)) if out.status.success() => Ok(()),
             Ok(Completion::Exited(out)) => {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -183,10 +182,43 @@ impl Cloner for GitCloner {
     }
 }
 
+/// `-c` settings every clone runs with: hooks off (a template hook must not
+/// run unattended in the daemon), and HTTPS as the only transport, so a host
+/// `url.*.insteadOf` rewrite to SSH fails the clone instead of using SSH.
+pub const CLONE_CONFIG: &[&str] = &[
+    "core.hooksPath=/dev/null",
+    "protocol.allow=never",
+    "protocol.https.allow=always",
+    "protocol.ssh.allow=never",
+];
+
+/// The `git clone` [`GitCloner`] runs: no prompt, no inherited repository
+/// override, and `slug`'s owner's per-owner `GH_CONFIG_DIR` when it has one.
+#[must_use]
+pub fn clone_command(slug: &str, url: &str, dest: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for pair in CLONE_CONFIG {
+        cmd.arg("-c").arg(pair);
+    }
+    cmd.args(["clone", "--quiet", "--no-recurse-submodules", "--", url])
+        .arg(dest)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("LC_ALL", "C");
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+        cmd.env_remove(var);
+    }
+    crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, slug);
+    cmd
+}
+
 /// What [`summarize`] may clone with this pass.
 pub struct Clones<'a> {
     cloner: Option<&'a dyn Cloner>,
     config: CloneConfig,
+    memory: Option<&'a std::sync::Mutex<CloneMemory>>,
+    now: Instant,
 }
 
 impl<'a> Clones<'a> {
@@ -196,16 +228,31 @@ impl<'a> Clones<'a> {
         Self {
             cloner: None,
             config: CloneConfig::default(),
+            memory: None,
+            now: Instant::now(),
         }
     }
 
-    /// Clone through `cloner`, within `config`.
+    /// Clone through `cloner`, within `config`, ordering and backing off by
+    /// `memory` as of `now`.
     #[must_use]
-    pub fn on(cloner: &'a dyn Cloner, config: CloneConfig) -> Self {
+    pub fn on(
+        cloner: &'a dyn Cloner,
+        config: CloneConfig,
+        memory: &'a std::sync::Mutex<CloneMemory>,
+        now: Instant,
+    ) -> Self {
         Self {
             cloner: Some(cloner).filter(|_| config.max_per_pass > 0),
             config,
+            memory: Some(memory),
+            now,
         }
+    }
+
+    fn with_memory<T>(&self, f: impl FnOnce(&mut CloneMemory) -> T) -> Option<T> {
+        let mut guard = self.memory?.lock().ok()?;
+        Some(f(&mut guard))
     }
 }
 
@@ -219,7 +266,8 @@ pub enum Outcome {
     Failed,
     /// Not tried: no GitHub remote, or the path is occupied.
     Refused,
-    /// Not tried: the per-pass cap was reached; next pass.
+    /// Not tried: the per-pass cap was reached, or the repo is backing off
+    /// after a failure; a later pass.
     Deferred,
 }
 
@@ -310,34 +358,63 @@ pub fn summarize(
     if !auto_apply {
         return out;
     }
-    let mut tried = 0usize;
+    let mut missing = Vec::new();
     for (i, change) in plan.changes.iter().enumerate() {
-        let add = match change {
-            Change::MissingClone { .. } => {
-                let Some(cloner) = clones.cloner else {
-                    out.unapplied += 1;
-                    continue;
-                };
-                let mut attempt = if tried >= clones.config.max_per_pass {
-                    deferred(change, clones.config.max_per_pass)
-                } else {
-                    let a = clone_one(change, cloner, clones.config.timeout);
-                    tried += usize::from(matches!(a.outcome, Outcome::Cloned | Outcome::Failed));
-                    a
-                };
-                let Some(add) = (attempt.outcome == Outcome::Cloned).then(|| as_add(change)) else {
-                    out.unapplied += 1;
-                    out.clones.push(attempt);
-                    continue;
-                };
-                out.drift[i] = format!("{} — cloned this pass", roster::describe(&add));
-                attempt.registered = record(&mut out, &add, apply);
-                out.clones.push(attempt);
-                continue;
+        match change {
+            Change::MissingClone { .. } if clones.cloner.is_some() => missing.push(i),
+            Change::MissingClone { .. } => out.unapplied += 1,
+            other => {
+                record(&mut out, other, apply);
             }
-            other => other,
+        }
+    }
+    let Some(cloner) = clones.cloner else {
+        return out;
+    };
+    // Never-failed first, then least recently failed (stable: plan order
+    // within each group), so a repo that keeps failing cannot starve others.
+    missing.sort_by_key(|&i| {
+        let (_, path, _) = fields(&plan.changes[i]);
+        clones
+            .with_memory(|m| m.order_key(path))
+            .unwrap_or((false, None))
+    });
+    let mut tried = 0usize;
+    for i in missing {
+        let change = &plan.changes[i];
+        let (_, path, _) = fields(change);
+        let waiting = clones
+            .with_memory(|m| m.waiting(path, clones.now))
+            .flatten();
+        let mut attempt = if let Some((count, left)) = waiting {
+            deferred(
+                change,
+                format!(
+                    "backing off after {count} failed clone(s); next try in about {}m",
+                    left.as_secs().div_ceil(60)
+                ),
+            )
+        } else if tried >= clones.config.max_per_pass {
+            let cap = clones.config.max_per_pass;
+            deferred(change, format!("the per-pass cap of {cap} clone(s) was reached; next pass"))
+        } else {
+            let a = clone_one(change, cloner, clones.config.timeout);
+            tried += usize::from(matches!(a.outcome, Outcome::Cloned | Outcome::Failed));
+            match a.outcome {
+                Outcome::Failed => clones.with_memory(|m| m.failed(path, clones.now)),
+                _ => clones.with_memory(|m| m.forget(path)),
+            };
+            a
         };
-        record(&mut out, add, apply);
+        if attempt.outcome != Outcome::Cloned {
+            out.unapplied += 1;
+            out.clones.push(attempt);
+            continue;
+        }
+        let add = as_add(change);
+        out.drift[i] = format!("{} — cloned this pass", roster::describe(&add));
+        attempt.registered = record(&mut out, &add, apply);
+        out.clones.push(attempt);
     }
     out
 }
@@ -393,7 +470,7 @@ fn fields(change: &Change) -> (&str, &Path, Option<&str>) {
     }
 }
 
-fn deferred(change: &Change, cap: usize) -> CloneAttempt {
+fn deferred(change: &Change, why: String) -> CloneAttempt {
     let (name, path, remote) = fields(change);
     CloneAttempt {
         name: name.to_string(),
@@ -402,7 +479,7 @@ fn deferred(change: &Change, cap: usize) -> CloneAttempt {
         outcome: Outcome::Deferred,
         duration_ms: 0,
         registered: false,
-        detail: Some(format!("the per-pass cap of {cap} clone(s) was reached; next pass")),
+        detail: Some(why),
     }
 }
 
@@ -415,7 +492,9 @@ fn clone_one(change: &Change, cloner: &dyn Cloner, timeout: Duration) -> CloneAt
         None => (
             Outcome::Refused,
             Some(match remote {
-                Some(r) => format!("remote `{r}` is not a github.com repo; not cloned"),
+                Some(r) => {
+                    format!("remote `{}` is not a github.com repo; not cloned", redact_userinfo(r))
+                }
                 None => "the record has no `remote`; not cloned".to_string(),
             }),
         ),
@@ -458,7 +537,21 @@ fn vacant(path: &Path) -> Result<bool, (Outcome, String)> {
     }
 }
 
-/// Clone into a temporary sibling, then rename into `path`.
+/// `remote` with any URL userinfo (`scheme://user:secret@host`) replaced by
+/// `***`, for messages that echo it.
+#[must_use]
+pub fn redact_userinfo(remote: &str) -> String {
+    let Some((scheme, rest)) = remote.split_once("://") else {
+        return remote.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://***{}", &rest[at..]),
+        None => remote.to_string(),
+    }
+}
+
+/// Clone into a marked staging sibling, then rename into `path`.
 fn place(
     slug: &str,
     path: &Path,
@@ -472,13 +565,12 @@ fn place(
     };
     std::fs::create_dir_all(parent)
         .map_err(|e| failed(format!("creating {}: {e}", parent.display())))?;
-    // Ours by name: a leftover from a clone this daemon did not finish.
-    let tmp = parent.join(format!(".{}.loom-clone", dir.to_string_lossy()));
-    let discard = || {
-        let _ = std::fs::remove_dir_all(&tmp);
-    };
-    discard();
-    let result = cloner
+    // Leftovers from a clone this daemon did not finish: only marked ones go.
+    staging::sweep(parent, dir).map_err(|why| (Outcome::Refused, why))?;
+    // Removed, with whatever is in it, when it goes out of scope.
+    let stage = staging::Staging::create(parent, dir).map_err(failed)?;
+    let tmp = stage.dest();
+    cloner
         .clone_into(slug, &https_url(slug), &tmp, timeout)
         .and_then(|()| {
             if tmp.join(".git").is_dir() {
@@ -494,11 +586,8 @@ fn place(
             }
             std::fs::rename(&tmp, path)
                 .map_err(|e| format!("moving the clone into {}: {e}", path.display()))
-        });
-    if result.is_err() {
-        discard();
-    }
-    result.map_err(failed)
+        })
+        .map_err(failed)
 }
 
 /// The `Fleet store:` status lines for this pass's clone attempts.
