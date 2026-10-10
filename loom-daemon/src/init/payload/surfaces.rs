@@ -110,8 +110,8 @@ pub(crate) const EXTRA_SURFACES: &[Surface] = &[
 
 /// What `resync-installed.sh` or the installer does that NO daemon resync
 /// does, and why. `daemon-reference.md` carries the same list for operators;
-/// the parity tests read this one (nothing at runtime does).
-#[cfg_attr(not(test), allow(dead_code))]
+/// the parity tests read this one, and `resync-payload` names its entries in
+/// the note it prints ([`super::standalone`], #8961).
 pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
     (
         ".loom/config.json",

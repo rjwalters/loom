@@ -134,6 +134,7 @@ pub(crate) mod release_fetch;
 pub(crate) mod release_resolve;
 mod release_stale_blocked;
 pub(crate) mod restart;
+mod resync_payload_cmd;
 mod resync_pin_cmd;
 pub(crate) mod retry_classify;
 pub(crate) mod role_tool_policy;
