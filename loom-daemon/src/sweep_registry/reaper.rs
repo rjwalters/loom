@@ -1019,6 +1019,11 @@ impl SweepRegistry {
             // yielding the real exit code. Reconstructed entries with no
             // handle fall back to the `kill(pid, 0)` probe.
             let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
+            // #11286: a live native sweep's seat is marked the moment its log
+            // says the allowance is gone, not only once the run exits.
+            if !is_dead {
+                self.watch_in_run_exhaustion(&sweep_id);
+            }
             if is_dead {
                 // Issue #4980 crash-path reap: the tracked leader is gone, but
                 // its process group may still hold a live `claude` agent and

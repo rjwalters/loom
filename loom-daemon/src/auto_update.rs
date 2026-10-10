@@ -601,6 +601,8 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+/// #10880: the failed-roll guard (attempt record, gate, held-roll alert).
+pub mod roll_attempt;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -1246,6 +1248,8 @@ pub struct AutoUpdateState {
     repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
+    /// #10880: the last version roll armed, persisted, and its retry gate.
+    attempt: roll_attempt::AttemptGuard,
 }
 
 impl AutoUpdateState {
@@ -1456,16 +1460,18 @@ impl AutoUpdateState {
         if in_flight == 0 {
             self.deferred_since = None;
         }
-        if let Some(skip) = self.terminal_or_backoff_gate(now) {
+        let selected = self
+            .floor
+            .select(floor_target.as_ref(), ahead_target.as_ref(), info);
+        // #10880: the failed-roll gate, then terminal (a floor target retries
+        // at the 6 h ceiling) and backoff — for every source, floor included.
+        if let Some(skip) = self.roll_gates(now, selected.source) {
             return skip;
         }
         // #10712: a floor-driven roll skips settle (and so does its supersede,
         // which re-decides here still floor-driven); autoUpdate rolls do not.
         // A repo-ahead demand (#10719) skips settle the same way. Only a host
         // with no fleet store reaches the settle gate (#10885).
-        let selected = self
-            .floor
-            .select(floor_target.as_ref(), ahead_target.as_ref(), info);
         if selected.source == floor_roll::TargetSource::AutoUpdate {
             if let Some(skip) = self.settle_gate(now, settle) {
                 return skip;

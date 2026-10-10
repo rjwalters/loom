@@ -153,9 +153,6 @@ pub(crate) fn enabled_role(
     else {
         return disabled(format!("`{role}` is not an enabled role for {}", root.display()));
     };
-    if let Some(why) = role_is_config_gated(&spec, root) {
-        return disabled(format!("`{role}` is gated: {why}"));
-    }
     Ok(spec.name)
 }
 

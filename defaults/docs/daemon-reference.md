@@ -2972,12 +2972,12 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
 - **Work-finder ordering** — `work_finder::tick_multi` now takes a
   `priorities: &[u32]` slice parallel to the workspaces. Instead of dispatching
   each repo's backlog in registration order, it gathers **every** eligible
-  candidate across all workspaces into one queue, sorts it by `candidate_cmp` —
-  **(workspace priority asc, issue age asc/oldest-first, issue number asc)**,
-  behind the two #9244 lanes below — and fills the single shared concurrency
-  budget in that global order. The cap/budget mechanics (#3811/#3930) are unchanged; this only
-  orders the queue. `createdAt` is added to the `gh issue list --json` fields for
-  the age key.
+  candidate across all workspaces and orders them by **weighted workspace
+  draws** (#11103, [`priority-model.md`](priority-model.md)): each draw picks a
+  workspace weighted by its priority and places its next issue (level, oldest,
+  number). It fills the single shared concurrency budget in that order. The
+  cap/budget mechanics (#3811/#3930) are unchanged; this only orders the queue.
+  `candidate_cmp` (below) now only ranks the published ready-queue rows.
 
 - **Epic supervisor** — `spawn_multi_supervisor_thread` reorders its cached
   per-repo supervisors by workspace priority each tick (stable within a tier) before
@@ -2987,10 +2987,10 @@ ordering (superseded by the weighted draw in [`priority-model.md`](priority-mode
   **Managed repos** table (a `PRIO` column) and the `--json` `per_repo[].priority`
   field, with the breakdown sorted highest-priority first.
 
-**Starvation stance (v1):** strict priority is intentional — tool repos are small
-queues that drain fast. A permanently-full higher tier **will** starve lower tiers;
-fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
-explicit follow-ups, deferred until observed to matter.
+**Starvation stance:** since #11103 the cross-repo order is a weighted draw, not
+strict tiers: a default-priority repo is drawn less often than a tool repo, never
+starved. A repo with `loom:very-important` work next wins the draw outright.
+Cross-repo dependency awareness stays a role judgment (label the blocker).
 
 **`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
 siblings are triage metadata; no daemon code reads them. Neither does
@@ -3048,8 +3048,8 @@ a key. Only the six keys below order the queue.
 5. `createdAt`, oldest first.
 6. Issue number ascending.
 
-The single-workspace tick sorts by keys 1-3 only, so its listing order is
-unchanged when nothing is starred or red.
+Since #11103 these keys rank the ready-queue rows only; dispatch follows the
+workspace draw, and the single-workspace tick uses level, oldest, number.
 
 **Starred issues outside `loom:issue`.** Besides the `loom:issue` listing, each
 tick makes a second ETag-cached listing of open `loom:operator-priority` issues
@@ -6527,9 +6527,35 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so
   hosts rolling together is accepted. Two hosts that roll minutes apart across
   a new release can land on different versions, both at or above the floor.
-- **Backoff still applies.** A failed fetch backs off as before, and a roll
-  whose new binary did not take is held back per target by the failed-roll
-  guard (#10832) inside the pause-and-roll itself.
+- **Backoff still applies, and a failed roll is never retried in a loop.** A
+  failed fetch backs off as before. A roll whose new binary did not take is
+  held back per target (#10880): before a version roll is armed, the loop
+  writes a `roll_attempt` record (target, version, tag, `target_source`,
+  attempt count) into `auto_update_state.json`. A daemon that starts running
+  a version **below** that record's has watched the attempt fail, whatever
+  binary saved the file, and neither fetches nor arms that target until
+  `not_before`: 15 min after the first failure, doubling to a 6 h ceiling and
+  continuing every 6 h, never terminal. This holds for every
+  `target_source`, floor included, and the tick reports `defer`. A different
+  target (a newer release, or the same version re-published under a new
+  checksum) is tried at once and starts the count over. The record is cleared
+  by the first tick on a binary at or above its version once that process has
+  been up for the 90 s startup grace, so a candidate that dies early leaves it
+  for the binary that comes back. Times are clamped on load (an arm time in
+  the future becomes now, a retry time past now + 6 h becomes now + 6 h). A
+  binary older than #10880 ignores the key; deleting the file clears it, and a
+  manual update is not gated by it. The pause-side guard of #10832
+  (`roll-failed-target.json`, checked by H3) stays as a backstop.
+- **A held roll alerts on every tick.** While a release roll is held by the
+  failed-roll guard, by fetch backoff after three or more consecutive
+  failures, or by a terminal fetch failure, every tick logs `FLOOR ROLL
+  FAILING: …` at **ERROR** when the host is below its floor (`ROLL HELD: …` at
+  WARN otherwise), naming the floor, the running version, the target, the
+  attempt count, the last failure and the next retry. The same text is in
+  `last tick:` and the `auto_update.tick` record's `roll_held`. Dispatch
+  continues on the running version. A **terminal** fetch failure on a floor
+  target is not final: it is retried every 6 h. Any other target keeps the
+  old rule (no retry until a new release).
 - **Every fleet host runs the loop, `autoUpdate.enabled` or not** (#10954).
   The mode is chosen once at startup, after the startup fleet-sync pass has
   classified the host: a store that is named but unusable is a fleet host
@@ -10863,7 +10889,6 @@ a unit test, so this list and the code cannot drift apart silently:
 | `hermit` | 600s (10 min) | yes |
 | `guide` | 900s (15 min) | yes |
 | `architect` | 3600s (1 h) | **no** — idle-addressable-only (#5656) |
-| `concierge` | 300s (5 min) | **no** — config-gated operator-agent persona (#7947) |
 
 At startup each spawned loop logs one line naming both the resolved cadence and
 the tier that supplied it:
@@ -10933,40 +10958,6 @@ naming it in `roles` (1h default cadence). Both paths pass the resolved
 per-invocation cap through as `/loom:architect --max-proposals <n>`; see
 `architectMaxProposals` in the config table above.
 
-### Config-gated roles: `concierge` (#7947)
-
-`architect`'s carve-out above is about *cadence*: name it in `roles` and it
-ticks. **`concierge` needs a second opt-in that `roles` cannot supply.**
-
-It is the operator-agent persona (Phase 3b of #4196) — the session that reads
-free-form prose out of a safehouse room and steers the daemon through Phase 3a's
-typed ChatOps verbs. It is an **inbound control channel**, so a repo that merely
-forgot to pin `roles` must never acquire one. Two independent gates:
-
-1. `interval_default: false`, like `architect` — excluded from the "unset
-   `roles` ⇒ all defaults" fallback.
-2. `role_runner::role_is_config_gated()`, checked inside `decide_root_tick`
-   after the master switch and before sharding: the tick is refused unless
-   `safehouse.concierge` resolves for that root (block present, `enabled` not
-   `false`, and **at least one usable Matrix ID in `allowedSenders`** — an empty
-   allowlist is deny-all, never allow-everyone).
-
-`role_is_config_gated` is written as a general predicate, not an inline
-`if spec.name == "concierge"`, so the next role with a config prerequisite has
-an obvious place to declare it — and a unit test pins that `concierge` is
-currently the *only* gated role, so an existing role cannot acquire a gate (and
-silently stop ticking everywhere) by accident.
-
-```bash
-loom-daemon concierge check     # exit 1 = off; prints which gate is closed
-```
-
-It also has no forge queue, so `role_collision::probe_target_for_role` returns
-`None` for it and pre-tick collision detection is a documented no-op (#4623) —
-its trigger source is a room, not a label. Budget bounds
-(`maxMessagesPerTick`, `maxTurnsPerDay`) live in a daemon-owned ledger rather
-than the prompt, because a daily cap spans sessions; full rationale in
-[`safehouse.md` § Operator-agent persona](safehouse.md).
 
 `onIdle` (#4364) lists the subset of the shipped roles to *also* fire on the
 work-finder **idle edge** — the moment a workspace transitions from busy to

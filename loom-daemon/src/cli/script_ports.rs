@@ -551,6 +551,15 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ResyncPin(super::resync_pin_cmd::ResyncPinCommand),
 
+    /// Resync a workspace's installed Loom files from the payload embedded
+    /// in this binary, with no Loom source tree (#8961). What
+    /// `resync-installed.sh` hands off to when no `defaults/` tree resolves.
+    /// Writes the working tree only: no commit, no push. Refuses rather than
+    /// downgrade, and only a verified official release build applies. Exit 0
+    /// applied or in sync, 1 refused or failed, 2 `--dry-run` found changes.
+    /// Not a port: brand-new logic, native per the shell-language policy.
+    ResyncPayload(super::resync_payload_cmd::ResyncPayloadArgs),
+
     /// The versioned forge **operation inventory** and its accounting (#9777,
     /// phase 1 of epic #9769): the coverage validator, the unclassified-call
     /// change gate, the four-axis coverage report and the hosted-probe
@@ -648,6 +657,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
+            ScriptPortCommand::ResyncPayload(args) => args.run(),
         }
     }
 }

@@ -336,17 +336,18 @@ pub struct RepoCapSnapshot {
 /// slice partition, then (when a per-repo cap is configured) the #9090 track
 /// affinity partition.
 ///
-/// **Lane candidates are exempt** (#9244): a starred or red-main-fix candidate
-/// stays at the head of the list, in its [`candidate_cmp`](super::candidate_cmp)
-/// order, and both partitions apply only to the ordinary tail behind it.
+/// **Lane candidates are exempt** (#9244): a starred, red-main-fix or
+/// `loom:very-important` (#11103) candidate stays at the head of the list, in
+/// its workspace-draw order, and both partitions apply only to the ordinary
+/// tail behind it.
 /// Affinity would otherwise float every hot-repo candidate ahead of a starred
 /// issue in a cold repo, and the slice would defer a starred issue whose repo
 /// another host prefers; either breaks "starred first, fleet-wide". A lane
 /// candidate's repo still counts toward the slice's "is my slice empty?"
 /// question, so the #6243 fallback behaves as before.
 ///
-/// Both partitions are **stable**, so `candidate_cmp` still decides order
-/// within each group and the comparator itself is untouched. With
+/// Both partitions are **stable**, so the workspace-draw order still decides
+/// order within each group. With
 /// `preferred_slice: None` and a disabled `cap` this returns `candidates`
 /// unchanged.
 ///
@@ -373,11 +374,15 @@ fn shape(
     cap: &RepoCap,
     report: &mut TickReport,
 ) -> Vec<PriorityCandidate> {
-    // `candidates` is sorted by `candidate_cmp`, whose first keys are the
-    // lanes, so this partition keeps the head exactly as sorted.
-    let (lanes, rest): (Vec<_>, Vec<_>) = candidates
-        .into_iter()
-        .partition(|c| c.operator_priority || c.main_red_fix);
+    // `candidates` is in workspace-draw order (#11103); this stable partition
+    // lifts the lane candidates to the head, keeping their draw order. A
+    // `loom:very-important` candidate is a lane too: its workspace won the
+    // draw, so affinity and the slice must not push it back.
+    let (lanes, rest): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
+        c.operator_priority
+            || c.main_red_fix
+            || c.level == crate::priority_pick::Level::VeryImportant
+    });
     let in_slice = |c: &PriorityCandidate| {
         preferred_slice.is_none_or(|s| s.get(c.workspace_idx).copied().unwrap_or(true))
     };

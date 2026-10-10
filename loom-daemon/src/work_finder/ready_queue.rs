@@ -84,18 +84,21 @@ pub fn key_of(
         main_red_fix: repo_red && item.is_main_red_fix(),
         created_at: item.created_at.clone(),
         number: item.number,
+        level: super::workspace_draw::effective_level(item, repo_red && item.is_main_red_fix()),
         complexity: None,
     }
 }
 
-/// Stable-sort one workspace's ready items by the #9244 lane keys alone
-/// (starred, starred-at, red-main fix): starred and fix issues move to the
-/// front, and every other item keeps its listing order. The single-workspace
-/// tick's ordering; the multi-workspace tick sorts by the full
-/// [`candidate_cmp`].
+/// Sort one workspace's ready items into the in-workspace order (#11103):
+/// level (see [`super::workspace_draw::effective_level`]), oldest
+/// `createdAt`, issue number. The single-workspace tick's ordering; the
+/// multi-workspace tick applies the same order inside each drawn workspace.
 pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
     items.sort_by(|a, b| {
-        super::ordering::lane_cmp(&key_of(0, 0, a, repo_red), &key_of(0, 0, b, repo_red))
+        super::workspace_draw::in_workspace_cmp(
+            &key_of(0, 0, a, repo_red),
+            &key_of(0, 0, b, repo_red),
+        )
     });
 }
 

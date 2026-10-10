@@ -47,12 +47,22 @@ pub fn build_tree_dirs(path: &Path) -> Option<BTreeSet<String>> {
 /// without the lines that are build-tree content, every other line passed
 /// through unchanged and in order.
 ///
-/// A line is dropped when its path (a rename's destination) is, or lies
-/// under, one of `dirs`; or when it is a collapsed untracked directory
-/// (`?? .loom/`) whose every untracked file lies under one. A collapsed
-/// directory that also holds real work is KEPT — its build trees are excluded
-/// by pathspec, not by dropping the line — and so is any line whose check
-/// cannot be made: dropping real dirt from a rescue is the worse failure.
+/// A line is dropped when its path is, or lies under, one of `dirs`; or when
+/// it is a collapsed untracked directory (`?? .loom/`) whose every untracked
+/// file lies under one. A collapsed directory that also holds real work is
+/// KEPT — its build trees are excluded by pathspec, not by dropping the line —
+/// and so is any line whose check cannot be made: dropping real dirt from a
+/// rescue is the worse failure.
+///
+/// Only a rename or copy line (`R`/`C` in either status column) is split on
+/// ` -> `; any other path is evaluated whole, so a quoted non-rename path such
+/// as `?? "a -> b"` is checked as `a -> b` (#11149). A rename INTO a build
+/// tree from outside one is rewritten to `D  <source>` (the source keeps its
+/// original quoting) rather than dropped, because the caller unstages the
+/// build-tree side and the source's deletion is real dirt that must still be
+/// rescued (#11149). A rename with both sides in build trees is dropped; a
+/// copy into a build tree is dropped whole, since a copy leaves its source
+/// untouched.
 #[must_use]
 pub fn filter_status(top: &Path, dirs: &BTreeSet<String>, status: &str) -> String {
     if dirs.is_empty() {
@@ -60,21 +70,61 @@ pub fn filter_status(top: &Path, dirs: &BTreeSet<String>, status: &str) -> Strin
     }
     status
         .lines()
-        .filter(|line| !line.trim().is_empty() && !is_build_tree_line(top, dirs, line))
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| filter_line(top, dirs, line))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn is_build_tree_line(top: &Path, dirs: &BTreeSet<String>, line: &str) -> bool {
-    let Some(raw) = line.get(3..) else {
-        return false;
+/// One porcelain line through the build-tree filter: `None` to drop it,
+/// otherwise the line to keep (possibly rewritten, see [`filter_status`]).
+fn filter_line(top: &Path, dirs: &BTreeSet<String>, line: &str) -> Option<String> {
+    let (Some(xy), Some(raw)) = (line.get(..2), line.get(3..)) else {
+        return Some(line.to_string());
     };
-    let raw = raw.rsplit_once(" -> ").map_or(raw, |(_, to)| to);
-    let path = git_unquote(raw);
-    if is_under_build_tree(&path, dirs) {
-        return true;
+    let pair = if xy.contains(['R', 'C']) {
+        split_rename(raw)
+    } else {
+        None
+    };
+    let Some((from, to)) = pair else {
+        let path = git_unquote(raw);
+        let drop = is_under_build_tree(&path, dirs)
+            || (line.starts_with("??")
+                && path.ends_with('/')
+                && only_build_tree_content(top, dirs, &path));
+        return (!drop).then(|| line.to_string());
+    };
+    if !is_under_build_tree(&git_unquote(to), dirs) {
+        return Some(line.to_string());
     }
-    line.starts_with("??") && path.ends_with('/') && only_build_tree_content(top, dirs, &path)
+    if xy.contains('R') && !is_under_build_tree(&git_unquote(from), dirs) {
+        return Some(format!("D  {from}"));
+    }
+    None
+}
+
+/// Split a rename/copy path field `old -> new` into its raw (still quoted)
+/// halves. A quoted source is scanned to its closing quote, so a ` -> ` inside
+/// either quoted side cannot mis-split; an unquoted source holds no space
+/// (git quotes those), so the first ` -> ` is the separator.
+fn split_rename(raw: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = raw.strip_prefix('"') {
+        let mut escaped = false;
+        for (i, b) in rest.bytes().enumerate() {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => {
+                    let (from, tail) = raw.split_at(i + 2);
+                    return tail.strip_prefix(" -> ").map(|to| (from, to));
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    raw.split_once(" -> ")
 }
 
 /// Whether every untracked file under the collapsed directory `dir` lies in a
@@ -205,9 +255,53 @@ mod tests {
         let status = "?? .loom/\n?? target-x/\n?? mixed/\n A target-x/a.o\nR  old.txt -> target-x/b.o\n M src/lib.rs\n?? \"caf\\303\\251.txt\"\n?? target/\n";
         assert_eq!(
             filter_status(root, &dirs, status),
-            "?? mixed/\n M src/lib.rs\n?? \"caf\\303\\251.txt\"\n?? target/"
+            "?? mixed/\nD  old.txt\n M src/lib.rs\n?? \"caf\\303\\251.txt\"\n?? target/"
         );
         // No build trees: byte-for-byte passthrough.
         assert_eq!(filter_status(root, &BTreeSet::new(), status), status);
+    }
+
+    #[test]
+    fn rename_into_a_build_tree_keeps_the_source_deletion() {
+        let r = repo();
+        let root = r.path();
+        write(root, "target-x/CACHEDIR.TAG", SIG);
+        write(root, "target-y/CACHEDIR.TAG", SIG);
+        let dirs = build_tree_dirs(root).unwrap();
+        // #11149: a rename into a tree leaves the source's deletion as dirt.
+        assert_eq!(filter_status(root, &dirs, "R  old.txt -> target-x/b.o\n"), "D  old.txt");
+        // Both sides in build trees: nothing left to rescue.
+        assert_eq!(filter_status(root, &dirs, "R  target-y/a.o -> target-x/b.o\n"), "");
+        // A quoted source keeps its quoting, even when it contains " -> ".
+        assert_eq!(
+            filter_status(root, &dirs, "R  \"my old -> file.txt\" -> target-x/b.o\n"),
+            "D  \"my old -> file.txt\""
+        );
+        assert_eq!(
+            filter_status(root, &dirs, "RM \"caf\\303\\251.txt\" -> \"target-x/x y.o\"\n"),
+            "D  \"caf\\303\\251.txt\""
+        );
+        // A copy leaves its source untouched: dropped whole.
+        assert_eq!(filter_status(root, &dirs, "C  keep.txt -> target-x/c.o\n"), "");
+        // A rename OUT of a build tree is real dirt at its destination: kept.
+        assert_eq!(
+            filter_status(root, &dirs, "R  target-x/a.o -> real.o\n"),
+            "R  target-x/a.o -> real.o"
+        );
+    }
+
+    #[test]
+    fn non_rename_path_containing_an_arrow_is_evaluated_whole() {
+        let r = repo();
+        let root = r.path();
+        // `b"` stands in for the garbage tail the old split produced.
+        let dirs: BTreeSet<String> = ["target-x".to_string(), "b\"".to_string()].into();
+        // #11149: the whole unquoted path `a -> b` is checked, never a `b"` tail.
+        assert_eq!(filter_status(root, &dirs, "?? \"a -> b\"\n"), "?? \"a -> b\"");
+        assert_eq!(
+            filter_status(root, &dirs, "?? \"a -> target-x/z\"\n"),
+            "?? \"a -> target-x/z\""
+        );
+        assert_eq!(filter_status(root, &dirs, " M \"target-x/a -> b\"\n"), "");
     }
 }

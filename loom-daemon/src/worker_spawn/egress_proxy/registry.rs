@@ -290,6 +290,9 @@ pub struct Record {
     /// Shared with every clone of this record so a per-request tally lands in
     /// the one instance the launch owns.
     usage: Arc<Mutex<Usage>>,
+    /// Tags for passive per-request telemetry (#11300). `None` = observe mode
+    /// off, which is the default.
+    observe: Option<Arc<super::observe::ObserveContext>>,
 }
 
 /// Upstream refusals the proxy itself observed for a record's current
@@ -359,7 +362,21 @@ impl Record {
             generation: 0,
             rotations: 0,
             evidence: Evidence::default(),
+            observe: None,
         }
+    }
+
+    /// Turn on passive per-request telemetry for this launch (#11300).
+    #[must_use]
+    pub fn with_observe(mut self, context: super::observe::ObserveContext) -> Self {
+        self.observe = Some(Arc::new(context));
+        self
+    }
+
+    /// The observe tags, when observe mode is on for this launch.
+    #[must_use]
+    pub fn observe(&self) -> Option<&super::observe::ObserveContext> {
+        self.observe.as_deref()
     }
 
     /// Attach the pool attribution the proxy needs to bad-mark this launch's

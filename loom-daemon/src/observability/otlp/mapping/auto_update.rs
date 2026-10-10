@@ -23,15 +23,18 @@ fn kv_bool(key: &str, value: bool) -> KeyValue {
 }
 
 /// The severity a decision warrants: a panic is an error, and so is an
-/// unsatisfiable fleet floor (#10712), whatever the tick decided. A
+/// unsatisfiable fleet floor (#10712) or a held floor roll (#10880), whatever
+/// the tick decided. Any other held roll (#10880), a
 /// stale-repo resolution and a non-success roll outcome are warnings,
 /// because each means the host is not converging. Everything else is info.
 fn severity(r: &AutoUpdateTickRecord) -> SeverityNumber {
-    if r.floor_stall.is_some() {
+    // #10880: a held roll below the floor is the same kind of alert.
+    if r.floor_stall.is_some() || r.roll_held.as_ref().is_some_and(|h| h.floor.is_some()) {
         return SeverityNumber::Error;
     }
     match r.decision {
         TickDecisionKind::Panic => SeverityNumber::Error,
+        _ if r.roll_held.is_some() => SeverityNumber::Warn,
         TickDecisionKind::StaleRepo => SeverityNumber::Warn,
         TickDecisionKind::Fetch | TickDecisionKind::Rebuild
             if r.outcome.as_deref() != Some("success") =>

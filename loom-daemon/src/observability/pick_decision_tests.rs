@@ -484,3 +484,45 @@ fn an_unread_journal_leaves_decisions_unobserved() {
         .iter()
         .all(|s| s.reason == PickSkipReason::NotSelected));
 }
+
+/// #11103: the work finder's record carries the tick's workspace draws —
+/// seed, every draw's candidates with weights, roll and pick — named by repo.
+#[test]
+fn work_finder_record_carries_the_workspace_draw() {
+    use crate::work_finder::workspace_draw::draw_order;
+    use crate::work_finder::{ready_queue, WorkItem};
+    let item = |n: u32| WorkItem::with_created_at(n, vec!["loom:issue".into()], None);
+    let candidates = vec![
+        ready_queue::key_of(0, 0, &item(1), false),
+        ready_queue::key_of(1, 100, &item(2), false),
+    ];
+    let (order, log) = draw_order(candidates, &[0, 100], 99);
+    let log = log.unwrap();
+    let names = ["o/tool", "o/product"];
+    let draw = workspace_draw_record(&log, |idx| names[idx].to_string());
+    let r = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve)
+        .with_workspace_draw(Some(draw));
+
+    let json = serde_json::to_value(&r).unwrap();
+    let d = &json["workspace_draw"];
+    assert_eq!(d["seed"], "99");
+    assert_eq!(d["draws_total"], 2);
+    let first = &d["draws"][0];
+    assert_eq!(first["pool"], "all");
+    assert_eq!(first["candidates"][0], serde_json::json!({"repo": "o/tool", "weight": 1000}));
+    assert_eq!(first["candidates"][1], serde_json::json!({"repo": "o/product", "weight": 9}));
+    assert_eq!(first["total_weight"], 1009);
+    assert!(first["roll"].as_u64().unwrap() < 1009);
+    assert_eq!(first["picked"], names[order[0].workspace_idx]);
+    assert_eq!(first["number"], order[0].number);
+    // The second draw is over the one workspace left.
+    assert_eq!(d["draws"][1]["candidates"].as_array().unwrap().len(), 1);
+    // It round-trips, and a role record (no draw) omits the field.
+    let back: PickDecisionRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(back, r);
+    let plain = work_finder_record(&summary(Vec::new()), "h", at(), at(), resolve);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("workspace_draw")
+        .is_none());
+}

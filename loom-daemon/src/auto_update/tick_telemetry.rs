@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use super::supersede::ArmedRoll;
 use super::{ArtifactResolution, UpdateCheck};
 use crate::telemetry::kinds::auto_update_tick::{
-    AutoUpdateTickRecord, DrainSnapshot, TickDecisionKind,
+    AutoUpdateTickRecord, DrainSnapshot, RollHeld, TickDecisionKind,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
@@ -43,6 +43,9 @@ pub struct TickSummary {
     /// started, changed, or its reminder came due). Not on the tick record:
     /// `floor_stall` there is the standing condition.
     pub floor_alerted: bool,
+    /// #10880: the held-roll alert this tick raised (ERROR below the floor,
+    /// WARN otherwise). Set on every tick the roll stays held.
+    pub roll_held: Option<RollHeld>,
 }
 
 impl TickSummary {
@@ -69,6 +72,7 @@ impl TickSummary {
             }),
             floor_stall: None,
             floor_alerted: false,
+            roll_held: None,
         }
     }
 
@@ -121,6 +125,7 @@ pub fn record(
         in_flight: summary.in_flight.map(|n| n as u64),
         drain: summary.drain.clone(),
         floor_stall: summary.floor_stall.clone(),
+        roll_held: summary.roll_held.clone(),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

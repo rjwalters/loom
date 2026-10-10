@@ -106,7 +106,13 @@ impl WorkSource for GhWorkSource {
         // #10307: one listing per level label (operator and inherited, every
         // level): a level-2 issue need not carry the star itself.
         let mut starred: Vec<WorkItem> = Vec::new();
-        for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
+        // #11103: `loom:very-important` is listed the same way (the new top
+        // level wins the workspace draw even outside `loom:issue`); the legacy
+        // star listings go in slice 2.
+        let side_labels = crate::operator_levels::starred_labels(crate::operator_levels::table())
+            .into_iter()
+            .chain(std::iter::once(crate::priority_pick::VERY_IMPORTANT_LABEL));
+        for label in side_labels {
             let rows = self.list_side_label(label, true);
             let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
             starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
