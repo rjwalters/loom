@@ -37,7 +37,10 @@ pub const CHANGES: &str = "loom:changes-requested";
 /// Any of these present means a reviewer already has (or resolved) the PR.
 pub const ADVANCED: &[&str] = &[QUEUE, "loom:reviewing", "loom:pr"];
 /// Labels whose appearance during the write means a review raced the add.
-pub const RIVALS: &[&str] = &["loom:reviewing", "loom:pr", CHANGES];
+/// `loom:reviewing` is deliberately absent: it is a claim overlay that coexists
+/// with `loom:review-requested`, so a Judge claiming mid-write is a normal
+/// hand-back, and withdrawing our add would strand the PR if that claim lapsed.
+pub const RIVALS: &[&str] = &["loom:pr", CHANGES];
 
 /// Exit code: the PR was already advanced; only the claim was released.
 pub const EXIT_ALREADY_ADVANCED: i32 = 10;

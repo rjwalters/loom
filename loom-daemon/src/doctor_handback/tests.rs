@@ -296,9 +296,21 @@ fn a_rival_that_already_displaced_the_add_is_reported_not_failed() {
 #[test]
 fn a_withdrawal_that_fails_is_loud() {
     let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
-    f.after_add = vec!["loom:reviewing"];
+    f.after_add = vec!["loom:pr"];
     f.fail_remove = vec![QUEUE];
     assert!(matches!(run(&mut f, PUSHED), Outcome::Failed(_)));
+}
+
+/// A Judge claim is an overlay on `loom:review-requested`, not a verdict: one
+/// landing mid-write must leave both labels on, never withdraw the queue label.
+#[test]
+fn a_judge_claim_landing_during_the_write_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.after_add = vec!["loom:reviewing"];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HandedBack);
+    assert_eq!(f.sorted(), names(&[QUEUE, "loom:reviewing"]));
+    assert!(!f.writes().contains(&format!("remove {QUEUE}").as_str()));
 }
 
 #[test]
