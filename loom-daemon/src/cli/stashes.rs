@@ -9,9 +9,10 @@ use anyhow::Result;
 
 use loom_daemon::quarantine_stash_status::StashOrigin;
 use loom_daemon::repo_root::resolve_repo_root;
+use loom_daemon::stash_issue_state::{IssueStateSummary, RecordingLookup};
 use loom_daemon::stash_retirement::{
-    self, AnyStashEntry, DropOutcome, GhIssueStateLookup, PathVerdict, QuarantineStashEntry,
-    RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
+    self, AnyStashEntry, DropOutcome, GhIssueStateLookup, IssueStateLookup, PathVerdict,
+    QuarantineStashEntry, RetireVerdict, RetirementReport, RETIREMENT_LOG_RELPATH,
 };
 
 use crate::StashesAction;
@@ -92,19 +93,52 @@ fn run(
     json: bool,
 ) -> Result<()> {
     let repo_root = resolve_repo_root(workspace)?;
+    let mut lookup = GhIssueStateLookup::new(repo_root.clone());
+    let opts = RunOptions {
+        issue_filter,
+        execute,
+        show_paths,
+        json,
+    };
+    run_with(&repo_root, &opts, &mut lookup)
+}
 
-    let mut entries = stash_retirement::list_quarantine_stashes(&repo_root)
+struct RunOptions {
+    issue_filter: Option<u64>,
+    execute: bool,
+    show_paths: bool,
+    json: bool,
+}
+
+/// [`run`] with the repo root and the issue-state lookup supplied by the
+/// caller (tests pass a fake).
+///
+/// Returns `Err` for a blind run (#8876): at least one issue was looked up
+/// and none could be read. The report is still printed first.
+fn run_with(
+    repo_root: &std::path::Path,
+    opts: &RunOptions,
+    lookup: &mut dyn IssueStateLookup,
+) -> Result<()> {
+    let &RunOptions {
+        issue_filter,
+        execute,
+        show_paths,
+        json,
+    } = opts;
+    let mut entries = stash_retirement::list_quarantine_stashes(repo_root)
         .map_err(|e| anyhow::anyhow!("failed to enumerate quarantine stashes: {e}"))?;
     if let Some(issue) = issue_filter {
         entries.retain(|e| e.issue == Some(issue));
     }
 
+    let mut recorder = RecordingLookup::new(lookup);
     let reports: Vec<RetirementReport> = if entries.is_empty() {
         Vec::new()
     } else {
-        let mut lookup = GhIssueStateLookup::new(repo_root.clone());
-        stash_retirement::plan_and_execute_retirement(&repo_root, &entries, &mut lookup, execute)
+        stash_retirement::plan_and_execute_retirement(repo_root, &entries, &mut recorder, execute)
     };
+    let issue_state = IssueStateSummary::new(&reports, recorder.seen());
 
     // #5512: label every OTHER `refs/stash` entry by origin too — never fed
     // to `plan_and_execute_retirement` above (that call only ever sees the
@@ -114,7 +148,7 @@ fn run(
     // to one issue's quarantine stashes — an unrelated operator/agent/
     // auditor stash is out of scope for that narrower view.
     let other_entries: Vec<AnyStashEntry> = if issue_filter.is_none() {
-        stash_retirement::list_all_stashes(&repo_root)
+        stash_retirement::list_all_stashes(repo_root)
             .map_err(|e| anyhow::anyhow!("failed to enumerate stashes: {e}"))?
             .into_iter()
             .filter(|e| e.origin != StashOrigin::Quarantine)
@@ -123,27 +157,24 @@ fn run(
         Vec::new()
     };
 
-    if reports.is_empty() && other_entries.is_empty() {
-        if json {
-            println!("{{\"quarantine\":[],\"other\":[]}}");
-        } else {
-            println!("no outstanding loom-quarantine: stashes.");
-        }
-        return Ok(());
-    }
-
     if json {
         let payload = serde_json::json!({
             "quarantine": reports,
             "other": other_entries,
+            "issue_state": issue_state,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if reports.is_empty() && other_entries.is_empty() {
+        println!("no outstanding loom-quarantine: stashes.");
     } else {
-        render_human(&reports, execute, show_paths);
+        render_human(&reports, &issue_state, execute, show_paths);
         render_other(&other_entries);
     }
 
-    Ok(())
+    match issue_state.blind_message() {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
+    }
 }
 
 /// #5512: print every non-quarantine `refs/stash` entry, labeled by origin
@@ -170,7 +201,12 @@ fn render_other(other: &[AnyStashEntry]) {
     }
 }
 
-fn render_human(reports: &[RetirementReport], execute: bool, show_paths: bool) {
+fn render_human(
+    reports: &[RetirementReport],
+    issue_state: &IssueStateSummary,
+    execute: bool,
+    show_paths: bool,
+) {
     let retire_count = reports
         .iter()
         .filter(|r| matches!(r.verdict, RetireVerdict::Retire { .. }))
@@ -187,6 +223,11 @@ fn render_human(reports: &[RetirementReport], execute: bool, show_paths: bool) {
              {retire_count} retirable entr{plural}.)",
             plural = if retire_count == 1 { "y" } else { "ies" }
         );
+    }
+    if let Some(message) = issue_state.blind_message() {
+        // #8876: one line for the run, ahead of the per-stash lines that
+        // would otherwise read like N unrelated hiccups.
+        println!("BLIND RUN: {message}");
     }
     println!();
 
@@ -276,3 +317,8 @@ fn describe_path_verdict(verdict: &PathVerdict) -> String {
         PathVerdict::NotProvenRecoverable => "NOT provably recoverable".to_string(),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "stashes_tests.rs"]
+mod tests;
