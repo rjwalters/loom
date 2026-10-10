@@ -666,6 +666,10 @@ fn is_assignment(word: &str) -> bool {
 
 /// Index of the first word after a run of `-`options, where each option in
 /// `with_value` consumes the following word too. `--` ends the options.
+///
+/// A short-option cluster (`-rn 1`, `-Hu root`, `-n1`) is read flag by flag: the
+/// first value-taking flag takes the rest of the cluster as its value when one
+/// is attached, and otherwise consumes the following word.
 fn skip_options(argv: &[String], with_value: &[&str]) -> usize {
     let mut j = 0;
     while j < argv.len() {
@@ -676,9 +680,31 @@ fn skip_options(argv: &[String], with_value: &[&str]) -> usize {
         if !w.starts_with('-') || w == "-" {
             break;
         }
-        j += if with_value.contains(&w) { 2 } else { 1 };
+        j += if with_value.contains(&w) || cluster_takes_next_word(w, with_value) {
+            2
+        } else {
+            1
+        };
     }
     j.min(argv.len())
+}
+
+/// True when `w` is a short-option cluster (`-rn`) whose first value-taking flag
+/// is the last character, so its value is the next word. A value-taking flag
+/// followed by more characters (`-n1`, `-Hroot`) has its value attached.
+fn cluster_takes_next_word(w: &str, with_value: &[&str]) -> bool {
+    if w.starts_with("--") {
+        return false;
+    }
+    let mut flag = [0u8; 4];
+    let body = &w[1..];
+    for (idx, c) in body.char_indices() {
+        let name = format!("-{}", c.encode_utf8(&mut flag));
+        if with_value.contains(&name.as_str()) {
+            return idx + c.len_utf8() == body.len();
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_lines)]

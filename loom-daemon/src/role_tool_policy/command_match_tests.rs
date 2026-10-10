@@ -613,6 +613,35 @@ fn taskset_and_chrt_consume_their_operand_exactly_once() {
 }
 
 #[test]
+fn clustered_short_options_still_consume_their_value() {
+    // The value-taking flag sits inside a cluster; its value is the next word
+    // (`-rn 1`) or the rest of the cluster (`-rn1`).
+    for cmd in [
+        "xargs -rn 1 ssh example.invalid",
+        "xargs -rP 1 ssh example.invalid",
+        "xargs -rn1 ssh example.invalid",
+        "xargs -rP1 ssh example.invalid",
+        "xargs -0rn 1 ssh example.invalid",
+        "xargs -rI{} ssh example.invalid",
+        "sudo -Hu root ssh example.invalid",
+        "sudo -Huroot ssh example.invalid",
+        "sudo -EHu root ssh example.invalid",
+        "ionice -tc 3 ssh example.invalid",
+        "stdbuf -oL ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("xargs -rP 1 aws sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap("sudo -Hu root gh secret list", "forge-secrets"));
+    // A cluster of plain flags consumes nothing; the next word is the command.
+    assert!(hits_cap("xargs -rt ssh example.invalid", "remote-shell"));
+    assert!(hits_cap("sudo -HE ssh example.invalid", "remote-shell"));
+    assert_clean("xargs -rn 1 echo");
+    assert_clean("sudo -Hu root echo");
+    assert_clean("xargs -rn1 echo");
+}
+
+#[test]
 fn stdbuf_and_ionice_keep_their_own_value_options() {
     for cmd in [
         "stdbuf -i0 -o L -e 0 ssh example.invalid",

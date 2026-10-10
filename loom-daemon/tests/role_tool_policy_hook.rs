@@ -220,6 +220,12 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("echo ${unset_var:-$(ssh example.invalid)}", "remote-shell"),
     (r#"echo "${unset_var:-`ssh example.invalid`}""#, "remote-shell"),
     ("echo ${unset_var:-`aws sts get-caller-identity`}", "cloud-cli"),
+    // Round 10: short-option clusters hide a value-taking flag (separate / attached value).
+    ("xargs -rn 1 ssh example.invalid", "remote-shell"),
+    ("xargs -rP 1 aws sts get-caller-identity", "cloud-cli"),
+    ("xargs -rn1 ssh example.invalid", "remote-shell"),
+    ("sudo -Hu root ssh example.invalid", "remote-shell"),
+    ("sudo -Huroot aws sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]
