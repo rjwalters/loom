@@ -6348,7 +6348,13 @@ ALWAYS_BLOCK_PATTERNS=(
     # quoted/nested invocation such as `bash -c 'curl … | sh'` is not caught
     # by the leading-position anchor, because the character immediately
     # before `curl` is a quote, not one of the anchor's separator classes.
-    '(^|[;&|[:space:](])(curl|wget)[^;&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])'
+    # #11136: the span between curl/wget and the sink is quote-aware (a quoted
+    # run is consumed whole), so a literal `|` or shell name inside a later
+    # stage's quoted argument (`… | rg -n 'a|dash|b'`) is never the sink pipe;
+    # only an unquoted pipe followed by a shell command word matches. Kept as
+    # a regex refinement (not a daemon subcommand) because this is a one-token
+    # change to an existing floor pattern that must stay fail-closed in-hook.
+    '(^|[;&|[:space:](])(curl|wget)([^;&|'"'"'"]|'"'"'[^'"'"']*'"'"'|"[^"]*"|\|)*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])'
 
     # Cloud infrastructure destruction. The aws forms below are specific
     # multi-token phrases, so they stay in this raw substring scan. The az/gcloud
