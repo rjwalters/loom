@@ -126,3 +126,29 @@ fn an_idle_tick_records_no_draw() {
     let report = tick_multi(&mut multi, &[0], 4, &[false]);
     assert!(report.workspace_draw.is_none());
 }
+
+/// A `loom:very-important` issue shares the star's cap rules (#11103): when
+/// the global cap is full it may take the host's single overflow slot, and a
+/// second one waits; plain work never does. Both tick paths.
+#[test]
+fn very_important_takes_the_single_overflow_slot_over_the_cap() {
+    let vi = |n| issue(n, "2026-01-01T00:00:00Z", &[VERY_IMPORTANT_LABEL]);
+    let full = || RecordingDispatcher {
+        in_flight: (1000..1002).collect(),
+        ..RecordingDispatcher::default()
+    };
+    let mut multi = vec![(
+        FakeSource::once(vec![vi(1), vi(2), issue(3, "2026-01-01T00:00:00Z", &[])]),
+        full(),
+    )];
+    let report = tick_multi(&mut multi, &[100], 2, &[false]);
+    assert_eq!((report.dispatched, report.dispatched_overflow), (1, 1));
+    assert_eq!(multi[0].1.dispatched_overflow, vec![1]);
+    assert_eq!(report.deferred_capacity, 2, "second very-important and the plain one wait");
+
+    let mut dispatcher = full();
+    let src = &mut FakeSource::once(vec![vi(1), vi(2), issue(3, "2026-01-01T00:00:00Z", &[])]);
+    let report = tick(src, &mut dispatcher, 2, false).unwrap();
+    assert_eq!((report.dispatched_overflow, report.deferred_capacity), (1, 2));
+    assert_eq!(dispatcher.dispatched_overflow, vec![1]);
+}

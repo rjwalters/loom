@@ -53,6 +53,17 @@ pub struct PriorityCandidate {
     pub complexity: Option<String>,
 }
 
+impl PriorityCandidate {
+    /// Whether the candidate is `loom:very-important` (#11103) for the
+    /// overflow slot and build back-off. A red-main fix is bridged to that
+    /// level for the draw only; it keeps its own rules (it never uses the
+    /// overflow slot, #9244), so it is excluded here.
+    #[must_use]
+    pub fn is_very_important(&self) -> bool {
+        self.level == crate::priority_pick::Level::VeryImportant && !self.main_red_fix
+    }
+}
+
 /// Total ordering over dispatch candidates (#3946, #9244, #10307):
 ///
 /// 0. effective operator priority level, highest first (level 2 before the

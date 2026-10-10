@@ -1281,8 +1281,8 @@ pub fn tick_with_lanes(
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick, unless
         //    this starred issue can take the host's overflow slot (#9244).
-        let over =
-            occupancy >= max_concurrent && overflow.admits(item.is_operator_priority(), occupancy);
+        let over = occupancy >= max_concurrent
+            && overflow.admits(item.is_operator_priority() || item.is_very_important(), occupancy);
         if occupancy >= max_concurrent && !over {
             report.deferred_capacity += 1;
             continue;
@@ -2051,7 +2051,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // per-repo cap may take the host's single over-limit slot. The ramp cap
         // is not a queue limit, so it still applies (checked below).
         let over = (occupancy >= max_concurrent || cap.at_cap(cand.workspace_idx))
-            && overflow.admits(cand.operator_priority, occupancy);
+            && overflow.admits(cand.operator_priority || cand.is_very_important(), occupancy);
         // Shared global cap across all workspaces — defer once the combined
         // occupancy hits the budget, regardless of which workspace still has
         // ready items.
