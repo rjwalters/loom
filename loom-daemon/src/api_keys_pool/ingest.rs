@@ -264,11 +264,28 @@ pub fn ingest_launch_log(
     anchor: &str,
     exit_code: Option<i32>,
 ) -> Option<LaunchFeedback> {
+    ingest_contents(workspace, contents, anchor, exit_code, None)
+}
+
+fn ingest_contents(
+    workspace: &Path,
+    contents: &str,
+    anchor: &str,
+    exit_code: Option<i32>,
+    live_mark: Option<&BadMark>,
+) -> Option<LaunchFeedback> {
     let (record, classification) = classify_launch_log(contents, anchor, exit_code)?;
     // The reset horizon (#11286) is read from the same provider-only lines
     // the classifier saw — never the agent's transcript.
     let provider_text = provider_lines(region_after(contents, anchor)?);
-    apply_mark(workspace, record, classification, &provider_text, "the launch log")
+    apply_mark_after_live(
+        workspace,
+        record,
+        classification,
+        &provider_text,
+        "the launch log",
+        live_mark,
+    )
 }
 
 /// Record the bad mark `classification` implies for a pool-selected
@@ -287,6 +304,28 @@ pub fn apply_mark(
     classification: Classification,
     provider_text: &str,
     origin: &str,
+) -> Option<LaunchFeedback> {
+    apply_mark_after_live(workspace, record, classification, provider_text, origin, None)
+}
+
+/// [`apply_mark`] for the exit-time pass of a launch the in-run watcher has
+/// already marked (`live_mark`, #11286).
+///
+/// Re-resolving the same evidence at exit would re-anchor the cooldown to the
+/// later clock (a default, configured or relative `retry_after` horizon is
+/// "now + N"), so the seat's deadline would slide by the run's remaining
+/// length and a second metric point would be emitted for one refusal. Exit
+/// evidence is therefore only a new mark when it asks for a **longer**
+/// cooldown than the live mark was given; otherwise the live mark stands,
+/// unchanged, and is handed back so the caller sees the same mark twice.
+#[must_use]
+pub fn apply_mark_after_live(
+    workspace: &Path,
+    record: LaunchRecord,
+    classification: Classification,
+    provider_text: &str,
+    origin: &str,
+    live_mark: Option<&BadMark>,
 ) -> Option<LaunchFeedback> {
     let provider = record.provider?;
     let account = record.account?;
@@ -336,6 +375,25 @@ pub fn apply_mark(
     let window = reset::configured_window(&root, &provider, &account);
     let (cooldown, source) =
         reset::resolve_cooldown(classification, provider_text, bad_marks::epoch_now(), window)?;
+    if let Some(live) = live_mark.filter(|m| m.name == account && m.model_class == model_class) {
+        let live_cooldown = live.resets_at.map(|at| at.saturating_sub(live.marked_at));
+        if live.is_active_at(bad_marks::epoch_now())
+            && live_cooldown.is_none_or(|live_secs| cooldown <= live_secs)
+        {
+            return Some(LaunchFeedback {
+                detail: format!(
+                    "api-keys pool: {provider}/{account} ({scope}) was already bad-marked in-run                      ({}) — keeping that mark; the {cooldown}s {} cooldown from {origin} adds                      nothing",
+                    live.reason,
+                    classification.label()
+                ),
+                provider,
+                account,
+                model_class,
+                classification,
+                mark: Some(live.clone()),
+            });
+        }
+    }
     let reason =
         format!("{} (classified from {origin}; {})", classification.label(), source.label());
     // #8699 AC2's double-mark guard: the egress proxy (or a concurrent
@@ -401,8 +459,21 @@ pub fn ingest_launch_log_at(
     anchor: &str,
     exit_code: Option<i32>,
 ) -> Option<LaunchFeedback> {
+    ingest_launch_log_at_after_live(workspace, log_path, anchor, exit_code, None)
+}
+
+/// [`ingest_launch_log_at`] for a launch the in-run watcher may already have
+/// marked — see [`apply_mark_after_live`].
+#[must_use]
+pub fn ingest_launch_log_at_after_live(
+    workspace: &Path,
+    log_path: &Path,
+    anchor: &str,
+    exit_code: Option<i32>,
+    live_mark: Option<&BadMark>,
+) -> Option<LaunchFeedback> {
     let contents = std::fs::read_to_string(log_path).ok()?;
-    ingest_launch_log(workspace, &contents, anchor, exit_code)
+    ingest_contents(workspace, &contents, anchor, exit_code, live_mark)
 }
 
 #[cfg(test)]

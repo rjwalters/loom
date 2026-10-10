@@ -459,6 +459,14 @@ fn a_live_native_sweep_is_marked_in_run_and_counted_once() {
         bad_marks::is_bad_for_class(&pool, "loomtest", "live-seat", None, bad_marks::epoch_now())
             .unwrap()
     };
+    let deadline = || {
+        bad_marks::read_marks(&pool, "loomtest")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "live-seat")
+            .and_then(|m| m.resets_at)
+    };
+    let clock = bad_marks::test_clock::pin(1_791_590_400);
 
     // Nothing yet: the run is healthy.
     registry.watch_in_run_exhaustion(&sweep_id);
@@ -475,9 +483,61 @@ fn a_live_native_sweep_is_marked_in_run_and_counted_once() {
     });
     assert!(marked(), "marked before the run exits");
     assert_eq!(live.metrics.len(), 1, "{:?}", live.metrics);
+    let live_deadline = deadline().expect("a finite in-run horizon");
 
+    // The run winds down a minute later: the same refusal must neither move
+    // the deadline nor emit a second point (default cooldown, no reset hint).
+    clock.set(1_791_590_400 + 60);
     let ((), exit) = crate::observability::ops::capture::capture(|| {
         registry.apply_provider_health_feedback(&sweep_id, Some(1));
     });
     assert!(exit.metrics.is_empty(), "{:?}", exit.metrics);
+    assert_eq!(deadline(), Some(live_deadline), "exit-time ingest re-anchored the mark");
+}
+
+/// A relative `retry_after` hint resolves against the clock, so the exit-time
+/// pass sees a *shorter* horizon than the live one and must leave it alone.
+#[test]
+fn a_relative_reset_hint_does_not_slide_a_live_mark_at_exit() {
+    use crate::api_keys_pool::{bad_marks, ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "live-seat", "LOOM_TEST_KEY_11286", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "model": "glm-5.3-flash",
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "live-seat",
+    });
+    // SYNTHETIC provider line (no real Z.ai capture exists).
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        76,
+        UNKNOWN_TOKEN_NAME,
+        &format!(
+            "{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n\
+             Error: insufficient balance, retry after 7200\n"
+        ),
+    );
+    registry.entries.get_mut(&sweep_id).unwrap().runtime = "opencode".into();
+    let clock = bad_marks::test_clock::pin(1_791_590_400);
+    let ((), live) = crate::observability::ops::capture::capture(|| {
+        registry.watch_in_run_exhaustion(&sweep_id);
+    });
+    assert_eq!(live.metrics.len(), 1, "{:?}", live.metrics);
+    let deadline = || {
+        bad_marks::read_marks(&pool, "loomtest")
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "live-seat")
+            .and_then(|m| m.resets_at)
+    };
+    assert_eq!(deadline(), Some(1_791_590_400 + 7200));
+
+    clock.set(1_791_590_400 + 600);
+    let ((), exit) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    assert!(exit.metrics.is_empty(), "{:?}", exit.metrics);
+    assert_eq!(deadline(), Some(1_791_590_400 + 7200));
 }

@@ -135,11 +135,12 @@ impl SweepRegistry {
         // exit-time ingest that finds it already covering the seat is not
         // counted as a second `loom.pool.account_marks` point.
         let live_mark = forget_in_run_watch(sweep_id);
-        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at(
+        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at_after_live(
             &self.config.workspace_root,
             log_path,
             &format!("sweep_id={sweep_id}"),
             exit_code,
+            live_mark.as_ref(),
         ) else {
             return;
         };
