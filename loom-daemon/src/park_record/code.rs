@@ -135,6 +135,11 @@ fn blank_inline(line: &str) -> String {
             i = line[i + 4..eol].find("-->").map_or(eol, |e| i + 4 + e + 3);
             continue;
         }
+        // A backslash-escaped backtick is a literal, never a span opener.
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'`') {
+            i += 2;
+            continue;
+        }
         if bytes[i] != b'`' {
             i += 1;
             continue;

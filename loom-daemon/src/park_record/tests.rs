@@ -385,6 +385,17 @@ fn indented_backticks_do_not_open_a_fence() {
     assert!(parse(body).is_empty());
 }
 
+/// A backslash-escaped backtick is literal text, so it cannot open a code span
+/// that hides a genuine record after it.
+#[test]
+fn escaped_backtick_does_not_open_a_code_span() {
+    let body = r#"\` <!-- loom:park Blocked by: #5 reason="the ` flag" -->"#;
+    assert_eq!(blockers(body), n(&[5]));
+    // An unescaped span still hides a quoted marker.
+    let body = "`<!-- loom:park Blocked by: #5 -->`\n";
+    assert!(parse(body).is_empty());
+}
+
 /// Indented code, blockquotes (plain, indented, fenced, lazy), and multiline
 /// inline code spans never declare a record; a real record after each does.
 #[test]
