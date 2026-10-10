@@ -2,11 +2,14 @@
 import { tool } from "@opencode-ai/plugin";
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-// HYPOTHESIS (#11283, unverified): a plain `{ id, server }` default export may
-// load under both majors. OpenCode 2.0.18's loader is documented to require
-// `{ id, setup | effect }`, so 2.x likely still rejects this shape, and 1.18.x
-// acceptance of a default object has not been checked. See #11308.
-async function server() {
+// One module, two loader contracts, both read from upstream source:
+// - 1.18.x (readV1Plugin, v1.18.31): default-exported object with a `server`
+//   function; unknown keys such as `setup` are ignored.
+// - 2.x (core/src/plugin/module.ts, v2.0.18): default-exported `{ id, effect }`
+//   or `{ id, setup }`; `server` is not accepted, so `setup` registers the
+//   same four tools through `context.tool.transform`.
+// Neither path has been exercised against a live harness here (#11308).
+function bind() {
   // Plugin-load receipt for the provider-free readiness probe (#8600): written
   // before anything can throw, only when the probe names a path, and never in a
   // production launch (the variable is absent there). A CLI that never loads
@@ -17,30 +20,53 @@ async function server() {
   const cwd = process.cwd();
   const binary = process.env.LOOM_NATIVE_TOOL_BIN;
   if (!workspace || !binary) throw new Error("Loom native tool context is missing");
-  const specs = {
-    read: ["Read a UTF-8 file, with optional 1-based offset and line limit", { path: tool.schema.string(), offset: tool.schema.number().optional(), limit: tool.schema.number().optional() }],
-    write: ["Write a file inside a Loom-managed worktree", { path: tool.schema.string(), content: tool.schema.string() }],
-    edit: ["Replace exactly one oldText occurrence; read the file first", { path: tool.schema.string(), oldText: tool.schema.string(), newText: tool.schema.string() }],
-    bash: ["Run a shell command through Loom policy; use cd for worktree commands", { command: tool.schema.string(), timeout: tool.schema.number().min(1).max(600).optional() }],
+  return (name, input, signal) => new Promise((resolve, reject) => {
+    const child = execFile(binary, ["runtime-tool", "--workspace", workspace, "--cwd", cwd],
+      { timeout: 625000, maxBuffer: 1024 * 1024, signal }, (error, stdout) => {
+        try {
+          const result = JSON.parse(stdout);
+          if (error || result.error || typeof result.text !== "string") reject(new Error(result.error || "Loom tool failed"));
+          else resolve(result.text);
+        } catch { reject(new Error("Loom native tool failed without a valid response")); }
+      });
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ tool: name, input }));
+  });
+}
+const str = { type: "string" };
+const num = { type: "number" };
+const specs = {
+  read: ["Read a UTF-8 file, with optional 1-based offset and line limit", { path: str, offset: num, limit: num }, ["path"]],
+  write: ["Write a file inside a Loom-managed worktree", { path: str, content: str }, ["path", "content"]],
+  edit: ["Replace exactly one oldText occurrence; read the file first", { path: str, oldText: str, newText: str }, ["path", "oldText", "newText"]],
+  bash: ["Run a shell command through Loom policy; use cd for worktree commands", { command: str, timeout: { type: "number", minimum: 1, maximum: 600 } }, ["command"]],
+};
+async function server() {
+  const run = bind();
+  const z = tool.schema;
+  const args = {
+    read: { path: z.string(), offset: z.number().optional(), limit: z.number().optional() },
+    write: { path: z.string(), content: z.string() },
+    edit: { path: z.string(), oldText: z.string(), newText: z.string() },
+    bash: { command: z.string(), timeout: z.number().min(1).max(600).optional() },
   };
   return {
-    tool: Object.fromEntries(Object.entries(specs).map(([name, [description, args]]) => [`loom_${name}`, tool({
-      description, args,
-      async execute(input, context) {
-        return await new Promise((resolve, reject) => {
-          const child = execFile(binary, ["runtime-tool", "--workspace", workspace, "--cwd", cwd],
-            { timeout: 625000, maxBuffer: 1024 * 1024, signal: context.abort }, (error, stdout) => {
-              try {
-                const result = JSON.parse(stdout);
-                if (error || result.error || typeof result.text !== "string") reject(new Error(result.error || "Loom tool failed"));
-                else resolve(result.text);
-              } catch { reject(new Error("Loom native tool failed without a valid response")); }
-            });
-          child.stdin.on("error", () => {});
-          child.stdin.end(JSON.stringify({ tool: name, input }));
-        });
-      },
+    tool: Object.fromEntries(Object.entries(specs).map(([name, [description]]) => [`loom_${name}`, tool({
+      description, args: args[name],
+      async execute(input, context) { return await run(name, input, context.abort); },
     })])),
   };
 }
-export default { id: "loom", server };
+async function setup(context) {
+  const run = bind();
+  await context.tool.transform((editor) => {
+    for (const [name, [description, properties, required]] of Object.entries(specs)) {
+      editor.add({
+        name: `loom_${name}`, description,
+        input: { type: "object", properties, required },
+        async execute(input, ctx) { return { content: await run(name, input, ctx.signal) }; },
+      });
+    }
+  });
+}
+export default { id: "loom", server, setup };

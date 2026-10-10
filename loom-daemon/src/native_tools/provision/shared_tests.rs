@@ -139,21 +139,27 @@ fn the_binding_key_is_content_addressed_and_stable() {
     assert_eq!(key, binding_key());
 }
 
-/// Source-text pin only (#11283): the module default-exports a plain
-/// `{ id, server }` object. This does NOT show either OpenCode major loads it;
-/// 2.x may require `setup`/`effect` and 1.18.x acceptance is unverified (#11308).
+/// The module default-exports `{ id, server, setup }` (#11283): 1.18.x's
+/// `readV1Plugin` reads `server` and ignores other keys; 2.x's plugin loader
+/// requires `{ id, setup }` (or `effect`) and rejects `server`-only. Source
+/// shape only: neither major has been loaded live (#11308).
 #[test]
-fn opencode_plugin_default_exports_a_plain_object_with_server() {
+fn opencode_plugin_default_exports_object_with_server_and_setup() {
     let src = include_str!("../opencode.mjs");
     assert!(
-        src.contains("export default { id: \"loom\", server };"),
-        "default export must be the plain object {{ id, server }}"
+        src.contains("export default { id: \"loom\", server, setup };"),
+        "default export must be the plain object {{ id, server, setup }}"
     );
     assert!(
         !src.contains("export default async function") && !src.contains("export default function"),
-        "the plain-object export replaced the function default export"
+        "default export must be an object, not a function"
     );
-    assert!(src.contains("async function server()"), "server hook is the async body");
+    assert!(src.contains("async function server()"), "1.x server hook present");
+    assert!(src.contains("async function setup(context)"), "2.x setup hook present");
+    assert!(
+        src.contains("context.tool.transform"),
+        "setup registers tools via the 2.x tool editor"
+    );
 }
 
 /// The existing receipt/fail-closed behaviour is unchanged (source-text pin): receipt write precedes the
