@@ -51,28 +51,31 @@ ROOT="${LOOM_PROJECT_ROOT:-}"
 [[ -n "$ROOT" ]] || ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)/.." 2>/dev/null && pwd)"
 [[ -n "$ROOT" ]] || ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Effective value of the canary key across the config tiers, lowest to highest
+# Effective value of the canary key: the config tiers deep-merged lowest to highest
 # precedence (private defaults < .loom/config.json < .loom-project/project.json
-# < .loom-local/local.json — config_resolver.rs): the LAST tier setting
-# guards.<key> wins, so a higher-tier false or non-boolean suppresses wrapper
-# records. 0 only when it is exactly true; no jq / bad JSON -> no record.
-_canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}" "$ROOT"/.loom/config.json "$ROOT"/.loom-project/project.json "$ROOT"/.loom-local/local.json 2>/dev/null | jq -s '[.[].guards.uncommittedWorkConsumerCanary?|select(.!=null)]|last' 2>/dev/null)" == true ]]; }
+# < .loom-local/local.json) exactly like config_resolver.rs deep_merge (jq `*`: a
+# higher-tier null or scalar REPLACES a lower value, even the whole `guards` object).
+# 0 only when it is exactly true; no jq / bad JSON -> no record.
+_canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}" "$ROOT"/.loom/config.json "$ROOT"/.loom-project/project.json "$ROOT"/.loom-local/local.json 2>/dev/null | jq -s 'reduce .[] as $t ({}; . * $t)|.guards.uncommittedWorkConsumerCanary?' 2>/dev/null)" == true ]]; }
+
+# Opted in but unable to record: a non-blocking coverage notice (never a block).
+_canary_gap() { printf '{"continue":true,"systemMessage":"uncommitted-work canary: wrapper failure (%s) NOT recorded (%s) - coverage gap; the stop was allowed."}\n' "$1" "$2"; }
 
 # $1 = failure class. Records only for a workspace whose EFFECTIVE canary key is
 # true (see _canary_effective_true), never grows the log past its 1 MiB bound (the daemon
-# owns rotation), and drops (fail open) a LOG override lying inside any Git checkout.
+# owns rotation), and drops (fail open, with a coverage notice) a LOG override lying inside any Git checkout.
 _record_wrapper_failure() {
     _canary_effective_true || return 0
     local ov="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-}" d event="" ws log
-    [[ -z "$ov" || "$ov" == /* ]] || return 0  # an override must be absolute
-    log="$(realpath -m "${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" 2>/dev/null)" && [[ "$log" == /* ]] || return 0  # symlinks/".." resolved first
-    d="$log"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && return 0; done  # never inside a checkout
-    mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
-    [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || return 0  # missing log -> "" -> 0
+    [[ -z "$ov" || "$ov" == /* ]] || { _canary_gap "$1" "relative log override"; return 0; }
+    log="$(realpath -m "${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" 2>/dev/null)" && [[ "$log" == /* ]] || { _canary_gap "$1" "log path unresolved"; return 0; }  # symlinks/".." resolved first
+    d="$log"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && { _canary_gap "$1" "log inside a Git checkout"; return 0; }; done
+    mkdir -p "$(dirname "$log")" 2>/dev/null && [[ ! -d "$log" ]] || { _canary_gap "$1" "log not writable"; return 0; }
+    [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || { _canary_gap "$1" "log full"; return 0; }  # missing log -> "" -> 0
     [[ "$PAYLOAD" =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z]+)\" ]] && event="${BASH_REMATCH[1]}"
     ws="${ROOT//\\/\\\\}" && ws="${ws//\"/\\\"}"  # minimal JSON string escape
     printf '{"schema":1,"ts":"%s","source":"wrapper","invocation_id":"%s","workspace":"%s","event":"%s","outcome":"wrapper_error","error":"%s"}\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$LOOM_HOOK_INVOCATION_ID" "$ws" "$event" "$1" >>"$log" 2>/dev/null || true
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$LOOM_HOOK_INVOCATION_ID" "$ws" "$event" "$1" 2>/dev/null >>"$log" || _canary_gap "$1" "append failed"
 }
 
 # At runtime SCRIPT_DIR is .loom/hooks/ (project-copy wiring) or

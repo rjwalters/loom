@@ -1391,13 +1391,14 @@ both events in both install modes, dedup, transition deferral and deprovision.
 `LOOM_UNCOMMITTED_WORK_CANARY_LOG`) — outside every checkout, rotated at 1 MiB with
 4 generations kept (`.1`…`.4`), so disk use is bounded at ~5 MiB per host.
 
-The override is honoured only **outside every Git checkout and worktree**: the daemon
-resolves symlinks and `..` and rejects any path with a `.git` entry in an ancestor
-(stopping at `$HOME`, so a dotfiles repo does not disqualify the default); the wrapper
-rejects a non-absolute path, any `..`, and any override with a `.git` ancestor. A rejected
+The override is honoured only **outside every Git checkout and worktree**: both the daemon
+and the wrapper resolve symlinks and `..` first (the wrapper via `realpath -m`, so a file
+symlink into a checkout is caught) and reject any path with a `.git` entry in an ancestor.
+The check does not stop at `$HOME` — a home directory that is itself a checkout disqualifies
+the default path. The wrapper additionally rejects a non-absolute override. A rejected
 path fails open (the stop is never blocked) and is a visible coverage gap — the daemon
 returns a non-blocking `systemMessage` ("NOT recorded … inside the Git checkout"); the
-wrapper records nothing.
+wrapper does the same for an opted-in workspace, and writes no record.
 
 | Field | Meaning |
 |---|---|
@@ -1418,11 +1419,14 @@ and the session sees only a non-blocking `systemMessage` saying the decision was
 **not recorded** — an unrecorded decision is a coverage gap, never a measured
 one, and a canary that cannot log must never keep a session from stopping.
 Wrapper records are written only for a workspace whose *effective* config sets
-the canary key to `true` (`guards.<key>` resolved with `jq` over the tiers in precedence order —
-private defaults, `.loom/config.json`, `.loom-project/project.json`,
-`.loom-local/local.json` — where the last tier setting it wins, so a
-higher-tier `false` or non-boolean suppresses them; no `jq` means no record), and the stub never appends past the size
-bound.
+the canary key to `true`: `jq` deep-merges the tiers in precedence order — private defaults,
+`.loom/config.json`, `.loom-project/project.json`, `.loom-local/local.json` — with the same
+semantics as the daemon's resolver, so a higher-tier `false`, non-boolean, `null`, or a
+scalar replacing the whole `guards` object opts the workspace out (no `jq` means no record).
+For an opted-in workspace whose wrapper record cannot be written (path rejected or
+unresolvable, directory or unwritable log, log at the 1 MiB bound, append failure) the stub
+emits a non-blocking `{"continue":true,"systemMessage":"… NOT recorded …"}` coverage notice
+and still exits 0; it never appends past the size bound.
 
 **Retrieving the sample:**
 

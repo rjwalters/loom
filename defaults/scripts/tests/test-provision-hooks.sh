@@ -810,6 +810,29 @@ for CFG in '{"guards":{"uncommittedWorkConsumerCanary":false},"other":{"uncommit
 done
 printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
 
+# 26d6: resolver merge semantics — a higher-tier null, or a scalar replacing the
+# whole `guards` object, clears a lower-tier true (config_resolver.rs deep_merge).
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom/config.json"
+for CFG in '{"guards":{"uncommittedWorkConsumerCanary":null}}' '{"guards":null}' '{"guards":"off"}'; do
+    printf '%s\n' "$CFG" > "$P26X/.loom-local/local.json"
+    LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$P26X/ok/canary.jsonl" \
+        bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+    assert_eq "$(cat "$P26X/ok/canary.jsonl" 2>/dev/null)" "" "local $CFG over config true writes no wrapper record"
+done
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
+
+# 26d7: opted in but unable to record -> exit 0 and a non-blocking coverage
+# notice on both events (full log, directory as log, rejected path, relative path).
+head -c 1048576 /dev/zero > "$P26X/full.jsonl"; mkdir -p "$P26X/logdir"
+for ev in Stop SubagentStop; do
+    for L in "$P26X/full.jsonl" "$P26X/logdir" "$P26X/chk/canary.jsonl" "rel/canary.jsonl"; do
+        G26=$(LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$L" \
+            bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"'"$ev"'"}' 2>/dev/null); rc26g=$?
+        assert_eq "$rc26g|$(printf '%s' "$G26" | jq -r '[.continue, (.systemMessage|contains("NOT recorded")), has("decision")]|@csv' 2>/dev/null)" "0|true,true,false" "$ev: unrecordable log $L -> exit 0 + non-blocking coverage notice"
+    done
+done
+assert_eq "$(wc -c < "$P26X/full.jsonl")" "1048576" "a full log is never grown"
+
 # 26e: deprovision removes both events' entries and leaves no empty arrays.
 deprovision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$S26" "$UW")" "0" "deprovision removed both uncommitted-work entries"
