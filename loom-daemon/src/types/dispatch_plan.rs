@@ -52,6 +52,8 @@ pub enum PlanGate {
     RepoCap,
     /// Outside this host's preferred repo slice while the slice had work.
     OutOfSlice,
+    /// Its affected files overlap same-repo work admitted or in flight (#9781).
+    FileOverlap,
     /// A gate this client does not know (forward compatibility).
     #[serde(other)]
     Unknown,

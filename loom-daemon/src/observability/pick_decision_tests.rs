@@ -95,6 +95,26 @@ fn work_finder_record_keeps_rank_order_and_classifies_each_row() {
 }
 
 #[test]
+fn a_file_overlap_deferral_carries_its_shared_paths_into_the_record() {
+    let mut s = summary(vec![
+        (1, QueueDisposition::Dispatched),
+        (2, QueueDisposition::DeferredFileOverlap),
+        (3, QueueDisposition::DispatchError),
+    ]);
+    s.queue[1].detail = Some("file overlap: src/a.rs, src/b.rs".to_string());
+    s.queue[2].detail = Some("free-form error text".to_string());
+    let r = work_finder_record(&s, "host-a", at(), at(), resolve);
+    let overlap = r.skipped.iter().find(|k| k.number == 2).unwrap();
+    assert_eq!(overlap.reason, PickSkipReason::OverlapChain);
+    assert_eq!(overlap.detail.as_deref(), Some("file overlap: src/a.rs, src/b.rs"));
+    let error = r.skipped.iter().find(|k| k.number == 3).unwrap();
+    assert_eq!(error.detail, None, "only the file-overlap detail is exported");
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["skipped"][0]["detail"], "file overlap: src/a.rs, src/b.rs");
+    assert!(json["skipped"][1].get("detail").is_none(), "absent, not null");
+}
+
+#[test]
 fn an_empty_work_finder_tick_still_yields_a_record() {
     let r = work_finder_record(&summary(vec![]), "host-a", at(), at(), resolve);
     assert_eq!(r.outcome, "idle");
