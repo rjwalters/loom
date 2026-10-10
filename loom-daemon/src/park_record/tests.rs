@@ -337,3 +337,37 @@ fn drop_blockers_never_drops_a_qualified_record_by_its_number() {
     assert_eq!(blockers(&out), vec![q("o/r", 1)]);
     assert!(has_qualified_ref(&out), "{out}");
 }
+
+/// #10837: a marker quoted in a fenced block or an inline code span renders as
+/// visible text, so it is not a record — and a re-park never edits it.
+#[test]
+fn a_marker_quoted_in_code_is_not_a_record() {
+    let quoted = "<!-- loom:park Blocked by: #1689 by=guide reason=\"x\" -->";
+    for body in [
+        format!("Report:\n\n```\n{quoted}\n```\n"),
+        format!("~~~text\n{quoted}\n~~~\n"),
+        format!("````md\n```\n{quoted}\n```\n````\n"),
+        format!("Unclosed:\n```\n{quoted}\n"),
+        format!("Inline: `{quoted}` and ``{quoted}``.\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+        assert_eq!(drop_blockers(&body, &[1689]), body);
+    }
+    // Outside the code, the same body still declares its own records.
+    let body = format!("```\n{quoted}\n```\n\n{}\n", render(&rec(7)));
+    assert_eq!(blockers(&body), n(&[7]));
+    assert_eq!(drop_blockers(&body, &[1689, 7]), format!("```\n{quoted}\n```\n\n"));
+}
+
+/// The code mask must not hide a real record: a backtick in its reason, a
+/// code span beside it, or non-ASCII text before it on the line.
+#[test]
+fn a_real_record_beside_code_still_parses() {
+    let body = "ünïcode `span` <!-- loom:park Blocked by: #5 reason=\"the ` flag\" --> `tail`\n";
+    assert_eq!(blockers(body), n(&[5]));
+    assert_eq!(parse(body)[0].reason.as_deref(), Some("the ` flag"));
+    // An inline triple backtick is code, not a fence opener.
+    let body = "Use ```x``` here.\n<!-- loom:park Blocked by: #6 -->\n";
+    assert_eq!(blockers(body), n(&[6]));
+}

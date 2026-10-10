@@ -732,6 +732,53 @@ fn dry_run_plans_with_zero_writes() {
     assert!(r.summary().contains("dry-run"));
 }
 
+// --- incident shapes (#10837) ---------------------------------------------------
+
+/// The three Guide records loom-ui#1695 carried, verbatim: identical `reason=`.
+const LOOM_UI_1695_RECORDS: &str = "\
+<!-- loom:park Blocked by: #1689 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->
+<!-- loom:park Blocked by: #1692 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->
+<!-- loom:park Blocked by: #1693 by=guide at=2026-10-05T21:24:30Z reason=\"needs slice 1a, finished-item mode and compact layout\" -->";
+
+#[test]
+fn loom_ui_1695_shape_releases_without_inventing_approval() {
+    // Starred, triage-only lane (never carried `loom:issue`), every blocker closed.
+    let mut w = World::new();
+    let body = format!("Card layout work.\n\n{LOOM_UI_1695_RECORDS}\n");
+    w.with_body(1695, false, &body, &["loom:triage", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    let lane = ["loom:triage", "loom:blocked", "loom:operator-priority"];
+    w.extra.events.insert(1695, lane.map(String::from).to_vec());
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![1689, 1692, 1693]);
+    assert_eq!(r.released[0].restored, None);
+    assert_eq!(w.park.writes, vec!["remove #1695 loom:blocked"]);
+    let labels = w.labels(1695);
+    assert!(labels.contains("loom:triage") && !labels.contains("loom:issue"));
+}
+
+#[test]
+fn records_quoted_in_a_code_fence_never_release_an_unrecorded_hold() {
+    // #10837 itself: its body quotes #1695's records as evidence, and an
+    // operator later parked it with no record of its own. Before the fix the
+    // pass read the quotes as declarations and released the hold.
+    let mut w = World::new();
+    let body = format!("Reproduction:\n\n```\n{LOOM_UI_1695_RECORDS}\n```\n\nMore prose.\n");
+    w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(skipped(&r, "no-park-record"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty());
+    assert!(w.no_writes());
+    assert!(w.labels(10837).contains("loom:blocked"));
+}
+
 // --- the tick's gate ------------------------------------------------------------
 
 #[test]
