@@ -537,7 +537,9 @@ fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestI
         state: "open".to_string(),
         body: None,
         author: None,
+        author_association: None,
         is_pull_request: is_pr,
+        comments: 0,
     }
 }
 
