@@ -314,6 +314,8 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+// Sibling of `shell_budget::callout::EVIDENCE_DIFF_FLAGS`; see there for why
+// the two are not shared.
 const DIFF_FLAGS: &[&str] = &[
     "-U0",
     "--no-color",
