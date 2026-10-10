@@ -150,6 +150,7 @@ pub(crate) fn build(
         upstream: args.upstream.clone(),
         header: args.header,
         base_url_env: args.base_url_env.clone(),
+        observe: false,
     };
     let upstream = declared.validate()?;
     let (program, rest) = args
@@ -202,6 +203,7 @@ pub(crate) fn build(
         upstream,
         &[args.credential_env.as_str()],
         Vec::new(),
+        None,
         None,
     )?;
 

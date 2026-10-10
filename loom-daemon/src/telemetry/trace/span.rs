@@ -90,6 +90,10 @@ pub enum SpanName {
     /// until.
     #[serde(rename = "forge.read.shed")]
     ForgeReadShed,
+    /// One provider request observed by the egress proxy (Issue #11300): its
+    /// own root trace, counts and classified codes only, never a body.
+    #[serde(rename = "loom.egress.request")]
+    EgressRequest,
 }
 
 impl SpanName {
@@ -117,6 +121,7 @@ impl SpanName {
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
             Self::ForgeReaderSpill => "forge.reader.spill",
             Self::ForgeReadShed => "forge.read.shed",
+            Self::EgressRequest => "loom.egress.request",
         }
     }
 }

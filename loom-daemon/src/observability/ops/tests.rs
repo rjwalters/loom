@@ -281,6 +281,10 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
         MetricName::AgentScopePeakMemoryBytes,
+        MetricName::EgressRequests,
+        MetricName::EgressTokens,
+        MetricName::EgressLatency,
+        MetricName::EgressTtft,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }

@@ -51,6 +51,7 @@
 //! so the exit-code-driven path neither duplicates the proxy's mark nor
 //! downgrades a stronger one.
 
+use super::observe;
 use super::registry::{Record, Refusal, Registry, CREDENTIAL_HEADERS};
 use super::rotation::{self, ControlRefusal, RotateRequest};
 use crate::api_keys_pool::classify::{self, Classification};
@@ -472,6 +473,9 @@ async fn forward(
     if !body.is_empty() {
         request = request.body(body);
     }
+    // Observe mode (#11300): timing starts when the request is handed to the
+    // client. Off unless the record carries an observe context.
+    let started = std::time::Instant::now();
     let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
@@ -482,6 +486,10 @@ async fn forward(
                 record.launch_id,
                 record.upstream.host()
             );
+            if let Some(context) = record.observe() {
+                let observation = observe::Observation::unreachable(started);
+                observe::publish(context, &record.provider, &record.launch_id, &observation);
+            }
             return write_status(stream, 502, "upstream request failed").await;
         }
     };
@@ -523,6 +531,12 @@ async fn forward(
         record.record_usage(request_bytes, error_body.len() as u64, usage_headers);
         let classification =
             classify_response(status.as_u16(), &String::from_utf8_lossy(&error_body));
+        // Classified to a code and dropped: the body itself is never exported.
+        let error_observation = record.observe().map(|context| {
+            let observation =
+                observe::Tap::new(started, false).finish(status.as_u16(), Some(&error_body));
+            (context, observation)
+        });
         // Reply first, mark second: the harness gets its 429 without waiting
         // on the pool's `mkdir` lock, and a client that already hung up still
         // gets its account marked.
@@ -538,12 +552,24 @@ async fn forward(
             stream.shutdown().await
         }
         .await;
+        if let Some((context, observation)) = &error_observation {
+            observe::publish(context, &record.provider, &record.launch_id, observation);
+        }
         if let Some(classification) = classification {
             bad_mark_at_proxy(record.clone(), classification).await;
         }
         return replied;
     }
 
+    // Passive tee (#11300): fed the same chunks the relay writes, never
+    // consulted by it.
+    let mut tap = record.observe().map(|_| {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        observe::Tap::new(started, observe::Tap::is_sse(content_type))
+    });
     let mut response_bytes: u64 = 0;
     // Usage is recorded after this block whether or not it succeeds, so a
     // client that disconnects mid-stream still has its bytes counted.
@@ -556,6 +582,9 @@ async fn forward(
             match response.chunk().await {
                 Ok(Some(chunk)) if !chunk.is_empty() => {
                     response_bytes += chunk.len() as u64;
+                    if let Some(tap) = tap.as_mut() {
+                        tap.feed(&chunk);
+                    }
                     stream
                         .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
                         .await?;
@@ -580,6 +609,10 @@ async fn forward(
     }
     .await;
     record.record_usage(request_bytes, response_bytes, usage_headers);
+    if let (Some(context), Some(tap)) = (record.observe(), tap) {
+        let observation = tap.finish(status.as_u16(), None);
+        observe::publish(context, &record.provider, &record.launch_id, &observation);
+    }
     streamed
 }
 

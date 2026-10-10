@@ -565,6 +565,7 @@ fn anthropic_proxy() -> ProfileProxy {
         upstream: "https://api.anthropic.com".into(),
         header: HeaderStyle::AuthorizationBearer,
         base_url_env: vec!["ANTHROPIC_BASE_URL".into()],
+        observe: false,
     }
 }
 
@@ -696,12 +697,14 @@ fn a_malformed_credential_proxy_block_is_refused_at_validation() {
         upstream: "not-a-url".into(),
         header: HeaderStyle::XApiKey,
         base_url_env: Vec::new(),
+        observe: false,
     };
     assert!(bad.validate().is_err());
     let bad_env = ProfileProxy {
         upstream: "https://api.anthropic.com".into(),
         header: HeaderStyle::XApiKey,
         base_url_env: vec!["not a var name".into()],
+        observe: false,
     };
     assert!(bad_env.validate().is_err());
     assert!(anthropic_proxy().validate().is_ok());

@@ -56,6 +56,7 @@
 //! installs nothing, and every rotation request there is refused.
 
 pub mod exec;
+pub mod observe;
 pub mod registry;
 pub mod rotate_client;
 pub mod rotation;
@@ -126,6 +127,10 @@ pub struct ProfileProxy {
     /// environment cannot be proxied by this slice; see the follow-ups.
     #[serde(default)]
     pub base_url_env: Vec<String>,
+    /// Opt this profile in to passive per-request telemetry (#11300). Takes
+    /// effect only when [`observe::enabled`] is also true; default off.
+    #[serde(default)]
+    pub observe: bool,
 }
 
 impl ProfileProxy {
@@ -286,6 +291,24 @@ pub fn prepare(
             account,
             model_class: bad_marks::normalize_model_class(&selection.model),
         });
+    let observe = (declared.observe && observe::enabled(config)).then(|| {
+        let runtime = std::env::var("LOOM_RUNTIME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "native".to_string());
+        let profile = selection
+            .profile
+            .clone()
+            .unwrap_or_else(|| selection.provider.clone());
+        let tap = match selection.profile.as_deref() {
+            Some(p) => crate::runtime_preference::Tap::with_profile(&runtime, p),
+            None => crate::runtime_preference::Tap::runtime(&runtime),
+        };
+        let seat = pool_attribution
+            .as_ref()
+            .map_or("-", |attribution| attribution.account.as_str());
+        observe::ObserveContext::from_env(seat, &tap.to_string(), &profile, &runtime)
+    });
     arm(
         secret,
         provider,
@@ -294,6 +317,7 @@ pub fn prepare(
         &[source.as_str(), target.as_str()],
         vec![crate::api_keys_pool::paths::per_repo_api_keys_dir(root)],
         pool_attribution,
+        observe,
     )
     .map(Some)
 }
@@ -320,6 +344,7 @@ struct PoolAttribution {
 /// `credential_names` are every environment variable the container might read
 /// the credential from: each is assigned the placeholder AND withheld from
 /// by-name forwarding.
+#[allow(clippy::too_many_arguments)] // one record shape; each argument is a distinct launch fact
 fn arm(
     secret: String,
     provider: String,
@@ -328,6 +353,7 @@ fn arm(
     credential_names: &[&str],
     mask_dirs: Vec<std::path::PathBuf>,
     pool_attribution: Option<PoolAttribution>,
+    observe: Option<observe::ObserveContext>,
 ) -> Result<Prepared, LaunchError> {
     let (bind_ip, container_host) = resolve_bind();
     let bound = server::Bound::bind(bind_ip).map_err(|e| {
@@ -346,6 +372,9 @@ fn arm(
             attribution.account,
             attribution.model_class,
         );
+    }
+    if let Some(context) = observe {
+        record = record.with_observe(context);
     }
     registry.insert(&placeholder, record);
 
