@@ -1368,6 +1368,11 @@ Exit codes: 0 artifact, 1 no artifact, 2 usage (Judge/Curator refused),
 orchestrator calls it before Builder/Doctor Task dispatch; see
 `native-sweep.md` and `sweep-execution-model.md`.
 
+Because a phase can outlast the Bash tool cap (120s default / 600s max), the
+orchestrator runs it as a background Bash process writing `exit` and
+`report.json` files and polls in-turn with bounded waits until the exit file
+exists; the recipe is in `native-sweep.md` "Waiting for `worker run`".
+
 ### Bounding the metered backstop tier (issue #8555)
 
 The backstop tap is the only entry in a preference list with a **marginal

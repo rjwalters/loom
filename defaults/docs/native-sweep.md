@@ -99,3 +99,23 @@ the helpers' effective worktree root: `LOOM_WORKTREE_ROOT` >
 helper takes the lease; the launched Builder still claims the issue exactly as
 a Task subagent does and its own `worktree.sh N` reuses the directory. A helper
 refusal, or an unreadable pre-launch PR snapshot, exits 78 before launch.
+
+### Waiting for `worker run` (long phases, #11285)
+
+A phase can outlast the Bash tool's 120s default / 600s maximum, so a direct
+foreground `worker run … --json` call cannot reliably return its report. Run it
+in the background and poll **in the same turn** until it exits. This is a Bash
+*process* the orchestrator awaits, not a background role subagent (still
+prohibited); never end the turn while it is pending (`sweep-execution-model.md`).
+
+```bash
+D=$(mktemp -d)   # Bash run_in_background:true; exit code lands in $D/exit
+( loom-daemon worker run --role builder --issue N --json >"$D/report.json" 2>"$D/stderr.log"; echo $? >"$D/exit" )
+```
+
+Then, in foreground Bash calls, each bounded under the tool cap (e.g.
+`for i in $(seq 9); do [ -s "$D/exit" ] && break; sleep 10; done`), repeat until
+`$D/exit` is non-empty. Read the exit code and `$D/report.json` only then:
+0 artifact, 1 no artifact, 75 fall back to Claude, 78 config, 124 timeout
+(`--timeout`, default 3600s). A missing `exit` file means the worker is still
+running, never success; if the wrapper itself died, treat it as exit 1.
