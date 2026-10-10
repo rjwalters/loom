@@ -477,7 +477,7 @@ mod tests {
         );
         assert!(doctor.contains(r#"PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}""#));
         let guard = r#"git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD"#;
-        let re_pin = "{ PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }";
+        let re_pin = "{ PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }";
         assert!(doctor.matches(re_pin).count() >= 2, "both rewrite recipes re-pin");
         // Every fenced block that rebases onto main and pushes a pinned lease
         // checks ancestry first — except the one that pins `git rev-parse HEAD`
@@ -492,10 +492,14 @@ mod tests {
             if block.contains("PUSH_LEASE_SHA=$(git rev-parse HEAD)\n") {
                 continue;
             }
+            // Step 9's block only *asserts* the pin was verified at setup (an
+            // ancestry check there rejects every amend); the conflicts recipe
+            // may verify inline. Either way it precedes the rebase.
+            let verified = r#"[ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ]"#;
             let at = block
-                .find(guard)
-                .expect("pinned rebase recipe lacks the ancestry check");
-            assert!(at < rebase, "the ancestry check must run BEFORE the rebase");
+                .find(verified)
+                .expect("pinned rebase recipe lacks the verified-pin check");
+            assert!(at < rebase, "the verified-pin check must run BEFORE the rebase");
             guarded += 1;
         }
         assert!(guarded >= 2, "found {guarded} guarded recipes, expected >= 2");
@@ -555,5 +559,116 @@ mod tests {
         let (_tmp, _origin, work) = fixture();
         assert!(ref_resolves(Some(&work), "refs/heads/feature/x"));
         assert!(!ref_resolves(Some(&work), "refs/heads/feature/missing"));
+    }
+
+    /// The fenced bash block under `heading` in the Doctor prompt, verbatim.
+    fn prompt_block(heading: &str) -> String {
+        let doctor = include_str!("../../../defaults/.claude/commands/loom/doctor.md");
+        let from = doctor.find(heading).expect("heading");
+        let rest = &doctor[from..];
+        let open = rest.find("```bash\n").expect("fence") + "```bash\n".len();
+        let close = rest[open..].find("```").expect("close");
+        rest[open..open + close].to_string()
+    }
+
+    /// Run the prompt's own "Verify the pin" and "Pin the lease" blocks, in
+    /// order, in `work`; `between` lists shell steps run before each push.
+    /// Returns (exit status ok, stderr).
+    fn doctor_flow(work: &Path, pushes: &[&str]) -> (bool, String) {
+        let mut script = String::from("set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n");
+        script.push_str(&prompt_block("### Verify the pin"));
+        for step in pushes {
+            script.push_str(step);
+            script.push('\n');
+            script.push_str(&prompt_block("### Pin the lease"));
+        }
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(work)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("bash runs");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
+    fn fixture_with_main() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, origin, work) = fixture();
+        run(&work, &["push", "-q", "origin", "main"]);
+        // The PR's own commit, on top of main, so an amend never touches main's.
+        std::fs::write(work.join("f.txt"), "f\n").expect("write");
+        run(&work, &["add", "f.txt"]);
+        run(&work, &["commit", "-q", "-m", "feature"]);
+        // Tracking set, as `gh pr checkout` leaves it (the recipe pushes without a refspec).
+        run(&work, &["push", "-q", "-u", "origin", "feature/x"]);
+        (tmp, origin, work)
+    }
+
+    const AMEND: &str = "echo x >> f.txt && git add f.txt && git commit -q --amend --no-edit";
+
+    /// PR #9966 Judge round 3: the pin is verified BEFORE the fix work, so an
+    /// amend (which drops the claim-time tip from HEAD's history) still pushes.
+    #[test]
+    fn the_prompt_flow_pushes_an_amended_tip() {
+        let (_tmp, _origin, work) = fixture_with_main();
+        let (ok, err) = doctor_flow(&work, &[AMEND]);
+        assert!(ok, "amend -> push must succeed: {err}");
+        assert_eq!(
+            live_tip(Some(&work), "origin", "feature/x").expect("ls-remote"),
+            LiveTip::At(rev_parse(&work, "HEAD")),
+        );
+    }
+
+    /// Own push -> amend -> second push: the re-pin carries its verification.
+    #[test]
+    fn the_prompt_flow_pushes_twice_with_an_amend_between() {
+        let (_tmp, _origin, work) = fixture_with_main();
+        let (ok, err) = doctor_flow(&work, &[AMEND, AMEND]);
+        assert!(ok, "push -> amend -> push must succeed: {err}");
+        assert_eq!(
+            live_tip(Some(&work), "origin", "feature/x").expect("ls-remote"),
+            LiveTip::At(rev_parse(&work, "HEAD")),
+        );
+    }
+
+    /// The sibling-push refusal is kept: a push that lands after the pin makes
+    /// the pinned lease reject, with or without an amend.
+    #[test]
+    fn the_prompt_flow_still_refuses_after_a_sibling_push() {
+        let (tmp, origin, work) = fixture_with_main();
+        let sibling = sibling_pushes(tmp.path(), &origin);
+        let (ok, _err) = doctor_flow(&work, &[AMEND]);
+        assert!(!ok, "a sibling push after the pin must be refused");
+        assert_eq!(
+            live_tip(Some(&work), "origin", "feature/x").expect("ls-remote"),
+            LiveTip::At(sibling),
+            "the sibling's commit survives"
+        );
+    }
+
+    /// Skipping the early verification fails safe: the push block refuses an
+    /// unverified pin instead of re-deriving it after a rewrite.
+    #[test]
+    fn the_push_block_refuses_an_unverified_pin() {
+        let (_tmp, _origin, work) = fixture_with_main();
+        let script = format!(
+            "set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n{AMEND}\n{}",
+            prompt_block("### Pin the lease")
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&work)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("bash runs");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Pin unverified"));
     }
 }

@@ -700,7 +700,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    ```
 3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
 4. **Read feedback**: Understand what the reviewer is asking for
-5. **Check out PR branch in a dedicated worktree** (see "PR Branch Isolation" above): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`.
+5. **Check out PR branch in a dedicated worktree** (see "PR Branch Isolation" above): use `./.loom/scripts/worktree.sh <ISSUE_NUM>` for `feature/issue-<N>` branches or `./.loom/scripts/pr-worktree.sh <PR_NUMBER>` for external/ad-hoc branches, then `cd` into the worktree before running `gh pr checkout`. Then "Verify the pin" (below), before any edit.
 6. **CRITICAL: Assess ALL CI failures FIRST** (see "CI Assessment" section below):
    - Run `forge wait-checks <number> --timeout 20` to identify ALL failing checks
    - Fetch logs for each failing check
@@ -715,7 +715,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
-   - **Then run "Pin the lease" below, top to bottom**: it is the pre-open rebase onto `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase") and the pinned push (#9487). Never rebase onto `main` before it: its ancestry check needs the pre-rebase `HEAD` (a moved `main` drops the pin, so it STOPs your own push). On a conflict resolve in place (`git add`, `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". Any dispatch reason; no-op if `main` hasn't moved.
+   - **Then run "Pin the lease" below, top to bottom**: the pre-open rebase onto `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase") and the pinned push (#9487). Never rebase before it. On a conflict resolve in place (`git add`, `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
@@ -937,40 +937,45 @@ git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --sh
 | Finding | Action |
 |---------|--------|
 | The concurrent push already fixes the blocker (checks green / Judge feedback addressed) | **Stand down.** Do not push. Comment, drop your claim, and exit (see below). |
-| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA` and push (below). Never `--force`. |
+| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA`, re-run "Verify the pin" before any further amend, and push (below). Never `--force`. |
 | Your work and theirs overlap partially | Keep only the parts still needed, rebase, re-run local checks, then re-pin and push as above. |
 | You cannot tell | Prefer standing down and commenting — a duplicate fix costs more than a deferred one. |
 
+### Verify the pin — after setup, BEFORE any edit or rewrite (#9487)
+
+The pin must be in `HEAD`'s history, checkable only until the first amend or
+rebase drops it. Verify once; the push block reuses it through every rewrite.
+
+```bash
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
+git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+PUSH_LEASE_OK=$PUSH_LEASE_SHA
+```
+
 ### Pin the lease — a bare `--force-with-lease` is unsafe here (#9487)
 
-The recheck above is the *social* layer; this mechanical one is **not
-optional**. A bare `--force-with-lease` checks `refs/remotes/origin/<branch>`,
-**shared by every linked worktree**: a sibling's `git fetch` makes your push
-delete their commit, no error (PR #9483). Pin the head you built on; never
-"freshen" the pin (that pins theirs). Why: `defaults/docs/push-lease-pinning.md`.
+The recheck above is the *social* layer; this one is **mandatory**. A bare
+`--force-with-lease` checks `refs/remotes/origin/<branch>`, **shared by every
+linked worktree**: a sibling's `git fetch` makes your push delete their commit
+(PR #9483). Pin the head you built on; never "freshen" it. Why: `defaults/docs/push-lease-pinning.md`.
 
 ```bash
 BRANCH=$(git branch --show-current)
 # CLAIM_HEAD_SHA (step 2, read BEFORE checkout); re-pin only per the table / last line.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
 [ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
-# BEFORE any rebase/amend: git accepts ANY full-SHA pin, even unfetched, and overwrites it.
-git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+# git accepts ANY full-SHA pin, even unfetched: "Verify the pin" must have run first.
+[ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { echo "Pin unverified: STOP." >&2; exit 1; }
 git fetch origin main && git rebase origin/main || exit 1  # conflict: resolve, add, --continue, resume here
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync after rebase (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
 git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
-  { PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
 ```
 
-**Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
-dropped"**, and never run `./scripts/version.sh bump …` here even if the gate's
-Fix: line suggests it (#7743): bumps are `version-bump-on-merge.yml`'s job, once,
-after merge, so the gate should never fire on a rebase. If it does, stop, do not
-push, report it on the PR — a hand-rolled bump produced `bef3e07a` (#7341: 8 core
-files patched, `.loom/install-metadata.json` missed, CI red).
+Never hand-bump `VERSION` & co. here (#7743, #7341): if the gate fires, stop and report on the PR.
 
 **Standing down** (a concurrent fix already landed):
 
@@ -1374,11 +1379,12 @@ All CI checks passing. Ready for re-review!"
 This is a critical issue that blocks merging. Fix it immediately:
 
 ```bash
-# Pin = the claim-time head, never re-read now; check it BEFORE the rebase ("Pin the lease").
+# Pin = the claim-time head, never re-read; verify BEFORE any rewrite.
 # Mid-rebase, check passed pre-rebase (step 9)? Skip to `git rebase --continue`.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}"
 BRANCH=$(git branch --show-current)
-git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+# Nothing rewritten yet? Verify now (an amend fails safe).
+[ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD && PUSH_LEASE_OK=$PUSH_LEASE_SHA; } || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
 
 git fetch origin main
 git rebase origin/main
@@ -1395,7 +1401,7 @@ fi
 
 # Force push with the lease PINNED (never bare -- #9487); re-pin to your own push
 git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
-  { PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 
 # Verify CI passes after rebase
 loom-daemon forge wait-checks 42 --timeout 20
