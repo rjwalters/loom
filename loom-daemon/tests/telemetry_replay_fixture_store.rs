@@ -16,20 +16,32 @@
 //! - an uncovered host is reported `unknown`, not empty (`h-silent`);
 //! - two hosts' rows for one item resolve to the row naming the holding host
 //!   (issue 60).
+//!
+//! `--check` (#11128) the same way, over the agreement fixture
+//! (`fixtures/signoz_replay/agreement.sql`): the command's own queries 6-7 and
+//! parameters, its reader and its exit code. The recorded export the unit
+//! tests read (`check_export.jsonl`) must equal this live run.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 use chrono::{TimeZone, Utc};
+use loom_daemon::telemetry_replay::check::{self, CheckParams, EXIT_AGREE, EXIT_DISAGREE};
 use loom_daemon::telemetry_replay::{
     assemble, render, state_and_coverage_queries, Replay, ReplayParams, REPLAY_QUERIES,
 };
 
 const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
 const FIXTURE: &str = include_str!("fixtures/signoz_replay/fleet_state.sql");
+const AGREEMENT_FIXTURE: &str = include_str!("fixtures/signoz_replay/agreement.sql");
+const CHECK_EXPORT: &str = include_str!("fixtures/signoz_replay/check_export.jsonl");
 
 fn run_query(params: &ReplayParams, sql: &str) -> String {
+    run_on(FIXTURE, &params.params(), sql)
+}
+
+fn run_on(fixture: &str, params: &[(String, String)], sql: &str) -> String {
     let mut args: Vec<String> = [
         "run",
         "--rm",
@@ -43,12 +55,7 @@ fn run_query(params: &ReplayParams, sql: &str) -> String {
     ]
     .map(str::to_string)
     .to_vec();
-    args.extend(
-        params
-            .params()
-            .into_iter()
-            .map(|(k, v)| format!("--param_{k}={v}")),
-    );
+    args.extend(params.iter().map(|(k, v)| format!("--param_{k}={v}")));
     let mut child = Command::new("docker")
         .args(&args)
         .stdin(Stdio::piped())
@@ -56,7 +63,7 @@ fn run_query(params: &ReplayParams, sql: &str) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("docker is required for this test");
-    let script = format!("{FIXTURE}\n{sql};\n");
+    let script = format!("{fixture}\n{sql};\n");
     child
         .stdin
         .as_mut()
@@ -126,4 +133,59 @@ fn telemetry_replay_reports_fixture_state_with_uncovered_hosts_unknown() {
 fn telemetry_replay_repo_scope_binds_through_to_the_state_query() {
     assert!(replay("other/repo").state.is_empty());
     assert_eq!(replay("rjwalters/loom").state.len(), 7);
+}
+
+fn check_params(repo: &str, threshold_sec: u32) -> CheckParams {
+    CheckParams {
+        replay: ReplayParams {
+            as_of: Utc.with_ymd_and_hms(2026, 10, 4, 13, 0, 0).unwrap(),
+            window_sec: 3900,
+            repo: repo.to_string(),
+        },
+        span_sec: 3600,
+        step_sec: 300,
+        threshold_sec,
+    }
+}
+
+fn run_check(params: &CheckParams) -> check::Check {
+    let (runs_sql, report_sql) = check::check_and_report_queries(REPLAY_QUERIES).unwrap();
+    let bound = params.params();
+    check::assemble(
+        params,
+        &run_on(AGREEMENT_FIXTURE, &bound, &runs_sql),
+        &run_on(AGREEMENT_FIXTURE, &bound, &report_sql),
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn telemetry_replay_check_fails_on_the_covered_host_past_the_threshold_only() {
+    let params = check_params("", 600);
+    let c = run_check(&params);
+    assert_eq!(c.exit_code(), EXIT_DISAGREE);
+    let failures: Vec<_> = c
+        .failures()
+        .map(|d| (d.emitter.as_str(), d.issue, d.disagree_sec))
+        .collect();
+    // h-drift's one disagreement spans two forge stages (600 s each): one
+    // 1200 s run, over the threshold.
+    assert_eq!(failures, [("h-stuck", 5, 2700), ("h-drift", 4, 1200)]);
+    // The unit tests' recorded export is this run, not a hand-written copy.
+    assert_eq!(c, check::assemble_export(&params, CHECK_EXPORT).unwrap());
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn telemetry_replay_check_agrees_when_only_uncovered_or_short_disagreements_remain() {
+    // Scoped to rjwalters/loom: h-gap's identical stale row is unknown, and
+    // h-lag's 300 s lag is under the threshold.
+    let c = run_check(&check_params("rjwalters/loom", 600));
+    assert_eq!(c.exit_code(), EXIT_AGREE, "{c:#?}");
+    let gap = c.hosts.iter().find(|h| h.emitter == "h-gap").unwrap();
+    assert_eq!(gap.coverage, "unknown");
+    assert!(c.disagreements.iter().all(|d| d.emitter == "h-lag"));
+    // --threshold raises the bar: neither 2700 s nor 1200 s fails at 3000 s.
+    assert_eq!(run_check(&check_params("", 3000)).exit_code(), EXIT_AGREE);
 }

@@ -18,15 +18,19 @@ fn params() -> ReplayParams {
 fn the_committed_sql_splits_into_the_state_and_coverage_queries() {
     let (state, coverage) = state_and_coverage_queries(REPLAY_QUERIES).unwrap();
     for q in [&state, &coverage] {
-        assert!(q.starts_with("WITH recs AS"), "{q}");
+        assert!(q.starts_with("WITH samples AS"), "{q}");
         // Knowable-at decides membership; no comment survives the split.
         assert!(q.contains("created_at < {t:DateTime64(3)}"), "{q}");
         assert!(!q.contains("--"), "{q}");
         assert!(!q.ends_with(';'));
     }
     assert!(state.contains("FROM live"), "{state}");
+    // Queries 1-3 read the instant t only, whatever span is bound.
+    for q in [&state, &coverage] {
+        assert!(q.contains("t = {t:DateTime64(3)}"), "{q}");
+    }
     assert!(state.contains("reporting_hosts"), "{state}");
-    assert!(coverage.contains("LEFT JOIN status s"), "{coverage}");
+    assert!(coverage.contains("FROM status WHERE t = {t:DateTime64(3)}) s"), "{coverage}");
     // No row caps: the only LIMIT in either query is the dedupe `LIMIT 1 BY`.
     for q in [&state, &coverage] {
         assert_eq!(q.matches("LIMIT").count(), q.matches("LIMIT 1 BY").count(), "{q}");
@@ -41,7 +45,7 @@ fn an_unexpected_sql_shape_is_refused_not_guessed() {
     let short = format!("{PREFIX_BEGIN}\nWITH x AS (SELECT 1)\n{PREFIX_END}\nSELECT 1;");
     assert!(state_and_coverage_queries(&short)
         .unwrap_err()
-        .contains("expected 8 statements"));
+        .contains("expected 10 statements"));
     // Query 1 no longer begins with the prefix.
     let moved = REPLAY_QUERIES.replacen(PREFIX_BEGIN, &format!("SELECT 9\n{PREFIX_BEGIN}"), 1);
     assert!(state_and_coverage_queries(&moved)
@@ -60,6 +64,8 @@ fn parameters_bind_the_instant_in_utc_the_window_and_the_repo_scope() {
             ("t".to_string(), "2026-10-04 13:00:00.250".to_string()),
             ("window".to_string(), "3900".to_string()),
             ("repo".to_string(), "rjwalters/loom".to_string()),
+            ("span".to_string(), "0".to_string()),
+            ("step".to_string(), "300".to_string()),
         ]
     );
 }
