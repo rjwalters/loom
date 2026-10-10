@@ -236,7 +236,15 @@ The contract:
    including `setsid` descendants. The stop is queued with `--no-block` and
    the cgroup is sent `SIGKILL` after a 5 s grace, so H4 never waits on
    systemd's stop job (#11051). H4 runs the teardowns in parallel (8 at once)
-   and ends its stop phase at the pause budget plus a 15 s margin. On launchd it is the orphan reaper's
+   and ends its stop phase at the pause budget plus a 15 s margin. A tree
+   whose teardown has not returned by then gets `SIGKILL` on its process group
+   only. **This is the one exception to "nothing outlives H4"**: a queued
+   teardown that never started gets no `SIGTERM` and its scope is not stopped,
+   so `setsid` children can survive until H5 reaps leftovers before it
+   resumes. `daemon.roll.paused` reports `forced_stops`, the number of trees
+   ended this way. A parked item killed at the bound stays resumable (its
+   safe point is on disk), unlike the ledger's deadline path, which requeues
+   it; H5's reap makes either safe. On launchd it is the orphan reaper's
    freeze-first tree kill over the worktree-attributed and pgid-attributed
    seeds. A pgid-only `kill(-pgid)` is not enough
    (`orphan_process_reaper.rs:16-35`). For session-exec items it is the `.cancel`
