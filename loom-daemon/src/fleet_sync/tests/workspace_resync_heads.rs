@@ -594,6 +594,68 @@ fn a_broken_credential_helper_raises_one_host_level_alert() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_credential_helper_failure_behind_a_forge_fault_stays_the_hosts() {
+    // The forge says NotFound/Forbidden (the query's credential cannot see a
+    // private repo) and the `git ls-remote` fallback cannot get a credential
+    // either. That is the host's credential helper, not the repo: one
+    // `credential-helper` alert, never a `repo-access` refusal per repo.
+    use std::os::unix::fs::PermissionsExt;
+    for fault in [
+        gone(),
+        HeadFault::Forbidden("Resource not accessible by integration".to_string()),
+    ] {
+        let fx = Fixture::new(current());
+        let host = Host::new(&fx, "host-a");
+        let private = fx.clone_as("private");
+        host.heads
+            .faults
+            .borrow_mut()
+            .insert(private.clone(), fault.clone());
+        // An ssh "transport" that fails the way git does with no credential.
+        let ssh = fx.tmp.path().join("no-credential-ssh");
+        write(
+            &ssh,
+            "#!/bin/sh\necho \"fatal: could not read Username for 'https://github.com': \
+             terminal prompts disabled\" >&2\nexit 128\n",
+        );
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&private, &["config", "core.sshCommand", ssh.to_str().unwrap()]);
+        git(
+            &private,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@example.invalid/acme/private.git",
+            ],
+        );
+        let roots = [private.clone(), host.root.clone()];
+
+        let mut alerts = Vec::new();
+        for _ in 0..4 {
+            let pass = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
+            let (bad, good) = (&pass.workspaces[0], &pass.workspaces[1]);
+            assert_eq!(good.state, WState::W0, "the healthy repo is unaffected: {pass:?}");
+            assert!(
+                !reason(bad).contains("the forge"),
+                "not wrapped as the forge's refusal ({fault}): {bad:?}"
+            );
+            assert!(reason(bad).contains("could not read Username"), "{bad:?}");
+            alerts.extend(pass.alerts.iter().map(|a| (a.kind, a.root.clone())));
+            assert!(host.memory.borrow().outage_hold(host.now.get()).is_none());
+            // Past the repo's own backoff: every pass retries it.
+            host.advance(Duration::from_secs(60 * 60));
+        }
+        assert_eq!(
+            alerts,
+            vec![("credential-helper", PathBuf::new())],
+            "one host alert across the retries, no `repo-access` ({fault})"
+        );
+    }
+}
+
 // ----------------------------------------------------------------------------
 // A pass that does not end
 // ----------------------------------------------------------------------------

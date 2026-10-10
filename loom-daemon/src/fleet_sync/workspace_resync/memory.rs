@@ -253,7 +253,8 @@ impl Memory {
             kind: "credential-helper",
             failures: 1,
             detail: format!(
-                "git could not get a credential from this host's credential helper, so private                  repos cannot be read (one alert for the host, not one per repo): {detail}"
+                "git could not get a credential from this host's credential helper, so private \
+                 repos cannot be read (one alert for the host, not one per repo): {detail}"
             ),
             next_attempt: now + chrono_of(interval),
         })

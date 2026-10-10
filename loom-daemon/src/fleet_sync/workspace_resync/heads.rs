@@ -467,6 +467,11 @@ pub(super) fn check(
                     }
                     Ok(head)
                 }
+                // git could get no credential at all: the host's failure, not
+                // the repo's, whatever the forge said. Kept as it is so the
+                // pass reports one `credential-helper` alert for the host
+                // instead of a refusal (and `repo-access`) per repo.
+                (Err(e), Some(_)) if e.downcast_ref::<git::Credential>().is_some() => Err(e),
                 // The forge says it has no such repo and the remote gave no
                 // head either: the repo's failure, however git worded it.
                 (Err(e), Some(fault)) => Err(git::Refused(format!("{fault} ({e:#})")).into()),
