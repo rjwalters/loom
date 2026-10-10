@@ -90,6 +90,47 @@ fn a_value_that_tries_to_close_its_own_quoting_cannot() {
 }
 
 #[test]
+fn prose_shaped_pass_through_values_survive_eval() {
+    // #9041: `BLOCK_REASON` / `ORTHOGONAL` echo `--block-reason` /
+    // `--orthogonal`, which the Curator builds from prose. Until they were
+    // routed through `shell_quote` these were emitted raw; now that free text
+    // reaches the quoting, pin that it holds for the shapes prose takes.
+    for value in [
+        "doctor cycle exhausted",               // curator.md's own example
+        "two words; and a semicolon",           // `;` ends the assignment
+        "reason $(touch /nonexistent/x) end",   // command substitution
+        "reason `touch /nonexistent/x` end",    // ... the backtick spelling
+        "says \"blocked\" in the review",       // double quote
+        "it's blocked",                         // single quote
+        "  Doctor   Cycle\tExhausted ",         // the suite's T7e value
+        "line1\nCONCLUSION_HASH=deadbeef",      // a forged later key
+        "epic-open-but-complete:owner/repo#14", // documented ORTHOGONAL id: `#`
+        "a && b || c | d > e < f & g",          // control operators
+        "* ? [a-z] ~ {a,b} !!",                 // glob / brace / history
+    ] {
+        assert_eq!(eval_roundtrip(value), value, "{value:?}");
+    }
+}
+
+#[test]
+fn a_quoted_value_is_always_exactly_one_line() {
+    // The forged-key shape (#9041): a newline in a raw value starts a new
+    // output line, and a first-match line parser reads `CONCLUSION_HASH=` off
+    // it. `eval` is not the only consumer that has to be safe.
+    for value in [
+        "line1\nCONCLUSION_HASH=deadbeef",
+        "a\n\nb",
+        "trailing\n",
+        "\nleading",
+        "tab\tand\nnewline",
+    ] {
+        let quoted = shell_quote(value);
+        assert!(!quoted.contains('\n'), "{value:?} quoted as {quoted:?}");
+        assert_eq!(eval_roundtrip(value), value, "{value:?}");
+    }
+}
+
+#[test]
 fn a_safe_word_is_left_bare() {
     // Not required for correctness, but it is what the existing fixtures see,
     // and gratuitously quoting every value would churn the suite's expectations.

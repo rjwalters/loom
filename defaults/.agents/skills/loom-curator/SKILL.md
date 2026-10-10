@@ -1602,9 +1602,9 @@ else
 fi
 ```
 
-`eval` is safe here exactly as it is for `claim-staleness.sh`: the script
-emits only `KEY=VALUE` lines built from a fixed enum, pre-sorted plain-text
-blocker lines and a hex hash — never raw forge text. **If
+`eval` is safe here because every value is shell-quoted, not because of its
+source: `BLOCK_REASON`/`ORTHOGONAL` are your own free text, echoed back
+as one quoted word each (#9041). **If
 `.loom/scripts/dep-recheck-fingerprint.sh` is missing** (an older install
 that has not been resynced yet): fall back to computing `VERDICT`/`BLOCKERS`
 inline exactly as this section did before #7281, but apply the same UNKNOWN
