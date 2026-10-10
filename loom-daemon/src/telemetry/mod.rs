@@ -68,7 +68,9 @@ pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
 mod start_facts;
-pub use start_facts::{model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS};
+pub use start_facts::{
+    effort_source, model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS,
+};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};

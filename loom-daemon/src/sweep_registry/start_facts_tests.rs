@@ -67,6 +67,7 @@ async fn sweep_started_carries_the_facts_its_outcome_reports() {
     let started = native(records.into_iter().next().expect("one sweep.started"));
     assert_eq!(started["kind"], "sweep.started");
     assert_eq!(started["model_source"], "explicit");
+    assert_eq!(started["effort_source"], "explicit");
     assert_eq!(
         registry
             .start_facts_snapshot()
@@ -93,7 +94,7 @@ async fn sweep_started_carries_the_facts_its_outcome_reports() {
     std::env::remove_var("LOOM_REPO");
 
     for (key, want) in [
-        ("model", serde_json::json!("opus")),
+        ("model", serde_json::json!("claude-opus-5-5")),
         ("effort", serde_json::json!("high")),
         ("attempt_index", serde_json::json!(2)),
         ("previous_sweep_id", serde_json::json!("sweep-prior")),
@@ -102,6 +103,46 @@ async fn sweep_started_carries_the_facts_its_outcome_reports() {
         assert_eq!(started[key], want, "sweep.started {key}");
         assert_eq!(outcome[key], want, "sweep.outcome {key}");
     }
+    assert_eq!(outcome["config"]["effort_source"], "explicit");
+}
+
+/// Issue #11370: no explicit effort reports the effort that applies, as a
+/// `default`; an alias reports its full id; an unnamed model is absent with
+/// `model_source=unknown`. The child's own arguments are unchanged.
+#[tokio::test]
+#[serial]
+async fn dispatch_reports_resolved_effort_and_model() {
+    std::env::set_var("LOOM_REPO", REPO);
+    std::env::remove_var("LOOM_EFFORT");
+    let dir = tempdir().unwrap();
+    let (mut registry, _rec) = fixture_registry(dir.path());
+    let alias = registry
+        .dispatch(&SweepKind::Issue(11371), None, Some("sonnet"), None, None)
+        .unwrap()
+        .sweep_id;
+    let unnamed = registry
+        .dispatch(&SweepKind::Issue(11372), None, None, None, None)
+        .unwrap()
+        .sweep_id;
+    std::env::remove_var("LOOM_REPO");
+
+    let facts = registry.start_facts_snapshot();
+    let a = &facts[&alias];
+    assert_eq!(a.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(a.model_source.as_deref(), Some("explicit"));
+    let u = &facts[&unnamed];
+    assert_eq!(u.model, None);
+    assert_eq!(u.model_source.as_deref(), Some("unknown"));
+    for f in [a, u] {
+        // Present exactly when the admitted runtime has an effort setting.
+        assert_eq!(f.effort.is_some(), f.effort_source.is_some());
+        if let Some(source) = f.effort_source.as_deref() {
+            assert_eq!(source, "default");
+        }
+    }
+    // The launch arguments stay as dispatched.
+    assert_eq!(registry.entries[&alias].model.as_deref(), Some("sonnet"));
+    assert_eq!(registry.entries[&alias].effort, None);
 }
 
 #[tokio::test]

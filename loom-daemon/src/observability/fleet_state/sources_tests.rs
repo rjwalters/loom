@@ -280,7 +280,8 @@ fn an_anchor_taken_mid_sweep_carries_its_start_facts_on_the_running_row() {
     assert_eq!(row["stage"], FleetStage::SweepCurator.as_str());
     assert_eq!(row["host"], "host-a");
     assert_eq!(row["slot"], "regular");
-    assert_eq!(row["model"], "opus");
+    assert_eq!(row["model"], "claude-opus-5-5");
+    assert_eq!(row["effort_source"], "explicit");
     assert_eq!(row["effort"], "high");
     assert_eq!(row["model_source"], "explicit");
     assert_eq!(row["attempt_index"], 1);
