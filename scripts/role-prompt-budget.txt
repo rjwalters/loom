@@ -21,7 +21,7 @@ auditor        20473        -
 builder        30748        -
 champion       14286        -
 curator        46758    30000
-doctor         32737    30000
+doctor         32708    30000
 driver         10760        -
 guide          44228        -
 hermit         16479        -

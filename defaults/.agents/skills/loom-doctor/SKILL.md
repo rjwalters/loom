@@ -1026,7 +1026,7 @@ and withdraws its add if a verdict landed meanwhile. Act on the exit:
 | 13 | `RACED` | A verdict landed mid-write; it withdrew its add. Done — write nothing more. |
 | 11 | `CLAIM-LOST` | `loom:treating` was gone; nothing written. Stand down (comment, exit). |
 | 12 | `HEAD-MOVED` | Someone pushed after you; only your claim was released. Comment, exit — no hand-back. |
-| 1 / other | `FAILED` (or a `loom-daemon` without the verb) | Retry once, then comment the printed line. Never fall back to `gh pr edit`. |
+| 1 / other | `FAILED` | Retry once, then comment the printed line. Never hand-add `loom:review-requested`. No such verb (old `loom-daemon`): also remove only your `loom:treating`, so the next pass's stale-verdict guard re-queues the new head. |
 
 **Pre-completion checklist** (verify before signaling completion):
 - [ ] All CI checks pass (verified via `forge wait-checks <number>`)

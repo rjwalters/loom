@@ -244,6 +244,16 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot) -> Outcome {
         .filter(|l| !pre.has(l) && post.has(l))
         .map(|l| (*l).to_string())
         .collect();
+    // The claim is ours alone: no rival writes it, so one that survived the
+    // remove is a stuck claim whatever else happened. Never report it as done.
+    let stuck_claim =
+        || Outcome::Failed(format!("the hand-back did not hold: still carries {CLAIM}"));
+    if !rivals.is_empty() && post.has(CLAIM) {
+        if post.has(QUEUE) {
+            forge.remove(QUEUE);
+        }
+        return stuck_claim();
+    }
     if !rivals.is_empty() && post.has(QUEUE) {
         // A review resolved or claimed the PR while we wrote: its label is the
         // lifecycle label, so withdrawing our add never leaves the PR empty.
