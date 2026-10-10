@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(calls[0].1, ["login", "--device-auth"]);
         assert_eq!(calls[2].0.file_name().unwrap(), "bob");
         assert_eq!(calls[4].0.file_name().unwrap(), "alice");
-        assert!(!format!("{:?}", &*calls).contains("recognizable-fake-secret"));
+        assert!(!format!("{:?}", *calls).contains("recognizable-fake-secret"));
     }
 
     /// #7389: `add --email`/`import --email` register a non-secret email
