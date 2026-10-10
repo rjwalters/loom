@@ -576,9 +576,6 @@ pub struct HealthInputs {
     /// [`ci_telemetry_section::assess_ci_telemetry`] — no section unless the
     /// poller is enabled here.
     pub ci_telemetry: Option<crate::ci_telemetry::CiTelemetryHealth>,
-    /// Unresolved mail config on a mail-meant host (#10137); see
-    /// [`inbox_mail_section`].
-    pub inbox_mail: Option<crate::inbox_config::InboxResolution>,
 }
 
 // ============================================================================
@@ -2721,9 +2718,6 @@ mod ci_telemetry_section;
 
 pub use ci_telemetry_section::assess_ci_telemetry;
 
-mod inbox_mail_section;
-pub use inbox_mail_section::assess_inbox_mail;
-
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2797,7 +2791,6 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_transcript_ingest(inputs));
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
-    sections.extend(assess_inbox_mail(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {

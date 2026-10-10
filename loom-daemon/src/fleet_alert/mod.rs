@@ -15,8 +15,8 @@
 //! - [`capacity`] (pure, #10214) adds the host-level capacity asks: disk or
 //!   RAM headroom holding the cap below `maxConcurrent`, and a starred
 //!   backlog more than 3x the cap.
-//! - [`task`] delivers each transition to independent sinks: the event bus
-//!   (relayed to Matrix by Safehouse) and the loom-ui inbox.
+//! - [`task`] delivers each transition to its sinks: the event bus (relayed
+//!   to Matrix by Safehouse). Loom sends no inbox mail (#11087).
 //!
 //! **No forge calls anywhere in this path**: the whole point is that the alert
 //! still arrives while `gh` is rate-limited. `loom-daemon health` output and
@@ -43,7 +43,7 @@ mod tests;
 
 pub use causes::TokenCause;
 
-/// Condition keys (stable; used in the inbox mail key and persisted state).
+/// Condition keys (stable; used in the event key and persisted state).
 pub const KEY_TOKENS: &str = "tokens-zero-healthy";
 pub const KEY_DISPATCH: &str = "dispatch-halted";
 pub const KEY_ROLES: &str = "roles-persistent";
@@ -57,7 +57,7 @@ pub struct Condition {
     pub headline: String,
     /// What to do about it.
     pub fix: String,
-    /// Deliver to the inbox as `critical` (evaluator severity), else `normal`.
+    /// Evaluator severity: `true` for a critical condition, else normal.
     pub critical: bool,
 }
 

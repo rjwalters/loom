@@ -91,3 +91,9 @@ scripts/tests/test-guide-urgency-rank.sh
 # #11098 (Stage 3) — the ETA subsystem moved to loom-ui and was deleted from
 # Loom; its operator reference went with it.
 docs/eta.md
+
+# #11087 — mail removed from Loom; human asks are labels only, so the
+# mail-send command, its inbox reference and its test went with it.
+commands/loom/mail-send.md
+docs/inbox-mail.md
+scripts/tests/test-inbox-mail.sh

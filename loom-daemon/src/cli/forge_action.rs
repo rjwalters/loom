@@ -798,13 +798,6 @@ pub(crate) enum ForgeAction {
         action: super::forge_parent_cmd::ParentAction,
     },
 
-    /// `forge inbox-config` (#10137) — print the resolved loom-ui inbox
-    /// `url=` and ingest `key_file=` (paths only, never the key) for
-    /// `mail-send`; unresolved items print as `missing=`. Exit 0 when both
-    /// resolve, 1 otherwise.
-    #[command(name = "inbox-config")]
-    InboxConfig,
-
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
     /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
     /// as `forge comment` would append it. The shell twin's format-pinning
@@ -858,14 +851,6 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
-        ForgeAction::InboxConfig => {
-            let root = loom_daemon::repo_root::find_repo_root_from_cwd()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let r = loom_daemon::inbox_config::resolve(&root);
-            print!("{}", loom_daemon::inbox_config::render_lines(&r));
-            std::process::exit(i32::from(!r.missing.is_empty()));
-        }
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::Calls(args) => return super::forge_calls_cmd::handle(args),
