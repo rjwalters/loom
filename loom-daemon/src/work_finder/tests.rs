@@ -2523,6 +2523,7 @@ mod maintain_only;
 mod operator_priority;
 mod ordering;
 mod ram_budget;
+mod workspace_draw;
 
 // ===================================================================
 // WorkItem

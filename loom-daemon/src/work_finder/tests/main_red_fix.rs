@@ -69,7 +69,9 @@ fn a_fix_sorts_first_only_while_main_is_verified_red() {
 }
 
 #[test]
-fn a_starred_issue_still_outranks_a_red_main_fix() {
+fn a_red_main_fix_outranks_a_starred_issue() {
+    // #11103 bridge: a verified red-main fix is `very-important`, the star
+    // `important`, so the fix goes first.
     let starred = WorkItem::new(5, vec![OPERATOR_PRIORITY_LABEL.into()]);
     let mut multi = vec![(FakeSource::once(vec![fix(9), starred]), RecordingDispatcher::default())];
     tick_multi_with_repo_cap(
@@ -84,7 +86,8 @@ fn a_starred_issue_still_outranks_a_red_main_fix() {
         None,
         &[RED],
     );
-    assert_eq!(multi[0].1.dispatched, vec![5]);
+    // The fix fills the cap of 1; the star then takes the overflow slot.
+    assert_eq!(multi[0].1.dispatched, vec![9, 5]);
 }
 
 #[test]

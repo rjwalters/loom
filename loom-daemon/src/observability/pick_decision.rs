@@ -33,11 +33,12 @@ use super::pick_journal::{
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
-    source, PickAction, PickCandidate, PickDecisionRecord, PickSkipReason, PickSortKey, PickTick,
-    PickVerdict, WORK_FINDER_ROLE,
+    source, PickAction, PickCandidate, PickDecisionRecord, PickDraw, PickDrawCandidate,
+    PickSkipReason, PickSortKey, PickTick, PickVerdict, PickWorkspaceDraw, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::{QueueDisposition, WorkFinderTickSummary};
+use crate::work_finder::workspace_draw::{self, DrawLog};
 
 /// `repo` value when no forge slug is known. Never a local path (#9442).
 pub const REPO_UNRESOLVED: &str = "repo_unresolved";
@@ -191,30 +192,82 @@ pub fn work_finder_record(
     .with_source(source::READY_QUEUE, true)
 }
 
+/// The tick's workspace draws (#11103) as `pick.decision` carries them.
+/// `resolve` maps a workspace index to the `repo` the record names.
+#[must_use]
+pub fn workspace_draw_record(
+    log: &DrawLog,
+    resolve: impl Fn(usize) -> String,
+) -> PickWorkspaceDraw {
+    let name =
+        |key: &str| workspace_draw::workspace_idx(key).map_or_else(|| key.to_string(), &resolve);
+    PickWorkspaceDraw {
+        seed: log.seed.to_string(),
+        draws_total: log.draws_total,
+        draws: log
+            .steps
+            .iter()
+            .map(|step| PickDraw {
+                pool: step.draw.pool.to_string(),
+                candidates: step
+                    .draw
+                    .candidates
+                    .iter()
+                    .map(|c| PickDrawCandidate {
+                        repo: name(&c.workspace),
+                        weight: c.weight,
+                    })
+                    .collect(),
+                total_weight: step.draw.total_weight,
+                roll: step.draw.roll,
+                picked: resolve(step.workspace_idx),
+                number: step.issue,
+            })
+            .collect(),
+    }
+}
+
+fn resolve_repo(repo: &str) -> String {
+    let path = Path::new(repo);
+    if path.is_absolute() {
+        repo_label(path)
+    } else {
+        REPO_UNRESOLVED.to_string()
+    }
+}
+
 /// Emit the work finder's decision for a completed tick (a no-op with no OTLP
 /// exporter). Called from the shared end-of-tick seam, so empty ticks count.
+/// `draw` is the tick's workspace-draw log (#11103) and `roots[i]` workspace
+/// `i`'s repo root, which names the draw's workspaces.
 pub fn emit_work_finder(
     summary: &WorkFinderTickSummary,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
+    draw: Option<&DrawLog>,
+    roots: &[std::path::PathBuf],
 ) {
     if !exporting() {
         return;
     }
-    emit(work_finder_record(
-        summary,
-        &crate::sweep_registry::host_identity(),
-        started_at,
-        ended_at,
-        |repo| {
-            let path = Path::new(repo);
-            if path.is_absolute() {
-                repo_label(path)
-            } else {
-                REPO_UNRESOLVED.to_string()
-            }
-        },
-    ))
+    let draw = draw.map(|log| {
+        workspace_draw_record(log, |idx| {
+            roots.get(idx).map_or_else(
+                || REPO_UNRESOLVED.to_string(),
+                |r| resolve_repo(&r.display().to_string()),
+            )
+        })
+    });
+    emit(
+        work_finder_record(
+            summary,
+            &crate::sweep_registry::host_identity(),
+            started_at,
+            ended_at,
+            resolve_repo,
+        )
+        .with_workspace_draw(draw),
+    )
 }
 
 /// The reason every candidate of a tick that never ran the role was skipped.
