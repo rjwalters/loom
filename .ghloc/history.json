@@ -1,0 +1,201 @@
+[
+  {
+    "total_loc": 1063792,
+    "total_files": 3709,
+    "languages": [
+      {
+        "language": "Python",
+        "lines": 91,
+        "code": 67,
+        "comments": 10,
+        "blanks": 14,
+        "files": 6
+      },
+      {
+        "language": "Shell",
+        "lines": 290293,
+        "code": 177214,
+        "comments": 91819,
+        "blanks": 21260,
+        "files": 679
+      },
+      {
+        "language": "#!",
+        "lines": 1905,
+        "code": 1732,
+        "comments": 0,
+        "blanks": 173,
+        "files": 15
+      },
+      {
+        "language": "SVG",
+        "lines": 344,
+        "code": 207,
+        "comments": 73,
+        "blanks": 64,
+        "files": 12
+      },
+      {
+        "language": "HTML",
+        "lines": 829,
+        "code": 760,
+        "comments": 14,
+        "blanks": 55,
+        "files": 3
+      },
+      {
+        "language": "Markdown",
+        "lines": 153276,
+        "code": 126677,
+        "comments": 0,
+        "blanks": 26599,
+        "files": 334
+      },
+      {
+        "language": "JSONC",
+        "lines": 146,
+        "code": 36,
+        "comments": 110,
+        "blanks": 0,
+        "files": 4
+      },
+      {
+        "language": "YAML",
+        "lines": 9906,
+        "code": 5652,
+        "comments": 3781,
+        "blanks": 473,
+        "files": 48
+      },
+      {
+        "language": "Docker ignore",
+        "lines": 43,
+        "code": 17,
+        "comments": 26,
+        "blanks": 0,
+        "files": 2
+      },
+      {
+        "language": "SQL",
+        "lines": 7685,
+        "code": 4705,
+        "comments": 2714,
+        "blanks": 266,
+        "files": 36
+      },
+      {
+        "language": "Rust",
+        "lines": 1012144,
+        "code": 713847,
+        "comments": 228862,
+        "blanks": 69435,
+        "files": 2316
+      },
+      {
+        "language": "CSS",
+        "lines": 167,
+        "code": 149,
+        "comments": 3,
+        "blanks": 15,
+        "files": 2
+      },
+      {
+        "language": "TOML",
+        "lines": 3669,
+        "code": 3048,
+        "comments": 426,
+        "blanks": 195,
+        "files": 18
+      },
+      {
+        "language": "gitignore",
+        "lines": 386,
+        "code": 182,
+        "comments": 154,
+        "blanks": 50,
+        "files": 5
+      },
+      {
+        "language": "JavaScript",
+        "lines": 1018,
+        "code": 699,
+        "comments": 257,
+        "blanks": 62,
+        "files": 6
+      },
+      {
+        "language": "Plain Text",
+        "lines": 3416,
+        "code": 3338,
+        "comments": 0,
+        "blanks": 78,
+        "files": 16
+      },
+      {
+        "language": "TypeScript",
+        "lines": 12660,
+        "code": 9997,
+        "comments": 1414,
+        "blanks": 1249,
+        "files": 86
+      },
+      {
+        "language": "TypeScript Typings",
+        "lines": 2,
+        "code": 0,
+        "comments": 2,
+        "blanks": 0,
+        "files": 2
+      },
+      {
+        "language": "JSON",
+        "lines": 12009,
+        "code": 11997,
+        "comments": 0,
+        "blanks": 12,
+        "files": 100
+      },
+      {
+        "language": "License",
+        "lines": 21,
+        "code": 17,
+        "comments": 0,
+        "blanks": 4,
+        "files": 1
+      },
+      {
+        "language": "Dockerfile",
+        "lines": 627,
+        "code": 204,
+        "comments": 381,
+        "blanks": 42,
+        "files": 4
+      },
+      {
+        "language": "Go Template",
+        "lines": 35,
+        "code": 35,
+        "comments": 0,
+        "blanks": 0,
+        "files": 1
+      },
+      {
+        "language": "JSONL",
+        "lines": 3164,
+        "code": 3164,
+        "comments": 0,
+        "blanks": 0,
+        "files": 12
+      },
+      {
+        "language": "JSON5",
+        "lines": 134,
+        "code": 48,
+        "comments": 62,
+        "blanks": 24,
+        "files": 1
+      }
+    ],
+    "created_at": "2026-10-10T23:52:00.447370603Z"
+  }
+]
