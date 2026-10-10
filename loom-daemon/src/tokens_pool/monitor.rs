@@ -495,6 +495,9 @@ pub fn run_monitor_check_with_reprobe(
     // CLI table and `--json` render. `MonitorAccount` has no error field by
     // design: `.ranking` never carries one.
     let mut reprobed: HashMap<String, AccountResult> = HashMap::new();
+    // Every account a request was sent for (#8972) — including a re-probe
+    // whose inconclusive result is discarded below.
+    let mut probed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(reprobe) = reprobe {
         for a in &mut accounts {
             let binding =
@@ -503,6 +506,9 @@ pub fn run_monitor_check_with_reprobe(
                 continue;
             }
             let fresh = reprobe(&a.name);
+            if fresh.probed {
+                probed.insert(a.name.clone());
+            }
             if fresh.status == "error" {
                 // Inconclusive — keep what the monitor said rather than
                 // softening a hard exclusion into an advisory one.
@@ -541,6 +547,10 @@ pub fn run_monitor_check_with_reprobe(
             s7d_reset: a.reset_7d.clone(),
             s5h_reset: a.reset_5h.clone(),
             error: reprobed.get(&a.name).and_then(|r| r.error.clone()),
+            probed: probed.contains(&a.name),
+            // Standing marks are attached by `check::run_check_traced`.
+            bad_mark: None,
+            probe_status: None,
         })
         .collect();
 

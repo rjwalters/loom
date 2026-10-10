@@ -660,6 +660,7 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
     let mut snapshots = Vec::with_capacity(inventory.len());
     for account in &inventory {
         let stored = health::account_health(workspace, &account.id)?;
+        let live_probe = account.enabled && options.live;
         let (snapshot, probe_detail) = if !account.enabled {
             (None, None)
         } else if options.live {
@@ -676,6 +677,8 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
             (latest_usage_snapshot(&account.credential_reference), None)
         };
         let mut row = assess_account(account, stored.as_ref(), snapshot.as_ref(), now);
+        // A live probe was attempted for this row (#8972's `probed` key).
+        row.probed = live_probe;
         // A live probe that measured nothing says *why* (not logged in, no
         // session container, ...) instead of the snapshot-only detail.
         if let (Some(detail), true) = (probe_detail, row.status == STATUS_UNKNOWN) {

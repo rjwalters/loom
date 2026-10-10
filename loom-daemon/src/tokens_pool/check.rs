@@ -81,6 +81,9 @@ use chrono::{DateTime, Utc};
 use super::account_registry::AccountProvider;
 use super::round_summary::RoundTrace;
 
+mod marked_probe;
+pub use marked_probe::BadMark;
+
 // ---------------------------------------------------------------------------
 // Constants (mirror check.py)
 // ---------------------------------------------------------------------------
@@ -137,6 +140,18 @@ pub struct AccountResult {
     /// charts (issue #4874). See [`limit_reset`].
     pub s5h_reset: Option<String>,
     pub error: Option<String>,
+    /// Whether a probe request was actually sent for this row in this run
+    /// (issue #8972). `false` for a monitor-served row and for a row that only
+    /// echoes a stored `.bad_tokens` record, so a recorded reason can never be
+    /// mistaken for a fresh measurement.
+    pub probed: bool,
+    /// The `.bad_tokens` entry standing against this account, reported as data
+    /// separate from the live result (issue #8972). See [`marked_probe`].
+    pub bad_mark: Option<BadMark>,
+    /// The live probe's own verdict, set only when a standing permanent mark
+    /// keeps `status` at `blocked` (which describes *selectability*) while a
+    /// request was nonetheless made under an explicit `--source probe`.
+    pub probe_status: Option<String>,
 }
 
 impl AccountResult {
@@ -152,6 +167,9 @@ impl AccountResult {
             s7d_reset: None,
             s5h_reset: None,
             error: None,
+            probed: false,
+            bad_mark: None,
+            probe_status: None,
         }
     }
 
@@ -218,6 +236,7 @@ impl AccountResult {
         if let Some(err) = &self.error {
             obj.insert("error".into(), serde_json::Value::String(err.clone()));
         }
+        marked_probe::extend_json(self, &mut obj);
         serde_json::Value::Object(obj)
     }
 }
@@ -468,6 +487,19 @@ fn provider_by_name(tokens_dir: &Path) -> HashMap<String, AccountProvider> {
 /// genuinely bad-marked account with a real reason string was silently
 /// probed with its live token instead of being reported `blocked`.
 pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvider)> {
+    discover_tokens_for(tokens_dir, false)
+}
+
+/// [`discover_tokens`], with `probe_marked` deciding whether an account with a
+/// standing `Auth` / `MalformedTimestamp` mark is handed its live token too.
+/// Only an explicitly resolved `--source probe` passes `true` (issue #8972):
+/// the periodic `auto` paths keep skipping such accounts. A marked account
+/// whose `.token` file is empty or unreadable is still surfaced with an empty
+/// token, so it is reported (unprobed) rather than dropped.
+fn discover_tokens_for(
+    tokens_dir: &Path,
+    probe_marked: bool,
+) -> Vec<(String, String, AccountProvider)> {
     if !tokens_dir.is_dir() {
         return Vec::new();
     }
@@ -494,6 +526,7 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvide
             .get(&name)
             .copied()
             .unwrap_or(AccountProvider::Claude);
+        let mut keep_empty = false;
         if let Some(entry) = super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name) {
             // #7522/#7538: an **exhaustion** entry (session-limit-worded or
             // ambiguous) is a blocking class whose expiry the probe itself
@@ -525,18 +558,20 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvide
             // `MalformedTimestamp` entries are still reported `blocked`
             // without a network call, carrying their real class + reason
             // (#6030) — auth/malformed entries never self-heal, so probing
-            // them would be wasted.
+            // them every cycle would be wasted. The one exception is an
+            // explicit `--source probe` (`probe_marked`, #8972): the operator
+            // asked "is this mark still true?", so the account is probed and
+            // the mark is reported alongside the live result.
             let probe_anyway = entry.class == super::bad_tokens::BadReasonClass::Exhaustion;
-            if !probe_anyway {
+            if !probe_anyway && !probe_marked {
                 tokens.push((name, String::new(), provider)); // known-bad: do not probe
                 continue;
             }
+            keep_empty = !probe_anyway;
         }
-        let token = match std::fs::read_to_string(&path) {
-            Ok(t) => t.trim().to_string(),
-            Err(_) => continue,
-        };
-        if !token.is_empty() {
+        let token =
+            std::fs::read_to_string(&path).map_or_else(|_| String::new(), |t| t.trim().to_string());
+        if !token.is_empty() || keep_empty {
             tokens.push((name, token, provider));
         }
     }
@@ -759,7 +794,22 @@ pub fn probe_account_with_blocking(
         });
         return r;
     }
+    // Everything past this point sends a request (#8972).
+    let mut r = probe_live(name, token, model, probe_prompt, timeout_secs, transport);
+    r.probed = true;
+    r
+}
 
+/// The request half of [`probe_account_with_blocking`]: always calls
+/// `transport`, so its caller can mark the row `probed`.
+fn probe_live(
+    name: &str,
+    token: &str,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+) -> AccountResult {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1,
@@ -798,15 +848,7 @@ pub fn probe_account_with_blocking(
     if code == 429 {
         let parsed = parse_rate_limit_headers(&resp.headers);
         let status = status_from_utilization(parsed.s7d_utilization, "rate_limited");
-        return AccountResult {
-            name: name.to_string(),
-            status,
-            s5h_utilization: parsed.s5h_utilization,
-            s7d_utilization: parsed.s7d_utilization,
-            s7d_reset: parsed.s7d_reset,
-            s5h_reset: parsed.s5h_reset,
-            error: None,
-        };
+        return measured(name, status, parsed);
     }
 
     if code >= 400 {
@@ -819,15 +861,17 @@ pub fn probe_account_with_blocking(
     // 2xx — successful probe.
     let parsed = parse_rate_limit_headers(&resp.headers);
     let status = status_from_utilization(parsed.s7d_utilization, "available");
-    AccountResult {
-        name: name.to_string(),
-        status,
-        s5h_utilization: parsed.s5h_utilization,
-        s7d_utilization: parsed.s7d_utilization,
-        s7d_reset: parsed.s7d_reset,
-        s5h_reset: parsed.s5h_reset,
-        error: None,
-    }
+    measured(name, status, parsed)
+}
+
+/// A row carrying the rate-limit measurements a response's headers reported.
+fn measured(name: &str, status: String, parsed: RateLimitFields) -> AccountResult {
+    let mut r = AccountResult::new(name, status);
+    r.s5h_utilization = parsed.s5h_utilization;
+    r.s7d_utilization = parsed.s7d_utilization;
+    r.s7d_reset = parsed.s7d_reset;
+    r.s5h_reset = parsed.s5h_reset;
+    r
 }
 
 /// Dispatch a discovered account to its provider's probe (design D6a, issue
@@ -973,7 +1017,7 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
         if a.status == "unsupported" {
             continue;
         }
-        out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization, a.limit_reset()));
+        out.push_str(&marked_probe::ranking_row(a));
         out.push('\n');
     }
     out
@@ -1185,7 +1229,7 @@ pub fn run_check_traced(
         } else {
             None
         };
-        if let Some(report) = super::monitor::run_monitor_check_with_reprobe(
+        if let Some(mut report) = super::monitor::run_monitor_check_with_reprobe(
             tokens_dir,
             opts.write_ranking,
             now_iso,
@@ -1193,6 +1237,7 @@ pub fn run_check_traced(
             hook,
         ) {
             trace.mark_monitor_served();
+            marked_probe::attach_standing_marks(tokens_dir, &mut report.accounts);
             return report;
         }
         if opts.source == Source::Monitor {
@@ -1206,7 +1251,9 @@ pub fn run_check_traced(
         // Auto: fall through to probing.
     }
 
-    let pairs = discover_tokens(tokens_dir);
+    // Only an explicit `--source probe` probes permanently-marked accounts
+    // (#8972); the `auto` fall-through keeps skipping them.
+    let pairs = discover_tokens_for(tokens_dir, opts.source == Source::Probe);
     if pairs.is_empty() {
         eprintln!("WARNING no tokens found in {}", tokens_dir.display());
     }
@@ -1219,14 +1266,11 @@ pub fn run_check_traced(
             let millis = 500 + (rng.next_u64() % 1000);
             std::thread::sleep(std::time::Duration::from_millis(millis));
         }
-        // A bad-marked account is never actually probed (empty token) — look
-        // up why it's blocked so the result carries the real class/reason
-        // instead of the opaque "bad_token_listed" (#6030).
-        let blocking = if token.is_empty() {
-            super::bad_tokens::blocking_entry_in_dir(tokens_dir, name)
-        } else {
-            None
-        };
+        // Look up the standing mark for every account: an unprobed one
+        // (empty token) carries its real class/reason instead of the opaque
+        // "bad_token_listed" (#6030), and a probed one reports the mark
+        // alongside its live result (#8972).
+        let blocking = super::bad_tokens::blocking_entry_in_dir(tokens_dir, name);
         trace.record(name, token, *provider);
         let result = dispatch_probe(
             name,
@@ -1238,7 +1282,9 @@ pub fn run_check_traced(
             transport,
             blocking.as_ref(),
         );
-        trace.record_result(name, &result.status);
+        let result = marked_probe::with_standing_mark(result, blocking.as_ref());
+        // The trace records what the request returned, not the pinned status.
+        trace.record_result(name, result.probe_status.as_deref().unwrap_or(&result.status));
         results.push(result);
     }
 
@@ -1280,7 +1326,7 @@ pub fn format_table(report: &ProbeReport) -> String {
 #[must_use]
 pub fn format_table_at(report: &ProbeReport, now: DateTime<Utc>) -> String {
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("Token pool ranking (probed at {})", report.ranked_at));
+    lines.push(marked_probe::table_header(report));
     lines.push("=".repeat(84));
     lines.push(format!(
         "{:<28} {:>9} {:>9} {:<13} {:<25}",
@@ -1307,13 +1353,10 @@ pub fn format_table_at(report: &ProbeReport, now: DateTime<Utc>) -> String {
             },
         );
         let mut row = format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset);
-        // Surface WHY a blocked/errored account is out of rotation (#6030) —
-        // in particular, whether it needs `tokens unblock` (auth-dead,
-        // permanent) or will clear itself (exhaustion, TTL) rather than just
-        // "blocked" with no explanation.
-        if let Some(err) = &a.error {
-            row.push_str(&format!("  ({err})"));
-        }
+        // Surface WHY a blocked/errored account is out of rotation (#6030),
+        // and — for a standing bad-mark — whether that is a live finding or
+        // only a stored record (#8972).
+        row.push_str(&marked_probe::row_note(a));
         lines.push(row);
     }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -1955,29 +1998,9 @@ mod tests {
         );
     }
 
-    /// #7522/#7538: an `Auth`-class blocking entry keeps the unchanged
-    /// "surface as empty, never probe" behavior — a broken credential never
-    /// self-heals, so probing it would be wasted. (A weekly-limit-worded
-    /// `Exhaustion` entry, by contrast, is now probed too — see
-    /// `discover_probes_an_ambiguous_exhaustion_entry_too` — #7538 widened
-    /// probe-eligibility from "session-limit match" to "any `Exhaustion`
-    /// entry" so an ambiguous reason can accumulate the `.ranking` evidence
-    /// its own two-signal release check needs.)
-    #[test]
-    fn discover_does_not_probe_auth_blocked_accounts() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-bbb\n").unwrap();
-        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        fs::write(
-            tmp.path().join(".bad_tokens"),
-            format!("{marked} agent-auth 401 unauthorized\n"),
-        )
-        .unwrap();
-        let got = discover_tokens(tmp.path());
-        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-auth").unwrap().1, "");
-    }
+    // `discover_does_not_probe_auth_blocked_accounts` and
+    // `run_check_surfaces_the_blocking_reason_for_a_bad_account` pinned the
+    // pre-#8972 contract; their rewrites live in `check/marked_probe_tests.rs`.
 
     /// #7538: an ambiguous-reason `Exhaustion` entry (does not match
     /// `is_session_limit_reason`) is now probed with its live token too —
@@ -2070,11 +2093,10 @@ mod tests {
         fs::write(tmp.path().join("agent-bad.token"), "sk-ant-oat01-bad").unwrap();
         fs::write(tmp.path().join(".bad_tokens"), "agent-bad\n").unwrap();
 
-        // Only agent-1 is probed (agent-bad has empty token -> blocked).
-        let t = StubTransport::new(vec![resp(
-            200,
-            &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")],
-        )]);
+        // #8972: an explicit `--source probe` probes agent-bad too, but its
+        // standing mark keeps it `blocked` whatever the probe answers.
+        let ok = || resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")]);
+        let t = StubTransport::new(vec![ok(), ok()]);
         let opts = CheckOptions {
             source: Source::Probe,
             write_ranking: true,
@@ -2097,51 +2119,6 @@ mod tests {
             .map(|l| l.split('|').next().unwrap())
             .collect();
         assert_eq!(names, HashSet::from(["agent-1", "agent-bad"]));
-    }
-
-    /// #6030: a bad-marked account's `error` field names the real class and
-    /// reason (e.g. `"auth: auth-dead: 401 Invalid bearer token"`) instead of
-    /// the opaque `"bad_token_listed"` — so `tokens check`'s table/JSON output
-    /// (the operator-visible list) can tell an auth-dead account apart from a
-    /// still-cooling-down exhaustion entry without a separate `unblock`-dry-run.
-    #[test]
-    fn run_check_surfaces_the_blocking_reason_for_a_bad_account() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-good").unwrap();
-        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-dead").unwrap();
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        fs::write(
-            tmp.path().join(".bad_tokens"),
-            format!("{ts} agent-auth auth-dead: 401 Invalid bearer token\n"),
-        )
-        .unwrap();
-
-        let t = StubTransport::new(vec![resp(
-            200,
-            &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")],
-        )]);
-        let opts = CheckOptions {
-            source: Source::Probe,
-            stagger: false,
-            ..Default::default()
-        };
-        let report = run_check(tmp.path(), &opts, &t);
-        let by_name: std::collections::HashMap<&str, &AccountResult> = report
-            .accounts
-            .iter()
-            .map(|a| (a.name.as_str(), a))
-            .collect();
-        assert_eq!(by_name["agent-auth"].status, "blocked");
-        assert_eq!(
-            by_name["agent-auth"].error.as_deref(),
-            Some("auth: auth-dead: 401 Invalid bearer token")
-        );
-
-        let table = format_table(&report);
-        assert!(
-            table.contains("auth: auth-dead: 401 Invalid bearer token"),
-            "table does not surface the blocking reason: {table}"
-        );
     }
 
     #[test]
