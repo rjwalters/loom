@@ -808,6 +808,35 @@ fn records_quoted_in_a_code_fence_never_release_an_unrecorded_hold() {
     assert!(w.labels(10837).contains("loom:blocked"));
 }
 
+#[test]
+fn quoted_or_indented_records_never_release_but_a_real_one_after_indented_backticks_does() {
+    // #10837 review: indented / blockquoted markers are not records, so they
+    // cannot release an unrecorded hold ...
+    for body in [
+        format!("Evidence:\n\n    {}\n", LOOM_UI_1695_RECORDS.replace('\n', "\n    ")),
+        format!("> {}\n", LOOM_UI_1695_RECORDS.replace('\n', "\n> ")),
+    ] {
+        let mut w = World::new();
+        w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+        for b in [1689, 1692, 1693] {
+            w.state(b, "CLOSED", false);
+        }
+        w.extra.events.insert(10837, vec!["loom:issue".into()]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "no-park-record"), 1, "{body}: {}", r.summary());
+        assert!(r.released.is_empty() && w.no_writes(), "{body}");
+    }
+    // ... while a real record after a 4-space-indented ``` still releases.
+    let mut w = World::new();
+    let body = "Evidence:\n\n    ```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    w.with_body(10837, false, body, &["loom:curated"]);
+    w.state(7, "CLOSED", false);
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
+}
+
 // --- the tick's gate ------------------------------------------------------------
 
 #[test]

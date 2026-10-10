@@ -371,3 +371,48 @@ fn a_real_record_beside_code_still_parses() {
     let body = "Use ```x``` here.\n<!-- loom:park Blocked by: #6 -->\n";
     assert_eq!(blockers(body), n(&[6]));
 }
+
+/// #10837 review: Markdown code boundaries. A 4-space-indented triple backtick
+/// is indented code, not a fence opener, so the real record after it parses.
+#[test]
+fn indented_backticks_do_not_open_a_fence() {
+    let body = "Evidence:\n\n    ```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    let body = "Evidence:\n\n\t```\n\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    // Up to 3 spaces still opens a fence.
+    let body = "   ```\n<!-- loom:park Blocked by: #7 -->\n```\n";
+    assert!(parse(body).is_empty());
+}
+
+/// Indented code, blockquotes (plain, indented, fenced, lazy), and multiline
+/// inline code spans never declare a record; a real record after each does.
+#[test]
+fn markers_in_indented_quoted_or_multiline_code_are_not_records() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("Evidence:\n\n    {q}\n"),
+        format!("Evidence:\n\n\t{q}\n"),
+        format!("> {q}\n"),
+        format!("  > {q}\n"),
+        format!("> > {q}\n"),
+        format!("> ```\n> {q}\n> ```\n"),
+        format!("Span `start\n{q}\nend` done\n"),
+        format!("Span ``start\n{q}\nend`` done\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+    }
+    // A real record right after a quote or code still parses.
+    for body in [
+        "> quoted\n\n<!-- loom:park Blocked by: #7 -->\n",
+        "> quoted\n<!-- loom:park Blocked by: #7 -->\n",
+        "    code\n\n<!-- loom:park Blocked by: #7 -->\n",
+        "Span `start\nend` done\n<!-- loom:park Blocked by: #7 -->\n",
+    ] {
+        assert_eq!(blockers(body), n(&[7]), "{body}");
+    }
+    // 4-space indent inside a paragraph is a continuation, not code.
+    let body = "para\n    <!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+}

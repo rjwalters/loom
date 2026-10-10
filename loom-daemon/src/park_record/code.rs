@@ -15,46 +15,100 @@
 //!
 //! # Scope
 //!
-//! Fenced blocks (```` ``` ```` / `~~~`, closed by a same-character fence at
-//! least as long; an unclosed fence runs to the end, as in CommonMark) and
-//! single-line inline code spans. An HTML comment that starts outside code
-//! claims its own line up to `-->` first, so a backtick inside a real record's
-//! `reason="…"` cannot hide that record. Indented code blocks and fences
-//! inside blockquotes are not recognised.
+//! Fenced blocks (```` ``` ```` / `~~~`, opened and closed with at most 3
+//! columns of indent -- a 4-space-indented fence is indented code, not a
+//! fence; closed by a same-character fence at least as long; an unclosed fence
+//! runs to the end), indented code blocks (not interrupting a paragraph),
+//! blockquotes (blanked wholesale, conservatively, including lazy
+//! continuation), and inline code spans, which may cross a newline within one
+//! paragraph. An HTML comment that starts outside code claims its own line up
+//! to `-->` first, so a backtick inside a real record's `reason="…"` cannot
+//! hide that record.
 
-/// `text` with every byte inside a code region replaced by a space (newlines
-/// kept). Byte length and every offset outside code are unchanged, so a match
-/// found in the result indexes the original text exactly.
+/// `text` with every byte inside a code region (or blockquote) replaced by a
+/// space (newlines kept). Byte length and every offset outside code are
+/// unchanged, so a match found in the result indexes the original text.
 #[must_use]
 pub(super) fn blank(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut fence: Option<(u8, usize)> = None;
+    // Consecutive plain-paragraph lines, so an inline span may cross a newline.
+    let mut para = String::new();
+    // Inside a blockquote (until a blank line).
+    let mut in_quote = false;
     for line in text.split_inclusive('\n') {
+        let indent = indent_width(line);
         let trimmed = line.trim_start_matches([' ', '\t']);
         let run = |c: u8| trimmed.bytes().take_while(|b| *b == c).count();
         if let Some((c, n)) = fence {
+            // A closing fence is indented at most 3 columns.
             let r = run(c);
-            if r >= n && trimmed[r..].trim().is_empty() {
+            if indent < 4 && r >= n && trimmed[r..].trim().is_empty() {
                 fence = None;
             }
             out.push_str(&spaces(line));
             continue;
         }
-        let opener = [b'`', b'~']
-            .into_iter()
-            .map(|c| (c, run(c)))
-            .find(|&(_, r)| r >= 3);
-        match opener {
-            // A backtick fence's info string cannot contain a backtick
-            // (CommonMark); such a line is inline code, not a fence.
-            Some((c, n)) if c == b'~' || !trimmed[n..].contains('`') => {
-                fence = Some((c, n));
-                out.push_str(&spaces(line));
-            }
-            _ => out.push_str(&blank_inline(line)),
+        let blank_line = trimmed.trim().is_empty();
+        if blank_line {
+            flush(&mut para, &mut out);
+            in_quote = false;
+            // A blank line inside an indented code run does not end it.
+            out.push_str(&spaces(line));
+            continue;
         }
+        let opener = if indent < 4 {
+            [b'`', b'~']
+                .into_iter()
+                .map(|c| (c, run(c)))
+                .find(|&(_, r)| r >= 3)
+                // A backtick fence's info string cannot contain a backtick.
+                .filter(|&(c, n)| c == b'~' || !trimmed[n..].contains('`'))
+        } else {
+            None
+        };
+        // Blockquote: its content (markers and fences alike) is blanked
+        // conservatively, including lazy continuation lines, but never a line
+        // that starts a new HTML comment block at column 0..3.
+        let quoted = indent < 4 && trimmed.starts_with('>');
+        let lazy = in_quote && para.is_empty() && opener.is_none() && !trimmed.starts_with("<!--");
+        if quoted || lazy {
+            flush(&mut para, &mut out);
+            in_quote = true;
+            out.push_str(&spaces(line));
+            continue;
+        }
+        in_quote = false;
+        if let Some(o) = opener {
+            flush(&mut para, &mut out);
+            fence = Some(o);
+            out.push_str(&spaces(line));
+            continue;
+        }
+        // Indented code cannot interrupt a paragraph.
+        if indent >= 4 && para.is_empty() {
+            out.push_str(&spaces(line));
+            continue;
+        }
+        para.push_str(line);
     }
+    flush(&mut para, &mut out);
     out
+}
+
+/// Columns of leading whitespace (a tab counts as 4).
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn flush(para: &mut String, out: &mut String) {
+    if !para.is_empty() {
+        out.push_str(&blank_inline(para));
+        para.clear();
+    }
 }
 
 /// Every byte of `s` as a space, newlines kept.
@@ -64,7 +118,7 @@ fn spaces(s: &str) -> String {
         .collect()
 }
 
-/// One line with its inline code spans blanked. A backtick run of length `n`
+/// One paragraph (one or more lines) with its inline code spans blanked. A backtick run of length `n`
 /// opens a span closed by the next run of exactly `n`; an unmatched run is
 /// literal.
 fn blank_inline(line: &str) -> String {
@@ -76,9 +130,9 @@ fn blank_inline(line: &str) -> String {
         // is not always a char boundary. Every slice below starts at an ASCII
         // byte (`<` or a backtick), which always is.
         if bytes[i..].starts_with(b"<!--") {
-            i = line[i + 4..]
-                .find("-->")
-                .map_or(bytes.len(), |e| i + 4 + e + 3);
+            // A comment is claimed only up to the end of its own line.
+            let eol = line[i..].find('\n').map_or(bytes.len(), |e| i + e);
+            i = line[i + 4..eol].find("-->").map_or(eol, |e| i + 4 + e + 3);
             continue;
         }
         if bytes[i] != b'`' {
