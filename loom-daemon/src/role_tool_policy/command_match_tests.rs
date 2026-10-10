@@ -541,6 +541,24 @@ fn glob_rules() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn xargs_option_values_do_not_hide_the_executable() {
+    for cmd in [
+        "xargs --process-slot-var SLOT ssh example.invalid",
+        "xargs --process-slot-var=SLOT ssh example.invalid",
+        "xargs --max-chars 100 ssh example.invalid",
+        "xargs -s 100 -P 2 -n 1 ssh example.invalid",
+        "xargs -s100 -I{} ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap(
+        "xargs --process-slot-var SLOT aws sts get-caller-identity",
+        "cloud-cli"
+    ));
+    assert_clean("xargs --process-slot-var SLOT echo");
+}
+
+#[test]
 fn time_options_do_not_hide_the_executable() {
     for cmd in [
         "time -p ssh example.invalid",

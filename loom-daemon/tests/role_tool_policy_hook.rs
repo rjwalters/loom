@@ -204,6 +204,9 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     // Round 5: bash truncates an ANSI-C string at the first NUL.
     (r"$'ssh\0suffix' example.invalid", "remote-shell"),
     (r"$'aws\x00suffix' sts get-caller-identity", "cloud-cli"),
+    // Round 6: value-taking xargs options must not hide the executable.
+    ("xargs --process-slot-var SLOT ssh example.invalid", "remote-shell"),
+    ("xargs --max-chars 100 aws sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]

@@ -797,6 +797,8 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
                     "--delimiter",
                     "--arg-file",
                     "--replace",
+                    "--max-chars",
+                    "--process-slot-var",
                 ],
             );
             recurse(j, hits);
