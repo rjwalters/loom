@@ -1272,7 +1272,7 @@ strands the seats already paid for.
 {
   "runtimes": {
     "preference": ["claude", "codex", {"runtime": "opencode", "modelProfile": "zai-metered"}],
-    "rolePreference": { "judge": ["codex", "claude", "opencode"] }
+    "rolePreference": { "judge": ["codex", "claude"] }
   }
 }
 ```
@@ -1352,6 +1352,42 @@ writes a byte-identical log. A role tick additionally records the decision
 durably in `role_tick.outcome` as `preference_tier` / `preference_tap` (absent,
 never a fabricated `0`, when no list decided it) — so "how much work is going to
 the backstop" is a query over the journal, not a grep of the daemon log.
+
+### GLM-first coding roles, never Judge (issue #11284)
+
+The Z.ai seats (`opencode:zai-flash`, GLM) are flat-rate with a weekly cap, so
+an idle seat is wasted paid capacity. For the mechanical coding roles the
+committed config therefore lists Z.ai **first** instead of as a last resort:
+
+```jsonc
+"rolePreference": {
+  "builder": [{"runtime": "opencode", "modelProfile": "zai-flash"}, "claude"],
+  "doctor":  [{"runtime": "opencode", "modelProfile": "zai-flash"}, "claude"],
+  "judge":   ["codex", "claude"]
+}
+```
+
+- **Fall-through bounds the cap.** With a free seat, Builder/Doctor launch on
+  `opencode:zai-flash@api_keys:zai`; with the Z.ai pool empty or disabled the
+  walk falls through to Claude rather than holding.
+- **OpenCode is admitted for both roles.** `defaults/runtimes/opencode.json`
+  declares `worktreeIsolation` and `loomControl` as `yes`, which is what
+  `defaults/roles/{builder,doctor}.json` require, so the entry is never skipped
+  as `not-admitted`.
+- **Judge is never Z.ai, and that is enforced, not just configured.** Runtime
+  admission refuses role `judge` on any `zai-*` model profile whatever picked
+  it: a `runtimes.roles.judge` config pin, a `LOOM_RUNTIME[_JUDGE]` env pin, an
+  explicit dispatch runtime, or a preference entry. A bare native runtime counts
+  as its effective profile (`LOOM_MODEL_PROFILE`, else
+  `runtimes.defaultModelProfile`, else the harness default `zai-flash`). The
+  refusal names `judge-excluded-from-zai`; a preference entry is *skipped* with
+  that reason (`not-admitted`) and a pin is rejected, never silently routed to
+  the Z.ai tap. Curator keeps the global order (Claude or Codex).
+  The exclusion covers standalone `judge` launches; a native `sweep-lifecycle`
+  runs every phase on one runtime, so phase-level Judge routing is #11285.
+- Not yet done (tracked on #11284): standalone Doctor ticks are still pinned to
+  Claude (#8505), `dispatch_sweep` has no `runtime`/`modelProfile` field, and
+  the work finder's concurrency is not yet floored at the free-seat count.
 
 ### Bounding the metered backstop tier (issue #8555)
 

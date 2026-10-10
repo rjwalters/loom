@@ -53,7 +53,8 @@ pub(super) struct ClearedRuntimeEnv {
     _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
 }
 
-const ISOLATED_VARS: [&str; 10] = [
+const ISOLATED_VARS: [&str; 11] = [
+    "LOOM_MODEL_PROFILE",
     "LOOM_RUNTIME",
     "LOOM_RUNTIME_BUILDER",
     "LOOM_RUNTIME_JUDGE",
@@ -418,7 +419,7 @@ pub(super) fn fixture() -> tempfile::TempDir {
     dir
 }
 
-fn write_config(root: &Path, config: &serde_json::Value) {
+pub(super) fn write_config(root: &Path, config: &serde_json::Value) {
     fs::create_dir_all(root.join(".loom")).unwrap();
     fs::write(root.join(".loom/config.json"), config.to_string()).unwrap();
 }

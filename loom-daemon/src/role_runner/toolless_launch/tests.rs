@@ -111,8 +111,11 @@ fn opencode_judge_workspace(root: &Path, stream: &str) {
     for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
         fs::create_dir_all(root.join(sub)).unwrap();
     }
-    fs::write(root.join(".loom/config.json"), r#"{"runtimes":{"roles":{"judge":"opencode"}}}"#)
-        .unwrap();
+    fs::write(
+        root.join(".loom/config.json"),
+        r#"{"runtimes":{"roles":{"judge":"opencode"},"defaultModelProfile":"kimi-k2"}}"#,
+    )
+    .unwrap();
     fs::write(
         root.join(".loom/roles/judge.json"),
         r#"{"runtimeRequirements":["loomControl"]}"#,

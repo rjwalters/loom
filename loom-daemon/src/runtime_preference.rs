@@ -689,6 +689,25 @@ fn admit_static(
     }
 }
 
+/// Admission for one preference-list candidate: [`admit_static`] with the
+/// tap's own model profile threaded through, so the Judge/`zai-*` exclusion
+/// (#11284) judges the profile this tap will actually launch with. A refusal
+/// here is a skip, never a fall onto the excluded tap.
+fn admit_tap(
+    root: &Path,
+    role: &str,
+    runtime: &str,
+    model_profile: Option<&str>,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<ResolvedRuntime, RuntimeRejection> {
+    match crate::runtime_admission::resolve_and_admit_tap(root, role, runtime, model_profile) {
+        Err(rejection) if rejection.containment_eligible() => {
+            preparer.contain(role, Some(runtime), rejection)
+        }
+        other => other,
+    }
+}
+
 /// [`resolve_runtime_for`] with a [`ContainmentPreparer`] (#8787).
 ///
 /// # Errors
@@ -751,18 +770,24 @@ pub fn resolve_runtime_contained(
     let resolution = resolve::resolve(
         &taps,
         |tap| {
-            admit_static(root, canonical, Some(&tap.runtime), *preparer.borrow_mut())
-                .map(|mut admitted| {
-                    // The walk chose among candidates; it is not the operator
-                    // pin `Explicit` denotes, even though each candidate was
-                    // offered to admission as an explicit runtime.
-                    admitted.source = RuntimeSource::Preference;
-                    admitted
-                })
-                .map_err(|rejection| SkipReason::NotAdmitted {
-                    unmet: rejection.unmet_capabilities.clone(),
-                    detail: rejection.reason.clone(),
-                })
+            admit_tap(
+                root,
+                canonical,
+                &tap.runtime,
+                tap.model_profile.as_deref(),
+                *preparer.borrow_mut(),
+            )
+            .map(|mut admitted| {
+                // The walk chose among candidates; it is not the operator
+                // pin `Explicit` denotes, even though each candidate was
+                // offered to admission as an explicit runtime.
+                admitted.source = RuntimeSource::Preference;
+                admitted
+            })
+            .map_err(|rejection| SkipReason::NotAdmitted {
+                unmet: rejection.unmet_capabilities.clone(),
+                detail: rejection.reason.clone(),
+            })
         },
         |tier, tap, admitted| {
             // A contained candidate that is about to be skipped must give its
@@ -827,3 +852,6 @@ mod sandbox_hold_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod zai_first_tests;

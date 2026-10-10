@@ -353,6 +353,15 @@ fn native_and_shell_conformance_for_every_shipped_pair() {
             };
             let (shell, code) = shell_decision(&checker, &defaults, shell_role, runtime);
 
+            // The Judge/`zai-*` exclusion (#11284) is a native-only policy,
+            // not a capability: the shell checker only knows capabilities.
+            if native
+                .as_ref()
+                .err()
+                .is_some_and(|r| r.reason.starts_with(JUDGE_ZAI_RULE))
+            {
+                continue;
+            }
             // 1. Identical decisions.
             assert_eq!(
                 native.is_ok(),
@@ -811,6 +820,7 @@ fn native_adapter_admits_through_a_deleted_current_exe_mid_roll() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
     )
@@ -832,6 +842,7 @@ fn native_adapter_ordinary_current_exe_admits_unchanged() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&exe, |_| None),
     )
@@ -856,6 +867,7 @@ fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
         d.path(),
         "curator",
         Some("opencode"),
+        None,
         AdmissionContext::Host,
         || crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None),
     )
