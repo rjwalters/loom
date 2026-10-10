@@ -21,7 +21,7 @@
 //!
 //! | section | source |
 //! |---------|--------|
-//! | liveness | [`crate::daemon_install_state`] (`probe()` + [`crate::daemon_install_state::pgrep_daemon_pids`]) plus the caller's IPC round-trip result |
+//! | liveness | [`crate::daemon_install_state`] (`probe()` + [`crate::daemon_install_state::pgrep_daemon_pids`], which already excludes `session-exec worker` / `health` / `status` and other subcommand processes - #10110) plus the caller's IPC round-trip result |
 //! | dispatch | [`crate::types::DaemonStatusReport`] + [`crate::work_finder::last_tick_summary`] |
 //! | tokens | [`crate::types::CapacityReport`] + the resolved pool's `.ranking` mtime |
 //! | roles | [`crate::role_runner::role_tick_records`] |
