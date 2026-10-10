@@ -2,7 +2,10 @@
 import { tool } from "@opencode-ai/plugin";
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-export default async function () {
+// OpenCode 2.x requires the module to default-export a plain object
+// ({ id, server }); a function with props is rejected. 1.18.x accepts the
+// same object when `server` is present, so one module serves both majors.
+async function server() {
   // Plugin-load receipt for the provider-free readiness probe (#8600): written
   // before anything can throw, only when the probe names a path, and never in a
   // production launch (the variable is absent there). A CLI that never loads
@@ -39,3 +42,4 @@ export default async function () {
     })])),
   };
 }
+export default { id: "loom", server };

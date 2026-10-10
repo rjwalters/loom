@@ -138,3 +138,34 @@ fn the_binding_key_is_content_addressed_and_stable() {
     assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(key, binding_key());
 }
+
+/// OpenCode 2.x rejects a function default export (even one with props); the
+/// module must default-export a plain `{ id, server }` object (#11283). 1.18.x
+/// accepts that same object, so the single template serves both majors.
+#[test]
+fn opencode_plugin_default_exports_a_plain_object_with_server() {
+    let src = include_str!("../opencode.mjs");
+    assert!(
+        src.contains("export default { id: \"loom\", server };"),
+        "default export must be the plain object {{ id, server }}"
+    );
+    assert!(
+        !src.contains("export default async function") && !src.contains("export default function"),
+        "a function default export is rejected by OpenCode 2.x"
+    );
+    assert!(src.contains("async function server()"), "server hook is the async body");
+}
+
+/// The 1.x-compatible behaviour is unchanged: receipt write precedes the
+/// fail-closed context check, and the four loom_* tools are still returned.
+#[test]
+fn opencode_plugin_keeps_receipt_and_fail_closed_behaviour_for_1x() {
+    let src = include_str!("../opencode.mjs");
+    let receipt = src.find("LOOM_NATIVE_READINESS_RECEIPT").unwrap();
+    let guard = src.find("Loom native tool context is missing").unwrap();
+    assert!(receipt < guard, "receipt is written before anything can throw");
+    for name in ["read", "write", "edit", "bash"] {
+        assert!(src.contains(&format!("{name}: [")), "tool spec {name} present");
+    }
+    assert!(src.contains("`loom_${name}`"));
+}

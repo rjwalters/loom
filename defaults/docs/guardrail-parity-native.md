@@ -205,6 +205,14 @@ mechanism for loading a local, per-launch tool binding is still unknown, so
 `Major::guard_verified`'s `V2 => false` refusal stays until a passing 2.x
 receipt exists.
 
+Update (#11283, **unverified**): the leading hypothesis for the 2.0.10 discovery
+failure is the plugin module shape. OpenCode 2.x wants the module to
+`export default` a plain object (`{ id, server }`), not a function; 1.18.x still
+accepts that object when `server` is present. `native_tools/opencode.mjs` now
+default-exports `{ id: "loom", server }`. This is a shape change only: no 2.x
+live canary has been run with it, so `V2 => false`, the 1.x pins, and this
+section's "unverified on 2.x" list are unchanged until a dated receipt lands.
+
 ## Kimi
 
 Kimi Code CLI has no extension point Loom can point at a local file the way
