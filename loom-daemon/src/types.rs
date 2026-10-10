@@ -1887,7 +1887,10 @@ pub use observability_export::{
 };
 
 mod forge_events;
-pub use forge_events::{ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus};
+pub use forge_events::{
+    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
+    PollGatingWorkspace,
+};
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};

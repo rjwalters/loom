@@ -23,6 +23,7 @@ pub fn render_block(status: Option<&ForgeEventsStatus>, now: DateTime<Utc>) -> S
     let mut lines = vec![render(status, now)];
     if let Some(s) = status {
         lines.extend(render_wakes(s));
+        lines.extend(render_poll_gating(s));
     }
     lines.join("\n")
 }
@@ -47,6 +48,40 @@ fn render_wakes(s: &ForgeEventsStatus) -> Vec<String> {
         ];
     }
     s.wakes.iter().map(wake_line).collect()
+}
+
+/// The `Forge poll gating:` block (#9255): nothing when gating is off (the
+/// default), otherwise a summary line (state, effective cap, skip/re-poll
+/// counters, lossy-feed rate) and one line per workspace.
+fn render_poll_gating(s: &ForgeEventsStatus) -> Vec<String> {
+    let Some(g) = s.poll_gating.as_ref() else {
+        return Vec::new();
+    };
+    let state = if g.gating_active {
+        "ACTIVE (feed healthy)"
+    } else {
+        "inactive (feed not healthy: every workspace on base cadence)"
+    };
+    let lossy = g.lossy_rate().map_or_else(
+        || "n/a (no hard-cap re-poll yet)".to_string(),
+        |rate| format!("{:.1}% ({}/{})", rate * 100.0, g.lossy_repolls, g.hard_cap_repolls),
+    );
+    let mut lines = vec![format!(
+        "Forge poll gating: {state} — hard cap {}s, {} poll(s) skipped, {} event re-poll(s), {} hard-cap re-poll(s), lossy-feed rate {lossy}",
+        g.hard_cap_secs, g.polls_skipped, g.event_repolls, g.hard_cap_repolls
+    )];
+    for w in &g.workspaces {
+        let age = w
+            .last_poll_age_secs
+            .map_or_else(|| "never".to_string(), |a| format!("{} ago", format_window(a)));
+        lines.push(format!(
+            "  {} ({}): {}, last poll {age}",
+            w.workspace,
+            w.repo,
+            if w.gated { "gated" } else { "ungated" }
+        ));
+    }
+    lines
 }
 
 /// One armed consumer's line: what it is, what it saw, and what that did.
@@ -290,6 +325,37 @@ mod tests {
     #[test]
     fn a_pre_adr_daemon_gets_no_wake_lines() {
         assert_eq!(render_block(None, now()).lines().count(), 1);
+    }
+
+    #[test]
+    fn poll_gating_renders_nothing_when_off_and_state_plus_lossy_rate_when_on() {
+        let mut s = status(State::Healthy);
+        assert!(!render_block(Some(&s), now()).contains("poll gating"));
+        s.poll_gating = Some(loom_daemon::types::PollGatingStatus {
+            enabled: true,
+            gating_active: true,
+            hard_cap_secs: 600,
+            polls_skipped: 7,
+            event_repolls: 2,
+            hard_cap_repolls: 4,
+            lossy_repolls: 1,
+            workspaces: vec![loom_daemon::types::PollGatingWorkspace {
+                workspace: "/ws/a".into(),
+                repo: "o/a".into(),
+                gated: true,
+                last_poll_age_secs: Some(90),
+            }],
+        });
+        let out = render_block(Some(&s), now());
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("Forge poll gating:"))
+            .expect("gating line");
+        assert_eq!(
+            line,
+            "Forge poll gating: ACTIVE (feed healthy) — hard cap 600s, 7 poll(s) skipped, 2 event re-poll(s), 4 hard-cap re-poll(s), lossy-feed rate 25.0% (1/4)"
+        );
+        assert!(out.contains("/ws/a (o/a): gated"), "{out}");
     }
 
     // The event key must never reach an operator-visible surface, even

@@ -194,6 +194,62 @@ pub struct ForgeEventsStatus {
     /// silent". Absent on a pre-#8995 daemon, which deserializes as empty.
     #[serde(default)]
     pub wakes: Vec<ForgeEventsWakeStatus>,
+    /// Event-gated polling state (`forgeEvents.pollGating`, #9255). `None`
+    /// when gating is off (the default) or on a pre-#9255 daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_gating: Option<PollGatingStatus>,
+}
+
+/// Event-gated polling counters and per-workspace gated state (#9255).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollGatingStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Gating is in effect right now: enabled AND the feed is `healthy`.
+    /// `false` means every workspace is on its base cadence.
+    #[serde(default)]
+    pub gating_active: bool,
+    /// The effective hard maximum staleness, in seconds.
+    #[serde(default)]
+    pub hard_cap_secs: u64,
+    /// Discovery polls skipped because no feed event named the repo.
+    #[serde(default)]
+    pub polls_skipped: u64,
+    /// Re-polls triggered by a feed event.
+    #[serde(default)]
+    pub event_repolls: u64,
+    /// Re-polls forced by the hard cap expiring.
+    #[serde(default)]
+    pub hard_cap_repolls: u64,
+    /// Hard-cap re-polls that found a change the feed never reported.
+    #[serde(default)]
+    pub lossy_repolls: u64,
+    #[serde(default)]
+    pub workspaces: Vec<PollGatingWorkspace>,
+}
+
+impl PollGatingStatus {
+    /// Lossy-feed rate: `lossy_repolls / hard_cap_repolls`, `None` before the
+    /// first hard-cap re-poll (nothing observed yet).
+    #[must_use]
+    pub fn lossy_rate(&self) -> Option<f64> {
+        (self.hard_cap_repolls > 0)
+            .then(|| self.lossy_repolls as f64 / self.hard_cap_repolls as f64)
+    }
+}
+
+/// One workspace's gated state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollGatingWorkspace {
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub repo: String,
+    /// The last decision skipped this workspace's poll.
+    #[serde(default)]
+    pub gated: bool,
+    #[serde(default)]
+    pub last_poll_age_secs: Option<u64>,
 }
 
 /// One armed early-tick consumer's live counters (ADR-0021 Phase 2, #8995).
