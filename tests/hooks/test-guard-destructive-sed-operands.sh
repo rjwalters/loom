@@ -87,6 +87,28 @@ assert_deny "sed-operands (#11074): BSD sed -i '' attached -es/a/b/ with checkou
 assert_deny "sed-operands (#11074): BSD sed -i '' positional script with checkout target still denies" \
     "sed -i '' 's/a/b/' README.md" "$WT_REPO"
 
+# --- `--` ends options: every later token is a file operand ----------------
+# GNU sed treats `-e`/`-f`/`--file=...` AFTER `--` as filenames; reading them as
+# script options would swallow the real target (`-- -e README.md`).
+assert_deny "sed-operands (#11074): sed -i -e ... -- -e README.md (-- terminates options) denies" \
+    "sed -i -e s/a/b/ -- -e README.md" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -e ... -- -f README.md denies" \
+    "sed -i -e s/a/b/ -- -f README.md" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -e ... -- --file=x README.md denies" \
+    "sed -i -e s/a/b/ -- --file=x README.md" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -e ... -- --expression README.md denies" \
+    "sed -i -e s/a/b/ -- --expression README.md" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -e ... -- -es/a/b/ README.md denies" \
+    "sed -i -e s/a/b/ -- -es/a/b/ README.md" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -e ... -- with absolute main-checkout target denies" \
+    "sed -i -e s/a/b/ -- $WT_REPO/f" "$WT_REPO"
+assert_deny "sed-operands (#11074): sed -i -- positional script then checkout target denies" \
+    "sed -i -- s/a/b/ README.md" "$WT_REPO"
+assert_allow "sed-operands (#11074): sed -i -e ... -- with external /tmp target allows" \
+    "sed -i -e s/a/b/ -- $EXT" "$WT_REPO"
+assert_allow "sed-operands (#11074): sed -i -- positional script with external /tmp target allows" \
+    "sed -i -- s/a/b/ $EXT" "$WT_REPO"
+
 rm -rf "$WT_REPO"
 
 echo ""

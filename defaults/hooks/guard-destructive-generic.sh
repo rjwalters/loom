@@ -8726,12 +8726,28 @@ _extract_write_targets_scan() {
                 # genuine main-checkout target among them still denies.
                 bare_i_pending = 0
                 have_script = 0
+                end_opts = 0
                 sed_skip = 1
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
                     if (j in stdin_redir) continue
                     if (j in numfd_redir) continue
+                    # `--` ends options (#11074): every later token -- even one
+                    # spelled `-e`/`-f`/`--file=x` -- is an operand, never a
+                    # script option that could swallow the next file.
+                    if (!end_opts && toks[j] == "--") { end_opts = 1; continue }
+                    if (end_opts) {
+                        if (toks[j] == "") continue
+                        if (toks[j] ~ /^<<-?/) {
+                            if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
+                            continue
+                        }
+                        nf++
+                        nfargs[nf] = toks[j]
+                        bare_i_pending = 0
+                        continue
+                    }
                     if (toks[j] == "-i") { has_i = 1; bare_i_pending = 1; continue }
                     if (toks[j] ~ /^-i/) has_i = 1
                     # Script options (#11074): `-e`/`-f`/`--expression`/`--file`
