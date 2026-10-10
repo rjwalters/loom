@@ -108,14 +108,28 @@ in the background and poll **in the same turn** until it exits. This is a Bash
 *process* the orchestrator awaits, not a background role subagent (still
 prohibited); never end the turn while it is pending (`sweep-execution-model.md`).
 
+Shell variables do not survive between Bash tool calls, so use a **literal**
+result dir `P=/tmp/loom-worker-<role>-<N>-<unix-time>` (pick the time once, then
+repeat the literal in every call). Launch with `run_in_background:true`:
+
 ```bash
-D=$(mktemp -d)   # Bash run_in_background:true; exit code lands in $D/exit
-( loom-daemon worker run --role builder --issue N --json >"$D/report.json" 2>"$D/stderr.log"; echo $? >"$D/exit" )
+P=/tmp/loom-worker-builder-N-T; mkdir -p "$P"; echo $$ >"$P/pid"; date +%s >"$P/start"
+loom-daemon worker run --role builder --issue N --json >"$P/report.json" 2>"$P/stderr.log"; echo $? >"$P/exit"
 ```
 
-Then, in foreground Bash calls, each bounded under the tool cap (e.g.
-`for i in $(seq 9); do [ -s "$D/exit" ] && break; sleep 10; done`), repeat until
-`$D/exit` is non-empty. Read the exit code and `$D/report.json` only then:
-0 artifact, 1 no artifact, 75 fall back to Claude, 78 config, 124 timeout
-(`--timeout`, default 3600s). A missing `exit` file means the worker is still
-running, never success; if the wrapper itself died, treat it as exit 1.
+Then repeat this foreground poll (~90s, under the tool cap) until it prints a
+code. Empty output means still running — poll again; never read it as success:
+
+```bash
+P=/tmp/loom-worker-builder-N-T
+for i in $(seq 9); do
+  [ -s "$P/exit" ] && break
+  if ! kill -0 "$(cat "$P/pid")" 2>/dev/null; then [ -s "$P/exit" ] || echo 1 >"$P/exit"; break; fi   # wrapper died
+  [ $(( $(date +%s) - $(cat "$P/start") )) -gt 3720 ] && { echo 1 >"$P/exit"; break; }   # --timeout 3600 + 120s
+  sleep 10
+done; cat "$P/exit" 2>/dev/null
+```
+
+Read `$P/report.json` once a code prints: 0 artifact, 1 no artifact (also a dead
+wrapper or missed deadline), 75 fall back to Claude, 78 config, 124 timeout
+(`--timeout`, default 3600s).
