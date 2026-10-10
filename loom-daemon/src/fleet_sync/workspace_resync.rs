@@ -246,7 +246,8 @@ pub struct Alert {
     pub repo: Option<String>,
     /// For one repo: `branch-protection`, `failure`, `resync-loop`, or
     /// `repo-access` (the forge or the remote refuses this repo). For the
-    /// host, with an empty `root`: `network` (one, however many remotes are
+    /// host, with an empty `root`: `credential-helper` (git can get no
+    /// credential, however many repos hit it), `network` (one, however many remotes are
     /// down), `head-query` (the batched head query keeps failing) or
     /// `pass-stuck` (a pass is still running several ticks later).
     pub kind: &'static str,
@@ -434,6 +435,9 @@ struct Scan {
     unreachable: u32,
     in_a_row: u32,
     first_error: Option<String>,
+    /// The first credential-helper failure this pass (the host's, not a
+    /// repo's).
+    credential: Option<String>,
     alerts: Vec<Alert>,
 }
 
@@ -444,6 +448,11 @@ impl Scan {
         self.reached += 1;
         self.in_a_row = 0;
         memory.down.remove(root);
+    }
+
+    fn no_credential(&mut self, name: &str, detail: &str) {
+        self.credential
+            .get_or_insert_with(|| format!("{name}: {detail}"));
     }
 
     fn no_answer(&mut self, root: &Path, name: &str, detail: &str, memory: &mut Memory) {
@@ -580,6 +589,12 @@ pub fn run(env: &Env<'_>, roots: &[PathBuf], mode: Mode, memory: &mut Memory) ->
         (env.clock)(),
     );
     if let Some(alert) = outage {
+        log::error!("workspace_resync: {}", alert.detail);
+        scan.alerts.push(alert);
+    }
+    let credential =
+        memory.note_credential(scan.credential.as_deref(), env.interval, (env.clock)());
+    if let Some(alert) = credential {
         log::error!("workspace_resync: {}", alert.detail);
         scan.alerts.push(alert);
     }
@@ -735,6 +750,11 @@ fn classify(
     // A pass that has stopped asking (three remotes in a row did not answer)
     // classifies the rest from what their clones hold.
     let asked = if scan.online { asked } else { Asked::No };
+    if let Asked::Skip(why) = &asked {
+        // Empty or archived: nothing to resync and nothing wrong.
+        log::debug!("workspace_resync: {}: {why}; skipped", root.display());
+        return skip(report, why);
+    }
     match classify_head(env, root, gate, memory, scan, asked, &mut report) {
         Ok(found) => (report, found.map(|(branch, commit)| (nwo, branch, commit))),
         Err(e) => {
@@ -761,6 +781,9 @@ fn classify(
             let (kind, detail) = if let Some(down) = e.downcast_ref::<git::Unreachable>() {
                 scan.no_answer(root, &nwo, &down.0, memory);
                 (FailureKind::Unreachable, format!("remote did not answer: {}", down.0))
+            } else if let Some(cred) = e.downcast_ref::<git::Credential>() {
+                scan.no_credential(&nwo, &cred.0);
+                (FailureKind::Credential, cred.0.clone())
             } else if let Some(refused) = e.downcast_ref::<git::Refused>() {
                 scan.answered(root, memory);
                 (FailureKind::Refused, refused.0.clone())
@@ -827,7 +850,7 @@ fn classify_head(
             .then(|| (branch.clone(), verdict.commit.clone()))
     };
     let head = match asked {
-        Asked::No => None,
+        Asked::No | Asked::Skip(_) => None,
         Asked::Forge {
             branch: theirs,
             commit,

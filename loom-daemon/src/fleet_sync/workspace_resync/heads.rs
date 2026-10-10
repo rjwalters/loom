@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -51,6 +51,11 @@ pub const PROBE_PARALLEL: usize = 8;
 
 /// Deadline for one query: a third of the pass's network budget.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the whole head check may spend across owners, token minting
+/// included: the pass's network budget. An owner not reached in time is
+/// asked with `git ls-remote` like any repo the query gave no head for.
+const HEADS_BUDGET: Duration = Duration::from_secs(45);
 
 /// The rate-limit breaker's name for this job.
 const CALLER: &str = "workspace_resync";
@@ -74,6 +79,8 @@ pub enum Fault {
     Forbidden(String),
     /// The repo has no default branch (it is empty).
     NoDefaultBranch,
+    /// The repository is archived: it cannot be pushed to.
+    Archived,
 }
 
 impl std::fmt::Display for Fault {
@@ -82,6 +89,7 @@ impl std::fmt::Display for Fault {
             Self::NotFound(why) => write!(f, "the forge has no such repository: {why}"),
             Self::Forbidden(why) => write!(f, "the forge refused to read the repository: {why}"),
             Self::NoDefaultBranch => f.write_str("the repository has no default branch"),
+            Self::Archived => f.write_str("the repository is archived"),
         }
     }
 }
@@ -109,6 +117,9 @@ pub struct Heads {
     pub requests: u32,
     /// The rate-limit breaker is open: some or all of the check was not sent.
     pub breaker_open: bool,
+    /// The check's time budget ran out between owners: later owners were not
+    /// asked.
+    pub out_of_budget: bool,
     /// Why a request got no usable answer, one entry per request.
     pub failures: Vec<String>,
 }
@@ -136,8 +147,8 @@ pub fn query(repos: &[&str]) -> String {
         .filter_map(|(i, nwo)| {
             let (owner, name) = owner_name(nwo)?;
             Some(format!(
-                " r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ defaultBranchRef {{ \
-                 name target {{ oid }} }} }}"
+                " r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ isArchived \
+                 defaultBranchRef {{ name target {{ oid }} }} }}"
             ))
         })
         .collect();
@@ -178,6 +189,9 @@ pub fn parse(body: &str, count: usize) -> Option<Vec<Option<Answer>>> {
             Some(repo) if repo.is_object() => repo,
             _ => return fault(&alias).map(Answer::Fault),
         };
+        if repo["isArchived"].as_bool() == Some(true) {
+            return Some(Answer::Fault(Fault::Archived));
+        }
         let head = &repo["defaultBranchRef"];
         if head.is_null() {
             return Some(Answer::Fault(Fault::NoDefaultBranch));
@@ -234,10 +248,14 @@ pub(super) fn batches(asks: &[HeadAsk]) -> Vec<Batch<'_>> {
 /// Send `asks`' [`batches`] with `send` (which returns a query's response
 /// body) and collect the answers. `breaker_open` is read before every
 /// request, because a refusal on the last one may have opened it; once it
-/// says yes nothing more is sent.
+/// says yes nothing more is sent. It is read once more after the last
+/// request: that one may have opened it, and then the caller must neither
+/// fall back to git nor claim. `out_of_budget` is read before each request
+/// after the first; once it says yes the remaining owners are not asked.
 pub(super) fn gather(
     asks: &[HeadAsk],
     breaker_open: &dyn Fn() -> bool,
+    out_of_budget: &dyn Fn() -> bool,
     send: &dyn Fn(&Batch<'_>) -> anyhow::Result<String>,
 ) -> Heads {
     let mut heads = Heads::default();
@@ -245,6 +263,10 @@ pub(super) fn gather(
         if breaker_open() {
             heads.breaker_open = true;
             return heads;
+        }
+        if heads.requests > 0 && out_of_budget() {
+            heads.out_of_budget = true;
+            break;
         }
         heads.requests += 1;
         let parsed = send(&batch).and_then(|body| {
@@ -269,19 +291,31 @@ pub(super) fn gather(
             }
         }
     }
+    if breaker_open() {
+        heads.breaker_open = true;
+    }
     heads
 }
 
 /// The production head check: one query per owner (per [`CHUNK`] repos),
 /// under that owner's writer credential.
 pub(super) fn live(asks: &[HeadAsk]) -> Heads {
-    gather(asks, &|| crate::rate_limit_breaker::global_skip_pass(CALLER), &|batch| {
-        GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_as_writer(
-            ops::GIT_DEFAULT_BRANCH_HEADS,
-            &query(&batch.repos),
-            QUERY_TIMEOUT,
-        )
-    })
+    let started = Instant::now();
+    gather(
+        asks,
+        &|| crate::rate_limit_breaker::global_skip_pass(CALLER),
+        &|| started.elapsed() >= HEADS_BUDGET,
+        &|batch| {
+            // Minting the owner's token happens inside this call, so the
+            // clock above covers it; the query gets what is left.
+            let left = HEADS_BUDGET.saturating_sub(started.elapsed());
+            GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_as_writer(
+                ops::GIT_DEFAULT_BRANCH_HEADS,
+                &query(&batch.repos),
+                QUERY_TIMEOUT.min(left.max(Duration::from_secs(1))),
+            )
+        },
+    )
 }
 
 /// Ask each of `roots`' remotes for its default branch's head with
@@ -330,6 +364,9 @@ pub(super) enum Asked {
     /// The remote was asked directly for the head of the branch the clone
     /// follows.
     Remote(anyhow::Result<String>),
+    /// Nothing to resync, and nothing wrong: the repo is empty or archived.
+    /// Skipped quietly, without a refusal or a warning.
+    Skip(String),
 }
 
 /// Check every workspace's default-branch head for one pass: the batched
@@ -397,6 +434,9 @@ pub(super) fn check(
                 };
                 found.insert(ask.root.clone(), head);
             }
+            Some(Answer::Fault(fault @ (Fault::NoDefaultBranch | Fault::Archived))) => {
+                found.insert(ask.root.clone(), Asked::Skip(fault.to_string()));
+            }
             Some(Answer::Fault(_)) | None => direct.push(ask),
         }
     }
@@ -427,6 +467,11 @@ pub(super) fn check(
                     }
                     Ok(head)
                 }
+                // git could get no credential at all: the host's failure, not
+                // the repo's, whatever the forge said. Kept as it is so the
+                // pass reports one `credential-helper` alert for the host
+                // instead of a refusal (and `repo-access`) per repo.
+                (Err(e), Some(_)) if e.downcast_ref::<git::Credential>().is_some() => Err(e),
                 // The forge says it has no such repo and the remote gave no
                 // head either: the repo's failure, however git worded it.
                 (Err(e), Some(fault)) => Err(git::Refused(format!("{fault} ({e:#})")).into()),

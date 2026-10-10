@@ -31,6 +31,8 @@ pub(super) struct ForgeHeads {
     pub(super) down: Cell<bool>,
     /// The rate-limit breaker is open: nothing is sent.
     pub(super) breaker: Cell<bool>,
+    /// The breaker opens on this very query (it was rate limited).
+    pub(super) trip_after_query: Cell<bool>,
     /// Repos the forge has no head for, by root.
     pub(super) faults: RefCell<HashMap<PathBuf, HeadFault>>,
     /// Repos whose default branch the forge calls something else, by root.
@@ -48,6 +50,7 @@ impl ForgeHeads {
         self.requests.set(self.requests.get() + 1);
         self.asked.borrow_mut().push(asks.len());
         heads.requests = 1;
+        heads.breaker_open = self.trip_after_query.get();
         if self.down.get() {
             heads.failures.push("acme: HTTP 502".to_string());
             return heads;
@@ -311,7 +314,6 @@ fn git_refusals_are_told_apart_from_a_remote_that_does_not_answer() {
         "remote: Repository not found.\nfatal: repository 'https://github.com/a/b.git/' not found",
         "ERROR: Repository not found.\nfatal: Could not read from remote repository.",
         "fatal: Authentication failed for 'https://github.com/a/b.git/'",
-        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
         "remote: Invalid username or token. Password authentication is not supported",
         "remote: Permission to a/b.git denied to someone.",
         "fatal: unable to access 'https://github.com/a/b/': The requested URL returned error: 403",
@@ -324,9 +326,14 @@ fn git_refusals_are_told_apart_from_a_remote_that_does_not_answer() {
         "ssh: connect to host github.com port 22: Operation timed out",
         "fatal: '/nonexistent/origin.git' does not appear to be a git repository",
         "",
+        // The host's credential helper, not this repo.
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
     ] {
         assert!(!is_refusal(silent), "{silent}");
     }
+    assert!(super::super::git::is_credential_failure(
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    ));
 }
 
 // ----------------------------------------------------------------------------
@@ -337,9 +344,9 @@ fn git_refusals_are_told_apart_from_a_remote_that_does_not_answer() {
 fn the_query_has_one_alias_per_repo_and_quotes_only_safe_names() {
     assert_eq!(
         query(&["acme/app", "acme/lib.rs"]),
-        "query { r0: repository(owner: \"acme\", name: \"app\") { defaultBranchRef { name \
-         target { oid } } } r1: repository(owner: \"acme\", name: \"lib.rs\") { \
-         defaultBranchRef { name target { oid } } } }"
+        "query { r0: repository(owner: \"acme\", name: \"app\") { isArchived \
+         defaultBranchRef { name target { oid } } } r1: repository(owner: \"acme\", \
+         name: \"lib.rs\") { isArchived defaultBranchRef { name target { oid } } } }"
     );
     // A slug that could break out of the string literal gets no alias (and
     // so no answer); the aliases of the others keep their positions.
@@ -436,7 +443,7 @@ fn git_default_branch_heads_is_one_query_per_owner_chunked_past_a_hundred_repos(
     // both clones of the repo that is cloned twice included.
     let oid = "b".repeat(40);
     let sent = Cell::new(0);
-    let heads = gather(&asked, &|| false, &|batch| {
+    let heads = gather(&asked, &|| false, &|| false, &|batch| {
         sent.set(sent.get() + 1);
         Ok(all_at(batch.repos.len(), &oid))
     });
@@ -444,14 +451,17 @@ fn git_default_branch_heads_is_one_query_per_owner_chunked_past_a_hundred_repos(
     assert_eq!(heads.answers.len(), asked.len());
     assert!(heads.failures.is_empty() && !heads.breaker_open);
     let one_owner = asks(&names[..60]);
-    assert_eq!(gather(&one_owner, &|| false, &|b| Ok(all_at(b.repos.len(), &oid))).requests, 1);
+    assert_eq!(
+        gather(&one_owner, &|| false, &|| false, &|b| Ok(all_at(b.repos.len(), &oid))).requests,
+        1
+    );
 }
 
 #[test]
 fn one_owners_failed_query_leaves_the_other_owners_answers() {
     let asked = asks(&["2AMLogic/a", "2AMLogic/b", "rjwalters/loom"]);
     let oid = "c".repeat(40);
-    let heads = gather(&asked, &|| false, &|batch| {
+    let heads = gather(&asked, &|| false, &|| false, &|batch| {
         if batch.owner == "2amlogic" {
             anyhow::bail!("the GraphQL query got no answer: HTTP 502")
         }
@@ -464,7 +474,9 @@ fn one_owners_failed_query_leaves_the_other_owners_answers() {
         .answers
         .contains_key(&PathBuf::from("/src/rjwalters/loom")));
     // A body with no `data` (a rate-limit message) is a failure too.
-    let heads = gather(&asked, &|| false, &|_| Ok(r#"{"message":"rate limited"}"#.to_string()));
+    let heads = gather(&asked, &|| false, &|| false, &|_| {
+        Ok(r#"{"message":"rate limited"}"#.to_string())
+    });
     assert_eq!((heads.answers.len(), heads.failures.len()), (0, 2));
 }
 
@@ -476,16 +488,172 @@ fn nothing_is_sent_while_the_breaker_is_open() {
         sent.set(sent.get() + 1);
         Ok(all_at(batch.repos.len(), &"d".repeat(40)))
     };
-    let heads = gather(&asked, &|| true, &send);
+    let heads = gather(&asked, &|| true, &|| false, &send);
     assert!(heads.breaker_open);
     assert_eq!((heads.requests, sent.get()), (0, 0));
     // It opens after the first request (which was refused): the second is
     // not sent.
-    let heads = gather(&asked, &|| sent.get() > 0, &send);
+    let heads = gather(&asked, &|| sent.get() > 0, &|| false, &send);
     assert!(heads.breaker_open);
     assert_eq!((heads.requests, sent.get()), (1, 1));
+    // The breaker opens on the last request itself (it was rate limited):
+    // the pass reports it, so the caller neither falls back nor claims.
+    sent.set(0);
+    let one = asks(&["2AMLogic/a"]);
+    let heads = gather(&one, &|| sent.get() > 0, &|| false, &send);
+    assert!(heads.breaker_open, "re-checked after the last request");
+    assert_eq!((heads.requests, sent.get()), (1, 1));
     // No repos, no request.
-    assert_eq!(gather(&[], &|| false, &send).requests, 0);
+    assert_eq!(gather(&[], &|| false, &|| false, &send).requests, 0);
+}
+
+#[test]
+fn the_budget_is_checked_between_owners() {
+    let asked = asks(&["2AMLogic/a", "rjwalters/loom", "zed/z"]);
+    let sent = Cell::new(0);
+    let send = |batch: &super::super::heads::Batch<'_>| {
+        sent.set(sent.get() + 1);
+        Ok(all_at(batch.repos.len(), &"e".repeat(40)))
+    };
+    // Spent after the first owner: the others are left to ls-remote.
+    let heads = gather(&asked, &|| false, &|| sent.get() >= 1, &send);
+    assert!(heads.out_of_budget && !heads.breaker_open);
+    assert_eq!((heads.requests, heads.answers.len()), (1, 1));
+}
+
+#[test]
+fn a_breaker_that_opens_on_the_passes_last_query_means_no_fallback_and_no_claim() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let before = fx.origin_head();
+    host.heads.trip_after_query.set(true);
+    let pass = host.pass();
+    assert_eq!(network(&pass), (1, 0, 0), "one query, no ls-remote, no fetch");
+    assert_eq!(only(&pass).state, WState::W1, "reported from the clone, not resynced");
+    assert!(pass
+        .host
+        .as_deref()
+        .is_some_and(|h| h.contains("breaker is open")));
+    assert!(fx.forge.calls.borrow().is_empty());
+    assert_eq!(fx.origin_head(), before);
+}
+
+#[test]
+fn empty_and_archived_repos_are_skipped_without_a_failure() {
+    for fault in [HeadFault::NoDefaultBranch, HeadFault::Archived] {
+        let fx = Fixture::new(STALE);
+        let host = Host::new(&fx, "host-a");
+        host.heads
+            .faults
+            .borrow_mut()
+            .insert(host.root.clone(), fault);
+        let pass = host.pass();
+        assert_eq!(only(&pass).state, WState::Skipped, "{pass:?}");
+        assert_eq!(network(&pass), (1, 0, 0), "no ls-remote for it");
+        assert!(pass.alerts.is_empty());
+        assert!(host.memory.borrow().backoff.is_empty());
+        assert!(host
+            .memory
+            .borrow()
+            .noted
+            .iter()
+            .all(|n| !n.starts_with("blind:")));
+    }
+}
+
+#[test]
+fn a_broken_credential_helper_raises_one_host_level_alert() {
+    use super::super::git::{network_failure, Credential, Refused};
+    let stderr = b"fatal: could not read Username for 'https://github.com': terminal prompts \
+                   disabled";
+    let err = network_failure("git ls-remote", stderr);
+    assert!(err.downcast_ref::<Credential>().is_some());
+    assert!(err.downcast_ref::<Refused>().is_none(), "not a per-repo refusal");
+
+    // Any number of repos failing that way, over any number of passes, is one
+    // alert for the host with an empty root; a clean pass ends the run.
+    let mut memory = Memory::default();
+    let now = Utc::now();
+    let first = memory.note_credential(Some("acme/a: no helper"), INTERVAL, now);
+    let first = first.expect("the first failing pass alerts");
+    assert_eq!((first.kind, first.root.as_os_str().is_empty()), ("credential-helper", true));
+    assert!(memory
+        .note_credential(Some("acme/b: no helper"), INTERVAL, now)
+        .is_none());
+    assert!(memory.note_credential(None, INTERVAL, now).is_none());
+    assert!(memory
+        .note_credential(Some("acme/a: no helper"), INTERVAL, now)
+        .is_some());
+
+    // And a per-repo failure of that kind never alerts as `repo-access`.
+    let root = PathBuf::from("/nonexistent/cred");
+    for _ in 0..5 {
+        let (_, alert) =
+            memory.fail(&report_for(&root), FailureKind::Credential, "x", INTERVAL, now);
+        assert!(alert.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_credential_helper_failure_behind_a_forge_fault_stays_the_hosts() {
+    // The forge says NotFound/Forbidden (the query's credential cannot see a
+    // private repo) and the `git ls-remote` fallback cannot get a credential
+    // either. That is the host's credential helper, not the repo: one
+    // `credential-helper` alert, never a `repo-access` refusal per repo.
+    use std::os::unix::fs::PermissionsExt;
+    for fault in [
+        gone(),
+        HeadFault::Forbidden("Resource not accessible by integration".to_string()),
+    ] {
+        let fx = Fixture::new(current());
+        let host = Host::new(&fx, "host-a");
+        let private = fx.clone_as("private");
+        host.heads
+            .faults
+            .borrow_mut()
+            .insert(private.clone(), fault.clone());
+        // An ssh "transport" that fails the way git does with no credential.
+        let ssh = fx.tmp.path().join("no-credential-ssh");
+        write(
+            &ssh,
+            "#!/bin/sh\necho \"fatal: could not read Username for 'https://github.com': \
+             terminal prompts disabled\" >&2\nexit 128\n",
+        );
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&private, &["config", "core.sshCommand", ssh.to_str().unwrap()]);
+        git(
+            &private,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@example.invalid/acme/private.git",
+            ],
+        );
+        let roots = [private.clone(), host.root.clone()];
+
+        let mut alerts = Vec::new();
+        for _ in 0..4 {
+            let pass = host.pass_over(&roots, Mode::Write, &|| Ok(()), None);
+            let (bad, good) = (&pass.workspaces[0], &pass.workspaces[1]);
+            assert_eq!(good.state, WState::W0, "the healthy repo is unaffected: {pass:?}");
+            assert!(
+                !reason(bad).contains("the forge"),
+                "not wrapped as the forge's refusal ({fault}): {bad:?}"
+            );
+            assert!(reason(bad).contains("could not read Username"), "{bad:?}");
+            alerts.extend(pass.alerts.iter().map(|a| (a.kind, a.root.clone())));
+            assert!(host.memory.borrow().outage_hold(host.now.get()).is_none());
+            // Past the repo's own backoff: every pass retries it.
+            host.advance(Duration::from_secs(60 * 60));
+        }
+        assert_eq!(
+            alerts,
+            vec![("credential-helper", PathBuf::new())],
+            "one host alert across the retries, no `repo-access` ({fault})"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
