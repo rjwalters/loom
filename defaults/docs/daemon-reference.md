@@ -10143,7 +10143,8 @@ Nothing is matched by process name. `dryRun` records the plan (event field
 
 **Records.** Each reap logs a line, publishes `daemon.agent_residue.reaped`
 (fields in `telemetry-schema.md`) and increments a counter. `loom-daemon status
---json` reports them under `agent_residue`:
+--json` reports them under `agent_residue` (selectable alone with
+`--section agent_residue`):
 
 | Field | Meaning |
 |-------|---------|
