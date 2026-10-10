@@ -332,13 +332,6 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // W4-B: the one routing step `read_credential` now wraps.
         "forge_identity/route.rs",
         "forge_etag_store.rs", // issue listings + cached views (GET, conditional)
-        // #10263: the ETA fleet refresh's repo set — issue listings and PR
-        // timelines, GETs only, through `fetch_with_reader`.
-        "observability/eta_fleet_refresh.rs",
-        // #10232: resolves which reader serves a repo only to derive the public
-        // `reader:<app id>@<owner>` bucket label; the credential is discarded
-        // and no request is made with it.
-        "eta/stall_features.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
         // #9872: the `GhInvocation` choke point. Only `AccessIntent::Read` +
@@ -353,9 +346,6 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // W7: the ETag store's W4-C deferrable chain (`ConditionalRead::
         // deferrable`), the same reviewed routing step with the router injected.
         "forge_etag_store/deferrable.rs",
-        // #10391: `eta doctor` resolves (never uses) a reader per repo to say
-        // whether one exists; it makes no forge call at all.
-        "eta/doctor_facts.rs",
         // W8: the installation snapshot reads `installation/repositories`
         // under the repo's reader (token env stripped) for visibility and
         // identity only; the write-scope probe passes the writer explicitly.

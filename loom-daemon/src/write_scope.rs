@@ -51,7 +51,7 @@
 //!
 //! # The one autonomous write outside this rule
 //!
-//! The captain's ETA fit publication (`eta::fit::publish`, #10395) writes to
+//! The captain's gauge heartbeat (`captain_gauges::store`, #10395) writes to
 //! the configured fleet store (`fleet.repo`), which is not a managed workspace
 //! repo and is written under the store's writer App, not `root`'s credential,
 //! so this rule cannot vet it. Its `FleetStore` entry in

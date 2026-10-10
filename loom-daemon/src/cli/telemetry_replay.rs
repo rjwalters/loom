@@ -219,7 +219,7 @@ impl ReplayArgs {
         if !used.is_empty() {
             eprintln!(
                 "[telemetry-replay] deprecated: {} read from {LEGACY_ENDPOINT_CONFIG_KEY}; \
-                 move it to {ENDPOINT_CONFIG_KEY} (the old key is removed with the ETA subsystem, #11098)",
+                 move it to {ENDPOINT_CONFIG_KEY} (the old key is a deprecated fallback and will be removed, #11098)",
                 used.join(", ")
             );
         }

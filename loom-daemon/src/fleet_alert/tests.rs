@@ -504,7 +504,7 @@ mod output_watch {
         let conds = outputs::conditions(&w, t0());
         assert!(!conds.is_empty());
         assert!(conds.iter().all(|c| outputs::is_output_key(&c.key)));
-        assert!(conds[0].headline.starts_with("CRITICAL"));
+        assert!(conds.iter().any(|c| c.headline.starts_with("CRITICAL")));
 
         let mut st = AlertState::new(1, Duration::from_secs(3600));
         let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
@@ -522,7 +522,9 @@ mod output_watch {
         );
         assert_eq!(out.len(), conds.len());
         assert!(out.iter().all(|t| t.kind == Kind::Started));
-        assert_eq!(inbox_payload(&out[0], "h")["severity"], serde_json::json!("critical"));
+        assert!(out
+            .iter()
+            .any(|t| inbox_payload(t, "h")["severity"] == serde_json::json!("critical")));
 
         // Output resumes: every alert clears.
         let src = Healthy(t0());

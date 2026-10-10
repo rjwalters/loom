@@ -987,19 +987,6 @@ async fn sample_snapshots(
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
-    // ETA (Issue #9289): review listings, outcome checks and re-estimates,
-    // after `stage_dwell` so the ETag-cached listings are warm.
-    super::eta::record(workspace_root, workspace_pool, slug_cache).await;
-    // #10414: the ETA pass finished; a no-op unless ETA registered it.
-    crate::task_liveness::beat_if_registered(crate::task_liveness::ETA_PASS);
-    // This host's live estimate set (Issue #9329) — native HTTPS only, and
-    // only when the set changed. After `eta::record` so it carries this
-    // pass's estimates rather than the previous pass's.
-    super::eta_snapshot::record().await;
-    // ETA pipeline health gauges (Issue #10391), OTLP-only: local state and
-    // file reads, no forge call; a no-op without the ops sink. After the
-    // snapshot so it reports this pass's built snapshot.
-    super::ops::eta_health::record(workspace_root).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot

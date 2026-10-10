@@ -446,7 +446,6 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
-        ("eta/retire_filing.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
         (
@@ -545,15 +544,6 @@ fn daemon_write_paths_are_scoped() {
         (
             "fleet_store/propose/mod.rs",
             OperatorOnly("`fleet-config propose`: a PR against the configured store"),
-        ),
-        (
-            "eta/fit/publish.rs",
-            FleetStore {
-                caller: "observability/eta_fleet_refresh.rs",
-                call: "distribute_publish(root, &publisher",
-                gate: "RefreshGate::Captain | RefreshGate::Authority)",
-                why: "the refresher (the captain, or the explicit ETA authority, #10918) publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
-            },
         ),
         (
             "observability/captain_gauges/store.rs",

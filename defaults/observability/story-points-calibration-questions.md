@@ -10,9 +10,8 @@ instead of an argument.
 Every question `CAL<n>` is a committed SQL statement of the same number in
 [`story-points-calibration-queries.sql`](story-points-calibration-queries.sql)
 — the same discipline as [`cycle-time-questions.md`](cycle-time-questions.md)
-and the ETA accuracy work it mirrors
-([`signoz/eta-queries.sql`](signoz/eta-queries.sql), #9289): the estimator
-differs (Curator vs heuristic) but the scoring discipline — per-revision
+and the (since removed) ETA accuracy work it mirrored (#9289): the estimator
+differed (Curator vs heuristic) but the scoring discipline — per-revision
 provenance, scored-vs-counted separation, baselines stated up front — is the
 same.
 
