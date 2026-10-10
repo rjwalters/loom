@@ -42,10 +42,10 @@ pub const ESCALATE_EVERY_FAILURES: u32 = 24;
 
 /// Most bytes of envelopes (as the JSON array the HTTPS exporter POSTs) one
 /// batch carries (#10928), under `/ingest`'s 5 MiB body limit. `batch_size`
-/// counts envelopes, and a few queued `eta.snapshot`s (each up to
-/// [`crate::telemetry::kinds::eta_snapshot::MAX_RECORD_BYTES`], one per
-/// 5-minute pass while the sink is down) would otherwise make a batch the
-/// sink answers 413 to on every retry, wedging the queue for good.
+/// counts envelopes, and a few large queued records (the since-removed
+/// `eta.snapshot` was capped at 1 MiB each, one per 5-minute pass
+/// while the sink was down) would otherwise make a batch the sink answers
+/// 413 to on every retry, wedging the queue for good.
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bytes of `value`'s compact JSON, counted without buffering it.

@@ -75,8 +75,6 @@ fn pick_decision() -> PickDecisionRecord {
     )
 }
 
-// `eta.backtest.*` payloads carry their own `kind` field, which collides with
-// the record's serde tag in flat wire JSON, so these two are struct literals.
 /// One minimal record per `otlp: Logs` kind. A new log kind fails
 /// [`every_otlp_log_kind_carries_exactly_one_loom_kind_equal_to_its_tag`]
 /// until it adds a sample here.
@@ -167,7 +165,7 @@ fn every_otlp_log_kind_carries_exactly_one_loom_kind_equal_to_its_tag() {
         .iter()
         .filter(|meta| meta.otlp == TelemetryKindOtlp::Logs)
         .collect();
-    assert!(log_kinds.iter().any(|m| m.kind == "eta.estimate"), "registry walk is live");
+    assert!(log_kinds.iter().any(|m| m.kind == "sweep.outcome"), "registry walk is live");
     for meta in log_kinds {
         let record = samples
             .iter()

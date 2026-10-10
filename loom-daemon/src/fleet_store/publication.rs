@@ -2,7 +2,7 @@
 //! branch of the fleet store (`fleet.repo`): the captain
 //! gauges heartbeat (W12; the ETA fit that shared it was removed, #11098).
 //!
-//! They lived in `eta::fit::publish` and were borrowed from there by
+//! They lived in the (since-removed) ETA fit publisher and were borrowed by
 //! `observability::captain_gauges::store`. They moved here (#11098, Stage 2)
 //! so the captain gauges no longer depend on the ETA subsystem; behaviour is
 //! unchanged. Nothing in this module writes to the forge: each artifact's

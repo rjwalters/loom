@@ -301,8 +301,8 @@ loom-daemon telemetry-replay --check --as-of 2026-10-04T13:00:00Z \
 
 **The comparator** is the webhook-derived label state. The loom-ui webhook
 Worker files one `label.transition` record per `loom:*` label change (and per
-opened / closed / reopened of an item carrying one; contract:
-`loom-daemon/src/eta/fleet_events_webhook.rs` until loom-ui owns the reader)
+opened / closed / reopened of an item carrying one; contract pinned by
+`loom-daemon/src/telemetry_replay_check_tests.rs` until loom-ui owns the reader)
 and exports it to SigNoz with resource `service.name = loom-ui-d1-export` and
 the D1 record as a flat JSON body. Loom does not own that schema; the body
 keys `kind`, `repo`, `target` (`issue` / `pr`), `number`, `action`, `label`
