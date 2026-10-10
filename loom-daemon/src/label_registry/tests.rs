@@ -218,6 +218,24 @@ fn work_finder_name_constants_match_their_registry_properties() {
 
 // --- slice 2b: more derived tables, pinned to their previous literals --------
 
+/// #11087: `human_gated` is the notifier contract ("a human must act"). The
+/// self-clearing sub-kind, the capability gate and the decision bounce are
+/// not human asks; the curation workflow labels are not either.
+#[test]
+fn human_gated_is_exactly_the_human_must_act_labels() {
+    assert_eq!(
+        set(embedded_set("human_gated")),
+        set([
+            "loom:operator",
+            "loom:operator-only",
+            "loom:operator-mechanical",
+            "loom:operator-decision",
+            "loom:operator-objective",
+            "external",
+        ])
+    );
+}
+
 #[test]
 fn derived_operator_gate_labels_equal_the_previous_literal() {
     assert_eq!(

@@ -1,7 +1,8 @@
 //! The alert thread and its delivery sinks (#10164).
 //!
 //! No forge access: status comes from the daemon's own IPC socket, delivery is
-//! the event bus and a plain HTTP POST to the loom-ui inbox.
+//! the event bus. Loom sends no mail (#11087): human-facing notification is
+//! derived outside Loom.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -15,8 +16,6 @@ use super::state::{AlertState, Kind, Transition};
 use super::{causes, classify, Settings};
 use crate::types::{DaemonStatusReport, Request, Response};
 
-const INBOX_URL_ENV: &str = "LOOM_UI_INBOX_URL";
-const INGEST_KEY_ENV: &str = "LOOM_UI_INGEST_KEY";
 const IPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One delivery channel. Each fails independently.
@@ -59,94 +58,6 @@ impl AlertSink for BusSink {
         // No subscriber (Safehouse off) is not a failure.
         let _ = self.0.publish(event);
         Ok(())
-    }
-}
-
-/// loom-ui inbox sink: keyed, idempotent `POST /api/inbox`.
-pub struct InboxSink {
-    url: String,
-    key: String,
-    client: reqwest::Client,
-    rt: tokio::runtime::Runtime,
-}
-
-impl InboxSink {
-    fn env_pair() -> Option<(String, String)> {
-        let url = std::env::var(INBOX_URL_ENV)
-            .ok()
-            .filter(|v| !v.trim().is_empty())?;
-        let key = std::env::var(INGEST_KEY_ENV)
-            .ok()
-            .filter(|v| !v.trim().is_empty())?;
-        Some((url, key))
-    }
-
-    /// Whether the inbox env vars are set (no runtime is built).
-    #[must_use]
-    pub fn configured() -> bool {
-        Self::env_pair().is_some()
-    }
-
-    /// `None` when the inbox is not configured. Owns a tokio `Runtime`, so
-    /// build and drop it off any async context.
-    #[must_use]
-    pub fn from_env() -> Option<Self> {
-        let (url, key) = Self::env_pair()?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .ok()?;
-        Some(Self {
-            url: format!("{}/api/inbox", url.trim_end_matches('/')),
-            key,
-            client,
-            rt,
-        })
-    }
-}
-
-/// The inbox request body for a transition (pure, for tests).
-#[must_use]
-pub fn inbox_payload(t: &Transition, host: &str) -> serde_json::Value {
-    let key = format!("mail-{host}-fleet-degraded-{}", t.key);
-    if t.kind == Kind::Cleared {
-        return serde_json::json!({ "key": key, "resolve": true });
-    }
-    serde_json::json!({
-        "key": key,
-        "title": format!("Fleet DEGRADED on {host}: {}", t.key),
-        "body": render_body(t),
-        "who": host,
-        "severity": if t.critical { "critical" } else { "normal" },
-    })
-}
-
-impl AlertSink for InboxSink {
-    fn name(&self) -> &'static str {
-        "inbox"
-    }
-    fn deliver(&self, t: &Transition, host: &str) -> Result<(), String> {
-        let payload = inbox_payload(t, host);
-        // The key travels only in the Authorization header, never argv or logs.
-        let resp = self
-            .rt
-            .block_on(
-                self.client
-                    .post(&self.url)
-                    .bearer_auth(&self.key)
-                    .json(&payload)
-                    .send(),
-            )
-            .map_err(|e| format!("request failed: {}", e.without_url()))?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!("HTTP {}", resp.status()))
-        }
     }
 }
 
@@ -226,10 +137,10 @@ pub fn spawn(
         );
         return None;
     }
-    if bus.is_none() && !InboxSink::configured() {
+    let Some(bus) = bus else {
         log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
         return None;
-    }
+    };
     let state_path = workspace_root
         .join(".loom")
         .join("logs")
@@ -237,22 +148,7 @@ pub fn spawn(
     let spawned = std::thread::Builder::new()
         .name("fleet-alert".to_string())
         .spawn(move || {
-            // Sinks are built on this thread: `InboxSink` owns a tokio
-            // `Runtime`, and dropping one inside the daemon's async context
-            // (e.g. if the thread failed to start) panics.
-            let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
-            if let Some(bus) = bus {
-                sinks.push(Box::new(BusSink(bus)));
-            }
-            if let Some(inbox) = InboxSink::from_env() {
-                sinks.push(Box::new(inbox));
-            } else {
-                log::info!("fleet_alert: inbox not configured ({INBOX_URL_ENV}/{INGEST_KEY_ENV}); skipping inbox sink");
-            }
-            if sinks.is_empty() {
-                log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
-                return;
-            }
+            let sinks: Vec<Box<dyn AlertSink>> = vec![Box::new(BusSink(bus))];
             let mut state =
                 AlertState::load(&state_path, settings.debounce_ticks, settings.reminder);
             let host = crate::sweep_registry::host_identity();
