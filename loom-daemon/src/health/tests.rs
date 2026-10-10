@@ -300,6 +300,23 @@ fn pgrep_blocks_a_dead_verdict_when_launchd_and_pidfile_are_negative() {
     assert_eq!(section.detail["declared_dead"], false);
 }
 
+/// #10110: once the pgrep fallback filters out session-exec workers and
+/// health/status probes, the assessor sees an empty set and, with IPC and
+/// install-state evidence negative, reports DEAD / `all-negative`.
+#[test]
+fn worker_only_candidates_filtered_to_empty_yield_all_negative_dead() {
+    let mut inputs = healthy_inputs();
+    inputs.status = None;
+    inputs.ipc_error = Some("connect failed".to_string());
+    inputs.install_state = Some(install_report(InstallState::NotExpected));
+    inputs.pgrep_pids = vec![];
+    let section = assess_liveness(&inputs);
+    assert_eq!(section.verdict, Verdict::Dead);
+    assert_eq!(section.detail["signal"], "all-negative");
+    assert_eq!(section.detail["install_state"], "not-expected");
+    assert_eq!(section.detail["declared_dead"], true);
+}
+
 /// An install-state classification of "alive but unresponsive" is DEGRADED,
 /// never DEAD — the daemon is running, it is just not answering. Uses a
 /// **non-timeout** IPC failure (`connect failed`) so this stays pinned to

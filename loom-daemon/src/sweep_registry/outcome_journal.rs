@@ -748,15 +748,26 @@ impl SweepRegistry {
         // durable outcome journal — no forge calls, no new state. Absent
         // (never fabricated) when the journal could not be read or the repo
         // slug never resolved (the journal matches on it).
-        let lineage = repo.as_deref().and_then(|repo_slug| {
-            let journal_path = self.config.resolve_outcome_telemetry_path();
-            let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
-            lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
-        });
-        let (attempt_index, previous_sweep_id, trigger) = lineage
-            .map_or((None, None, None), |(index, previous, trigger)| {
-                (Some(index), previous, Some(trigger.to_string()))
-            });
+        //
+        // Issue #11280: a sweep dispatched by this daemon already published
+        // its lineage on `sweep.started` / `fleet.state`; reuse that captured
+        // value (including "unknown") so the start and outcome rows cannot
+        // disagree when the journal rotated or became unreadable in between.
+        // Only a sweep with no captured facts (adopted, PR-set) derives it
+        // here.
+        let (attempt_index, previous_sweep_id, trigger) =
+            if let Some(facts) = self.start_facts.get(sweep_id) {
+                (facts.attempt_index, facts.previous_sweep_id.clone(), facts.trigger.clone())
+            } else {
+                let lineage = repo.as_deref().and_then(|repo_slug| {
+                    let journal_path = self.config.resolve_outcome_telemetry_path();
+                    let prior = sweep_outcomes::read_all_sweep_outcomes(&journal_path);
+                    lineage::derive_lineage(&prior, repo_slug, issue, sweep_id)
+                });
+                lineage.map_or((None, None, None), |(index, previous, trigger)| {
+                    (Some(index), previous, Some(trigger.to_string()))
+                })
+            };
 
         // In-sweep rework events (Issue #9444), two sources, markers first:
         // (a) events the performing paths explicitly marked in the

@@ -178,6 +178,7 @@ pub fn check_topic_taxonomy(content: &str, required_topics: &[&str]) {
                 kind: SweepKind::Issue(42),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
                 story_points: None,
             },
