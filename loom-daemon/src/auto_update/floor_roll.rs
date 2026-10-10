@@ -728,8 +728,7 @@ mod tests {
         }
     }
 
-    /// #10866 item 4: an unresolved tick keeps a standing stall; every other
-    /// reading replaces it.
+    /// #11029: a below-floor host that stays unresolved escalates to WARN.
     #[test]
     fn a_below_floor_host_escalates_after_consecutive_unresolved_ticks() {
         let mut state = FloorState::default();
@@ -760,6 +759,8 @@ mod tests {
         assert!(!met.floor_blind());
     }
 
+    /// #10866 item 4: an unresolved tick keeps a standing stall; every other
+    /// reading replaces it.
     #[test]
     fn an_unresolved_tick_keeps_a_standing_stall() {
         let mut state = FloorState::default();

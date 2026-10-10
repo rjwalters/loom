@@ -392,7 +392,7 @@ fn walk_candidates(releases: Vec<ListedRelease>) -> Vec<(String, String)> {
             Some((key, r.tag_name, version))
         })
         .collect();
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|c| std::cmp::Reverse(c.0));
     out.into_iter().map(|(_, t, v)| (t, v)).collect()
 }
 
