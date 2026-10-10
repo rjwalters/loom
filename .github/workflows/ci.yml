@@ -1440,6 +1440,35 @@ jobs:
           echo "Scanning $range"
           ./target/debug/loom-daemon secret-scan --range "$range"
 
+      # #8858: a semantic change to the private-control POLICY map in
+      # bundle.rs must come with a strictly greater CONTROL_VERSION, measured
+      # against the MERGE BASE of base and head (not the moving base tip).
+      # Needs history, hence this job's `fetch-depth: 0`; reads git objects
+      # only, no network. Explicit refs per event so it is reproducible locally:
+      #   loom-daemon check-private-control-version --base origin/main --head HEAD
+      - name: Require a CONTROL_VERSION bump when the private-control POLICY changes (#8858)
+        if: ${{ !cancelled() && needs.changes.outputs.daemon != 'false' }}
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          elif [ "$EVENT" = merge_group ]; then
+            base="$MG_BASE"; head="$MG_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"; head="$PUSH_AFTER"
+          else
+            base="$PUSH_AFTER^"; head="$PUSH_AFTER"
+          fi
+          ./target/debug/loom-daemon check-private-control-version --repo-root . --base "$base" --head "$head"
+
   install-surface-checks:
     name: Install Surface Checks
     # Agent Skills Sync Check and Fresh Install Link Check on the shared debug

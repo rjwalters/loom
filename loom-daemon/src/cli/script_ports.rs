@@ -448,6 +448,15 @@ pub(crate) enum ScriptPortCommand {
     /// shell-language policy and the #7810 shell-budget gate both send here.
     CheckGuardWiring(super::check_guard_wiring::CheckGuardWiringArgs),
 
+    /// CI gate (#8858): the private-control `POLICY` map in `bundle.rs` may only
+    /// change semantically together with a strictly greater `CONTROL_VERSION`,
+    /// measured against the merge base of `--base` and `--head` straight from
+    /// git objects (no network). Exit 1 on a violation or any missing ref /
+    /// malformed / duplicate / ambiguous declaration. New logic, not a shell port.
+    CheckPrivateControlVersion(
+        super::check_private_control_version::CheckPrivateControlVersionArgs,
+    ),
+
     /// The Renovate-side routing contract (#9418): every `labels` array in the
     /// repo's Renovate config (top-level, `packageRules`, `vulnerabilityAlerts`,
     /// `lockFileMaintenance`, …) contains `loom:review-requested`. Exit 1 on
@@ -644,6 +653,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
+            ScriptPortCommand::CheckPrivateControlVersion(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),

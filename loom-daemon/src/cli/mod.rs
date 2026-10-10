@@ -26,6 +26,7 @@ pub(crate) mod attend_hook;
 pub(crate) mod cancel;
 pub(crate) mod cargo_target_dir;
 mod check_guard_wiring;
+mod check_private_control_version;
 mod check_renovate_labels;
 pub(crate) mod ci_telemetry_cli;
 pub(crate) mod cleanup_ops;
