@@ -330,8 +330,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             if r.repo_unresolved {
                 attributes.push(kv_string("loom.repo_unresolved", "true".to_string()));
             }
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));
@@ -369,8 +373,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             ];
             // Every optional field stays optional here too: an unobserved
             // measurement must be an ABSENT attribute, never a zero one.
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
+            if let Some(model) = r
+                .model
+                .as_deref()
+                .and_then(crate::sweep_registry::normalize_model_id)
+            {
+                attributes.push(kv_string("loom.model", model));
             }
             if let Some(effort) = &r.effort {
                 attributes.push(kv_string("loom.effort", effort.clone()));

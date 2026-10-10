@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 fn facts() -> SweepStartFacts {
     SweepStartFacts {
-        model: Some("opus".to_string()),
+        model: Some("claude-opus-5-5".to_string()),
         effort: Some("high".to_string()),
+        effort_source: Some("explicit".to_string()),
         model_source: Some("explicit".to_string()),
         runtime: Some("codex".to_string()),
         attempt_index: Some(2),
@@ -57,6 +58,9 @@ fn sweep_started_exports_its_facts_as_the_native_record_and_the_outcome_do() {
     outcome
         .config
         .insert("runtime".to_string(), "codex".to_string());
+    outcome
+        .config
+        .insert("effort_source".to_string(), "explicit".to_string());
     outcome.attempt_index = facts.attempt_index;
     outcome.trigger = facts.trigger;
     outcome.previous_sweep_id = facts.previous_sweep_id;
@@ -78,5 +82,24 @@ fn unknown_facts_are_absent_attributes() {
     let otlp = attributes(&envelope("host-a", TelemetryRecord::SweepStarted(started)));
     for key in SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS {
         assert!(!otlp.contains_key(*key), "{key} exported without a value");
+    }
+}
+
+/// Issue #11370: an outcome or role tick naming an alias reports the full id;
+/// an empty model is an absent attribute, never `''`.
+#[test]
+fn outcome_model_is_a_full_id_and_never_empty() {
+    let TelemetryRecord::SweepOutcome(mut outcome) = sweep_outcome_envelope().record else {
+        panic!("fixture is a sweep.outcome record")
+    };
+    for (model, want) in [
+        (Some("sonnet"), Some("claude-sonnet-5-5")),
+        (Some("claude-haiku-5-5"), Some("claude-haiku-5-5")),
+        (Some(""), None),
+        (None, None),
+    ] {
+        outcome.model = model.map(str::to_string);
+        let otlp = attributes(&envelope("host-a", TelemetryRecord::SweepOutcome(outcome.clone())));
+        assert_eq!(otlp.get("loom.model"), want.map(|w| serde_json::json!(w)).as_ref());
     }
 }
