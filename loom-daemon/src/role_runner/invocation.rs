@@ -149,7 +149,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     if let Some(reason) =
                         crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
                     {
-                        MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+                        MODEL_RUNTIME_MISMATCH_SKIP_COUNT.record();
                         let mismatch = ModelRuntimeMismatch {
                             role: role.to_string(),
                             runtime: admitted.runtime.clone(),
