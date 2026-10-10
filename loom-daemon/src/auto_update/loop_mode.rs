@@ -92,13 +92,13 @@ impl LoopMode {
     #[must_use]
     pub fn ignored_opt_out_note(self, explicitly_disabled: bool) -> Option<&'static str> {
         (explicitly_disabled
-            && self
-                == Self::Fleet {
-                    auto_update_enabled: false,
-                })
-        .then_some(
-            "autoUpdate.enabled=false is set explicitly, but this is a fleet host: the setting              is ignored for the fleet floor. The loop still rolls this host up to              loom_min_version (and for a workspace that needs a newer daemon), never to the              newest release",
-        )
+ && self
+ == Self::Fleet {
+ auto_update_enabled: false,
+ })
+ .then_some(
+ "autoUpdate.enabled=false is set explicitly, but this is a fleet host: the setting is ignored for the fleet floor. The loop still rolls this host up to loom_min_version (and for a workspace that needs a newer daemon), never to the newest release",
+ )
     }
 
     /// The status / log rendering: what the loop does and why it runs.
@@ -125,7 +125,7 @@ impl LoopMode {
 pub fn idle_reason(chase_enabled: bool, fleet_host: bool) -> Option<String> {
     (!chase_enabled && !fleet_host).then(|| {
         "not a fleet host this tick, and autoUpdate.enabled=false — the loop runs only for the \
-         fleet floor, so nothing is checked"
+ fleet floor, so nothing is checked"
             .to_string()
     })
 }
@@ -168,7 +168,7 @@ pub fn start(
     if !mode.spawns() {
         log::debug!(
             "auto_update: disabled (not a fleet host; set LOOM_AUTO_UPDATE=1 or \
-             autonomous.autoUpdate.enabled=true to opt in)"
+ autonomous.autoUpdate.enabled=true to opt in)"
         );
         return None;
     }
