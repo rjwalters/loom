@@ -1355,9 +1355,11 @@ the backstop" is a query over the journal, not a grep of the daemon log.
 
 ### Per-phase runtime: `loom-daemon worker run` (issue #11285)
 
-`loom-daemon worker run --role builder|doctor (--issue N | --pr N) [--json] [--timeout SECS]`
+`loom-daemon worker run --role builder|doctor (--issue N [--base BRANCH] | --pr N) [--json] [--timeout SECS]`
 resolves the role through `resolve_for_dispatch` (so `runtimes.rolePreference.<role>`
-applies), then launches the guarded native worker (`spawn-worker.sh`) in the
+applies; a parent dispatch's inherited `LOOM_RUNTIME`+`LOOM_ROLE` pin is dropped
+first, `LOOM_RUNTIME_<ROLE>` still wins), creates a missing worktree via
+`worktree.sh N [--base BRANCH]` / `pr-worktree.sh`, then launches the guarded native worker (`spawn-worker.sh`) in the
 issue worktree with the chosen tap pinned through `launch_env::apply_launch_env`,
 so the launch record shows the real runtime and model profile. A `claude`
 resolution prints `outcome=delegate-to-claude` and exits 0 without launching.

@@ -85,8 +85,17 @@ Before each such phase the orchestrator calls
 daemon-dispatch `LOOM_RUNTIME` pin is ignored; `LOOM_RUNTIME_<ROLE>` still wins); when that is
 `claude` it prints `outcome=delegate-to-claude` and exits 0 without launching
 (dispatch the Task subagent as before). Otherwise it blocks, launches the guarded
-native worker in `.loom/worktrees/issue-N` (created via `worktree.sh`, or `pr-worktree.sh` for a Doctor, when absent), and exits 0 (artifact produced:
+native worker in the issue worktree, and exits 0 (artifact produced:
 PR labelled `loom:review-requested` / new Doctor commit with the label
 flipped), 1 (ran, no artifact), 75 (no eligible runtime or pool seat: fall back
 to Claude), 78 (config unresolvable) or 124 (`--timeout`). `--role judge` and
 `--role curator` are refused (exit 2); they stay Claude Task subagents.
+
+A fresh Builder has no worktree yet, so a missing one is first created (under
+the helpers' effective worktree root: `LOOM_WORKTREE_ROOT` >
+`worktree.root` > `.loom/worktrees`) with the same idempotent
+`worktree.sh N [--base feature/issue-<parent>]` the Builder itself runs — pass
+`--base` for a stacked child — or `pr-worktree.sh <pr>` for a Doctor. The
+helper takes the lease; the launched Builder still claims the issue exactly as
+a Task subagent does and its own `worktree.sh N` reuses the directory. A helper
+refusal, or an unreadable pre-launch PR snapshot, exits 78 before launch.

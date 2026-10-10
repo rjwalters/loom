@@ -98,7 +98,7 @@ Concretely, when this skill says "dispatch builders for the wave", that means: i
 
 If a future maintainer is tempted to "simplify" by replacing the wave-loop with parallel `/loom:sweep` calls: don't. Read #3289, then read this section again.
 
-**Per-phase runtime (#11285).** Before a Builder/Doctor Task dispatch run `loom-daemon worker run --role builder --issue N --json` (Doctor: `--role doctor --pr N`). `outcome=delegate-to-claude` (exit 0) ⇒ dispatch the Task as usual; otherwise its exit replaces the subagent (details: `native-sweep.md`). Judge/Curator never use it.
+**Per-phase runtime (#11285).** Before a Builder/Doctor Task run `loom-daemon worker run --role builder --issue N --json` (stacked: `--base feature/issue-<parent>`; Doctor: `--role doctor --pr N`). `outcome=delegate-to-claude` ⇒ dispatch the Task; else its exit replaces it (it creates a missing worktree; Builder still claims; `native-sweep.md`). Not Judge/Curator.
 
 ### Model selection for subagent dispatch (issue #3477, Phase 1)
 

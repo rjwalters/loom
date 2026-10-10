@@ -37,6 +37,25 @@ pub struct RunArgs {
     /// Wall-clock budget in seconds; exits 124 when exceeded.
     #[arg(long, default_value_t = 3600)]
     timeout: u64,
+    /// Stacked child (builder): branch a missing worktree off this branch,
+    /// e.g. `feature/issue-<parent>` (passed to `worktree.sh --base`).
+    #[arg(long, value_name = "BRANCH", requires = "issue")]
+    base: Option<String>,
+}
+
+/// The Builder's pre-launch PR snapshot. An unreadable one is refused rather
+/// than read as "no prior PRs": that would credit an unchanged pre-existing
+/// `loom:review-requested` PR to a worker that did nothing.
+fn builder_baseline(
+    issue: u64,
+    snapshot: Option<serde_json::Value>,
+) -> Result<serde_json::Value, LaunchError> {
+    snapshot.ok_or_else(|| {
+        LaunchError::config(format!(
+            "cannot read open feature/issue-{issue} PRs via gh before launch; \
+             refusing to launch (artifact attribution would be unsound)"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,13 +300,20 @@ pub fn is_inherited_dispatch_pin(runtime: Option<&str>, role: Option<&str>) -> b
 /// guard, lease, configured roots and stacked bases stay its business). A
 /// Doctor's open PR makes `worktree.sh` refuse by design, so a missing issue
 /// worktree falls back to `pr-worktree.sh`.
+///
+/// The base directory is the helpers' own effective root
+/// (`LOOM_WORKTREE_ROOT` > `worktree.root` > `.loom/worktrees`, with their
+/// unreadable-override fallback), so an external root is found and verified
+/// where the script actually puts it. `base` stacks a Builder's fresh worktree
+/// (`worktree.sh N --base feature/issue-<parent>`).
 fn ensure_worktree(
     root: &Path,
     role: Role,
     issue: u64,
     pr: Option<u64>,
+    base: Option<&str>,
 ) -> Result<PathBuf, LaunchError> {
-    let dir = root.join(".loom/worktrees");
+    let dir = crate::worktree_root::worktree_root_readable(root);
     let issue_wt = dir.join(format!("issue-{issue}"));
     if issue_wt.is_dir() {
         return Ok(issue_wt);
@@ -301,6 +327,9 @@ fn ensure_worktree(
     }
     let mut cmd = Command::new(super::scripts_dir(root).join(script));
     cmd.current_dir(root).arg(arg.to_string());
+    if let (Role::Builder, Some(base)) = (role, base) {
+        cmd.arg("--base").arg(base);
+    }
     let output = crate::proc_exec::run_bounded(cmd, Duration::from_secs(300))
         .map_err(|e| LaunchError::config(format!("cannot run {script}: {e}")))?
         .output();
@@ -362,19 +391,19 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         }
         _ => return Err(LaunchError::config("missing target")),
     };
-    let worktree = ensure_worktree(&root, role, issue, args.pr)?;
+    // Pre-launch snapshot so a PR that already existed is not credited to this
+    // worker. Taken before any setup: an unreadable one refuses the launch.
+    let builder_before = match role {
+        Role::Builder => builder_baseline(issue, open_issue_prs(&root, issue))?,
+        Role::Doctor => serde_json::Value::Null,
+    };
+    let worktree = ensure_worktree(&root, role, issue, args.pr, args.base.as_deref())?;
     let log = root.join(".loom/logs").join(format!(
         "worker-run-{}-{}-{}.log",
         role.as_str(),
         issue,
         chrono::Utc::now().timestamp()
     ));
-    // Pre-launch snapshot so a PR that already existed is not credited to this
-    // worker. An unreadable snapshot degrades to "no prior PRs".
-    let builder_before = match role {
-        Role::Builder => open_issue_prs(&root, issue).unwrap_or_else(|| serde_json::json!([])),
-        Role::Doctor => serde_json::Value::Null,
-    };
     let target = args.issue.or(args.pr).unwrap_or(issue);
     let mut cmd = Command::new(super::scripts_dir(&root).join("spawn-worker.sh"));
     cmd.current_dir(&worktree)
@@ -549,20 +578,169 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_worktree_is_created_by_script() {
+        let _env = EnvGuard::clear();
         let dir = tempfile::tempdir().unwrap();
-        let scripts = dir.path().join(".loom/scripts");
-        std::fs::create_dir_all(&scripts).unwrap();
-        let script = scripts.join("worktree.sh");
-        std::fs::write(
-            &script,
+        write_exec(
+            &dir.path().join(".loom/scripts/worktree.sh"),
             "#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/../worktrees/issue-$1\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let wt = ensure_worktree(dir.path(), Role::Builder, 42, None).unwrap();
+        );
+        let wt = ensure_worktree(dir.path(), Role::Builder, 42, None, None).unwrap();
         assert!(wt.ends_with("issue-42") && wt.is_dir());
+    }
+
+    /// Saves, clears and restores the env this module reads (serial tests).
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+    impl EnvGuard {
+        fn clear() -> Self {
+            let keys = [
+                "LOOM_RUNTIME",
+                "LOOM_ROLE",
+                "LOOM_MODEL_PROFILE",
+                crate::launch_env::PREFERENCE_MARKER_ENV,
+                "LOOM_RUNTIME_BUILDER",
+                "LOOM_RUNTIME_DOCTOR",
+                "LOOM_WORKTREE_ROOT",
+            ];
+            let prior = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self(prior)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// #11303 review (P1 at 3b70a80dc): a daemon-launched Claude orchestrator's
+    /// inherited env (`LOOM_RUNTIME`+`LOOM_ROLE`, profile, marker) must not send
+    /// Builder/Doctor back to Claude over `rolePreference`; a genuine
+    /// `LOOM_RUNTIME_<ROLE>` or a bare operator `LOOM_RUNTIME` still wins.
+    #[test]
+    #[serial_test::serial]
+    fn claude_orchestrator_env_does_not_capture_builder_or_doctor() {
+        let _env = EnvGuard::clear();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for kind in ["roles", "runtimes"] {
+            let to = dir.path().join(".loom").join(kind);
+            std::fs::create_dir_all(&to).unwrap();
+            for entry in std::fs::read_dir(repo.join("defaults").join(kind))
+                .unwrap()
+                .flatten()
+            {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    std::fs::copy(&p, to.join(p.file_name().unwrap())).unwrap();
+                }
+            }
+        }
+        for rt in ["claude", "opencode"] {
+            write_exec(&dir.path().join(format!(".loom/scripts/spawn-{rt}.sh")), "#!/bin/sh\n");
+        }
+        let flash = serde_json::json!([{"runtime": "opencode", "modelProfile": "zai-flash"}]);
+        let config = serde_json::json!({
+            "runtimes": {"rolePreference": {"builder": flash, "doctor": flash}}
+        });
+        std::fs::write(dir.path().join(".loom/config.json"), config.to_string()).unwrap();
+        let orchestrator = || {
+            std::env::set_var("LOOM_RUNTIME", "claude");
+            std::env::set_var("LOOM_ROLE", "sweep-lifecycle");
+            std::env::set_var("LOOM_MODEL_PROFILE", "claude-parent");
+            std::env::set_var(crate::launch_env::PREFERENCE_MARKER_ENV, "# parent");
+        };
+        for role in [Role::Builder, Role::Doctor] {
+            orchestrator();
+            let (admitted, _) = admit(dir.path(), role).unwrap();
+            assert_eq!(admitted.runtime, "opencode", "{role:?}");
+            let profile = admitted.preference.and_then(|p| p.model_profile);
+            assert_eq!(profile.as_deref(), Some("zai-flash"), "{role:?}");
+        }
+        orchestrator();
+        std::env::set_var("LOOM_RUNTIME_BUILDER", "claude");
+        assert_eq!(admit(dir.path(), Role::Builder).unwrap().0.runtime, "claude");
+        std::env::remove_var("LOOM_RUNTIME_BUILDER");
+        std::env::remove_var("LOOM_ROLE");
+        std::env::set_var("LOOM_RUNTIME", "claude");
+        assert_eq!(admit(dir.path(), Role::Doctor).unwrap().0.runtime, "claude");
+    }
+
+    /// #11303 review (P1 at d7fa7f835): setup and reuse resolve the helpers'
+    /// effective root, for an env and a config override, Builder and Doctor;
+    /// a stacked Builder passes `--base`.
+    #[test]
+    #[serial_test::serial]
+    fn ensure_worktree_honours_the_configured_root() {
+        let _env = EnvGuard::clear();
+        let ext = tempfile::tempdir().unwrap();
+        for via_env in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let over = ext.path().join(if via_env { "env" } else { "cfg" });
+            if via_env {
+                std::env::set_var("LOOM_WORKTREE_ROOT", &over);
+            } else {
+                std::env::remove_var("LOOM_WORKTREE_ROOT");
+                let cfg = serde_json::json!({"worktree": {"root": over}});
+                std::fs::create_dir_all(root.join(".loom")).unwrap();
+                std::fs::write(root.join(".loom/config.json"), cfg.to_string()).unwrap();
+            }
+            let eff = over.join(root.file_name().unwrap());
+            for (script, prefix) in [("worktree.sh", "issue"), ("pr-worktree.sh", "pr")] {
+                let body = format!(
+                    "#!/bin/sh\necho \"{script} $*\" >> calls.txt\nmkdir -p '{}/{prefix}-'\"$1\"\n",
+                    eff.display()
+                );
+                write_exec(&root.join(".loom/scripts").join(script), &body);
+            }
+            let b = ensure_worktree(root, Role::Builder, 42, None, Some("feature/issue-41"));
+            assert_eq!(b.unwrap(), eff.join("issue-42"), "via_env={via_env}");
+            let d = ensure_worktree(root, Role::Doctor, 50, Some(77), None).unwrap();
+            assert_eq!(d, eff.join("pr-77"));
+            // Reuse: existing worktrees under the external root, no new calls.
+            assert_eq!(
+                ensure_worktree(root, Role::Builder, 42, None, None).unwrap(),
+                eff.join("issue-42")
+            );
+            assert_eq!(
+                ensure_worktree(root, Role::Doctor, 42, Some(78), None).unwrap(),
+                eff.join("issue-42")
+            );
+            ensure_worktree(root, Role::Doctor, 50, Some(77), None).unwrap();
+            let calls = std::fs::read_to_string(root.join("calls.txt")).unwrap();
+            assert_eq!(calls, "worktree.sh 42 --base feature/issue-41\npr-worktree.sh 77\n");
+        }
+    }
+
+    /// #11303 review (P2 at d7fa7f835): a failed pre-launch read must not
+    /// become an empty baseline that credits an unchanged pre-existing PR.
+    #[test]
+    fn an_unreadable_builder_baseline_refuses_the_launch() {
+        let rr = serde_json::json!([{"name": "loom:review-requested"}]);
+        let after = serde_json::json!([{"number": 7, "headRefOid": "a", "labels": rr}]);
+        // The pre-fix fallback (`[]`) would have credited the unchanged PR.
+        assert!(builder_artifact(&serde_json::json!([]), &after));
+        let err = builder_baseline(7, None).unwrap_err();
+        assert_eq!(err.code, 78);
+        assert!(err.message.contains("refusing to launch"), "{}", err.message);
+        let before = builder_baseline(7, Some(after.clone())).unwrap();
+        assert!(!builder_artifact(&before, &after));
     }
 
     #[test]
