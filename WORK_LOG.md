@@ -6,7 +6,59 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-10-10
+
+- **Issue #9492** (closed): Decide which other required CI jobs the local build gate should mirror (follow-up to #9140)
+- **PR #11281**: docs(build-gate): per-job CI coverage audit and installed-tree link independence (#9492)
+- **Issue #11218** (closed): Roster autoApply: clone missing fleet repos, then register (admission still needs ssh on every dispatcher)
+- **PR #11254**: feat(fleet-sync): clone missing roster repos under autoApply, then register (#11218)
+- **Issue #11161** (closed): telemetry: fleet.state at work-finder cadence (60 s) with 5-minute anchors (#10196 R9)
+- **PR #11163**: telemetry: fleet.state at work-finder cadence with 5-minute anchors (#10196 R9)
+- **PR #11241**: chore(harness): track latest CLIs — codex 0.162.0→0.162.1
+- **PR #11279**: feat(priority): important/very-important labels + weighted workspace pick module (part of #11103)
+- **Issue #11087** (closed): Remove mail from Loom: human asks are signaled by labels only (notifier moves to 2am workers)
+- **PR #11276**: Remove mail from Loom: human asks are signaled by labels only (#11087)
+- **PR #10410**: test+docs(lease-renew): define release signal, pin cached-read failure (Part of #10229)
+- **Issue #11098** (closed): Remove the ETA subsystem from Loom (moved to loom-ui) — staged
+- **PR #11256**: feat(eta): delete the ETA subsystem (#11098, Stage 3)
+- **Issue #11083** (closed): Parallel H4 stop follow-ups from #11081: parked-at-bound disposition, group-only kill at the bound, record race, forced-stop count
+- **PR #11265**: pause_roll: forced-stop count, near-bound record fix, document H4 bound exceptions
+- **Issue #9510** (closed): insert_nonempty_bounded truncates by chars, span allowlist bounds by bytes (256 mismatch)
+- **PR #11264**: fix(telemetry): bound insert_nonempty_bounded by bytes, not chars (#9510)
+- **Issue #9041** (closed): dep-recheck-fingerprint: BLOCK_REASON and ORTHOGONAL are emitted unquoted, so the documented eval word-splits them and executes the remainder (#8323's fix missed the two pass-throughs)
+- **PR #11255**: fix(dep-recheck): shell-quote BLOCK_REASON and ORTHOGONAL (#9041)
+- **Issue #11068** (closed): Auditor: scoped test passes miss required Rust lint checks
+- **PR #11253**: docs(prompts): lint with CI's flags, report apart from scoped tests (#11068)
+- **Issue #11066** (closed): Flaky ci_telemetry tests: parallel runs race on process-global env vars
+- **PR #11252**: fix(ci_telemetry): release the cycle lock explicitly; stop tests writing env
+- **Issue #11128** (closed): telemetry: telemetry replay --check and 24h agreement report (#10196 R7)
+- **PR #11213**: feat(telemetry): telemetry-replay --check and the 24h agreement report (#10196 R7)
+- **Issue #11029** (closed): Floor roll target: walk back to the newest release >= floor with assets; make an unresolved below-floor host loud
+- **PR #11251**: Floor roll: walk back to newest complete release >= floor; loud unresolved below-floor host (#11029)
+- **Issue #11126** (closed): telemetry: re-home pr.resolved and eta.stage_outcome producers outside eta/ (#10196 R5)
+- **PR #11171**: telemetry: re-home pr.resolved and eta.stage_outcome outside eta/ (#10196 R5)
+- **Issue #9065** (closed): CI: cut PR wall time from ~8.5 min to ≤5 min (build once, dedupe nextest, shard serial suites) and stop false-stale merges
+- **Issue #10870** (closed): MCP pre-flight smoke test ignores the server's .mcp.json env block
+- **PR #11150**: fix(claude-wrapper): apply the server's declared .mcp.json env in MCP pre-flight
+- **Issue #9258** (closed): A verdict body of `@-` yields an approval with no rationale that still gates a merge
+- **PR #11223**: fix: empty/@- verdict bodies and markerless approvals can no longer gate a merge (#9258)
+- **Issue #9611** (closed): Champion criterion #3: version_only_diff fails OPEN when its gh api call errors, so a critical-file hold can auto-release
+- **PR #11220**: fix(champion): make criterion #3's version-only carve-out fail closed (#9611)
+
 ### 2026-10-09
+- **Issue #11191** (closed): Disk admission charges a flat 8 GB per sweep and ignores in-flight growth: loom sweeps dispatched at ~50 GB free while two builds grew by 50 GB
+- **PR #11215**: Disk admission: charge each repo its measured footprint and reserve in-flight growth (#11191)
+- **Issue #10687** (closed): Auditor: update executable fixtures when changing worker environment or CLI help
+- **PR #11248**: builder: align fixtures/oracles with changed contracts before review (#10687)
+- **Issue #9078** (closed): defaults/optional/github-workflows/label-external-issues.yml has invalid YAML (unindented multi-line JS template literal)
+- **PR #11217**: fix: make label-external-issues.yml template parse as YAML (#9078)
+- **PR #11187**: fix(stale-blocked): vet the release comment under the root's own credential (#10837)
+- **Issue #9126** (closed): Document the quoted-heredoc rule in comment-body-literal-path.md: an unquoted delimiter silently executes and deletes backticked prose
+- **PR #11243**: docs: explain quoted heredoc delimiter in comment-body-literal-path.md
+- **Issue #9308** (closed): dep-recheck-fingerprint: CONCLUSION_HASH not stable across loom-daemon versions for identical input, defeats Curator idempotency suppression
+- **PR #11183**: test(dep-recheck): pin CONCLUSION_HASH golden vectors, document the #8320 transition
+- **Issue #11221** (closed): Chain-head merge lock cap (1200 s) is shorter than required CI (~45 min): approved PRs starve for hours
+- **PR #11224**: fix(merge-pr): raise chain-head lock cap to 2 hours
 - **PR #11203**: perf(spawn): cap dev/test debuginfo for Loom-spawned cargo builds (#11190)
 - **PR #11216**: Reclaim finished sweeps' run target dirs at sweep end, and dead owners' dirs within minutes (#11031)
 - **PR #11202**: eager reclaim: re-arm on level below the floor, escalate tiers, alert on empty passes (#11192)
