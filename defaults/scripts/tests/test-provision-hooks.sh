@@ -775,10 +775,10 @@ LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CAN
 assert_contains "$(cat "$LOG26X" 2>/dev/null)" '"error":"lib_missing"' "effective true (local overrides config false) writes a wrapper record"
 
 # 26d3: the log override may not point inside a Git checkout (main: .git dir) or
-# worktree (.git file), nor use "..": no record, no directory, still exit 0.
+# worktree (.git file), nor reach one via "..": no record, no directory, still exit 0.
 printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
 mkdir -p "$P26X/chk/.git" "$P26X/wt"; : > "$P26X/wt/.git"
-for L in "$P26X/chk/sub/canary.jsonl" "$P26X/wt/canary.jsonl" "$P26X/other/../canary.jsonl"; do
+for L in "$P26X/chk/sub/canary.jsonl" "$P26X/wt/canary.jsonl" "$P26X/other/../chk/canary.jsonl"; do
     LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$L" \
         bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
     assert_eq "$?|$(ls "$P26X/chk/sub" "$P26X/other" 2>/dev/null)|$([[ -e "$L" ]] && echo wrote)" "0||" "override $L is refused: exit 0, nothing written"
@@ -786,6 +786,29 @@ done
 LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$P26X/ok/canary.jsonl" \
     bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
 assert_contains "$(cat "$P26X/ok/canary.jsonl" 2>/dev/null)" '"error":"lib_missing"' "an override outside every checkout is still honoured"
+
+# 26d4: a FILE symlink (outside) pointing into a checkout/worktree is resolved
+# before the containment check; nothing is appended through it.
+mkdir -p "$P26X/lnk"; : > "$P26X/chk/target.jsonl"; : > "$P26X/wt/target.jsonl"
+ln -sf "$P26X/chk/target.jsonl" "$P26X/lnk/main.jsonl"; ln -sf "$P26X/wt/target.jsonl" "$P26X/lnk/wt.jsonl"
+for L in "$P26X/lnk/main.jsonl" "$P26X/lnk/wt.jsonl"; do
+    LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$L" \
+        bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+    assert_eq "$(cat "$P26X/chk/target.jsonl" "$P26X/wt/target.jsonl")" "" "file symlink $L into a checkout appends nothing"
+done
+
+# 26d5: only guards.<key> counts — an unrelated same-name key or a non-boolean
+# higher-tier value must not enable wrapper records.
+: > "$P26X/ok/canary.jsonl"
+for CFG in '{"guards":{"uncommittedWorkConsumerCanary":false},"other":{"uncommittedWorkConsumerCanary":true}}' \
+           '{"other":{"uncommittedWorkConsumerCanary":true}}' \
+           '{"guards":{"uncommittedWorkConsumerCanary":"true"}}'; do
+    printf '%s\n' "$CFG" > "$P26X/.loom-local/local.json"
+    LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$P26X/ok/canary.jsonl" \
+        bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+    assert_eq "$(cat "$P26X/ok/canary.jsonl" 2>/dev/null)" "" "config $CFG writes no wrapper record"
+done
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
 
 # 26e: deprovision removes both events' entries and leaves no empty arrays.
 deprovision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1

@@ -1418,10 +1418,10 @@ and the session sees only a non-blocking `systemMessage` saying the decision was
 **not recorded** — an unrecorded decision is a coverage gap, never a measured
 one, and a canary that cannot log must never keep a session from stopping.
 Wrapper records are written only for a workspace whose *effective* config sets
-the canary key to `true` (a text match over the tiers in precedence order —
+the canary key to `true` (`guards.<key>` resolved with `jq` over the tiers in precedence order —
 private defaults, `.loom/config.json`, `.loom-project/project.json`,
-`.loom-local/local.json` — where the last tier naming the key wins, so a
-higher-tier `false` suppresses them), and the stub never appends past the size
+`.loom-local/local.json` — where the last tier setting it wins, so a
+higher-tier `false` or non-boolean suppresses them; no `jq` means no record), and the stub never appends past the size
 bound.
 
 **Retrieving the sample:**

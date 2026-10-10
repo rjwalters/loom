@@ -30,7 +30,7 @@
 # WRAPPER-FAILURE RECORDS. When the daemon cannot run, it cannot record
 # anything, so this stub appends ONE line itself (`"source":"wrapper"`) to the
 # same bounded canary log — but only for a workspace whose effective config sets the
-# canary key to true (a cheap text match, used ONLY to decide whether to record;
+# canary key to true (resolved with jq, used ONLY to decide whether to record;
 # the real gate is the daemon's config resolution). These records stay visible
 # and are excluded from the detection false-positive denominator. The stub
 # never grows the log past its size bound; the daemon owns rotation.
@@ -53,10 +53,10 @@ ROOT="${LOOM_PROJECT_ROOT:-}"
 
 # Effective value of the canary key across the config tiers, lowest to highest
 # precedence (private defaults < .loom/config.json < .loom-project/project.json
-# < .loom-local/local.json — config_resolver.rs): the LAST tier naming the key
-# as a boolean wins, so a higher-tier false suppresses wrapper records. Returns
-# 0 only when the effective value is true. A text match, not a JSON parse.
-_canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}" "$ROOT"/.loom/config.json "$ROOT"/.loom-project/project.json "$ROOT"/.loom-local/local.json 2>/dev/null | grep -Eo '"uncommittedWorkConsumerCanary"[[:space:]]*:[[:space:]]*(true|false)' | tail -n1)" == *true ]]; }
+# < .loom-local/local.json — config_resolver.rs): the LAST tier setting
+# guards.<key> wins, so a higher-tier false or non-boolean suppresses wrapper
+# records. 0 only when it is exactly true; no jq / bad JSON -> no record.
+_canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}" "$ROOT"/.loom/config.json "$ROOT"/.loom-project/project.json "$ROOT"/.loom-local/local.json 2>/dev/null | jq -s '[.[].guards.uncommittedWorkConsumerCanary?|select(.!=null)]|last' 2>/dev/null)" == true ]]; }
 
 # $1 = failure class. Records only for a workspace whose EFFECTIVE canary key is
 # true (see _canary_effective_true), never grows the log past its 1 MiB bound (the daemon
@@ -64,9 +64,9 @@ _canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.loc
 _record_wrapper_failure() {
     _canary_effective_true || return 0
     local ov="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-}" d event="" ws log
-    log="${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}"
-    [[ "$log" == /* && "$log" != *..* ]] || return 0  # an override must be absolute, no ".."
-    d="$ov"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && return 0; done  # never inside a checkout
+    [[ -z "$ov" || "$ov" == /* ]] || return 0  # an override must be absolute
+    log="$(realpath -m "${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" 2>/dev/null)" && [[ "$log" == /* ]] || return 0  # symlinks/".." resolved first
+    d="$log"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && return 0; done  # never inside a checkout
     mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || return 0  # missing log -> "" -> 0
     [[ "$PAYLOAD" =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z]+)\" ]] && event="${BASH_REMATCH[1]}"

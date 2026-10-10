@@ -214,14 +214,12 @@ fn resolve_log_path(log: &Path) -> PathBuf {
 
 /// The Git checkout or worktree root that contains `log`, if any. The outcome
 /// log carries session/transcript/worktree attribution and must stay outside
-/// every repository. The walk stops at `$HOME` (a dotfiles repo there must not
-/// disqualify the default `~/.loom/logs/…` location).
+/// every repository, `$HOME` included (an unusual home-directory checkout must
+/// be detected, not assumed away).
 fn containing_checkout(log: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir().map(|h| h.canonicalize().unwrap_or(h));
     resolve_log_path(log)
         .ancestors()
         .skip(1)
-        .take_while(|d| Some(*d) != home.as_deref())
         .find(|d| d.join(".git").exists())
         .map(Path::to_path_buf)
 }
