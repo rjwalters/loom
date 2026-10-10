@@ -110,26 +110,31 @@ prohibited); never end the turn while it is pending (`sweep-execution-model.md`)
 
 Shell variables do not survive between Bash tool calls, so use a **literal**
 result dir `P=/tmp/loom-worker-<role>-<N>-<unix-time>` (pick the time once, then
-repeat the literal in every call). Launch with `run_in_background:true`:
+repeat the literal in every call). Launch with `run_in_background:true`; `setsid -w`
+makes the wrapper's pid the process-group id of the whole phase:
 
 ```bash
-P=/tmp/loom-worker-builder-N-T; mkdir -p "$P"; echo $$ >"$P/pid"; date +%s >"$P/start"
-loom-daemon worker run --role builder --issue N --json >"$P/report.json" 2>"$P/stderr.log"; echo $? >"$P/exit"
+P=/tmp/loom-worker-builder-N-T; mkdir -p "$P"; date +%s >"$P/start"
+setsid -w bash -c 'echo $$ >"$1/pid"; loom-daemon worker run --role builder --issue N --json >"$1/report.json" 2>"$1/stderr.log"; echo $? >"$1/exit"' _ "$P"
 ```
 
 Then repeat this foreground poll (~90s, under the tool cap) until it prints a
-code. Empty output means still running — poll again; never read it as success:
+code. Empty output means still running — poll again; never read it as success.
+Only the wrapper writes `exit`; the poll never does. If the wrapper dies or the
+deadline passes it stops the whole group and prints only once nothing is left
+running. The deadline is `--timeout` (default 3600) + 600s for setup; raise `4200`
+for a custom `--timeout`:
 
 ```bash
-P=/tmp/loom-worker-builder-N-T
+P=/tmp/loom-worker-builder-N-T; G=$(cat "$P/pid") || { echo 1; exit; }
+alive() { s=$(ps -o stat= -p "$G" 2>/dev/null); [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }
+stop() { kill -TERM -- -"$G" 2>/dev/null; for j in $(seq 20); do kill -0 -- -"$G" 2>/dev/null || return 0; sleep 1; done; kill -KILL -- -"$G" 2>/dev/null; sleep 2; }
 for i in $(seq 9); do
-  [ -s "$P/exit" ] && break
-  if ! kill -0 "$(cat "$P/pid")" 2>/dev/null; then [ -s "$P/exit" ] || echo 1 >"$P/exit"; break; fi   # wrapper died
-  [ $(( $(date +%s) - $(cat "$P/start") )) -gt 3720 ] && { echo 1 >"$P/exit"; break; }   # --timeout 3600 + 120s
+  [ -s "$P/exit" ] || [ -s "$P/stopped" ] && break
+  if ! alive || [ $(( $(date +%s) - $(cat "$P/start") )) -gt 4200 ]; then stop; [ -s "$P/exit" ] || echo 1 >"$P/stopped"; break; fi
   sleep 10
-done; cat "$P/exit" 2>/dev/null
+done; cat "$P/exit" "$P/stopped" 2>/dev/null | head -n1
 ```
 
-Read `$P/report.json` once a code prints: 0 artifact, 1 no artifact (also a dead
-wrapper or missed deadline), 75 fall back to Claude, 78 config, 124 timeout
-(`--timeout`, default 3600s).
+Read `$P/report.json` once a code prints: 0 artifact, 1 no artifact (also a
+stopped phase), 75 fall back to Claude, 78 config, 124 timeout.
