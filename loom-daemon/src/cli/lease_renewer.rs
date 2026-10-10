@@ -118,6 +118,31 @@ pub(crate) enum RenewerAction {
         #[command(flatten)]
         key: KeyArgs,
     },
+    /// Stop a renewer safely (#11086): `stop <PID>` signals the pid only if it
+    /// is provably a lease renewer (its command line is `sweep-lease-renew.sh
+    /// start ...` or `loom-daemon lease renewer ...`, with a start identity
+    /// that did not change while it was checked); `stop --issue N` ends every
+    /// recorded renewer of issue N in this repo (any sweep unless `--sweep-id`
+    /// is given) and never a peer issue's. Anything else is refused (exit 1)
+    /// with no signal sent.
+    Stop {
+        /// The renewer loop's pid, as printed by `start`.
+        #[arg(
+            value_name = "PID",
+            conflicts_with = "issue",
+            required_unless_present = "issue"
+        )]
+        pid: Option<String>,
+        /// Stop the renewer(s) of this issue instead of naming a pid.
+        #[arg(long)]
+        issue: Option<u64>,
+        /// With `--issue`: only this host's renewer (default: any host).
+        #[arg(long, requires = "issue")]
+        host: Option<String>,
+        /// With `--issue`: only this sweep's renewer (default: any sweep).
+        #[arg(long, requires = "issue")]
+        sweep_id: Option<String>,
+    },
     /// Mark every inherited fd above 2 close-on-exec, then exec `CMD` (#10203).
     ///
     /// `sweep-lease-renew.sh start` re-enters itself through this so its
@@ -339,10 +364,24 @@ pub(crate) fn release(
     is_live: LiveProbe<'_>,
     signal: &dyn Fn(u32),
 ) -> Result<usize> {
+    end_owners(store, repo, issue, host, Some(sweep), is_live, signal)
+}
+
+/// Like [`release`], but `sweep: None` matches every sweep's owner of
+/// `(repo, issue)` (#11086). A different issue's owner never matches.
+pub(crate) fn end_owners(
+    store: &Store,
+    repo: &str,
+    issue: u64,
+    host: Option<&str>,
+    sweep: Option<&str>,
+    is_live: LiveProbe<'_>,
+    signal: &dyn Fn(u32),
+) -> Result<usize> {
     let _lock = store.lock()?;
     let mut n = 0;
     for (path, mut rec) in store.all() {
-        if rec.repo != repo || rec.issue != issue || rec.sweep != sweep {
+        if rec.repo != repo || rec.issue != issue || sweep.is_some_and(|s| s != rec.sweep) {
             continue;
         }
         if host.is_some_and(|h| h != rec.host) {
@@ -358,6 +397,95 @@ pub(crate) fn release(
         std::fs::rename(&tmp, &path)?;
     }
     Ok(n)
+}
+
+/// Is this argv a lease renewer this tooling started? Either
+/// `<shell> .../sweep-lease-renew.sh start ...` (the detached loop is a
+/// subshell of that script, so it shares its argv) or
+/// `.../loom-daemon lease renewer ...`.
+pub(crate) fn is_renewer_argv(argv: &[String]) -> bool {
+    let base = |a: &str| a.rsplit('/').next().unwrap_or(a).to_string();
+    // The script follows the interpreter, optionally after option flags only.
+    let script_start = argv
+        .iter()
+        .skip(1)
+        .position(|a| !a.starts_with('-'))
+        .map(|i| i + 1)
+        .is_some_and(|i| {
+            base(&argv[i]) == "sweep-lease-renew.sh"
+                && argv.get(i + 1).is_some_and(|a| a == "start")
+        });
+    let daemon = argv.first().is_some_and(|a| base(a) == "loom-daemon")
+        && argv.get(1).is_some_and(|a| a == "lease")
+        && argv.get(2).is_some_and(|a| a == "renewer");
+    script_start || daemon
+}
+
+/// A process's argv: `/proc/<pid>/cmdline` on Linux, `ps -o command=` elsewhere
+/// (macOS). `None` when the process is gone or unreadable.
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+    if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        return (!argv.is_empty()).then_some(argv);
+    }
+    let out = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let argv: Vec<String> = s.split_whitespace().map(str::to_string).collect();
+    (out.status.success() && !argv.is_empty()).then_some(argv)
+}
+
+/// What `stop <PID>` decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    Stopped,
+    /// Nothing is running under that pid; nothing was signalled (reported as a
+    /// refusal: the number may be an issue number typed by mistake).
+    NotRunning,
+    /// Refused, with the reason; nothing was signalled.
+    Refused(String),
+}
+
+/// Signal `pid_arg` only when it is provably a renewer: a plain number above 1,
+/// not this process, whose argv is a renewer's, and whose start identity is the
+/// same before and after the argv was read (so a pid recycled mid-check is
+/// ambiguous and refused).
+pub(crate) fn stop_pid(
+    pid_arg: &str,
+    self_pid: u32,
+    ident_of: &dyn Fn(u32) -> Option<String>,
+    argv_of: &dyn Fn(u32) -> Option<Vec<String>>,
+    signal: &dyn Fn(u32),
+) -> StopOutcome {
+    let Ok(pid) = pid_arg.trim().parse::<u32>() else {
+        return StopOutcome::Refused(format!("`{pid_arg}` is not a numeric pid"));
+    };
+    if pid <= 1 || pid == self_pid {
+        return StopOutcome::Refused(format!("pid {pid} is not a lease renewer"));
+    }
+    let Some(before) = ident_of(pid) else {
+        return StopOutcome::NotRunning;
+    };
+    let Some(argv) = argv_of(pid) else {
+        return StopOutcome::Refused(format!("cannot read the command line of pid {pid}"));
+    };
+    if !is_renewer_argv(&argv) {
+        return StopOutcome::Refused(format!(
+            "pid {pid} is not a lease renewer (command: {}); for an issue number use `stop --issue N`",
+            argv.join(" ")
+        ));
+    }
+    if ident_of(pid).as_deref() != Some(before.as_str()) {
+        return StopOutcome::Refused(format!("pid {pid} changed identity while being checked"));
+    }
+    signal(pid);
+    StopOutcome::Stopped
 }
 
 /// The repo half of the key: `$LOOM_REPO`, else origin's GitHub slug (or raw
@@ -462,6 +590,49 @@ impl RenewerAction {
                 std::process::exit(code)
             }
             Self::SanitizeExec { .. } => unreachable!("handled before the store is opened"),
+            Self::Stop {
+                pid,
+                issue,
+                host,
+                sweep_id,
+            } => {
+                let signal = |pid: u32| {
+                    if let Ok(pid) = i32::try_from(pid) {
+                        // SAFETY: plain kill(2) on a pid verified as a renewer by argv + identity.
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                    }
+                };
+                if let Some(issue) = issue {
+                    let live = |p: u32, ident: &str| {
+                        owner_is_live(p, ident)
+                            && process_argv(p).is_some_and(|a| is_renewer_argv(&a))
+                    };
+                    let n = end_owners(
+                        &store,
+                        &repo,
+                        issue,
+                        host.as_deref(),
+                        sweep_id.as_deref(),
+                        &live,
+                        &signal,
+                    )?;
+                    eprintln!("stopped renewal for issue #{issue} ({n} renewer(s) recorded)");
+                    return Ok(());
+                }
+                let arg = pid.unwrap_or_default();
+                match stop_pid(&arg, std::process::id(), &start_identity, &process_argv, &signal) {
+                    StopOutcome::Stopped => Ok(()),
+                    // Not-running is a refusal too: a pid that is not a live renewer
+                    // may be an issue number typed by mistake (#11086).
+                    StopOutcome::NotRunning => anyhow::bail!(
+                        "sweep-lease-renew: no process {arg} is running; nothing signalled \
+                         (to stop an issue's renewer use `stop --issue N`)"
+                    ),
+                    StopOutcome::Refused(why) => {
+                        anyhow::bail!("sweep-lease-renew: refusing to stop: {why}")
+                    }
+                }
+            }
             Self::Release { key } => {
                 let sweep = key.sweep_id.clone().unwrap_or_else(|| {
                     std::env::var("LOOM_TERMINAL_ID")
