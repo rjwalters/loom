@@ -229,6 +229,9 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     // Round 11: watch's -d/--differences takes no separate value.
     ("watch -d ssh example.invalid", "remote-shell"),
     ("watch -d aws sts get-caller-identity", "cloud-cli"),
+    // Round 12: unbuffer's -p is a pipeline flag, not sudo's value-taking -p.
+    ("unbuffer -p ssh example.invalid", "remote-shell"),
+    ("unbuffer -p aws sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]
@@ -251,6 +254,7 @@ fn round_1_bypasses_are_denied_by_the_real_hooks() {
         "rsync -a src/ dst/",
         "taskset -c 0 echo ok",
         "chrt -i 0 echo ok",
+        "unbuffer -p echo ok",
         r#"echo "${v:-$(echo hi)}" ${w:-fallback}"#,
     ] {
         let (d, reason) = f.bash(cmd, Some("judge"), BIN);

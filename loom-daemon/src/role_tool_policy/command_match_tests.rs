@@ -659,6 +659,20 @@ fn watch_differences_flag_does_not_consume_the_command() {
 }
 
 #[test]
+fn unbuffer_pipeline_flag_does_not_consume_the_command() {
+    for cmd in [
+        "unbuffer ssh example.invalid",
+        "unbuffer -p ssh example.invalid",
+        "unbuffer -a ssh example.invalid",
+        "unbuffer -p -a ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("unbuffer -p aws sts get-caller-identity", "cloud-cli"));
+    assert_clean("unbuffer -p echo ok");
+}
+
+#[test]
 fn stdbuf_and_ionice_keep_their_own_value_options() {
     for cmd in [
         "stdbuf -i0 -o L -e 0 ssh example.invalid",

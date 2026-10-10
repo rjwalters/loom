@@ -89,12 +89,11 @@ const KEYWORDS: [&str; 13] = [
 /// Wrappers that run their remaining arguments as a command after skipping
 /// their own `-`options. Option VALUES are handled per wrapper below where a
 /// wrapper takes one.
-const PLAIN_WRAPPERS: [&str; 9] = [
+const PLAIN_WRAPPERS: [&str; 8] = [
     "builtin",
     "exec",
     "nohup",
     "setsid",
-    "unbuffer",
     "caffeinate",
     "chronic",
     "doas",
@@ -872,6 +871,11 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
                     "--process-slot-var",
                 ],
             );
+            recurse(j, hits);
+        }
+        "unbuffer" => {
+            // `-p` (pipeline mode) and `-a` are plain flags here, not sudo's value-taking ones.
+            let j = skip_options(rest, &[]);
             recurse(j, hits);
         }
         "watch" => {
