@@ -96,20 +96,31 @@ fn strip_comments(src: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Byte offsets of every `const <name>` declaration (word-boundary checked).
+/// Byte offsets of every `const <name>` declaration. `const` and the name are
+/// matched as separate tokens (any whitespace between them, including newlines
+/// or a comment already collapsed to a space), with identifier boundaries on
+/// both words.
 fn find_decls(text: &str, name: &str) -> Vec<usize> {
-    let needle = format!("const {name}");
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut hits = Vec::new();
     let mut from = 0;
-    while let Some(p) = text[from..].find(&needle) {
+    while let Some(p) = text[from..].find("const") {
         let at = from + p;
-        let after = at + needle.len();
-        let next = text[after..].chars().next();
-        let ident_continues = next.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if !ident_continues {
-            hits.push(at);
-        }
+        let after = at + "const".len();
         from = after;
+        if text[..at].chars().next_back().is_some_and(is_ident) {
+            continue;
+        }
+        let rest = &text[after..];
+        let trimmed = rest.trim_start();
+        if trimmed.len() == rest.len() {
+            continue; // `const` not followed by whitespace (e.g. `constant`)
+        }
+        if let Some(tail) = trimmed.strip_prefix(name) {
+            if !tail.chars().next().is_some_and(is_ident) {
+                hits.push(at);
+            }
+        }
     }
     hits
 }

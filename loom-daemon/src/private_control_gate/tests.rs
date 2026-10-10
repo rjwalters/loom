@@ -138,6 +138,33 @@ fn formatting_comments_and_order_do_not_need_bump() {
 }
 
 #[test]
+fn declaration_whitespace_and_comments_between_tokens_parse() {
+    let canonical = parse_declarations(&src("2", BASE)).unwrap();
+    let variants = [
+        "pub const\nCONTROL_VERSION: u32 = 2;\npub const\nPOLICY: [(&str, &str); 2] = \
+         [(\"LOOM_GUARD_SQL\", \"1\"), (\"LOOM_RM_SCOPE\", \"repo\")];\n",
+        "pub const   CONTROL_VERSION: u32 = 2;\npub const  \tPOLICY: [(&str, &str); 2] = \
+         [(\"LOOM_GUARD_SQL\", \"1\"), (\"LOOM_RM_SCOPE\", \"repo\")];\n",
+        "pub const /* c */ CONTROL_VERSION: u32 = 2;\npub const/* c */POLICY: [(&str, &str); 2] = \
+         [(\"LOOM_GUARD_SQL\", \"1\"), (\"LOOM_RM_SCOPE\", \"repo\")];\n",
+        "pub const // c\nCONTROL_VERSION: u32 = 2;\npub const // c\nPOLICY: [(&str, &str); 2] = \
+         [(\"LOOM_GUARD_SQL\", \"1\"), (\"LOOM_RM_SCOPE\", \"repo\")];\n",
+    ];
+    for v in variants {
+        let got = parse_declarations(v).unwrap_or_else(|e| panic!("{v:?}: {e}"));
+        assert_eq!(format!("{got:?}"), format!("{canonical:?}"), "{v:?}");
+    }
+}
+
+#[test]
+fn lookalike_identifiers_are_not_declarations() {
+    assert!(find_decls("const POLICY_X: u8 = 1;", "POLICY").is_empty());
+    assert!(find_decls("constPOLICY: u8 = 1;", "POLICY").is_empty());
+    assert!(find_decls("myconst POLICY: u8 = 1;", "POLICY").is_empty());
+    assert_eq!(find_decls("pub const\n POLICY: u8 = 1;", "POLICY").len(), 1);
+}
+
+#[test]
 fn diverged_branch_uses_merge_base_not_base_tip() {
     let d = repo(&src("2", BASE));
     topic(d.path(), &src("2", BASE).replace("doc", "topic only"));
