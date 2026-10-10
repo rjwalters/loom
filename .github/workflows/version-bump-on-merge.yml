@@ -9,9 +9,8 @@ name: Version Bump on Merge
 # against a moved `main` (nine closed issues about this in 60 days, #7743's
 # own body has the table). Moving the bump here removes the requirement
 # instead of teaching every actor to comply with it better: one workflow,
-# triggered only when a just-merged commit touched `defaults/`, always
-# bumping from the tree it is bumping -- correct by construction, not by
-# review. `defaults/scripts/check-defaults-version-bump.sh --forbid-bump`
+# always bumping from the tree it is bumping -- correct by construction, not
+# by review. `defaults/scripts/check-defaults-version-bump.sh --forbid-bump`
 # (wired into ci.yml's `defaults-version-bump-check` job) is the matching
 # gate: it now REJECTS a PR that hand-edits a version-bearing file's value,
 # since that value change should only ever come from this workflow.
@@ -38,19 +37,52 @@ name: Version Bump on Merge
 # unreleased `VERSION`, finishes green in `CI` — release.yml runs on
 # `workflow_run` of `CI`, not on this push. A version whose commits never go
 # green is skipped (no tag); see defaults/docs/release-cadence.md.
+#
+# Cadence (#11174): at most ONE bump per RELEASE_MIN_INTERVAL (repo variable
+# `vars.RELEASE_MIN_INTERVAL`, seconds, default 86400 = 24 h). Before this,
+# every `defaults/` merge cut a version (52 bumps, ~955 workflow runs in one
+# day), each bump commit its own `main` CI run plus a release. Now merges
+# inside the window just accumulate, unreleased; scripts/version-bump-gate.sh
+# decides, from local git history only (no forge calls -- the bypass ledger
+# pins this workflow at one `gh api` call), whether this run bumps:
+#   push              bump if the window has elapsed, else `deferred:` (exit 0)
+#   schedule (hourly) the catch-up for a quiet day: bump if the window has
+#                     elapsed AND defaults/ changed since the last bump
+#   workflow_dispatch `force: true` + `reason` skips the window (operator
+#                     hotfix path, e.g. a fix a `loom_min_version` floor needs
+#                     now); the reason and actor are recorded in the commit
+# Every path still requires an unreleased defaults/ change, so no no-op
+# version is ever cut. The gate runs before any toolchain setup, so a
+# deferred run costs seconds.
 
 on:
   push:
     branches: [main]
     paths:
       - "defaults/**"
+  # Hourly, not daily: against a 24 h window that started at an arbitrary
+  # time, a once-a-day cron can push the catch-up out to ~48 h. Hourly bounds
+  # the worst case at RELEASE_MIN_INTERVAL + ~1 h (+ GitHub's own schedule
+  # delay); each run is a seconds-long gate check.
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Bump now, skipping the release interval (operator hotfix path)"
+        type: boolean
+        default: false
+      reason:
+        description: "Why the bump is forced (required with force; recorded in the bump commit)"
+        type: string
+        default: ""
 
 # Serialize runs instead of racing them -- deliberately NOT cancel-in-progress:
-# every merge that touched `defaults/` needs its own bump (this is a queue of
-# real work, not redundant re-verification of the same commit; see
-# .loom/docs/ci-principles.md), so back-to-back merges should queue and each
-# run should bump from whatever `main` looks like when it starts (which, for
-# a queued run, already includes every earlier run's own bump commit).
+# a queued run re-checks the gate against whatever `main` looks like when it
+# starts (which already includes any earlier run's bump commit, so it defers
+# instead of bumping twice), and GitHub keeps at most one pending run per
+# group anyway. Cancelling a started run would only lose a gate verdict (see
+# .loom/docs/ci-principles.md).
 concurrency:
   group: version-bump-on-merge
   cancel-in-progress: false
@@ -60,7 +92,7 @@ permissions:
 
 jobs:
   bump-version:
-    name: Bump VERSION after a defaults/ merge
+    name: Bump VERSION (at most once per release interval)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -79,23 +111,67 @@ jobs:
       # wherever `main` actually is now, not from the commit that originally
       # triggered it (which may already be several bumps behind by the time
       # this run gets to the front of the concurrency group).
+      # Full commit history (trees, no blobs): the gate looks up the last
+      # bump, which after a quiet stretch can be weeks back. With depth 1 the
+      # lookup would see one commit and decide wrongly; the gate refuses a
+      # shallow clone outright.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          fetch-depth: 1
+          fetch-depth: 0
+          filter: blob:none
           token: ${{ steps.app-token.outputs.token }}
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # Before any toolchain setup or mutation. Exit 0 with decision=deferred
+      # or nothing leaves VERSION alone; an unreadable history or a bad
+      # RELEASE_MIN_INTERVAL fails red (never "always bump", never a silent
+      # stop). inputs.reason reaches the shell only through env:, never as an
+      # expression inside run: (template injection).
+      - name: Release cadence gate
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+          FORCE_REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.triggering_actor }}
+          RELEASE_MIN_INTERVAL: ${{ vars.RELEASE_MIN_INTERVAL }}
+        run: |
+          set -euo pipefail
+          out="$(bash scripts/version-bump-gate.sh --event "$EVENT_NAME" --force "$FORCE" \
+            --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)"
+          echo "$out"
+          decision="$(sed -n 's/^decision=//p' <<<"$out")"
+          reason="$(sed -n 's/^reason=//p' <<<"$out")"
+          echo "decision=$decision" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Version bump gate: ${decision}"
+            echo ""
+            echo "$reason"
+            echo ""
+            echo '```'
+            echo "$out"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - if: steps.gate.outputs.decision == 'bump'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - if: steps.gate.outputs.decision == 'bump'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
 
       - name: Bump version and push (retries on a racing push to main)
+        if: steps.gate.outputs.decision == 'bump'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+          FORCE_REASON: ${{ inputs.reason }}
+          ACTOR: ${{ github.triggering_actor }}
+          RELEASE_MIN_INTERVAL: ${{ vars.RELEASE_MIN_INTERVAL }}
         run: |
           set -euo pipefail
 
@@ -113,6 +189,17 @@ jobs:
             git fetch origin main
             git checkout -B main origin/main
 
+            # Re-check the gate against the new tip: a bump that landed while
+            # we raced (a forced dispatch, a queued run) must make this run
+            # defer rather than bump a second time inside the window.
+            gate="$(bash scripts/version-bump-gate.sh --event "$EVENT_NAME" --force "$FORCE" \
+              --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)"
+            if ! grep -qx 'decision=bump' <<<"$gate"; then
+              echo "$gate"
+              echo "Gate no longer says bump on the current tip -- not bumping." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
             ./scripts/version.sh bump patch
             new_version="$(./scripts/version.sh show)"
 
@@ -121,7 +208,12 @@ jobs:
             if [ -f .loom/install-metadata.json ]; then
               git add .loom/install-metadata.json
             fi
-            git commit -m "chore: bump version to $new_version"
+            if [ "$FORCE" = "true" ]; then
+              git commit -m "chore: bump version to $new_version" \
+                -m "Forced-by: $ACTOR" -m "Reason: $FORCE_REASON"
+            else
+              git commit -m "chore: bump version to $new_version"
+            fi
 
             if git push origin HEAD:main; then
               echo "Pushed version bump to $new_version"

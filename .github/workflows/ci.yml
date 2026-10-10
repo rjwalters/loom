@@ -877,6 +877,9 @@ jobs:
       - name: Test the release decision and release.yml wiring (#10826)
         if: ${{ !cancelled() }}
         run: bash scripts/test-release-decision.sh
+      - name: Test the version-bump cadence gate (#11174)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-version-bump-gate.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
