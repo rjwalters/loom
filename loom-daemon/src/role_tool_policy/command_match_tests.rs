@@ -642,6 +642,23 @@ fn clustered_short_options_still_consume_their_value() {
 }
 
 #[test]
+fn watch_differences_flag_does_not_consume_the_command() {
+    for cmd in [
+        "watch -d ssh example.invalid",
+        "watch -d=permanent ssh example.invalid",
+        "watch --differences ssh example.invalid",
+        "watch --differences=permanent ssh example.invalid",
+        "watch -dn 1 ssh example.invalid",
+        "watch -n 1 -d ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("watch -d aws sts get-caller-identity", "cloud-cli"));
+    assert_clean("watch -d echo hi");
+    assert_clean("watch -n 1 -d echo hi");
+}
+
+#[test]
 fn stdbuf_and_ionice_keep_their_own_value_options() {
     for cmd in [
         "stdbuf -i0 -o L -e 0 ssh example.invalid",

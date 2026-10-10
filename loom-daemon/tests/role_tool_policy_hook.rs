@@ -226,6 +226,9 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("xargs -rn1 ssh example.invalid", "remote-shell"),
     ("sudo -Hu root ssh example.invalid", "remote-shell"),
     ("sudo -Huroot aws sts get-caller-identity", "cloud-cli"),
+    // Round 11: watch's -d/--differences takes no separate value.
+    ("watch -d ssh example.invalid", "remote-shell"),
+    ("watch -d aws sts get-caller-identity", "cloud-cli"),
 ];
 
 #[test]

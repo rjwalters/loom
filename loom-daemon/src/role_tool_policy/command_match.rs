@@ -875,7 +875,8 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
             recurse(j, hits);
         }
         "watch" => {
-            let j = skip_options(rest, &["-n", "--interval", "-d"]);
+            // `-d`/`--differences` takes an optional `=value` only, never the next word.
+            let j = skip_options(rest, &["-n", "--interval"]);
             if j < rest.len() {
                 analyze_str(&rest[j..].join(" "), home, depth + 1, hits);
             }
