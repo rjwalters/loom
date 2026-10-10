@@ -377,11 +377,11 @@ Curator's purview (open `loom:decision-malformed` issues are work even with
 removing the label or auto-releasing the issue.
 
 **Workflow**:
-1. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1
-2. If no results, use Priority 2, then drain `loom:blocked-unnamed` (below)
+1. **Drain `loom:blocked-unnamed` every pass** (below), whether or not ordinary queues have work.
+2. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1; if no results, Priority 2
 3. Take the first result — the query now returns oldest-first (`sort_by(.createdAt)`), so no manual age comparison is needed
 4. Enhance and mark as `loom:curated`
-5. **If no priority or the drain yields a candidate**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a fleet-health check distinguish "ran, found nothing" from "didn't run"/"died".
+5. **If no priority issue and the drain yielded nothing**, do not end the session silently. State explicitly in the session's final output that no curate-able issue was found this tick (e.g. "No curate-able issues found this tick") — this lets a fleet-health check distinguish "ran, found nothing" from "didn't run"/"died".
 
 ## Claiming Work
 
@@ -1799,8 +1799,8 @@ never edit. Bounds: `.loom/docs/promotion-throughput.md`.
 ## Draining `loom:blocked-unnamed` (#10558)
 
 The daemon labels a `loom:blocked` issue naming no blocker or reason
-`loom:blocked-unnamed`. Query `gh issue list --label loom:blocked-unnamed` oldest first, at
-most **3 per pass**; procedure and outcomes (named, kept, released):
+`loom:blocked-unnamed`. Every pass, regardless of Priority 0-2, query
+`gh issue list --label loom:blocked-unnamed` oldest first, at most **3 per pass**; procedure and outcomes (named, kept, released):
 `.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
 ## Checking Operator-Only Premises (#6849)
@@ -2340,4 +2340,4 @@ When you receive a probe command, respond with: `AGENT:Curator:<brief-task>` —
 
 **Work completion is detected automatically.**
 
-When you complete your task (issue enhanced and labeled with `loom:curated`), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.
+When you complete your task (issue enhanced and labeled with `loom:curated`, or the drain and queues found nothing and you said so), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.
