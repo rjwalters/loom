@@ -656,7 +656,7 @@ pub struct SweepRegistry {
     /// outcome classification, so it never overlaps or interferes with
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
-    noop_cooldown: HashMap<u32, NoopCooldownState>,
+    noop_cooldown: NoopCooldownTable,
     /// Hard-exclusion decline cooldown parameters (Issue #7528). Set at
     /// provision time from the resolved env > config > default value,
     /// mirroring [`noop_cooldown_config`](Self::noop_cooldown_config).
@@ -1143,7 +1143,7 @@ impl SweepRegistry {
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
-            noop_cooldown: HashMap::new(),
+            noop_cooldown: NoopCooldownTable::default(),
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),

@@ -95,6 +95,22 @@
 
 use super::*;
 
+mod fingerprint;
+mod hold;
+
+pub(crate) use fingerprint::ParkKind;
+pub(crate) use hold::NoopCooldownTable;
+pub use hold::{
+    NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER, NOOP_HOLD_FAILED_COMMENT_MARKER,
+};
+
+/// Env var overriding how many consecutive unchanged no-op releases park an
+/// issue (Issue #10156). `0` disables the hold only; the cooldown is unaffected.
+pub const NOOP_HOLD_THRESHOLD_ENV: &str = "LOOM_WORK_FINDER_NOOP_HOLD_THRESHOLD";
+
+/// Default consecutive no-op count at which the hold parks an issue (#10156).
+pub const DEFAULT_NOOP_HOLD_THRESHOLD: u32 = 3;
+
 /// Env var toggling the no-op re-dispatch cooldown (Issue #6670). `0`/`false`/
 /// `no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides config.
 /// Defaults ON — like quarantine/dispatch-backoff it is a dispatch-efficiency
@@ -124,6 +140,9 @@ pub struct NoopCooldownConfig {
     pub enabled: bool,
     /// How long a recorded no-op release holds the issue out of dispatch.
     pub cooldown: Duration,
+    /// Consecutive no-ops with an unchanged forge fingerprint after which the
+    /// issue is durably parked (Issue #10156); `0` disables the hold.
+    pub hold_threshold: u32,
 }
 
 impl Default for NoopCooldownConfig {
@@ -131,6 +150,7 @@ impl Default for NoopCooldownConfig {
         Self {
             enabled: true,
             cooldown: Duration::from_secs(DEFAULT_NOOP_COOLDOWN_SECS),
+            hold_threshold: DEFAULT_NOOP_HOLD_THRESHOLD,
         }
     }
 }
@@ -171,6 +191,8 @@ pub struct NoopCooldownFileConfig {
     pub enabled: Option<bool>,
     /// `autonomous.workFinder.noopCooldown.cooldownSecs` (zero/invalid dropped).
     pub cooldown_secs: Option<u64>,
+    /// `autonomous.workFinder.noopCooldown.holdThreshold` (`0` disables).
+    pub hold_threshold: Option<u32>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder.noopCooldown` (Issue
@@ -190,6 +212,10 @@ pub fn read_noop_cooldown_file_config(repo_root: &Path) -> NoopCooldownFileConfi
             .get("cooldownSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        hold_threshold: c
+            .get("holdThreshold")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
     }
 }
 
@@ -213,9 +239,16 @@ pub fn resolve_noop_cooldown_config(repo_root: &Path) -> NoopCooldownConfig {
         .or(file.cooldown_secs)
         .unwrap_or(DEFAULT_NOOP_COOLDOWN_SECS);
 
+    let hold_threshold = std::env::var(NOOP_HOLD_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .or(file.hold_threshold)
+        .unwrap_or(DEFAULT_NOOP_HOLD_THRESHOLD);
+
     NoopCooldownConfig {
         enabled,
         cooldown: Duration::from_secs(cooldown_secs),
+        hold_threshold,
     }
 }
 
@@ -274,6 +307,7 @@ impl SweepRegistry {
         // conclusion it is rather than classifying it a second time as a
         // PR-less failure — see `noop_release_covers_dispatch`.
         let released_by_sweep = self.live_issue_sweep_id(issue);
+        let reason_for_hold = reason.clone();
         self.noop_cooldown.insert(
             issue,
             NoopCooldownState {
@@ -281,9 +315,12 @@ impl SweepRegistry {
                 until,
                 consecutive,
                 reason,
-                released_by_sweep,
+                released_by_sweep: released_by_sweep.clone(),
             },
         );
+        // Issue #10156: feed the durable hold's streak (see `hold`). After the
+        // window is armed, so a slow forge read cannot delay the cooldown.
+        self.note_noop_for_hold(issue, released_by_sweep.as_deref(), reason_for_hold.as_deref());
         // Issue #7972: a self-reported no-op is a *deliberate conclusion*, not
         // a failed attempt — and this cooldown is the correct brake for it. A
         // standing/tracking issue that keeps legitimately concluding "still
@@ -661,6 +698,7 @@ mod tests {
         reg.set_noop_cooldown_config(NoopCooldownConfig {
             enabled: false,
             cooldown: Duration::from_secs(60),
+            ..NoopCooldownConfig::default()
         });
         reg.record_noop_release(1, None);
         assert_eq!(reg.noop_release_count(1), 0);
@@ -914,6 +952,7 @@ mod tests {
         reg.set_noop_cooldown_config(NoopCooldownConfig {
             enabled: false,
             cooldown: Duration::from_secs(60),
+            ..NoopCooldownConfig::default()
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         reg.set_peer_claim_publisher(tx);
@@ -1008,6 +1047,7 @@ mod tests {
         reg.set_noop_cooldown_config(NoopCooldownConfig {
             enabled: true,
             cooldown: Duration::from_secs(60),
+            ..NoopCooldownConfig::default()
         });
         reg.record_noop_release(9929, None);
         attach_peer_armed_cooldown(&mut reg, 9929, 3600);
@@ -1051,6 +1091,7 @@ mod tests {
         reg.set_noop_cooldown_config(NoopCooldownConfig {
             enabled: false,
             cooldown: Duration::from_secs(60),
+            ..NoopCooldownConfig::default()
         });
         attach_peer_armed_cooldown(&mut reg, 9928, 3600);
         assert!(reg.noop_cooldown_dispatch_block(9928, Utc::now()).is_none());
@@ -1064,6 +1105,7 @@ mod tests {
         reg.set_noop_cooldown_config(NoopCooldownConfig {
             enabled: false,
             cooldown: Duration::from_secs(60),
+            ..NoopCooldownConfig::default()
         });
         let repo = peer_claims::repo_slug(&reg.config().workspace_root);
         let view =

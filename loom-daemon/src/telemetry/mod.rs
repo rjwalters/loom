@@ -73,8 +73,8 @@ pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{
-    classify_disposition, DispositionSignals, IssueEndState, SweepDisposition,
-    NO_PHASE_SIGNAL_CLASS,
+    apply_noop_loop_class, classify_disposition, DispositionSignals, IssueEndState,
+    SweepDisposition, NO_PHASE_SIGNAL_CLASS,
 };
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{

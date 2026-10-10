@@ -947,6 +947,15 @@ impl SweepRegistry {
                 )
             });
 
+        // Issue #10156: an `after-curator` stop that is part of a no-op loop is
+        // its own outcome class instead of `unclassified`.
+        let failure_class = telemetry::apply_noop_loop_class(
+            disposition,
+            failure_class,
+            self.noop_loop_kind(issue, sweep_id)
+                .map(ParkKind::failure_class),
+        );
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             repo_unresolved,
@@ -1318,6 +1327,15 @@ impl SweepRegistry {
             return None;
         }
         crate::git_utils::diff_stat_against_mainline(&wt)
+    }
+
+    /// Whether every phase sampled for `sweep_id` is the Curator's (Issue
+    /// #10156): `Some(true)` for a non-empty history that never got past
+    /// curation, `Some(false)` once any later phase was seen, `None` when
+    /// nothing was sampled. Free (no forge call).
+    pub(crate) fn sampled_only_curator(&self, sweep_id: &str) -> Option<bool> {
+        let history = self.phase_history.get(sweep_id).filter(|h| !h.is_empty())?;
+        Some(history.iter().all(|o| phase_label(&o.phase) == "curator"))
     }
 
     /// Whether this sweep was ever observed completing the Merge phase (Issue

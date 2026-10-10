@@ -266,6 +266,25 @@ impl DispositionSignals<'_> {
     }
 }
 
+/// Re-class an `unclassified:after-curator` stop that belongs to a no-op loop
+/// (Issue #10156) as `loop_class` (`noop-loop:human-gate` /
+/// `noop-loop:blocked`). Anything else — another disposition, another class,
+/// or no loop — passes through, so a first-time Curator-only stop stays
+/// `after-curator`.
+#[must_use]
+pub fn apply_noop_loop_class(
+    disposition: SweepDisposition,
+    class: Option<String>,
+    loop_class: Option<&str>,
+) -> Option<String> {
+    match (disposition, class.as_deref(), loop_class) {
+        (SweepDisposition::Unknown, Some("unclassified:after-curator"), Some(lc)) => {
+            Some(lc.to_string())
+        }
+        _ => class,
+    }
+}
+
 /// Whether `class` names an *environmental* fault — the run broke, rather than
 /// the work being hard (Issue #9441).
 ///
@@ -846,6 +865,28 @@ mod tests {
         let (disposition, class) = classify_disposition(&signals);
         assert_eq!(disposition, SweepDisposition::Unknown);
         assert_eq!(class.as_deref(), Some("unclassified:no-phase-signal"));
+    }
+
+    #[test]
+    fn noop_loop_reclasses_only_the_after_curator_stop() {
+        let signals = DispositionSignals {
+            phase_durations: &phases(&["curator"]),
+            total_duration_sec: 400,
+            ..base(SweepResult::Failure)
+        };
+        let (disposition, class) = classify_disposition(&signals);
+        assert_eq!(class.as_deref(), Some("unclassified:after-curator"));
+        let none = apply_noop_loop_class(disposition, class.clone(), None);
+        assert_eq!(none.as_deref(), Some("unclassified:after-curator"));
+        let looped = apply_noop_loop_class(disposition, class, Some("noop-loop:human-gate"));
+        assert_eq!(looped.as_deref(), Some("noop-loop:human-gate"));
+        // A different class is never overwritten.
+        let other = apply_noop_loop_class(
+            SweepDisposition::Unknown,
+            Some("unclassified:after-builder".into()),
+            Some("noop-loop:blocked"),
+        );
+        assert_eq!(other.as_deref(), Some("unclassified:after-builder"));
     }
 
     /// The 2,810-record shape: stopped after the Curator, with no forge
