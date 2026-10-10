@@ -423,3 +423,55 @@ fn end_owners_matches_any_sweep_for_the_issue_but_never_a_peer() {
             .unwrap();
     assert_eq!((n, sent.borrow().len()), (1, 0));
 }
+
+#[test]
+fn issue_owner_is_not_signalled_when_identity_changes_during_argv_lookup() {
+    let argv = |_: u32| {
+        Some(vec![
+            "bash".into(),
+            "/x/sweep-lease-renew.sh".into(),
+            "start".into(),
+        ])
+    };
+    // Stable identity matching the record: signalable.
+    let same = |_: u32| Some("id-1".to_string());
+    assert!(issue_owner_signalable(500, "id-1", &same, &argv));
+    // Identity differs from the record at the first read (pid reused).
+    let other = |_: u32| Some("id-2".to_string());
+    assert!(!issue_owner_signalable(500, "id-1", &other, &argv));
+    // Identity matches first, then changes while argv is read; the replacement
+    // has valid renewer argv, so only the post-argv recheck can refuse it.
+    let calls = RefCell::new(0);
+    let flips = |_: u32| {
+        *calls.borrow_mut() += 1;
+        Some(if *calls.borrow() == 1 { "id-1" } else { "id-2" }.to_string())
+    };
+    assert!(!issue_owner_signalable(500, "id-1", &flips, &argv));
+    // An empty recorded identity is never enough to signal.
+    assert!(!issue_owner_signalable(500, "", &same, &argv));
+    // A dead pid is not signalled.
+    assert!(!issue_owner_signalable(500, "id-1", &|_| None, &argv));
+}
+
+#[test]
+fn end_owners_tombstones_but_does_not_signal_a_refused_issue_owner() {
+    let (_d, s) = store();
+    let k = key("acme/widget", "h", "s1", 7);
+    claim(&s, &k, 100, "t1", &ident, &all_live).unwrap();
+    let sent = RefCell::new(vec![]);
+    let live = |p: u32, i: &str| {
+        let argv =
+            |_: u32| Some(vec!["bash".into(), "sweep-lease-renew.sh".into(), "start".into()]);
+        let n = RefCell::new(0);
+        let flip = |_: u32| {
+            *n.borrow_mut() += 1;
+            Some(if *n.borrow() == 1 { i } else { "reused" }.to_string())
+        };
+        issue_owner_signalable(p, i, &flip, &argv)
+    };
+    let n = end_owners(&s, "acme/widget", 7, None, None, &live, &|p| sent.borrow_mut().push(p))
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(sent.borrow().is_empty());
+    assert!(s.read(&k).unwrap().unwrap().released);
+}
