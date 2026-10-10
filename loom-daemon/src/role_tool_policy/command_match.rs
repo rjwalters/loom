@@ -516,10 +516,25 @@ fn search_pattern_word(seg: &[Word]) -> Option<usize> {
             pattern_by_option = pattern_by_option.or(Some(i + 1));
             i += 2;
         } else if t.starts_with('-') && t != "-" {
-            // `-f`/`--file` take a FILE: it stays a checked path, and the
-            // pattern then comes from that file, not from an operand.
-            if t == "-f" || t == "--file" || t.starts_with("--file=") {
+            // Pattern given inside this very word (`--regexp=x`, `-ex`,
+            // `-rnex`), via `-f`/`--file` (a FILE that stays a checked path),
+            // or no pattern at all (`rg --files`): either way no operand is
+            // the pattern, so every operand stays a checked path.
+            let (short_e, short_f) = short_cluster_flags(t);
+            if t.starts_with("--regexp=")
+                || t == "-f"
+                || t == "--file"
+                || t.starts_with("--file=")
+                || t == "--files"
+                || short_f
+                || short_e == Some(true)
+            {
                 pattern_by_option = pattern_by_option.or(Some(usize::MAX));
+            } else if short_e == Some(false) {
+                // Trailing `e` of a cluster (`-rne`): the next word is the pattern.
+                pattern_by_option = pattern_by_option.or(Some(i + 1));
+                i += 2;
+                continue;
             }
             i += if WITH_VALUE.contains(&t) { 2 } else { 1 };
         } else {
@@ -530,6 +545,24 @@ fn search_pattern_word(seg: &[Word]) -> Option<usize> {
     // With `-e PATTERN` every operand is a file; otherwise the first operand
     // is the pattern.
     pattern_by_option.map_or(first_operand, |p| (p != usize::MAX).then_some(p))
+}
+
+/// For a short-option cluster (`-rne`, `-ex`, `-fFILE`): whether it carries
+/// `-e` (`Some(true)` = pattern attached in the same word, `Some(false)` = `e`
+/// is last so the pattern is the next word), and whether it carries `-f`.
+/// Long options and non-clusters yield `(None, false)`.
+fn short_cluster_flags(word: &str) -> (Option<bool>, bool) {
+    let Some(rest) = word.strip_prefix('-').filter(|r| !r.starts_with('-')) else {
+        return (None, false);
+    };
+    for (idx, c) in rest.char_indices() {
+        match c {
+            'e' => return (Some(idx + 1 < rest.len()), false),
+            'f' => return (None, true),
+            _ => {}
+        }
+    }
+    (None, false)
 }
 
 fn seg_runs_shell(seg: &[Word]) -> bool {

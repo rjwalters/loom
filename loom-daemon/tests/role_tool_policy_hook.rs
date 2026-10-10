@@ -178,6 +178,13 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     // Round 2: quoted FILE operands to grep/rg are paths, not inert text.
     ("grep -h \".*\" \"{home}/.ssh/id_rsa\"", "credential-store"),
     ("rg \"x\" \"{home}/.aws/credentials\"", "credential-store"),
+    // Round 3: attached pattern options and pattern-less modes leave every
+    // operand a file.
+    ("grep --regexp=x {home}/.ssh/id_rsa", "credential-store"),
+    ("grep -ex {home}/.ssh/id_rsa", "credential-store"),
+    ("rg -ex {home}/.ssh/id_rsa", "credential-store"),
+    ("grep --regexp=x -- {home}/.ssh/id_rsa", "credential-store"),
+    ("rg --files {home}/.ssh", "credential-store"),
     ("gh -R o/r secret list", "forge-secrets"),
     ("gh --repo o/r variable list", "forge-secrets"),
     ("rsync -e ssh a b:c", "remote-shell"),

@@ -389,6 +389,7 @@ fn a_grep_pattern_is_text_but_every_other_operand_is_a_path() {
         "rg '~/.aws/credentials' src",
         "grep -e '~/.ssh' -- docs/",
         "grep -A 3 '~/.ssh' docs/",
+        "grep -rne '~/.ssh' docs/",
     ] {
         assert!(!hits_cap(cmd, "credential-store"), "pattern flagged: {cmd:?}");
     }
@@ -401,6 +402,15 @@ fn a_grep_pattern_is_text_but_every_other_operand_is_a_path() {
         "grep -f ~/.ssh/id_rsa docs/",
         "grep -f pats ~/.ssh/id_rsa",
         "grep -rn '~/.ssh' ~/.ssh",
+        "grep --regexp=x ~/.ssh/id_rsa",
+        "grep -ex ~/.ssh/id_rsa",
+        "rg -ex ~/.ssh/id_rsa",
+        "grep -rnex ~/.ssh/id_rsa",
+        "grep -rne x ~/.ssh/id_rsa",
+        "grep --regexp=x -- ~/.ssh/id_rsa",
+        "grep -ex -- ~/.ssh/id_rsa",
+        "rg --files ~/.ssh",
+        "grep -fpats ~/.ssh/id_rsa",
     ] {
         assert!(hits_cap(cmd, "credential-store"), "missed: {cmd:?}");
     }
