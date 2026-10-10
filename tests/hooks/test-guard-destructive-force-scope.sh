@@ -814,14 +814,49 @@ assert_ask "force-op:detached (#9317 close-token pin): \`pwd -P)\` is NOT the re
     "WORKTREE_ABS=\"\$(cd .loom/worktrees/issue-2 && pwd -P)\"
 git -C \"\$WORKTREE_ABS\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
 
-# NOTE (#9317): the non-`&&` separators inside the substitution -- `|`, `&`,
-# `||` -- are deliberately NOT asserted here. extract_cdpwd_open() does not
-# know which operator qsplit() split at, so it treats them like `&&` and
-# currently resolves shapes whose real shell value is the repo root (`|`, `&`)
-# or empty (`||`). That is a pre-existing modelling gap in qsplit()'s
-# separator handling rather than something this change introduced -- filed
-# separately as #9405; pinning the current (wrong) verdicts here would
-# cement them, so #9405 owns adding them as assert_ask cases alongside its fix.
+# ---- #9405: the cd/pwd capture closes ONLY across a `&&` or `;` split. ----
+# qsplit() now records the operator it split at, so parse_force_ops() refuses
+# the pending capture's close when that operator is `|`/`&` (each side runs in
+# its own subshell -- W is the REPO ROOT, so the reset would hit the primary
+# checkout) or `||` (cd succeeded, pwd never runs -- W is empty).
+assert_ask "force-op:detached + \$(cd <path> | pwd) capture (#9405): a pipe runs pwd in its own subshell -- W is the repo root, still asks" \
+    "W=\"\$(cd .loom/worktrees/issue-2 | pwd)\"
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$(cd <path> & pwd) capture (#9405): a backgrounded cd never reaches pwd's shell -- W is the repo root, still asks" \
+    "W=\"\$(cd .loom/worktrees/issue-2 & pwd)\"
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$(cd <path> || pwd) capture (#9405): pwd never runs after a successful cd -- W is empty, still asks" \
+    "W=\"\$(cd .loom/worktrees/issue-2 || pwd)\"
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> ; pwd) capture (#9405 non-regression): a \`;\` split runs pwd in the cd'd shell -- still resolves and allows" \
+    "W=\"\$(cd .loom/worktrees/issue-2 ; pwd)\"
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9405 non-regression): the \`&&\` split still resolves and allows" \
+    "W=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
+git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# A refused close must not leave the variable's PREVIOUS value live: the shell
+# DID reassign W (to the repo root / empty), so trusting the earlier worktree
+# value flips ask->allow on a command that targets the primary checkout.
+git -C "$FORCE_DETACHED_WT_REPO" worktree add -q "$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-3" \
+    -b feature/issue-3 >/dev/null 2>&1
+FORCE_ATTACHED_WT="$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-3"
+cat > "$FORCE_ATTACHED_WT/.loom-managed" <<'EOF'
+# Loom-managed worktree marker
+# Created by .loom/scripts/worktree.sh
+# Issue: 3
+# Branch: feature/issue-3
+EOF
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> | pwd) (#9405): W is now the repo root, previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO | pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> & pwd) (#9405): W is now the repo root, previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO & pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> || pwd) (#9405): W is now empty (git -C \"\" = cwd), previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO || pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W after a closed && capture then \$(cd . | pwd) (#9405): the refused reassign must poison the earlier resolved value" \
+    "W=\"\$(cd $FORCE_DETACHED_WT && pwd)\"; W=\"\$(cd . | pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:attached + stale-W reassign then git -C \"\$W\" push --force origin HEAD (#9405): would force-push the primary checkout" \
+    "W=$FORCE_ATTACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO | pwd)\"; git -C \"\$W\" push --force origin HEAD" "$FORCE_DETACHED_WT_REPO"
 
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
