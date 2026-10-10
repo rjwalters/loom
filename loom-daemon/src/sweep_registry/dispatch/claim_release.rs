@@ -55,17 +55,23 @@ impl SweepRegistry {
              PR) right after the claim flip (#11304) - the pre-flip guard failed open. \
              Releasing the claim instead of spawning a builder."
         );
-        if let Err(e) = self.restore_label_to_ready(issue_number) {
-            log::warn!(
-                "sweep_registry: post-claim release of closed issue #{issue_number} failed: {e}"
-            );
+        let restore = self.restore_label_to_ready(issue_number);
+        if restore.is_ok() {
+            self.note_label_flip(issue_number); // #4485 flap detection
         }
-        self.note_label_flip(issue_number); // #4485 flap detection
         self.unwind_local_claim(issue_number, sweep_id, idempotency_key);
-        Err(anyhow!(
-            "refusing to dispatch issue #{issue_number}: it was found closed on the forge \
-             right after the claim flip (#11304 post-claim re-verification); the \
-             `loom:building` claim was released and no builder was spawned."
-        ))
+        match restore {
+            Ok(()) => Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: it was found closed on the forge \
+                 right after the claim flip (#11304 post-claim re-verification); the \
+                 `loom:building` claim was released and no builder was spawned."
+            )),
+            Err(e) => Err(e.context(format!(
+                "refusing to dispatch issue #{issue_number}: it was found closed on the forge \
+                 right after the claim flip (#11304 post-claim re-verification), but removing \
+                 the `loom:building` claim FAILED - the forge may still carry it; no builder \
+                 was spawned and local claim state was unwound"
+            ))),
+        }
     }
 }
