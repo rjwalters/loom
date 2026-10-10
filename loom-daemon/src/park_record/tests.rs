@@ -396,6 +396,50 @@ fn escaped_backtick_does_not_open_a_code_span() {
     assert!(parse(body).is_empty());
 }
 
+/// #10837 review: backslashes pair off. An odd run escapes the backtick (no
+/// span, so the real record parses); an even run leaves it active (a span
+/// that quotes the marker).
+#[test]
+fn backslash_parity_decides_whether_a_backtick_is_escaped() {
+    let q = "<!-- loom:park Blocked by: #7 -->";
+    // Two or four backslashes: the backtick is a live span opener, so the
+    // marker is code.
+    for body in [format!("\\\\`{q}`\n"), format!("\\\\\\\\`{q}`\n")] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+        assert_eq!(drop_blockers(&body, &[7]), body);
+    }
+    // One or three backslashes: escaped, so the marker is a real record.
+    for body in [format!("\\`{q}`\n"), format!("\\\\\\`{q}`\n")] {
+        assert_eq!(blockers(&body), n(&[7]), "{body}");
+    }
+}
+
+/// #10837 review: a heading is not an open paragraph, so a 4-space-indented
+/// marker directly under it is indented code; a real record after is a control.
+#[test]
+fn indented_marker_after_a_heading_is_code() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("## Evidence\n    {q}\n"),
+        format!("# Evidence #\n\t{q}\n"),
+        format!("---\n    {q}\n"),
+        format!("Title\n===\n    {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+        assert_eq!(drop_blockers(&body, &[1689]), body);
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        assert_eq!(blockers(&after), n(&[7]), "{after}");
+    }
+    // Plain paragraph text (or a `#tag` without a space) stays a paragraph, so
+    // an indented line is a continuation and the marker is a real record.
+    let body = format!("Evidence\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+    let body = format!("#Evidence\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+}
+
 /// #10837 review: a fence opened directly inside a list item (bulleted,
 /// numbered, nested) quotes its content, even across blank lines; a genuine
 /// record after the list is still read.

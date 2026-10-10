@@ -121,10 +121,39 @@ pub(super) fn blank(text: &str) -> String {
             out.push_str(&spaces(line));
             continue;
         }
+        // A heading, thematic break, or setext underline is not an open
+        // paragraph: it closes the one it ends, so indented code may follow.
+        let closes = ends_paragraph(trimmed, !para.is_empty());
         para.push_str(line);
+        if closes {
+            flush(&mut para, &mut out);
+        }
     }
     flush(&mut para, &mut out);
     out
+}
+
+/// Whether `trimmed` (a non-blank line, indent removed) is a single-line block
+/// that leaves no paragraph open: an ATX heading, a thematic break, or a
+/// setext underline under an open paragraph.
+fn ends_paragraph(trimmed: &str, para_open: bool) -> bool {
+    let t = trimmed.trim_end();
+    let hashes = t.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes)
+        && (t.len() == hashes || matches!(t.as_bytes()[hashes], b' ' | b'\t'))
+    {
+        return true;
+    }
+    let Some(c) = t.bytes().next() else {
+        return false;
+    };
+    let marks = t.bytes().filter(|b| *b == c).count();
+    let only = t.bytes().all(|b| b == c || b == b' ' || b == b'\t');
+    match c {
+        b'-' | b'*' | b'_' => only && marks >= 3,
+        b'=' => only && para_open && !t.contains([' ', '\t']),
+        _ => false,
+    }
 }
 
 /// Width of the list marker at the start of `t` (`-`, `*`, `+`, or up to nine
@@ -228,9 +257,15 @@ fn blank_inline(line: &str) -> String {
             i = line[i + 4..eol].find("-->").map_or(eol, |e| i + 4 + e + 3);
             continue;
         }
-        // A backslash-escaped backtick is a literal, never a span opener.
-        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'`') {
-            i += 2;
+        // A backslash escapes the next byte, so a run of them pairs off: an odd
+        // run escapes a following backtick (a literal, never a span opener); an
+        // even run leaves it active.
+        if bytes[i] == b'\\' {
+            let n = bytes[i..].iter().take_while(|b| **b == b'\\').count();
+            i += n;
+            if n % 2 == 1 && bytes.get(i) == Some(&b'`') {
+                i += 1;
+            }
             continue;
         }
         if bytes[i] != b'`' {

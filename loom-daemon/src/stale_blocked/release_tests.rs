@@ -838,6 +838,32 @@ fn quoted_or_indented_records_never_release_but_a_real_one_after_indented_backti
 }
 
 #[test]
+fn quoted_after_heading_or_even_backslashes_never_release_an_unrecorded_hold() {
+    // #10837 review: a marker indented under a heading, or inside a span opened
+    // after an even backslash run, is quoted code; closed #1689 causes no write.
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [format!("## Evidence\n    {q}\n"), format!("\\\\`{q}`\n")] {
+        let mut w = World::new();
+        w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+        w.state(1689, "CLOSED", false);
+        w.extra.events.insert(10837, vec!["loom:issue".into()]);
+        let r = w.run();
+        assert_eq!(skipped(&r, "no-park-record"), 1, "{body}: {}", r.summary());
+        assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes(), "{body}");
+    }
+    // Control: a real record after the code block still releases.
+    let mut w = World::new();
+    let body =
+        "## Evidence\n    <!-- loom:park Blocked by: #7 -->\n\n<!-- loom:park Blocked by: #7 -->\n";
+    w.with_body(10837, false, body, &["loom:curated"]);
+    w.state(7, "CLOSED", false);
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
+}
+
+#[test]
 fn records_quoted_in_a_list_item_fence_never_release_but_a_real_one_after_the_list_does() {
     // #10837 review: a fence opened directly inside a list item quotes its
     // content, so it cannot release an unrecorded hold ...
