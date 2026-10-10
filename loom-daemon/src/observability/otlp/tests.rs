@@ -195,6 +195,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             captainless_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
+            otlp_export: None,
             memory: None,
         }),
     )

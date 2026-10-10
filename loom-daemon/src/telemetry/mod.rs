@@ -1650,6 +1650,11 @@ pub struct HostHealthRecord {
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exporters: Vec<String>,
+    /// Whether this daemon exports OTLP (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt` (+ detail). `None` means
+    /// "not reported" (a pre-#11353 daemon), never "ok".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// This host's memory/pressure readings at the sampling moment — the
     /// "deferred vs killed vs timed out" slice (RAM, compressed memory,
     /// swap and its rates, PSI class, kernel OOM counter) — see

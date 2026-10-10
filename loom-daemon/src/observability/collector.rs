@@ -1221,6 +1221,9 @@ async fn sample_host_health(
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
         exported_kinds,
         exporters,
+        otlp_export: Some(crate::observability::otlp_health::check_global(
+            &crate::observability::read_config(workspace_root),
+        )),
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
         // zero — the same absence contract `protection`/`admission_brake`

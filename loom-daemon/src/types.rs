@@ -1770,6 +1770,11 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_exports: std::collections::BTreeMap<String, ObservabilityExportStatus>,
+    /// Whether this daemon exports OTLP to SigNoz (Issue #11353):
+    /// `no_exporter` / `failing` / `ok` / `exempt`. `None` only from a
+    /// pre-#11353 daemon; never read as `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
     /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
     /// daemon is polling its operator-provisioned per-host event feed, under
     /// which `host_id`, how far its cursor has advanced, and — when it is not
