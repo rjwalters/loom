@@ -589,6 +589,42 @@ fn priority_wrapper_long_options_consume_their_values() {
 }
 
 #[test]
+fn taskset_and_chrt_consume_their_operand_exactly_once() {
+    // `taskset -c` is the CPU-list mode flag, not a value option: the list is
+    // the single positional operand, and the executable follows it.
+    for cmd in [
+        "taskset -c 0 ssh example.invalid",
+        "taskset --cpu-list 0-3 ssh example.invalid",
+        "taskset 0x1 ssh example.invalid",
+        "taskset -a -c 0,2 ssh example.invalid",
+        "chrt -i 0 ssh example.invalid",
+        "chrt -o 0 ssh example.invalid",
+        "chrt -f 10 ssh example.invalid",
+        "chrt --idle 0 ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("taskset -c 0 aws sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap("taskset --cpu-list 0 aws sts get-caller-identity", "cloud-cli"));
+    assert!(hits_cap("taskset -c 0 gh secret list", "forge-secrets"));
+    assert_clean("taskset -c 0 echo");
+    assert_clean("taskset 0x1 echo");
+    assert_clean("chrt -i 0 echo");
+}
+
+#[test]
+fn stdbuf_and_ionice_keep_their_own_value_options() {
+    for cmd in [
+        "stdbuf -i0 -o L -e 0 ssh example.invalid",
+        "ionice -c 3 ssh example.invalid",
+        "ionice -P 1 -t ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert_clean("ionice -c 3 echo");
+}
+
+#[test]
 fn time_options_do_not_hide_the_executable() {
     for cmd in [
         "time -p ssh example.invalid",

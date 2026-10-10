@@ -765,30 +765,39 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
             recurse(j, hits);
         }
         "nice" | "ionice" | "stdbuf" | "chrt" | "taskset" => {
-            let j = skip_options(
-                rest,
-                &[
-                    "-n",
+            // Each wrapper has its own option grammar: `-c` takes a value for
+            // ionice but is the CPU-list *mode flag* for taskset, and `-i`/`-o`
+            // are chrt policy flags but stdbuf buffer-mode values.
+            let with_value: &[&str] = match prog {
+                "nice" => &["-n", "--adjustment"],
+                "ionice" => &[
                     "-c",
+                    "-n",
                     "-p",
-                    "-i",
-                    "-o",
-                    "-e",
-                    "--adjustment",
+                    "-P",
+                    "-u",
                     "--class",
                     "--classdata",
                     "--pid",
                     "--pgid",
                     "--uid",
-                    "--input",
-                    "--output",
-                    "--error",
+                ],
+                "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
+                "chrt" => &[
+                    "-T",
+                    "-P",
+                    "-D",
                     "--sched-runtime",
                     "--sched-deadline",
                     "--sched-period",
                 ],
-            );
-            // chrt/taskset take a priority / mask operand before the command.
+                // taskset: `-c`/`--cpu-list` only changes how the mask operand is
+                // read; it takes no value of its own.
+                _ => &[],
+            };
+            let j = skip_options(rest, with_value);
+            // chrt takes a priority and taskset a mask / CPU-list operand before
+            // the command; consume it exactly once.
             let j = if matches!(prog, "chrt" | "taskset") {
                 j + 1
             } else {

@@ -211,6 +211,10 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("nice --adjustment 5 ssh example.invalid", "remote-shell"),
     ("nice --adjustment 5 aws sts get-caller-identity", "cloud-cli"),
     ("xargs --replace ssh example.invalid", "remote-shell"),
+    // Round 8: taskset -c is a mode flag; the CPU list is the one operand.
+    ("taskset -c 0 ssh example.invalid", "remote-shell"),
+    ("taskset --cpu-list 0-3 aws sts get-caller-identity", "cloud-cli"),
+    ("chrt -i 0 ssh example.invalid", "remote-shell"),
 ];
 
 #[test]
@@ -231,6 +235,8 @@ fn round_1_bypasses_are_denied_by_the_real_hooks() {
         "gh -R o/r pr view 12",
         "gh --repo o/r issue list",
         "rsync -a src/ dst/",
+        "taskset -c 0 echo ok",
+        "chrt -i 0 echo ok",
     ] {
         let (d, reason) = f.bash(cmd, Some("judge"), BIN);
         assert_eq!(d, "allow", "judge: {cmd} -> {reason}");
