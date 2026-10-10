@@ -251,6 +251,7 @@ pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
 pub mod jev_tier;
+pub mod journal;
 pub mod kimi_usage;
 pub mod label_registry;
 pub mod launch_env;
