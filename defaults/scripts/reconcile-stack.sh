@@ -14,7 +14,8 @@
 #
 # What it does:
 #   git rebase --onto <fetched default-branch COMMIT> <parent-ref> <child-branch>
-#   git push --force-with-lease
+#   git push --force-with-lease=<child-branch>:<child's live remote head, pinned
+#                                               before the rebase>
 #   gh pr edit <child-pr> --base <default-branch>
 #
 # The repo merges with merge commits (setup-repository-settings.sh default,
@@ -32,7 +33,10 @@
 # .loom/docs/shell-language-policy.md. This file keeps its name (merge-pr.sh,
 # role prompts and the sweep lifecycle all invoke it by path) and keeps the
 # three forge/publish steps: resolve the child branch, force-with-lease push,
-# retarget the PR base. New logic goes into the subcommand, not here.
+# retarget the PR base. New logic goes into the subcommand, not here — which is
+# why #9487's pinned-lease logic is `loom-daemon push-lease pin-flag` and this
+# file only calls it, keeps the argument it prints, and refuses on its exit
+# code (see defaults/docs/push-lease-pinning.md).
 #
 # The destination is the commit this run FETCHED from the remote, never the
 # local branch of the same name: a stale local default branch made an
@@ -41,7 +45,14 @@
 #
 # Safety:
 #   - Uses --force-with-lease (NEVER a bare --force) so a concurrent push to the
-#     child branch aborts the rebase rather than clobbering it.
+#     child branch aborts the rebase rather than clobbering it, and PINS the
+#     lease to the child's live remote head read before the rebase (#9487) —
+#     the bare flag would compare against refs/remotes/origin/<child>, a ref
+#     shared by every linked worktree that a sibling agent's fetch can advance
+#     out from under this run, defeating the lease entirely.
+#   - Refuses when origin/<child> holds commits this clone has not
+#     incorporated: the pin would be accurate and the push would still delete
+#     them (#9487).
 #   - --dry-run plans (and fetches, and verifies every prerequisite) but
 #     mutates no branch and prints the remaining commands.
 #   - Refuses on a dirty working tree, a failed fetch, a missing remote
@@ -74,7 +85,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -162,6 +173,29 @@ if [[ -z "$DAEMON_BIN" ]]; then
     exit 1
 fi
 
+# #9487: capture the child branch's LIVE remote head NOW — before step 1's
+# rebase rewrites anything — and pin step 2's --force-with-lease to it. A bare
+# --force-with-lease compares against refs/remotes/origin/<child>, a ref SHARED
+# by every linked worktree of this clone: a sibling agent's fetch can advance it
+# to a commit this run never saw, after which the bare lease is satisfied and
+# the push silently deletes that commit (the live PR #9483 incident). Capturing
+# before the rewrite, and never re-reading it later, is the whole point — a
+# fetch taken just before the push would pin the sibling's commit and launder
+# the clobber as "fresh". The query, the rendering, and the ancestry half that
+# catches a commit published BEFORE the pin was taken all live in
+# `loom-daemon push-lease pin-flag` (cli/push_lease.rs) per the shell language
+# policy: exit 3 = origin could not be queried, 4 = origin holds commits this
+# clone never incorporated. There is deliberately no bare-flag fallback.
+# requires-daemon: push-lease >= 0.19.655   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
+loom_daemon_version_preflight push-lease "$DAEMON_BIN"
+PIN_RC=0
+PUSH_LEASE_ARG="$("$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$CHILD_BRANCH" --local-ref "refs/heads/$CHILD_BRANCH")" || PIN_RC=$?
+if [[ $PIN_RC -ne 0 ]]; then
+    err "No pinned force-with-lease value for '$CHILD_BRANCH' (loom-daemon push-lease pin-flag exit $PIN_RC — the bracketed prerequisite token naming which half refused is above, #9487; 'unrecognized subcommand' = this loom-daemon predates #9487: roll it). Refusing to rebase+push: the only fallback is the bare lease this exists to replace. Nothing was mutated."
+    exit 1
+fi
+info "Pinned force-with-lease argument for '$CHILD_BRANCH': $PUSH_LEASE_ARG"
+
 # 1. Fetch + pin the remote default-branch tip, route to the worktree holding
 #    the child branch, resolve the parent ref (branch name, else the #7982
 #    pin, whose ancestry is checked per #8010), then replay ONLY the child's
@@ -184,7 +218,7 @@ PLAN_OUT="$("$DAEMON_BIN" reconcile-stack "${RECONCILE_ARGS[@]}")" || PLAN_RC=$?
 if [[ $PLAN_RC -eq 2 ]]; then
     err "Rebase failed (likely a conflict). Resolve it, then re-run this script or finish manually:"
     echo "    git rebase --continue   # after resolving" >&2
-    echo "    git push --force-with-lease" >&2
+    echo "    git push $PUSH_LEASE_ARG origin $CHILD_BRANCH   # pinned, never bare (#9487)" >&2
     echo "    gh pr edit $CHILD_PR --base $DEFAULT_BRANCH" >&2
     exit 2
 elif [[ $PLAN_RC -ne 0 ]]; then
@@ -223,10 +257,11 @@ run() {
 # holds the branch, else here), so the current branch there is the child.
 GIT_C=(git -C "$LOOM_RS_GIT_DIR")
 
-# 2. Publish the rewritten child branch. --force-with-lease (never bare
-#    --force) so a concurrent push aborts rather than clobbers.
-info "Step 2/3: push --force-with-lease"
-if ! run "${GIT_C[@]}" push --force-with-lease; then
+# 2. Publish the rewritten child branch with $PUSH_LEASE_ARG — the lease PINNED
+#    to the head captured above (never bare --force, and never the bare lease
+#    either, #9487) so a concurrent push aborts rather than clobbers.
+info "Step 2/3: push $PUSH_LEASE_ARG"
+if ! run "${GIT_C[@]}" push "$PUSH_LEASE_ARG" origin "$CHILD_BRANCH"; then
     # A reported rejection is not always a real one (#6695): Git LFS's
     # pre-push hook can race the lease re-check on a branch with pending LFS
     # objects, so the ref update lands while the printed rejection reflects a

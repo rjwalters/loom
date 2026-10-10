@@ -277,10 +277,16 @@ pub enum Route {
     ///
     /// This is also the route an *unreadable* label set takes, preserving the
     /// retired shell's documented disposition: the reconcile is best-effort and
-    /// `push --force-with-lease` independently refuses to overwrite a tip the
-    /// pusher has not seen, so an unanswered claim lookup is not, on its own, a
-    /// data-loss risk. Which of the two situations produced this route is
-    /// reported separately, in [`Decision::why`].
+    /// `reconcile-stack.sh`'s *pinned* `push --force-with-lease=<branch>:<oid>`
+    /// independently refuses to overwrite a tip the pusher has not seen, so an
+    /// unanswered claim lookup is not, on its own, a data-loss risk. That
+    /// backstop only holds because the lease is pinned to a head read live
+    /// before the rebase: a *bare* `--force-with-lease` compares against the
+    /// clone-wide `refs/remotes/origin/<branch>`, which a sibling worktree's
+    /// fetch can advance, and would accept exactly the clobber this relies on
+    /// it to refuse (#9487, `defaults/docs/push-lease-pinning.md`). Which of
+    /// the two situations produced this route is reported separately, in
+    /// [`Decision::why`].
     Reconcile,
     /// The child's issue is still `loom:building` — defer, and post
     /// [`defer_comment`].
