@@ -150,7 +150,6 @@ pub mod cmd_out;
 pub mod codex_sandbox_noop;
 pub mod codex_usage;
 pub mod comment_trust;
-pub mod concierge;
 pub mod config_resolver;
 pub mod cpu_headroom;
 pub mod credential_preflight;

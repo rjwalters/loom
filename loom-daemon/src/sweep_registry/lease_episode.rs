@@ -216,6 +216,12 @@ mod lease_episode_dispatch_tests;
 #[path = "lease_trust_tests.rs"]
 mod lease_trust_tests;
 
+// #11112: two hosts, one shared forge lease list, no peer-claim channel —
+// exactly one builds (same ratchet reason as above).
+#[cfg(test)]
+#[path = "lease_cross_host_tests.rs"]
+mod lease_cross_host_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

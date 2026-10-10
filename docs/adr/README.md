@@ -58,6 +58,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Design note for the cross-host slice of #10512: the `fleet.captain` host (or the loom-ui mirror) publishes one snapshot per repo of the `star_liveness`, `stage_dwell` and `work_finder` listings; other hosts read it when fresh and fall back to their own conditional reads otherwise
   - **Key Decision**: Additive over an unchanged polling floor, observability/discovery reads only (gate reads stay local); projected fleet total about 8.4k to about 2.7k billable calls/h
 
+- [ADR-0025: The Forge Lease Is the Only Cross-Host Claim; Dispatch Cooldowns Stay Per-Host](0025-forge-lease-only-cross-host-claim.md)
+  - **Status**: Accepted
+  - **Summary**: Records the #11112 decision made while removing the safehouse (Matrix) integration: the `loom:lease` comment plus the claim-then-verify-order tie-break is the only cross-host claim (pinned by `lease_cross_host_tests.rs`). The #7477 no-op cooldown broadcast is removed and stays per-host. The #9936 quarantine broadcast was never implemented and is dropped
+  - **Key Decision**: Accept up to N× no-op cooldown dilution on an N-host fleet rather than add a forge marker or keep a side channel. Correctness comes from the lease, not the cooldown
+
 ### Orchestration Architecture
 
 - [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)
