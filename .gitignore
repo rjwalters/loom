@@ -85,6 +85,7 @@ Thumbs.db
 .loom/stuck-config.json
 .loom/metrics/
 .loom/usage-cache.json
+.loom/closed-watch-cursor.json
 .loom/claude-config/
 .loom/claude-config.*/
 .loom/claude-config-*/

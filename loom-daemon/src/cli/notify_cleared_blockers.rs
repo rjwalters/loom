@@ -56,7 +56,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use loom_daemon::cmd_out::CmdOutcome;
+use loom_daemon::forge_identity::FleetLogins;
 use loom_daemon::script_helpers::run_gh;
+use loom_daemon::stale_blocked::batch::StaleBlockedForge;
 use loom_daemon::stale_blocked::notify::{self, marker_for};
 use loom_daemon::stale_blocked::{batch, budget, classify, Artifact, Verdict};
 
@@ -104,12 +106,143 @@ pub(crate) struct NotifyClearedBlockersArgs {
 }
 
 /// One artifact this close event newly cleared (or would, under `--dry-run`).
-struct Notified {
+pub(crate) struct Notified {
     kind: Artifact,
     number: i64,
     cited: Vec<i64>,
     reasons: Vec<String>,
     posted: bool,
+}
+
+/// Inputs to [`scan_cleared`] other than the closed set itself.
+pub(crate) struct ScanOptions<'a> {
+    pub repo: Option<&'a str>,
+    pub root: &'a Path,
+    pub limit: u32,
+    pub no_prs: bool,
+    pub dry_run: bool,
+}
+
+/// What one [`scan_cleared`] pass found.
+pub(crate) struct ScanReport {
+    notified: Vec<Notified>,
+    /// Things that could not be read or evaluated (unknown, not clear).
+    pub unread: Vec<String>,
+    /// The `loom:blocked` enumeration failed, so the scan may have missed a
+    /// candidate.
+    pub enumeration_failed: bool,
+}
+
+impl ScanReport {
+    /// How many comments were posted (not counting `dry_run` previews).
+    pub(crate) fn posted(&self) -> usize {
+        self.notified.iter().filter(|n| n.posted).count()
+    }
+
+    /// Whether a re-scan is worth it: the enumeration failed, any candidate's
+    /// text or evidence read failed (its answer is unknown, so it may still be
+    /// owed a notice), or a comment that should have been posted was not. The
+    /// daemon's closed-item poll keeps its cursor in place on `true` so the
+    /// next tick retries (#10150); the marker makes the retry idempotent for
+    /// the artifacts this pass already notified.
+    pub(crate) fn needs_retry(&self, dry_run: bool) -> bool {
+        self.enumeration_failed
+            || !self.unread.is_empty()
+            || (!dry_run && self.notified.iter().any(|n| !n.posted))
+    }
+}
+
+/// The shared core of the cleared-blocker re-check: `closed` (already
+/// expanded, deduplicated) in, one comment per newly-cleared open
+/// `loom:blocked` artifact out, through the batched REST + ETag gatherer
+/// (#10515). Called by the `notify-cleared-blockers` CLI (`merge-pr.sh`'s
+/// fast path) and by the daemon's closed-item poll (#10150). Never edits a
+/// label.
+pub(crate) fn scan_cleared(closed: &[i64], opts: &ScanOptions<'_>) -> ScanReport {
+    let (repo, root) = (opts.repo, opts.root);
+    let mut forge = batch::GhStaleBlockedForge::new(root, repo);
+    let fleet = FleetLogins::for_root(root);
+    let gather = batch::Options {
+        limit: opts.limit,
+        no_prs: opts.no_prs,
+        floor: budget::Floor::default(),
+    };
+    scan_cleared_with(
+        &mut forge,
+        &fleet,
+        gather,
+        closed,
+        opts.dry_run,
+        &mut |kind, number, cited, reasons| post_comment(kind, number, cited, reasons, repo, root),
+    )
+}
+
+/// Posts one notice: `(kind, number, cited, reasons)` in, whether `gh`
+/// reported success out.
+pub(crate) type PostNotice<'a> = dyn FnMut(Artifact, i64, &[i64], &[String]) -> bool + 'a;
+
+/// [`scan_cleared`] against an injected forge and comment poster, so the
+/// closed-item poll's tests drive the real gather -> classify -> post path.
+pub(crate) fn scan_cleared_with(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    gather: batch::Options,
+    closed: &[i64],
+    dry_run: bool,
+    post: &mut PostNotice<'_>,
+) -> ScanReport {
+    let mut unread: Vec<String> = Vec::new();
+    let notify::CitedGathering {
+        gathering,
+        mut cited,
+    } = notify::gather_cited(forge, fleet, gather, closed);
+    let enumeration_failed = gathering.enumerate_error.is_some();
+    if let Some(why) = gathering.enumerate_error {
+        unread.push(format!("population: {why}"));
+    }
+
+    let mut notified: Vec<Notified> = Vec::new();
+    for g in gathering.items {
+        let evidence = match g.evidence {
+            Ok(e) => e,
+            Err(why) => {
+                unread.push(format!("{} #{}: {why}", g.kind.label(), g.number));
+                continue;
+            }
+        };
+        let Some(cited) = cited.remove(&(g.kind, g.number)) else {
+            continue;
+        };
+        let reasons = match classify(&evidence) {
+            Verdict::Stale(reasons) => reasons,
+            Verdict::Superseded { cleared, .. } => cleared,
+            // Unticked (#9274): every checklist ref resolved but a box is
+            // still unticked. Not stale (an unticked box is unmet until a
+            // human confirms it), yet "tick the box or drop the block" is
+            // exactly the human signal this advisory exists to send.
+            Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } => vec![unticked_reason(&resolved_refs, unparsed)],
+            // StillBlocked: the forge does not (yet) read the cited number
+            // as resolved. Undocumented cannot follow a citation. Neither is
+            // a cleared block worth a comment.
+            Verdict::Undocumented | Verdict::StillBlocked => continue,
+        };
+        let posted = !dry_run && post(g.kind, g.number, &cited, &reasons);
+        notified.push(Notified {
+            kind: g.kind,
+            number: g.number,
+            cited,
+            reasons,
+            posted,
+        });
+    }
+    ScanReport {
+        notified,
+        unread,
+        enumeration_failed,
+    }
 }
 
 impl NotifyClearedBlockersArgs {
@@ -132,61 +265,16 @@ impl NotifyClearedBlockersArgs {
         closed.sort_unstable();
         closed.dedup();
 
-        let mut forge = batch::GhStaleBlockedForge::new(&root, repo);
-        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
-        let opts = batch::Options {
+        let opts = ScanOptions {
+            repo,
+            root: &root,
             limit: self.limit,
             no_prs: self.no_prs,
-            floor: budget::Floor::default(),
+            dry_run: self.dry_run,
         };
-        let notify::CitedGathering {
-            gathering,
-            mut cited,
-        } = notify::gather_cited(&mut forge, &fleet, opts, &closed);
-        if let Some(why) = gathering.enumerate_error {
-            unread.push(format!("population: {why}"));
-        }
-
-        let mut notified: Vec<Notified> = Vec::new();
-        for g in gathering.items {
-            let evidence = match g.evidence {
-                Ok(e) => e,
-                Err(why) => {
-                    unread.push(format!("{} #{}: {why}", g.kind.label(), g.number));
-                    continue;
-                }
-            };
-            let Some(cited) = cited.remove(&(g.kind, g.number)) else {
-                continue;
-            };
-            let reasons = match classify(&evidence) {
-                Verdict::Stale(reasons) => reasons,
-                Verdict::Superseded { cleared, .. } => cleared,
-                // Unticked (#9274): every checklist ref resolved but a box is
-                // still unticked. Not stale (an unticked box is unmet until a
-                // human confirms it), yet "tick the box or drop the block" is
-                // exactly the human signal this advisory exists to send.
-                Verdict::Unticked {
-                    resolved_refs,
-                    unparsed,
-                } => vec![unticked_reason(&resolved_refs, unparsed)],
-                // StillBlocked: the forge does not (yet) read the cited number
-                // as resolved. Undocumented cannot follow a citation. Neither is
-                // a cleared block worth a comment.
-                Verdict::Undocumented | Verdict::StillBlocked => continue,
-            };
-            let posted =
-                !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
-            notified.push(Notified {
-                kind: g.kind,
-                number: g.number,
-                cited,
-                reasons,
-                posted,
-            });
-        }
-
-        report(&notified, &closed, &unread, self.dry_run, self.quiet);
+        let rep = scan_cleared(&closed, &opts);
+        unread.extend(rep.unread);
+        report(&rep.notified, &closed, &unread, self.dry_run, self.quiet);
         Ok(())
     }
 }
@@ -248,7 +336,7 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
 }
 
 /// The notification comment. Pure, so the wording is unit-tested.
-fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
+pub(super) fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
     let refs: Vec<String> = cited.iter().map(|n| format!("#{n}")).collect();
     let mut body = format!(
         "**Cited blocker cleared**: {} just closed, and this {}'s `loom:blocked` cites it. \

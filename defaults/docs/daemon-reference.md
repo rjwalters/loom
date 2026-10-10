@@ -4616,6 +4616,39 @@ cite it as unpromoted); the Champion-side check is what actually resolves the
 trap once it has already occurred, including across a repo boundary this
 supervisor cannot cross.
 
+### Closed-item poll for cleared blockers (`autonomous.closedWatch`, #10150)
+
+`loom-daemon notify-cleared-blockers` (#9102) posts a `loom:blocker-cleared`
+comment on every open `loom:blocked` issue/PR that cites a just-closed number,
+but `merge-pr.sh` was its only caller, so a merge made in the GitHub UI, with
+the gh CLI, or by hand never fired it. The daemon now polls recently closed
+items and feeds them to the same core (one batched `loom:blocked` read per tick).
+`merge-pr.sh`'s call stays as the fast path; the per-artifact
+`<!-- loom:blocker-cleared:#N -->` marker dedupes the two paths.
+
+| Knob | Env | Config | Default |
+|------|-----|--------|---------|
+| Enable | `LOOM_CLOSED_WATCH` | `autonomous.closedWatch.enabled` | off |
+| Interval | `LOOM_CLOSED_WATCH_INTERVAL_SECS` | `autonomous.closedWatch.intervalSecs` | 300 |
+
+Precedence is env > config > default. The poll is REST
+(`gh api repos/{o}/{r}/issues?state=closed&since=...`), runs against the
+primary workspace, and persists a cursor in `.loom/closed-watch-cursor.json`:
+the highest `(updated_at, number)` key scanned. The listing order, the cursor,
+and the "past the cursor" test all use that one key, and each request
+re-anchors `since` at the cursor (keyset paging), so a pass truncated by its
+cap (5 pages of new rows) or reordered by a concurrent update leaves the rest
+past the cursor for the next tick (#10638). `closed_at` is not a filter, so a
+comment on an old closed item rescans its number; the marker makes that a
+no-op. The first run looks back 24h. The cursor advances only when every read
+answered (the listing, each merged PR's closing references, the `loom:blocked`
+listing, every candidate's text/evidence read) and every owed comment posted;
+otherwise the tick retries, and the marker keeps the retry from re-posting.
+With nothing past the cursor no `loom:blocked` read is made.
+It never edits labels, and failures are logged, never fatal. Two hosts polling
+one repo may both post in the check-then-post window; the duplicate is harmless
+and accepted. Source: `loom-daemon/src/cli/closed_watch.rs`.
+
 ## Curator intake reconcile (#10041)
 
 Each work-finder listing of a workspace also runs a cadence-gated intake pass
