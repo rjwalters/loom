@@ -1,7 +1,7 @@
 //! `loom.kind` -- the kind discriminator on every OTLP log record (#9881,
 //! #10899).
 //!
-//! The dashboard and the ETA readers filter logs on `loom.kind`, never on the
+//! The dashboard and its readers filter logs on `loom.kind`, never on the
 //! log `name` column (loom-ui#747). Until #10899 each `log_record_for` arm
 //! had to push the attribute itself, and the `eta.*`, `ci.*`, `sweep.phase`,
 //! `daemon.event`, `pr.resolved`, `session.output`, `auto_update.tick` and
@@ -12,17 +12,10 @@
 //! wire tag, so a kind added later cannot ship unqueryable.
 
 use super::*;
-use crate::eta::emit::Trigger;
-use crate::eta::heuristics::LandV1;
-use crate::eta::score::{score, EstimateSummary, OutcomeKind};
-use crate::eta::{
-    AgeSource, CurrentStage, CurrentState, EstimateInput, Heuristic, Provenance, Stage, Subject,
-};
-use crate::telemetry::kinds::eta::{EtaEstimateRecord, EtaOutcomeRecord};
-use crate::telemetry::kinds::eta_backtest::{EtaBacktestFoldRecord, EtaBacktestSummaryRecord};
 use crate::telemetry::kinds::pick_decision::{
     PickCandidate, PickDecisionRecord, PickTick, PickVerdict,
 };
+use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TELEMETRY_KINDS;
 use serde_json::{json, Value};
 
@@ -59,49 +52,6 @@ fn ci(kind: &str, extra: Value) -> TelemetryRecord {
     wire(v)
 }
 
-fn eta_estimate() -> EtaEstimateRecord {
-    let as_of = ts();
-    let input = EstimateInput {
-        subject: Subject::new("rjwalters/loom", Some(1), 10899),
-        as_of,
-        current: CurrentState::At(CurrentStage {
-            stage: Stage::ReviewWait,
-            entered_at: Some(as_of),
-            age_sec: 0,
-            age_source: AgeSource::Bus,
-            rework_rounds: 0,
-            episode_entered_at: None,
-        }),
-        features: Default::default(),
-        features_omitted: Vec::new(),
-        provenance: provenance(),
-        dispatch: None,
-        stalls: Vec::new(),
-        held: None,
-        queue: Vec::new(),
-        dependencies: None,
-    };
-    EtaEstimateRecord {
-        trigger: Trigger::First,
-        primary: true,
-        explanation: Box::new(LandV1.estimate(&input, &Default::default())),
-    }
-}
-
-fn eta_outcome() -> EtaOutcomeRecord {
-    let summary = EstimateSummary::of(&eta_estimate().explanation);
-    let at = summary.as_of + chrono::Duration::seconds(600);
-    EtaOutcomeRecord {
-        score: score(&summary, OutcomeKind::Landed, at, &[]),
-        estimate: summary,
-        loom: provenance(),
-        outcome_source: "pulls_read".to_string(),
-        outcome_resolution_sec: Some(120),
-        result: None,
-        attribution: None,
-    }
-}
-
 fn pick_decision() -> PickDecisionRecord {
     PickDecisionRecord::build(
         PickTick {
@@ -127,56 +77,6 @@ fn pick_decision() -> PickDecisionRecord {
 
 // `eta.backtest.*` payloads carry their own `kind` field, which collides with
 // the record's serde tag in flat wire JSON, so these two are struct literals.
-fn backtest_fold() -> EtaBacktestFoldRecord {
-    EtaBacktestFoldRecord {
-        fold_id: "f".into(),
-        heuristic: "h".into(),
-        kind: "land".into(),
-        day: "2026-07-30".into(),
-        cutoff: ts(),
-        compared_to: "c".into(),
-        is_current: true,
-        n_cases: 0,
-        n_answered: 0,
-        answer_rate: None,
-        pinball4_loss_sec: None,
-        cov_25_75: None,
-        late_surprise: None,
-        paired_pairs: 0,
-        delta_pinball4_loss_sec: None,
-        delta_answer_rate: None,
-        delta_late_surprise: None,
-        win: None,
-        fit_id: None,
-        loom: provenance(),
-    }
-}
-
-fn backtest_summary() -> EtaBacktestSummaryRecord {
-    EtaBacktestSummaryRecord {
-        summary_id: "s".into(),
-        heuristic: "h".into(),
-        kind: "land".into(),
-        compared_to: "c".into(),
-        as_of_day: "2026-07-30".into(),
-        cutoff: ts(),
-        cases: 0,
-        days: 0,
-        wins: 0,
-        ties: 0,
-        win_rate: None,
-        ci_low: None,
-        ci_high: None,
-        min_folds: 1,
-        gate_ready: false,
-        gate_detail: "d".into(),
-        fitted_from: None,
-        cases_before_fit: 0,
-        fit_id: None,
-        loom: provenance(),
-    }
-}
-
 /// One minimal record per `otlp: Logs` kind. A new log kind fails
 /// [`every_otlp_log_kind_carries_exactly_one_loom_kind_equal_to_its_tag`]
 /// until it adds a sample here.
@@ -210,8 +110,6 @@ fn samples() -> Vec<TelemetryRecord> {
             json!({"job_id": 2, "job": "test", "chunk_index": 0, "chunk_count": 1,
                    "log_bytes_total": 2, "truncated": false, "text": "ok"}),
         ),
-        TelemetryRecord::EtaEstimate(eta_estimate()),
-        TelemetryRecord::EtaOutcome(eta_outcome()),
         wire(json!({"kind": "eta.stage_outcome", "repo": "rjwalters/loom", "issue": 1,
                     "stage": "review_wait", "left_at": AT, "exit": "pass",
                     "event": "label.transition", "observed_at": AT, "open_estimates": 0,
@@ -220,11 +118,6 @@ fn samples() -> Vec<TelemetryRecord> {
                     "category": "output", "stream": "assistant", "stream_id": "s",
                     "sequence": 0, "event_id": "e", "source_at": AT, "observed_at": AT,
                     "coverage": "live", "state": "running", "redaction": "v1"})),
-        wire(json!({"kind": "eta.fleet_refresh", "repo": "rjwalters/loom", "cycle_id": "c",
-                    "started_at": AT, "pass": "p", "stop_reason": "done", "promoted": true,
-                    "prs_read": 0, "pass_done": 0, "timelines_incomplete": 0,
-                    "samples_added": 0, "forge_calls": 0, "not_modified_calls": 0,
-                    "duration_ms": 0, "loom": p})),
         wire(json!({"kind": "auto_update.tick", "tick_id": "t", "started_at": AT,
                     "decision": "skip", "reason": "r", "roll_armed": false,
                     "drain": {"armed": false, "pending": false, "refusals": 0},
@@ -234,14 +127,10 @@ fn samples() -> Vec<TelemetryRecord> {
                     "anchor_as_of": AT, "repos": []})),
         wire(json!({"kind": "host.export", "captured_at": AT, "host": "host-a",
                     "exporters": []})),
-        wire(json!({"kind": "eta.fit", "check_id": "c", "trigger": "t", "started_at": AT,
-                    "outcome": "skipped", "snapshots": 0, "duration_ms": 0, "loom": p})),
         TelemetryRecord::PickDecision(pick_decision()),
         wire(json!({"kind": "pr.resolved", "repo": "rjwalters/loom", "pr_number": 1,
                     "state": "merged", "resolved_at": AT, "observed_at": AT,
                     "resolution_sec": 0, "loom": p})),
-        TelemetryRecord::EtaBacktestFold(backtest_fold()),
-        TelemetryRecord::EtaBacktestSummary(backtest_summary()),
         wire(json!({"kind": "pass.summary", "pass_id": "p", "mechanism": "m",
                     "repo": "rjwalters/loom", "host": "host-a", "mode": "dry_run",
                     "outcome": "completed", "started_at": AT, "ended_at": AT,
@@ -304,22 +193,5 @@ fn every_otlp_log_kind_carries_exactly_one_loom_kind_equal_to_its_tag() {
         // `metadata::bounded` can never be what drops it.
         assert_eq!(kinds[0].0, 1, "`{}`: loom.kind must sit at index 1", meta.kind);
         assert_eq!(log.attributes[0].key, "loom.record_id");
-    }
-}
-
-#[test]
-fn eta_logs_keep_their_loom_eta_attributes_alongside_the_kind() {
-    // The `eta.*` panels filter on `loom.eta.*` keys; the kind is additive.
-    for record in [
-        TelemetryRecord::EtaEstimate(eta_estimate()),
-        TelemetryRecord::EtaOutcome(eta_outcome()),
-    ] {
-        let log = log_record_for(&envelope("host-a", record.clone())).unwrap();
-        assert_eq!(loom_kinds(&log).len(), 1);
-        assert!(
-            log.attributes.iter().any(|kv| kv.key == "loom.eta.kind"),
-            "{} lost its loom.eta.* attributes",
-            record.kind()
-        );
     }
 }

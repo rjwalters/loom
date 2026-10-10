@@ -18,10 +18,6 @@ fn set<'a>(it: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a str> {
     it.into_iter().collect()
 }
 
-fn prop(p: &str) -> BTreeSet<&'static str> {
-    set(reg().with_property(p).expect("known property"))
-}
-
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -256,17 +252,7 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
 }
 
 #[test]
-fn derived_eta_hold_labels_and_queue_blocked_colabels() {
-    let mut want: BTreeSet<&str> = BTreeSet::new();
-    want.insert(crate::observability::queue_blocked::BLOCKED_LABEL);
-    want.extend(prop("park"));
-    want.extend(
-        prop("skip")
-            .into_iter()
-            .filter(|n| reg().get(n).unwrap().kind != "claim"),
-    );
-    want.extend(prop("blocked_colabel"));
-    assert_eq!(set(crate::eta::labels::hold_labels()), want);
+fn derived_queue_blocked_hold_labels() {
     assert_eq!(
         set(crate::observability::queue_blocked::HOLD_LABELS
             .iter()
@@ -295,14 +281,6 @@ fn derived_merge_pr_blocking_equals_the_previous_literal_in_order() {
     );
 }
 
-#[test]
-fn derived_human_gated_labels_equal_the_previous_literal() {
-    assert_eq!(
-        *crate::eta::labels::HUMAN_GATED_LABELS,
-        ["loom:triage", "loom:curating", "loom:curated"]
-    );
-}
-
 // dep_classify's operator-only base/sub-kind labels are single named labels
 // (each with its own writer and marker), not a set, so they stay consts; this
 // test keeps them and the registry's requires_base/remove_with pairing (#5671)
@@ -327,30 +305,4 @@ fn lockstep_dep_classify_operator_only_kinds() {
         .map(|l| l.name.as_str())
         .collect();
     assert_eq!(requiring, set(base.remove_with.iter().map(String::as_str)));
-}
-
-#[test]
-fn derived_eta_operator_hold_sets_match_the_previous_literals() {
-    use crate::eta::labels::{
-        MERGE_HOLD_COMPANION_LABELS, MERGE_HOLD_LABELS, OPERATOR_HOLD_LABELS,
-    };
-    assert_eq!(
-        set(MERGE_HOLD_LABELS.iter().copied()),
-        set([
-            "loom:operator",
-            "loom:operator-only",
-            "loom:operator-decision"
-        ])
-    );
-    assert_eq!(*MERGE_HOLD_COMPANION_LABELS, ["loom:operator-mechanical"]);
-    // Order is load-bearing: `operator_hold_label` reports the first match.
-    assert_eq!(
-        *OPERATOR_HOLD_LABELS,
-        [
-            "loom:operator",
-            "loom:operator-only",
-            "loom:operator-decision",
-            "loom:operator-mechanical"
-        ]
-    );
 }

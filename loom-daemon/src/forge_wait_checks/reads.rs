@@ -15,8 +15,8 @@
 //! The one read that is NOT conditional is the base branch's required-context
 //! lookup — [`required_contexts`], i.e.
 //! [`crate::merge_pr::stale_checks::fetch::required_contexts_with`], shared
-//! verbatim with the merge guards and the ETA's check features (#10232) so
-//! all of them agree about what a branch requires. It runs only when a verdict needs it, is cached once it
+//! verbatim with the merge guards so
+//! both agree about what a branch requires. It runs only when a verdict needs it, is cached once it
 //! succeeds, is retried on later polls while it fails (#10351), and is
 //! accounted under that implementation's own caller.
 
@@ -307,9 +307,9 @@ fn denied(url: &str, r: &crate::forge_listing::HttpResponse, stderr: &str) -> Re
 /// `nwo`'s `base_ref` required status-check contexts (rulesets and classic
 /// branch protection, unioned), plus any notices the caller must surface.
 ///
-/// The one required-context lookup: [`GhReads::required`] and the ETA's
-/// check features (`eta::pr_features_forge`, #10232) both call it, so the
-/// wait and the estimate cannot disagree about what a branch requires. An
+/// The one required-context lookup: [`GhReads::required`] and the merge
+/// guards both call it, so the wait and the guard cannot disagree about what
+/// a branch requires. An
 /// `Err` is a failed lookup, never "nothing required" (#10351).
 ///
 /// # Errors

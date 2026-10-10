@@ -1,6 +1,6 @@
 //! Read-side and validation helpers for an artifact published to a dedicated
-//! branch of the fleet store (`fleet.repo`): the ETA fit (#10395) and the
-//! captain gauges heartbeat (W12).
+//! branch of the fleet store (`fleet.repo`): the captain
+//! gauges heartbeat (W12; the ETA fit that shared it was removed, #11098).
 //!
 //! They lived in `eta::fit::publish` and were borrowed from there by
 //! `observability::captain_gauges::store`. They moved here (#11098, Stage 2)

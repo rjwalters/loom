@@ -111,13 +111,6 @@ pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
-pub mod eta;
-mod eta_dependency;
-pub mod eta_fit;
-pub mod eta_fleet_refresh;
-mod eta_friction;
-pub mod eta_nightly_folds;
-pub mod eta_snapshot;
 pub mod exporter;
 pub mod fleet_state;
 pub mod lifecycle;
@@ -1295,50 +1288,9 @@ pub fn spawn_task(
     // that just started — it cannot add or start an exporter either.
     #[cfg(feature = "otlp")]
     ops_handles.extend(otlp::relay::start(&workspace_root, &host_id, &ingest_key, &relay_sinks));
-    // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
-    // tracker and its bus subscriber run (and journal) even without them.
-    eta::register_sink(otlp_queues.clone(), &host_id);
     // `fleet.state` (#10196): the replay contract's state record, OTLP-only,
-    // built on the collector's snapshot pass whether or not ETA is enabled.
+    // built on the collector's snapshot pass.
     fleet_state::register_sink(otlp_queues.clone(), &host_id);
-    let eta_handle =
-        eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
-    // #10414: the ETA pass runs inside the collector's 5-minute pass, which
-    // beats it after each `eta::record`; registered only when ETA is on.
-    if eta_handle.is_some() {
-        crate::task_liveness::register(
-            crate::task_liveness::ETA_PASS,
-            SNAPSHOT_INTERVAL,
-            crate::task_liveness::default_stale_after(SNAPSHOT_INTERVAL),
-        );
-    }
-    ops_handles.extend(eta_handle);
-    // The daily ETA refit (#10245) and the fleet snapshot refresh (#10263):
-    // either/or. With fleet refresh on, the refit check runs at the end of
-    // every refresh cycle (`eta_fleet_refresh::owns_fit`), so it always sees
-    // that cycle's snapshots and the standalone refit task is not spawned —
-    // two loops calling `refit_if_due` would only race.
-    if eta_fleet_refresh::owns_fit(&crate::eta::config::read(&workspace_root)) {
-        ops_handles.extend(eta_fleet_refresh::spawn_task(
-            workspace_root.clone(),
-            workspace_pool.clone(),
-            otlp_queues.clone(),
-            host_id.clone(),
-        ));
-    } else {
-        ops_handles.extend(eta_fit::spawn_task(
-            workspace_root.clone(),
-            otlp_queues.clone(),
-            host_id.clone(),
-        ));
-    }
-    // The captain's nightly walk-forward backtest folds (#10492): independent
-    // of the refit/refresh either/or above; `fleet.captain`-gated per check.
-    ops_handles.extend(eta_nightly_folds::spawn_task(
-        workspace_root.clone(),
-        otlp_queues.clone(),
-        host_id.clone(),
-    ));
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the
@@ -1358,14 +1310,8 @@ pub fn spawn_task(
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.
-    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues.clone(), &host_id) {
+    if let Some(sink) = queue_snapshot::sink_for_native_queues(native_queues, &host_id) {
         queue_snapshot::register_global_sink(sink);
-    }
-    // `eta.snapshot` (Issue #9329): the ETA counterpart of the record above —
-    // the same native-HTTPS-only split, sampled by the same collector pass.
-    // SigNoz keeps the per-estimate `eta.estimate` records registered above.
-    if let Some(sink) = eta_snapshot::sink_for_native_queues(native_queues, &host_id) {
-        eta_snapshot::register_global_sink(sink);
     }
     // `daemon.event` collection (Issue #8760, G4): a second, independent bus
     // subscription alongside `collector::spawn_task` below — see

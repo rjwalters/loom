@@ -87,9 +87,6 @@ path = "loom-daemon/src/work_finder/forge.rs"
 kind = "rust"
 path = "loom-daemon/src/forge_listing.rs"
 [[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_fetch.rs"
-[[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/guide.md"
 
@@ -530,12 +527,6 @@ path = "defaults/scripts/check-promotion-landed.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_dwell.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_events_forge.rs"
-[[operation.callers]]
-kind = "rust"
-path = "loom-daemon/src/eta/fleet_fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/stale_blocked/release_gh.rs"

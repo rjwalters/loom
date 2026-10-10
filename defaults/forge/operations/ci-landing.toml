@@ -69,9 +69,6 @@ kind = "rust"
 path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
 [[operation.callers]]
 kind = "rust"
-path = "loom-daemon/src/eta/fleet_events_forge.rs"
-[[operation.callers]]
-kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
 
 [[operation]]

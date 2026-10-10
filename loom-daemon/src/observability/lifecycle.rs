@@ -180,8 +180,7 @@ pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
 /// A dwell/percentile aggregate over `loom.role_attempt` **must** filter
 /// `loom.attempt.worked = true`; the unconditioned median is dominated by the
 /// `false` population and collapses to milliseconds. See
-/// `defaults/docs/eta.md` § "Role-attempt stages: read the conditioned
-/// percentile".
+/// `defaults/docs/tracing.md`.
 pub const ATTEMPT_WORKED: &str = "loom.attempt.worked";
 
 /// `loom.timing_source` values of a **synthetic** attempt span: one Loom

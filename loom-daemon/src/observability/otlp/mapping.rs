@@ -4,7 +4,6 @@
 
 mod auto_update;
 mod ci;
-mod eta;
 mod fact_id;
 mod fleet_state;
 mod host_export;
@@ -608,20 +607,6 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             let (event_name, severity, completed_at, attributes) = ci::log_parts(&envelope.record)?;
             time_unix_nano = completed_at;
             body_override = Some(r.text.clone());
-            (event_name, severity, String::new(), attributes)
-        }
-        TelemetryRecord::EtaEstimate(_)
-        | TelemetryRecord::EtaOutcome(_)
-        | TelemetryRecord::EtaFleetRefresh(_)
-        | TelemetryRecord::EtaFit(_)
-        | TelemetryRecord::EtaBacktestFold(_)
-        | TelemetryRecord::EtaBacktestSummary(_) => {
-            // Issue #9289: the body is the record's JSON; scalars are `loom.eta.*`.
-            let (event_name, severity, at, mut attributes, body) =
-                eta::log_parts(&envelope.record)?;
-            eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
-            time_unix_nano = at;
-            body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
         TelemetryRecord::AutoUpdateTick(_)

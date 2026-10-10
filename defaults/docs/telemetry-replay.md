@@ -6,7 +6,7 @@ slices 1 and R3/R4), the `fleet.state` record (slice R1),
 against the forge with the daily agreement report (slice R7, #11128).
 
 The question this contract answers: **what did the fleet look like at instant
-`t`, as a daemon running at `t` could have known it?** ETA backtesting
+`t`, as a daemon running at `t` could have known it?** Backtesting
 (#10193) and any retroactive analysis depend on it.
 
 ## Two clocks
@@ -16,7 +16,7 @@ conflated.
 
 | Clock | OTLP column | Meaning |
 |-------|-------------|---------|
-| **Event time** | `timestamp` (`time_unix_nano`) | When the thing happened (usually the envelope's `emitted_at`; `eta.*` and `session.output` override it with their own source instant). |
+| **Event time** | `timestamp` (`time_unix_nano`) | When the thing happened (usually the envelope's `emitted_at`; `session.output` overrides it with its own source instant). |
 | **Knowable-at** | `created_at` (SigNoz insert time) | When the record became *available to a reader*. The OTLP `observed_timestamp` is only a producer-side lower bound (see below). |
 
 Delivery is batched, retried and at-least-once, so a `sweep.outcome` can reach
@@ -95,9 +95,7 @@ loom.record_id = derived_hex(["loom.record", kind, host_id, emitted_at, <record 
 It follows `trace-identity.md`: SHA-256 over NUL-terminated parts, never a
 random value. A retried delivery of the same envelope hashes identically; a
 re-snapshot of unchanged state is a distinct record because `emitted_at`
-differs. `eta.*` records additionally keep their own `loom.eta.estimate_id`,
-which is unchanged.
-
+differs.
 ### Outcome facts and the cross-host id
 
 `loom.record_id` includes `host_id`, so it dedupes repeated deliveries from one
@@ -161,7 +159,7 @@ slice.
 ## Fleet state (`fleet.state`)
 
 Every host with an OTLP exporter sends `fleet.state` log records on its
-5-minute snapshot pass, whether or not ETA is enabled. **Each host emits its
+5-minute snapshot pass. **Each host emits its
 own view; nothing is elected.** The field reference is in
 [`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per `(repo, issue)`
 the host can see, it carries stage, entered-at and PR; a row for a sweep the
@@ -269,8 +267,8 @@ An uncovered host is never shown as empty. No row is capped and no host is
 elected; it computes no estimate or statistic.
 
 - **Endpoint config**: flags, then `telemetry.signoz.{endpoint,user,credentialFile}`.
-  The old `autonomous.eta.fleetRefresh.signoz.*` key is read as a fallback for
-  one release, with a deprecation warning (it goes with #11098).
+  The old `autonomous.eta.fleetRefresh.signoz.*` key is still read as a
+  fallback, with one deprecation warning. Nothing else reads `autonomous.eta`.
 - **Offline**: `--print-sql` prints both queries for `clickhouse-client
   --param_t=… --param_window=… --param_repo= --param_span=0 --param_step=300
   --format JSONEachRow`; feed the combined output back with `--from-file`.
@@ -285,9 +283,8 @@ elected; it computes no estimate or statistic.
 
 The reader is the neutral client in `loom-daemon/src/signoz_read.rs` (#11127):
 `ClickhouseHttp` (bound `param_*` parameters, credential read from an
-owner-only file at call time and never logged) and `FileRows`. Nothing in it
-or in the replay command depends on `eta/`, so both survive the ETA
-subsystem's removal (#11098).
+owner-only file at call time and never logged) and `FileRows`. It survived the
+ETA subsystem's removal (#11098) unchanged.
 
 ## Agreement with the forge (`--check`, the daily report)
 
@@ -309,8 +306,8 @@ opened / closed / reopened of an item carrying one; contract:
 and exports it to SigNoz with resource `service.name = loom-ui-d1-export` and
 the D1 record as a flat JSON body. Loom does not own that schema; the body
 keys `kind`, `repo`, `target` (`issue` / `pr`), `number`, `action`, `label`
-and `at` (the Worker's receipt time) are the whole dependency, pinned by a
-unit test. The forge state at an instant is built from the rows whose `at` is
+and `at` (the Worker's receipt time) are the whole dependency, exercised by the
+replay fixture store test. The forge state at an instant is built from the rows whose `at` is
 before it, whenever the export inserted them: a label is on when its last
 `labeled` / `unlabeled` was `labeled`, and an item whose last lifecycle row is
 `closed` is `closed`. An item with no webhook row yet is `no_forge_record`,

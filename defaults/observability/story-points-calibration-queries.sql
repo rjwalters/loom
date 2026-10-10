@@ -45,7 +45,7 @@ SELECT '2026-09-29T00:00:00Z' AS since,
        '2026-10-08T00:00:00Z' AS until;
 
 -- The rubric revision timeline — the provenance rule (#9434, mirroring
--- signoz/eta-queries.sql's revision grouping): EVERY calibration view groups
+-- the former ETA accuracy queries' revision grouping): EVERY calibration view groups
 -- by the revision a landing was sized under, so a rubric change mid-window
 -- shows up as two populations, never a silent average. This view is the one
 -- place in SQL the timeline is written, and it must name the same markers as
