@@ -1409,6 +1409,23 @@ if [[ "$_CONTAINMENT_CRED_PROXY" != "1" && -f "$_mcp_config_lib" ]]; then
     fi
 fi
 
+# --- Per-role tool restriction at spawn (#8256) ---
+# Defense in depth for the guard hooks: the role JSON's
+# toolPolicy.allowedCapabilities (plus any forge-egress policy) become
+# --disallowedTools specs, computed by `loom-daemon role-tool-policy
+# deny-specs`. Bypassable on its own (`bash -c 'ssh …'`), which is why the hooks
+# are the backstop. Appended last so no positional follows the variadic flag,
+# and additive to any --disallowedTools the caller passed. No binary or no
+# specs => byte-for-byte no-op; never fails the spawn.
+# requires-daemon: role-tool-policy optional   #8256 — `deny-specs` (since #8322); no binary or no answer injects nothing, and the guard hooks still enforce the role's declaration.
+_rtp_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+_rtp_specs=()
+while IFS= read -r _rtp_spec; do [[ -z "$_rtp_spec" ]] || _rtp_specs+=("$_rtp_spec"); done < <([[ -z "$_rtp_bin" ]] || "$_rtp_bin" role-tool-policy deny-specs --workspace "$WORKSPACE" --roles-dir "$_script_dir/../roles" 2>/dev/null || true)
+if [[ ${#_rtp_specs[@]} -gt 0 ]]; then
+    PASSTHROUGH_ARGS+=(--disallowedTools "${_rtp_specs[@]}")
+    log_info "spawn-claude: per-role tool restriction (#8256): role=${LOOM_ROLE:-unset} gets ${#_rtp_specs[@]} --disallowedTools specs"
+fi
+
 # --- Dispatch ---
 # SLEEP_INHIBIT_WRAP (issue #6311) then CPU_QUOTA_WRAP (issue #5111) are
 # prepended, in that order, to whichever final command is exec'd below —
