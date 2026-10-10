@@ -765,7 +765,29 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
             recurse(j, hits);
         }
         "nice" | "ionice" | "stdbuf" | "chrt" | "taskset" => {
-            let j = skip_options(rest, &["-n", "-c", "-p", "-i", "-o", "-e"]);
+            let j = skip_options(
+                rest,
+                &[
+                    "-n",
+                    "-c",
+                    "-p",
+                    "-i",
+                    "-o",
+                    "-e",
+                    "--adjustment",
+                    "--class",
+                    "--classdata",
+                    "--pid",
+                    "--pgid",
+                    "--uid",
+                    "--input",
+                    "--output",
+                    "--error",
+                    "--sched-runtime",
+                    "--sched-deadline",
+                    "--sched-period",
+                ],
+            );
             // chrt/taskset take a priority / mask operand before the command.
             let j = if matches!(prog, "chrt" | "taskset") {
                 j + 1
@@ -793,10 +815,8 @@ fn analyze_argv(argv: &[String], home: Option<&str>, depth: usize, hits: &mut Ve
                     "-a",
                     "--max-args",
                     "--max-procs",
-                    "--max-lines",
                     "--delimiter",
                     "--arg-file",
-                    "--replace",
                     "--max-chars",
                     "--process-slot-var",
                 ],

@@ -207,6 +207,10 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     // Round 6: value-taking xargs options must not hide the executable.
     ("xargs --process-slot-var SLOT ssh example.invalid", "remote-shell"),
     ("xargs --max-chars 100 aws sts get-caller-identity", "cloud-cli"),
+    // Round 7: long priority-wrapper options and optional-value xargs options.
+    ("nice --adjustment 5 ssh example.invalid", "remote-shell"),
+    ("nice --adjustment 5 aws sts get-caller-identity", "cloud-cli"),
+    ("xargs --replace ssh example.invalid", "remote-shell"),
 ];
 
 #[test]

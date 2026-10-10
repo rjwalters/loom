@@ -559,6 +559,36 @@ fn xargs_option_values_do_not_hide_the_executable() {
 }
 
 #[test]
+fn xargs_optional_value_options_do_not_swallow_the_executable() {
+    // GNU `--replace` / `--max-lines` take only an attached `=value`.
+    for cmd in [
+        "xargs --replace ssh example.invalid",
+        "xargs --max-lines ssh example.invalid",
+        "xargs --replace=X ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+}
+
+#[test]
+fn priority_wrapper_long_options_consume_their_values() {
+    for cmd in [
+        "nice --adjustment 5 ssh example.invalid",
+        "nice --adjustment=5 ssh example.invalid",
+        "nice -n 5 ssh example.invalid",
+        "ionice --class 2 --classdata 4 ssh example.invalid",
+        "ionice -c 2 -n 4 ssh example.invalid",
+        "stdbuf --output L --error 0 ssh example.invalid",
+        "stdbuf -oL ssh example.invalid",
+        "chrt --sched-runtime 1000 --sched-deadline 2000 --deadline 0 ssh example.invalid",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap("nice --adjustment 5 aws sts get-caller-identity", "cloud-cli"));
+    assert_clean("nice --adjustment 5 echo");
+}
+
+#[test]
 fn time_options_do_not_hide_the_executable() {
     for cmd in [
         "time -p ssh example.invalid",
