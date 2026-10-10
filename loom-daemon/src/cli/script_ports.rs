@@ -957,6 +957,13 @@ pub(crate) enum MergePrCommand {
     /// decision — see `cli::merge_pr_closed_building`.
     ClosedBuilding(super::merge_pr_closed_building::ClosedBuildingArgs),
 
+    /// Did THIS PR's merge close `--issue` (#8942)? The gate in front of
+    /// Champion Step 4's negated-reference reopen. Facts on stdin (the
+    /// `--print-query` GraphQL response and/or REST issue + pull objects);
+    /// exit 0 = yes, 1 = no, 3 = could not answer, each with one
+    /// `LOOM-CLOSED-BY-MERGE` line — see `cli::merge_pr_closed_by_merge`.
+    ClosedByMerge(super::merge_pr_closed_by_merge::ClosedByMergeArgs),
+
     /// The post-merge stacked-child reconcile PLAN (#3747 item 1): the
     /// parent-branch gate, the `[{number, headRefName}]` children-rollup parse
     /// (on stdin) and each child's derived issue number. Prints
@@ -1077,6 +1084,7 @@ impl MergePrCommand {
             MergePrCommand::PartialComment(args) => args.run(),
             MergePrCommand::ClassifyResponse(args) => args.run(),
             MergePrCommand::ClosedBuilding(args) => args.run(),
+            MergePrCommand::ClosedByMerge(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::RetargetChildren(args) => args.run(),
