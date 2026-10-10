@@ -520,6 +520,9 @@ async fn forward(
                 return write_status(stream, 502, "upstream response body failed").await;
             }
         };
+        // #11286: the provider's own reset hint — the body plus any
+        // `retry-after`/rate-limit-reset header — feeds the mark's horizon.
+        let reset_text = reset_evidence(&String::from_utf8_lossy(&error_body), &usage_headers);
         record.record_usage(request_bytes, error_body.len() as u64, usage_headers);
         let classification =
             classify_response(status.as_u16(), &String::from_utf8_lossy(&error_body));
@@ -539,7 +542,7 @@ async fn forward(
         }
         .await;
         if let Some(classification) = classification {
-            bad_mark_at_proxy(record.clone(), classification).await;
+            bad_mark_at_proxy(record.clone(), classification, reset_text).await;
         }
         return replied;
     }
@@ -652,6 +655,19 @@ fn classify_response(status: u16, body: &str) -> Option<Classification> {
     (status == 429).then_some(Classification::RateLimited)
 }
 
+/// The text a proxy-side mark reads its reset horizon from (#11286): the
+/// error body, then one `<header>: <value>` line per captured usage header —
+/// so a `retry-after: 3600` is read by [`crate::api_keys_pool::reset`]'s
+/// prose rule exactly as it would be in a log.
+fn reset_evidence(body: &str, usage_headers: &[(String, String)]) -> String {
+    let mut text = body.to_string();
+    for (name, value) in usage_headers {
+        text.push('\n');
+        text.push_str(&format!("{name}: {value}"));
+    }
+    text
+}
+
 /// Bad-mark this launch's pool account at the proxy (#8699 AC2), the moment a
 /// 429/quota-exhausted response is seen — never waiting for the child to
 /// exit. A no-op when the launch's credential was not pool-selected
@@ -659,49 +675,66 @@ fn classify_response(status: u16, body: &str) -> Option<Classification> {
 /// [`Record::begin_bad_mark`] — for every request on the same launch that is
 /// not strictly stronger than one already marked.
 ///
+/// The horizon is [`crate::api_keys_pool::reset::resolve_cooldown`]'s
+/// (#11286): a reset the provider named in `reset_text`, else the account's
+/// configured plan window, else the classification's default.
+///
 /// Runs the actual pool write on a blocking thread:
 /// [`crate::api_keys_pool::escalate_bad_for_class`] takes a filesystem
 /// `mkdir` lock that can retry for seconds under
 /// contention, which must never stall this listener's async reactor (it runs
 /// on a two-worker-thread runtime, see [`super::run_with_proxy`]).
-async fn bad_mark_at_proxy(record: Record, classification: Classification) {
+async fn bad_mark_at_proxy(record: Record, classification: Classification, reset_text: String) {
+    use crate::api_keys_pool::reset;
     let (Some(root), Some(account)) = (
         record.workspace_root().map(std::path::Path::to_path_buf),
         record.pool_account().map(str::to_string),
     ) else {
         return;
     };
-    let Some(cooldown) = classification.default_cooldown_secs() else {
-        return;
-    };
-    if !record.begin_bad_mark(Some(cooldown)) {
+    if !classification.marks_bad() {
         return;
     }
     let provider = record.provider.clone();
     let launch_id = record.launch_id.clone();
     let model_class = record.model_class().map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
-            .map_err(|e| e.to_string())
-            .and_then(|provider_root| {
-                crate::api_keys_pool::escalate_bad_for_class(
-                    &provider_root,
-                    &provider,
-                    &account,
-                    &format!("{} (classified at the egress proxy)", classification.label()),
-                    Some(cooldown),
-                    model_class.as_deref(),
-                )
-            })
-            .map(|write| (provider, account, write))
+        let provider_root = crate::api_keys_pool::paths::resolve_provider_root(&root, &provider)
+            .map_err(|e| e.to_string())?;
+        let window = reset::configured_window(&provider_root, &provider, &account);
+        let now = crate::api_keys_pool::bad_marks::epoch_now();
+        let Some((cooldown, source)) =
+            reset::resolve_cooldown(classification, &reset_text, now, window)
+        else {
+            return Ok(None);
+        };
+        if !record.begin_bad_mark(Some(cooldown)) {
+            return Ok(None);
+        }
+        crate::api_keys_pool::escalate_bad_for_class(
+            &provider_root,
+            &provider,
+            &account,
+            &format!(
+                "{} (classified at the egress proxy; {})",
+                classification.label(),
+                source.label()
+            ),
+            Some(cooldown),
+            model_class.as_deref(),
+        )
+        .map(|write| Some((provider, account, write)))
     })
     .await;
     match outcome {
-        Ok(Ok((provider, account, crate::api_keys_pool::MarkWrite::Written(_)))) => log::warn!(
-            "egress-proxy: bad-marked {provider}/{account} as {} launch={launch_id}",
-            classification.label()
-        ),
-        Ok(Ok((provider, account, crate::api_keys_pool::MarkWrite::AlreadyCovered(_)))) => {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some((provider, account, crate::api_keys_pool::MarkWrite::Written(_))))) => {
+            log::warn!(
+                "egress-proxy: bad-marked {provider}/{account} as {} launch={launch_id}",
+                classification.label()
+            );
+        }
+        Ok(Ok(Some((provider, account, crate::api_keys_pool::MarkWrite::AlreadyCovered(_))))) => {
             log::info!(
                 "egress-proxy: {provider}/{account} already bad-marked at least as long as {} \
                  — not re-marked launch={launch_id}",
@@ -709,7 +742,7 @@ async fn bad_mark_at_proxy(record: Record, classification: Classification) {
             );
         }
         Ok(Err(error)) => {
-            log::warn!("egress-proxy: could not bad-mark for launch={launch_id}: {error}")
+            log::warn!("egress-proxy: could not bad-mark for launch={launch_id}: {error}");
         }
         Err(error) => log::warn!("egress-proxy: bad-mark task failed launch={launch_id}: {error}"),
     }

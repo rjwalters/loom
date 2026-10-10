@@ -33,13 +33,16 @@ fn find<'a>(
 // ------------------------------------------------------------------ pool
 
 fn account(provider: &str, name: &str, usable: bool, exhausted: bool) -> PoolAccount {
-    PoolAccount {
-        provider: provider.into(),
-        account: name.into(),
-        usable,
-        exhausted,
-    }
+    PoolAccount::new(provider, name, usable, exhausted)
 }
+
+/// The per-provider aggregate families, which carry no account label.
+const AGGREGATES: &[MetricName] = &[
+    MetricName::PoolAccounts,
+    MetricName::PoolExhausted,
+    MetricName::PoolExhaustions,
+    MetricName::PoolExhaustedSeconds,
+];
 
 #[test]
 fn pool_gauges_count_usable_and_exhausted_per_provider() {
@@ -70,7 +73,65 @@ fn pool_gauges_count_usable_and_exhausted_per_provider() {
             && find(&points, MetricName::PoolExhaustedSeconds, &[]).is_none(),
         "the first sample emits no deltas"
     );
-    assert!(points.iter().all(|p| !p.labels.contains_key("account")));
+    assert!(points
+        .iter()
+        .filter(|p| AGGREGATES.contains(&p.name))
+        .all(|p| !p.labels.contains_key("account")));
+}
+
+/// Issue #11286: per-account pool state, one 0/1 series per account and
+/// state, beside (not instead of) the per-provider aggregates.
+#[test]
+fn per_account_state_gauges_carry_the_account_label() {
+    let mut state = QuotaState::default();
+    let accounts = [
+        account("zai", "z1", true, false),
+        account("zai", "z2", false, true),
+        // Seen twice (two pools): emitted once.
+        account("zai", "z2", false, true),
+    ];
+    let points = state.pool_points(&accounts, at(0));
+    let get = |labels: &[(&str, &str)]| {
+        value(find(&points, MetricName::PoolAccountState, labels).unwrap())
+    };
+    assert_eq!(get(&[("account", "z1"), ("state", "usable")]), 1);
+    assert_eq!(get(&[("account", "z1"), ("state", "exhausted")]), 0);
+    assert_eq!(get(&[("account", "z2"), ("state", "usable")]), 0);
+    assert_eq!(get(&[("account", "z2"), ("state", "exhausted")]), 1);
+    assert_eq!(
+        points
+            .iter()
+            .filter(|p| p.name == MetricName::PoolAccountState)
+            .count(),
+        4
+    );
+    assert!(points
+        .iter()
+        .filter(|p| p.name == MetricName::PoolAccountState)
+        .all(|p| p.labels.get("provider").map(String::as_str) == Some("zai")));
+    // The provider aggregate still counts the duplicate as it always did.
+    assert!(find(&points, MetricName::PoolAccounts, &[("provider", "zai")]).is_some());
+}
+
+/// Issue #11286: the declared plan facts are exported where declared, and
+/// absent — never zero — where not.
+#[test]
+fn plan_limit_gauges_appear_only_where_declared() {
+    let mut state = QuotaState::default();
+    let mut declared = account("zai", "z1", true, false);
+    declared.plan_token_limit = Some(50_000_000);
+    declared.plan_window_secs = Some(604_800);
+    let points = state.pool_points(&[declared, account("zai", "z2", true, false)], at(0));
+    assert_eq!(
+        value(find(&points, MetricName::PoolPlanTokenLimit, &[("account", "z1")]).unwrap()),
+        50_000_000
+    );
+    assert_eq!(
+        value(find(&points, MetricName::PoolPlanWindowSeconds, &[("account", "z1")]).unwrap()),
+        604_800
+    );
+    assert!(find(&points, MetricName::PoolPlanTokenLimit, &[("account", "z2")]).is_none());
+    assert!(find(&points, MetricName::PoolPlanWindowSeconds, &[("account", "z2")]).is_none());
 }
 
 #[test]

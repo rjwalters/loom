@@ -108,9 +108,18 @@ const SQLITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// so [`tokens_by_model`] queries every match and merges the results. Per-call
 /// directory + window attribution keeps other sessions in the same store out.
 ///
+/// Plus — Issue #11286 — every **guarded launch's** private store. A
+/// daemon-dispatched OpenCode launch runs with a per-launch `XDG_DATA_HOME`
+/// (`native_tools::provision::state`), so its sessions land in
+/// `<native-tools>/<workspace-hash>/<launch-uuid>/data/opencode/opencode.db`
+/// and nowhere above. Without this scan the burn sampler and the per-sweep
+/// usage readers never saw the fleet's own GLM work. See
+/// [`native_launch_dbs`] for the bound.
+///
 /// De-duplicated by canonical path, so a store reachable two ways (an
 /// `XDG_DATA_HOME` pointing into `~/.loom/opt/…`, a symlink) is read once.
-/// Loom-managed stores come first, sorted, then the XDG default.
+/// Loom-managed stores come first, sorted, then the XDG default, then the
+/// per-launch stores (most recently written first).
 ///
 /// [`OPENCODE_DB_ENV`] short-circuits the scan entirely when set (tests, and
 /// an operator pinning an exact path). `home` is injectable for tests;
@@ -126,15 +135,127 @@ pub fn discover_opencode_dbs(home: Option<&Path>) -> Vec<PathBuf> {
             Vec::new()
         };
     }
+    // The native-tools base: an injected `home` (tests) derives it, so a test
+    // never scans the host's real launch state; production honours
+    // `LOOM_NATIVE_TOOLS_DIR` exactly as the launch path does.
+    let native_base = match home {
+        Some(home) => Some(home.join(NATIVE_TOOLS_SUBDIR)),
+        None => crate::native_tools::provision::reap::default_base(),
+    };
     let home = home.map(Path::to_path_buf).or_else(dirs::home_dir);
     let mut found = home.as_deref().map(loom_managed_dbs).unwrap_or_default();
     found.sort();
     if let Some(db) = xdg_default_db(home.as_deref()).filter(|db| db.is_file()) {
         found.push(db);
     }
+    if let Some(base) = native_base {
+        found.extend(native_launch_dbs(&base));
+    }
     let mut seen = std::collections::HashSet::new();
     found.retain(|db| seen.insert(db.canonicalize().unwrap_or_else(|_| db.clone())));
     found
+}
+
+/// The default native-tools base relative to a home directory — the same
+/// path `native_tools::provision::state::create` falls back to.
+const NATIVE_TOOLS_SUBDIR: &str = ".local/state/loom/native-tools";
+
+/// Most per-workspace directories [`native_launch_dbs`] enumerates.
+pub const MAX_NATIVE_WORKSPACES: usize = 256;
+
+/// Most launch directories [`native_launch_dbs`] inspects, across all
+/// workspaces — the bound on one scan's per-store `stat` calls. When more
+/// launch directories exist, the most recently modified ones are inspected
+/// (a live launch is among the newest), not an arbitrary `read_dir` slice.
+pub const MAX_NATIVE_LAUNCH_ENTRIES: usize = 4096;
+
+/// Most launch-directory names [`native_launch_dbs`] enumerates before
+/// choosing which [`MAX_NATIVE_LAUNCH_ENTRIES`] to inspect. Only a backlog
+/// above the inspection bound pays one extra `stat` per name, to rank them.
+pub const MAX_NATIVE_LAUNCH_NAMES: usize = 4 * MAX_NATIVE_LAUNCH_ENTRIES;
+
+/// Most per-launch stores [`native_launch_dbs`] returns (the most recently
+/// written ones). Each is one read-only SQLite open per sample, so this bounds
+/// a poll's cost however many launch directories the reaper has not yet
+/// reclaimed.
+pub const MAX_NATIVE_LAUNCH_DBS: usize = 128;
+
+/// Every guarded launch's `data/opencode/opencode.db` under `base`
+/// (`<base>/<workspace-hash>/<launch-uuid>/…`), most recently written first,
+/// bounded by [`MAX_NATIVE_WORKSPACES`], [`MAX_NATIVE_LAUNCH_NAMES`],
+/// [`MAX_NATIVE_LAUNCH_ENTRIES`] and [`MAX_NATIVE_LAUNCH_DBS`].
+///
+/// "Written" is the newer of the database's and its `-wal`'s mtime, because a
+/// live OpenCode writes through the WAL and may not touch the main file for a
+/// long time. An unreadable base or workspace directory contributes nothing;
+/// a scan never fails.
+#[must_use]
+pub fn native_launch_dbs(base: &Path) -> Vec<PathBuf> {
+    native_launch_dbs_bounded(base, MAX_NATIVE_LAUNCH_ENTRIES)
+}
+
+/// [`native_launch_dbs`] with the inspection bound injectable (tests).
+fn native_launch_dbs_bounded(base: &Path, max_entries: usize) -> Vec<PathBuf> {
+    let Ok(workspaces) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut launches: Vec<PathBuf> = Vec::new();
+    'enumerate: for workspace in workspaces.flatten().take(MAX_NATIVE_WORKSPACES) {
+        let Ok(entries) = std::fs::read_dir(workspace.path()) else {
+            continue;
+        };
+        for launch in entries.flatten() {
+            if launches.len() >= MAX_NATIVE_LAUNCH_NAMES {
+                break 'enumerate;
+            }
+            launches.push(launch.path());
+        }
+    }
+    if launches.len() > max_entries {
+        // A backlog: rank by the launch directory's own mtime so the live
+        // launch is not lost to arbitrary directory order.
+        let mut ranked: Vec<(Option<std::time::SystemTime>, PathBuf)> = launches
+            .into_iter()
+            .map(|dir| {
+                let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                (modified, dir)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        launches = ranked
+            .into_iter()
+            .take(max_entries)
+            .map(|(_, dir)| dir)
+            .collect();
+    }
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = launches
+        .into_iter()
+        .filter_map(|launch| {
+            let db = launch.join("data").join("opencode").join("opencode.db");
+            last_written(&db).map(|written| (written, db))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates
+        .into_iter()
+        .take(MAX_NATIVE_LAUNCH_DBS)
+        .map(|(_, db)| db)
+        .collect()
+}
+
+/// The newer of `db`'s and `db-wal`'s mtime, or `None` when `db` is not a
+/// regular file.
+fn last_written(db: &Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::metadata(db)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    let main = meta.modified().ok()?;
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = std::fs::metadata(PathBuf::from(wal))
+        .and_then(|m| m.modified())
+        .ok();
+    Some(wal.map_or(main, |wal| wal.max(main)))
 }
 
 /// Every `~/.loom/opt/opencode-<ver>/xdg/data/opencode/opencode.db` that

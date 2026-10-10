@@ -257,6 +257,19 @@ pub enum MetricName {
     /// Seconds since the previous sample the pool read as exhausted.
     #[serde(rename = "loom.pool.exhausted_seconds")]
     PoolExhaustedSeconds,
+    /// One pool account's state (Issue #11286): `1` for the state it is in,
+    /// `0` otherwise, labelled `provider`, `account` and `state` =
+    /// `usable`/`exhausted`.
+    #[serde(rename = "loom.pool.account_state")]
+    PoolAccountState,
+    /// An API-key seat's declared plan token allowance per window (Issue
+    /// #11286), labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_token_limit")]
+    PoolPlanTokenLimit,
+    /// An API-key seat's declared plan window in seconds (Issue #11286),
+    /// labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_window_seconds")]
+    PoolPlanWindowSeconds,
     // ---- Reason-classified account marks (Issue #8931) -------------------
     /// Pool accounts marked out of selection since the previous point,
     /// labelled `provider` and `reason` (a closed set — see
@@ -425,6 +438,9 @@ impl MetricName {
             Self::PoolExhausted => "loom.pool.exhausted",
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
+            Self::PoolAccountState => "loom.pool.account_state",
+            Self::PoolPlanTokenLimit => "loom.pool.plan_token_limit",
+            Self::PoolPlanWindowSeconds => "loom.pool.plan_window_seconds",
             Self::PoolAccountMarks => "loom.pool.account_marks",
             Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
@@ -508,8 +524,9 @@ impl MetricName {
             | Self::LlmTokensCacheWrite => "{token}",
             Self::LlmRequests => "{request}",
             Self::PoolAccounts | Self::PoolExhaustions | Self::PoolAccountMarks => "{account}",
-            Self::PoolExhausted => "1",
-            Self::PoolExhaustedSeconds => "s",
+            Self::PoolExhausted | Self::PoolAccountState => "1",
+            Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
+            Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
@@ -571,6 +588,9 @@ impl MetricName {
             Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
             Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
             Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
+            Self::PoolAccountState => "1 for the state a pool account is in, else 0.",
+            Self::PoolPlanTokenLimit => "Declared plan token allowance per window.",
+            Self::PoolPlanWindowSeconds => "Declared plan quota window.",
             Self::PoolAccountMarks => {
                 "Pool accounts marked out of selection, by provider and reason."
             }

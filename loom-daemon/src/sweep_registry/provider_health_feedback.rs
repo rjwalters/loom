@@ -25,6 +25,33 @@
 use super::*;
 use crate::tokens_pool::codex_reset::exhaustion_reset_horizon;
 
+/// One live sweep's in-run watcher and the mark it wrote, if any (#11286).
+struct InRunWatch {
+    watch: crate::api_keys_pool::live_watch::LiveWatch,
+    mark: Option<crate::api_keys_pool::BadMark>,
+    /// When the watcher first acted on the exhaustion evidence — the instant
+    /// its horizon was anchored on, reused at exit so the same evidence
+    /// resolves the same deadline (#11286).
+    evidence_at: Option<u64>,
+}
+
+/// Per-sweep in-run watchers, keyed by sweep id. Process-global rather than a
+/// [`SweepRegistry`] field because `mod.rs` is frozen by the file-size
+/// ratchet; an entry is dropped when its sweep's exit-time feedback runs
+/// ([`forget_in_run_watch`]), so the map holds only live native sweeps.
+static IN_RUN_WATCHES: std::sync::Mutex<std::collections::BTreeMap<String, InRunWatch>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Drop `sweep_id`'s in-run watcher, returning the mark it wrote (if any)
+/// and the instant its horizon was anchored on.
+fn forget_in_run_watch(sweep_id: &str) -> (Option<crate::api_keys_pool::BadMark>, Option<u64>) {
+    IN_RUN_WATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(sweep_id)
+        .map_or((None, None), |entry| (entry.mark, entry.evidence_at))
+}
+
 impl SweepRegistry {
     /// Persist provider health before any reaper retry/failover decision.
     pub(crate) fn apply_provider_health_feedback(
@@ -109,16 +136,91 @@ impl SweepRegistry {
         log_path: &Path,
         exit_code: Option<i32>,
     ) {
-        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at(
+        // #11286: the in-run watcher's mark (if any) for this sweep, so the
+        // exit-time ingest that finds it already covering the seat is not
+        // counted as a second `loom.pool.account_marks` point. The exit pass
+        // anchors its horizon on the watcher's instant, so re-reading the
+        // same evidence resolves the deadline already written instead of
+        // `exit time + window` (which would extend the hold and re-count).
+        let (live_mark, evidence_at) = forget_in_run_watch(sweep_id);
+        let Some(feedback) = crate::api_keys_pool::ingest::ingest_launch_log_at_since(
             &self.config.workspace_root,
             log_path,
             &format!("sweep_id={sweep_id}"),
             exit_code,
+            evidence_at,
+        ) else {
+            return;
+        };
+        // `record_api_key` counts only a `Some` mark, so an exit that finds
+        // the hold lapsed (`mark: None`) is not counted either.
+        if feedback.mark != live_mark {
+            crate::observability::ops::pool_marks::record_api_key(&feedback);
+        }
+        log::warn!("sweep_registry: {sweep_id} {}", feedback.detail);
+    }
+
+    /// In-run exhaustion marking for a **live** native sweep (#11286 item 3):
+    /// tail the sweep's own log region since the previous reaper tick and
+    /// bad-mark its pool seat the moment the provider says the allowance is
+    /// gone — so concurrent spawns stop landing on an empty seat while this
+    /// run is still winding down. Every guard and the horizon are
+    /// [`crate::api_keys_pool::live_watch`]'s and
+    /// [`crate::api_keys_pool::ingest::apply_mark`]'s; this is a call site.
+    pub(crate) fn watch_in_run_exhaustion(&self, sweep_id: &SweepId) {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return;
+        };
+        if !crate::worker_spawn::is_native(&info.runtime) {
+            return;
+        }
+        let decided = {
+            let mut watches = IN_RUN_WATCHES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A sweep that left the registry without an exit-time feedback
+            // pass (cancelled, GC'd) must not keep its watcher forever.
+            watches.retain(|id, _| {
+                self.entries.get(id).is_some_and(|entry| {
+                    matches!(entry.state, SweepState::Running | SweepState::Pending)
+                })
+            });
+            watches
+                .entry(sweep_id.to_string())
+                .or_insert_with(|| InRunWatch {
+                    watch: crate::api_keys_pool::live_watch::LiveWatch::new(format!(
+                        "sweep_id={sweep_id}"
+                    )),
+                    mark: None,
+                    evidence_at: None,
+                })
+                .watch
+                .poll(&info.log_path)
+        };
+        let Some(decided) = decided else {
+            return;
+        };
+        let evidence_at = crate::api_keys_pool::bad_marks::epoch_now();
+        let Some(feedback) = crate::api_keys_pool::ingest::apply_mark_at(
+            &self.config.workspace_root,
+            decided.record,
+            decided.classification,
+            &decided.provider_text,
+            "the live launch log",
+            evidence_at,
         ) else {
             return;
         };
         crate::observability::ops::pool_marks::record_api_key(&feedback);
-        log::warn!("sweep_registry: {sweep_id} {}", feedback.detail);
+        log::warn!("sweep_registry: {sweep_id} (in-run) {}", feedback.detail);
+        if let Some(entry) = IN_RUN_WATCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(sweep_id.as_str())
+        {
+            entry.mark = feedback.mark;
+            entry.evidence_at = Some(evidence_at);
+        }
     }
 
     /// The Claude insta-crash seam's account mark (#4122), plus its
