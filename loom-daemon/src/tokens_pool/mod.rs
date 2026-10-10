@@ -80,6 +80,7 @@ pub mod locking;
 pub mod monitor;
 pub mod monitor_classes;
 pub mod monitor_db;
+pub mod monitor_dir;
 pub mod monitor_ranking_json;
 pub mod operator_interrupt;
 pub mod paths;

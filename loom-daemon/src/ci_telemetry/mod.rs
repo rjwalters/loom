@@ -285,15 +285,25 @@ pub fn read_config(root: &Path) -> CiTelemetryConfig {
     }
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|value| {
+/// Looks up one env var by name. [`resolve`] passes the process env;
+/// tests pass a fixed map, so they never write process-global env that a
+/// test on another thread could read mid-flight (#11066).
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The process env, as an [`EnvLookup`].
+#[must_use]
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn env_bool(env: EnvLookup<'_>, name: &str) -> Option<bool> {
+    env(name).map(|value| {
         matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }
 
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+fn env_nonempty(env: EnvLookup<'_>, name: &str) -> Option<String> {
+    env(name)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
@@ -324,28 +334,36 @@ pub struct ResolvedCiTelemetry {
 /// Resolve every knob, **env > config > default**.
 #[must_use]
 pub fn resolve(config: &CiTelemetryConfig) -> ResolvedCiTelemetry {
+    resolve_with_env(config, &process_env)
+}
+
+/// [`resolve`] against `env` instead of the process env.
+#[must_use]
+pub fn resolve_with_env(config: &CiTelemetryConfig, env: EnvLookup<'_>) -> ResolvedCiTelemetry {
     let (owners, owners_source) = owners::resolve_owners(
-        env_nonempty(OWNERS_ENV).as_deref(),
-        env_nonempty(ORG_ENV).as_deref(),
+        env_nonempty(env, OWNERS_ENV).as_deref(),
+        env_nonempty(env, ORG_ENV).as_deref(),
         config.owners.as_deref(),
         config.org.as_deref(),
         DEFAULT_ORG,
     );
     ResolvedCiTelemetry {
-        enabled: env_bool(ENABLED_ENV).or(config.enabled).unwrap_or(false),
+        enabled: env_bool(env, ENABLED_ENV)
+            .or(config.enabled)
+            .unwrap_or(false),
         owners,
         owners_source,
-        interval_secs: env_nonempty(INTERVAL_SECS_ENV)
+        interval_secs: env_nonempty(env, INTERVAL_SECS_ENV)
             .and_then(|v| v.parse().ok())
             .filter(|v: &u64| *v > 0)
             .or(config.interval_secs)
             .unwrap_or(DEFAULT_INTERVAL_SECS),
         excluded_repos: config.excluded_repos.clone().unwrap_or_default(),
         refused_exclusions: config.refused_exclusions.clone(),
-        log_capture_requested: env_bool(LOG_CAPTURE_ENABLED_ENV)
+        log_capture_requested: env_bool(env, LOG_CAPTURE_ENABLED_ENV)
             .or(config.log_capture_enabled)
             .unwrap_or(false),
-        log_capture_max_bytes: env_nonempty(LOG_CAPTURE_MAX_BYTES_ENV)
+        log_capture_max_bytes: env_nonempty(env, LOG_CAPTURE_MAX_BYTES_ENV)
             .and_then(|v| v.parse().ok())
             .filter(|v: &usize| *v > 0)
             .or(config.log_capture_max_bytes)

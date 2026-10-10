@@ -401,6 +401,10 @@ fn daemon_write_paths_are_scoped() {
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
+        (
+            "claim_reconciliation/unanchored_verdict.rs",
+            Via(PASS, "verdict pass: anchor + unmarked-approval re-queue (#9258)"),
+        ),
         ("claim_reconciliation/review_conflict.rs", Via(PASS, "conflict pass")),
         ("claim_reconciliation/merge_sequence.rs", Via(PASS, "merge-sequence pass")),
         ("claim_reconciliation/merge_sequence_stall.rs", Via(PASS, "merge-sequence stall escalation")),

@@ -217,6 +217,17 @@ assert_deny "Block gh issue comment --body @path (unquoted)" \
 assert_deny "Block gh pr comment -b @path (short flag)" \
     "gh pr comment 123 -b @/tmp/review.md"
 
+# #9258: the stdin spelling. `--body @-` posts the literal `@-` (only
+# `gh api -F body=@-` reads stdin); a merged approval's whole body was `@-`.
+assert_deny "#9258: Block gh pr comment --body @- (unquoted)" "gh pr comment 1 --body @-"
+assert_deny "#9258: Block gh pr comment --body \"@-\" (quoted)" 'gh pr comment 1 --body "@-"'
+assert_deny "#9258: Block gh issue edit --body @-" "gh issue edit 1 --body @-"
+assert_deny "#9258: Block gh api -f body=@-" "gh api repos/o/r/issues/1/comments -f body=@-"
+assert_deny "#9258: Block --body \"\$VAR\" where VAR=@-" 'B=@-; gh pr comment 1 --body "$B"'
+assert_allow "#9258: Allow gh api -F body=@- (capital F reads stdin)" "gh api repos/o/r/issues/1/comments -F body=@-"
+assert_allow "#9258: Allow --body \"@reviewer ...\" prose" 'gh pr comment 1 --body "@reviewer this looks good because the tests cover it"'
+assert_allow "#9258: Allow a @-prefixed handle in prose" 'gh pr comment 1 --body "@-dash-handle thanks for the fix"'
+
 # --- #4601: the same literal-@ loss reached through SHELL-VARIABLE INDIRECTION
 #
 # Root cause of the PR #4600 recurrence: the #4523 rule above only inspects the

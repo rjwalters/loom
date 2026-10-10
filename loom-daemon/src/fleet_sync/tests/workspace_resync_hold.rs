@@ -342,3 +342,32 @@ fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
     assert_eq!(events.iter().map(|e| e.event).collect::<Vec<_>>(), ["cleared"]);
     assert!(holds.holds().is_empty(), "cleared in the same pass");
 }
+
+/// #11186: a maintain-only workspace is maintained exactly like any other.
+/// The pass resyncs it (it never asks about dispatch holds), the hold the
+/// pass judges stays clear, and nothing raises a roll demand; dispatch is
+/// refused all the while.
+#[test]
+fn a_maintain_only_workspace_is_still_resynced() {
+    use crate::workspace_hold::{hold_for, set_maintain_only_for_test};
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let mark = MaintainOnly {
+        by: MaintainOnlySource::FleetStore,
+        since: t0(),
+    };
+    set_maintain_only_for_test(&host.root, Some(mark));
+    let commits = fx.origin_commits();
+
+    let mut holds = Holds::default();
+    let (pass, _) = hold_pass_in(&host, Mode::Write, None, &mut holds);
+    assert_eq!(only(&pass).state, WState::W0, "{pass:?}");
+    assert!(reason(only(&pass)).starts_with("resynced to v0.19.880"), "{pass:?}");
+    assert_eq!(fx.origin_commits(), commits + 1, "resynced");
+    assert!(holds.holds().is_empty(), "no pass hold");
+    assert_eq!(holds.demand(), None, "no roll demand");
+    assert_eq!(hold_for(&host.root).unwrap().kind, HoldKind::MaintainOnly);
+
+    set_maintain_only_for_test(&host.root, None);
+}

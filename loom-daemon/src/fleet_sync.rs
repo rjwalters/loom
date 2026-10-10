@@ -452,17 +452,29 @@ pub fn summarize_roster(
 /// those verbs use. Loads and saves per change so a mid-plan failure leaves the
 /// earlier changes durably applied, exactly as the CLI's per-verb loop does.
 pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
-    use crate::workspace_registry::WorkspaceRegistry;
+    use crate::workspace_registry::{MaintainOnlySource, WorkspaceRegistry};
     let mut registry = WorkspaceRegistry::load(registry_path)
         .with_context(|| format!("reading {}", registry_path.display()))?;
+    // #11186: the store's maintain-only mark. An add carries it in the same
+    // write, so the workspace is never registered dispatchable first.
+    let mode = |on: bool| on.then_some(MaintainOnlySource::FleetStore);
     let changed = match change {
-        Change::Add { path, priority, .. } => {
+        Change::Add {
+            path,
+            priority,
+            maintain_only,
+            ..
+        } => {
             let claude_state = crate::terminal::claude_config_state_path();
             registry.add_and_trust(path, None, *priority, &claude_state)?;
+            registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
         }
         Change::Remove { path, .. } => registry.remove(path),
         Change::SetPriority { path, to, .. } => registry.set_priority(path, *to),
+        Change::SetMaintainOnly { path, to, .. } => registry
+            .set_maintain_only(path, mode(*to), Utc::now())
+            .unwrap_or(false),
         // Never reachable: `summarize_roster` counts these as unapplied
         // without calling here — a desired repo that is not cloned is
         // reported, never cloned (the roster's own contract).
@@ -1112,6 +1124,7 @@ fn roster_half(
         .map(|w| Registered {
             root: w.root.clone(),
             priority: w.priority,
+            maintain_only: w.maintain_only.is_some(),
         })
         .collect();
     let Some(home) = dirs::home_dir() else {
@@ -1237,6 +1250,21 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #11029: "unset" is only trustworthy when every config tier was
+            // readable. A tier that failed to read may be the one carrying
+            // `fleet.repo`; running as `NoStore` would chase the latest
+            // release. Treat that as a fleet host with an unknown floor.
+            let dead = crate::config_resolver::unreadable_tiers(workspace);
+            if let Some((path, why)) = dead.first() {
+                let why = format!(
+                    "config tier {} is unreadable ({why}), so whether this host reads a fleet \
+                     store is not known",
+                    path.display()
+                );
+                log::warn!("fleet_sync: {why} — treating the fleet floor as unknown");
+                floor_knowledge::set_unreadable_config(why);
+                return None;
+            }
             // #10885: not a fleet host, so it has no floor by definition.
             floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;

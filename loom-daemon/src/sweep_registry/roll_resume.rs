@@ -681,3 +681,9 @@ impl SweepRegistry {
 #[allow(clippy::unwrap_used)]
 #[path = "roll_resume_tests.rs"]
 mod tests;
+
+// #11191: every re-dispatch route is gated by disk admission. Declared here
+// rather than in the frozen `mod.rs` (file-size ratchet).
+#[cfg(test)]
+#[path = "disk_admission_tests.rs"]
+mod disk_admission_tests;

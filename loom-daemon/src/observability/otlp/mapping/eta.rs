@@ -1,6 +1,6 @@
 //! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289),
-//! `eta.fleet_refresh` (#10263), `eta.fit` (#10391), `pr.resolved`
-//! (#10519) and `eta.stage_outcome` (#10929).
+//! `eta.fleet_refresh` (#10263) and `eta.fit` (#10391). `pr.resolved` and
+//! `eta.stage_outcome` are mapped by `outcome_facts` (#11126).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -54,9 +54,9 @@ fn opt_int(attributes: &mut Vec<KeyValue>, key: &str, value: Option<i64>) {
     }
 }
 
-/// #10498: only the fleet's ETA authority emits estimates, outcomes and
-/// stage outcomes (#10929), so the emitting host *is* the authority. Pushes
-/// `loom.eta.authority` for those three kinds; a no-op for every other record. Kept here, not in the caller,
+/// #10498: only the fleet's ETA authority emits estimates and outcomes, so
+/// the emitting host *is* the authority. Pushes `loom.eta.authority` for those
+/// two kinds; a no-op for every other record. Kept here, not in the caller,
 /// because this file is the one place `loom.eta.*` attributes are produced
 /// (`tests/eta_artifacts.rs` scans it).
 pub(super) fn push_authority(
@@ -64,24 +64,8 @@ pub(super) fn push_authority(
     record: &TelemetryRecord,
     host_id: &str,
 ) {
-    if matches!(
-        record,
-        TelemetryRecord::EtaEstimate(_)
-            | TelemetryRecord::EtaOutcome(_)
-            | TelemetryRecord::EtaStageOutcome(_)
-    ) {
+    if matches!(record, TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_)) {
         attributes.push(kv_string("loom.eta.authority", host_id.to_string()));
-    }
-}
-
-/// The knowable-at instant of a record whose event time is not when the
-/// daemon observed it: `pr.resolved` (#10519) and `eta.stage_outcome`
-/// (#10929). `None` for every other kind.
-pub(super) fn observed_at(record: &TelemetryRecord) -> Option<chrono::DateTime<chrono::Utc>> {
-    match record {
-        TelemetryRecord::PrResolved(r) => Some(r.observed_at),
-        TelemetryRecord::EtaStageOutcome(r) => Some(r.observed_at),
-        _ => None,
     }
 }
 
@@ -301,55 +285,6 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.fit", SeverityNumber::Info, nanos(r.started_at), attributes, body))
         }
-        TelemetryRecord::PrResolved(r) => {
-            // #10519: stamped at the merge/close instant; the caller sets the
-            // observed timestamp to `observed_at` (the knowable-at time).
-            let instant = crate::telemetry::trace::instant;
-            let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
-                kv_int("loom.pr_number", i64::from(r.pr_number)),
-                kv_string("loom.eta.pr.state", r.state.as_str()),
-                kv_string("loom.eta.pr.resolved_at", instant(r.resolved_at)),
-                kv_string("loom.eta.pr.observed_at", instant(r.observed_at)),
-                kv_int("loom.eta.pr.resolution_sec", r.resolution_sec),
-            ];
-            provenance(&mut attributes, "loom.eta.", &r.loom);
-            opt_int(&mut attributes, "loom.issue", r.issue.map(i64::from));
-            let body = serde_json::to_string(r).unwrap_or_default();
-            Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
-        }
-        TelemetryRecord::EtaStageOutcome(r) => {
-            // #10929: stamped at `left_at`; the caller sets the observed
-            // timestamp to `observed_at` (the knowable-at time).
-            let instant = crate::telemetry::trace::instant;
-            let mut attributes = vec![
-                kv_string("loom.repo", r.repo.clone()),
-                kv_int("loom.issue", i64::from(r.issue)),
-                kv_string("loom.eta.stage_outcome.stage", r.stage.as_str()),
-                kv_string("loom.eta.stage_outcome.exit", r.exit.as_str()),
-                kv_string("loom.eta.stage_outcome.left_at", instant(r.left_at)),
-                kv_int(
-                    "loom.eta.stage_outcome.open_estimates",
-                    i64::try_from(r.open_estimates).unwrap_or(i64::MAX),
-                ),
-            ];
-            provenance(&mut attributes, "loom.eta.", &r.loom);
-            opt_int(&mut attributes, "loom.pr_number", r.pr_number.map(i64::from));
-            opt_int(&mut attributes, "loom.eta.stage_outcome.dwell_sec", r.dwell_sec);
-            for (key, value) in [
-                (
-                    "loom.eta.stage_outcome.next_stage",
-                    r.next_stage.map(|s| s.as_str().to_string()),
-                ),
-                ("loom.eta.stage_outcome.entered_at", r.entered_at.map(instant)),
-            ] {
-                if let Some(value) = value {
-                    attributes.push(kv_string(key, value));
-                }
-            }
-            let body = serde_json::to_string(r).unwrap_or_default();
-            Some(("eta.stage_outcome", SeverityNumber::Info, nanos(r.left_at), attributes, body))
-        }
         TelemetryRecord::EtaBacktestFold(r) => {
             // #10492: one heuristic's fold for one day; stamped at its cutoff.
             let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
@@ -430,8 +365,8 @@ pub(super) fn log_parts(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-#[path = "eta_stage_outcome_tests.rs"]
-mod stage_outcome_tests;
+#[path = "eta_attribution_tests.rs"]
+mod attribution_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -824,58 +759,5 @@ mod tests {
         };
         let parsed: EtaFitRecord = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, fit);
-    }
-
-    #[test]
-    fn a_pr_resolved_record_is_stamped_at_the_merge_and_observed_at_the_pass() {
-        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
-        use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
-        let merged_at = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
-        let observed_at = merged_at + chrono::Duration::seconds(240);
-        let resolved = PrResolvedRecord {
-            repo: "rjwalters/loom".to_string(),
-            pr_number: 10547,
-            issue: Some(10511),
-            state: PrResolution::Merged,
-            resolved_at: merged_at,
-            observed_at,
-            resolution_sec: 0,
-            loom: record().explanation.loom.clone(),
-        };
-        let envelope =
-            TelemetryEnvelope::new("host", TelemetryRecord::PrResolved(resolved.clone()));
-        let log = log_record_for(&envelope).unwrap();
-        assert_eq!(log.event_name, "pr.resolved");
-        assert_eq!(log.time_unix_nano, super::nanos(merged_at), "event time");
-        assert_eq!(log.observed_time_unix_nano, super::nanos(observed_at), "knowable-at");
-        for kv in &log.attributes {
-            assert!(
-                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                    || [
-                        "loom.repo",
-                        "loom.record_id",
-                        "loom.kind",
-                        "loom.pr_number",
-                        "loom.issue"
-                    ]
-                    .contains(&kv.key.as_str()),
-                "{} is not allowlisted",
-                kv.key
-            );
-        }
-        for key in ETA_LOG_ATTRIBUTE_KEYS
-            .iter()
-            .filter(|k| k.starts_with("loom.eta.pr."))
-        {
-            assert!(attr(&log, key).is_some(), "{key} is emitted");
-        }
-        assert_eq!(attr(&log, "loom.pr_number"), Some(Value::IntValue(10547)));
-        assert_eq!(attr(&log, "loom.eta.pr.state"), Some(Value::StringValue("merged".to_string())));
-        assert!(attr(&log, "loom.eta.authority").is_none(), "not an estimate");
-        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
-            panic!("string body");
-        };
-        let parsed: PrResolvedRecord = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed, resolved);
     }
 }

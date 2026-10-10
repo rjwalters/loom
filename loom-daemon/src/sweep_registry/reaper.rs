@@ -9,6 +9,7 @@ mod liveness;
 pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
 pub(crate) mod pr_park;
+mod run_dir_end;
 pub(crate) use group_drain::{GroupDrain, PendingGroupReap};
 
 // ============================================================================
@@ -788,6 +789,8 @@ impl SweepRegistry {
         // the exit was already reaped in the poll loop above, or when no
         // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
+        let pgid = self.entries.get(sweep_id).and_then(|info| info.pgid);
+        self.on_sweep_process_end(sweep_id, pid, pgid); // #11031
 
         // Read `pr_number` BEFORE mutating terminal state so the
         // orphaned-claim gate below sees the pre-cancel value (the state
@@ -1036,6 +1039,8 @@ impl SweepRegistry {
                     GroupDrain::Draining => continue,
                     GroupDrain::Drained(code) => code,
                 };
+                // #11031: drained, so the sweep's run target dir goes (off this thread).
+                self.on_sweep_process_end(&sweep_id, pid, pgid);
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);

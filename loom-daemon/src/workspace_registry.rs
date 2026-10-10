@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+mod maintain_only;
+pub use maintain_only::{MaintainOnly, MaintainOnlySource};
+
 /// Environment override for the registry file location (mirrors
 /// `LOOM_SOCKET_PATH`). When set, both the CLI and the daemon read/write the
 /// registry there instead of `~/.loom/workspaces.json`. Primarily a test seam,
@@ -74,6 +77,13 @@ pub struct Workspace {
     /// later phases layer them over the repo's `.loom/config.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<serde_json::Value>,
+    /// Set when the workspace is **maintain-only** (#11186): the daemon keeps
+    /// its Loom install current (resync, checkout fast-forward, floor checks)
+    /// but dispatches nothing into it — see [`crate::workspace_hold`]'s
+    /// `maintain-only` hold. Absent (every older file) means a normal,
+    /// dispatched workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain_only: Option<MaintainOnly>,
 }
 
 /// The machine-level set of managed workspaces, persisted at
@@ -292,6 +302,7 @@ impl WorkspaceRegistry {
             root: canonical.clone(),
             priority,
             config_overrides,
+            maintain_only: None,
         });
         Ok(AddOutcome::Added {
             canonical,
@@ -794,6 +805,7 @@ mod tests {
             root: canonical.clone(),
             priority: DEFAULT_WORKSPACE_PRIORITY,
             config_overrides: None,
+            maintain_only: None,
         });
 
         std::fs::remove_dir_all(&repo).unwrap();

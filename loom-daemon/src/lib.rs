@@ -169,6 +169,8 @@ pub mod daemon_update;
 pub mod deep_clean;
 pub mod dep_classify;
 pub mod dep_recheck;
+pub mod disk_admission;
+pub mod disk_footprint;
 pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod docker_image_clean;
@@ -219,6 +221,7 @@ pub mod forge_read_pool;
 pub(crate) mod forge_repo_facts;
 pub mod forge_rerun;
 pub mod forge_tree_unchanged;
+pub mod forge_version_only_diff;
 pub mod forge_wait_checks;
 /// Generated content a quarantine must never stash: name-based artifacts and
 /// content-verified cargo build trees (#5690, #11075).
@@ -411,6 +414,8 @@ pub mod tokens_pool;
 pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
+/// Is a verdict comment body a rationale at all? (`forge verdict-body-check`, #9258)
+pub mod verdict_body;
 pub mod verdict_equivalence;
 /// The verdict-time gate and label transition behind `post-verdict.sh` (#10581).
 pub mod verdict_gate;

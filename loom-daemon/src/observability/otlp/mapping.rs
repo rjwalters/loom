@@ -10,6 +10,7 @@ mod fleet_state;
 mod host_export;
 mod metadata;
 mod ops;
+mod outcome_facts;
 mod pass;
 mod pick_decision;
 mod session_output;
@@ -614,21 +615,12 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaFleetRefresh(_)
         | TelemetryRecord::EtaFit(_)
         | TelemetryRecord::EtaBacktestFold(_)
-        | TelemetryRecord::EtaBacktestSummary(_)
-        | TelemetryRecord::PrResolved(_)
-        | TelemetryRecord::EtaStageOutcome(_) => {
-            // Issue #9289: the body is the record's JSON (an estimate's whole
-            // explanation); scalars ride as `loom.eta.*` attributes. Issues
-            // #10519 / #10929: `pr.resolved` and `eta.stage_outcome` are
-            // stamped at the merge/close or stage exit, and observed when the
-            // daemon saw it (knowable-at).
+        | TelemetryRecord::EtaBacktestSummary(_) => {
+            // Issue #9289: the body is the record's JSON; scalars are `loom.eta.*`.
             let (event_name, severity, at, mut attributes, body) =
                 eta::log_parts(&envelope.record)?;
             eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
             time_unix_nano = at;
-            if let Some(observed) = eta::observed_at(&envelope.record) {
-                observed_time_unix_nano = nanos(observed);
-            }
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
@@ -658,14 +650,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::SessionOutput(_) => {
+        TelemetryRecord::SessionOutput(_)
+        | TelemetryRecord::PrResolved(_)
+        | TelemetryRecord::StageOutcome(_) => {
             // Issue #9764: the body is the producer-redacted readable text,
-            // and this is the only kind that overrides BOTH timestamps — the
-            // source event's time and the producer's read time are separate
-            // facts here, and collapsing either into the envelope's
-            // `emitted_at` would make a quiet run indistinguishable from a
-            // stalled export.
-            let parts = session_output::log_parts(&envelope.record)?;
+            // and these kinds override BOTH timestamps — the source event's
+            // time and the producer's read time are separate facts here, and
+            // collapsing either into the envelope's `emitted_at` would make a
+            // quiet run indistinguishable from a stalled export. Issues
+            // #10519 / #10929 / #11126: the outcome facts are stamped at the
+            // merge/close or stage exit and observed when the daemon saw it.
+            let r = &envelope.record;
+            let parts = session_output::log_parts(r)
+                .or_else(|| outcome_facts::log_parts(r, &envelope.host_id))?;
             time_unix_nano = parts.source_at;
             observed_time_unix_nano = parts.observed_at;
             body_override = Some(parts.body);

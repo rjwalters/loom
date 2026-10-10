@@ -284,6 +284,7 @@ fn sweep_info_repo_round_trips_and_defaults_to_none() {
 fn sample_repo_status(root_missing: bool) -> RepoStatus {
     RepoStatus {
         root: PathBuf::from("/repos/gamma"),
+        maintain_only: None,
         priority: 100,
         in_flight_count: 0,
         health_gate_halted: false,
@@ -322,6 +323,24 @@ fn repo_status_root_missing_round_trips_through_serde() {
     assert!(json.contains("\"root_missing\":true"));
     let back: RepoStatus = serde_json::from_str(&json).unwrap();
     assert!(back.root_missing);
+}
+
+/// #11186: `status --json` carries the maintain-only mark per repo, and a
+/// normal repo's line has no key at all.
+#[test]
+fn repo_status_maintain_only_is_in_status_json() {
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let normal = serde_json::to_value(sample_repo_status(false)).unwrap();
+    assert!(normal.get("maintain_only").is_none(), "{normal}");
+    let mut status = sample_repo_status(false);
+    status.maintain_only = Some(MaintainOnly {
+        by: MaintainOnlySource::FleetStore,
+        since: chrono::Utc::now(),
+    });
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["maintain_only"]["by"], "fleet-store", "{json}");
+    let back: RepoStatus = serde_json::from_value(json).unwrap();
+    assert_eq!(back.maintain_only.unwrap().label(), "maintain-only (fleet store)");
 }
 
 #[test]

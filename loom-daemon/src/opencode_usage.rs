@@ -83,7 +83,8 @@ const DEFAULT_BUCKET: &str = "standard";
 
 /// Env override naming an exact `opencode.db` path — for tests, and for an
 /// operator whose host does not match [`discover_opencode_dbs`]'s layout.
-/// Mirrors the `LOOM_CLAUDE_MONITOR_DIR` override convention.
+/// Mirrors the `LOOM_LLM_MONITOR_DIR` (legacy `LOOM_CLAUDE_MONITOR_DIR`)
+/// override convention.
 pub const OPENCODE_DB_ENV: &str = "LOOM_OPENCODE_DB";
 
 /// The ONLY query this module ever issues (see the module doc's "Security"

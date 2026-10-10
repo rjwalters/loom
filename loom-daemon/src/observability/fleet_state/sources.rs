@@ -29,7 +29,7 @@ fn small(n: usize) -> u32 {
 }
 
 /// Every provisioned root with its lowercased slug, one root per slug.
-async fn managed_roots(
+pub(super) async fn managed_roots(
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
 ) -> Vec<(PathBuf, String)> {

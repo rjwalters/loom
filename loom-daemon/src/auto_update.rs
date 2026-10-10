@@ -1309,10 +1309,15 @@ impl AutoUpdateState {
                     self.clear_tracking();
                     let unchased = (check.update_available == Some(true))
                         .then_some("the source checkout's newer HEAD (no source rebuilds)");
-                    return TickDecision::Skip(format!(
-                        "no artifact ({reason}) → {}",
-                        self.floor.hold_reason(unchased)
-                    ));
+                    let note =
+                        format!("no artifact ({reason}) → {}", self.floor.hold_reason(unchased));
+                    // #11029: a below-floor host that stays unresolved is not
+                    // an INFO-level wait for long.
+                    return if self.floor.unresolved_escalated() {
+                        TickDecision::SkipWarn(note)
+                    } else {
+                        TickDecision::Skip(note)
+                    };
                 }
                 match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
                 {
@@ -1364,6 +1369,11 @@ impl AutoUpdateState {
         let (target, why) = match verdict {
             ArtifactVerdict::UpToDate { version, why } => {
                 self.clear_tracking();
+                // #11029: a host that cannot compare itself with its floor
+                // rolls nowhere; "up to date" would hide that.
+                if self.floor.floor_blind() {
+                    return TickDecision::Skip(self.floor.hold_reason(None));
+                }
                 let staged = native_probe::staged_note(info);
                 return TickDecision::Skip(format!(
                     "artifact {version}: {why}{staged} → up to date"

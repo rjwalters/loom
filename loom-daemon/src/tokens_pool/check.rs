@@ -1343,6 +1343,7 @@ pub fn format_table_at(report: &ProbeReport, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokens_pool::monitor_dir::test_env::MonitorDirEnvGuard;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::fs;
@@ -2545,9 +2546,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts.len(), 1);
         assert_eq!(report.accounts[0].status, "blocked");
@@ -2582,9 +2583,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts[0].status, "exhausted");
         assert!(!tokens_dir.join(".bad_tokens").exists());
@@ -2606,9 +2607,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts[0].status, "exhausted");
         assert!(!tokens_dir.join(".bad_tokens").exists());
@@ -2636,9 +2637,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts[0].status, "available");
         assert!(!tokens_dir.join(".bad_tokens").exists());
@@ -2672,9 +2673,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts[0].status, "blocked");
         assert_eq!(
@@ -2704,9 +2705,9 @@ mod tests {
             stagger: false,
             ..Default::default()
         };
-        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
         let report = run_check(&tokens_dir, &opts, &t);
-        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+        drop(env_guard);
 
         assert_eq!(report.accounts[0].status, "blocked");
         assert_eq!(report.accounts[0].error.as_deref(), Some("auth_401"));

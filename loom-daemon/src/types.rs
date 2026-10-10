@@ -2660,6 +2660,11 @@ pub use roster_status::{RosterMemberStatus, RosterStatus};
 pub struct RepoStatus {
     /// The normalized workspace root this line describes.
     pub root: PathBuf,
+    /// The registry's maintain-only mark (#11186): the daemon keeps this
+    /// repo's Loom install current and dispatches nothing into it. `None` for
+    /// a normal workspace, and from a daemon that predates the mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
     /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
     /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
     /// Surfaced so `loom-daemon status` shows which repos the autonomous loops

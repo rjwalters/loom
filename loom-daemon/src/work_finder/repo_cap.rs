@@ -105,24 +105,48 @@ pub fn resolve(config: &WorkFinderConfig) -> Option<usize> {
 /// in production since #11094, the per-repo RAM budget
 /// ([`crate::ram_headroom::RamBudget`]). `Option<usize>` converts to a
 /// RAM-less value, so every pre-#11094 caller is unchanged.
+/// Since #11191 it also carries the per-repo disk budget
+/// ([`crate::disk_admission::DiskBudget`]).
 #[derive(Debug, Clone, Default)]
 pub struct RepoLimits {
     pub per_repo: Option<usize>,
     pub ram: Option<crate::ram_headroom::RamBudget>,
+    pub disk: Option<crate::disk_admission::DiskBudget>,
 }
 
 impl From<Option<usize>> for RepoLimits {
     fn from(per_repo: Option<usize>) -> Self {
         Self {
             per_repo,
-            ram: None,
+            ..Self::default()
         }
     }
 }
 
 impl From<(Option<usize>, Option<crate::ram_headroom::RamBudget>)> for RepoLimits {
     fn from((per_repo, ram): (Option<usize>, Option<crate::ram_headroom::RamBudget>)) -> Self {
-        Self { per_repo, ram }
+        Self {
+            per_repo,
+            ram,
+            disk: None,
+        }
+    }
+}
+
+/// The production tick's limits (#11191): per-repo cap, RAM and disk budgets.
+type TickLimits = (
+    Option<usize>,
+    Option<crate::ram_headroom::RamBudget>,
+    Option<crate::disk_admission::DiskBudget>,
+);
+
+impl From<TickLimits> for RepoLimits {
+    fn from((per_repo, ram, disk): TickLimits) -> Self {
+        Self {
+            per_repo,
+            ram,
+            disk,
+        }
     }
 }
 
@@ -142,6 +166,8 @@ pub struct RepoCap {
     hot: Vec<bool>,
     /// The tick's per-repo RAM budget (#11094); `None` ⇒ no RAM gate here.
     ram: Option<crate::ram_headroom::RamBudget>,
+    /// The tick's per-repo disk budget (#11191); `None` ⇒ no disk gate here.
+    disk: Option<crate::disk_admission::DiskBudget>,
 }
 
 impl RepoCap {
@@ -163,6 +189,7 @@ impl RepoCap {
             hot: occupancy.iter().map(|&o| o > 0).collect(),
             occupancy,
             ram: limits.ram,
+            disk: limits.disk,
         }
     }
 
@@ -232,6 +259,14 @@ impl RepoCap {
             ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
             return true;
         }
+        // #11191: the same for the repo's disk charge; a star cannot buy disk.
+        if let Some(disk) = self.disk.as_ref().filter(|d| !d.fits(cand.workspace_idx)) {
+            let detail = disk.deferral_detail(cand.workspace_idx);
+            log::debug!("work_finder: deferring issue #{} — {detail}", cand.number);
+            report.deferred_capacity += 1;
+            ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
+            return true;
+        }
         !over && self.defer(cand, report)
     }
 
@@ -253,6 +288,9 @@ impl RepoCap {
         }
         if let Some(ram) = self.ram.as_mut() {
             ram.debit(idx);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.debit(idx);
         }
     }
 }

@@ -5,6 +5,11 @@ use super::*;
 use std::time::{Duration, SystemTime};
 
 const HOUR: i64 = 3600;
+/// The production defaults: 3 h for legacy dirs, 10 min for a dead owner's.
+const AGES: AgeGates = AgeGates {
+    max_age_secs: 3 * HOUR,
+    dead_owner_grace_secs: 600,
+};
 
 /// Set the mtime of `path` and everything under it to `hours` ago.
 fn backdate(path: &Path, hours: u64) {
@@ -37,6 +42,7 @@ fn make_run_dir(path: &Path, hours: u64) {
 struct Fixture {
     free: fn(&Path) -> Option<bool>,
     alive: fn(u32) -> bool,
+    identity: fn(u32) -> Option<String>,
     live: HashSet<u32>,
     protected: Vec<PathBuf>,
     gates: RootGates,
@@ -48,6 +54,7 @@ impl Fixture {
         Self {
             free: |_| Some(false),
             alive: |_| false,
+            identity: |_| None,
             live: HashSet::new(),
             protected: Vec::new(),
             gates: RootGates::default(),
@@ -59,11 +66,12 @@ impl Fixture {
         let probes = Probes {
             open_handles: &self.free,
             owner_alive: &self.alive,
+            owner_identity: &self.identity,
             live_issues: &self.live,
             protected: &self.protected,
             euid: self.euid,
         };
-        evaluate(path, self.gates, Utc::now(), 3 * HOUR, &probes)
+        evaluate(path, self.gates, Utc::now(), AGES, &probes)
     }
 }
 
@@ -388,11 +396,12 @@ fn run_fixture_as(
     let probes = Probes {
         open_handles: &free,
         owner_alive: &|_| false,
+        owner_identity: &|_| None,
         live_issues: &live,
         protected: &[],
         euid,
     };
-    run_with(repo, roots, Utc::now(), 3 * HOUR, dry_run, &probes)
+    run_with(repo, roots, Utc::now(), AGES, dry_run, &probes)
 }
 
 /// [`populated`]'s roots: the repo is the parent of the first root's `.loom`.
@@ -525,6 +534,7 @@ fn config_and_env_resolution() {
         enabled: Some(false),
         max_age_hours: Some(12),
         min_interval_secs: Some(60),
+        dead_owner_grace_minutes: None,
     };
     assert_eq!(resolve_max_age_hours(&cfg), 12);
     std::env::set_var(MAX_AGE_HOURS_ENV, "0");
@@ -737,4 +747,175 @@ fn a_pass_running_as_another_user_removes_nothing_from_a_shared_root() {
         .any(|(p, why)| *p == shared && matches!(why, KeepReason::ForeignOwner { .. })));
     assert_eq!(report.removed.len(), 2, "only the two repo-internal dirs: {report:?}");
     assert!(report.removed.iter().all(|c| c.path.starts_with(&repo)), "{report:?}");
+}
+
+// ============================================================================
+// #11031: a dead owner's run dir goes after a grace of minutes, not hours.
+// ============================================================================
+
+/// Set the mtime of `path` and everything under it to `secs` ago.
+fn backdate_secs(path: &Path, secs: u64) {
+    let when = SystemTime::now() - Duration::from_secs(secs);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if !entry.file_type().unwrap().is_symlink() {
+                backdate_secs(&entry.path(), secs);
+            }
+        }
+    }
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+fn run_dir_fx() -> Fixture {
+    Fixture {
+        gates: RUN_DIRS,
+        ..Fixture::new()
+    }
+}
+
+#[test]
+fn a_dead_owners_run_dir_goes_after_the_grace_not_the_max_age() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = crate::run_target_dir::planned_for(repo.path(), "sweep-lifecycle", "723062-1");
+    crate::run_target_dir::provision(&dir, 4242).unwrap();
+    std::fs::write(dir.join("lib.rlib"), vec![0u8; 1024]).unwrap();
+    backdate_secs(&dir, 5 * 60);
+    assert!(
+        matches!(run_dir_fx().eval(&dir), Err(KeepReason::Young { .. })),
+        "inside the grace a straggling write may still land"
+    );
+    backdate_secs(&dir, 11 * 60);
+    assert!(run_dir_fx().eval(&dir).is_ok(), "11 min after the last write, owner gone");
+
+    // An unmarked legacy location of the same age still waits the 3 h.
+    let legacy = repo.path().join(".loom/target-builder-10744");
+    make_dir(&legacy, 0);
+    backdate_secs(&legacy, 11 * 60);
+    assert!(matches!(Fixture::new().eval(&legacy), Err(KeepReason::Young { .. })));
+}
+
+#[test]
+fn a_live_owners_run_dir_is_never_touched_however_old() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = crate::run_target_dir::planned_for(repo.path(), "sweep-lifecycle", "4242-1");
+    crate::run_target_dir::provision(&dir, 4242).unwrap();
+    std::fs::write(dir.join(crate::run_target_dir::owner::OWNER_START_FILE), "t1\n").unwrap();
+    backdate(&dir, 100);
+    let alive = Fixture {
+        alive: |pid| pid == 4242,
+        identity: |_| Some("t1".to_string()),
+        ..run_dir_fx()
+    };
+    assert_eq!(alive.eval(&dir), Err(KeepReason::OwnerAlive(4242)));
+    let unknown_identity = Fixture {
+        identity: |_| None,
+        ..alive
+    };
+    assert_eq!(
+        unknown_identity.eval(&dir),
+        Err(KeepReason::OwnerAlive(4242)),
+        "an identity that cannot be read is a keep"
+    );
+}
+
+#[test]
+fn a_reused_owner_pid_does_not_keep_the_dir() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = crate::run_target_dir::planned_for(repo.path(), "sweep-lifecycle", "4242-1");
+    crate::run_target_dir::provision(&dir, 4242).unwrap();
+    std::fs::write(dir.join(crate::run_target_dir::owner::OWNER_START_FILE), "t1\n").unwrap();
+    backdate_secs(&dir, 11 * 60);
+    let reused = Fixture {
+        alive: |pid| pid == 4242,
+        identity: |_| Some("t2".to_string()),
+        ..run_dir_fx()
+    };
+    assert!(reused.eval(&dir).is_ok(), "pid 4242 now belongs to another process");
+}
+
+/// The production probes against a real live process (this test) wearing the
+/// marker's pid: kept with its own identity, collected with a foreign one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn production_identity_sees_through_pid_reuse() {
+    let repo = tempfile::tempdir().unwrap();
+    let me = std::process::id();
+    let dir = crate::run_target_dir::planned_for(repo.path(), "sweep-lifecycle", "me-1");
+    crate::run_target_dir::provision(&dir, me).unwrap();
+    backdate_secs(&dir, 11 * 60);
+    let fx = Fixture {
+        alive: crate::live_claim::pid_is_live_process,
+        identity: crate::run_target_dir::owner::process_start_token,
+        ..run_dir_fx()
+    };
+    assert_eq!(fx.eval(&dir), Err(KeepReason::OwnerAlive(me)));
+    std::fs::write(dir.join(crate::run_target_dir::owner::OWNER_START_FILE), "other\n").unwrap();
+    backdate_secs(&dir, 11 * 60);
+    assert!(fx.eval(&dir).is_ok());
+}
+
+#[test]
+fn a_pass_removes_a_dead_owners_run_dir_minutes_after_its_last_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let dead = repo.join(".loom/targets/sweep-lifecycle-723062-1791560640");
+    let fresh = repo.join(".loom/targets/sweep-lifecycle-3487011-1791557602");
+    for dir in [&dead, &fresh] {
+        std::fs::create_dir_all(dir.join("debug")).unwrap();
+        std::fs::write(dir.join("debug/lib.rlib"), vec![0u8; 1024]).unwrap();
+        std::fs::write(dir.join(crate::run_target_dir::OWNER_FILE), "999999\n").unwrap();
+    }
+    backdate_secs(&dead, 15 * 60);
+    backdate_secs(&fresh, 2 * 60);
+    let roots = roots_for(&repo, &tmp.path().join("tmp"));
+    let report = run_fixture_as(&repo, &roots[..1], false, |_| Some(false), current_euid());
+    assert_eq!(report.removed.len(), 1, "{report:?}");
+    assert!(!dead.exists());
+    assert!(fresh.join("debug/lib.rlib").exists(), "still inside its grace");
+}
+
+#[test]
+#[serial_test::serial]
+fn dead_owner_grace_resolution() {
+    std::env::remove_var(DEAD_OWNER_GRACE_ENV);
+    std::env::remove_var(MAX_AGE_HOURS_ENV);
+    let none = TargetOrphanConfig::default();
+    assert_eq!(resolve_dead_owner_grace_minutes(&none), DEFAULT_DEAD_OWNER_GRACE_MINUTES);
+    assert_eq!(
+        resolve_ages(&none),
+        AgeGates {
+            max_age_secs: 3 * HOUR,
+            dead_owner_grace_secs: 600
+        }
+    );
+    let cfg = TargetOrphanConfig {
+        dead_owner_grace_minutes: Some(30),
+        ..TargetOrphanConfig::default()
+    };
+    assert_eq!(resolve_dead_owner_grace_minutes(&cfg), 30);
+    std::env::set_var(DEAD_OWNER_GRACE_ENV, "0");
+    assert_eq!(resolve_dead_owner_grace_minutes(&cfg), 30, "a zero env value falls through");
+    std::env::set_var(DEAD_OWNER_GRACE_ENV, "5");
+    assert_eq!(resolve_dead_owner_grace_minutes(&cfg), 5);
+    std::env::remove_var(DEAD_OWNER_GRACE_ENV);
+    assert_eq!(
+        AgeGates::from_units(1, 600).dead_owner_grace_secs,
+        HOUR,
+        "the grace never exceeds the max age"
+    );
+}
+
+#[test]
+fn the_config_block_reads_the_grace() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".loom")).unwrap();
+    std::fs::write(
+        repo.path().join(".loom/config.json"),
+        r#"{"autonomous":{"worktreeReaper":{"targetOrphanReclaim":{"deadOwnerGraceMinutes":20}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(read_config(repo.path()).dead_owner_grace_minutes, Some(20));
 }
