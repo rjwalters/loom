@@ -225,3 +225,27 @@ fn red_main_fix_is_never_deferred_but_still_occupies() {
     gate.occupy(&fix);
     assert_eq!(gate.overlapping(&cand(2, false, false)), vec!["b.rs"]);
 }
+
+#[test]
+fn extensionless_root_files_are_paths_but_identifiers_are_not() {
+    let s = affected_surface(
+        "## Affected Files\n- `Dockerfile`, `Makefile`, `VERSION`, `./LICENSE`\n- `version`, `Makefiles`, `dockerfile`\n",
+    )
+    .unwrap();
+    assert_eq!(s, set(&["Dockerfile", "Makefile", "VERSION", "LICENSE"]));
+    assert_eq!(affected_surface("## Affected Files\n- `version` and `Makefiles`\n"), None);
+}
+
+#[test]
+fn candidates_sharing_an_extensionless_root_file_defer_the_later_one() {
+    let items = vec![
+        item(1, Some(body(&["Dockerfile"])), None),
+        item(2, Some(body(&["Dockerfile"])), None),
+    ];
+    let mut ws = [(Src(Some(items)), Disp::default())];
+    let report = run(&mut ws);
+    assert_eq!(ws[0].1.dispatched, vec![1]);
+    let (d, detail) = row(&report, 2).unwrap();
+    assert_eq!(d, Qd::DeferredFileOverlap);
+    assert!(detail.unwrap().contains("Dockerfile"));
+}

@@ -278,3 +278,26 @@ fn a_row_without_plan_fields_decodes_with_defaults() {
     .unwrap();
     assert_eq!(row.plan, crate::types::RowPlan::default());
 }
+
+#[test]
+fn deferred_file_overlap_row_exports_its_shared_paths_in_the_serialized_snapshot() {
+    let s = summary(vec![
+        row(
+            1,
+            PUBLIC_ROOT,
+            10,
+            Qd::DeferredFileOverlap,
+            Some("file overlap: x/b.rs, Dockerfile"),
+        ),
+        row(2, PUBLIC_ROOT, 11, Qd::DispatchError, Some("boom: secret stderr")),
+    ]);
+    let record = build_record(&s, &repos());
+    let json = serde_json::to_value(&record).unwrap();
+    let rows = json["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["detail"], "file overlap: x/b.rs, Dockerfile");
+    assert!(rows[1].get("detail").is_none_or(serde_json::Value::is_null), "{}", rows[1]);
+    assert!(
+        !json.to_string().contains("secret stderr"),
+        "dispatch-error text stays excluded"
+    );
+}

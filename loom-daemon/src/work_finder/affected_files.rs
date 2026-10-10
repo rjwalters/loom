@@ -57,10 +57,34 @@ const ROOT_FILE_EXTS: &[&str] = &[
     "txt", "lock", "html", "css", "sql", "go", "rb", "cfg", "ini", "xml", "svg",
 ];
 
+/// Extensionless root files a slash-less span may name exactly (`Dockerfile`,
+/// `VERSION`). Matched case-sensitively and whole, so an identifier such as
+/// `version` or `Makefiles` still reads as not path-shaped.
+const ROOT_FILE_NAMES: &[&str] = &[
+    "Dockerfile",
+    "Containerfile",
+    "Makefile",
+    "GNUmakefile",
+    "Justfile",
+    "Procfile",
+    "Gemfile",
+    "Rakefile",
+    "Brewfile",
+    "Vagrantfile",
+    "VERSION",
+    "LICENSE",
+    "CODEOWNERS",
+    ".gitignore",
+    ".gitattributes",
+    ".dockerignore",
+    ".editorconfig",
+];
+
 /// `span` as a repo-relative file path, or `None` when it is not path-shaped
 /// (an identifier, a code snippet, a bare word). A trailing `:line` is dropped.
 /// A span with a `/` is a path; one without must end in a known file
-/// extension ([`ROOT_FILE_EXTS`]).
+/// extension ([`ROOT_FILE_EXTS`]) or be a known extensionless root file
+/// ([`ROOT_FILE_NAMES`]).
 fn as_path(span: &str) -> Option<String> {
     let base = match span.rsplit_once(':') {
         Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
@@ -73,7 +97,7 @@ fn as_path(span: &str) -> Option<String> {
     let has_ext = base.rsplit_once('.').is_some_and(|(stem, ext)| {
         !stem.is_empty() && ROOT_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str())
     });
-    (base.contains('/') || has_ext).then(|| base.to_string())
+    (base.contains('/') || has_ext || ROOT_FILE_NAMES.contains(&base)).then(|| base.to_string())
 }
 
 /// The paths present in both surfaces, sorted.

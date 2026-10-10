@@ -165,7 +165,9 @@ pub struct QueueLandingRow {
 
 /// `detail` survives only for dispositions whose detail is structured: the
 /// park label, the open PR, a `labelled_blocked` row's allowlisted hold
-/// labels (#8957), and a `workspace_halted` row's closed-vocabulary hold
+/// labels (#8957), a `deferred_file_overlap` row's shared `## Affected Files`
+/// paths (#9781; the daemon formats `file overlap: <paths>`, never forge free
+/// text), and a `workspace_halted` row's closed-vocabulary hold
 /// cause (#9017 — `main_red`, `gate_pending`, `token_pool`, …, emitted by
 /// `work_finder::halt_cause`, never free-form text).
 #[must_use]
@@ -174,6 +176,7 @@ pub fn exportable_detail(disposition: QueueDisposition, detail: Option<&str>) ->
         QueueDisposition::Parked
         | QueueDisposition::OpenPr
         | QueueDisposition::LabelledBlocked
+        | QueueDisposition::DeferredFileOverlap
         | QueueDisposition::WorkspaceHalted => detail.map(str::to_string),
         _ => None,
     }
