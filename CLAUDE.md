@@ -75,8 +75,8 @@ interval-cadence Architect/Hermit work generation is out of scope (#3381).
 
 ## Agent Roles
 
-Eleven specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
-Doctor, Guide, Driver, Auditor, Concierge) plus `loom` (daemon-mode operator) —
+Ten specialized roles (Builder, Judge, Champion, Curator, Architect, Hermit,
+Doctor, Guide, Driver, Auditor) plus `loom` (daemon-mode operator) —
 purpose/cadence table: [`.loom/roles/README.md`](.loom/roles/README.md)
 §"Available Roles". Full definitions: `.loom/roles/<name>.md`.
 

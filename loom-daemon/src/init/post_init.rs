@@ -250,12 +250,6 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // the last matching pattern). Add a negation here only for a file a human
     // writes and wants committed — never for anything the daemon writes.
     "!.loom/state/detect-unlabeled-epics-dismissed",
-    // Concierge budget ledger (#7947): the per-day turn / per-tick relay
-    // counters the operator-agent persona consults at the top of every turn.
-    // Machine-local and disposable — deleting it costs at most one day's spent
-    // budget — but it must never be committed, or one host's spend would
-    // arrive as another host's starting balance.
-    ".loom/concierge/",
     ".loom/stats/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
@@ -1190,10 +1184,6 @@ mod tests {
             // #9592: all daemon-written `.loom/state/` runtime state (the
             // pending-ETA ledger was committed once by a resync, 101aa8f66).
             ".loom/state/*",
-            // #7947: the concierge budget ledger. Committing it would hand one
-            // host's spent turn budget to every other host as a starting
-            // balance.
-            ".loom/concierge/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
             ".loom/metrics_state.json",
