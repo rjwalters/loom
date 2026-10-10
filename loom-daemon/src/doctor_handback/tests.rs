@@ -484,3 +484,27 @@ fn a_head_move_with_a_stuck_claim_is_a_failure_not_a_stand_down() {
     f.fail_remove = vec![CLAIM];
     assert!(matches!(run(&mut f, PUSHED), Outcome::Failed(_)));
 }
+
+/// A head move plus a Judge claim with no verdict: the claim is an overlay on
+/// the queue label, so withdrawing the queue would strand the PR if that
+/// review stands down.
+#[test]
+fn a_head_move_with_a_newer_review_claim_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.after_add = vec!["loom:reviewing"];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&[QUEUE, "loom:reviewing"]));
+}
+
+#[test]
+fn a_head_move_with_a_review_claim_and_a_stuck_doctor_claim_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.after_add = vec!["loom:reviewing"];
+    f.fail_remove = vec![CLAIM];
+    assert!(matches!(run(&mut f, PUSHED), Outcome::Failed(_)));
+    assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
+    assert!(f.sorted().contains(&"loom:reviewing".to_string()));
+}
