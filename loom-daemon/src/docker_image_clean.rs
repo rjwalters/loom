@@ -56,6 +56,27 @@
 //! tracked, and not allowlisted is left alone by construction: this pass only
 //! ever acts on images it explicitly recognizes.
 //!
+//! 3. **Unused images under disk pressure (#11195).** When free space on the
+//!    Docker data volume is below the floor (`diskWarnFreeGb`), images that
+//!    no container (running or stopped) references and that are older than
+//!    `unusedMaxAgeDays` (default 7) are removed **largest first, stopping
+//!    once the free-space deficit is covered** —
+//!    [`RetentionPlan::remove_unused_aged`]. Docker exposes no portable
+//!    "last used" timestamp, so the conservative age source is the image's
+//!    **creation time** (an image pulled recently but built long ago counts as
+//!    old; this errs toward removing, but only ever under pressure and never
+//!    for a container-referenced or allowlisted image). Above the floor this
+//!    rule never fires.
+//!
+//! **Untagged includes digest-only refs (#11195).** On containerd-store hosts a
+//! superseded image keeps a digest ref (`openroad/orfs@sha256:…`) in
+//! `RepoTags` rather than becoming `<none>:<none>`; an image whose every
+//! `RepoTags` entry is a digest ref or `<none>:<none>` is untagged. An image
+//! with any real `repo:tag` alias alongside a digest ref is not.
+//!
+//! **Container-referenced images are never planned** (any removal rule),
+//! whether the container is running or stopped.
+//!
 //! # Safety
 //!
 //! Mirrors `deep_clean`'s gates: the removal half holds the machine-wide
@@ -100,6 +121,14 @@ pub const DOCKER_RETENTION_MIN_INTERVAL_ENV: &str = "LOOM_DOCKER_IMAGE_RETENTION
 /// Default number of newest tagged images kept per tracked repository.
 pub const DEFAULT_KEEP_LAST_N: usize = 2;
 
+/// Env override for the unused-image age floor (days) applied under pressure.
+pub const DOCKER_RETENTION_UNUSED_MAX_AGE_DAYS_ENV: &str =
+    "LOOM_DOCKER_IMAGE_RETENTION_UNUSED_MAX_AGE_DAYS";
+
+/// Default age (days since creation) past which an unreferenced image may be
+/// removed when the host is below the free-space floor (#11195).
+pub const DEFAULT_UNUSED_MAX_AGE_DAYS: u64 = 7;
+
 /// Default cooldown between passes: 30 minutes. Much shorter than
 /// `deep_clean`'s 6h — this pass is not disk-pressure-gated and cheap, the
 /// cooldown exists only to avoid re-shelling to `docker` on every repo in a
@@ -134,6 +163,10 @@ const DOCKER_RETENTION_SLOT_POLL: Duration = Duration::from_millis(500);
 /// uses the system `docker`).
 const DOCKER_BIN: &str = "docker";
 
+/// Default Docker data root; its nearest existing ancestor's filesystem is the
+/// volume the free-space floor is measured against (#11195).
+const DOCKER_DATA_ROOT: &str = "/var/lib/docker";
+
 // ============================================================================
 // Config (.loom/config.json → autonomous.dockerImageRetention)
 // ============================================================================
@@ -158,6 +191,9 @@ pub struct DockerRetentionConfig {
     /// a host with a shared long-lived image, e.g. an EDA toolchain image,
     /// must opt it in explicitly).
     pub allowlist: Option<Vec<String>>,
+    /// `…dockerImageRetention.unusedMaxAgeDays` (default
+    /// [`DEFAULT_UNUSED_MAX_AGE_DAYS`]).
+    pub unused_max_age_days: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous.dockerImageRetention`, soft-failing
@@ -195,6 +231,9 @@ pub fn read_docker_retention_config(repo_root: &Path) -> DockerRetentionConfig {
             .filter(|&s| s > 0),
         tracked_repos: str_vec("trackedRepos"),
         allowlist: str_vec("allowlist"),
+        unused_max_age_days: block
+            .get("unusedMaxAgeDays")
+            .and_then(serde_json::Value::as_u64),
     }
 }
 
@@ -227,6 +266,17 @@ pub fn resolve_min_interval_secs(config: &DockerRetentionConfig) -> u64 {
         .filter(|&s| s > 0)
         .or(config.min_interval_secs)
         .unwrap_or(DEFAULT_MIN_INTERVAL_SECS)
+}
+
+/// Resolve the unused-image age floor (days) — precedence
+/// **env > config > default**.
+#[must_use]
+pub fn resolve_unused_max_age_days(config: &DockerRetentionConfig) -> u64 {
+    std::env::var(DOCKER_RETENTION_UNUSED_MAX_AGE_DAYS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or(config.unused_max_age_days)
+        .unwrap_or(DEFAULT_UNUSED_MAX_AGE_DAYS)
 }
 
 /// Resolve the tracked-repository list — precedence **config > default**
@@ -268,13 +318,26 @@ pub struct DockerImageRecord {
     pub created_at: DateTime<Utc>,
     /// On-disk size in bytes, for reporting only.
     pub size_bytes: u64,
+    /// True when any container (running **or** stopped) references this image
+    /// ID. Such an image is never planned for removal (#11195).
+    pub in_use: bool,
+}
+
+/// True for a digest reference (`repo@sha256:…`) as opposed to `repo:tag`.
+fn is_digest_ref(tag: &str) -> bool {
+    tag.contains("@sha256:")
 }
 
 impl DockerImageRecord {
-    /// True when no tag currently points at this image.
+    /// True when no real `repo:tag` name points at this image: `RepoTags` is
+    /// empty, or every entry is `<none>:<none>` or a digest ref
+    /// (`repo@sha256:…`, the shape a superseded image keeps on
+    /// containerd-store hosts — #11195).
     #[must_use]
     pub fn is_dangling(&self) -> bool {
-        self.repo_tags.is_empty() || self.repo_tags.iter().all(|t| t == "<none>:<none>")
+        self.repo_tags
+            .iter()
+            .all(|t| t == "<none>:<none>" || is_digest_ref(t))
     }
 
     /// Human-readable size, matching [`crate::worktree_ops::clean`]'s report
@@ -327,7 +390,37 @@ pub struct RetentionPlan {
     /// Explicitly exempted by the allowlist — never evaluated against either
     /// removal rule.
     pub allowlisted: Vec<DockerImageRecord>,
+    /// Unreferenced, old, otherwise-unmanaged images, removed only while the
+    /// host is below the free-space floor (#11195), largest first.
+    pub remove_unused_aged: Vec<DockerImageRecord>,
+    /// Bytes of unreferenced images this plan leaves behind (kept or
+    /// allowlisted, not container-referenced) — surfaced so a pass that
+    /// removed nothing next to a large reclaimable pool shows as an anomaly.
+    pub reclaimable_left_bytes: u64,
 }
+
+/// Disk-pressure inputs for the unused-image rule (#11195).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PressurePolicy {
+    /// Free GB on the Docker data volume.
+    pub free_gb: u64,
+    /// The floor (`diskWarnFreeGb`).
+    pub floor_gb: u64,
+    /// Minimum age in days (since creation) for an unused image.
+    pub unused_max_age_days: u64,
+    /// Evaluation time.
+    pub now: DateTime<Utc>,
+}
+
+impl PressurePolicy {
+    /// Whether free space is strictly below the floor.
+    #[must_use]
+    pub fn below_floor(&self) -> bool {
+        self.free_gb < self.floor_gb
+    }
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 impl RetentionPlan {
     /// Every image this plan would remove, dangling first.
@@ -336,13 +429,14 @@ impl RetentionPlan {
         self.remove_dangling
             .iter()
             .chain(self.remove_stale_tracked.iter())
+            .chain(self.remove_unused_aged.iter())
             .collect()
     }
 
     /// `"3 dangling (7.6G), 2 stale tracked (2.4G)"`, or `"nothing"`.
     #[must_use]
     pub fn summary(&self) -> String {
-        if self.remove_dangling.is_empty() && self.remove_stale_tracked.is_empty() {
+        if self.to_remove().is_empty() {
             return "nothing".to_string();
         }
         let mut parts = Vec::new();
@@ -355,6 +449,14 @@ impl RetentionPlan {
             parts.push(format!(
                 "{} stale tracked ({})",
                 self.remove_stale_tracked.len(),
+                human_size(bytes)
+            ));
+        }
+        if !self.remove_unused_aged.is_empty() {
+            let bytes: u64 = self.remove_unused_aged.iter().map(|i| i.size_bytes).sum();
+            parts.push(format!(
+                "{} unused aged ({})",
+                self.remove_unused_aged.len(),
                 human_size(bytes)
             ));
         }
@@ -394,12 +496,35 @@ pub fn plan_retention(
     allowlist: &[String],
     keep_last_n: usize,
 ) -> RetentionPlan {
+    plan_retention_with_pressure(images, tracked_repos, allowlist, keep_last_n, None)
+}
+
+/// [`plan_retention`] plus the disk-pressure unused-image rule (#11195).
+///
+/// Order: allowlist, then container-referenced (never removed), then
+/// untagged, then tracked family, then — only when `pressure` says the host is
+/// below the floor — unused images older than `unused_max_age_days`, largest
+/// first, until the bytes already planned plus these cover the free-space
+/// deficit.
+#[must_use]
+pub fn plan_retention_with_pressure(
+    images: &[DockerImageRecord],
+    tracked_repos: &[String],
+    allowlist: &[String],
+    keep_last_n: usize,
+    pressure: Option<&PressurePolicy>,
+) -> RetentionPlan {
     let mut plan = RetentionPlan::default();
     let mut tracked: BTreeMap<String, Vec<DockerImageRecord>> = BTreeMap::new();
+    let mut aged_candidates: Vec<DockerImageRecord> = Vec::new();
 
     for image in images {
         if matches_allowlist(image, allowlist) {
             plan.allowlisted.push(image.clone());
+            continue;
+        }
+        if image.in_use && !tracked_member(image, tracked_repos) {
+            plan.kept.push(image.clone());
             continue;
         }
         if image.is_dangling() {
@@ -409,6 +534,7 @@ pub fn plan_retention(
         let tracked_repo = image
             .repo_tags
             .iter()
+            .filter(|rt| !is_digest_ref(rt))
             .map(|rt| repo_of(rt))
             .find(|repo| tracked_repos.iter().any(|tr| tr == repo));
         match tracked_repo {
@@ -416,7 +542,17 @@ pub fn plan_retention(
                 .entry(repo.to_string())
                 .or_default()
                 .push(image.clone()),
-            None => plan.kept.push(image.clone()),
+            None => {
+                let old_enough = pressure.is_some_and(|p| {
+                    let age_days = (p.now - image.created_at).num_days();
+                    age_days >= 0 && age_days as u64 >= p.unused_max_age_days
+                });
+                if old_enough {
+                    aged_candidates.push(image.clone());
+                } else {
+                    plan.kept.push(image.clone());
+                }
+            }
         }
     }
 
@@ -431,7 +567,8 @@ pub fn plan_retention(
                 .then_with(|| a.id.cmp(&b.id))
         });
         for (i, image) in group.into_iter().enumerate() {
-            if i < keep_last_n {
+            // A container-referenced image is never removed, whatever its rank.
+            if i < keep_last_n || image.in_use {
                 plan.kept.push(image);
             } else {
                 plan.remove_stale_tracked.push(image);
@@ -439,7 +576,51 @@ pub fn plan_retention(
         }
     }
 
+    if let Some(p) = pressure.filter(|p| p.below_floor()) {
+        let mut remaining = p.floor_gb.saturating_sub(p.free_gb).saturating_mul(GIB);
+        let planned: u64 = plan
+            .remove_dangling
+            .iter()
+            .chain(plan.remove_stale_tracked.iter())
+            .map(|i| i.size_bytes)
+            .sum();
+        remaining = remaining.saturating_sub(planned);
+        // Largest first; ID breaks ties deterministically.
+        aged_candidates.sort_by(|a, b| {
+            b.size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for image in aged_candidates {
+            if remaining > 0 {
+                remaining = remaining.saturating_sub(image.size_bytes);
+                plan.remove_unused_aged.push(image);
+            } else {
+                plan.kept.push(image);
+            }
+        }
+    } else {
+        plan.kept.append(&mut aged_candidates);
+    }
+
+    plan.reclaimable_left_bytes = plan
+        .kept
+        .iter()
+        .chain(plan.allowlisted.iter())
+        .filter(|i| !i.in_use)
+        .map(|i| i.size_bytes)
+        .sum();
+
     plan
+}
+
+/// Whether any non-digest alias of `image` is in a tracked repository.
+fn tracked_member(image: &DockerImageRecord, tracked_repos: &[String]) -> bool {
+    image
+        .repo_tags
+        .iter()
+        .filter(|rt| !is_digest_ref(rt))
+        .any(|rt| tracked_repos.iter().any(|tr| tr == repo_of(rt)))
 }
 
 // ============================================================================
@@ -486,6 +667,8 @@ pub fn list_images() -> Option<Vec<DockerImageRecord>> {
         return Some(Vec::new());
     }
 
+    let in_use_ids = list_container_image_ids()?;
+
     let mut cmd = Command::new(DOCKER_BIN);
     cmd.arg("image").arg("inspect");
     cmd.args(&ids);
@@ -501,13 +684,52 @@ pub fn list_images() -> Option<Vec<DockerImageRecord>> {
                 let created_at = DateTime::parse_from_rfc3339(&img.created)
                     .ok()?
                     .with_timezone(&Utc);
+                let in_use = in_use_ids.contains(&img.id);
                 Some(DockerImageRecord {
                     id: img.id,
                     repo_tags: img.repo_tags.unwrap_or_default(),
                     created_at,
                     size_bytes: img.size.unwrap_or(0),
+                    in_use,
                 })
             })
+            .collect(),
+    )
+}
+
+/// Image IDs referenced by any container, running **or** stopped (#11195).
+/// `None` on any failure — unknown must never read as "no container uses it".
+fn list_container_image_ids() -> Option<std::collections::BTreeSet<String>> {
+    let ps = Command::new(DOCKER_BIN)
+        .args(["ps", "-aq", "--no-trunc"])
+        .output()
+        .ok()?;
+    if !ps.status.success() {
+        return None;
+    }
+    let containers: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if containers.is_empty() {
+        return Some(std::collections::BTreeSet::new());
+    }
+    let inspect = Command::new(DOCKER_BIN)
+        .args(["inspect", "--format", "{{.Image}}"])
+        .args(&containers)
+        .output()
+        .ok()?;
+    if !inspect.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&inspect.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
             .collect(),
     )
 }
@@ -602,6 +824,9 @@ pub struct DockerRetentionInputs<'a> {
     pub allowlist: &'a [String],
     pub keep_last_n: usize,
     pub now: DateTime<Utc>,
+    /// Disk-pressure inputs for the unused-image rule; `None` disables it
+    /// (free space unmeasurable, or not applicable).
+    pub pressure: Option<PressurePolicy>,
 }
 
 /// Run one pass, with listing and removal both injected — mirrors
@@ -632,7 +857,13 @@ pub fn run_pass(
         };
     };
 
-    let plan = plan_retention(&images, inputs.tracked_repos, inputs.allowlist, inputs.keep_last_n);
+    let plan = plan_retention_with_pressure(
+        &images,
+        inputs.tracked_repos,
+        inputs.allowlist,
+        inputs.keep_last_n,
+        inputs.pressure.as_ref(),
+    );
     let to_remove = plan.to_remove();
     if to_remove.is_empty() {
         return DockerRetentionReport {
@@ -826,18 +1057,45 @@ pub fn run_for(repo_root: &Path) -> DockerRetentionReport {
         };
     }
 
+    // #11195: the unused-image rule needs the floor and the free space on the
+    // volume Docker actually stores images on. Unmeasurable free space means
+    // no pressure rule (unknown != low).
+    let reaper_config = crate::worktree_reaper::read_worktree_reaper_config(repo_root);
+    let floor_gb = crate::worktree_reaper::resolve_disk_warn_free_gb(&reaper_config);
+    let pressure = crate::disk_headroom::path_free_gb(Path::new(DOCKER_DATA_ROOT)).map(|free_gb| {
+        PressurePolicy {
+            free_gb,
+            floor_gb,
+            unused_max_age_days: resolve_unused_max_age_days(&config),
+            now,
+        }
+    });
+
     let inputs = DockerRetentionInputs {
         enabled,
         tracked_repos: &resolve_tracked_repos(&config),
         allowlist: &resolve_allowlist(&config),
         keep_last_n: resolve_keep_last_n(&config),
         now,
+        pressure,
     };
     let report = run_pass(&inputs, &list_images, &remove_image, &production_with_build_slot);
     if enabled {
         record_evaluated(now);
     }
     log_report(&report);
+    // #11195: below the floor, always say what the pass left behind at INFO,
+    // so "removed 0" next to tens of GB reclaimable reads as an anomaly.
+    if let (Some(p), Some(plan)) = (pressure.filter(PressurePolicy::below_floor), &report.plan) {
+        log::info!(
+            "docker_image_clean: below floor ({} GB free < {} GB): planned {}, removed {},              {} left reclaimable",
+            p.free_gb,
+            p.floor_gb,
+            plan.summary(),
+            report.removed.len(),
+            human_size(plan.reclaimable_left_bytes)
+        );
+    }
     report
 }
 
@@ -858,6 +1116,7 @@ mod tests {
             repo_tags: tags.iter().map(|s| (*s).to_string()).collect(),
             created_at: t(created_secs),
             size_bytes: (size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            in_use: false,
         }
     }
 
@@ -907,6 +1166,126 @@ mod tests {
     #[test]
     fn a_real_tag_is_not_dangling() {
         assert!(!image("sha256:a", &["loom-worker:ci-smoke"], 0, 1.0).is_dangling());
+    }
+
+    #[test]
+    fn digest_only_repo_tags_are_untagged() {
+        let sha = "openroad/orfs@sha256:ebc8";
+        assert!(image("sha256:a", &[sha], 0, 6.5).is_dangling());
+        assert!(image("sha256:a", &[sha, "<none>:<none>"], 0, 6.5).is_dangling());
+        assert!(!image("sha256:a", &["openroad/orfs:latest", sha], 0, 6.5).is_dangling());
+    }
+
+    #[test]
+    fn digest_only_image_is_planned_for_removal_but_mixed_is_not() {
+        let images = vec![
+            image("sha256:digest", &["openroad/orfs@sha256:ebc8"], 0, 6.5),
+            image("sha256:mixed", &["openroad/orfs:latest", "openroad/orfs@sha256:ebc8"], 0, 6.5),
+        ];
+        let plan = plan_retention(&images, &tracked(), &[], 2);
+        assert_eq!(plan.remove_dangling.len(), 1);
+        assert_eq!(plan.remove_dangling[0].id, "sha256:digest");
+        assert_eq!(plan.kept.len(), 1);
+        assert_eq!(plan.kept[0].id, "sha256:mixed");
+    }
+
+    #[test]
+    fn container_referenced_untagged_image_is_never_planned() {
+        let mut img = image("sha256:a", &["postgres@sha256:abc"], 0, 1.0);
+        img.in_use = true;
+        let plan = plan_retention(&[img], &tracked(), &[], 2);
+        assert!(plan.to_remove().is_empty());
+        assert_eq!(plan.kept.len(), 1);
+    }
+
+    // ===================================================================
+    // unused-image pressure rule (#11195)
+    // ===================================================================
+
+    const DAY: i64 = 86_400;
+
+    fn pressure(free_gb: u64) -> PressurePolicy {
+        PressurePolicy {
+            free_gb,
+            floor_gb: 20,
+            unused_max_age_days: 7,
+            now: t(30 * DAY),
+        }
+    }
+
+    #[test]
+    fn below_floor_an_old_unused_third_party_image_is_planned() {
+        let images = vec![image("sha256:k", &["kicad/kicad:9.0"], 0, 5.0)];
+        let plan = plan_retention_with_pressure(&images, &tracked(), &[], 2, Some(&pressure(10)));
+        assert_eq!(plan.remove_unused_aged.len(), 1);
+        assert_eq!(plan.to_remove().len(), 1);
+    }
+
+    #[test]
+    fn above_floor_an_old_unused_third_party_image_is_kept() {
+        let images = vec![image("sha256:k", &["kicad/kicad:9.0"], 0, 5.0)];
+        let plan = plan_retention_with_pressure(&images, &tracked(), &[], 2, Some(&pressure(25)));
+        assert!(plan.to_remove().is_empty());
+        assert_eq!(plan.reclaimable_left_bytes, images[0].size_bytes);
+    }
+
+    #[test]
+    fn below_floor_a_young_unused_image_is_kept() {
+        let images = vec![image("sha256:k", &["kicad/kicad:9.0"], 28 * DAY, 5.0)];
+        let plan = plan_retention_with_pressure(&images, &tracked(), &[], 2, Some(&pressure(10)));
+        assert!(plan.to_remove().is_empty());
+    }
+
+    #[test]
+    fn below_floor_a_container_referenced_image_is_never_planned() {
+        let mut img = image("sha256:k", &["kicad/kicad:9.0"], 0, 5.0);
+        img.in_use = true;
+        let plan = plan_retention_with_pressure(&[img], &tracked(), &[], 2, Some(&pressure(1)));
+        assert!(plan.to_remove().is_empty());
+        assert_eq!(plan.reclaimable_left_bytes, 0);
+    }
+
+    #[test]
+    fn below_floor_an_allowlisted_image_is_never_planned() {
+        let images = vec![image("sha256:k", &["kicad/kicad:9.0"], 0, 5.0)];
+        let plan = plan_retention_with_pressure(
+            &images,
+            &tracked(),
+            &["kicad".to_string()],
+            2,
+            Some(&pressure(1)),
+        );
+        assert!(plan.to_remove().is_empty());
+        assert_eq!(plan.allowlisted.len(), 1);
+    }
+
+    #[test]
+    fn pressure_removal_goes_largest_first_and_stops_at_the_deficit() {
+        // Deficit is 10 GB (free 10, floor 20): the 8 GB image alone does not
+        // cover it, the 6 GB one then does, so the 1 GB one is left alone.
+        let images = vec![
+            image("sha256:s", &["a/small:1"], 0, 1.0),
+            image("sha256:l", &["a/large:1"], 0, 8.0),
+            image("sha256:m", &["a/medium:1"], 0, 6.0),
+        ];
+        let plan = plan_retention_with_pressure(&images, &tracked(), &[], 2, Some(&pressure(10)));
+        let ids: Vec<&str> = plan
+            .remove_unused_aged
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sha256:l", "sha256:m"]);
+        assert_eq!(plan.kept.len(), 1);
+    }
+
+    #[test]
+    fn in_use_tracked_image_beyond_keep_n_is_kept() {
+        let mut oldest = image("sha256:a", &["loom-worker:old"], 0, 1.0);
+        oldest.in_use = true;
+        let images = vec![oldest, image("sha256:b", &["loom-worker:new"], 10, 1.0)];
+        let plan = plan_retention(&images, &tracked(), &[], 1);
+        assert!(plan.remove_stale_tracked.is_empty());
+        assert_eq!(plan.kept.len(), 2);
     }
 
     // ===================================================================
@@ -1063,6 +1442,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let listed = std::sync::atomic::AtomicBool::new(false);
         let report = run_pass(
@@ -1087,6 +1467,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let report = run_pass(&inputs, &|| None, &|_| panic!("must never remove"), &slot_free);
         assert!(report.plan.is_none());
@@ -1102,6 +1483,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let report = run_pass(
             &inputs,
@@ -1136,6 +1518,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let slot_held = std::cell::Cell::new(false);
         let removals_while_held = std::cell::Cell::new(0usize);
@@ -1210,6 +1593,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let took_slot = std::sync::atomic::AtomicBool::new(false);
         let report = run_pass(
@@ -1238,6 +1622,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let report = run_pass(
             &inputs,
@@ -1262,6 +1647,7 @@ mod tests {
             allowlist: &[],
             keep_last_n: 2,
             now: t(0),
+            pressure: None,
         };
         let report = run_pass(&inputs, &move || Some(images.clone()), &|_| true, &slot_free);
         assert!(report.reason().contains("removed 1 of planned 1"));
@@ -1310,6 +1696,7 @@ mod tests {
         assert_eq!(resolve_min_interval_secs(&config), DEFAULT_MIN_INTERVAL_SECS);
         assert_eq!(resolve_tracked_repos(&config), tracked());
         assert!(resolve_allowlist(&config).is_empty());
+        assert_eq!(resolve_unused_max_age_days(&config), DEFAULT_UNUSED_MAX_AGE_DAYS);
     }
 
     #[test]
@@ -1320,12 +1707,14 @@ mod tests {
             min_interval_secs: Some(3_600),
             tracked_repos: Some(vec!["my-repo".to_string()]),
             allowlist: Some(vec!["shared".to_string()]),
+            unused_max_age_days: Some(3),
         };
         assert!(!resolve_enabled(&config));
         assert_eq!(resolve_keep_last_n(&config), 5);
         assert_eq!(resolve_min_interval_secs(&config), 3_600);
         assert_eq!(resolve_tracked_repos(&config), vec!["my-repo".to_string()]);
         assert_eq!(resolve_allowlist(&config), vec!["shared".to_string()]);
+        assert_eq!(resolve_unused_max_age_days(&config), 3);
     }
 
     #[test]
