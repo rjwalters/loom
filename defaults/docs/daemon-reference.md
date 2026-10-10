@@ -6512,6 +6512,20 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   newest release; on a host with no fleet store it still switches the opt-in
   loop on and off. Should a floor-only loop's host stop reading a fleet store
   while running, its ticks check nothing rather than start chasing.
+  `auto_update.enabled` in `status --json` means "the loop runs"; the setting
+  itself is `auto_update.config_enabled` (#11042). An explicit
+  `autoUpdate.enabled: false` on a fleet host logs one INFO line at startup
+  saying it is ignored for the floor.
+- **Status says why a host below the floor is not rolling** (#11042):
+  `auto_update.floor_not_rolling` in `status --json` (and the tick record's
+  `floor_not_rolling`) is one of `unsatisfiable`, `no_release`,
+  `unsupervised`, `backoff`, `terminal`, `roll_refused`; the human status
+  prints `Below the fleet floor, NOT rolling (<reason>)`.
+- **An unsupervised host fetches each target once** (#11042). With no
+  launchd/systemd supervisor the pause-and-roll refuses to start (H7
+  `unsupervised`). The release is installed by that first fetch, and later
+  ticks for the same target do not download it again (they report
+  `unsupervised`); a manual restart runs it. A newer target is fetched once.
 - **There is no per-host opt-out from a floor roll.** `autoUpdate.enabled=false`
   does not stop one, and neither does the fleet store's `paused` run state
   ([Run-state enforcement](#run-state-enforcement-9598)): a fleet-paused host

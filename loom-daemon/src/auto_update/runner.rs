@@ -138,6 +138,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         in_flight,
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
+    // #11042: an unsupervised host does not re-fetch a target it already
+    // installed and could not roll to.
+    let decision = not_rolling::gate(state, trigger, decision);
+    let unsupervised = trigger.unsupervised().is_some();
     let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
@@ -196,6 +200,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             let drain_accepted = matches!(outcome, RebuildOutcome::Success)
                 && trigger.trigger_pause_roll(&RollTarget::repo_ahead());
             summary.roll_armed = drain_accepted;
+            let tracked = state.tracked_target.as_deref();
+            state
+                .unsupervised
+                .record(tracked, &outcome, drain_accepted, unsupervised);
             let mut note = state.record_rebuild(now, &outcome, drain_accepted);
             if low_priority {
                 note = format!(
@@ -255,6 +263,10 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             let drain_accepted =
                 matches!(outcome, RebuildOutcome::Success) && trigger.trigger_pause_roll(&target);
             summary.roll_armed = drain_accepted;
+            let tracked = state.tracked_target.as_deref();
+            state
+                .unsupervised
+                .record(tracked, &outcome, drain_accepted, unsupervised);
             let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
             if low_priority {
                 note = format!(
@@ -303,7 +315,19 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_stall.get_or_insert(stall);
     }
 
-    status.publish(state.snapshot(true, last_check, note.clone(), &artifact));
+    // #11042: below the floor and not rolling — say why, typed.
+    summary.floor_not_rolling = not_rolling::classify(&not_rolling::TickFacts {
+        verdict: state.floor.verdict(),
+        decision: kind,
+        outcome,
+        roll_armed: summary.roll_armed,
+        terminal: state.terminal_reason.is_some(),
+        backing_off: state.backoff_until.is_some_and(|until| now < until),
+        unsupervised,
+    });
+    let mut snapshot = state.snapshot(true, last_check, note.clone(), &artifact);
+    snapshot.floor_not_rolling = summary.floor_not_rolling;
+    status.publish(snapshot);
     summary.finish(kind, note, &artifact, outcome)
 }
 

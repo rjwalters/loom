@@ -58,6 +58,16 @@ pub trait RollTrigger: Send {
         let _ = (from, to);
         false
     }
+
+    /// Why a roll cannot start on this host because nothing would relaunch
+    /// the daemon (Issue #11042), or `None` when a supervisor is present.
+    ///
+    /// The tick reads this to stop re-fetching a target it already installed
+    /// and could not roll to ([`super::not_rolling`]). Defaults to `None`
+    /// (supervised) so test and alternative triggers behave as before.
+    fn unsupervised(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The production [`RollTrigger`]: starts the H4 pause inside a captured
@@ -132,6 +142,13 @@ impl RollTrigger for IpcRollTrigger {
                 || snap.pause.as_ref().is_some_and(|p| p.stopped),
             then_exit: snap.then_exit,
         })
+    }
+
+    /// The same check `start_pause_roll` refuses on (H7 `unsupervised`).
+    fn unsupervised(&self) -> Option<String> {
+        crate::ipc::detect_supervisor()
+            .is_none()
+            .then(|| "no supervisor is detected (LOOM_DAEMON_SUPERVISOR unset)".to_string())
     }
 
     fn supersede_roll(&self, from: &str, to: &str) -> bool {

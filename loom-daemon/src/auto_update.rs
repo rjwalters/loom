@@ -217,12 +217,6 @@ pub const DEFAULT_AUTO_UPDATE_SETTLE_SECS: u64 = 600;
 /// "stampedes on every busy period".
 pub const DEFAULT_AUTO_UPDATE_DEFER_DEADLINE_SECS: u64 = 21_600;
 
-/// `nice` value applied to the rebuild subprocess when it runs under the gate-4
-/// deadline override, so a build forced onto a saturated host yields CPU to the
-/// in-flight sweeps instead of competing with them. `19` is the maximum (lowest
-/// priority) niceness on Linux and macOS.
-const LOW_PRIORITY_NICE: i32 = 19;
-
 /// First backoff delay after a retryable build failure. Subsequent failures
 /// double it, capped at [`BACKOFF_CEILING`].
 const BACKOFF_BASE: Duration = Duration::from_secs(60);
@@ -413,6 +407,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling, or `None`.
+    pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -601,6 +597,11 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+/// Low-priority (`nice`) setup for the rebuild subprocess.
+mod nice;
+/// #11042: the unsupervised re-download guard and the typed not-rolling reason.
+pub mod not_rolling;
+use nice::nice_child;
 
 /// A record of the last artifact this daemon actually installed, persisted so
 /// it survives the restart the roll itself performs.
@@ -947,7 +948,7 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
 /// →Retryable.
 ///
 /// `low_priority` (#4929) niced the whole build subtree to
-/// [`LOW_PRIORITY_NICE`] via a `pre_exec` `setpriority(2)` — inherited by
+/// [`nice::LOW_PRIORITY_NICE`] via a `pre_exec` `setpriority(2)` — inherited by
 /// `cargo`/`rustc`, so a rebuild forced past gate 4's deadline yields CPU to
 /// the in-flight sweeps rather than stampeding them.
 ///
@@ -1073,31 +1074,6 @@ fn run_update_script_with(
     let _ = std::fs::remove_file(&log_path);
     outcome
 }
-
-/// Nice the child (and, by inheritance, the `cargo`/`rustc` processes it
-/// spawns) down to [`LOW_PRIORITY_NICE`] before `exec`. Best-effort: a failing
-/// `setpriority` is deliberately ignored — a build at normal priority is far
-/// better than no build at all, which is the starvation this whole path exists
-/// to end (#4929).
-#[cfg(unix)]
-fn nice_child(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: `pre_exec` runs between fork and exec, where only
-    // async-signal-safe work is permitted. `setpriority(2)` is a bare syscall
-    // wrapper — it allocates nothing, takes no locks, and touches no libc
-    // global state — so it is safe in that window.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setpriority(libc::PRIO_PROCESS, 0, LOW_PRIORITY_NICE);
-            Ok(())
-        });
-    }
-}
-
-/// Non-unix hosts have no `setpriority`; the build simply runs at normal
-/// priority (the daemon's supervised install targets are macOS/Linux).
-#[cfg(not(unix))]
-fn nice_child(_command: &mut Command) {}
 
 /// Map a `loom-daemon-update.sh` exit code to a [`RebuildOutcome`], attaching a
 /// [`failure_digest`] of the captured output on any non-success.
@@ -1246,6 +1222,8 @@ pub struct AutoUpdateState {
     repo_ahead: floor_roll::repo_ahead::RepoAheadState,
     /// #10713: where this state is persisted (disabled unless attached).
     persist: persisted_state::Persistence,
+    /// #11042: the target an unsupervised host installed and could not roll to.
+    unsupervised: not_rolling::UnsupervisedStage,
 }
 
 impl AutoUpdateState {
@@ -1816,6 +1794,7 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
+            floor_not_rolling: None,
         }
     }
 }
