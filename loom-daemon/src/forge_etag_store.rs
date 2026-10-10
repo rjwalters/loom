@@ -438,31 +438,6 @@ pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::F
 /// `(exit status, parsed `--include` response, trimmed stderr)` of one fetch.
 pub(crate) type FetchResult = (ExitStatus, Option<HttpResponse>, String);
 
-/// One `gh api --include <url>` read under **exactly** the reader App whose
-/// `GH_CONFIG_DIR` is `reader_dir` — the reader-only primitive (#10263).
-///
-/// Unlike [`fetch_conditional`] there is no writer anywhere on this path: a
-/// failed read is returned as-is for the caller to classify (and withdraw the
-/// reader through [`crate::forge_identity::withdraw_after`]), never retried on
-/// the writer, and the child runs
-/// [`GhInvocation::without_token_env`], so an env `GH_TOKEN` / `GITHUB_TOKEN`
-/// cannot outrank the reader dir. A caller that must never spend the
-/// operator's credential — the ETA fleet snapshot refresh — uses this and
-/// nothing else. Call accounting, egress routing and the rate-limit headers
-/// are the same [`GhInvocation`] path every conditional read takes.
-pub(crate) fn fetch_with_reader(
-    site: ConditionalRead,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    target: &Target,
-    url: &str,
-    etag: Option<&str>,
-    reader_dir: &Path,
-) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    let role = crate::forge_identity::IdentityRole::Reader;
-    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role, None)
-}
-
 /// Deadline for one conditional read (they were unbounded `.output()`s before
 /// #10089). A listing is one page, so a minute is generous.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

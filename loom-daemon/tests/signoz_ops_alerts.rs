@@ -1,6 +1,6 @@
 //! Proof for the SigNoz alert rules added by #10973 (the 2026-10-08 loom-worker-1
 //! disk-full incident): `alerts/host-disk-low.json`, `alerts/host-disk-critical.json`,
-//! `alerts/work-finder-stale.json` and `alerts/eta-ready-coverage.json`.
+//! and `alerts/work-finder-stale.json`.
 //!
 //! Two groups, as in `signoz_queue_starvation_alert.rs`. The static tests read the
 //! committed JSON only and run in ordinary CI. The replay tests run each rule's
@@ -37,8 +37,6 @@ const DISK_CRITICAL: &str =
     include_str!("../../defaults/observability/signoz/alerts/host-disk-critical.json");
 const WORK_FINDER: &str =
     include_str!("../../defaults/observability/signoz/alerts/work-finder-stale.json");
-const ETA_COVERAGE: &str =
-    include_str!("../../defaults/observability/signoz/alerts/eta-ready-coverage.json");
 const TEMPLATE: &str =
     include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json");
 
@@ -77,7 +75,6 @@ fn new_alerts_share_the_template_schema() {
         ("host-disk-low", DISK_LOW),
         ("host-disk-critical", DISK_CRITICAL),
         ("work-finder-stale", WORK_FINDER),
-        ("eta-ready-coverage", ETA_COVERAGE),
     ] {
         let rule = parse(raw);
         assert_eq!(keys(&rule), keys(&template), "{name}: top-level keys differ from template");
@@ -217,11 +214,6 @@ fn clickhouse(script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-const SCHEMA: &str = "CREATE DATABASE signoz_logs;\n\
-CREATE TABLE signoz_logs.distributed_logs_v2 (timestamp UInt64, \
-resources_string Map(String, String), attributes_string Map(String, String), body String) \
-ENGINE = Memory;\n";
-
 const METRICS_SCHEMA: &str = "CREATE DATABASE signoz_metrics;\n\
 CREATE TABLE signoz_metrics.samples_v4 (metric_name LowCardinality(String), fingerprint UInt64, \
 unix_milli Int64, value Float64) ENGINE = Memory;\n\
@@ -230,23 +222,6 @@ fingerprint UInt64, unix_milli Int64, labels String) ENGINE = Memory;\n";
 
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-fn insert(ts_sec: i64, res: &[(&str, &str)], attrs: &[(&str, &str)], body: &str) -> String {
-    let map = |kv: &[(&str, &str)]| {
-        let items: Vec<String> = kv
-            .iter()
-            .map(|(k, v)| format!("'{}', '{}'", esc(k), esc(v)))
-            .collect();
-        format!("map({})", items.join(", "))
-    };
-    format!(
-        "INSERT INTO signoz_logs.distributed_logs_v2 VALUES ({}, {}, {}, '{}');\n",
-        ts_sec * 1_000_000_000,
-        map(res),
-        map(attrs),
-        esc(body)
-    )
 }
 
 /// A synthetic SigNoz metrics store: one `time_series_v4` row per series
@@ -523,44 +498,4 @@ fn replayed_work_finder_stall_on_a_live_host_pages_within_one_interval() {
         firing(WORK_FINDER, &f, at(15, 11)),
         ["host-e1d4c843", "loom-worker-1", "loom-worker-4"]
     );
-}
-
-fn eta_row(ts_sec: i64, host: &str, stage: &str, reason: Option<&str>) -> String {
-    let mut attrs = vec![
-        ("loom.eta.trigger", "start"),
-        ("loom.eta.stage", stage),
-        ("loom.eta.estimate_id", "x"),
-    ];
-    if let Some(r) = reason {
-        attrs.push(("loom.eta.no_estimate_reason", r));
-    }
-    insert(ts_sec, &[("host.id", host)], &attrs, "{}")
-}
-
-#[test]
-#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
-fn replayed_all_stale_inputs_ready_refusals_trip_the_coverage_alert() {
-    let mut f = String::from(SCHEMA);
-    // Authority, healthy until 14:20: Ready estimates answered.
-    for m in (0..20).step_by(5) {
-        f += &eta_row(at(14, m), "loom-worker-1", "ready_wait", None);
-    }
-    // From 14:20 every Ready item is a stale_inputs refusal; PR-stage rows continue,
-    // mostly no_model -- exactly the incident's shape.
-    for m in 20..50 {
-        f += &eta_row(at(14, m), "loom-worker-1", "ready_wait", Some("stale_inputs"));
-        f += &eta_row(at(14, m), "loom-worker-1", "review_wait", Some("no_model"));
-    }
-    // A healthy host: mostly answered, some stale_inputs (answered > 0 => no alert).
-    for m in 0..50 {
-        let r = if m % 3 == 0 {
-            Some("stale_inputs")
-        } else {
-            None
-        };
-        f += &eta_row(at(14, m), "loom-worker-2", "ready_wait", r);
-    }
-    assert!(firing(ETA_COVERAGE, &f, at(14, 20)).is_empty(), "before the outage");
-    assert_eq!(firing(ETA_COVERAGE, &f, at(14, 40)), ["loom-worker-1"]);
-    assert_eq!(firing(ETA_COVERAGE, &f, at(15, 0)), ["loom-worker-1"]);
 }

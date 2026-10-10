@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as Cd, TimeZone, Utc};
 
 use super::state::{self, AlertState, Kind};
-use super::task::{inbox_payload, run_tick, AlertSink, BusSink, TickContext};
+use super::task::{run_tick, AlertSink, BusSink, TickContext};
 use super::*;
 use crate::types::{CapacityReport, DaemonStatusReport, RoleTickRecord, WorkFinderTickSummary};
 
@@ -358,28 +358,6 @@ fn blocked_with_exhaustion_bad_tokens_entry_is_exhausted() {
 }
 
 #[test]
-fn inbox_payload_keyed_and_resolves_on_clear() {
-    let t = state::Transition {
-        kind: Kind::Started,
-        key: KEY_TOKENS.into(),
-        headline: "h".into(),
-        fix: "f".into(),
-        critical: false,
-    };
-    let p = inbox_payload(&t, "box");
-    assert_eq!(p["severity"], "normal");
-    assert_eq!(p["key"], "mail-box-fleet-degraded-tokens-zero-healthy");
-    assert!(p["body"].as_str().unwrap().contains("Fix: f"));
-    let c = state::Transition {
-        kind: Kind::Cleared,
-        ..t
-    };
-    let p = inbox_payload(&c, "box");
-    assert_eq!(p["resolve"], true);
-    assert_eq!(p["key"], "mail-box-fleet-degraded-tokens-zero-healthy");
-}
-
-#[test]
 fn settings_block_and_defaults() {
     let d = Settings::from_block(None);
     assert!(!d.enabled);
@@ -476,7 +454,7 @@ mod output_watch {
         );
         assert_eq!(out.len(), 1);
         assert!(outputs::is_output_key(&out[0].key));
-        assert_eq!(inbox_payload(&out[0], "h")["severity"], serde_json::json!("normal"));
+        assert!(!out[0].critical);
     }
 
     fn roster() -> Vec<String> {
@@ -504,7 +482,7 @@ mod output_watch {
         let conds = outputs::conditions(&w, t0());
         assert!(!conds.is_empty());
         assert!(conds.iter().all(|c| outputs::is_output_key(&c.key)));
-        assert!(conds[0].headline.starts_with("CRITICAL"));
+        assert!(conds.iter().any(|c| c.headline.starts_with("CRITICAL")));
 
         let mut st = AlertState::new(1, Duration::from_secs(3600));
         let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
@@ -522,7 +500,7 @@ mod output_watch {
         );
         assert_eq!(out.len(), conds.len());
         assert!(out.iter().all(|t| t.kind == Kind::Started));
-        assert_eq!(inbox_payload(&out[0], "h")["severity"], serde_json::json!("critical"));
+        assert!(out.iter().any(|t| t.critical));
 
         // Output resumes: every alert clears.
         let src = Healthy(t0());

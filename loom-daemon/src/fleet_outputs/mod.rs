@@ -7,17 +7,10 @@
 //! host identity is an input, so a job that moved to a host that does not
 //! produce (or silently stopped) is caught the same way as a stalled one.
 //!
-//! Two gates elect the one producing host, and both are covered:
-//! - [`Gate::SingletonJob`]: a named job in the `fleet_captain` registry,
-//!   owned via `arm_singleton_job(<job>, ..)` (the captain) or, for the ETA
-//!   jobs when `eta::job_owner` names an explicit authority (#10918),
-//!   `record_owned_singleton_job(<job>, ..)`.
-//! - [`Gate::EtaAuthority`]: `eta::authority::resolve{,_with}` (#10498). The
-//!   10-07 incident (28 of 30 repos without `eta.estimate` for ~31h) was on
-//!   this path, which records no named job at all.
-//!
-//! The `singleton_registry` tests scan the source tree so a new call site of
-//! either gate cannot land without a row here or a reasoned exemption.
+//! The producing host is elected by a named job in the `fleet_captain`
+//! registry ([`Gate::SingletonJob`]), owned via `arm_singleton_job(<job>, ..)`.
+//! The `singleton_registry` tests scan the source tree so a new call site
+//! cannot land without a row here or a reasoned exemption.
 //!
 //! Slice 1 only: no delivery wiring and no runtime behaviour change. Later
 //! slices feed [`Condition`]s into `fleet_alert` and add a SigNoz rule.
@@ -40,10 +33,10 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     FleetWide,
-    /// One record per roster repo every pass (e.g. `eta.fleet_refresh`).
+    /// One record per roster repo every pass (e.g. `ci.run`).
     PerRepo,
-    /// Emitted only for repos with something to report (e.g. `eta.estimate` is
-    /// per tracked item: an idle or all-abstaining repo legitimately emits
+    /// Emitted only for repos with something to report (e.g. a per-tracked-item
+    /// record: an idle or all-abstaining repo legitimately emits
     /// nothing). Judged against [`OutputSource::expected_repos`], not the
     /// roster.
     PerActiveRepo,
@@ -61,27 +54,15 @@ pub enum Severity {
 pub enum Gate {
     /// A named `fleet_captain` singleton job; `job` is its name.
     SingletonJob,
-    /// `eta::authority::resolve{,_with}`; `job` is [`ETA_AUTHORITY`].
-    EtaAuthority,
 }
 
-/// The `job` name of every [`Gate::EtaAuthority`] row.
-pub const ETA_AUTHORITY: &str = "eta-authority";
-
-/// Config toggle: every ETA job (`EtaConfig::enabled`).
-pub const ETA_ENABLED_KEY: &str = "autonomous.eta.enabled";
-/// Config toggle: the nightly backtest folds (`EtaConfig::nightly_folds_enabled`).
-pub const ETA_NIGHTLY_FOLDS_KEY: &str = "autonomous.eta.nightlyFolds.enabled";
-/// Config toggle: the daily ETA fit check (`EtaConfig::fit_enabled`; also
-/// `LOOM_ETA_FIT_ENABLED`). Only `eta.fit` honours it; `eta.estimate` does not.
-pub const ETA_FIT_KEY: &str = "autonomous.eta.fit.enabled";
 /// Config toggle: the CI telemetry poller (`ci_telemetry::Settings::enabled`).
 pub const CI_TELEMETRY_KEY: &str = "autonomous.ciTelemetry.enabled";
 
 /// One output a singleton job is obliged to keep producing.
 #[derive(Debug, Clone, Copy)]
 pub struct SingletonOutput {
-    /// The singleton job name, or [`ETA_AUTHORITY`].
+    /// The singleton job name.
     pub job: &'static str,
     pub gate: Gate,
     /// Record kind / heartbeat the job emits.
@@ -146,45 +127,8 @@ const fn gauge(
     }
 }
 
-const fn authority(
-    kind: &'static str,
-    scope: Scope,
-    cadence: Duration,
-    enabled_by: &'static [&'static str],
-) -> SingletonOutput {
-    SingletonOutput {
-        job: ETA_AUTHORITY,
-        gate: Gate::EtaAuthority,
-        record_kind: kind,
-        scope,
-        cadence,
-        severity: Severity::Critical,
-        enabled_by,
-        deadline_override: None,
-    }
-}
-
 /// Every singleton output the fleet must keep producing.
 pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
-    // ETA jobs: owned by the explicit ETA authority if set, else the captain
-    // (#10918). One refresh record per repo per cycle (default 3600s).
-    job(
-        crate::observability::eta_fleet_refresh::SINGLETON_JOB_NAME,
-        "eta.fleet_refresh",
-        Scope::PerRepo,
-        hours(1),
-        &[ETA_ENABLED_KEY],
-    ),
-    // Stamped at the folded day's cutoff (end of UTC day D), not at emission:
-    // a healthy observed age peaks near 24h + the run window, inside 48h
-    // (`fold_stamp_lag_fits_the_deadline`).
-    job(
-        crate::eta::nightly_folds::SINGLETON_JOB_NAME,
-        "eta.backtest.fold",
-        Scope::FleetWide,
-        hours(24),
-        &[ETA_ENABLED_KEY, ETA_NIGHTLY_FOLDS_KEY],
-    ),
     // Runs complete fleet-wide around the clock, but a quiet spell is legal:
     // a long cadence and Warning, not Critical.
     SingletonOutput {
@@ -212,44 +156,15 @@ pub const SINGLETON_OUTPUTS: &[SingletonOutput] = &[
         "captain-gauges/v1:queue-blocked",
         &[gauges::ENABLED_KEY, gauges::QUEUE_BLOCKED_KEY],
     ),
-    // The ETA authority: the daily fit check (emitted fitted or skipped) and
-    // per-repo estimates (the 10-07 incident).
-    // The fit check also needs its own toggle (`eta_fit::should_run`).
-    authority("eta.fit", Scope::FleetWide, hours(24), &[ETA_ENABLED_KEY, ETA_FIT_KEY]),
-    authority("eta.estimate", Scope::PerActiveRepo, mins(30), &[ETA_ENABLED_KEY]),
 ];
 
 /// Singleton job names deliberately absent from [`SINGLETON_OUTPUTS`], each with
 /// a reason.
-pub const EXEMPT: &[(&str, &str)] = &[
-    (
-        crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
-        "emits no record kind yet: its output is forge labels, and a pass that finds nothing to \
+pub const EXEMPT: &[(&str, &str)] = &[(
+    crate::intake_reconcile::singleton::SINGLETON_JOB_NAME,
+    "emits no record kind yet: its output is forge labels, and a pass that finds nothing to \
          label is healthy; needs a pass heartbeat before it can be watched (#10916 follow-up)",
-    ),
-    (
-        crate::eta::retire_filing::JOB_NAME,
-        "runs inside eta-nightly-folds (whose eta.backtest.fold row watches the host) and its \
-         output is forge issues, filed only when a heuristic should retire: silence is healthy",
-    ),
-];
-
-/// Every source file (relative to `loom-daemon/src`) that calls
-/// `eta::authority::resolve{,_with}`, and the registry `record_kind` that call
-/// gates, or `None` with the reason it gates no output.
-pub const AUTHORITY_SITES: &[(&str, Option<&str>, &str)] = &[
-    (
-        "observability/eta_fleet_refresh.rs",
-        Some("eta.fit"),
-        "fit_authority: only the authority fits",
-    ),
-    (
-        "observability/eta/authority.rs",
-        Some("eta.estimate"),
-        "restore/refresh: a non-authority host drops pending estimates and emits none",
-    ),
-    ("eta/doctor_facts.rs", None, "read-only `loom-daemon doctor` diagnostic"),
-];
+)];
 
 /// Read access to when outputs were last observed (fleet store / local queue
 /// in production, a fake in tests).
@@ -262,7 +177,7 @@ pub trait OutputSource {
     /// those with at least one estimable tracked item). `None` = unknown,
     /// which is judged against the whole roster (fail loud). `Some(empty)`
     /// = nothing expected, so silence is healthy. Slice 2 must derive this
-    /// independently of the silent output (never from `eta.estimate` itself).
+    /// independently of the silent output.
     fn expected_repos(&self, _record_kind: &str) -> Option<Vec<String>> {
         None
     }
@@ -274,47 +189,10 @@ pub trait OutputSource {
     }
 }
 
-/// One open forge item, for [`estimate_owed`].
-#[derive(Debug, Clone)]
-pub struct OpenItem {
-    pub repo: String,
-    pub opened_at: DateTime<Utc>,
-    /// Whether the item's newest observed `eta.estimate` is a refusal; `None`
-    /// when none was observed yet. A refusal is emitted once and never
-    /// refreshed, so the caller needs an unbounded look-back for it (or a
-    /// source that does not age out): once a refusal ages out of the window
-    /// this becomes `None`, and an all-abstaining repo owes again.
-    pub newest_refused: Option<bool>,
-}
-
-/// The repos that owe `eta.estimate`: the pure producer for
-/// [`OutputSource::expected_repos`], from the forge's open items and the
-/// observed records, never from the authority.
-///
-/// An estimable item is refreshed every pass (`eta::emit`); a refusal is
-/// emitted once and not refreshed; a first emission always goes out. So a
-/// repo owes estimates while one of its open items is not refused. An item
-/// with no record yet gets `grace` from when it opened (pass the row's
-/// deadline) before it counts, so a just-opened item does not fire. A repo
-/// with no open item (idle) or whose items all abstain owes nothing.
-#[must_use]
-pub fn estimate_owed(open: &[OpenItem], now: DateTime<Utc>, grace: Duration) -> Vec<String> {
-    let grace = chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX);
-    let owing: BTreeSet<&str> = open
-        .iter()
-        .filter(|i| match i.newest_refused {
-            Some(refused) => !refused,
-            None => now.signed_duration_since(i.opened_at) > grace,
-        })
-        .map(|i| i.repo.as_str())
-        .collect();
-    owing.into_iter().map(str::to_owned).collect()
-}
-
 /// One output currently missing or stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Condition {
-    /// Stable per-output identity, e.g. `output-missing:eta-authority:eta.estimate`.
+    /// Stable per-output identity, e.g. `output-missing:<job>:<record_kind>`.
     pub key: String,
     pub job: &'static str,
     pub record_kind: &'static str,

@@ -96,11 +96,4 @@ mod tests {
         assert_eq!(back, p);
         assert!(p.is_valid());
     }
-
-    /// `eta` re-exports the moved type, so ETA records keep the same type.
-    #[test]
-    fn eta_reexports_the_same_type() {
-        let p: crate::eta::Provenance = Provenance::current();
-        assert!(p.is_valid());
-    }
 }

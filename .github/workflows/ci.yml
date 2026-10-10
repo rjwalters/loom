@@ -692,38 +692,9 @@ jobs:
       # zero rows survive the SQL so SigNoz can see a series recover.
       - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
-      # #10973: replay of the host-disk, work-finder-stale and ETA Ready-coverage alert rules
-      - name: Verify the SigNoz disk, work-finder and ETA Ready-coverage alert rules against a real pinned ClickHouse
+      # #10973: replay of the host-disk and work-finder-stale alert rules
+      - name: Verify the SigNoz disk and work-finder alert rules against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ops_alerts -- --ignored --nocapture
-      # #10916: the fleet singleton-output alert (alerts/fleet-singleton-output.json),
-      # the cross-host detector for a one-host fleet job that stops producing
-      # while every host looks healthy. Only this run shows that the 2026-10-07
-      # replay (28 of 30 repos without eta.estimate) fires one evaluation past
-      # 2 x cadence and not before, that an idle or all-abstaining repo stays
-      # quiet, and that an empty logs table fires every watched row. Its
-      # deadline-vs-registry no-drift check runs in the ordinary test job.
-      - name: Verify the SigNoz fleet singleton-output alert rule against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_fleet_singleton_output_alert -- --ignored --nocapture
-      # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
-      # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
-      # heuristic is promoted on. eta_artifacts.rs already pins every attribute
-      # it reads to the emitted schema in ordinary CI; only this run shows that
-      # an abandoned sweep -- which carries no error field at all -- is scored as
-      # a PERFECT prediction once the presence filter goes, lowering the MAE that
-      # decides the promotion; that pooling two revisions hides a 5x regression
-      # behind an average belonging to neither build; that ROLLUP's subtotal rows
-      # are keyed with the same '' a missing heuristic attribute reads as; and
-      # that a feature which never varied scores rankCorr 0.5 rather than 0.
-      - name: Verify the SigNoz ETA accuracy queries against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_eta_queries -- --ignored --nocapture
-      # #10233: the same technique for the late-surprise, stability,
-      # convergence and answer-rate views (eta-queries.sql Q4-Q7), over their
-      # own fixture. Only this run shows that dropping the common decidable
-      # subset lets a heuristic that refuses the hard cases read as better,
-      # that remaining seconds invert the stability ranking, and that counting
-      # rows inflates the answer rate because refusals are never refreshed.
-      - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
-        run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
       # #11125: the same technique for the replay reconstruction
       # (replay-queries.sql queries 1-3). Only this run shows that an issue
       # removed, re-added and removed again stays deleted, and that a lost

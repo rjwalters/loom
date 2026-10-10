@@ -927,7 +927,7 @@ pub(crate) fn run_h4_with(
         let id = w.item.id.clone();
         run.event(Some(&id), "budget_missed", Some(detail));
     }
-    run.finish_stops(&mut pool, stop_bound);
+    let forced_stops = run.finish_stops(&mut pool, stop_bound);
     drop(pool);
     let stop_elapsed = stop_started.elapsed();
     let stop_secs = stop_elapsed.as_secs();
@@ -1061,6 +1061,7 @@ pub(crate) fn run_h4_with(
             "settle_secs": settle_secs,
             "stop_secs": stop_secs,
             "stop_ms": stop_ms,
+            "forced_stops": forced_stops,
             "total_secs": started.elapsed().as_secs(),
         }),
     );

@@ -10,8 +10,7 @@
 //! [`LabelSet`]s derived from registry properties via [`embedded_set`].
 //!
 //! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels`, merge_pr
-//! `BLOCKING`, eta `HUMAN_GATED_LABELS` and queue_blocked `HOLD_LABELS` are
-//! derived too; `tests.rs` pins each to its previous literal. dep_classify's
+//! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs` pins each to its previous literal. dep_classify's
 //! operator-only labels are single named consts, kept in lockstep by a test.
 //!
 //! Final slice (AC 6): `propagate` holds #10012's propagation rule table;
@@ -148,6 +147,9 @@ pub struct Label {
     pub blocked_colabel: bool,
     pub hard_exclusion: bool,
     pub champion_path: bool,
+    /// A human must act (#11087): the notifier contract. An external
+    /// notifier reads `labels list --property human_gated` instead of
+    /// hard-coding names; see `label-state-machine.md`.
     pub human_gated: bool,
     /// Operator holds that make an approved PR's wait a merge hold (#10218).
     pub merge_hold: bool,

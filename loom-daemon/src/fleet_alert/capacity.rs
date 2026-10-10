@@ -6,8 +6,7 @@
 //! The only signal was per-issue "no progress" comments blaming the work
 //! finder. Neither condition is an issue's problem, so neither belongs in a
 //! per-issue comment: each is one host-level [`Condition`], de-duplicated and
-//! delivered by the fleet-alert state machine and sinks (the event bus and,
-//! independently of Safehouse, the loom-ui inbox).
+//! delivered by the fleet-alert state machine and sinks (the event bus).
 
 use super::Condition;
 use crate::star_liveness::queue::waiting_star;

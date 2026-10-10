@@ -227,8 +227,7 @@ impl std::fmt::Debug for SessionOutputSink {
 static GLOBAL_SINK: OnceLock<SessionOutputSink> = OnceLock::new();
 
 /// Register the process-global sink over the **already-resolved** OTLP
-/// queues. Registers nothing when there are none, exactly like
-/// [`super::eta::register_sink`].
+/// queues. Registers nothing when there are none.
 pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
     if let Some(sink) = SessionOutputSink::new(otlp_queues, host_id) {
         let _ = GLOBAL_SINK.set(sink);
