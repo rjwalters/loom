@@ -548,3 +548,67 @@ fn a_non_fleet_host_with_autoupdate_off_never_rolls() {
     assert_eq!(resolves, 0, "no release is even resolved");
     assert!(summary.note.contains("not a fleet host"), "{}", summary.note);
 }
+
+/// #10880 item 4: a persist that panics does not unwind out of `guarded_tick`
+/// (it has its own `catch_unwind`, apart from the tick's): the tick's decision
+/// stands, one `panic` fault is counted, and the next tick runs.
+#[test]
+fn a_panicking_persist_is_a_fault_not_an_unwind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(newer("0.19.731", "0.19.701"));
+    let status = AutoUpdateStatus::new(true);
+    let tune = tuning(Duration::from_secs(900), Duration::from_secs(600));
+    let mut st = state(&dir);
+    st.persist.panic_on_store = true;
+    for n in 0..2 {
+        let (summary, captured) = capture(|| {
+            guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store())
+        });
+        assert_eq!(summary.decision, TickDecisionKind::Defer, "tick {n}");
+        let faults: Vec<_> = captured
+            .metrics
+            .iter()
+            .filter(|p| p.name == MetricName::DaemonTaskFaults)
+            .collect();
+        assert_eq!(faults.len(), 1, "tick {n}");
+        assert_eq!(faults[0].labels["reason"], "panic");
+        assert_eq!(captured.records.len(), 1, "tick {n}: the record is still emitted");
+    }
+}
+
+/// #10880 rule 5, wired: a record for the running version survives ticks
+/// inside the startup grace and is cleared by the first one after it.
+#[test]
+fn a_roll_that_took_is_forgotten_after_the_startup_grace() {
+    use crate::auto_update::roll_attempt::{RollAttempt, STARTUP_GRACE};
+    let dir = tempfile::tempdir().unwrap();
+    let running = env!("CARGO_PKG_VERSION");
+    let mut probe = ScriptedProbe::new(newer(running, running));
+    let status = AutoUpdateStatus::new(true);
+    let tune = tuning(Duration::from_secs(900), NOW);
+    let mut st = state(&dir);
+    let now_utc = Utc::now();
+    let record = RollAttempt {
+        target: format!("artifact:{running}:aaaa"),
+        version: running.to_string(),
+        tag: format!("v{running}"),
+        source: "autoupdate".to_string(),
+        from_binary: "0.0.1+old".to_string(),
+        attempts: 1,
+        first_armed_at: now_utc,
+        last_armed_at: now_utc,
+        not_before: None,
+        last_failure: None,
+    };
+    st.attempt
+        .restore(Some(record), Instant::now(), now_utc, running);
+    st.attempt.set_started(Instant::now());
+    guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store());
+    assert!(st.attempt.record().is_some(), "kept inside the grace");
+    let Some(long_ago) = Instant::now().checked_sub(STARTUP_GRACE) else {
+        return; // a monotonic clock younger than the grace cannot express it
+    };
+    st.attempt.set_started(long_ago);
+    guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store());
+    assert_eq!(st.attempt.record(), None, "cleared after the grace");
+}
