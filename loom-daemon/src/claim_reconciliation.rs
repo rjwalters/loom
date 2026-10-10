@@ -2020,13 +2020,12 @@ pub mod forge {
         fetch_most_recent_judge_activity_at,
     };
     use super::{
-        apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
-        extract_latest_verdict_sha, plan, plan_pr, resolve_lease_ttl_minutes,
-        resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_anchoring_enabled,
-        verdict_staleness_enabled, AnchorAction, ClaimedPr, LeaseEvidence, NoProgressEvidence,
-        PrClaimKind, PrClaimOutcome, PrReclaimReason, PrReconcileAction, ReclaimReason,
-        ReconcileAction, VerdictAction, VerdictKeepReason, VerdictKind, VerdictPr,
-        VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
+        apply_live_claim_veto, classify_lease_evidence, decide_verdict, extract_latest_verdict_sha,
+        plan, plan_pr, resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes,
+        resolve_stale_hours, verdict_anchoring_enabled, verdict_staleness_enabled, ClaimedPr,
+        LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
+        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
