@@ -256,3 +256,250 @@ fn field_types_match_the_retired_unquoted_splices() {
     // first), but it must still produce parseable JSON if it ever did.
     assert!(json_issue("x").is_string());
 }
+
+// ---------------------------------------------------------------------------
+// #9319: the refusal names the worktree still holding the branch.
+// ---------------------------------------------------------------------------
+
+/// Today's line, spelled out — the string the no-holder path must still equal.
+const BARE_REFUSAL: &str = "Local branch 'feature/issue-42' has already landed on main (already-merged PR #999) - refusing to reuse it. Delete it and re-run: git branch -D feature/issue-42 && ./.loom/scripts/worktree.sh 42";
+
+/// A linked worktree on `feature/issue-42`, under a directory with a space in
+/// its name, optionally carrying the `.loom-managed` sentinel.
+fn linked_worktree(fx: &Fx, managed: bool) -> PathBuf {
+    let wt = fx.root.join("wt s").join("pr-9");
+    fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "feature/issue-42",
+        ],
+    );
+    if managed {
+        fs::write(wt.join(".loom-managed"), "issue=42\n").unwrap();
+    }
+    wt
+}
+
+fn branch_exists(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "-q", "refs/heads/feature/issue-42"])
+        .output()
+        .expect("git")
+        .status
+        .success()
+}
+
+/// Run the first `steps` `&&`-joined commands of a printed remedy, verbatim,
+/// through a real shell in the main workspace — the way an operator would.
+fn run_remedy(repo: &Path, message: &str, steps: usize) -> std::process::Output {
+    let commands = message.rsplit_once("re-run: ").expect("a remedy").1;
+    let head: Vec<&str> = commands.split(" && ").take(steps).collect();
+    Command::new("sh")
+        .arg("-c")
+        .arg(head.join(" && "))
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("sh")
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    fs::canonicalize(a).unwrap() == fs::canonicalize(b).unwrap()
+}
+
+#[test]
+fn with_no_holder_the_refusal_line_is_unchanged() {
+    let fx = fixture("holder-none", true);
+    let o = opts(&fx.repo, false);
+    assert_eq!(holder::find(&fx.repo, &o.branch), None);
+    assert_eq!(refusal_message(&o, Some("999"), None), BARE_REFUSAL);
+    assert_eq!(
+        refusal_message(&o, None, None),
+        BARE_REFUSAL.replace(" (already-merged PR #999)", "")
+    );
+}
+
+#[test]
+fn a_managed_holder_gets_a_remedy_that_works_verbatim() {
+    let fx = fixture("holder-managed", true);
+    let wt = linked_worktree(&fx, true);
+    let o = opts(&fx.repo, false);
+
+    // The defect: the bare remedy's first command is refused by git.
+    let bare = run_remedy(&fx.repo, BARE_REFUSAL, 1);
+    assert!(!bare.status.success(), "git deleted a branch a worktree holds");
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("used by worktree"));
+
+    let held = holder::find(&fx.repo, &o.branch).expect("the pr worktree holds the branch");
+    assert_eq!(held.kind, holder::Kind::Managed);
+    assert!(same_dir(&held.path, &wt));
+
+    let msg = refusal_message(&o, Some("999"), Some(&held));
+    assert!(msg.contains(&held.path.display().to_string()), "{msg}");
+    assert!(
+        msg.ends_with(&format!(
+            "git worktree remove {} --force && git branch -D feature/issue-42 && ./.loom/scripts/worktree.sh 42",
+            holder::shell_word(&held.path)
+        )),
+        "{msg}"
+    );
+
+    // The path contains a space (`re po`'s sibling `wt s`), so this only
+    // passes if the printed path is quoted.
+    let ran = run_remedy(&fx.repo, &msg, 2);
+    assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+    assert!(!wt.exists(), "the stale worktree is still on disk");
+    assert!(!branch_exists(&fx.repo), "the landed branch survived the remedy");
+}
+
+#[test]
+fn the_refusal_itself_removes_nothing_when_a_worktree_holds_the_branch() {
+    let fx = fixture("holder-nondestructive", true);
+    let wt = linked_worktree(&fx, true);
+    let tip = rev(&fx.repo, "feature/issue-42");
+    assert_eq!(run_with(&opts(&fx.repo, false), &|_| merged_at(&tip, "999")), 1);
+    assert_eq!(run_with(&opts(&fx.repo, true), &|_| merged_at(&tip, "999")), 1);
+    assert!(wt.join(".loom-managed").is_file(), "the holding worktree was touched");
+    assert_eq!(rev(&fx.repo, "feature/issue-42"), tip, "branch tip moved");
+}
+
+#[test]
+fn a_user_provisioned_holder_is_named_but_never_offered_for_removal() {
+    let fx = fixture("holder-user", true);
+    let wt = linked_worktree(&fx, false);
+    let o = opts(&fx.repo, false);
+    let held = holder::find(&fx.repo, &o.branch).expect("holder");
+    assert_eq!(held.kind, holder::Kind::Unmanaged);
+    assert!(same_dir(&held.path, &wt));
+
+    let msg = refusal_message(&o, Some("999"), Some(&held));
+    assert!(msg.contains(&held.path.display().to_string()), "{msg}");
+    assert!(msg.contains("still holds it"), "{msg}");
+    assert!(!msg.contains("--force"), "{msg}");
+    assert!(!msg.contains("worktree remove"), "{msg}");
+    // What it does print is still true: nothing after `re-run:` is a removal.
+    assert!(
+        msg.ends_with("re-run: git branch -D feature/issue-42 && ./.loom/scripts/worktree.sh 42")
+    );
+}
+
+#[test]
+fn the_main_workspace_as_holder_is_told_to_switch_not_to_remove() {
+    let fx = fixture("holder-main", true);
+    git(&fx.repo, &["checkout", "-q", "feature/issue-42"]);
+    let o = opts(&fx.repo, false);
+    let held = holder::find(&fx.repo, &o.branch).expect("holder");
+    assert_eq!(held.kind, holder::Kind::Main);
+    assert!(same_dir(&held.path, &fx.repo));
+
+    let msg = refusal_message(&o, Some("999"), Some(&held));
+    assert!(msg.contains("main workspace"), "{msg}");
+    assert!(!msg.contains("worktree remove"), "{msg}");
+    assert!(!msg.contains("--force"), "{msg}");
+
+    let ran = run_remedy(&fx.repo, &msg, 2);
+    assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+    assert!(!branch_exists(&fx.repo));
+}
+
+#[test]
+fn a_worktree_mid_rebase_on_the_branch_is_still_the_holder() {
+    // git reports this worktree as `detached`, so a `branch refs/heads/…`
+    // porcelain match alone would miss it — and `git branch -D` would still
+    // refuse. The answer has to come from `branch_holders`.
+    let fx = fixture("holder-rebase", true);
+    let wt = linked_worktree(&fx, true);
+    fs::write(fx.repo.join("slice.txt"), "main\n").unwrap();
+    git(&fx.repo, &["add", "slice.txt"]);
+    git(&fx.repo, &["commit", "-q", "-m", "conflicting main change"]);
+    let rebase = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "rebase",
+            "main",
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_EDITOR", "true")
+        .output()
+        .expect("git");
+    assert!(!rebase.status.success(), "the rebase must stop on a conflict");
+    let porcelain = Command::new("git")
+        .arg("-C")
+        .arg(&fx.repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git");
+    let porcelain = String::from_utf8_lossy(&porcelain.stdout).into_owned();
+    assert!(
+        !porcelain.contains("branch refs/heads/feature/issue-42"),
+        "precondition: the worktree must read as detached\n{porcelain}"
+    );
+
+    let held = holder::find(&fx.repo, "feature/issue-42").expect("a mid-rebase holder");
+    assert_eq!(held.kind, holder::Kind::Managed);
+    assert!(same_dir(&held.path, &wt));
+}
+
+#[test]
+fn a_failed_holder_probe_degrades_to_the_unchanged_line() {
+    // `git worktree list` cannot run in a directory that is not there.
+    let gone = std::env::temp_dir().join(format!("loom-wt-reuse-gone-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&gone);
+    let o = opts(&gone, false);
+    let held = holder::find(&gone, &o.branch);
+    assert_eq!(held, None);
+    assert_eq!(refusal_message(&o, Some("999"), held.as_ref()), BARE_REFUSAL);
+}
+
+#[test]
+fn the_document_gains_held_by_worktree_and_keeps_every_other_field() {
+    let o = opts(Path::new("/nowhere"), true);
+    // A path holding a space, a double quote and a backslash — all of which a
+    // hand-spliced document would have broken on.
+    let held = holder::Holder {
+        path: PathBuf::from("/tmp/wt s/pr-\"9\\x"),
+        kind: holder::Kind::Managed,
+    };
+    let text = refusal_document(&o, Some("999"), Some(&held)).to_string();
+    let v: serde_json::Value = serde_json::from_str(&text).expect("must parse");
+    assert_eq!(v["heldByWorktree"], "/tmp/wt s/pr-\"9\\x");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "branch-already-landed");
+    assert_eq!(v["issueNumber"], 42);
+    assert_eq!(v["branch"], "feature/issue-42");
+    assert_eq!(v["prNumber"], 999);
+    assert_eq!(v.as_object().unwrap().len(), 6, "an unexpected key: {text}");
+
+    // With no holder the document is the pre-#9319 one, key for key: the
+    // field is absent (so `.heldByWorktree` still reads as null).
+    let none = refusal_document(&o, None, None);
+    assert!(none["heldByWorktree"].is_null());
+    assert_eq!(none.as_object().unwrap().len(), 5, "{none}");
+    assert!(none["prNumber"].is_null());
+}
+
+#[test]
+fn a_path_holding_a_single_quote_is_still_one_shell_word() {
+    let word = holder::shell_word(Path::new("/tmp/it's here"));
+    assert_eq!(word, r"'/tmp/it'\''s here'");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf %s {word}"))
+        .output()
+        .expect("sh");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "/tmp/it's here");
+}
