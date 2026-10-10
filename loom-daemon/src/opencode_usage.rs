@@ -164,8 +164,15 @@ const NATIVE_TOOLS_SUBDIR: &str = ".local/state/loom/native-tools";
 pub const MAX_NATIVE_WORKSPACES: usize = 256;
 
 /// Most launch directories [`native_launch_dbs`] inspects, across all
-/// workspaces — the bound on one scan's `stat` calls.
+/// workspaces — the bound on one scan's per-store `stat` calls. When more
+/// launch directories exist, the most recently modified ones are inspected
+/// (a live launch is among the newest), not an arbitrary `read_dir` slice.
 pub const MAX_NATIVE_LAUNCH_ENTRIES: usize = 4096;
+
+/// Most launch-directory names [`native_launch_dbs`] enumerates before
+/// choosing which [`MAX_NATIVE_LAUNCH_ENTRIES`] to inspect. Only a backlog
+/// above the inspection bound pays one extra `stat` per name, to rank them.
+pub const MAX_NATIVE_LAUNCH_NAMES: usize = 4 * MAX_NATIVE_LAUNCH_ENTRIES;
 
 /// Most per-launch stores [`native_launch_dbs`] returns (the most recently
 /// written ones). Each is one read-only SQLite open per sample, so this bounds
@@ -175,8 +182,8 @@ pub const MAX_NATIVE_LAUNCH_DBS: usize = 128;
 
 /// Every guarded launch's `data/opencode/opencode.db` under `base`
 /// (`<base>/<workspace-hash>/<launch-uuid>/…`), most recently written first,
-/// bounded by [`MAX_NATIVE_WORKSPACES`], [`MAX_NATIVE_LAUNCH_ENTRIES`] and
-/// [`MAX_NATIVE_LAUNCH_DBS`].
+/// bounded by [`MAX_NATIVE_WORKSPACES`], [`MAX_NATIVE_LAUNCH_NAMES`],
+/// [`MAX_NATIVE_LAUNCH_ENTRIES`] and [`MAX_NATIVE_LAUNCH_DBS`].
 ///
 /// "Written" is the newer of the database's and its `-wal`'s mtime, because a
 /// live OpenCode writes through the WAL and may not touch the main file for a
@@ -184,31 +191,50 @@ pub const MAX_NATIVE_LAUNCH_DBS: usize = 128;
 /// a scan never fails.
 #[must_use]
 pub fn native_launch_dbs(base: &Path) -> Vec<PathBuf> {
+    native_launch_dbs_bounded(base, MAX_NATIVE_LAUNCH_ENTRIES)
+}
+
+/// [`native_launch_dbs`] with the inspection bound injectable (tests).
+fn native_launch_dbs_bounded(base: &Path, max_entries: usize) -> Vec<PathBuf> {
     let Ok(workspaces) = std::fs::read_dir(base) else {
         return Vec::new();
     };
-    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let mut inspected = 0usize;
-    for workspace in workspaces.flatten().take(MAX_NATIVE_WORKSPACES) {
-        let Ok(launches) = std::fs::read_dir(workspace.path()) else {
+    let mut launches: Vec<PathBuf> = Vec::new();
+    'enumerate: for workspace in workspaces.flatten().take(MAX_NATIVE_WORKSPACES) {
+        let Ok(entries) = std::fs::read_dir(workspace.path()) else {
             continue;
         };
-        for launch in launches.flatten() {
-            if inspected >= MAX_NATIVE_LAUNCH_ENTRIES {
-                break;
+        for launch in entries.flatten() {
+            if launches.len() >= MAX_NATIVE_LAUNCH_NAMES {
+                break 'enumerate;
             }
-            inspected += 1;
-            let db = launch
-                .path()
-                .join("data")
-                .join("opencode")
-                .join("opencode.db");
-            let Some(written) = last_written(&db) else {
-                continue;
-            };
-            candidates.push((written, db));
+            launches.push(launch.path());
         }
     }
+    if launches.len() > max_entries {
+        // A backlog: rank by the launch directory's own mtime so the live
+        // launch is not lost to arbitrary directory order.
+        let mut ranked: Vec<(Option<std::time::SystemTime>, PathBuf)> = launches
+            .into_iter()
+            .map(|dir| {
+                let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                (modified, dir)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        launches = ranked
+            .into_iter()
+            .take(max_entries)
+            .map(|(_, dir)| dir)
+            .collect();
+    }
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = launches
+        .into_iter()
+        .filter_map(|launch| {
+            let db = launch.join("data").join("opencode").join("opencode.db");
+            last_written(&db).map(|written| (written, db))
+        })
+        .collect();
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     candidates
         .into_iter()

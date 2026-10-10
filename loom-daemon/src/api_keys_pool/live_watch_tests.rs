@@ -126,6 +126,77 @@ fn polls_a_growing_file_by_offset_and_restarts_on_truncation() {
     assert_eq!(watch.poll(&tmp.path().join("missing.log")), None);
 }
 
+/// Judge finding on PR #11307: an over-64KiB transcript event straddling a
+/// poll boundary must not have its tail read as a fresh (prose) line. The
+/// tail here carries an Exhausted needle, as a `judge.md` tool result would.
+#[test]
+fn an_over_long_line_split_across_two_polls_never_decides() {
+    let mut watch = LiveWatch::new(ANCHOR);
+    watch.feed(&header("pool"));
+    let head = format!("{{\"type\":\"tool_result\",\"text\":\"{}", "x".repeat(70 * 1024));
+    assert_eq!(watch.feed(&head), None);
+    assert_eq!(watch.feed("... quota exceeded ...\"}\n"), None);
+    assert!(!watch.decided());
+    // The line after it is read normally.
+    assert!(watch.feed("Error: insufficient balance\n").is_some());
+}
+
+#[test]
+fn an_over_long_line_split_across_many_polls_never_decides() {
+    let mut watch = LiveWatch::new(ANCHOR);
+    watch.feed(&header("pool"));
+    // A complete line, then the head of an over-long one, in one poll.
+    let first = format!(
+        "{{\"type\":\"text\",\"text\":\"ok\"}}\n{{\"type\":\"tool_result\",\"text\":\"{}",
+        "y".repeat(65 * 1024)
+    );
+    assert_eq!(watch.feed(&first), None);
+    // Middle chunks without a newline, one carrying the needle.
+    assert_eq!(watch.feed(&"z".repeat(40 * 1024)), None);
+    assert_eq!(watch.feed("Error: quota exceeded"), None);
+    assert_eq!(watch.feed(&"z".repeat(40 * 1024)), None);
+    // The tail, terminated, with the needle again, then a short partial.
+    assert_eq!(watch.feed("insufficient balance\"}\nError: insuff"), None);
+    assert!(!watch.decided());
+    // The short partial after the over-long line is kept and read whole.
+    assert!(watch.feed("icient balance\n").is_some());
+}
+
+#[test]
+fn an_over_long_line_via_poll_is_discarded_to_its_newline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sweep.log");
+    let mut contents = header("pool");
+    contents.push_str("{\"type\":\"tool_result\",\"text\":\"");
+    // Long enough that the 1 MiB per-poll cap cuts it mid-line.
+    contents.push_str(&"x".repeat(MAX_READ_PER_POLL as usize + 1024));
+    contents.push_str(" quota exceeded \"}\n");
+    std::fs::write(&path, &contents).unwrap();
+    let mut watch = LiveWatch::new(ANCHOR);
+    assert_eq!(watch.poll(&path), None);
+    assert_eq!(watch.poll(&path), None);
+    assert!(!watch.decided());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_log_replaced_by_one_at_least_as_long_is_read_from_the_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sweep.log");
+    std::fs::write(&path, header("pool")).unwrap();
+    let mut watch = LiveWatch::new(ANCHOR);
+    assert_eq!(watch.poll(&path), None);
+    // A new file (new inode) renamed over the log, longer than the old one,
+    // whose launch is NOT pool-selected. A length check alone would resume
+    // mid-file, keep the stale pool record, and mark the seat.
+    let replacement = tmp.path().join("sweep.log.new");
+    std::fs::write(&replacement, format!("{}Error: insufficient balance\n", header("env")))
+        .unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert_eq!(watch.poll(&path), None, "re-read from the start");
+    assert!(!watch.decided());
+}
+
 /// End to end with the shared marking half: the live decision marks the seat
 /// until the configured plan window, and the account leaves selection.
 #[test]

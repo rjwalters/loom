@@ -53,7 +53,9 @@ use super::ingest::{parse_launch_record, LaunchRecord, LAUNCH_RECORD_PREFIX};
 pub const MAX_READ_PER_POLL: u64 = 1024 * 1024;
 
 /// Longest unterminated trailing line kept between polls. Anything longer is
-/// a transcript event (provider error lines are short), so it is dropped.
+/// a transcript event (provider error lines are short), so it is dropped —
+/// and so is the rest of it, up to its terminating newline, when that arrives
+/// in a later poll (see [`LiveWatch::feed`]).
 const MAX_PARTIAL_LINE: usize = 64 * 1024;
 
 /// Provider-written lines kept for the reset-horizon parse.
@@ -77,6 +79,14 @@ pub struct LiveWatch {
     anchor: String,
     offset: u64,
     partial: String,
+    /// An over-long line's head was dropped: everything up to (and
+    /// including) the next `\n` is that line's tail and must not be read as
+    /// a fresh line (a JSON tool-result tail would otherwise classify as
+    /// provider prose — the #8521 over-marking failure).
+    discarding_line: bool,
+    /// `(dev, inode)` of the log as last read, so a replacement at least as
+    /// long as the old file is still noticed. `None` off unix.
+    file_id: Option<(u64, u64)>,
     in_region: bool,
     record: Option<LaunchRecord>,
     credential_failure: bool,
@@ -110,11 +120,15 @@ impl LiveWatch {
     /// unreadable log is "no opinion" and is retried next poll.
     pub fn poll(&mut self, log: &Path) -> Option<LiveExhaustion> {
         let mut file = std::fs::File::open(log).ok()?;
-        let len = file.metadata().ok()?.len();
-        if len < self.offset {
+        let meta = file.metadata().ok()?;
+        let len = meta.len();
+        let file_id = file_identity(&meta);
+        let replaced = self.offset > 0 && self.file_id.is_some() && file_id != self.file_id;
+        if len < self.offset || replaced {
             // Truncated or replaced: start over, as a fresh watch would.
             *self = Self::new(std::mem::take(&mut self.anchor));
         }
+        self.file_id = file_id;
         file.seek(SeekFrom::Start(self.offset)).ok()?;
         let mut bytes = Vec::new();
         file.take(MAX_READ_PER_POLL).read_to_end(&mut bytes).ok()?;
@@ -124,6 +138,18 @@ impl LiveWatch {
 
     /// Feed newly appended text (pure half of [`Self::poll`]).
     pub fn feed(&mut self, appended: &str) -> Option<LiveExhaustion> {
+        let mut appended = appended;
+        if self.discarding_line {
+            // Still inside an over-long line whose head was dropped: its tail
+            // is not a line of its own.
+            match appended.find('\n') {
+                Some(end) => {
+                    appended = &appended[end + 1..];
+                    self.discarding_line = false;
+                }
+                None => return self.decision(),
+            }
+        }
         let mut text = std::mem::take(&mut self.partial);
         text.push_str(appended);
         let complete = match text.rfind('\n') {
@@ -131,12 +157,16 @@ impl LiveWatch {
                 let rest = text.split_off(end + 1);
                 if rest.len() <= MAX_PARTIAL_LINE {
                     self.partial = rest;
+                } else {
+                    self.discarding_line = true;
                 }
                 text
             }
             None => {
                 if text.len() <= MAX_PARTIAL_LINE {
                     self.partial = text;
+                } else {
+                    self.discarding_line = true;
                 }
                 return self.decision();
             }
@@ -218,6 +248,19 @@ impl LiveWatch {
                 .join("\n"),
         })
     }
+}
+
+/// `(dev, inode)` identifying the open log, so [`LiveWatch::poll`] notices a
+/// replacement that is not shorter than what was already read.
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(test)]

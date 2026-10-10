@@ -646,6 +646,36 @@ fn the_per_launch_scan_is_bounded_and_prefers_the_most_recently_written() {
     assert!(native_launch_dbs(&base.join("absent")).is_empty());
 }
 
+/// Judge note on PR #11307: when the launch backlog exceeds the inspection
+/// bound, the newest launch directories are inspected, not whichever ones
+/// `read_dir` happened to yield first.
+#[test]
+fn a_launch_backlog_over_the_inspection_bound_keeps_the_newest_launches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let total = 12;
+    for i in 0..total {
+        let launch = base.join("ws").join(format!("uuid-{i:04}"));
+        let dir = launch.join("data/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.db"), b"").unwrap();
+        let at = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000 + i as u64);
+        std::fs::File::open(&launch)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+    let found = native_launch_dbs_bounded(base, 3);
+    let mut expected: Vec<_> = (total - 3..total)
+        .map(|i| base.join(format!("ws/uuid-{i:04}/data/opencode/opencode.db")))
+        .collect();
+    expected.sort();
+    let mut got = found.clone();
+    got.sort();
+    assert_eq!(got, expected, "{found:?}");
+}
+
 /// End to end: a sweep's tokens in a guarded per-launch store reach the
 /// per-sweep usage reader (and, through the same discovery, the burn sampler).
 #[test]
