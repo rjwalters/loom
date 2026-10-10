@@ -548,7 +548,8 @@ fn cmd_roster(ctx: &Ctx, check: bool, apply: bool, json: bool) -> Result<i32> {
     }
     if unapplied > 0 {
         eprintln!(
-            "{unapplied} desired repo(s) not cloned under {} — not registered",
+            "{unapplied} desired repo(s) not cloned under {} — not registered (this command \
+             never clones; a daemon with fleet.autoApply clones them on its timer pass)",
             parsed.root.display()
         );
         return Ok(1);
