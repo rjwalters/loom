@@ -130,6 +130,20 @@ fn monitor_drop_latch_is_idempotent_and_ignores_reset() {
 }
 
 #[test]
+fn monitor_out_of_order_reading_does_not_double_count_growth() {
+    let mut m = OtlpHealthMonitor::default();
+    let i = OtlpHealthInputs {
+        last_success_at: Some(t(30)),
+        ..base()
+    };
+    m.observe(i.clone(), Some(5), t(1));
+    // Stale lower reading applied late, then the true reading again: only the
+    // first rise above the high-water mark counts, and 5 -> 5 is not growth.
+    m.observe(i.clone(), Some(3), t(30));
+    assert_eq!(m.observe(i, Some(5), t(31)).health.state, OtlpExportState::Ok);
+}
+
+#[test]
 fn serializes_snake_case_and_omits_empty_detail() {
     let v = serde_json::to_value(OtlpExportHealth {
         state: OtlpExportState::NoExporter,

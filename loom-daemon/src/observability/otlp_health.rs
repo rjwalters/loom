@@ -191,11 +191,14 @@ impl OtlpHealthMonitor {
     ) -> Observation {
         let first_seen = *self.first_seen_at.get_or_insert(now);
         if let Some(dropped) = dropped_total {
-            // A decrease is a counter reset (daemon restart), not growth.
-            if self.last_dropped.is_some_and(|prev| dropped > prev) {
+            // A decrease is a counter reset or a reading applied out of order
+            // by a concurrent caller, not growth. Keep the high-water mark so
+            // a late stale reading cannot make the next one double-count.
+            let prev = self.last_dropped;
+            if prev.is_some_and(|p| dropped > p) {
                 self.last_drop_growth_at = Some(now);
             }
-            self.last_dropped = Some(dropped);
+            self.last_dropped = Some(prev.map_or(dropped, |p| p.max(dropped)));
         }
         base.started_at = base.started_at.or(Some(first_seen));
         base.last_drop_growth_at = self.last_drop_growth_at;
