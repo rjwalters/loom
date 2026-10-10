@@ -1185,8 +1185,17 @@ per-issue clean / substantive-rework / environmental-rework split), IE2 (the
 issues whose cost was mostly environment), IE3 (the attempt/trigger
 distribution), IE4 (in-sweep rework by kind), IE5 (how much of the cost the
 classification can attribute at all). It reads the raw `records` store,
-complementing #9446's `sweep_facts` rollup (whose rework columns are
-per-classification *counts*, not per-event durations).
+complementing #9446's `sweep_facts` rollup. That rollup now carries the
+seconds too (#9507): `rework_substantive_sec` / `rework_environmental_sec`
+(Σ measured `duration_sec` per class) and `rework_substantive_open` /
+`rework_environmental_open` (events with no `duration_sec` — open, never
+zero) beside the per-classification counts, in D1 and both ClickHouse
+extractions; `defaults/observability/sweep-facts/issue-effort.sql`'s
+`issue_effort` view applies IE1's arithmetic and trigger → bucket table to
+them (`clean_sec` / `substantive_rework_sec` / `environmental_rework_sec` /
+`unattributed_sec`, plus `overaccounted_sec` and coverage), so dashboards
+reading the bundle get the same split IE1 computes from raw `records`. IE4's
+per-*kind* breakdown remains raw-store-only.
 
 **PR linkage and the model that ran** (Issue #9465): `pr_numbers` (integer
 array, first-seen order) lists every PR the sweep's lifecycle was observed to
