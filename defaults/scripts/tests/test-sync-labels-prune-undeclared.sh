@@ -20,6 +20,9 @@
 #      label remains.
 #   4. A bare --dry-run (no --prune-undeclared) stays forge-free.
 #   5. --help documents the flag.
+#   6. The real run passes the real #9548 write-scope gate (the fixture is
+#      registered, nothing is stubbed), and a target the credential cannot
+#      write gets no `label delete` at all.
 #
 # Usage:
 #   ./defaults/scripts/tests/test-sync-labels-prune-undeclared.sh
@@ -33,12 +36,15 @@ SLS="$SCRIPTS_DIR/sync-labels.sh"
 # shellcheck source=lib/require-daemon-bin.sh
 source "$TEST_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin "$SCRIPTS_DIR" "labels"
-# The real run vets its write target (`forge may-write`, #9548); that decision
-# is test-write-scope.sh's subject, not this suite's.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$TEST_DIR/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# The real run vets its write target twice (#9548): the shell's
+# `loom_write_repo` and `labels undeclared --prune`'s own may_write_from. The
+# fixture is registered so the real gate admits it (write-scope-fixture.sh).
+# shellcheck source=lib/write-scope-fixture.sh
+source "$TEST_DIR/lib/write-scope-fixture.sh"
+# The permission probe must ask the fixture's gh, not a host's cached GitHub
+# App installation snapshot (which never lists owner/repo): the snapshot's own
+# kill switch restores the probe's two-leg path. The gate itself still runs.
+export LOOM_INSTALLATION_SNAPSHOT=0
 
 PASSED=0
 FAILED=0
@@ -49,7 +55,7 @@ contains() { if [[ "$2" == *"$3"* ]]; then pass "$1"; else fail "$1" "missing '$
 lacks() { if [[ "$2" != *"$3"* ]]; then pass "$1"; else fail "$1" "unexpected '$3' in: ${2:0:900}"; fi; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP" "$WS_STUB_DIR" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP" 2>/dev/null || true' EXIT
 STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
 
@@ -89,6 +95,9 @@ cat > "$SRC/.github/labels.yml" <<'EOF'
 # END LOOM LABELS
 EOF
 
+WRITE_SCOPE_INNER_GH="$STUB_DIR/gh" write_scope_register "$SRC" owner/repo
+FIXTURE_GH="$LOOM_GH_BIN"
+
 LIVE=$'loom:issue\nloom:healing\nloom:failed:judge\nloom:in-progress\nbug\nrust\npriority:high'
 GH_LOG="$TMP/gh.log"
 RC=0 OUT="" LOG=""
@@ -96,7 +105,7 @@ run_sls() {
     : > "$GH_LOG"
     OUT="$(
         cd "$SRC" || exit 99
-        PATH="$STUB_DIR:$PATH" LOOM_GH_BIN="$STUB_DIR/gh" \
+        PATH="$STUB_DIR:$PATH" LOOM_GH_BIN="$FIXTURE_GH" \
         LOOM_TEST_GH_LOG="$GH_LOG" LOOM_TEST_GH_LIVE="$LIVE" \
         LOOM_CONFIG_DEFAULTS_FILE="" LOOM_FORGE_TYPE=github \
         bash "$SLS" "$@" 2>&1
@@ -128,6 +137,15 @@ lacks "a declared label is not deleted" "$LOG" "label delete loom:issue"
 lacks "a non-loom: label is not deleted" "$LOG" "label delete rust"
 contains "pruned labels are reported" "$OUT" "PRUNED loom:healing"
 contains "kept label is reported" "$OUT" "KEPT loom:in-progress (open: #7)"
+
+echo "=== a credential that cannot write the target deletes nothing ==="
+rm -rf "$LOOM_WRITE_SCOPE_CACHE_DIR"
+WRITE_SCOPE_INNER_GH="$STUB_DIR/gh" write_scope_register "$SRC" owner/repo pull
+run_sls --repo owner/repo --prune-undeclared
+if [[ "$RC" -ne 0 ]]; then pass "a refused prune exits non-zero"; else fail "a refused prune exits non-zero" "got 0"; fi
+lacks "a refused prune makes no label delete" "$LOG" "label delete"
+rm -rf "$LOOM_WRITE_SCOPE_CACHE_DIR"
+WRITE_SCOPE_INNER_GH="$STUB_DIR/gh" write_scope_register "$SRC" owner/repo
 
 echo "=== a bare --dry-run stays forge-free ==="
 run_sls --repo owner/repo --dry-run

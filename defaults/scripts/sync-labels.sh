@@ -73,7 +73,8 @@
 # on in the label picker. A label still on an OPEN issue/PR is kept and
 # reported, never deleted. With --dry-run it is the read-only report of every
 # undeclared loom:* label (the one dry run that reads the forge, like
-# --prune-defaults --dry-run). GitHub-only; the logic is
+# --prune-defaults --dry-run); a bare --dry-run deliberately stays forge-free
+# (#4498) and only points at the flag. GitHub-only; the logic is
 # `loom-daemon labels undeclared` (shell-language policy: this is `contract`
 # shell, so only the call-site lives here).
 # requires-daemon: labels optional  only --prune-undeclared needs `labels undeclared`; an older binary is refused with a clear message there and every other path is unaffected
