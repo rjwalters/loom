@@ -240,7 +240,7 @@ pub fn initialize_workspace_with_mode(
     // configuration too, so it is installed HERE, at install time only, and
     // not by `install_payload_files` below — that step is also what a daemon
     // resync runs, and it overwrites wholesale. See `install_config_dir_files`.
-    install_config_dir_files(workspace, &defaults, &loom_path, force, &mut report)?;
+    install_config_dir_files(&defaults, &loom_path, &mut report)?;
     // The Loom payload proper: every file this step writes is a verbatim
     // function of `defaults/` and the previous install's ownership record.
     // `payload::materialize_payload` (#10717) runs this same step into a
@@ -448,14 +448,14 @@ fn copy_single_file(
 /// - **Absent** → copied verbatim, recorded as `added`.
 /// - **Present** → left exactly as it is, recorded as `preserved` (which also
 ///   keeps it out of `verification_failures`).
-/// - **Present, and `force` is set** → overwritten with the shipped copy,
-///   recorded as `updated`. This mirrors `scripts/install-loom.sh`, which
-///   overwrites under `--force`/`--clean` and passes `--force` to this init in
-///   exactly those two cases. One exception: a path pinned in
-///   `.loom/resync-ignore` is preserved even under `force`, because a
-///   repo-owned declaration outranks the installer everywhere else in init
-///   (#5971) and `install.sh --quick --confirm-reinstall` passes `--force`
-///   unconditionally.
+/// - **`force` changes neither rule.** Init never overwrites one of these
+///   files, which mirrors `install.sh`'s `finalize_quick_install`.
+///   `install.sh --quick --confirm-reinstall` passes `--force` unconditionally,
+///   and a legacy (pre-manifest) uninstall leaves `.loom/config/` in place, so
+///   an overwrite here would silently replace a consumer's edit.
+///   `scripts/install-loom.sh` keeps its own overwrite under `--force`/`--clean`
+///   in its shell copy. To get the shipped copy back from init, delete the file
+///   and re-run it.
 ///
 /// Deliberately NOT part of [`install_payload_files`]: a daemon resync runs
 /// that step, so a copy there would overwrite a consumer's edits on every
@@ -463,10 +463,8 @@ fn copy_single_file(
 /// `skill-routes.json` is the documented way to switch the router hook off.
 /// `payload::surfaces::INSTALL_TIME_ONLY` carries the matching declaration.
 fn install_config_dir_files(
-    workspace: &Path,
     defaults: &Path,
     loom_path: &Path,
-    force: bool,
     report: &mut InitReport,
 ) -> Result<(), String> {
     let src_dir = defaults.join("config");
@@ -493,7 +491,6 @@ fn install_config_dir_files(
     let dst_dir = loom_path.join("config");
     fs::create_dir_all(&dst_dir)
         .map_err(|e| format!("Failed to create {}: {e}", dst_dir.display()))?;
-    let ownership = OwnershipBoundary::load(workspace);
 
     for name in names {
         let src = src_dir.join(&name);
@@ -501,22 +498,14 @@ fn install_config_dir_files(
         let rel = format!(".loom/config/{name}");
         // `symlink_metadata`, not `exists()`: a dangling symlink is still
         // something the consumer put there, and is preserved like a file.
-        let present = fs::symlink_metadata(&dst).is_ok();
-        let overwrite = force && !ownership.is_declared_repo_owned(&rel);
-
-        if present && !overwrite {
+        if fs::symlink_metadata(&dst).is_ok() {
             log::info!("init: config/{name}: preserved existing {}", dst.display());
             report.preserved.push(rel);
             continue;
         }
 
         fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config/{name}: {e}"))?;
-        if present {
-            log::info!("init: config/{name}: force-overwrote {}", dst.display());
-            report.updated.push(rel);
-        } else {
-            report.added.push(rel);
-        }
+        report.added.push(rel);
     }
     Ok(())
 }

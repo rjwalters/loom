@@ -105,35 +105,34 @@ fn test_reinstall_preserves_an_edited_config_file() {
 }
 
 #[test]
-fn test_force_overwrites_an_edited_config_file() {
-    // Mirrors scripts/install-loom.sh, which overwrites under --force/--clean
-    // and passes --force to init in exactly those cases.
+fn test_force_preserves_an_edited_config_file() {
+    // Init never overwrites these files, with or without --force:
+    // `install.sh --quick --confirm-reinstall` passes --force unconditionally,
+    // and a legacy uninstall leaves `.loom/config/` in place before it.
     let (_tmp, workspace, defaults) = fixture(&[("skill-routes.json", SHIPPED)]);
     init(&workspace, &defaults, false);
     fs::write(workspace.join(ROUTES), EDITED).unwrap();
 
     let report = init(&workspace, &defaults, true);
 
-    assert_eq!(fs::read_to_string(workspace.join(ROUTES)).unwrap(), SHIPPED);
-    assert!(report.updated.iter().any(|p| p == ROUTES), "{:?}", report.updated);
-    assert!(!report.preserved.iter().any(|p| p == ROUTES), "{:?}", report.preserved);
+    assert_eq!(fs::read_to_string(workspace.join(ROUTES)).unwrap(), EDITED);
+    assert!(report.preserved.iter().any(|p| p == ROUTES), "{:?}", report.preserved);
+    assert!(!report.updated.iter().any(|p| p == ROUTES), "{:?}", report.updated);
 }
 
 #[test]
-fn test_force_preserves_a_config_file_pinned_in_resync_ignore() {
-    // A repo-owned declaration outranks --force, as it does for every other
-    // installer step (#5971). Both spellings of the pin are honoured.
-    for pin in ["config/skill-routes.json", ".loom/config/skill-routes.json"] {
-        let (_tmp, workspace, defaults) = fixture(&[("skill-routes.json", SHIPPED)]);
-        init(&workspace, &defaults, false);
-        fs::write(workspace.join(ROUTES), EDITED).unwrap();
-        fs::write(workspace.join(".loom/resync-ignore"), format!("# ours\n{pin}\n")).unwrap();
+fn test_force_installs_a_missing_config_file() {
+    // The manifest-era `--confirm-reinstall` shape: the uninstall removed the
+    // file, then init runs with --force and copies the shipped one.
+    let (_tmp, workspace, defaults) = fixture(&[("skill-routes.json", SHIPPED)]);
+    init(&workspace, &defaults, false);
+    fs::remove_file(workspace.join(ROUTES)).unwrap();
 
-        let report = init(&workspace, &defaults, true);
+    let report = init(&workspace, &defaults, true);
 
-        assert_eq!(fs::read_to_string(workspace.join(ROUTES)).unwrap(), EDITED, "pin {pin}");
-        assert!(report.preserved.iter().any(|p| p == ROUTES), "{:?}", report.preserved);
-    }
+    assert_eq!(fs::read_to_string(workspace.join(ROUTES)).unwrap(), SHIPPED);
+    assert!(report.added.iter().any(|p| p == ROUTES), "{:?}", report.added);
+    assert!(!report.updated.iter().any(|p| p == ROUTES), "{:?}", report.updated);
 }
 
 #[test]
