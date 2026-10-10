@@ -806,17 +806,17 @@ Run the appropriate build check after every meaningful code change:
 | Language | Build Check Command | What It Catches |
 |----------|-------------------|-----------------|
 | Rust | `cargo check` | Type errors, borrow checker violations, async Send issues |
-| Rust | `cargo clippy` | Common mistakes, anti-patterns, correctness issues |
+| Rust | CI's lint (not bare `cargo clippy`) | Anti-patterns, unused imports |
 | TypeScript | `pnpm tsc --noEmit` | Type errors, missing imports |
 
 For Rust changes specifically, run these **before committing**:
 ```bash
 cargo check          # Fast compilation check (no codegen)
-cargo clippy         # Lint for common mistakes
-cargo fmt            # Format code
+cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings  # elsewhere: discover CI's flags
+cargo fmt
 ```
 
-`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
+Passing scoped tests is not passing lint: report lint separately; a missing tool is "unvalidated". Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
 
 ### Build-time performance
 

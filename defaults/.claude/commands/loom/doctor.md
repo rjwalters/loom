@@ -1258,7 +1258,7 @@ Comment on the PR when pushing fixes ("Addressed: formatting, added tests for ed
 
 ### Quality Checks
 ```bash
-# Always run full CI before pushing
+# Run CI's exact checks (lint with its feature/target flags; report apart from tests; missing tool = unvalidated)
 pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 
 # Check specific areas if review mentioned them
