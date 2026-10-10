@@ -508,3 +508,38 @@ fn a_head_move_with_a_review_claim_and_a_stuck_doctor_claim_keeps_the_queue_labe
     assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
     assert!(f.sorted().contains(&"loom:reviewing".to_string()));
 }
+
+/// The old rejection could not be put back after a head move: the queue label
+/// is then the only lifecycle label left, so it must stay.
+#[test]
+fn a_head_move_whose_restore_fails_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.fail_add_of = Some(CHANGES);
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
+    assert_eq!(f.sorted(), names(&[QUEUE]));
+}
+
+#[test]
+fn a_head_move_with_a_stuck_claim_and_a_failed_restore_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.fail_add_of = Some(CHANGES);
+    f.fail_remove = vec![CLAIM];
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
+    assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
+}
+
+/// Unreadable evidence after the DELETE and the restore fails: the own add
+/// stays, so the PR keeps a lifecycle label.
+#[test]
+fn an_unverified_removal_whose_restore_fails_keeps_the_queue_label() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.rejected_seq = vec![Some(false), None];
+    f.fail_add_of = Some(CHANGES);
+    let out = run(&mut f, PUSHED);
+    assert!(matches!(out, Outcome::Failed(_)), "{out:?}");
+    assert!(f.sorted().contains(&QUEUE.to_string()), "{:?}", f.sorted());
+}

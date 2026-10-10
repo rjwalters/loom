@@ -250,8 +250,10 @@ fn unverified_rejection(forge: &mut impl Forge) -> Outcome {
 /// The post-removal rejection check was unreadable: put the old label back
 /// and withdraw the own add, as if the removal never happened.
 fn unverified_removal(forge: &mut impl Forge) -> Outcome {
+    // Add-before-remove: the queue label is the only lifecycle label left once
+    // CHANGES is gone, so it stays unless CHANGES is back.
     let restored = forge.add(CHANGES);
-    let withdrawn = forge.remove(QUEUE);
+    let withdrawn = restored && forge.remove(QUEUE);
     if restored && withdrawn {
         Outcome::Failed(format!(
             "the comments could not be read after removing {CHANGES}; restored it and withdrew \
@@ -281,7 +283,9 @@ fn stand_down_head_moved(
     // A review claim is an overlay on the queue label: without a verdict the
     // claim alone cannot bring the PR back if that review stands down.
     let keep_queue = !newer_verdict && post.has("loom:reviewing");
-    let withdrawn = keep_queue || forge.remove(QUEUE);
+    // Add-before-remove: with no replacement label (restore failed), the queue
+    // label is all that is left, so keep it.
+    let withdrawn = keep_queue || (restored && forge.remove(QUEUE));
     if restored && withdrawn {
         Outcome::HeadMoved(post.head_sha.clone())
     } else {
@@ -343,11 +347,8 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     // stand-down must not report it as released.
     if !same_sha(&post.head_sha, expected_head) {
         if post.has(CLAIM) {
-            let keep_queue =
-                !(post.has(CHANGES) || post.has("loom:pr")) && post.has("loom:reviewing");
-            if !keep_queue {
-                forge.remove(QUEUE);
-            }
+            // Same undo as a clean stand-down; the stuck claim makes it a failure.
+            stand_down_head_moved(forge, &post, changes_removed);
             return Outcome::Failed(format!(
                 "head moved to {} during the hand-back and {CLAIM} could not be removed",
                 post.head_sha
