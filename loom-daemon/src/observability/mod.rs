@@ -118,6 +118,7 @@ pub mod llm_billing;
 pub mod ops;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+pub mod otlp_health;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
@@ -195,6 +196,15 @@ pub struct ObservabilityConfig {
     /// are kept as raw strings for the same reason as [`Self::exporter`]:
     /// [`resolve_exporters`] owns the warn-and-skip of an unknown kind.
     pub exporters: Option<Vec<RawExporterEntry>>,
+    /// `observability.otlp_required` (Issue #11353): `false` opts this host out
+    /// of the "must export OTLP" health check; needs
+    /// [`Self::otlp_exempt_reason`] to take effect.
+    pub otlp_required: Option<bool>,
+    /// `observability.otlp_exempt_reason`: why this host is exempt.
+    pub otlp_exempt_reason: Option<String>,
+    /// `observability.otlp_failure_window_minutes`: the no-success window
+    /// after which OTLP export is `failing` (default 15).
+    pub otlp_failure_window_minutes: Option<u64>,
 }
 
 /// One raw `observability.exporters` entry as parsed from config (Issue
@@ -310,6 +320,19 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         exporters: block.get("exporters").and_then(parse_raw_exporters),
+        otlp_required: ["otlp_required", "otlpRequired"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_bool),
+        otlp_exempt_reason: ["otlp_exempt_reason", "otlpExemptReason"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        otlp_failure_window_minutes: ["otlp_failure_window_minutes", "otlpFailureWindowMinutes"]
+            .iter()
+            .find_map(|k| block.get(*k))
+            .and_then(serde_json::Value::as_u64),
     }
 }
 

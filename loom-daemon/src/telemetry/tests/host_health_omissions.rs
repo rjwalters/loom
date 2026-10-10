@@ -42,6 +42,7 @@ fn host_health_omits_built_at_when_unknown() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -89,6 +90,7 @@ fn host_health_omits_managed_repos_when_empty() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -131,6 +133,7 @@ fn host_health_omits_persistent_when_empty_but_still_carries_roles() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -168,6 +171,7 @@ fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -207,6 +211,7 @@ fn host_health_omits_protection_when_absent() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -247,6 +252,7 @@ fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -294,6 +300,7 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     });
     let value = serde_json::to_value(&record).unwrap();
@@ -302,4 +309,57 @@ fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
     assert!(protection.get("watchdog_provisioned").is_none());
     let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
     assert_eq!(decoded, record);
+}
+
+#[test]
+fn host_health_otlp_export_is_omitted_when_unreported_and_round_trips() {
+    use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
+    let mut value = serde_json::to_value(sample_record_for_otlp_export(None)).unwrap();
+    assert!(
+        value
+            .get("record")
+            .unwrap_or(&value)
+            .get("otlp_export")
+            .is_none(),
+        "an unreported state must be absent, never read as ok"
+    );
+    let health = OtlpExportHealth {
+        state: OtlpExportState::NoExporter,
+        detail: Some("no usable `otlp` entry".to_string()),
+    };
+    let record = sample_record_for_otlp_export(Some(health));
+    value = serde_json::to_value(&record).unwrap();
+    let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded, record);
+}
+
+fn sample_record_for_otlp_export(
+    otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
+) -> TelemetryRecord {
+    TelemetryRecord::HostHealth(HostHealthRecord {
+        captured_at: ts(),
+        daemon_version: "0.17.0".to_string(),
+        build_commit: "unknown".to_string(),
+        built_at: None,
+        uptime_sec: 1,
+        logical_cpus: 4,
+        cpu_idle_fraction: None,
+        load_per_core: None,
+        worktree_root_free_gb: None,
+        worktree_root_total_gb: None,
+        active_sweep_ids: Vec::new(),
+        dispatch_halted: false,
+        halt_reason: None,
+        managed_repos: Vec::new(),
+        roles: RoleTickHealth::default(),
+        protection: None,
+        admission_brake: None,
+        is_captain: None,
+        armed_singleton_jobs: Vec::new(),
+        captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
+        otlp_export,
+        memory: None,
+    })
 }

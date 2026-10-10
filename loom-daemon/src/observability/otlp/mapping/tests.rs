@@ -226,6 +226,7 @@ fn host_health_envelope() -> TelemetryEnvelope {
             captainless_singleton_jobs: Vec::new(),
             exported_kinds: Vec::new(),
             exporters: Vec::new(),
+            otlp_export: None,
             memory: Some(MemoryPressureSummary {
                 mem_total_bytes: Some(34_359_738_368),
                 mem_available_bytes: Some(4_294_967_296),
@@ -642,6 +643,7 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         captainless_singleton_jobs: Vec::new(),
         exported_kinds: Vec::new(),
         exporters: Vec::new(),
+        otlp_export: None,
         memory: None,
     };
     let batch = vec![envelope(

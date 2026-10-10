@@ -482,6 +482,36 @@ new config knob, an HTTP scrape in the sender loop, and a new state wired
 through every surface. Tracked separately — until it exists, the end-to-end
 check is external and the daemon says so instead of implying otherwise.
 
+## 3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)
+
+A daemon that does not export to SigNoz looks healthy everywhere else, so the
+condition is a first-class health check with four states, shown on the
+`OTLP export:` line of `loom-daemon status`, as `otlp_export` in
+`status --json`, and as `otlp_export` on the `host.health` record:
+
+| State | Meaning |
+|---|---|
+| `no_exporter` | The resolved `observability.exporters` has no usable `otlp` entry (or observability is off), or the binary was built without the `otlp` feature (#10700). |
+| `failing` | An `otlp` exporter is configured, but no batch was acked within the window, or the OTLP queue's `dropped_total` grew within the window. |
+| `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
+| `exempt` | The host opted out; the reason is shown. |
+
+Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A WARN is logged at
+daemon start and on each change of state, never per tick.
+
+```json
+{ "observability": {
+    "otlp_required": false,
+    "otlp_exempt_reason": "robb-studio: no SigNoz route, see 2am#3649",
+    "otlp_failure_window_minutes": 15
+} }
+```
+
+`otlp_required: false` takes effect only with a non-empty `otlp_exempt_reason`;
+without one the daemon warns and treats the host as not exempt. The window
+defaults to 15 minutes. The `host.health` field is carried in the record body;
+it is not mapped to a separate OTLP attribute.
+
 ## 3c. Operational signals from daemon loops (Issue #8860)
 
 `observability::ops` is the shared path every daemon loop uses to put a
