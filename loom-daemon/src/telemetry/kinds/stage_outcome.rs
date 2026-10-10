@@ -42,6 +42,7 @@ pub const OUTCOME_FACT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.stage_outcome.entered_at",
     "loom.eta.stage_outcome.left_at",
     "loom.eta.stage_outcome.dwell_sec",
+    "loom.eta.stage_outcome.entered_at_source",
 ];
 
 /// How the item left the stage.
@@ -99,6 +100,30 @@ impl StageExit {
     }
 }
 
+/// Where a record's `entered_at` came from (#11367).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnteredAtSource {
+    /// The forge's own event: the label that put the item in the stage.
+    Forge,
+    /// This host's sweep checkpoint.
+    Checkpoint,
+    /// Not known: `entered_at` is absent.
+    Unknown,
+}
+
+impl EnteredAtSource {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnteredAtSource::Forge => "forge",
+            EnteredAtSource::Checkpoint => "checkpoint",
+            EnteredAtSource::Unknown => "unknown",
+        }
+    }
+}
+
 /// One stage an item left.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageOutcomeRecord {
@@ -111,10 +136,14 @@ pub struct StageOutcomeRecord {
     pub pr_number: Option<u32>,
     /// The stage left.
     pub stage: FleetStage,
-    /// When it was entered, when that was observed exactly. Absent for a
-    /// stage first seen mid-way (a restart, a first listing).
+    /// When it was entered: the forge's label event, or this host's sweep
+    /// checkpoint. Absent when neither dates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entered_at: Option<DateTime<Utc>>,
+    /// Where `entered_at` came from; `unknown` when it is absent. Absent only
+    /// on records from before #11367.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entered_at_source: Option<EnteredAtSource>,
     /// When it was left: the event time.
     pub left_at: DateTime<Utc>,
     /// `left_at − entered_at`, when the stage completed and its entry was

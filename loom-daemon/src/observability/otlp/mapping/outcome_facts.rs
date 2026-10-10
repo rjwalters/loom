@@ -81,6 +81,10 @@ pub(super) fn log_parts(record: &TelemetryRecord, host_id: &str) -> Option<LogPa
                     r.next_stage.map(|s| s.as_str().to_string()),
                 ),
                 ("loom.eta.stage_outcome.entered_at", r.entered_at.map(instant)),
+                (
+                    "loom.eta.stage_outcome.entered_at_source",
+                    r.entered_at_source.map(|s| s.as_str().to_string()),
+                ),
             ] {
                 if let Some(value) = value {
                     attributes.push(kv_string(key, value));
