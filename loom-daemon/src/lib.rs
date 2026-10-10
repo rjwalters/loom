@@ -173,6 +173,8 @@ pub mod disk_footprint;
 pub mod disk_full_halt;
 pub mod disk_headroom;
 pub mod docker_image_clean;
+/// Doctor hand-back as a conditional, verified label transition (#9388).
+pub mod doctor_handback;
 pub mod eager_reclaim;
 pub mod epic_state;
 pub mod epic_supervisor;

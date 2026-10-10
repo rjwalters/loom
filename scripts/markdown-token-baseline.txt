@@ -35,7 +35,7 @@
 3663 defaults/.claude/commands/loom/champion.md
 1100 defaults/.claude/commands/loom/comment-body-literal-path.md
 35295 defaults/.claude/commands/loom/curator.md
-21592 defaults/.claude/commands/loom/doctor.md
+20990 defaults/.claude/commands/loom/doctor.md
 131 defaults/.claude/commands/loom/driver.md
 2992 defaults/.claude/commands/loom/epic.md
 32503 defaults/.claude/commands/loom/guide.md
