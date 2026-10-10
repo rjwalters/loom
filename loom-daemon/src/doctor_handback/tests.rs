@@ -464,3 +464,23 @@ fn a_head_move_with_no_changes_label_only_withdraws_the_add() {
     assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
     assert_eq!(f.sorted(), names(&["loom:ci-failure"]));
 }
+
+/// The old rejection was removed, then a newer head was pushed and approved:
+/// the stand-down must not put the old rejection back beside `loom:pr`.
+#[test]
+fn a_head_move_with_a_newer_approval_does_not_restore_the_old_rejection() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.after_remove = vec![(CHANGES, "loom:pr")];
+    let out = run(&mut f, PUSHED);
+    assert_eq!(out, Outcome::HeadMoved(OTHER.into()));
+    assert_eq!(f.sorted(), names(&["loom:pr"]), "the newer approval stands alone");
+}
+
+#[test]
+fn a_head_move_with_a_stuck_claim_is_a_failure_not_a_stand_down() {
+    let mut f = Fake::new(&[CHANGES, CLAIM], PUSHED);
+    f.head_after_add = Some(OTHER);
+    f.fail_remove = vec![CLAIM];
+    assert!(matches!(run(&mut f, PUSHED), Outcome::Failed(_)));
+}

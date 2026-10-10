@@ -267,14 +267,23 @@ fn unverified_removal(forge: &mut impl Forge) -> Outcome {
 
 /// The head moved while we wrote: the labels we touched may now describe the
 /// newer head. Undo our writes (the claim is already released) and stand down.
-fn stand_down_head_moved(forge: &mut impl Forge, head: String, restore_changes: bool) -> Outcome {
-    let restored = !restore_changes || forge.add(CHANGES);
+/// The old rejection is restored only when nothing newer holds the PR: a
+/// verdict or review claim that landed on the newer head is not ours to
+/// contradict.
+fn stand_down_head_moved(
+    forge: &mut impl Forge,
+    post: &Snapshot,
+    restore_changes: bool,
+) -> Outcome {
+    let newer_state = post.has(CHANGES) || post.has("loom:pr") || post.has("loom:reviewing");
+    let restored = !restore_changes || newer_state || forge.add(CHANGES);
     let withdrawn = forge.remove(QUEUE);
     if restored && withdrawn {
-        Outcome::HeadMoved(head)
+        Outcome::HeadMoved(post.head_sha.clone())
     } else {
         Outcome::Failed(format!(
-            "head moved to {head} during the hand-back and the labels could not be put back"
+            "head moved to {} during the hand-back and the labels could not be put back",
+            post.head_sha
         ))
     }
 }
@@ -326,8 +335,17 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     let Some(post) = forge.read() else {
         return Outcome::Failed("the labels could not be re-read to verify the hand-back".into());
     };
+    // The claim is ours alone: one that survived the remove is stuck, and a
+    // stand-down must not report it as released.
     if !same_sha(&post.head_sha, expected_head) {
-        return stand_down_head_moved(forge, post.head_sha, changes_removed);
+        if post.has(CLAIM) {
+            forge.remove(QUEUE);
+            return Outcome::Failed(format!(
+                "head moved to {} during the hand-back and {CLAIM} could not be removed",
+                post.head_sha
+            ));
+        }
+        return stand_down_head_moved(forge, &post, changes_removed);
     }
     // A CHANGES that survives our own successful remove, or that we kept
     // because it is a new rejection, is a raced verdict, not a stuck label.
