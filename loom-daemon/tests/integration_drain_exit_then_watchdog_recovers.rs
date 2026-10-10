@@ -310,7 +310,8 @@ esac
 
     let path_var = format!("{}:{}", stub_dir.display(), std::env::var("PATH").unwrap_or_default());
 
-    let watchdog_output = Command::new("bash")
+    let mut watchdog_cmd = Command::new("bash");
+    watchdog_cmd
         .arg(&watchdog_script)
         .env("PATH", path_var)
         // #8086: the watchdog script is now a thin stub over `loom-daemon
@@ -362,9 +363,13 @@ esac
         .env("LOOM_WATCHDOG_LOG", &watchdog_log)
         .env("LOOM_DAEMON_LAUNCHD", "0")
         .env("LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS", "40")
-        .env("LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL", "0.25")
-        .output()
-        .expect("run watchdog script");
+        .env("LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL", "0.25");
+    // #11024: the daemon the stub relaunches inherits THIS env, so it must get
+    // the fixture build-slot dir too — else its reaper tick falls back to the
+    // host's `~/.loom/locks/build-slot`. Assert it so a regression fails loudly.
+    common::isolate_build_slot(&mut watchdog_cmd, temp_dir.path());
+    common::assert_build_slot_isolated(&watchdog_cmd, temp_dir.path());
+    let watchdog_output = watchdog_cmd.output().expect("run watchdog script");
 
     let watchdog_stdout = String::from_utf8_lossy(&watchdog_output.stdout).to_string();
     let watchdog_stderr = String::from_utf8_lossy(&watchdog_output.stderr).to_string();

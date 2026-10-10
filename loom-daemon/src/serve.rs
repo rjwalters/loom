@@ -1558,6 +1558,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             },
             Event::SweepGlobalCompleted {
@@ -1677,6 +1678,7 @@ mod tests {
             kind: SweepKind::Issue(4392),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: Some("/repos/loom".to_string()),
         });
         let data = frame.trim_start_matches("data: ").trim_end_matches("\n\n");
@@ -1984,6 +1986,7 @@ mod tests {
                 kind: SweepKind::Issue(4392),
                 runtime: None,
                 runtime_source: None,
+                start: None,
                 repo: None,
             })
             .expect("publish");

@@ -87,6 +87,18 @@ pub struct ApiKeyAccount {
     /// selection ladder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// Declared plan window (#11286) — see
+    /// [`limits::AccountLimits::exhaustion_window_secs`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exhaustion_window_secs: Option<u64>,
+    /// Declared plan token allowance (#11286) — see
+    /// [`limits::AccountLimits::plan_token_limit`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_token_limit: Option<u64>,
+    /// When the active bad mark that makes this account
+    /// [`Ineligible::Exhausted`] resets (Unix seconds), if it has a horizon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
 }
 
 impl ApiKeyAccount {
@@ -214,7 +226,9 @@ fn describe_for_class(
         model_class,
         bad_marks::epoch_now(),
     );
-    let declared_cap = limits::max_concurrent(root, provider, &name);
+    let declared =
+        limits::read_limits(root, provider).map(|all| all.get(&name).cloned().unwrap_or_default());
+    let declared_cap = declared.as_ref().map(|l| l.max_concurrent);
     let ineligible = if problem.is_some() {
         Some(Ineligible::Malformed)
     } else if let Err(unreadable) = &disabled {
@@ -225,7 +239,7 @@ fn describe_for_class(
     } else if let Err(unreadable) = &active_mark {
         problem = Some(unreadable.clone());
         Some(Ineligible::Unverifiable)
-    } else if let Err(unreadable) = &declared_cap {
+    } else if let Err(unreadable) = &declared {
         // An unreadable `.limits.json` withholds the account for the same
         // reason an unreadable `.disabled` does: the operator's declared
         // ceiling is unknown, and guessing "unbounded" would breach it.
@@ -255,6 +269,12 @@ fn describe_for_class(
         ineligible,
         problem,
         max_concurrent: declared_cap.unwrap_or(None),
+        exhaustion_window_secs: declared
+            .as_ref()
+            .ok()
+            .and_then(|l| l.exhaustion_window_secs),
+        plan_token_limit: declared.as_ref().ok().and_then(|l| l.plan_token_limit),
+        resets_at: active_mark.ok().flatten().and_then(|mark| mark.resets_at),
     }
 }
 

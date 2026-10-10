@@ -595,6 +595,7 @@ mod tests {
             upstream: "https://api.anthropic.com".to_string(),
             header: super::super::egress_proxy::HeaderStyle::AuthorizationBearer,
             base_url_env: vec!["ANTHROPIC_BASE_URL".to_string()],
+            observe: false,
         });
 
         let error = resolve("test-runtime", "test-profile", &profile);

@@ -308,6 +308,34 @@ fn native_llm_billing(
     )
 }
 
+/// The runtime this launch runs on, and where that choice came from: the
+/// role binding (`LOOM_ROLE` → `runtime_admission::resolve_binding`), then
+/// `LOOM_RUNTIME`, then `runtimes.default`, then the built-in `claude`. The
+/// single source of truth for the launch's runtime — downstream attribution
+/// (e.g. the egress proxy's observe tags, #11300) takes this value rather than
+/// rereading the environment.
+pub(crate) fn resolve_launch_runtime(
+    root: &Path,
+    config: &serde_json::Value,
+) -> Result<(String, String), LaunchError> {
+    if let Some(role) = nonempty_env("LOOM_ROLE") {
+        let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
+        return Ok((runtime, source.to_string()));
+    }
+    if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
+        return Ok((runtime, "env (LOOM_RUNTIME)".to_string()));
+    }
+    if let Some(runtime) = config
+        .pointer("/runtimes/default")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok((runtime.into(), "config (runtimes.default)".to_string()));
+    }
+    Ok(("claude".into(), "default".to_string()))
+}
+
 fn run_preflight(
     args: WorkerArgs,
     root: &Path,
@@ -317,21 +345,7 @@ fn run_preflight(
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
-    let (runtime, source) = if let Some(role) = nonempty_env("LOOM_ROLE") {
-        let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
-            .map_err(|e| LaunchError::config(e.diagnostic()))?;
-        (runtime, source.to_string())
-    } else if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
-        (runtime, "env (LOOM_RUNTIME)".to_string())
-    } else if let Some(runtime) = config
-        .pointer("/runtimes/default")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-    {
-        (runtime.into(), "config (runtimes.default)".to_string())
-    } else {
-        ("claude".into(), "default".to_string())
-    };
+    let (runtime, source) = resolve_launch_runtime(root, &config)?;
     if runtime.is_empty()
         || !runtime
             .bytes()
@@ -440,7 +454,7 @@ fn run_preflight(
             // proxy. `prepare` fails closed — it never silently reverts to
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
-            let prepared = egress_proxy::prepare(root, &selection, &config)?;
+            let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)?;
             if worker_egress.as_ref().is_some_and(|e| e.required)
                 && !containment::image_has_python3(&profile.image)
             {

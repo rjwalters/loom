@@ -1117,6 +1117,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn every_removal_runs_while_the_build_slot_is_still_held() {
         // Regression test for the PR #7334 review finding: the seam used to be
         // a stateless `-> Option<String>` probe, so the `BuildSlotLease` it

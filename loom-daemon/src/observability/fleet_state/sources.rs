@@ -110,12 +110,12 @@ fn live_sweep_count(registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>
 /// `slug`. Each registry lock is held only for the in-memory clone;
 /// checkpoint reads happen after.
 fn held_sweeps(
-    workspace_pool: &WorkspacePool,
+    registries: &[std::sync::Arc<std::sync::Mutex<SweepRegistry>>],
     slug: impl Fn(&str) -> Option<String>,
 ) -> Vec<HeldSweep> {
     let mut held = Vec::new();
-    for registry in workspace_pool.provisioned_registries() {
-        let (snapshot, root, checkpoint_dir) = {
+    for registry in registries {
+        let (snapshot, root, checkpoint_dir, starts) = {
             let guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -123,6 +123,7 @@ fn held_sweeps(
                 guard.snapshot(),
                 guard.config().workspace_root.clone(),
                 guard.config().checkpoint_dir(),
+                guard.start_facts_snapshot(),
             )
         };
         let Some(slug) = slug(&root.to_string_lossy()) else {
@@ -146,6 +147,7 @@ fn held_sweeps(
                 entered_at_lower_bound: lower_bound,
                 pr,
                 overflow: info.overflow,
+                start: starts.get(&info.sweep_id).cloned().unwrap_or_default(),
             });
         }
     }
@@ -431,8 +433,9 @@ pub(super) async fn gather(
     // Resolves every provisioned root, so the registries' roots are cached.
     let roots = managed_roots(workspace_pool, slug_cache).await;
     let managed: BTreeSet<String> = roots.iter().map(|(_, slug)| slug.clone()).collect();
-    let held =
-        held_sweeps(workspace_pool, |root| slug_cache.get(root).map(|s| s.to_ascii_lowercase()));
+    let held = held_sweeps(&workspace_pool.provisioned_registries(), |root| {
+        slug_cache.get(root).map(|s| s.to_ascii_lowercase())
+    });
     let listings = review_listings(&roots).await;
     let ready = ready_queue(&managed, slug_cache).await;
     let main_ci = main_ci_by_slug(
@@ -484,7 +487,7 @@ pub(super) fn tick_input(
             live_sweep_count(&workspace_pool.provisioned_registries()),
         )),
         main_ci: tick_main_ci(reused),
-        held: held_sweeps(workspace_pool, |root| reused.slug(root)),
+        held: held_sweeps(&workspace_pool.provisioned_registries(), |root| reused.slug(root)),
         ready: crate::work_finder::last_tick_summary().map(|summary| ready_input(&summary, reused)),
         ..reused_input(host_id, reused)
     }

@@ -431,3 +431,157 @@ fn a_claude_insta_crash_mark_emits_exactly_one_reason_classified_point() {
     let wire = serde_json::to_string(point).unwrap();
     assert!(!wire.contains("secret") && !wire.contains("usage credits"), "{wire}");
 }
+
+/// `IN_RUN_WATCHES` is process-global and `watch_in_run_exhaustion` prunes
+/// watchers whose sweep is not in *its* registry, so two of these tests on
+/// parallel threads would drop each other's watcher. Serialise them.
+static LIVE_WATCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A live native (`opencode`) sweep on pool seat `loomtest/live-seat`.
+fn live_native_sweep(dir: &Path, issue: u32) -> (SweepRegistry, std::path::PathBuf, SweepId) {
+    use crate::api_keys_pool::{ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    let (mut registry, _record_log) = fixture_registry(dir);
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "live-seat", "LOOM_TEST_KEY_11286", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "model": "glm-5.3-flash",
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "live-seat",
+    });
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        issue,
+        UNKNOWN_TOKEN_NAME,
+        &format!("{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n"),
+    );
+    registry.entries.get_mut(&sweep_id).unwrap().runtime = "opencode".into();
+    (registry, pool, sweep_id)
+}
+
+fn append_to_log(registry: &SweepRegistry, sweep_id: &SweepId, line: &str) {
+    let log_path = registry.entries[sweep_id].log_path.clone();
+    let mut body = std::fs::read_to_string(&log_path).unwrap();
+    body.push_str(line);
+    std::fs::write(&log_path, body).unwrap();
+}
+
+fn seat_marks(pool: &Path) -> Vec<crate::api_keys_pool::BadMark> {
+    crate::api_keys_pool::bad_marks::read_marks(pool, "loomtest").unwrap()
+}
+
+/// #11286 item 3: a live native sweep's seat is marked while the run is still
+/// going — before any exit — and the exit-time ingest that then finds the
+/// same mark covering it emits no second `loom.pool.account_marks` point.
+/// The provider line is SYNTHETIC (no real Z.ai capture exists).
+#[test]
+fn a_live_native_sweep_is_marked_in_run_and_counted_once() {
+    use crate::api_keys_pool::bad_marks;
+    let _serial = LIVE_WATCH_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempdir().unwrap();
+    let (registry, pool, sweep_id) = live_native_sweep(dir.path(), 75);
+    let marked = || {
+        bad_marks::is_bad_for_class(&pool, "loomtest", "live-seat", None, bad_marks::epoch_now())
+            .unwrap()
+    };
+
+    // Nothing yet: the run is healthy.
+    registry.watch_in_run_exhaustion(&sweep_id);
+    assert!(!marked());
+
+    // The provider says the plan is gone while the run is still live.
+    append_to_log(&registry, &sweep_id, "Error: insufficient balance for this account\n");
+    let ((), live) = crate::observability::ops::capture::capture(|| {
+        registry.watch_in_run_exhaustion(&sweep_id);
+        registry.watch_in_run_exhaustion(&sweep_id);
+    });
+    assert!(marked(), "marked before the run exits");
+    assert_eq!(live.metrics.len(), 1, "{:?}", live.metrics);
+
+    let ((), exit) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    assert!(exit.metrics.is_empty(), "{:?}", exit.metrics);
+}
+
+/// Mark a live sweep in-run at `T`, move the clock to `exit_at`, run the exit
+/// feedback, and return (in-run mark, marks after exit, exit metric count).
+fn mark_live_then_exit(
+    issue: u32,
+    provider_line: &str,
+    exit_at: impl FnOnce(u64) -> u64,
+) -> (crate::api_keys_pool::BadMark, Vec<crate::api_keys_pool::BadMark>, usize) {
+    use crate::api_keys_pool::bad_marks::test_clock;
+    const T: u64 = 1_791_590_400;
+    let dir = tempdir().unwrap();
+    let (registry, pool, sweep_id) = live_native_sweep(dir.path(), issue);
+    let clock = test_clock::pin(T);
+    registry.watch_in_run_exhaustion(&sweep_id);
+    append_to_log(&registry, &sweep_id, provider_line);
+    let ((), live) = crate::observability::ops::capture::capture(|| {
+        registry.watch_in_run_exhaustion(&sweep_id);
+    });
+    assert_eq!(live.metrics.len(), 1, "{:?}", live.metrics);
+    let [in_run] = seat_marks(&pool)
+        .try_into()
+        .expect("exactly one in-run mark");
+    assert_eq!(in_run.marked_at, T);
+
+    clock.set(exit_at(in_run.resets_at.expect("a timed hold")));
+    let ((), exit) = crate::observability::ops::capture::capture(|| {
+        registry.apply_provider_health_feedback(&sweep_id, Some(1));
+    });
+    (in_run, seat_marks(&pool), exit.metrics.len())
+}
+
+/// #11286 (Judge P2): the exit pass runs a reaper tick or more after the
+/// in-run mark. Re-reading the same evidence must reuse the deadline the
+/// watcher wrote — not `exit time + window`, which would push the hold out
+/// and record a second `loom.pool.account_marks` point.
+#[test]
+fn an_exit_after_the_in_run_mark_keeps_its_deadline_and_counts_once() {
+    let _serial = LIVE_WATCH_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (in_run, after, exit_metrics) =
+        mark_live_then_exit(76, "Error: insufficient balance for this account\n", |_| {
+            1_791_590_400 + 120
+        });
+    assert_eq!(in_run.resets_at, Some(1_791_590_400 + 6 * 3600), "default horizon from T");
+    assert_eq!(after, vec![in_run], "deadline unchanged, mark not rewritten");
+    assert_eq!(exit_metrics, 0, "a single metric point across both checks");
+}
+
+/// The same for a provider's relative `retry-after`: it is relative to when
+/// it was printed, which the watcher saw, not to when the run exited.
+#[test]
+fn an_exit_replaying_a_relative_retry_after_keeps_its_deadline() {
+    let _serial = LIVE_WATCH_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (in_run, after, exit_metrics) = mark_live_then_exit(
+        77,
+        "Error: insufficient balance for this account; Retry-After: 3600\n",
+        |_| 1_791_590_400 + 300,
+    );
+    assert_eq!(in_run.resets_at, Some(1_791_590_400 + 3600), "{}", in_run.reason);
+    assert!(in_run.reason.contains("provider-reported reset"), "{}", in_run.reason);
+    assert_eq!(after, vec![in_run]);
+    assert_eq!(exit_metrics, 0);
+}
+
+/// An exit after the in-run hold already lapsed replays old evidence: it
+/// must not open a fresh hold (nor count one).
+#[test]
+fn an_exit_after_the_in_run_deadline_opens_no_fresh_hold() {
+    let _serial = LIVE_WATCH_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (in_run, after, exit_metrics) =
+        mark_live_then_exit(78, "Error: insufficient balance for this account\n", |deadline| {
+            deadline + 60
+        });
+    assert_eq!(after, vec![in_run], "the lapsed mark is not renewed");
+    assert_eq!(exit_metrics, 0);
+}

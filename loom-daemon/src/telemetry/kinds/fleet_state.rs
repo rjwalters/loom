@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::RepoVisibility;
+use crate::telemetry::{RepoVisibility, SweepStartFacts};
 
 /// Schema tag carried in every record.
 pub const FLEET_STATE_SCHEMA: &str = "fleet-state/v1";
@@ -237,6 +237,13 @@ pub struct FleetStateRow {
     /// The dispatch slot the sweep holds. Present exactly when `host` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<FleetSlot>,
+    /// A sweep row only: its model, effort, runtime and attempt lineage, the
+    /// values its `sweep.started` carried (#11280). Flattened, so the keys
+    /// sit beside `host` / `slot` under `sweep.outcome`'s names. Absent for a
+    /// sweep this daemon did not dispatch (adopted after a restart). Additive
+    /// on `fleet-state/v1`.
+    #[serde(flatten)]
+    pub start: SweepStartFacts,
     /// `ready_wait` only: this host's planner rank, the 1-based position in
     /// the work finder's dispatch order on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +300,7 @@ impl FleetStateRow {
             pr: None,
             host: None,
             slot: None,
+            start: SweepStartFacts::default(),
             rank: None,
             star: false,
             star_at: None,

@@ -44,9 +44,7 @@ fn trace_wire_has_hex_ids_and_preserves_parent_and_log_relationship() {
             issue: 18,
             sweep_id: "fixture".into(),
             started_at: Utc::now(),
-            model: None,
-            effort: None,
-            runtime: None,
+            facts: Default::default(),
         }),
     );
     log.trace_context = Some(child.clone());

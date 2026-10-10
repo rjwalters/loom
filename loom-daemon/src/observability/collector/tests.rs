@@ -14,6 +14,7 @@ fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
         kind: SweepKind::Issue(issue),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: Some("/repos/loom".to_string()),
     }
 }
@@ -217,6 +218,7 @@ fn event_issue_ignores_pr_set_dispatch() {
         kind: SweepKind::PrSet(vec![1, 2]),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     };
     assert_eq!(event_issue(&event), None);
@@ -280,12 +282,13 @@ fn sweep_started_carries_the_dispatch_runtime() {
         kind: SweepKind::Issue(7),
         runtime: Some("codex".to_string()),
         runtime_source: None,
+        start: None,
         repo: Some("/repos/loom".to_string()),
     };
     let records =
         map_event_to_records(&event, 7, "rjwalters/loom", RepoVisibility::Public, &mut dispatches);
     match &records[0] {
-        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime.as_deref(), Some("codex")),
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.facts.runtime.as_deref(), Some("codex")),
         other => panic!("expected sweep.started, got {other:?}"),
     }
 
@@ -297,7 +300,7 @@ fn sweep_started_carries_the_dispatch_runtime() {
         &mut dispatches,
     );
     match &records[0] {
-        TelemetryRecord::SweepStarted(r) => assert_eq!(r.runtime, None),
+        TelemetryRecord::SweepStarted(r) => assert_eq!(r.facts.runtime, None),
         other => panic!("expected sweep.started, got {other:?}"),
     }
 }

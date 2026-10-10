@@ -28,9 +28,10 @@ fn started(story_points: Option<u32>) -> SweepStartedRecord {
         issue: 9432,
         sweep_id: "sweep-issue-9432-0".to_string(),
         started_at: ts(),
-        model: None,
-        effort: None,
-        runtime: Some("claude".to_string()),
+        facts: crate::telemetry::SweepStartFacts {
+            runtime: Some("claude".to_string()),
+            ..Default::default()
+        },
         story_points,
     }
 }
@@ -124,7 +125,7 @@ fn records_from_a_pre_9432_daemon_still_decode() {
     .unwrap();
     match start {
         TelemetryRecord::SweepStarted(r) => {
-            assert_eq!(r.runtime.as_deref(), Some("claude"));
+            assert_eq!(r.facts.runtime.as_deref(), Some("claude"));
             assert_eq!(r.story_points, None);
         }
         other => panic!("expected SweepStarted, got {other:?}"),

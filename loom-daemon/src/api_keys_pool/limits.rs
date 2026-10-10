@@ -1,5 +1,7 @@
-//! Per-account limits an operator *declares* for an API-key account — today
-//! just a concurrency cap (#8424 item 4).
+//! Per-account limits an operator *declares* for an API-key account: a
+//! concurrency cap (#8424 item 4), plus the plan's quota window and token
+//! allowance (#11286) — configured, not probed, because no provider in scope
+//! offers a plan-safe usage probe.
 //!
 //! # Why a sibling file and not the account's own `.env`
 //!
@@ -12,7 +14,7 @@
 //! [`super::registry::write_secret`] under the same `.control.lock`:
 //!
 //! ```json
-//! { "alpha": { "maxConcurrent": 2 } }
+//! { "alpha": { "maxConcurrent": 2, "exhaustionWindowSecs": 604800, "planTokenLimit": 50000000 } }
 //! ```
 //!
 //! One file per provider rather than one per account so selection pays a
@@ -48,12 +50,26 @@ pub struct AccountLimits {
     /// unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
+    /// The plan's quota window in seconds (#11286) — how long an exhausted
+    /// seat stays out of selection when the provider's refusal names no reset
+    /// instant of its own (see [`super::reset`]). `None` keeps the 6 h
+    /// default. A weekly-capped Z.ai seat is `604800`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhaustion_window_secs: Option<u64>,
+    /// The plan's token allowance per [`Self::exhaustion_window_secs`]
+    /// (#11286). Exported as the `loom.pool.plan_token_limit` gauge so the
+    /// dashboard can divide `loom.llm.tokens.*` by it; nothing here enforces
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_token_limit: Option<u64>,
 }
 
 impl AccountLimits {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.max_concurrent.is_none()
+            && self.exhaustion_window_secs.is_none()
+            && self.plan_token_limit.is_none()
     }
 }
 
@@ -112,16 +128,69 @@ pub fn set_max_concurrent(
     name: &str,
     cap: Option<u32>,
 ) -> Result<(), String> {
-    validate_provider(provider)?;
-    validate_account(name)?;
     if cap == Some(0) {
         return Err("maxConcurrent must be > 0 (use `api-keys disable` to take an account out of \
              selection entirely)"
             .to_string());
     }
+    update(root, provider, name, cap.is_some(), |limits| limits.max_concurrent = cap)
+}
+
+/// Declare (or clear, with `None`) `name`'s plan window — see
+/// [`AccountLimits::exhaustion_window_secs`] (#11286).
+///
+/// # Errors
+/// `Some(0)` (a window that ends the instant it starts), plus everything
+/// [`set_max_concurrent`] can fail on.
+pub fn set_exhaustion_window(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    secs: Option<u64>,
+) -> Result<(), String> {
+    if secs == Some(0) {
+        return Err("exhaustionWindowSecs must be > 0".to_string());
+    }
+    update(root, provider, name, secs.is_some(), |limits| {
+        limits.exhaustion_window_secs = secs;
+    })
+}
+
+/// Declare (or clear, with `None`) `name`'s plan token allowance — see
+/// [`AccountLimits::plan_token_limit`] (#11286).
+///
+/// # Errors
+/// `Some(0)`, plus everything [`set_max_concurrent`] can fail on.
+pub fn set_plan_token_limit(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    tokens: Option<u64>,
+) -> Result<(), String> {
+    if tokens == Some(0) {
+        return Err("planTokenLimit must be > 0".to_string());
+    }
+    update(root, provider, name, tokens.is_some(), |limits| {
+        limits.plan_token_limit = tokens;
+    })
+}
+
+/// Read-modify-write one account's entry under the provider's control lock.
+/// `declaring` is whether the edit sets something (as opposed to clearing):
+/// clearing on a provider that has no directory yet is a no-op, not a
+/// `mkdir`.
+fn update(
+    root: &Path,
+    provider: &str,
+    name: &str,
+    declaring: bool,
+    edit: impl FnOnce(&mut AccountLimits),
+) -> Result<(), String> {
+    validate_provider(provider)?;
+    validate_account(name)?;
     let dir = provider_dir(root, provider);
     if !dir.exists() {
-        if cap.is_none() {
+        if !declaring {
             return Ok(());
         }
         std::fs::create_dir_all(&dir)
@@ -131,16 +200,7 @@ pub fn set_max_concurrent(
     let _lock = MkdirLock::acquire(&dir.join(".control.lock"))
         .map_err(|e| format!("cannot lock {}: {e}", limits_path(root, provider).display()))?;
     let mut limits = read_limits(root, provider)?;
-    match cap {
-        Some(cap) => {
-            limits.entry(name.to_string()).or_default().max_concurrent = Some(cap);
-        }
-        None => {
-            if let Some(entry) = limits.get_mut(name) {
-                entry.max_concurrent = None;
-            }
-        }
-    }
+    edit(limits.entry(name.to_string()).or_default());
     limits.retain(|_, l| !l.is_empty());
     write_limits(root, provider, &limits)
 }
@@ -234,6 +294,40 @@ mod tests {
             assert!(set_max_concurrent(tmp.path(), "zai", "beta", Some(1)).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), torn, "file was clobbered");
         }
+    }
+
+    /// #11286: the plan window and token allowance round-trip beside the cap
+    /// and clear independently of it.
+    #[test]
+    fn the_plan_window_and_token_limit_round_trip_independently() {
+        let tmp = pool(&["alpha"]);
+        set_max_concurrent(tmp.path(), "zai", "alpha", Some(2)).unwrap();
+        set_exhaustion_window(tmp.path(), "zai", "alpha", Some(604_800)).unwrap();
+        set_plan_token_limit(tmp.path(), "zai", "alpha", Some(50_000_000)).unwrap();
+        let got = read_limits(tmp.path(), "zai").unwrap()["alpha"].clone();
+        assert_eq!(
+            got,
+            AccountLimits {
+                max_concurrent: Some(2),
+                exhaustion_window_secs: Some(604_800),
+                plan_token_limit: Some(50_000_000),
+            }
+        );
+        let body = std::fs::read_to_string(limits_path(tmp.path(), "zai")).unwrap();
+        assert!(body.contains("\"exhaustionWindowSecs\": 604800"), "{body}");
+        assert!(body.contains("\"planTokenLimit\": 50000000"), "{body}");
+
+        set_max_concurrent(tmp.path(), "zai", "alpha", None).unwrap();
+        assert_eq!(max_concurrent(tmp.path(), "zai", "alpha").unwrap(), None);
+        assert_eq!(
+            super::super::reset::configured_window(tmp.path(), "zai", "alpha"),
+            Some(604_800)
+        );
+        set_exhaustion_window(tmp.path(), "zai", "alpha", None).unwrap();
+        set_plan_token_limit(tmp.path(), "zai", "alpha", None).unwrap();
+        assert!(!limits_path(tmp.path(), "zai").exists());
+        assert!(set_exhaustion_window(tmp.path(), "zai", "alpha", Some(0)).is_err());
+        assert!(set_plan_token_limit(tmp.path(), "zai", "alpha", Some(0)).is_err());
     }
 
     #[test]

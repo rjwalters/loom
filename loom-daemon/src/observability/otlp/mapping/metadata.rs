@@ -4,7 +4,7 @@ use super::{
     any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
-use crate::telemetry::{PhaseDuration, SweepOutcomeRecord};
+use crate::telemetry::{PhaseDuration, SweepOutcomeRecord, SweepStartFacts};
 const MAX_GROUPS: usize = 64;
 const MAX_STRING_BYTES: usize = 256;
 
@@ -23,6 +23,34 @@ fn row(values: Vec<KeyValue>) -> AnyValue {
     AnyValue {
         value: Some(any_value::Value::KvlistValue(KeyValueList { values })),
     }
+}
+
+/// `sweep.started`'s dispatch facts (#11280), under `sweep.outcome`'s key
+/// names. An absent fact is an absent attribute.
+pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
+    let mut attrs = Vec::new();
+    for (key, value) in [
+        ("loom.model", &facts.model),
+        ("loom.effort", &facts.effort),
+        ("loom.model_source", &facts.model_source),
+        ("loom.runtime", &facts.runtime),
+    ] {
+        if let Some(value) = value.as_ref().filter(|v| text(v)) {
+            attrs.push(kv_string(key, value.clone()));
+        }
+    }
+    if let Some(value) = facts.attempt_index {
+        attrs.push(kv_int("loom.attempt_index", i64::from(value)));
+    }
+    for (key, value) in [
+        ("loom.trigger", &facts.trigger),
+        ("loom.previous_sweep_id", &facts.previous_sweep_id),
+    ] {
+        if let Some(value) = value.as_ref().filter(|v| text(v)) {
+            attrs.push(kv_string(key, value.clone()));
+        }
+    }
+    attrs
 }
 
 pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {

@@ -91,6 +91,7 @@ pub fn gate_of(disposition: Qd) -> Option<PlanGate> {
         Qd::DeferredBuildBackoff => Some(PlanGate::BuildBackoff),
         Qd::DeferredRepoCap => Some(PlanGate::RepoCap),
         Qd::DeferredOutOfSlice => Some(PlanGate::OutOfSlice),
+        Qd::DeferredFileOverlap => Some(PlanGate::FileOverlap),
         _ => None,
     }
 }

@@ -149,6 +149,17 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `loom.egress.request` spans (#11300): one proxied provider request.
+    // Counts, classified codes and ids only, never a body or credential.
+    "loom.egress.seat",
+    "loom.egress.tap",
+    "loom.egress.profile",
+    "loom.egress.launch_id",
+    "loom.egress.status",
+    "loom.egress.latency_ms",
+    "loom.egress.ttft_ms",
+    "loom.egress.error_code",
+    "loom.egress.stream",
 ];
 
 /// Longest label value kept, in bytes.
@@ -257,6 +268,19 @@ pub enum MetricName {
     /// Seconds since the previous sample the pool read as exhausted.
     #[serde(rename = "loom.pool.exhausted_seconds")]
     PoolExhaustedSeconds,
+    /// One pool account's state (Issue #11286): `1` for the state it is in,
+    /// `0` otherwise, labelled `provider`, `account` and `state` =
+    /// `usable`/`exhausted`.
+    #[serde(rename = "loom.pool.account_state")]
+    PoolAccountState,
+    /// An API-key seat's declared plan token allowance per window (Issue
+    /// #11286), labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_token_limit")]
+    PoolPlanTokenLimit,
+    /// An API-key seat's declared plan window in seconds (Issue #11286),
+    /// labelled `provider` + `account`. Only where declared.
+    #[serde(rename = "loom.pool.plan_window_seconds")]
+    PoolPlanWindowSeconds,
     // ---- Reason-classified account marks (Issue #8931) -------------------
     /// Pool accounts marked out of selection since the previous point,
     /// labelled `provider` and `reason` (a closed set — see
@@ -332,6 +356,23 @@ pub enum MetricName {
     /// trailing window.
     #[serde(rename = "loom.merge.time_to_land_max")]
     MergeTimeToLandMax,
+    // ---- Egress proxy observe mode (Issue #11300) -------------------------
+    /// Provider requests the egress proxy observed since the previous point,
+    /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
+    /// (`ok` / `error`) and `reason` (a classified code on an error).
+    #[serde(rename = "loom.egress.requests")]
+    EgressRequests,
+    /// Tokens the proxy read off provider responses, labelled as
+    /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
+    /// / `cache_write`.
+    #[serde(rename = "loom.egress.tokens")]
+    EgressTokens,
+    /// Summed request latency (send to last byte), seconds.
+    #[serde(rename = "loom.egress.latency")]
+    EgressLatency,
+    /// Summed time to first response byte, seconds.
+    #[serde(rename = "loom.egress.ttft")]
+    EgressTtft,
     // ---- Long-running task liveness (Issue #10414) -----------------------
     /// 1 while a long-running daemon loop beat within its staleness window,
     /// 0 once it went silent or marked itself dead, labelled `task`
@@ -425,6 +466,9 @@ impl MetricName {
             Self::PoolExhausted => "loom.pool.exhausted",
             Self::PoolExhaustions => "loom.pool.exhaustions",
             Self::PoolExhaustedSeconds => "loom.pool.exhausted_seconds",
+            Self::PoolAccountState => "loom.pool.account_state",
+            Self::PoolPlanTokenLimit => "loom.pool.plan_token_limit",
+            Self::PoolPlanWindowSeconds => "loom.pool.plan_window_seconds",
             Self::PoolAccountMarks => "loom.pool.account_marks",
             Self::DispatchSlotTurnaround => "loom.dispatch.slot_turnaround",
             Self::DispatchSlotTurnaroundSamples => "loom.dispatch.slot_turnaround.samples",
@@ -443,6 +487,10 @@ impl MetricName {
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
+            Self::EgressRequests => "loom.egress.requests",
+            Self::EgressTokens => "loom.egress.tokens",
+            Self::EgressLatency => "loom.egress.latency",
+            Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
@@ -482,6 +530,10 @@ impl MetricName {
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
             | Self::ForgeFacadeEvents
+            | Self::EgressRequests
+            | Self::EgressTokens
+            | Self::EgressLatency
+            | Self::EgressTtft
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
             | Self::DaemonIpcRequests
@@ -508,8 +560,9 @@ impl MetricName {
             | Self::LlmTokensCacheWrite => "{token}",
             Self::LlmRequests => "{request}",
             Self::PoolAccounts | Self::PoolExhaustions | Self::PoolAccountMarks => "{account}",
-            Self::PoolExhausted => "1",
-            Self::PoolExhaustedSeconds => "s",
+            Self::PoolExhausted | Self::PoolAccountState => "1",
+            Self::PoolExhaustedSeconds | Self::PoolPlanWindowSeconds => "s",
+            Self::PoolPlanTokenLimit => "{token}",
             Self::QueueOldestWait | Self::QueueDispatchWait => "s",
             Self::DispatchSlotTurnaround
             | Self::DispatchIdleSlotSeconds
@@ -525,6 +578,9 @@ impl MetricName {
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
+            Self::EgressRequests => "{request}",
+            Self::EgressTokens => "{token}",
+            Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
@@ -571,6 +627,9 @@ impl MetricName {
             Self::PoolExhausted => "1 when no account in the provider's pool is usable.",
             Self::PoolExhaustions => "Accounts that became exhausted since the last sample.",
             Self::PoolExhaustedSeconds => "Seconds the provider's pool read as exhausted.",
+            Self::PoolAccountState => "1 for the state a pool account is in, else 0.",
+            Self::PoolPlanTokenLimit => "Declared plan token allowance per window.",
+            Self::PoolPlanWindowSeconds => "Declared plan quota window.",
             Self::PoolAccountMarks => {
                 "Pool accounts marked out of selection, by provider and reason."
             }
@@ -606,6 +665,10 @@ impl MetricName {
                 "Longest first-re-date-to-landing time of a PR landed in the window."
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
+            Self::EgressRequests => "Provider requests observed by the egress proxy, by seat.",
+            Self::EgressTokens => "Tokens read off provider responses by the egress proxy.",
+            Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
+            Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
@@ -660,6 +723,16 @@ impl MetricPoint {
         MetricPoint {
             name,
             value: MetricValue::Int(value),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// An unlabelled floating-point point.
+    #[must_use]
+    pub fn double(name: MetricName, value: f64) -> Self {
+        MetricPoint {
+            name,
+            value: MetricValue::Double(value),
             labels: BTreeMap::new(),
         }
     }

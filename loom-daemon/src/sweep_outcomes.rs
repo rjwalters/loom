@@ -532,6 +532,29 @@ pub fn read_all_outcome_telemetry(path: &Path) -> Vec<telemetry::TelemetryEnvelo
         .collect()
 }
 
+/// Like [`read_all_sweep_outcomes`], but `None` when the journal exists and
+/// could not be read (a directory at the path, invalid UTF-8, permissions). A
+/// missing file is a genuinely new journal and yields `Some(vec![])`, so a
+/// caller that must not fabricate "first attempt" from an unreadable journal
+/// (Issue #11280) can tell the two apart.
+#[must_use]
+pub fn try_read_all_sweep_outcomes(path: &Path) -> Option<Vec<telemetry::SweepOutcomeRecord>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Some(
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<telemetry::TelemetryEnvelope>(line).ok())
+                .filter_map(|envelope| match envelope.record {
+                    telemetry::TelemetryRecord::SweepOutcome(record) => Some(record),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
 /// Read every [`crate::telemetry::SweepOutcomeRecord`] from `path` (unwrapping
 /// each envelope and discarding any non-`sweep.outcome` record kind — this
 /// journal only ever carries that one kind today, but the filter keeps the

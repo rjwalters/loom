@@ -147,6 +147,7 @@ impl PickSkipReason {
             | Qd::DeferredSaturation
             | Qd::DeferredOutOfSlice
             | Qd::DeferredRepoCap => Self::Cap,
+            Qd::DeferredFileOverlap => Self::OverlapChain,
             Qd::DeferredBuildBackoff
             | Qd::RecheckInterval
             | Qd::DispatchBackoff
@@ -206,6 +207,12 @@ pub struct PickSkip {
     pub repo: String,
     pub number: u32,
     pub reason: PickSkipReason,
+    /// Daemon-templated specifics of the skip, when the reason has them.
+    /// Today only a work-finder file-overlap deferral (#9781) sets it: the
+    /// shared `## Affected Files` paths (`file overlap: a, b`, bounded to one
+    /// short line). Additive and optional; absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// What the tick concluded about one ranked candidate.
@@ -215,6 +222,8 @@ pub enum PickVerdict {
     Acted(&'static str),
     /// Skipped, with the closed-set reason.
     Skipped(PickSkipReason),
+    /// Skipped, with the reason and its [`PickSkip::detail`].
+    SkippedWithDetail(PickSkipReason, String),
     /// Considered; the daemon cannot see what the role did with it (a role
     /// agent chooses among its queue itself).
     Undecided,
@@ -291,7 +300,16 @@ impl PickDecisionRecord {
                     repo: candidate.repo.clone(),
                     number: candidate.number,
                     reason,
+                    detail: None,
                 }),
+                PickVerdict::SkippedWithDetail(reason, detail) if listed => {
+                    skipped.push(PickSkip {
+                        repo: candidate.repo.clone(),
+                        number: candidate.number,
+                        reason,
+                        detail: Some(detail),
+                    });
+                }
                 _ => {}
             }
             if listed {

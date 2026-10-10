@@ -67,6 +67,8 @@ pub mod ops;
 pub mod provenance;
 pub mod queue_snapshot;
 pub mod repo_identity;
+mod start_facts;
+pub use start_facts::{model_source, SweepStartFacts, SWEEP_START_FACT_LOG_ATTRIBUTE_KEYS};
 pub mod trace;
 pub mod visibility;
 pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
@@ -535,19 +537,11 @@ pub struct SweepStartedRecord {
     pub sweep_id: String,
     /// When the sweep started.
     pub started_at: DateTime<Utc>,
-    /// Selected Claude model, when one was chosen (mirrors `SweepInfo::model`'s
-    /// empty-means-unset contract).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Selected reasoning-effort level, when one was chosen.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    /// Runtime adapter the sweep was dispatched on (`claude`, `codex`, …),
-    /// when the dispatch event carried one — the same value
-    /// `SweepInfo::runtime` records. Absent for a legacy dispatch that did
-    /// not name its runtime; never fabricated as `"claude"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
+    /// Model, effort, runtime and attempt lineage as the dispatch knew them
+    /// (#11280), flattened so the existing `model` / `effort` / `runtime`
+    /// keys keep their wire names.
+    #[serde(flatten)]
+    pub facts: SweepStartFacts,
     /// The Curator's story-point size estimate for this sweep's issue (Issue
     /// #9432, epic #9429) — the numeric value of its single `points:*` label,
     /// carried on the `sweep.global.dispatch` event from the label read the

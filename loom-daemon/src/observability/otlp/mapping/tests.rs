@@ -9,6 +9,7 @@ mod fact_id;
 mod host_name;
 mod loom_kind;
 mod record_id;
+mod start_facts;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
     SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
@@ -37,9 +38,12 @@ fn sweep_started_envelope() -> TelemetryEnvelope {
             issue: 4858,
             sweep_id: "sweep-issue-4858-0".to_string(),
             started_at: ts(),
-            model: Some("opus".to_string()),
-            effort: Some("high".to_string()),
-            runtime: Some("claude".to_string()),
+            facts: crate::telemetry::SweepStartFacts {
+                model: Some("opus".to_string()),
+                effort: Some("high".to_string()),
+                runtime: Some("claude".to_string()),
+                ..Default::default()
+            },
         }),
     )
 }
