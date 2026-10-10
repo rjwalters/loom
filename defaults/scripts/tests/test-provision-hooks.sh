@@ -774,6 +774,19 @@ LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CAN
     bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
 assert_contains "$(cat "$LOG26X" 2>/dev/null)" '"error":"lib_missing"' "effective true (local overrides config false) writes a wrapper record"
 
+# 26d3: the log override may not point inside a Git checkout (main: .git dir) or
+# worktree (.git file), nor use "..": no record, no directory, still exit 0.
+printf '{"guards":{"uncommittedWorkConsumerCanary":true}}\n' > "$P26X/.loom-local/local.json"
+mkdir -p "$P26X/chk/.git" "$P26X/wt"; : > "$P26X/wt/.git"
+for L in "$P26X/chk/sub/canary.jsonl" "$P26X/wt/canary.jsonl" "$P26X/other/../canary.jsonl"; do
+    LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$L" \
+        bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+    assert_eq "$?|$(ls "$P26X/chk/sub" "$P26X/other" 2>/dev/null)|$([[ -e "$L" ]] && echo wrote)" "0||" "override $L is refused: exit 0, nothing written"
+done
+LOOM_PROJECT_ROOT="$P26X" LOOM_CONFIG_DEFAULTS_FILE="" LOOM_UNCOMMITTED_WORK_CANARY_LOG="$P26X/ok/canary.jsonl" \
+    bash "$P26X/defaults/hooks/$UW" <<<'{"hook_event_name":"Stop"}' >/dev/null 2>&1
+assert_contains "$(cat "$P26X/ok/canary.jsonl" 2>/dev/null)" '"error":"lib_missing"' "an override outside every checkout is still honoured"
+
 # 26e: deprovision removes both events' entries and leaves no empty arrays.
 deprovision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$S26" "$UW")" "0" "deprovision removed both uncommitted-work entries"

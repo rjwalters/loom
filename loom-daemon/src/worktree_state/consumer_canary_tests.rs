@@ -323,6 +323,34 @@ fn a_log_write_failure_fails_open_and_surfaces_the_gap() {
 }
 
 #[test]
+fn a_log_override_inside_any_checkout_is_rejected_fails_open_and_surfaces_the_gap() {
+    let ws = Ws::opted_in();
+    std::fs::write(ws.wt().join("probe.sh"), "#!/bin/sh\n").unwrap();
+    let inside_main = ws.main().join("logs/canary.jsonl");
+    let inside_wt = ws.wt().join("canary.jsonl");
+    let dotdot = ws
+        .logs
+        .path()
+        .join("../../../../../../../../..")
+        .join(inside_main.strip_prefix("/").unwrap());
+    for event in ["Stop", "SubagentStop"] {
+        let raw = ws.payload(event, &ws.wt(), None, false);
+        for bad in [&inside_main, &inside_wt, &dotdot] {
+            let out = run(&raw, "main", ws.main(), Some(bad), "inv");
+            assert!(!is_block(&out), "{event}: {}: must not block", bad.display());
+            let out = out.expect("the gap must be visible, not silent");
+            let msg = out["systemMessage"].as_str().unwrap();
+            assert!(
+                msg.contains("NOT recorded") && msg.contains("inside the Git checkout"),
+                "{msg}"
+            );
+            assert!(!bad.exists(), "{event}: nothing may be written inside a checkout");
+        }
+        assert!(!ws.main().join("logs").exists(), "no directory created in the checkout");
+    }
+}
+
+#[test]
 fn the_outcome_log_is_bounded_by_rotation() {
     let ws = Ws::opted_in();
     let log = ws.log();

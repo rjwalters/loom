@@ -86,7 +86,8 @@ pub fn canary_enabled(root: &Path) -> bool {
     )
 }
 
-/// Where outcome records go: `$LOOM_UNCOMMITTED_WORK_CANARY_LOG`, else
+/// Where outcome records go: `$LOOM_UNCOMMITTED_WORK_CANARY_LOG` (rejected by
+/// [`run`] when it lies inside a Git checkout or worktree), else
 /// `~/.loom/logs/uncommitted-work-canary.jsonl`. `None` only when no home
 /// directory can be determined (then nothing can be recorded — a coverage gap,
 /// reported as such).
@@ -190,6 +191,41 @@ pub fn append_record(log: &Path, record: &serde_json::Value) -> Result<(), Strin
         .map_err(|e| format!("write {}: {e}", log.display()))
 }
 
+/// `log` made absolute with its deepest existing ancestor canonicalised, so a
+/// symlink or `..` cannot smuggle a path into a checkout.
+fn resolve_log_path(log: &Path) -> PathBuf {
+    let abs = std::path::absolute(log).unwrap_or_else(|_| log.to_path_buf());
+    let mut tail = Vec::new();
+    let mut cur = abs.clone();
+    loop {
+        if let Ok(mut base) = cur.canonicalize() {
+            base.extend(tail.iter().rev());
+            return base;
+        }
+        match (cur.file_name().map(std::ffi::OsStr::to_os_string), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cur = parent.to_path_buf();
+            }
+            _ => return abs,
+        }
+    }
+}
+
+/// The Git checkout or worktree root that contains `log`, if any. The outcome
+/// log carries session/transcript/worktree attribution and must stay outside
+/// every repository. The walk stops at `$HOME` (a dotfiles repo there must not
+/// disqualify the default `~/.loom/logs/…` location).
+fn containing_checkout(log: &Path) -> Option<PathBuf> {
+    let home = dirs::home_dir().map(|h| h.canonicalize().unwrap_or(h));
+    resolve_log_path(log)
+        .ancestors()
+        .skip(1)
+        .take_while(|d| Some(*d) != home.as_deref())
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// The hook output when a record could not be written: a NON-blocking coverage
 /// gap notice. The decision is dropped (fail open) — a canary that cannot
 /// record must never be the reason a session cannot stop — but any
@@ -262,7 +298,14 @@ pub fn run(
     };
 
     let written = match log {
-        Some(path) => append_record(path, &record),
+        Some(path) => match containing_checkout(path) {
+            Some(root) => Err(format!(
+                "outcome log {} is inside the Git checkout {}; it must stay outside every repository",
+                path.display(),
+                root.display()
+            )),
+            None => append_record(path, &record),
+        },
         None => Err("no home directory for the outcome log".to_string()),
     };
     match written {

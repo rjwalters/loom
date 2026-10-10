@@ -41,8 +41,7 @@ set -uo pipefail  # NOTE: no -e — a Stop hook must never exit non-zero
 
 PAYLOAD="$(cat 2>/dev/null)" || PAYLOAD=""
 # One correlation id per hook invocation, shared with the daemon's record.
-LOOM_HOOK_INVOCATION_ID="inv-$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null)-$$-${RANDOM}"
-export LOOM_HOOK_INVOCATION_ID
+export LOOM_HOOK_INVOCATION_ID="inv-$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null)-$$-${RANDOM}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
 
 # Workspace root: LOOM_PROJECT_ROOT (set by the user-scope wrapper), then the
@@ -57,22 +56,18 @@ ROOT="${LOOM_PROJECT_ROOT:-}"
 # < .loom-local/local.json — config_resolver.rs): the LAST tier naming the key
 # as a boolean wins, so a higher-tier false suppresses wrapper records. Returns
 # 0 only when the effective value is true. A text match, not a JSON parse.
-_canary_effective_true() {
-    local f v eff="" defaults="${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}"
-    for f in "$defaults" "$ROOT/.loom/config.json" "$ROOT/.loom-project/project.json" "$ROOT/.loom-local/local.json"; do
-        [[ -n "$f" && -r "$f" ]] || continue
-        v="$(grep -Eso '"uncommittedWorkConsumerCanary"[[:space:]]*:[[:space:]]*(true|false)' "$f" 2>/dev/null | tail -n1)"
-        [[ -n "$v" ]] && eff="${v##*[: ]}"
-    done
-    [[ "$eff" == true ]]
-}
+_canary_effective_true() { [[ "$(cat "${LOOM_CONFIG_DEFAULTS_FILE-${HOME:-}/.local/share/loom/config/defaults.json}" "$ROOT"/.loom/config.json "$ROOT"/.loom-project/project.json "$ROOT"/.loom-local/local.json 2>/dev/null | grep -Eo '"uncommittedWorkConsumerCanary"[[:space:]]*:[[:space:]]*(true|false)' | tail -n1)" == *true ]]; }
 
 # $1 = failure class. Records only for a workspace whose EFFECTIVE canary key is
-# true (see _canary_effective_true), and never grows the log past its 1 MiB bound (the daemon owns rotation).
+# true (see _canary_effective_true), never grows the log past its 1 MiB bound (the daemon
+# owns rotation), and drops (fail open) a LOG override lying inside any Git checkout.
 _record_wrapper_failure() {
     _canary_effective_true || return 0
-    local log="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}" event="" ws
-    [[ "$log" == /* ]] && mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+    local ov="${LOOM_UNCOMMITTED_WORK_CANARY_LOG:-}" d event="" ws log
+    log="${ov:-${HOME:-}/.loom/logs/uncommitted-work-canary.jsonl}"
+    [[ "$log" == /* && "$log" != *..* ]] || return 0  # an override must be absolute, no ".."
+    d="$ov"; while [[ "$d" == /?* ]]; do d="${d%/*}"; [[ -e "${d:-/}/.git" ]] && return 0; done  # never inside a checkout
+    mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
     [[ "$(wc -c 2>/dev/null <"$log")" -lt 1048576 ]] || return 0  # missing log -> "" -> 0
     [[ "$PAYLOAD" =~ \"hook_event_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z]+)\" ]] && event="${BASH_REMATCH[1]}"
     ws="${ROOT//\\/\\\\}" && ws="${ws//\"/\\\"}"  # minimal JSON string escape
@@ -91,10 +86,7 @@ BIN="$(loom_resolve_self_daemon_bin 2>/dev/null)" || BIN=""
 # loom-daemon call-site. Any non-zero exit discards the partial stdout.
 OUT="$(printf '%s' "$PAYLOAD" | "$BIN" worktree-state stop-hook --consumer-canary 2>/dev/null)"
 RC=$?
-if [[ "$RC" -ne 0 ]]; then
-    [[ "$RC" -eq 2 ]] && CLASS=unsupported_subcommand_or_flag || CLASS="daemon_exit_${RC}"
-    _record_wrapper_failure "$CLASS"
-    exit 0
-fi
+CLASS="daemon_exit_${RC}"; [[ "$RC" -eq 2 ]] && CLASS=unsupported_subcommand_or_flag
+[[ "$RC" -eq 0 ]] || { _record_wrapper_failure "$CLASS"; exit 0; }
 [[ -n "$OUT" ]] && printf '%s\n' "$OUT"
 exit 0

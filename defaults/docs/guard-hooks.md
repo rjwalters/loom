@@ -1391,6 +1391,14 @@ both events in both install modes, dedup, transition deferral and deprovision.
 `LOOM_UNCOMMITTED_WORK_CANARY_LOG`) — outside every checkout, rotated at 1 MiB with
 4 generations kept (`.1`…`.4`), so disk use is bounded at ~5 MiB per host.
 
+The override is honoured only **outside every Git checkout and worktree**: the daemon
+resolves symlinks and `..` and rejects any path with a `.git` entry in an ancestor
+(stopping at `$HOME`, so a dotfiles repo does not disqualify the default); the wrapper
+rejects a non-absolute path, any `..`, and any override with a `.git` ancestor. A rejected
+path fails open (the stop is never blocked) and is a visible coverage gap — the daemon
+returns a non-blocking `systemMessage` ("NOT recorded … inside the Git checkout"); the
+wrapper records nothing.
+
 | Field | Meaning |
 |---|---|
 | `schema` | `1` |
