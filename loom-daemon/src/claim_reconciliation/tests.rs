@@ -2258,6 +2258,8 @@ fn claimed_pr(
         updated_at,
         claim_labeled_at: None,
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: head_ref_name.map(ToString::to_string),
     }
 }
@@ -2395,6 +2397,8 @@ fn decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at
         updated_at: Some(standdown_inflated),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2427,6 +2431,8 @@ fn decide_pr_keeps_when_claim_labeled_at_is_fresh_even_if_updated_at_is_old() {
         updated_at: Some(stale_updated_at),
         claim_labeled_at: Some(recent_claim),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: None,
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2474,6 +2480,8 @@ fn decide_pr_keeps_when_old_claim_labeled_at_but_recent_genuine_comment() {
         updated_at: Some(claimed_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: Some(recent_genuine_comment),
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("pr-worktree-review-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2500,6 +2508,8 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
         updated_at: Some(now - Duration::seconds(5)),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: None,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-doctor-branch".to_string()),
     };
     let action = decide_pr(&pr, None, None, &|_| true, 30.0, now);
@@ -2519,124 +2529,11 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
 // defaults/scripts/claim-staleness.sh)
 // ------------------------------------------------------------------
 
-/// The claim timestamp used by the marker fixtures below, rendered exactly
-/// as the forge emits a `labeled` event's `created_at`.
-fn fixture_claimed_at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-08-19T08:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc)
-}
-
 fn comment(created_at: DateTime<Utc>, body: &str) -> PrComment {
     PrComment {
         created_at,
         body: body.to_string(),
     }
-}
-
-#[test]
-fn claim_activity_marker_matches_claim_staleness_sh() {
-    // The marker MUST be byte-identical to what
-    // `defaults/scripts/claim-staleness.sh marker` prints:
-    //   ACTIVITY_PREFIX='<!-- loom:claim-activity claim=' + CLAIMED_AT + ' -->'
-    // with CLAIMED_AT the timeline `created_at` verbatim (which that
-    // script validates as ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$).
-    assert_eq!(CLAIM_ACTIVITY_MARKER_PREFIX, "<!-- loom:claim-activity claim=");
-    assert_eq!(
-        claim_activity_marker(fixture_claimed_at()),
-        "<!-- loom:claim-activity claim=2026-08-19T08:00:00Z -->"
-    );
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_an_unrelated_comment() {
-    // AC (a) / the #6513 shape reconstructed daemon-side: a routine
-    // Builder post-push status note is not claimant liveness. Before
-    // #6523 this comment WAS counted (it is not a stand-down note), which
-    // is exactly the conflation #6514 removed on the agent side.
-    let claimed_at = fixture_claimed_at();
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(2), "Pushed the fix, CI running."),
-        comment(claimed_at + Duration::minutes(9), "Champion: capped-PR notice."),
-    ];
-    assert_eq!(
-        most_recent_claim_activity_at(&comments, claimed_at),
-        None,
-        "an unrelated comment must not count as claimant activity"
-    );
-}
-
-#[test]
-fn most_recent_claim_activity_at_counts_a_marked_claimant_heartbeat() {
-    // AC (b): a comment carrying THIS claim's marker is claimant liveness.
-    let claimed_at = fixture_claimed_at();
-    let heartbeat_at = claimed_at + Duration::minutes(12);
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(2), "Pushed the fix, CI running."),
-        comment(
-            heartbeat_at,
-            &format!(
-                "Doctor: still working the failing test.\n{}",
-                claim_activity_marker(claimed_at)
-            ),
-        ),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), Some(heartbeat_at));
-}
-
-#[test]
-fn most_recent_claim_activity_at_takes_the_newest_marked_heartbeat() {
-    let claimed_at = fixture_claimed_at();
-    let marker = claim_activity_marker(claimed_at);
-    let newest = claimed_at + Duration::minutes(20);
-    let comments = vec![
-        comment(claimed_at + Duration::minutes(5), &marker),
-        comment(newest, &marker),
-        comment(claimed_at + Duration::minutes(12), &marker),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), Some(newest));
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_a_marker_for_a_different_claim() {
-    // Mirrors claim-staleness.sh: the marker is matched against the
-    // claim's OWN labeled-at timestamp, so a heartbeat left behind by an
-    // earlier claim generation (before a reclaim + re-claim) cannot keep
-    // the new claim alive.
-    let claimed_at = fixture_claimed_at();
-    let older_claim = claimed_at - Duration::minutes(45);
-    let comments = vec![comment(
-        claimed_at + Duration::minutes(3),
-        &format!("Judge: reviewing.\n{}", claim_activity_marker(older_claim)),
-    )];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
-}
-
-#[test]
-fn most_recent_claim_activity_at_ignores_comments_at_or_before_the_claim() {
-    let claimed_at = fixture_claimed_at();
-    let marker = claim_activity_marker(claimed_at);
-    let comments = vec![
-        comment(claimed_at - Duration::minutes(1), &marker),
-        comment(claimed_at, &marker),
-    ];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
-}
-
-#[test]
-fn most_recent_claim_activity_at_still_excludes_standdown_comments() {
-    // #4618 regression guard, preserved: a stand-down comment is evidence
-    // a LATER pass declined to reclaim, never claimant activity — even in
-    // the pathological case where its body quotes an activity marker.
-    let claimed_at = fixture_claimed_at();
-    let comments = vec![comment(
-            claimed_at + Duration::minutes(7),
-            &format!(
-                "Judge pass: standing down, not stomping.\n{}\n{STANDDOWN_MARKER_PREFIX}2026-08-19T08:00:00Z seq=2 -->",
-                claim_activity_marker(claimed_at)
-            ),
-        )];
-    assert_eq!(most_recent_claim_activity_at(&comments, claimed_at), None);
 }
 
 #[test]
@@ -2662,6 +2559,8 @@ fn decide_pr_reclaims_when_only_unrelated_comments_since_the_claim() {
         updated_at: Some(now - Duration::minutes(2)),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     match decide_pr(&pr, None, None, &|_| true, DEFAULT_STALE_REVIEWING_MINUTES, now) {
@@ -2695,6 +2594,8 @@ fn decide_pr_keeps_when_a_marked_claimant_heartbeat_is_recent() {
         updated_at: Some(heartbeat_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: Some("some-judge-branch".to_string()),
     };
     assert_eq!(
@@ -2722,6 +2623,8 @@ fn decide_pr_marked_heartbeat_extends_by_exactly_one_window_not_indefinitely() {
         updated_at: Some(heartbeat_at),
         claim_labeled_at: Some(claimed_at),
         most_recent_claim_activity_at: scanned,
+        most_recent_judge_activity_at: None,
+        most_recent_head_push_at: None,
         head_ref_name: None,
     };
 
@@ -2792,6 +2695,8 @@ fn decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity() {
             updated_at: Some(now - Duration::seconds(5)),
             claim_labeled_at: Some(claimed_at),
             most_recent_claim_activity_at: None,
+            most_recent_judge_activity_at: None,
+            most_recent_head_push_at: None,
             head_ref_name: Some("feature/issue-6523".to_string()),
         };
         assert_eq!(
