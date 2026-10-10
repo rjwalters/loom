@@ -329,12 +329,12 @@ fn insert_f64(attrs: &mut TraceAttributes, key: &str, value: Option<f64>) {
     }
 }
 
-/// Insert `value` trimmed to the span attribute bound, leaving the key absent
-/// when nothing safe remains.
+/// Insert `value` cut to the 256-**byte** bound `trace::span::bounded_attributes`
+/// exports (on a char boundary), leaving the key absent when nothing remains.
 fn insert_nonempty_bounded(attrs: &mut TraceAttributes, key: &str, value: &str) {
-    let truncated: String = value.chars().take(256).collect();
+    let truncated = &value[..value.floor_char_boundary(256)];
     if !truncated.trim().is_empty() {
-        attrs.insert(key.to_owned(), truncated);
+        attrs.insert(key.to_owned(), truncated.to_owned());
     }
 }
 
