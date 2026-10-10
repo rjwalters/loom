@@ -1003,3 +1003,8 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "forge_listing_open_pages_tests.rs"]
 mod open_pages_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "forge_listing_pr_rows_tests.rs"]
+mod pr_rows_tests;
