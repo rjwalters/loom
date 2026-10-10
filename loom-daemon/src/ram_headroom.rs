@@ -596,6 +596,7 @@ mod tests {
                 issue: None,
                 peak_bytes: GIB,
                 current_bytes: GIB,
+                ..crate::ram_peaks::InFlight::default()
             },
         );
         let (cap, budget) = ram_admission(10, &store, &roots(), &[0, 0], None);
@@ -619,6 +620,7 @@ mod tests {
             issue: Some(issue),
             peak_bytes: current,
             current_bytes: current,
+            ..crate::ram_peaks::InFlight::default()
         }
     }
 
@@ -653,6 +655,7 @@ mod tests {
             scope: "loom-agent-1-1.scope".into(),
             repo: "heavy".into(),
             issue: Some(1),
+            role: None,
         }];
         crate::ram_peaks::observe(&mut store, &live, |_| None);
         assert!(store.inflight.is_empty());
@@ -661,6 +664,32 @@ mod tests {
         assert_eq!(b.remaining_gb, 13, "28 - the unsampled sweep's 15 GB");
         assert_eq!(cap, 1 + 6, "one running + floor(13 / 2) at small's charge");
         assert!(!b.fits(0), "15 > 13: no second heavy sweep");
+    }
+
+    #[test]
+    fn test_ram_admission_stale_unreadable_sweep_is_charged_in_full() {
+        // Sampled once, then its cgroup stays unreadable: below the threshold
+        // it is still credited; at MAX_UNREADABLE_TICKS it is charged in full.
+        use crate::ram_peaks::{observe, LiveScope, MAX_UNREADABLE_TICKS};
+        let mut store = crate::ram_peaks::Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        let live = vec![LiveScope {
+            scope: "loom-agent-1-1.scope".into(),
+            repo: "heavy".into(),
+            issue: Some(1),
+            role: None,
+        }];
+        observe(&mut store, &live, |_| Some((5 * GIB, 5 * GIB)));
+        for _ in 0..MAX_UNREADABLE_TICKS - 1 {
+            observe(&mut store, &live, |_| None);
+        }
+        let roots: Vec<std::path::PathBuf> = vec!["/w/heavy".into()];
+        let (_, b) = ram_admission(28, &store, &roots, &[1], None);
+        assert_eq!(b.unwrap().remaining_gb, 20, "still credited: 28 - 8");
+        observe(&mut store, &live, |_| None);
+        assert!(store.inflight.is_empty());
+        let (_, b) = ram_admission(28, &store, &roots, &[1], None);
+        assert_eq!(b.unwrap().remaining_gb, 13, "charged in full: 28 - 15");
     }
 
     #[test]
