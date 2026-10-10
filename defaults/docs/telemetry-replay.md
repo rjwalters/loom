@@ -112,8 +112,23 @@ nothing is elected, so duplicates across hosts are expected.
 
 | Kind | Natural key | Event time | Knowable-at | Notes |
 |------|-------------|------------|-------------|-------|
-| `pr.resolved` | `(repo, pr_number, state)` | `resolved_at` | `created_at` | `state` is `merged` or `closed`. |
-| `eta.stage_outcome` | `(repo, issue, stage, left_at)` | `left_at` | `created_at` | `left_at` is RFC 3339 UTC, nanosecond precision. After the ETA subsystem moves to loom-ui (#11098) the kind is re-homed; the wire kind name and `loom.eta.*` attribute keys are kept (stage 1 is additive only), and `loom.fact_id` is additive. |
+| `pr.resolved` | `(repo, pr_number, state, closed_at)` | `resolved_at` | `created_at` | `state` is `merged` or `closed`; `closed_at` is the forge's, so a PR closed, reopened and closed again is two facts. |
+| `eta.stage_outcome` | `(repo, issue, stage, next_stage, forge_transition_at)` | `left_at` | `created_at` | `forge_transition_at` is the forge's own instant (a label event's `created_at`, a PR's `merged_at` / `closed_at`); `next_stage` is empty when the item left the view. Instants are RFC 3339 UTC, nanosecond precision. Re-homed outside ETA by #11126; the wire kind name and `loom.eta.*` attribute keys are kept (stage 1 is additive only). |
+
+Every key part is a forge-observed fact, identical on every host whatever its
+polling time. A host's own polling time (`left_at` for a polled move,
+`observed_at`) is never part of a key: two hosts that poll one transition at
+different times would otherwise emit two ids for it.
+
+**No forge instant, no fact id.** A stage exit the producer has no forge
+instant for (a sweep stage, a failed read, a label event outside the pass
+window) is emitted **without** `loom.fact_id`. So is a
+`pr.resolved` from a build before #11126 (no `closed_at`). Readers dedupe
+these by `(repo, issue, next_stage)` for `eta.stage_outcome` (`(repo,
+pr_number, state)` for `pr.resolved`) within a short window: two hosts'
+records of one transition are at most one pass interval apart (their
+`resolution_sec`), so a window of twice the largest `resolution_sec` in the
+group keeps one row per transition, the earliest knowable-at.
 
 State precedence for a PR: an external webhook outcome row is primary for the
 merge or close instant, `pr.resolved` corroborates it, and a missing webhook

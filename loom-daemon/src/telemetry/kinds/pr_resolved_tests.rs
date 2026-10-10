@@ -1,13 +1,10 @@
-//! `pr.resolved` (#10519): registration, wire shape, and the journal mapping.
+//! `pr.resolved`: registration and wire shape.
 
 use super::*;
-use crate::eta::Stage;
 use crate::telemetry::{
     TelemetryEnvelope, TelemetryKindOtlp, TelemetryRecord, NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS,
 };
-use chrono::{Duration, TimeZone};
-
-const REPO: &str = "rjwalters/loom";
+use chrono::TimeZone;
 
 fn provenance() -> Provenance {
     Provenance {
@@ -18,17 +15,19 @@ fn provenance() -> Provenance {
     }
 }
 
-fn t(sec: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap() + Duration::seconds(sec)
-}
-
-fn resolved_row(pr: u32, state: &str, left_at: Option<DateTime<Utc>>) -> JournalEntry {
-    let mut row = JournalEntry::new("pr.resolved", REPO, left_at.unwrap_or(t(0)), &provenance());
-    row.issue = Some(pr - 1);
-    row.pr_number = Some(pr);
-    row.left_at = left_at;
-    row.raw = serde_json::json!({"pr": pr, "state": state});
-    row
+fn record() -> PrResolvedRecord {
+    let at = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    PrResolvedRecord {
+        repo: "rjwalters/loom".to_string(),
+        pr_number: 101,
+        issue: Some(100),
+        state: PrResolution::Merged,
+        resolved_at: at,
+        observed_at: at + chrono::Duration::seconds(300),
+        resolution_sec: 0,
+        closed_at: Some(at),
+        loom: provenance(),
+    }
 }
 
 #[test]
@@ -39,69 +38,43 @@ fn pr_resolved_is_registered_as_an_otlp_log_kind() {
         .expect("pr.resolved has a registry row");
     assert_eq!(meta.variant, "PrResolved");
     assert_eq!(meta.otlp, TelemetryKindOtlp::Logs);
-    assert!(!meta.native_ingest, "OTLP-only, like the eta.* log kinds");
+    assert!(!meta.native_ingest, "OTLP-only");
     assert_eq!(meta.schema_version, NEW_KIND_SCHEMA_VERSION);
 }
 
 #[test]
-fn a_merge_carries_the_forge_instant_and_a_close_the_observation() {
-    let merged_at = t(-900);
-    let rows = vec![
-        resolved_row(101, "merged", Some(merged_at)),
-        resolved_row(202, "closed", None),
-    ];
-    let records = from_journal(&rows, t(0), 300, &provenance());
-    assert_eq!(records.len(), 2);
-
-    let merge = &records[0];
-    assert_eq!((merge.pr_number, merge.state), (101, PrResolution::Merged));
-    assert_eq!(merge.issue, Some(100));
-    assert_eq!(merge.resolved_at, merged_at, "the forge's merged_at");
-    assert_eq!(merge.observed_at, t(0), "knowable when the pass saw it");
-    assert_eq!(merge.resolution_sec, 0);
-
-    let close = &records[1];
-    assert_eq!((close.pr_number, close.state), (202, PrResolution::Closed));
-    assert_eq!(close.resolved_at, t(0), "no close instant: the observation");
-    assert_eq!(close.resolution_sec, 300, "at most one listing interval late");
-}
-
-#[test]
-fn a_held_merge_is_one_record_and_other_rows_are_none() {
-    let merged_at = t(-60);
-    let mut hold = resolved_row(101, "merged", Some(merged_at));
-    hold.stage = Some(Stage::MergeHold);
-    let mut open = resolved_row(303, "open", None);
-    open.raw = serde_json::json!({"pr": 303, "state": "open"});
-    let mut label = resolved_row(404, "merged", Some(merged_at));
-    label.event = "label.transition".to_string();
-    let mut no_pr = resolved_row(505, "merged", Some(merged_at));
-    no_pr.pr_number = None;
-    no_pr.raw = serde_json::json!({"state": "merged"});
-    let rows = vec![
-        hold,
-        resolved_row(101, "merged", Some(merged_at)),
-        open,
-        label,
-        no_pr,
-    ];
-    let records = from_journal(&rows, t(0), 300, &provenance());
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0].pr_number, 101);
-}
-
-#[test]
-fn an_event_time_is_never_after_the_observation() {
-    let rows = vec![resolved_row(101, "merged", Some(t(60)))];
-    let records = from_journal(&rows, t(0), 300, &provenance());
-    assert_eq!(records[0].resolved_at, t(0));
+fn the_body_keeps_its_field_names_and_adds_closed_at() {
+    let json = serde_json::to_value(record()).unwrap();
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "closed_at",
+            "issue",
+            "loom",
+            "observed_at",
+            "pr_number",
+            "repo",
+            "resolution_sec",
+            "resolved_at",
+            "state"
+        ]
+    );
+    let mut old = json;
+    old.as_object_mut().unwrap().remove("closed_at");
+    let parsed: PrResolvedRecord = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.closed_at, None, "an older build's body still parses");
 }
 
 #[test]
 fn the_record_round_trips_and_requires_provenance() {
-    let records =
-        from_journal(&[resolved_row(101, "merged", Some(t(-5)))], t(0), 300, &provenance());
-    let record = records[0].clone();
+    let record = record();
     assert!(record.has_provenance());
     let envelope = TelemetryEnvelope::new("host-a", TelemetryRecord::PrResolved(record.clone()));
     let json = serde_json::to_value(&envelope).unwrap();

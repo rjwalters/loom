@@ -12,7 +12,6 @@ use crate::eta::stage_forecast::{
 };
 use crate::eta::tracker::{EstimateContext, Tracker};
 use crate::eta::{Explanation, Heuristic, Kind, Registry, Stage, StageSamples};
-use crate::telemetry::kinds::eta_stage_outcome::{from_journal, StageExit};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
@@ -251,12 +250,11 @@ fn context<'a>(
     }
 }
 
-/// End to end through the tracker: a fully bus-observed sweep emits one
-/// `eta.stage_outcome` per stage it left, each linked to the newest open
-/// estimate per series, and the primary `land` outcome's attribution sums
+/// End to end through the tracker: a fully bus-observed sweep journals one
+/// row per stage it left, and the primary `land` outcome's attribution sums
 /// to its error with nothing unattributed.
 #[test]
-fn a_tracked_sweep_emits_stage_outcomes_and_attributes_its_landing() {
+fn a_tracked_sweep_journals_its_stages_and_attributes_its_landing() {
     let registry = Registry::builtin();
     let history = history_a();
     let repo_ids = BTreeMap::from([(REPO.to_string(), 1_073_994_527_u64)]);
@@ -294,47 +292,24 @@ fn a_tracked_sweep_emits_stage_outcomes_and_attributes_its_landing() {
         .any(|r| r.stage == Some(Stage::MergeWait)));
     step(merge);
 
-    // Every stage the sweep left, in order, each a record.
-    let open: Vec<&EstimateSummary> = tracker
-        .pending()
+    // Every stage the sweep left is journaled, in order.
+    let left: Vec<Stage> = rows
         .iter()
-        .chain(outcomes.iter().map(|r| &r.estimate))
+        .filter(|r| r.issue.is_some() && r.left_at.is_some())
+        .filter_map(|r| r.stage)
         .collect();
-    let records = from_journal(&rows, open.iter().copied(), t(6600), &provenance());
-    let left: Vec<(Stage, StageExit)> = records.iter().map(|r| (r.stage, r.exit)).collect();
     assert_eq!(
         left,
         vec![
-            (Stage::SweepCurator, StageExit::Advance),
-            (Stage::SweepBuilder, StageExit::Advance),
-            (Stage::ReviewWait, StageExit::Judged),
-            (Stage::Doctor, StageExit::Advance),
-            (Stage::ReviewWait, StageExit::Judged),
-            (Stage::MergeWait, StageExit::Landed),
+            Stage::SweepCurator,
+            Stage::SweepBuilder,
+            Stage::ReviewWait,
+            Stage::Doctor,
+            Stage::ReviewWait,
+            Stage::MergeWait,
         ]
     );
-    assert_eq!(records[0].dwell_sec, Some(600));
-    assert_eq!(records[1].dwell_sec, Some(2400));
-    assert_eq!(records[3].entered_at, Some(t(3900)), "doctor entered at the verdict");
-    assert_eq!(records[5].left_at, t(6600));
-    assert!(records.iter().all(|r| r.repo_id == Some(1_073_994_527)));
-
-    // The curator record links the estimates made before it was left (at
-    // t(1)); the merge record links the newest per series, and the merge's
-    // own resolution removed them from pending, so they come from outcomes.
-    let curator = &records[0];
-    let series = first.len();
-    assert_eq!(curator.estimate_ids.len(), series, "one id per series");
-    assert_eq!(curator.open_estimates, series);
-    assert!(curator.estimate_ids.contains(&land_v1.estimate_id));
-    let merged = &records[5];
-    assert!(merged.open_estimates > merged.estimate_ids.len(), "newest per series only");
-    assert!(
-        pending_before_merge
-            .iter()
-            .any(|e| merged.estimate_ids.contains(&e.estimate_id)),
-        "the merge's links include estimates its own resolution scored"
-    );
+    assert!(!pending_before_merge.is_empty());
 
     // The land-v1 estimate's attribution: nothing unattributed on a
     // fully observed, unshifted path, and the identity holds exactly.

@@ -178,17 +178,17 @@ pub mod eta_fleet_refresh;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
-/// `eta.stage_outcome` (#10929) — one stage an item left, from the ETA tracker.
-pub mod eta_stage_outcome;
-
 /// `pass.summary` / `pass.verdict` (#10752) — what a pass over artifacts did.
 pub mod pass;
 
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
-/// `pr.resolved` (#10519) — a PR's merge or close instant, from the ETA pass.
+/// `pr.resolved` (#10519) — a PR's merge or close instant, from `fleet.state`.
 pub mod pr_resolved;
+
+/// `eta.stage_outcome` (#10929) — one stage an item left, from `fleet.state`.
+pub mod stage_outcome;
 
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
@@ -436,18 +436,16 @@ macro_rules! telemetry_kind_table {
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// A PR the ETA pass saw leave the review listings, with its merge
-            /// or close instant (Issue #10519). Built from rows the pass
-            /// already journals, so no new forge read. OTLP-only. See
-            /// [`pr_resolved`].
+            /// A PR that left the review listings, with its forge merge or
+            /// close instant (Issue #10519; produced by `fleet.state` since
+            /// #11126). OTLP-only. See [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
-            /// One stage an item left, with its entry and exit instants and the
-            /// estimates open for the item then (Issue #10929). Built from rows
-            /// the ETA tracker already journals, so no new forge read.
-            /// OTLP-only. See [`eta_stage_outcome`].
-            EtaStageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::eta_stage_outcome::EtaStageOutcomeRecord,
+            /// One stage an item left, with its entry and exit instants (Issue
+            /// #10929; produced by `fleet.state` since #11126). The wire tag
+            /// keeps its `eta.` prefix. OTLP-only. See [`stage_outcome`].
+            StageOutcome = "eta.stage_outcome" => $crate::telemetry::kinds::stage_outcome::StageOutcomeRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One heuristic's nightly walk-forward fold for one UTC day (Issue

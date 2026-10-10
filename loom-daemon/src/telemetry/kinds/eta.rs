@@ -21,13 +21,13 @@ use crate::eta::{Explanation, Provenance};
 use serde::{Deserialize, Serialize};
 
 /// Every log attribute key the ETA kinds export besides the generic
-/// `loom.repo` / `loom.issue` / `loom.pr_number`. The collector's
+/// `loom.repo` / `loom.issue` / `loom.pr_number`. The outcome facts
+/// (`pr.resolved`, `eta.stage_outcome`) have their own list,
+/// `stage_outcome::OUTCOME_FACT_LOG_ATTRIBUTE_KEYS`. The collector's
 /// `transform/privacy` log `keep_keys` must list each one
 /// (`defaults/observability/collector/config.yaml`, contract-tested).
 pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.story",
-    // #11125: cross-host outcome fact id (`pr.resolved`, `eta.stage_outcome`).
-    "loom.fact_id",
     "loom.eta.estimate_id",
     // `eta.estimate` / `eta.outcome` (#10498): the authority host id.
     "loom.eta.authority",
@@ -115,22 +115,9 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.fit.coeff_bytes",
     "loom.eta.fit.coeff_sha256",
     "loom.eta.fit.duration_ms",
-    // `pr.resolved` (#10519).
-    "loom.eta.pr.state",
-    "loom.eta.pr.resolved_at",
-    "loom.eta.pr.observed_at",
-    "loom.eta.pr.resolution_sec",
     // `eta.outcome` stage attribution (#10929).
     "loom.eta.attribution.unattributed_sec",
     "loom.eta.attribution.dominant_stage",
-    // `eta.stage_outcome` (#10929).
-    "loom.eta.stage_outcome.stage",
-    "loom.eta.stage_outcome.exit",
-    "loom.eta.stage_outcome.next_stage",
-    "loom.eta.stage_outcome.entered_at",
-    "loom.eta.stage_outcome.left_at",
-    "loom.eta.stage_outcome.dwell_sec",
-    "loom.eta.stage_outcome.open_estimates",
     // `eta.backtest.fold` (#10492).
     "loom.eta.backtest.fold.fold_id",
     "loom.eta.backtest.fold.heuristic",

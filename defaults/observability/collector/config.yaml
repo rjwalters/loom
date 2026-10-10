@@ -317,6 +317,10 @@ processors:
           # loom.eta.* keys (ETA_LOG_ATTRIBUTE_KEYS in
           # loom-daemon/src/telemetry/kinds/eta.rs, contract-tested); their
           # body is the record's JSON, which keep_keys does not touch.
+          # pr.resolved and eta.stage_outcome have a non-ETA owner since
+          # #11126: their keys (and loom.fact_id) are OUTCOME_FACT_LOG_ATTRIBUTE_KEYS
+          # in loom-daemon/src/telemetry/kinds/stage_outcome.rs, contract-tested.
+          # loom.eta.stage_outcome.open_estimates is no longer emitted.
           # auto_update.tick (#10414) adds the loom.auto_update.* keys
           # (AUTO_UPDATE_LOG_ATTRIBUTE_KEYS in
           # loom-daemon/src/telemetry/kinds/auto_update_tick.rs, contract-tested).
