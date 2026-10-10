@@ -683,6 +683,11 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "scripts/test-release-decision.sh",
             "scripts/release-decision.sh",
             ".github/workflows/release.yml",
+            // The version-bump cadence gate tests ride here too (#11174); they
+            // drive the gate script and grep version-bump-on-merge.yml.
+            "scripts/test-version-bump-gate.sh",
+            "scripts/version-bump-gate.sh",
+            ".github/workflows/version-bump-on-merge.yml",
             // The image-input tests ride here too (#10825); they drive the
             // detection script, which reads .dockerignore, and parse ci.yml.
             "scripts/test-ci-image-inputs.sh",
