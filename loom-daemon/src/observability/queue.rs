@@ -70,7 +70,27 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     dropped_total: u64,
+    /// Bulk-backfill offers refused at the backfill limit (#11115).
+    deferred_total: u64,
     head_sequence: u128,
+}
+
+/// Outcome of a bounded bulk-backfill offer (#11115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Every sink took the record.
+    Admitted,
+    /// At least one sink was at its backfill limit; the caller must keep the
+    /// record behind its cursor and retry on a later pass.
+    Deferred,
+}
+
+/// Occupancy ceiling for bulk backfill: 75% of `capacity` (never above it).
+/// The remaining quarter is headroom that ordinary lifecycle/CI producers
+/// can use without evicting anything while a replay is in progress.
+#[must_use]
+pub fn backfill_limit(capacity: usize) -> usize {
+    capacity - capacity / 4
 }
 
 /// An in-process queue cursor plus immutable payload snapshot. Sequence identity
@@ -85,6 +105,15 @@ pub struct DurableQueue {
     path: PathBuf,
     capacity: usize,
     state: Mutex<QueueState>,
+}
+
+impl std::fmt::Debug for DurableQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableQueue")
+            .field("path", &self.path)
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DurableQueue {
@@ -110,6 +139,7 @@ impl DurableQueue {
             state: Mutex::new(QueueState {
                 items,
                 dropped_total: 0,
+                deferred_total: 0,
                 head_sequence: 0,
             }),
         }
@@ -136,6 +166,13 @@ impl DurableQueue {
 
     fn push_inner(&self, envelope: TelemetryEnvelope, durable: bool) -> std::io::Result<()> {
         let mut state = self.lock();
+        self.evict_if_full(&mut state);
+        self.enqueue_locked(&mut state, envelope, durable)
+    }
+
+    /// Drop-oldest eviction for ordinary producers. Never reached by the
+    /// bounded backfill path ([`Self::push_bounded`] / [`FanoutQueue`]).
+    fn evict_if_full(&self, state: &mut QueueState) {
         if state.items.len() >= self.capacity {
             state.items.pop_front();
             state.head_sequence += 1;
@@ -147,6 +184,17 @@ impl DurableQueue {
                 state.dropped_total
             );
         }
+    }
+
+    /// Append `envelope` and persist, with the caller already holding this
+    /// queue's lock (`state`). Never evicts: callers that need drop-oldest run
+    /// [`Self::evict_if_full`] first under the same lock hold.
+    fn enqueue_locked(
+        &self,
+        state: &mut QueueState,
+        envelope: TelemetryEnvelope,
+        durable: bool,
+    ) -> std::io::Result<()> {
         state.items.push_back(envelope);
         persist_to(&self.path, &state.items)?;
         if durable {
@@ -178,6 +226,59 @@ impl DurableQueue {
     #[must_use]
     pub fn dropped_total(&self) -> u64 {
         self.lock().dropped_total
+    }
+
+    /// Total bulk-backfill offers refused at the backfill limit over this
+    /// queue's lifetime (session-scoped). Deferral is not loss.
+    #[must_use]
+    pub fn deferred_total(&self) -> u64 {
+        self.lock().deferred_total
+    }
+
+    /// Live pressure snapshot for the status path (#11115).
+    #[must_use]
+    pub fn pressure(&self) -> crate::types::ObservabilityQueuePressure {
+        let state = self.lock();
+        crate::types::ObservabilityQueuePressure {
+            depth: state.items.len() as u64,
+            capacity: self.capacity as u64,
+            backfill_limit: backfill_limit(self.capacity) as u64,
+            dropped_total: state.dropped_total,
+            backfill_deferred_total: state.deferred_total,
+        }
+    }
+
+    /// True when a bulk-backfill offer fits below [`backfill_limit`]; counts a
+    /// deferral when it does not. Takes the caller's lock guard so the answer
+    /// stays true until the caller's enqueue under that same hold.
+    fn backfill_room_locked(&self, state: &mut QueueState) -> bool {
+        if state.items.len() < backfill_limit(self.capacity) {
+            true
+        } else {
+            state.deferred_total += 1;
+            false
+        }
+    }
+
+    /// Bounded, non-evicting durable enqueue for bulk backfill (#11115):
+    /// admits only while occupancy is below [`backfill_limit`]; otherwise
+    /// counts a deferral and returns [`Admission::Deferred`] without touching
+    /// the queue. Ordinary [`Self::push`] keeps its drop-oldest behavior.
+    ///
+    /// The limit check, the enqueue and the durable write all happen under a
+    /// single hold of the queue lock, and this path never calls
+    /// [`Self::evict_if_full`]: no concurrent producer can fill the queue
+    /// between the check and the push, so an [`Admission::Admitted`] answer
+    /// never coincides with an eviction.
+    pub fn push_bounded(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        let mut state = self.lock();
+        if !self.backfill_room_locked(&mut state) {
+            return Ok(Admission::Deferred);
+        }
+        #[cfg(test)]
+        tests::run_bounded_admit_probe(self);
+        self.enqueue_locked(&mut state, envelope, true)?;
+        Ok(Admission::Admitted)
     }
 
     /// Clone up to `n` envelopes from the front of the queue **without**
@@ -253,6 +354,15 @@ pub trait QueueSink: Send + Sync {
     /// context for immediately after (trace spans): the queue file and its
     /// directory must reach stable storage before returning `Ok(())`.
     fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()>;
+
+    /// Bounded admission for bulk journal replay (#11115). Unlike
+    /// [`Self::offer_durable`] this must never evict already-queued records:
+    /// a sink at its backfill limit answers [`Admission::Deferred`] and the
+    /// caller leaves the record behind its persisted cursor. The default
+    /// (for sinks with no capacity notion) is an unconditional durable offer.
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        self.offer_durable(envelope).map(|()| Admission::Admitted)
+    }
 }
 
 impl QueueSink for DurableQueue {
@@ -262,6 +372,10 @@ impl QueueSink for DurableQueue {
 
     fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
         self.push_durable(envelope)
+    }
+
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        self.push_bounded(envelope)
     }
 }
 
@@ -304,6 +418,46 @@ impl QueueSink for FanoutQueue {
         }
         Ok(())
     }
+
+    /// All-or-defer across unequal queues (#11115). Every queue's lock is
+    /// taken first, in config order, and held through the checks and the
+    /// pushes, so no producer can fill a queue between its check and its push
+    /// and the push never evicts. Every queue is checked (no short-circuit:
+    /// each saturated exporter counts its own deferral, so pressure is
+    /// attributed per exporter), and the record is pushed only when **all**
+    /// have room.
+    ///
+    /// Lock order is safe: `FanoutQueue` is the only holder of more than one
+    /// queue lock, it always locks in config order, and a queue listed twice
+    /// is locked (and offered) once.
+    ///
+    /// A persistence failure on a later queue still leaves earlier queues
+    /// holding the record while the caller's cursor does not advance; the
+    /// retry re-offers it, so delivery is at-least-once (a duplicate, never
+    /// an omission).
+    fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
+        let mut locked: Vec<(&DurableQueue, std::sync::MutexGuard<'_, QueueState>)> =
+            Vec::with_capacity(self.queues.len());
+        for queue in &self.queues {
+            if locked.iter().any(|(held, _)| std::ptr::eq(*held, &**queue)) {
+                continue;
+            }
+            locked.push((queue, queue.lock()));
+        }
+        let mut all_have_room = true;
+        for (queue, state) in &mut locked {
+            all_have_room &= queue.backfill_room_locked(state);
+        }
+        if !all_have_room {
+            return Ok(Admission::Deferred);
+        }
+        for (queue, state) in &mut locked {
+            #[cfg(test)]
+            tests::run_bounded_admit_probe(queue);
+            queue.enqueue_locked(state, envelope.clone(), true)?;
+        }
+        Ok(Admission::Admitted)
+    }
 }
 
 fn load_existing(path: &Path) -> VecDeque<TelemetryEnvelope> {
@@ -341,7 +495,182 @@ mod tests {
     use super::*;
     use crate::telemetry::{RepoVisibility, SweepStartedRecord, TelemetryRecord};
     use serial_test::serial;
+    use std::cell::Cell;
+    use std::sync::TryLockError;
     use tempfile::tempdir;
+
+    thread_local! {
+        /// Test hook fired on the bounded path after the limit check and
+        /// before the enqueue (#11115) — i.e. exactly where a racing producer
+        /// used to slip in. Thread-local so parallel tests never see it.
+        static BOUNDED_ADMIT_PROBE: Cell<Option<fn(&DurableQueue)>> = const { Cell::new(None) };
+        static BOUNDED_ADMIT_PROBE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn run_bounded_admit_probe(queue: &DurableQueue) {
+        if let Some(probe) = BOUNDED_ADMIT_PROBE.with(Cell::get) {
+            BOUNDED_ADMIT_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            probe(queue);
+        }
+    }
+
+    /// Arms a probe asserting that, between the limit check and the enqueue,
+    /// the queue lock is still held: any other producer's `push` would block
+    /// rather than fill the queue in the gap.
+    fn arm_lock_held_probe() {
+        fn assert_lock_held(queue: &DurableQueue) {
+            assert!(
+                matches!(queue.state.try_lock(), Err(TryLockError::WouldBlock)),
+                "bounded admission released the queue lock between check and enqueue"
+            );
+        }
+        BOUNDED_ADMIT_PROBE.with(|probe| probe.set(Some(assert_lock_held)));
+        BOUNDED_ADMIT_PROBE_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn disarm_probe() -> usize {
+        BOUNDED_ADMIT_PROBE.with(|probe| probe.set(None));
+        BOUNDED_ADMIT_PROBE_CALLS.with(Cell::get)
+    }
+
+    fn issues(queue: &DurableQueue) -> Vec<u32> {
+        queue
+            .peek_batch(usize::MAX)
+            .iter()
+            .map(|e| match &e.record {
+                TelemetryRecord::SweepStarted(r) => r.issue,
+                other => panic!("unexpected record {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bounded_check_and_enqueue_share_one_lock_hold() {
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 8);
+        for i in 1..=5 {
+            queue.push(envelope(i));
+        }
+        arm_lock_held_probe();
+        let admission = queue.push_bounded(envelope(100)).unwrap();
+        assert_eq!(disarm_probe(), 1, "probe must fire between check and enqueue");
+        assert_eq!(admission, Admission::Admitted);
+        assert_eq!(queue.dropped_total(), 0);
+    }
+
+    #[test]
+    fn reviewer_interleaving_never_evicts_on_backfill() {
+        // Capacity 8, limit 6, depth 5: the judge's #11115 interleaving.
+        let dir = tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 8);
+        for i in 1..=5 {
+            queue.push(envelope(i));
+        }
+        assert_eq!(queue.push_bounded(envelope(100)).unwrap(), Admission::Admitted);
+        // Ordinary producers fill the headroom to capacity without evicting.
+        queue.push(envelope(6));
+        queue.push(envelope(7));
+        assert_eq!(queue.len(), 8);
+        assert_eq!(queue.dropped_total(), 0);
+        // Backfill at hard capacity defers; it must not take the eviction branch.
+        assert_eq!(queue.push_bounded(envelope(101)).unwrap(), Admission::Deferred);
+        assert_eq!(queue.dropped_total(), 0, "bounded push evicted at capacity");
+        assert_eq!(issues(&queue), vec![1, 2, 3, 4, 5, 100, 6, 7]);
+        // Ordinary push still drops oldest.
+        queue.push(envelope(8));
+        assert_eq!(queue.dropped_total(), 1);
+        assert_eq!(issues(&queue)[0], 2);
+    }
+
+    #[test]
+    fn bounded_push_never_evicts_at_any_depth() {
+        let dir = tempdir().unwrap();
+        for depth in 0..=8u32 {
+            let queue = DurableQueue::open(dir.path().join(format!("q{depth}.jsonl")), 8);
+            for i in 0..depth {
+                queue.push(envelope(i));
+            }
+            let before = issues(&queue);
+            let admission = queue.push_bounded(envelope(999)).unwrap();
+            assert_eq!(queue.dropped_total(), 0, "depth {depth}");
+            assert_eq!(&issues(&queue)[..before.len()], &before[..], "depth {depth}");
+            let expect = if depth < 6 {
+                Admission::Admitted
+            } else {
+                Admission::Deferred
+            };
+            assert_eq!(admission, expect, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn concurrent_bounded_callers_cannot_overshoot_the_limit() {
+        let dir = tempdir().unwrap();
+        let queue = Arc::new(DurableQueue::open(dir.path().join("q.jsonl"), 8));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16u32)
+            .map(|i| {
+                let queue = Arc::clone(&queue);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    queue.push_bounded(envelope(i)).unwrap()
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|a| *a == Admission::Admitted)
+            .count();
+        assert_eq!(admitted, 6, "exactly backfill_limit(8) offers admitted");
+        assert_eq!(queue.len(), 6);
+        assert_eq!(queue.dropped_total(), 0);
+        assert_eq!(queue.deferred_total(), 10);
+    }
+
+    #[test]
+    fn fanout_backfill_holds_every_queue_lock_through_enqueue() {
+        let dir = tempdir().unwrap();
+        let a = Arc::new(DurableQueue::open(dir.path().join("q.a.jsonl"), 8));
+        let b = Arc::new(DurableQueue::open(dir.path().join("q.b.jsonl"), 4));
+        let fanout = FanoutQueue::new(vec![a.clone(), b.clone()]);
+        arm_lock_held_probe();
+        assert_eq!(fanout.offer_backfill(envelope(1)).unwrap(), Admission::Admitted);
+        assert_eq!(disarm_probe(), 2, "probe fires once per queue");
+        // Smaller queue reaches its limit (3) first: all-or-defer, no eviction.
+        fanout.offer_backfill(envelope(2)).unwrap();
+        fanout.offer_backfill(envelope(3)).unwrap();
+        assert_eq!(fanout.offer_backfill(envelope(4)).unwrap(), Admission::Deferred);
+        assert_eq!((a.len(), b.len()), (3, 3));
+        assert_eq!((a.dropped_total(), b.dropped_total()), (0, 0));
+        assert_eq!((a.deferred_total(), b.deferred_total()), (0, 1));
+    }
+
+    #[test]
+    fn fanout_backfill_with_a_repeated_queue_does_not_deadlock() {
+        let dir = tempdir().unwrap();
+        let a = Arc::new(DurableQueue::open(dir.path().join("q.a.jsonl"), 8));
+        let fanout = FanoutQueue::new(vec![a.clone(), a.clone()]);
+        assert_eq!(fanout.offer_backfill(envelope(1)).unwrap(), Admission::Admitted);
+        assert_eq!(a.len(), 1);
+    }
+
+    #[test]
+    fn fanout_backfill_persist_failure_is_at_least_once() {
+        let dir = tempdir().unwrap();
+        let ok = Arc::new(DurableQueue::open(dir.path().join("q.https.jsonl"), 8));
+        let bad_path = dir.path().join("not-a-file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+        let bad = Arc::new(DurableQueue::open(bad_path, 8));
+        let fanout = FanoutQueue::new(vec![ok.clone(), bad]);
+        // Err: the caller keeps its cursor and retries; the earlier queue
+        // already holds the record, so the retry yields a duplicate there,
+        // never an omission.
+        assert!(fanout.offer_backfill(envelope(1)).is_err());
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok.dropped_total(), 0);
+    }
 
     fn envelope(issue: u32) -> TelemetryEnvelope {
         TelemetryEnvelope::new(
