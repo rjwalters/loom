@@ -837,6 +837,37 @@ fn quoted_or_indented_records_never_release_but_a_real_one_after_indented_backti
     assert_eq!(r.released[0].resolved, vec![7]);
 }
 
+#[test]
+fn records_quoted_in_a_list_item_fence_never_release_but_a_real_one_after_the_list_does() {
+    // #10837 review: a fence opened directly inside a list item quotes its
+    // content, so it cannot release an unrecorded hold ...
+    let body = format!(
+        "Evidence:\n\n- ```\n\n  {}\n\n  ```\n",
+        LOOM_UI_1695_RECORDS.replace('\n', "\n  ")
+    );
+    let mut w = World::new();
+    w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(skipped(&r, "no-park-record"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes());
+    // ... while a real record after the list still releases.
+    let mut w = World::new();
+    let body = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+    w.with_body(10837, false, &body, &["loom:curated"]);
+    // The quoted refs are still prose references the pass must see closed.
+    for b in [7, 1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra.events.insert(10837, vec!["loom:issue".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].resolved, vec![7]);
+}
+
 // --- the tick's gate ------------------------------------------------------------
 
 #[test]

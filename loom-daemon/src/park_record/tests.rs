@@ -396,6 +396,39 @@ fn escaped_backtick_does_not_open_a_code_span() {
     assert!(parse(body).is_empty());
 }
 
+/// #10837 review: a fence opened directly inside a list item (bulleted,
+/// numbered, nested) quotes its content, even across blank lines; a genuine
+/// record after the list is still read.
+#[test]
+fn fences_inside_list_items_quote_their_markers() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("- ```\n\n  {q}\n\n  ```\n"),
+        format!("* ```\n  {q}\n  ```\n"),
+        format!("1. ```\n\n   {q}\n\n   ```\n"),
+        format!("1) ~~~text\n   {q}\n   ~~~\n"),
+        format!("- outer\n  - ```\n\n    {q}\n\n    ```\n"),
+        format!("- item\n\n  ```\n\n  {q}\n\n  ```\n"),
+        // Unclosed: runs to the end of the item (the end of the body here).
+        format!("- ```\n  {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+        assert_eq!(drop_blockers(&body, &[1689]), body);
+        // A genuine record after the list is the control.
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        if !body.ends_with(&format!("{q}\n")) {
+            assert_eq!(blockers(&after), n(&[7]), "{after}");
+        }
+    }
+    // A line dedented past the item ends its fence, so the record is real.
+    let body = "- ```\n  code\n<!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+    // A marker on a list item's own line is still a record.
+    let body = "- <!-- loom:park Blocked by: #7 -->\n";
+    assert_eq!(blockers(body), n(&[7]));
+}
+
 /// Indented code, blockquotes (plain, indented, fenced, lazy), and multiline
 /// inline code spans never declare a record; a real record after each does.
 #[test]

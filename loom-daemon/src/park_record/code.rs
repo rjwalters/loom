@@ -18,7 +18,9 @@
 //! Fenced blocks (```` ``` ```` / `~~~`, opened and closed with at most 3
 //! columns of indent -- a 4-space-indented fence is indented code, not a
 //! fence; closed by a same-character fence at least as long; an unclosed fence
-//! runs to the end), indented code blocks (not interrupting a paragraph),
+//! runs to the end), including fences opened inside a list item
+//! (bulleted, numbered, or nested: the item's content column replaces column
+//! 0, and a line dedented past it ends the fence), indented code blocks (not interrupting a paragraph),
 //! blockquotes (blanked wholesale, conservatively, including lazy
 //! continuation), and inline code spans, which may cross a newline within one
 //! paragraph. An HTML comment that starts outside code claims its own line up
@@ -31,31 +33,57 @@
 #[must_use]
 pub(super) fn blank(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut fence: Option<(u8, usize)> = None;
+    // An open fence: its character, its length, and the content column of the
+    // list item it sits in (0 outside a list).
+    let mut fence: Option<(u8, usize, usize)> = None;
+    // Content column of the enclosing list item, 0 outside a list.
+    let mut list_col = 0;
     // Consecutive plain-paragraph lines, so an inline span may cross a newline.
     let mut para = String::new();
     // Inside a blockquote (until a blank line).
     let mut in_quote = false;
     for line in text.split_inclusive('\n') {
-        let indent = indent_width(line);
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        let run = |c: u8| trimmed.bytes().take_while(|b| *b == c).count();
-        if let Some((c, n)) = fence {
-            // A closing fence is indented at most 3 columns.
-            let r = run(c);
-            if indent < 4 && r >= n && trimmed[r..].trim().is_empty() {
-                fence = None;
+        if let Some((c, n, fcol)) = fence {
+            if line.trim().is_empty() {
+                out.push_str(&spaces(line));
+                continue;
             }
-            out.push_str(&spaces(line));
-            continue;
+            // A line dedented past its list item ends the item, and the fence.
+            if indent_width(line) >= fcol {
+                // A closing fence is indented at most 3 columns past the item.
+                let trimmed = line.trim_start_matches([' ', '\t']);
+                let r = trimmed.bytes().take_while(|b| *b == c).count();
+                if indent_width(line) - fcol < 4 && r >= n && trimmed[r..].trim().is_empty() {
+                    fence = None;
+                }
+                out.push_str(&spaces(line));
+                continue;
+            }
+            fence = None;
+            list_col = 0;
         }
+        let (col, rest, item) = strip_lists(line, list_col);
+        let indent = indent_width(rest);
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        let run = |c: u8| trimmed.bytes().take_while(|b| *b == c).count();
         let blank_line = trimmed.trim().is_empty();
         if blank_line {
             flush(&mut para, &mut out);
             in_quote = false;
+            if item {
+                list_col = col;
+            }
             // A blank line inside an indented code run does not end it.
             out.push_str(&spaces(line));
             continue;
+        }
+        if item {
+            flush(&mut para, &mut out);
+        }
+        if col > 0 {
+            list_col = col;
+        } else if para.is_empty() {
+            list_col = 0;
         }
         let opener = if indent < 4 {
             [b'`', b'~']
@@ -75,13 +103,16 @@ pub(super) fn blank(text: &str) -> String {
         if quoted || lazy {
             flush(&mut para, &mut out);
             in_quote = true;
+            if col == 0 {
+                list_col = 0;
+            }
             out.push_str(&spaces(line));
             continue;
         }
         in_quote = false;
-        if let Some(o) = opener {
+        if let Some((c, n)) = opener {
             flush(&mut para, &mut out);
-            fence = Some(o);
+            fence = Some((c, n, col));
             out.push_str(&spaces(line));
             continue;
         }
@@ -94,6 +125,68 @@ pub(super) fn blank(text: &str) -> String {
     }
     flush(&mut para, &mut out);
     out
+}
+
+/// Width of the list marker at the start of `t` (`-`, `*`, `+`, or up to nine
+/// digits then `.` / `)`), when whitespace or the end of the line follows it.
+fn marker_width(t: &str) -> Option<usize> {
+    let b = t.as_bytes();
+    let w = match b.first()? {
+        b'-' | b'*' | b'+' => 1,
+        b'0'..=b'9' => {
+            let d = b.iter().take_while(|c| c.is_ascii_digit()).count();
+            if d > 9 || !matches!(b.get(d), Some(b'.' | b')')) {
+                return None;
+            }
+            d + 1
+        }
+        _ => return None,
+    };
+    matches!(b.get(w), None | Some(b' ' | b'\t' | b'\r' | b'\n')).then_some(w)
+}
+
+/// Peels list-item containers off the front of `line`: first the continuation
+/// indent of the enclosing item (`list_col`), then any markers opening further
+/// (nested) items. Returns the content column, the rest of the line, and
+/// whether a marker opened an item on this line.
+fn strip_lists(line: &str, list_col: usize) -> (usize, &str, bool) {
+    let (mut col, mut rest, mut item) = (0, line, false);
+    if list_col > 0 && indent_width(line) >= list_col {
+        (col, rest) = (list_col, skip_cols(line, list_col));
+    }
+    while indent_width(rest) < 4 {
+        let t = rest.trim_start_matches([' ', '\t']);
+        let Some(w) = marker_width(t) else { break };
+        let after = &t[w..];
+        let gap = indent_width(after);
+        let content = after.trim_start_matches([' ', '\t']);
+        // Five or more spaces after the marker: the content is indented code.
+        let pad = if content.trim().is_empty() || gap > 4 {
+            1
+        } else {
+            gap.max(1)
+        };
+        col += indent_width(rest) + w + pad;
+        rest = if pad == gap {
+            content
+        } else {
+            after.get(1..).unwrap_or("")
+        };
+        item = true;
+    }
+    (col, rest, item)
+}
+
+/// `s` without up to `n` columns of leading whitespace (a tab counts as 4).
+fn skip_cols(s: &str, n: usize) -> &str {
+    let mut w = 0;
+    for (i, c) in s.char_indices() {
+        if w >= n || !matches!(c, ' ' | '\t') {
+            return &s[i..];
+        }
+        w += if c == '\t' { 4 } else { 1 };
+    }
+    ""
 }
 
 /// Columns of leading whitespace (a tab counts as 4).
