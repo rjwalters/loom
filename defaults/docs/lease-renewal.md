@@ -117,10 +117,12 @@ startup" — because that is precisely what a restart would drop.
 - **`stop <PID>`** / **`stop --issue <N>`** (alias `stop-issue <N>`) —
   best-effort teardown, delegated to `loom-daemon lease renewer stop`
   (#11086). `<PID>` is signalled only after its command line proves it is a
-  lease renewer (`sweep-lease-renew.sh start ...` or `loom-daemon lease
-  renewer ...`) and its start identity is stable; an issue number passed by
-  mistake, an unrelated process or a non-number is refused (non-zero, nothing
-  signalled). `--issue N` ends every recorded renewer of that issue in this
+  lease renewer (a shell — bash/sh/zsh/dash — running `sweep-lease-renew.sh
+  start ...` as a file, never a `-c` string, or `loom-daemon lease renewer
+  ...`) and its start identity is stable; an issue number passed by mistake,
+  an unrelated process (even one whose arguments look like a renewer's) or a
+  non-number is refused (non-zero, nothing signalled; the refusal names only
+  the pid and program basename, never the target's arguments). `--issue N` ends every recorded renewer of that issue in this
   repo (any sweep unless `--sweep-id`), never a peer issue's. It fails closed:
   a `loom-daemon` predating the verb refuses rather than killing blindly. Not
   required for correctness; the loop already self-terminates.

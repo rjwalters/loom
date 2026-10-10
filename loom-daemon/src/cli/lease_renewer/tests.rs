@@ -250,6 +250,58 @@ fn renewer_argv_matches_only_this_toolings_renewers() {
     assert!(!is_renewer_argv(&argv("grep loom-daemon lease renewer")));
 }
 
+#[test]
+fn renewer_argv_requires_a_shell_running_the_script_file() {
+    for ok in [
+        "sh x/sweep-lease-renew.sh start 7",
+        "/usr/bin/zsh x/sweep-lease-renew.sh start 7",
+        "dash x/sweep-lease-renew.sh start 7",
+        "bash -x x/sweep-lease-renew.sh start 7",
+        "bash -eu x/sweep-lease-renew.sh start 7",
+    ] {
+        assert!(is_renewer_argv(&argv(ok)), "{ok}");
+    }
+    // Non-shell programs whose arguments look like a renewer's.
+    for bad in [
+        "python3 x/sweep-lease-renew.sh start 7",
+        "python3 -I /tmp/x/sweep-lease-renew.sh start",
+        "vim x/sweep-lease-renew.sh start",
+        "/usr/bin/vim -R x/sweep-lease-renew.sh start",
+        "less x/sweep-lease-renew.sh start",
+        "x/sweep-lease-renew.sh start 7",
+        "fakebash x/sweep-lease-renew.sh start",
+        // Command-string / stdin forms and options that take an argument.
+        "bash -c sleep x/sweep-lease-renew.sh start",
+        "bash -xc sleep x/sweep-lease-renew.sh start",
+        "sh -c sleep x/sweep-lease-renew.sh start",
+        "bash -s x/sweep-lease-renew.sh start",
+        "bash -o x/sweep-lease-renew.sh start",
+        "bash -O x/sweep-lease-renew.sh start",
+        "bash --rcfile x/sweep-lease-renew.sh start",
+        "bash -- x/sweep-lease-renew.sh start",
+        "bash - x/sweep-lease-renew.sh start",
+    ] {
+        assert!(!is_renewer_argv(&argv(bad)), "{bad}");
+    }
+    assert!(!is_renewer_argv(&[]));
+}
+
+#[test]
+fn stop_pid_refusal_names_the_program_but_never_its_arguments() {
+    let sent = RefCell::new(vec![]);
+    let fake = "FAKE-SECRET-SENTINEL-must-not-be-logged";
+    let cmd = format!("/opt/tool/deploy --token {fake} x/sweep-lease-renew.sh start");
+    let StopOutcome::Refused(why) = run_stop("500", &[Some("a")], Some(&cmd), &sent) else {
+        panic!("expected a refusal");
+    };
+    assert!(why.contains("pid 500") && why.contains("program: deploy"), "{why}");
+    assert!(
+        !why.contains(fake) && !why.contains("--token") && !why.contains("/opt/tool"),
+        "{why}"
+    );
+    assert!(sent.borrow().is_empty());
+}
+
 fn run_stop(
     arg: &str,
     ids: &[Option<&str>],
@@ -279,6 +331,8 @@ fn stop_pid_refuses_unrelated_nonnumeric_and_reserved_pids_without_signalling() 
     let renewer = Some("bash sweep-lease-renew.sh start 9");
     for (arg, a) in [
         ("500", Some("sleep 30")),
+        ("500", Some("python3 -I /tmp/x/sweep-lease-renew.sh start")),
+        ("500", Some("vim x/sweep-lease-renew.sh start")),
         ("11086", Some("node server.js")),
         ("abc", renewer),
         ("-1", renewer),

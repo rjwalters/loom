@@ -28,8 +28,9 @@
 #        renewal continues, loop still ends when the watched pid dies
 #
 # With LEASE_RENEWER_DAEMON=<built loom-daemon> the stub hands `lease renewer`
-# to the real binary and (r1)-(r4) run end to end: closed issue, concurrent
-# identical starts, independent keys, release, dead-owner recovery.
+# to the real binary and (r1)-(r6) run end to end: closed issue, concurrent
+# identical starts, independent keys, release, dead-owner recovery, and an
+# ownership-checked stop that spares look-alike processes (#11086).
 #
 # `gh` is stubbed on PATH; no real credentials or live forge calls.
 
@@ -291,6 +292,25 @@ else
     sleep 0.5
     assert_eq "true" "$([[ $RC -eq 0 ]] && ! alive "$R5A" && alive "$WATCH" && echo true || echo false)" "(r5) stop <real renewer pid> ends it"
     kill "$BYSTANDER" "$WATCH" 2> /dev/null
+
+    # (r6) look-alikes whose argv mimics a renewer's survive `stop` (#11086):
+    # a non-shell program, and a shell running a `-c` string. The refusal names
+    # the program only, never the target's (fake) credential argument.
+    mkdir -p "$STUB_DIR/la" && printf 'import time\ntime.sleep(30)\n' > "$STUB_DIR/la/sweep-lease-renew.sh"
+    bash -c 'sleep 30; :' "$STUB_DIR/la/sweep-lease-renew.sh" start &
+    LA_SH=$!
+    RC=0; "$SCRIPT" stop "$LA_SH" > /dev/null 2>&1 || RC=$?; sleep 0.3
+    assert_eq "true" "$([[ $RC -ne 0 ]] && alive "$LA_SH" && echo true || echo false)" "(r6) a 'bash -c' look-alike is refused and survives"
+    kill "$LA_SH" 2> /dev/null
+    if command -v python3 > /dev/null 2>&1; then
+        python3 -I "$STUB_DIR/la/sweep-lease-renew.sh" start --token FAKE-SECRET-SENTINEL-r6 &
+        LA_PY=$!
+        sleep 0.3
+        RC=0; ERR="$("$SCRIPT" stop "$LA_PY" 2>&1 > /dev/null)" || RC=$?; sleep 0.3
+        assert_eq "true" "$([[ $RC -ne 0 ]] && alive "$LA_PY" && echo true || echo false)" "(r6) a python3 look-alike is refused and survives"
+        assert_eq "true" "$([[ "$ERR" == *"program: python3"* && "$ERR" != *FAKE-SECRET-SENTINEL* ]] && echo true || echo false)" "(r6) the refusal names the program, not its arguments"
+        kill "$LA_PY" 2> /dev/null
+    fi
 fi
 
 # (y6) per-cycle budget: steady state is one state read + one list/window read
