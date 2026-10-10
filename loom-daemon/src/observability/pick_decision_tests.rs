@@ -464,3 +464,22 @@ fn an_unread_journal_leaves_decisions_unobserved() {
         .iter()
         .all(|s| s.reason == PickSkipReason::NotSelected));
 }
+
+#[test]
+fn lane_plan_is_stashed_converted_and_drained_once() {
+    use crate::role_runner::concurrent_dispatch::lane_rule::RepoLane;
+    stash_lane_plan(
+        Path::new("/tmp/loom-10630-obs"),
+        vec![RepoLane {
+            root: "/tmp/loom-10630-obs".into(),
+            debt: 60,
+            wanted: 3,
+            lanes: 2,
+        }],
+    );
+    let lanes = take_lane_plan();
+    assert_eq!((lanes.len(), lanes[0].debt, lanes[0].wanted, lanes[0].lanes), (1, 60, 3, 2));
+    assert!(take_lane_plan().is_empty(), "drained");
+    let json = serde_json::to_value(&lanes).unwrap();
+    assert_eq!(json[0]["debt"], 60);
+}

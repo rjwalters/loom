@@ -33,8 +33,8 @@ use super::pick_journal::{
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
-    source, PickAction, PickCandidate, PickDecisionRecord, PickSkipReason, PickSortKey, PickTick,
-    PickVerdict, WORK_FINDER_ROLE,
+    source, PickAction, PickCandidate, PickDecisionRecord, PickLane, PickSkipReason, PickSortKey,
+    PickTick, PickVerdict, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::WorkFinderTickSummary;
@@ -55,6 +55,39 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The lane plan the admission of this thread's run computed (#10630).
+    static LANE_PLAN: RefCell<Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Stash the per-repository lane plan the admission computed, for the run's
+/// end-of-tick record (#10630).
+pub fn stash_lane_plan(
+    _root: &Path,
+    plan: Vec<crate::role_runner::concurrent_dispatch::lane_rule::RepoLane>,
+) {
+    LANE_PLAN.with(|s| *s.borrow_mut() = plan);
+}
+
+fn take_lane_plan() -> Vec<PickLane> {
+    LANE_PLAN.with(|s| {
+        std::mem::take(&mut *s.borrow_mut())
+            .into_iter()
+            .take(MAX_PICK_LANES)
+            .map(|r| PickLane {
+                repo: repo_label(&r.root),
+                debt: r.debt,
+                wanted: r.wanted,
+                lanes: r.lanes,
+            })
+            .collect()
+    })
+}
+
+/// Most repositories one record lists lanes for.
+const MAX_PICK_LANES: usize = 32;
+
 /// Stash the open PR rows of a gate listing the role runner already made.
 pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
     let rows: Vec<GateRow> = rows
@@ -74,6 +107,7 @@ pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
 /// Drop anything stashed by an earlier tick on this (reused) blocking thread.
 pub fn clear_gate_listings() {
     GATE_LISTINGS.with(|s| s.borrow_mut().clear());
+    LANE_PLAN.with(|s| s.borrow_mut().clear());
     super::pick_journal::discard();
 }
 
@@ -111,6 +145,18 @@ fn repo_label(root: &Path) -> String {
 fn emit(record: PickDecisionRecord) {
     if let Some(sink) = super::ops::global_ops_sink() {
         sink.emit_record(TelemetryRecord::PickDecision(record));
+    }
+}
+
+/// Always drains the stash (it must not leak into the next tick on this
+/// thread); converts it (a cached local `git` read per repository) only with an
+/// exporter running.
+fn take_lane_plan_if_exporting() -> Vec<PickLane> {
+    if exporting() {
+        take_lane_plan()
+    } else {
+        LANE_PLAN.with(|s| s.borrow_mut().clear());
+        Vec::new()
     }
 }
 
@@ -382,6 +428,7 @@ pub fn emit_role_tick(
 ) {
     let gate = take_gate_listings(root);
     let journal = super::pick_journal::take(root);
+    let lane_plan = take_lane_plan_if_exporting();
     if !exporting() {
         return;
     }
@@ -397,7 +444,9 @@ pub fn emit_role_tick(
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
     let observed = RoleObservation { journal, gate };
-    emit(role_record(tick, result, observed, &repo_label(root), holds));
+    let mut record = role_record(tick, result, observed, &repo_label(root), holds);
+    record.lanes = lane_plan;
+    emit(record);
 }
 
 #[cfg(test)]

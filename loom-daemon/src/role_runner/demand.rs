@@ -171,6 +171,12 @@ pub struct DemandConfig {
     /// once, sized from that repository's own changes debt (#10632). `1` is
     /// the classic one instance per `(repository, role)`.
     pub doctor_max_per_repo: usize,
+    /// `laneK` — debt items per extra lane in the per-repository lane rule
+    /// (#10630): `lanes = clamp(ceil(debt / laneK), 1, cap)`.
+    pub lane_k: usize,
+    /// `perRepoCap` — the most judge runs (and, unless `doctorMaxPerRepo` is
+    /// set, doctor runs) one repository may hold at once (#10630).
+    pub per_repo_cap: usize,
 }
 
 /// Hard bound on `doctorMaxPerRepo`: a typo cannot point a host's whole
@@ -187,6 +193,8 @@ impl Default for DemandConfig {
             non_pr_floor: 1,
             stale_secs: 1800,
             doctor_max_per_repo: 3,
+            lane_k: 10,
+            per_repo_cap: 3,
         }
     }
 }
@@ -227,6 +235,7 @@ pub fn parse_demand_config(role_runner_block: &serde_json::Value) -> DemandConfi
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default)
     };
+    let per_repo_cap = count("perRepoCap", d.per_repo_cap).min(DOCTOR_MAX_PER_REPO_LIMIT);
     DemandConfig {
         enabled: flag("enabled", d.enabled),
         per_run: count("perRun", d.per_run),
@@ -234,8 +243,11 @@ pub fn parse_demand_config(role_runner_block: &serde_json::Value) -> DemandConfi
         reserve: flag("reserve", d.reserve),
         non_pr_floor: count("nonPrFloor", d.non_pr_floor),
         stale_secs: positive("staleSecs").unwrap_or(d.stale_secs),
-        doctor_max_per_repo: count("doctorMaxPerRepo", d.doctor_max_per_repo)
-            .min(DOCTOR_MAX_PER_REPO_LIMIT),
+        // `doctorMaxPerRepo` (#10632) stays a doctor-only override of
+        // `perRepoCap`, so an existing config keeps its meaning.
+        doctor_max_per_repo: count("doctorMaxPerRepo", per_repo_cap).min(DOCTOR_MAX_PER_REPO_LIMIT),
+        lane_k: count("laneK", d.lane_k),
+        per_repo_cap,
     }
 }
 
@@ -438,6 +450,16 @@ impl DemandLedger {
         entries.retain(|(root, _), _| roots.contains(root));
     }
 
+    /// Every root with at least one ledger entry, sorted (deterministic).
+    #[must_use]
+    pub fn known_roots(&self) -> Vec<PathBuf> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut roots: Vec<PathBuf> = entries.keys().map(|(r, _)| r.clone()).collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
     /// How many times the host or a repo debt has been read.
     #[must_use]
     pub fn reads(&self) -> usize {
@@ -587,22 +609,24 @@ pub fn width(debt: Option<usize>, cfg: &DemandConfig, phase1_budget: usize) -> u
     debt.map_or(phase1_budget, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
 }
 
-/// How many runs of `role` one repository may hold at once (#10632), sized
-/// from **that repository's** own debt (`repo`, a
-/// [`DemandLedger::repo_debt`] reading): doctor gets
-/// `clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)`; every other
-/// role, and a doctor whose repository's changes axis is unobserved, gets the
+/// How many runs of `role` one repository may hold at once (#10632, #10630),
+/// sized from **that repository's** own debt (`repo`, a
+/// [`DemandLedger::repo_debt`] reading) on the role's axis:
+/// `clamp(ceil(debt / laneK), 1, cap)` for judge (review debt, `perRepoCap`)
+/// and doctor (changes debt, `doctorMaxPerRepo`, default `perRepoCap`). Every
+/// other role, and a repository whose axis is unobserved or drained, gets the
 /// classic `1`. The host ceiling, the role's budget and the reservation still
 /// bound every lane, so this only lets a hot repository use slots the host
-/// already allows doctor.
+/// already allows the role.
 #[must_use]
 pub fn repo_lanes(role: &str, repo: &HostDebt, cfg: &DemandConfig) -> usize {
-    if role != "doctor" {
-        return 1;
-    }
-    let upper = cfg.doctor_max_per_repo.max(1);
-    repo.axis_width(DebtAxis::Changes)
-        .map_or(1, |d| d.div_ceil(cfg.per_run.max(1)).clamp(1, upper))
+    let (axis, cap) = match role {
+        "judge" => (DebtAxis::Review, cfg.per_repo_cap),
+        "doctor" => (DebtAxis::Changes, cfg.doctor_max_per_repo),
+        _ => return 1,
+    };
+    repo.axis_width(axis)
+        .map_or(1, |d| d.div_ceil(cfg.lane_k.max(1)).clamp(1, cap.max(1)))
 }
 
 /// The slots a PR role wants held: `min(width, roots_with_debt)`, or 0 when
