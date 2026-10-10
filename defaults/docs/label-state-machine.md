@@ -102,7 +102,7 @@ guard consults.
 
 ## `loom:operator-priority` is not a hold (#9244)
 
-`loom:operator-priority` (the operator's "star") shares a prefix with
+`loom:operator-priority` (the operator's "star"; being replaced by `loom:important` / `loom:very-important`, see [`priority-model.md`](priority-model.md)) shares a prefix with
 `loom:operator` but means the opposite: not "the engine stopped, a human must
 act" but "a human wants this landed ASAP, act now". It is the one "land this
 ASAP" signal; the older urgent label is retired (its `labels.yml` description
