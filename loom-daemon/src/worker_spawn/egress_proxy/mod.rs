@@ -223,10 +223,16 @@ impl std::fmt::Debug for Prepared {
 /// `Ok(None)` means "env-passthrough, unchanged" and is reached only when the
 /// feature is off or the profile declares no `credentialProxy`. Every other
 /// outcome is `Err`.
+///
+/// `runtime` is the launcher's already-resolved runtime (role binding, env,
+/// `runtimes.default` or built-in default — see
+/// `worker_spawn::resolve_launch_runtime`); observe-mode attribution uses it
+/// verbatim rather than rereading `LOOM_RUNTIME`.
 pub fn prepare(
     root: &std::path::Path,
     selection: &Selection,
     config: &Value,
+    runtime: &str,
 ) -> Result<Option<Prepared>, LaunchError> {
     if !enabled(config) {
         return Ok(None);
@@ -292,22 +298,10 @@ pub fn prepare(
             model_class: bad_marks::normalize_model_class(&selection.model),
         });
     let observe = (declared.observe && observe::enabled(config)).then(|| {
-        let runtime = std::env::var("LOOM_RUNTIME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "native".to_string());
-        let profile = selection
-            .profile
-            .clone()
-            .unwrap_or_else(|| selection.provider.clone());
-        let tap = match selection.profile.as_deref() {
-            Some(p) => crate::runtime_preference::Tap::with_profile(&runtime, p),
-            None => crate::runtime_preference::Tap::runtime(&runtime),
-        };
         let seat = pool_attribution
             .as_ref()
             .map_or("-", |attribution| attribution.account.as_str());
-        observe::ObserveContext::from_env(seat, &tap.to_string(), &profile, &runtime)
+        observe_context(runtime, selection, seat)
     });
     arm(
         secret,
@@ -320,6 +314,20 @@ pub fn prepare(
         observe,
     )
     .map(Some)
+}
+
+/// Observe-mode tags for a launch on `runtime` (the launcher's resolved
+/// runtime, never reread from the environment) with `selection`'s profile.
+fn observe_context(runtime: &str, selection: &Selection, seat: &str) -> observe::ObserveContext {
+    let profile = selection
+        .profile
+        .clone()
+        .unwrap_or_else(|| selection.provider.clone());
+    let tap = match selection.profile.as_deref() {
+        Some(p) => crate::runtime_preference::Tap::with_profile(runtime, p),
+        None => crate::runtime_preference::Tap::runtime(runtime),
+    };
+    observe::ObserveContext::from_env(seat, &tap.to_string(), &profile, runtime)
 }
 
 /// The pool attribution [`arm`] needs so the proxy can bad-mark this launch's

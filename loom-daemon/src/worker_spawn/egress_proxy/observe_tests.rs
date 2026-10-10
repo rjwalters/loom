@@ -438,6 +438,44 @@ fn an_oversize_sse_line_is_skipped_and_parsing_resumes() {
     assert_eq!((obs.usage.input, obs.usage.output), (Some(4), Some(6)));
 }
 
+/// An oversized `data:` line whose usage would be parsed, sized just past the
+/// bound (so the stale-usage check below proves it was skipped, not parsed).
+fn oversized_usage_line() -> Vec<u8> {
+    let mut line =
+        b"data: {\"usage\":{\"input_tokens\":999,\"output_tokens\":999},\"pad\":\"".to_vec();
+    line.resize(MAX_LINE_BYTES + 1, b'x');
+    line.extend_from_slice(b"\"}\n");
+    line
+}
+
+#[test]
+fn a_whole_oversize_line_in_one_feed_is_skipped_and_parsing_resumes() {
+    let mut tap = Tap::new(Instant::now(), true);
+    let mut chunk = oversized_usage_line();
+    chunk.extend_from_slice(b"\ndata: {\"usage\":{\"output_tokens\":6}}\n\n");
+    tap.feed(&chunk);
+    assert!(tap.carry.len() <= MAX_LINE_BYTES);
+    let obs = tap.finish(200, None);
+    assert_eq!((obs.usage.input, obs.usage.output), (None, Some(6)), "oversize line parsed");
+}
+
+#[test]
+fn an_oversize_line_completed_by_the_next_feed_is_skipped_and_parsing_resumes() {
+    let line = oversized_usage_line();
+    // The first feed stays under the bound, so it is carried; the next feed
+    // completes the line past it.
+    let (head, tail) = line.split_at(MAX_LINE_BYTES / 2);
+    let mut tap = Tap::new(Instant::now(), true);
+    tap.feed(head);
+    assert_eq!(tap.carry.len(), head.len(), "partial line under the bound is carried");
+    let mut next = tail.to_vec();
+    next.extend_from_slice(b"\ndata: {\"usage\":{\"output_tokens\":6}}\n\n");
+    tap.feed(&next);
+    assert!(tap.carry.len() <= MAX_LINE_BYTES);
+    let obs = tap.finish(200, None);
+    assert_eq!((obs.usage.input, obs.usage.output), (None, Some(6)), "oversize line parsed");
+}
+
 // -------------------------------------------------------- emission hygiene
 
 #[test]
@@ -570,4 +608,99 @@ fn error_codes_are_a_closed_vocabulary() {
     assert_eq!(error_code(401, b"nope"), "credential");
     assert_eq!(error_code(500, b"boom"), "http_5xx");
     assert_eq!(error_code(404, b"missing"), "http_4xx");
+}
+
+// ------------------------------------------- runtime attribution (launcher)
+
+/// Resolve the runtime exactly as the launcher does, run `prepare` with it in
+/// observe mode, and return the `(runtime, tap)` the launch record carries.
+fn attributed_runtime(config: &serde_json::Value) -> (String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+    std::fs::write(tmp.path().join(".loom/config.json"), config.to_string()).unwrap();
+    let effective = crate::config_resolver::resolve_effective_config(tmp.path());
+    let (runtime, _source) =
+        crate::worker_spawn::resolve_launch_runtime(tmp.path(), &effective).unwrap();
+    let mut selection = crate::worker_spawn::profiles::Selection {
+        provider: "anthropic".into(),
+        model: "test-model".into(),
+        effort: None,
+        profile: Some("test-profile".into()),
+        credentials: vec![("LOOM_TEST_OBSERVE_KEY_11300".into(), "ANTHROPIC_AUTH_TOKEN".into())],
+        credential_sources: vec!["LOOM_TEST_OBSERVE_KEY_11300".into()],
+        provider_options: None,
+        provider_definition: None,
+        credential_pool: None,
+        credential_proxy: None,
+    };
+    selection.credential_proxy = Some(ProfileProxy {
+        upstream: "https://api.anthropic.com".into(),
+        header: HeaderStyle::AuthorizationBearer,
+        base_url_env: vec!["ANTHROPIC_BASE_URL".into()],
+        observe: true,
+    });
+    std::env::set_var("LOOM_TEST_OBSERVE_KEY_11300", CREDENTIAL);
+    let prepared = super::super::prepare(tmp.path(), &selection, &effective, &runtime)
+        .unwrap()
+        .expect("substitution should apply");
+    std::env::remove_var("LOOM_TEST_OBSERVE_KEY_11300");
+    let placeholder = prepared
+        .injection
+        .assignments
+        .iter()
+        .find(|(k, _)| k == "ANTHROPIC_AUTH_TOKEN")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let record = prepared
+        .registry
+        .authorize("POST", &[placeholder], None)
+        .unwrap();
+    let ctx = record.observe().expect("observe mode is on").clone();
+    (ctx.runtime, ctx.tap)
+}
+
+/// Clear every variable the launcher's runtime resolution reads.
+fn clear_runtime_env() {
+    for key in [
+        "LOOM_ROLE",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_EGRESS_PROXY_OBSERVE",
+    ] {
+        std::env::remove_var(key);
+    }
+    std::env::remove_var("LOOM_NATIVE_CREDENTIAL_PROXY");
+}
+
+const OBSERVE_ON: &str = r#"{"credentialProxy":true,"credentialProxyObserve":true}"#;
+
+#[test]
+#[serial_test::serial]
+fn observe_attribution_uses_the_config_selected_runtime_not_a_native_fallback() {
+    let _g = super::super::tests::env_lock();
+    clear_runtime_env();
+    let containment: serde_json::Value = serde_json::from_str(OBSERVE_ON).unwrap();
+    let config = json!({"runtimes": {"default": "opencode", "containment": containment}});
+    let (runtime, tap) = attributed_runtime(&config);
+    clear_runtime_env();
+    assert_eq!(runtime, "opencode");
+    assert_eq!(tap, "opencode:test-profile");
+}
+
+#[test]
+#[serial_test::serial]
+fn observe_attribution_follows_a_role_binding_over_an_inherited_runtime() {
+    let _g = super::super::tests::env_lock();
+    clear_runtime_env();
+    // The parent exported LOOM_RUNTIME=claude; this launch's role binding
+    // (LOOM_ROLE=builder + LOOM_RUNTIME_BUILDER) puts it on opencode.
+    std::env::set_var("LOOM_RUNTIME", "claude");
+    std::env::set_var("LOOM_ROLE", "builder");
+    std::env::set_var("LOOM_RUNTIME_BUILDER", "opencode");
+    let containment: serde_json::Value = serde_json::from_str(OBSERVE_ON).unwrap();
+    let config = json!({"runtimes": {"containment": containment}});
+    let (runtime, tap) = attributed_runtime(&config);
+    clear_runtime_env();
+    assert_eq!(runtime, "opencode");
+    assert_eq!(tap, "opencode:test-profile");
 }

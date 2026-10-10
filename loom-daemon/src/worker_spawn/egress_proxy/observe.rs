@@ -239,6 +239,13 @@ impl Tap {
                 self.carry.clear();
                 continue;
             }
+            // Bound the *completed* line too, whatever the chunk boundaries:
+            // a whole oversized line in one chunk, or a carried partial line
+            // completed past the limit, is skipped rather than copied/parsed.
+            if self.carry.len() + line.len() > MAX_LINE_BYTES {
+                self.carry.clear();
+                continue;
+            }
             if self.carry.is_empty() {
                 self.line(line);
             } else {
