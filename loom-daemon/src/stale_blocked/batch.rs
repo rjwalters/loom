@@ -276,6 +276,8 @@ pub fn gather_filtered(
         let rows = rows
             .iter()
             .filter(|r| r.is_pull_request == want_pr)
+            // Champion's digest is not a parked artifact (#9397).
+            .filter(|r| !super::digest::excluded(kind, r))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
     }
