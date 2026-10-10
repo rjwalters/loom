@@ -2882,7 +2882,7 @@ command needs to run again at all before those checks ever see it.
 By default the multi-repo work-finder and epic supervisor iterate
 `effective_roots()` in **registration order**, so a deep product-repo backlog can
 starve the tool repos whose fixes compound. Priority tiers add cross-repo dispatch
-ordering:
+ordering (superseded by the weighted draw in [`priority-model.md`](priority-model.md), #11103):
 
 - **Registry schema** — each `~/.loom/workspaces.json` entry gains an optional
   `priority` integer (`Workspace.priority`, `loom-daemon/src/workspace_registry.rs`):
