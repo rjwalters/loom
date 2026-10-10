@@ -61,8 +61,20 @@ pub const AGENT_SCOPE_PREFIX: &str = "loom-agent-";
 /// Prefix of `spawn-claude.sh`'s throwaway probe scopes, which are not agents.
 const PROBE_SCOPE_PREFIX: &str = "loom-agent-probe-";
 
+/// Consecutive failed cgroup reads after which a tracked scope's frozen
+/// sample is dropped, so it stops being credited back into admission (#11182).
+pub const MAX_UNREADABLE_TICKS: u32 = 3;
+
+/// On-disk format this build writes. A file with no `version` field is the
+/// original format (read as current); a higher one is never overwritten.
+pub const STORE_VERSION: u32 = 1;
+
 /// One live scope's last sample.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Every field added after the first release is additive and
+/// `#[serde(default)]`, so an older daemon (which ignores unknown fields) can
+/// still read a store written by this build (#11182).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InFlight {
     pub repo: String,
     /// The claimed issue; `None` for a role agent with no issue lock.
@@ -70,17 +82,45 @@ pub struct InFlight {
     pub issue: Option<u32>,
     pub peak_bytes: u64,
     pub current_bytes: u64,
+    /// The role of a role-agent scope, when known (`judge`, `doctor`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Consecutive ticks the scope's cgroup could not be read.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreadable_ticks: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// On-disk state: rolling peak history per repo plus the live scopes.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Store {
+    /// Format version; absent in files written before versioning (read as 0).
+    #[serde(default)]
+    pub version: u32,
     /// Repo -> recent per-sweep peaks (bytes), oldest first.
     #[serde(default)]
     pub repos: BTreeMap<String, Vec<u64>>,
+    /// Repo -> role -> recent peaks (bytes) of role agents with no issue lock.
+    #[serde(default)]
+    pub roles: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
     /// Scope unit -> last sample of a still-running scope.
     #[serde(default)]
     pub inflight: BTreeMap<String, InFlight>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            version: STORE_VERSION,
+            repos: BTreeMap::new(),
+            roles: BTreeMap::new(),
+            inflight: BTreeMap::new(),
+        }
+    }
 }
 
 /// A scope that was live at the previous observation and is gone now.
@@ -89,6 +129,7 @@ pub struct EndedScope {
     pub scope: String,
     pub repo: String,
     pub issue: Option<u32>,
+    pub role: Option<String>,
     pub peak_bytes: u64,
 }
 
@@ -99,6 +140,8 @@ pub struct LiveScope {
     pub repo: String,
     /// `None` for a scope found only by [`discover_scopes`] (a role agent).
     pub issue: Option<u32>,
+    /// The role of a role-agent scope, when known ([`attach_roles`]).
+    pub role: Option<String>,
 }
 
 /// Where a sweep's RAM charge came from.
@@ -174,6 +217,25 @@ pub fn expected_peak_bytes(store: &Store, repo: &str) -> Option<u64> {
         })
 }
 
+/// The peak a specific in-flight scope is expected to reach. A role-agent
+/// scope (no issue lock) with a known role and real `(repo, role)` history uses
+/// that history; anything else falls back to [`expected_peak_bytes`], so
+/// role-keyed history only ever lowers a reservation once it has samples.
+#[must_use]
+pub fn expected_peak_for(store: &Store, f: &InFlight) -> Option<u64> {
+    if f.issue.is_none() {
+        if let Some(b) = f
+            .role
+            .as_deref()
+            .and_then(|r| store.roles.get(&f.repo)?.get(r))
+            .and_then(|h| high_water_bytes(h))
+        {
+            return Some(b);
+        }
+    }
+    expected_peak_bytes(store, &f.repo)
+}
+
 /// Bytes still to be realised by the live agent scopes (sweeps and role
 /// agents alike): for each one with an expected peak
 /// ([`expected_peak_bytes`]), `max(0, expected_peak - current_usage)`. A scope
@@ -185,7 +247,7 @@ pub fn reserved_bytes(store: &Store) -> u64 {
         .inflight
         .values()
         .filter_map(|f| {
-            let expected = expected_peak_bytes(store, &f.repo)?;
+            let expected = expected_peak_for(store, f)?;
             Some(expected.saturating_sub(f.current_bytes))
         })
         .sum()
@@ -200,18 +262,48 @@ pub fn reserved_bytes(store: &Store) -> u64 {
 pub fn accounted_sweeps(store: &Store) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     for f in store.inflight.values() {
-        if f.issue.is_some() && expected_peak_bytes(store, &f.repo).is_some() {
+        if f.issue.is_some() && expected_peak_for(store, f).is_some() {
             *out.entry(f.repo.clone()).or_insert(0) += 1;
         }
     }
     out
 }
 
+fn push_sample(hist: &mut Vec<u64>, peak: u64) {
+    hist.push(peak);
+    if hist.len() > HISTORY_LEN {
+        let excess = hist.len() - HISTORY_LEN;
+        hist.drain(..excess);
+    }
+}
+
+/// Fold a scope's peak into history: role agents with a known role go to
+/// `roles[repo][role]`, sweeps and role-unknown scopes to `repos[repo]`.
+fn fold_history(store: &mut Store, f: &InFlight) {
+    if f.peak_bytes == 0 {
+        return;
+    }
+    match (&f.role, f.issue) {
+        (Some(role), None) => push_sample(
+            store
+                .roles
+                .entry(f.repo.clone())
+                .or_default()
+                .entry(role.clone())
+                .or_default(),
+            f.peak_bytes,
+        ),
+        _ => push_sample(store.repos.entry(f.repo.clone()).or_default(), f.peak_bytes),
+    }
+}
+
 /// Fold one observation tick into `store`. `read` returns `(peak, current)`
-/// bytes for a scope, or `None` when its cgroup files are unavailable (the
-/// scope is then left out of `inflight`: a no-op, not an error). Scopes that
-/// were tracked but are no longer live are folded into their repo's history
-/// and returned.
+/// bytes for a scope, or `None` when its cgroup files are unavailable (an
+/// untracked scope is then left out of `inflight`; a tracked one keeps its
+/// last sample for [`MAX_UNREADABLE_TICKS`] consecutive failures and is then
+/// dropped, its peak folded into history, so a frozen sample is not credited
+/// forever). Scopes that were tracked but are no longer live are folded into
+/// their history and returned.
 pub fn observe(
     store: &mut Store,
     live: &[LiveScope],
@@ -219,6 +311,15 @@ pub fn observe(
 ) -> Vec<EndedScope> {
     for l in live {
         let Some((peak, current)) = read(&l.scope) else {
+            let expired = store.inflight.get_mut(&l.scope).is_some_and(|f| {
+                f.unreadable_ticks = f.unreadable_ticks.saturating_add(1);
+                f.unreadable_ticks >= MAX_UNREADABLE_TICKS
+            });
+            if expired {
+                if let Some(f) = store.inflight.remove(&l.scope) {
+                    fold_history(store, &f);
+                }
+            }
             continue;
         };
         let prev_peak = store.inflight.get(&l.scope).map_or(0, |f| f.peak_bytes);
@@ -229,6 +330,8 @@ pub fn observe(
                 issue: l.issue,
                 peak_bytes: peak.max(prev_peak),
                 current_bytes: current,
+                role: l.role.clone(),
+                unreadable_ticks: 0,
             },
         );
     }
@@ -243,22 +346,27 @@ pub fn observe(
         let Some(f) = store.inflight.remove(&scope) else {
             continue;
         };
-        if f.peak_bytes > 0 {
-            let hist = store.repos.entry(f.repo.clone()).or_default();
-            hist.push(f.peak_bytes);
-            if hist.len() > HISTORY_LEN {
-                let excess = hist.len() - HISTORY_LEN;
-                hist.drain(..excess);
-            }
-        }
+        fold_history(store, &f);
         ended.push(EndedScope {
             scope,
             repo: f.repo,
             issue: f.issue,
+            role: f.role,
             peak_bytes: f.peak_bytes,
         });
     }
     ended
+}
+
+/// Stamp each issue-less scope in `scopes` with the role of the live role run
+/// whose `scope_unit` matches. `runs` is `(scope_unit, role)` pairs (from
+/// `roll_pause::live_runs::snapshot()`); non-matching scopes keep `None`.
+pub fn attach_roles(scopes: &mut [LiveScope], runs: &[(String, String)]) {
+    for s in scopes.iter_mut().filter(|s| s.issue.is_none()) {
+        if let Some((_, role)) = runs.iter().find(|(unit, _)| unit == &s.scope) {
+            s.role = Some(role.clone());
+        }
+    }
 }
 
 /// Store location: `$LOOM_RAM_PEAKS_PATH`, else `$HOME/.loom/ram-peaks.json`.
@@ -271,13 +379,37 @@ pub fn store_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".loom").join("ram-peaks.json"))
 }
 
-/// Load the store; a missing or corrupt file is an empty store.
+/// Why a store file could not be used as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// The file exists but does not parse.
+    Unparseable,
+    /// The file was written by a newer format than this build supports.
+    NewerVersion(u32),
+}
+
+/// Load the store. A missing file is an empty store; a file that exists but
+/// does not parse, or carries a newer `version`, is an error so the caller
+/// never overwrites it (#11182).
+pub fn load_checked(path: &Path) -> Result<Store, LoadError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::default()),
+        Err(_) => return Err(LoadError::Unparseable),
+    };
+    let mut store: Store = serde_json::from_str(&raw).map_err(|_| LoadError::Unparseable)?;
+    if store.version > STORE_VERSION {
+        return Err(LoadError::NewerVersion(store.version));
+    }
+    store.version = STORE_VERSION;
+    Ok(store)
+}
+
+/// Load the store for read-only use; any unreadable file is an empty store
+/// (no history: today's flat-charge behaviour).
 #[must_use]
 pub fn load(path: &Path) -> Store {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    load_checked(path).unwrap_or_default()
 }
 
 /// Atomically persist the store (best effort).
@@ -428,6 +560,7 @@ pub fn discover_scopes(
                 scope,
                 repo,
                 issue: None,
+                role: None,
             }
         })
         .collect()
@@ -437,9 +570,10 @@ pub fn discover_scopes(
 /// [`record_tick`]'s Linux branch calls it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn emit_ended(e: &EndedScope) {
-    let who = e
-        .issue
-        .map_or_else(|| "role agent".to_string(), |n| format!("issue #{n}"));
+    let who = e.issue.map_or_else(
+        || format!("role agent {}", e.role.as_deref().unwrap_or("unknown")),
+        |n| format!("issue #{n}"),
+    );
     log::info!(
         "ram_peaks: scope {} ({who}, repo {}) peaked at {} bytes ({:.2} GiB)",
         e.scope,
@@ -480,6 +614,7 @@ pub fn live_scopes(
                     scope,
                     repo: repo_key(root),
                     issue: Some(a.issue),
+                    role: None,
                 });
             }
         }
@@ -490,7 +625,43 @@ pub fn live_scopes(
         let extra = discover_scopes(&slice, roots, &out, cwd_of);
         out.extend(extra);
     }
+    let runs: Vec<(String, String)> = crate::roll_pause::live_runs::snapshot()
+        .into_iter()
+        .filter_map(|r| Some((r.scope_unit?, r.role)))
+        .collect();
+    attach_roles(&mut out, &runs);
     (out, in_flight)
+}
+
+/// Load, observe and persist one tick against `path`. An existing file that
+/// is unreadable (does not parse, or a newer `version`) is left byte-for-byte
+/// untouched and WARNed about once per process, so a downgrade-and-upgrade
+/// round trip keeps its history. Returns the ended scopes (empty when skipped).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn persist_tick(
+    path: &Path,
+    live: &[LiveScope],
+    read: impl Fn(&str) -> Option<(u64, u64)>,
+) -> Vec<EndedScope> {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut store = match load_checked(path) {
+        Ok(s) => s,
+        Err(e) => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "ram_peaks: {} is unreadable ({e:?}); leaving it untouched and not recording peaks",
+                    path.display()
+                );
+            }
+            return Vec::new();
+        }
+    };
+    let before = store.clone();
+    let ended = observe(&mut store, live, read);
+    if store != before {
+        save(path, &store);
+    }
+    ended
 }
 
 /// One observation pass over the live scopes of all managed roots. Reads the
@@ -502,14 +673,8 @@ pub fn record_tick(live: &[LiveScope]) {
         let (Some(path), Some(slice)) = (store_path(), agents_slice_dir()) else {
             return;
         };
-        let mut store = load(&path);
-        let before = store.clone();
-        let ended = observe(&mut store, live, |s| read_scope(&slice, s));
-        for e in &ended {
+        for e in &persist_tick(&path, live, |s| read_scope(&slice, s)) {
             emit_ended(e);
-        }
-        if store != before {
-            save(&path, &store);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -526,6 +691,7 @@ mod tests {
             scope: scope.into(),
             repo: repo.into(),
             issue: Some(1),
+            role: None,
         }
     }
 
@@ -631,6 +797,7 @@ mod tests {
             issue: Some(1),
             peak_bytes: cur,
             current_bytes: cur,
+            ..InFlight::default()
         };
         store.inflight.insert("a".into(), f("hist", 4 * GIB));
         store.inflight.insert("b".into(), f("nohist", GIB));
@@ -675,6 +842,7 @@ mod tests {
             scope: "loom-agent-10-1.scope".into(),
             repo: "heavy".into(),
             issue: Some(5),
+            role: None,
         }];
         let found = discover_scopes(slice.path(), &roots, &known, cwd);
         assert_eq!(
@@ -684,11 +852,13 @@ mod tests {
                     scope: "loom-agent-20-2.scope".into(),
                     repo: "small".into(),
                     issue: None,
+                    role: None,
                 },
                 LiveScope {
                     scope: "loom-agent-30-3.scope".into(),
                     repo: UNATTRIBUTED_REPO.into(),
                     issue: None,
+                    role: None,
                 },
             ]
         );
@@ -716,6 +886,7 @@ mod tests {
             issue: None,
             peak_bytes: cur,
             current_bytes: cur,
+            ..InFlight::default()
         };
         // A Doctor in `small` at 1 GiB of its 3 GiB history reserves 2 GiB.
         store.inflight.insert("doctor".into(), role("small", GIB));
@@ -748,5 +919,175 @@ mod tests {
         assert_eq!(load(&p), s);
         std::fs::write(&p, "not json").unwrap();
         assert_eq!(load(&p), Store::default());
+    }
+
+    fn role_live(scope: &str, repo: &str, role: Option<&str>) -> LiveScope {
+        LiveScope {
+            scope: scope.into(),
+            repo: repo.into(),
+            issue: None,
+            role: role.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn role_keyed_history_routes_ended_scopes() {
+        let mut runs_scopes = vec![
+            role_live("j.scope", "r", None),
+            role_live("x.scope", "r", None),
+            live("s.scope", "r"),
+        ];
+        attach_roles(&mut runs_scopes, &[("j.scope".into(), "judge".into())]);
+        assert_eq!(runs_scopes[0].role.as_deref(), Some("judge"));
+        assert_eq!(runs_scopes[1].role, None);
+        assert_eq!(runs_scopes[2].role, None);
+
+        let mut store = Store::default();
+        observe(&mut store, &runs_scopes, |_| Some((2 * GIB, GIB)));
+        observe(&mut store, &[], |_| None);
+        assert_eq!(store.roles["r"]["judge"], vec![2 * GIB]);
+        // Role-unknown role scope and the issue-lock scope stay in `repos`.
+        assert_eq!(store.repos["r"], vec![2 * GIB, 2 * GIB]);
+    }
+
+    #[test]
+    fn role_history_lowers_reservation_only_once_it_has_samples() {
+        let mut store = Store::default();
+        store.repos.insert("heavy".into(), vec![13 * GIB]);
+        let f = |role: Option<&str>| InFlight {
+            repo: "heavy".into(),
+            issue: None,
+            peak_bytes: GIB,
+            current_bytes: GIB,
+            role: role.map(Into::into),
+            unreadable_ticks: 0,
+        };
+        store.inflight.insert("j".into(), f(Some("judge")));
+        assert_eq!(reserved_bytes(&store), 12 * GIB, "no judge history");
+        store
+            .roles
+            .entry("heavy".into())
+            .or_default()
+            .insert("judge".into(), vec![2 * GIB]);
+        assert_eq!(reserved_bytes(&store), GIB);
+        store.inflight.clear();
+        store.inflight.insert("u".into(), f(None));
+        assert_eq!(reserved_bytes(&store), 12 * GIB, "unknown role");
+        store.inflight.clear();
+        store.inflight.insert("d".into(), f(Some("doctor")));
+        assert_eq!(reserved_bytes(&store), 12 * GIB, "other role, no history");
+    }
+
+    /// The v0.19.976 struct definitions, to prove forward-tolerance.
+    #[derive(Debug, Deserialize)]
+    struct OldInFlight {
+        repo: String,
+        #[serde(default)]
+        issue: Option<u32>,
+        peak_bytes: u64,
+        current_bytes: u64,
+    }
+    #[derive(Debug, Default, Deserialize)]
+    struct OldStore {
+        #[serde(default)]
+        repos: BTreeMap<String, Vec<u64>>,
+        #[serde(default)]
+        inflight: BTreeMap<String, OldInFlight>,
+    }
+
+    #[test]
+    fn new_store_deserializes_into_the_v0_19_976_structs() {
+        let mut s = Store::default();
+        s.repos.insert("r".into(), vec![7]);
+        s.roles
+            .entry("r".into())
+            .or_default()
+            .insert("judge".into(), vec![3]);
+        s.inflight.insert(
+            "a".into(),
+            InFlight {
+                repo: "r".into(),
+                issue: None,
+                peak_bytes: 5,
+                current_bytes: 4,
+                role: Some("judge".into()),
+                unreadable_ticks: 2,
+            },
+        );
+        s.inflight.insert(
+            "b".into(),
+            InFlight {
+                repo: "r".into(),
+                issue: Some(3),
+                ..InFlight::default()
+            },
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let old: OldStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.repos["r"], vec![7]);
+        assert_eq!(old.inflight["a"].peak_bytes, 5);
+        assert_eq!(old.inflight["a"].current_bytes, 4);
+        assert_eq!(old.inflight["a"].issue, None);
+        assert_eq!(old.inflight["b"].issue, Some(3));
+        assert_eq!(old.inflight["b"].repo, "r");
+        // `None` options and zero counters are not written at all.
+        let b = serde_json::to_value(&s.inflight["b"]).unwrap();
+        assert!(b.get("role").is_none() && b.get("unreadable_ticks").is_none());
+    }
+
+    #[test]
+    fn unparseable_or_newer_store_is_never_overwritten() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p.json");
+        let l = [live("a.scope", "r")];
+        for body in ["not json", r#"{"version":99,"repos":{"r":[1]}}"#] {
+            std::fs::write(&p, body).unwrap();
+            let ended = persist_tick(&p, &l, |_| Some((GIB, GIB)));
+            assert!(ended.is_empty());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+        }
+        assert_eq!(load_checked(&p), Err(LoadError::NewerVersion(99)));
+        // A healthy file is still updated.
+        std::fs::write(&p, "{}").unwrap();
+        persist_tick(&p, &l, |_| Some((GIB, GIB)));
+        assert!(load_checked(&p).unwrap().inflight.contains_key("a.scope"));
+    }
+
+    #[test]
+    fn missing_version_loads_as_current_and_newer_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p.json");
+        std::fs::write(&p, r#"{"repos":{"r":[1]}}"#).unwrap();
+        let s = load_checked(&p).unwrap();
+        assert_eq!(s.version, STORE_VERSION);
+        assert_eq!(s.repos["r"], vec![1]);
+        assert_eq!(load_checked(&d.path().join("absent.json")), Ok(Store::default()));
+        std::fs::write(&p, format!(r#"{{"version":{}}}"#, STORE_VERSION + 1)).unwrap();
+        assert!(matches!(load_checked(&p), Err(LoadError::NewerVersion(_))));
+    }
+
+    #[test]
+    fn unreadable_tracked_scope_ages_out_and_success_resets() {
+        let mut store = Store::default();
+        store.repos.insert("r".into(), vec![13 * GIB]);
+        let l = [live("a.scope", "r")];
+        observe(&mut store, &l, |_| Some((5 * GIB, GIB)));
+        assert_eq!(accounted_sweeps(&store)["r"], 1);
+        for _ in 0..MAX_UNREADABLE_TICKS - 1 {
+            observe(&mut store, &l, |_| None);
+        }
+        assert!(store.inflight.contains_key("a.scope"), "below threshold");
+        // A good read resets the counter.
+        observe(&mut store, &l, |_| Some((5 * GIB, GIB)));
+        assert_eq!(store.inflight["a.scope"].unreadable_ticks, 0);
+        for _ in 0..MAX_UNREADABLE_TICKS - 1 {
+            observe(&mut store, &l, |_| None);
+        }
+        assert!(store.inflight.contains_key("a.scope"));
+        let ended = observe(&mut store, &l, |_| None);
+        assert!(ended.is_empty(), "not an ended scope");
+        assert!(!store.inflight.contains_key("a.scope"));
+        assert!(accounted_sweeps(&store).is_empty());
+        assert_eq!(*store.repos["r"].last().unwrap(), 5 * GIB, "peak folded");
     }
 }
