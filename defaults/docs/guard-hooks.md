@@ -478,7 +478,7 @@ shipped roles split as follows:
 
 | Roles | `allowedCapabilities` |
 |---|---|
-| architect, auditor, champion, concierge, curator, guide, hermit, judge | `[]`: reaches none |
+| architect, auditor, champion, curator, guide, hermit, judge | `[]`: reaches none |
 | builder, doctor, driver, loom | `["*"]`: unrestricted, unchanged |
 
 The four capabilities, and the rules for the array (undeclared means

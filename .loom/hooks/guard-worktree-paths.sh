@@ -535,7 +535,7 @@ if [[ -n "${LOOM_ROLE:-}" ]]; then
     RTP_OUT=$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" role-tool-policy check --roles-dir "$SCRIPT_DIR/../roles" --workspace "$SCRIPT_DIR/../.." --path "$NORM_PATH" 2>/dev/null) || RTP_RC=$?
     if [[ "$RTP_RC" -eq 1 && "$RTP_OUT" == "BLOCKED [role-tool-policy]"* ]]; then
         emit_deny "$RTP_OUT"
-    elif [[ "$RTP_RC" -ne 0 && " architect auditor champion concierge curator guide hermit judge " == *" $(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-') "* ]]; then
+    elif [[ "$RTP_RC" -ne 0 && " architect auditor champion curator guide hermit judge " == *" $(printf '%s' "$LOOM_ROLE" | tr '[:upper:]_' '[:lower:]-') "* ]]; then
         emit_deny "BLOCKED [role-tool-policy]: role '$LOOM_ROLE' is restricted, and loom-daemon role-tool-policy check could not answer (exit $RTP_RC), so this write is denied rather than allowed unchecked (#8256)."
     fi
     [[ "$_WT_GUARD_ON" == true || "$_IFW_GUARD_ON" == true ]] || exit 0

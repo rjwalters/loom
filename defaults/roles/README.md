@@ -83,7 +83,7 @@ every tool call, and at session spawn as defense in depth.
 its `--disallowedTools` list, `restricted` gives the Codex path its predicate —
 so the hooks and spawn scripts call out to it rather than re-deriving the
 answer, and the two runtimes cannot disagree about the same role file. The
-shipped read-only roles (architect, auditor, champion, concierge, curator,
+shipped read-only roles (architect, auditor, champion, curator,
 guide, hermit, judge) declare `[]`; builder, doctor, driver and loom declare
 `["*"]`. What `check` matches, and its fail-closed rule, are in
 `defaults/docs/guard-hooks.md` ("Per-role tool restriction").
