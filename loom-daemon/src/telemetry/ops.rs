@@ -149,6 +149,17 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.read.owner",
     "forge.read.resource",
     "forge.read.until",
+    // `loom.egress.request` spans (#11300): one proxied provider request.
+    // Counts, classified codes and ids only, never a body or credential.
+    "loom.egress.seat",
+    "loom.egress.tap",
+    "loom.egress.profile",
+    "loom.egress.launch_id",
+    "loom.egress.status",
+    "loom.egress.latency_ms",
+    "loom.egress.ttft_ms",
+    "loom.egress.error_code",
+    "loom.egress.stream",
 ];
 
 /// Longest label value kept, in bytes.
@@ -345,6 +356,23 @@ pub enum MetricName {
     /// trailing window.
     #[serde(rename = "loom.merge.time_to_land_max")]
     MergeTimeToLandMax,
+    // ---- Egress proxy observe mode (Issue #11300) -------------------------
+    /// Provider requests the egress proxy observed since the previous point,
+    /// labelled `provider`, `account` (the seat), `model`, `role`, `outcome`
+    /// (`ok` / `error`) and `reason` (a classified code on an error).
+    #[serde(rename = "loom.egress.requests")]
+    EgressRequests,
+    /// Tokens the proxy read off provider responses, labelled as
+    /// `loom.egress.requests` plus `kind` = `input` / `output` / `cache_read`
+    /// / `cache_write`.
+    #[serde(rename = "loom.egress.tokens")]
+    EgressTokens,
+    /// Summed request latency (send to last byte), seconds.
+    #[serde(rename = "loom.egress.latency")]
+    EgressLatency,
+    /// Summed time to first response byte, seconds.
+    #[serde(rename = "loom.egress.ttft")]
+    EgressTtft,
     // ---- Long-running task liveness (Issue #10414) -----------------------
     /// 1 while a long-running daemon loop beat within its staleness window,
     /// 0 once it went silent or marked itself dead, labelled `task`
@@ -459,6 +487,10 @@ impl MetricName {
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
+            Self::EgressRequests => "loom.egress.requests",
+            Self::EgressTokens => "loom.egress.tokens",
+            Self::EgressLatency => "loom.egress.latency",
+            Self::EgressTtft => "loom.egress.ttft",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
             Self::DaemonIpcLatencyMax => "loom.daemon.ipc.latency_max",
@@ -498,6 +530,10 @@ impl MetricName {
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
             | Self::ForgeFacadeEvents
+            | Self::EgressRequests
+            | Self::EgressTokens
+            | Self::EgressLatency
+            | Self::EgressTtft
             | Self::DaemonTaskFaults
             | Self::DaemonIpcLatency
             | Self::DaemonIpcRequests
@@ -542,6 +578,9 @@ impl MetricName {
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
+            Self::EgressRequests => "{request}",
+            Self::EgressTokens => "{token}",
+            Self::EgressLatency | Self::EgressTtft => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
             Self::DaemonIpcLatencyMax | Self::DaemonIpcLatency => "s",
@@ -626,6 +665,10 @@ impl MetricName {
                 "Longest first-re-date-to-landing time of a PR landed in the window."
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
+            Self::EgressRequests => "Provider requests observed by the egress proxy, by seat.",
+            Self::EgressTokens => "Tokens read off provider responses by the egress proxy.",
+            Self::EgressLatency => "Summed egress-proxy request latency, by seat.",
+            Self::EgressTtft => "Summed egress-proxy time to first response byte, by seat.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
             Self::DaemonIpcLatencyMax => "Slowest IPC request answered in the interval, by kind.",
             Self::DaemonIpcLatency => "Summed IPC request latency, by request kind.",
@@ -680,6 +723,16 @@ impl MetricPoint {
         MetricPoint {
             name,
             value: MetricValue::Int(value),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    /// An unlabelled floating-point point.
+    #[must_use]
+    pub fn double(name: MetricName, value: f64) -> Self {
+        MetricPoint {
+            name,
+            value: MetricValue::Double(value),
             labels: BTreeMap::new(),
         }
     }
