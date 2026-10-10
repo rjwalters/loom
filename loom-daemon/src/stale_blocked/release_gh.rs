@@ -186,11 +186,18 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
     Some(report)
 }
 
+/// The pass's body/label forge, vetted under the root's own credential like
+/// the audit comment (#10837): the process credential's `may_write_from`
+/// refused every cross-owner root after its comment had already posted.
+fn park_forge(root: &Path, repo: Option<&str>) -> GhForge {
+    GhForge::new(root.to_path_buf(), repo.map(str::to_string)).vetted_under_root()
+}
+
 /// One pass over the workspace at `root` (or the explicit `repo`).
 #[must_use]
 pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
     let mut gather = GhStaleBlockedForge::new(root, repo);
-    let mut park = GhForge::new(root.to_path_buf(), repo.map(str::to_string));
+    let mut park = park_forge(root, repo);
     let mut extra = GhReleaseForge::new(root, repo);
     let mut report = run(
         &mut gather,
