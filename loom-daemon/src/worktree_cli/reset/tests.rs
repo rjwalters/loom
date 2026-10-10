@@ -56,12 +56,24 @@ fn git(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A one-commit repo at `<dir>/<name>`. `name` may contain spaces.
+///
+/// **Background maintenance is off (#9973).** Hypothesis (NOT reproduced; see
+/// the PR): `git commit` ends by spawning `git maintenance run --auto
+/// --detach`, which daemonizes without leaving the `git -C` cwd, so for a
+/// short window a reparented `git` could sit inside the repo and the #7463
+/// liveness probe [`super::run`] opens with would refuse. The production
+/// fetches that precede a reset already pass `-c maintenance.auto=false`
+/// (#9620) and `tests/worktree_reset_differential.rs` sets these keys too.
+/// Only the fixture changes; the probe and its veto are untouched, so every
+/// liveness case below still proves a *real* holder refuses.
 fn repo(dir: &Path, name: &str) -> PathBuf {
     let repo = dir.join(name);
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "maintenance.auto", "false"]);
+    git(&repo, &["config", "gc.auto", "0"]);
     fs::write(repo.join("tracked.txt"), "base content\n").unwrap();
     git(&repo, &["add", "tracked.txt"]);
     git(&repo, &["commit", "-q", "-m", "base"]);
@@ -90,6 +102,34 @@ fn opts(worktree: &Path, target_ref: &str, label: &str) -> Options {
         // needs excluding unless a case says so.
         ignore_pids: Vec::new(),
     }
+}
+
+/// [`super::run`] for a case that expects `0`, which on a nonzero return
+/// panics naming whatever has its cwd inside the worktree (#9973).
+///
+/// **Best-effort re-scan, not the refusing probe's own result.** `run` keeps
+/// its matched PIDs to itself, so this runs a *second*
+/// `find_processes_with_cwd_in_directory` immediately after the refusal. A
+/// holder that exited in between is missed (reported as an empty scan), so an
+/// empty list here does not prove there was no holder. The production probe and
+/// refusal text are untouched; the differential suite pins the latter.
+fn run_expecting_ok(o: &Options) {
+    let code = run(o);
+    if code == 0 {
+        return;
+    }
+    let rescan = match safety::find_processes_with_cwd_in_directory(&o.worktree) {
+        CwdProbe::Pids(pids) if pids.is_empty() => {
+            "re-scan found nothing (holder, if any, already gone)".to_string()
+        }
+        CwdProbe::Pids(pids) => describe_pids(&pids),
+        CwdProbe::Unprobable => "re-scan unavailable (no /proc, no lsof)".to_string(),
+    };
+    panic!(
+        "run({}) returned {code}, expected 0; best-effort re-scan of processes \
+         with cwd inside the worktree right after the return: {rescan}",
+        o.worktree.display()
+    );
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -181,7 +221,7 @@ fn a_clean_worktree_resets_and_writes_no_rescue_patch() {
     let second = commit(&repo, "second\n", "second");
     git(&repo, &["reset", "-q", "--hard", &base]);
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(head(&repo), second, "the reset must land on the target ref");
     assert!(patches(&repo).is_empty(), "a clean worktree has nothing to rescue");
 }
@@ -198,7 +238,7 @@ fn an_untracked_file_needs_no_rescue_and_survives_the_reset() {
     git(&repo, &["reset", "-q", "--hard", &base]);
     fs::write(repo.join("scratch.txt"), "untracked scratch\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &second, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &second, "test-rescue"));
     assert_eq!(fs::read_to_string(repo.join("scratch.txt")).unwrap(), "untracked scratch\n");
     assert!(patches(&repo).is_empty());
 }
@@ -214,7 +254,7 @@ fn foreign_tracked_changes_are_rescued_to_a_replayable_patch_before_the_reset() 
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "test-rescue")), 0);
+    run_expecting_ok(&opts(&repo, &base, "test-rescue"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected exactly one rescue patch: {found:?}");
@@ -241,7 +281,7 @@ fn the_rescue_patch_is_named_from_the_label_and_a_utc_stamp() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "issue-42-stale-worktree-reset")), 0);
+    run_expecting_ok(&opts(&repo, &base, "issue-42-stale-worktree-reset"));
 
     let found = patches(&repo);
     let name = found[0].file_name().unwrap().to_string_lossy().to_string();
@@ -492,7 +532,7 @@ fn a_worktree_path_containing_spaces_is_rescued_and_reset_whole() {
     let base = head(&repo);
     fs::write(repo.join("tracked.txt"), "foreign edit\n").unwrap();
 
-    assert_eq!(run(&opts(&repo, &base, "label with spaces")), 0);
+    run_expecting_ok(&opts(&repo, &base, "label with spaces"));
 
     let found = patches(&repo);
     assert_eq!(found.len(), 1, "expected one patch: {found:?}");
@@ -545,7 +585,89 @@ fn a_live_holder_under_a_space_bearing_path_is_still_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Helpers
+// 6. Fixture hermeticity (#9973)
+// ---------------------------------------------------------------------------
+
+/// `pid=… ppid=… exe=… cmdline=…` for each PID, read straight from `/proc`
+/// (best effort — a holder that has already exited reads as `<gone>`). Used
+/// only in failure messages. The probe guard below feeds it the PIDs from the
+/// same probe call that matched them; [`run_expecting_ok`] can only feed it a
+/// later re-scan, which misses a holder that has already exited.
+fn describe_pids(pids: &[u32]) -> String {
+    let read = |pid: u32, f: &str| {
+        fs::read(format!("/proc/{pid}/{f}"))
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_else(|_| "<gone>".to_string())
+    };
+    pids.iter()
+        .map(|&pid| {
+            let cmdline = read(pid, "cmdline");
+            let ppid = read(pid, "status")
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().to_string()))
+                .unwrap_or_else(|| "<gone>".to_string());
+            let exe = fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<gone>".to_string());
+            format!("pid={pid} ppid={ppid} exe={exe} cmdline={cmdline}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[test]
+fn fixture_repos_disable_gits_detached_background_maintenance() {
+    // A fixture pin (#9973), not a regression test: it asserts the keys are
+    // set, and cannot tell the old behaviour from the new. The prior fixture
+    // left both unset, so — per the unreproduced hypothesis on `repo()` — on
+    // git >= 2.47 a fixture commit could leave a daemonized
+    // `git maintenance run --auto --detach` inside the repo.
+    let dir = tmpdir("fixture-maintenance");
+    let repo = repo(&dir, "repo");
+    let get = |key: &str| {
+        String::from_utf8_lossy(&git(&repo, &["config", "--local", "--get", key]).stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(get("maintenance.auto"), "false");
+    assert_eq!(get("gc.auto"), "0");
+}
+
+#[test]
+fn a_fixture_commit_leaves_no_process_inside_the_worktree() {
+    // A guard, not proof: probe immediately after each fixture commit, which
+    // is when a detached maintenance child (if any) would be alive.
+    // Hypothesis (#9973, unreproduced; 0/40 trips on git 2.54 with the prior
+    // fixture): a detached maintenance child could be visible here. With
+    // maintenance off it has nothing to find on any git, so it should not fail
+    // spuriously; if it ever does, the message names the holder from this same
+    // probe call.
+    let dir = tmpdir("fixture-no-holder");
+    let repo = repo(&dir, "repo");
+    if !probe_available(&repo) {
+        eprintln!("SKIP: no /proc and no lsof on this host");
+        return;
+    }
+    for n in 0..25 {
+        commit(&repo, &format!("commit {n}\n"), &format!("c{n}"));
+        if let CwdProbe::Pids(pids) = safety::find_processes_with_cwd_in_directory(&repo) {
+            assert!(
+                pids.is_empty(),
+                "a fixture commit left a live process inside the worktree, which \
+                 the reset's liveness probe would count as a foreign holder: {}",
+                describe_pids(&pids)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Helpers
 // ---------------------------------------------------------------------------
 
 #[test]
