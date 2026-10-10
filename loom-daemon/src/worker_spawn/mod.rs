@@ -15,6 +15,7 @@ pub mod launch_outcome;
 // `pub(crate)` so the daemon's dispatch surfaces can call `guard_dispatch`.
 pub(crate) mod llm_gateway;
 mod opencode_version;
+mod phase_run;
 mod profile_check;
 pub(crate) mod profiles;
 mod prompt;

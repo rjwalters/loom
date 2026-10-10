@@ -348,6 +348,44 @@ fn a_child_ignoring_a_forwarded_signal_is_killed_after_the_grace() {
     assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
 }
 
+/// #11303 review: the leader handles the forwarded TERM by exiting while a
+/// descendant ignores it. The group must still be killed within the grace and
+/// reported as interrupted, not left running behind an `Exited` result.
+#[test]
+#[cfg(unix)]
+fn a_leader_exiting_on_a_forwarded_stop_does_not_strand_a_term_ignoring_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("child.pid");
+    let start = Instant::now();
+    let pending = move || (start.elapsed() >= Duration::from_millis(500)).then_some(libc::SIGTERM);
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "(trap '' TERM; sleep 120) & echo $! >{}; trap 'exit 0' TERM; while :; do sleep 0.1; done",
+        pidfile.display()
+    ));
+    let error = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(60),
+        Duration::from_millis(600),
+        &pending,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Collect(e) if e.kind() == io::ErrorKind::Interrupted),
+        "{error}"
+    );
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: signal 0 only probes existence.
+    assert!(unsafe { libc::kill(pid, 0) } != 0, "descendant {pid} survived the stop");
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+}
+
 /// Issue #10799. A child that prints its answer and exits 0 while a descendant
 /// still holds the pipe open longer than [`DRAIN_GRACE`] — the deterministic
 /// stand-in for "the reader thread was not scheduled within 500ms on a loaded

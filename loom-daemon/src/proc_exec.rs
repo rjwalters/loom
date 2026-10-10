@@ -219,6 +219,37 @@ fn signal_group(pid: u32, signal: i32) {
 #[cfg(not(unix))]
 fn signal_group(_pid: u32, _signal: i32) {}
 
+/// After the leader (`pid`) has been reaped, wait until `deadline` for the rest
+/// of its group to leave; kill whatever remains. `true` = the group emptied by
+/// itself, `false` = survivors had to be killed.
+///
+/// The leader's pid stays reserved as a pgid while any member lives, so
+/// `killpg` cannot reach an unrelated group until the group is empty — and an
+/// empty group (ESRCH) is never signalled. Only `killpg` is used: a bare `kill`
+/// on the reaped pid could hit a reused one.
+#[cfg(unix)]
+fn await_group_exit(pid: u32, deadline: Instant) -> bool {
+    let pgid = pid as libc::pid_t;
+    // SAFETY: signal 0 probes existence only. EPERM still means a member exists.
+    let alive = || unsafe {
+        libc::killpg(pgid, 0) == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    while alive() {
+        if Instant::now() >= deadline {
+            // SAFETY: see above; the group is non-empty, so `pgid` is still ours.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn await_group_exit(_pid: u32, _deadline: Instant) -> bool {
+    true
+}
+
 /// Run with cooperative cancellation, terminating the owned process group.
 /// Cancellation returns `Collect(Interrupted)` because side effects may have run.
 pub fn run_bounded_cancellable(
@@ -291,6 +322,17 @@ fn run_bounded_inner(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A forwarded stop was aimed at the whole group, but the leader
+                // can exit on it while a descendant ignores it: stop the rest
+                // inside the grace, or report the group as killed.
+                if forwarded && !await_group_exit(pid, deadline) {
+                    let _ = collect(&stdout_rx, DRAIN_GRACE);
+                    let _ = collect(&stderr_rx, DRAIN_GRACE);
+                    return Err(ExecError::Collect(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "execution cancelled; process group terminated",
+                    )));
+                }
                 // The child exited on its own. Its pipes reach EOF once every
                 // writer is gone — which a lingering descendant can delay — so
                 // drain against the call's remaining budget, and fail rather
