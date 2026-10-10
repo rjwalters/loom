@@ -459,6 +459,60 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
     (out.status.success() && !argv.is_empty()).then_some(argv)
 }
 
+/// Result of [`verify_renewer`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verified {
+    Gone,
+    Unreadable,
+    /// Not a renewer; carries the program's basename only.
+    NotRenewer(String),
+    IdentityChanged,
+    Renewer,
+}
+
+/// Is `pid` provably a renewer? Its start identity is read before and after
+/// its argv, and must be identical (a pid recycled mid-check is ambiguous).
+/// With `expected` (the identity recorded when the renewer was claimed), the
+/// first read must also match it, so a pid reused by a different renewer is
+/// refused. The one check behind both `stop <PID>` and `stop --issue` (#11086).
+pub(crate) fn verify_renewer(
+    pid: u32,
+    expected: Option<&str>,
+    ident_of: &dyn Fn(u32) -> Option<String>,
+    argv_of: &dyn Fn(u32) -> Option<Vec<String>>,
+) -> Verified {
+    let Some(before) = ident_of(pid) else {
+        return Verified::Gone;
+    };
+    if expected.is_some_and(|e| e != before) {
+        return Verified::IdentityChanged;
+    }
+    let Some(argv) = argv_of(pid) else {
+        return Verified::Unreadable;
+    };
+    if !is_renewer_argv(&argv) {
+        let program = argv.first().map_or("?", |a| argv_base(a));
+        return Verified::NotRenewer(program.to_string());
+    }
+    if ident_of(pid).as_deref() != Some(before.as_str()) {
+        return Verified::IdentityChanged;
+    }
+    Verified::Renewer
+}
+
+/// May `stop --issue` signal the recorded owner `pid`? Only with a nonempty
+/// recorded identity that still matches before and after the argv read, and a
+/// renewer's argv (#11086).
+pub(crate) fn issue_owner_signalable(
+    pid: u32,
+    recorded_ident: &str,
+    ident_of: &dyn Fn(u32) -> Option<String>,
+    argv_of: &dyn Fn(u32) -> Option<Vec<String>>,
+) -> bool {
+    !recorded_ident.is_empty()
+        && verify_renewer(pid, Some(recorded_ident), ident_of, argv_of) == Verified::Renewer
+}
+
 /// What `stop <PID>` decided.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StopOutcome {
@@ -487,22 +541,22 @@ pub(crate) fn stop_pid(
     if pid <= 1 || pid == self_pid {
         return StopOutcome::Refused(format!("pid {pid} is not a lease renewer"));
     }
-    let Some(before) = ident_of(pid) else {
-        return StopOutcome::NotRunning;
-    };
-    let Some(argv) = argv_of(pid) else {
-        return StopOutcome::Refused(format!("cannot read the command line of pid {pid}"));
-    };
-    if !is_renewer_argv(&argv) {
-        // Name only the program's basename: the full argv of an unrelated
-        // process may carry credentials and must not reach logs (#11086).
-        let program = argv.first().map_or("?", |a| argv_base(a));
-        return StopOutcome::Refused(format!(
-            "pid {pid} is not a lease renewer (program: {program}); for an issue number use `stop --issue N`"
-        ));
-    }
-    if ident_of(pid).as_deref() != Some(before.as_str()) {
-        return StopOutcome::Refused(format!("pid {pid} changed identity while being checked"));
+    match verify_renewer(pid, None, ident_of, argv_of) {
+        Verified::Gone => return StopOutcome::NotRunning,
+        Verified::Unreadable => {
+            return StopOutcome::Refused(format!("cannot read the command line of pid {pid}"));
+        }
+        Verified::NotRenewer(program) => {
+            // Only the program's basename: the full argv of an unrelated
+            // process may carry credentials and must not reach logs (#11086).
+            return StopOutcome::Refused(format!(
+                "pid {pid} is not a lease renewer (program: {program}); for an issue number use `stop --issue N`"
+            ));
+        }
+        Verified::IdentityChanged => {
+            return StopOutcome::Refused(format!("pid {pid} changed identity while being checked"));
+        }
+        Verified::Renewer => {}
     }
     signal(pid);
     StopOutcome::Stopped
@@ -624,8 +678,8 @@ impl RenewerAction {
                 };
                 if let Some(issue) = issue {
                     let live = |p: u32, ident: &str| {
-                        owner_is_live(p, ident)
-                            && process_argv(p).is_some_and(|a| is_renewer_argv(&a))
+                        loom_daemon::live_claim::pid_is_live_process(p)
+                            && issue_owner_signalable(p, ident, &start_identity, &process_argv)
                     };
                     let n = end_owners(
                         &store,
