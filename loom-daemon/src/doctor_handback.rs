@@ -275,9 +275,13 @@ fn stand_down_head_moved(
     post: &Snapshot,
     restore_changes: bool,
 ) -> Outcome {
-    let newer_state = post.has(CHANGES) || post.has("loom:pr") || post.has("loom:reviewing");
+    let newer_verdict = post.has(CHANGES) || post.has("loom:pr");
+    let newer_state = newer_verdict || post.has("loom:reviewing");
     let restored = !restore_changes || newer_state || forge.add(CHANGES);
-    let withdrawn = forge.remove(QUEUE);
+    // A review claim is an overlay on the queue label: without a verdict the
+    // claim alone cannot bring the PR back if that review stands down.
+    let keep_queue = !newer_verdict && post.has("loom:reviewing");
+    let withdrawn = keep_queue || forge.remove(QUEUE);
     if restored && withdrawn {
         Outcome::HeadMoved(post.head_sha.clone())
     } else {
@@ -339,7 +343,11 @@ fn hand_back(forge: &mut impl Forge, pre: &Snapshot, expected_head: &str) -> Out
     // stand-down must not report it as released.
     if !same_sha(&post.head_sha, expected_head) {
         if post.has(CLAIM) {
-            forge.remove(QUEUE);
+            let keep_queue =
+                !(post.has(CHANGES) || post.has("loom:pr")) && post.has("loom:reviewing");
+            if !keep_queue {
+                forge.remove(QUEUE);
+            }
             return Outcome::Failed(format!(
                 "head moved to {} during the hand-back and {CLAIM} could not be removed",
                 post.head_sha
