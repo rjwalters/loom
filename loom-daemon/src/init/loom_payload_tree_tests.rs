@@ -20,7 +20,7 @@ use tempfile::TempDir;
 /// Repo root (`loom-daemon/`'s parent), for tests that run against the real
 /// shipped tree. Same resolution the `test_real_defaults_*` tests in
 /// `tests.rs` use.
-fn repo_root_for_tests() -> std::path::PathBuf {
+pub(super) fn repo_root_for_tests() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("loom-daemon/ has a parent")
@@ -61,7 +61,10 @@ fn defaults_loom_tree_paths(defaults: &Path) -> std::collections::BTreeSet<Strin
 /// Run `scripts/install/manifest.sh`'s `_emit_loom_ownership_set` — the
 /// enumeration that becomes `install-metadata.json`'s `installed_files` — and
 /// return it as a set of target-relative paths.
-fn installed_files_manifest(repo_root: &Path, target: &Path) -> std::collections::BTreeSet<String> {
+pub(super) fn installed_files_manifest(
+    repo_root: &Path,
+    target: &Path,
+) -> std::collections::BTreeSet<String> {
     let script = repo_root.join("scripts/install/manifest.sh");
     assert!(
         script.is_file(),
@@ -117,9 +120,11 @@ fn test_defaults_loom_tree_copy_and_manifest_enumerations_agree() {
     assert!(result.is_ok(), "init against real defaults/ failed: {:?}", result.err());
 
     // The enumeration that feeds `installed_files`, narrowed to the entries
-    // that originate in `defaults/.loom/` (the rest of the manifest is
-    // materialized by other surfaces — `defaults/roles/`, `defaults/config/`
-    // via install-loom.sh, and so on).
+    // that originate in `defaults/.loom/`. The rest of the manifest comes
+    // from other steps of the same init (`defaults/roles/`,
+    // `defaults/config/`, and so on); the whole-manifest form of this
+    // assertion is `config_dir_tests.rs`'s
+    // `test_standalone_init_materializes_the_whole_installed_files_manifest`.
     let shipped = defaults_loom_tree_paths(&defaults);
     assert!(
         !shipped.is_empty(),

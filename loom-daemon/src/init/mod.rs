@@ -236,6 +236,11 @@ pub fn initialize_workspace_with_mode(
     // `worktree.root`. A bare `fs::copy` from the template would silently drop
     // those keys — see `merge_config_file`.
     merge_config_file(&defaults, &loom_path, mode, &mut report)?;
+    // `defaults/config/*.json` -> `.loom/config/` (#9129): consumer-editable
+    // configuration too, so it is installed HERE, at install time only, and
+    // not by `install_payload_files` below — that step is also what a daemon
+    // resync runs, and it overwrites wholesale. See `install_config_dir_files`.
+    install_config_dir_files(&defaults, &loom_path, &mut report)?;
     // The Loom payload proper: every file this step writes is a verbatim
     // function of `defaults/` and the previous install's ownership record.
     // `payload::materialize_payload` (#10717) runs this same step into a
@@ -298,7 +303,8 @@ pub fn initialize_workspace_with_mode(
 /// Split out of [`initialize_workspace_with_mode`] for #10717: the resync in
 /// [`payload`] runs exactly this step into a staging copy of a workspace to
 /// learn what this binary would install, so the two can never drift apart.
-/// Consumer configuration (`config.json`) and the template-substituted
+/// Consumer configuration (`config.json`, and the `config/` directory that
+/// [`install_config_dir_files`] installs) and the template-substituted
 /// scaffolding are deliberately not part of it.
 fn install_payload_files(
     workspace: &Path,
@@ -418,6 +424,88 @@ fn copy_single_file(
         } else {
             report.added.push(report_name.to_string());
         }
+    }
+    Ok(())
+}
+
+/// Install `defaults/config/*.json` into `<workspace>/.loom/config/`, copying
+/// each file only when the workspace does not already have it (issue #9129).
+///
+/// `scripts/install/manifest.sh` translates `defaults/config/X` to
+/// `.loom/config/X` and records it in `install-metadata.json`'s
+/// `installed_files`, but until #9129 the only code that copied it was shell
+/// (`scripts/install-loom.sh`, `install.sh`'s `finalize_quick_install`). A
+/// standalone `loom-daemon init` — what `fleet add-worker` runs — therefore
+/// left `.loom/config/skill-routes.json` absent, and `skill-router.sh` exits
+/// silently without it: skill routing was off with nothing to say so.
+///
+/// The directory is WALKED, not named, so a second file added to
+/// `defaults/config/` cannot reopen the gap (the lesson of #9123). Only
+/// top-level `*.json` files are taken, which is the glob both shell copies use.
+///
+/// These files are consumer-editable configuration, not payload, so per file:
+///
+/// - **Absent** → copied verbatim, recorded as `added`.
+/// - **Present** → left exactly as it is, recorded as `preserved` (which also
+///   keeps it out of `verification_failures`).
+/// - **`force` changes neither rule.** Init never overwrites one of these
+///   files, which mirrors `install.sh`'s `finalize_quick_install`.
+///   `install.sh --quick --confirm-reinstall` passes `--force` unconditionally,
+///   and a legacy (pre-manifest) uninstall leaves `.loom/config/` in place, so
+///   an overwrite here would silently replace a consumer's edit.
+///   `scripts/install-loom.sh` keeps its own overwrite under `--force`/`--clean`
+///   in its shell copy. To get the shipped copy back from init, delete the file
+///   and re-run it.
+///
+/// Deliberately NOT part of [`install_payload_files`]: a daemon resync runs
+/// that step, so a copy there would overwrite a consumer's edits on every
+/// resync and re-create a file the consumer deleted — deleting
+/// `skill-routes.json` is the documented way to switch the router hook off.
+/// `payload::surfaces::INSTALL_TIME_ONLY` carries the matching declaration.
+fn install_config_dir_files(
+    defaults: &Path,
+    loom_path: &Path,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src_dir = defaults.join("config");
+    if !src_dir.is_dir() {
+        // No `config/` shipped — nothing to do (mirrors `merge_config_file`).
+        return Ok(());
+    }
+
+    let mut names: Vec<String> = fs::read_dir(&src_dir)
+        .map_err(|e| format!("Failed to read {}: {e}", src_dir.display()))?
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            Path::new(name).extension().is_some_and(|ext| ext == "json")
+                && !is_transient_artifact(name)
+        })
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort();
+
+    let dst_dir = loom_path.join("config");
+    fs::create_dir_all(&dst_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", dst_dir.display()))?;
+
+    for name in names {
+        let src = src_dir.join(&name);
+        let dst = dst_dir.join(&name);
+        let rel = format!(".loom/config/{name}");
+        // `symlink_metadata`, not `exists()`: a dangling symlink is still
+        // something the consumer put there, and is preserved like a file.
+        if fs::symlink_metadata(&dst).is_ok() {
+            log::info!("init: config/{name}: preserved existing {}", dst.display());
+            report.preserved.push(rel);
+            continue;
+        }
+
+        fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config/{name}: {e}"))?;
+        report.added.push(rel);
     }
     Ok(())
 }
@@ -1195,3 +1283,8 @@ mod session_mode_init_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod payload_tests;
+// #9129: the `defaults/config/` install step, in its own file for the same
+// file-size-ratchet reason as the modules above.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod config_dir_tests;
