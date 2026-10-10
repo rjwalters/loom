@@ -497,8 +497,9 @@ condition is a first-class health check with four states, shown on the
 | `ok` | The last successful export is recent (a fresh exporter gets the window as startup grace). |
 | `exempt` | The host opted out; the reason is shown. |
 
-Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A WARN is logged at
-daemon start and on each change of state, never per tick.
+Precedence is `exempt`, `no_exporter`, `failing`, `ok`. A line is logged at
+daemon start and on each change of state, never per tick: WARN for `no_exporter`
+and `failing`, INFO for recovery to `ok` and entry into `exempt`.
 
 ```json
 { "observability": {
@@ -510,8 +511,11 @@ daemon start and on each change of state, never per tick.
 
 `otlp_required: false` takes effect only with a non-empty `otlp_exempt_reason`;
 without one the daemon warns and treats the host as not exempt. The window
-defaults to 15 minutes. The `host.health` field is carried in the record body;
-it is not mapped to a separate OTLP attribute.
+defaults to 15 minutes. The `host.health` field is carried in the record body
+on the native HTTPS path. Over OTLP, where `host.health` becomes gauges, the
+state is the `loom.host.otlp_export` gauge (value 1) with a `state` label and,
+when exempt, a `reason` label; both labels are already on the collector's
+datapoint allowlist.
 
 ## 3c. Operational signals from daemon loops (Issue #8860)
 

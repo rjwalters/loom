@@ -115,6 +115,46 @@ fn monitor_reports_change_once_per_state() {
 }
 
 #[test]
+fn every_transition_is_logged_once_and_repeats_are_silent() {
+    let mut m = OtlpHealthMonitor::default();
+    let mut lines = Vec::new();
+    let mut step = |m: &mut OtlpHealthMonitor, i: OtlpHealthInputs, min: i64| {
+        let o = m.observe(i, None, t(min));
+        if let Some((level, line)) = log_line(&o) {
+            lines.push((o.health.state, level, line));
+        }
+    };
+    // Startup in a steady-good state (exempt) still logs once.
+    let mut exempt = base();
+    exempt.exempt_reason = Some("lab".into());
+    step(&mut m, exempt.clone(), 0);
+    step(&mut m, exempt, 1);
+    // exempt -> no_exporter (WARN)
+    let mut none = base();
+    none.otlp_planned = false;
+    step(&mut m, none, 2);
+    // no_exporter -> failing (WARN), then failing -> ok (recovery INFO)
+    let mut failing = base();
+    failing.started_at = Some(t(-60));
+    step(&mut m, failing.clone(), 3);
+    step(&mut m, failing.clone(), 4);
+    let mut ok = failing;
+    ok.last_success_at = Some(t(5));
+    step(&mut m, ok.clone(), 5);
+    step(&mut m, ok, 6);
+    let seen: Vec<_> = lines.iter().map(|(s, l, _)| (*s, *l)).collect();
+    assert_eq!(
+        seen,
+        vec![
+            (OtlpExportState::Exempt, log::Level::Info),
+            (OtlpExportState::NoExporter, log::Level::Warn),
+            (OtlpExportState::Failing, log::Level::Warn),
+            (OtlpExportState::Ok, log::Level::Info),
+        ]
+    );
+}
+
+#[test]
 fn monitor_drop_latch_is_idempotent_and_ignores_reset() {
     let mut m = OtlpHealthMonitor::default();
     let mut i = base();

@@ -844,6 +844,28 @@ fn metric_samples_for(envelope: &TelemetryEnvelope) -> Vec<MetricSample> {
                     time_unix_nano,
                 },
             ];
+            // Issue #11353: `host.health` reaches OTLP as gauges only, so the
+            // OTLP-export state rides as a state-labelled gauge. `state` and
+            // `reason` are already on the collector's datapoint allowlist; the
+            // exemption reason is the `reason` label, present only when exempt.
+            // Absent (pre-#11353 daemon) stays absent, never a fabricated `ok`.
+            if let Some(otlp_export) = &r.otlp_export {
+                let mut attributes = vec![kv_string("state", otlp_export.state.as_str())];
+                if otlp_export.state == crate::observability::otlp_health::OtlpExportState::Exempt {
+                    if let Some(reason) = otlp_export.detail.as_deref() {
+                        attributes.push(kv_string("reason", reason));
+                    }
+                }
+                samples.push(MetricSample {
+                    name: "loom.host.otlp_export",
+                    description: "OTLP export health of this daemon (1 per current state; \
+                                  state label: no_exporter|failing|ok|exempt).",
+                    unit: "1",
+                    attributes,
+                    value: number_data_point::Value::AsInt(1),
+                    time_unix_nano,
+                });
+            }
             if let Some(cpu_idle_fraction) = r.cpu_idle_fraction {
                 samples.push(MetricSample {
                     name: "loom.host.cpu_idle_fraction",

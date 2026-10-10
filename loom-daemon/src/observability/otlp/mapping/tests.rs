@@ -569,6 +569,54 @@ fn role_tick_health_with_no_ticks_sampled_reports_zero_not_no_metric() {
 }
 
 #[test]
+fn otlp_export_state_rides_a_state_labelled_gauge() {
+    use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
+    let gauge_for = |health: Option<OtlpExportHealth>| {
+        let mut record = host_health_envelope();
+        if let TelemetryRecord::HostHealth(r) = &mut record.record {
+            r.otlp_export = health;
+        }
+        let request = build_metrics_request(&[record]).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        metrics
+            .iter()
+            .find(|m| m.name == "loom.host.otlp_export")
+            .cloned()
+    };
+    let attr = |m: &Metric, key: &str| -> Option<String> {
+        let Some(metric::Data::Gauge(g)) = &m.data else {
+            panic!("gauge expected")
+        };
+        g.data_points[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                any_value::Value::StringValue(s) => Some(s.clone()),
+                _ => None,
+            })
+    };
+    // Absent stays absent (pre-#11353 daemon), never a fabricated ok.
+    assert!(gauge_for(None).is_none());
+    // Exempt carries its reason as the `reason` label.
+    let exempt = gauge_for(Some(OtlpExportHealth {
+        state: OtlpExportState::Exempt,
+        detail: Some("air-gapped lab".into()),
+    }))
+    .unwrap();
+    assert_eq!(attr(&exempt, "state").as_deref(), Some("exempt"));
+    assert_eq!(attr(&exempt, "reason").as_deref(), Some("air-gapped lab"));
+    // Other states carry only the state label.
+    let failing = gauge_for(Some(OtlpExportHealth {
+        state: OtlpExportState::Failing,
+        detail: Some("no ack for 20m".into()),
+    }))
+    .unwrap();
+    assert_eq!(attr(&failing, "state").as_deref(), Some("failing"));
+    assert_eq!(attr(&failing, "reason"), None);
+}
+
+#[test]
 fn daemon_version_becomes_a_resource_attribute_not_a_metric() {
     let batch = vec![host_health_envelope()];
     let request = build_metrics_request(&batch).unwrap();

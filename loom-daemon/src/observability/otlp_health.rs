@@ -209,8 +209,7 @@ impl OtlpHealthMonitor {
     }
 }
 
-/// The WARN line for a state that needs attention; `None` for `ok`/`exempt`
-/// steady states.
+/// The WARN line for a state that needs attention; `None` for `ok`/`exempt`.
 #[must_use]
 pub fn warn_line(health: &OtlpExportHealth) -> Option<String> {
     let detail = health.detail.as_deref().unwrap_or("");
@@ -223,6 +222,31 @@ pub fn warn_line(health: &OtlpExportHealth) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// The INFO line logged when the state changes to one that needs no attention
+/// (recovery to `ok`, entry into `exempt`); `None` for the WARN states.
+#[must_use]
+pub fn transition_line(health: &OtlpExportHealth) -> Option<String> {
+    let detail = health.detail.as_deref().unwrap_or("");
+    match health.state {
+        OtlpExportState::Ok | OtlpExportState::Exempt => {
+            Some(format!("observability: otlp_export={} ({detail})", health.state.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// The line to log for `observation`: nothing for a repeated sample, otherwise
+/// the WARN or INFO line for the new state. Startup counts as a change.
+#[must_use]
+pub fn log_line(observation: &Observation) -> Option<(log::Level, String)> {
+    if !observation.changed {
+        return None;
+    }
+    warn_line(&observation.health)
+        .map(|l| (log::Level::Warn, l))
+        .or_else(|| transition_line(&observation.health).map(|l| (log::Level::Info, l)))
 }
 
 static MONITOR: Mutex<Option<OtlpHealthMonitor>> = Mutex::new(None);
@@ -255,8 +279,8 @@ pub fn check_global(config: &ObservabilityConfig) -> OtlpExportHealth {
         if let Some(warning) = warning {
             log::warn!("{warning}");
         }
-        if let Some(line) = warn_line(&observation.health) {
-            log::warn!("{line}");
+        if let Some((level, line)) = log_line(&observation) {
+            log::log!(level, "{line}");
         }
     }
     observation.health
