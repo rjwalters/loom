@@ -112,14 +112,24 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         .env(
             "LOOM_SESSION_FALLBACK_ROOT_FILE",
             fixture.join("session-reconcile-fallback-root.json"),
-        )
-        // #11024: the worktree reaper's `deep_clean::run_for` takes the real
-        // machine-wide build slot when the host is below the disk floor.
-        // Point the slot dir inside the fixture so a test daemon never
-        // contends for (or leaves state in) the host's `~/.loom/locks`.
-        .env("LOOM_BUILD_SLOT_DIR", fixture.join("build-slots"))
-        .env_remove("LOOM_BUILD_SLOT_HELD");
+        );
+    isolate_build_slot(cmd, fixture);
     assert_build_slot_isolated(cmd, fixture);
+}
+
+/// Points the build-slot dir inside `fixture` and drops any inherited
+/// held-marker (#11024).
+///
+/// The worktree reaper's `deep_clean::run_for` takes the real machine-wide
+/// build slot when the host is below the disk floor. Point the slot dir inside
+/// the fixture so a test daemon never contends for (or leaves state in) the
+/// host's `~/.loom/locks`. Split out of `isolate_daemon_state` for spawn paths
+/// that build their own environment — e.g. the watchdog command whose stub
+/// relaunches a real daemon — and so cannot take the full isolation helper.
+#[allow(dead_code)]
+pub fn isolate_build_slot(cmd: &mut Command, fixture: &Path) {
+    cmd.env("LOOM_BUILD_SLOT_DIR", fixture.join("build-slots"))
+        .env_remove("LOOM_BUILD_SLOT_HELD");
 }
 
 /// Fails (panics) unless `cmd` will spawn a daemon whose build-slot dir
