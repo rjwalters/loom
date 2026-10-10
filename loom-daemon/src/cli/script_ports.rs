@@ -1024,6 +1024,12 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
 
+    /// The already-merged / closed-unmerged terminal-state gate at the top of
+    /// `merge-pr.sh` (#8191 slice). One line `LOOM-PR-STATE MERGED|CLOSED|OPEN`,
+    /// exit 0; the shell acts only on MERGED/CLOSED and proceeds otherwise —
+    /// see `cli::merge_pr_pr_state`.
+    PrState(super::merge_pr_pr_state::PrStateArgs),
+
     /// The wait-or-timeout decision for `--auto`'s unfetchable-check-runs and
     /// pending-checks poll arms (#8191 slice): one `LOOM-POLL-WAIT
     /// <WAIT|TIMEOUT> <level> <message>` line, exit 0; the shell keeps the
@@ -1085,6 +1091,7 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::PrState(args) => args.run(),
             MergePrCommand::PollWait(args) => args.run(),
             MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
