@@ -406,6 +406,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // from sweep children, plus consumer for `SubscribeEvents` streams).
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
+    loom_daemon::agent_residue_reaper::install_event_bus(event_bus.clone());
 
     // #10832: a live pause manifest must hold restart recovery off its paused
     // agents BEFORE the first registry is reconstructed (design §7 H5).

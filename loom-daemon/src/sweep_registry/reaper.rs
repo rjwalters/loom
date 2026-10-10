@@ -790,6 +790,12 @@ impl SweepRegistry {
         // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
         let pgid = self.entries.get(sweep_id).and_then(|info| info.pgid);
+        // #10802: a cancel is a terminal exit too.
+        let cancel_issue = match kind {
+            SweepKind::Issue(n) => Some(*n),
+            SweepKind::PrSet(_) => None,
+        };
+        self.request_residue_teardown(sweep_id, cancel_issue, pid, pgid, started_at);
         self.on_sweep_process_end(sweep_id, pid, pgid); // #11031
 
         // Read `pr_number` BEFORE mutating terminal state so the
@@ -1044,6 +1050,10 @@ impl SweepRegistry {
                     GroupDrain::Draining => continue,
                     GroupDrain::Drained(code) => code,
                 };
+                // #10802: whatever the agent left behind (dev servers, its scope)
+                // goes with it, for any exit reason. Captured before the lock
+                // release below, which deletes the recorded scope unit.
+                self.request_residue_teardown(&sweep_id, issue, pid, pgid, started_at);
                 // #11031: drained, so the sweep's run target dir goes (off this thread).
                 self.on_sweep_process_end(&sweep_id, pid, pgid);
                 // #4493: account health must be updated before any bounded

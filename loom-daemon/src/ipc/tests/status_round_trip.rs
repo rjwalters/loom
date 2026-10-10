@@ -36,6 +36,7 @@ fn test_daemon_status_request_response_round_trip() {
         preflight_advisory_active: false,
         preflight_advisory_message: None,
         preflight_advisory_changed_at: None,
+        agent_residue: crate::types::AgentResidueStatus::default(),
         configured_max: 5,
         dynamic_cap: 3,
         main_health_gate_halted: true,

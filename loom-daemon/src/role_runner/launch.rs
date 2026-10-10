@@ -332,6 +332,7 @@ pub(super) fn run_role_with_timeout(
                 .to_string(),
         );
     };
+    let spawned_at = chrono::Utc::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -356,6 +357,17 @@ pub(super) fn run_role_with_timeout(
     // tap; every bail-out before this point dropped it, releasing it.
     crate::runtime_preference::handoff::attach(backstop, pid);
     crate::observability::lifecycle::role_child_spawned(pid);
+    // #10802: whatever the run leaves behind (its scope, its process group)
+    // is torn down on every return below, exactly as a terminal sweep's is.
+    let _residue = crate::agent_residue_reaper::ExitTeardownOnDrop(Some(
+        crate::agent_residue_reaper::ExitRequest::for_role(
+            workspace_root,
+            &item,
+            pid,
+            spawned_at,
+            session.as_ref().and_then(|s| s.scope_unit.clone()),
+        ),
+    ));
     // #10831: list this run for the pause-and-roll H4 snapshot until it ends
     // (every return below drops the guard).
     let live_run = session

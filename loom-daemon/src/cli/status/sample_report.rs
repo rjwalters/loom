@@ -31,6 +31,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         preflight_advisory_active: false,
         preflight_advisory_message: None,
         preflight_advisory_changed_at: None,
+        agent_residue: loom_daemon::types::AgentResidueStatus::default(),
         configured_max: 5,
         dynamic_cap: 3,
         main_health_gate_halted: false,

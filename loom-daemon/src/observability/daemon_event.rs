@@ -42,6 +42,7 @@ pub fn spawn_task(
         "daemon.drain",
         "daemon.capacity.advisory",
         "daemon.preflight.advisory",
+        "daemon.agent_residue",
         "epic.issue",
     ]);
     tokio::spawn(run(subscription, queue, host_id))
@@ -103,7 +104,11 @@ pub(crate) fn map_event_to_daemon_event_record(event: &Event) -> Option<Telemetr
         // `daemon.drain.*` rides `Event::Generic` (published via
         // `EventBus::publish_generic` from `ipc.rs`) — its payload is
         // already the bare, tag-free shape.
-        Event::Generic { payload, .. } if topic.starts_with("daemon.drain.") => payload.clone(),
+        Event::Generic { payload, .. }
+            if topic.starts_with("daemon.drain.") || topic.starts_with("daemon.agent_residue.") =>
+        {
+            payload.clone()
+        }
         _ => return None,
     };
     Some(TelemetryRecord::DaemonEvent(DaemonEventRecord { topic, payload }))
