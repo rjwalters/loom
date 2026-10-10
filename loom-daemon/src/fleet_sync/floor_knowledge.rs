@@ -88,6 +88,17 @@ pub(super) fn set_store_mode(mode: StoreMode) {
     }
 }
 
+/// A config tier was unreadable at boot, so whether a fleet store is named is
+/// not known (#11029). The host is a fleet host with an unknown floor, never
+/// `NoStore`.
+pub(super) fn set_unreadable_config(why: String) {
+    set_store_mode(StoreMode::Configured);
+    if let Ok(mut m) = meta().lock() {
+        m.last_error = Some(why);
+    }
+    floor_wake().bump();
+}
+
 /// Publish one pass's floor to the process-wide value, and wake the
 /// self-update loop when it differs from what the previous pass resolved (or
 /// when this is the first pass to resolve anything).
@@ -144,11 +155,11 @@ fn knowledge_from(
         }
         (StoreMode::Configured, None) => snapshot().map_or_else(
             || {
-                FloorKnowledge::Unknown(
+                FloorKnowledge::Unknown(last_error.unwrap_or_else(|| {
                     "no fleet-sync pass has completed in this process, and no earlier snapshot \
                      records a floor"
-                        .to_string(),
-                )
+                        .to_string()
+                }))
             },
             FloorKnowledge::Set,
         ),
@@ -218,6 +229,19 @@ mod tests {
 
     fn never() -> Option<String> {
         panic!("the snapshot is read only when no pass has completed")
+    }
+
+    #[test]
+    fn an_unreadable_config_tier_is_unknown_with_its_reason_never_no_store() {
+        let FloorKnowledge::Unknown(why) = knowledge_from(
+            StoreMode::Configured,
+            None,
+            Some("config tier x is unreadable".to_string()),
+            || None,
+        ) else {
+            panic!("an unreadable tier must not read as `NoStore`");
+        };
+        assert!(why.contains("unreadable"), "{why}");
     }
 
     #[test]

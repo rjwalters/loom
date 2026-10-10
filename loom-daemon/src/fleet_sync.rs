@@ -1250,6 +1250,21 @@ pub async fn start(
                 workspace.display()
             );
             clear_status();
+            // #11029: "unset" is only trustworthy when every config tier was
+            // readable. A tier that failed to read may be the one carrying
+            // `fleet.repo`; running as `NoStore` would chase the latest
+            // release. Treat that as a fleet host with an unknown floor.
+            let dead = crate::config_resolver::unreadable_tiers(workspace);
+            if let Some((path, why)) = dead.first() {
+                let why = format!(
+                    "config tier {} is unreadable ({why}), so whether this host reads a fleet \
+                     store is not known",
+                    path.display()
+                );
+                log::warn!("fleet_sync: {why} — treating the fleet floor as unknown");
+                floor_knowledge::set_unreadable_config(why);
+                return None;
+            }
             // #10885: not a fleet host, so it has no floor by definition.
             floor_knowledge::set_store_mode(floor_knowledge::StoreMode::Absent);
             return None;
