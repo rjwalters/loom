@@ -246,6 +246,12 @@ fn admit(
     ),
     LaunchError,
 > {
+    if is_inherited_dispatch_pin(
+        std::env::var("LOOM_RUNTIME").ok().as_deref(),
+        std::env::var("LOOM_ROLE").ok().as_deref(),
+    ) {
+        std::env::remove_var("LOOM_RUNTIME");
+    }
     let mut admission = crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None)
         .map_err(|r| LaunchError {
             code: rejection_exit_code(&r.reason),
@@ -256,6 +262,68 @@ fn admit(
         .admitted
         .ok_or_else(|| LaunchError::config("no runtime resolved for role"))?;
     Ok((admitted, backstop))
+}
+
+/// A global `LOOM_RUNTIME` that arrived together with `LOOM_ROLE` was exported
+/// by the daemon's own dispatch (`launch_env::apply_launch_env` pins both) for
+/// the *parent* phase, not set by an operator for this one. Treating it as an
+/// operator pin would short-circuit the role preference of the phase being
+/// launched. Per-role (`LOOM_RUNTIME_<ROLE>`) pins are untouched.
+pub fn is_inherited_dispatch_pin(runtime: Option<&str>, role: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    set(runtime) && set(role)
+}
+
+/// Resolve (creating if needed) the managed worktree the phase runs in.
+///
+/// `worker run` is the step that *launches* the Builder, so a fresh issue has
+/// no worktree yet. Setup is delegated to the guarded `worktree.sh` (claim
+/// guard, lease, configured roots and stacked bases stay its business). A
+/// Doctor's open PR makes `worktree.sh` refuse by design, so a missing issue
+/// worktree falls back to `pr-worktree.sh`.
+fn ensure_worktree(
+    root: &Path,
+    role: Role,
+    issue: u64,
+    pr: Option<u64>,
+) -> Result<PathBuf, LaunchError> {
+    let dir = root.join(".loom/worktrees");
+    let issue_wt = dir.join(format!("issue-{issue}"));
+    if issue_wt.is_dir() {
+        return Ok(issue_wt);
+    }
+    let (script, arg, wt) = match (role, pr) {
+        (Role::Doctor, Some(pr)) => ("pr-worktree.sh", pr, dir.join(format!("pr-{pr}"))),
+        _ => ("worktree.sh", issue, issue_wt),
+    };
+    if wt.is_dir() {
+        return Ok(wt);
+    }
+    let mut cmd = Command::new(super::scripts_dir(root).join(script));
+    cmd.current_dir(root).arg(arg.to_string());
+    let output = crate::proc_exec::run_bounded(cmd, Duration::from_secs(300))
+        .map_err(|e| LaunchError::config(format!("cannot run {script}: {e}")))?
+        .output();
+    if !output.as_ref().is_some_and(|o| o.status.success()) || !wt.is_dir() {
+        let detail = output
+            .map(|o| {
+                String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .chars()
+                    .rev()
+                    .take(1000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        return Err(LaunchError::config(format!(
+            "worktree {} missing and ./.loom/scripts/{script} {arg} did not create it: {detail}",
+            wt.display()
+        )));
+    }
+    Ok(wt)
 }
 
 fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
@@ -294,13 +362,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         }
         _ => return Err(LaunchError::config("missing target")),
     };
-    let worktree: PathBuf = root.join(".loom/worktrees").join(format!("issue-{issue}"));
-    if !worktree.is_dir() {
-        return Err(LaunchError::config(format!(
-            "worktree {} missing; create it with ./.loom/scripts/worktree.sh {issue}",
-            worktree.display()
-        )));
-    }
+    let worktree = ensure_worktree(&root, role, issue, args.pr)?;
     let log = root.join(".loom/logs").join(format!(
         "worker-run-{}-{}-{}.log",
         role.as_str(),
@@ -322,6 +384,11 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         .arg("--log")
         .arg(&log)
         .arg("--dangerously-skip-permissions");
+    // The orchestrator's own marker/profile must not leak into a phase that
+    // resolved statically; `apply_launch_env` re-sets them only when this
+    // phase's preference walk produced them.
+    cmd.env_remove(crate::launch_env::PREFERENCE_MARKER_ENV)
+        .env_remove("LOOM_MODEL_PROFILE");
     crate::launch_env::apply_launch_env(&mut cmd, Some(&admitted), "worker_run");
     report.log_path = Some(log.display().to_string());
 
@@ -470,6 +537,32 @@ mod tests {
         let tail = stderr_tail(long.as_bytes()).unwrap();
         assert_eq!(tail.len(), DIAGNOSTIC_TAIL_BYTES);
         assert!(tail.ends_with("END"));
+    }
+
+    #[test]
+    fn global_runtime_with_role_is_an_inherited_dispatch_pin() {
+        assert!(is_inherited_dispatch_pin(Some("claude"), Some("sweep-lifecycle")));
+        // A bare operator `LOOM_RUNTIME` (no daemon-pinned role) stays a pin.
+        assert!(!is_inherited_dispatch_pin(Some("claude"), None));
+        assert!(!is_inherited_dispatch_pin(Some("claude"), Some("  ")));
+        assert!(!is_inherited_dispatch_pin(None, Some("sweep-lifecycle")));
+    }
+
+    #[test]
+    fn missing_worktree_is_created_by_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join(".loom/scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("worktree.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/../worktrees/issue-$1\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wt = ensure_worktree(dir.path(), Role::Builder, 42, None).unwrap();
+        assert!(wt.ends_with("issue-42") && wt.is_dir());
     }
 
     #[test]
