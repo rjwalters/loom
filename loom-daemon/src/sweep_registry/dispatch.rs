@@ -8,6 +8,9 @@ use super::*;
 
 pub(super) mod child_env_markers;
 
+// Issue #11304: claim-unwind + post-claim closed-issue re-verification.
+mod claim_release;
+
 // Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
 mod lease_renewal_start;
 use lease_renewal_start::lease_renewal_start_command;
@@ -2341,6 +2344,9 @@ impl SweepRegistry {
         // local window of this dispatcher's own flip, so step 4d can tell a
         // phantom (own flip misread) from a genuine hand-claim.
         let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+        // #11304: set once the flip below succeeds, so the post-claim state
+        // re-check (4e) only runs for a claim this dispatch actually took.
+        let mut claim_flipped = false;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -2367,14 +2373,8 @@ impl SweepRegistry {
                      advertisement this host had already applied instead of flipping the label \
                      and duplicating the sweep."
                 );
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
-                let _ = self.release_lock_owned(issue_number, &sweep_id);
-                // #9572: this attempt is abandoned — release the in-flight
-                // idempotency key claimed at step 3.05 so a later same-key
-                // dispatch is not wedged behind a sweep that never spawned.
-                if let Some(ref key) = idempotency_key {
-                    self.inflight_idempotency.remove(key);
-                }
+                // #9572: also releases the in-flight idempotency key (3.05).
+                self.unwind_local_claim(issue_number, &sweep_id, idempotency_key.as_ref());
                 return Err(CollisionDispatchError {
                     issue: issue_number,
                     source: CollisionSource::ForgeLabel { labels },
@@ -2383,6 +2383,7 @@ impl SweepRegistry {
             }
             match self.flip_label_to_building(issue_number) {
                 Ok(()) => {
+                    claim_flipped = true;
                     // 4b. Write the lease record (Issue #6179, Epic #6165
                     //     Phase 1): a best-effort forge comment documenting
                     //     which host/sweep now holds this claim, posted only
@@ -2502,6 +2503,16 @@ impl SweepRegistry {
             .into());
         }
 
+        // 4e. Post-claim closed-issue re-verification (Issue #11304): release a
+        //     claim the fail-open 2.5 guard let through. See `claim_release.rs`.
+        if claim_flipped {
+            self.release_claim_if_closed_after_flip(
+                issue_number,
+                &sweep_id,
+                idempotency_key.as_ref(),
+            )?;
+        }
+
         // 5. Compute the log path and spawn the child.
         //
         // Serialize concurrent child startups (Issue #3887): enforce a minimum
@@ -2550,14 +2561,8 @@ impl SweepRegistry {
                     let _ = self.restore_label_to_ready(issue_number);
                     self.note_label_flip(issue_number); // #4485 flap detection
                 }
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
-                let _ = self.release_lock_owned(issue_number, &sweep_id);
-                // #9572: this attempt is abandoned — release the in-flight
-                // idempotency key claimed at step 3.05 so a later same-key
-                // dispatch is not wedged behind a sweep that never spawned.
-                if let Some(ref key) = idempotency_key {
-                    self.inflight_idempotency.remove(key);
-                }
+                // #9572: also releases the in-flight idempotency key (3.05).
+                self.unwind_local_claim(issue_number, &sweep_id, idempotency_key.as_ref());
                 return Err(e.context("failed to spawn sweep child"));
             }
         };
@@ -3511,3 +3516,8 @@ mod forge_egress_tests;
 // Issue #8997's rate-limited label-flip breaker coverage (same reason).
 #[cfg(test)]
 mod rate_limit_tests;
+
+// Issue #11304's post-claim closed-issue re-verification coverage — a sibling
+// module for the same reason as the ones above.
+#[cfg(test)]
+mod closed_after_claim_tests;
