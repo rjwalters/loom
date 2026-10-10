@@ -385,7 +385,7 @@ processors:
           # lockout.{duration_seconds,frozen_candidates_count,frozen_points_sum}
           # — the repo lockout weight (frozen backlog count, summed story
           # points, in-process observation floor of the lock age).
-          # loom.sweep spans of an issue add loom.story_id (#9038), loom.story and loom.story.key_version (D32 v1, #9068).
+          # loom.sweep spans of an issue add loom.story_id (#9038), loom.story and loom.story.key_version (story key v1, #9068).
           # Every span adds loom.daemon.{version,revision,tree_state}; loom.sweep spans add
           # loom.install.{version,revision} and loom.prompts.digest
           # (trace provenance policy, docs/trace-identity.md; contract-tested).
