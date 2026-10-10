@@ -259,6 +259,35 @@ fn never_approved_issue_is_released_without_loom_issue() {
     assert!(w.extra.posted[0].1.contains("was not restored"));
 }
 
+/// Regression coverage for #10837 (loom-ui#1695): a starred, triage-only issue
+/// carrying three identical-reason park records whose same-repo blockers are
+/// all CLOSED is released, with no `loom:issue` invented and the star kept.
+#[test]
+fn starred_triage_only_issue_with_three_identical_reason_parks_is_released() {
+    let mut w = World::new();
+    let reason = Some("needs slice 1a, finished-item mode and compact layout");
+    let records: Vec<String> = [1689u64, 1692, 1693]
+        .iter()
+        .map(|b| render_park(&[*b], Some("guide"), Some("2026-10-05T21:24:30Z"), reason))
+        .collect();
+    let body = format!("Work.\n\n{}\n", records.join("\n"));
+    w.with_body(1695, false, &body, &["loom:triage", "loom:operator-priority"]);
+    for b in [1689, 1692, 1693] {
+        w.state(b, "CLOSED", false);
+    }
+    w.extra
+        .events
+        .insert(1695, vec!["loom:triage".into(), "loom:blocked".into()]);
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+    assert_eq!(r.released[0].restored, None);
+    assert!(r.released[0].applied && r.released[0].commented);
+    assert_eq!(w.park.writes, vec!["remove #1695 loom:blocked"]);
+    let l = w.labels(1695);
+    assert!(!l.contains("loom:blocked") && !l.contains("loom:issue"));
+    assert!(l.contains("loom:triage") && l.contains("loom:operator-priority"));
+}
+
 #[test]
 fn merged_pr_blocker_counts_as_resolved() {
     let mut w = World::new();
