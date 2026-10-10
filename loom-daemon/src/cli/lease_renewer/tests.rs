@@ -166,6 +166,28 @@ fn release_host_filter_is_exact_when_given() {
 }
 
 #[test]
+fn release_is_a_local_exact_key_signal_never_a_pre_emptive_stop() {
+    let (_d, s) = store();
+    let sig = |_: u32| {};
+    // Releasing a key nobody owns leaves no tombstone behind...
+    assert_eq!(release(&s, "acme/widget", 7, Some("h"), "s", &all_live, &sig).unwrap(), 0);
+    assert!(s.all().is_empty(), "no record is created by an unmatched release");
+    // ...so a later start of that same key is a normal owner and keeps renewing.
+    let k = key("acme/widget", "h", "s", 7);
+    assert_eq!(claim(&s, &k, 100, "t", &ident, &all_live).unwrap(), 100);
+    assert_eq!(check(&s, &k, "t", Some("open")).0, EXIT_RENEW);
+    // A release for another sweep's or issue's key never stops this loop.
+    for (issue, sweep) in [(8, "s"), (7, "other")] {
+        release(&s, "acme/widget", issue, Some("h"), sweep, &all_live, &sig).unwrap();
+        assert_eq!(check(&s, &k, "t", Some("open")).0, EXIT_RENEW);
+    }
+    // An unverified state after a release still stops: a release is never "skipped".
+    release(&s, "acme/widget", 7, Some("h"), "s", &all_live, &sig).unwrap();
+    assert_eq!(check(&s, &k, "t", Some("")).0, EXIT_STOP);
+    assert_eq!(check(&s, &k, "t", None).0, EXIT_STOP);
+}
+
+#[test]
 fn parse_state_rejects_anything_but_open_or_closed() {
     assert_eq!(parse_state("\"closed\""), Some("closed"));
     assert_eq!(parse_state("all"), None);
