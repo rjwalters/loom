@@ -440,6 +440,30 @@ fn indented_marker_after_a_heading_is_code() {
     assert_eq!(blockers(&body), n(&[1689]));
 }
 
+/// #10837 review: a short (`--`) setext underline closes the paragraph like a
+/// long one, so an indented marker after it is code; a real record after a
+/// blank line is the control. An underline-looking line with inner spaces, or
+/// with no paragraph above it, does not change how the next line reads.
+#[test]
+fn indented_marker_after_a_short_setext_underline_is_code() {
+    let q = "<!-- loom:park Blocked by: #1689 -->";
+    for body in [
+        format!("Evidence\n--\n    {q}\n"),
+        format!("Evidence\n-\n\t{q}\n"),
+        format!("Evidence\n----  \n    {q}\n"),
+    ] {
+        assert!(parse(&body).is_empty(), "{body}");
+        assert!(!has_record(&body), "{body}");
+        assert_eq!(drop_blockers(&body, &[1689]), body);
+        let after = format!("{body}\n<!-- loom:park Blocked by: #7 -->\n");
+        assert_eq!(blockers(&after), n(&[7]), "{after}");
+    }
+    // `- -` is not an underline (inner space), so the paragraph stays open and
+    // the indented marker is a continuation: a real record.
+    let body = format!("Evidence\n- -\n    {q}\n");
+    assert_eq!(blockers(&body), n(&[1689]));
+}
+
 /// #10837 review: a fence opened directly inside a list item (bulleted,
 /// numbered, nested) quotes its content, even across blank lines; a genuine
 /// record after the list is still read.

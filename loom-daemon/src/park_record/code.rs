@@ -62,6 +62,13 @@ pub(super) fn blank(text: &str) -> String {
             fence = None;
             list_col = 0;
         }
+        // A lone `-` under a top-level paragraph is a setext underline, not an
+        // empty list item (which cannot interrupt a paragraph).
+        if !para.is_empty() && list_col == 0 && indent_width(line) < 4 && line.trim() == "-" {
+            flush(&mut para, &mut out);
+            out.push_str(&spaces(line));
+            continue;
+        }
         let (col, rest, item) = strip_lists(line, list_col);
         let indent = indent_width(rest);
         let trimmed = rest.trim_start_matches([' ', '\t']);
@@ -150,7 +157,10 @@ fn ends_paragraph(trimmed: &str, para_open: bool) -> bool {
     let marks = t.bytes().filter(|b| *b == c).count();
     let only = t.bytes().all(|b| b == c || b == b' ' || b == b'\t');
     match c {
-        b'-' | b'*' | b'_' => only && marks >= 3,
+        // Under an open paragraph a hyphen run of any length (no inner spaces)
+        // is a setext underline; otherwise it must be a 3+ thematic break.
+        b'-' => only && (marks >= 3 || (para_open && !t.contains([' ', '\t']))),
+        b'*' | b'_' => only && marks >= 3,
         b'=' => only && para_open && !t.contains([' ', '\t']),
         _ => false,
     }

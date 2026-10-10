@@ -842,7 +842,11 @@ fn quoted_after_heading_or_even_backslashes_never_release_an_unrecorded_hold() {
     // #10837 review: a marker indented under a heading, or inside a span opened
     // after an even backslash run, is quoted code; closed #1689 causes no write.
     let q = "<!-- loom:park Blocked by: #1689 -->";
-    for body in [format!("## Evidence\n    {q}\n"), format!("\\\\`{q}`\n")] {
+    for body in [
+        format!("## Evidence\n    {q}\n"),
+        format!("\\\\`{q}`\n"),
+        format!("Evidence\n--\n    {q}\n"),
+    ] {
         let mut w = World::new();
         w.with_body(10837, false, &body, &["loom:curated", "loom:operator-priority"]);
         w.state(1689, "CLOSED", false);
