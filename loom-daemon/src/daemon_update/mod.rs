@@ -489,10 +489,24 @@ impl Stage {
                         == std::cmp::Ordering::Less
                 {
                     fetch_release_behind_source = true;
-                    out::warn(&format!(
-                        "Artifact path cannot reach current source: newest release {} ({}) is behind this source tree's VERSION ({source_version}) — a forced '--fetch' will hard-fail until a release >= {source_version} is cut; '--no-fetch' (source build) remains available in the meantime.",
-                        r.latest_tag, r.latest_version
-                    ));
+                    // #11070: once the artifact path is CHOSEN, its target is
+                    // the release, not this checkout — a checkout a few
+                    // commits ahead of the newest release is routine in a
+                    // mixed fleet. Saying a forced '--fetch' "will hard-fail"
+                    // here contradicted the fetch that then proceeds. The
+                    // comparison is informational on that path; the hard-fail
+                    // itself (no usable artifact under a forced --fetch) is
+                    // reported by stage_two only when it actually happens.
+                    if artifact_mode {
+                        out::say(&format!(
+                            "Note (informational): this run installs release {artifact_tag} ({artifact_version}), which is behind this source tree's VERSION ({source_version}) — the target is the release, not the checkout; the checkout's newer commits arrive with a later release (or '--no-fetch' for a source build)."
+                        ));
+                    } else if a.fetch_mode != FetchMode::Force {
+                        out::say(&format!(
+                            "Note (informational): newest release {} ({}) is behind this source tree's VERSION ({source_version}) and not newer than the installed binary — no release artifact can update this host until a release >= {source_version} is cut; the source-build path remains available.",
+                            r.latest_tag, r.latest_version
+                        ));
+                    }
                 }
             } else if let Some(tag) = a.tag.as_deref() {
                 // #10709: a pinned tag names the ONE release to install. A
