@@ -424,7 +424,8 @@ fn analyze_str(command: &str, home: Option<&str>, depth: usize, hits: &mut Vec<H
     }
     let lexed = lex(command);
     for seg in &lexed.segments {
-        for w in seg {
+        let pattern_word = search_pattern_word(seg);
+        for (idx, w) in seg.iter().enumerate() {
             // `GIT_SSH_COMMAND=…` (prefix, `env`, `export`) makes the next
             // git transport an arbitrary remote-shell command.
             if w.kind == WordKind::Plain && is_assignment(&w.text) {
@@ -435,8 +436,10 @@ fn analyze_str(command: &str, home: Option<&str>, depth: usize, hits: &mut Vec<H
             }
             // Every word, wherever it sits, can name a credential store —
             // including `--key=~/.ssh/id` and `host:~/.ssh/x`.
+            // The one exception is a grep/rg search PATTERN: it is text the
+            // tool matches against, never a file it opens.
             for piece in w.text.split(['=', ':']) {
-                if is_credential_path(piece, home) {
+                if Some(idx) != pattern_word && is_credential_path(piece, home) {
                     hits.push(Hit::new("credential-store", w.text.clone()));
                     break;
                 }
@@ -460,6 +463,73 @@ fn analyze_str(command: &str, home: Option<&str>, depth: usize, hits: &mut Vec<H
     for body in &lexed.nested {
         analyze_str(body, home, depth + 1, hits);
     }
+}
+
+/// Index (into `seg`) of the search pattern when the segment is a plain
+/// `grep`/`rg`-family call, so a quoted `'~/.ssh'` pattern is not mistaken for
+/// a path. Input FILE operands (including `-f FILE`) are never returned.
+fn search_pattern_word(seg: &[Word]) -> Option<usize> {
+    const SEARCHERS: [&str; 7] = ["grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack"];
+    const WITH_VALUE: [&str; 17] = [
+        "-A",
+        "-B",
+        "-C",
+        "-m",
+        "-g",
+        "-t",
+        "-T",
+        "-d",
+        "-D",
+        "--glob",
+        "--type",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--max-count",
+        "--context",
+        "--max-depth",
+    ];
+    let mut i = seg
+        .iter()
+        .position(|w| w.kind == WordKind::Plain && !is_assignment(&w.text))?;
+    if !SEARCHERS.contains(&basename(&seg[i].text)) {
+        return None;
+    }
+    i += 1;
+    let mut first_operand = None;
+    let mut pattern_by_option = None;
+    while i < seg.len() {
+        let w = &seg[i];
+        if w.kind != WordKind::Plain {
+            i += 1;
+            continue;
+        }
+        let t = w.text.as_str();
+        if t == "--" {
+            first_operand = first_operand.or(seg[i + 1..]
+                .iter()
+                .position(|n| n.kind == WordKind::Plain)
+                .map(|p| i + 1 + p));
+            break;
+        }
+        if t == "-e" || t == "--regexp" {
+            pattern_by_option = pattern_by_option.or(Some(i + 1));
+            i += 2;
+        } else if t.starts_with('-') && t != "-" {
+            // `-f`/`--file` take a FILE: it stays a checked path, and the
+            // pattern then comes from that file, not from an operand.
+            if t == "-f" || t == "--file" || t.starts_with("--file=") {
+                pattern_by_option = pattern_by_option.or(Some(usize::MAX));
+            }
+            i += if WITH_VALUE.contains(&t) { 2 } else { 1 };
+        } else {
+            first_operand = first_operand.or(Some(i));
+            break;
+        }
+    }
+    // With `-e PATTERN` every operand is a file; otherwise the first operand
+    // is the pattern.
+    pattern_by_option.map_or(first_operand, |p| (p != usize::MAX).then_some(p))
 }
 
 fn seg_runs_shell(seg: &[Word]) -> bool {

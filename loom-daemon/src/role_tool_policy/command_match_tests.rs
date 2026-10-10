@@ -380,11 +380,30 @@ fn credential_store_lookalikes_stay_clean() {
 }
 
 #[test]
-fn a_quoted_credential_path_is_still_a_path() {
-    // The matcher cannot tell a grep PATTERN from a path, so it over-denies
-    // here on purpose. guard-loom-workflow.sh hands it the masked command
-    // text, in which a quoted grep/rg/echo argument is already blanked.
-    assert!(hits_cap("grep -rn '~/.ssh' docs/", "credential-store"));
+fn a_grep_pattern_is_text_but_every_other_operand_is_a_path() {
+    // The hook hands the matcher the real operands (not blanked text), so the
+    // matcher itself separates a grep/rg PATTERN from the files it reads.
+    for cmd in [
+        "grep -rn '~/.ssh' docs/",
+        "grep -rn \"/home/agent/.ssh\" docs/",
+        "rg '~/.aws/credentials' src",
+        "grep -e '~/.ssh' -- docs/",
+        "grep -A 3 '~/.ssh' docs/",
+    ] {
+        assert!(!hits_cap(cmd, "credential-store"), "pattern flagged: {cmd:?}");
+    }
+    for cmd in [
+        "grep -h \".*\" \"/home/agent/.ssh/id_rsa\"",
+        "rg \"x\" \"/home/agent/.aws/credentials\"",
+        "grep x ~/.ssh/id_rsa",
+        "grep -e x ~/.ssh/id_rsa",
+        "grep -e x -- ~/.ssh/id_rsa",
+        "grep -f ~/.ssh/id_rsa docs/",
+        "grep -f pats ~/.ssh/id_rsa",
+        "grep -rn '~/.ssh' ~/.ssh",
+    ] {
+        assert!(hits_cap(cmd, "credential-store"), "missed: {cmd:?}");
+    }
 }
 
 #[test]

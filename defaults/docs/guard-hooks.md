@@ -525,7 +525,7 @@ in a worktree cannot grant its own session a capability.
 
 | Where | What |
 |---|---|
-| `guard-loom-workflow.sh` (Bash) | `check --command`, on the same masked text the merge redirect scans, so a quoted `grep`/`echo` argument never matches |
+| `guard-loom-workflow.sh` (Bash) | `check --command`, on the command with only heredoc bodies and named text flags (`--body`, `-m`, …) blanked — NOT the positional masking the merge redirect scans, which would hide a quoted file operand (`grep x "$HOME/.ssh/id_rsa"`). The matcher itself treats a `grep`/`rg` search pattern as text and every other operand as a path |
 | `guard-worktree-paths.sh` (Edit/Write) | `check --path` on the canonical target |
 | `guard-codex-bridge.sh` (Codex) | no code of its own: it already runs the two hooks above, so Codex shell and `apply_patch` calls get the same verdict |
 | `spawn-claude.sh` | `role-tool-policy deny-specs` becomes `--disallowedTools`. This is defense in depth only: a deny spec is a prefix glob that `bash -c 'ssh …'` walks past |

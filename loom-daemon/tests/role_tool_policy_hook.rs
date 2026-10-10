@@ -175,6 +175,9 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("cat /proc/self/root{home}/.ssh/id_rsa", "credential-store"),
     ("cat /{home}/.ssh/id_rsa", "credential-store"),
     ("cat /.{home}/.ssh/id_rsa", "credential-store"),
+    // Round 2: quoted FILE operands to grep/rg are paths, not inert text.
+    ("grep -h \".*\" \"{home}/.ssh/id_rsa\"", "credential-store"),
+    ("rg \"x\" \"{home}/.aws/credentials\"", "credential-store"),
     ("gh -R o/r secret list", "forge-secrets"),
     ("gh --repo o/r variable list", "forge-secrets"),
     ("rsync -e ssh a b:c", "remote-shell"),
