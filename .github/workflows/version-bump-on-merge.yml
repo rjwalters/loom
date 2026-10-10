@@ -137,8 +137,12 @@ jobs:
           RELEASE_MIN_INTERVAL: ${{ vars.RELEASE_MIN_INTERVAL }}
         run: |
           set -euo pipefail
+          # Capture the exit code instead of letting set -e end the step at
+          # the assignment: the gate prints decision=error/reason=... to stdout
+          # on failure, and that reason must reach the log and job summary.
+          rc=0
           out="$(bash scripts/version-bump-gate.sh --event "$EVENT_NAME" --force "$FORCE" \
-            --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)"
+            --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)" || rc=$?
           echo "$out"
           decision="$(sed -n 's/^decision=//p' <<<"$out")"
           reason="$(sed -n 's/^reason=//p' <<<"$out")"
@@ -152,6 +156,7 @@ jobs:
             echo "$out"
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       - if: steps.gate.outputs.decision == 'bump'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -192,8 +197,15 @@ jobs:
             # Re-check the gate against the new tip: a bump that landed while
             # we raced (a forced dispatch, a queued run) must make this run
             # defer rather than bump a second time inside the window.
+            gate_rc=0
             gate="$(bash scripts/version-bump-gate.sh --event "$EVENT_NAME" --force "$FORCE" \
-              --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)"
+              --reason "$FORCE_REASON" --actor "$ACTOR" --ref origin/main)" || gate_rc=$?
+            if [ "$gate_rc" -ne 0 ]; then
+              echo "$gate"
+              echo "Gate re-check failed (exit $gate_rc) on the current tip:" >>"$GITHUB_STEP_SUMMARY"
+              echo "$gate" >>"$GITHUB_STEP_SUMMARY"
+              exit "$gate_rc"
+            fi
             if ! grep -qx 'decision=bump' <<<"$gate"; then
               echo "$gate"
               echo "Gate no longer says bump on the current tip -- not bumping." | tee -a "$GITHUB_STEP_SUMMARY"

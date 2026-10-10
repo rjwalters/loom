@@ -554,6 +554,15 @@ assert_present '-m "Forced-by: $ACTOR" -m "Reason: $FORCE_REASON"' \
     "Case 9: a forced bump commit records the actor and the reason"
 assert_present '>>"$GITHUB_STEP_SUMMARY"' \
     "Case 9: the gate verdict (deferred / nothing / bump) is written to the job summary"
+# A failing gate prints decision=error/reason=... to stdout; under set -e a
+# bare `out="$(...)"` would end the step before that reason is echoed or
+# summarised, so both gate invocations must capture the exit code instead.
+assert_present '--ref origin/main)" || rc=$?' \
+    "Case 9: a failing gate's reason is surfaced (exit code captured, not set -e)"
+assert_order '} >>"$GITHUB_STEP_SUMMARY"' 'exit "$rc"' \
+    "Case 9: the gate step exits with the gate's code only after writing the summary"
+assert_present '--ref origin/main)" || gate_rc=$?' \
+    "Case 9: a failing in-loop gate re-check surfaces its reason (exit code captured)"
 
 GH_CALLS="$(workflow_code | grep -cE '(^|[^[:alnum:]_.-])gh (api|pr|issue|release|run|workflow|repo|label|search)( |$)' || true)"
 if [[ "$GH_CALLS" -eq 1 ]]; then
@@ -780,6 +789,11 @@ ANCHORS
         "$WORKFLOW" >"$MUTANT"
     expect_child_fails "Case 9: RELEASE_MIN_INTERVAL comes only from vars.RELEASE_MIN_INTERVAL" \
         "Case 8: hardcoded RELEASE_MIN_INTERVAL is rejected"
+
+    # The gate's exit code no longer captured (set -e swallows the reason).
+    sed 's/--ref origin\/main)" || rc=\$?/--ref origin\/main)"/' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 9: a failing gate's reason is surfaced (exit code captured, not set -e)" \
+        "Case 8: bare out=\"\$(gate)\" under set -e is rejected"
 
     # Back to a shallow checkout.
     sed 's|fetch-depth: 0|fetch-depth: 1|' "$WORKFLOW" >"$MUTANT"
