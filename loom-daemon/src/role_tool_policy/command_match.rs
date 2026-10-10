@@ -245,7 +245,7 @@ fn lex(input: &str) -> Lexed {
                             continue;
                         }
                         '$' if c.get(i + 1) == Some(&'{') => {
-                            let end = take_brace(&c, i + 2);
+                            let end = take_brace(&c, i + 2, &mut out.nested);
                             cur.extend(&c[i..end]);
                             i = end;
                             continue;
@@ -270,7 +270,7 @@ fn lex(input: &str) -> Lexed {
                 continue;
             }
             '$' if next == Some('{') => {
-                let end = take_brace(&c, i + 2);
+                let end = take_brace(&c, i + 2, &mut out.nested);
                 cur.extend(&c[i..end]);
                 in_word = true;
                 i = end;
@@ -388,11 +388,27 @@ fn take_balanced(c: &[char], start: usize) -> (String, usize) {
 }
 
 /// Index just past the `}` closing a `${…}` whose body starts at `start`.
-fn take_brace(c: &[char], start: usize) -> usize {
+/// Executable substitutions inside the expansion (`${v:-$(cmd)}`,
+/// `${v:-`cmd`}`) run when bash expands it, so their bodies are pushed onto
+/// `nested` and skipped over (a `}` inside one does not close the expansion).
+fn take_brace(c: &[char], start: usize, nested: &mut Vec<String>) -> usize {
     let mut depth = 1usize;
     let mut i = start;
     while i < c.len() {
         match c[i] {
+            '\\' => i += 1,
+            '$' if c.get(i + 1) == Some(&'(') => {
+                let (body, end) = take_balanced(c, i + 2);
+                nested.push(body);
+                i = end;
+                continue;
+            }
+            '`' => {
+                let (body, end) = take_backtick(c, i + 1);
+                nested.push(body);
+                i = end;
+                continue;
+            }
             '{' => depth += 1,
             '}' => {
                 depth -= 1;

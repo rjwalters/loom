@@ -668,3 +668,21 @@ fn ansi_c_nul_truncates_the_word_like_bash() {
     assert!(hits_cap(r"$'ssh\000suffix' example.invalid", "remote-shell"));
     assert_clean(r"$'ls\0ssh' example.invalid");
 }
+
+#[test]
+fn substitutions_inside_parameter_expansions_are_analyzed() {
+    for cmd in [
+        r#"echo "${unset_var:-$(ssh example.invalid)}""#,
+        "echo ${unset_var:-$(ssh example.invalid)}",
+        r#"echo "${unset_var:-`ssh example.invalid`}""#,
+        "echo ${unset_var:-`ssh example.invalid`}",
+        // A `}` inside the substitution must not end the expansion early.
+        "echo ${v:-$(echo }; ssh example.invalid)}",
+        "echo ${a:-${b:-$(ssh example.invalid)}}",
+    ] {
+        assert!(hits_cap(cmd, "remote-shell"), "{cmd}");
+    }
+    assert!(hits_cap(r#"echo "${v:-$(aws sts get-caller-identity)}""#, "cloud-cli"));
+    assert_clean(r#"echo "${v:-$(echo hi)}" ${w:-fallback} ${#x} "${y%.txt}""#);
+    assert_clean(r#"echo "${v:-`date`}""#);
+}

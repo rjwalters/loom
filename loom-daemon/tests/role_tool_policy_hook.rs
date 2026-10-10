@@ -215,6 +215,11 @@ const ROUND_1_BYPASSES: &[(&str, &str)] = &[
     ("taskset -c 0 ssh example.invalid", "remote-shell"),
     ("taskset --cpu-list 0-3 aws sts get-caller-identity", "cloud-cli"),
     ("chrt -i 0 ssh example.invalid", "remote-shell"),
+    // Round 9: substitutions inside `${…}` execute when the expansion does.
+    (r#"echo "${unset_var:-$(ssh example.invalid)}""#, "remote-shell"),
+    ("echo ${unset_var:-$(ssh example.invalid)}", "remote-shell"),
+    (r#"echo "${unset_var:-`ssh example.invalid`}""#, "remote-shell"),
+    ("echo ${unset_var:-`aws sts get-caller-identity`}", "cloud-cli"),
 ];
 
 #[test]
@@ -237,6 +242,7 @@ fn round_1_bypasses_are_denied_by_the_real_hooks() {
         "rsync -a src/ dst/",
         "taskset -c 0 echo ok",
         "chrt -i 0 echo ok",
+        r#"echo "${v:-$(echo hi)}" ${w:-fallback}"#,
     ] {
         let (d, reason) = f.bash(cmd, Some("judge"), BIN);
         assert_eq!(d, "allow", "judge: {cmd} -> {reason}");
