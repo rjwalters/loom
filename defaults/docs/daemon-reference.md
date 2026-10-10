@@ -6442,7 +6442,7 @@ knobs not yet audited here.
 | `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `300` | No-progress window before auto-restart (raised from 120s in #4088 — the old default sat inside the observed 110–150s dispatch→worktree window and cancelled healthy sweeps) |
 | `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
-| `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
+| `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Activity-silence window (log, transcripts, worktree, tool processes; #9533) before a hung sweep is re-dispatched |
 | `autonomous.watchdog.staleSweep` | `LOOM_SWEEP_STALE_SWEEP` | `true` | Stale-untracked-sweep backstop on/off (#7529). Runs in the same tick as the other three, but acts only on entries none of them can reach (see below) |
 | `autonomous.watchdog.staleSweepAgeSecs` | `LOOM_SWEEP_STALE_AGE_SECS` | `10800` (3h, 4× `reviewStallTimeoutSecs`) | Age sanity ceiling before an untracked, log-silent sweep is reaped |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision detection and enforcement (#4085, upgraded from detection-only by #5789). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. When enabled, a confirmed pre-flip collision backs off the dispatch instead of only logging/counting it |
@@ -6813,11 +6813,16 @@ cases) emitting zero output until the very end**, silently blocking the sweep's
 back half with no self-heal. The third backstop, running in the same watchdog
 tick, closes that gap: for each still-running daemon-dispatched sweep that has
 already made startup progress, it measures **activity silence** — the
-minimum idle time over the per-sweep log file's mtime **and** the sweep's
-session transcripts (`~/.claude/projects/<slug>/*.jsonl` plus
-`subagents/*.jsonl`; #9533 — a headless `claude -p` sweep writes nothing to its
-log while it works, so log mtime alone is not liveness; unreadable signals
-are skipped and, with none readable, the sweep is left alone). The same
+minimum idle time over four signals (#9533 — a headless `claude -p` sweep
+writes nothing to its log while it works, so log mtime alone is not liveness):
+(1) the per-sweep log file's mtime; (2) the sweep's session transcripts
+(`~/.claude/projects/<slug>/*.jsonl` plus `subagents/*.jsonl`); (3) worktree
+writes under `.loom/worktrees/issue-<N>` (root, git refs, `target/` to depth 2,
+and a bounded source walk); (4) the youngest tool process spawned under the
+sweep's `claude`/`codex` agent (Linux `/proc`; the wrapper's own monitor
+`sleep`s do not count, and a stuck tool call ages out). A sweep is stalled
+only when **every** readable signal is older than the timeout; unreadable
+signals are skipped and, with none readable, the sweep is left alone. The same
 predicate backs the stale-sweep backstop below. While a roll/drain is armed the
 watchdog neither cancels nor re-dispatches (a respawn would keep the drain from
 converging), and its log lines name the sweep's checkpoint phase. Past `reviewStallTimeoutSecs`
@@ -6866,10 +6871,10 @@ class of entry never had.
 The fourth backstop closes that gap: every tick, `stale_sweep_findings` scans
 for exactly the entries the other two cannot reach
 (`!self.children.contains_key`) whose age exceeds `staleSweepAgeSecs` (default
-3h, 4× the review-stall timeout) **and** whose log has gone silent past
-`reviewStallTimeoutSecs` (or is unreadable/missing — treated as stale, not
-healthy-by-default). A sweep still producing log output, however old, is left
-alone — the same "any observed progress is Healthy" rule every watchdog here
+3h, 4× the review-stall timeout) **and** that has shown no activity on any
+of the four signals above past `reviewStallTimeoutSecs` (no readable signal at
+all is treated as stale, not healthy-by-default). A sweep still showing
+activity, however old, is left alone — the same "any observed progress is Healthy" rule every watchdog here
 follows. A match is cancelled (SIGTERM → grace → SIGKILL, releasing the claim
 lock and restoring `loom:building` → `loom:issue`, exactly like every other
 watchdog's cancel path) and a forge comment explains why; there is no bounded

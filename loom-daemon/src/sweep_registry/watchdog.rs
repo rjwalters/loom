@@ -838,10 +838,20 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 return None;
             }
             let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+            if elapsed < min_age {
+                // Too young to judge; skip the (possibly costly) probes below.
+                return None;
+            }
             // #9533: log mtime alone is not liveness (headless sweeps
-            // write nothing to it); fold in the session transcripts.
-            let log_idle =
-                activity::sweep_idle(&info.log_path, workspace_root, issue, log_silence_timeout);
+            // write nothing to it); fold in transcripts, worktree writes,
+            // and the agent's tool processes.
+            let log_idle = activity::sweep_idle(
+                &info.log_path,
+                workspace_root,
+                issue,
+                info.pid,
+                log_silence_timeout,
+            );
             if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
                 return None;
             }
@@ -1896,8 +1906,9 @@ impl SweepRegistry {
     /// The daemon redirects each child's stdout/stderr to `log_path`, but a
     /// headless (`claude -p`) sweep writes nothing there while it works, so
     /// this is **not** a liveness signal on its own (#9533). The watchdogs
-    /// judge [`activity::sweep_idle`] instead, which also folds in the session
-    /// transcripts' mtimes; this is only the log-file input to it.
+    /// judge [`activity::sweep_idle`] instead, which also folds in session
+    /// transcripts, worktree writes, and the agent's tool processes; this is
+    /// only the log-file input to it.
     ///
     /// Returns `None` when the file is missing or its mtime is unreadable / in
     /// the future (clock skew) — callers treat `None` as "cannot assess, leave
@@ -1948,7 +1959,7 @@ impl SweepRegistry {
     pub fn review_stall_watchdog_once(&mut self, timeout: Duration) -> usize {
         // Snapshot eligible candidates first so we can mutate below (mirrors
         // `watchdog_once`).
-        let candidates: Vec<(SweepId, u32, PathBuf)> = self
+        let candidates: Vec<(SweepId, u32, u32, PathBuf)> = self
             .entries
             .iter()
             .filter(|(id, info)| {
@@ -1957,36 +1968,29 @@ impl SweepRegistry {
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
-            .filter_map(|(id, info)| match info.kind {
-                SweepKind::Issue(issue) => Some((id.clone(), issue, info.log_path.clone())),
+            .filter_map(|(id, i)| match i.kind {
+                SweepKind::Issue(n) => Some((id.clone(), n, i.pid, i.log_path.clone())),
                 SweepKind::PrSet(_) => None,
             })
             .collect();
 
         let mut restarts = 0usize;
-        for (sweep_id, issue, log_path) in candidates {
+        for (sweep_id, issue, pid, log_path) in candidates {
             // Gate to sweeps past startup: a sweep that has made NO progress is
             // the #3887 startup watchdog's job, not ours. This keeps the two
             // backstops disjoint on any given tick.
             if !self.sweep_made_progress(issue, &log_path) {
                 continue;
             }
-            // No readable signal ⇒ cannot assess ⇒ leave alone. Log mtime AND
-            // session-transcript mtime (#9533): headless sweeps don't log.
+            // No readable signal ⇒ cannot assess ⇒ leave alone. Log mtime,
+            // session transcripts, worktree writes, and the agent's tool
+            // processes (#9533): headless sweeps don't log.
             let Some(idle) =
-                activity::sweep_idle(&log_path, &self.config.workspace_root, issue, timeout)
+                activity::sweep_idle(&log_path, &self.config.workspace_root, issue, pid, timeout)
             else {
                 continue;
             };
-            let phase = activity::phase_label(
-                reaper::read_checkpoint_phase(
-                    &self
-                        .config
-                        .checkpoint_dir()
-                        .join(format!("issue-{issue}.json")),
-                )
-                .as_deref(),
-            );
+            let phase = activity::checkpoint_phase_label(&self.config.checkpoint_dir(), issue);
             let already_retried = self.review_stall_retried.contains(&issue);
             match review_stall_decision(idle, timeout, already_retried) {
                 WatchdogDecision::Healthy => {}
@@ -1994,9 +1998,9 @@ impl SweepRegistry {
                     if self.review_stall_gaveup.insert(issue) {
                         log::error!(
                             "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) \
-                             stalled again (no log or session activity for {}s) after an \
-                             auto-restart — giving up (bounded to one retry). Operator \
-                             intervention needed: it appears wedged; inspect \
+                             stalled again (no log/session/worktree/tool-process activity \
+                             for {}s) after an auto-restart — giving up (bounded to one \
+                             retry). Operator intervention needed: it appears wedged; inspect \
                              .loom/logs/sweep-issue-{issue}.log, then cancel + re-dispatch (#3910).",
                             idle.as_secs()
                         );
@@ -2024,9 +2028,9 @@ impl SweepRegistry {
                     }
                     log::warn!(
                         "review-stall-watchdog: {phase} for issue #{issue} ({sweep_id}) showed no \
-                         log or session activity in {}s despite making startup progress — looks \
-                         hung; auto-cancelling and re-dispatching once. The re-dispatch resumes \
-                         from the sweep checkpoint (#3910).",
+                         log/session/worktree/tool-process activity in {}s despite making startup \
+                         progress — looks hung; auto-cancelling and re-dispatching once. The \
+                         re-dispatch resumes from the sweep checkpoint (#3910).",
                         idle.as_secs()
                     );
                     // Capture re-dispatch params from the wedged entry BEFORE
