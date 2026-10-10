@@ -111,6 +111,65 @@ fn an_unfinished_review_walk_is_an_error_not_the_first_page() {
     assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
 }
 
+/// A stub serving `loom:curated` issues: `cu1.json` on page 1, `cu2.json` on
+/// `&page=2`, anything else empty; `fail<N>` fails page N.
+fn curated_stub(dir: &Path) -> PathBuf {
+    let path = review_stub(dir);
+    let script = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("labels=loom:review-requested&'*'&page=2'", "labels=loom:curated&'*'&page=2'")
+        .replace("labels=loom:review-requested&'", "labels=loom:curated&'")
+        .replace("f=rr2.json", "f=cu2.json")
+        .replace("f=rr1.json", "f=cu1.json");
+    std::fs::write(&path, script).unwrap();
+    path
+}
+
+fn issue_page(numbers: std::ops::Range<u32>) -> String {
+    let rows: Vec<String> = numbers
+        .map(|n| {
+            format!(
+                r#"{{"number": {n}, "state": "open", "created_at": "2026-10-01T00:00:{:02}Z",
+                    "labels": [{{"name": "loom:curated"}}]}}"#,
+                n % 60
+            )
+        })
+        .collect();
+    format!("[{}]\n", rows.join(","))
+}
+
+/// The curated listing walks past page 1 and carries each creation instant;
+/// a pull request under the label is not an issue.
+#[test]
+fn the_curated_listing_is_paginated_and_dated() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    let gh = curated_stub(dir.path());
+
+    let listing = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap();
+    assert_eq!(listing.keys().copied().collect::<Vec<_>>(), (1..131).collect::<Vec<_>>());
+    assert_eq!(listing[&7].unwrap().to_rfc3339(), "2026-10-01T00:00:07+00:00");
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("&page=2"), "{calls}");
+}
+
+/// A walk that cannot finish is an error: the repo has no curated listing
+/// this pass rather than the first page only.
+#[test]
+fn an_unfinished_curated_walk_is_an_error_not_the_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/fleet-curated-fail-{}", std::process::id());
+    std::fs::write(dir.path().join("cu1.json"), issue_page(1..101)).unwrap();
+    std::fs::write(dir.path().join("cu2.json"), issue_page(101..131)).unwrap();
+    std::fs::write(dir.path().join("fail2"), "").unwrap();
+    let gh = curated_stub(dir.path());
+
+    let err = super::curated_listing_with(&gh, dir.path(), Some(&repo)).unwrap_err();
+    assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
+}
+
 fn row(repo: &str, issue: u32) -> ReadyQueueRow {
     serde_json::from_value(serde_json::json!({
         "rank": issue, "repo": repo, "issue": issue, "workspace_priority": 100,

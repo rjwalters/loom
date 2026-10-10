@@ -250,6 +250,15 @@ fn telemetry_replay_check_vocabulary_matches_the_stage_enum_registry_and_webhook
             stage.as_str()
         );
     }
+    // The pre-ready stages (#11368) are `eta.stage_outcome` only: they carry
+    // wire names but are not `fleet.state` stages the SQL has to map.
+    for (stage, wire) in [
+        (FleetStage::TriageWait, "triage_wait"),
+        (FleetStage::ApprovalWait, "approval_wait"),
+    ] {
+        assert_eq!(stage.as_str(), wire);
+        assert_eq!(serde_json::from_value::<FleetStage>(wire.into()).unwrap(), stage);
+    }
     let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut holds: Vec<String> = crate::label_registry::embedded_set("merge_hold")
         .iter()
