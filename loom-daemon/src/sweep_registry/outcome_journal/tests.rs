@@ -870,6 +870,7 @@ async fn a_real_phase_transition_reaches_the_telemetry_queue() {
             kind: SweepKind::Issue(issue),
             runtime: None,
             runtime_source: None,
+            start: None,
             repo: None,
         },
         issue,

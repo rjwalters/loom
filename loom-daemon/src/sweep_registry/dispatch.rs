@@ -1822,6 +1822,7 @@ impl SweepRegistry {
             let resolved_model = model.resolve(&self.config, kind, admission.admitted.as_ref());
             (admission, resolved_model, None)
         };
+        let model_source = model.source();
         let model = resolved_model.as_deref();
 
         // 2. `Issue` and `PrSet` dispatch diverge here (Issue #5342): `PrSet`
@@ -2574,6 +2575,7 @@ impl SweepRegistry {
             depends_on,
             admission,
             story_points,
+            model_source,
             mid_spawn: self.roll_gate.enter(),
         })))
     }
@@ -2611,6 +2613,7 @@ impl SweepRegistry {
             depends_on,
             mut admission,
             story_points,
+            model_source,
             mid_spawn: _mid_spawn, // #10974: held until the entry is recorded
         } = prepared;
 
@@ -2837,19 +2840,10 @@ impl SweepRegistry {
         // 7. Emit `sweep.global.dispatch` (best-effort — never block
         //    dispatch progress on the bus). If no subscribers are
         //    listening, the bus returns NoSubscribers; log at debug.
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
-            // matching the pattern already used for SweepPhase/Blocker/Exited/
-            // Crashed — leave it `None` at construction.
-            repo: None,
-            // #9432: the size estimate resolved at step 2.71 from the labels
-            // the park guard already read. Absent for an unsized issue.
-            story_points,
-        });
+        //    #9432: `story_points` is the size estimate resolved at step 2.71
+        //    from the labels the park guard already read. #11280: the event
+        //    also carries this sweep's start facts (`start_facts.rs`).
+        self.emit_dispatch(&sweep_id, &admission, story_points, Some(model_source));
 
         Ok(DispatchOutcome {
             sweep_id,
@@ -3017,17 +3011,10 @@ impl SweepRegistry {
         // stranded `loom:building` claim — a `PrSet` dispatch claims no
         // issue, so there is nothing for that recovery path to re-arm.
 
-        self.emit_event(Event::SweepGlobalDispatch {
-            sweep_id: sweep_id.clone(),
-            kind: kind.clone(),
-            runtime: admission.admitted.as_ref().map(|a| a.runtime.clone()),
-            runtime_source: admission.admitted.as_ref().map(|a| a.source.clone()),
-            repo: None,
-            // A `PrSet` dispatch claims no issue (see this method's doc
-            // comment), so there is no `points:*` label to resolve — omitted,
-            // never `0` (#9432).
-            story_points: None,
-        });
+        // A `PrSet` dispatch claims no issue (see this method's doc
+        // comment), so there is no `points:*` label to resolve — omitted,
+        // never `0` (#9432) — and no attempt lineage (#11280).
+        self.emit_dispatch(&sweep_id, &admission, None, None);
 
         Ok(DispatchOutcome {
             sweep_id,

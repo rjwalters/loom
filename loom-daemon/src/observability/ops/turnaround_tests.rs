@@ -25,6 +25,7 @@ fn dispatched(kind: SweepKind) -> Event {
         kind,
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     }
 }
@@ -153,6 +154,7 @@ fn dispatched_id(sweep_id: &str) -> Event {
         kind: SweepKind::Issue(1),
         runtime: None,
         runtime_source: None,
+        start: None,
         repo: None,
     }
 }

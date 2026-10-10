@@ -230,15 +230,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
             ];
-            if let Some(model) = &r.model {
-                attributes.push(kv_string("loom.model", model.clone()));
-            }
-            if let Some(effort) = &r.effort {
-                attributes.push(kv_string("loom.effort", effort.clone()));
-            }
-            if let Some(runtime) = &r.runtime {
-                attributes.push(kv_string("loom.runtime", runtime.clone()));
-            }
+            attributes.extend(metadata::start_facts(&r.facts));
             // Issue #9432: the assigned story-point size of the work now in
             // flight, as a NUMERIC attribute so a backend can sum it. Pushed
             // only when the issue carried exactly one legal `points:*` label —
