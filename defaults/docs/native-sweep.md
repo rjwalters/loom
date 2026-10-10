@@ -110,28 +110,36 @@ prohibited); never end the turn while it is pending (`sweep-execution-model.md`)
 
 Shell variables do not survive between Bash tool calls, so use a **literal**
 result dir `P=/tmp/loom-worker-<role>-<N>-<unix-time>` (pick the time once, then
-repeat the literal in every call). Launch with `run_in_background:true`; `setsid -w`
-makes the wrapper's pid the process-group id of the whole phase:
+repeat the literal in every call). Launch with `run_in_background:true`. The
+wrapper records the pid of `worker run` itself (not a process group): `worker run`
+puts the worker in its **own** process group, so signalling the wrapper's group
+would miss it. Instead `worker run` owns the stop: on SIGTERM/SIGINT it forwards
+the signal to the worker's group, awaits it (SIGKILL after 15s), and exits 1 with
+outcome `interrupted`; a second signal kills the group at once.
 
 ```bash
 P=/tmp/loom-worker-builder-N-T; mkdir -p "$P"; date +%s >"$P/start"
-setsid -w bash -c 'echo $$ >"$1/pid"; loom-daemon worker run --role builder --issue N --json >"$1/report.json" 2>"$1/stderr.log"; echo $? >"$1/exit"' _ "$P"
+setsid -w bash -c 'echo $$ >"$1/wrapper"; loom-daemon worker run --role builder --issue N --json >"$1/report.json" 2>"$1/stderr.log" & echo $! >"$1/pid"; wait $!; echo $? >"$1/exit"' _ "$P"
 ```
 
 Then repeat this foreground poll (~90s, under the tool cap) until it prints a
 code. Empty output means still running — poll again; never read it as success.
 Only the wrapper writes `exit`; the poll never does. If the wrapper dies or the
-deadline passes it stops the whole group and prints only once nothing is left
-running. The deadline is `--timeout` (default 3600) + 600s for setup; raise `4200`
-for a custom `--timeout`:
+deadline passes it signals `worker run` (TERM, then a second TERM after 20s) and
+prints only once that process — and with it the worker group — has exited. The
+deadline is `--timeout` (default 3600) + 600s for setup; raise `4200` for a
+custom `--timeout`:
 
 ```bash
-P=/tmp/loom-worker-builder-N-T; G=$(cat "$P/pid") || { echo 1; exit; }
-alive() { s=$(ps -o stat= -p "$G" 2>/dev/null); [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }
-stop() { kill -TERM -- -"$G" 2>/dev/null; for j in $(seq 20); do kill -0 -- -"$G" 2>/dev/null || return 0; sleep 1; done; kill -KILL -- -"$G" 2>/dev/null; sleep 2; }
+P=/tmp/loom-worker-builder-N-T; W=$(cat "$P/pid" 2>/dev/null); B=$(cat "$P/wrapper" 2>/dev/null)
+up() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && [ "$(ps -o stat= -p "$1" | cut -c1)" != Z ]; }
+stop() { kill -TERM "$W" 2>/dev/null; for j in $(seq 20); do up "$W" || return 0; sleep 1; done; kill -TERM "$W" 2>/dev/null; for j in $(seq 10); do up "$W" || return 0; sleep 1; done; }
 for i in $(seq 9); do
   [ -s "$P/exit" ] || [ -s "$P/stopped" ] && break
-  if ! alive || [ $(( $(date +%s) - $(cat "$P/start") )) -gt 4200 ]; then stop; [ -s "$P/exit" ] || echo 1 >"$P/stopped"; break; fi
+  if [ $(( $(date +%s) - $(cat "$P/start") )) -gt 4200 ] || { [ -n "$B" ] && ! up "$B"; }; then
+    sleep 1; [ -s "$P/exit" ] && break
+    stop; up "$W" && continue; echo 1 >"$P/stopped"; break
+  fi
   sleep 10
 done; cat "$P/exit" "$P/stopped" 2>/dev/null | head -n1
 ```

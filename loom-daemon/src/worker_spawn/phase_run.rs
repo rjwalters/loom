@@ -9,7 +9,8 @@
 //! Exit codes: 0 finished with its artifact, or `delegate-to-claude`; 1 ran
 //! without producing the artifact; 2 usage (bad role); 75 no eligible
 //! runtime/pool seat (caller falls back to Claude); 78 config unresolvable;
-//! 124 timeout.
+//! 124 timeout. A SIGTERM/SIGINT to `worker run` is forwarded to the worker's
+//! process group, awaited, and reported as outcome `interrupted` (exit 1).
 use super::LaunchError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -355,6 +356,25 @@ fn ensure_worktree(
     Ok(wt)
 }
 
+/// How long a signalled worker group gets to exit before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(15);
+
+/// Run the worker under `timeout`, owning its process group: the deadline and a
+/// forwarded `pending` signal both terminate that group (descendants included)
+/// and await it before returning.
+fn launch_bounded(
+    cmd: Command,
+    timeout: Duration,
+    grace: Duration,
+    pending: &dyn Fn() -> Option<i32>,
+    spawned: impl FnOnce(u32),
+) -> Result<crate::proc_exec::Completion, crate::proc_exec::ExecError> {
+    crate::proc_exec::run_bounded_forwarding(cmd, timeout, grace, pending, |pid| {
+        crate::tokens_pool::operator_interrupt::set_active_group(pid);
+        spawned(pid);
+    })
+}
+
 fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
     let root = super::workspace(None)?;
     let (admitted, backstop) = admit(&root, role)?;
@@ -421,15 +441,42 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
     crate::launch_env::apply_launch_env(&mut cmd, Some(&admitted), "worker_run");
     report.log_path = Some(log.display().to_string());
 
-    let completion = crate::proc_exec::run_bounded_observed(
+    // An operator/watchdog SIGTERM/SIGINT is forwarded to the worker's own
+    // process group (`proc_exec` places it in one), which is awaited and, if it
+    // ignores the signal past the grace, killed. A second signal kills it at once.
+    if let Err(e) = crate::tokens_pool::operator_interrupt::install() {
+        eprintln!("warning: cannot trap SIGTERM/SIGINT; a stop will not reach the worker: {e}");
+    }
+    let completion = launch_bounded(
         cmd,
         Duration::from_secs(args.timeout),
+        STOP_GRACE,
+        &crate::tokens_pool::operator_interrupt::pending,
         move |pid| crate::runtime_preference::handoff::attach(backstop, pid),
-    )
-    .map_err(|e| LaunchError {
-        code: 126,
-        message: format!("cannot launch worker: {e}"),
-    })?;
+    );
+    crate::tokens_pool::operator_interrupt::clear_active_group();
+    let signal = crate::tokens_pool::operator_interrupt::pending();
+    let completion = match completion {
+        Err(crate::proc_exec::ExecError::Collect(e))
+            if e.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            None
+        }
+        other => Some(other.map_err(|e| LaunchError {
+            code: 126,
+            message: format!("cannot launch worker: {e}"),
+        })?),
+    };
+    let completion = match completion {
+        Some(c) if signal.is_none() || c.succeeded() => c,
+        _ => {
+            // Stopped by a signal: the worker group is gone (awaited above).
+            report.outcome = "interrupted".into();
+            report.diagnostic = signal.map(|s| format!("stopped by signal {s}"));
+            emit(args, &report);
+            return Ok(EXIT_NO_ARTIFACT);
+        }
+    };
     let code = match completion {
         crate::proc_exec::Completion::TimedOut { .. } => {
             report.outcome = "timeout".into();
@@ -473,6 +520,89 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #11303 review (P1 at 2be696897): the worker runs in its own process group,
+    /// so a stop must reach and await THAT group, not just the caller's.
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn stub_with_descendant(dir: &Path, prelude: &str) -> (Command, PathBuf) {
+        let pidfile = dir.join("child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("{prelude} sleep 120 & echo $! >{}; wait", pidfile.display()));
+        (cmd, pidfile)
+    }
+
+    fn read_pid(path: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Some(p) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no pid written");
+    }
+
+    #[test]
+    fn a_forwarded_stop_kills_and_awaits_the_workers_own_group() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ignores TERM (inherited by the descendant), so only the post-grace
+        // kill of the worker's own group can end it.
+        let (cmd, pidfile) = stub_with_descendant(dir.path(), "trap '' TERM;");
+        let start = std::time::Instant::now();
+        let pending = || (start.elapsed() >= Duration::from_millis(500)).then_some(libc::SIGTERM);
+        let res = launch_bounded(
+            cmd,
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+            &pending,
+            |_| {},
+        );
+        assert!(
+            matches!(&res, Err(crate::proc_exec::ExecError::Collect(e))
+                if e.kind() == std::io::ErrorKind::Interrupted),
+            "{res:?}"
+        );
+        // Gone by the time the call returned (reaped by init once its parent died).
+        let child = read_pid(&pidfile);
+        for _ in 0..40 {
+            if !alive(child) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(child), "descendant in the worker's group survived the stop");
+        assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_deadline_kills_and_awaits_the_workers_own_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cmd, pidfile) = stub_with_descendant(dir.path(), "");
+        let res = launch_bounded(
+            cmd,
+            Duration::from_secs(1),
+            Duration::from_millis(300),
+            &|| None,
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(res, crate::proc_exec::Completion::TimedOut { .. }));
+        let child = read_pid(&pidfile);
+        for _ in 0..40 {
+            if !alive(child) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(child), "descendant in the worker's group survived the deadline");
+    }
 
     #[test]
     fn judge_and_curator_are_refused() {
