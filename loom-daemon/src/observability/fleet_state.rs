@@ -28,6 +28,9 @@
 //! When one `(repo, issue)` is seen by several sources, the held row wins,
 //! then the PR row, then the ready row.
 //!
+//! The same two consecutive views also give the outcome facts
+//! `eta.stage_outcome` and `pr.resolved` ([`outcomes`], #11126).
+//!
 //! [`build_view`] and [`decide`] are pure. A full anchor goes out on the first
 //! pass of a process, whenever the planner stamps change, and once the last
 //! anchor is [`ANCHOR_INTERVAL_SECS`] old; in between a delta goes out only
@@ -52,6 +55,7 @@ use crate::telemetry::kinds::fleet_state::{
 };
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 
+pub mod outcomes;
 mod sources;
 
 /// The review labels whose listings give the PR stages and the census.
@@ -650,10 +654,13 @@ impl FleetStateSink {
 
     /// Enqueue one record.
     pub fn push(&self, record: FleetStateRecord) {
-        self.queue.offer(TelemetryEnvelope::new(
-            self.host_id.clone(),
-            TelemetryRecord::FleetState(record),
-        ));
+        self.offer(TelemetryRecord::FleetState(record));
+    }
+
+    /// Enqueue any record this pass produces.
+    pub fn offer(&self, record: TelemetryRecord) {
+        self.queue
+            .offer(TelemetryEnvelope::new(self.host_id.clone(), record));
     }
 }
 
@@ -669,17 +676,79 @@ pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
     let _ = SINK.set(FleetStateSink::new(Arc::new(FanoutQueue::new(otlp_queues)), host_id));
 }
 
-/// The previous pass's view, and what the previous record left behind.
+/// The previous pass's view, what the previous record left behind, and what
+/// the outcome diff needs from the previous pass.
 #[derive(Debug, Clone, Default)]
 struct PassState {
     prev: Option<FleetView>,
     emitted: Option<Emitted>,
+    outcomes: outcomes::Memory,
 }
 
 static STATE: Mutex<PassState> = Mutex::new(PassState {
     prev: None,
     emitted: None,
+    outcomes: outcomes::Memory {
+        listed: BTreeMap::new(),
+        unread: BTreeMap::new(),
+        settled: BTreeSet::new(),
+        view: None,
+        at: None,
+    },
 });
+
+/// Emit this pass's outcome facts and remember the pass for the next diff.
+/// The forge reads run off the event loop.
+async fn record_outcomes(
+    sink: &FleetStateSink,
+    input: &FleetInput,
+    view: &FleetView,
+    now: DateTime<Utc>,
+    workspace_pool: &crate::workspace_pool::WorkspacePool,
+    slug_cache: &mut std::collections::HashMap<String, String>,
+) {
+    let mut memory = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .outcomes
+        .clone();
+    let roots = sources::managed_roots(workspace_pool, slug_cache)
+        .await
+        .into_iter()
+        .map(|(root, slug)| (slug, root))
+        .collect();
+    let listed = outcomes::listed(&input.listings);
+    let (view, managed) = (view.clone(), input.managed.clone());
+    let joined = tokio::task::spawn_blocking(move || {
+        let pass = outcomes::Pass {
+            view: &view,
+            listed: &listed,
+            managed: &managed,
+            now,
+        };
+        let mut forge = outcomes::GhForgeReads { roots };
+        let records = outcomes::diff(
+            &mut memory,
+            &pass,
+            &mut forge,
+            &crate::telemetry::provenance::Provenance::current(),
+        );
+        (records, outcomes::remember(memory, &pass))
+    })
+    .await;
+    let (records, memory) = match joined {
+        Ok(done) => done,
+        Err(join_error) => {
+            log::warn!("fleet.state: outcome diff panicked: {join_error}");
+            return;
+        }
+    };
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .outcomes = memory;
+    outcomes::offer(records, sink);
+}
 
 /// One `fleet.state` pass.
 pub(super) async fn record(
@@ -699,6 +768,7 @@ pub(super) async fn record(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let view = build_view(&input, state.prev.as_ref(), now);
+    record_outcomes(sink, &input, &view, now, workspace_pool, slug_cache).await;
     let Some(mut record) = decide(&view, &stamps, state.emitted.as_ref(), now) else {
         STATE
             .lock()
@@ -730,17 +800,16 @@ pub(super) async fn record(
     for chunk in chunks {
         sink.push(chunk);
     }
-    *STATE
+    let mut state = STATE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = PassState {
-        prev: Some(view.clone()),
-        emitted: Some(Emitted {
-            view,
-            stamps,
-            as_of: now,
-            anchor_as_of,
-        }),
-    };
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.prev = Some(view.clone());
+    state.emitted = Some(Emitted {
+        view,
+        stamps,
+        as_of: now,
+        anchor_as_of,
+    });
 }
 
 #[cfg(test)]

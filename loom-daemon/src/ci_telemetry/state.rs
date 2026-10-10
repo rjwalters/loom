@@ -342,7 +342,7 @@ pub fn save_discovery_cache(dir: &Path, cache: &DiscoveryCache) -> io::Result<()
 /// on one host so two writers never race the ledger.
 #[derive(Debug)]
 pub struct CycleLock {
-    _file: File,
+    file: File,
 }
 
 impl CycleLock {
@@ -369,6 +369,25 @@ impl CycleLock {
                 return Err(error);
             }
         }
-        Ok(Some(CycleLock { _file: file }))
+        Ok(Some(CycleLock { file }))
+    }
+}
+
+/// Unlock explicitly rather than relying on `close` (#11066). An `flock`
+/// lock belongs to the open file description, and a child that any thread
+/// forks shares that description until it execs. Closing only our copy
+/// would leave the lock held for as long as such a child lingers between
+/// fork and exec, so the next cycle, export pass, or status note would
+/// read a lock held by a holder that has already finished. `LOCK_UN`
+/// releases the description itself, whoever else still has a copy.
+impl Drop for CycleLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `flock` on a descriptor we still own; no memory is
+            // shared with the kernel.
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }

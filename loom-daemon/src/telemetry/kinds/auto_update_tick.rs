@@ -142,7 +142,7 @@ pub struct AutoUpdateTickRecord {
     pub in_flight: Option<u64>,
     /// The drain armed at tick start.
     pub drain: DrainSnapshot,
-    /// #10712: the fleet floor is above every published release, so this host
+    /// #10712: the fleet floor is above every release with this platform's assets, so this host
     /// cannot reach it (the alert text). Absent when the floor is unset,
     /// satisfied, or being rolled to. Raises the record's severity to ERROR.
     /// #10719: also carries the unsatisfiable repo-ahead demand (a workspace

@@ -13,6 +13,10 @@
 //! host whose state is not reconstructable at `t` is reported as **unknown**
 //! (with the reason the SQL gave), never as an empty host.
 //!
+//! `--check` (#10196 R7, #11128) lives in [`check`]: queries 6 and 7 of the
+//! same file compare each covered host's reconstruction with the
+//! webhook-derived label state over a run of sample instants.
+//!
 //! Rules it keeps (#10196): no row caps (every row the queries return is
 //! reported), every host's own view is reported (nothing is elected; the
 //! per-item merge is the SQL's own documented rule), and no estimate or
@@ -32,12 +36,16 @@ pub const REPLAY_QUERIES: &str =
 const PREFIX_BEGIN: &str = "-- >>> replay-prefix";
 const PREFIX_END: &str = "-- <<< replay-prefix";
 
-/// The documented statement count: query 0, 1-3, 4a-4c and 5.
-const STATEMENTS: usize = 8;
+/// The documented statement count: query 0, 1-3, 4a-4c, 5 and 6-7.
+const STATEMENTS: usize = 10;
 
 /// Default lookback for the base anchor and its chain, seconds: one anchor
 /// interval plus one pass, as `replay-queries.sql` documents.
 pub const DEFAULT_WINDOW_SEC: u32 = 3900;
+
+/// Seconds between sample instants when a caller does not choose: one
+/// `fleet.state` pass.
+pub const DEFAULT_STEP_SEC: u32 = 300;
 
 fn strip_comments(sql: &str) -> String {
     sql.lines()
@@ -54,17 +62,28 @@ fn strip_comments(sql: &str) -> String {
 /// `sql` no longer has the documented shape (markers, statement count, or
 /// query 1 not starting with the prefix): the file changed under this reader.
 pub fn state_and_coverage_queries(sql: &str) -> Result<(String, String), String> {
-    let begin = sql
-        .find(PREFIX_BEGIN)
-        .ok_or("replay-queries.sql: no replay-prefix begin marker")?
-        + PREFIX_BEGIN.len();
-    let end = sql
-        .find(PREFIX_END)
-        .ok_or("replay-queries.sql: no replay-prefix end marker")?;
-    if end < begin {
-        return Err("replay-queries.sql: replay-prefix markers out of order".to_string());
+    let (prefix, statements) = prefix_and_statements(sql)?;
+    Ok((statements[1].clone(), format!("{prefix}\n{}", statements[3])))
+}
+
+/// The text between two markers, comments stripped.
+fn marked(sql: &str, begin: &str, end: &str, name: &str) -> Result<String, String> {
+    let from = sql
+        .find(begin)
+        .ok_or(format!("replay-queries.sql: no {name} begin marker"))?
+        + begin.len();
+    let to = sql
+        .find(end)
+        .ok_or(format!("replay-queries.sql: no {name} end marker"))?;
+    if to < from {
+        return Err(format!("replay-queries.sql: {name} markers out of order"));
     }
-    let prefix = strip_comments(&sql[begin..end]).trim().to_string();
+    Ok(strip_comments(&sql[from..to]).trim().to_string())
+}
+
+/// The replay prefix and the committed statements, the shape checked.
+fn prefix_and_statements(sql: &str) -> Result<(String, Vec<String>), String> {
+    let prefix = marked(sql, PREFIX_BEGIN, PREFIX_END, "replay-prefix")?;
     let statements: Vec<String> = strip_comments(sql)
         .split(';')
         .map(str::trim)
@@ -73,14 +92,14 @@ pub fn state_and_coverage_queries(sql: &str) -> Result<(String, String), String>
         .collect();
     if statements.len() != STATEMENTS {
         return Err(format!(
-            "replay-queries.sql: expected {STATEMENTS} statements (0, 1-3, 4a-4c, 5), found {}",
+            "replay-queries.sql: expected {STATEMENTS} statements (0, 1-3, 4a-4c, 5, 6-7), found {}",
             statements.len()
         ));
     }
     if !statements[1].starts_with(&prefix) {
         return Err("replay-queries.sql: query 1 does not begin with the replay prefix".into());
     }
-    Ok((statements[1].clone(), format!("{prefix}\n{}", statements[3])))
+    Ok((prefix, statements))
 }
 
 /// The bound parameters of queries 1-3.
@@ -96,12 +115,15 @@ pub struct ReplayParams {
 
 impl ReplayParams {
     /// As ClickHouse query parameters (`t` is a `DateTime64(3)` in UTC).
+    /// Queries 1-3 read the instant `t` only, so the sample span is 0.
     #[must_use]
     pub fn params(&self) -> Vec<(String, String)> {
         vec![
             ("t".to_string(), self.as_of.format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
             ("window".to_string(), self.window_sec.to_string()),
             ("repo".to_string(), self.repo.clone()),
+            ("span".to_string(), "0".to_string()),
+            ("step".to_string(), DEFAULT_STEP_SEC.to_string()),
         ]
     }
 }
@@ -346,6 +368,9 @@ pub fn render(replay: &Replay) -> String {
     }
     out
 }
+
+#[path = "telemetry_replay_check.rs"]
+pub mod check;
 
 #[cfg(test)]
 #[path = "telemetry_replay_tests.rs"]

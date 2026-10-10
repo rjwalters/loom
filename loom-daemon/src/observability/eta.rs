@@ -1,6 +1,7 @@
 //! ETA wiring (#9289): feeds the [`crate::eta::tracker::Tracker`] from the
 //! event bus and the forge, writes the stage-sample journal, and emits
-//! `eta.estimate` / `eta.outcome` / `eta.stage_outcome` (#10929).
+//! `eta.estimate` / `eta.outcome`. `eta.stage_outcome` and `pr.resolved` are
+//! produced by `fleet_state::outcomes` (#11126).
 //!
 //! Two triggers, per the operator decisions on #9289:
 //!
@@ -428,15 +429,10 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     dirty.dedup();
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
-    let stages = match lock().as_mut() {
-        Some(state) => {
-            note_outcomes(state, &effects.outcomes, now);
-            stage_outcome::build(&effects.journal, state.tracker.pending(), &effects.outcomes, now)
-        }
-        None => Vec::new(),
-    };
+    if let Some(state) = lock().as_mut() {
+        note_outcomes(state, &effects.outcomes, now);
+    }
     authority::deliver_checked(emissions, effects.outcomes, &host_id, dry_run);
-    stage_outcome::emit(stages, &host_id, dry_run);
 }
 
 /// The workspace root → slug, resolving and caching on first sight.
@@ -1137,9 +1133,6 @@ pub(super) async fn record(
         .map(|state| state.tracker.pending().to_vec())
         .unwrap_or_default();
     append_journal(workspace_root, &rows);
-    pr_resolved::emit(&rows, &host_id, dry_run, now, resolution_sec);
-    let stages = stage_outcome::build(&rows, &pending, &outcomes, now);
-    stage_outcome::emit(stages, &host_id, dry_run);
     let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
@@ -1224,8 +1217,6 @@ mod eta_marker_pass;
 mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
-mod pr_resolved;
-mod stage_outcome;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]

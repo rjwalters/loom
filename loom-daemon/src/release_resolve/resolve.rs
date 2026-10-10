@@ -126,12 +126,30 @@ pub struct Inputs<'a> {
     pub installed_bin: Option<PathBuf>,
     /// `--no-fetch` / `LOOM_DAEMON_UPDATE_FETCH=0`.
     pub fetch_disabled: bool,
+    /// The fleet floor (`X.Y.Z`) when the caller is a host below it (#11029).
+    ///
+    /// `Some` switches the target from "the forge's Latest release" to "the
+    /// newest release that publishes this platform's binary and `.sha256`",
+    /// found by listing releases and walking back past any that do not (a
+    /// hand-cut or failed-promotion Latest, or a newer release that was never
+    /// promoted). `None` keeps the Latest-only resolution.
+    pub min_version: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TagName {
     #[serde(rename = "tagName")]
     tag_name: String,
+}
+
+#[derive(Deserialize)]
+struct ListedRelease {
+    #[serde(rename = "tagName")]
+    tag_name: String,
+    #[serde(default, rename = "isDraft")]
+    is_draft: bool,
+    #[serde(default, rename = "isPrerelease")]
+    is_prerelease: bool,
 }
 
 #[derive(Deserialize)]
@@ -213,7 +231,8 @@ pub fn resolve_repo(inputs: &Inputs<'_>) -> Option<String> {
         .or_else(|| host::repo_slug(inputs.repo_root))
 }
 
-/// Resolve the latest release artifact for this host.
+/// Resolve the release artifact for this host: the forge's Latest release, or
+/// (with [`Inputs::min_version`]) the newest release publishing its assets.
 ///
 /// Read-only: the only download is the release's ~65-byte `.sha256` asset.
 #[must_use]
@@ -252,46 +271,71 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     };
 
     let root = inputs.repo_root;
-    let q: Query<TagName> = gh_query(
-        &["release", "view", "--json", "tagName", "-R", &repo],
-        root,
-        false,
-        |t: &TagName| t.tag_name.is_empty(),
-    );
-    let Query::Populated(tag) = q else {
-        return Resolution::Unresolved(format!(
-            "'gh release view' found no latest release for {repo} \
-             (no Releases yet, an unreachable/rate-limited API, or an auth failure)"
-        ));
-    };
-    let tag = tag.tag_name;
-
-    let Some(version) = semver::extract_version(&tag) else {
-        return Resolution::Unresolved(format!(
-            "could not parse a semver version out of release tag '{tag}'"
-        ));
-    };
-
     // BOTH assets must exist. The binary alone is not enough: without the
     // `.sha256` sibling there is nothing to verify a fetch against, so an
     // artifact that resolved on the binary alone would promise a verified
     // upgrade this host cannot actually verify.
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    // An unreadable asset list is `None` here and resolves to the same empty
-    // list it always did: unresolved, fall back to source. (The fetch path
-    // treats that `None` differently -- see `asset_names`.)
-    let listed = asset_names(root, &repo, None);
-    let names: Vec<String> = listed.clone().unwrap_or_default();
-    if !names.contains(&bin_name) || !names.contains(&sha_name) {
-        return Resolution::Unresolved(classify_no_artifact(
+
+    // #11029: a host below the fleet floor installs the newest release that
+    // has this platform's assets, which is not necessarily Latest.
+    let walked = inputs
+        .min_version
+        .as_deref()
+        .and_then(|_| walk_releases(root, &repo, &bin_name, &sha_name));
+    let (tag, version) = if let Some(found) = walked {
+        match found {
+            Walk::Found { tag, version } => (tag, version),
+            Walk::NoneComplete { newest_tag } => {
+                let listed = asset_names(root, &repo, Some(&newest_tag));
+                return Resolution::Unresolved(format!(
+                    "no listed release of {repo} publishes this platform's artifact; {}",
+                    classify_no_artifact(
+                        root,
+                        &repo,
+                        &newest_tag,
+                        &target,
+                        listed.as_ref().map(Vec::len),
+                    )
+                ));
+            }
+        }
+    } else {
+        let q: Query<TagName> = gh_query(
+            &["release", "view", "--json", "tagName", "-R", &repo],
             root,
-            &repo,
-            &tag,
-            &target,
-            listed.as_ref().map(Vec::len),
-        ));
-    }
+            false,
+            |t: &TagName| t.tag_name.is_empty(),
+        );
+        let Query::Populated(tag) = q else {
+            return Resolution::Unresolved(format!(
+                "'gh release view' found no latest release for {repo} \
+                 (no Releases yet, an unreachable/rate-limited API, or an auth failure)"
+            ));
+        };
+        let tag = tag.tag_name;
+        let Some(version) = semver::extract_version(&tag) else {
+            return Resolution::Unresolved(format!(
+                "could not parse a semver version out of release tag '{tag}'"
+            ));
+        };
+        // An unreadable asset list is `None` here and resolves to the same
+        // empty list it always did: unresolved, fall back to source. (The
+        // fetch path treats that `None` differently -- see `asset_names`.)
+        let listed = asset_names(root, &repo, Some(&tag));
+        let names: Vec<String> = listed.clone().unwrap_or_default();
+        if !names.contains(&bin_name) || !names.contains(&sha_name) {
+            return Resolution::Unresolved(classify_no_artifact(
+                root,
+                &repo,
+                &tag,
+                &target,
+                listed.as_ref().map(Vec::len),
+            ));
+        }
+        (tag, version)
+    };
 
     let published_at = fetch_published_at(&tag, &repo, root);
     let asset_sha256 = fetch_asset_sha256(&tag, &repo, &sha_name, root);
@@ -311,6 +355,93 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
         source_version: read_source_version(root),
         source_commit: read_source_commit(root),
     }))
+}
+
+/// Most releases whose assets one walk will inspect. Bounds the `gh` calls a
+/// tick makes when several newest releases are incomplete.
+const WALK_MAX_RELEASES: usize = 8;
+
+/// How many releases the listing asks for.
+const WALK_LIST_LIMIT: &str = "30";
+
+/// What walking the release list concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Walk {
+    /// The newest release (by version) that publishes both assets.
+    Found { tag: String, version: String },
+    /// Releases were listed but none inspected publishes both assets.
+    /// `newest_tag` is the newest, for the refusal wording.
+    NoneComplete { newest_tag: String },
+}
+
+/// The releases a walk considers, newest version first: published (not draft,
+/// not prerelease) with a plain `X.Y.Z` version. Pure, so the ordering is
+/// testable without a forge. Returns `(tag, version)` pairs.
+fn walk_candidates(releases: Vec<ListedRelease>) -> Vec<(String, String)> {
+    let mut out: Vec<((u64, u64, u64), String, String)> = releases
+        .into_iter()
+        .filter(|r| !r.is_draft && !r.is_prerelease)
+        .filter_map(|r| {
+            let version = semver::extract_version(&r.tag_name)?;
+            // `extract_version` scans, so `v0.20.0-rc1` yields `0.20.0`; a walk
+            // target must be exactly `[v]X.Y.Z`.
+            if r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name) != version {
+                return None;
+            }
+            let key = crate::fleet_store::floor::parse_triple(&version)?;
+            Some((key, r.tag_name, version))
+        })
+        .collect();
+    out.sort_by_key(|c| std::cmp::Reverse(c.0));
+    out.into_iter().map(|(_, t, v)| (t, v)).collect()
+}
+
+/// Pick the first candidate `has_assets` accepts, inspecting at most
+/// [`WALK_MAX_RELEASES`]. `None` when there are no candidates at all.
+fn pick_complete(
+    candidates: &[(String, String)],
+    mut has_assets: impl FnMut(&str) -> bool,
+) -> Option<Walk> {
+    let (newest_tag, _) = candidates.first()?;
+    for (tag, version) in candidates.iter().take(WALK_MAX_RELEASES) {
+        if has_assets(tag) {
+            return Some(Walk::Found {
+                tag: tag.clone(),
+                version: version.clone(),
+            });
+        }
+    }
+    Some(Walk::NoneComplete {
+        newest_tag: newest_tag.clone(),
+    })
+}
+
+/// List the repo's releases and walk back to the newest complete one (#11029).
+/// `None` when the listing could not be read or holds nothing usable, so the
+/// caller falls back to the Latest-only lookup.
+fn walk_releases(root: &Path, repo: &str, bin_name: &str, sha_name: &str) -> Option<Walk> {
+    let q: Query<Vec<ListedRelease>> = gh_query(
+        &[
+            "release",
+            "list",
+            "--json",
+            "tagName,isDraft,isPrerelease",
+            "--limit",
+            WALK_LIST_LIMIT,
+            "-R",
+            repo,
+        ],
+        root,
+        false,
+        |l: &Vec<ListedRelease>| l.is_empty(),
+    );
+    let Query::Populated(listed) = q else {
+        return None;
+    };
+    pick_complete(&walk_candidates(listed), |tag| {
+        asset_names(root, repo, Some(tag))
+            .is_some_and(|n| n.iter().any(|a| a == bin_name) && n.iter().any(|a| a == sha_name))
+    })
 }
 
 /// Why `tag` of `repo` offers no artifact for `target` — the #8515

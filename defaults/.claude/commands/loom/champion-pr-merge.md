@@ -214,8 +214,8 @@ VERDICT_RC=$?
 |------|---------|--------|
 | `0` | **FRESH** — the approval was rendered against the current head SHA | Proceed to criterion 1. |
 | `10` | No verdict label (raced away between listing and now) | **Skip this PR** — it is no longer merge-eligible. |
-| `11` | **UNVERIFIABLE** — no marker from a trusted author for this verdict: a pre-convention verdict, or (most often, #6319) a dropped marker. An outsider's or another fleet's marker is prose, not a marker (#9548) | Proceed to criterion 1, unless REASON says markers `could not be authenticated` (loom-daemon lacks `forge trusted-comments`): then do not merge; say so and skip. The guard fails **safe** (verdict kept); that is the pre-#5686 risk posture, a real exposure. Since #6319 Judge's `--anchor` sweep and `loom-daemon`'s `reconcile_pr_verdicts` stamp the missing marker at the then-current head, so a PR that keeps reporting `11` is on a hold or something is wrong: say so in the completion summary. |
-| `12` | **STALE** — the approval covers a tree that is gone | **Do NOT merge.** The guard already removed `loom:pr`, re-queued the PR as `loom:review-requested`, and posted a comment naming both SHAs. `continue` to the next PR. |
+| `11` | **UNVERIFIABLE** — no trusted marker could be confirmed for this verdict (on `loom:pr` this now means markers `could not be authenticated`: loom-daemon lacks `forge trusted-comments`, #9548) | **Do NOT merge** a `loom:pr` PR on `11`: skip it and report it in the completion summary. `post-verdict.sh` marks every verdict (#6382), so an approval with no confirmed marker approves no known tree (#9258: one merged with the literal body `@-`). |
+| `12` | **STALE** — the approval covers a tree that is gone, or (#9258) it carried no trusted marker at all, so it never covered a known tree. Never anchored | **Do NOT merge.** The guard already removed `loom:pr`, re-queued the PR as `loom:review-requested`, and posted a comment naming both SHAs. `continue` to the next PR. |
 | any other | `gh`/environment error | **Do NOT merge.** Treat exactly like any other `gh` failure in this document — skip the PR this pass and retry next tick. Never read an error as "the approval is fine". |
 
 **Exit 12 is not a rejection of the PR** — it is a statement that no verdict
@@ -257,7 +257,7 @@ For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do 
 
 ### 1. Label Check
 - [ ] PR has `loom:pr` label (Judge approval)
-- [ ] That approval is **not stale** — the Verdict-State Janitor's Part 2 above returned `0` (FRESH) or `11` (UNVERIFIABLE), never `12` (STALE). A `loom:pr` label rendered against a head SHA that has since moved is not an approval of the tree you are about to merge (#5686).
+- [ ] That approval is **not stale** — the Verdict-State Janitor's Part 2 above returned `0` (FRESH), never `11` (UNVERIFIABLE: an approval with no confirmed marker bypassed `post-verdict.sh`, #9258) or `12` (STALE). A `loom:pr` label rendered against a head SHA that has since moved is not an approval of the tree you are about to merge (#5686).
 
 **Verification command**:
 ```bash

@@ -25,9 +25,11 @@
 //! is the same pause-and-roll every trigger uses (#10831).
 //!
 //! "The newest release" is what [`super::AutoUpdateProbe::resolve_artifact`]
-//! resolves: the forge's latest release, and only when it publishes this
-//! platform's binary and its `.sha256`. A tag with no assets yet does not
-//! resolve, so it is never a target; the host waits for the next tick.
+//! resolves. For a host below its floor that is the newest published release
+//! that carries this platform's binary and its `.sha256`, found by listing
+//! releases and walking back past any without them (#11029); it need not be
+//! the forge's Latest. Otherwise it is the forge's latest release. A tag with
+//! no assets is never a target.
 //!
 //! # One roll path, one comparator
 //!
@@ -41,9 +43,11 @@
 //! the same kind (#10719, [`repo_ahead`]): it enters [`select_target`] beside
 //! the floor target and is recorded as [`TargetSource::RepoAhead`].
 //!
-//! "Newest release at or above the floor" is the resolved latest release when
-//! that meets the floor: releases are monotonic, so if the latest one is below
-//! the floor, no release satisfies it.
+//! "Newest release at or above the floor" is the resolved release when that
+//! meets the floor. The resolver already walked back to the newest release
+//! with this platform's assets (#11029), so if that one is below the floor, no
+//! release with assets satisfies it. The forge's Latest is not assumed to be
+//! the newest release.
 //!
 //! # Other demands (#10719, #10720)
 //!
@@ -58,7 +62,7 @@ use crate::fleet_sync::FloorKnowledge;
 
 /// The stall this loop can declare (Issue #10712): the fleet floor
 /// (`loom_min_version`) is above the running version and above every published
-/// release, so no roll can satisfy it.
+/// release that carries this platform's assets, so no roll can satisfy it.
 ///
 /// There is nothing to abandon: no roll is armed for an unsatisfiable floor,
 /// and **nothing is paused** for it. The host keeps dispatching on its current
@@ -73,7 +77,8 @@ pub struct FloorStallReport {
     pub floor: String,
     /// The running version, below the floor.
     pub running: String,
-    /// The newest published release's version, also below the floor.
+    /// The newest release's version that carries this platform's assets, also
+    /// below the floor.
     pub newest: String,
 }
 
@@ -87,8 +92,8 @@ impl FloorStallReport {
             newest,
         } = self;
         format!(
-            "FLEET FLOOR UNSATISFIABLE: loom_min_version {floor} is above every published release \
-             (newest {newest}), so this host (running {running}) cannot roll to it. Most likely a \
+            "FLEET FLOOR UNSATISFIABLE: loom_min_version {floor} is above every release that publishes \
+             this platform's binary (newest {newest}), so this host (running {running}) cannot roll to it. Most likely a \
              typo in the fleet store's loom_min_version. DISPATCH CONTINUES on {running}: the \
              floor never refuses work, and this host does not roll until the floor can be met. \
              Fix the floor, or publish a release at or above {floor}."
@@ -319,7 +324,15 @@ pub struct FloorState {
     /// #10866: the stall last alerted on. `Some` only while that stall
     /// stands, or between a restore and the first [`Self::set_basis`].
     alert: Option<alert::FloorAlert>,
+    /// #11029: consecutive ticks a host below its floor could not resolve a
+    /// release to roll to. Reset by any other reading and by a changed basis.
+    unresolved_streak: u32,
 }
+
+/// #11029: consecutive below-floor ticks with no resolvable target before the
+/// tick is logged at WARN instead of INFO. At the default 900s interval, one
+/// hour.
+pub const UNRESOLVED_WARN_AFTER: u32 = 4;
 
 impl FloorState {
     /// Set this tick's basis: what is known about the floor and the running
@@ -342,6 +355,7 @@ impl FloorState {
         }
         self.knowledge = knowledge;
         self.running = running.to_string();
+        self.unresolved_streak = 0;
         let floor = self.floor().map(str::to_string);
         self.alert = self
             .alert
@@ -408,6 +422,12 @@ impl FloorState {
             FloorVerdict::Unsatisfiable(_) => {
                 "no release meets the fleet floor — not rolling".to_string()
             }
+            FloorVerdict::Unresolved { .. } if self.unresolved_escalated() => format!(
+                "STILL BELOW THE FLEET FLOOR: running {running} has had no release to roll to \
+                 for {} consecutive ticks — not rolling. Check that a release at or above the \
+                 floor publishes this platform's binary and .sha256",
+                self.unresolved_streak
+            ),
             FloorVerdict::Unresolved { .. } => {
                 "below the fleet floor with no release to roll to this tick — not rolling"
                     .to_string()
@@ -431,6 +451,12 @@ impl FloorState {
         let seen = floor_verdict(&self.knowledge, &self.running, newest);
         let keep_stall = matches!(seen, FloorVerdict::Unresolved { .. })
             && matches!(self.verdict, FloorVerdict::Unsatisfiable(_));
+        let unresolved = matches!(seen, FloorVerdict::Unresolved { .. });
+        self.unresolved_streak = if unresolved && !keep_stall {
+            self.unresolved_streak.saturating_add(1)
+        } else {
+            0
+        };
         if !keep_stall {
             self.verdict = seen;
         }
@@ -470,6 +496,21 @@ impl FloorState {
             FloorVerdict::Below { .. } => TargetSource::Floor,
             _ => TargetSource::AutoUpdate,
         }
+    }
+
+    /// Whether a below-floor host has gone [`UNRESOLVED_WARN_AFTER`]
+    /// consecutive ticks without a release to roll to (#11029). The tick
+    /// logs at WARN while this holds.
+    #[must_use]
+    pub fn unresolved_escalated(&self) -> bool {
+        self.unresolved_streak >= UNRESOLVED_WARN_AFTER
+    }
+
+    /// Whether the floor is unknown or cannot be compared, so no version roll
+    /// is possible and `status` must say why instead of "up to date" (#11029).
+    #[must_use]
+    pub fn floor_blind(&self) -> bool {
+        matches!(self.verdict, FloorVerdict::Unknown { .. } | FloorVerdict::Uncomparable { .. })
     }
 
     /// The last verdict.
@@ -685,6 +726,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #11029: a below-floor host that stays unresolved escalates to WARN.
+    #[test]
+    fn a_below_floor_host_escalates_after_consecutive_unresolved_ticks() {
+        let mut state = FloorState::default();
+        state.set_basis(FloorKnowledge::Set("0.19.850".to_string()), "0.19.800");
+        for tick in 1..=UNRESOLVED_WARN_AFTER {
+            assert!(!state.unresolved_escalated(), "tick {tick}");
+            state.observe(None);
+        }
+        assert!(state.unresolved_escalated());
+        assert!(state
+            .hold_reason(None)
+            .contains("STILL BELOW THE FLEET FLOOR"));
+        // Any other reading resets the streak.
+        state.observe(Some(&rel("0.19.900")));
+        assert!(!state.unresolved_escalated());
+    }
+
+    #[test]
+    fn an_unknown_floor_is_floor_blind_and_says_why() {
+        let mut state = FloorState::default();
+        state.set_basis(FloorKnowledge::Unknown("store offline".to_string()), "0.19.900");
+        state.observe(Some(&rel("0.19.900")));
+        assert!(state.floor_blind());
+        assert!(state.hold_reason(None).contains("store offline"));
+        let mut met = FloorState::default();
+        met.set_basis(FloorKnowledge::Set("0.19.800".to_string()), "0.19.900");
+        met.observe(Some(&rel("0.19.900")));
+        assert!(!met.floor_blind());
     }
 
     /// #10866 item 4: an unresolved tick keeps a standing stall; every other

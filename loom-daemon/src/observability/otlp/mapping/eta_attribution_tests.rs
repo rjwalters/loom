@@ -1,11 +1,8 @@
-//! OTLP mapping for `eta.stage_outcome` and `eta.outcome.attribution`
-//! (#10929).
+//! OTLP mapping for `eta.outcome.attribution` (#10929).
 
 use super::super::log_record_for;
 use crate::eta::stage_forecast::{Attribution, StageError};
 use crate::eta::{Provenance, Stage};
-use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
-use crate::telemetry::kinds::eta_stage_outcome::{EtaStageOutcomeRecord, StageExit};
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use chrono::{Duration, TimeZone, Utc};
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -27,73 +24,6 @@ fn provenance() -> Provenance {
         tree_state: "clean".to_string(),
         complete: true,
     }
-}
-
-#[test]
-fn a_stage_outcome_is_stamped_when_left_observed_at_the_pass_and_names_the_authority() {
-    let left_at = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
-    let observed_at = left_at + Duration::seconds(300);
-    let record = EtaStageOutcomeRecord {
-        repo: "rjwalters/loom".to_string(),
-        repo_id: Some(1_073_994_527),
-        issue: 10929,
-        pr_number: Some(10950),
-        stage: Stage::ReviewWait,
-        entered_at: Some(left_at - Duration::seconds(5400)),
-        left_at,
-        dwell_sec: Some(5400),
-        exit: StageExit::Pass,
-        next_stage: Some(Stage::MergeWait),
-        event: "label.transition".to_string(),
-        observed_at,
-        resolution_sec: Some(300),
-        open_estimates: 40,
-        estimate_ids: vec!["0123456789abcdef".to_string()],
-        loom: provenance(),
-    };
-    let envelope =
-        TelemetryEnvelope::new("host-authority", TelemetryRecord::EtaStageOutcome(record.clone()));
-    let log = log_record_for(&envelope).unwrap();
-    assert_eq!(log.event_name, "eta.stage_outcome");
-    assert_eq!(log.time_unix_nano, super::nanos(left_at), "event time");
-    assert_eq!(log.observed_time_unix_nano, super::nanos(observed_at), "knowable-at");
-    for kv in &log.attributes {
-        assert!(
-            ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                || [
-                    "loom.kind",
-                    "loom.repo",
-                    "loom.record_id",
-                    "loom.pr_number",
-                    "loom.issue"
-                ]
-                .contains(&kv.key.as_str()),
-            "{} is not allowlisted",
-            kv.key
-        );
-    }
-    for key in ETA_LOG_ATTRIBUTE_KEYS
-        .iter()
-        .filter(|k| k.starts_with("loom.eta.stage_outcome."))
-    {
-        assert!(attr(&log, key).is_some(), "{key} is emitted");
-    }
-    assert_eq!(
-        attr(&log, "loom.eta.authority"),
-        Some(Value::StringValue("host-authority".to_string())),
-        "#10498: the emitting host is the authority"
-    );
-    assert_eq!(
-        attr(&log, "loom.eta.stage_outcome.exit"),
-        Some(Value::StringValue("pass".into()))
-    );
-    assert_eq!(attr(&log, "loom.eta.stage_outcome.dwell_sec"), Some(Value::IntValue(5400)));
-    assert_eq!(attr(&log, "loom.issue"), Some(Value::IntValue(10929)));
-    let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
-        panic!("string body");
-    };
-    let parsed: EtaStageOutcomeRecord = serde_json::from_str(&body).unwrap();
-    assert_eq!(parsed, record);
 }
 
 #[test]

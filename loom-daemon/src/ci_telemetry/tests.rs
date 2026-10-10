@@ -11,6 +11,8 @@ mod billing_block;
 mod captain_gate;
 mod compaction;
 mod credential_rejection;
+#[cfg(unix)]
+mod cycle_lock;
 mod dependency_wait;
 mod feed_capture;
 mod job_logs;
@@ -906,15 +908,45 @@ fn records_emit_exactly_the_declared_vocabulary() {
 // Config, the log-capture gate, and export
 // ---------------------------------------------------------------------------
 //
-// Isolation rule (#8976): `resolve()` reads process-wide env (`ENABLED_ENV`,
-// `ORG_ENV`, `INTERVAL_SECS_ENV`, `LOG_CAPTURE_ENABLED_ENV`,
-// `LOG_CAPTURE_MAX_BYTES_ENV`) and `env_overrides_config` *mutates* it, so
-// EVERY test below that reaches `resolve()` — or reads one of those vars
-// directly — carries `#[serial_test::serial]`. `#[serial]` only serializes
-// against other `#[serial]` tests; one unmarked reader is enough to observe
-// the setter's vars mid-flight (the original symptom was
-// `interval_secs: left: 45, right: 120`). Mark new tests here the same way
-// rather than auditing which fields a given assertion happens to touch.
+// Isolation rule (#8976, #11066): `resolve()` reads process-wide env
+// (`ENABLED_ENV`, `ORG_ENV`, `INTERVAL_SECS_ENV`, `LOG_CAPTURE_ENABLED_ENV`,
+// `LOG_CAPTURE_MAX_BYTES_ENV`). No test writes that env: a test of an env
+// override passes a fixed map to `resolve_with_env` (see `fixed_env`), so no
+// reader on another thread, marked `#[serial]` or not, can observe a value
+// mid-flight. `ci_telemetry_tests_never_write_process_env` enforces that.
+// The `#[serial_test::serial]` marks below remain from #8976 and are harmless.
+
+/// An env of exactly `pairs`, for `resolve_with_env` and the other
+/// `*_with_env` resolvers (#11066).
+pub(super) fn fixed_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let map: std::collections::HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    move |name| map.get(name).cloned()
+}
+
+/// No ci_telemetry test writes process env (#11066). A write races every
+/// test on another thread that reads it, `#[serial]` or not; inject a
+/// `fixed_env` instead.
+#[test]
+fn ci_telemetry_tests_never_write_process_env() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ci_telemetry");
+    let mut files = vec![dir.join("tests.rs")];
+    for entry in std::fs::read_dir(dir.join("tests")).unwrap() {
+        files.push(entry.unwrap().path());
+    }
+    let banned = [["set", "_var("].concat(), ["remove", "_var("].concat()];
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            banned.iter().any(|b| text.contains(b.as_str()))
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+    assert!(offenders.is_empty(), "process env written in {offenders:?}");
+}
 
 #[test]
 #[serial_test::serial]
@@ -983,27 +1015,18 @@ fn env_overrides_config() {
         log_capture_excluded_repos: Some(vec![exclusion.clone()]),
         ..CiTelemetryConfig::default()
     };
-    std::env::set_var(ENABLED_ENV, "1");
-    std::env::set_var(ORG_ENV, "from-env");
-    std::env::set_var(INTERVAL_SECS_ENV, "45");
-    std::env::set_var(LOG_CAPTURE_ENABLED_ENV, "1");
-    std::env::set_var(LOG_CAPTURE_MAX_BYTES_ENV, "2048");
-    // Not recognised overrides: exclusions are committed-config-only, both
-    // the record-level list and #8825's log-only one.
-    std::env::set_var("LOOM_CI_TELEMETRY_EXCLUDED_REPOS", "x, y");
-    std::env::set_var("LOOM_CI_TELEMETRY_LOG_CAPTURE_EXCLUDED_REPOS", "x, y");
-    let resolved = resolve(&config);
-    for name in [
-        ENABLED_ENV,
-        ORG_ENV,
-        INTERVAL_SECS_ENV,
-        LOG_CAPTURE_ENABLED_ENV,
-        LOG_CAPTURE_MAX_BYTES_ENV,
-        "LOOM_CI_TELEMETRY_EXCLUDED_REPOS",
-        "LOOM_CI_TELEMETRY_LOG_CAPTURE_EXCLUDED_REPOS",
-    ] {
-        std::env::remove_var(name);
-    }
+    let env = fixed_env(&[
+        (ENABLED_ENV, "1"),
+        (ORG_ENV, "from-env"),
+        (INTERVAL_SECS_ENV, "45"),
+        (LOG_CAPTURE_ENABLED_ENV, "1"),
+        (LOG_CAPTURE_MAX_BYTES_ENV, "2048"),
+        // Not recognised overrides: exclusions are committed-config-only,
+        // both the record-level list and #8825's log-only one.
+        ("LOOM_CI_TELEMETRY_EXCLUDED_REPOS", "x, y"),
+        ("LOOM_CI_TELEMETRY_LOG_CAPTURE_EXCLUDED_REPOS", "x, y"),
+    ]);
+    let resolved = resolve_with_env(&config, &env);
     assert!(resolved.enabled);
     assert_eq!(resolved.owners, vec![super::owners::Owner::org("from-env")]);
     assert_eq!(resolved.interval_secs, 45);
