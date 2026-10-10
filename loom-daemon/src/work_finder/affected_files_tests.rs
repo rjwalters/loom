@@ -156,6 +156,19 @@ fn listed_building_item_occupies_its_surface() {
 }
 
 #[test]
+fn listed_building_item_occupies_without_in_flight_membership() {
+    let items = vec![
+        item(9, Some(body(&["a.rs"])), Some("loom:building")),
+        item(1, Some(body(&["a.rs"])), None),
+        item(2, Some(body(&["z.rs"])), None),
+    ];
+    let mut ws = [(Src(Some(items)), Disp::default())];
+    let report = run(&mut ws);
+    assert_eq!(ws[0].1.dispatched, vec![2]);
+    assert_eq!(row(&report, 1).unwrap().0, Qd::DeferredFileOverlap);
+}
+
+#[test]
 fn identical_paths_in_different_repos_do_not_defer() {
     let a = vec![item(1, Some(body(&["a.rs"])), None)];
     let b = vec![item(2, Some(body(&["a.rs"])), None)];

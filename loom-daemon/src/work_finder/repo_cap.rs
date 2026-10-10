@@ -283,9 +283,12 @@ impl RepoCap {
         true
     }
 
-    /// Record a listed item's `## Affected Files` surface (#9781); `occupying`
-    /// marks an already-in-flight item. Reads only the listing's own body.
-    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, occupying: bool) {
+    /// Record a listed item's `## Affected Files` surface (#9781); `in_flight`
+    /// marks an item this dispatcher already holds, and a listed
+    /// `loom:building` item occupies its surface regardless. Reads only the
+    /// listing's own body and labels.
+    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, in_flight: bool) {
+        let occupying = in_flight || item.labels.iter().any(|l| l == super::BUILDING_LABEL);
         self.overlap
             .note(idx, item.number, item.body.as_deref(), occupying);
     }
