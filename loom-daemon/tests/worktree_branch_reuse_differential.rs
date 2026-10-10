@@ -358,3 +358,45 @@ fn live_worktree_sh_reuses_a_branch_the_forge_cannot_answer_for() {
     assert!(text.contains("already exists - reusing it"), "{text}");
     assert!(text.contains("has diverged from main"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// #9319: a worktree still holding the landed branch. Port only — the retired
+// shell had no such case, which is the defect: its one remedy, `git branch -D`,
+// is refused by git while any worktree holds the branch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_port_names_a_worktree_holding_the_landed_branch() {
+    let fx = fixture("held", BRANCH, true, Forge::MergedAtTip);
+    let wt = fx.root.join("wt s").join("pr-9"); // a space here too
+    fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    git(&fx.repo, &["worktree", "add", "-q", wt.to_str().unwrap(), BRANCH]);
+    fs::write(wt.join(".loom-managed"), "issue=42\n").unwrap();
+    let tip = rev(&fx.repo, BRANCH);
+
+    let p = port(&fx, BRANCH, true);
+    assert_eq!(p.status.code(), Some(1));
+    let v: serde_json::Value =
+        serde_json::from_str(&json_doc(&p).expect("port emitted a document")).unwrap();
+    let held = v["heldByWorktree"]
+        .as_str()
+        .expect("the holder's path")
+        .to_string();
+    assert_eq!(fs::canonicalize(&held).unwrap(), fs::canonicalize(&wt).unwrap());
+    assert_eq!(v["error"], "branch-already-landed");
+    assert_eq!(v["issueNumber"], 42);
+    assert_eq!(v["prNumber"], 999);
+
+    let p = port(&fx, BRANCH, false);
+    assert_eq!(p.status.code(), Some(1));
+    let lines = msgs(&p);
+    let refusal = lines.last().expect("a refusal line");
+    let remedy = format!(
+        "re-run: git worktree remove '{held}' --force && git branch -D {BRANCH} && ./.loom/scripts/worktree.sh 42"
+    );
+    assert!(refusal.ends_with(&remedy), "{refusal}");
+
+    // Still a diagnosis: two refusals later, nothing has been removed.
+    assert!(wt.join(".loom-managed").is_file());
+    assert_eq!(rev(&fx.repo, BRANCH), tip);
+}
