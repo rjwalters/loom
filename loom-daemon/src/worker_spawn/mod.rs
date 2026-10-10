@@ -400,8 +400,13 @@ fn run_preflight(
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            crate::runtime_admission::resolve_and_admit_tap(
+                root,
+                role,
+                &runtime,
+                options.profile.as_deref(),
+            )
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
         trace_identity.insert("loom.provider".into(), selection.provider.clone());
@@ -835,6 +840,9 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod judge_profile_tests;
 
 #[cfg(test)]
 mod codex_adapter_tests {
