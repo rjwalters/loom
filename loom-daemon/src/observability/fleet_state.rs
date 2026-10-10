@@ -59,7 +59,7 @@ use crate::telemetry::kinds::fleet_state::{
     FleetStage, FleetStateRecord, FleetStateRepo, FleetStateRow, MainCi, PlannerStamps,
     ANCHOR_INTERVAL_SECS, CHUNK_BYTES, FLEET_STATE_SCHEMA,
 };
-use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
 pub mod outcomes;
 mod sources;
@@ -119,6 +119,8 @@ pub struct HeldSweep {
     pub pr: Option<u32>,
     /// Admitted through the overflow slot (#9244).
     pub overflow: bool,
+    /// The sweep's dispatch-time facts (#11280), when this daemon has them.
+    pub start: SweepStartFacts,
 }
 
 /// One open item from a repo's review listings.
@@ -326,6 +328,7 @@ pub fn build_view(input: &FleetInput, prev: Option<&FleetView>, now: DateTime<Ut
             } else {
                 FleetSlot::Regular
             }),
+            start: sweep.start.clone(),
             ..FleetStateRow::new(sweep.issue, sweep.stage, sweep.entered_at)
         };
         offer(&mut candidates, &sweep.repo, Source::Held, row);

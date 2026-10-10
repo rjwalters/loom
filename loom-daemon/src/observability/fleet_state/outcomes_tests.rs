@@ -232,6 +232,7 @@ fn held_merge_wait() -> HeldSweep {
         entered_at_lower_bound: false,
         pr: Some(21),
         overflow: false,
+        start: Default::default(),
     }
 }
 
@@ -445,6 +446,7 @@ fn a_held_sweep_advancing_is_a_stage_outcome_without_a_forge_instant() {
         entered_at_lower_bound: false,
         pr: None,
         overflow: false,
+        start: Default::default(),
     };
     let mut forge = Forge::default();
     let out = run(

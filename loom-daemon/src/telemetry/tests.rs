@@ -39,9 +39,12 @@ fn sweep_started() -> TelemetryRecord {
         issue: 4703,
         sweep_id: "sweep-issue-4703-0".to_string(),
         started_at: ts(),
-        model: Some("opus".to_string()),
-        effort: Some("high".to_string()),
-        runtime: Some("claude".to_string()),
+        facts: crate::telemetry::SweepStartFacts {
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+            runtime: Some("claude".to_string()),
+            ..Default::default()
+        },
     })
 }
 

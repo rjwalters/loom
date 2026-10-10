@@ -3210,6 +3210,11 @@ pub enum Event {
         /// compatible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         story_points: Option<u32>,
+        /// Model, effort, runtime and attempt lineage as this dispatch knew
+        /// them (#11280), copied onto `sweep.started`. Absent for a `PrSet`
+        /// dispatch and on pre-#11280 wire data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<Box<crate::telemetry::SweepStartFacts>>,
     },
     /// `sweep.global.runtime_rejected` — a dispatch was **refused** by
     /// fail-closed runtime admission (issue #4494, epic #4489 Phase 5), before

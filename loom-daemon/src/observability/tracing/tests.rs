@@ -14,9 +14,7 @@ fn legacy_queue_envelope_stays_compatible_and_native_context_is_stripped() {
             issue: 18,
             sweep_id: "fixture".into(),
             started_at: chrono::Utc::now(),
-            model: None,
-            effort: None,
-            runtime: None,
+            facts: Default::default(),
         }),
     );
     let bytes = serde_json::to_vec(&old).unwrap();

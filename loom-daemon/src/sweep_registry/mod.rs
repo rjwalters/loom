@@ -128,6 +128,8 @@ mod overflow;
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
 mod pool_hold_broadcast;
+mod prepared_dispatch;
+pub use prepared_dispatch::PreparedIssueDispatch;
 pub(crate) mod private_dispatch;
 mod prless_retry;
 mod quarantine;
@@ -140,6 +142,7 @@ pub(crate) mod roll_requeue;
 pub(crate) mod roll_resume;
 mod spawn_process;
 mod stacking;
+mod start_facts;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) mod test_support;
@@ -772,6 +775,9 @@ pub struct SweepRegistry {
     /// Pruned alongside `phase_history` at the same terminal-entry GC site,
     /// for the same "unbounded across many dispatches" reason.
     sampled_loc: HashMap<SweepId, (i64, i64)>,
+    /// What each dispatch knew about the sweep it started (#11280): read by
+    /// `fleet.state` for the sweep's running row. Pruned with `phase_history`.
+    start_facts: HashMap<SweepId, telemetry::SweepStartFacts>,
     /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
     ///
     /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
@@ -1039,49 +1045,6 @@ pub enum BeginIssueDispatch {
     Spawned(Box<PreparedIssueDispatch>),
 }
 
-/// Everything [`finish_issue_dispatch`](SweepRegistry::finish_issue_dispatch)
-/// needs to record a dispatch after the caller has polled the spawned child
-/// OUTSIDE the registry mutex (Issue #6592). Produced by
-/// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch).
-pub struct PreparedIssueDispatch {
-    /// The live child handle. `poll_and_classify_spawned_child` takes this
-    /// by `&mut` to poll its log/exit status; `finish_issue_dispatch` then
-    /// takes ownership to record it in `self.children`.
-    pub(crate) child: Child,
-    /// `sweep_id=<id>` — anchors the log scan to this dispatch's own header
-    /// line (see `spawn_child_process`'s doc comment).
-    pub(crate) header_anchor: String,
-    pub(crate) log_path: PathBuf,
-    pub(crate) issue_number: u32,
-    pub(crate) sweep_id: SweepId,
-    pub(crate) kind: SweepKind,
-    pub(crate) idempotency_key: Option<String>,
-    /// Already normalized: empty strings collapsed to `None`, matching the
-    /// spawn-side rule that `--model ""` / `--effort ""` are never emitted.
-    pub(crate) model: Option<String>,
-    pub(crate) effort: Option<String>,
-    pub(crate) depends_on: Option<u32>,
-    /// What this dispatch resolved onto, and the metered backstop slot that
-    /// choosing it took (#8555). Carried here — rather than parked in shared
-    /// state keyed on the resolving thread — because this box is precisely the
-    /// value that crosses the resolve→spawn seam on EVERY dispatch path,
-    /// including the two that do not stay on one thread: `ipc.rs`'s
-    /// `spawn_blocking(...).await` between begin and finish, and the reaper's
-    /// batch of pending resumes prepared in one pass and finished in another.
-    /// Dropping this box releases the slot, so an abandoned dispatch cannot
-    /// leak one. See `runtime_preference::handoff`.
-    pub(crate) admission: crate::runtime_preference::DispatchAdmission,
-    /// The issue's story-point size (#9432), resolved at guard-chain step 2.71
-    /// from the label set the #4444 park guard already fetched, and carried
-    /// across the begin→poll→finish seam so `finish_issue_dispatch` can stamp
-    /// it on the `sweep.global.dispatch` event without re-reading the forge.
-    /// `None` for an unsized issue, a defective points label set, or a skipped
-    /// label read — never `0`.
-    pub(crate) story_points: Option<u32>,
-    /// #10974: counts this dispatch as mid-spawn until it is dropped (`roll_gate`).
-    pub(crate) mid_spawn: roll_gate::MidSpawn,
-}
-
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
 /// step of a split cancel (Issue #3807).
 ///
@@ -1191,6 +1154,7 @@ impl SweepRegistry {
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
             sampled_loc: HashMap::new(),
+            start_facts: HashMap::new(),
             pending_group_reaps: HashMap::new(),
             activity_window: None,
             owner_repo_cache: Mutex::new(None),

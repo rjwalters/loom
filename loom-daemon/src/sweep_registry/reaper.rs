@@ -2118,6 +2118,7 @@ impl SweepRegistry {
             // `sweep.outcome` record, already written at this entry's
             // terminal transition an hour ago.
             self.sampled_loc.remove(&id);
+            self.start_facts.remove(&id);
             changes += 1;
         }
         ReapOnceOutcome {

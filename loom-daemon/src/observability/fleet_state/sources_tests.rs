@@ -246,3 +246,44 @@ fn live_workers_counts_every_nonterminal_sweep_regardless_of_kind_or_slug() {
     assert_eq!(super::live_sweep_count(&[reg_a, reg_b]), 2);
     assert_eq!(super::live_sweep_count(&[]), 0);
 }
+
+/// Issue #11280: an anchor taken mid-sweep carries the sweep's model, effort,
+/// model source and attempt lineage on its running row, beside `host`/`slot`.
+#[test]
+#[serial_test::serial]
+fn an_anchor_taken_mid_sweep_carries_its_start_facts_on_the_running_row() {
+    use crate::telemetry::kinds::fleet_state::FleetStage;
+    use crate::types::SweepKind;
+    use std::sync::{Arc, Mutex};
+
+    std::env::set_var("LOOM_REPO", "rjwalters/loom");
+    let dir = tempfile::tempdir().unwrap();
+    let (mut registry, _rec) = crate::sweep_registry::test_support::fixture_registry(dir.path());
+    let dispatched =
+        registry.dispatch(&SweepKind::Issue(11280), None, Some("opus"), Some("high"), None);
+    std::env::remove_var("LOOM_REPO");
+    dispatched.unwrap();
+
+    let held = super::held_sweeps(&[Arc::new(Mutex::new(registry))], |_| {
+        Some("rjwalters/loom".to_string())
+    });
+    let input = FleetInput {
+        host_id: "host-a".to_string(),
+        held,
+        ..Default::default()
+    };
+    let now = Utc::now();
+    let anchor =
+        decide(&build_view(&input, None, now), &PlannerStamps::default(), None, now).unwrap();
+    assert!(anchor.anchor);
+    let row = serde_json::to_value(&anchor.repos[0].rows[0]).unwrap();
+    assert_eq!(row["stage"], FleetStage::SweepCurator.as_str());
+    assert_eq!(row["host"], "host-a");
+    assert_eq!(row["slot"], "regular");
+    assert_eq!(row["model"], "opus");
+    assert_eq!(row["effort"], "high");
+    assert_eq!(row["model_source"], "explicit");
+    assert_eq!(row["attempt_index"], 1);
+    assert_eq!(row["trigger"], "first");
+    assert!(row.get("previous_sweep_id").is_none());
+}

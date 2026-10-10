@@ -617,9 +617,13 @@ pub(crate) fn map_event_to_records(
             sweep_id,
             runtime,
             story_points,
+            start,
             ..
         } => {
             let started_at = Utc::now();
+            let mut facts = start.as_deref().cloned().unwrap_or_default();
+            // The event's own `runtime` field stays the authority for it.
+            facts.runtime.clone_from(runtime);
             dispatches.insert(
                 (repo.to_owned(), issue),
                 DispatchState {
@@ -639,12 +643,10 @@ pub(crate) fn map_event_to_records(
                 issue,
                 sweep_id: sweep_id.clone(),
                 started_at,
-                model: None,
-                effort: None,
-                // The dispatch event already names the admitted runtime
-                // adapter; carrying it here is what lets the dashboard say
-                // *which agent* is working each in-flight sweep.
-                runtime: runtime.clone(),
+                // #11280: model, effort, runtime and attempt lineage as the
+                // dispatch knew them, so the in-flight record carries the
+                // same facts `sweep.outcome` later reports.
+                facts,
             })]
         }
         Event::SweepGlobalDispatch { .. } => Vec::new(),
