@@ -2341,6 +2341,9 @@ impl SweepRegistry {
         // local window of this dispatcher's own flip, so step 4d can tell a
         // phantom (own flip misread) from a genuine hand-claim.
         let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+        // #11304: set once the flip below succeeds, so the post-claim state
+        // re-check (4e) only runs for a claim this dispatch actually took.
+        let mut claim_flipped = false;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -2383,6 +2386,7 @@ impl SweepRegistry {
             }
             match self.flip_label_to_building(issue_number) {
                 Ok(()) => {
+                    claim_flipped = true;
                     // 4b. Write the lease record (Issue #6179, Epic #6165
                     //     Phase 1): a best-effort forge comment documenting
                     //     which host/sweep now holds this claim, posted only
@@ -2500,6 +2504,42 @@ impl SweepRegistry {
                 earliest_sweep_id,
             }
             .into());
+        }
+
+        // 4e. Post-claim closed-issue re-verification (Issue #11304). The 2.5
+        //     guard is deliberately fail-open — a forge lookup error, breaker
+        //     or timeout returns `None` and dispatch proceeds — and `gh issue
+        //     edit` succeeds on a closed issue, so a closed issue can still
+        //     get claimed. Re-probe through the 2.5 reader now that the
+        //     flip has landed (the own-write pin makes that read unconditional,
+        //     so it is never served stale from a `304`). Only a positive CLOSED/PR answer
+        //     releases the claim; a `None` (probe error) stays fail-open.
+        //     The release goes through `restore_label_to_ready`, whose #9463
+        //     carve-out removes `loom:building` but never re-adds `loom:issue`
+        //     to a closed issue. No child has been spawned yet.
+        if claim_flipped && self.guard_closed_or_pr(issue_number) == Some(true) {
+            log::warn!(
+                "sweep_registry: issue #{issue_number} sweep_id={sweep_id} was found CLOSED (or a \
+                 PR) right after the claim flip (#11304) - the pre-flip guard failed open. \
+                 Releasing the claim instead of spawning a builder."
+            );
+            if let Err(e) = self.restore_label_to_ready(issue_number) {
+                log::warn!(
+                    "sweep_registry: post-claim release of closed issue #{issue_number} failed: {e}"
+                );
+            }
+            self.note_label_flip(issue_number); // #4485 flap detection
+            self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+            let _ = self.release_lock_owned(issue_number, &sweep_id);
+            // #9572: release the in-flight idempotency key claimed at 3.05.
+            if let Some(ref key) = idempotency_key {
+                self.inflight_idempotency.remove(key);
+            }
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: it was found closed on the forge \
+                 right after the claim flip (#11304 post-claim re-verification); the \
+                 `loom:building` claim was released and no builder was spawned."
+            ));
         }
 
         // 5. Compute the log path and spawn the child.
@@ -3511,3 +3551,8 @@ mod forge_egress_tests;
 // Issue #8997's rate-limited label-flip breaker coverage (same reason).
 #[cfg(test)]
 mod rate_limit_tests;
+
+// Issue #11304's post-claim closed-issue re-verification coverage — a sibling
+// module for the same reason as the ones above.
+#[cfg(test)]
+mod closed_after_claim_tests;
