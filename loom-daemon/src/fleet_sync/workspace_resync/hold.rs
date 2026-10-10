@@ -265,7 +265,13 @@ fn checkout(
     // A half-applied resync is held whatever its versions say: the stamp is
     // written last, so it still names the old release (#11109).
     if let Some(pending) = pending_resync(&raw) {
-        if gate_metadata(&raw, &daemon).is_ok() {
+        // A newer stamp (`RepoAheadOfDaemon`) is held too: `gate_metadata`
+        // returns it before it looks at the pending key, and the refusal
+        // alone maps to Clear. Other refusals keep their own verdicts.
+        if matches!(
+            gate_metadata(&raw, &daemon),
+            Ok(_) | Err(ResyncRefusal::RepoAheadOfDaemon { .. })
+        ) {
             return Finding::install_incompatible(format!(
                 "a resync to {pending} was interrupted: the installed files are a mix of two releases"
             ));
