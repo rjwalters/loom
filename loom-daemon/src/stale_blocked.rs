@@ -73,6 +73,9 @@ pub mod release_task;
 pub mod release_items;
 pub mod release_telemetry;
 
+// Champion's merge-risk hold digest is exempt from the gather (#9397).
+pub mod digest;
+
 /// Which kind of artifact a finding is about.
 ///
 /// Carried rather than inferred: the two populations come from different
