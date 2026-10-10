@@ -198,6 +198,17 @@ if [[ -z "${LEASE_RENEWER_DAEMON:-}" ]]; then
     "$SCRIPT" release 10229 --host y-host --sweep-id y-sweep 2> /dev/null
     assert_eq "lease renewer release 10229 --host y-host --sweep-id y-sweep" "$(cat "$STUB_DIR/renewer-args.log" 2> /dev/null)" "(y5) release is the daemon verb"
 
+    # (y5b) stop / stop-issue delegate to the daemon verb; no local kill.
+    reset_state
+    sleep 30 &
+    BYSTANDER=$!
+    "$SCRIPT" stop "$BYSTANDER" 2> /dev/null
+    assert_eq "lease renewer stop $BYSTANDER" "$(cat "$STUB_DIR/renewer-args.log" 2> /dev/null)" "(y5b) stop <PID> is the daemon verb"
+    "$SCRIPT" stop-issue 10229 --host y-host 2> /dev/null
+    assert_eq "lease renewer stop --issue 10229 --host y-host" "$(tail -n1 "$STUB_DIR/renewer-args.log" 2> /dev/null)" "(y5b) stop-issue is stop --issue"
+    assert_eq "true" "$(yb alive "$BYSTANDER")" "(y5b) the script itself signalled nothing"
+    kill "$BYSTANDER" 2> /dev/null
+
     # (y7) a daemon predating the verb (clap exit 2) renews as before.
     reset_state
     gate 2
@@ -258,6 +269,28 @@ else
     REC="$(start_loop 10229 "$WATCH")"
     assert_eq "true" "$([[ -n "$REC" && "$REC" != "$NEW" ]] && yb alive "$REC" || echo false)" "(r4) a killed owner's record is recovered"
     kill "$REC" "$O_ISSUE" "$O_SWEEP" "$O_REPO" "$WATCH" 2> /dev/null
+
+    # (r5) stop is ownership-checked (#11086).
+    reset_state
+    sleep 30 &
+    WATCH=$!
+    sleep 30 &
+    BYSTANDER=$!
+    R5A="$(start_loop 10229 "$WATCH")"
+    R5B="$(start_loop 10230 "$WATCH")"
+    RC=0; "$SCRIPT" stop "$BYSTANDER" > /dev/null 2>&1 || RC=$?
+    assert_eq "true" "$([[ $RC -ne 0 ]] && alive "$BYSTANDER" && echo true || echo false)" "(r5) stop of an unrelated PID is refused and the process survives"
+    RC=0; "$SCRIPT" stop 10229 > /dev/null 2>&1 || RC=$?
+    assert_eq "true" "$([[ $RC -ne 0 ]] && alive "$R5A" && alive "$R5B" && echo true || echo false)" "(r5) an issue number passed as a PID is refused, nothing signalled"
+    RC=0; "$SCRIPT" stop abc > /dev/null 2>&1 || RC=$?
+    assert_eq "true" "$([[ $RC -ne 0 ]] && echo true || echo false)" "(r5) a non-numeric PID is refused"
+    RC=0; "$SCRIPT" stop --issue 10230 > /dev/null 2>&1 || RC=$?
+    sleep 0.5
+    assert_eq "true" "$([[ $RC -eq 0 ]] && ! alive "$R5B" && alive "$R5A" && alive "$WATCH" && echo true || echo false)" "(r5) stop --issue N ends that issue's renewer only"
+    RC=0; "$SCRIPT" stop "$R5A" > /dev/null 2>&1 || RC=$?
+    sleep 0.5
+    assert_eq "true" "$([[ $RC -eq 0 ]] && ! alive "$R5A" && alive "$WATCH" && echo true || echo false)" "(r5) stop <real renewer pid> ends it"
+    kill "$BYSTANDER" "$WATCH" 2> /dev/null
 fi
 
 # (y6) per-cycle budget: steady state is one state read + one list/window read

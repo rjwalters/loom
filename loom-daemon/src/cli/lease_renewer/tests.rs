@@ -228,3 +228,144 @@ fn start_identity_tracks_a_real_process_and_its_death() {
     child.wait().unwrap();
     assert!(!owner_is_live(pid, &first));
 }
+
+// --- stop (#11086) ---------------------------------------------------------
+
+fn argv(s: &str) -> Vec<String> {
+    s.split_whitespace().map(str::to_string).collect()
+}
+
+#[test]
+fn renewer_argv_matches_only_this_toolings_renewers() {
+    assert!(is_renewer_argv(&argv(
+        "bash /w/.loom/scripts/sweep-lease-renew.sh start 7 --watch-pid 1"
+    )));
+    assert!(is_renewer_argv(&argv("/bin/bash sweep-lease-renew.sh start 7")));
+    assert!(is_renewer_argv(&argv("/usr/bin/loom-daemon lease renewer claim 7")));
+    assert!(!is_renewer_argv(&argv("sleep 30")));
+    assert!(!is_renewer_argv(&argv("claude --resume start")));
+    assert!(!is_renewer_argv(&argv("bash sweep-lease-renew.sh renew-once 7")));
+    assert!(!is_renewer_argv(&argv("vim notes sweep-lease-renew.sh start")));
+    assert!(!is_renewer_argv(&argv("loom-daemon lease ensure 7")));
+    assert!(!is_renewer_argv(&argv("grep loom-daemon lease renewer")));
+}
+
+fn run_stop(
+    arg: &str,
+    ids: &[Option<&str>],
+    args: Option<&str>,
+    sent: &RefCell<Vec<u32>>,
+) -> StopOutcome {
+    let calls = RefCell::new(0usize);
+    let ident_of = |_: u32| {
+        let i = (*calls.borrow()).min(ids.len() - 1);
+        *calls.borrow_mut() += 1;
+        ids[i].map(str::to_string)
+    };
+    stop_pid(arg, 4242, &ident_of, &|_| args.map(argv), &|p| sent.borrow_mut().push(p))
+}
+
+#[test]
+fn stop_pid_signals_a_verified_renewer_only() {
+    let sent = RefCell::new(vec![]);
+    let r = run_stop("500", &[Some("a")], Some("bash x/sweep-lease-renew.sh start 9"), &sent);
+    assert_eq!(r, StopOutcome::Stopped);
+    assert_eq!(*sent.borrow(), vec![500]);
+}
+
+#[test]
+fn stop_pid_refuses_unrelated_nonnumeric_and_reserved_pids_without_signalling() {
+    let sent = RefCell::new(vec![]);
+    let renewer = Some("bash sweep-lease-renew.sh start 9");
+    for (arg, a) in [
+        ("500", Some("sleep 30")),
+        ("11086", Some("node server.js")),
+        ("abc", renewer),
+        ("-1", renewer),
+        ("", renewer),
+        ("1", renewer),
+        ("4242", renewer),
+        ("500", None),
+    ] {
+        assert!(
+            matches!(run_stop(arg, &[Some("a")], a, &sent), StopOutcome::Refused(_)),
+            "{arg:?}"
+        );
+    }
+    assert!(sent.borrow().is_empty());
+}
+
+#[test]
+fn stop_pid_refuses_an_identity_that_changes_mid_check_and_ignores_a_dead_pid() {
+    let sent = RefCell::new(vec![]);
+    let r =
+        run_stop("500", &[Some("a"), Some("b")], Some("bash sweep-lease-renew.sh start 9"), &sent);
+    assert!(matches!(r, StopOutcome::Refused(_)));
+    assert_eq!(run_stop("500", &[None], None, &sent), StopOutcome::NotRunning);
+    assert!(sent.borrow().is_empty());
+}
+
+#[test]
+fn stop_pid_never_signals_a_real_unrelated_process() {
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let sent = RefCell::new(vec![]);
+    let r = stop_pid(
+        &child.id().to_string(),
+        std::process::id(),
+        &start_identity,
+        &process_argv,
+        &|p| sent.borrow_mut().push(p),
+    );
+    assert!(matches!(r, StopOutcome::Refused(_)), "{r:?}");
+    assert!(sent.borrow().is_empty());
+    assert!(process_argv(child.id())
+        .unwrap()
+        .contains(&"sleep".to_string()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn end_owners_matches_any_sweep_for_the_issue_but_never_a_peer() {
+    let (_d, s) = store();
+    claim(&s, &key("acme/widget", "h", "s1", 7), 100, "t1", &ident, &all_live).unwrap();
+    claim(&s, &key("acme/widget", "h", "s2", 7), 101, "t2", &ident, &all_live).unwrap();
+    claim(&s, &key("acme/widget", "h", "s1", 8), 102, "t3", &ident, &all_live).unwrap();
+    claim(&s, &key("acme/other", "h", "s1", 7), 103, "t4", &ident, &all_live).unwrap();
+    let sent = RefCell::new(vec![]);
+    let n = end_owners(&s, "acme/widget", 7, None, None, &all_live, &|p| sent.borrow_mut().push(p))
+        .unwrap();
+    assert_eq!(n, 2);
+    let mut got = sent.borrow().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![100, 101]);
+    assert!(
+        s.read(&key("acme/widget", "h", "s1", 7))
+            .unwrap()
+            .unwrap()
+            .released
+    );
+    assert!(
+        !s.read(&key("acme/widget", "h", "s1", 8))
+            .unwrap()
+            .unwrap()
+            .released
+    );
+    assert!(
+        !s.read(&key("acme/other", "h", "s1", 7))
+            .unwrap()
+            .unwrap()
+            .released
+    );
+    // A sweep filter narrows it; a dead owner is tombstoned but not signalled.
+    let sent = RefCell::new(vec![]);
+    let n = end_owners(&s, "acme/widget", 8, None, Some("nope"), &all_live, &|p| {
+        sent.borrow_mut().push(p)
+    })
+    .unwrap();
+    assert_eq!((n, sent.borrow().len()), (0, 0));
+    let n =
+        end_owners(&s, "acme/widget", 8, None, None, &none_live, &|p| sent.borrow_mut().push(p))
+            .unwrap();
+    assert_eq!((n, sent.borrow().len()), (1, 0));
+}
