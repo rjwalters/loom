@@ -4,7 +4,7 @@
 use super::*;
 use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
-use crate::telemetry::kinds::stage_outcome::{StageExit, StageOutcomeRecord};
+use crate::telemetry::kinds::stage_outcome::{EnteredAtSource, StageExit, StageOutcomeRecord};
 use crate::telemetry::provenance::Provenance;
 use chrono::Duration;
 
@@ -44,6 +44,7 @@ fn stage_record(issue: u32, stage: FleetStage, next: FleetStage, poll: i64) -> S
         pr_number: Some(issue + 1),
         stage,
         entered_at: None,
+        entered_at_source: Some(EnteredAtSource::Unknown),
         left_at: ts(),
         dwell_sec: None,
         exit: StageExit::between(stage, next),
@@ -158,8 +159,9 @@ fn fact_id_differs_across_natural_keys() {
 /// move at different times and on different cadences, and map to one fact.
 #[test]
 fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
+    use crate::observability::fleet_state::history::HistoryEvent;
     use crate::observability::fleet_state::outcomes::{
-        diff, listed, remember, ForgeReads, Memory, Pass, PullFacts,
+        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
     };
     use crate::observability::fleet_state::{build_view, FleetInput, ListedPr, RepoListing};
     use std::collections::BTreeMap;
@@ -169,8 +171,10 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
         fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
             None
         }
-        fn label_times(&mut self, _: &str, _: u32) -> Option<BTreeMap<String, DateTime<Utc>>> {
-            Some([("loom:pr".to_string(), self.0)].into())
+        fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
+            Some(LabelHistory {
+                events: vec![(self.0, HistoryEvent::Labeled("loom:pr".to_string()))],
+            })
         }
     }
     let input = |label: &str| FleetInput {
@@ -218,4 +222,102 @@ fn two_hosts_running_the_producer_at_different_times_emit_one_fact() {
     assert_eq!(fact_a.len(), 16);
     assert_eq!(fact_a, fact_b, "one transition, one fact");
     assert_ne!(record_a, record_b);
+}
+
+/// End to end through the producer (#11367): the host whose sweep claimed a
+/// ready issue and a host that only saw it leave the ready queue key the exit
+/// on the same forge facts, so they map to one fact.
+#[test]
+fn a_claimed_ready_issue_is_one_fact_across_hosts() {
+    use crate::observability::fleet_state::history::HistoryEvent;
+    use crate::observability::fleet_state::outcomes::{
+        diff, listed, remember, ForgeReads, LabelHistory, Memory, Pass, PullFacts,
+    };
+    use crate::observability::fleet_state::{
+        build_view, FleetInput, HeldSweep, ReadyItem, ReadyQueue,
+    };
+    use std::collections::BTreeMap;
+
+    let claimed_at = ts() + Duration::seconds(100);
+    struct Forge(DateTime<Utc>);
+    impl ForgeReads for Forge {
+        fn pull(&mut self, _: &str, _: u32) -> Option<PullFacts> {
+            None
+        }
+        fn label_history(&mut self, _: &str, _: u32) -> Option<LabelHistory> {
+            let label = |l: &str| l.to_string();
+            Some(LabelHistory {
+                events: vec![
+                    (self.0 - Duration::hours(1), HistoryEvent::Labeled(label("loom:issue"))),
+                    (self.0, HistoryEvent::Unlabeled(label("loom:issue"))),
+                    (self.0, HistoryEvent::Labeled(label("loom:building"))),
+                ],
+            })
+        }
+    }
+    let input = |ready: bool, held: bool| FleetInput {
+        host_id: "h".to_string(),
+        managed: ["o/r".to_string()].into(),
+        held: held
+            .then(|| HeldSweep {
+                repo: "o/r".to_string(),
+                issue: 7,
+                stage: FleetStage::SweepCurator,
+                entered_at: claimed_at,
+                entered_at_lower_bound: false,
+                pr: None,
+                overflow: false,
+                start: Default::default(),
+            })
+            .into_iter()
+            .collect(),
+        listings: Vec::new(),
+        listed_at: None,
+        ready: Some(ReadyQueue {
+            items: ready
+                .then(|| ReadyItem {
+                    repo: "o/r".to_string(),
+                    issue: 7,
+                    rank: 1,
+                    star: false,
+                    star_at: None,
+                    level: 0,
+                    fleet_priority: 0,
+                    created_at: None,
+                    main_red_fix: false,
+                })
+                .into_iter()
+                .collect(),
+            listed: ["o/r".to_string()].into(),
+            complete: ["o/r".to_string()].into(),
+            slots: None,
+        }),
+        capacity: None,
+        main_ci: BTreeMap::new(),
+    };
+    let host = |name: &str, claims: bool, first: i64, second: i64| {
+        let mut memory = Memory::default();
+        let mut prev = None;
+        let mut records = Vec::new();
+        for (at, fleet) in [(first, input(true, false)), (second, input(false, claims))] {
+            let now = ts() + Duration::seconds(at);
+            let view = build_view(&fleet, prev.as_ref(), now);
+            let listed = listed(&fleet.listings);
+            let pass = Pass {
+                view: &view,
+                listed: &listed,
+                managed: &fleet.managed,
+                now,
+            };
+            records = diff(&mut memory, &pass, &mut Forge(claimed_at), &provenance());
+            memory = remember(memory, &pass);
+            prev = Some(view);
+        }
+        assert_eq!(records.len(), 1, "{records:?}");
+        ids(name, &records[0], second)
+    };
+    let (fact_a, _) = host("host-a", true, 0, 130);
+    let (fact_b, _) = host("host-b", false, 60, 360);
+    assert_eq!(fact_a.len(), 16);
+    assert_eq!(fact_a, fact_b, "one claim, one fact");
 }

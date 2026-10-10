@@ -7,7 +7,8 @@ use super::nanos;
 use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
 use crate::telemetry::kinds::stage_outcome::{
-    StageExit, StageOutcomeRecord, FLEET_STATE_EVENT, OUTCOME_FACT_LOG_ATTRIBUTE_KEYS,
+    EnteredAtSource, StageExit, StageOutcomeRecord, FLEET_STATE_EVENT,
+    OUTCOME_FACT_LOG_ATTRIBUTE_KEYS,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
@@ -113,7 +114,8 @@ fn pr_resolved_keeps_its_wire_tag_and_every_attribute_key() {
 
 /// Golden: the attribute keys `eta.stage_outcome` carried under the ETA owner,
 /// minus `loom.eta.stage_outcome.open_estimates` (dropped with loom-ui's
-/// sign-off on #11098), plus the additive `loom.fact_id`.
+/// sign-off on #11098), plus the additive `loom.fact_id` and
+/// `loom.eta.stage_outcome.entered_at_source` (#11367).
 #[test]
 fn stage_outcome_keeps_its_wire_tag_and_every_attribute_key_but_open_estimates() {
     let left_at = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
@@ -124,6 +126,7 @@ fn stage_outcome_keeps_its_wire_tag_and_every_attribute_key_but_open_estimates()
         pr_number: Some(10950),
         stage: FleetStage::ReviewWait,
         entered_at: Some(left_at - Duration::seconds(5400)),
+        entered_at_source: Some(EnteredAtSource::Forge),
         left_at,
         dwell_sec: Some(5400),
         exit: StageExit::Pass,
@@ -152,6 +155,7 @@ fn stage_outcome_keeps_its_wire_tag_and_every_attribute_key_but_open_estimates()
         "loom.eta.stage_outcome.dwell_sec",
         "loom.eta.stage_outcome.next_stage",
         "loom.eta.stage_outcome.entered_at",
+        "loom.eta.stage_outcome.entered_at_source",
         "loom.eta.version",
         "loom.eta.revision",
         "loom.eta.tree_state",
@@ -172,6 +176,10 @@ fn stage_outcome_keeps_its_wire_tag_and_every_attribute_key_but_open_estimates()
         Some(Value::StringValue("pass".into()))
     );
     assert_eq!(attr(&log, "loom.eta.stage_outcome.dwell_sec"), Some(Value::IntValue(5400)));
+    assert_eq!(
+        attr(&log, "loom.eta.stage_outcome.entered_at_source"),
+        Some(Value::StringValue("forge".into()))
+    );
     let parsed: StageOutcomeRecord = serde_json::from_str(&body(&log)).unwrap();
     assert_eq!(parsed, record);
 }
@@ -185,6 +193,7 @@ fn every_outcome_fact_key_is_emitted_by_some_record() {
         pr_number: Some(2),
         stage: FleetStage::MergeWait,
         entered_at: Some(at - Duration::seconds(60)),
+        entered_at_source: Some(EnteredAtSource::Checkpoint),
         left_at: at,
         dwell_sec: Some(60),
         exit: StageExit::Hold,

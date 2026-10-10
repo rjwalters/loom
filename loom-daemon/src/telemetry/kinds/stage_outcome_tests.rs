@@ -24,6 +24,7 @@ fn record() -> StageOutcomeRecord {
         pr_number: Some(8),
         stage: FleetStage::ReviewWait,
         entered_at: Some(at - chrono::Duration::seconds(900)),
+        entered_at_source: Some(EnteredAtSource::Forge),
         left_at: at,
         dwell_sec: Some(900),
         exit: StageExit::Pass,
@@ -68,7 +69,8 @@ fn every_stage_move_gets_its_exit() {
 }
 
 /// The body keeps every field name it had under the ETA owner, minus the
-/// three estimate-derived fields loom-ui agreed to drop (#11098).
+/// three estimate-derived fields loom-ui agreed to drop (#11098), plus the
+/// additive `entered_at_source` (#11367).
 #[test]
 fn the_body_keeps_its_field_names_without_the_dropped_estimate_fields() {
     let json = serde_json::to_value(record()).unwrap();
@@ -84,6 +86,7 @@ fn the_body_keeps_its_field_names_without_the_dropped_estimate_fields() {
         "pr_number",
         "stage",
         "entered_at",
+        "entered_at_source",
         "left_at",
         "dwell_sec",
         "exit",
@@ -115,6 +118,22 @@ fn an_old_body_with_the_dropped_fields_still_parses() {
     });
     let parsed: StageOutcomeRecord = serde_json::from_value(old).unwrap();
     assert_eq!(parsed.forge_transition_at, None);
+    assert_eq!(parsed.entered_at_source, None, "a body from before #11367");
+}
+
+#[test]
+fn entered_at_source_has_its_wire_names() {
+    for (source, name) in [
+        (EnteredAtSource::Forge, "forge"),
+        (EnteredAtSource::Checkpoint, "checkpoint"),
+        (EnteredAtSource::Unknown, "unknown"),
+    ] {
+        assert_eq!(source.as_str(), name);
+        assert_eq!(serde_json::to_value(source).unwrap(), name);
+        let back: EnteredAtSource = serde_json::from_value(name.into()).unwrap();
+        assert_eq!(back, source);
+    }
+    assert_eq!(serde_json::to_value(record()).unwrap()["entered_at_source"], "forge");
 }
 
 #[test]

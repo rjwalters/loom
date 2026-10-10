@@ -61,6 +61,7 @@ use crate::telemetry::kinds::fleet_state::{
 };
 use crate::telemetry::{RepoVisibility, SweepStartFacts, TelemetryEnvelope, TelemetryRecord};
 
+pub mod history;
 pub mod outcomes;
 mod sources;
 
@@ -702,6 +703,7 @@ static STATE: Mutex<PassState> = Mutex::new(PassState {
         listed: BTreeMap::new(),
         unread: BTreeMap::new(),
         settled: BTreeSet::new(),
+        pending_ready: BTreeMap::new(),
         view: None,
         at: None,
     },
