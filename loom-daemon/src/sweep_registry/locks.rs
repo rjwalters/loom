@@ -951,7 +951,14 @@ impl SweepRegistry {
                     );
                     continue;
                 }
-                if !alive {
+                // #11076: a dead leader whose recorded group still has members
+                // (a wrapper retry) is not a dead sweep. Admit it as `Running`
+                // so the reaper's `await_group_drain` gate owns the release.
+                let orphaned_group = !alive
+                    && owner
+                        .pgid
+                        .is_some_and(|pgid| self.group_still_populated(&owner.sweep_id, pgid));
+                if !alive && !orphaned_group {
                     // Stale lock: the daemon-dispatched child's PID (recorded
                     // by `record_child_pid_in_lock`, #3808) is dead. This lock
                     // is the daemon's own crash-surviving evidence that it
@@ -1009,6 +1016,11 @@ impl SweepRegistry {
                 // group-killing a stranger's group is exactly the blast radius
                 // this must never have — drop to `None` and degrade.
                 let pgid = owner.pgid.filter(|&recorded| {
+                    if orphaned_group {
+                        // Dead leader: the OS cannot confirm; `group_still_populated`
+                        // already vetted the group (#11076).
+                        return true;
+                    }
                     let actual = process_group_of(owner.owner_pid);
                     if actual == Some(recorded) {
                         true
