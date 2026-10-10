@@ -2188,16 +2188,17 @@ record's JSON. The scalars ride as `loom.auto_update.*` attributes
 allowlists). The record time is the tick's start. Provenance is required:
 `loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
-never emitted. Severity is `ERROR` for `panic`. It is `WARN` for
-`stale_repo` and a fetch or rebuild that did not succeed, and `INFO`
-otherwise. (#10831 removed the stall decision along with the wait-for-zero
+never emitted. Severity is `ERROR` for `panic`, for a record carrying
+`floor_stall`, and for a `roll_held` with a `floor` (#10880). It is `WARN`
+for any other `roll_held`, for `stale_repo` and a fetch or rebuild that did
+not succeed, and `INFO` otherwise. (#10831 removed the stall decision along with the wait-for-zero
 roll it reported; no record carries it any more.)
 
 | Field | Type | Notes |
 |---|---|---|
 | `tick_id` | string | derived, never random: `derived_hex(["loom.auto_update.tick", host_id, tick start], 32)` |
 | `started_at` | RFC3339 | the tick's start |
-| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
+| `decision` | string | `skip` (nothing to roll onto; since #10885 this includes a fleet host at or above its floor, or whose floor is not known, whatever newer release exists), `defer` (a target is tracked, but a gate held it: settle window, backoff, terminal failure, in-flight sweeps, or the failed-roll guard holding a target whose last roll did not take, #10880), `stale_repo` (#8513), `fetch`, `rebuild`, `drain_wait` (a roll or drain is already armed), `panic` (the tick panicked; the loop keeps running) |
 | `reason` | string | the tick's note, the same text as `last tick:` in `loom-daemon status` |
 | `outcome` | string? | `success` / `retryable` / `terminal`, for `fetch` and `rebuild` |
 | `roll_armed` | bool | the fetch or rebuild succeeded and its pause-and-roll started (#10831) |
@@ -2206,6 +2207,8 @@ roll it reported; no record carries it any more.)
 | `commits_behind` / `hours_behind` | integer? | source-checkout staleness, when the tick read it |
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
 | `drain` | object | `{armed, pending, refusals, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) and `refusals` is always `0` |
+| `floor_stall` | string? | the unsatisfiable-floor alert text (#10712), or an unsatisfiable repo-ahead demand (#10719); absent otherwise |
+| `roll_held` | object? | #10880: a release roll this tick left held, raised on every such tick: `{floor?, running, target, cause, attempts, last_failure?, next_retry?}`. `cause` is `failed_roll` (an armed roll did not take; the failed-roll guard holds it), `fetch_backoff` (three or more consecutive fetch failures) or `fetch_terminal`. `floor` is set when the host is below its fleet floor. `next_retry` is absent only for a terminal failure on a target that is not the floor's |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |
 | `loom` | object | the deciding (running) daemon's provenance (required) |

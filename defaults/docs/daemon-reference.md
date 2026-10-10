@@ -6527,9 +6527,35 @@ says** (#10954): the loop is spawned on every host with a fleet store, and
   not staggered. A roll is a pause, a restart and a resume (#10831, #10832), so
   hosts rolling together is accepted. Two hosts that roll minutes apart across
   a new release can land on different versions, both at or above the floor.
-- **Backoff still applies.** A failed fetch backs off as before, and a roll
-  whose new binary did not take is held back per target by the failed-roll
-  guard (#10832) inside the pause-and-roll itself.
+- **Backoff still applies, and a failed roll is never retried in a loop.** A
+  failed fetch backs off as before. A roll whose new binary did not take is
+  held back per target (#10880): before a version roll is armed, the loop
+  writes a `roll_attempt` record (target, version, tag, `target_source`,
+  attempt count) into `auto_update_state.json`. A daemon that starts running
+  a version **below** that record's has watched the attempt fail, whatever
+  binary saved the file, and neither fetches nor arms that target until
+  `not_before`: 15 min after the first failure, doubling to a 6 h ceiling and
+  continuing every 6 h, never terminal. This holds for every
+  `target_source`, floor included, and the tick reports `defer`. A different
+  target (a newer release, or the same version re-published under a new
+  checksum) is tried at once and starts the count over. The record is cleared
+  by the first tick on a binary at or above its version once that process has
+  been up for the 90 s startup grace, so a candidate that dies early leaves it
+  for the binary that comes back. Times are clamped on load (an arm time in
+  the future becomes now, a retry time past now + 6 h becomes now + 6 h). A
+  binary older than #10880 ignores the key; deleting the file clears it, and a
+  manual update is not gated by it. The pause-side guard of #10832
+  (`roll-failed-target.json`, checked by H3) stays as a backstop.
+- **A held roll alerts on every tick.** While a release roll is held by the
+  failed-roll guard, by fetch backoff after three or more consecutive
+  failures, or by a terminal fetch failure, every tick logs `FLOOR ROLL
+  FAILING: …` at **ERROR** when the host is below its floor (`ROLL HELD: …` at
+  WARN otherwise), naming the floor, the running version, the target, the
+  attempt count, the last failure and the next retry. The same text is in
+  `last tick:` and the `auto_update.tick` record's `roll_held`. Dispatch
+  continues on the running version. A **terminal** fetch failure on a floor
+  target is not final: it is retried every 6 h. Any other target keeps the
+  old rule (no retry until a new release).
 - **Every fleet host runs the loop, `autoUpdate.enabled` or not** (#10954).
   The mode is chosen once at startup, after the startup fleet-sync pass has
   classified the host: a store that is named but unusable is a fleet host

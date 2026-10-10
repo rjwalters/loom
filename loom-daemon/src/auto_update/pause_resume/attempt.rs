@@ -28,6 +28,10 @@
 //!
 //! The delays are #10880's: 15 minutes, doubling per failed attempt on the
 //! same target, capped at 6 hours. Never terminal: the roll is retried.
+//!
+//! #10880's tick-side record has since landed
+//! ([`crate::auto_update::roll_attempt`]); it shares [`delay`] and gates the
+//! tick before it fetches. This guard stays as the pause-side backstop.
 
 use std::path::{Path, PathBuf};
 
