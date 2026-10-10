@@ -83,18 +83,54 @@ pub struct Report {
     pub model_profile: Option<String>,
     pub outcome: String,
     pub log_path: Option<String>,
+    /// Tail of the worker's stderr on a nonzero exit (preflight rejections
+    /// otherwise reach the caller with no reason).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
-fn gh_json(root: &Path, args: &[&str]) -> Option<serde_json::Value> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(root);
-    let out = crate::proc_exec::run_bounded(cmd, Duration::from_secs(60))
-        .ok()?
-        .output()?;
-    if !out.status.success() {
+/// Bytes of worker stderr kept as the `diagnostic` on a failed launch.
+const DIAGNOSTIC_TAIL_BYTES: usize = 2000;
+
+/// The last [`DIAGNOSTIC_TAIL_BYTES`] of `stderr`, trimmed; `None` when empty.
+pub fn stderr_tail(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
         return None;
     }
-    serde_json::from_slice(&out.stdout).ok()
+    let mut start = text.len().saturating_sub(DIAGNOSTIC_TAIL_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(text[start..].to_string())
+}
+
+/// Only a non-claude runtime is launched here; `claude` keeps today's Task
+/// subagent path byte-identical and the caller is told `delegate-to-claude`.
+pub fn delegates_to_claude(runtime: &str) -> bool {
+    runtime == "claude"
+}
+
+/// One read-only `gh` call through the managed facade (#9985/#9987), parsed
+/// as JSON. `None` on any failure: the callers treat "unknown" as "no artifact".
+fn gh_json(root: &Path, op: &'static str, args: &[&str]) -> Option<serde_json::Value> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let outcome = GhInvocation::new(
+        Operation::new(op),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(60),
+    )
+    .args(args)
+    .current_dir(root)
+    .run();
+    match outcome {
+        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
+            serde_json::from_slice(&out.stdout).ok()
+        }
+        _ => None,
+    }
 }
 
 fn has_label(value: &serde_json::Value, label: &str) -> bool {
@@ -103,11 +139,13 @@ fn has_label(value: &serde_json::Value, label: &str) -> bool {
         .is_some_and(|l| l.iter().any(|x| x["name"] == label))
 }
 
-/// Builder artifact: an open PR on `feature/issue-N` labelled `loom:review-requested`.
-fn builder_artifact(root: &Path, issue: u64) -> bool {
+/// Open PRs on `feature/issue-N` (number, head SHA, labels); `None` when gh
+/// could not answer.
+fn open_issue_prs(root: &Path, issue: u64) -> Option<serde_json::Value> {
     let head = format!("feature/issue-{issue}");
     gh_json(
         root,
+        "worker_run.pr_list",
         &[
             "pr",
             "list",
@@ -116,16 +154,33 @@ fn builder_artifact(root: &Path, issue: u64) -> bool {
             "--state",
             "open",
             "--json",
-            "number,labels",
+            "number,headRefOid,labels",
         ],
     )
-    .and_then(|v| v.as_array().cloned())
-    .is_some_and(|prs| prs.iter().any(|p| has_label(p, "loom:review-requested")))
+}
+
+/// Builder artifact: an open `feature/issue-N` PR labelled
+/// `loom:review-requested` that is new since `before` (the pre-launch
+/// snapshot) or whose head moved, so a pre-existing PR is not credited to a
+/// worker that did nothing.
+pub fn builder_artifact(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    let prior = |number: &serde_json::Value| {
+        before
+            .as_array()
+            .and_then(|prs| prs.iter().find(|p| &p["number"] == number))
+    };
+    after.as_array().is_some_and(|prs| {
+        prs.iter().any(|p| {
+            has_label(p, "loom:review-requested")
+                && prior(&p["number"]).is_none_or(|b| b["headRefOid"] != p["headRefOid"])
+        })
+    })
 }
 
 fn pr_view(root: &Path, pr: u64) -> Option<serde_json::Value> {
     gh_json(
         root,
+        "worker_run.pr_view",
         &[
             "pr",
             "view",
@@ -179,9 +234,19 @@ pub fn cli(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
-    let root = super::workspace(None)?;
-    let mut admission = crate::runtime_preference::resolve_for_dispatch(&root, role.as_str(), None)
+/// Resolve the role's runtime the way a dispatch does (#8554). `Err` carries
+/// the exit code: 75 no seat, 78 config.
+fn admit(
+    root: &Path,
+    role: Role,
+) -> Result<
+    (
+        crate::runtime_admission::ResolvedRuntime,
+        Option<crate::runtime_preference::Reservation>,
+    ),
+    LaunchError,
+> {
+    let mut admission = crate::runtime_preference::resolve_for_dispatch(root, role.as_str(), None)
         .map_err(|r| LaunchError {
             code: rejection_exit_code(&r.reason),
             message: r.diagnostic(),
@@ -190,6 +255,12 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
     let admitted = admission
         .admitted
         .ok_or_else(|| LaunchError::config("no runtime resolved for role"))?;
+    Ok((admitted, backstop))
+}
+
+fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
+    let root = super::workspace(None)?;
+    let (admitted, backstop) = admit(&root, role)?;
     let model_profile = admitted
         .preference
         .as_ref()
@@ -202,9 +273,9 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         model_profile,
         outcome: "delegate-to-claude".into(),
         log_path: None,
+        diagnostic: None,
     };
-    if admitted.runtime == "claude" {
-        // Today's Task-subagent path stays byte-identical; nothing is launched.
+    if delegates_to_claude(&admitted.runtime) {
         emit(args, &report);
         return Ok(0);
     }
@@ -236,6 +307,12 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         issue,
         chrono::Utc::now().timestamp()
     ));
+    // Pre-launch snapshot so a PR that already existed is not credited to this
+    // worker. An unreadable snapshot degrades to "no prior PRs".
+    let builder_before = match role {
+        Role::Builder => open_issue_prs(&root, issue).unwrap_or_else(|| serde_json::json!([])),
+        Role::Doctor => serde_json::Value::Null,
+    };
     let target = args.issue.or(args.pr).unwrap_or(issue);
     let mut cmd = Command::new(super::scripts_dir(&root).join("spawn-worker.sh"));
     cmd.current_dir(&worktree)
@@ -264,6 +341,10 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         }
         crate::proc_exec::Completion::Exited(out) if !out.status.success() => {
             report.outcome = "worker-failed".into();
+            report.diagnostic = stderr_tail(&out.stderr);
+            if let Some(tail) = &report.diagnostic {
+                eprintln!("worker exited {:?}; stderr tail:\n{tail}", out.status.code());
+            }
             // Preflight rejections (78/75/126) pass through; a plain failure is 1.
             match out.status.code() {
                 Some(c @ (75 | 78 | 126 | 127)) => c,
@@ -272,7 +353,8 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         }
         crate::proc_exec::Completion::Exited(_) => {
             let produced = match role {
-                Role::Builder => builder_artifact(&root, issue),
+                Role::Builder => open_issue_prs(&root, issue)
+                    .is_some_and(|after| builder_artifact(&builder_before, &after)),
                 Role::Doctor => args
                     .pr
                     .and_then(|pr| pr_view(&root, pr))
@@ -323,16 +405,71 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn claude_resolution_delegates_without_launching() {
+        // Isolate from a dispatched session's runtime pins (#4739), restoring after.
+        let pins = [
+            "LOOM_RUNTIME",
+            "LOOM_RUNTIME_BUILDER",
+            "LOOM_RUNTIME_DOCTOR",
+        ];
+        let prior: Vec<_> = pins.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in pins {
+            std::env::remove_var(k);
+        }
+        // Unconfigured repo with the claude adapter present: the static path.
         let dir = tempfile::tempdir().unwrap();
-        let admission =
-            crate::runtime_preference::resolve_for_dispatch(dir.path(), "builder", None);
-        // With no preference configured the static path must not name a non-claude runtime.
-        if let Ok(a) = admission {
-            if let Some(r) = a.admitted {
-                assert_eq!(r.runtime, "claude");
+        let adapter = dir.path().join("defaults/scripts/spawn-claude.sh");
+        std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for rel in [
+            "defaults/roles/builder.json",
+            "defaults/runtimes/claude.json",
+        ] {
+            let to = dir.path().join(rel);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(repo.join(rel), to).unwrap();
+        }
+        let result = admit(dir.path(), Role::Builder);
+        for (k, v) in prior {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
             }
         }
+        let (admitted, backstop) = result.unwrap();
+        assert_eq!(admitted.runtime, "claude");
+        assert!(backstop.is_none());
+        assert!(delegates_to_claude(&admitted.runtime));
+        assert!(!delegates_to_claude("codex"));
+        assert!(!delegates_to_claude("opencode"));
+    }
+
+    #[test]
+    fn builder_artifact_ignores_a_preexisting_unchanged_pr() {
+        let rr = serde_json::json!([{"name": "loom:review-requested"}]);
+        let pr =
+            |n: u64, sha: &str| serde_json::json!({"number": n, "headRefOid": sha, "labels": rr});
+        let before = serde_json::json!([pr(7, "a")]);
+        assert!(!builder_artifact(&before, &serde_json::json!([pr(7, "a")])));
+        assert!(builder_artifact(&before, &serde_json::json!([pr(7, "b")])));
+        assert!(builder_artifact(&serde_json::json!([]), &serde_json::json!([pr(8, "a")])));
+        let unlabelled = serde_json::json!([{"number": 9, "headRefOid": "c", "labels": []}]);
+        assert!(!builder_artifact(&serde_json::json!([]), &unlabelled));
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_end_and_skips_empty() {
+        assert_eq!(stderr_tail(b"  \n"), None);
+        assert_eq!(stderr_tail(b"no seat\n").as_deref(), Some("no seat"));
+        let long = format!("{}END", "x".repeat(5000));
+        let tail = stderr_tail(long.as_bytes()).unwrap();
+        assert_eq!(tail.len(), DIAGNOSTIC_TAIL_BYTES);
+        assert!(tail.ends_with("END"));
     }
 
     #[test]
