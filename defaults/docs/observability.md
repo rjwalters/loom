@@ -16,6 +16,7 @@
 - [2. What gets sent: the wire schema](#2-what-gets-sent-the-wire-schema)
 - [3. Exporters: HTTPS (default) or OTLP (opt-in)](#3-exporters-https-default-or-otlp-opt-in)
 - [3b. Confirming telemetry is actually flowing](#3b-confirming-telemetry-is-actually-flowing)
+- [3b-2. Every daemon must export OTLP: `otlp_export` (Issue #11353)](#3b-2-every-daemon-must-export-otlp-otlp_export-issue-11353)
 - [3c. Operational signals from daemon loops (Issue #8860)](#3c-operational-signals-from-daemon-loops-issue-8860)
 - [3d. Agent telemetry relay (Issue #10964)](#3d-agent-telemetry-relay-issue-10964)
 - [4. The backend: deploy your own Cloudflare Worker](#4-the-backend-deploy-your-own-cloudflare-worker)
