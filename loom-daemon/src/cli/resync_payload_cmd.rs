@@ -6,11 +6,14 @@
 //! resolves; it is also run by hand. Logic and the exit-code contract live in
 //! [`loom_daemon::init::payload::standalone`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 
 use loom_daemon::init::payload::standalone;
+use loom_daemon::release_fetch::source;
+use loom_daemon::release_provenance::{self, Provenance};
 
 #[derive(clap::Args)]
 pub(crate) struct ResyncPayloadArgs {
@@ -29,7 +32,7 @@ impl ResyncPayloadArgs {
             Some(dir) => dir,
             None => std::env::current_dir()?,
         };
-        let code = match standalone::run(&dest, self.dry_run) {
+        let code = match standalone::run(&dest, self.dry_run, || establish_provenance(&dest)) {
             Ok(report) => {
                 let text = report.render(&dest);
                 if report.refused() {
@@ -46,4 +49,13 @@ impl ResyncPayloadArgs {
         };
         std::process::exit(code);
     }
+}
+
+/// Ask the forge what this binary's release tag names: `gh api` run from
+/// `dest`, peeling an annotated tag to its commit. A zero interval because a
+/// one-shot process has no earlier attempt to back off from.
+fn establish_provenance(dest: &Path) -> Provenance {
+    release_provenance::ensure(chrono::Utc::now(), Duration::ZERO, &|repo, tag| {
+        source::resolve_tag_commit(&|path| source::gh_api(dest, path), repo, tag)
+    })
 }

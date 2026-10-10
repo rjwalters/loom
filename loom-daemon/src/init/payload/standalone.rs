@@ -29,7 +29,6 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -246,25 +245,24 @@ pub fn run_with(payload: &Payload, dest: &Path, dry_run: bool) -> Result<Report>
 
 /// [`run_with`] for the payload embedded in this binary.
 ///
-/// Asks the forge what this binary's release tag names first, at most once
-/// and only for a binary the release workflow stamped
-/// ([`crate::release_provenance`]): a one-shot process has no earlier answer
-/// to reuse. Any other build, and a stamped one whose tag gets no answer, is
-/// refused by the gate like everywhere else.
+/// `establish` settles this binary's release provenance before the gate
+/// reads it ([`crate::release_provenance`]): a one-shot process has no
+/// earlier answer to reuse, so the caller asks the forge what the release
+/// tag names, at most once and only for a binary the release workflow
+/// stamped. The lookup is the caller's because it needs the forge client,
+/// which nothing under `init` reaches. Any other build, and a stamped one
+/// whose tag gets no answer, is refused by the gate like everywhere else.
 ///
 /// # Errors
 /// `dest` is not a directory, the payload does not unpack, or see
 /// [`run_with`].
-pub fn run(dest: &Path, dry_run: bool) -> Result<Report> {
+pub fn run(
+    dest: &Path,
+    dry_run: bool,
+    establish: impl FnOnce() -> crate::release_provenance::Provenance,
+) -> Result<Report> {
     anyhow::ensure!(dest.is_dir(), "{} is not a directory", dest.display());
-    let provenance =
-        crate::release_provenance::ensure(chrono::Utc::now(), Duration::ZERO, &|repo, tag| {
-            crate::release_fetch::source::resolve_tag_commit(
-                &|path| crate::release_fetch::source::gh_api(dest, path),
-                repo,
-                tag,
-            )
-        });
+    let provenance = establish();
     let payload = Payload::embedded().context("unpack the embedded payload")?;
     let mut report = run_with(&payload, dest, dry_run)?;
     if report.verdict == Verdict::Refused(ResyncRefusal::NotAReleaseBuild) {
