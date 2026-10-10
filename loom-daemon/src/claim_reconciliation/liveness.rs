@@ -105,16 +105,18 @@ pub fn most_recent_claim_activity_at(
         .max()
 }
 
-/// Prefixes of the structured comments only a Judge posts while reviewing
+/// Prefixes of the structured comments that only a Judge posts while reviewing
 /// (Issue #10235). A trusted-author comment carrying one, posted after the
 /// claim, is Judge progress even when it carries no
 /// [`claim_activity_marker`]: a Judge that merged `main`, re-ran suites or
 /// recorded a fast-path evaluation is demonstrably alive. Deliberately NOT
-/// including [`STANDDOWN_MARKER_PREFIX`] (a *later* pass declining to act).
+/// including [`STANDDOWN_MARKER_PREFIX`] (a *later* pass declining to act), nor
+/// `loom:ac-verified`: `builder.md` tells Builders (and `judge.md` allows
+/// operators) to post it, and `PrComment` carries no claimant identity, so it
+/// would let a Builder's acceptance comment renew a dead Judge's claim.
 pub const JUDGE_ACTIVITY_MARKER_PREFIXES: &[&str] = &[
     "<!-- loom:verdict-sha",
     "<!-- loom:review-reconciliation",
-    "<!-- loom:ac-verified",
     "<!-- loom:fast-track-evaluation",
     "<!-- loom:docs-fast-path-evaluation",
     "<!-- loom:fallback-evaluated",

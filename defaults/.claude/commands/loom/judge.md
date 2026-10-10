@@ -602,7 +602,7 @@ the idle clock**, so a genuine heartbeat buys another
 `LOOM_STALE_REVIEWING_MINUTES`.
 
 The script also asks the daemon (`forge claim-liveness`, #10235) for a trusted Judge-progress comment
-(`loom:ac-verified`, `loom:verdict-sha`, ...) or your own force-push of the PR head, so both sides agree;
+(`loom:verdict-sha`, `loom:review-reconciliation`, ...; not `loom:ac-verified`, which Builders also post) or your own force-push of the PR head, so both sides agree;
 without that verb only the marker below counts.
 
 **If your review runs long** (esp. before a CI wait), post a progress comment ending

@@ -239,16 +239,25 @@ fn judge_activity_requires_a_judge_marker_after_the_claim_and_not_standdown() {
     );
     assert_eq!(
         most_recent_judge_activity_at(
-            &[comment(at, "<!-- loom:ac-verified sha=abc -->")],
+            &[comment(at, "<!-- loom:verdict-sha sha=abc verdict=x -->")],
             claimed_at
         ),
         Some(at)
+    );
+    // Cross-role: a Builder/operator acceptance comment is not Judge progress.
+    assert_eq!(
+        most_recent_judge_activity_at(
+            &[comment(at, "<!-- loom:ac-verified sha=abc -->")],
+            claimed_at
+        ),
+        None,
+        "ac-verified is Builder-postable and must not renew a Judge claim"
     );
     assert_eq!(
         most_recent_judge_activity_at(
             &[comment(
                 claimed_at - Duration::minutes(1),
-                "<!-- loom:ac-verified -->"
+                "<!-- loom:verdict-sha -->"
             )],
             claimed_at
         ),
@@ -259,7 +268,7 @@ fn judge_activity_requires_a_judge_marker_after_the_claim_and_not_standdown() {
         most_recent_judge_activity_at(
             &[comment(
                 at,
-                &format!("<!-- loom:ac-verified -->\n{STANDDOWN_MARKER_PREFIX}x seq=1 -->")
+                &format!("<!-- loom:verdict-sha -->\n{STANDDOWN_MARKER_PREFIX}x seq=1 -->")
             )],
             claimed_at
         ),
