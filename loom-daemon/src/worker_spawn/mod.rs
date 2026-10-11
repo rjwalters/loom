@@ -399,9 +399,22 @@ fn run_preflight(
             .as_deref()
             .and_then(prompt::role_invocation)
             .map(|(r, _)| r);
+        // #11400: judge exclusion against the profile this launch will select —
+        // an explicit `--profile` — not the env/default profile it overrides.
+        let launch_profile = options
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
         for role in role.as_deref().into_iter().chain(prompt_role) {
-            crate::runtime_admission::resolve_and_admit(root, role, Some(&runtime))
-                .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            crate::runtime_admission::resolve_and_admit_profiled(
+                root,
+                role,
+                Some(&runtime),
+                launch_profile,
+                crate::runtime_admission::AdmissionContext::Host,
+            )
+            .map_err(|e| LaunchError::config(e.diagnostic()))?;
         }
         let mut selection = profiles::select(&runtime, &options, &config)?;
         // #11400: the profile actually selected (an explicit `--profile` may

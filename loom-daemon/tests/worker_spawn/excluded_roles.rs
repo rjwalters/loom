@@ -7,7 +7,7 @@ use super::worker;
 fn roles(root: &std::path::Path) {
     let roles = root.join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    for role in ["judge", "curator", "doctor"] {
+    for role in ["builder", "judge", "curator", "doctor"] {
         std::fs::write(roles.join(format!("{role}.json")), "{}").unwrap();
         std::fs::write(roles.join(format!("{role}.md")), "Role task: $ARGUMENTS").unwrap();
     }
@@ -58,5 +58,56 @@ fn judge_and_curator_never_launch_on_zai_flash() {
             .output()
             .unwrap();
         assert!(out.status.success(), "{runtime}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// The effective launch profile is what admission judges: an explicit allowed
+/// `--profile` launches despite an excluding default or `LOOM_MODEL_PROFILE`.
+#[test]
+fn explicit_allowed_profile_overrides_an_excluding_default_or_env() {
+    let d = tempfile::tempdir().unwrap();
+    roles(d.path());
+    for runtime in ["pi", "opencode"] {
+        for role in ["judge", "curator"] {
+            // Bundled zai-flash default, explicit quick-flash, role slash prompt.
+            let out = worker(d.path(), runtime)
+                .args(["--profile", "quick-flash", "-p", &format!("/loom:{role} 1")])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{runtime} {role}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Excluding env pin, explicit allowed profile, role-tagged launch.
+            let out = worker(d.path(), runtime)
+                .env("LOOM_ROLE", role)
+                .env("LOOM_MODEL_PROFILE", "zai-flash")
+                .args(["--profile", "quick-flash", "-p", "hello"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{runtime} {role}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // A native sweep runs Judge/Curator in-session: same override applies...
+        let out = worker(d.path(), runtime)
+            .args(["--profile", "quick-flash", "-p", "/loom:sweep 1"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{runtime} sweep: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // ...and the opposite override is still refused.
+        let out = worker(d.path(), runtime)
+            .args(["--profile", "zai-flash", "-p", "/loom:sweep 1"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(78), "{runtime} sweep");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("excludedRoles"));
     }
 }
