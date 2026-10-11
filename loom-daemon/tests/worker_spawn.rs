@@ -264,11 +264,11 @@ fn role_instructions_are_expanded_and_gate_cannot_be_bypassed_by_slash_prompt() 
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
-    std::fs::write(roles.join("curator.md"), "Role task: $ARGUMENTS").unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.md"), "Role task: $ARGUMENTS").unwrap();
     std::fs::write(d.path().join("CLAUDE.md"), "Repository rule marker").unwrap();
     let out = worker(d.path(), "pi")
-        .args(["-p", "/loom:curator 8362"])
+        .args(["-p", "/loom:guide 8362"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -292,7 +292,7 @@ fn role_runner_probe() {
     };
     use loom_daemon::role_runner::{RoleInvocationRunner, ScriptRoleInvocationRunner};
     let mut runner = ScriptRoleInvocationRunner::new(root.into());
-    let result = runner.invoke("curator", "/loom:curator");
+    let result = runner.invoke("guide", "/loom:guide");
     assert!(result.is_success(), "{result:?}");
     assert_eq!(runner.resolved_launch().unwrap().model, "");
 }
@@ -302,7 +302,7 @@ fn native_role_runner_does_not_require_claude_tokens_or_inherit_sonnet() {
     legacy(d.path(), "worker");
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
     config(d.path(), serde_json::json!({"runtimes":{"default":"pi"}}));
     // #9548: a role tick launches only on a workspace this installation may
     // write to, so the probe root is made a managed, writable checkout.
@@ -637,15 +637,15 @@ fn an_oversized_repo_claude_md_still_launches_and_delivers_the_prompt_byte_for_b
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
-    std::fs::write(roles.join("curator.md"), "Role task: $ARGUMENTS").unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.md"), "Role task: $ARGUMENTS").unwrap();
     // Comfortably over the old 128 KiB argv ceiling; nowhere near the new
     // stdin-based sanity ceiling.
     let big_claude_md = "x".repeat(300 * 1024);
     std::fs::write(d.path().join("CLAUDE.md"), &big_claude_md).unwrap();
     for runtime in ["pi", "opencode"] {
         let out = worker(d.path(), runtime)
-            .args(["-p", "/loom:curator 8506"])
+            .args(["-p", "/loom:guide 8506"])
             .output()
             .unwrap();
         assert!(out.status.success(), "{runtime}: {}", String::from_utf8_lossy(&out.stderr));
@@ -674,12 +674,12 @@ fn a_pathological_prompt_fails_closed_with_a_classified_size_error() {
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
-    std::fs::write(roles.join("curator.md"), "Role task: $ARGUMENTS").unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.md"), "Role task: $ARGUMENTS").unwrap();
     // Comfortably over `prompt::MAX_PROMPT_BYTES` (8 MiB).
     std::fs::write(d.path().join("CLAUDE.md"), "x".repeat(9 * 1024 * 1024)).unwrap();
     let out = worker(d.path(), "pi")
-        .args(["-p", "/loom:curator 8506"])
+        .args(["-p", "/loom:guide 8506"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(126), "{}", String::from_utf8_lossy(&out.stderr));
@@ -695,23 +695,23 @@ fn per_role_binding_is_shared_with_native_dispatch() {
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
-    std::fs::write(roles.join("curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+    std::fs::write(roles.join("guide.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
     config(
         d.path(),
-        serde_json::json!({"runtimes":{"default":"claude","roles":{"curator":"opencode"}}}),
+        serde_json::json!({"runtimes":{"default":"claude","roles":{"guide":"opencode"}}}),
     );
     let out = worker(d.path(), "claude")
         .env_remove("LOOM_RUNTIME")
-        .env("LOOM_ROLE", "curator")
-        .env_remove("LOOM_RUNTIME_CURATOR")
+        .env("LOOM_ROLE", "guide")
+        .env_remove("LOOM_RUNTIME_GUIDE")
         .args(["-p", "hello"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("runtime=opencode"));
     let out = worker(d.path(), "opencode")
-        .env("LOOM_ROLE", "curator")
-        .env("LOOM_RUNTIME_CURATOR", "pi")
+        .env("LOOM_ROLE", "guide")
+        .env("LOOM_RUNTIME_GUIDE", "pi")
         .args(["-p", "hello"])
         .output()
         .unwrap();
@@ -994,6 +994,9 @@ fn native_sweep_prompt_uses_sequential_cli_lifecycle_and_fails_closed_tools() {
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
+    // A native sweep runs Judge/Curator in-session; the bundled default
+    // profile (`zai-flash`) excludes both (#11400), so pin one that does not.
+    config(d.path(), serde_json::json!({"runtimes":{"defaultModelProfile":"quick-flash"}}));
     std::fs::write(
         roles.join("builder.json"),
         r#"{"runtimeRequirements":["loomControl","worktreeIsolation"]}"#,
@@ -1030,6 +1033,9 @@ fn native_sweep_cannot_bypass_a_phase_capability_requirement() {
     let d = tempfile::tempdir().unwrap();
     let roles = d.path().join(".loom/roles");
     std::fs::create_dir_all(&roles).unwrap();
+    // A native sweep runs Judge/Curator in-session; the bundled default
+    // profile (`zai-flash`) excludes both (#11400), so pin one that does not.
+    config(d.path(), serde_json::json!({"runtimes":{"defaultModelProfile":"quick-flash"}}));
     for role in ["builder", "curator", "doctor"] {
         std::fs::write(roles.join(format!("{role}.json")), "{}").unwrap();
     }
@@ -1115,3 +1121,5 @@ fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
 
 #[path = "worker_spawn/cargo_debuginfo.rs"]
 mod cargo_debuginfo;
+#[path = "worker_spawn/excluded_roles.rs"]
+mod excluded_roles;
