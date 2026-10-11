@@ -10,10 +10,15 @@
 //!
 //! Every host emits what it observes; nothing is elected. Duplicates across
 //! hosts are expected, and `loom.fact_id` collapses them. The fact id is
-//! keyed on forge instants only: a PR's `merged_at` / `closed_at`, and for a
-//! review-label move the new label's `labeled` event. A move with no forge
-//! instant (a sweep stage, a failed read) is still emitted, without a fact
-//! id, at the observing pass with `resolution_sec` set to the pass interval.
+//! keyed first on forge instants: a PR's `merged_at` / `closed_at`, for a
+//! review-label move the new label's `labeled` event, and for a hold release
+//! the hold label's `unlabeled` event. A move with no forge instant is still
+//! emitted at the observing pass with `resolution_sec` set to the pass
+//! interval, and its fact id (#11401) keys on the id of this host's sweep
+//! that held the stage (only that host emits a sweep row), else on the
+//! forge-dated entry. With neither, the record carries
+//! `loom.fact_id_missing_reason` (`forge_read_failed` / `no_forge_instant`)
+//! instead, and `host.export` counts it.
 //!
 //! **Entry instants (#11367).** A sweep's own checkpoint dates its entry
 //! (`entered_at_source = checkpoint`). Any other row of a stage a label
@@ -31,7 +36,8 @@
 //! same fact id. A row that left the view while the forge shows no
 //! departure yet (a peer's live claim, label lag) is pending: no record,
 //! dropped if the row comes back, emitted once the departure shows, and
-//! after [`PENDING_READY_MAX_PASSES`] one `unknown` without a fact id.
+//! after [`PENDING_READY_MAX_PASSES`] one `unknown` keyed on its forge-dated
+//! entry when known.
 //!
 //! **Pre-ready exits (#11368).** `triage_wait` (creation or latest reopen to
 //! the first `loom:curated` / `loom:issue` label; `approval_wait` follows
@@ -60,7 +66,7 @@ use super::{FleetView, RepoListing, Source, MERGE_HOLD_LABELS, REVIEW_LABELS, TR
 use crate::telemetry::kinds::fleet_state::{FleetStage, FleetStateRow};
 use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
 use crate::telemetry::kinds::stage_outcome::{
-    EnteredAtSource, StageExit, StageOutcomeRecord, FLEET_STATE_EVENT,
+    EnteredAtSource, FactIdMissingReason, StageExit, StageOutcomeRecord, FLEET_STATE_EVENT,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
@@ -248,6 +254,8 @@ struct Diff<'a, F> {
     /// This pass's history reads, by `(repo, number)`; a failed read is
     /// `None` and is not repeated within the pass.
     histories: BTreeMap<(String, u32), Option<LabelHistory>>,
+    /// PRs whose `pulls/{n}` read failed this pass, `(repo, number)`.
+    unread_pulls: BTreeSet<(String, u32)>,
 }
 
 impl<F: ForgeReads> Diff<'_, F> {
@@ -283,6 +291,31 @@ impl<F: ForgeReads> Diff<'_, F> {
             .history(repo, pr)?
             .latest(now, |e| labeled(e, &labels))?;
         (at > prev_at).then_some(at)
+    }
+
+    /// The forge instant of `pr`'s hold release: the latest `unlabeled` hold
+    /// event after the previous observation and no later than this one.
+    fn release_instant(&mut self, repo: &str, pr: u32) -> Option<DateTime<Utc>> {
+        let holds: Vec<&str> = MERGE_HOLD_LABELS.iter().copied().collect();
+        let (prev_at, now) = (self.prev_at, self.now);
+        let at = self
+            .history(repo, pr)?
+            .latest(now, |e| unlabeled(e, &holds))?;
+        (at > prev_at).then_some(at)
+    }
+
+    /// Why a record of `was` has no forge instant: a read this pass needed
+    /// failed (the item's history, or the PR), else none dates it.
+    fn missing_reason(&self, repo: &str, issue: u32, was: &FleetStateRow) -> FactIdMissingReason {
+        let failed = |n: u32| {
+            let key = (repo.to_string(), n);
+            matches!(self.histories.get(&key), Some(None)) || self.unread_pulls.contains(&key)
+        };
+        if failed(issue) || was.pr.is_some_and(failed) {
+            FactIdMissingReason::ForgeReadFailed
+        } else {
+            FactIdMissingReason::NoForgeInstant
+        }
     }
 
     /// When `was` entered its stage, and how that is known. An exact
@@ -387,6 +420,8 @@ impl<F: ForgeReads> Diff<'_, F> {
                 observed_at: now,
                 resolution_sec: Some(0),
                 forge_transition_at: Some(exit.left),
+                sweep_id: None,
+                fact_id_missing_reason: None,
                 loom: self.loom.clone(),
             }));
         }
@@ -409,6 +444,9 @@ impl<F: ForgeReads> Diff<'_, F> {
         let left_at = forge_at.unwrap_or(self.now).min(self.now);
         let (entered_at, entered_at_source) = self.entry(repo, issue, was, source, left_at);
         let dwell_sec = dwell(exit, entered_at, left_at);
+        let fact_id_missing_reason = forge_at
+            .is_none()
+            .then(|| self.missing_reason(repo, issue, was));
         StageOutcomeRecord {
             repo: repo.to_string(),
             issue,
@@ -428,6 +466,8 @@ impl<F: ForgeReads> Diff<'_, F> {
                 self.interval()
             }),
             forge_transition_at: forge_at,
+            sweep_id: was.sweep_id.clone(),
+            fact_id_missing_reason,
             loom: self.loom.clone(),
         }
     }
@@ -595,6 +635,7 @@ pub fn diff(
         now: pass.now,
         prev_at,
         histories: std::mem::take(&mut memory.warm),
+        unread_pulls: BTreeSet::new(),
     };
     let mut out = Vec::new();
     pre_ready_pass(memory, prev, pass, &mut diff, &mut out);
@@ -616,6 +657,7 @@ pub fn diff(
         for (number, issue) in departed {
             let Some(facts) = diff.forge.pull(repo, number) else {
                 log::debug!("fleet.state: pulls/{number} of {repo} unread; retrying next pass");
+                diff.unread_pulls.insert((repo.clone(), number));
                 unread
                     .entry(repo.clone())
                     .or_default()
@@ -705,13 +747,15 @@ pub fn diff(
                 }
                 Some(now) => {
                     // A hold release is the removal of the hold label; `loom:pr`
-                    // stays applied, so no `labeled` event dates it.
+                    // stays applied, so the hold's `unlabeled` event dates it
+                    // (#11401), not a `labeled` one.
                     let released =
                         was.stage == FleetStage::MergeHold && now.stage == FleetStage::MergeWait;
                     let forge_at = match (now_repo.sources.get(&issue), now.pr) {
-                        (Some(Source::Review), Some(pr)) if !released => {
-                            diff.label_instant(repo, pr, now.stage)
+                        (Some(Source::Review), Some(pr)) if released => {
+                            diff.release_instant(repo, pr)
                         }
+                        (Some(Source::Review), Some(pr)) => diff.label_instant(repo, pr, now.stage),
                         _ => None,
                     };
                     let leaving = Leaving {
@@ -769,8 +813,8 @@ pub fn diff(
 /// one whose row is back in `ready_wait` (or whose repo is no longer
 /// managed), emit one whose departure the forge now shows, and emit one
 /// past [`PENDING_READY_MAX_PASSES`] as the view saw it (`unknown` unless
-/// this host's own claim showed the next stage), with no fact id. Returns
-/// those still waiting.
+/// this host's own claim showed the next stage), with no forge exit instant.
+/// Returns those still waiting.
 fn settle_pending_ready<F: ForgeReads>(
     memory: &mut Memory,
     pass: &Pass<'_>,
@@ -857,6 +901,18 @@ pub fn offer(records: Vec<TelemetryRecord>, sink: &super::FleetStateSink) -> usi
             continue;
         }
         log::debug!("fleet.state: emit {}", record.kind());
+        if let TelemetryRecord::StageOutcome(r) = &record {
+            if let Some(reason) = r.missing_fact_id_reason() {
+                log::debug!(
+                    "fleet.state: {}#{} left {} with no fact id ({})",
+                    r.repo,
+                    r.issue,
+                    r.stage.as_str(),
+                    reason.as_str()
+                );
+                crate::telemetry::kinds::stage_outcome::note_fact_id_missing();
+            }
+        }
         sink.offer(record);
         offered += 1;
     }

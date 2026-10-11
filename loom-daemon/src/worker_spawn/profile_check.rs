@@ -56,6 +56,12 @@ enum WorkerCommand {
     /// proxy to bad-mark this launch's current account and swap in another
     /// behind the same placeholder. Prints `export LOOM_TOKEN_NAME='…'`.
     ProxyRotate(super::egress_proxy::rotate_client::RotateArgs),
+
+    /// Launch one sweep phase (`--role builder|doctor`) out of process on the
+    /// runtime its `rolePreference` resolves to (#11285). Blocking; exits 0
+    /// with `delegate-to-claude` when the role resolves to Claude. Judge and
+    /// Curator are refused (exit 2).
+    Run(super::phase_run::RunArgs),
 }
 
 fn report(name: Option<&str>, runtime: Option<&str>) -> Result<(String, bool), LaunchError> {
@@ -252,6 +258,7 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
         WorkerCommand::Readiness(args) => return args.run(),
         WorkerCommand::ProxyExec(args) => return super::egress_proxy::exec::cli(args),
         WorkerCommand::ProxyRotate(args) => return super::egress_proxy::rotate_client::cli(args),
+        WorkerCommand::Run(args) => return super::phase_run::cli(args),
     };
     match report(name.as_deref(), runtime.as_deref()) {
         Ok((text, resolvable)) => {

@@ -78,6 +78,8 @@ use crate::workspace_pool::WorkspacePool;
 use super::queue::QueueSink;
 mod correlation;
 mod identity;
+mod zai_accounts;
+use zai_accounts::sample_zai_accounts;
 pub(crate) type DispatchKey = (String, u32);
 
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
@@ -940,6 +942,12 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // The Z.ai api-keys seats (#11396): per-seat 5h/weekly burn from the
+    // read-only quota endpoint, cached between ticks; unknown, never 0, on any
+    // failure. Skipped entirely (no client, no request) with no zai seats.
+    token_record
+        .accounts
+        .extend(sample_zai_accounts(workspace_root).await);
     // Token burn + per-provider pool state (Issue #8857), through the
     // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
     super::ops::quota::record(workspace_root, &token_record.accounts).await;

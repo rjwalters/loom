@@ -36,16 +36,22 @@ impl std::fmt::Display for Trigger {
 pub const PROPOSAL_LABELS: &[&str] = &["loom:architect", "loom:hermit", "loom:auditor"];
 
 /// Heading fragments that make an issue an incident report, matched
-/// case-insensitively as substrings of a markdown heading's text.
+/// case-insensitively as substrings of a markdown heading's text — with one
+/// exception (#9549): a heading that is *bare* `what happened` — the phrase
+/// alone, with trailing ASCII punctuation (`?`, `!`, `.`, `:`) — is the
+/// standard first section of a GitHub issue-form bug report and does **not**
+/// fire. The same phrase *qualified* by a date, host, or context
+/// (`## What happened (2026-09-16, robb-pro, launchd)`) narrates an event
+/// and still does. See [`is_bare`].
 ///
 /// DELIBERATELY EXCLUDED, and why: `steps to reproduce`, `expected`, `actual`,
-/// `current behaviour`, `symptom`, `description`, `bug`. Those are the
-/// ordinary bug-report vocabulary — an ordinary bug report is *also* an
-/// observation the filer has not diagnosed, so a vocabulary built from them
-/// would pull the entire bug queue into the gate and falsify #8396's
-/// "routine bug fixes are demonstrably unaffected" criterion. What separates
-/// an incident report is that it narrates a *host- or fleet-level event*, and
-/// that is what these fragments name.
+/// `current behaviour`, `symptom`, `description`, `bug`, and the bare `what
+/// happened` form above. Those are the ordinary bug-report vocabulary — an
+/// ordinary bug report is *also* an observation the filer has not diagnosed,
+/// so a vocabulary built from them would pull the entire bug queue into the
+/// gate and falsify #8396's "routine bug fixes are demonstrably unaffected"
+/// criterion. What separates an incident report is that it narrates a *host-
+/// or fleet-level event*, and that is what these fragments name.
 pub const INCIDENT_HEADINGS: &[&str] = &[
     "what happened",
     "what went wrong",
@@ -133,13 +139,33 @@ pub fn trigger(title: &str, body: &str, labels: &[String]) -> Option<Trigger> {
     for heading in headings(body) {
         let lower = heading.to_lowercase();
         for frag in INCIDENT_HEADINGS {
-            if lower.contains(frag) {
-                return Some(Trigger::IncidentReport(heading));
+            if !lower.contains(frag) {
+                continue;
             }
+            // `what happened` is the one fragment with a bare form-field
+            // reading (#9549): the phrase alone is a bug-report section, not
+            // a narrated event. The qualified form still fires below.
+            if *frag == "what happened" && is_bare(&lower, frag) {
+                break;
+            }
+            return Some(Trigger::IncidentReport(heading));
         }
     }
 
     None
+}
+
+/// True when `heading_lower` is the bare form of `frag`: surrounding
+/// whitespace and trailing ASCII punctuation (`?`, `!`, `.`, `:`) stripped
+/// and nothing left but the phrase — `## What happened`, `### What
+/// happened?`, `## What happened:` — rather than a qualified event name like
+/// `## What happened (2026-09-16, robb-pro, launchd)`.
+fn is_bare(heading_lower: &str, frag: &str) -> bool {
+    heading_lower
+        .trim()
+        .trim_end_matches(['?', '!', '.', ':'])
+        .trim()
+        == frag
 }
 
 /// Markdown heading texts, in document order.
