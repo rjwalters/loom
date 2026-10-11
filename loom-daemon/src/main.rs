@@ -355,6 +355,9 @@ enum Commands {
         /// not the case this gate exists to stop.
         #[arg(long)]
         allow_local: bool,
+
+        #[command(flatten)]
+        tap: cli::dispatch::DispatchTapArgs,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`

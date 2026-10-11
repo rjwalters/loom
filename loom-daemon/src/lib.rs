@@ -173,6 +173,7 @@ pub mod disk_admission;
 pub mod disk_footprint;
 pub mod disk_full_halt;
 pub mod disk_headroom;
+pub mod dispatch_tap;
 pub mod docker_image_clean;
 pub mod doctor_escalation;
 pub mod eager_reclaim;

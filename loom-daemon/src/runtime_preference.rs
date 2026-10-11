@@ -107,6 +107,7 @@
 pub mod availability;
 pub mod ceiling;
 pub mod codex_guard;
+pub mod explicit_tap;
 pub mod handoff;
 pub mod launch_failure_hold;
 pub mod resolve;

@@ -102,6 +102,8 @@ pub fn command_to_request(command: &Command) -> Option<Request> {
             depends_on: None,
             workspace_root: None,
             force: false,
+            runtime: None,
+            model_profile: None,
         }),
         Command::Cancel { sweep } => Some(Request::CancelSweep {
             sweep_id: sweep.clone(),

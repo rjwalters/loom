@@ -15,6 +15,7 @@ import {
   formatDispatchTokenLine,
   formatRuntimeRejection,
   formatStructuredError,
+  sweepTools,
   type RuntimeRejection,
 } from "./sweeps.js";
 
@@ -155,5 +156,22 @@ describe("formatStructuredError", () => {
 
   it("never throws on a fully empty payload", () => {
     expect(formatStructuredError({})).toBe("Unknown structured error");
+  });
+});
+
+describe("dispatch_sweep per-dispatch tap schema (issue #11284)", () => {
+  const tool = sweepTools.find((t) => t.name === "dispatch_sweep");
+  const schema = tool?.inputSchema as {
+    properties: Record<string, { type: string }>;
+    required: string[];
+  };
+
+  it("accepts optional runtime and model_profile strings", () => {
+    expect(schema.properties.runtime?.type).toBe("string");
+    expect(schema.properties.model_profile?.type).toBe("string");
+  });
+
+  it("keeps them optional so legacy callers are unchanged", () => {
+    expect(schema.required).toEqual(["kind"]);
   });
 });
