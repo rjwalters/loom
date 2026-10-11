@@ -25,7 +25,7 @@ use serde_json::Value;
 use super::{
     field, flag, json, lines, prefix_and_statements, text, uint, ReplayParams, REPLAY_QUERIES,
 };
-use crate::signoz_read::{ClickhouseHttp, ReadError};
+use crate::signoz_read::{ReadError, TelemetryReader};
 
 const AGREEMENT_BEGIN: &str = "-- >>> agreement-prefix";
 const AGREEMENT_END: &str = "-- <<< agreement-prefix";
@@ -278,7 +278,7 @@ pub fn assemble_export(params: &CheckParams, export: &str) -> Result<Check, Stri
 ///
 /// The committed SQL has an unexpected shape, the store could not be read, or
 /// it returned rows this reader cannot parse.
-pub fn fetch(http: &ClickhouseHttp, params: &CheckParams) -> Result<Check, String> {
+pub fn fetch(http: &TelemetryReader, params: &CheckParams) -> Result<Check, String> {
     let (check_sql, report_sql) = check_and_report_queries(REPLAY_QUERIES)?;
     if params.replay.knowable_since.is_none() {
         return Err(super::MISSING_KNOWABLE_SINCE.to_string());

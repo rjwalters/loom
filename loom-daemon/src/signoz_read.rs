@@ -1,5 +1,5 @@
 //! The SigNoz read client: keyset-paged `JSONEachRow` reads from the
-//! telemetry store's ClickHouse (#10196 R6).
+//! telemetry store, through the telemetry-reader (#10196 R6, #11357).
 //!
 //! This is transport only. It knows nothing about what a query selects or
 //! what a row means: callers bring their own SQL and their own row parser.
@@ -17,16 +17,16 @@
 //!
 //! # Two transports
 //!
-//! - [`ClickhouseHttp`]: ClickHouse's HTTP interface, bound query parameters,
-//!   the credential read from an owner-only file at call time and never
-//!   logged ([`SqlPages`] pairs it with one query).
+//! - [`TelemetryReader`]: the telemetry-reader's `POST /v1/query`, the SQL as
+//!   the body and bound `param_*` URL parameters, no credential
+//!   ([`SqlPages`] pairs it with one query).
 //! - [`FileRows`]: the rows of an export an operator ran with
 //!   `clickhouse-client`, served under the same filters, order and keyset —
 //!   and the recorded-fixture reader tests use.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The paging position of one row: `(knowable_time_ns, record_id)` exactly
 /// as the query orders by, so a continuation resumes after it even when the
@@ -81,7 +81,7 @@ impl PageQuery {
 /// Why a page could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
-    /// The backend did not answer (connection, timeout, missing credential).
+    /// The backend did not answer (connection, timeout, bad endpoint).
     Unavailable(String),
     /// It answered with an error status.
     Refused(String),
@@ -173,67 +173,58 @@ impl SignozRead for FileRows {
     }
 }
 
-/// ClickHouse's HTTP interface: `POST` a query, bind the parameters as
-/// `param_*`, authenticate with `X-ClickHouse-User` / `X-ClickHouse-Key`.
+/// The telemetry-reader (2AMLogic/2am#3704, #3855): `POST <base>/v1/query`
+/// with the statement as the body and each bound value as a `param_<name>`
+/// URL parameter.
 ///
-/// The password is read from `credential_file` on every request and dropped
-/// immediately; it never reaches a log line, an error string or a file. A
-/// credential file readable by group or others is refused (unix), per the
-/// owner-only rule in `credential-storage.md`.
+/// It carries **no credential**: the reader identifies the caller by its
+/// network identity and runs the statement as that caller's read-only store
+/// account, so no Loom component holds a ClickHouse password (#11357,
+/// #11178). The base comes from `--endpoint`, `TELEMETRY_READER_URL` or
+/// `telemetry.signoz.endpoint` ([`EndpointConfig`]); no address is built in.
 #[derive(Debug, Clone)]
-pub struct ClickhouseHttp {
-    /// `http(s)://host:port`.
+pub struct TelemetryReader {
+    /// The reader's base, a bare `http(s)://host[:port]`.
     pub endpoint: String,
-    /// ClickHouse user.
-    pub user: Option<String>,
-    /// Owner-only password file.
-    pub credential_file: Option<PathBuf>,
     /// Per-request timeout.
     pub timeout: std::time::Duration,
 }
 
-impl ClickhouseHttp {
-    fn password(&self) -> Result<Option<String>, ReadError> {
-        let Some(path) = &self.credential_file else {
-            return Ok(None);
-        };
-        let unavailable = |why: &str| {
-            ReadError::Unavailable(format!("credential file {}: {why}", path.display()))
-        };
-        let meta = std::fs::metadata(path).map_err(|_| unavailable("unreadable"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(unavailable("readable by group or others; chmod 600 it"));
-            }
-        }
-        let _ = meta;
-        let secret = std::fs::read_to_string(path).map_err(|_| unavailable("unreadable"))?;
-        let secret = secret.trim().to_string();
-        if secret.is_empty() {
-            return Err(unavailable("empty"));
-        }
-        Ok(Some(secret))
-    }
+/// The reader's one query route, joined onto [`TelemetryReader::endpoint`].
+pub const QUERY_PATH: &str = "/v1/query";
 
-    /// The request URL: the endpoint plus every parameter in `params`, each
-    /// bound as `param_<name>`.
+impl TelemetryReader {
+    /// The request URL: the base's [`QUERY_PATH`] plus every parameter in
+    /// `params`, each bound as `param_<name>` (the only query keys the reader
+    /// accepts).
     ///
     /// # Errors
     ///
-    /// The endpoint is not an `http(s)` URL.
+    /// The endpoint is not a bare `http(s)://host[:port]` base (a path, a
+    /// query, a fragment or userinfo in it is refused, and never echoed).
     pub fn url_with(&self, params: &[(String, String)]) -> Result<reqwest::Url, ReadError> {
-        let mut url = reqwest::Url::parse(&self.endpoint)
-            .map_err(|e| ReadError::Unavailable(format!("invalid endpoint: {e}")))?;
+        let bad = |why: &str| ReadError::Unavailable(format!("invalid reader endpoint: {why}"));
+        let mut url = reqwest::Url::parse(self.endpoint.trim()).map_err(|e| bad(&e.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(ReadError::Unavailable("endpoint is not http(s)".to_string()));
+            return Err(bad("not http(s)"));
         }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(bad("carries userinfo; the reader takes no credential"));
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(bad(&format!(
+                "pass the bare base http(s)://host[:port]; {QUERY_PATH} is added"
+            )));
+        }
+        url.set_path(QUERY_PATH);
         {
             let mut pairs = url.query_pairs_mut();
             for (name, value) in params {
                 pairs.append_pair(&format!("param_{name}"), value);
             }
+        }
+        if params.is_empty() {
+            url.set_query(None);
         }
         Ok(url)
     }
@@ -242,7 +233,7 @@ impl ClickhouseHttp {
     ///
     /// # Errors
     ///
-    /// The endpoint is not an `http(s)` URL.
+    /// As for [`Self::url_with`].
     pub fn url(&self, query: &PageQuery) -> Result<reqwest::Url, ReadError> {
         self.url_with(&query.params())
     }
@@ -251,7 +242,7 @@ impl ClickhouseHttp {
     ///
     /// # Errors
     ///
-    /// The backend is unreachable or answered with an error status.
+    /// The reader is unreachable or answered with an error status.
     pub fn post(&self, sql: &str, query: &PageQuery) -> Result<String, ReadError> {
         self.post_with(sql, &query.params())
     }
@@ -260,11 +251,9 @@ impl ClickhouseHttp {
     ///
     /// # Errors
     ///
-    /// The backend is unreachable or answered with an error status.
+    /// The reader is unreachable or answered with an error status.
     pub fn post_with(&self, sql: &str, params: &[(String, String)]) -> Result<String, ReadError> {
         let url = self.url_with(params)?;
-        let password = self.password()?;
-        let user = self.user.clone();
         let timeout = self.timeout;
         let sql = sql.to_string();
         // A private current-thread runtime on its own thread: callers are
@@ -278,20 +267,25 @@ impl ClickhouseHttp {
                         .build()
                         .map_err(|e| ReadError::Unavailable(format!("runtime: {e}")))?;
                     runtime.block_on(async move {
+                        // No redirects: a redirect could carry the statement
+                        // somewhere other than the configured reader.
                         let client = reqwest::Client::builder()
                             .timeout(timeout)
+                            .redirect(reqwest::redirect::Policy::none())
                             .build()
                             .map_err(|e| ReadError::Unavailable(format!("client: {e}")))?;
-                        let mut request = client.post(url).body(sql);
-                        if let Some(user) = user {
-                            request = request.header("X-ClickHouse-User", user);
-                        }
-                        if let Some(password) = password {
-                            request = request.header("X-ClickHouse-Key", password);
-                        }
-                        let response = request.send().await.map_err(|e| {
-                            ReadError::Unavailable(format!("request failed: {}", e.without_url()))
-                        })?;
+                        let response = client
+                            .post(url)
+                            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                            .body(sql)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                ReadError::Unavailable(format!(
+                                    "request failed: {}",
+                                    e.without_url()
+                                ))
+                            })?;
                         let status = response.status();
                         let body = response.text().await.map_err(|e| {
                             ReadError::Unavailable(format!("body: {}", e.without_url()))
@@ -309,81 +303,85 @@ impl ClickhouseHttp {
     }
 }
 
-/// Where the telemetry store's ClickHouse is, from configuration.
+/// Where the telemetry-reader is: `TELEMETRY_READER_URL`, else
+/// `telemetry.signoz.endpoint` (a `--endpoint` flag overrides both).
 ///
-/// The neutral key is `telemetry.signoz.{endpoint,user,credentialFile}`. For
-/// one release the old `autonomous.eta.fleetRefresh.signoz.*` key is read as a
-/// per-field fallback (`legacy` names the fields that came from it, so the
-/// caller can warn once), letting #11098 Stage 3 delete `autonomous.eta.*`
-/// without breaking replay. `credentialFile` is a **path** to an owner-only
-/// file, never the secret.
+/// There is no credential to configure. Every other key under
+/// `telemetry.signoz` (the old ClickHouse user and password-file settings)
+/// and the retired `autonomous.eta.fleetRefresh.signoz` block are not read;
+/// `ignored` names any that are still set, so the caller can say so once.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EndpointConfig {
-    /// `http(s)://host:port`.
+    /// The reader's base, `http(s)://host[:port]`.
     pub endpoint: Option<String>,
-    /// ClickHouse user.
-    pub user: Option<String>,
-    /// Owner-only password file.
-    pub credential_file: Option<PathBuf>,
-    /// The fields read from the deprecated `autonomous.eta` key.
-    pub legacy: Vec<&'static str>,
+    /// Retired keys still present in the configuration (dotted paths).
+    pub ignored: Vec<String>,
 }
 
-/// The neutral configuration key.
+/// The configuration key.
 pub const ENDPOINT_CONFIG_KEY: &str = "telemetry.signoz";
-/// The deprecated key read as a fallback for one release.
-pub const LEGACY_ENDPOINT_CONFIG_KEY: &str = "autonomous.eta.fleetRefresh.signoz";
+/// The environment variable naming the reader's base (2am's client
+/// convention); it wins over the configuration.
+pub const ENDPOINT_ENV: &str = "TELEMETRY_READER_URL";
+/// The retired ETA-era block, no longer read.
+const RETIRED_CONFIG_KEY: &str = "autonomous.eta.fleetRefresh.signoz";
 
 impl EndpointConfig {
-    /// Resolve from an effective config document.
+    /// Resolve from an effective config document and the value of
+    /// [`ENDPOINT_ENV`] (`None` or blank: unset).
     #[must_use]
-    pub fn from_config(config: &Value) -> Self {
+    pub fn resolve(config: &Value, env: Option<&str>) -> Self {
         let block = |path: &str| {
             path.split('.')
                 .try_fold(config, |node, key| node.get(key))
                 .cloned()
         };
         let neutral = block(ENDPOINT_CONFIG_KEY);
-        let legacy = block(LEGACY_ENDPOINT_CONFIG_KEY);
-        let read = |b: &Option<Value>, key: &str| {
-            b.as_ref()
-                .and_then(|b| b.get(key))
-                .and_then(Value::as_str)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        };
-        let mut out = EndpointConfig::default();
-        let mut pick = |key: &'static str| {
-            read(&neutral, key).or_else(|| {
-                let old = read(&legacy, key);
-                if old.is_some() {
-                    out.legacy.push(key);
-                }
-                old
-            })
-        };
-        let endpoint = pick("endpoint");
-        let user = pick("user");
-        let credential_file = pick("credentialFile").map(PathBuf::from);
-        out.endpoint = endpoint;
-        out.user = user;
-        out.credential_file = credential_file;
-        out
+        let configured = neutral
+            .as_ref()
+            .and_then(|b| b.get("endpoint"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let env = env
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let mut ignored = Vec::new();
+        if let Some(Value::Object(block)) = &neutral {
+            ignored.extend(
+                block
+                    .keys()
+                    .filter(|key| *key != "endpoint")
+                    .map(|key| format!("{ENDPOINT_CONFIG_KEY}.{key}")),
+            );
+        }
+        if block(RETIRED_CONFIG_KEY).is_some() {
+            ignored.push(RETIRED_CONFIG_KEY.to_string());
+        }
+        EndpointConfig {
+            endpoint: env.or(configured),
+            ignored,
+        }
     }
 
-    /// Resolve from `repo_root`'s effective Loom configuration.
+    /// Resolve from `repo_root`'s effective Loom configuration and the
+    /// process environment.
     #[must_use]
     pub fn read(repo_root: &Path) -> Self {
-        Self::from_config(&crate::config_resolver::resolve_effective_config(repo_root))
+        Self::resolve(
+            &crate::config_resolver::resolve_effective_config(repo_root),
+            std::env::var(ENDPOINT_ENV).ok().as_deref(),
+        )
     }
 }
 
-/// One query over [`ClickhouseHttp`]: every page `POST`s `sql` with the
+/// One query over [`TelemetryReader`]: every page `POST`s `sql` with the
 /// page's parameters bound.
 #[derive(Debug, Clone)]
 pub struct SqlPages {
     /// The transport.
-    pub http: ClickhouseHttp,
+    pub http: TelemetryReader,
     /// The keyset-paged query (see the module's paging contract).
     pub sql: &'static str,
 }
