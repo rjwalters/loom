@@ -591,7 +591,8 @@ fn untracked_symlink_to_a_tracked_file_is_uncommitted() {
 
 /// Gap 3: a committed symlink that leaves the checkout or loops never reads
 /// as `present`. It does not park either: what is behind it is not a file in
-/// the working tree.
+/// the working tree. (A link whose absolute target is the checkout itself is
+/// the other case; see `committed_absolute_symlink_into_the_checkout_parks`.)
 #[test]
 fn committed_symlink_leaving_the_checkout_is_not_followed() {
     use std::os::unix::fs::symlink;
@@ -734,4 +735,77 @@ touch `src/gen.rs`
 
     let clear = body.replace("touch `src/gen.rs`", "touch src/gen.rs");
     assert_eq!(check(&clear, repo.path(), "HEAD").unwrap().exit_code(), EXIT_CLEAR);
+}
+
+/// Judge finding on #11456: `src/./draft.rs` and `src//draft.rs` name the
+/// untracked `src/draft.rs`. The working-tree lookup matches each segment
+/// against a directory listing, which holds neither `.` nor an empty name, so
+/// before the path was normalised these spellings missed the file and a
+/// `(new)` marker cleared them.
+#[test]
+fn dot_and_empty_segments_do_not_hide_an_untracked_path() {
+    let repo = fixture();
+    for spelling in ["src/./draft.rs", "src//draft.rs", "./src/.//./draft.rs"] {
+        for marker in ["", " (new)"] {
+            let body = format!("## Affected Files\n\n- `{spelling}`{marker} - edit\n");
+            let report = check(&body, repo.path(), "HEAD").unwrap();
+            assert_eq!(report.render(), "uncommitted\tsrc/draft.rs\n", "{body}");
+            assert_eq!(report.exit_code(), EXIT_UNCOMMITTED, "{body}");
+        }
+    }
+}
+
+/// The same spellings of paths that are not in the working tree keep their
+/// class and are reported under the normalised name, also through the
+/// committed link and before a `#fragment`.
+#[test]
+fn dot_and_empty_segments_are_dropped_before_both_lookups() {
+    let repo = fixture();
+    let body = "\
+## Affected Files
+
+- `src/./kept.rs`, `src//kept.rs:12` and `link/.//kept.rs`
+- `src/./made.rs` (new)
+- `src//gone.rs`
+- `src/./kept.rs#usage` and `src//`
+";
+    let report = check(body, repo.path(), "HEAD").unwrap();
+    assert_eq!(
+        report.render(),
+        "present\tlink/kept.rs\npresent\tsrc\nunknown\tsrc/gone.rs\npresent\tsrc/kept.rs\n\
+         new\tsrc/made.rs\n"
+    );
+    // Dropping segments never turns a rejected span into a repo path.
+    let rejected = "## Affected Files\n\n- `//etc/hosts.txt`, `src/./../x.rs`, `.//x.rs`, `./.`\n";
+    assert!(listed_paths(rejected).is_empty(), "{:?}", listed_paths(rejected));
+}
+
+/// Judge finding on #11456: a committed symlink whose absolute target is this
+/// checkout is not followed (in a Builder worktree it would still point at
+/// this checkout), so nothing behind it is ever `present`. The working-tree
+/// lookup does descend it, so both the tracked and the untracked file behind
+/// it park, whatever the marker says. Parking a tracked file is the safe
+/// side: not descending would let `(new)` clear the untracked draft.
+#[test]
+fn committed_absolute_symlink_into_the_checkout_parks() {
+    use std::os::unix::fs::symlink;
+    let repo = fixture();
+    let root = repo.path();
+    symlink(root.canonicalize().unwrap().join("src"), root.join("abs")).unwrap();
+    git_ok(root, &["add", "-A", "abs"]);
+    git_ok(root, &["commit", "-q", "-m", "absolute link"]);
+    let body = "\
+## Affected Files
+
+- `abs/kept.rs` and `abs/draft.rs` (new)
+- `abs/made.rs` (new)
+- `abs/gone.rs`
+";
+    let report = check(body, root, "HEAD").unwrap();
+    assert_eq!(
+        report.render(),
+        "uncommitted\tabs/draft.rs\nunknown\tabs/gone.rs\nuncommitted\tabs/kept.rs\n\
+         new\tabs/made.rs\n"
+    );
+    assert_eq!(report.exit_code(), EXIT_UNCOMMITTED);
 }

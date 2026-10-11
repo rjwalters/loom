@@ -22,7 +22,10 @@
 //! * **Only symlinks committed on the base are followed**, with the target
 //!   read from the base blob, and never out of the checkout. An untracked
 //!   symlink is looked up under its own name, so it cannot borrow the status
-//!   of the tracked file it points at.
+//!   of the tracked file it points at. A committed link with an absolute
+//!   target is never followed, even when the target is this checkout: in the
+//!   Builder's worktree it would still point here. What is behind it reads
+//!   `uncommitted` when it is in this working tree, never `present`.
 //! * **The working-tree test matches the spelling exactly.** `readme.md` for
 //!   a tracked `README.md` is `unknown` on every platform; a plain stat on a
 //!   case-insensitive filesystem would find the tracked file and park. A path
@@ -236,6 +239,10 @@ fn path_shaped(span: &str) -> Option<String> {
 /// `path` normalised for lookup, or `None` when it cannot name a repo-relative
 /// file: a URL, a command-line flag, or a path outside the repo. Glob-shaped
 /// spans are kept here; see [`glob_shaped`].
+///
+/// `.` and empty segments are dropped (`src/./a.rs` and `src//a.rs` are
+/// `src/a.rs`), so the base lookup and the working-tree lookup, which matches
+/// each segment against a directory listing, are given the same spelling.
 fn concrete(path: &str) -> Option<String> {
     // `as_path` drops a `:42` suffix; a `:40-60` line range is cited as often.
     let p = match path.rsplit_once(':') {
@@ -249,12 +256,15 @@ fn concrete(path: &str) -> Option<String> {
         }
         _ => path,
     };
-    let p = p.trim_end_matches('/');
-    let skip = p.is_empty()
-        || p.starts_with(['/', '~', '-'])
+    let skip = p.starts_with(['/', '~', '-'])
         || p.contains("://")
         || p.split('/').any(|seg| seg == ".." || seg == "...");
-    (!skip).then(|| p.to_string())
+    let p = p
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    (!skip && !p.is_empty()).then_some(p)
 }
 
 /// Every path listed under an `Affected Files` heading, mapped to
