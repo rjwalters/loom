@@ -121,3 +121,32 @@ fn registry_provider_accounts_preserve_missing_health_and_report_holds() {
         assert_eq!(account.limit_window_reset_at, deadline);
     }
 }
+
+#[test]
+fn zai_seats_carry_the_key_in_process_but_rows_never_do() {
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = tempfile::tempdir().unwrap();
+    let dir = workspace.path().join(".loom/api-keys/zai");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = "sk-test-secret-value-1234567890";
+    let file = dir.join("seat-a.env");
+    std::fs::write(&file, format!("ZAI_API_KEY={secret}\n")).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let seats = zai_seats(workspace.path());
+    assert_eq!(seats.len(), 1);
+    assert_eq!(seats[0].name, "seat-a");
+    assert_eq!(seats[0].key, secret);
+
+    // The row built for it names the seat and nothing secret.
+    let row = crate::observability::ops::quota::zai::account_state("seat-a", None, false, None);
+    let rendered = format!("{row:?}");
+    assert!(!rendered.contains(secret));
+    assert_eq!(row.usage_fraction, None);
+}
+
+#[test]
+fn no_zai_seats_when_unprovisioned() {
+    let workspace = tempfile::tempdir().unwrap();
+    assert!(zai_seats(workspace.path()).is_empty());
+}

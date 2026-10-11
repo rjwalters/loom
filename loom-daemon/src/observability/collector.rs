@@ -940,6 +940,12 @@ async fn sample_snapshots(
     token_record
         .accounts
         .extend(sample_registry_provider_accounts(workspace_root));
+    // The Z.ai api-keys seats (#11396): per-seat 5h/weekly burn from the
+    // read-only quota endpoint, cached between ticks; unknown, never 0, on any
+    // failure. Skipped entirely (no client, no request) with no zai seats.
+    token_record
+        .accounts
+        .extend(sample_zai_accounts(workspace_root).await);
     // Token burn + per-provider pool state (Issue #8857), through the
     // OTLP-only ops sink — a no-op (no reads at all) without an OTLP exporter.
     super::ops::quota::record(workspace_root, &token_record.accounts).await;
@@ -1122,6 +1128,46 @@ fn sample_registry_provider_accounts(workspace_root: &Path) -> Vec<TokenAccountS
         }
     }
     accounts
+}
+
+/// The enabled `zai` api-keys seats as quota-poll inputs. A seat whose key
+/// cannot be read is left out (its pool state still reaches the pool gauges
+/// through `ops::quota`); the key never leaves this struct.
+fn zai_seats(workspace_root: &Path) -> Vec<super::ops::quota::zai::Seat> {
+    use crate::api_keys_pool::{paths, registry, select, Ineligible};
+    let provider = super::ops::quota::zai::ZAI_PROVIDER;
+    let roots = paths::pool_roots(workspace_root);
+    let Ok(accounts) = select::list_accounts_in(&roots, Some(provider)) else {
+        return Vec::new();
+    };
+    let Ok(provider_root) = paths::resolve_provider_root_in(&roots, provider) else {
+        return Vec::new();
+    };
+    accounts
+        .into_iter()
+        .filter(|account| account.enabled && account.ineligible != Some(Ineligible::Malformed))
+        .filter_map(|account| {
+            let credential =
+                registry::read_credential(&provider_root, provider, &account.name).ok()?;
+            Some(super::ops::quota::zai::Seat {
+                marked_exhausted: account.ineligible == Some(Ineligible::Exhausted),
+                mark_resets_at: account
+                    .resets_at
+                    .and_then(|at| DateTime::<Utc>::from_timestamp(i64::try_from(at).ok()?, 0)),
+                name: account.name,
+                key: credential.value,
+            })
+        })
+        .collect()
+}
+
+/// `zai` seat rows for `tokens.snapshot` (Issue #11396).
+async fn sample_zai_accounts(workspace_root: &Path) -> Vec<TokenAccountState> {
+    let root = workspace_root.to_path_buf();
+    let Ok(seats) = tokio::task::spawn_blocking(move || zai_seats(&root)).await else {
+        return Vec::new();
+    };
+    super::ops::quota::zai::sample(seats).await
 }
 
 /// Sample host CPU/disk headroom into a [`HostHealthRecord`], stamped with the

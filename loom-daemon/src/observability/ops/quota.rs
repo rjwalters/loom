@@ -62,6 +62,7 @@ pub mod codex;
 pub mod kimi;
 pub mod opencode;
 pub mod tail;
+pub mod zai;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -280,7 +281,21 @@ fn sample(workspace_root: &Path, mut accounts: Vec<PoolAccount>, now: DateTime<U
     let (pool, pool_start) = {
         let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
         let state = guard.get_or_insert_with(QuotaState::default);
-        accounts.extend(state.api_key_pool(api_keys));
+        // A seat `tokens.snapshot` already carries (Z.ai, #11396) is not
+        // counted a second time in the per-provider aggregates; it only
+        // picks up the declared plan facts the snapshot row has no field for.
+        for pooled in state.api_key_pool(api_keys) {
+            match accounts
+                .iter_mut()
+                .find(|a| a.provider == pooled.provider && a.account == pooled.account)
+            {
+                Some(known) => {
+                    known.plan_token_limit = pooled.plan_token_limit;
+                    known.plan_window_secs = pooled.plan_window_secs;
+                }
+                None => accounts.push(pooled),
+            }
+        }
         let pool_start = state.last_pool_sample;
         (state.pool_points(&accounts, now), pool_start)
     };
