@@ -551,7 +551,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 `WAVE_MERGED_FILES` is the load-bearing state for the intra-wave collision guard (#3647): it accumulates the changed-file paths of every PR already merged **in this wave**, so the step 7 gate can tell whether the next PR overlaps a sibling that has already landed. Seed it empty at the start of each wave (it does **not** carry across waves — each wave rebases onto a settled `main`).
 
 **Checkpoint skip.** For each PR:
-- If `CHECKPOINT_PHASE == "judge-done"` for the corresponding issue, the Judge already approved the PR in a prior sweep run. Skip the Judge invocation and route the PR straight to Merge (step 7). The PR should already carry `loom:pr` (judge writes that label as part of the approve path); if it doesn't, the checkpoint and forge state have diverged — log a warning and re-run Judge.
+- If `CHECKPOINT_PHASE == "judge-done"`, Judge approved in a prior run, but a head pushed since is unreviewed (#11384). No `loom:pr` → checkpoint and forge diverged: log a warning, re-run Judge. Else skip Judge, run `./.loom/scripts/verdict-staleness-guard.sh <PR> --clear`, and route by exit as Mode C's C1c table: `0` (FRESH) → Merge (step 7); `12` (STALE, re-queued) → re-run Judge; `11` (UNVERIFIABLE) or other → do not merge, log, keep the checkpoint.
 - If `CHECKPOINT_PHASE == "doctor-done"`, Doctor has already run (a feedback fix, or a rebase pass). **Re-run the Judge phase** for this PR — Judge has not yet evaluated the post-doctor diff in the current sweep run.
 - If `CHECKPOINT_PHASE == "judge-rejected"`, an earlier sweep run's Judge already completed and requested changes on this PR — the sweep was killed before the inline Doctor cycle finished. **Do NOT re-run the initial Judge pass.** Route directly to the Doctor phase (step 6) for this PR. **Forge/checkpoint divergence guard:** before trusting this checkpoint, verify the PR still carries `loom:changes-requested`:
   ```bash
@@ -559,7 +559,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
   # concurrent process moved the PR on, which a cached label set would hide.
   gh pr view <PR> --json labels --jq '[.labels[].name] | contains(["loom:changes-requested"])'
   ```
-  If it does not (e.g. a concurrent process already merged, re-judged, or otherwise moved the PR on), the checkpoint and forge state have diverged — log a warning and fall back to running Judge normally instead of trusting the stale checkpoint.
+  If it does not (a concurrent process merged, re-judged, or moved the PR on), the checkpoint and forge state have diverged — log a warning and run Judge normally.
 - Otherwise (`builder-done`, or no checkpoint yet because Builder just ran in this wave), run Judge normally.
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
@@ -591,10 +591,10 @@ If Judge requests changes on PR `#X` mid-wave, **or `CHECKPOINT_PHASE == "judge-
 - Doctor addresses the judge's feedback, commits the fixes, and pushes.
 - **On successful Doctor completion**, write the `doctor-done` checkpoint for the issue (carrying the PR number, the attempt counter, and the model the Doctor actually ran on — escalated or pinned, #3482) **before** re-invoking Judge:
   ```bash
-  # <attempt> is the cycle index + 1: 2 for the first Doctor cycle, 3 for the second, etc.
+  # <attempt>: unchanged for a rebase pass (Execution Model); else cycle index + 1 (2, 3, ...).
   ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "$RUN_ID" --pr-number <PR> --attempt <attempt> --model <doctor-model>
   ```
-  So a sweep killed between Doctor and the follow-up Judge resumes at the Judge phase (step 5), not the Doctor work.
+  So a kill between Doctor and the follow-up Judge resumes at Judge (step 5), not the Doctor work.
 - On completion, re-label the PR from `loom:changes-requested` back to `loom:review-requested` and **re-run the Judge phase** (step 5) for this PR.
 - **Cap: up to `sweep.max_doctor_cycles` Doctor→Judge cycles per PR (default 1).** If Judge still requests changes after the configured number of Doctor passes, mark this PR as blocked (`PR #X blocked: doctor cycle exhausted after <k> Doctor→Judge round(s); human attention required`), log the reason, and proceed to the next PR in the wave (do NOT block the wave on it). **Do NOT write a `judge-rejected` checkpoint for this terminal rejection** — the PR is leaving the sweep for this run, so leave the last checkpoint (`doctor-done`) as-is; the reaper honors that PR-side block and skips its #4256 resume dispatch (#8689), and stale-checkpoint cleanup handles it once the PR is closed or reconciled.
 - **Re-rejection under the cap (multi-cycle, #4185).** If Judge requests changes again and the cap has **not** yet been reached (`sweep.max_doctor_cycles > 1`, or the distinct-defect grace cycle below is granted), write `judge-rejected` for this issue **before** dispatching the next Doctor cycle — same as the initial rejection in step 5, but this time carry `--attempt` matching the value the **next** `doctor-done` write will use, so a kill-and-resume re-enters the correct escalation cycle and the cap survives the kill:
